@@ -3693,7 +3693,7 @@ def _compose_frozen_job_prompt(project: TimelineProject, job: GenerationJob) -> 
         key: value for key, value in compiled.items()
                     if key not in {"attachment_channel_routes",
                                    "attachment_capability_projections",
-                                   "section_window_states"}
+                                   "section_window_states", "copy_plan"}
     }
     job.minimax_h3_setup_snapshot = copy.deepcopy(
         compiled.get("setup_manifest", {}))
@@ -8139,9 +8139,9 @@ if routes is not None:
             labels_on=body.get("labels_on", False) is True,
             delimiter=delimiter, prompt_threshold=prompt_threshold,
             reference_threshold=reference_threshold,
-            convert_plan_for=(body.get("convert_plan_for")
-                              if isinstance(body.get("convert_plan_for"), dict)
-                              else None))
+            copy_plan_for=(body.get("copy_plan_for")
+                           if isinstance(body.get("copy_plan_for"), dict)
+                           else None))
         compiled["execution_window"] = execution_window
         compiled["candidate_base_modified_at"] = actual
         return web.json_response(compiled)

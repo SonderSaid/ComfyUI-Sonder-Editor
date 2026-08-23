@@ -48,6 +48,7 @@ import {
 } from "./prompt_channel_templates.js";
 import {
     configurePromptAttachment,
+    attachmentChannelProjectionSignature,
     createAttachmentChannelProjections,
     createPromptProjectionBox,
     createPromptDocumentEditor,
@@ -83,14 +84,19 @@ import {
     mountPromptIdentityPanel,
     promptReferenceAttachment,
     promptIdentityDependents,
+    sameIdentitySnapshot,
 } from "./prompt_identity_panel.js";
 import {
     buildPromptContextDiagnostics,
+    promptCandidateVisuallyStale,
     promptContextDiagnosticTitle,
 } from "./prompt_context_diagnostics.js";
 
 const WRITING_BREAK = "---";
 const WRITING_DRAFT_TEXT_CAP = 20000;
+const COPY_CAPABILITY_KINDS = new Set([
+    "definitions", "retention", "mentions", "summary", "audio_relationship",
+]);
 
 export { promptIdentityDependents as referenceBackedSubjectDependents };
 
@@ -294,6 +300,180 @@ export function identityCandidateSignature(candidate) {
         candidate.setup_manifest ?? null,
         candidate.ordinal_manifest ?? null,
     ]);
+}
+
+/** Read compiler-candidate and Relay-shaped payloads through one view seam. */
+export function writingCompiledPayload(payload) {
+    const source = payload && typeof payload === "object" ? payload : {};
+    const prompt = Object.prototype.hasOwnProperty.call(source, "prompt")
+        ? source.prompt : source.compiled_prompt;
+    const channels = Object.prototype.hasOwnProperty.call(source, "channels")
+        ? source.channels : source.compiled_channels;
+    return {
+        prompt: String(prompt || ""),
+        channels: channels && typeof channels === "object" && !Array.isArray(channels)
+            ? channels : {},
+    };
+}
+
+/**
+ * The parts of a Writing document that can move or change its read-only
+ * contribution blocks.
+ *
+ * Authored prose is deliberately absent. A normal keystroke changes the text
+ * and the compiled preview, but it does not change where a contribution is
+ * painted. Channel headings, section breaks, and attachment membership do.
+ * Keeping the distinction here prevents the candidate debounce from replacing
+ * every contribution DOM node while the author types.
+ */
+export function writingDecorationDocumentSignature(documentValue, channelKeys,
+    { defaultKey = "" } = {}) {
+    const document_ = normalizePromptDocument(documentValue);
+    const regions = channelRegionsByNode(document_, channelKeys, { defaultKey });
+    const ranges = writingBlockNodeRanges(document_).map((range) => ({
+        block: range.block,
+        firstIndex: range.firstIndex,
+    }));
+    const blockAttachments = [[]];
+    let block = 0;
+    for (const node of document_.nodes) {
+        if (node.type === "attachment") {
+            blockAttachments[block].push(String(node.attachment_id || ""));
+            continue;
+        }
+        for (const line of String(node.text || "").split("\n")) {
+            if (line.trim() !== "---") continue;
+            block += 1;
+            blockAttachments[block] = [];
+        }
+    }
+    return JSON.stringify({ regions, ranges, blockAttachments });
+}
+
+export async function materializePromptIdentityOwner(owner, semanticUnits, saveChange, saveOptions = {}) {
+    if (owner?.type !== "identity") {
+        return { owner, previous: null, next: null };
+    }
+    const identityId = String(owner?.identityId || "");
+    const previous = (semanticUnits || []).find((unit) =>
+        String(unit?.semantic_unit_id || "") === identityId);
+    if (!previous) throw new Error("The prompt identity no longer exists.");
+    const observedHandle = String(owner?.storedHandle || "").trim();
+    const currentHandle = String(previous?.handle || "").trim();
+    if (observedHandle && observedHandle !== currentHandle) {
+        throw new Error("The prompt identity handle changed elsewhere. Reopen and try again.");
+    }
+    if (currentHandle) {
+        // A dialog opened while the identity was blank may outlive a save in
+        // another surface. Adopt the durable spelling; never overwrite it with
+        // the stale suggestion the dialog captured.
+        return {
+            owner: { ...owner, handle: currentHandle, storedHandle: currentHandle },
+            previous: null, next: null,
+        };
+    }
+    const handle = String(owner?.handle || "").trim();
+    if (!handle) throw new Error("The prompt identity handle could not be materialized.");
+    const next = { ...structuredClone(previous), handle };
+    const saved = await saveChange?.({
+        type: "upsert", value: next, expected: structuredClone(previous),
+    }, "materialize prompt identity handle", saveOptions);
+    if (!saved) throw new Error("The prompt identity handle could not be materialized.");
+    return {
+        owner: { ...owner, handle, storedHandle: handle },
+        previous: structuredClone(previous), next,
+    };
+}
+
+export async function rollbackPromptIdentityAttachment(host, history = {}) {
+    const change = history?.promptIdentityChange;
+    if (!change) return true;
+    try {
+        if (typeof host?._applyPromptIdentityChange !== "function") {
+            throw new Error("Prompt identity rollback is unavailable.");
+        }
+        await host._applyPromptIdentityChange(change,
+            "rollback refused prompt identity attachment", { recordUndo: false });
+        return true;
+    } catch (error) {
+        // The handle is still durable, so retain one target-safe recovery
+        // action. It can retry after a transient failure and will refuse rather
+        // than overwrite an identity that changed elsewhere.
+        let targetChanged = error?.code === "prompt_identity_changed_elsewhere"
+            || error?.code === "prompt_identity_created_elsewhere";
+        if (!targetChanged && typeof host?._fetchReferences === "function") {
+            const refreshed = await host._fetchReferences({
+                ignoreMutationGate: true, reason: "prompt_identity_rollback_reconcile",
+                force: true,
+            });
+            if (refreshed) {
+                const identityId = String(change?.value?.semantic_unit_id || "");
+                const current = (host._promptSemanticUnits || []).find((unit) =>
+                    String(unit?.semantic_unit_id || "") === identityId) || null;
+                // A lost response may report failure after the server already
+                // applied the rollback. In that case there is nothing to undo.
+                if (sameIdentitySnapshot(current, change.value)) return true;
+                targetChanged = !sameIdentitySnapshot(current, change.expected);
+            }
+        }
+        const recoveryRetained = !targetChanged
+            && typeof host?._pushPromptIdentityUndo === "function";
+        if (recoveryRetained) {
+            host._pushPromptIdentityUndo("materialize prompt identity handle",
+                change, history?.inversePromptIdentityChange);
+        }
+        throw new Error(`The prompt Reference attachment was refused; ${targetChanged
+            ? "the identity changed elsewhere and was left untouched"
+            : recoveryRetained
+            ? "the new handle remains undoable"
+            : "the new handle could not be added to Undo history"}. ${
+            error?.message || "Rollback failed."}`);
+    }
+}
+
+export async function rollbackPromptPhysicalAttachment(host, history = {}) {
+    const operations = history?.referenceOperations || [];
+    if (!operations.length) return true;
+    try {
+        if (typeof host?._mutateReferences !== "function") {
+            throw new Error("Physical Reference rollback is unavailable.");
+        }
+        await host._mutateReferences(operations,
+            "rollback refused prompt Reference attachment");
+        return true;
+    } catch (error) {
+        let targetChanged = error?.code === "identity_mismatch";
+        if (!targetChanged && typeof host?._fetchReferences === "function") {
+            const refreshed = await host._fetchReferences({
+                ignoreMutationGate: true, reason: "physical_handle_rollback_reconcile",
+                force: true,
+            });
+            if (refreshed) {
+                const operation = operations[0] || {};
+                const memberId = String(operation.member_id || "");
+                const current = (host._references || [])
+                    .flatMap((reference) => reference?.members || [])
+                    .find((member) => String(member?.member_id || "") === memberId);
+                const currentHandle = String(current?.handle || "");
+                const rollbackHandle = String(operation?.fields?.handle || "");
+                const materializedHandle = String(operation?.expected?.handle || "");
+                if (currentHandle === rollbackHandle) return true;
+                targetChanged = currentHandle !== materializedHandle;
+            }
+        }
+        const recoveryRetained = !targetChanged
+            && typeof host?._pushReferenceUndo === "function";
+        if (recoveryRetained) {
+            host._pushReferenceUndo("materialize prompt Reference handle",
+                operations, history?.inverseReferenceOperations || []);
+        }
+        throw new Error(`The prompt Reference attachment was refused; ${targetChanged
+            ? "the physical Reference changed elsewhere and was left untouched"
+            : recoveryRetained
+            ? "the new handle remains undoable"
+            : "the new handle could not be added to Undo history"}. ${
+            error?.message || "Rollback failed."}`);
+    }
 }
 
 /**
@@ -698,6 +878,7 @@ export function mountPromptManagementPanel(host) {
     let identityPanelCleanup = () => {};
     let renderNow = () => {};
     let lastIdentityCandidateSignature = null;
+    let lastDiagnosticsSignature = null;
     // Set while the Writing draft is mounted so a landed candidate can repaint
     // its contributions WITHOUT going through the panel's `render()`, which
     // rebuilds the draft element and takes the caret and the chip editor's
@@ -1137,14 +1318,19 @@ export function mountPromptManagementPanel(host) {
         const line = document.createElement("div");
         line.style.cssText = `font-size:9px;color:${COLORS.textDim};`
             + "line-height:1.4;opacity:.9;";
+        let lastDormancySignature = null;
         const apply = () => {
             const dormancy = resolve();
+            const signature = JSON.stringify(dormancy || null);
+            if (signature === lastDormancySignature) return false;
+            lastDormancySignature = signature;
             line.dataset.sonderPromptDormancy = String(dormancy?.state || "");
             line.textContent = dormancy?.message || "";
             // Collapsed rather than removed: the row is rebuilt by a compile
             // that lands while the author is typing, and removing an element
             // from a card mid-edit reflows everything under the pointer.
             line.style.display = dormancy ? "" : "none";
+            return true;
         };
         apply();
         // `live: false` for a caller whose resolver closes over a fixed value --
@@ -1175,22 +1361,22 @@ export function mountPromptManagementPanel(host) {
             output.appendChild(status);
             return;
         }
-        if (payload._stale) {
+        if (promptCandidateVisuallyStale(payload)) {
             status.textContent = "Updating compiled output from the current Writing draft…";
             output.appendChild(status);
         } else {
             status.textContent = "Read-only compiler output for the current render window.";
             output.appendChild(status);
         }
+        const compiled = writingCompiledPayload(payload);
         const prompt = document.createElement("pre");
         prompt.dataset.sonderWritingCompiledPrompt = "1";
         prompt.style.cssText = `margin:0;padding:9px;border:1px solid ${COLORS.promptBorder};border-radius:5px;`
             + `background:${COLORS.panelMuted};color:${COLORS.text};font:11px/1.45 ${FONT.mono || "monospace"};`
             + "white-space:pre-wrap;overflow-wrap:anywhere;min-height:90px;";
-        prompt.textContent = String(payload.compiled_prompt || "");
+        prompt.textContent = compiled.prompt;
         output.appendChild(prompt);
-        const channels = payload.compiled_channels && typeof payload.compiled_channels === "object"
-            ? payload.compiled_channels : {};
+        const channels = compiled.channels;
         const orderedKeys = [...new Set([
             ...templateChannelKeys(host._channelTemplate()), ...Object.keys(channels),
         ])].filter((key) => Object.prototype.hasOwnProperty.call(channels, key));
@@ -1212,46 +1398,54 @@ export function mountPromptManagementPanel(host) {
     };
     const renderDiagnostics = (payload = currentCandidatePayload()) => {
         const state = buildPromptContextDiagnostics(payload);
-        diagnostics.style.opacity = state.stale ? "0.62" : "1";
-        diagnostics.dataset.sonderPromptDiagnosticsStale = state.stale ? "1" : "0";
-        diagnostics.textContent = "";
-        const windowLine = document.createElement("div");
-        windowLine.textContent = state.windowLabel;
-        windowLine.style.color = COLORS.textMuted;
-        diagnostics.appendChild(windowLine);
-        for (const row of state.general) {
-            const line = document.createElement("div");
-            const text = document.createElement("span");
-            text.textContent = `${row.tier === "error" ? "Error" : "Warning"} ${row.code}: ${row.message}`;
-            line.appendChild(text);
-            line.style.color = row.tier === "error" ? COLORS.dangerText : COLORS.warningText;
-            if (row.tier === "warning"
-                    && ["overall_soundscape", "non_diegetic_music"].includes(row.channel_key)) {
-                const addNA = makeBtn("Add N/A", `Write N/A into the global ${row.channel_key} channel`);
-                addNA.style.marginLeft = "6px";
-                addNA.addEventListener("mousedown", (event) => event.preventDefault());
-                addNA.addEventListener("click", () => {
-                    const selector = `[data-sonder-prompt-global-channel="${row.channel_key}"]`;
-                    const input = panel.querySelector(selector);
-                    if (!input) return;
-                    input.focus();
-                    input.insertText?.("N/A");
-                    input.blur();
-                });
-                line.appendChild(addNA);
+        const diagnosticsSignature = JSON.stringify(state);
+        if (diagnosticsSignature !== lastDiagnosticsSignature) {
+            lastDiagnosticsSignature = diagnosticsSignature;
+            diagnostics.style.opacity = state.stale ? "0.62" : "1";
+            diagnostics.dataset.sonderPromptDiagnosticsStale = state.stale ? "1" : "0";
+            diagnostics.textContent = "";
+            const windowLine = document.createElement("div");
+            windowLine.textContent = state.windowLabel;
+            windowLine.style.color = COLORS.textMuted;
+            diagnostics.appendChild(windowLine);
+            for (const row of state.general) {
+                const line = document.createElement("div");
+                const text = document.createElement("span");
+                text.textContent = `${row.tier === "error" ? "Error" : "Warning"} ${row.code}: ${row.message}`;
+                line.appendChild(text);
+                line.style.color = row.tier === "error" ? COLORS.dangerText : COLORS.warningText;
+                if (row.tier === "warning"
+                        && ["overall_soundscape", "non_diegetic_music"].includes(row.channel_key)) {
+                    const addNA = makeBtn("Add N/A", `Write N/A into the global ${row.channel_key} channel`);
+                    addNA.style.marginLeft = "6px";
+                    addNA.addEventListener("mousedown", (event) => event.preventDefault());
+                    addNA.addEventListener("click", () => {
+                        const selector = `[data-sonder-prompt-global-channel="${row.channel_key}"]`;
+                        const input = panel.querySelector(selector);
+                        if (!input) return;
+                        input.focus();
+                        input.insertText?.("N/A");
+                        input.blur();
+                    });
+                    line.appendChild(addNA);
+                }
+                diagnostics.appendChild(line);
             }
-            diagnostics.appendChild(line);
+            if (state.attachmentDiagnosticCount) {
+                const line = document.createElement("div");
+                line.textContent = `${state.attachmentDiagnosticCount} chip diagnostic${state.attachmentDiagnosticCount === 1 ? " is" : "s are"} marked below.`;
+                line.style.color = state.errorCount ? COLORS.dangerText : COLORS.warningText;
+                diagnostics.appendChild(line);
+            } else if (!state.general.length && payload) {
+                const clean = document.createElement("div");
+                clean.textContent = "No compile diagnostics in this render window.";
+                diagnostics.appendChild(clean);
+            }
         }
-        if (state.attachmentDiagnosticCount) {
-            const line = document.createElement("div");
-            line.textContent = `${state.attachmentDiagnosticCount} chip diagnostic${state.attachmentDiagnosticCount === 1 ? " is" : "s are"} marked below.`;
-            line.style.color = state.errorCount ? COLORS.dangerText : COLORS.warningText;
-            diagnostics.appendChild(line);
-        } else if (!state.general.length && payload) {
-            const clean = document.createElement("div");
-            clean.textContent = "No compile diagnostics in this render window.";
-            diagnostics.appendChild(clean);
-        }
+
+        // Body renders create new queue badges even when diagnostic state is
+        // byte-identical. Keep this consumer outside the diagnostic-line DOM
+        // guard so a same-state full render still initializes the new nodes.
         for (const badge of panel.querySelectorAll("[data-sonder-queue-advisory-count]")) {
             badge.textContent = state.warningCount
                 ? `${state.warningCount} advisor${state.warningCount === 1 ? "y" : "ies"}` : "";
@@ -1451,12 +1645,9 @@ export function mountPromptManagementPanel(host) {
                 candidate: currentCandidatePayload(),
             });
         };
-        // Turn one staged capability into prose the author owns. One-way and
-        // explicit: the chip stops emitting that capability and the sentence
-        // becomes ordinary text with live `@handle` anchors where an entity was
-        // named. Anything the server could not give a live spelling for blocks
-        // the whole conversion rather than being frozen as a number — see
-        // `convert_capability_plan`.
+        // Copy is offered only for the Reference contribution kinds the server
+        // can segment. Live spellings stay handles; anything with no live
+        // spelling crosses as disclosed plain text — see `copy_capability_plan`.
         /**
          * Put the caret at a draft anchor, given as `{ index, offset }`.
          *
@@ -1487,16 +1678,17 @@ export function mountPromptManagementPanel(host) {
          * text and lets them decide where it goes; turning the chip off is a
          * separate, visible action beside it.
          *
-         * What it copies is handles, never the rendered line. `PromptSection`
-         * channels are persisted, so pasting `<Subject 1>` would freeze an
-         * ordinal into stored text — the one invariant this feature exists to
-         * protect. The plan is built inside the compile for the same reason it
-         * always was: the context it needs is injected during compilation.
+         * It prefers handles. A derived segment with no live spelling crosses
+         * as rendered text with an explicit ordinal/static disclosure, and the
+         * paste destination independently warns if an ordinal enters durable
+         * authored prose. The plan stays inside compile because the context it
+         * needs is injected there.
          */
-        const copyContribution = async (attachmentId, capabilityId) => {
-            const plan = await host._promptConvertPlan?.(
+        const copyContribution = async (attachmentId, capabilityId,
+            { sceneWide = false } = {}) => {
+            const plan = await host._promptCopyPlan?.(
                 attachmentId, capabilityId, buildWritingCandidatePatch(
-                    writingBlockDocuments()));
+                    writingBlockDocuments()), { sceneWide });
             if (!plan) {
                 notifyWarning("Could not work out what this contribution says.",
                     { source: "prompt-copy" });
@@ -1518,7 +1710,8 @@ export function mountPromptManagementPanel(host) {
                 return String((units.find((value) =>
                     String(value?.semantic_unit_id || "") === id) || {}).handle || "");
             };
-            const missing = [];
+            const frozenStatic = [...(plan.frozen_static || [])].filter(Boolean);
+            const frozenOrdinal = [...(plan.frozen_ordinal || [])].filter(Boolean);
             const lines = [];
             for (const line of plan.lines || []) {
                 let text = "";
@@ -1526,7 +1719,11 @@ export function mountPromptManagementPanel(host) {
                     if (part.kind === "text") { text += part.text; continue; }
                     if (part.kind === "handle") {
                         const handle = handleFor(part);
-                        if (!handle) { missing.push(part.rendered); continue; }
+                        if (!handle) {
+                            text += String(part.rendered || "");
+                            if (part.rendered) frozenOrdinal.push(part.rendered);
+                            continue;
+                        }
                         text += `@${handle}`;
                         continue;
                     }
@@ -1541,7 +1738,8 @@ export function mountPromptManagementPanel(host) {
                         // it because an empty list satisfies every predicate.
                         if (!names.length) continue;
                         if (names.some((value) => !value)) {
-                            missing.push(part.rendered);
+                            text += String(part.rendered || "");
+                            if (part.rendered) frozenOrdinal.push(part.rendered);
                             continue;
                         }
                         // Mirrors the server exactly: two sources join with
@@ -1562,12 +1760,6 @@ export function mountPromptManagementPanel(host) {
                 }
                 if (text.trim()) lines.push(text);
             }
-            if (missing.length) {
-                notifyWarning(`${[...new Set(missing)].join(", ")} has no handle,`
-                    + " so copying it would freeze its number. Give it a handle"
-                    + " first.", { source: "prompt-copy" });
-                return false;
-            }
             if (!lines.length) {
                 notifyWarning("This contribution resolves to nothing right now,"
                     + " so there is nothing to copy.", { source: "prompt-copy" });
@@ -1581,13 +1773,18 @@ export function mountPromptManagementPanel(host) {
                     + " was copied.", { source: "prompt-copy" });
                 return false;
             }
-            const frozen = (plan.frozen || []).filter(Boolean);
-            if (frozen.length) {
-                notifyInfo(`Copied. ${frozen.join(", ")} came across as plain text`
-                    + " and will stop following staged intent.",
+            const staticNames = [...new Set(frozenStatic)];
+            const ordinalNames = [...new Set(frozenOrdinal)];
+            if (staticNames.length || ordinalNames.length) {
+                const disclosures = [];
+                if (staticNames.length) disclosures.push(
+                    `${staticNames.join(", ")} came across as plain text and will stop following staged intent`);
+                if (ordinalNames.length) disclosures.push(
+                    `${ordinalNames.join(", ")} came across as a number staging can change`);
+                notifyInfo(`Copied. ${disclosures.join("; ")}.`,
                     { source: "prompt-copy" });
             } else {
-                notifySuccess("Copied, with handles rather than numbers.",
+                notifySuccess("Copied with live handles.",
                     { source: "prompt-copy" });
             }
             return true;
@@ -1815,14 +2012,15 @@ export function mountPromptManagementPanel(host) {
                         // Copy only what the prompt actually carries. A row that
                         // emits nothing has nothing to put on a clipboard, and
                         // offering it hands the author text the render refused.
-                        if (line.emitting) {
+                        if (line.emitting && COPY_CAPABILITY_KINDS.has(line.capability)) {
                             items.push({ label: "Copy with handles",
                                 // `hint`, not `title` — `openContextMenu` reads
                                 // `hint`, so anything under another key renders
                                 // as a bare label and the explanation is lost.
-                                hint: "spelled with @handles, so it stays live",
+                                hint: "uses live @handles and discloses any frozen text",
                                 action: () => copyContribution(
-                                    line.attachmentId, line.capabilityId) });
+                                    line.attachmentId, line.capabilityId,
+                                    { sceneWide: Boolean(dormancy) }) });
                         }
                         // BOTH directions, always. Turning a contribution off
                         // made its row vanish with no way back inside Writing —
@@ -1926,7 +2124,41 @@ export function mountPromptManagementPanel(host) {
                 writingState.blockMeta = Array.isArray(value) ? value : [];
             },
         });
-        refreshWritingDecorations = () => draftArea?.refreshDecorations?.();
+        const decorationCandidateSlice = (candidate) => ({
+            projections: (candidate?.attachment_capability_projections || []).map(
+                (value) => ({
+                    attachment_id: value?.attachment_id,
+                    capability_id: value?.capability_id,
+                    capability_kind: value?.capability_kind,
+                    channel_key: value?.channel_key,
+                    state: value?.state,
+                    text: value?.text,
+                    state_reason: value?.state_reason,
+                    rendered_at_anchor: value?.rendered_at_anchor === true,
+                    region: value?.region,
+                    order: value?.order,
+                })),
+            section_window_states: candidate?.section_window_states || [],
+        });
+        const writingDecorationSignature = () => JSON.stringify({
+            document: writingDecorationDocumentSignature(
+                writingState.document, templateChannelKeys(host._channelTemplate()),
+                { defaultKey: writingDefaultChannelKey() }),
+            attachments: writingState.attachments,
+            block_meta: writingState.blockMeta,
+            allocations: writingState.allocations,
+            block_prompt_ids: writingBlockPromptIds,
+            windowed: decorationCandidateSlice(currentCandidatePayload()),
+            scene: decorationCandidateSlice(host._promptScenePayload?.()),
+        });
+        let lastWritingDecorationSignature = writingDecorationSignature();
+        refreshWritingDecorations = () => {
+            const signature = writingDecorationSignature();
+            if (signature === lastWritingDecorationSignature) return false;
+            lastWritingDecorationSignature = signature;
+            draftArea?.refreshDecorations?.();
+            return true;
+        };
         draftArea.style.minHeight = "120px";
         applyBoxHeight(host, draftArea, "panelDraftBoxHeight", 160);
         registerPromptBoxGuard(draftArea, () => writingState.draft);
@@ -2887,24 +3119,52 @@ export function mountPromptManagementPanel(host) {
         menuWrap.appendChild(menuButton);
         actionRow.append(profileRow, saveAs, createNew, menuWrap);
         card.insertBefore(actionRow, card.firstChild);
-        const commit = async (operations, label, history = {}) => {
-            host._pushUndo?.(label, history);
+        const commit = async (operations, label, history = {}, lifecycleToken = null) => {
+            const supportsLifecycle = typeof host._beginSceneHistoryLifecycle === "function";
+            const ownsLifecycle = !lifecycleToken;
+            const token = lifecycleToken || host._beginSceneHistoryLifecycle?.(label);
+            if (supportsLifecycle && !token) return false;
             try {
-                await host._runSceneMutation(operations, {
-                    key: `scene:${host.activeSceneId}:prompt-context:${Date.now()}`,
-                    label, coalesce: false, refreshScenes: false,
-                    // These operations may carry complete setup/recipe arrays.
-                    // Replan after a conflict instead of replaying stale arrays.
-                    retryOnConflict: false,
-                });
-                await host._fetchScenes?.({ ignoreMutationGate: true, reason: "prompt_context" });
-                render();
+                const undoEntry = host._pushUndo?.(label, { ...history, pending: true });
+                try {
+                    await host._runSceneMutation(operations, {
+                        key: `scene:${host.activeSceneId}:prompt-context:${Date.now()}`,
+                        label, coalesce: false, refreshScenes: false,
+                        // These operations may carry complete setup/recipe arrays.
+                        // Replan after a conflict instead of replaying stale arrays.
+                        retryOnConflict: false,
+                    });
+                } catch (error) {
+                    if (typeof host._discardUndoEntry === "function") {
+                        host._discardUndoEntry(undoEntry);
+                    } else {
+                        host._discardLastUndo?.(label);
+                    }
+                    notifyWarning(error?.message || "Prompt Context change was refused.",
+                        { source: "prompt-context-refused" });
+                    return false;
+                }
+                host._commitUndoEntry?.(undoEntry);
+                try {
+                    const refreshApplied = await host._fetchScenes?.({
+                        ignoreMutationGate: true,
+                        reason: "prompt_context",
+                        sceneHistoryLifecycleToken: token,
+                    });
+                    if (refreshApplied === false) {
+                        throw new Error("Prompt Context saved, but its scene refresh did not apply.");
+                    }
+                    render();
+                } catch (error) {
+                    // The durable mutation and its history already committed.
+                    // Refresh failure may leave this surface stale, but must never
+                    // invoke cross-resource compensation against saved state.
+                    notifyWarning(error?.message || "Prompt Context saved, but refresh failed.",
+                        { source: "prompt-context-refresh-failed" });
+                }
                 return true;
-            } catch (error) {
-                host._discardLastUndo?.(label);
-                notifyWarning(error?.message || "Prompt Context change was refused.",
-                    { source: "prompt-context-refused" });
-                return false;
+            } finally {
+                if (ownsLifecycle && token) host._endSceneHistoryLifecycle?.(token);
             }
         };
         profile.addEventListener("change", () => commit([{
@@ -2971,54 +3231,104 @@ export function mountPromptManagementPanel(host) {
             return sourceKey && (attachment.source?.[sourceKey] || []).map(String)
                 .includes(String(owner?.memberId || ""));
         };
+        const saveSemanticUnitChange = (change, label, options = {}) => {
+            if (typeof host._applyPromptIdentityChange === "function") {
+                return host._applyPromptIdentityChange(change, label, options);
+            }
+            return host._savePromptSemanticUnits?.(applyPromptIdentityChange(
+                host._promptSemanticUnits || [], change), label, options);
+        };
         const attachReference = async (owner, target, overrides = null) => {
-            const sectionIndex = Number(target?.sectionIndex);
+            const supportsLifecycle = typeof host._beginSceneHistoryLifecycle === "function";
+            const lifecycleToken = host._beginSceneHistoryLifecycle?.("attach prompt Reference");
+            if (supportsLifecycle && !lifecycleToken) return false;
+            try {
+                const sectionIndex = Number(target?.sectionIndex);
             const section = target?.scope === "section"
                 ? scene.prompt_sections?.[sectionIndex] : null;
             const current = normalizePromptAttachments(section
                 ? section.attachments : scene.global_attachments);
+            const alreadyAttached = current.some((attachment) =>
+                sameReferenceOwner(attachment, owner));
+            // Validate/build before crossing either durable handle mutation
+            // seam. A profile with no Reference parts must not leave a newly
+            // stored handle behind when attachment construction refuses.
+            const attachment = alreadyAttached
+                ? null : promptReferenceAttachment(owner, identityProfile);
+            if (attachment && overrides && typeof overrides === "object"
+                    && Object.keys(overrides).length) {
+                attachment.config = { ...attachment.config, overrides };
+            }
             let materializedHandle = "";
             let history = {};
+            let identityMaterialization = null;
             if (owner?.type === "physical" && !owner.storedHandle) {
-                materializedHandle = await host._materializeReferenceMemberHandle?.({
+                const physicalMaterialization = await host._materializeReferenceMemberHandle?.({
                     referenceId: owner.referenceId, memberId: owner.memberId,
                     suggestion: owner.handle, expectedHandle: "",
                 });
+                materializedHandle = String(physicalMaterialization?.handle || "");
                 if (!materializedHandle) {
                     throw new Error("The physical Reference handle could not be materialized.");
                 }
-                history = {
-                    referenceOperations: [{
-                        type: "update_member", reference_id: owner.referenceId,
-                        member_id: owner.memberId, fields: { handle: "" },
-                        expected: { handle: materializedHandle },
-                    }],
-                    inverseReferenceOperations: [{
-                        type: "update_member", reference_id: owner.referenceId,
-                        member_id: owner.memberId, fields: { handle: materializedHandle },
-                        expected: { handle: "" },
-                    }],
-                };
+                if (physicalMaterialization?.ownsHandle) {
+                    history = {
+                        referenceOperations: [{
+                            type: "update_member", reference_id: owner.referenceId,
+                            member_id: owner.memberId, fields: { handle: "" },
+                            expected: { handle: materializedHandle },
+                        }],
+                        inverseReferenceOperations: [{
+                            type: "update_member", reference_id: owner.referenceId,
+                            member_id: owner.memberId, fields: { handle: materializedHandle },
+                            expected: { handle: "" },
+                        }],
+                    };
+                }
+            } else if (owner?.type === "identity") {
+                identityMaterialization = await materializePromptIdentityOwner(
+                    owner, host._promptSemanticUnits || [], saveSemanticUnitChange,
+                    { recordUndo: false });
+                owner = identityMaterialization.owner;
+                materializedHandle = owner.storedHandle;
+                if (identityMaterialization.next) {
+                    // Target-owned expected-state changes preserve unrelated
+                    // identities and formats when Undo/Redo rebases onto a
+                    // newer project version.
+                    history = {
+                        ...history,
+                        promptIdentityChange: {
+                            type: "upsert",
+                            value: identityMaterialization.previous,
+                            expected: identityMaterialization.next,
+                        },
+                        inversePromptIdentityChange: {
+                            type: "upsert",
+                            value: identityMaterialization.next,
+                            expected: identityMaterialization.previous,
+                        },
+                    };
+                }
             }
-            if (current.some((attachment) => sameReferenceOwner(attachment, owner))) {
+            if (alreadyAttached) {
                 // The durable handle materialization is still a user-visible
                 // mutation even when the target already owns the attachment.
                 // Record a same-scene snapshot so one Undo removes the handle.
                 if (history.referenceOperations?.length) {
-                    host._pushUndo?.("materialize prompt Reference handle", history);
+                    host._pushReferenceUndo?.("materialize prompt Reference handle",
+                        history.referenceOperations, history.inverseReferenceOperations);
+                }
+                if (history.promptIdentityChange) {
+                    host._pushPromptIdentityUndo?.("materialize prompt identity handle",
+                        history.promptIdentityChange, history.inversePromptIdentityChange);
                 }
                 notifySuccess(`@${materializedHandle || owner.handle || "Reference"} is already attached here.`,
                     { source: "prompt-reference-reused" });
                 return true;
             }
-            const attachment = promptReferenceAttachment(owner, identityProfile);
             // Overrides authored in the Attach dialog ride the SAME scene batch
             // as the attachment, so one Undo removes both — and, on the
             // first-use path, the materialized handle with them.
-            if (overrides && typeof overrides === "object"
-                    && Object.keys(overrides).length) {
-                attachment.config = { ...attachment.config, overrides };
-            }
             const next = [...current, attachment];
             const operations = section ? [{
                 type: "update_prompt_section", index: sectionIndex,
@@ -3028,15 +3338,20 @@ export function mountPromptManagementPanel(host) {
                 type: "update_scene_fields", fields: { global_attachments: next },
             }];
             const label = "attach prompt Reference";
-            const committed = await commit(operations, label, history);
+            const committed = await commit(operations, label, history, lifecycleToken);
             if (!committed && history.referenceOperations?.length) {
-                await host._mutateReferences?.(history.referenceOperations,
-                    "rollback refused prompt Reference attachment");
+                await rollbackPromptPhysicalAttachment(host, history);
+            }
+            if (!committed && history.promptIdentityChange) {
+                await rollbackPromptIdentityAttachment(host, history);
             }
             if (!committed) throw new Error("The prompt Reference attachment was refused.");
             notifySuccess(`Attached @${materializedHandle || owner.handle || "Reference"}.`,
                 { source: "prompt-reference-attached" });
             return true;
+            } finally {
+                if (lifecycleToken) host._endSceneHistoryLifecycle?.(lifecycleToken);
+            }
         };
         identityPanelCleanup = mountPromptIdentityPanel(card, {
             candidate,
@@ -3049,9 +3364,7 @@ export function mountPromptManagementPanel(host) {
             projectKey: host._projectDirName?.() || host.projectId || "project",
             scenes: (host.scenes || []).length
                 ? host.scenes : [host.activeScene].filter(Boolean),
-            saveSemanticUnitChange: (change, label) =>
-                host._savePromptSemanticUnits?.(applyPromptIdentityChange(
-                    host._promptSemanticUnits || [], change), label),
+            saveSemanticUnitChange,
             mutateReferences: (operations, label) =>
                 host._mutateReferences?.(operations, label),
             attachReference,
@@ -3226,7 +3539,14 @@ export function mountPromptManagementPanel(host) {
                 channelKey: key,
             });
             let projectionHosts = null;
+            let projectionSignature = null;
             const refreshProjection = (payload = currentCandidatePayload()) => {
+                const signature = attachmentChannelProjectionSignature({
+                    channelKey: key, attachments: globalAttachments,
+                    candidate: payload, attachmentLabelFor,
+                    disabled: globalLocked,
+                });
+                if (projectionHosts && signature === projectionSignature) return;
                 const next = createAttachmentChannelProjections({
                     channelKey: key,
                     attachments: globalAttachments,
@@ -3252,6 +3572,7 @@ export function mountPromptManagementPanel(host) {
                 projectionHosts?.beforeHost.replaceWith(next.beforeHost);
                 projectionHosts?.afterHost.replaceWith(next.afterHost);
                 projectionHosts = next;
+                projectionSignature = signature;
             };
             refreshProjection();
             column.append(head, createPromptProjectionBox(
@@ -3519,8 +3840,15 @@ export function mountPromptManagementPanel(host) {
                     channelKey: key,
                 });
                 let projectionHosts = null;
+                let projectionSignature = null;
                 const refreshProjection = (
                     payload = candidateForSection(section.prompt_id)) => {
+                    const signature = attachmentChannelProjectionSignature({
+                        channelKey: key, attachments: sectionAttachments,
+                        candidate: payload, attachmentLabelFor,
+                        disabled: sectionsLocked,
+                    });
+                    if (projectionHosts && signature === projectionSignature) return;
                     const next = createAttachmentChannelProjections({
                         channelKey: key,
                         attachments: sectionAttachments,
@@ -3553,6 +3881,7 @@ export function mountPromptManagementPanel(host) {
                     projectionHosts?.beforeHost.replaceWith(next.beforeHost);
                     projectionHosts?.afterHost.replaceWith(next.afterHost);
                     projectionHosts = next;
+                    projectionSignature = signature;
                 };
                 refreshProjection();
                 column.append(caption, createPromptProjectionBox(

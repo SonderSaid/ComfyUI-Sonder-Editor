@@ -408,6 +408,24 @@ export function installChromeScrollbarStyles(targetDocument = null) {
     doc.head.appendChild(styleEl);
 }
 
+export const CHROME_DIM_PLACEHOLDER_CLASS = "sonder-chrome-dim-placeholder";
+
+// Inline control styles cannot express `::placeholder`. Install this once per
+// document so a suggested value can remain visibly distinct from durable input.
+export function installChromePlaceholderStyles(targetDocument = null) {
+    const doc = targetDocument || (typeof document !== "undefined" ? document : null);
+    if (!doc?.head || doc.getElementById("sonder-editor-placeholder-styles")) return;
+    const styleEl = doc.createElement("style");
+    styleEl.id = "sonder-editor-placeholder-styles";
+    styleEl.textContent = `
+        .${CHROME_DIM_PLACEHOLDER_CLASS}::placeholder {
+            color: ${THEME.fgPlaceholder};
+            opacity: 1;
+        }
+    `;
+    doc.head.appendChild(styleEl);
+}
+
 export function statusPillCss({ state = "idle", padding = "4px 8px" } = {}) {
     const color = {
         idle: THEME.statusIdle,

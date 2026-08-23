@@ -94,6 +94,13 @@ SHOT_ORDINAL_KEY = "shots"
 # must stay chronological, so both are inline-only in every authoring surface.
 INLINE_ONLY_KINDS = frozenset({"prompt_link", "vocal_event"})
 SCOPE_ONLY_KINDS = frozenset({"prompt_link_scope"})
+# These kinds require section-local chronology or composition state.  The
+# compiler reports them as invalid in global scope, and both global render paths
+# must share the same non-emission authority or an invalid chip can claim a
+# dedupe key before its valid section clone.
+GLOBAL_SECTION_ONLY_KINDS = frozenset({
+    "shot", "timestamp", "prompt_link", "prompt_link_scope", "vocal_event",
+})
 VISUAL_INTENTS = {
     "preserve": "fully_preserved",
     "partial": "partially_preserved",
@@ -864,6 +871,11 @@ def prompt_token_declarations(profile) -> dict:
                 "label_template": str(
                     declaration.get("referenced_label_template") or ""),
                 "physical": False,
+                # Identity ordinals share one manifest population, but their
+                # referenced and assetless spellings do not denote the same
+                # members. Consumers that inspect rendered literals need this
+                # distinction to avoid declaring the other population live.
+                "identity_source_mode": "referenced",
             }
     for declaration in physical_population_declarations(profile):
         token_kind = str(declaration.get("token_kind") or "")
@@ -896,6 +908,127 @@ def prompt_token_declarations(profile) -> dict:
             "physical": False,
         }
     return result
+
+
+def authored_ordinal_literals(text, profile, context) -> dict:
+    """Rendered ordinal spellings in prose mapped to current resolvability."""
+    declarations = []
+    for declaration in prompt_token_declarations(profile).values():
+        template = str(declaration.get("label_template") or "")
+        if "{n}" in template:
+            declarations.append((template,
+                                 str(declaration.get("manifest_key") or ""),
+                                 str(declaration.get("identity_source_mode") or "")))
+    for declaration in identity_kind_declarations(profile):
+        template = str(declaration.get("assetless_label_template") or "")
+        if "{n}" in template:
+            declarations.append((
+                template, identity_ordinal_key(declaration.get("key")),
+                "assetless"))
+    speaker_template = str(effective_speaker_policy(
+        profile).get("token_template") or "")
+    if "{n}" in speaker_template:
+        declarations.append((speaker_template, "__speakers__", ""))
+
+    found = {}
+
+    def ordinal_number(value):
+        # Manifests cannot approach this width, and Python builds may refuse
+        # huge decimal-to-int conversions. Treat them as unresolved prose
+        # instead of letting an advisory crash compilation.
+        digits = str(value or "")
+        return int(digits) if len(digits) <= 18 else -1
+
+    for template, manifest_key, identity_source_mode in dict.fromkeys(declarations):
+        escaped = re.escape(template)
+        placeholder = re.escape("{n}")
+        # A declaration may use the same ordinal more than once (for example
+        # ``<Picture {n}/{n}>``). One named group plus backreferences models
+        # that grammar without compiling duplicate group names.
+        pattern = re.compile(
+            escaped.replace(placeholder, r"(?P<number>\d+)", 1).replace(
+                placeholder, r"(?P=number)"))
+        if manifest_key == "__speakers__":
+            staged = (context.get("speaker_order") or {}).values()
+        else:
+            manifest = ((context.get("ordinal_manifest") or {}).get(
+                manifest_key) or {})
+            if identity_source_mode:
+                units = context.get("semantic_units_by_id") or {}
+                staged = [number for unit_id, number in manifest.items()
+                          if bool((units.get(str(unit_id)) or {}).get("sources"))
+                          == (identity_source_mode == "referenced")]
+            else:
+                staged = manifest.values()
+        staged_numbers = {int(value) for value in staged
+                          if isinstance(value, int)
+                          and not isinstance(value, bool) and value > 0}
+        compound_spans = []
+        if manifest_key == "__speakers__":
+            policy = effective_speaker_policy(profile)
+            joiner = str(policy.get("compound_join") or ",")
+            wrapped = template.startswith("(") and template.endswith(")")
+            item_template = template[1:-1] if wrapped else template
+            item_escaped = re.escape(item_template).replace(
+                placeholder, r"\d+")
+            compound_body = (rf"{item_escaped}(?:{re.escape(joiner)}"
+                             rf"{item_escaped})+")
+            compound_pattern = re.compile(
+                rf"\({compound_body}\)" if wrapped else compound_body)
+            item_capture = re.compile(
+                re.escape(item_template).replace(
+                    placeholder, r"(?P<number>\d+)", 1).replace(
+                        placeholder, r"(?P=number)"))
+            bounded_item = re.compile(
+                rf"(?:{item_capture.pattern})(?={re.escape(joiner)}|$)")
+            for compound in compound_pattern.finditer(str(text or "")):
+                rendered = compound.group(0)
+                body = rendered[1:-1] if wrapped else rendered
+                # Parse against item grammar plus separator, rather than split:
+                # the declaration may legitimately use its compound joiner as
+                # literal token text too (``(S/{n})`` joined by ``/``). A
+                # separator lookahead gives each item an exact boundary while
+                # an iterative cursor keeps input length out of call depth.
+                numbers = []
+                cursor = 0
+                while cursor < len(body):
+                    item = bounded_item.match(body, cursor)
+                    if not item:
+                        numbers = []
+                        break
+                    numbers.append(ordinal_number(item.group("number")))
+                    cursor = item.end()
+                    if cursor == len(body):
+                        break
+                    if not body.startswith(joiner, cursor):
+                        numbers = []
+                        break
+                    cursor += len(joiner)
+                # The broad compound matcher establishes the span; at least two
+                # valid items must reconstruct it before it is an ordinal.
+                if not numbers or len(numbers) < 2:
+                    continue
+                found[rendered] = bool(numbers) and all(
+                    number in staged_numbers for number in numbers)
+                compound_spans.append(compound.span())
+        # Both finditer streams are ordered and non-overlapping. Advance one
+        # cursor through the compound intervals instead of rescanning every
+        # prior interval for every simple token: unwrapped speaker grammars
+        # such as ``S{n}`` make both patterns match, and the nested scan made a
+        # valid repeated ``S1,S2`` draft quadratic on the aiohttp event loop.
+        compound_index = 0
+        for match in pattern.finditer(str(text or "")):
+            while (compound_index < len(compound_spans)
+                   and compound_spans[compound_index][1] <= match.start()):
+                compound_index += 1
+            if (compound_index < len(compound_spans)
+                    and compound_spans[compound_index][0] <= match.start()
+                    and match.end() <= compound_spans[compound_index][1]):
+                continue
+            rendered = match.group(0)
+            number = ordinal_number(match.group("number"))
+            found[rendered] = bool(found.get(rendered)) or number in staged_numbers
+    return found
 
 
 def _new_id() -> str:
@@ -2511,10 +2644,8 @@ def _render_reference_capability(attachment, capability, context):
 # staged intent, and speaker tokens follow document order. Freezing any of them
 # into stored prose violates the ordinal invariant.
 #
-# EXPIRY: `DERIVED_SEGMENT_KINDS` currently has no reader — its two consumers
-# went with the materializer. It is held for the prose-read renderer and Convert
-# to prose, which need exactly this authored/derived split. Delete it if both are
-# abandoned; do not delete it merely because nothing imports it today.
+# The prose-read renderer and Copy plan both need exactly this authored/derived
+# split. Delete it only if both are abandoned.
 SEGMENT_TEXT = "text"
 SEGMENT_LABEL = "label"
 SEGMENT_SOURCES = "sources"
@@ -2550,47 +2681,32 @@ def reference_capability_segments(attachment, capability, context) -> list[tuple
     Same owner keys and same order; each line carries its segment list instead
     of its rendered string.
 
-    EXPIRY: no production caller yet — this is the seam the prose-read renderer
-    and Convert to prose consume, since they need to know which runs the author
-    owns and which the compiler derives. Delete it if both are abandoned.
+    The prose-read renderer and Copy plan consume this seam because both need to
+    know which runs the author owns and which the compiler derives.
     """
     return _reference_capability_parts(attachment, capability, context)
 
 
-def convert_capability_plan(attachment, capability, context) -> dict:
-    """What "Convert to prose" would write, or why it refuses.
+def copy_capability_plan(attachment, capability, context) -> dict:
+    """What "Copy with handles" puts on the clipboard, with disclosure.
 
-    Convert is the author's one-way escape hatch: it turns a chip's rendered
-    contribution into prose they own outright. The rule it has to satisfy is
-    NOT "prose is better" — it is that no ordinal may become stored text.
-    `PromptSection.channels` is derived from the channel documents
-    (`channel_document_mirrors`) and persisted to `project.json`, so anything
-    Convert writes into a document reaches disk; freezing `<Subject 1>` or
-    `[Shot 2]` there would make the file say something staging no longer agrees
-    with, which is the ordinal invariant.
-
-    So each derived segment kind must either have a LIVE spelling or block the
-    conversion:
+    Copy does not mutate a PromptDocument, so a derived segment with no live
+    spelling no longer blocks the whole action. It crosses as rendered text and
+    is classified by the consequence the destination needs to disclose:
 
     * `label`   -> a handle for the semantic unit. Renumbers as before.
     * `sources` -> a handle per contributing member (needs `unit_source_members`).
-    * `marker`  -> frozen as text. `fully_preserved` is an enum drawn from staged
-                   intent, not an ordinal, so freezing it loses tracking but
-                   writes nothing positional to disk. Disclosed, never silent.
-    * `shots`   -> REFUSED. The segment carries rendered numbers, not shot ids
-                   (`appearances` is a list of ordinals), so `@shot(id)` cannot
-                   be built from here and the only alternative is freezing
-                   `[Shot 2]`, which the invariant forbids. Lifting this needs a
-                   `unit_shot_ids` sidecar beside `unit_source_members`.
-    * `speaker` -> REFUSED. `(S1)` is an ordinal and has no handle spelling at
-                   all.
+    * `marker`  -> `frozen_static`: loses tracking of staged intent, but writes
+                   no number.
+    * `shots`   -> `frozen_ordinal`: writes a number staging can still change.
+    * `speaker` -> `frozen_ordinal`: the speaker token has no handle spelling.
 
     Returns ids rather than handles: the browser owns handle resolution and
     attachment minting, and duplicating that here would be a second authority
     over the same fact.
     """
-    plan = {"lines": [], "refused": "", "frozen": []}
-    blockers = set()
+    plan = {"lines": [], "refused": "", "frozen_static": [],
+            "frozen_ordinal": []}
     for owner, segments in reference_capability_segments(
             attachment, capability, context):
         parts = []
@@ -2609,10 +2725,11 @@ def convert_capability_plan(attachment, capability, context) -> dict:
                 unit_id = str(segment.get("unit_id") or "")
                 member_id = str(segment.get("member_id") or "")
                 if not unit_id and not member_id:
-                    # No id means no handle to emit, and the only alternative is
-                    # freezing the ordinal — recorded in the withdrawn
-                    # materializer plan as the reason this blocks.
-                    blockers.add("an entity with no stable id")
+                    if text:
+                        parts.append({"kind": "text", "text": text,
+                                      "frozen": True,
+                                      "freeze_class": "ordinal"})
+                        plan["frozen_ordinal"].append(text.strip())
                     continue
                 parts.append({"kind": "handle",
                               "source": "unit" if unit_id else "member",
@@ -2623,8 +2740,9 @@ def convert_capability_plan(attachment, capability, context) -> dict:
                                              in segment.get("member_ids") or []]})
             elif kind == SEGMENT_MARKER:
                 if text:
-                    parts.append({"kind": "text", "text": text, "frozen": True})
-                    plan["frozen"].append(text.strip())
+                    parts.append({"kind": "text", "text": text, "frozen": True,
+                                  "freeze_class": "static"})
+                    plan["frozen_static"].append(text.strip())
             elif kind in DERIVED_SEGMENT_KINDS:
                 # An EMPTY derived segment contributes nothing to the rendered
                 # line, so there is no number to freeze and nothing to block.
@@ -2633,20 +2751,11 @@ def convert_capability_plan(attachment, capability, context) -> dict:
                 # a blocker refused every retention line and left the marker
                 # freeze rule with no case that reached it.
                 if text.strip():
-                    blockers.add(kind)
+                    parts.append({"kind": "text", "text": text, "frozen": True,
+                                  "freeze_class": "ordinal"})
+                    plan["frozen_ordinal"].append(text.strip())
         if parts:
             plan["lines"].append({"owner": record_owner_key(owner), "parts": parts})
-    if blockers:
-        named = ", ".join(sorted(blockers))
-        plan["refused"] = (
-            f"This contribution cites {named}, which follow staging and the "
-            "render window and have no handle spelling. Converting would "
-            "freeze a number that staging can still change.")
-        # A refusal emits NOTHING. Leaving `frozen` populated would report a
-        # freeze that never happened, and a caller disclosing it would warn the
-        # author about a change it did not make.
-        plan["lines"] = []
-        plan["frozen"] = []
     return plan
 
 
@@ -2654,8 +2763,8 @@ def record_owner_key(owner) -> str:
     """Readable owner tuple, for reporting only.
 
     Deliberately NOT an identity: the retention/audio owners embed a rendered
-    label, which is why per-LINE conversion is not offered and Convert operates
-    on a whole capability. See the withdrawn materializer plan for the full
+    label, which is why Copy operates on a whole capability rather than on an
+    unstable per-line identity. See the withdrawn materializer plan for the full
     argument.
     """
     if isinstance(owner, (list, tuple)):
@@ -3310,10 +3419,13 @@ def _resolved_capability(attachment, capability, profile) -> dict:
     return value
 
 
-def _capabilities(attachment, profile):
+def _resolved_capabilities(attachment, profile):
     values = attachment["capabilities"] or [_default_capability(attachment, profile)]
-    resolved = [_resolved_capability(attachment, value, profile) for value in values]
-    return [value for value in resolved
+    return [_resolved_capability(attachment, value, profile) for value in values]
+
+
+def _capabilities(attachment, profile):
+    return [value for value in _resolved_capabilities(attachment, profile)
             if value.get("placement") in PLACEMENT_PHASES]
 
 
@@ -3424,16 +3536,21 @@ def profile_error_result(exc, *, window_start=0, window_end=1, fps=24.0) -> dict
     return result
 
 
-def _locate_capability(convert_plan_for, global_attachments, sections):
-    """The staged (attachment, capability) a Convert request names, or None.
+def _locate_capability(copy_plan_for, global_attachments, sections,
+                       resolved_profile, active_channel_keys):
+    """The staged (attachment, capability) a Copy request names, or None.
 
     Searches the compiled state itself rather than trusting the request, so a
-    Convert cannot name a capability the author cannot see staged.
+    Copy cannot name a capability the author cannot see staged. Capability
+    records are deliberately sparse, so this resolves declaration defaults and
+    per-channel scope-link projections through the same authorities as compile.
+    Matching happens before the placement filter so a preserved unknown value
+    remains locatable and can report its real empty/invalid result.
     """
-    if not isinstance(convert_plan_for, dict):
+    if not isinstance(copy_plan_for, dict):
         return None
-    attachment_id = str(convert_plan_for.get("attachment_id") or "")
-    capability_id = str(convert_plan_for.get("capability_id") or "")
+    attachment_id = str(copy_plan_for.get("attachment_id") or "")
+    capability_id = str(copy_plan_for.get("capability_id") or "")
     if not attachment_id or not capability_id:
         return None
     pools = [global_attachments or []]
@@ -3446,9 +3563,29 @@ def _locate_capability(convert_plan_for, global_attachments, sections):
             attachment = normalize_attachment(raw)
             if attachment.get("attachment_id") != attachment_id:
                 continue
-            for capability in attachment.get("capabilities") or []:
-                if str(capability.get("capability_id") or "") == capability_id:
+            for capability in _resolved_capabilities(attachment, resolved_profile):
+                current = str(capability.get("capability_id")
+                              or capability.get("kind") or "")
+                if current == capability_id:
                     return attachment, capability
+            if (attachment.get("kind") == "prompt_link_scope"
+                    and capability_id.startswith(SCOPE_LINK_CHANNEL_CAPABILITY_PREFIX)):
+                channel = capability_id[len(SCOPE_LINK_CHANNEL_CAPABILITY_PREFIX):]
+                source = attachment.get("source") or {}
+                selected = [str(value) for value in source.get("channel_keys") or []
+                            if str(value)]
+                if not selected and source.get("channel_key"):
+                    selected = [str(source.get("channel_key"))]
+                # The active compile template is authoritative. A profile may
+                # support several compatible templates, so reconstructing this
+                # set from its primary `template_id` can reject a capability
+                # that the currently compiling template visibly projected.
+                declared = {str(value) for value in active_channel_keys or []
+                            if str(value)}
+                if (channel in declared
+                        and (not selected or channel in selected)):
+                    return attachment, _scope_link_capability(
+                        attachment, resolved_profile, channel)
     return None
 
 
@@ -3459,7 +3596,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                            context=None, labels_on=True,
                            delimiter=prompt_payload.DEFAULT_SECTION_DELIMITER,
                            boundary_threshold_pct=0.0,
-                           convert_plan_for=None) -> dict:
+                           copy_plan_for=None) -> dict:
     """Compile candidate state to a frozen, provider-ready prompt.
 
     The function never mutates inputs.  It returns diagnostics instead of
@@ -3520,8 +3657,12 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     original_prompt_ids = []
     global_attachment_values = normalize_attachments(global_attachments)
     for attachment in global_attachment_values:
-        if attachment.get("kind") in {"shot", "timestamp", "prompt_link",
-                                       "prompt_link_scope"}:
+        # Disabled chips are inert preserved state.  They neither render below
+        # nor participate in provider/placement validation anywhere else.
+        if not attachment.get("enabled", True):
+            continue
+        if (attachment.get("kind") in GLOBAL_SECTION_ONLY_KINDS
+                and attachment.get("kind") != "vocal_event"):
             errors.append({
                 "code": "invalid_global_attachment",
                 "attachment_id": attachment.get("attachment_id", ""),
@@ -3677,6 +3818,27 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 "channel_key": str(channel_key or ""),
                 "message": ("Prompt tokens resolve inside Context-chip fields, not "
                             "in authored prose. This text will be sent literally."),
+            })
+
+    def warn_authored_ordinal_literals(origin, documents):
+        """Disclose provider ordinals pasted into durable authored prose."""
+        for channel_key, document in (documents or {}).items():
+            text = prompt_document_text(document)
+            found = authored_ordinal_literals(text, resolved_profile, context)
+            if not found:
+                continue
+            details = [
+                (f"{rendered} currently resolves to staged input"
+                 if resolves else
+                 f"{rendered} does not resolve to anything currently staged")
+                for rendered, resolves in found.items()
+            ]
+            warnings.append({
+                "code": "authored_ordinal_literal",
+                "origin": str(origin or ""),
+                "channel_key": str(channel_key or ""),
+                "message": (f"Authored ordinal text ({'; '.join(details)}) is sent "
+                            "literally; its number will not follow later staging."),
             })
 
     warn_authored_prompt_tokens("global", global_docs)
@@ -4194,6 +4356,10 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             context.setdefault("_reserved_key_conflicts", []).append(SHOT_ORDINAL_KEY)
         else:
             context["ordinal_manifest"][SHOT_ORDINAL_KEY] = shot_ordinals
+    warn_authored_ordinal_literals("global", global_docs)
+    for section in selected_sections:
+        warn_authored_ordinal_literals(
+            section.get("prompt_id", ""), section.get("channel_docs") or {})
     emitted_groups = {}
     # Same resolved text, different owner key. Definition/retention dedupe is
     # per semantic unit OR physical slot, so one member's Library prose reaching
@@ -4568,6 +4734,120 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         attachment_capability_projections.append(row)
         return row
 
+    # Global attachments render before sections so scene-wide ownership is
+    # stable as the selected section/window changes. First-writer-wins applies
+    # to conflicting text as well as identical text: the global value owns the
+    # emission and the section writer carries the dedupe/conflict diagnostic.
+    global_by_id = _attachment_map(global_attachments)
+    global_anchored = {node.get("attachment_id")
+                       for document in global_docs.values()
+                       for node in document.get("nodes", [])
+                       if node.get("type") == "attachment"}
+    global_phase_parts = defaultdict(lambda: defaultdict(list))
+
+    def global_anchor_renderer(attachment, capability_id, channel_key, anchor_node_id):
+        capabilities = _capabilities(attachment, resolved_profile)
+        if capability_id:
+            capabilities = [cap for cap in capabilities
+                            if cap["capability_id"] == capability_id]
+        if not capabilities:
+            if attachment.get("capabilities"):
+                return ""
+            capabilities = [_default_capability(attachment, resolved_profile)]
+        inline_values = []
+        section_only = attachment["kind"] in GLOBAL_SECTION_ONLY_KINDS
+        for capability in capabilities:
+            route = _route_for(attachment, capability, resolved_profile, channel_key)
+            projection = record_capability_projection(
+                attachment, capability, route, "global", anchor_node_id)
+            if section_only:
+                # The validation pass already names the invalid global chip.
+                # Keep its projection discoverable, but never let it emit or
+                # claim a semantic owner before a valid section attachment.
+                continue
+            if not capability.get("enabled", True):
+                continue
+            record_attachment_route(attachment, route, capability["placement"])
+            if route == channel_key and capability["placement"] == "inline":
+                inline_values.append(render(attachment, capability,
+                                            origin="global", channel=channel_key,
+                                            projection=projection))
+            else:
+                global_phase_parts[route][capability["placement"]].append(
+                    (attachment, capability, projection))
+        return _join_emissions(inline_values,
+                               resolved_profile.get("separators", {}).get(
+                                   "attachment", " "))
+
+    for key in keys:
+        global_mirror[key] = _document_render(
+            global_docs.get(key), global_by_id,
+            lambda attachment, capability_id, anchor_node_id, key=key:
+                global_anchor_renderer(
+                    attachment, capability_id, key, anchor_node_id),
+            context)
+    for attachment in global_by_id.values():
+        if not attachment["enabled"] or attachment["attachment_id"] in global_anchored:
+            continue
+        if attachment["kind"] in GLOBAL_SECTION_ONLY_KINDS:
+            if attachment["kind"] != "vocal_event":
+                warnings.append({"code": "invalid_global_attachment",
+                                 "attachment_id": attachment["attachment_id"], "message":
+                                 f"{attachment['kind']} is section-scoped and was ignored globally."})
+            continue
+        for capability in _capabilities(attachment, resolved_profile):
+            route = _route_for(attachment, capability, resolved_profile,
+                               keys[0] if keys else "visual")
+            projection = record_capability_projection(
+                attachment, capability, route, "global")
+            if not capability.get("enabled", True):
+                continue
+            record_attachment_route(attachment, route, capability["placement"])
+            if route not in global_mirror:
+                set_projection_state(
+                    projection, "invalid_route", reason=
+                    f"Route {route!r} is not in the active channel template.")
+                errors.append({"code": "invalid_attachment_route",
+                               "attachment_id": attachment["attachment_id"], "message":
+                               f"Attachment route {route!r} is not in the active template."})
+                continue
+            global_phase_parts[route][capability["placement"]].append(
+                (attachment, capability, projection))
+    for route, phases in global_phase_parts.items():
+        if route not in global_mirror:
+            attachment_ids = {a["attachment_id"]
+                              for values in phases.values()
+                              for a, _capability, _projection in values}
+            for values in phases.values():
+                for _attachment, _capability, projection in values:
+                    set_projection_state(
+                        projection, "invalid_route", reason=
+                        f"Route {route!r} is not in the active channel template.")
+            for attachment_id in sorted(attachment_ids):
+                errors.append({"code": "invalid_attachment_route",
+                               "attachment_id": attachment_id,
+                               "message":
+                               f"Attachment route {route!r} is not in the active template."})
+            continue
+        global_attachment_separator = resolved_profile.get("separators", {}).get(
+            "attachment", " ")
+        prefixes, suffixes = [], []
+        for phase in PLACEMENT_PHASES[:PLACEMENT_PHASES.index("inline") + 1]:
+            prefixes.extend(
+                (render(a, c, origin="global", channel=route, projection=projection),
+                 declared_capability_separator(c, resolved_profile,
+                                               global_attachment_separator))
+                for a, c, projection in phases.get(phase, []))
+        for phase in PLACEMENT_PHASES[PLACEMENT_PHASES.index("inline") + 1:]:
+            suffixes.extend(
+                (render(a, c, origin="global", channel=route, projection=projection),
+                 declared_capability_separator(c, resolved_profile,
+                                               global_attachment_separator))
+                for a, c, projection in phases.get(phase, []))
+        global_mirror[route] = _join_declared_emissions(
+            prefixes + [(global_mirror[route], global_attachment_separator)] + suffixes,
+            global_attachment_separator)
+
     for section in selected_sections:
         section_index = section_positions.get(
             str(section.get("prompt_id") or ""), 0)
@@ -4817,111 +5097,6 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             "global_channel_exceptions": section.get("global_channel_exceptions", []),
         })
 
-    # Global scope emissions prepend to their routed channel documents.
-    global_by_id = _attachment_map(global_attachments)
-    global_anchored = {node.get("attachment_id")
-                       for document in global_docs.values()
-                       for node in document.get("nodes", [])
-                       if node.get("type") == "attachment"}
-    global_phase_parts = defaultdict(lambda: defaultdict(list))
-
-    def global_anchor_renderer(attachment, capability_id, channel_key, anchor_node_id):
-        capabilities = _capabilities(attachment, resolved_profile)
-        if capability_id:
-            capabilities = [cap for cap in capabilities
-                            if cap["capability_id"] == capability_id]
-        if not capabilities:
-            if attachment.get("capabilities"):
-                return ""
-            capabilities = [_default_capability(attachment, resolved_profile)]
-        inline_values = []
-        for capability in capabilities:
-            route = _route_for(attachment, capability, resolved_profile, channel_key)
-            projection = record_capability_projection(
-                attachment, capability, route, "global", anchor_node_id)
-            if not capability.get("enabled", True):
-                continue
-            record_attachment_route(attachment, route, capability["placement"])
-            if route == channel_key and capability["placement"] == "inline":
-                inline_values.append(render(attachment, capability,
-                                            origin="global", channel=channel_key,
-                                            projection=projection))
-            else:
-                global_phase_parts[route][capability["placement"]].append(
-                    (attachment, capability, projection))
-        return _join_emissions(inline_values,
-                               resolved_profile.get("separators", {}).get(
-                                   "attachment", " "))
-
-    for key in keys:
-        global_mirror[key] = _document_render(
-            global_docs.get(key), global_by_id,
-            lambda attachment, capability_id, anchor_node_id, key=key:
-                global_anchor_renderer(
-                    attachment, capability_id, key, anchor_node_id),
-            context)
-    for attachment in global_by_id.values():
-        if not attachment["enabled"] or attachment["attachment_id"] in global_anchored:
-            continue
-        if attachment["kind"] in {"shot", "timestamp", "prompt_link",
-                                   "prompt_link_scope"}:
-            warnings.append({"code": "invalid_global_attachment",
-                             "attachment_id": attachment["attachment_id"], "message":
-                             f"{attachment['kind']} is section-scoped and was ignored globally."})
-            continue
-        for capability in _capabilities(attachment, resolved_profile):
-            route = _route_for(attachment, capability, resolved_profile,
-                               keys[0] if keys else "visual")
-            projection = record_capability_projection(
-                attachment, capability, route, "global")
-            if not capability.get("enabled", True):
-                continue
-            record_attachment_route(attachment, route, capability["placement"])
-            if route not in global_mirror:
-                set_projection_state(
-                    projection, "invalid_route", reason=
-                    f"Route {route!r} is not in the active channel template.")
-                errors.append({"code": "invalid_attachment_route",
-                               "attachment_id": attachment["attachment_id"], "message":
-                               f"Attachment route {route!r} is not in the active template."})
-                continue
-            global_phase_parts[route][capability["placement"]].append(
-                (attachment, capability, projection))
-    for route, phases in global_phase_parts.items():
-        if route not in global_mirror:
-            attachment_ids = {a["attachment_id"]
-                              for values in phases.values()
-                              for a, _capability, _projection in values}
-            for values in phases.values():
-                for _attachment, _capability, projection in values:
-                    set_projection_state(
-                        projection, "invalid_route", reason=
-                        f"Route {route!r} is not in the active channel template.")
-            for attachment_id in sorted(attachment_ids):
-                errors.append({"code": "invalid_attachment_route",
-                               "attachment_id": attachment_id,
-                               "message":
-                               f"Attachment route {route!r} is not in the active template."})
-            continue
-        global_attachment_separator = resolved_profile.get("separators", {}).get(
-            "attachment", " ")
-        prefixes, suffixes = [], []
-        for phase in PLACEMENT_PHASES[:PLACEMENT_PHASES.index("inline") + 1]:
-            prefixes.extend(
-                (render(a, c, origin="global", channel=route, projection=projection),
-                 declared_capability_separator(c, resolved_profile,
-                                               global_attachment_separator))
-                for a, c, projection in phases.get(phase, []))
-        for phase in PLACEMENT_PHASES[PLACEMENT_PHASES.index("inline") + 1:]:
-            suffixes.extend(
-                (render(a, c, origin="global", channel=route, projection=projection),
-                 declared_capability_separator(c, resolved_profile,
-                                               global_attachment_separator))
-                for a, c, projection in phases.get(phase, []))
-        global_mirror[route] = _join_declared_emissions(
-            prefixes + [(global_mirror[route], global_attachment_separator)] + suffixes,
-            global_attachment_separator)
-
     final_prompt = prompt_payload.compose_range_prompt(
         prompt_payload.compose_section_text(global_mirror, labels_on=False),
         expanded_sections, window_start, window_end, labels_on=labels_on,
@@ -5166,13 +5341,14 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     # enumerated context keys by hand got neither and produced empty plans that
     # looked like successful conversions. Enumeration is the bug, so this does
     # not enumerate.
-    convert_plan = None
-    if convert_plan_for is not None:
-        located = _locate_capability(convert_plan_for, global_attachments, sections)
-        convert_plan = (convert_capability_plan(located[0], located[1], context)
-                        if located else
-                        {"lines": [], "frozen": [],
-                         "refused": "That capability is not staged in this scene."})
+    copy_plan = None
+    if copy_plan_for is not None:
+        located = _locate_capability(
+            copy_plan_for, global_attachments, sections, resolved_profile, keys)
+        copy_plan = (copy_capability_plan(located[0], located[1], context)
+                     if located else
+                     {"lines": [], "frozen_static": [], "frozen_ordinal": [],
+                      "refused": "That capability is not staged in this scene."})
 
     result = {
         "format": FORMAT_VERSION,
@@ -5183,7 +5359,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         "window": {"start_frame": int(window_start), "end_frame": int(window_end),
                    "fps": float(fps)},
         "emissions": emissions,
-        **({"convert_plan": convert_plan} if convert_plan is not None else {}),
+        **({"copy_plan": copy_plan} if copy_plan is not None else {}),
         "attachment_previews": {key: "\n".join(value)
                                 for key, value in previews.items()},
         "attachment_channel_previews": {

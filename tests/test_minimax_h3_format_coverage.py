@@ -20,7 +20,9 @@ relationship Sonder currently emits differently. They fail loudly the day the
 gap is closed, which is the signal to promote them to ordinary rows.
 """
 
+import copy
 import re
+import time
 
 import pytest
 
@@ -151,6 +153,56 @@ def scene_single_member_subject():
                             {"summary": "The target video follows her."},
                             capabilities=("summary",))])]
     return _compile(resolved, units, sections)
+
+
+def test_global_h3_summary_owns_the_scene_wide_summary_key():
+    """H3 summaries dedupe scene-wide even when their reuse groups differ."""
+    entity = ReferenceEntity(reference_id="e", name="Woman", members=[
+        ReferenceMember(member_id="mp", asset_id="img_a",
+                        prompt="the young woman with long dark hair")])
+    recipes = [ReferenceLaneRecipe(lane_id="lp", media_kind="image",
+                                   recipe=PICTURE_RECIPE)]
+    items = [ReferenceItem(reference_item_id="ip", lane_index=0, start_frame=0,
+                           end_frame=WINDOW_END, members=[
+                               {"entity_id": "e", "member_id": "mp",
+                                "role": "identity", "visual_intent": "preserve"}])]
+    units = [{"semantic_unit_id": "u", "name": "Woman", "order": 0,
+              "sources": [{"entity_id": "e", "member_id": "mp"}]}]
+    resolved = _resolve(
+        setup={"mode": "reference", "picture_lane_ids": ["lp"]},
+        entities=[entity], items=items, recipes=recipes, units=units)
+    global_summary = _reference_chip(
+        "global-summary", {"semantic_unit_ids": ["u"]},
+        {"summary": "GLOBAL SUMMARY"}, capabilities=("summary",),
+        group="global-summary-group")
+    section_summary = _reference_chip(
+        "section-summary", {"semantic_unit_ids": ["u"]},
+        {"summary": "SECTION SUMMARY"}, capabilities=("summary",),
+        group="section-summary-group")
+    context = {
+        "setup_manifest": resolved["setup_manifest"],
+        "ordinal_manifest": resolved["ordinal_manifest"],
+        "unit_picture_ordinals": resolved.get("unit_picture_ordinals", {}),
+        "unit_source_labels": resolved.get("unit_source_labels", {}),
+        "unit_source_members": resolved.get("unit_source_members", {}),
+        "semantic_units": units,
+    }
+
+    compiled = prompt_context.compile_prompt_context(
+        global_channels={"summary": "GLOBAL AUTHORED"},
+        global_attachments=[global_summary],
+        sections=[PromptSection(0, WINDOW_END, channels={
+            "summary": "SECTION AUTHORED"}, attachments=[section_summary])],
+        window_start=0, window_end=WINDOW_END, fps=24.0,
+        template="minimax_h3_ref", profile="minimax_h3_ref@1",
+        context=context, labels_on=True)
+
+    assert "GLOBAL SUMMARY" in compiled["prompt"]
+    assert "SECTION SUMMARY" not in compiled["prompt"]
+    assert [row["attachment_id"] for row in compiled["emissions"]
+            if row["capability_id"] == "summary"] == ["global-summary"]
+    assert [row["attachment_id"] for row in compiled["errors"]
+            if row["code"] == "conflicting_emission"] == ["section-summary"]
 
 
 def scene_composite_subject():
@@ -1221,61 +1273,46 @@ def test_an_anchored_document_refuses_a_flat_text_overwrite(monkeypatch):
             prompt_context.replace_document_text(document, "flattened")
 
 
-def test_convert_to_prose_never_writes_an_ordinal_to_disk(monkeypatch):
-    """The guard that decides whether Convert is safe to ship at all.
+def test_copy_classifies_ordinals_instead_of_refusing(monkeypatch):
+    """Every offered Reference contribution copies, with truthful disclosure.
 
-    `PromptSection.channels` is derived from the channel documents and persisted
-    to `project.json`, so every literal Convert emits reaches disk. An ordinal
-    there would make the file assert a number staging can still change — the
-    invariant the whole design is built around.
-
-    This walks every Reference capability the H3 fixtures produce, converts it,
-    and asserts of the TEXT parts that no `<Label N>` and no `[Shot N]` survives.
-    Anything that would have to be frozen as a number is refused instead, and
-    the refusal count is asserted non-zero so a build that quietly converted
-    everything could not pass by having nothing to refuse.
+    Copy itself does not write project data, so an ordinal no longer refuses the
+    whole action. It must be classified as `frozen_ordinal`, while markers and
+    task prefixes that merely stop tracking intent are `frozen_static`.
     """
-    ordinal = re.compile(r"<[A-Za-z ]+\d+>")
-    converted = 0
-    refused = 0
-    froze_a_marker = 0
+    ordinal = re.compile(r"<[A-Za-z ]+\d+>|\[Shot \d+\]|\(S\d+\)")
+    copied = 0
+    ordinal_parts = 0
+    static_parts = 0
     for _document, _rendered, attachment, capability, context in _anchored_samples(
             monkeypatch):
-        plan = prompt_context.convert_capability_plan(
+        plan = prompt_context.copy_capability_plan(
             attachment, capability, context)
-        if plan["refused"]:
-            refused += 1
-            # A refusal emits nothing AND reports no freeze. Reporting a freeze
-            # that never happened would make a caller warn the author about a
-            # change the tool did not make.
-            assert not plan["lines"], "a refusal must emit nothing"
-            assert not plan["frozen"], "a refusal must report no freeze"
-            continue
-        converted += 1
+        assert not plan["refused"], plan
+        copied += bool(plan["lines"])
         for line in plan["lines"]:
             for part in line["parts"]:
-                if part["kind"] != "text":
+                freeze_class = part.get("freeze_class")
+                if not freeze_class:
                     continue
-                assert not ordinal.search(part["text"]), part
-                assert "[Shot " not in part["text"], part
-                assert "(S" not in part["text"], part
-        if plan["frozen"]:
-            froze_a_marker += 1
-    # Both arms have to be exercised or this proves nothing.
-    assert converted, "nothing converted"
-    assert refused, "nothing refused"
-    # WORTH KNOWING, and asserted so it cannot change silently: under the
-    # shipped H3 format nothing reaches the marker-freeze branch, because every
-    # retention line carries either a shot citation or a physical label, and
-    # both block. Convert is therefore a DEFINITIONS-only action in practice.
-    # The freeze rule exists for formats whose retention cites neither; if a
-    # fixture ever starts freezing a marker this flips and the disclosure path
-    # needs its own coverage before it ships.
-    assert froze_a_marker == 0
+                if freeze_class == "ordinal":
+                    ordinal_parts += 1
+                    assert ordinal.search(part["text"]), part
+                    assert part["text"].strip() in plan["frozen_ordinal"]
+                else:
+                    static_parts += 1
+                    assert freeze_class == "static", part
+                    assert not ordinal.search(part["text"]), part
+                    assert part["text"].strip() in plan["frozen_static"]
+    # Every arm is exercised, so classifying everything into one bucket cannot
+    # satisfy this test.
+    assert copied, "nothing copied"
+    assert ordinal_parts, "no ordinal disclosure was exercised"
+    assert static_parts, "no static disclosure was exercised"
 
 
-def test_convert_keeps_the_entity_and_its_sources_live(monkeypatch):
-    """A converted definition must still renumber.
+def test_copy_keeps_the_entity_and_its_sources_live(monkeypatch):
+    """A copied definition prefers live handles for identity and sources.
 
     `label` and `sources` are the two derived kinds with a live spelling, so
     they leave as handle references carrying stable ids rather than as the text
@@ -1287,7 +1324,7 @@ def test_convert_keeps_the_entity_and_its_sources_live(monkeypatch):
     empty_sources = 0
     for _document, _rendered, attachment, capability, context in _anchored_samples(
             monkeypatch):
-        plan = prompt_context.convert_capability_plan(
+        plan = prompt_context.copy_capability_plan(
             attachment, capability, context)
         if plan["refused"]:
             continue
@@ -1295,7 +1332,7 @@ def test_convert_keeps_the_entity_and_its_sources_live(monkeypatch):
             for part in line["parts"]:
                 if part["kind"] == "handle":
                     # A handle with no id would resolve to nothing and the
-                    # conversion would silently drop the entity.
+                    # copy would silently drop the entity.
                     assert part["source"] == "unit"
                     assert part["id"], part
                     seen_handle += 1
@@ -1325,29 +1362,31 @@ def test_convert_keeps_the_entity_and_its_sources_live(monkeypatch):
     # is not asserted; the browser guard carries a manual row instead.
 
 
-def test_convert_refuses_a_line_whose_numbers_have_no_spelling(monkeypatch):
-    """Refusal is the feature, not a gap.
+def test_copy_classifies_numbers_with_no_live_spelling(monkeypatch):
+    """Numbers without a live spelling are ordinal, never static.
 
     A retention line cites `[Shot 2]` and a speech line carries `(S1)`. Both are
-    ordinals; neither has a handle spelling reachable from the segment. The only
-    way to convert them is to freeze the number, which is precisely what may not
-    reach `project.json` — so Convert declines and says which parts stopped it.
+    ordinals; neither has a handle spelling reachable from the segment. Copy
+    carries the rendered number, while naming the stronger consequence so the
+    author knows a paste can go stale.
     """
-    reasons = []
+    ordinal_parts = []
+    static_parts = []
     for _document, _rendered, attachment, capability, context in _anchored_samples(
             monkeypatch):
-        plan = prompt_context.convert_capability_plan(
+        plan = prompt_context.copy_capability_plan(
             attachment, capability, context)
-        if plan["refused"]:
-            reasons.append(plan["refused"])
-    assert reasons, "no fixture produced a refusal"
-    # The message must NAME what blocked it — a bare "cannot convert" leaves the
-    # author with no way to tell whether it is their doing.
-    assert any("shots" in reason or "speaker" in reason for reason in reasons), reasons
-    assert all("freeze a number" in reason for reason in reasons), reasons
-    # A PHYSICAL definition blocks for its own reason: its owner is keyed by
-    # the rendered label, so there is no id to hand a handle.
-    assert any("no stable id" in reason for reason in reasons), reasons
+        assert not plan["refused"], plan
+        ordinal_parts.extend(plan["frozen_ordinal"])
+        static_parts.extend(plan["frozen_static"])
+    assert any("[Shot " in value for value in ordinal_parts), ordinal_parts
+    assert any("(S" in value for value in ordinal_parts), ordinal_parts
+    assert any(re.search(r"<(?:Picture|Video|Audio) \d+>", value)
+               for value in ordinal_parts), ordinal_parts
+    assert static_parts, "the fixtures must exercise staged-intent disclosure"
+    assert not any("[Shot " in value or "(S" in value
+                   or re.search(r"<[A-Za-z ]+\d+>", value)
+                   for value in static_parts), static_parts
 
 
 def test_the_source_member_sidecar_stays_aligned_with_its_labels():
@@ -1384,10 +1423,10 @@ def test_the_source_member_sidecar_stays_aligned_with_its_labels():
     assert set(members) <= {"mp", "mq"}
 
 
-def test_convert_plan_through_the_real_compile_keeps_the_entity_and_sources():
+def test_copy_plan_through_the_real_compile_keeps_the_entity_and_sources():
     """Convert, through the wiring rather than the pure function.
 
-    The pure `convert_capability_plan` was already covered — and it passed the
+    The pure `copy_capability_plan` was already covered — and it passed the
     whole time the feature was broken. The defect lived in the WIRING: the plan
     was built from a context assembled by hand, and `_reference_capability_parts`
     reads `semantic_units_by_id` and `profile`, which `compile_prompt_context`
@@ -1433,9 +1472,9 @@ def test_convert_plan_through_the_real_compile_keeps_the_entity_and_sources():
             "unit_source_members": resolved.get("unit_source_members", {}),
             "semantic_units": units,
         }, labels_on=True,
-        convert_plan_for={"attachment_id": "chip-1", "capability_id": "definitions"})
+        copy_plan_for={"attachment_id": "chip-1", "capability_id": "definitions"})
 
-    plan = compiled["convert_plan"]
+    plan = compiled["copy_plan"]
     assert not plan["refused"], plan
     assert plan["lines"], "the wiring produced no lines; this is the shipped defect"
     parts = plan["lines"][0]["parts"]
@@ -1455,7 +1494,7 @@ def test_convert_plan_through_the_real_compile_keeps_the_entity_and_sources():
     assert sources["member_ids"] == ["mp"], sources
 
 
-def test_convert_plan_refuses_a_capability_that_is_not_staged():
+def test_copy_plan_refuses_a_capability_that_is_not_staged():
     """A Convert request naming something absent must decline, not crash.
 
     The lookup deliberately searches the compiled state rather than trusting the
@@ -1467,10 +1506,69 @@ def test_convert_plan_refuses_a_capability_that_is_not_staged():
                                 channels={"detailed_description": "She looks up."})],
         window_start=0, window_end=WINDOW_END, fps=24.0,
         template="minimax_h3_ref", profile="minimax_h3_ref@1",
-        convert_plan_for={"attachment_id": "nope", "capability_id": "definitions"})
-    plan = compiled["convert_plan"]
+        copy_plan_for={"attachment_id": "nope", "capability_id": "definitions"})
+    plan = compiled["copy_plan"]
     assert plan["refused"]
-    assert not plan["lines"] and not plan["frozen"]
+    assert not plan["lines"] and not plan["frozen_static"]
+    assert not plan["frozen_ordinal"]
+
+
+def test_copy_locator_uses_compiler_capability_authorities():
+    """Sparse, preserved, and synthesized capabilities remain locatable."""
+    profile = H3_PROFILE
+    sparse = prompt_context.normalize_attachment({
+        "attachment_id": "sparse", "kind": "reference", "capabilities": [],
+    })
+    located = prompt_context._locate_capability(
+        {"attachment_id": "sparse", "capability_id": "definitions"},
+        [sparse], [], profile, H3_KEYS)
+    assert located and located[1]["kind"] == "definitions", located
+
+    preserved = prompt_context.normalize_attachment({
+        "attachment_id": "preserved", "kind": "reference",
+        "capabilities": [{"capability_id": "definitions", "kind": "definitions",
+                          "placement": "future_phase"}],
+    })
+    assert prompt_context._capabilities(preserved, profile) == []
+    located = prompt_context._locate_capability(
+        {"attachment_id": "preserved", "capability_id": "definitions"},
+        [preserved], [], profile, H3_KEYS)
+    assert located and located[1]["placement"] == "future_phase", located
+
+    scope_link = prompt_context.normalize_attachment({
+        "attachment_id": "scope", "kind": "prompt_link_scope",
+        "source": {"prompt_id": "earlier", "channel_keys": ["summary"]},
+        "capabilities": [],
+    })
+    located = prompt_context._locate_capability(
+        {"attachment_id": "scope",
+         "capability_id": "prompt_link_scope:summary"},
+        [], [PromptSection(0, WINDOW_END, attachments=[scope_link])], profile,
+        H3_KEYS)
+    assert located, "the synthesized per-channel capability was invisible"
+    assert located[1]["capability_id"] == "prompt_link_scope:summary", located
+    assert prompt_context._locate_capability(
+        {"attachment_id": "scope",
+         "capability_id": "prompt_link_scope:detailed_description"},
+        [], [PromptSection(0, WINDOW_END, attachments=[scope_link])], profile,
+        H3_KEYS
+    ) is None
+    assert prompt_context._locate_capability(
+        {"attachment_id": "scope",
+         "capability_id": "prompt_link_scope:not_a_template_channel"},
+        [], [PromptSection(0, WINDOW_END, attachments=[scope_link])], profile,
+        H3_KEYS
+    ) is None
+
+    compatible = copy.deepcopy(profile)
+    compatible["template_id"] = "standard"
+    compatible["compatible_templates"] = ["standard", "minimax_h3_ref"]
+    located = prompt_context._locate_capability(
+        {"attachment_id": "scope",
+         "capability_id": "prompt_link_scope:summary"},
+        [], [PromptSection(0, WINDOW_END, attachments=[scope_link])], compatible,
+        H3_KEYS)
+    assert located, "the active compatible template, not the primary, owns channels"
 
 
 def test_a_converted_mention_renders_where_the_author_put_it():
@@ -1598,7 +1696,8 @@ def test_a_converted_mention_that_only_seeds_its_kind_routes_away():
     assert "<Subject 1>" not in compiled["channels"]["subject_definitions"]
 
 
-def _handle_prose_scene(text, *, unit_handle="KWoman", member_handle="Sheet"):
+def _handle_prose_scene(text, *, unit_handle="KWoman", member_handle="Sheet",
+                        attachments=()):
     """One staged Subject and one staged Picture, with prose instead of chips."""
     entity = ReferenceEntity(reference_id="e", name="Woman", members=[
         ReferenceMember(member_id="mp", asset_id="img_a", handle=member_handle,
@@ -1616,7 +1715,8 @@ def _handle_prose_scene(text, *, unit_handle="KWoman", member_handle="Sheet"):
     document = {"nodes": [{"type": "text", "text": text}]}
     return prompt_context.compile_prompt_context(
         sections=[PromptSection(0, WINDOW_END,
-                                channel_docs={"detailed_description": document})],
+                                channel_docs={"detailed_description": document},
+                                attachments=list(attachments))],
         window_start=0, window_end=WINDOW_END, fps=24.0,
         template="minimax_h3_ref", profile="minimax_h3_ref@1",
         context={
@@ -1919,8 +2019,8 @@ def test_a_copy_plan_spells_a_mention_as_handles_in_both_namespaces():
             "semantic_units": units,
             "references": [entity.to_dict()],
         }, labels_on=True,
-        convert_plan_for={"attachment_id": "chip-1", "capability_id": "mentions"})
-    plan = compiled["convert_plan"]
+        copy_plan_for={"attachment_id": "chip-1", "capability_id": "mentions"})
+    plan = compiled["copy_plan"]
     assert not plan["refused"], plan
     parts = plan["lines"][0]["parts"]
     handles = [part for part in parts if part["kind"] == "handle"]
@@ -1963,6 +2063,92 @@ def test_prose_whose_handles_all_resolve_says_nothing():
     compiled = _handle_prose_scene("a @KWoman walks past")
     assert not [w for w in compiled["warnings"]
                 if w.get("code") == "unresolved_handle_mention"], compiled["warnings"]
+
+
+def test_authored_ordinals_report_resolved_and_unresolved_numbers():
+    """The paste advisory compares every spelling with the live manifest."""
+    compiled = _handle_prose_scene(
+        ("<Picture 1> and <Picture 2>; [Shot 1] then [Shot 2]; "
+         "(S1), (S1,S2), not (S1,S3)"),
+        attachments=[prompt_context.shot_attachment(),
+                     _vocal_event("voice-1", voice_id="one"),
+                     _vocal_event("voice-2", voice_id="two")])
+    rows = [value for value in compiled["warnings"]
+            if value.get("code") == "authored_ordinal_literal"]
+    assert len(rows) == 1, rows
+    row = rows[0]
+    assert row["channel_key"] == "detailed_description", row
+    for spelling in ("<Picture 1>", "[Shot 1]", "(S1)", "(S1,S2)"):
+        assert f"{spelling} currently resolves to staged input" in row["message"], row
+    for spelling in ("<Picture 2>", "[Shot 2]", "(S1,S3)"):
+        assert (f"{spelling} does not resolve to anything currently staged"
+                in row["message"]), row
+
+
+def test_authored_ordinal_patterns_include_assetless_and_escape_templates():
+    """Identity populations stay distinct; regex syntax and bare labels are safe."""
+    profile = copy.deepcopy(H3_PROFILE)
+    identity = profile["identity_kinds"][0]
+    identity["referenced_label_template"] = "<Subject {n}>"
+    identity["assetless_label_template"] = "[Hero {n}]"
+    found = prompt_context.authored_ordinal_literals(
+        "<Subject 1> <Subject 2> [Hero 1] [Hero 2]", profile,
+        {"ordinal_manifest": {"subjects": {"referenced": 1, "assetless": 2}},
+         "semantic_units_by_id": {
+             "referenced": {"sources": [{"member_id": "m"}]},
+             "assetless": {"sources": []},
+         }})
+    assert found == {
+        "<Subject 1>": True, "<Subject 2>": False,
+        "[Hero 1]": False, "[Hero 2]": True,
+    }
+
+    # Repeating the same declaration placeholder is valid and denotes one
+    # ordinal. The scanner must use a backreference, not duplicate a named
+    # regex group and crash the entire compile.
+    profile["physical_populations"][0]["label_template"] = "<Picture {n}/{n}>"
+    repeated = prompt_context.authored_ordinal_literals(
+        "<Picture 3/3> <Picture 3/4>", profile,
+        {"ordinal_manifest": {"pictures": {"member": 3}},
+         "semantic_units_by_id": {}})
+    assert repeated == {"<Picture 3/3>": True}
+
+    profile["speaker_policy"]["token_template"] = "(S{n}/{n})"
+    compound = prompt_context.authored_ordinal_literals(
+        "(S1/1,S2/2) (S1/2,S2/2)", profile,
+        {"speaker_order": {"voice:two": 2}, "ordinal_manifest": {},
+         "semantic_units_by_id": {}})
+    assert compound == {"(S1/1,S2/2)": False}
+
+    profile["speaker_policy"].update({
+        "token_template": "(S/{n})", "compound_join": "/"})
+    joiner_collision = prompt_context.authored_ordinal_literals(
+        "(S/1/S/2)", profile,
+        {"speaker_order": {"voice:one": 1, "voice:two": 2},
+         "ordinal_manifest": {}, "semantic_units_by_id": {}})
+    assert joiner_collision == {"(S/1/S/2)": True}
+
+    profile["speaker_policy"].update({
+        "token_template": "(S{n})", "compound_join": ","})
+    many_speakers = "(" + ",".join(["S1"] * 1200) + ")"
+    assert prompt_context.authored_ordinal_literals(
+        many_speakers, profile,
+        {"speaker_order": {"voice:one": 1}, "ordinal_manifest": {},
+         "semantic_units_by_id": {}}) == {many_speakers: True}
+
+    # An unwrapped token makes the compound and simple patterns both match.
+    # Re-scanning every prior compound span for every simple token was O(n²)
+    # and blocked the synchronous candidate-compile endpoint for seconds.
+    profile["speaker_policy"]["token_template"] = "S{n}"
+    repeated_compounds = "S1,S2 " * 5000
+    started = time.perf_counter()
+    repeated = prompt_context.authored_ordinal_literals(
+        repeated_compounds, profile,
+        {"speaker_order": {"voice:one": 1, "voice:two": 2},
+         "ordinal_manifest": {}, "semantic_units_by_id": {}})
+    elapsed = time.perf_counter() - started
+    assert repeated == {"S1,S2": True}
+    assert elapsed < 1.0, f"repeated compound scan took {elapsed:.3f}s"
 
 
 def test_copy_refuses_a_capability_whose_contribution_the_render_refuses():
@@ -2088,11 +2274,11 @@ def test_an_identity_handle_that_resolves_to_nothing_is_reported():
         raise AssertionError(f"fixture resolved @Ghost: {described}")
 
 
-def test_a_compile_without_a_convert_request_carries_no_plan():
+def test_a_compile_without_a_copy_request_carries_no_plan():
     """The field appears only when asked for; every other compile is unchanged."""
     compiled = prompt_context.compile_prompt_context(
         sections=[PromptSection(0, WINDOW_END,
                                 channels={"detailed_description": "She looks up."})],
         window_start=0, window_end=WINDOW_END, fps=24.0,
         template="minimax_h3_ref", profile="minimax_h3_ref@1")
-    assert "convert_plan" not in compiled
+    assert "copy_plan" not in compiled

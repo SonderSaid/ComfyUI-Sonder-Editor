@@ -787,6 +787,7 @@ class FullscreenEditorSession {
             onFullscreenExit: () => this._handleEditorClosed(),
             onMountInTab: () => this.controller.mountFullscreenInTab(),
             onWidgetValueChange: (name, value) => this.controller.onEditorWidgetValueChange(name, value),
+            onWidgetStateApplied: (values) => this.controller._onFullscreenWidgetStateApplied(values),
         });
 
         this.editor = editor;
@@ -1919,26 +1920,57 @@ export class EditorNodeController {
 
     _applyRemoteWidgetState(values = {}, source = "unknown", remoteSessionId = "") {
         if (!values || typeof values !== "object") return false;
-        const changedFields = [];
-        const previewRefreshKeys = new Set();
-        for (const [name, value] of Object.entries(values)) {
+        const orderedEntries = Object.entries(values).sort(([left], [right]) => {
+            if (left === "scene_id") return -1;
+            if (right === "scene_id") return 1;
+            return 0;
+        });
+        const acceptedValues = {};
+        const changedValues = {};
+        for (const [name, value] of orderedEntries) {
             if (!EDITOR_WIDGET_FIELDS.includes(name)) continue;
+            acceptedValues[name] = value;
             if (Object.is(this._getWidgetValue(name), value)) continue;
-            this._setWidgetValue(name, value);
-            this.onEditorWidgetValueChange(name, value, { publish: false, refreshPreview: false });
-            for (const key of this._previewInvalidationKeysForWidget(name)) {
-                previewRefreshKeys.add(key);
-            }
-            changedFields.push(name);
+            changedValues[name] = value;
         }
+        const fullscreenEditor = this.fullscreenSession?.editor;
+        const stateToApply = fullscreenEditor?.hasDeferredWidgetState?.()
+            ? acceptedValues
+            : changedValues;
+        const changedFields = Object.keys(stateToApply);
         if (!changedFields.length) return false;
         this._recordDiagEvent("widget_state_apply", {
             source,
             remote_session_id: remoteSessionId || "",
             fields: changedFields,
         });
+
+        if (fullscreenEditor?.applyWidgetState) {
+            // The editor owns drag/history deferral. Give it the payload before
+            // mutating the shared node widgets so scene-relative fields cannot
+            // leak into the scene that still owns an in-flight transaction.
+            fullscreenEditor.applyWidgetState(stateToApply);
+            return true;
+        }
+
+        for (const [name, value] of Object.entries(stateToApply)) {
+            this._setWidgetValue(name, value);
+        }
+        this._onFullscreenWidgetStateApplied(stateToApply);
+        return true;
+    }
+
+    _onFullscreenWidgetStateApplied(values = {}) {
+        if (!values || typeof values !== "object") return false;
+        const previewRefreshKeys = new Set();
+        for (const [name, value] of Object.entries(values)) {
+            if (!EDITOR_WIDGET_FIELDS.includes(name)) continue;
+            this.onEditorWidgetValueChange(name, value, { publish: false, refreshPreview: false });
+            for (const key of this._previewInvalidationKeysForWidget(name)) {
+                previewRefreshKeys.add(key);
+            }
+        }
         this.node?.setDirtyCanvas?.(true, true);
-        this.fullscreenSession?.editor?.applyWidgetState?.(values);
         if (previewRefreshKeys.size) {
             this._schedulePreviewStateRefresh(Array.from(previewRefreshKeys));
         } else {

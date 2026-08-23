@@ -304,6 +304,126 @@ def test_contradictory_overlapping_definitions_are_reported():
                for value in compiled["errors"])
 
 
+def test_global_definition_owns_conflict_and_declared_phase_in_every_window():
+    """A selected section must never displace the scene-wide owner.
+
+    The section writer used to run first.  That made its override win whenever
+    its section was selected, then handed ownership back to the global chip as
+    soon as the window moved away.  A suffix-placement global also proves that
+    global-first does not flatten the capability's declared phase.
+    """
+    def definition_chip(attachment_id, definition, placement):
+        return prompt_context.normalize_attachment({
+            "attachment_id": attachment_id,
+            "emission_group_id": f"group-{attachment_id}",
+            "kind": "reference",
+            "source": {"semantic_unit_ids": ["a"]},
+            "config": {"definition": definition},
+            "capabilities": [{
+                "capability_id": "definitions", "kind": "definitions",
+                "placement": placement, "channel_key": "visual",
+            }],
+        })
+
+    global_chip = definition_chip("global-definition", "GLOBAL VALUE",
+                                  "section_suffix")
+    section_chip = definition_chip("section-definition", "SECTION VALUE",
+                                   "section_prefix")
+    sections = [
+        _section(0, 10, "FIRST BODY", prompt_id="first",
+                 attachments=[section_chip]),
+        _section(10, 20, "SECOND BODY", prompt_id="second"),
+    ]
+
+    first = prompt_context.compile_prompt_context(
+        global_channels={"visual": "GLOBAL AUTHORED"},
+        global_attachments=[global_chip], sections=sections,
+        window_start=0, window_end=10, fps=24, template="standard",
+        profile=_REFERENCE_IDENTITY_PROFILE, context=_reference_context())
+    second = prompt_context.compile_prompt_context(
+        global_channels={"visual": "GLOBAL AUTHORED"},
+        global_attachments=[global_chip], sections=sections,
+        window_start=10, window_end=20, fps=24, template="standard",
+        profile=_REFERENCE_IDENTITY_PROFILE, context=_reference_context())
+
+    global_line = "<Subject 1> is GLOBAL VALUE"
+    for compiled, section_body in ((first, "FIRST BODY"),
+                                   (second, "SECOND BODY")):
+        assert global_line in compiled["prompt"]
+        assert "SECTION VALUE" not in compiled["prompt"]
+        assert compiled["prompt"].index("GLOBAL AUTHORED") < compiled["prompt"].index(global_line)
+        assert compiled["prompt"].index(global_line) < compiled["prompt"].index(section_body)
+        assert [row["attachment_id"] for row in compiled["emissions"]
+                if row["capability_id"] == "definitions"] == ["global-definition"]
+        projection = next(
+            row for row in compiled["attachment_capability_projections"]
+            if row["attachment_id"] == "global-definition")
+        assert projection["effective_phase"] == "section_suffix"
+        assert projection["state"] == "emitted"
+
+    conflicts = [row for row in first["errors"]
+                 if row["code"] == "conflicting_emission"]
+    assert [row["attachment_id"] for row in conflicts] == ["section-definition"]
+    assert not [row for row in second["errors"]
+                if row["code"] == "conflicting_emission"]
+
+
+def test_identical_global_definition_marks_the_section_writer_deduplicated():
+    def chip(attachment_id):
+        return prompt_context.normalize_attachment({
+            "attachment_id": attachment_id,
+            "kind": "reference",
+            "source": {"semantic_unit_ids": ["a"]},
+            "config": {"definition": "SAME VALUE"},
+            "capabilities": [{
+                "capability_id": "definitions", "kind": "definitions",
+                "placement": "section_prefix", "channel_key": "visual",
+            }],
+        })
+
+    compiled = prompt_context.compile_prompt_context(
+        global_attachments=[chip("global-definition")],
+        sections=[_section(0, 10, "BODY", attachments=[chip("section-definition")])],
+        window_start=0, window_end=10, fps=24, template="standard",
+        profile=_REFERENCE_IDENTITY_PROFILE, context=_reference_context())
+    projections = {row["attachment_id"]: row
+                   for row in compiled["attachment_capability_projections"]}
+    assert projections["global-definition"]["state"] == "emitted"
+    assert projections["section-definition"]["state"] == "deduplicated"
+    assert compiled["prompt"].count("<Subject 1> is SAME VALUE") == 1
+
+
+def test_global_custom_chip_owns_the_generic_emission_key():
+    profile = {
+        "profile_id": "custom_owner", "version": "1", "name": "Custom owner",
+        "template_id": "standard", "writing_aids": [],
+        "capabilities": {"custom": {
+            "channel_key": "visual", "placement": "section_prefix",
+        }},
+    }
+
+    def chip(attachment_id, text):
+        return prompt_context.normalize_attachment({
+            "attachment_id": attachment_id,
+            "emission_group_id": "shared-custom-emission",
+            "kind": "custom", "config": {"text": text},
+        })
+
+    compiled = prompt_context.compile_prompt_context(
+        global_attachments=[chip("global-custom", "GLOBAL CUSTOM")],
+        sections=[_section(0, 10, "BODY", attachments=[
+            chip("section-custom", "SECTION CUSTOM")])],
+        window_start=0, window_end=10, fps=24, template="standard",
+        profile=profile)
+
+    assert "GLOBAL CUSTOM" in compiled["prompt"]
+    assert "SECTION CUSTOM" not in compiled["prompt"]
+    assert [row["attachment_id"] for row in compiled["emissions"]] == [
+        "global-custom"]
+    assert [row["attachment_id"] for row in compiled["errors"]
+            if row["code"] == "conflicting_emission"] == ["section-custom"]
+
+
 # 8 — provider registry.
 
 def test_unknown_attachment_provider_blocks_only_while_enabled():
@@ -1557,12 +1677,14 @@ def test_scope_row_shows_linked_badge_and_carries_its_actions_in_one_menu():
             kind: "reference", source: {}, config: {} };
         const row = mod.createScopeChipRow({ attachments: [current],
             label: "Section 2 context",
+            previews: { a: "<Subject 1> wears a red coat" },
             allSceneAttachments: [current, linked, reusable],
             reusableAttachments: [linked, reusable],
             onReuse() {}, onUnlink() {}, onActivate() {}, onRemove() {},
             attachmentLabelFor: () => "Granny" });
         const buttons = row.querySelectorAll("button");
-        buttons.find((value) => value.dataset.attachmentId)._handlers.click[0]();
+        const chip = buttons.find((value) => value.dataset.attachmentId);
+        chip._handlers.click[0]();
         const menu = document.body.children.at(-1).querySelectorAll("div")
             .filter((value) => value.attributes.role === "menuitem")
             .map((value) => value.children[0].textContent);
@@ -1572,6 +1694,8 @@ def test_scope_row_shows_linked_badge_and_carries_its_actions_in_one_menu():
             linkedBadges: row.querySelectorAll("span").filter((value) =>
                 value.dataset.sonderLinkedAttachment === "1").length,
             buttons: buttons.map((value) => value.textContent),
+            chipTitle: chip.title,
+            chipAria: chip.attributes["aria-label"],
             selectCount: row.querySelectorAll("select").length,
             menu,
         }));
@@ -1581,10 +1705,80 @@ def test_scope_row_shows_linked_badge_and_carries_its_actions_in_one_menu():
     # One `+ Attach` and one chip. No selects at all -- four tail controls became
     # one, which is the whole point of the tier.
     assert result["selectCount"] == 0, result
-    assert result["buttons"] == ["Granny", "+ Attach"], result
+    # Attach is the primary row action, intentionally first in visual and tab
+    # order. Its x is therefore independent of chip count and wrapping.
+    assert result["buttons"] == ["+ Attach", "Granny"], result
+    assert "<Subject 1> wears a red coat" in result["chipTitle"], result
+    assert result["chipAria"] == (
+        "Granny — <Subject 1> wears a red coat Context chip"), result
     assert result["menu"] == [
         "Used in 2 sections", "Configure\u2026",
         "Unlink from the other sections", "Remove Granny"], result
+
+
+def test_projection_signature_covers_every_rendered_authority():
+    """A skipped host rebuild is safe only when every renderer input matches."""
+    result = _run_chip_dom_script("""
+        const attachment = { attachment_id: "a", emission_group_id: "g",
+            kind: "reference", source: {}, config: { value: "one" } };
+        const row = { attachment_id: "a", emission_group_id: "g",
+            capability_id: "definitions", channel_key: "visual",
+            state: "emitted", text: "one", rendered_at_anchor: false,
+            region: "before", declared_placement: "section_prefix",
+            effective_phase: "section_prefix", state_reason: "" };
+        const candidate = { _stale: false,
+            attachment_capability_projections: [row],
+            attachment_channel_previews: { a: { visual: "fallback" } },
+            attachment_channel_routes: { a: { visual: ["section_prefix"] } },
+            emissions: [{ attachment_id: "a", emission_group_id: "g",
+                channel_key: "visual", origin: "section" }] };
+        const signature = (candidateValue = candidate, attachmentValue = attachment,
+            disabled = false, label = "Identity") =>
+            mod.attachmentChannelProjectionSignature({ channelKey: "visual",
+                attachments: [attachmentValue], candidate: candidateValue,
+                disabled, attachmentLabelFor: () => label });
+        const base = signature();
+        const changed = (patch) => signature({ ...candidate, ...patch }) !== base;
+        const changedRow = (patch) => changed({
+            attachment_capability_projections: [{ ...row, ...patch }] });
+        console.log(JSON.stringify({
+            stableClone: signature(structuredClone(candidate),
+                structuredClone(attachment)) === base,
+            stale: changed({ _stale: true }),
+            pendingStale: changed({ _stale: true, _stale_visual: false }),
+            state: changedRow({ state: "disabled" }),
+            text: changedRow({ text: "two" }),
+            anchor: changedRow({ rendered_at_anchor: true }),
+            declared: changedRow({ declared_placement: "channel_prefix" }),
+            effective: changedRow({ effective_phase: "channel_prefix" }),
+            reason: changedRow({ state_reason: "why" }),
+            region: changedRow({ region: "after" }),
+            order: changedRow({ order: 2 }),
+            linked: changed({ attachment_capability_projections: [row,
+                { ...row, attachment_id: "linked", channel_key: "audio",
+                    state: "emitted" }] }),
+            preview: changed({ attachment_channel_previews:
+                { a: { visual: "different" } } }),
+            route: changed({ attachment_channel_routes:
+                { a: { visual: ["channel_suffix"] } } }),
+            emission: changed({ emissions: [{ attachment_id: "a",
+                emission_group_id: "g", channel_key: "visual",
+                origin: "global" }] }),
+            disabled: signature(candidate, attachment, true) !== base,
+            attachment: signature(candidate, { ...attachment,
+                config: { value: "two" } }) !== base,
+            label: signature(candidate, attachment, false, "Other") !== base,
+        }));
+    """)
+    assert result == {
+        "stableClone": True,
+        "stale": True, "pendingStale": False,
+        "state": True, "text": True, "anchor": True,
+        "declared": True, "effective": True, "reason": True, "region": True,
+        "order": True, "linked": True,
+        "preview": True, "route": True, "emission": True,
+        "disabled": True, "attachment": True, "label": True,
+    }
 
 
 def test_a_chip_menu_opens_with_the_keyboard_on_its_first_row():
@@ -1626,6 +1820,42 @@ def test_a_chip_menu_opens_with_the_keyboard_on_its_first_row():
     assert result["haspopup"] == "menu", result
 
 
+def test_attach_stays_immediately_after_caption_at_every_row_size():
+    """Zero, ordinary, and overflow rows share one visual and tab order."""
+    result = _run_chip_dom_script("""
+        const attachment = (index) => ({
+            attachment_id: `a${index}`, emission_group_id: `g${index}`,
+            kind: "reference", source: {}, config: {},
+        });
+        const inspect = (count) => {
+            const row = mod.createScopeChipRow({
+                attachments: Array.from({ length: count }, (_, i) => attachment(i)),
+                attachmentLabelFor: (value) => `Chip ${value.attachment_id}`,
+            });
+            const caption = row.children.find((value) =>
+                value.dataset.sonderScopeRowLabel === "1");
+            const attach = row.children.find((value) =>
+                value.dataset.sonderScopeRowAttach === "1");
+            return {
+                count,
+                immediatelyAfterCaption: caption.nextSibling === attach,
+                firstButton: row.querySelectorAll("button")[0]?.textContent || "",
+                hasOverflow: row.querySelectorAll("button").some((value) =>
+                    value.dataset.sonderScopeRowOverflow === "1"),
+            };
+        };
+        console.log(JSON.stringify([inspect(0), inspect(1), inspect(7)]));
+    """)
+    assert result == [
+        {"count": 0, "immediatelyAfterCaption": True,
+         "firstButton": "+ Attach", "hasOverflow": False},
+        {"count": 1, "immediatelyAfterCaption": True,
+         "firstButton": "+ Attach", "hasOverflow": False},
+        {"count": 7, "immediatelyAfterCaption": True,
+         "firstButton": "+ Attach", "hasOverflow": True},
+    ]
+
+
 def test_the_seventh_chip_is_reachable():
     """`+N` was a dead label counting chips it gave no way to open.
 
@@ -1640,6 +1870,7 @@ def test_the_seventh_chip_is_reachable():
             kind: "reference", source: {}, config: {} }));
         const row = mod.createScopeChipRow({ attachments: many,
             label: "Section 1 context",
+            previews: { a6: "<Subject 7> waits by the window" },
             onActivate() {}, onRemove() {},
             attachmentLabelFor: (value) => `Chip ${value.attachment_id}` });
         const overflow = row.querySelectorAll("button")
@@ -1659,6 +1890,9 @@ def test_the_seventh_chip_is_reachable():
                 .filter((value) => value.dataset.attachmentId).length,
             overflowLabel: overflow.textContent,
             hidden: hidden.map((value) => value.children[0].textContent),
+            hiddenHints: hidden.map((value) => value.querySelectorAll("span")
+                .find((span) => span.dataset.sonderContextMenuHint === "1")
+                ?.textContent || ""),
             actions,
         }));
     """)
@@ -1667,6 +1901,8 @@ def test_the_seventh_chip_is_reachable():
     assert result["chips"] == 6, result
     assert result["overflowLabel"].startswith("1 more"), result
     assert result["hidden"] == ["Reference: Chip a6"], result
+    assert result["hiddenHints"] == [
+        "Chip a6 — <Subject 7> waits by the window"], result
     # ...and it carries the same actions it would have had in the row.
     assert result["actions"][0].startswith("Configure"), result
     assert any(value.startswith("Remove ") for value in result["actions"]), result
@@ -3977,9 +4213,22 @@ def test_section_window_states_are_response_only():
     }) == compiled["content_hash"]
     # And the freeze excludes it beside the two projection keys it belongs with.
     source = (ROOT / "server" / "routes.py").read_text(encoding="utf-8")
-    freeze = source.split("job.compiled_prompt_context = {")[1][:400]
+    marker = "job.compiled_prompt_context = {"
+    start = source.index(marker)
+    opening = source.index("{", start)
+    depth = 0
+    freeze = ""
+    for index in range(opening, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                freeze = source[start:index + 1]
+                break
+    assert freeze and "if key not in" in freeze, freeze
     for key in ("attachment_channel_routes", "attachment_capability_projections",
-                "section_window_states"):
+                "section_window_states", "copy_plan"):
         assert key in freeze, freeze
 
 

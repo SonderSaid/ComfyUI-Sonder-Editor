@@ -317,7 +317,7 @@ const details=nodes.filter((n)=>n.tagName==="DETAILS").map((n)=>({
 const kindHelp=nodes.find((n)=>n.textContent.includes("visible person or character"))?.textContent || "";
 const search=nodes.find((n)=>n.tagName==="INPUT" && n.placeholder==="Search physical References…");
 const sourceRows=nodes.filter((n)=>n.tagName==="DIV"
-  && n.children.some((c)=>String(c.textContent || "").startsWith("@Portrait")));
+  && n.children.some((c)=>String(c.textContent || "").startsWith("Portrait")));
 const before=sourceRows.map((row)=>row.style.display || "");
 search.value="second"; search._handlers.input[0]();
 const after=sourceRows.map((row)=>row.style.display || "");
@@ -772,11 +772,19 @@ console.log(JSON.stringify({{physical, identity}}));
     }]
     panel = _source("web/js/editor_prompt_panel.js")
     widget = _source("web/js/editor_widget.js")
-    assert panel.index("_materializeReferenceMemberHandle") < panel.index(
-        "const committed = await commit(operations, label, history)")
+    lifecycle = panel.index(
+        'host._beginSceneHistoryLifecycle?.("attach prompt Reference")')
+    materialize = panel.index("_materializeReferenceMemberHandle", lifecycle)
+    scene_commit = panel.index(
+        "const committed = await commit(operations, label, history, lifecycleToken)",
+        materialize)
+    lifecycle_end = panel.index(
+        "host._endSceneHistoryLifecycle?.(lifecycleToken)", scene_commit)
+    assert lifecycle < materialize < scene_commit < lifecycle_end
     assert "referenceOperations" in panel and "inverseReferenceOperations" in panel
+    assert "physicalMaterialization?.ownsHandle" in panel
     assert "referenceOperations: structuredClone" in widget
-    assert "await this._mutateReferences(entry.referenceOperations" in widget
+    assert "await this._applyReferenceHistoryOperations(entry.referenceOperations" in widget
 
 
 def test_prompt_declaration_projection_drives_recipe_union_and_role_choices():
@@ -890,7 +898,8 @@ console.log(JSON.stringify([
     assert result == ["@KWoman", "@KoreanWoman"]
     panel = _source("web/js/editor_prompt_panel.js")
     assert 'compiled.dataset.sonderWritingCompiled = "1"' in panel
-    assert 'payload.compiled_prompt' in panel
+    assert "writingCompiledPayload(payload)" in panel
+    assert "prompt.textContent = compiled.prompt" in panel
     assert '["prompt_link", "prompt_link_scope"].includes(attachment.kind)' in panel
 
 
@@ -1018,6 +1027,79 @@ def _method_body(source, name, marker=None):
     raise AssertionError(f"unbalanced braces after {name}")
 
 
+def test_copy_plan_discloses_fallbacks_and_is_offered_only_when_supported():
+    """The browser cannot offer Copy on a contribution the builder cannot serve."""
+    panel = _source("web/js/editor_prompt_panel.js")
+    widget = _source("web/js/editor_widget.js")
+    assert '"definitions", "retention", "mentions", "summary", "audio_relationship"' in panel
+    assert "line.emitting && COPY_CAPABILITY_KINDS.has(line.capability)" in panel
+    assert "plan.frozen_static" in panel and "plan.frozen_ordinal" in panel
+    assert 'text += String(part.rendered || "")' in panel
+    assert "frozenOrdinal.push(part.rendered)" in panel
+
+    request = _method_body(
+        widget, "_promptCopyPlan", marker="return payload?.copy_plan || null")
+    assert "copy_plan_for:" in request
+    assert "convert_plan_for" not in request
+    assert "sceneWide" in request
+    assert "selectionStart: 0, selectionEnd: duration" in request
+
+    # A dormant row is projected from the scene-wide compile, so its Copy
+    # action must request that same scope instead of silently recompiling the
+    # current narrow selection and returning an empty plan.
+    assert "{ sceneWide: Boolean(dormancy) }" in panel
+
+
+def test_copy_plan_executes_the_scope_used_by_its_projection_row():
+    """Dormant Copy behavior, not merely its source spelling, stays scene-wide."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for Copy scope coverage")
+    widget = _source("web/js/editor_widget.js")
+    method = _method_body(
+        widget, "_promptCopyPlan", marker="return payload?.copy_plan || null")
+    script = """
+const api = { apiURL: (value) => value };
+const requests = [];
+globalThis.fetch = async (_url, options) => {
+  requests.push(JSON.parse(options.body));
+  return { ok: true, json: async () => ({ copy_plan: { lines: [] } }) };
+};
+class Subject {
+  async """ + method + """
+  constructor() {
+    this.activeSceneId = "scene";
+    this.activeScene = { duration_frames: 100 };
+    this.totalFrames = 100;
+  }
+  _projectDirName() { return "project"; }
+  _selectionContextRange() { return { contextStart: 10, contextEnd: 20 }; }
+  _promptCompileRequestBody({ windowStart, windowEnd, selection = null }) {
+    return {
+      window_start: windowStart,
+      window_end: windowEnd,
+      selection_start: selection ? selection.selectionStart : windowStart,
+      selection_end: selection ? selection.selectionEnd : windowEnd,
+    };
+  }
+}
+const subject = new Subject();
+await subject._promptCopyPlan("attachment", "capability", null,
+  { sceneWide: true });
+await subject._promptCopyPlan("attachment", "capability");
+console.log(JSON.stringify(requests));
+"""
+    requests = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+    assert [requests[0][key] for key in (
+        "window_start", "window_end", "selection_start", "selection_end"
+    )] == [0, 100, 0, 100]
+    assert [requests[1][key] for key in (
+        "window_start", "window_end", "selection_start", "selection_end"
+    )] == [10, 20, 10, 20]
+
+
 def test_prompt_panel_consumes_only_windowed_candidate_diagnostics():
     """Prompt-tool blockers come only from the WINDOWED candidate compile.
 
@@ -1087,6 +1169,352 @@ def test_the_scene_wide_compile_asks_for_the_whole_scene():
     assert "windowStart: 0, windowEnd: duration" in arrival
     # ...and it does not fire at all when the window already is the scene.
     assert "if (windowStart <= 0 && windowEnd >= duration)" in arrival
+
+
+def test_prompt_projection_repaints_are_signature_gated_at_every_consumer():
+    panel = _source("web/js/editor_prompt_panel.js")
+    widget = _source("web/js/editor_widget.js")
+    assert panel.count("attachmentChannelProjectionSignature({") == 2
+    assert widget.count("attachmentChannelProjectionSignature({") == 1
+    # The first call must build hosts before callers dereference them.
+    assert panel.count(
+        "if (projectionHosts && signature === projectionSignature) return;") == 2
+    assert "if (signature === projectionSignatures[key]) continue;" in widget
+    assert "lastDiagnosticsSignature" in panel
+    assert "lastWritingDecorationSignature" in panel
+    assert "lastDormancySignature" in panel
+
+
+def test_writing_decoration_signature_ignores_prose_but_tracks_layout_changes():
+    module = (ROOT / "web/js/editor_prompt_panel.js").as_uri()
+    result = _run_node(f"""
+const mod = await import({json.dumps(module)});
+const sig = (document) => mod.writingDecorationDocumentSignature(
+  document, ["summary", "detailed_description"],
+  {{defaultKey: "detailed_description"}});
+const base = {{nodes:[
+  {{type:"text",node_id:"a",text:"detailed_description:\\nA shot"}},
+  {{type:"attachment",node_id:"b",attachment_id:"ref-1"}},
+]}};
+const prose = {{nodes:[
+  {{type:"text",node_id:"a",text:"detailed_description:\\nA changed shot"}},
+  {{type:"attachment",node_id:"b",attachment_id:"ref-1"}},
+]}};
+const heading = {{nodes:[
+  {{type:"text",node_id:"a",text:"summary:\\nA changed shot"}},
+  {{type:"attachment",node_id:"b",attachment_id:"ref-1"}},
+]}};
+const movedBlock = {{nodes:[
+  {{type:"text",node_id:"a",text:"detailed_description:\\nA shot\\n---\\nNext"}},
+  {{type:"attachment",node_id:"b",attachment_id:"ref-1"}},
+]}};
+console.log(JSON.stringify({{
+  proseIsInert: sig(base) === sig(prose),
+  headingRepaints: sig(base) !== sig(heading),
+  blockMembershipRepaints: sig(base) !== sig(movedBlock),
+}}));
+""")
+    assert result == {
+        "proseIsInert": True,
+        "headingRepaints": True,
+        "blockMembershipRepaints": True,
+    }
+
+
+def test_writing_compiled_view_reads_candidate_and_relay_payload_shapes():
+    module = (ROOT / "web/js/editor_prompt_panel.js").as_uri()
+    result = _run_node(f"""
+const mod = await import({json.dumps(module)});
+console.log(JSON.stringify({{
+  candidate: mod.writingCompiledPayload({{
+    prompt:"candidate prompt", channels:{{summary:"candidate summary"}},
+    compiled_prompt:"stale relay prompt",
+  }}),
+  relay: mod.writingCompiledPayload({{
+    compiled_prompt:"relay prompt", compiled_channels:{{summary:"relay summary"}},
+  }}),
+  invalid: mod.writingCompiledPayload(null),
+}}));
+""")
+    assert result == {
+        "candidate": {
+            "prompt": "candidate prompt",
+            "channels": {"summary": "candidate summary"},
+        },
+        "relay": {
+            "prompt": "relay prompt",
+            "channels": {"summary": "relay summary"},
+        },
+        "invalid": {"prompt": "", "channels": {}},
+    }
+
+
+def test_stale_cache_marking_is_immediate_but_its_visual_repaint_waits():
+    widget = _source("web/js/editor_widget.js")
+    definition = widget[widget.index("\n    _previewPromptContextCandidate("):]
+    preview = _method_body(definition, "_previewPromptContextCandidate",
+                           marker="Math.max(0, Number(delay) || 0)")
+    assert "PROMPT_STALE_VISUAL_DELAY_MS = 300" in widget
+    assert "_promptContextCandidateCache = {" in preview
+    assert "_promptContextScenePayloadCache = {" in preview
+    stale_timer = preview.index("_promptContextStaleVisualTimer = setTimeout")
+    compile_timer = preview.index("_promptContextPreviewTimer = setTimeout")
+    assert stale_timer < compile_timer
+    immediate = preview[preview.index("if (this._promptScenePayload())"):stale_timer]
+    assert "refreshDiagnostics" not in immediate
+    assert "_refreshInlinePromptProjections" not in immediate
+    # Every terminal window branch settles against both parallel caches.
+    assert preview.count("_clearPromptStaleVisualTimerIfSettled(sceneId)") >= 2
+
+
+def test_stale_visual_timer_and_scene_invalidation_execute_at_edit_time():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for stale-paint lifecycle coverage")
+    widget = _source("web/js/editor_widget.js")
+    definition = widget[widget.index("\n    _previewPromptContextCandidate("):]
+    method = _method_body(definition, "_previewPromptContextCandidate",
+                          marker="Math.max(0, Number(delay) || 0)")
+    script = """
+const PROMPT_STALE_VISUAL_DELAY_MS = 300;
+const api = { apiURL: (value) => value };
+const resolvePromptCandidateSelection = (start, end, duration) =>
+  ({ selectionStart: start || 0, selectionEnd: end || duration });
+const timers = [];
+globalThis.setTimeout = (fn, ms) => {
+  const timer = { fn, ms, cancelled: false };
+  timers.push(timer);
+  return timer;
+};
+globalThis.clearTimeout = (timer) => { if (timer) timer.cancelled = true; };
+class Subject {
+""" + method + """
+  constructor() {
+    this.activeSceneId = "scene";
+    this.activeScene = { duration_frames: 100 };
+    this.totalFrames = 100;
+    this.selectionStart = 0;
+    this.selectionEnd = 100;
+    this._promptContextPreviewToken = 0;
+    this._promptContextScenePayloadToken = 7;
+    this._promptContextCandidateCache = {
+      _candidate_scene_id: "scene", _stale: false };
+    this._promptContextScenePayloadCache = {
+      _candidate_scene_id: "scene", _stale: false };
+    this.counts = { diagnostics: 0, projections: 0, inline: 0 };
+    this._promptPanelHandle = {
+      // Production `renderDiagnostics` owns the panel projection fan-out.
+      refreshDiagnostics: () => {
+        this.counts.diagnostics++; this.counts.projections++;
+      },
+      refreshProjections: () => this.counts.projections++,
+    };
+    this._refreshInlinePromptProjections = () => this.counts.inline++;
+  }
+  _projectDirName() { return "project"; }
+  _selectionContextRange() { return { contextStart: 0, contextEnd: 100 }; }
+  _promptScenePayload() { return this._promptContextScenePayloadCache; }
+}
+const subject = new Subject();
+subject._previewPromptContextCandidate({}, 1000);
+const immediate = {
+  windowStale: subject._promptContextCandidateCache._stale,
+  windowVisual: subject._promptContextCandidateCache._stale_visual,
+  sceneStale: subject._promptContextScenePayloadCache._stale,
+  sceneVisual: subject._promptContextScenePayloadCache._stale_visual,
+  sceneToken: subject._promptContextScenePayloadToken,
+  counts: { ...subject.counts },
+};
+const staleTimer = timers.find((timer) =>
+  timer.ms === PROMPT_STALE_VISUAL_DELAY_MS && !timer.cancelled);
+await staleTimer.fn();
+const painted = {
+  windowVisual: subject._promptContextCandidateCache._stale_visual,
+  sceneVisual: subject._promptContextScenePayloadCache._stale_visual,
+  counts: { ...subject.counts },
+};
+subject._previewPromptContextCandidate({}, 1000);
+console.log(JSON.stringify({ immediate, painted,
+  secondSceneToken: subject._promptContextScenePayloadToken }));
+"""
+    result = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+    assert result == {
+        "immediate": {
+            "windowStale": True, "windowVisual": False,
+            "sceneStale": True, "sceneVisual": False,
+            "sceneToken": 8,
+            "counts": {"diagnostics": 0, "projections": 0, "inline": 0},
+        },
+        "painted": {
+            "windowVisual": True, "sceneVisual": True,
+            "counts": {"diagnostics": 1, "projections": 1, "inline": 1},
+        },
+        "secondSceneToken": 9,
+    }
+
+
+def test_window_settlement_keeps_timer_while_scene_cache_is_stale():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for parallel-cache settlement coverage")
+    widget = _source("web/js/editor_widget.js")
+    start = widget.index("\n    _clearPromptStaleVisualTimerIfSettled(")
+    settle = _method_body(widget[start:], "_clearPromptStaleVisualTimerIfSettled",
+                          marker="return true;")
+    script = """
+const cancelled = [];
+globalThis.clearTimeout = (value) => cancelled.push(value);
+class Subject {
+""" + settle + """
+}
+const subject = new Subject();
+subject.activeSceneId = "scene";
+subject._promptContextStaleVisualTimer = "timer";
+subject._promptContextCandidateCache = {
+  _candidate_scene_id: "scene", _stale: false };
+subject._promptContextScenePayloadCache = {
+  _candidate_scene_id: "scene", _stale: true, _stale_visual: false };
+const whileScenePending = subject._clearPromptStaleVisualTimerIfSettled("scene");
+subject._promptContextScenePayloadCache = null;
+const afterSceneSettles = subject._clearPromptStaleVisualTimerIfSettled("scene");
+console.log(JSON.stringify({ whileScenePending, afterSceneSettles,
+  cancelled, timer: subject._promptContextStaleVisualTimer }));
+"""
+    result = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+    assert result == {
+        "whileScenePending": False,
+        "afterSceneSettles": True,
+        "cancelled": ["timer"],
+        "timer": None,
+    }
+
+
+def test_invalid_window_payload_publishes_failure_and_settles_timer():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for invalid-payload lifecycle coverage")
+    widget = _source("web/js/editor_widget.js")
+    preview_start = widget.index("\n    _previewPromptContextCandidate(")
+    preview = _method_body(widget[preview_start:], "_previewPromptContextCandidate",
+                           marker="Math.max(0, Number(delay) || 0)")
+    settle_start = widget.index("\n    _clearPromptStaleVisualTimerIfSettled(")
+    settle = _method_body(widget[settle_start:],
+                          "_clearPromptStaleVisualTimerIfSettled",
+                          marker="return true;")
+    script = """
+const PROMPT_STALE_VISUAL_DELAY_MS = 300;
+const api = { apiURL: (value) => value };
+const resolvePromptCandidateSelection = (_start, _end, duration) =>
+  ({ selectionStart: 0, selectionEnd: duration });
+const timers = [];
+globalThis.setTimeout = (fn, ms) => {
+  const timer = { fn, ms, cancelled: false };
+  timers.push(timer); return timer;
+};
+globalThis.clearTimeout = (timer) => { if (timer) timer.cancelled = true; };
+globalThis.fetch = async () => ({ ok: true, status: 200,
+  json: async () => null });
+class Subject {
+""" + settle + """
+""" + preview + """
+  constructor() {
+    this.activeSceneId = "scene";
+    this.activeScene = { duration_frames: 100 };
+    this.totalFrames = 100;
+    this._promptContextCandidateCache = {
+      _candidate_scene_id: "scene", _stale: false };
+    this._promptContextScenePayloadCache = null;
+    this.counts = { diagnostics: 0, inline: 0, apply: 0 };
+    this._promptPanelHandle = {
+      refreshDiagnostics: () => this.counts.diagnostics++,
+      applyCandidate: () => this.counts.apply++,
+    };
+    this._refreshInlinePromptProjections = () => this.counts.inline++;
+  }
+  _projectDirName() { return "project"; }
+  _selectionContextRange() { return { contextStart: 0, contextEnd: 100 }; }
+  _promptScenePayload() { return null; }
+  _previewPromptContextScenePayload() {}
+  _promptCompileRequestBody() { return {}; }
+}
+const subject = new Subject();
+subject._previewPromptContextCandidate({}, 0);
+const compile = timers.find((timer) => timer.ms === 0 && !timer.cancelled);
+await compile.fn();
+const staleTimer = timers.find((timer) => timer.ms === 300);
+console.log(JSON.stringify({
+  code: subject._promptContextCandidateCache.errors[0].code,
+  stale: subject._promptContextCandidateCache._stale,
+  staleTimerCancelled: staleTimer.cancelled,
+  counts: subject.counts,
+}));
+"""
+    result = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+    assert result == {
+        "code": "preview_invalid_response", "stale": False,
+        "staleTimerCancelled": True,
+        "counts": {"diagnostics": 1, "inline": 1, "apply": 1},
+    }
+
+
+def test_invalid_scene_payload_clears_obsolete_dormant_projections():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for scene failure settlement coverage")
+    widget = _source("web/js/editor_widget.js")
+    scene_start = widget.index("\n    _previewPromptContextScenePayload(")
+    scene_method = _method_body(widget[scene_start:],
+                                "_previewPromptContextScenePayload",
+                                marker="refreshProjections?.();")
+    settle_start = widget.index("\n    _clearPromptStaleVisualTimerIfSettled(")
+    settle = _method_body(widget[settle_start:],
+                          "_clearPromptStaleVisualTimerIfSettled",
+                          marker="return true;")
+    script = """
+const api = { apiURL: (value) => value };
+globalThis.fetch = async () => ({ ok: true, status: 200,
+  json: async () => null });
+class Subject {
+""" + settle + """
+""" + scene_method + """
+  constructor() {
+    this.activeSceneId = "scene";
+    this.totalFrames = 100;
+    this._promptContextScenePayloadToken = 0;
+    this._promptContextCandidateCache = {
+      _candidate_scene_id: "scene", _stale: false };
+    this._promptContextScenePayloadCache = {
+      _candidate_scene_id: "scene", _stale: true, _stale_visual: false };
+    this._promptContextStaleVisualTimer = setTimeout(() => {}, 10000);
+    this.counts = { inline: 0, projections: 0 };
+    this._refreshInlinePromptProjections = () => this.counts.inline++;
+    this._promptPanelHandle = {
+      refreshProjections: () => this.counts.projections++,
+    };
+  }
+  _promptCompileRequestBody() { return {}; }
+  _promptProjectionSubset(value) { return value; }
+}
+const subject = new Subject();
+subject._previewPromptContextScenePayload({ dirName: "project", sceneId: "scene",
+  candidate: { duration_frames: 100 }, windowStart: 10, windowEnd: 20 });
+await new Promise((resolve) => setTimeout(resolve, 0));
+console.log(JSON.stringify({ cache: subject._promptContextScenePayloadCache,
+  timer: subject._promptContextStaleVisualTimer, counts: subject.counts }));
+"""
+    result = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+    assert result == {
+        "cache": None, "timer": None,
+        "counts": {"inline": 1, "projections": 1},
+    }
 
 
 def test_an_editing_surface_never_reads_the_scene_wide_payload():
@@ -1548,7 +1976,10 @@ def test_every_reference_chip_surface_uses_runtime_identity_and_authoring_contro
     reference_case = label_function[:label_function.index(
         'if (["prompt_link", "prompt_link_scope"].includes(attachment?.kind))')]
     assert "attachment?.config?.label" not in reference_case
-    assert widget.count("attachmentLabelFor,") == 3
+    # The render-signature call mirrors the label resolver beside each
+    # projection renderer, so it adds one occurrence in Widget and two in the
+    # panel without adding a new user surface.
+    assert widget.count("attachmentLabelFor,") == 4
     # Ten: the Writing contribution resolver is a chip surface too, and it is
     # called twice — once for channels the author has written in and once for
     # the channels a chip feeds but they have not. Omitting identity there is
@@ -1556,7 +1987,7 @@ def test_every_reference_chip_surface_uses_runtime_identity_and_authoring_contro
     # 9, not 10: the Writing decoration resolved its rows twice — once for
     # written channels and once for fed-but-unwritten ones — and now does
     # it through one `rowsFor` helper. A surface was merged, not lost.
-    assert panel.count("attachmentLabelFor,") == 9
+    assert panel.count("attachmentLabelFor,") == 11
     assert "Shared identity default · @" in chips
     assert "Prompt Format default ·" in chips
     assert "no managed Vocal Event in this window" in chips
@@ -1822,6 +2253,1329 @@ def test_handle_suggestions_are_typeable_and_sanitize_live():
     assert result["sanitizeLeadingDigit"] == "Ref2Fast"
     assert result["sanitizePunctuation"] == "abcd"
     assert "starting with a letter" in result["rule"]
+
+
+def test_unstored_handles_render_as_suggestions_without_mutating_project_state():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for handle-state DOM coverage")
+    identity_url = (ROOT / "web/js/prompt_identity_panel.js").as_uri()
+    script = f"""
+class N {{
+  constructor(tag) {{ this.tagName=String(tag).toUpperCase(); this.children=[];
+    this.style={{cssText:""}}; this.dataset={{}}; this.attributes={{}};
+    this.value=""; this.placeholder=""; this.textContent=""; this._handlers={{}};
+    this.classNames=[]; this.classList={{add:(value)=>this.classNames.push(value)}}; }}
+  appendChild(c) {{ this.children.push(c); c.parentElement=this; return c; }}
+  append(...cs) {{ cs.forEach((c)=>c?.tagName && this.appendChild(c)); }}
+  addEventListener(t,h) {{ (this._handlers[t] ||= []).push(h); }}
+  setAttribute(k,v) {{ this.attributes[k]=String(v); }}
+  querySelector() {{ return null; }}
+}}
+globalThis.document={{createElement:(t)=>new N(t),body:new N("body"),activeElement:null}};
+globalThis.window={{addEventListener(){{}},removeEventListener(){{}}}};
+globalThis.localStorage={{getItem(){{return null;}},setItem(){{}}}};
+globalThis.CSS={{escape:(v)=>String(v)}};
+const mod=await import({json.dumps(identity_url)});
+const root=new N("div"); let referenceMutations=0; let identitySaves=0;
+mod.mountPromptIdentityPanel(root, {{
+  profile: {{
+    physical_populations:[{{key:"pictures",label:"Picture",source_key:"picture_ids",label_template:"<Picture {{n}}>"}}],
+    identity_kinds:[{{key:"subject",label:"Subject"}}],
+  }},
+  candidate: {{setup_manifest:{{pictures:[{{member_id:"member-1",asset_id:"asset-1",slot_number:1}}]}}}},
+  references:[{{reference_id:"reference-1",name:"Cast",members:[
+    {{member_id:"member-1",name:"Portrait One",asset_id:"asset-1"}}]}}],
+  assets:[{{asset_id:"asset-1",asset_type:"image"}}],
+  semanticUnits:[
+    {{semantic_unit_id:"unstored",name:"Korean Woman",kind:"subject",sources:[]}},
+    {{semantic_unit_id:"stored",name:"Sailor",handle:"Captain",kind:"subject",sources:[]}},
+  ],
+  mutateReferences:async()=>{{referenceMutations += 1;}},
+  saveSemanticUnitChange:async()=>{{identitySaves += 1;}},
+}});
+const walk=(n,out=[])=>{{out.push(n);n.children.forEach((c)=>walk(c,out));return out;}};
+const text=(n)=>[n.textContent,...n.children.map(text)].join("").trim();
+const nodes=walk(root);
+const physical=nodes.find((n)=>n.tagName==="INPUT"
+  && n.attributes["aria-label"]==="Physical Reference handle");
+const identityRows=nodes.filter((n)=>n.dataset?.promptingRow==="identity")
+  .map((row)=>text(row.children[1]));
+console.log(JSON.stringify({{
+  physical:{{value:physical.value,placeholder:physical.placeholder,
+    classes:physical.classNames}},
+  identityRows,referenceMutations,identitySaves,
+  unstoredPicker:mod.promptReferencePickerLabel({{name:"Cast"}},{{name:"Portrait One"}}),
+  storedPicker:mod.promptReferencePickerLabel({{name:"Cast"}},{{name:"Portrait One",handle:"Portrait"}}),
+  owner:mod.promptIdentityAttachmentOwner({{semantic_unit_id:"unstored",name:"Korean Woman"}}),
+}}));
+"""
+    result = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+    assert result["physical"]["value"] == ""
+    assert result["physical"]["placeholder"] == "PortraitOne"
+    assert result["physical"]["classes"] == ["sonder-chrome-dim-placeholder"]
+    assert result["identityRows"] == [
+        "Korean Woman· no handle", "@Captain — Sailor"]
+    assert result["unstoredPicker"] == "Portrait One"
+    assert result["storedPicker"] == "@Portrait — Portrait One"
+    assert result["owner"] == {
+        "type": "identity", "identityId": "unstored",
+        "handle": "KoreanWoman", "storedHandle": "",
+        "displayName": "Korean Woman"}
+    # Projection/render is read-only. Suggestions do not become project state
+    # until an explicit edit or Attach action invokes a mutation seam.
+    assert result["referenceMutations"] == 0
+    assert result["identitySaves"] == 0
+
+
+def test_identity_attach_materializes_the_suggested_handle_through_save_seam():
+    panel_url = (ROOT / "web/js/editor_prompt_panel.js").as_uri()
+    result = _run_node(f"""
+const mod=await import({json.dumps(panel_url)});
+const units=[{{semantic_unit_id:"unit",name:"Korean Woman",kind:"subject",sources:[]}}];
+const calls=[];
+const result=await mod.materializePromptIdentityOwner({{
+  type:"identity",identityId:"unit",handle:"KoreanWoman",storedHandle:"",
+}}, units, async(change,label,options)=>{{calls.push({{change,label,options}});return [change.value];}},
+{{recordUndo:false}});
+const adoptedCalls=[];
+const adopted=await mod.materializePromptIdentityOwner({{
+  type:"identity",identityId:"unit",handle:"StaleSuggestion",storedHandle:"",
+}}, [{{...units[0],handle:"StoredNow"}}], async(...args)=>adoptedCalls.push(args));
+let changedError="";
+try {{
+  await mod.materializePromptIdentityOwner({{
+    type:"identity",identityId:"unit",handle:"StoredBefore",storedHandle:"StoredBefore",
+  }}, [{{...units[0],handle:"StoredNow"}}], async()=>true);
+}} catch(error) {{ changedError=error.message; }}
+console.log(JSON.stringify({{result,calls,units,adopted,adoptedCalls,changedError}}));
+""")
+    assert result["calls"][0]["label"] == "materialize prompt identity handle"
+    assert result["calls"][0]["options"] == {"recordUndo": False}
+    change = result["calls"][0]["change"]
+    assert change["type"] == "upsert"
+    assert "handle" not in change["expected"]
+    assert change["value"]["handle"] == "KoreanWoman"
+    assert result["result"]["owner"]["storedHandle"] == "KoreanWoman"
+    assert result["adopted"]["owner"]["storedHandle"] == "StoredNow"
+    assert result["adoptedCalls"] == []
+    assert "changed elsewhere" in result["changedError"]
+    # The renderer/helper does not mutate its input snapshot in place.
+    assert "handle" not in result["units"][0]
+
+
+def test_failed_identity_attach_uses_targeted_rollback_or_keeps_recovery_undo():
+    panel_url = (ROOT / "web/js/editor_prompt_panel.js").as_uri()
+    result = _run_node(f"""
+const mod=await import({json.dumps(panel_url)});
+const history={{
+  promptIdentityChange:{{type:"upsert",value:{{semantic_unit_id:"u"}},
+    expected:{{semantic_unit_id:"u",handle:"Person"}}}},
+  inversePromptIdentityChange:{{type:"upsert",
+    value:{{semantic_unit_id:"u",handle:"Person"}},
+    expected:{{semantic_unit_id:"u"}}}},
+}};
+const successCalls=[];
+const success={{_applyPromptIdentityChange:async(...args)=>successCalls.push(args),
+  _pushPromptIdentityUndo:()=>{{throw new Error("unexpected recovery");}}}};
+await mod.rollbackPromptIdentityAttachment(success,history);
+const recovery=[];
+const failed={{_applyPromptIdentityChange:async()=>{{throw new Error("offline");}},
+  _pushPromptIdentityUndo:(...args)=>recovery.push(args)}};
+let failedError="";
+try {{ await mod.rollbackPromptIdentityAttachment(failed,history); }}
+catch(error) {{ failedError=error.message; }}
+const changedRecovery=[];
+const changed={{_applyPromptIdentityChange:async()=>{{const error=new Error("changed");
+  error.code="prompt_identity_changed_elsewhere"; throw error;}},
+  _pushPromptIdentityUndo:(...args)=>changedRecovery.push(args)}};
+let changedError="";
+try {{ await mod.rollbackPromptIdentityAttachment(changed,history); }}
+catch(error) {{ changedError=error.message; }}
+const lostResponseRecovery=[];
+const lostResponse={{_promptSemanticUnits:[history.promptIdentityChange.value],
+  _applyPromptIdentityChange:async()=>{{throw new Error("lost response");}},
+  _fetchReferences:async()=>({{ok:true}}),
+  _pushPromptIdentityUndo:(...args)=>lostResponseRecovery.push(args)}};
+const lostResponseResult=await mod.rollbackPromptIdentityAttachment(lostResponse,history);
+console.log(JSON.stringify({{successCalls,recovery,failedError,changedRecovery,changedError,
+  lostResponseRecovery,lostResponseResult}}));
+""")
+    assert result["successCalls"][0][1:] == [
+        "rollback refused prompt identity attachment", {"recordUndo": False}]
+    assert result["recovery"][0] == [
+        "materialize prompt identity handle",
+        {
+            "type": "upsert",
+            "value": {"semantic_unit_id": "u"},
+            "expected": {"semantic_unit_id": "u", "handle": "Person"},
+        },
+        {
+            "type": "upsert",
+            "value": {"semantic_unit_id": "u", "handle": "Person"},
+            "expected": {"semantic_unit_id": "u"},
+        },
+    ]
+    assert "remains undoable" in result["failedError"]
+    assert "offline" in result["failedError"]
+    assert result["changedRecovery"] == []
+    assert "changed elsewhere and was left untouched" in result["changedError"]
+    assert "undoable" not in result["changedError"]
+    assert result["lostResponseRecovery"] == []
+    assert result["lostResponseResult"] is True
+
+
+def test_failed_physical_attach_uses_targeted_rollback_or_keeps_recovery_undo():
+    panel_url = (ROOT / "web/js/editor_prompt_panel.js").as_uri()
+    result = _run_node(f"""
+const mod=await import({json.dumps(panel_url)});
+const history={{referenceOperations:[{{type:"update_member",member_id:"m",
+  fields:{{handle:""}},expected:{{handle:"Portrait"}}}}],
+  inverseReferenceOperations:[{{type:"update_member",member_id:"m",
+  fields:{{handle:"Portrait"}},expected:{{handle:""}}}}]}};
+const calls=[];
+await mod.rollbackPromptPhysicalAttachment(
+  {{_mutateReferences:async(...args)=>calls.push(args)}},history);
+const recovery=[];
+let failedError="";
+try {{ await mod.rollbackPromptPhysicalAttachment({{
+  _mutateReferences:async()=>{{throw new Error("offline");}},
+  _pushReferenceUndo:(...args)=>recovery.push(args),
+}},history); }} catch(error) {{ failedError=error.message; }}
+const changedRecovery=[]; let changedError="";
+try {{ await mod.rollbackPromptPhysicalAttachment({{
+  _mutateReferences:async()=>{{const error=new Error("changed");
+    error.code="identity_mismatch"; throw error;}},
+  _pushReferenceUndo:(...args)=>changedRecovery.push(args),
+}},history); }} catch(error) {{ changedError=error.message; }}
+const lostResponseRecovery=[];
+const lostResponse={{_references:[{{members:[{{member_id:"m",handle:""}}]}}],
+  _mutateReferences:async()=>{{throw new Error("lost response");}},
+  _fetchReferences:async()=>({{ok:true}}),
+  _pushReferenceUndo:(...args)=>lostResponseRecovery.push(args)}};
+const lostResponseResult=await mod.rollbackPromptPhysicalAttachment(lostResponse,history);
+console.log(JSON.stringify({{calls,recovery,failedError,changedRecovery,changedError,
+  lostResponseRecovery,lostResponseResult}}));
+""")
+    assert result["calls"][0][1] == (
+        "rollback refused prompt Reference attachment")
+    assert result["recovery"][0][0] == "materialize prompt Reference handle"
+    assert result["recovery"][0][1:] == [
+        [{"type": "update_member", "member_id": "m",
+          "fields": {"handle": ""}, "expected": {"handle": "Portrait"}}],
+        [{"type": "update_member", "member_id": "m",
+          "fields": {"handle": "Portrait"}, "expected": {"handle": ""}}],
+    ]
+    assert "remains undoable" in result["failedError"]
+    assert result["changedRecovery"] == []
+    assert "changed elsewhere and was left untouched" in result["changedError"]
+    assert result["lostResponseRecovery"] == []
+    assert result["lostResponseResult"] is True
+
+
+def test_composite_scene_undo_restores_identity_dependencies_in_one_step():
+    widget = _source("web/js/editor_widget.js")
+    push = _method(widget, "_pushUndo", "_captureProjectDependencies")
+    undo = _method(widget, "_undo", "_redo")
+    redo = _method(widget, "_redo", "_restoreScene")
+    result = _run_node(f"""
+globalThis.document={{activeElement:null}};
+globalThis.describeKeyboardDebugElement=()=>({{}});
+globalThis.notifyWarning=()=>{{}};
+class Harness {{
+{push}
+{undo}
+{redo}
+  constructor() {{
+    this.activeSceneId="scene"; this.activeScene={{attachments:[]}};
+    this.currentDependencies={{prompt_semantic_units:[{{semantic_unit_id:"u"}}]}};
+    this._undoStack=[]; this._redoStack=[]; this._maxUndoSteps=20;
+    this._editorFocused=false; this.events=[];
+  }}
+  _keyboardDebug() {{}}
+  async _applyPromptIdentityChange(change) {{
+    this.events.push(["identity",change.value?.handle || ""]);
+    this.currentDependencies={{prompt_semantic_units:[structuredClone(change.value)]}};
+  }}
+  async _restoreScene(_sceneId,value) {{
+    this.events.push(["scene",value.attachments.length]);
+    this.activeScene=structuredClone(value);
+  }}
+  async _mutateReferences() {{}}
+}}
+const h=new Harness();
+const before={{semantic_unit_id:"u"}};
+const after={{semantic_unit_id:"u",handle:"KoreanWoman"}};
+h._pushUndo("attach prompt Reference",{{
+  promptIdentityChange:{{type:"upsert",value:before,expected:after}},
+  inversePromptIdentityChange:{{type:"upsert",value:after,expected:before}},
+}});
+h.activeScene={{attachments:[{{attachment_id:"chip"}}]}};
+h.currentDependencies={{prompt_semantic_units:[structuredClone(after)]}};
+const depthAfterAttach=h._undoStack.length;
+await h._undo();
+const afterUndo={{scene:h.activeScene,deps:h.currentDependencies,
+  undo:h._undoStack.length,redo:h._redoStack.length,events:[...h.events]}};
+h.events=[];
+await h._redo();
+console.log(JSON.stringify({{depthAfterAttach,afterUndo,afterRedo:{{
+  scene:h.activeScene,deps:h.currentDependencies,
+  undo:h._undoStack.length,redo:h._redoStack.length,events:h.events,
+}}}}));
+""")
+    assert result["depthAfterAttach"] == 1
+    assert result["afterUndo"]["scene"]["attachments"] == []
+    assert "handle" not in result["afterUndo"]["deps"]["prompt_semantic_units"][0]
+    assert result["afterUndo"]["undo"] == 0
+    assert result["afterUndo"]["redo"] == 1
+    assert result["afterUndo"]["events"] == [
+        ["identity", ""], ["scene", 0]]
+    assert result["afterRedo"]["scene"]["attachments"] == [
+        {"attachment_id": "chip"}]
+    assert result["afterRedo"]["deps"]["prompt_semantic_units"][0]["handle"] == (
+        "KoreanWoman")
+    assert result["afterRedo"]["undo"] == 1
+    assert result["afterRedo"]["redo"] == 0
+    assert result["afterRedo"]["events"] == [
+        ["identity", "KoreanWoman"], ["scene", 1]]
+
+
+def test_semantic_unit_save_can_defer_undo_to_composite_scene_history():
+    widget = _source("web/js/editor_widget.js")
+    save = _method(widget, "_savePromptSemanticUnits", "_applyReferencePayload")
+    result = _run_node(f"""
+globalThis.api={{apiURL:(value)=>value}};
+globalThis.fetchProjectJson=async()=>({{payload:{{prompt_semantic_units:[{{handle:"Stored"}}]}}}});
+class Harness {{
+{save}
+  constructor() {{ this.projectDir="project"; this.undo=[]; this.fetches=0; }}
+  _captureProjectDependencies() {{ return {{prompt_semantic_units:[]}}; }}
+  _projectDirName() {{ return "project"; }}
+  _pushProjectDependencyUndo(...args) {{ this.undo.push(args); }}
+  async _fetchReferences() {{ this.fetches += 1; }}
+}}
+const deferred=new Harness();
+await deferred._savePromptSemanticUnits([{{handle:"Stored"}}],"materialize",{{recordUndo:false}});
+const normal=new Harness();
+await normal._savePromptSemanticUnits([{{handle:"Stored"}}],"materialize");
+console.log(JSON.stringify({{deferredUndo:deferred.undo.length,normalUndo:normal.undo.length,
+  deferredFetches:deferred.fetches,normalFetches:normal.fetches}}));
+""")
+    assert result == {
+        "deferredUndo": 0, "normalUndo": 1,
+        "deferredFetches": 1, "normalFetches": 1,
+    }
+
+
+def test_failed_scene_commit_can_discard_its_exact_interleaved_undo_entry():
+    widget = _source("web/js/editor_widget.js")
+    push = _method(widget, "_pushUndo", "_captureProjectDependencies")
+    discard = _method(widget, "_discardUndoEntry", "_trimLocalLaneConfigs")
+    result = _run_node(f"""
+class Harness {{
+{push}
+{discard}
+  constructor() {{ this.activeSceneId="scene"; this.activeScene={{}};
+    this._undoStack=[]; this._redoStack=[]; this._maxUndoSteps=20; }}
+}}
+const h=new Harness();
+const failed=h._pushUndo("attach prompt Reference");
+const concurrent=h._pushUndo("concurrent edit");
+const removed=h._discardUndoEntry(failed);
+console.log(JSON.stringify({{removed,labels:h._undoStack.map((entry)=>entry.label),
+  concurrentRetained:h._undoStack[0]===concurrent}}));
+""")
+    assert result == {
+        "removed": True,
+        "labels": ["concurrent edit"],
+        "concurrentRetained": True,
+    }
+
+
+def test_post_commit_refresh_failure_cannot_trigger_durable_compensation():
+    panel = _source("web/js/editor_prompt_panel.js")
+    start = panel.index(
+        "const commit = async (operations, label, history = {}, lifecycleToken = null)")
+    end = panel.index('profile.addEventListener("change"', start)
+    commit = panel[start:end]
+    reserved = commit.index("host._beginSceneHistoryLifecycle")
+    mutation = commit.index("await host._runSceneMutation")
+    refused = commit.index("prompt-context-refused")
+    committed = commit.index("host._commitUndoEntry")
+    refresh = commit.index("await host._fetchScenes")
+    refresh_token = commit.index("sceneHistoryLifecycleToken: token", refresh)
+    refresh_failed = commit.index("prompt-context-refresh-failed")
+    released = commit.index("host._endSceneHistoryLifecycle")
+    assert (reserved < mutation < refused < committed < refresh < refresh_token
+            < refresh_failed < released)
+    assert commit.count("return false;") == 2
+    assert commit.rindex("return true;") > refresh_failed
+
+
+def test_prompt_commit_lifecycle_reservation_releases_only_owned_tokens():
+    panel = _source("web/js/editor_prompt_panel.js")
+    start = panel.index(
+        "const commit = async (operations, label, history = {}, lifecycleToken = null)")
+    end = panel.index('profile.addEventListener("change"', start)
+    commit = panel[start:end]
+    result = _run_node(f"""
+const warnings=[]; globalThis.notifyWarning=(message)=>warnings.push(message);
+const render=()=>{{host.renders += 1;}};
+const host={{owner:null,begins:0,ends:0,renders:0,mutations:0,commits:0,discards:0,
+  failMutation:false,failRefresh:false,
+  _beginSceneHistoryLifecycle(label){{if(this.owner)return null;
+    this.begins += 1; this.owner={{label}}; return this.owner;}},
+  _endSceneHistoryLifecycle(token){{if(this.owner!==token)return false;
+    this.ends += 1; this.owner=null; return true;}},
+  _pushUndo(){{return {{pending:true}};}},
+  _commitUndoEntry(entry){{entry.pending=false;this.commits += 1;}},
+  _discardUndoEntry(){{this.discards += 1;}},
+  async _runSceneMutation(){{this.mutations += 1;
+    if(this.failMutation)throw new Error("refused");
+    if(!this.owner)throw new Error("mutation ran without reservation");}},
+  async _fetchScenes(options){{if(options.sceneHistoryLifecycleToken!==this.owner)
+    throw new Error("refresh ran without its exact reservation");
+    if(this.failRefresh)throw new Error("refresh refused");return true;}},
+  activeSceneId:"A",
+}};
+{commit}
+const success=await commit([],"save");
+const outer=host._beginSceneHistoryLifecycle("attach");
+const borrowed=await commit([],"attach",{{}},outer);
+const retained=host.owner===outer;
+host._endSceneHistoryLifecycle(outer);
+host.failMutation=true;
+const refused=await commit([],"refused");
+host.failMutation=false;host.failRefresh=true;
+const refreshFailed=await commit([],"refresh failed");
+console.log(JSON.stringify({{success,borrowed,retained,refused,refreshFailed,owner:host.owner,
+  begins:host.begins,ends:host.ends,mutations:host.mutations,commits:host.commits,
+  discards:host.discards,renders:host.renders,warnings}}));
+""")
+    assert result == {
+        "success": True, "borrowed": True, "retained": True, "refused": False,
+        "refreshFailed": True, "owner": None, "begins": 4, "ends": 4,
+        "mutations": 4, "commits": 3, "discards": 1, "renders": 2,
+        "warnings": ["refused", "refresh refused"],
+    }
+
+
+def test_pending_scene_history_cannot_be_consumed_by_undo():
+    widget = _source("web/js/editor_widget.js")
+    pending_helper = _method(
+        widget, "_hasPendingHistoryCommit", "_historyIsBusy")
+    push = _method(widget, "_pushUndo", "_commitUndoEntry")
+    commit_entry = _method(widget, "_commitUndoEntry", "_captureProjectDependencies")
+    undo = _method(widget, "_undo", "_redo")
+    redo = _method(widget, "_redo", "_restoreScene")
+    result = _run_node(f"""
+globalThis.document={{activeElement:null}};
+globalThis.describeKeyboardDebugElement=()=>({{}});
+const notices=[]; globalThis.notifyInfo=(message)=>notices.push(message);
+globalThis.notifyWarning=()=>{{}};
+class Harness {{
+{pending_helper}
+{push}
+{commit_entry}
+{undo}
+{redo}
+  constructor() {{ this.activeSceneId="scene"; this.activeScene={{value:"after"}};
+    this._undoStack=[]; this._redoStack=[{{label:"older redo"}}]; this._maxUndoSteps=20;
+    this._editorFocused=false; this.restores=0; }}
+  _keyboardDebug() {{}}
+  async _restoreScene(_id,snapshot) {{ this.restores += 1; this.activeScene=snapshot; }}
+  async _mutateReferences() {{}}
+  async _applyPromptIdentityChange() {{}}
+}}
+const h=new Harness();
+const entry=h._pushUndo("attach",{{pending:true}});
+await h._undo();
+await h._redo();
+const whilePending={{undo:h._undoStack.length,redo:h._redoStack.length,
+  restores:h.restores,pending:entry.pending}};
+const interleaved=new Harness();
+const buried=interleaved._pushUndo("attach",{{pending:true}});
+interleaved._pushUndo("later edit");
+interleaved._redoStack=[{{label:"later redo"}}];
+await interleaved._undo(); await interleaved._redo();
+const whileBuried={{undo:interleaved._undoStack.map((value)=>value.label),
+  redo:interleaved._redoStack.map((value)=>value.label),
+  restores:interleaved.restores,pending:buried.pending}};
+h._commitUndoEntry(entry);
+await h._undo();
+const orphaned=new Harness(); orphaned.activeSceneId="scene-b";
+const orphan={{sceneId:"scene-a",snapshot:{{}},label:"attach",pending:true}};
+const orphanCommitted=orphaned._commitUndoEntry(orphan);
+console.log(JSON.stringify({{whilePending,whileBuried,afterCommit:{{undo:h._undoStack.length,
+  redo:h._redoStack.length,restores:h.restores,pending:entry.pending}},notices,
+  orphan:{{committed:orphanCommitted,undo:orphaned._undoStack.length,
+  pending:orphan.pending}}}}));
+""")
+    assert result["whilePending"] == {
+        "undo": 1, "redo": 1, "restores": 0, "pending": True}
+    assert result["whileBuried"] == {
+        "undo": ["attach", "later edit"],
+        "redo": ["later redo"], "restores": 0, "pending": True,
+    }
+    assert result["afterCommit"] == {
+        "undo": 0, "redo": 1, "restores": 1, "pending": False}
+    assert result["notices"] == [
+        "That change is still saving. Try Undo again when it finishes.",
+        "That change is still saving. Try Redo again when it finishes.",
+        "That change is still saving. Try Undo again when it finishes.",
+        "That change is still saving. Try Redo again when it finishes.",
+    ]
+    assert result["orphan"] == {
+        "committed": False, "undo": 0, "pending": True}
+
+
+def test_refused_pending_transaction_preserves_unrelated_redo_history():
+    widget = _source("web/js/editor_widget.js")
+    push = _method(widget, "_pushUndo", "_commitUndoEntry")
+    trim = _method(widget, "_trimUndoStack", "_captureProjectDependencies")
+    discard = _method(widget, "_discardUndoEntry", "_trimLocalLaneConfigs")
+    result = _run_node(f"""
+class Harness {{
+{push}
+{trim}
+{discard}
+  constructor() {{ this.activeSceneId="scene"; this.activeScene={{}};
+    this._undoStack=[{{label:"oldest"}},{{label:"newest"}}];
+    this._redoStack=[{{label:"prior redo"}}]; this._maxUndoSteps=2; }}
+}}
+const h=new Harness();
+const entry=h._pushUndo("attach",{{pending:true}});
+const during=h._redoStack.map((value)=>value.label);
+h._discardUndoEntry(entry);
+console.log(JSON.stringify({{during,after:h._redoStack.map((value)=>value.label),
+  undo:h._undoStack.map((value)=>value.label)}}));
+""")
+    assert result == {
+        "during": ["prior redo"], "after": ["prior redo"],
+        "undo": ["oldest", "newest"],
+    }
+
+
+def test_undo_and_redo_share_a_non_reentrant_history_gate():
+    widget = _source("web/js/editor_widget.js")
+    undo = _method(widget, "_undo", "_redo")
+    redo = _method(widget, "_redo", "_restoreScene")
+    result = _run_node(f"""
+globalThis.document={{activeElement:null}};
+globalThis.describeKeyboardDebugElement=()=>({{}});
+const notices=[]; globalThis.notifyInfo=(message)=>notices.push(message);
+globalThis.notifyWarning=()=>{{}};
+class Harness {{
+{undo}
+{redo}
+  constructor() {{ this.activeSceneId="scene"; this.activeScene={{value:2}};
+    this._undoStack=[
+      {{sceneId:"scene",snapshot:{{value:0}},label:"first"}},
+      {{sceneId:"scene",snapshot:{{value:1}},label:"second"}},
+    ]; this._redoStack=[]; this._editorFocused=false; this.restores=0; }}
+  _keyboardDebug() {{}}
+  async _restoreScene() {{ this.restores += 1;
+    await new Promise((resolve)=>{{this.release=resolve;}}); }}
+  async _applyPromptIdentityChange() {{}}
+  async _applyReferenceHistoryOperations() {{}}
+}}
+const h=new Harness();
+const first=h._undo(); await Promise.resolve();
+await h._undo();
+await h._redo();
+const whileRunning={{undo:h._undoStack.length,redo:h._redoStack.length,
+  restores:h.restores,inFlight:h._historyOperationInFlight}};
+h.release(); await first;
+console.log(JSON.stringify({{whileRunning,after:{{undo:h._undoStack.length,
+  redo:h._redoStack.length,restores:h.restores,inFlight:h._historyOperationInFlight}},
+  notices}}));
+""")
+    assert result["whileRunning"] == {
+        "undo": 1, "redo": 0, "restores": 1, "inFlight": True}
+    assert result["after"] == {
+        "undo": 1, "redo": 1, "restores": 1, "inFlight": False}
+    assert result["notices"] == [
+        "Undo or Redo is still finishing. Try again in a moment.",
+        "Undo or Redo is still finishing. Try again in a moment.",
+    ]
+
+
+def test_scene_navigation_cannot_clear_history_while_undo_or_redo_is_in_flight():
+    widget = _source("web/js/editor_widget.js")
+    history_busy = _method(widget, "_hasPendingHistoryCommit", "applyWidgetState")
+    create_scene = _method(widget, "_createScene", "_setActiveScene")
+    set_scene = _method(widget, "_setActiveScene", "_refreshDurationInput")
+    assert set_scene.index('_setWidgetValue("scene_id"') < set_scene.index(
+        '_setWidgetValue("selection_start"')
+    cycle = _method(widget, "_cycleScene", "_renameScene")
+    delete_scene = _method(widget, "_deleteScene", "_duplicateScene")
+    duplicate_scene = _method(widget, "_duplicateScene", "_allProjectAssetsForGallery")
+    result = _run_node(f"""
+const notices=[]; globalThis.notifyInfo=(message)=>notices.push(message);
+class Harness {{
+{history_busy}
+{create_scene}
+{set_scene}
+{cycle}
+{delete_scene}
+{duplicate_scene}
+  constructor(inFlight,pending) {{ this._historyOperationInFlight=inFlight; this.activeSceneId="A";
+    this.activeScene={{scene_id:"A"}}; this.scenes=[this.activeScene,{{scene_id:"B"}}];
+    this._undoStack=[{{label:"older"}},...(pending?[{{label:"attach",pending:true}}]:[])];
+    this._redoStack=[{{label:"redo"}}]; this.projectDir="project"; }}
+}}
+    const activeOp=new Harness(true,false);
+    const activeDirect=activeOp._setActiveScene(activeOp.scenes[1]); activeOp._cycleScene(1);
+    activeOp._sceneHistoryLifecycleOwner={{allowSceneSwitch:true}};
+    const borrowedPermission=activeOp._setActiveScene(activeOp.scenes[1]);
+    const pendingCommit=new Harness(false,true);
+const pendingDirect=pendingCommit._setActiveScene(pendingCommit.scenes[1]);
+pendingCommit._cycleScene(1);
+await pendingCommit._createScene();
+await pendingCommit._deleteScene(pendingCommit.activeScene);
+await pendingCommit._duplicateScene(pendingCommit.activeScene);
+    console.log(JSON.stringify({{activeDirect,borrowedPermission,pendingDirect,
+  active:activeOp.activeSceneId,pendingActive:pendingCommit.activeSceneId,
+  activeUndo:activeOp._undoStack.map((entry)=>entry.label),
+  pendingUndo:pendingCommit._undoStack.map((entry)=>entry.label),
+  activeRedo:activeOp._redoStack.map((entry)=>entry.label),
+  pendingRedo:pendingCommit._redoStack.map((entry)=>entry.label),notices}}));
+""")
+    assert result == {
+        "activeDirect": False,
+        "borrowedPermission": False,
+        "pendingDirect": False,
+        "active": "A",
+        "pendingActive": "A",
+        "activeUndo": ["older"],
+        "pendingUndo": ["older", "attach"],
+        "activeRedo": ["redo"],
+        "pendingRedo": ["redo"],
+        "notices": [
+            "Finish saving, Undo, or Redo before switching scenes.",
+            "Finish saving, Undo, or Redo before switching scenes.",
+            "Finish saving, Undo, or Redo before switching scenes.",
+            "Finish saving, Undo, or Redo before switching scenes.",
+            "Finish saving, Undo, or Redo before switching scenes.",
+            "Another scene change is still finishing. Try again in a moment.",
+            "Another scene change is still finishing. Try again in a moment.",
+            "Another scene change is still finishing. Try again in a moment.",
+        ],
+    }
+
+
+def test_active_scene_delete_holds_lifecycle_through_delayed_refresh():
+    widget = _source("web/js/editor_widget.js")
+    history_lifecycle = _method(widget, "_hasPendingHistoryCommit", "applyWidgetState")
+    delete_scene = _method(widget, "_deleteScene", "_duplicateScene")
+    result = _run_node(f"""
+const notices=[]; globalThis.notifyInfo=(message)=>notices.push(message);
+globalThis.confirm=()=>true; globalThis.api={{apiURL:(value)=>value}};
+let releaseDelete;
+globalThis.fetch=()=>new Promise((resolve)=>{{releaseDelete=()=>resolve({{ok:true}});}});
+class Harness {{
+{history_lifecycle}
+{delete_scene}
+  constructor(){{this._historyOperationInFlight=false;this._undoStack=[];
+    this._redoStack=[];this._sceneHistoryLifecycleOwner=null;
+    this.activeSceneId="A";this.activeScene={{scene_id:"A",name:"A"}};
+    this.scenes=[this.activeScene,{{scene_id:"B",name:"B"}}];this.projectDir="project";
+    this.fetchOwner=null;this.fetchTokenMatched=false;this.switched=false;}}
+  async _fetchScenes(options){{this.fetchOwner=this._sceneHistoryLifecycleOwner;
+    this.fetchTokenMatched=options.sceneHistoryLifecycleToken===this.fetchOwner;
+    this.switched=!!(this.fetchOwner?.allowSceneSwitch && this.fetchTokenMatched);
+    if(this.switched)this.activeSceneId="B";}}
+}}
+const h=new Harness();
+const deletion=h._deleteScene(h.activeScene); await Promise.resolve();
+const ownerDuringDelete=h._sceneHistoryLifecycleOwner;
+const blockedAttach=h._beginSceneHistoryLifecycle("attach prompt Reference");
+releaseDelete(); await deletion;
+const ownerAfterDelete=h._sceneHistoryLifecycleOwner;
+const attachAfter=h._beginSceneHistoryLifecycle("attach prompt Reference");
+const attachAccepted=!!attachAfter; h._endSceneHistoryLifecycle(attachAfter);
+console.log(JSON.stringify({{ownerDuringDelete:!!ownerDuringDelete,blockedAttach,
+  fetchOwned:h.fetchOwner===ownerDuringDelete,fetchTokenMatched:h.fetchTokenMatched,
+  switched:h.switched,active:h.activeSceneId,ownerAfterDelete,attachAccepted,
+  finalOwner:h._sceneHistoryLifecycleOwner,notices}}));
+""")
+    assert result == {
+        "ownerDuringDelete": True,
+        "blockedAttach": None,
+        "fetchOwned": True,
+        "fetchTokenMatched": True,
+        "switched": True,
+        "active": "B",
+        "ownerAfterDelete": None,
+        "attachAccepted": True,
+        "finalOwner": None,
+        "notices": ["Another scene change is still finishing. Try again in a moment."],
+    }
+
+
+def test_scene_refresh_cannot_supersede_a_foreign_lifecycle_owner():
+    widget = _source("web/js/editor_widget.js")
+    fetch_scenes = _method(widget, "_fetchScenes", "_createScene")
+    result = _run_node(f"""
+globalThis.api={{apiURL:(value)=>value}};
+globalThis.getProjectVersion=()=>""; globalThis.sessionDiagRecord=()=>{{}};
+let fetchCount=0; let releaseFetch;
+globalThis.fetch=()=>{{fetchCount += 1;return new Promise((resolve)=>{{
+  releaseFetch=()=>resolve({{ok:true,headers:{{get:()=>""}},
+    json:async()=>({{scenes:[{{scene_id:"B"}}]}})}});
+}});}};
+class Harness {{
+{fetch_scenes}
+  constructor(){{this.projectDir="project";this.activeSceneId="A";
+    this.scenes=[{{scene_id:"A"}}];this._sceneFetchSeq=0;
+    this._sceneMutationInvalidationSeq=0;this._sceneHistoryLifecycleOwner=null;
+    this._pendingScenesRefresh=false;this.deferred=[];}}
+  _shouldDeferSceneRefresh(){{return false;}}
+  _deferSceneRefresh(reason,details){{this._pendingScenesRefresh=true;
+    this.deferred.push([reason,details.stage]);}}
+  _clearProjectNotFound(){{}}
+  _markStaleReplayApplied(){{}}
+  _getWidgetValue(){{return "";}}
+  _setActiveScene(scene){{this.activeSceneId=scene.scene_id;}}
+  _governStaleVersionReplay(){{return true;}}
+}}
+const h=new Harness();
+h._sceneHistoryLifecycleOwner={{label:"delete"}};
+const startResult=await h._fetchScenes({{reason:"foreign-start"}});
+const blockedAtStart={{fetchCount,pending:h._pendingScenesRefresh,
+  scenes:h.scenes.map((scene)=>scene.scene_id),result:startResult}};
+h._pendingScenesRefresh=false;h._sceneHistoryLifecycleOwner=null;
+const inFlight=h._fetchScenes({{reason:"foreign-apply"}});await Promise.resolve();
+h._sceneHistoryLifecycleOwner={{label:"delete"}};releaseFetch();const applyResult=await inFlight;
+console.log(JSON.stringify({{blockedAtStart,afterApply:{{fetchCount,
+  pending:h._pendingScenesRefresh,scenes:h.scenes.map((scene)=>scene.scene_id),
+  active:h.activeSceneId,result:applyResult,deferred:h.deferred}}}}));
+""")
+    assert result == {
+        "blockedAtStart": {
+            "fetchCount": 0, "pending": True, "scenes": ["A"], "result": False},
+        "afterApply": {
+            "fetchCount": 1,
+            "pending": True,
+            "scenes": ["A"],
+            "active": "A",
+            "result": False,
+            "deferred": [
+                ["foreign-start", "scene_history_lifecycle_start"],
+                ["foreign-apply", "scene_history_lifecycle_apply"],
+            ],
+        },
+    }
+
+
+def test_scene_fetch_reports_network_and_http_failure_without_applying():
+    widget = _source("web/js/editor_widget.js")
+    fetch_scenes = _method(widget, "_fetchScenes", "_createScene")
+    result = _run_node(f"""
+globalThis.api={{apiURL:(value)=>value}};globalThis.getProjectVersion=()=>"";
+globalThis.sessionDiagRecord=()=>{{}};globalThis.console.warn=()=>{{}};
+class Harness {{
+{fetch_scenes}
+  constructor(){{this.projectDir="project";this.activeSceneId="A";
+    this.scenes=[{{scene_id:"A"}}];this._sceneFetchSeq=0;
+    this._sceneMutationInvalidationSeq=0;this._sceneHistoryLifecycleOwner={{label:"prompt"}};
+    this._pendingScenesRefresh=false;}}
+  _shouldDeferSceneRefresh(){{return false;}}
+  _deferSceneRefresh(){{this._pendingScenesRefresh=true;}}
+  _clearProjectNotFound(){{}}
+  _showProjectNotFound(){{}}
+  _markStaleReplayApplied(){{}}
+  _getWidgetValue(){{return "";}}
+  _setActiveScene(scene){{this.activeSceneId=scene.scene_id;}}
+  _governStaleVersionReplay(){{return true;}}
+}}
+const h=new Harness();const token=h._sceneHistoryLifecycleOwner;
+globalThis.fetch=async()=>{{throw new Error("offline");}};
+const network=await h._fetchScenes({{sceneHistoryLifecycleToken:token}});
+globalThis.fetch=async()=>({{ok:false,status:500,headers:{{get:()=>""}}}});
+const http=await h._fetchScenes({{sceneHistoryLifecycleToken:token}});
+globalThis.fetch=async()=>({{ok:true,status:200,headers:{{get:()=>""}},
+  json:async()=>({{scenes:[{{scene_id:"A",fresh:true}}]}})}});
+const success=await h._fetchScenes({{sceneHistoryLifecycleToken:token}});
+console.log(JSON.stringify({{network,http,success,fresh:h.scenes[0].fresh===true,
+  ownerRetained:h._sceneHistoryLifecycleOwner===token}}));
+""")
+    assert result == {
+        "network": False,
+        "http": False,
+        "success": True,
+        "fresh": True,
+        "ownerRetained": True,
+    }
+
+
+def test_remote_scene_state_defers_before_host_write_during_history():
+    widget = _source("web/js/editor_widget.js")
+    history_busy = _method(widget, "_hasPendingHistoryCommit", "applyWidgetState")
+    apply_state = _method(widget, "applyWidgetState", "_flushDeferredDragState")
+    flush_drag = _method(
+        widget, "_flushDeferredDragState", "_shouldDeferSceneRefresh")
+    commit_entry = _method(widget, "_commitUndoEntry", "_captureProjectDependencies")
+    finish_history = _method(widget, "_finishHistoryOperation", "_runUndo")
+    result = _run_node(f"""
+globalThis.sessionDiagRecord=()=>{{}};
+globalThis.coerceBoolean=(value)=>Boolean(value);
+globalThis.notifyWarning=()=>{{}};
+class Harness {{
+{history_busy}
+{apply_state}
+{flush_drag}
+{commit_entry}
+{finish_history}
+  constructor(scenes) {{ this._historyOperationInFlight=true; this.activeSceneId="A";
+    this.activeScene={{scene_id:"A"}}; this.scenes=scenes; this.hostWrites=[];
+    this.selectionStart=0; this.selectionEnd=10; this.playhead=0; this.totalFrames=10;
+    this._undoStack=[]; this._redoStack=[]; this._maxUndoSteps=20; }}
+  _setHostValueLocal(name,value) {{ this.hostWrites.push([name,value]); }}
+  _setActiveScene(scene) {{ this.activeSceneId=scene.scene_id; this.activeScene=scene; }}
+  _refreshContextInputs() {{}} _refreshSelectionInputs() {{}} _updateToolbar() {{}}
+  _renderTimeline() {{}} _renderQueuePanel() {{}}
+  _replayDeferredProjectBackedRefresh() {{}}
+  _promptContextConsumersMounted() {{ return false; }}
+}}
+const known=new Harness([{{scene_id:"A"}},{{scene_id:"B"}}]);
+known.applyWidgetState({{scene_id:"B",selection_start:4}});
+const knownDeferred={{active:known.activeSceneId,writes:[...known.hostWrites],
+  pending:structuredClone(known._pendingHistoryWidgetState)}};
+known._finishHistoryOperation();
+const unknown=new Harness([{{scene_id:"A"}}]);
+unknown._undoStack=[{{label:"scene-a"}}]; unknown._redoStack=[{{label:"redo-a"}}];
+unknown.applyWidgetState({{scene_id:"C",selection_start:6}});
+const unknownDeferred={{active:unknown.activeSceneId,writes:[...unknown.hostWrites]}};
+unknown._finishHistoryOperation();
+const ordered=new Harness([{{scene_id:"A"}},{{scene_id:"B"}}]);
+ordered.applyWidgetState({{scene_id:"B",selection_start:4}});
+ordered.applyWidgetState({{selection_start:7}});
+ordered.applyWidgetState({{scene_id:"A",selection_start:8}});
+const orderedDeferred={{active:ordered.activeSceneId,writes:[...ordered.hostWrites],
+  pending:structuredClone(ordered._pendingHistoryWidgetState)}};
+ordered._finishHistoryOperation();
+const dragOrdered=new Harness([{{scene_id:"A"}},{{scene_id:"B"}}]);
+dragOrdered.isDragging=true;
+dragOrdered.applyWidgetState({{selection_start:7}});
+dragOrdered.applyWidgetState({{scene_id:"B",selection_start:4}});
+dragOrdered.isDragging=false;
+dragOrdered._flushDeferredDragState();
+const dragDeferred={{active:dragOrdered.activeSceneId,writes:[...dragOrdered.hostWrites],
+  drag:dragOrdered._pendingApplyWidgetState || null,
+  pending:structuredClone(dragOrdered._pendingHistoryWidgetState)}};
+dragOrdered._finishHistoryOperation();
+const sceneSuperseded=new Harness([{{scene_id:"A"}},{{scene_id:"B"}}]);
+sceneSuperseded.applyWidgetState({{scene_id:"B",selection_start:4}});
+sceneSuperseded.applyWidgetState({{scene_id:"A"}});
+const supersededPending=structuredClone(sceneSuperseded._pendingHistoryWidgetState);
+sceneSuperseded._finishHistoryOperation();
+const postDragGap=new Harness([{{scene_id:"A"}}]);
+postDragGap._historyOperationInFlight=false;
+postDragGap.isDragging=true;
+postDragGap.applyWidgetState({{selection_start:7}});
+postDragGap.isDragging=false;
+postDragGap.applyWidgetState({{selection_start:4}});
+postDragGap._flushDeferredDragState();
+const pendingCommit=new Harness([{{scene_id:"A"}},{{scene_id:"B"}}]);
+pendingCommit._historyOperationInFlight=false;
+const pendingEntry={{pending:true}}; pendingCommit._undoStack.push(pendingEntry);
+pendingCommit.applyWidgetState({{scene_id:"B",selection_start:4}});
+const pendingCommitDeferred={{active:pendingCommit.activeSceneId,
+  writes:[...pendingCommit.hostWrites],
+  pending:structuredClone(pendingCommit._pendingHistoryWidgetState)}};
+pendingCommit._commitUndoEntry(pendingEntry);
+const selectionFirst=new Harness([{{scene_id:"A"}},{{scene_id:"B"}}]);
+selectionFirst._historyOperationInFlight=false;
+const selectionFirstEntry={{pending:true}};
+selectionFirst._undoStack.push(selectionFirstEntry);
+selectionFirst.applyWidgetState({{selection_start:4}});
+const selectionOnlyDeferred={{active:selectionFirst.activeSceneId,
+  writes:[...selectionFirst.hostWrites],
+  pending:structuredClone(selectionFirst._pendingHistoryWidgetState)}};
+selectionFirst.applyWidgetState({{scene_id:"B"}});
+const identifiedPending=structuredClone(selectionFirst._pendingHistoryWidgetState);
+selectionFirst._commitUndoEntry(selectionFirstEntry);
+console.log(JSON.stringify({{knownDeferred,knownAfter:{{active:known.activeSceneId,
+  writes:known.hostWrites,selection:known.selectionStart}},unknownDeferred,
+  unknownAfter:{{active:unknown.activeSceneId,writes:unknown.hostWrites,
+  selection:unknown.selectionStart,undo:unknown._undoStack.length,
+  redo:unknown._redoStack.length}},orderedDeferred,
+  orderedAfter:{{active:ordered.activeSceneId,writes:ordered.hostWrites,
+  selection:ordered.selectionStart}},dragDeferred,
+  dragAfter:{{active:dragOrdered.activeSceneId,writes:dragOrdered.hostWrites,
+  selection:dragOrdered.selectionStart}},supersededPending,
+  supersededAfter:{{active:sceneSuperseded.activeSceneId,
+  writes:sceneSuperseded.hostWrites,selection:sceneSuperseded.selectionStart}},
+  postDragGap:{{writes:postDragGap.hostWrites,selection:postDragGap.selectionStart,
+  pending:postDragGap._pendingApplyWidgetState || null}},pendingCommitDeferred,
+  pendingCommitAfter:{{active:pendingCommit.activeSceneId,
+  writes:pendingCommit.hostWrites,selection:pendingCommit.selectionStart}},
+  selectionOnlyDeferred,identifiedPending,
+  selectionFirstAfter:{{active:selectionFirst.activeSceneId,
+  writes:selectionFirst.hostWrites,selection:selectionFirst.selectionStart}}}}));
+""")
+    assert result["knownDeferred"] == {
+        "active": "A", "writes": [],
+        "pending": {"scene_id": "B", "selection_start": 4},
+    }
+    assert result["knownAfter"] == {
+        "active": "B",
+        "writes": [["scene_id", "B"], ["selection_start", 4]],
+        "selection": 4,
+    }
+    assert result["unknownDeferred"] == {"active": "A", "writes": []}
+    assert result["unknownAfter"] == {
+        "active": "C",
+        "writes": [["scene_id", "C"], ["selection_start", 6]],
+        "selection": 6,
+        "undo": 0,
+        "redo": 0,
+    }
+    assert result["orderedDeferred"] == {
+        "active": "A", "writes": [],
+        "pending": {"scene_id": "A", "selection_start": 8},
+    }
+    assert result["orderedAfter"] == {
+        "active": "A",
+        "writes": [["scene_id", "A"], ["selection_start", 8]],
+        "selection": 8,
+    }
+    assert result["dragDeferred"] == {
+        "active": "A", "writes": [], "drag": None,
+        "pending": {"selection_start": 4, "scene_id": "B"},
+    }
+    assert result["dragAfter"] == {
+        "active": "B",
+        "writes": [["scene_id", "B"], ["selection_start", 4]],
+        "selection": 4,
+    }
+    assert result["supersededPending"] == {"scene_id": "A"}
+    assert result["supersededAfter"] == {
+        "active": "A", "writes": [["scene_id", "A"]], "selection": 0,
+    }
+    assert result["postDragGap"] == {
+        "writes": [["selection_start", 4]], "selection": 4, "pending": None,
+    }
+    assert result["pendingCommitDeferred"] == {
+        "active": "A", "writes": [],
+        "pending": {"scene_id": "B", "selection_start": 4},
+    }
+    assert result["pendingCommitAfter"] == {
+        "active": "B",
+        "writes": [["scene_id", "B"], ["selection_start", 4]],
+        "selection": 4,
+    }
+    assert result["selectionOnlyDeferred"] == {
+        "active": "A", "writes": [], "pending": {"selection_start": 4},
+    }
+    assert result["identifiedPending"] == {
+        "selection_start": 4, "scene_id": "B"}
+    assert result["selectionFirstAfter"] == {
+        "active": "B",
+        "writes": [["scene_id", "B"], ["selection_start", 4]],
+        "selection": 4,
+    }
+
+
+def test_controller_delegates_remote_widget_state_before_shared_widget_mutation():
+    controller = _source("web/js/editor_node_controller.js")
+    apply_remote = _method(
+        controller, "_applyRemoteWidgetState", "_onFullscreenWidgetStateApplied")
+    finalize = _method(
+        controller, "_onFullscreenWidgetStateApplied", "_startWidgetStateFallbackPolling")
+    result = _run_node(f"""
+globalThis.EDITOR_WIDGET_FIELDS=["scene_id","selection_start","selection_end"];
+class Harness {{
+{apply_remote}
+{finalize}
+  constructor(editor) {{
+    this.values={{scene_id:"A",selection_start:0,selection_end:10}};
+    this.widgetWrites=[]; this.stateCalls=[]; this.previewCalls=[];
+    this.fullscreenSession=editor ? {{editor}} : null;
+    this.node={{setDirtyCanvas:()=>{{}}}};
+  }}
+  _getWidgetValue(name) {{ return this.values[name]; }}
+  _setWidgetValue(name,value) {{ this.widgetWrites.push([name,value]); this.values[name]=value; }}
+  _recordDiagEvent() {{}}
+  onEditorWidgetValueChange(name,value) {{ this.stateCalls.push([name,value]); }}
+  _previewInvalidationKeysForWidget(name) {{ return name === "scene_id" ? ["scene"] : ["preview"]; }}
+  _schedulePreviewStateRefresh(keys) {{ this.previewCalls.push(keys); }}
+  refreshSummary() {{ return Promise.resolve(); }}
+  render() {{}}
+}}
+const editor={{pending:true,received:[],hasDeferredWidgetState(){{return this.pending;}},
+  applyWidgetState(values){{this.received.push(structuredClone(values));}}}};
+const mounted=new Harness(editor);
+const accepted=mounted._applyRemoteWidgetState({{selection_start:0,scene_id:"A"}},"ws","peer");
+const deferred={{accepted,writes:[...mounted.widgetWrites],received:[...editor.received]}};
+editor.pending=false;
+mounted._applyRemoteWidgetState({{selection_start:4,scene_id:"B"}},"ws","peer");
+const immediate={{writes:[...mounted.widgetWrites],received:[...editor.received]}};
+mounted.values.scene_id="B"; mounted.values.selection_start=4;
+mounted._onFullscreenWidgetStateApplied({{scene_id:"B",selection_start:4}});
+const finalized={{stateCalls:mounted.stateCalls,previewCalls:mounted.previewCalls}};
+const dormant=new Harness(null);
+dormant._applyRemoteWidgetState({{selection_start:4,scene_id:"B"}},"poll","peer");
+console.log(JSON.stringify({{deferred,immediate,finalized,
+  dormant:{{writes:dormant.widgetWrites,stateCalls:dormant.stateCalls}}}}));
+""")
+    assert result["deferred"] == {
+        "accepted": True,
+        "writes": [],
+        "received": [{"scene_id": "A", "selection_start": 0}],
+    }
+    assert result["immediate"] == {
+        "writes": [],
+        "received": [
+            {"scene_id": "A", "selection_start": 0},
+            {"scene_id": "B", "selection_start": 4},
+        ],
+    }
+    assert result["finalized"] == {
+        "stateCalls": [["scene_id", "B"], ["selection_start", 4]],
+        "previewCalls": [["scene", "preview"]],
+    }
+    assert result["dormant"] == {
+        "writes": [["scene_id", "B"], ["selection_start", 4]],
+        "stateCalls": [["scene_id", "B"], ["selection_start", 4]],
+    }
+
+
+def test_standalone_reference_recovery_history_undoes_and_redoes_target_change():
+    widget = _source("web/js/editor_widget.js")
+    push_reference = _method(
+        widget, "_pushReferenceUndo", "_restoreProjectDependencies")
+    undo = _method(widget, "_undo", "_redo")
+    redo = _method(widget, "_redo", "_restoreScene")
+    result = _run_node(f"""
+globalThis.document={{activeElement:null}};
+globalThis.describeKeyboardDebugElement=()=>({{}});
+globalThis.notifyInfo=()=>{{}}; globalThis.notifyWarning=()=>{{}};
+class Harness {{
+{push_reference}
+{undo}
+{redo}
+  constructor() {{ this.activeSceneId="scene"; this.activeScene={{}};
+    this._undoStack=[]; this._redoStack=[]; this._maxUndoSteps=20;
+    this._editorFocused=false; this.calls=[]; }}
+  _keyboardDebug() {{}}
+  _trimUndoStack() {{}}
+  async _applyReferenceHistoryOperations(operations) {{
+    this.calls.push(operations[0].fields.handle);
+  }}
+  async _restoreScene() {{}}
+  async _applyPromptIdentityChange() {{}}
+}}
+const h=new Harness();
+const rollback=[{{type:"update_member",fields:{{handle:""}},expected:{{handle:"Portrait"}}}}];
+const forward=[{{type:"update_member",fields:{{handle:"Portrait"}},expected:{{handle:""}}}}];
+h._pushReferenceUndo("materialize",rollback,forward);
+await h._undo(); await h._redo();
+console.log(JSON.stringify({{calls:h.calls,undo:h._undoStack.length,redo:h._redoStack.length}}));
+""")
+    assert result == {"calls": ["", "Portrait"], "undo": 1, "redo": 0}
+
+
+def test_project_dependency_history_restore_failure_keeps_source_entry():
+    widget = _source("web/js/editor_widget.js")
+    undo = _method(widget, "_undo", "_redo")
+    redo = _method(widget, "_redo", "_restoreScene")
+    result = _run_node(f"""
+globalThis.document={{activeElement:null}};
+globalThis.describeKeyboardDebugElement=()=>({{}});
+const warnings=[]; globalThis.notifyWarning=(message)=>warnings.push(message);
+class Harness {{
+{undo}
+{redo}
+  constructor() {{
+    this.activeSceneId="scene"; this.activeScene={{}}; this._editorFocused=false;
+    this._undoStack=[]; this._redoStack=[];
+  }}
+  _keyboardDebug() {{}}
+  _captureProjectDependencies() {{ return {{value:"current"}}; }}
+  async _restoreProjectDependencies() {{ throw new Error("dependency restore refused"); }}
+  async _restoreScene() {{}}
+  async _mutateReferences() {{}}
+}}
+const undoHarness=new Harness();
+undoHarness._undoStack.push({{kind:"project_dependencies",sceneId:"scene",
+  snapshot:{{value:"before"}},label:"identity edit"}});
+await undoHarness._undo();
+const undoState={{undo:undoHarness._undoStack.length,redo:undoHarness._redoStack.length}};
+const redoHarness=new Harness();
+redoHarness._redoStack.push({{kind:"project_dependencies",sceneId:"scene",
+  snapshot:{{value:"after"}},label:"identity edit"}});
+await redoHarness._redo();
+console.log(JSON.stringify({{undoState,redoState:{{undo:redoHarness._undoStack.length,
+  redo:redoHarness._redoStack.length}},warnings}}));
+""")
+    assert result["undoState"] == {"undo": 1, "redo": 0}
+    assert result["redoState"] == {"undo": 0, "redo": 1}
+    assert result["warnings"] == [
+        "dependency restore refused", "dependency restore refused"]
+
+
+def test_composite_history_compensation_failure_keeps_retryable_entry():
+    widget = _source("web/js/editor_widget.js")
+    undo = _method(widget, "_undo", "_redo")
+    redo = _method(widget, "_redo", "_restoreScene")
+    result = _run_node(f"""
+globalThis.document={{activeElement:null}};
+globalThis.describeKeyboardDebugElement=()=>({{}});
+const warnings=[]; globalThis.notifyWarning=(message)=>warnings.push(message);
+class Harness {{
+{undo}
+{redo}
+  constructor(mode) {{
+    this.mode=mode; this.activeSceneId="scene"; this.activeScene={{value:"current"}};
+    this._editorFocused=false; this._undoStack=[]; this._redoStack=[]; this.identityCalls=0;
+  }}
+  _keyboardDebug() {{}}
+  async _applyPromptIdentityChange() {{
+    this.identityCalls += 1;
+    if (this.identityCalls > 1) throw new Error(`${{this.mode}} compensation refused`);
+  }}
+  async _restoreScene() {{ throw new Error(`${{this.mode}} scene refused`); }}
+  async _mutateReferences() {{}}
+}}
+const entry={{sceneId:"scene",snapshot:{{value:"other"}},label:"attach",
+  promptIdentityChange:{{type:"upsert",value:{{handle:""}}}},
+  inversePromptIdentityChange:{{type:"upsert",value:{{handle:"Stored"}}}}}};
+const undoHarness=new Harness("undo"); undoHarness._undoStack.push(structuredClone(entry));
+await undoHarness._undo();
+const undoState={{undo:undoHarness._undoStack.length,redo:undoHarness._redoStack.length}};
+const redoHarness=new Harness("redo"); redoHarness._redoStack.push(structuredClone(entry));
+await redoHarness._redo();
+console.log(JSON.stringify({{undoState,redoState:{{undo:redoHarness._undoStack.length,
+  redo:redoHarness._redoStack.length}},warnings}}));
+""")
+    assert result["undoState"] == {"undo": 1, "redo": 0}
+    assert result["redoState"] == {"undo": 0, "redo": 1}
+    assert "undo scene refused Recovery also failed: undo compensation refused" in result["warnings"]
+    assert "redo scene refused Recovery also failed: redo compensation refused" in result["warnings"]
+
+
+def test_prompt_identity_history_rebases_without_erasing_unrelated_units():
+    widget = _source("web/js/editor_widget.js")
+    apply_change = _method(
+        widget, "_applyPromptIdentityChange", "_applyReferencePayload")
+    identity_url = (ROOT / "web/js/prompt_identity_panel.js").as_uri()
+    result = _run_node(f"""
+const identity=await import({json.dumps(identity_url)});
+globalThis.applyPromptIdentityChange=identity.applyPromptIdentityChange;
+globalThis.sameIdentitySnapshot=identity.sameIdentitySnapshot;
+class Harness {{
+{apply_change}
+  constructor(units) {{ this.projectDir="project"; this._promptSemanticUnits=units;
+    this.serverUnits=structuredClone(units); this.saved=[]; this.refreshes=0;
+    this.conflictProject=null; this.loseNext=false; }}
+  async _fetchReferences() {{ this.refreshes += 1;
+    this._promptSemanticUnits=structuredClone(this.serverUnits); return {{ok:true}}; }}
+  async _savePromptSemanticUnits(units,_label,options) {{
+    if (this.conflictProject) {{
+      const project=this.conflictProject; this.conflictProject=null;
+      const error=new Error("conflict"); error.code="project_version_conflict";
+      error.project=project; throw error;
+    }}
+    if (this.loseNext) {{ this.loseNext=false;
+      this.serverUnits=structuredClone(units); throw new Error("lost response"); }}
+    this.saved.push(structuredClone(units)); this.options=options;
+    this.serverUnits=structuredClone(units);
+    this._promptSemanticUnits=structuredClone(units); return units;
+  }}
+}}
+const previous={{semantic_unit_id:"u",name:"Person"}};
+const next={{...previous,handle:"Person"}};
+const unrelated={{semantic_unit_id:"other",name:"Concurrent"}};
+const safe=new Harness([next,unrelated]);
+await safe._applyPromptIdentityChange({{type:"upsert",value:previous,expected:next}},
+  "rollback",{{recordUndo:false}});
+const changed=new Harness([{{...next,name:"Changed elsewhere"}},unrelated]);
+let changedError="";
+try {{
+  await changed._applyPromptIdentityChange(
+    {{type:"upsert",value:previous,expected:next}},"rollback",{{recordUndo:false}});
+}} catch(error) {{ changedError=error.message; }}
+const rebased=new Harness([next]);
+rebased.conflictProject={{prompt_semantic_units:[next,unrelated],
+  prompt_context_profiles:[{{profile_id:"concurrent"}}]}};
+rebased.serverUnits=[next,unrelated];
+await rebased._applyPromptIdentityChange(
+  {{type:"upsert",value:previous,expected:next}},"rollback",{{recordUndo:false}});
+const lost=new Harness([next,unrelated]); lost.loseNext=true;
+const lostResult=await lost._applyPromptIdentityChange(
+  {{type:"upsert",value:previous,expected:next}},"undo",{{recordUndo:false}});
+const rebasedLost=new Harness([next]);
+rebasedLost.serverUnits=[next,unrelated];
+rebasedLost.conflictProject={{prompt_semantic_units:[next,unrelated],
+  prompt_context_profiles:[{{profile_id:"concurrent"}}]}};
+rebasedLost.loseNext=true;
+const rebasedLostResult=await rebasedLost._applyPromptIdentityChange(
+  {{type:"upsert",value:previous,expected:next}},"undo",{{recordUndo:false}});
+console.log(JSON.stringify({{safe:safe.saved[0],options:safe.options,
+  refreshes:safe.refreshes,changedSaves:changed.saved.length,changedError,
+  rebased:rebased.saved[0],profiles:rebased._promptContextProfiles,
+  lost:lostResult,lostRefreshes:lost.refreshes,
+  rebasedLost:rebasedLostResult,rebasedLostRefreshes:rebasedLost.refreshes}}));
+""")
+    assert result["safe"] == [
+        {"semantic_unit_id": "u", "name": "Person"},
+        {"semantic_unit_id": "other", "name": "Concurrent"},
+    ]
+    assert result["options"] == {"recordUndo": False}
+    assert result["refreshes"] == 1
+    assert result["changedSaves"] == 0
+    assert "changed elsewhere" in result["changedError"]
+    assert result["rebased"] == [
+        {"semantic_unit_id": "u", "name": "Person"},
+        {"semantic_unit_id": "other", "name": "Concurrent"},
+    ]
+    assert result["profiles"] == [{"profile_id": "concurrent"}]
+    assert result["lost"] == [
+        {"semantic_unit_id": "u", "name": "Person"},
+        {"semantic_unit_id": "other", "name": "Concurrent"},
+    ]
+    assert result["lostRefreshes"] == 2
+    assert result["rebasedLost"] == [
+        {"semantic_unit_id": "u", "name": "Person"},
+        {"semantic_unit_id": "other", "name": "Concurrent"},
+    ]
+    assert result["rebasedLostRefreshes"] == 2
+
+
+def test_reference_history_reconciles_an_apply_then_lost_response():
+    widget = _source("web/js/editor_widget.js")
+    apply_reference = _method(
+        widget, "_applyReferenceHistoryOperations", "_applyReferencePayload")
+    result = _run_node(f"""
+class Harness {{
+{apply_reference}
+  constructor() {{ this.serverHandle="Portrait"; this._references=[];
+    this.refreshes=0; this.mutations=0; }}
+  async _fetchReferences() {{ this.refreshes += 1;
+    this._references=[{{members:[{{member_id:"m",handle:this.serverHandle}}]}}];
+    return {{ok:true}}; }}
+  async _mutateReferences(operations) {{ this.mutations += 1;
+    this.serverHandle=operations[0].fields.handle; throw new Error("lost response"); }}
+}}
+const h=new Harness();
+const result=await h._applyReferenceHistoryOperations([{{
+  type:"update_member",member_id:"m",fields:{{handle:""}},
+  expected:{{handle:"Portrait"}},
+}}],"undo materialize");
+console.log(JSON.stringify({{result,handle:h._references[0].members[0].handle,
+  refreshes:h.refreshes,mutations:h.mutations}}));
+""")
+    assert result == {
+        "result": True, "handle": "", "refreshes": 2, "mutations": 1}
+
+
+def test_physical_handle_materialization_reconciles_unknown_outcome_without_claiming_undo():
+    widget = _source("web/js/editor_widget.js")
+    materialize = _method(
+        widget, "_materializeReferenceMemberHandle",
+        "_reconcileReferencesAfterAssetDeletion")
+    result = _run_node(f"""
+class Harness {{
+{materialize}
+  constructor(mode) {{ this.mode=mode; this.serverHandle="";
+    this._references=[{{reference_id:"other",members:[{{member_id:"m",handle:"Wrong"}}]}},
+      {{reference_id:"r",members:[{{member_id:"m",handle:""}}]}}]; }}
+  async _mutateReferences() {{
+    if (this.mode === "success") {{
+      this.serverHandle="Portrait";
+      this._references[1].members[0].handle=this.serverHandle;
+      return {{payload:{{results:[{{type:"materialize_member_handle",
+        member_id:"m",handle:this.serverHandle}}]}}}};
+    }}
+    if (this.mode === "lost_applied") this.serverHandle="Portrait";
+    if (this.mode === "concurrent") this.serverHandle="OtherAuthor";
+    throw new Error("offline");
+  }}
+  async _fetchReferences() {{
+    this._references[1].members[0].handle=this.serverHandle;
+    return {{ok:true}};
+  }}
+}}
+const invoke=(h)=>h._materializeReferenceMemberHandle({{
+  referenceId:"r",memberId:"m",suggestion:"Portrait",expectedHandle:""}});
+const success=await invoke(new Harness("success"));
+const lost=await invoke(new Harness("lost_applied"));
+const concurrent=await invoke(new Harness("concurrent"));
+let missing=""; try {{ await invoke(new Harness("lost_unapplied")); }}
+catch(error) {{ missing=error.message; }}
+console.log(JSON.stringify({{success,lost,concurrent,missing}}));
+""")
+    assert result == {
+        "success": {"handle": "Portrait", "ownsHandle": True},
+        "lost": {"handle": "Portrait", "ownsHandle": False},
+        "concurrent": {"handle": "OtherAuthor", "ownsHandle": False},
+        "missing": "offline",
+    }
+
+
+def test_production_scene_restore_rejects_http_and_network_failures():
+    widget = _source("web/js/editor_widget.js")
+    restore = _method(widget, "_restoreScene", "_setWidgetValue")
+    result = _run_node(f"""
+globalThis.document={{activeElement:null}};
+globalThis.describeKeyboardDebugElement=()=>({{}});
+globalThis.api={{apiURL:(value)=>value}};
+class Harness {{
+{restore}
+  constructor() {{ this.projectDir="project"; this.activeSceneId="scene";
+    this.activeScene={{scene_id:"scene",attachments:[{{id:"chip"}}]}}; this.scenes=[]; }}
+  _keyboardDebug() {{}}
+  _setActiveScene(scene) {{ this.activeSceneId=scene.scene_id; this.activeScene=scene; }}
+  _renderTimeline() {{}}
+  _renderViewportFrame() {{}}
+}}
+const h=new Harness();
+globalThis.fetch=async()=>({{ok:false,status:500}});
+let http=""; try {{ await h._restoreScene("scene",{{}}); }}
+catch(error) {{ http=error.message; }}
+globalThis.fetch=async()=>{{throw new Error("offline")}};
+let network=""; try {{ await h._restoreScene("scene",{{}}); }}
+catch(error) {{ network=error.message; }}
+const target={{scene_id:"scene",attachments:[]}}; let lostCalls=0;
+globalThis.fetch=async()=>{{ lostCalls += 1;
+  if (lostCalls===1) throw new Error("lost response");
+  return {{ok:true,status:200,json:async()=>({{scenes:[target]}})}};
+}};
+let lost=""; try {{ await h._restoreScene("scene",target); }}
+catch(error) {{ lost=error.message; }}
+console.log(JSON.stringify({{http,network,lost,lostCalls,active:h.activeScene}}));
+""")
+    assert result == {
+        "http": "Scene restore failed (500).",
+        "network": "offline",
+        "lost": "",
+        "lostCalls": 2,
+        "active": {"scene_id": "scene", "attachments": []},
+    }
+
+
+def test_chrome_placeholder_style_is_theme_owned_and_idempotent():
+    theme_url = (ROOT / "web/js/editor_theme.js").as_uri()
+    result = _run_node(f"""
+const mod=await import({json.dumps(theme_url)});
+const children=[];
+const doc={{
+  head:{{appendChild:(node)=>children.push(node)}},
+  createElement:()=>({{id:"",textContent:""}}),
+  getElementById:(id)=>children.find((node)=>node.id===id) || null,
+}};
+mod.installChromePlaceholderStyles(doc);
+mod.installChromePlaceholderStyles(doc);
+console.log(JSON.stringify({{count:children.length,css:children[0]?.textContent || "",
+  color:mod.THEME.fgPlaceholder,className:mod.CHROME_DIM_PLACEHOLDER_CLASS}}));
+""")
+    assert result["count"] == 1
+    assert f'.{result["className"]}::placeholder' in result["css"]
+    assert result["color"] in result["css"]
 
 
 def test_physical_row_status_uses_declared_role_labels():
@@ -2158,11 +3912,12 @@ def test_writing_draft_stamps_its_draft_channel_rather_than_resolving_at_apply()
     assert "defaultDraftChannel: writingState.defaultDraftChannel" in panel
     # One accessor feeds the hint and EVERY split call site, so what the panel
     # promises, what the contribution decorations are placed against, and what
-    # Apply writes cannot disagree. Three call sites: the Apply projection, the
-    # compile-candidate patch, and the decoration region walk. A new splitter
-    # that resolves the channel itself instead of taking the stamp is the
-    # regression this counts.
-    assert panel.count("defaultKey: writingDefaultChannelKey()") == 3
+    # Apply writes cannot disagree. Four call sites: the Apply projection, the
+    # compile-candidate patch, the decoration region walk, and the decoration
+    # layout signature that decides whether that walk must repaint. A new
+    # splitter that resolves the channel itself instead of taking the stamp is
+    # the regression this counts.
+    assert panel.count("defaultKey: writingDefaultChannelKey()") == 4
     assert "Unlabelled text goes to ${writingDefaultChannelKey()" in panel
     # Persisted only when set, exactly like `stash`, so an older record keeps
     # the shape it was written with.

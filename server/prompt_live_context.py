@@ -80,11 +80,11 @@ def compile_live_scene_prompt_context(project, scene, *, template,
                                       labels_on=False, delimiter=".",
                                       prompt_threshold=0.0,
                                       reference_threshold=0.0,
-                                      convert_plan_for=None) -> dict:
+                                      copy_plan_for=None) -> dict:
     """Compile one live scene with the same complete context used by preview.
 
-    `convert_plan_for` is `{"attachment_id", "capability_id"}` and asks, in the
-    same request, what "Convert to prose" would write for that one capability.
+    `copy_plan_for` is `{"attachment_id", "capability_id"}` and asks, in the
+    same request, what "Copy with handles" would write for that capability.
     It is answered INSIDE the compile, where the enriched context lives. An
     earlier version rebuilt that context by hand out here and silently produced
     empty plans: the keys the assemblers actually read (`profile`,
@@ -125,7 +125,7 @@ def compile_live_scene_prompt_context(project, scene, *, template,
             },
             labels_on=labels_on, delimiter=delimiter,
             boundary_threshold_pct=prompt_threshold,
-            convert_plan_for=convert_plan_for)
+            copy_plan_for=copy_plan_for)
     except prompt_context.ProfileResolutionError as exc:
         compiled = prompt_context.profile_error_result(
             exc, window_start=window_start, window_end=window_end, fps=fps)

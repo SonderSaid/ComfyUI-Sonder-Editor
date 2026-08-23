@@ -381,6 +381,75 @@ def test_section_only_attachments_are_blocked_even_when_anchored_globally(kind, 
     diagnostic = next(value for value in compiled["errors"]
                       if value["code"] == code)
     assert diagnostic["attachment_id"] == attachment["attachment_id"]
+    assert not [row for row in compiled["emissions"]
+                if row["attachment_id"] == attachment["attachment_id"]]
+
+
+@pytest.mark.parametrize("kind", [
+    "shot", "timestamp", "prompt_link", "prompt_link_scope", "vocal_event",
+])
+def test_disabled_global_section_only_attachment_is_inert(kind):
+    attachment = prompt_context.normalize_attachment({
+        "kind": kind, "enabled": False,
+    })
+    compiled = prompt_context.compile_prompt_context(
+        global_attachments=[attachment], sections=[], window_start=0,
+        window_end=10, fps=24, template="standard")
+    assert not [row for row in compiled["errors"]
+                if row.get("attachment_id") == attachment["attachment_id"]]
+    assert not [row for row in compiled["warnings"]
+                if row.get("attachment_id") == attachment["attachment_id"]]
+    assert not [row for row in compiled["emissions"]
+                if row["attachment_id"] == attachment["attachment_id"]]
+
+
+def test_invalid_global_vocal_event_cannot_preempt_a_valid_section_clone():
+    profile = {
+        "profile_id": "voice_owner", "version": "1", "name": "Voice owner",
+        "template_id": "standard", "writing_aids": [],
+        "capabilities": {"vocal_event": {
+            "channel_key": "visual", "placement": "inline",
+        }},
+        "identity_kinds": [prompt_context.MINIMAX_SUBJECT_KIND],
+    }
+
+    def vocal_event(attachment_id, text):
+        return prompt_context.normalize_attachment({
+            "attachment_id": attachment_id,
+            "emission_group_id": "shared-vocal-event",
+            "kind": "vocal_event",
+            "source": {"subject_ids": ["narrator"]},
+            "config": {
+                "event_type": "narration", "language": "English",
+                "subject_phrase": "the narrator", "text": text,
+            },
+        })
+
+    global_vocal = vocal_event("global-vocal", "GLOBAL LINE")
+    section_vocal = vocal_event("section-vocal", "SECTION LINE")
+    section_document = {"nodes": [{
+        "type": "attachment", "node_id": "voice-anchor",
+        "attachment_id": "section-vocal", "capability_id": "vocal_event",
+    }]}
+    compiled = prompt_context.compile_prompt_context(
+        global_attachments=[global_vocal],
+        sections=[PromptSection(
+            0, 10, attachments=[section_vocal],
+            channel_docs={"visual": section_document})],
+        window_start=0, window_end=10, fps=24, template="standard",
+        profile=profile, context={"semantic_units": [{
+            "semantic_unit_id": "narrator", "kind": "subject",
+            "name": "Narrator", "definition": "the narrator", "sources": [],
+        }]})
+
+    assert "SECTION LINE" in compiled["prompt"]
+    assert "GLOBAL LINE" not in compiled["prompt"]
+    assert [row["attachment_id"] for row in compiled["emissions"]] == [
+        "section-vocal"]
+    assert [row["attachment_id"] for row in compiled["errors"]
+            if row["code"] == "global_vocal_event"] == ["global-vocal"]
+    assert not [row for row in compiled["errors"]
+                if row["code"] == "conflicting_emission"]
 
 
 def test_invalid_attachment_route_diagnostic_targets_the_chip():

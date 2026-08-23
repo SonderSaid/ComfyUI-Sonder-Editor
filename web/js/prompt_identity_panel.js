@@ -2,7 +2,8 @@
 // The Prompt panel host owns state, networking, and durable commits. This
 // module owns only the derived DOM/listeners and returns a cleanup callback.
 
-import { EDITOR_COLORS as COLORS, chromeInputCss, setButtonDisabled,
+import { CHROME_DIM_PLACEHOLDER_CLASS, EDITOR_COLORS as COLORS, chromeInputCss,
+    installChromePlaceholderStyles, setButtonDisabled,
     setButtonVariant } from "./editor_theme.js";
 import { createReferenceOverrideFieldset,
     normalizePromptAttachment } from "./prompt_context_chips.js";
@@ -74,7 +75,7 @@ function stableIdentitySnapshot(value) {
     ]));
 }
 
-function sameIdentitySnapshot(left, right) {
+export function sameIdentitySnapshot(left, right) {
     return JSON.stringify(stableIdentitySnapshot(left ?? null))
         === JSON.stringify(stableIdentitySnapshot(right ?? null));
 }
@@ -94,10 +95,14 @@ export function applyPromptIdentityChange(currentUnits = [], change = {}) {
     const found = index >= 0 ? current[index] : null;
     const expected = Object.hasOwn(change, "expected") ? change.expected : undefined;
     if (expected === null && found) {
-        throw new Error("Prompt identity was created elsewhere. Reopen and try again.");
+        const error = new Error("Prompt identity was created elsewhere. Reopen and try again.");
+        error.code = "prompt_identity_created_elsewhere";
+        throw error;
     }
     if (expected && !sameIdentitySnapshot(found, expected)) {
-        throw new Error("Prompt identity changed elsewhere. Reopen it before saving.");
+        const error = new Error("Prompt identity changed elsewhere. Reopen it before saving.");
+        error.code = "prompt_identity_changed_elsewhere";
+        throw error;
     }
     if (type === "delete") {
         if (!found) throw new Error("Prompt identity was already deleted.");
@@ -164,6 +169,24 @@ export function derivePromptHandleSuggestion(value, fallback = "Reference") {
         word[0]?.toUpperCase() + word.slice(1)).join("");
     if (!handle) handle = String(fallback || "Reference").replace(/[^A-Za-z0-9]/g, "");
     return sanitizePromptHandle(handle) || "Reference";
+}
+
+export function promptReferencePickerLabel(reference = {}, member = {}) {
+    const name = String(member?.name || reference?.name || "Reference");
+    const handle = String(member?.handle || "").trim();
+    return handle ? `@${handle} — ${name}` : name;
+}
+
+export function promptIdentityAttachmentOwner(unit = {}) {
+    const storedHandle = String(unit?.handle || "").trim();
+    return {
+        type: "identity",
+        identityId: String(unit?.semantic_unit_id || ""),
+        handle: storedHandle
+            || derivePromptHandleSuggestion(unit?.name, "Identity"),
+        storedHandle,
+        displayName: String(unit?.name || unit?.semantic_unit_id || "Identity"),
+    };
 }
 
 export function promptIdentityDependents(identityId, scenes = [], identity = null) {
@@ -443,7 +466,10 @@ function openAttachmentTargetPicker({ scene, owner, onAttach, onClose, onError,
     const title = document.createElement("strong");
     title.id = `sonder-prompt-attachment-title-${uid()}`;
     modal.setAttribute("aria-labelledby", title.id);
-    title.textContent = `Attach @${owner?.handle || "Reference"}`;
+    title.textContent = owner?.storedHandle
+        ? `Attach @${owner.storedHandle}`
+        : `Attach ${owner?.displayName || "Reference"} (will create @${
+            owner?.handle || "Reference"})`;
     const target = makeSelect([
         ["global", "Scene-wide Context"],
         ...(scene?.prompt_sections || []).map((section, index) => [
@@ -668,7 +694,7 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
             const enabled = document.createElement("input"); enabled.type = "checkbox";
             enabled.checked = sourceMap.has(key);
             const label = document.createElement("span");
-            label.textContent = `@${member.handle || derivePromptHandleSuggestion(member.name || reference.name)} - ${reference.name || "Reference"}`;
+            label.textContent = promptReferencePickerLabel(reference, member);
             const asset = (assets || []).find((value) =>
                 String(value?.asset_id || "") === String(member.asset_id || ""));
             const populationKeys = (profile?.physical_populations || [])
@@ -729,7 +755,7 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
     filterSources();
     const voice = makeSelect([["", "No voice reference"], ...sourceRows
         .map(({ reference, member }) => [String(member.member_id),
-            `@${member.handle || derivePromptHandleSuggestion(member.name || reference.name)}`])],
+            promptReferencePickerLabel(reference, member)])],
     identity?.voice?.member_id || "");
     const requiredNotice = document.createElement("div");
     requiredNotice.dataset.sonderIdentityRequired = "1";
@@ -982,6 +1008,7 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
 
 export function mountPromptIdentityPanel(container, options = {}) {
     if (!container) return () => {};
+    installChromePlaceholderStyles(container.ownerDocument);
     const cleanups = [];
     const profile = options.profile || {};
     const references = options.references || [];
@@ -1088,7 +1115,9 @@ export function mountPromptIdentityPanel(container, options = {}) {
             const suggestion = derivePromptHandleSuggestion(row.member?.name
                 || row.reference?.name || row.display_name, "Reference");
             const handle = document.createElement("input");
-            handle.value = row.member?.handle || suggestion;
+            handle.value = row.member?.handle || "";
+            handle.placeholder = suggestion;
+            handle.classList?.add(CHROME_DIM_PLACEHOLDER_CLASS);
             handle.setAttribute("aria-label", "Physical Reference handle");
             handle.title = `${row.member?.handle
                 ? "Durable handle."
@@ -1105,7 +1134,7 @@ export function mountPromptIdentityPanel(container, options = {}) {
                 handle.value = sanitized;
                 handle.setSelectionRange?.(caret, caret);
             });
-            handle.style.cssText = `${chromeInputCss()}font-weight:600;color:${row.member?.handle ? COLORS.text : COLORS.textDim};`;
+            handle.style.cssText = `${chromeInputCss()}font-weight:600;color:${COLORS.text};`;
             const commitHandle = async () => {
                 if (!row.member || !row.reference
                         || handle.value.trim() === String(row.member.handle || "")) return;
@@ -1117,7 +1146,7 @@ export function mountPromptIdentityPanel(container, options = {}) {
                         expected: { handle: String(row.member.handle || "") },
                     }], "edit physical Reference handle");
                     rerender();
-                } catch (error) { handle.value = row.member.handle || suggestion; options.onError?.(error); }
+                } catch (error) { handle.value = row.member.handle || ""; options.onError?.(error); }
             };
             handle.addEventListener("change", () => { void commitHandle(); });
             handle.addEventListener("keydown", (event) => {
@@ -1244,6 +1273,7 @@ export function mountPromptIdentityPanel(container, options = {}) {
                 referenceId: row.reference?.reference_id || "",
                 handle: row.member?.handle || suggestion,
                 storedHandle: row.member?.handle || "",
+                displayName: row.member?.name || row.reference?.name || "Reference",
                 declaration: group.declaration,
             }));
             rowEl = buildPromptingRow("physical", [
@@ -1288,7 +1318,16 @@ export function mountPromptIdentityPanel(container, options = {}) {
         thumbnail.textContent = String(kindDeclaration?.label || unit.kind || "Identity")
             .slice(0, 1).toUpperCase();
         const name = document.createElement("span");
-        name.textContent = `@${unit.handle || derivePromptHandleSuggestion(unit.name, "Identity")} — ${unit.name || unit.semantic_unit_id}`;
+        const identityName = String(unit.name || unit.semantic_unit_id);
+        if (unit.handle) {
+            name.textContent = `@${unit.handle} — ${identityName}`;
+        } else {
+            name.textContent = identityName;
+            const noHandle = document.createElement("span");
+            noHandle.textContent = " · no handle";
+            noHandle.style.cssText = `font:9px system-ui;color:${COLORS.textDim};`;
+            name.appendChild(noHandle);
+        }
         name.style.cssText = `font:10px system-ui;color:${COLORS.text};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`;
         const speakerIndex = (candidate?.managed_speaker_subject_ids || [])
             .map(String).indexOf(String(unit.semantic_unit_id));
@@ -1302,10 +1341,8 @@ export function mountPromptIdentityPanel(container, options = {}) {
         const edit = makeButton("Edit", "Edit identity, sources, contributions, and voice");
         edit.addEventListener("click", () => openEditor(unit));
         const attach = makeButton("Attach...", "Attach this prompt identity to the scene or a section");
-        attach.addEventListener("click", () => openAttach({
-            type: "identity", identityId: unit.semantic_unit_id,
-            handle: unit.handle || derivePromptHandleSuggestion(unit.name, "Identity"),
-        }));
+        attach.addEventListener("click", () => openAttach(
+            promptIdentityAttachmentOwner(unit)));
         const remove = makeButton("×", "Delete with dependency disclosure", "danger",
             "Delete prompt identity");
         remove.style.cssText += "min-width:24px;padding:2px 6px;font-size:12px;";

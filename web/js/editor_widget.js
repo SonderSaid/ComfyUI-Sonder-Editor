@@ -14,6 +14,10 @@ const { api } = window.comfyAPI.api;
 // Persistent enable across page reloads: set `localStorage.SONDER_DEBUG_SESSION = "1"`
 // once; this bootstrap copies it into the window global on import.
 const SESSION_DIAG_RING_MAX = 2048;
+// Compile starts after 180 ms and ordinarily lands before this. Stale caches
+// are marked immediately for correctness; only their dimmed repaint waits, so
+// normal typing never flashes through an intermediate visual state.
+const PROMPT_STALE_VISUAL_DELAY_MS = 300;
 
 if (typeof window !== "undefined" && !window.SONDER_DEBUG_SESSION) {
     try {
@@ -251,6 +255,7 @@ import { mountTimelineExportPanel } from "./editor_timeline_export_panel.js";
 import { mountPromptManagementPanel } from "./editor_prompt_panel.js";
 import {
     configurePromptAttachment,
+    attachmentChannelProjectionSignature,
     createAttachmentChannelProjections,
     createPromptProjectionBox,
     createPromptDocumentEditor,
@@ -364,6 +369,7 @@ import {
     requestProjectAssetRefresh,
 } from "./asset_refresh_coordinator.js";
 import { ProjectMutationQueue } from "./project_mutation_queue.js";
+import { applyPromptIdentityChange, sameIdentitySnapshot } from "./prompt_identity_panel.js";
 import {
     findConstrainedSelectionEndpoint,
     isSelectionDurationWithinRecommendation,
@@ -597,6 +603,7 @@ export class EditorWidget {
         this.onMountInTab = options.onMountInTab || null;
         this.hostMode = options.hostMode || "node";
         this.onWidgetValueChange = options.onWidgetValueChange || null;
+        this.onWidgetStateApplied = options.onWidgetStateApplied || null;
         this.widgetHost = options.host || this._createNodeWidgetHost(node);
         this.projectDir = "";
         this.projectId = "";
@@ -776,6 +783,7 @@ export class EditorWidget {
         this._undoStack = [];   // Array of { sceneId, snapshot, label }
         this._redoStack = [];
         this._maxUndoSteps = 50;
+        this._sceneHistoryLifecycleOwner = null;
 
         // Thumbnail strip cache: { assetId: { img: Image, frameWidth, numFrames, loaded } }
         this._thumbStripCache = {};
@@ -879,9 +887,80 @@ export class EditorWidget {
         this._setWidgetValue(name, value);
     }
 
+    hasDeferredWidgetState() {
+        return !!(this._pendingHistoryWidgetState || this._pendingApplyWidgetState);
+    }
+
+    _hasPendingHistoryCommit() {
+        return !!this._undoStack?.some((entry) => entry?.pending);
+    }
+
+    _historyIsBusy() {
+        return !!(this._sceneHistoryLifecycleOwner
+            || this._historyOperationInFlight || this._hasPendingHistoryCommit());
+    }
+
+    _beginSceneHistoryLifecycle(label = "scene change", { allowSceneSwitch = false } = {}) {
+        if (this._historyIsBusy()) {
+            notifyInfo("Another scene change is still finishing. Try again in a moment.",
+                { source: "scene-history-lifecycle-pending" });
+            return null;
+        }
+        const token = { label, allowSceneSwitch: Boolean(allowSceneSwitch) };
+        this._sceneHistoryLifecycleOwner = token;
+        return token;
+    }
+
+    _endSceneHistoryLifecycle(token) {
+        if (!token || this._sceneHistoryLifecycleOwner !== token) return false;
+        this._sceneHistoryLifecycleOwner = null;
+        this._replayDeferredHistoryWidgetStateIfIdle?.();
+        if (this._pendingScenesRefresh) {
+            this._pendingScenesRefresh = false;
+            this._fetchScenes?.({ reason: "scene_history_lifecycle_replay" });
+        }
+        return true;
+    }
+
     applyWidgetState(values = {}) {
         if (!values || typeof values !== "object") return;
-        const fieldNames = Object.keys(values);
+        let nextValues = values;
+        const carriesScene = Object.prototype.hasOwnProperty.call(nextValues, "scene_id");
+        if (this._historyIsBusy() && Object.keys(nextValues).length > 0) {
+            // Remote widget updates may carry scene-relative selection fields
+            // beside scene_id. Defer the whole payload so none of B's state is
+            // written into A while A still owns an Undo/Redo transaction.
+            const pendingBase = {
+                ...(this._pendingApplyWidgetState || {}),
+                ...(this._pendingHistoryWidgetState || {}),
+            };
+            const hasPendingScene = Object.prototype.hasOwnProperty.call(
+                pendingBase, "scene_id");
+            const pendingSceneId = String(pendingBase.scene_id || "");
+            const requestedSceneId = String(nextValues.scene_id || "");
+            if (carriesScene && hasPendingScene
+                    && requestedSceneId !== pendingSceneId) {
+                for (const name of [
+                    "selection_start", "selection_end",
+                    "pre_context_frames", "post_context_frames",
+                    "mask_pre_offset", "mask_post_offset",
+                ]) {
+                    delete pendingBase[name];
+                }
+            }
+            this._pendingHistoryWidgetState = { ...pendingBase, ...nextValues };
+            // A drag buffer can only predate the first history-scene payload:
+            // once history buffering exists, every later payload enters it at
+            // this earlier branch. Transfer the older state exactly once so a
+            // mouseup replay cannot overwrite the newer scene-relative fields.
+            this._pendingApplyWidgetState = null;
+            sessionDiagRecord("widget_state_history_deferred", {
+                active_scene_id: this.activeSceneId || "",
+                requested_scene_id: String(nextValues.scene_id || ""),
+            });
+            return;
+        }
+        const fieldNames = Object.keys(nextValues);
         if (this.isDragging && fieldNames.length > 0) {
             // #36 residual: remote widget_state_changed events can arrive while a
             // drag/trim owns editor object references and scalar selection state.
@@ -889,7 +968,7 @@ export class EditorWidget {
             // persists to project or browser-local state.
             this._pendingApplyWidgetState = {
                 ...(this._pendingApplyWidgetState || {}),
-                ...values,
+                ...nextValues,
             };
             sessionDiagRecord("widget_state_deferred", {
                 drag_type: this.dragType || "",
@@ -897,22 +976,38 @@ export class EditorWidget {
             });
             return;
         }
+        if (this._pendingApplyWidgetState) {
+            // Mouseup clears isDragging before an async commit may flush the
+            // older buffer. A newer remote payload in that gap must absorb and
+            // clear the buffer or the scheduled flush can replay stale state.
+            nextValues = { ...this._pendingApplyWidgetState, ...nextValues };
+            this._pendingApplyWidgetState = null;
+        }
         // A draft anchor is intentionally local and ephemeral. Any externally
         // applied widget state supersedes it, even when the update only changes
         // context or another related workflow field.
         this._selectionDraftAnchor = null;
         this._applyingWidgetState = true;
+        const orderedEntries = Object.entries(nextValues).sort(([left], [right]) => {
+            if (left === "scene_id") return -1;
+            if (right === "scene_id") return 1;
+            return 0;
+        });
         try {
-            for (const [name, value] of Object.entries(values)) {
+            for (const [name, value] of orderedEntries) {
                 this._setHostValueLocal(name, value);
-            }
-            if (Object.prototype.hasOwnProperty.call(values, "scene_id")) {
-                const sceneId = String(values.scene_id || "");
+                if (name !== "scene_id") continue;
+                const sceneId = String(value || "");
                 if (sceneId && sceneId !== this.activeSceneId) {
-                    const scene = this.scenes.find(s => s.scene_id === sceneId);
+                    const scene = this.scenes.find(item => item.scene_id === sceneId);
                     if (scene) {
                         this._setActiveScene(scene);
                     } else {
+                        // The matching scene payload may arrive on the next
+                        // refresh. Scene-local snapshots must still stop being
+                        // actionable as soon as ownership moves to this id.
+                        this._undoStack = [];
+                        this._redoStack = [];
                         this.activeSceneId = sceneId;
                     }
                 }
@@ -920,14 +1015,14 @@ export class EditorWidget {
         } finally {
             this._applyingWidgetState = false;
         }
-        if (Object.prototype.hasOwnProperty.call(values, "selection_start")) {
-            this.selectionStart = Math.max(0, parseInt(values.selection_start, 10) || 0);
+        if (Object.prototype.hasOwnProperty.call(nextValues, "selection_start")) {
+            this.selectionStart = Math.max(0, parseInt(nextValues.selection_start, 10) || 0);
         }
-        if (Object.prototype.hasOwnProperty.call(values, "selection_end")) {
-            this.selectionEnd = Math.max(0, parseInt(values.selection_end, 10) || 0);
+        if (Object.prototype.hasOwnProperty.call(nextValues, "selection_end")) {
+            this.selectionEnd = Math.max(0, parseInt(nextValues.selection_end, 10) || 0);
         }
-        if (Object.prototype.hasOwnProperty.call(values, "render_queue_active")) {
-            this.renderQueueActive = coerceBoolean(values.render_queue_active, true);
+        if (Object.prototype.hasOwnProperty.call(nextValues, "render_queue_active")) {
+            this.renderQueueActive = coerceBoolean(nextValues.render_queue_active, true);
         }
         this.selectionStart = Math.min(this.selectionStart, this.selectionEnd);
         this.playhead = Math.max(0, Math.min(this.playhead, this.totalFrames));
@@ -939,6 +1034,7 @@ export class EditorWidget {
         if (this._promptContextConsumersMounted()) {
             this._previewPromptContextCandidate({}, 0);
         }
+        this.onWidgetStateApplied?.(Object.fromEntries(orderedEntries));
     }
 
     _flushDeferredDragState(commitPromise = null) {
@@ -1201,8 +1297,18 @@ export class EditorWidget {
     }
 
     // ── Scene Management ───────────────────────────────────────────────
-    async _fetchScenes({ ignoreMutationGate = false, reason = "external" } = {}) {
-        if (!this.projectDir) return;
+    async _fetchScenes({
+        ignoreMutationGate = false,
+        reason = "external",
+        sceneHistoryLifecycleToken = null,
+    } = {}) {
+        if (!this.projectDir) return false;
+        const ownsSceneHistoryLifecycle = () => !!(sceneHistoryLifecycleToken
+            && this._sceneHistoryLifecycleOwner === sceneHistoryLifecycleToken);
+        if (this._sceneHistoryLifecycleOwner && !ownsSceneHistoryLifecycle()) {
+            this._deferSceneRefresh(reason, { stage: "scene_history_lifecycle_start" });
+            return false;
+        }
 
         // #36 mid-drag refresh race: external WS / heartbeat / timer paths can call
         // `_fetchScenes` while the user is mid-drag/mid-trim. `_setActiveScene` replaces
@@ -1215,7 +1321,7 @@ export class EditorWidget {
         // because a pre-drag fetch can resolve after the next drag has started.
         if (this._shouldDeferSceneRefresh({ ignoreMutationGate })) {
             this._deferSceneRefresh(reason, { stage: "start" });
-            return;
+            return false;
         }
 
         const fetchSeq = ++this._sceneFetchSeq;
@@ -1241,7 +1347,7 @@ export class EditorWidget {
                     // A newer scenes fetch superseded this one: latest-wins.
                     // Re-deferring a dispatch-order rejection lets overlapping
                     // chains invalidate one another forever at idle.
-                    return;
+                    return false;
                 }
                 if (mutationSeq !== this._sceneMutationInvalidationSeq) {
                     sessionDiagRecord("scene_refresh_mutation_invalidated", {
@@ -1254,7 +1360,7 @@ export class EditorWidget {
                     // refreshScenes:false writes converge after their in-flight
                     // pre-mutation payload is discarded.
                     this._deferProjectBackedRefresh(["scenes"], "scene_refresh_mutation_replay");
-                    return;
+                    return false;
                 }
                 // Commit-order race guard: a GET served by the backend BEFORE
                 // our latest mutation committed can resolve after every client
@@ -1279,11 +1385,17 @@ export class EditorWidget {
                         compareVersion,
                         "scene_refresh_stale_version_replay",
                     );
-                    if (!accepted) return;
+                    if (!accepted) return false;
                 }
                 if (this._shouldDeferSceneRefresh({ ignoreMutationGate })) {
                     this._deferSceneRefresh(reason, { stage: "apply" });
-                    return;
+                    return false;
+                }
+                if (this._sceneHistoryLifecycleOwner && !ownsSceneHistoryLifecycle()) {
+                    this._deferSceneRefresh(reason, {
+                        stage: "scene_history_lifecycle_apply",
+                    });
+                    return false;
                 }
                 this._markStaleReplayApplied("scenes", dirName);
                 this._pendingScenesRefresh = false;
@@ -1295,21 +1407,33 @@ export class EditorWidget {
                         .map(id => this.scenes.find(s => s.scene_id === id))
                         .find(Boolean);
                     if (scene) {
-                        this._setActiveScene(scene);
+                        const applied = this._setActiveScene(scene, {
+                            lifecycleToken: sceneHistoryLifecycleToken,
+                        });
+                        if (applied === false) return false;
                     } else {
-                        this._setActiveScene(this.scenes[0]);
+                        const applied = this._setActiveScene(this.scenes[0], {
+                            lifecycleToken: sceneHistoryLifecycleToken,
+                        });
+                        if (applied === false) return false;
                     }
                 }
+                return true;
             } else if (resp.status === 404) {
                 this._showProjectNotFound();
             }
+            return false;
         } catch (e) {
             console.warn("[Sonder] Failed to fetch scenes:", e);
+            return false;
         }
     }
 
     async _createScene() {
         if (!this.projectDir) return;
+        const lifecycleToken = this._beginSceneHistoryLifecycle(
+            "create scene", { allowSceneSwitch: true });
+        if (!lifecycleToken) return;
         const dirName = this.projectDir.split(/[/\\]/).pop();
 
         try {
@@ -1324,14 +1448,25 @@ export class EditorWidget {
             if (resp.ok) {
                 const scene = await resp.json();
                 this.scenes.push(scene);
-                this._setActiveScene(scene);
+                this._setActiveScene(scene, { lifecycleToken });
             }
         } catch (e) {
             console.warn("[Sonder] Failed to create scene:", e);
+        } finally {
+            this._endSceneHistoryLifecycle(lifecycleToken);
         }
     }
 
-    _setActiveScene(scene) {
+    _setActiveScene(scene, { lifecycleToken = null } = {}) {
+        const lifecycleOwnsSwitch = !!(lifecycleToken
+            && this._sceneHistoryLifecycleOwner === lifecycleToken
+            && lifecycleToken.allowSceneSwitch);
+        if (this._historyIsBusy() && !lifecycleOwnsSwitch && this.activeSceneId
+                && String(scene?.scene_id || "") !== String(this.activeSceneId)) {
+            notifyInfo("Finish saving, Undo, or Redo before switching scenes.",
+                { source: "scene-switch-history-pending" });
+            return false;
+        }
         const hasActiveScene = !!this.activeScene;
         const preservePendingFrameSelection = !hasActiveScene && this.activeSceneId === scene.scene_id;
         const isSameScene = hasActiveScene && this.activeSceneId === scene.scene_id;
@@ -1343,6 +1478,11 @@ export class EditorWidget {
             ? this._readStoredTimelineSelection(scene)
             : null;
 
+        // Publish the scene owner before any scene-relative selection widgets.
+        // Remote peers can then buffer/apply the following partial events under
+        // the correct scene instead of briefly writing B's range into A.
+        this._setWidgetValue("scene_id", scene.scene_id);
+
         if (!isSameScene) {
             this._promptContextCandidateCache = null;
             this._promptContextScenePayloadCache = null;
@@ -1353,6 +1493,10 @@ export class EditorWidget {
             this._promptContextPreviewToken = (this._promptContextPreviewToken || 0) + 1;
             if (this._promptContextPreviewTimer) clearTimeout(this._promptContextPreviewTimer);
             this._promptContextPreviewTimer = null;
+            if (this._promptContextStaleVisualTimer) {
+                clearTimeout(this._promptContextStaleVisualTimer);
+            }
+            this._promptContextStaleVisualTimer = null;
             this._selectionDraftAnchor = null;
             this._animaticMode = false;
             this._stopPlayback();
@@ -1403,9 +1547,6 @@ export class EditorWidget {
             this._refreshContextInputs();
         }
         this._updateViewportHeader();
-
-        // Update hidden widgets
-        this._setWidgetValue("scene_id", scene.scene_id);
 
         if (!isSameScene) {
             // Defer auto-fit to next frame so browser reflows after editor hide
@@ -1602,6 +1743,11 @@ export class EditorWidget {
     }
 
     _cycleScene(dir) {
+        if (this._historyIsBusy()) {
+            notifyInfo("Finish saving, Undo, or Redo before switching scenes.",
+                { source: "scene-switch-history-pending" });
+            return;
+        }
         if (this.scenes.length === 0) return;
         const idx = this.scenes.findIndex(s => s.scene_id === this.activeSceneId);
         let newIdx = idx + dir;
@@ -1683,11 +1829,19 @@ export class EditorWidget {
     async _deleteScene(targetScene = null) {
         const scene = targetScene || this.activeScene;
         if (!scene || !this.projectDir) return;
+        const deletesActive = scene.scene_id === this.activeSceneId;
+        const lifecycleToken = deletesActive ? this._beginSceneHistoryLifecycle(
+            "delete active scene", { allowSceneSwitch: true }) : null;
+        if (deletesActive && !lifecycleToken) return;
         if (this.scenes.length <= 1) {
             alert("Cannot delete the last scene.");
+            this._endSceneHistoryLifecycle(lifecycleToken);
             return;
         }
-        if (!confirm(`Delete scene "${scene.name}"? This cannot be undone.`)) return;
+        if (!confirm(`Delete scene "${scene.name}"? This cannot be undone.`)) {
+            this._endSceneHistoryLifecycle(lifecycleToken);
+            return;
+        }
 
         const dirName = this.projectDir.split(/[/\\]/).pop();
         try {
@@ -1696,9 +1850,14 @@ export class EditorWidget {
             });
             // _fetchScenes preserves the active scene when it still exists, so deleting a
             // non-active scene keeps the user in place; deleting the active one falls to scene 0.
-            await this._fetchScenes();
+            await this._fetchScenes({
+                reason: "delete_scene",
+                sceneHistoryLifecycleToken: lifecycleToken,
+            });
         } catch (e) {
             console.warn("[Sonder] Failed to delete scene:", e);
+        } finally {
+            this._endSceneHistoryLifecycle(lifecycleToken);
         }
     }
 
@@ -1706,6 +1865,9 @@ export class EditorWidget {
         const scene = targetScene || this.activeScene;
         if (!scene || !this.projectDir) return;
         const isActive = scene.scene_id === this.activeSceneId;
+        const lifecycleToken = isActive ? this._beginSceneHistoryLifecycle(
+            "duplicate active scene", { allowSceneSwitch: true }) : null;
+        if (isActive && !lifecycleToken) return;
         const dirName = this.projectDir.split(/[/\\]/).pop();
 
         try {
@@ -1718,9 +1880,11 @@ export class EditorWidget {
             this.scenes.push(newScene);
             // Duplicating the active scene jumps to the copy (existing flow); duplicating a
             // non-active scene from the switcher leaves the user on their current scene.
-            if (isActive) this._setActiveScene(newScene);
+            if (isActive) this._setActiveScene(newScene, { lifecycleToken });
         } catch (e) {
             console.warn("[Sonder] Failed to duplicate scene:", e);
+        } finally {
+            this._endSceneHistoryLifecycle(lifecycleToken);
         }
     }
 
@@ -1867,7 +2031,9 @@ export class EditorWidget {
         });
     }
 
-    async _savePromptSemanticUnits(units, label = "edit prompt identities") {
+    async _savePromptSemanticUnits(units, label = "edit prompt identities", {
+        recordUndo = true,
+    } = {}) {
         if (!this.projectDir) return null;
         const before = this._captureProjectDependencies();
         const dirName = this._projectDirName();
@@ -1879,10 +2045,127 @@ export class EditorWidget {
         );
         this._promptSemanticUnits = Array.isArray(payload?.prompt_semantic_units)
             ? payload.prompt_semantic_units : [];
-        this._pushProjectDependencyUndo(label, before);
+        if (recordUndo) this._pushProjectDependencyUndo(label, before);
         await this._fetchReferences({ ignoreMutationGate: true,
             reason: "prompt_semantic_units", force: true });
         return this._promptSemanticUnits;
+    }
+
+    /**
+     * Apply one identity-owned change against fresh project state.
+     *
+     * The project endpoint replaces the semantic-unit array wholesale, so a
+     * history/compensation write must rebase its expected-state operation onto
+     * the latest array before PUT. Otherwise an unrelated edit from another
+     * window could be deleted by a stale rollback snapshot.
+     */
+    async _applyPromptIdentityChange(change, label = "edit prompt identity", {
+        recordUndo = true,
+    } = {}) {
+        if (!this.projectDir) return null;
+        const refreshed = await this._fetchReferences({
+            ignoreMutationGate: true, reason: "prompt_identity_change", force: true,
+        });
+        if (!refreshed) {
+            throw new Error("Current prompt identities could not be loaded safely.");
+        }
+        const identityId = String(change?.value?.semantic_unit_id
+            || change?.semantic_unit_id || "");
+        const currentIdentity = (units) => (units || []).find((unit) =>
+            String(unit?.semantic_unit_id || "") === identityId) || null;
+        const alreadyApplied = (units) => change?.type === "delete"
+            ? !currentIdentity(units)
+            : sameIdentitySnapshot(currentIdentity(units), change?.value);
+        const targetChanged = (units) => Object.hasOwn(change || {}, "expected")
+            && !sameIdentitySnapshot(currentIdentity(units), change.expected);
+        if (alreadyApplied(this._promptSemanticUnits)) {
+            return this._promptSemanticUnits;
+        }
+        const saveAgainst = async (units) => this._savePromptSemanticUnits(
+            applyPromptIdentityChange(units || [], change), label, { recordUndo });
+        const reconcileUnknownOutcome = async (error) => {
+            const reconciled = await this._fetchReferences({
+                ignoreMutationGate: true,
+                reason: "prompt_identity_change_reconcile", force: true,
+            });
+            if (reconciled && alreadyApplied(this._promptSemanticUnits)) {
+                return this._promptSemanticUnits;
+            }
+            if (reconciled && targetChanged(this._promptSemanticUnits)) {
+                const changed = new Error(
+                    "Prompt identity changed elsewhere. Reopen it before saving.");
+                changed.code = "prompt_identity_changed_elsewhere";
+                throw changed;
+            }
+            throw error;
+        };
+        try {
+            return await saveAgainst(this._promptSemanticUnits || []);
+        } catch (error) {
+            if (error?.code === "project_version_conflict"
+                    && Array.isArray(error?.project?.prompt_semantic_units)) {
+                // `fetchProjectJson` adopted the 409 response version. Rebase
+                // once; expected state protects the target while preserving
+                // unrelated identities and formats.
+                this._promptSemanticUnits = structuredClone(
+                    error.project.prompt_semantic_units);
+                if (Array.isArray(error.project.prompt_context_profiles)) {
+                    this._promptContextProfiles = structuredClone(
+                        error.project.prompt_context_profiles);
+                }
+                if (alreadyApplied(this._promptSemanticUnits)) {
+                    return this._promptSemanticUnits;
+                }
+                try {
+                    return await saveAgainst(this._promptSemanticUnits);
+                } catch (retryError) {
+                    return reconcileUnknownOutcome(retryError);
+                }
+            }
+            // A dropped response can hide a successful PUT. Re-read before
+            // deciding whether history advances or remains retryable.
+            return reconcileUnknownOutcome(error);
+        }
+    }
+
+    async _applyReferenceHistoryOperations(operations, label) {
+        const requested = Array.isArray(operations) ? operations : [];
+        const stateFor = (operation) => {
+            const memberId = String(operation?.member_id || "");
+            return (this._references || []).flatMap((reference) =>
+                reference?.members || []).find((member) =>
+                String(member?.member_id || "") === memberId) || null;
+        };
+        const fieldsMatch = (member, fields) => Object.entries(fields || {})
+            .every(([key, value]) => String(member?.[key] || "") === String(value || ""));
+        const alreadyApplied = () => requested.every((operation) =>
+            fieldsMatch(stateFor(operation), operation?.fields));
+        const expectedStillCurrent = () => requested.every((operation) =>
+            fieldsMatch(stateFor(operation), operation?.expected));
+        const refreshed = await this._fetchReferences({
+            ignoreMutationGate: true, reason: "reference_history", force: true,
+        });
+        if (!refreshed) {
+            throw new Error("Current physical References could not be loaded safely.");
+        }
+        if (alreadyApplied()) return true;
+        try {
+            await this._mutateReferences(requested, label);
+            return true;
+        } catch (error) {
+            const reconciled = await this._fetchReferences({
+                ignoreMutationGate: true,
+                reason: "reference_history_reconcile", force: true,
+            });
+            if (reconciled && alreadyApplied()) return true;
+            if (reconciled && !expectedStillCurrent()) {
+                const changed = new Error(
+                    "The physical Reference changed elsewhere. Reopen and try again.");
+                changed.code = "identity_mismatch";
+                throw changed;
+            }
+            throw error;
+        }
     }
 
     _applyReferencePayload(payload, { projectDir = this.projectDir, requestSeq = this._referenceFetchSeq } = {}) {
@@ -2012,23 +2295,46 @@ export class EditorWidget {
     async _materializeReferenceMemberHandle({
         referenceId, memberId, suggestion, expectedHandle = "",
     } = {}) {
-        const result = await this._mutateReferences([{
+        const targetReferenceId = String(referenceId || "");
+        const targetMemberId = String(memberId || "");
+        const operation = {
             type: "materialize_member_handle",
-            reference_id: String(referenceId || ""),
-            member_id: String(memberId || ""),
+            reference_id: targetReferenceId,
+            member_id: targetMemberId,
             suggestion: String(suggestion || ""),
             // Exact stored state only. A derived suggestion is never an
             // expected value and therefore cannot create a false mismatch.
             expected: { handle: String(expectedHandle || "") },
-        }], "materialize physical Reference handle");
-        const responseHandle = result?.payload?.results?.find((value) =>
-            value?.type === "materialize_member_handle"
-                && String(value?.member_id || "") === String(memberId || ""))?.handle;
-        const storedHandle = responseHandle || (this._references || [])
-            .flatMap((reference) => reference?.members || [])
-            .find((member) => String(member?.member_id || "") === String(memberId || ""))?.handle;
-        if (!storedHandle) throw new Error("The Reference handle was not materialized.");
-        return String(storedHandle);
+        };
+        const storedTarget = () => (this._references || [])
+            .find((reference) => String(reference?.reference_id || "")
+                === targetReferenceId)?.members?.find((member) =>
+                String(member?.member_id || "") === targetMemberId) || null;
+        try {
+            const result = await this._mutateReferences(
+                [operation], "materialize physical Reference handle");
+            const responseHandle = result?.payload?.results?.find((value) =>
+                value?.type === "materialize_member_handle"
+                    && String(value?.member_id || "") === targetMemberId)?.handle;
+            const storedHandle = responseHandle || storedTarget()?.handle;
+            if (!storedHandle) throw new Error("The Reference handle was not materialized.");
+            return { handle: String(storedHandle), ownsHandle: true };
+        } catch (error) {
+            // The POST may have committed before its response was lost. Re-read
+            // the exact target and let Attach use any now-durable handle. The
+            // observed handle is deliberately not claimed for Undo: without a
+            // response it could instead be a concurrent author's edit.
+            const reconciled = await this._fetchReferences({
+                ignoreMutationGate: true,
+                reason: "materialize_reference_handle_reconcile",
+                force: true,
+            });
+            const observedHandle = reconciled ? String(storedTarget()?.handle || "") : "";
+            if (observedHandle) {
+                return { handle: observedHandle, ownsHandle: false };
+            }
+            throw error;
+        }
     }
 
     _reconcileReferencesAfterAssetDeletion(payload) {
@@ -2939,6 +3245,15 @@ export class EditorWidget {
         const entry = this._undoStack[this._undoStack.length - 1];
         if (label && entry?.label !== label) return false;
         this._undoStack.pop();
+        return true;
+    }
+
+    _discardUndoEntry(target) {
+        if (!target || !this._undoStack?.length) return false;
+        const index = this._undoStack.lastIndexOf(target);
+        if (index < 0) return false;
+        this._undoStack.splice(index, 1);
+        this._replayDeferredHistoryWidgetStateIfIdle?.();
         return true;
     }
 
@@ -9614,6 +9929,7 @@ export class EditorWidget {
         const inputs = {};
         const columns = {};
         const projectionHosts = {};
+        const projectionSignatures = {};
         let sharedAttachments = normalizePromptAttachments(initialAttachments);
         const draftSceneSnapshot = () => {
             const draftChannels = Object.fromEntries(keys.map((key) => [
@@ -9842,6 +10158,7 @@ export class EditorWidget {
         dormancyLine.style.cssText = "flex:1 0 100%;min-width:0;display:none;"
             + `font-size:9px;line-height:1.4;color:${COLORS.textDim};`;
         wrap.insertBefore(dormancyLine, wrap.firstChild);
+        let dormancySignature = null;
         const renderChannelProjections = (candidate = undefined) => {
             if (candidate === undefined) {
                 candidate = consumerSection
@@ -9856,10 +10173,19 @@ export class EditorWidget {
                 const dormancy = consumerSection
                     ? this._promptSectionDormancy(consumerSection.prompt_id || "")
                     : null;
-                dormancyLine.textContent = dormancy?.message || "";
-                dormancyLine.style.display = dormancy ? "" : "none";
+                const nextDormancySignature = JSON.stringify(dormancy || null);
+                if (nextDormancySignature !== dormancySignature) {
+                    dormancySignature = nextDormancySignature;
+                    dormancyLine.textContent = dormancy?.message || "";
+                    dormancyLine.style.display = dormancy ? "" : "none";
+                }
             }
             for (const key of keys) {
+                const signature = attachmentChannelProjectionSignature({
+                    channelKey: key, attachments: sharedAttachments,
+                    candidate, attachmentLabelFor,
+                });
+                if (signature === projectionSignatures[key]) continue;
                 const next = createAttachmentChannelProjections({
                     channelKey: key,
                     attachments: sharedAttachments,
@@ -9917,6 +10243,7 @@ export class EditorWidget {
                 projectionHosts[key].beforeHost.replaceWith(next.beforeHost);
                 projectionHosts[key].afterHost.replaceWith(next.afterHost);
                 projectionHosts[key] = next;
+                projectionSignatures[key] = signature;
             }
         };
         this._refreshInlinePromptProjections = renderChannelProjections;
@@ -10902,7 +11229,7 @@ export class EditorWidget {
      *  user is editing. Enqueue invokes the same backend compiler again and
      *  freezes that result; hover merely reads this versioned cache. */
     /**
-     * What "Convert to prose" would write for one staged capability.
+     * What "Copy with handles" would write for one staged capability.
      *
      * Rides the existing compile endpoint rather than a route of its own: the
      * plan needs the fully resolved setup context, and a second endpoint that
@@ -10910,16 +11237,23 @@ export class EditorWidget {
      * Never cached — the answer depends on staging, which the author may have
      * changed since the last compile.
      */
-    async _promptConvertPlan(attachmentId, capabilityId, scenePatch = null) {
+    async _promptCopyPlan(attachmentId, capabilityId, scenePatch = null,
+        { sceneWide = false } = {}) {
         const dirName = this._projectDirName?.();
         const sceneId = this.activeSceneId;
         if (!dirName || !sceneId) return null;
         const candidate = { ...structuredClone(this.activeScene),
             ...structuredClone(scenePatch || {}) };
         const range = this._selectionContextRange?.();
-        const windowStart = Math.max(0, Math.round(range?.contextStart ?? 0));
-        const windowEnd = Math.max(windowStart + 1, Math.round(
-            range?.contextEnd ?? candidate.duration_frames ?? this.totalFrames ?? 1));
+        const duration = Math.max(1, Math.round(
+            candidate.duration_frames ?? this.totalFrames ?? 1));
+        const windowStart = sceneWide
+            ? 0 : Math.max(0, Math.round(range?.contextStart ?? 0));
+        const windowEnd = sceneWide
+            ? duration : Math.max(windowStart + 1, Math.round(
+                range?.contextEnd ?? duration));
+        const selection = sceneWide
+            ? { selectionStart: 0, selectionEnd: duration } : null;
         const response = await fetch(api.apiURL(
             `/sonder-editor/project/${encodeURIComponent(dirName)}/scenes/${encodeURIComponent(sceneId)}/prompt-context/compile`
         ), {
@@ -10927,20 +11261,21 @@ export class EditorWidget {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 ...this._promptCompileRequestBody({
-                    dirName, candidate, windowStart, windowEnd, labelsOn: true }),
-                convert_plan_for: { attachment_id: attachmentId,
+                    dirName, candidate, windowStart, windowEnd, selection,
+                    labelsOn: true }),
+                copy_plan_for: { attachment_id: attachmentId,
                     capability_id: capabilityId },
             }),
         });
         if (!response.ok) return null;
         const payload = await response.json();
-        return payload?.convert_plan || null;
+        return payload?.copy_plan || null;
     }
 
     /**
      * The compile request body, built once for every caller.
      *
-     * Preview and the Convert plan each assembled this separately, and the
+     * Preview and the Copy plan each assembled this separately, and the old
      * Convert copy carried 7 of the 13 fields. That divergence did not cause
      * the empty-plan defect — the hand-built server context did — but two
      * copies of a request body that must describe the SAME candidate is how a
@@ -11069,6 +11404,19 @@ export class EditorWidget {
         return this._promptScenePayload() || windowed;
     }
 
+    /** Clear the shared stale-paint timer only after BOTH parallel caches settle. */
+    _clearPromptStaleVisualTimerIfSettled(sceneId = this.activeSceneId) {
+        const pending = [this._promptContextCandidateCache,
+            this._promptContextScenePayloadCache].some((value) =>
+            value?._candidate_scene_id === sceneId && value?._stale === true);
+        if (pending) return false;
+        if (this._promptContextStaleVisualTimer) {
+            clearTimeout(this._promptContextStaleVisualTimer);
+        }
+        this._promptContextStaleVisualTimer = null;
+        return true;
+    }
+
     /**
      * The same candidate, compiled over the WHOLE scene, for dormant sections.
      *
@@ -11098,6 +11446,7 @@ export class EditorWidget {
         if (windowStart <= 0 && windowEnd >= duration) {
             // The window IS the scene, so the two compiles would be identical.
             this._promptContextScenePayloadCache = null;
+            this._clearPromptStaleVisualTimerIfSettled(sceneId);
             return;
         }
         (async () => {
@@ -11113,21 +11462,35 @@ export class EditorWidget {
                     })),
                 });
                 if (token !== this._promptContextScenePayloadToken) return;
-                if (!response.ok) { this._promptContextScenePayloadCache = null; return; }
+                if (!response.ok) {
+                    this._promptContextScenePayloadCache = null;
+                    this._clearPromptStaleVisualTimerIfSettled(sceneId);
+                    this._refreshInlinePromptProjections?.();
+                    this._promptPanelHandle?.refreshProjections?.();
+                    return;
+                }
                 const payload = await response.json().catch(() => null);
-                if (token !== this._promptContextScenePayloadToken || !payload) return;
+                if (token !== this._promptContextScenePayloadToken) return;
+                if (!payload) {
+                    this._promptContextScenePayloadCache = null;
+                    this._clearPromptStaleVisualTimerIfSettled(sceneId);
+                    this._refreshInlinePromptProjections?.();
+                    this._promptPanelHandle?.refreshProjections?.();
+                    return;
+                }
                 this._promptContextScenePayloadCache = {
                     ...this._promptProjectionSubset(payload),
                     _candidate_scene_id: sceneId,
                     _stale: false,
                 };
+                this._clearPromptStaleVisualTimerIfSettled(sceneId);
             } catch (error) {
                 // A dormant projection is an aid, not a result. Leaving the
                 // cache null degrades to the empty box this feature replaces
                 // rather than to a wrong one, so a failure is not reported.
-                if (token === this._promptContextScenePayloadToken) {
-                    this._promptContextScenePayloadCache = null;
-                }
+                if (token !== this._promptContextScenePayloadToken) return;
+                this._promptContextScenePayloadCache = null;
+                this._clearPromptStaleVisualTimerIfSettled(sceneId);
             }
             // Deliberately NOT `refreshDiagnostics` and NOT `applyCandidate`.
             // Diagnostics must stay windowed-only, and Reference Prompting
@@ -11142,8 +11505,18 @@ export class EditorWidget {
         const sceneId = this.activeSceneId;
         if (!dirName || !sceneId || !this.activeScene) return;
         if (this._promptContextPreviewTimer) clearTimeout(this._promptContextPreviewTimer);
+        if (this._promptContextStaleVisualTimer) {
+            clearTimeout(this._promptContextStaleVisualTimer);
+        }
+        this._promptContextStaleVisualTimer = null;
         const token = (this._promptContextPreviewToken || 0) + 1;
         this._promptContextPreviewToken = token;
+        // Invalidate the previous scene-wide sibling NOW, not when this edit's
+        // debounced request eventually starts. Otherwise an older response can
+        // land during the debounce gap and repaint superseded projections as
+        // fresh data.
+        this._promptContextScenePayloadToken =
+            (this._promptContextScenePayloadToken || 0) + 1;
         const candidate = { ...structuredClone(this.activeScene),
             ...structuredClone(scenePatch || {}) };
         const range = this._selectionContextRange?.();
@@ -11159,16 +11532,46 @@ export class EditorWidget {
             // all, so dormant rows showed undimmed data from a superseded
             // compile while the windowed rows beside them correctly dimmed.
             this._promptContextScenePayloadCache = {
-                ...this._promptContextScenePayloadCache, _stale: true };
+                ...this._promptContextScenePayloadCache,
+                _stale: true, _stale_visual: false };
         }
         if (this._promptContextCandidateCache?._candidate_scene_id === sceneId) {
             this._promptContextCandidateCache = {
                 ...this._promptContextCandidateCache,
                 _stale: true,
+                _stale_visual: false,
             };
-            this._promptPanelHandle?.refreshDiagnostics?.(
-                this._promptContextCandidateCache);
-            this._refreshInlinePromptProjections?.();
+        }
+        if (this._promptScenePayload()
+                || this._promptContextCandidateCache?._candidate_scene_id === sceneId) {
+            this._promptContextStaleVisualTimer = setTimeout(() => {
+                this._promptContextStaleVisualTimer = null;
+                if (token !== this._promptContextPreviewToken
+                        || sceneId !== this.activeSceneId) return;
+                if (this._promptContextScenePayloadCache?._stale === true) {
+                    this._promptContextScenePayloadCache = {
+                        ...this._promptContextScenePayloadCache,
+                        _stale_visual: true,
+                    };
+                }
+                if (this._promptContextCandidateCache?._stale === true) {
+                    this._promptContextCandidateCache = {
+                        ...this._promptContextCandidateCache,
+                        _stale_visual: true,
+                    };
+                }
+                const hasWindowed =
+                    this._promptContextCandidateCache?._candidate_scene_id === sceneId;
+                if (hasWindowed) {
+                    this._promptPanelHandle?.refreshDiagnostics?.(
+                        this._promptContextCandidateCache);
+                } else {
+                    // With no windowed payload there is no diagnostics fan-out
+                    // to sweep the panel's projection hosts.
+                    this._promptPanelHandle?.refreshProjections?.();
+                }
+                this._refreshInlinePromptProjections?.();
+            }, PROMPT_STALE_VISUAL_DELAY_MS);
         }
         this._promptContextPreviewTimer = setTimeout(async () => {
             this._previewPromptContextScenePayload({
@@ -11185,11 +11588,15 @@ export class EditorWidget {
                     })),
                 });
                 const payload = await response.json().catch(() => null);
-                if (token !== this._promptContextPreviewToken || !payload) return;
-                const candidatePayload = response.ok ? payload : {
+                if (token !== this._promptContextPreviewToken) return;
+                const candidatePayload = response.ok && payload ? payload : {
                     errors: [{
-                        code: payload?.code || `preview_http_${response.status}`,
-                        message: payload?.error || "Prompt Context candidate preview failed.",
+                        code: payload?.code || (response.ok
+                            ? "preview_invalid_response"
+                            : `preview_http_${response.status}`),
+                        message: payload?.error || (response.ok
+                            ? "Prompt Context candidate preview returned no usable payload."
+                            : "Prompt Context candidate preview failed."),
                     }],
                     warnings: [],
                     attachment_previews: {},
@@ -11199,6 +11606,7 @@ export class EditorWidget {
                     _candidate_scene_id: sceneId,
                     _stale: false,
                 };
+                this._clearPromptStaleVisualTimerIfSettled(sceneId);
                 this._promptPanelHandle?.refreshDiagnostics?.(
                     this._promptContextCandidateCache);
                 this._refreshInlinePromptProjections?.();
@@ -11218,7 +11626,11 @@ export class EditorWidget {
                         _candidate_scene_id: sceneId,
                         _stale: false,
                     };
+                    this._clearPromptStaleVisualTimerIfSettled(sceneId);
                     this._promptPanelHandle?.refreshDiagnostics?.(
+                        this._promptContextCandidateCache);
+                    this._refreshInlinePromptProjections?.();
+                    this._promptPanelHandle?.applyCandidate?.(
                         this._promptContextCandidateCache);
                 }
             }
@@ -16893,23 +17305,58 @@ export class EditorWidget {
     /** Capture a snapshot of the active scene BEFORE a mutation. */
     _pushUndo(label = "edit", {
         referenceOperations = [], inverseReferenceOperations = [],
+        promptIdentityChange = null, inversePromptIdentityChange = null,
+        pending = false,
     } = {}) {
         if (!this.activeScene || !this.activeSceneId) return;
         // Deep-clone the scene dict as snapshot
         const snapshot = JSON.parse(JSON.stringify(this.activeScene));
-        this._undoStack.push({
+        const entry = {
             sceneId: this.activeSceneId,
             snapshot,
             label,
             referenceOperations: structuredClone(referenceOperations || []),
             inverseReferenceOperations: structuredClone(inverseReferenceOperations || []),
-        });
-        // Trim to max size
-        if (this._undoStack.length > this._maxUndoSteps) {
-            this._undoStack.shift();
+            promptIdentityChange: promptIdentityChange
+                ? structuredClone(promptIdentityChange) : null,
+            inversePromptIdentityChange: inversePromptIdentityChange
+                ? structuredClone(inversePromptIdentityChange) : null,
+            pending: Boolean(pending),
+        };
+        this._undoStack.push(entry);
+        this._trimUndoStack();
+        // A pending transaction has not changed durable scene state yet. Keep
+        // prior Redo ownership until commit; a fully refused + compensated
+        // action must be history-neutral.
+        if (!entry.pending) this._redoStack = [];
+        return entry;
+    }
+
+    _commitUndoEntry(entry) {
+        if (!entry) return false;
+        if (!this._undoStack.includes(entry)) {
+            // Pending entries are never trimmed. Absence means their owning
+            // scene/history was reset; never re-home that snapshot into the
+            // current scene's stack.
+            return false;
         }
-        // Any new action clears the redo stack
+        entry.pending = false;
+        this._trimUndoStack();
         this._redoStack = [];
+        this._replayDeferredHistoryWidgetStateIfIdle?.();
+        return true;
+    }
+
+    _trimUndoStack() {
+        // Pending entries have not committed durable state and therefore do
+        // not spend an Undo slot yet. If they later refuse, exact removal must
+        // recover the byte-for-byte history stack that preceded them.
+        while (this._undoStack.filter((entry) => !entry?.pending).length
+                > this._maxUndoSteps) {
+            const index = this._undoStack.findIndex((entry) => !entry?.pending);
+            if (index < 0) break;
+            this._undoStack.splice(index, 1);
+        }
     }
 
     _captureProjectDependencies() {
@@ -16926,7 +17373,31 @@ export class EditorWidget {
             snapshot: structuredClone(snapshot || this._captureProjectDependencies()),
             label,
         });
-        if (this._undoStack.length > this._maxUndoSteps) this._undoStack.shift();
+        this._trimUndoStack();
+        this._redoStack = [];
+    }
+
+    _pushPromptIdentityUndo(label, change, inverseChange) {
+        this._undoStack.push({
+            kind: "prompt_identity",
+            sceneId: this.activeSceneId || "",
+            change: structuredClone(change),
+            inverseChange: structuredClone(inverseChange),
+            label,
+        });
+        this._trimUndoStack();
+        this._redoStack = [];
+    }
+
+    _pushReferenceUndo(label, operations, inverseOperations) {
+        this._undoStack.push({
+            kind: "reference_change",
+            sceneId: this.activeSceneId || "",
+            operations: structuredClone(operations || []),
+            inverseOperations: structuredClone(inverseOperations || []),
+            label,
+        });
+        this._trimUndoStack();
         this._redoStack = [];
     }
 
@@ -16952,12 +17423,62 @@ export class EditorWidget {
     }
 
     async _undo() {
+        if (this._historyOperationInFlight) {
+            notifyInfo("Undo or Redo is still finishing. Try again in a moment.",
+                { source: "history-operation-pending" });
+            return;
+        }
+        if (this._hasPendingHistoryCommit?.()) {
+            notifyInfo("That change is still saving. Try Undo again when it finishes.",
+                { source: "undo-pending" });
+            return;
+        }
+        if (this._sceneHistoryLifecycleOwner) {
+            notifyInfo("Another scene change is still finishing. Try Undo again in a moment.",
+                { source: "undo-scene-lifecycle-pending" });
+            return;
+        }
+        this._historyOperationInFlight = true;
+        try {
+            return await this._runUndo();
+        } finally {
+            this._finishHistoryOperation();
+        }
+    }
+
+    _finishHistoryOperation() {
+        this._historyOperationInFlight = false;
+        this._replayDeferredHistoryWidgetStateIfIdle();
+    }
+
+    _replayDeferredHistoryWidgetStateIfIdle() {
+        if (this._historyIsBusy?.()) return false;
+        const pending = this._pendingHistoryWidgetState;
+        this._pendingHistoryWidgetState = null;
+        if (pending) {
+            try {
+                this.applyWidgetState(pending);
+            } catch (error) {
+                notifyWarning(error?.message || "Deferred scene state could not be applied.",
+                    { source: "history-widget-state-replay-failed" });
+            }
+        }
+        return true;
+    }
+
+    async _runUndo() {
         if (this._undoStack.length === 0) {
             this._keyboardDebug("undo skipped: empty stack", {
                 activeSceneId: this.activeSceneId || "",
                 undoDepth: this._undoStack.length,
                 redoDepth: this._redoStack.length,
             });
+            return;
+        }
+        const pendingEntry = this._undoStack[this._undoStack.length - 1];
+        if (pendingEntry?.pending) {
+            notifyInfo("That change is still saving. Try Undo again when it finishes.",
+                { source: "undo-pending" });
             return;
         }
         const entry = this._undoStack.pop();
@@ -16972,11 +17493,54 @@ export class EditorWidget {
         });
 
         if (entry.kind === "project_dependencies") {
-            this._redoStack.push({
+            const opposite = {
                 kind: "project_dependencies", sceneId: this.activeSceneId || "",
                 snapshot: this._captureProjectDependencies(), label: entry.label,
-            });
-            await this._restoreProjectDependencies(entry.snapshot);
+            };
+            try {
+                await this._restoreProjectDependencies(entry.snapshot);
+            } catch (error) {
+                this._undoStack.push(entry);
+                notifyWarning(error?.message || "Undo was refused.", { source: "undo-refused" });
+                return;
+            }
+            this._redoStack.push(opposite);
+            return;
+        }
+
+        if (entry.kind === "prompt_identity") {
+            const opposite = {
+                kind: "prompt_identity", sceneId: this.activeSceneId || "",
+                change: structuredClone(entry.inverseChange),
+                inverseChange: structuredClone(entry.change), label: entry.label,
+            };
+            try {
+                await this._applyPromptIdentityChange(entry.change,
+                    `undo ${entry.label || "prompt identity"}`, { recordUndo: false });
+            } catch (error) {
+                this._undoStack.push(entry);
+                notifyWarning(error?.message || "Undo was refused.", { source: "undo-refused" });
+                return;
+            }
+            this._redoStack.push(opposite);
+            return;
+        }
+
+        if (entry.kind === "reference_change") {
+            const opposite = {
+                kind: "reference_change", sceneId: this.activeSceneId || "",
+                operations: structuredClone(entry.inverseOperations || []),
+                inverseOperations: structuredClone(entry.operations || []), label: entry.label,
+            };
+            try {
+                await this._applyReferenceHistoryOperations(entry.operations,
+                    `undo ${entry.label || "Reference change"}`);
+            } catch (error) {
+                this._undoStack.push(entry);
+                notifyWarning(error?.message || "Undo was refused.", { source: "undo-refused" });
+                return;
+            }
+            this._redoStack.push(opposite);
             return;
         }
 
@@ -16986,23 +17550,56 @@ export class EditorWidget {
             label: entry.label,
             referenceOperations: structuredClone(entry.inverseReferenceOperations || []),
             inverseReferenceOperations: structuredClone(entry.referenceOperations || []),
+            promptIdentityChange: entry.inversePromptIdentityChange
+                ? structuredClone(entry.inversePromptIdentityChange) : null,
+            inversePromptIdentityChange: entry.promptIdentityChange
+                ? structuredClone(entry.promptIdentityChange) : null,
         } : null;
         let referencesApplied = false;
+        let promptIdentityApplied = false;
         try {
             if (entry.referenceOperations?.length) {
-                await this._mutateReferences(entry.referenceOperations,
+                await this._applyReferenceHistoryOperations(entry.referenceOperations,
                     `undo ${entry.label || "prompt attachment"}`);
                 referencesApplied = true;
+            }
+            if (entry.promptIdentityChange) {
+                await this._applyPromptIdentityChange(entry.promptIdentityChange,
+                    `undo ${entry.label || "prompt attachment"}`, { recordUndo: false });
+                promptIdentityApplied = true;
             }
             await this._restoreScene(entry.sceneId, entry.snapshot);
             if (opposite) this._redoStack.push(opposite);
         } catch (error) {
-            if (referencesApplied && entry.inverseReferenceOperations?.length) {
-                await this._mutateReferences(entry.inverseReferenceOperations,
-                    `restore failed undo ${entry.label || "prompt attachment"}`);
-            }
+            // The source entry remains authoritative until every durable
+            // participant has completed. Requeue it before attempting
+            // best-effort compensation so a second failure cannot erase the
+            // user's only retry path.
             this._undoStack.push(entry);
-            notifyWarning(error?.message || "Undo was refused.", { source: "undo-refused" });
+            const compensationErrors = [];
+            if (promptIdentityApplied && entry.inversePromptIdentityChange) {
+                try {
+                    await this._applyPromptIdentityChange(entry.inversePromptIdentityChange,
+                        `restore failed undo ${entry.label || "prompt attachment"}`,
+                        { recordUndo: false });
+                } catch (compensationError) {
+                    compensationErrors.push(compensationError);
+                }
+            }
+            if (referencesApplied && entry.inverseReferenceOperations?.length) {
+                try {
+                    await this._applyReferenceHistoryOperations(
+                        entry.inverseReferenceOperations,
+                        `restore failed undo ${entry.label || "prompt attachment"}`);
+                } catch (compensationError) {
+                    compensationErrors.push(compensationError);
+                }
+            }
+            const recoveryDetail = compensationErrors.length
+                ? ` Recovery also failed: ${compensationErrors.map((value) =>
+                    value?.message || String(value)).join("; ")}` : "";
+            notifyWarning(`${error?.message || "Undo was refused."}${recoveryDetail}`,
+                { source: "undo-refused" });
             return;
         }
         this._keyboardDebug("undo complete", {
@@ -17015,6 +17612,35 @@ export class EditorWidget {
     }
 
     async _redo() {
+        if (this._historyOperationInFlight) {
+            notifyInfo("Undo or Redo is still finishing. Try again in a moment.",
+                { source: "history-operation-pending" });
+            return;
+        }
+        if (this._hasPendingHistoryCommit?.()) {
+            notifyInfo("That change is still saving. Try Redo again when it finishes.",
+                { source: "redo-pending" });
+            return;
+        }
+        if (this._sceneHistoryLifecycleOwner) {
+            notifyInfo("Another scene change is still finishing. Try Redo again in a moment.",
+                { source: "redo-scene-lifecycle-pending" });
+            return;
+        }
+        this._historyOperationInFlight = true;
+        try {
+            return await this._runRedo();
+        } finally {
+            this._finishHistoryOperation();
+        }
+    }
+
+    async _runRedo() {
+        if (this._undoStack[this._undoStack.length - 1]?.pending) {
+            notifyInfo("That change is still saving. Try Redo again when it finishes.",
+                { source: "redo-pending" });
+            return;
+        }
         if (this._redoStack.length === 0) {
             this._keyboardDebug("redo skipped: empty stack", {
                 activeSceneId: this.activeSceneId || "",
@@ -17035,11 +17661,54 @@ export class EditorWidget {
         });
 
         if (entry.kind === "project_dependencies") {
-            this._undoStack.push({
+            const opposite = {
                 kind: "project_dependencies", sceneId: this.activeSceneId || "",
                 snapshot: this._captureProjectDependencies(), label: entry.label,
-            });
-            await this._restoreProjectDependencies(entry.snapshot);
+            };
+            try {
+                await this._restoreProjectDependencies(entry.snapshot);
+            } catch (error) {
+                this._redoStack.push(entry);
+                notifyWarning(error?.message || "Redo was refused.", { source: "redo-refused" });
+                return;
+            }
+            this._undoStack.push(opposite);
+            return;
+        }
+
+        if (entry.kind === "prompt_identity") {
+            const opposite = {
+                kind: "prompt_identity", sceneId: this.activeSceneId || "",
+                change: structuredClone(entry.inverseChange),
+                inverseChange: structuredClone(entry.change), label: entry.label,
+            };
+            try {
+                await this._applyPromptIdentityChange(entry.change,
+                    `redo ${entry.label || "prompt identity"}`, { recordUndo: false });
+            } catch (error) {
+                this._redoStack.push(entry);
+                notifyWarning(error?.message || "Redo was refused.", { source: "redo-refused" });
+                return;
+            }
+            this._undoStack.push(opposite);
+            return;
+        }
+
+        if (entry.kind === "reference_change") {
+            const opposite = {
+                kind: "reference_change", sceneId: this.activeSceneId || "",
+                operations: structuredClone(entry.inverseOperations || []),
+                inverseOperations: structuredClone(entry.operations || []), label: entry.label,
+            };
+            try {
+                await this._applyReferenceHistoryOperations(entry.operations,
+                    `redo ${entry.label || "Reference change"}`);
+            } catch (error) {
+                this._redoStack.push(entry);
+                notifyWarning(error?.message || "Redo was refused.", { source: "redo-refused" });
+                return;
+            }
+            this._undoStack.push(opposite);
             return;
         }
 
@@ -17049,23 +17718,52 @@ export class EditorWidget {
             label: entry.label,
             referenceOperations: structuredClone(entry.inverseReferenceOperations || []),
             inverseReferenceOperations: structuredClone(entry.referenceOperations || []),
+            promptIdentityChange: entry.inversePromptIdentityChange
+                ? structuredClone(entry.inversePromptIdentityChange) : null,
+            inversePromptIdentityChange: entry.promptIdentityChange
+                ? structuredClone(entry.promptIdentityChange) : null,
         } : null;
         let referencesApplied = false;
+        let promptIdentityApplied = false;
         try {
             if (entry.referenceOperations?.length) {
-                await this._mutateReferences(entry.referenceOperations,
+                await this._applyReferenceHistoryOperations(entry.referenceOperations,
                     `redo ${entry.label || "prompt attachment"}`);
                 referencesApplied = true;
+            }
+            if (entry.promptIdentityChange) {
+                await this._applyPromptIdentityChange(entry.promptIdentityChange,
+                    `redo ${entry.label || "prompt attachment"}`, { recordUndo: false });
+                promptIdentityApplied = true;
             }
             await this._restoreScene(entry.sceneId, entry.snapshot);
             if (opposite) this._undoStack.push(opposite);
         } catch (error) {
-            if (referencesApplied && entry.inverseReferenceOperations?.length) {
-                await this._mutateReferences(entry.inverseReferenceOperations,
-                    `restore failed redo ${entry.label || "prompt attachment"}`);
-            }
             this._redoStack.push(entry);
-            notifyWarning(error?.message || "Redo was refused.", { source: "redo-refused" });
+            const compensationErrors = [];
+            if (promptIdentityApplied && entry.inversePromptIdentityChange) {
+                try {
+                    await this._applyPromptIdentityChange(entry.inversePromptIdentityChange,
+                        `restore failed redo ${entry.label || "prompt attachment"}`,
+                        { recordUndo: false });
+                } catch (compensationError) {
+                    compensationErrors.push(compensationError);
+                }
+            }
+            if (referencesApplied && entry.inverseReferenceOperations?.length) {
+                try {
+                    await this._applyReferenceHistoryOperations(
+                        entry.inverseReferenceOperations,
+                        `restore failed redo ${entry.label || "prompt attachment"}`);
+                } catch (compensationError) {
+                    compensationErrors.push(compensationError);
+                }
+            }
+            const recoveryDetail = compensationErrors.length
+                ? ` Recovery also failed: ${compensationErrors.map((value) =>
+                    value?.message || String(value)).join("; ")}` : "";
+            notifyWarning(`${error?.message || "Redo was refused."}${recoveryDetail}`,
+                { source: "redo-refused" });
             return;
         }
         this._keyboardDebug("redo complete", {
@@ -17078,7 +17776,7 @@ export class EditorWidget {
     }
 
     async _restoreScene(sceneId, snapshot) {
-        if (!this.projectDir) return;
+        if (!this.projectDir) throw new Error("No project is open for scene restore.");
         const dirName = this.projectDir.split(/[/\\]/).pop();
         this._keyboardDebug("restore start", {
             sceneId,
@@ -17098,33 +17796,64 @@ export class EditorWidget {
                 status: resp.status,
                 ok: resp.ok,
             });
-            if (resp.ok) {
-                // If we're restoring a different scene, switch to it
-                if (this.activeSceneId !== sceneId) {
-                    this.activeSceneId = sceneId;
-                }
-                await this._fetchScenes();
-                this._keyboardDebug("restore fetched scenes", {
-                    sceneId,
-                    activeSceneId: this.activeSceneId || "",
-                    sceneCount: this.scenes.length,
-                    activeElement: describeKeyboardDebugElement(document.activeElement),
-                });
-                this._renderTimeline();
-                this._renderViewportFrame();
-                this._keyboardDebug("restore render complete", {
-                    sceneId,
-                    activeSceneId: this.activeSceneId || "",
-                    editorFocused: !!this._editorFocused,
-                    activeElement: describeKeyboardDebugElement(document.activeElement),
-                });
+            if (!resp.ok) {
+                throw new Error(`Scene restore failed (${resp.status}).`);
             }
+            // If we're restoring a different scene, switch to it
+            if (this.activeSceneId !== sceneId) {
+                this.activeSceneId = sceneId;
+            }
+            await this._fetchScenes();
+            this._keyboardDebug("restore fetched scenes", {
+                sceneId,
+                activeSceneId: this.activeSceneId || "",
+                sceneCount: this.scenes.length,
+                activeElement: describeKeyboardDebugElement(document.activeElement),
+            });
+            this._renderTimeline();
+            this._renderViewportFrame();
+            this._keyboardDebug("restore render complete", {
+                sceneId,
+                activeSceneId: this.activeSceneId || "",
+                editorFocused: !!this._editorFocused,
+                activeElement: describeKeyboardDebugElement(document.activeElement),
+            });
         } catch (e) {
             this._keyboardDebug("restore failed", {
                 sceneId,
                 error: e?.message || String(e),
             });
             console.warn("[Sonder] Undo/redo restore failed:", e);
+            // The restore PUT may have committed before its response or the
+            // following refresh failed. Re-read and treat an exact target
+            // snapshot as success so history cannot strand an already-applied
+            // scene transition.
+            try {
+                const reconcileResponse = await fetch(api.apiURL(
+                    `/sonder-editor/project/${dirName}/scenes`));
+                if (!reconcileResponse.ok) throw new Error(
+                    `Scene history reconciliation failed (${reconcileResponse.status}).`);
+                const reconcilePayload = await reconcileResponse.json();
+                const reconciledScenes = Array.isArray(reconcilePayload?.scenes)
+                    ? reconcilePayload.scenes : [];
+                const restored = reconciledScenes.find((scene) =>
+                    String(scene?.scene_id || "") === String(sceneId || ""));
+                if (restored && JSON.stringify(restored) === JSON.stringify(snapshot)) {
+                    this.scenes = reconciledScenes;
+                    this._setActiveScene(restored);
+                    try {
+                        this._renderTimeline();
+                        this._renderViewportFrame();
+                    } catch (renderError) {
+                        console.warn("[Sonder] Restored scene, but history repaint failed:",
+                            renderError);
+                    }
+                    return;
+                }
+            } catch (reconcileError) {
+                console.warn("[Sonder] Failed to reconcile scene restore:", reconcileError);
+            }
+            throw e;
         }
     }
 

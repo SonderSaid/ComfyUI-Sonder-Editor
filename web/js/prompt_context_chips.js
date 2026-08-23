@@ -19,6 +19,7 @@ import {
     referenceDerivedDeclarations,
     referenceFieldDeclaration,
 } from "./prompt_profile_declarations.js";
+import { promptCandidateVisuallyStale } from "./prompt_context_diagnostics.js";
 
 /**
  * Context-chip role identity: the violet that marks an authored chip as a chip
@@ -4935,6 +4936,71 @@ export function channelContributionRows({ channelKey = "", attachments = [],
     return out;
 }
 
+/** Everything `createAttachmentChannelProjections` reads, as one render key. */
+export function attachmentChannelProjectionSignature({ channelKey = "",
+    attachments = [], candidate = null, attachmentLabelFor = null,
+    disabled = false } = {}) {
+    const normalized = normalizePromptAttachments(attachments);
+    const ids = new Set(normalized.map((value) => value.attachment_id));
+    const groups = new Set(normalized.map((value) => value.emission_group_id));
+    const projections = (candidate?.attachment_capability_projections || [])
+        .filter((value) => value?.channel_key === channelKey
+            && ids.has(value?.attachment_id))
+        .map((value) => ({
+            attachment_id: value?.attachment_id,
+            capability_id: value?.capability_id,
+            emission_group_id: value?.emission_group_id,
+            state: value?.state,
+            text: value?.text,
+            rendered_at_anchor: value?.rendered_at_anchor === true,
+            region: value?.region,
+            order: value?.order,
+            declared_placement: value?.declared_placement,
+            effective_phase: value?.effective_phase,
+            state_reason: value?.state_reason,
+        }));
+    // Suppression controls disclose other enabled chips in the same emission
+    // group, even when those siblings are outside this host's attachment pool.
+    const linkedProjections = (candidate?.attachment_capability_projections || [])
+        .filter((value) => groups.has(value?.emission_group_id))
+        .map((value) => ({
+            attachment_id: value?.attachment_id,
+            capability_id: value?.capability_id,
+            emission_group_id: value?.emission_group_id,
+            state: value?.state,
+        }));
+    const split = candidate?.attachment_channel_previews || {};
+    const routes = candidate?.attachment_channel_routes || {};
+    const fallback = normalized.map((attachment) => ({
+        attachment_id: attachment.attachment_id,
+        emission_group_id: attachment.emission_group_id,
+        label: attachmentLabelFor?.(attachment) || "",
+        preview: split?.[attachment.attachment_id]?.[channelKey] || "",
+        route: routes?.[attachment.attachment_id]?.[channelKey] ?? null,
+    }));
+    const emissions = (candidate?.emissions || [])
+        .filter((value) => value?.channel_key === channelKey
+            && (ids.has(value?.attachment_id)
+                || groups.has(value?.emission_group_id)))
+        .map((value) => ({
+            attachment_id: value?.attachment_id,
+            emission_group_id: value?.emission_group_id,
+            channel_key: value?.channel_key,
+            origin: value?.origin,
+        }));
+    return JSON.stringify({
+        stale: promptCandidateVisuallyStale(candidate),
+        disabled: disabled === true,
+        // The controls close over these exact records. A superseded object
+        // must rebuild even when its rendered projection happens to match.
+        attachments: normalized,
+        projections,
+        linked_projections: linkedProjections,
+        fallback,
+        emissions,
+    });
+}
+
 export function createAttachmentChannelProjections({ channelKey = "", attachments = [],
     candidate = null, attachmentLabelFor = null, onActivate = null,
     onSetCapabilityEnabled = null, onLinkedSuppressionWarning = null } = {}) {
@@ -4987,7 +5053,7 @@ export function createAttachmentChannelProjections({ channelKey = "", attachment
             // it names, so it is interaction, not metadata.
             projection.style.cssText = `min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:2px 7px;border:1px solid ${COLORS.border};border-radius:999px;background:${COLORS.panelRaised};color:${COLORS.accentHi};font:9px/1.3 system-ui;cursor:pointer;text-align:left;`;
             projection.title = [
-                candidate?._stale
+                promptCandidateVisuallyStale(candidate)
                     ? "Preview is updating; showing the latest scene-matched compile." : "",
                 `Source: ${sourceLabel}`, `Destination: ${channelKey}`,
                 `Declared placement: ${placementDisplayLabel(
@@ -5047,7 +5113,7 @@ export function createAttachmentChannelProjections({ channelKey = "", attachment
         }
         if (!beforeHost.childElementCount) beforeHost.style.display = "none";
         if (!afterHost.childElementCount) afterHost.style.display = "none";
-        if (candidate?._stale) {
+        if (promptCandidateVisuallyStale(candidate)) {
             beforeHost.style.opacity = "0.62";
             afterHost.style.opacity = "0.62";
         }
@@ -5078,7 +5144,7 @@ export function createAttachmentChannelProjections({ channelKey = "", attachment
             projection.textContent = `${LABELS[attachment.kind] || attachment.kind}: ${identity || "Context"}${text ? "" : " · no output"}`;
             projection.style.cssText = `max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:2px 7px;border:1px solid ${COLORS.border};border-radius:999px;background:${COLORS.panelRaised};color:${COLORS.accentHi};font:9px/1.3 system-ui;cursor:pointer;`;
             projection.title = [
-                candidate?._stale ? "Preview is updating; showing the latest scene-matched compile." : "",
+                promptCandidateVisuallyStale(candidate) ? "Preview is updating; showing the latest scene-matched compile." : "",
                 identity ? `Source: ${identity}` : "Source: Context attachment",
                 text ? `Contribution to ${channelKey}:\n${text}`
                     : (linkedEmission
@@ -5208,16 +5274,25 @@ export function createScopeChipRow({ attachments = [], previews = {}, disabled =
         // After the style, never before: assigning cssText would wipe the
         // dimming, and the flag alone leaves a control that looks live.
         setButtonDisabled(chip, disabled);
-        const chipLabel = attachmentLabel(attachment,
-            previews?.[attachment.attachment_id] || "",
-            attachmentLabelFor?.(attachment) || "");
-        chip.setAttribute("aria-label", `${chipLabel} Context chip`);
+        const identityLabel = attachmentLabelFor?.(attachment) || "";
+        const preview = previews?.[attachment.attachment_id] || "";
+        // A scope chip identifies what is staged; it does not repaint itself
+        // as the compiler's latest emission. Keep that richer, potentially
+        // stale spelling as hover disclosure only. Inline pills deliberately
+        // continue to pass their preview to `attachmentLabel`.
+        const chipLabel = attachmentLabel(attachment, "", identityLabel);
+        const previewedLabel = attachmentLabel(
+            attachment, preview, identityLabel);
+        // The visible text stays stable, but the richer spelling must not be a
+        // mouse-only native tooltip. Its accessible name distinguishes two
+        // same-identity chips whose resolved contributions differ.
+        chip.setAttribute("aria-label", `${previewedLabel} Context chip`);
         chip.setAttribute("aria-haspopup", "menu");
         chip.appendChild(contextChipLabel(chipLabel));
         const inlineOnly = INLINE_ONLY_KINDS.includes(attachment.kind);
         chip.title = inlineOnly
-            ? `${chipLabel} \u2014 ${LABELS[attachment.kind] || attachment.kind} must be placed inline in the prompt text; re-insert or remove this chip.`
-            : `${chipLabel} \u2014 click for what you can do with it`;
+            ? `${previewedLabel} \u2014 ${LABELS[attachment.kind] || attachment.kind} must be placed inline in the prompt text; re-insert or remove this chip.`
+            : `${previewedLabel} \u2014 click for what you can do with it`;
         if (inlineOnly) {
             // A legacy scope row stays visible and reachable so it can be
             // rebound or removed; the compiler refuses the job meanwhile.
@@ -5283,10 +5358,14 @@ export function createScopeChipRow({ attachments = [], previews = {}, disabled =
                 x: rect.left, y: rect.bottom + 2, closeOnScroll: true,
                 focusFirst: true,
                 items: hidden.map((attachment) => {
-                    const chipLabel = attachmentLabel(attachment,
-                        previews?.[attachment.attachment_id] || "",
-                        attachmentLabelFor?.(attachment) || "");
+                    const identityLabel = attachmentLabelFor?.(attachment) || "";
+                    const preview = previews?.[attachment.attachment_id] || "";
+                    const chipLabel = attachmentLabel(
+                        attachment, "", identityLabel);
+                    const previewedLabel = attachmentLabel(
+                        attachment, preview, identityLabel);
                     return { label: `${LABELS[attachment.kind] || attachment.kind}: ${chipLabel}`,
+                        hint: previewedLabel,
                         submenu: () => chipMenuItems(attachment, chipLabel) };
                 }),
             });
@@ -5349,7 +5428,11 @@ export function createScopeChipRow({ attachments = [], previews = {}, disabled =
         openContextMenu({ x: rect.left, y: rect.bottom + 2, items,
             closeOnScroll: true, focusFirst: true });
     });
-    row.appendChild(add);
+    // Attach is the row's primary action, so it intentionally precedes the
+    // chips in both visual and keyboard order. Inserting it after construction
+    // keeps the menu's already-computed kind/reuse closures intact while its x
+    // no longer moves as chips are added, removed, hidden, or wrapped.
+    row.insertBefore(add, caption.nextSibling);
     // The offered kinds, for anything that needs to know what this row allows
     // without opening its menu. `INLINE_ONLY_KINDS` and the format gate are
     // applied above, once, so no reader can re-derive them differently.

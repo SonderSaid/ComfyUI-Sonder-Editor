@@ -3,6 +3,10 @@
  * the Prompt tool needs. Candidate payloads are ephemeral and window-specific;
  * they must never be confused with the full-scene PromptRelay preview.
  */
+export function promptCandidateVisuallyStale(payload) {
+    return payload?._stale === true && payload?._stale_visual !== false;
+}
+
 export function buildPromptContextDiagnostics(payload) {
     const value = payload && typeof payload === "object" ? payload : {};
     const byAttachment = {};
@@ -49,7 +53,7 @@ export function buildPromptContextDiagnostics(payload) {
         warningCount: (Array.isArray(value.warnings) ? value.warnings.length : 0),
         attachmentDiagnosticCount: Object.values(byAttachment)
             .reduce((sum, rows) => sum + rows.length, 0),
-        stale: value._stale === true,
+        stale: promptCandidateVisuallyStale(value),
     };
 }
 
