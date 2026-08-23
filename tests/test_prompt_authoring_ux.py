@@ -1,6 +1,7 @@
 """Phase 1 contracts for visible compile failures and cooperative prompt bars."""
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -924,9 +925,24 @@ def test_context_actions_are_named_by_inline_vs_scope_semantics():
     assert 'label: "Writing aid"' in chips
     assert "export function installPromptContextMenu" in chips
     assert "createContextPicker" not in chips
-    assert 'add.textContent = "Attach to this section/scene";' in chips
+    # One control where four were: the kind select, Attach, the reuse select and
+    # Reuse collapsed into a single `+ Attach` whose menu carries the kinds and
+    # a Reuse submenu. The old label named the two SCOPES it could attach to,
+    # which the row's own caption now says once instead of on every button.
+    assert 'add.textContent = "+ Attach";' in chips
     scope = chips[chips.index("export function createScopeChipRow"):]
-    assert "add.title" not in scope
+    # No selects at all, and no per-chip trailing controls: a chip is label-only
+    # so its holder's width is its width, which is what "uniform" means here.
+    assert 'createElement("select")' not in scope
+    assert 'textContent = "Unlink"' not in scope
+    assert 'textContent = "Convert to copy"' not in scope
+    # The two actions that both read "Unlink" are now distinguishable, because a
+    # menu row can carry a hint and a button in a crowded row could not.
+    assert '"Unlink this section"' in scope
+    assert '"Unlink from the other sections"' in scope
+    # And the filter that keeps Timeline, Structured and Writing agreeing about
+    # what may be attached still runs once, here.
+    assert "promptContextGatedKinds(" in scope
 
 
 def test_writing_grip_and_prompt_panel_use_the_advertised_space():
@@ -942,11 +958,78 @@ def test_writing_grip_and_prompt_panel_use_the_advertised_space():
     assert 'maxWidth: "1320px"' in panel
 
 
+def _call_text(source, start):
+    """One call, from its opening paren to its matching close.
+
+    A fixed-width slice is a magic number that decides what the guard can see:
+    the call this exists to police is 2034 characters long, so a 2000-character
+    window missed its last argument and the probe that should have failed came
+    back green.
+    """
+    depth = 0
+    for index in range(source.index("(", start), len(source)):
+        if source[index] == "(":
+            depth += 1
+        elif source[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return source[start:index + 1]
+    raise AssertionError("unbalanced call")
+
+
+def _method_body(source, name, marker=None):
+    """The text of one method: its parameter list, then its brace-matched body.
+
+    Balances the PARENTHESES first. A destructured parameter list carries its
+    own braces, so matching braces from the signature stops at the end of the
+    parameters and returns a body of nothing -- which then satisfies every
+    "this identifier is absent" assertion made about it.
+    """
+    start = source.index(name + "(")
+    depth = 0
+    cursor = start + len(name)
+    for index in range(cursor, len(source)):
+        if source[index] == "(":
+            depth += 1
+        elif source[index] == ")":
+            depth -= 1
+            if depth == 0:
+                cursor = source.index("{", index)
+                break
+    else:
+        raise AssertionError(f"unbalanced parentheses after {name}")
+    depth = 0
+    for index in range(cursor, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                body = source[start:index + 1]
+                # Truncation is the dangerous failure, not total failure: a
+                # short body satisfies every "this identifier is absent"
+                # assertion vacuously. Brace matching cannot see braces inside
+                # strings or template literals, so the caller states a marker it
+                # knows the real body ends with.
+                assert len(body) > len(name) + 40, body
+                if marker is not None:
+                    assert marker in body, (name, body[-300:])
+                return body
+    raise AssertionError(f"unbalanced braces after {name}")
+
+
 def test_prompt_panel_consumes_only_windowed_candidate_diagnostics():
+    """Prompt-tool blockers come only from the WINDOWED candidate compile.
+
+    This used to assert `"_promptPayloadCache" not in panel` -- a NAME, so the
+    moment a second full-scene payload arrived under any other name the guard
+    passed while the invariant it was written for was gone. It now asserts the
+    property: the only full-scene payload that exists is projection-shaped, the
+    panel reaches it exclusively through two host helpers, and nothing on its
+    arrival path can reach diagnostics.
+    """
     panel = _source("web/js/editor_prompt_panel.js")
     widget = _source("web/js/editor_widget.js")
-    assert "_promptPayloadCache" not in panel
-    assert "currentCandidatePayload()?.attachment_previews" in panel
     assert "refreshDiagnostics: renderDiagnostics" in panel
     assert "_candidate_scene_id: sceneId" in widget
     assert "const candidateSelection = resolvePromptCandidateSelection(" in widget
@@ -958,6 +1041,102 @@ def test_prompt_panel_consumes_only_windowed_candidate_diagnostics():
     assert "selection_start: selection ? selection.selectionStart" in widget
     assert "_promptCompileRequestBody({" in widget
     assert "this._promptPayloadCache = payload" not in widget
+
+    # The scene-wide payload is kept behind two named helpers. The panel may not
+    # touch the cache itself, or a surface could read a field the subset drops
+    # and silently get `undefined` instead of the windowed answer.
+    assert "_promptContextScenePayloadCache" not in panel
+    assert "host._promptCandidateForSection?.(" in panel
+    assert "host._promptSectionDormancy?.(" in panel
+
+    # What the subset keeps, exactly. Anything not on this list never leaves the
+    # fetch, which is the only form of the rule that survives a later change.
+    subset = _method_body(widget, "_promptProjectionSubset", marker="return out;")
+    keep = set(re.findall(r'"([a-z_]+)"', subset))
+    assert keep == {
+        "attachment_capability_projections", "attachment_channel_previews",
+        "attachment_channel_routes", "emissions", "attachment_previews",
+        "section_window_states"}, keep
+
+    # And nothing on the scene payload's arrival path can reach diagnostics,
+    # the queue gate, or Reference Prompting -- which derives from a
+    # `setup_manifest` this payload deliberately does not carry.
+    arrival = _method_body(widget, "_previewPromptContextScenePayload",
+                           marker="refreshProjections?.();")
+    # Comments stripped: the body explains at length what it must not do, and
+    # matching that prose would make the guard pass or fail on the wording.
+    code = " ".join(line.split("//")[0] for line in arrival.splitlines())
+    for forbidden in ("refreshDiagnostics", "applyCandidate", "setup_manifest",
+                      "ordinal_manifest", "errors", "warnings"):
+        assert forbidden not in code, forbidden
+
+
+def test_the_scene_wide_compile_asks_for_the_whole_scene():
+    """A full-scene SELECTION, not a full-scene window. They are not the same.
+
+    `window_start`/`window_end` in the compile body are only defaults for the
+    selection; the server resolves the real window from `selection +/- context`
+    (`resolve_execution_window`). Sending window fields alone therefore compiles
+    the NARROW window again -- a scene-wide payload that is a copy of the one it
+    exists to supplement, with nothing to show it went wrong.
+    """
+    widget = _source("web/js/editor_widget.js")
+    arrival = _method_body(widget, "_previewPromptContextScenePayload",
+                           marker="refreshProjections?.();")
+    assert "selection: { selectionStart: 0, selectionEnd: duration }" in arrival
+    assert "windowStart: 0, windowEnd: duration" in arrival
+    # ...and it does not fire at all when the window already is the scene.
+    assert "if (windowStart <= 0 && windowEnd >= duration)" in arrival
+
+
+def test_an_editing_surface_never_reads_the_scene_wide_payload():
+    """The attach dialog is an editing surface, not a projection surface.
+
+    `configurePromptAttachment` renders each capability's live routing state
+    from `attachment_capability_projections` and a standalone Time's resolved
+    value from `attachment_channel_previews` -- both of which the scene payload
+    KEEPS. So "we dropped the dangerous fields" is not by itself an argument:
+    handed the scene payload it would show a compile state the render will not
+    produce, with none of the disclosure a projection row carries. It also reads
+    `setup_manifest`, which the subset drops, so it would silently degrade.
+    """
+    panel = _source("web/js/editor_prompt_panel.js")
+    widget = _source("web/js/editor_widget.js")
+    chips = _source("web/js/prompt_context_chips.js")
+    # The fields that make this a live question rather than a theoretical one.
+    assert "candidate?.attachment_capability_projections" in chips
+    assert "candidate?.attachment_channel_previews" in chips
+    # EVERY configure call, in BOTH files, and every one of them -- not the
+    # first. The inline timeline bar lives in `editor_widget.js`, which an
+    # earlier version of this guard did not read at all, and it was handing the
+    # dialog its own per-section `candidate` closure.
+    windowed = ("candidate: currentCandidatePayload()",
+                "candidate: this._windowedPromptCandidate()")
+    checked = 0
+    for source in (panel, widget):
+        start = 0
+        while True:
+            start = source.find("configurePromptAttachment(", start)
+            if start < 0:
+                break
+            call = _call_text(source, start)
+            start += 1
+            # SHORTHAND counts. `candidate,` passes a local named
+            # `candidate`, which in the inline bar is the per-section
+            # payload. An earlier version of this guard skipped any call
+            # with no literal `candidate:`, so the one real violation in
+            # the tree went unseen and the probe that should have caught
+            # it came back green.
+            for line in call.split(chr(10)):
+                assert line.strip() not in ("candidate,", "candidate"), call[:600]
+            if "candidate:" not in call:
+                continue
+            assert any(value in call for value in windowed), call[:600]
+            checked += 1
+    # The guard is worthless if it matched nothing; there are several.
+    assert checked >= 4, checked
+    # And the projection surfaces are the ones that switch.
+    assert "payload = candidateForSection(section.prompt_id)) => {" in panel
 
 
 def test_refused_prompt_writes_reconcile_every_mounted_consumer():
@@ -1374,7 +1553,10 @@ def test_every_reference_chip_surface_uses_runtime_identity_and_authoring_contro
     # called twice — once for channels the author has written in and once for
     # the channels a chip feeds but they have not. Omitting identity there is
     # how every Shot and every section-scoped chip came to read "Reference".
-    assert panel.count("attachmentLabelFor,") == 10
+    # 9, not 10: the Writing decoration resolved its rows twice — once for
+    # written channels and once for fed-but-unwritten ones — and now does
+    # it through one `rowsFor` helper. A surface was merged, not lost.
+    assert panel.count("attachmentLabelFor,") == 9
     assert "Shared identity default · @" in chips
     assert "Prompt Format default ·" in chips
     assert "no managed Vocal Event in this window" in chips
@@ -1926,72 +2108,6 @@ def test_handle_attach_default_matches_the_servers_undeclared_order_rule():
     assert result["serverDefault"] == []
     assert result["deviating"] == [
         {"capability_id": "unordered", "kind": "unordered"}]
-
-
-def test_the_inline_reference_capability_is_read_from_the_declaration():
-    """Which capability Convert mints, and why it cannot be a hardcoded name.
-
-    A converted handle has to render where it sits, which only a capability the
-    format declares `inline` does. That kind is per-format — `mentions` under
-    MiniMax H3 Full Reference, `derived_prompt` under generic — so it comes from
-    the declaration. A format declaring no inline capability answers "", and
-    Convert refuses rather than falling back: the fallback is a section-prefix
-    capability that emits its own line and nothing at the caret, which is the
-    shipped defect.
-    """
-    from server import prompt_context
-
-    builtin = prompt_context.BUILTIN_PROFILES
-    profiles = {
-        "h3": builtin["minimax_h3_ref@1"],
-        "generic": builtin["generic@1"],
-        # Declares Reference capabilities, none of them inline.
-        "prefix_only": {"capabilities": {"reference": {"derived": {
-            "definitions": {"order": 1, "channel_key": "body",
-                            "placement": "section_prefix"},
-        }}}},
-        # No Reference capabilities at all.
-        "bare": {"capabilities": {}},
-    }
-    result = _run_node(
-        f"const mod = await import("
-        f"{json.dumps((ROOT / 'web/js/prompt_context_chips.js').as_uri())});\n"
-        f"const p = {json.dumps(profiles)};\n"
-        "console.log(JSON.stringify(Object.fromEntries("
-        " Object.entries(p).map(([k, v]) =>"
-        " [k, mod.inlineReferenceCapabilityKind(v)]))));\n")
-    assert result == {"h3": "mentions", "generic": "derived_prompt",
-                      "prefix_only": "", "bare": ""}
-
-
-def test_convert_pins_both_routing_axes_on_the_chip_it_mints():
-    """Seeding the inline KIND alone leaves the sentence with a hole.
-
-    `_route_for` answers with a capability's DECLARED channel, and the compiler
-    renders at the anchor only when `route == channel_key`, so a `mentions` chip
-    converted into `subject_definitions` routes out to `detailed_description`.
-    Convert therefore writes `channel_key` and `placement` — the two axes a MENU
-    attach deliberately leaves sparse, because a menu attach infers routing
-    while Convert records where the author put the sentence.
-
-    Source-level: the compiled behaviour is pinned end to end in
-    `test_a_converted_mention_renders_where_the_author_put_it`, and what this
-    adds is that the browser is the thing writing that record.
-    """
-    panel = (ROOT / "web/js/editor_prompt_panel.js").read_text(encoding="utf-8")
-    convert = panel.split("const convertContributionToProse")[1].split(
-        "const writingDecorations")[0]
-    assert "inlineReferenceCapabilityKind(" in convert
-    assert "capabilityId: inlineKind" in convert
-    assert "channelKey, placement: \"inline\"" in convert
-    # The refusal is reachable and sits with the other pre-confirm guards, so a
-    # format with no inline capability never disables anything.
-    assert convert.index("if (!inlineKind)") < convert.index("window.confirm")
-    # The MENU attach keeps inferring from its channel; this must not become a
-    # symmetry. `onAccepted` is the `@` mention path.
-    accepted = panel.split("onAccepted: ({ value, channelKey")[1][:600]
-    assert "handleAttachCapabilityRecord(profile, { channelKey })" in accepted
-    assert "inlineReferenceCapabilityKind" not in accepted
 
 
 def test_unheadered_draft_text_lands_in_the_declared_default_draft_channel():

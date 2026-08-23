@@ -67,20 +67,13 @@ import {
     sceneWithDraftGlobal,
     sceneWithDraftSection,
     splitPromptDocumentChannels,
-    writingMentionQuery,
-    handleMentionCandidates,
-    promptMentionCandidates,
-    promptReferenceSourceOptions,
-    applyPromptReferenceSource,
     normalizePromptAttachment,
-    handleAttachCapabilityRecord,
-    inlineReferenceCapabilityKind,
-    sparseCapabilityRecord,
     splitWritingPromptDocument,
     setPromptAttachmentCapabilityEnabled,
 } from "./prompt_context_chips.js";
 import { getProjectVersion } from "./api_client.js";
 import { notifyInfo, notifySuccess, notifyWarning } from "./editor_notifications.js";
+import { openContextMenu } from "./editor_context_menu.js";
 import { resolvedPromptProfile } from "./prompt_profile_declarations.js";
 import { mountPromptFormatDeclarationEditor } from "./prompt_format_editor.js";
 import { createModalDraftGuard } from "./modal_draft_guard.js";
@@ -215,151 +208,6 @@ export function writingSplitText(activeChannel, defaultChannel) {
     const fallback = String(defaultChannel || "");
     const carry = active && active !== fallback ? `${active}:\n` : "";
     return `\n${WRITING_BREAK}\n${carry}`;
-}
-
-/** Typeahead for `@handle` while writing prose.
- *
- *  Accepting ATTACHES a Reference. It used to insert text, on the reasoning
- *  that attaching per keystroke would make an undo step per character — which
- *  confused a keystroke with an accept. The text version was worse than
- *  incomplete: the compiler's grammar is `@kind(source_id)`, so a bare
- *  `@KWoman` in prose compiles literally and never becomes `<Subject 1>`. Only
- *  an attachment resolves.
- *
- *  `sources()` is called once per menu OPEN, not per keystroke: the only
- *  builder of the shape it needs also reconciles block metadata and can clone
- *  attachments, so calling it per input event would be both expensive and
- *  side-effectful on the draft.
- *
- *  Returns a cleanup function, matching the module-host contract.
- */
-export function installWritingMentionMenu(area, { sources, channelAt, onAccepted } = {}) {
-    const menu = document.createElement("div");
-    menu.dataset.sonderPromptContextMenu = "1";
-    menu.setAttribute("role", "listbox");
-    // The Writing draft lives inside the panel overlay (z-index 10000), and
-    // dialogs above it use 12000 — a menu at 40 on `document.body` renders
-    // BEHIND all of it, which is indistinguishable from not opening at all.
-    // 12010 is the established "menu above panel chrome" tier. `fixed`, not
-    // `absolute`, because the anchor it is positioned from is itself fixed.
-    menu.style.cssText = `position:fixed;z-index:12010;display:none;min-width:150px;
-        max-height:180px;overflow:auto;border:1px solid ${COLORS.border};border-radius:6px;
-        background:${COLORS.panelRaised};box-shadow:0 6px 18px rgba(0,0,0,.45);padding:2px;`;
-    // The panel re-renders freely and builds a fresh draft area each time. Its
-    // callers cannot be relied on to run the returned cleanup, and a leaked
-    // menu is not merely garbage — it keeps a listener bound to a DETACHED
-    // editor, so a stale instance can still answer keys. Sweep any menu whose
-    // owner is gone before adding this one.
-    for (const stale of document.querySelectorAll("[data-sonder-writing-mention='1']")) {
-        if (!stale.__sonderOwner || !stale.__sonderOwner.isConnected) {
-            stale.__sonderDispose?.();
-            stale.remove();
-        }
-    }
-    menu.dataset.sonderWritingMention = "1";
-    menu.__sonderOwner = area;
-    document.body.appendChild(menu);
-    let rows = [];
-    let active = 0;
-    let query = null;
-
-    const close = () => { menu.style.display = "none"; rows = []; query = null; };
-    const paint = () => {
-        [...menu.children].forEach((row, index) => {
-            row.style.background = index === active ? COLORS.panelMuted : "transparent";
-            row.setAttribute("aria-selected", index === active ? "true" : "false");
-        });
-    };
-    const accept = (index) => {
-        const chosen = rows[index];
-        if (!chosen || !query) return close();
-        // An ineligible source is listed so the menu can explain itself, but it
-        // cannot be attached — accepting one would create a chip the compiler
-        // will refuse.
-        if (chosen.eligible === false) return;
-        // The channel the caret is writing in decides which declared capability
-        // the chip seeds. Without it every mention would seed `mentions`, whose
-        // route is the body field, so a mention typed under `subject_definitions`
-        // would emit somewhere else entirely — the defect the caret menu already
-        // had fixed.
-        const attached = onAccepted?.({
-            handle: chosen.handle,
-            value: chosen.value,
-            channelKey: channelAt?.(query.start) || "",
-            // In `value` coordinates, so the editor can delete the typed query
-            // and put the chip in its place. Leaving the text behind is what
-            // made a mention compile literally.
-            replaceTextRange: { start: query.start, end: query.end },
-        });
-        close();
-        return attached;
-    };
-    let sourceRows = [];
-    const refresh = () => {
-        const previous = query;
-        query = writingMentionQuery(area.value, area.promptTextOffset ?? -1);
-        if (!query || query.completingQualifier) return close();
-        // Once per OPEN. `sources()` reconciles block metadata and can clone
-        // attachments, so running it per keystroke would mutate the draft on
-        // every character typed.
-        if (!previous) sourceRows = sources?.() || [];
-        rows = handleMentionCandidates(query.handle, sourceRows);
-        if (!rows.length) return close();
-        menu.replaceChildren(...rows.map((row, index) => {
-            const item = document.createElement("div");
-            item.setAttribute("role", "option");
-            item.style.cssText = `padding:3px 7px;border-radius:4px;cursor:pointer;
-                color:${COLORS.text};font:11px system-ui,sans-serif;white-space:nowrap;`;
-            item.textContent = row.label === row.handle
-                ? `@${row.handle}` : `@${row.handle} — ${row.label}`;
-            item.addEventListener("mousedown", (event) => {
-                event.preventDefault();
-                accept(index);
-            });
-            return item;
-        }));
-        active = 0;
-        // Viewport coordinates, to match `position:fixed`. Flipped above the
-        // caret line when the menu would fall off the bottom of the window.
-        const box = area.getBoundingClientRect();
-        const height = Math.min(180, rows.length * 22 + 8);
-        const below = box.bottom + 2;
-        menu.style.left = `${Math.max(4, box.left)}px`;
-        menu.style.top = below + height > globalThis.innerHeight
-            ? `${Math.max(4, box.top - height - 2)}px` : `${below}px`;
-        menu.style.display = "block";
-        paint();
-    };
-
-    const onInput = () => refresh();
-    const onKeyDown = (event) => {
-        if (menu.style.display === "none") return false;
-        if (area.isPromptComposing?.() || event.isComposing || event.keyCode === 229) return false;
-        if (event.key === "Escape") { close(); return true; }
-        if (["ArrowDown", "ArrowUp"].includes(event.key)) {
-            active = (active + (event.key === "ArrowDown" ? 1 : rows.length - 1)) % rows.length;
-            paint();
-            return true;
-        }
-        if (["Enter", "Tab"].includes(event.key)) { accept(active); return true; }
-        return false;
-    };
-    area.addEventListener("input", onInput);
-    // NOT a raw keydown listener: `keyboard_ownership` owns these keys at
-    // capture on document and calls `stopImmediatePropagation`, so a listener
-    // on the element never runs. `addOwnedKeyHandler` is the editor's seam
-    // into that layer, and returning true marks the key consumed.
-    const removeOwned = area.addOwnedKeyHandler?.(onKeyDown) ?? (() => {});
-    area.addEventListener("blur", close);
-    const dispose = () => {
-        area.removeEventListener("input", onInput);
-        removeOwned();
-        area.removeEventListener("blur", close);
-        menu.__sonderDispose = null;
-        menu.remove();
-    };
-    menu.__sonderDispose = dispose;
-    return dispose;
 }
 
 /** Min-first proportional allocator (audit F2 — min to every block FIRST so
@@ -855,6 +703,13 @@ export function mountPromptManagementPanel(host) {
     // rebuilds the draft element and takes the caret and the chip editor's
     // undo history with it.
     let refreshWritingDecorations = null;
+    // Rebuilt by every render, called by every landed payload. The dormancy
+    // notice derives from a compile, and the panel renders before the first one
+    // arrives — leaving it to `render()` meant the notice appeared only when
+    // something unrelated forced a rebuild, which is the class of bug
+    // `durable_rules.md` calls "the consumer that regressed is rarely the one
+    // the payload is named after".
+    let dormancyRefreshers = [];
     const identityRefreshGate = createModalRefreshGate(() => renderNow());
     const render = () => identityRefreshGate.request();
     // Esc/blur-commit guard (audit F1): the OVERLAY consumer fires on the
@@ -1253,6 +1108,51 @@ export function mountPromptManagementPanel(host) {
         const payload = host._promptContextCandidateCache;
         return payload?._candidate_scene_id === host.activeSceneId ? payload : null;
     };
+    /**
+     * The payload that answers for ONE section's projections.
+     *
+     * A section outside the render window compiles not at all, so its chips
+     * projected nothing and the surface read as "nothing is staged". The
+     * scene-wide payload fills those rows in. Never use this for an EDITING
+     * surface — `configurePromptAttachment` renders live routing state and a
+     * standalone Time's resolved value from the same fields, and would show a
+     * compile state the render will not produce with none of the disclosure a
+     * projection row carries. Those keep `currentCandidatePayload()`.
+     */
+    const candidateForSection = (promptId) => {
+        const payload = host._promptCandidateForSection?.(String(promptId || ""));
+        return payload?._candidate_scene_id === host.activeSceneId ? payload : null;
+    };
+    /** Why a section contributes nothing here, or null when it contributes. */
+    const sectionDormancy = (promptId) =>
+        host._promptSectionDormancy?.(String(promptId || "")) || null;
+    /**
+     * One dim line saying why, and what its numbering means.
+     *
+     * Once per section, never per pill: under H3 a section can carry six
+     * channels and repeating the disclosure on each would bury the rows it is
+     * disclosing about.
+     */
+    const dormancyNotice = (resolve, { live = true } = {}) => {
+        const line = document.createElement("div");
+        line.style.cssText = `font-size:9px;color:${COLORS.textDim};`
+            + "line-height:1.4;opacity:.9;";
+        const apply = () => {
+            const dormancy = resolve();
+            line.dataset.sonderPromptDormancy = String(dormancy?.state || "");
+            line.textContent = dormancy?.message || "";
+            // Collapsed rather than removed: the row is rebuilt by a compile
+            // that lands while the author is typing, and removing an element
+            // from a card mid-edit reflows everything under the pointer.
+            line.style.display = dormancy ? "" : "none";
+        };
+        apply();
+        // `live: false` for a caller whose resolver closes over a fixed value --
+        // repainting it can never change anything, and registering it anyway is
+        // how a list reset only by a full render grows for a whole session.
+        if (live) dormancyRefreshers.push({ line, apply });
+        return line;
+    };
     const currentPromptProfile = (profileId = "") => resolvedPromptProfile({
         profileId: String(profileId || host.activeScene?.prompt_context_profile_id
             || host._channelTemplate?.()?.default_context_profile || "generic@1"),
@@ -1362,7 +1262,11 @@ export function mountPromptManagementPanel(host) {
 
         for (const projections of panel.querySelectorAll(
             "[data-sonder-prompt-channel-projections]")) {
-            projections._sonderRefreshProjection?.(payload);
+            // No payload: each host resolves the one that answers for its own
+            // section. Forwarding this one repainted a dormant section from the
+            // windowed compile, which holds no rows for it -- blanking the
+            // scene-derived pills under a line still saying they were there.
+            projections._sonderRefreshProjection?.();
         }
 
         for (const chip of panel.querySelectorAll("[data-attachment-id]")) {
@@ -1411,6 +1315,14 @@ export function mountPromptManagementPanel(host) {
             splitWritingPromptDocument(writingState.document, {
                 keepEmpty: writingState.blockMeta.length > 0,
             }));
+        // Which prompt id each block compiles under. NOT re-derived: a block
+        // keeps its source section's id when it has one and takes `newId`
+        // otherwise, and `newId` is a CALLER parameter — preview passes
+        // `preview:N`, Apply passes a fresh uuid — so a second copy of that
+        // expression would be wrong for Apply by construction. Stamped by the
+        // one projection both share. An index with no entry falls back to
+        // `selected`, i.e. to the behaviour before any of this.
+        let writingBlockPromptIds = [];
         const buildWritingCandidatePatch = (blockDocuments) => {
             const { sections, totalFrames: cursor } = writingSectionsFromDraft({
                 blocks: blockDocuments,
@@ -1422,9 +1334,27 @@ export function mountPromptManagementPanel(host) {
                 minLen,
                 newId: (index) => `preview:${index}`,
             });
+            writingBlockPromptIds = sections.map((value) => value.prompt_id);
             return { prompt_sections: sections,
                 duration_frames: Math.max(totalFrames, cursor) };
         };
+        /**
+         * The prompt id of one block, or "" while the stamp is out of date.
+         *
+         * `writingBlockPromptIds` is stamped from `writingState.document` on the
+         * strip's 300ms debounce, while the decorations index it against ranges
+         * derived from the LIVE model on every landed compile. Between typing a
+         * `---` and the strip catching up the two disagree by one, and block n
+         * would read block n-1's id -- a dormancy line and a payload belonging
+         * to a different section. A count mismatch is the cheap, exact signal
+         * that the stamp is stale, and refusing falls back to `selected`, which
+         * is the behaviour before any of this.
+         */
+        const writingBlockPromptId = (blockIndex, blockCount) =>
+            (writingBlockPromptIds.length === blockCount
+                ? writingBlockPromptIds[blockIndex] : "") || "";
+        const writingBlockDormancy = (blockIndex, blockCount) =>
+            sectionDormancy(writingBlockPromptId(blockIndex, blockCount));
         const previewWritingBlocks = (blockDocuments) => {
             host._previewPromptContextCandidate?.(
                 buildWritingCandidatePatch(blockDocuments));
@@ -1469,7 +1399,6 @@ export function mountPromptManagementPanel(host) {
         let draftTimer = null;
         let draftArea = null;
         refreshWritingDecorations = null;
-        let disposeMentionMenu = null;
         const draftAttachmentContext = (nodeId = "") => {
             const blockDocuments = reconcileWritingBlockMeta(
                 splitWritingPromptDocument(writingState.document, {
@@ -1548,272 +1477,154 @@ export function mountPromptManagementPanel(host) {
             return draftArea.restorePromptSelection({
                 start: position, end: position }) ? node : null;
         };
-        const convertContributionToProse = async (attachmentId, capabilityId,
-            channelKey, anchor) => {
+        /**
+         * Put a contribution's LIVE SPELLING on the clipboard.
+         *
+         * The successor to *Convert to prose*, and deliberately smaller. Convert
+         * had to write prose AND disable the chip atomically, which meant caret
+         * placement, chip minting, heading creation and a group-wide disable —
+         * every one of which was a way to get it wrong. Copy hands the author
+         * text and lets them decide where it goes; turning the chip off is a
+         * separate, visible action beside it.
+         *
+         * What it copies is handles, never the rendered line. `PromptSection`
+         * channels are persisted, so pasting `<Subject 1>` would freeze an
+         * ordinal into stored text — the one invariant this feature exists to
+         * protect. The plan is built inside the compile for the same reason it
+         * always was: the context it needs is injected during compilation.
+         */
+        const copyContribution = async (attachmentId, capabilityId) => {
             const plan = await host._promptConvertPlan?.(
                 attachmentId, capabilityId, buildWritingCandidatePatch(
                     writingBlockDocuments()));
             if (!plan) {
-                notifyWarning("Could not work out what converting this would write.",
-                    { source: "prompt-convert" });
+                notifyWarning("Could not work out what this contribution says.",
+                    { source: "prompt-copy" });
                 return false;
             }
             if (plan.refused) {
-                notifyWarning(plan.refused, { source: "prompt-convert" });
+                notifyWarning(plan.refused, { source: "prompt-copy" });
                 return false;
             }
-            // Nothing to write is a REFUSAL, never a quiet success. The shipped
-            // version disabled the capability regardless, so the contribution
-            // left the prompt with nothing in its place. Checked here, before
-            // the confirm: a before/after comparison of the draft text cannot
-            // stand in for it, because the insertion below unconditionally
-            // writes a newline first and the text always changes.
-            if (!(plan.lines || []).some((line) => (line.parts || []).length)) {
-                notifyWarning("This contribution resolves to nothing right now, so"
-                    + " there is no prose to write. Nothing was changed.",
-                    { source: "prompt-convert" });
-                return false;
-            }
-            // Resolved BEFORE the confirm, with the other refusals. A converted
-            // handle has to render where it sits, and only a capability the
-            // format declares `inline` does that; a format declaring none has
-            // no live spelling for a Reference inside a sentence, which is the
-            // same refusal `missing[]` makes below for an entity with no handle.
-            const inlineKind = inlineReferenceCapabilityKind(
-                host._resolvedPromptContextProfile?.());
-            if (!inlineKind) {
-                notifyWarning("This prompt format has no way to name a Reference"
-                    + " inside a sentence, so converting would freeze its number."
-                    + " Nothing was changed.", { source: "prompt-convert" });
-                return false;
-            }
-            // Every chip the emission group stages, because Convert silences the
-            // GROUP. Dedupe keys on `(emission_group_id, capability_id, kind,
-            // channel)`, so with the same Reference staged on three sections
-            // only one chip emits and the others read "equivalent output
-            // already emitted" — disabling just the clicked one promotes a
-            // sibling and the definition still reaches the prompt, now twice:
-            // once as the author's prose. The group already behaves as one
-            // record and the author converted the group's contribution.
-            //
-            // Matched on capability only, not on channel: a linked group is one
-            // chip cloned, so its capability set is identical, while a sibling
-            // whose record pins a different channel would slip through a
-            // channel filter and keep emitting.
-            const projections = currentCandidatePayload()
-                ?.attachment_capability_projections || [];
-            const clickedRow = projections.find((row) =>
-                String(row?.attachment_id || "") === attachmentId
-                && String(row?.capability_id || "") === capabilityId);
-            const emissionGroup = String(clickedRow?.emission_group_id || "");
-            const groupAttachmentIds = new Set([attachmentId,
-                ...(emissionGroup ? projections
-                    .filter((row) => String(row?.emission_group_id || "") === emissionGroup
-                        && String(row?.capability_id || "") === capabilityId)
-                    .map((row) => String(row?.attachment_id || ""))
-                    .filter(Boolean) : [])]);
             const units = host._promptSemanticUnits || [];
-            const handleForUnit = (unitId) => String((units.find((value) =>
-                String(value?.semantic_unit_id || "") === String(unitId)) || {})
-                .handle || "");
             const members = (host._references || []).flatMap((entity) =>
-                (entity?.members || []).map((member) => ({
-                    member_id: String(member?.member_id || ""),
-                    handle: String(member?.handle || "") })));
-            const handleForMember = (memberId) => String((members.find((value) =>
-                value.member_id === String(memberId)) || {}).handle || "");
-
-            // A piece is either literal text or a REFERENCE the prose names.
-            // Building one string and inserting it would leave `@KWoman` as
-            // inert text: nothing re-parses a mention out of prose, so the
-            // provider would receive the literal handle and the Reference would
-            // stop being cited at all — worse output than the ordinal this
-            // action exists to avoid. Each named entity is inserted as a real
-            // attachment node, the same way accepting a mention does.
-            const pieces = [];
-            const missing = [];
-            // The same two calls the mention menu makes, in the same order.
-            // `promptReferenceSourceOptions` is the authority on what may be
-            // attached and why; its rows carry no handle, so
-            // `promptMentionCandidates` is the join. Reusing both means Convert
-            // can only attach what the author could have attached by hand, and
-            // there is no second opinion about eligibility.
-            const sourceOptions = promptMentionCandidates({
-                options: promptReferenceSourceOptions({
-                    scene: { ...(scene || {}),
-                        _context_reference_frame_threshold:
-                            host._referenceFrameThreshold || 0 },
-                    references: host._references || [],
-                    semanticUnits: host._promptSemanticUnits || [],
-                    profileId: scene?.prompt_context_profile_id
-                        || host._channelTemplate().default_context_profile || "generic@1",
-                    scope: "global",
-                    resolvedProfile: host._resolvedPromptContextProfile?.(),
-                }),
-                references: host._references || [],
-                semanticUnits: host._promptSemanticUnits || [],
-            }) || [];
-            const optionForHandle = (handle) => (sourceOptions.find((row) =>
-                String(row?.handle || "") === String(handle)
-                && row?.eligible !== false) || null);
-            const pushReference = (handle, rendered) => {
-                const option = optionForHandle(handle);
-                if (!option) { missing.push(rendered); return; }
-                pieces.push({ kind: "reference", option, handle });
+                (entity?.members || []));
+            const handleFor = (part) => {
+                const id = String(part?.id || "");
+                if (part?.source === "member") {
+                    return String((members.find((value) =>
+                        String(value?.member_id || "") === id) || {}).handle || "");
+                }
+                return String((units.find((value) =>
+                    String(value?.semantic_unit_id || "") === id) || {}).handle || "");
             };
+            const missing = [];
+            const lines = [];
             for (const line of plan.lines || []) {
+                let text = "";
                 for (const part of line.parts || []) {
-                    if (part.kind === "text") {
-                        pieces.push({ kind: "text", text: part.text });
-                        continue;
-                    }
+                    if (part.kind === "text") { text += part.text; continue; }
                     if (part.kind === "handle") {
-                        const handle = handleForUnit(part.id);
+                        const handle = handleFor(part);
                         if (!handle) { missing.push(part.rendered); continue; }
-                        pushReference(handle, part.rendered);
+                        text += `@${handle}`;
                         continue;
                     }
                     if (part.kind === "sources") {
-                        const names = (part.member_ids || []).map(handleForMember);
+                        const names = (part.member_ids || []).map((id) =>
+                            String((members.find((value) =>
+                                String(value?.member_id || "") === String(id))
+                                || {}).handle || ""));
                         // A Subject with no VISUAL source still gets a sources
-                        // segment, empty. Falling through emitted
-                        // " from  and @undefined" into the author's prompt, and
-                        // `some(v => !v)` cannot catch it because an empty list
-                        // satisfies every predicate.
+                        // segment, empty. Falling through wrote " from  and "
+                        // into the clipboard, and `some(v => !v)` cannot catch
+                        // it because an empty list satisfies every predicate.
                         if (!names.length) continue;
                         if (names.some((value) => !value)) {
                             missing.push(part.rendered);
                             continue;
                         }
-                        pieces.push({ kind: "text", text: " from " });
-                        names.forEach((handle, index) => {
-                            if (index) {
-                                pieces.push({ kind: "text",
-                                    text: index === names.length - 1
-                                        ? (names.length > 2 ? ", and " : " and ") : ", " });
-                            }
-                            pushReference(handle, part.rendered);
-                        });
+                        // Mirrors the server exactly: two sources join with
+                        // " and ", three or more take an Oxford comma before
+                        // the last. A plain `", "` join for 3+ produced text
+                        // the chip does not emit, which is the one thing a
+                        // clipboard copy must never do.
+                        const spelled = names.map((h) => `@${h}`);
+                        text += " from " + (spelled.length > 2
+                            ? `${spelled.slice(0, -1).join(", ")}, and ${spelled.at(-1)}`
+                            : spelled.join(" and "));
+                        continue;
                     }
+                    // A frozen part has no live spelling but is not an ordinal
+                    // either — a retention marker, or a task-type prefix drawn
+                    // from staged roles. It copies as written and is disclosed.
+                    text += String(part.rendered || part.text || "");
                 }
-                pieces.push({ kind: "text", text: "\n" });
+                if (text.trim()) lines.push(text);
             }
             if (missing.length) {
-                // A named entity with no handle, or none this format can attach,
-                // has no live spelling in prose. Writing its rendered label
-                // instead is exactly the ordinal freeze this action avoids.
-                notifyWarning(`${[...new Set(missing)].join(", ")} cannot be`
-                    + " attached here, so this cannot become prose without freezing"
-                    + " its number. Give it a handle first.",
-                    { source: "prompt-convert" });
+                notifyWarning(`${[...new Set(missing)].join(", ")} has no handle,`
+                    + " so copying it would freeze its number. Give it a handle"
+                    + " first.", { source: "prompt-copy" });
                 return false;
             }
-            if (!pieces.some((piece) => piece.kind !== "text" || piece.text.trim())) {
-                // Every part was filtered out on the way to prose. Same rule:
-                // disable nothing.
-                notifyWarning("There is nothing to write for this contribution."
-                    + " Nothing was changed.", { source: "prompt-convert" });
+            if (!lines.length) {
+                notifyWarning("This contribution resolves to nothing right now,"
+                    + " so there is nothing to copy.", { source: "prompt-copy" });
+                return false;
+            }
+            const text = lines.join("\n");
+            try {
+                await navigator.clipboard.writeText(text);
+            } catch (_error) {
+                notifyWarning("The browser refused clipboard access, so nothing"
+                    + " was copied.", { source: "prompt-copy" });
                 return false;
             }
             const frozen = (plan.frozen || []).filter(Boolean);
-            const warning = frozen.length
-                ? `\n\n${frozen.join(", ")} will become plain text and stop following`
-                    + " staged intent."
-                : "";
-            // Silencing three chips must never be silent, so the count is in the
-            // question rather than in a toast afterwards.
-            const linked = groupAttachmentIds.size > 1
-                ? `\n\nThis Reference is linked across ${groupAttachmentIds.size}`
-                    + " sections; the contribution stops on all of them, or a"
-                    + " linked chip would emit it again beside your prose."
-                : "";
-            if (!window.confirm(`Convert this ${channelKey} contribution to prose?`
-                + " The chip stops emitting it and you own the sentence."
-                + ` This cannot be undone from the prose.${linked}${warning}`)) return false;
-
-            // Land it in the channel it was converted FROM. `focusEnd()` put it
-            // after the whole draft — under the shipped H3 template that is the
-            // last section's last channel, so a subject definition reappeared as
-            // music prose.
-            if (!placeWritingCaret(anchor)) {
-                notifyWarning("Could not place the caret in that channel, so"
-                    + " nothing was converted.", { source: "prompt-convert" });
-                return false;
+            if (frozen.length) {
+                notifyInfo(`Copied. ${frozen.join(", ")} came across as plain text`
+                    + " and will stop following staged intent.",
+                    { source: "prompt-copy" });
+            } else {
+                notifySuccess("Copied, with handles rather than numbers.",
+                    { source: "prompt-copy" });
             }
-            // Sequential inserts chain: each leaves the caret after what it
-            // wrote, so text and attachments interleave in order.
-            draftArea.insertText("\n");
-            for (const piece of pieces) {
-                if (piece.kind === "text") {
-                    if (piece.text) draftArea.insertText(piece.text);
-                    continue;
-                }
-                const attachment = applyPromptReferenceSource(
-                    normalizePromptAttachment({ kind: "reference" }), piece.option.value);
-                // BOTH routing axes, deliberately, where a menu attach leaves
-                // them sparse. Seeding the inline kind alone is not enough:
-                // `_route_for` answers with the capability's DECLARED channel —
-                // `mentions` declares `detailed_description` — and the compiler
-                // renders at the anchor only when `route == channel_key`, so a
-                // mention converted into `subject_definitions` would route away
-                // and leave a hole where the handle sits. A menu attach INFERS
-                // routing and should keep following the format; Convert records
-                // that the author put this sentence in this channel, so freezing
-                // is the semantics rather than an oversight.
-                attachment.capabilities = [sparseCapabilityRecord({}, {
-                    capabilityId: inlineKind, enabled: true, inheritedEnabled: true,
-                    channelKey, placement: "inline" })];
-                draftArea.insertAttachment(attachment, "");
-            }
-            // Per-CAPABILITY, never per-line: a per-line suppression would need
-            // a stable per-record key, and the only one that ever existed
-            // embedded a rendered ordinal.
-            //
-            // The record has to be disabled in BOTH homes. An INLINE-anchored
-            // chip lives in the editor's registry; a chip attached to the
-            // section lives in `blockMeta[i].attachments`, and
-            // `writingSectionsFromDraft` reads the unanchored ones from there.
-            // Writing only the registry copy left a section-scoped chip still
-            // emitting, so Apply produced the contribution twice — once as the
-            // author's new prose and once from the chip.
-            const disable = (value) => setPromptAttachmentCapabilityEnabled(
-                value, { capability_id: capabilityId }, false);
+            return true;
+        };
+        /** Turn one capability on or off, wherever this draft holds the chip. */
+        const setContributionEnabled = (attachmentId, capabilityId, enabled) => {
+            const apply = (value) => setPromptAttachmentCapabilityEnabled(
+                value, { capability_id: capabilityId }, enabled);
             let touched = false;
-            // Snapshot: `replaceAttachment` writes through to the same registry
-            // this is walking.
+            // BOTH homes. An inline-anchored chip lives in the editor registry;
+            // one attached to the section lives in `blockMeta[i].attachments`,
+            // and `writingSectionsFromDraft` reads the unanchored ones there.
             for (const value of [...writingState.attachments]) {
-                if (!groupAttachmentIds.has(value.attachment_id)) continue;
-                draftArea.replaceAttachment(disable(value));
+                if (value.attachment_id !== attachmentId) continue;
+                draftArea.replaceAttachment(apply(value));
                 touched = true;
             }
             for (const meta of writingState.blockMeta || []) {
                 (meta.attachments || []).forEach((value, index) => {
-                    if (!groupAttachmentIds.has(value.attachment_id)) return;
-                    meta.attachments[index] = disable(value);
+                    if (value.attachment_id !== attachmentId) return;
+                    meta.attachments[index] = apply(value);
                     touched = true;
                 });
             }
             if (!touched) {
-                notifyWarning("That Reference is no longer staged here, so nothing"
-                    + " was converted.", { source: "prompt-convert" });
-                return false;
+                notifyWarning("That Reference is no longer staged here.",
+                    { source: "prompt-contribution" });
+                return;
             }
             writingState.draft = draftArea.value;
             writingState.document = draftArea.promptDocument;
             writingState.attachments = draftArea.promptAttachments;
             saveWritingState();
-            notifySuccess("Converted to prose.", { source: "prompt-convert" });
             render();
-            return true;
         };
-        // Each chip's RESOLVED contribution, rendered as read-only prose under
-        // the channel it is staged in. This is the whole point of the Writing
-        // view after the pivot: the author reads the sentence their chips will
-        // produce, in place, while the chips stay the record. Nothing here is
-        // document content — see `decorations` on the chips editor.
         const writingDecorations = (model) => {
-            const payload = currentCandidatePayload();
-            if (!payload) return [];
+            if (!currentCandidatePayload()) return [];
             const keys = templateChannelKeys(host._channelTemplate());
             const regions = channelRegionsByNode(model, keys,
                 { defaultKey: writingDefaultChannelKey() });
@@ -1822,149 +1633,244 @@ export function mountPromptManagementPanel(host) {
             // block and hand a region the NEXT block's chips — a wrong reading
             // rather than a missing one.
             const blocks = splitWritingPromptDocument(model, { keepEmpty: true });
+            const ranges = writingBlockNodeRanges(model);
             const out = [];
-            const seen = new Set();
-            for (const region of regions) {
-                const blockDocument = blocks[region.block];
-                if (!blockDocument) continue;
+            const poolFor = (blockIndex) => {
+                const blockDocument = blocks[blockIndex];
+                if (!blockDocument) return [];
                 const anchored = new Set(normalizePromptDocument(blockDocument).nodes
                     .filter((node) => node.type === "attachment")
                     .map((node) => node.attachment_id));
                 // BOTH pools. A chip attached with "Attach to this section"
                 // never reaches the editor's registry, and looking it up there
                 // alone is what left every one of them labelled "Reference".
-                const pool = [
+                return [
                     ...normalizePromptAttachments(writingState.attachments)
                         .filter((value) => anchored.has(value.attachment_id)),
                     ...normalizePromptAttachments(
-                        writingState.blockMeta[region.block]?.attachments),
+                        writingState.blockMeta[blockIndex]?.attachments),
                 ];
-                const lines = channelContributionRows({
-                    channelKey: region.channelKey, attachments: pool,
-                    candidate: payload, attachmentLabelFor,
-                })
-                    // An inline capability compiles where its anchor sits, so it
-                    // is already in the sentence the author wrote. Printing it
-                    // again under the heading states one emission twice, in the
-                    // wrong place. `rendered_at_anchor` is the authority here,
-                    // not the route table — a DISABLED inline capability
-                    // publishes no route and read as "show it".
-                    .filter((contribution) => !contribution.atAnchor)
-                    // A capability the author turned OFF contributes nothing to
-                    // this channel, which is what this block reports. Listing it
-                    // as "disabled and contributes no text" made a successful
-                    // Convert read as a failure — the line it replaced was still
-                    // sitting there. The chip's own state stays visible in
-                    // Structured, where turning it back on happens.
-                    .filter((contribution) => contribution.state !== "disabled")
-                    .map((contribution) => ({
-                        label: contribution.label,
-                        // `resolved` is the marker's own text when it emits one
-                        // and the reason when it does not, so a Shot reads
-                        // `[Shot 1] At 00:00.000,` rather than its excuse.
-                        text: contribution.emitting ? contribution.resolved : "",
-                        reason: contribution.emitting ? "" : contribution.resolved,
-                        attachmentId: contribution.attachmentId,
-                        capabilityId: contribution.capabilityId,
-                    }));
-                if (!lines.length) continue;
-                seen.add(`${region.block}::${region.channelKey}`);
-                out.push({ afterIndex: region.afterIndex,
-                    element: writingDecorationElement(region.channelKey, lines,
-                        convertContributionToProse,
-                        { index: region.afterIndex, offset: null }) });
+            };
+            const rowsFor = (channelKey, pool, payload) => channelContributionRows({
+                channelKey, attachments: pool, candidate: payload,
+                attachmentLabelFor,
+            })
+                // An inline capability compiles where its anchor sits, so it is
+                // already in the sentence the author wrote. Printing it again
+                // under the heading states one emission twice, in the wrong
+                // place. `rendered_at_anchor` is the authority here, not the
+                // route table — a DISABLED inline capability publishes no route
+                // and read as "show it".
+                .filter((contribution) => !contribution.atAnchor)
+                .map((contribution) => ({
+                    label: contribution.label,
+                    state: contribution.state,
+                    emitting: contribution.emitting,
+                    // Which CAPABILITY this row is. Under H3 both `summary` and
+                    // `audio_relationship` route to `summary`, so two rows read
+                    // `@KWoman` and only their capability tells them apart.
+                    capability: String(contribution.row?.capability_kind
+                        || contribution.capabilityId || ""),
+                    // `resolved` is the marker's own text when it emits one and
+                    // the reason when it does not, so a Shot reads
+                    // `[Shot 1] At 00:00.000,` rather than its excuse.
+                    text: contribution.emitting ? contribution.resolved : "",
+                    reason: contribution.emitting ? "" : contribution.resolved,
+                    attachmentId: contribution.attachmentId,
+                    capabilityId: contribution.capabilityId,
+                }));
+            const byBlock = new Map();
+            for (const region of regions) {
+                if (!byBlock.has(region.block)) byBlock.set(region.block, new Map());
+                byBlock.get(region.block).set(region.channelKey, region.afterIndex);
             }
-            // A channel a chip FEEDS but the author has never typed in has no
-            // heading in the draft, so it has no region and nothing above found
-            // it — which meant most of what a Reference actually produces was
-            // invisible here. Give those a home at the end of their block, in
-            // template order, with the heading drawn by the decoration itself.
-            //
-            // Deliberately NOT written into the document: this runs from the
-            // debounced compile, and `insertText` focuses the editor, pushes an
-            // undo entry and moves the caret. A heading the author deleted
-            // would also be restored on the next compile, a fight they cannot
-            // win. `Write here` materialises it on an explicit click instead.
-            const ranges = writingBlockNodeRanges(model);
             for (const range of ranges) {
-                const blockDocument = blocks[range.block];
-                if (!blockDocument) continue;
-                const anchored = new Set(normalizePromptDocument(blockDocument).nodes
-                    .filter((node) => node.type === "attachment")
-                    .map((node) => node.attachment_id));
-                const pool = [
-                    ...normalizePromptAttachments(writingState.attachments)
-                        .filter((value) => anchored.has(value.attachment_id)),
-                    ...normalizePromptAttachments(
-                        writingState.blockMeta[range.block]?.attachments),
-                ];
-                if (!pool.length) continue;
+                const written = byBlock.get(range.block) || new Map();
+                const pool = poolFor(range.block);
+                if (!pool.length && !written.size) continue;
+                // A block outside the render window compiles nothing in the
+                // windowed payload, so its rows come from the scene-wide one and
+                // its numbering is scene-wide with them. The block says so once,
+                // under its heading, rather than every row saying it.
+                const dormancy = writingBlockDormancy(range.block, ranges.length);
+                const payload = candidateForSection(
+                    writingBlockPromptId(range.block, ranges.length));
+                if (!payload) continue;
+                // TEMPLATE ORDER, interleaved with what the author has written.
+                // Unwritten channels used to paint at the block tail, so under
+                // H3 the three channels the template LEADS with appeared after
+                // the last thing typed. Each one now sits after whichever
+                // channel precedes it in the template, which is where its
+                // heading would be if the author had written it.
+                // The BLOCK's leading slot until a written channel is reached,
+                // not the document's. `-1` means "before everything", so using
+                // it for every block stacked block 2's template-leading
+                // channels at the very top of the draft, above block 0.
+                // For block 0 the block's leading slot IS -1. After that it is
+                // `firstIndex` — the node carrying the `---`, which
+                // `joinWritingSectionDocuments` writes as its own node, so
+                // painting after it lands between the separator and the block's
+                // first content. `firstIndex - 1` would be the previous block's
+                // last content node, which reads adjacent and is wrong.
+                let anchor = range.block === 0 ? -1 : range.firstIndex;
                 for (const channelKey of keys) {
-                    if (seen.has(`${range.block}::${channelKey}`)) continue;
-                    const lines = channelContributionRows({
-                        channelKey, attachments: pool, candidate: payload,
-                        attachmentLabelFor,
-                    })
-                        .filter((contribution) => !contribution.atAnchor
-                            && contribution.emitting)
-                        .map((contribution) => ({
-                            label: contribution.label,
-                            text: contribution.resolved,
-                            attachmentId: contribution.attachmentId,
-                            capabilityId: contribution.capabilityId,
-                        }));
-                    if (!lines.length) continue;
-                    // The TAIL, not `lastIndex`: a block closing with a `---`
-                    // inside its last node ends before that break, so painting
-                    // and inserting at `lastIndex` both land in the next block.
-                    out.push({ afterIndex: range.tailIndex,
-                        element: writingDecorationElement(channelKey, lines,
-                            convertContributionToProse,
-                            { index: range.tailIndex, offset: range.tailOffset },
-                            { unwritten: true, block: range.block }) });
+                    const isWritten = written.has(channelKey);
+                    if (isWritten) anchor = written.get(channelKey);
+                    const lines = rowsFor(channelKey, pool, payload);
+                    // A HEADER means this channel has content. A block whose
+                    // rows all resolve to nothing would put a heading on a
+                    // channel that contributes nothing — six of them under H3 —
+                    // and claim the opposite of what it shows. The non-emitting
+                    // rows still appear once at least one row emits, because
+                    // that is where "why is this one silent" gets answered.
+                    // ...OR something here was switched off. Gating on
+                    // emitted text alone deleted the whole block the moment the
+                    // last contributing capability was disabled, taking the
+                    // "Contribute here again" row with it -- the trap the
+                    // disabled row exists to avoid, reintroduced one level up.
+                    if (!lines.some((line) => line.text
+                        || line.state === "disabled")) continue;
+                    out.push({ afterIndex: anchor,
+                        element: writingContributionBlock(channelKey, lines,
+                            { written: isWritten, block: range.block, dormancy }) });
                 }
             }
             return out;
         };
-        const writingDecorationElement = (channelKey, lines, onConvert, anchor,
-            unwritten = null) => {
+        /**
+         * One channel's contributions, as read-only prose under its heading.
+         *
+         * The heading is NOT provisional: this block exists only when the
+         * channel resolves emitting content, so a header and content are one
+         * condition. Whether a text node backs it is an implementation detail
+         * the author is not asked to track — typing here makes it real.
+         *
+         * No per-row buttons. Up to six stacked inside a read-only block, and
+         * two of them had an unstated dependency on each other. A row carries
+         * its actions in a menu instead, opened by clicking the row.
+         *
+         * MOUSE-ONLY, knowingly. Decorations refuse focus so that nothing typed
+         * into one can be silently eaten by the next render, and the keyboard
+         * menu opens at the caret — which can never be inside a decoration. The
+         * buttons this replaces were tab stops, so this is an accessibility
+         * regression accepted for the decluttering, not an oversight.
+         */
+        const writingContributionBlock = (channelKey, lines,
+            { written, block, dormancy = null }) => {
             const host_ = document.createElement("div");
             host_.dataset.sonderWritingContribution = String(channelKey);
             host_.style.cssText = `margin:4px 0 6px;padding:5px 8px;border-left:2px solid ${COLORS.promptBorder};`
                 + `background:${COLORS.panelMuted};border-radius:0 4px 4px 0;`;
             const heading = document.createElement("div");
-            heading.textContent = unwritten
-                ? `${channelKey} — from your References · you have not written here`
-                : `${channelKey} — from your References`;
-            heading.style.cssText = `font-size:9px;letter-spacing:.04em;text-transform:uppercase;`
+            heading.dataset.sonderWritingChannelHeading = written ? "written" : "derived";
+            // Named so a row's menu can offer the same action its hint does.
+            heading.textContent = `${channelKey}:`;
+            heading.style.cssText = "font:11px/1.5 system-ui;"
                 + `color:${COLORS.textDim};margin-bottom:2px;`;
             host_.appendChild(heading);
+            if (dormancy) {
+                const note = dormancyNotice(() => dormancy, { live: false });
+                note.style.cssText += "margin-bottom:3px;";
+                host_.appendChild(note);
+            }
             for (const line of lines) {
                 const row = document.createElement("div");
+                row.dataset.sonderWritingContributionRow = String(line.capabilityId || "");
                 row.style.cssText = `font:11px/1.5 system-ui;color:${line.text ? COLORS.text : COLORS.textDim};`
-                    + "white-space:pre-wrap;overflow-wrap:anywhere;";
-                row.textContent = line.text || `${line.label}: ${line.reason}`;
+                    + "white-space:pre-wrap;overflow-wrap:anywhere;"
+                    + "border-radius:3px;padding:1px 3px;margin:0 -3px;";
+                // A row that resolves to nothing NAMES its capability. Two rows
+                // reading `@KWoman: …` with no way to tell which is which is
+                // what sent the last pass looking for a bug that was not there.
+                row.textContent = line.text
+                    || `${line.label} · ${line.capability}: ${line.reason}`;
+                // A composer-owned MARKER has no per-capability suppression —
+                // the compiler reports `marker` even when a stored flag says
+                // disabled — so offering the toggle would write a record that
+                // changes nothing and leave the row exactly where it was. The
+                // Structured pill guards this the same way.
+                const actionable = !applyBlocked && line.capabilityId
+                    && line.state !== "marker";
+                // A row's own dblclick must not also reach the block's, which
+                // would open the menu, reopen it, AND write a heading.
+                row.addEventListener("dblclick", (event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                });
+                if (actionable) {
+                    row.style.cursor = "pointer";
+                    row.title = "Click for what you can do with this contribution";
+                    row.addEventListener("mouseenter", () => {
+                        row.style.background = COLORS.panelRaised;
+                    });
+                    row.addEventListener("mouseleave", () => {
+                        row.style.background = "transparent";
+                    });
+                    row.addEventListener("mousedown", (event) => {
+                        // The decoration already refuses mousedown so a caret
+                        // cannot land inside it; claim this one for the menu.
+                        event.preventDefault();
+                        event.stopPropagation();
+                        const items = [];
+                        // Copy only what the prompt actually carries. A row that
+                        // emits nothing has nothing to put on a clipboard, and
+                        // offering it hands the author text the render refused.
+                        if (line.emitting) {
+                            items.push({ label: "Copy with handles",
+                                // `hint`, not `title` — `openContextMenu` reads
+                                // `hint`, so anything under another key renders
+                                // as a bare label and the explanation is lost.
+                                hint: "spelled with @handles, so it stays live",
+                                action: () => copyContribution(
+                                    line.attachmentId, line.capabilityId) });
+                        }
+                        // BOTH directions, always. Turning a contribution off
+                        // made its row vanish with no way back inside Writing —
+                        // the draft is a browser-local fork, so the Structured
+                        // pill that would re-enable it reads the saved scene and
+                        // cannot see the change. A one-way action with no
+                        // inverse is a trap, not a feature.
+                        items.push(line.state === "disabled"
+                            ? { label: "Contribute here again",
+                                hint: "turn this capability back on",
+                                action: () => setContributionEnabled(
+                                    line.attachmentId, line.capabilityId, true) }
+                            : { label: "Stop contributing here",
+                                // The honest half: per-capability `enabled` is
+                                // LOCAL suppression that never propagates, and
+                                // dedupe promotes a sibling, so on a Reference
+                                // staged in several sections the contribution
+                                // does not stop — it moves.
+                                hint: "on this chip only; a linked section may"
+                                    + " then emit it instead",
+                                action: () => setContributionEnabled(
+                                    line.attachmentId, line.capabilityId, false) });
+                        if (!written) {
+                            items.push({ type: "separator" });
+                            items.push({ label: "Write here too",
+                                hint: "add this channel's heading to the draft",
+                                action: () => materialiseChannelHeading(
+                                    channelKey, block) });
+                        }
+                        openContextMenu({ x: event.clientX, y: event.clientY, items });
+                    });
+                }
                 host_.appendChild(row);
-                if (!line.text || !line.capabilityId || applyBlocked) continue;
-                const convert = makeBtn("Convert to prose",
-                    "Write this contribution into the draft as text you own."
-                    + " The chip stops emitting it.", "subtle");
-                convert.style.cssText += ";margin-top:3px;font-size:10px;";
-                convert.addEventListener("click", () => {
-                    onConvert?.(line.attachmentId, line.capabilityId, channelKey,
-                        anchor);
-                });
-                host_.appendChild(convert);
             }
-            if (unwritten) {
-                const write = makeBtn("Write here",
-                    `Add a ${channelKey} heading to the draft so you can type in`
-                    + " this channel.", "subtle");
-                write.style.cssText += ";margin-top:4px;font-size:10px;";
-                write.addEventListener("click", () => {
-                    materialiseChannelHeading(channelKey, unwritten.block);
+            if (!written) {
+                const hint = document.createElement("div");
+                hint.textContent = "Double-click to write here too.";
+                hint.style.cssText = `font:10px/1.4 system-ui;color:${COLORS.textDim};`
+                    + "margin-top:3px;opacity:.75;";
+                hint.dataset.sonderWritingChannelHint = String(block);
+                host_.appendChild(hint);
+                // On the HINT, not the block: on the block it fired for a
+                // double-click anywhere, including on a row that had just
+                // opened its own menu.
+                hint.addEventListener("dblclick", (event) => {
+                    event.preventDefault();
+                    materialiseChannelHeading(channelKey, block);
                 });
-                host_.appendChild(write);
             }
             return host_;
         };
@@ -2033,51 +1939,20 @@ export function mountPromptManagementPanel(host) {
             saveWritingState();
         });
         draftArea.addEventListener("keydown", (e) => e.stopPropagation());
-        // Keep the disposer. The panel rebuilds its draft area on every render
-        // and the installer's own sweep only runs when a NEW menu is installed,
-        // so leaving Writing mode without this strands a menu in `document.body`
-        // with listeners bound to a detached editor.
-        disposeMentionMenu?.();
-        disposeMentionMenu = installWritingMentionMenu(draftArea, {
-            // Built once per menu open. `promptReferenceSourceOptions` is the
-            // authority on what may be attached and why; the handle join is
-            // explicit because its rows carry no handle of their own.
-            sources: () => promptMentionCandidates({
-                options: promptReferenceSourceOptions({
-                    scene: { ...(scene || {}),
-                        _context_reference_frame_threshold:
-                            host._referenceFrameThreshold || 0 },
-                    references: host._references || [],
-                    semanticUnits: host._promptSemanticUnits || [],
-                    profileId: scene?.prompt_context_profile_id
-                        || host._channelTemplate().default_context_profile || "generic@1",
-                    scope: "global",
-                    resolvedProfile: host._resolvedPromptContextProfile?.(),
-                }),
-                references: host._references || [],
-                semanticUnits: host._promptSemanticUnits || [],
-            }),
-            // Writing Source is one box over every channel, so the caret is the
-            // only thing that says which channel a mention belongs to.
-            channelAt: (offset) => writingChannelAtCaret(
-                draftArea.value, offset, templateChannelKeys(host._channelTemplate())),
-            onAccepted: ({ value, channelKey, replaceTextRange }) => {
-                const profile = host._resolvedPromptContextProfile?.();
-                const attachment = applyPromptReferenceSource(
-                    normalizePromptAttachment({ kind: "reference" }), value);
-                const seeded = handleAttachCapabilityRecord(profile, { channelKey });
-                if (seeded.length) attachment.capabilities = structuredClone(seeded);
-                draftArea.insertAttachment(attachment, "", { replaceTextRange });
-                writingState.draft = draftArea.value;
-                writingState.document = draftArea.promptDocument;
-                // The registry changes now, which the text-only accept never did.
-                writingState.attachments = draftArea.promptAttachments;
-                saveWritingState();
-                return attachment;
-            },
-        });
+        // `@` completion rides with this install; the mention menu is no longer
+        // mounted separately. Its own sweep reclaims a menu once its editor has
+        // been seen attached and has since gone, which is what a panel re-render
+        // produces.
         installPromptContextMenu({
             editor: draftArea,
+            // An accepted `@` mention is TEXT, so only the draft and its
+            // document move; the attachment registry is untouched, unlike an
+            // inserted chip.
+            onMentionAccepted: () => {
+                writingState.draft = draftArea.value;
+                writingState.document = draftArea.promptDocument;
+                saveWritingState();
+            },
             onInserted: () => {
                 writingState.draft = draftArea.value;
                 writingState.document = draftArea.promptDocument;
@@ -2086,6 +1961,21 @@ export function mountPromptManagementPanel(host) {
             },
             onCreate: (attachment) => configureDraftAttachment(attachment),
             profile: host._resolvedPromptContextProfile?.(),
+            // Resolved per open, like every other surface. Writing had no
+            // reference context at all while its `@` completion was installed
+            // separately, so folding the two together silently took completion
+            // away from the one surface that had it.
+            referenceContext: () => ({
+                scene: { ...(scene || {}),
+                    _context_reference_frame_threshold:
+                        host._referenceFrameThreshold || 0 },
+                references: host._references || [],
+                semanticUnits: host._promptSemanticUnits || [],
+                profileId: scene?.prompt_context_profile_id
+                    || host._channelTemplate().default_context_profile || "generic@1",
+                scope: "global",
+                resolvedProfile: host._resolvedPromptContextProfile?.(),
+            }),
             writingAids: host._promptContextWritingAids?.(
                 scene?.prompt_context_profile_id
                     || host._channelTemplate().default_context_profile || "generic@1") || [],
@@ -2243,6 +2133,11 @@ export function mountPromptManagementPanel(host) {
                 writingState.allocations = allocateWritingBlocks(
                     blocks, totalFrames, minLen, writingState.allocations);
             }
+            // Stamps `writingBlockPromptIds` as a side effect, which is what the
+            // strip rows and the draft decorations both key on. Cheap and pure;
+            // the alternative is the strip labelling blocks by an id nothing
+            // else agrees with.
+            buildWritingCandidatePatch(blockDocuments);
             strip.textContent = "";
             blocks.forEach((text, i) => {
                 const blockStart = writingState.allocations.slice(0, i)
@@ -2286,6 +2181,18 @@ export function mountPromptManagementPanel(host) {
                 syncHint();
                 chip.append(preview, lengthInput, timecodeHint);
                 blockCard.appendChild(chip);
+                // The strip is the block-identity surface — it already knows
+                // which block is which — so the reason lands here rather than
+                // being anchored inside the draft, where node granularity would
+                // make it approximate. Its tooltip owns the caveat: a draft's
+                // blocks are recompacted from frame 0 and the compile window is
+                // still the timeline selection, so the two need not line up.
+                const blockNotice = dormancyNotice(
+                    () => writingBlockDormancy(i, blocks.length));
+                blockNotice.title = "Writing blocks are laid out from frame 0"
+                    + " on Apply; the render window still follows the"
+                    + " timeline selection, so the two can disagree.";
+                blockCard.appendChild(blockNotice);
                 const anchorIds = new Set(normalizePromptDocument(blockDocuments[i]).nodes
                     .filter((node) => node.type === "attachment")
                     .map((node) => node.attachment_id));
@@ -2294,8 +2201,10 @@ export function mountPromptManagementPanel(host) {
                     const scoped = normalizePromptAttachments(meta?.attachments)
                         .filter((value) => !anchorIds.has(value.attachment_id));
                     const row = createScopeChipRow({
+                        label: `Block ${i + 1} context`,
                         attachments: scoped,
-                        previews: currentCandidatePayload()?.attachment_previews || {},
+                        previews: candidateForSection(writingBlockPromptId(
+                            i, writingState.allocations.length))?.attachment_previews || {},
                         attachmentLabelFor,
                         disabled: applyBlocked,
                         profile: host._resolvedPromptContextProfile?.(),
@@ -3158,6 +3067,7 @@ export function mountPromptManagementPanel(host) {
     };
 
     renderNow = () => {
+        dormancyRefreshers = [];
         if (!mounted) return;
         identityPanelCleanup();
         identityPanelCleanup = () => {};
@@ -3380,6 +3290,7 @@ export function mountPromptManagementPanel(host) {
         const renderGlobalScope = () => {
             const anchored = globalAnchorIds();
             globalScopeHost.replaceChildren(createScopeChipRow({
+                label: "Scene context",
                 attachments: globalAttachments.filter((value) => !anchored.has(value.attachment_id)),
                 previews: currentCandidatePayload()?.attachment_previews || {},
                 attachmentLabelFor,
@@ -3541,7 +3452,8 @@ export function mountPromptManagementPanel(host) {
                     document: normalizePromptDocument(
                         channelDocuments[key], channels[key] || ""),
                     attachments: sectionAttachments,
-                    previews: currentCandidatePayload()?.attachment_previews || {},
+                    previews: candidateForSection(section.prompt_id)
+                        ?.attachment_previews || {},
                     attachmentLabelFor,
                     attachmentContext: { scene, template },
                     disabled: sectionsLocked,
@@ -3607,7 +3519,8 @@ export function mountPromptManagementPanel(host) {
                     channelKey: key,
                 });
                 let projectionHosts = null;
-                const refreshProjection = (payload = currentCandidatePayload()) => {
+                const refreshProjection = (
+                    payload = candidateForSection(section.prompt_id)) => {
                     const next = createAttachmentChannelProjections({
                         channelKey: key,
                         attachments: sectionAttachments,
@@ -3700,8 +3613,10 @@ export function mountPromptManagementPanel(host) {
                     .filter((node) => node.type === "attachment")
                     .map((node) => node.attachment_id));
                 scopeHost.replaceChildren(createScopeChipRow({
+                    label: `Section ${idx + 1} context`,
                     attachments: sectionAttachments.filter((value) => !anchored.has(value.attachment_id)),
-                    previews: currentCandidatePayload()?.attachment_previews || {},
+                    previews: candidateForSection(section.prompt_id)
+                        ?.attachment_previews || {},
                     attachmentLabelFor,
                     disabled: sectionsLocked,
                     profile: host._resolvedPromptContextProfile?.(),
@@ -3852,7 +3767,10 @@ export function mountPromptManagementPanel(host) {
             const row = buildPromptSectionControlRow(
                 [startInput, endInput, spacer, selectBtn, queueBtn, queueAdvisory],
                 [addAfterBtn, deleteBtn]);
-            card.append(row, channelRow, scopeHost);
+            // Between the controls and the channels, so it reads as a statement
+            // about this section rather than about one channel.
+            card.append(row, dormancyNotice(() => sectionDormancy(section.prompt_id)),
+                channelRow, scopeHost);
 
             // Which scene-global channels this section takes. One checkbox per
             // global channel, so a template with global channels off shows
@@ -4064,6 +3982,26 @@ export function mountPromptManagementPanel(host) {
         element: backdrop,
         refresh: render,
         refreshDiagnostics: renderDiagnostics,
+        // Projections ONLY. The scene-wide payload lands here, and it must not
+        // reach diagnostics (blockers stay windowed-only) or `applyCandidate`
+        // (Reference Prompting derives from a `setup_manifest` that payload
+        // does not carry). Naming a narrower seam is what keeps that true when
+        // someone later adds a consumer.
+        refreshProjections: () => {
+            if (!mounted) return;
+            // Drop entries whose element left the document. `updateStrip`
+            // runs on a 300ms typing debounce and each pass registers a fresh
+            // row, so a list reset only by `renderNow` would grow all session
+            // and pin every discarded node it ever built.
+            dormancyRefreshers = dormancyRefreshers.filter(
+                (entry) => backdrop.contains(entry.line));
+            for (const entry of dormancyRefreshers) entry.apply();
+            refreshWritingDecorations?.();
+            for (const host_ of backdrop.querySelectorAll(
+                "[data-sonder-prompt-projection-region='before']")) {
+                host_._sonderRefreshProjection?.();
+            }
+        },
         // A landed candidate must reach every consumer that derives from it,
         // not only diagnostics and inline projections. Routed through `render`
         // so it passes `identityRefreshGate` — calling the identity section
@@ -4074,7 +4012,7 @@ export function mountPromptManagementPanel(host) {
             // Contributions follow the compiled output, which changes on every
             // recompile — including the many that leave identity untouched and
             // return false below. Repaint them first, and directly.
-            refreshWritingDecorations?.();
+            handle.refreshProjections();
             const next = identityCandidateSignature(payload);
             if (next === lastIdentityCandidateSignature) return false;
             lastIdentityCandidateSignature = next;

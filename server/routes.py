@@ -3692,7 +3692,8 @@ def _compose_frozen_job_prompt(project: TimelineProject, job: GenerationJob) -> 
     job.compiled_prompt_context = {
         key: value for key, value in compiled.items()
                     if key not in {"attachment_channel_routes",
-                                   "attachment_capability_projections"}
+                                   "attachment_capability_projections",
+                                   "section_window_states"}
     }
     job.minimax_h3_setup_snapshot = copy.deepcopy(
         compiled.get("setup_manifest", {}))

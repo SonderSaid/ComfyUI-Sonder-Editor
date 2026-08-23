@@ -1345,6 +1345,11 @@ export class EditorWidget {
 
         if (!isSameScene) {
             this._promptContextCandidateCache = null;
+            this._promptContextScenePayloadCache = null;
+            // Scene id alone would let an in-flight payload land and survive a
+            // switch back to the scene it was compiled for.
+            this._promptContextScenePayloadToken =
+                (this._promptContextScenePayloadToken || 0) + 1;
             this._promptContextPreviewToken = (this._promptContextPreviewToken || 0) + 1;
             if (this._promptContextPreviewTimer) clearTimeout(this._promptContextPreviewTimer);
             this._promptContextPreviewTimer = null;
@@ -9722,11 +9727,9 @@ export class EditorWidget {
                 profile: this._resolvedPromptContextProfile(),
                 placementPhases: this._promptContextCatalog?.placement_phases || [],
                 managedSpeakerSubjectIds: managedSpeakerSubjectIds(),
-                ordinalManifest: this._promptContextCandidateCache?._candidate_scene_id
-                    === this.activeSceneId
-                    ? (this._promptContextCandidateCache.ordinal_manifest || {}) : {},
-                candidate: this._promptContextCandidateCache?._candidate_scene_id
-                    === this.activeSceneId ? this._promptContextCandidateCache : null,
+                ordinalManifest: this._windowedPromptCandidate()
+                    ?.ordinal_manifest || {},
+                candidate: this._windowedPromptCandidate(),
             });
             const input = createPromptDocumentEditor({
                 document: normalizePromptDocument(initialDocuments?.[key], channels[key] || ""),
@@ -9834,8 +9837,28 @@ export class EditorWidget {
             }
             wrap.appendChild(column);
         }
-        const renderChannelProjections = (candidate = this._promptContextCandidateCache) => {
+        const dormancyLine = document.createElement("div");
+        dormancyLine.dataset.sonderPromptDormancy = "1";
+        dormancyLine.style.cssText = "flex:1 0 100%;min-width:0;display:none;"
+            + `font-size:9px;line-height:1.4;color:${COLORS.textDim};`;
+        wrap.insertBefore(dormancyLine, wrap.firstChild);
+        const renderChannelProjections = (candidate = undefined) => {
+            if (candidate === undefined) {
+                candidate = consumerSection
+                    ? this._promptCandidateForSection(consumerSection.prompt_id || "")
+                    : this._promptContextCandidateCache;
+            }
             if (candidate?._candidate_scene_id !== this.activeSceneId) candidate = null;
+            // Once per bar, above the channels: a bar whose section is dormant
+            // shows scene-wide numbering, and six channel rows repeating that
+            // would bury what they are disclosing about.
+            if (dormancyLine) {
+                const dormancy = consumerSection
+                    ? this._promptSectionDormancy(consumerSection.prompt_id || "")
+                    : null;
+                dormancyLine.textContent = dormancy?.message || "";
+                dormancyLine.style.display = dormancy ? "" : "none";
+            }
             for (const key of keys) {
                 const next = createAttachmentChannelProjections({
                     channelKey: key,
@@ -9856,11 +9879,20 @@ export class EditorWidget {
                             scope: consumerSection ? "section" : "global",
                             anchoredChannels: anchoredChannelsFor(
                                 attachment.attachment_id),
-                            profile: this._resolvedPromptContextProfile("", candidate),
+                            // The WINDOWED payload, never `candidate` --
+                            // which on a dormant section is the scene-wide one.
+                            // An attach dialog is an EDITING surface: it renders
+                            // live routing state and a Time's resolved value from
+                            // fields the scene payload keeps, and reads a
+                            // `setup_manifest` it drops. Handed that, it shows a
+                            // compile state the render will not produce.
+                            profile: this._resolvedPromptContextProfile(
+                                "", this._windowedPromptCandidate()),
                             placementPhases: this._promptContextCatalog?.placement_phases || [],
                             managedSpeakerSubjectIds: managedSpeakerSubjectIds(),
-                            ordinalManifest: candidate?.ordinal_manifest || {},
-                            candidate,
+                            ordinalManifest: this._windowedPromptCandidate()
+                                ?.ordinal_manifest || {},
+                            candidate: this._windowedPromptCandidate(),
                         });
                         if (!configured) return;
                         if (consumerSection && isLinkedAttachment(attachment)) {
@@ -9947,11 +9979,9 @@ export class EditorWidget {
             profile: this._resolvedPromptContextProfile(),
             placementPhases: this._promptContextCatalog?.placement_phases || [],
             managedSpeakerSubjectIds: managedSpeakerSubjectIds(),
-            ordinalManifest: this._promptContextCandidateCache?._candidate_scene_id
-                === this.activeSceneId
-                ? (this._promptContextCandidateCache.ordinal_manifest || {}) : {},
-            candidate: this._promptContextCandidateCache?._candidate_scene_id
-                === this.activeSceneId ? this._promptContextCandidateCache : null,
+            ordinalManifest: this._windowedPromptCandidate()
+                ?.ordinal_manifest || {},
+            candidate: this._windowedPromptCandidate(),
         });
         const anchoredIds = () => new Set(Object.values(inputs)
             .flatMap((input) => input.promptDocument?.nodes || [])
@@ -9960,6 +9990,7 @@ export class EditorWidget {
         const renderScope = () => {
             const anchored = anchoredIds();
             scopeHost.replaceChildren(createScopeChipRow({
+                label: globalScope ? "Scene context" : "Section context",
                 attachments: sharedAttachments.filter((value) => !anchored.has(value.attachment_id)),
                 previews,
                 attachmentLabelFor,
@@ -10937,6 +10968,175 @@ export class EditorWidget {
         };
     }
 
+    /**
+     * The projection-only fields of a compile. Everything else is DROPPED.
+     *
+     * This is the seam that keeps the scene-wide compile from becoming a second
+     * authority. `errors`, `warnings`, `prompt`, `channels`, `setup_manifest`,
+     * `ordinal_manifest` and `profile` never leave this function, so no
+     * downstream consumer has to remember not to read them — which is the only
+     * form of that rule that survives contact with a later change.
+     * `durable_rules.md`: out-of-window sections are dormant, and Prompt-tool
+     * blockers come only from the windowed candidate compile.
+     */
+    _promptProjectionSubset(payload) {
+        const keep = ["attachment_capability_projections",
+            "attachment_channel_previews", "attachment_channel_routes",
+            "emissions", "attachment_previews", "section_window_states"];
+        const out = {};
+        for (const key of keep) {
+            if (payload && key in payload) out[key] = payload[key];
+        }
+        return out;
+    }
+
+    /** The windowed compile for the active scene, or null. */
+    _windowedPromptCandidate() {
+        const value = this._promptContextCandidateCache;
+        return value?._candidate_scene_id === this.activeSceneId ? value : null;
+    }
+
+    /** What the compiler said about one section in the CURRENT window. */
+    _promptSectionWindowState(promptId, payload = null, index = -1) {
+        const source = payload || this._windowedPromptCandidate();
+        const rows = source?.section_window_states;
+        if (!Array.isArray(rows) || !rows.length) return "selected";
+        const id = String(promptId || "");
+        // By id first, then by raw ORDER. A section with no `prompt_id` reports
+        // an empty one -- the compiler's `__compile_section_N` substitute is
+        // deliberately not published, because no client has ever seen it -- so
+        // index is the only handle such a section has. An empty list, or a
+        // section this compile never saw, means "nothing known": today's
+        // behaviour, not a claim about the window.
+        const row = (id && rows.find((value) => String(value?.prompt_id || "") === id))
+            || (index >= 0 && rows.find((value) => Number(value?.index) === index))
+            || null;
+        return String(row?.state || "selected");
+    }
+
+    /**
+     * Why a section contributes nothing here, or null when it contributes.
+     *
+     * `not_covered` carries two different facts that one resolve cannot
+     * separate — outside this window, and shadowed by an earlier section on the
+     * lane. The scene-wide payload separates them for free: a section IT
+     * selected is merely out of window. With no selection there is no scene
+     * payload, but then the window is the scene, so `not_covered` already means
+     * shadowed.
+     */
+    _promptSectionDormancy(promptId, index = -1) {
+        const state = this._promptSectionWindowState(promptId, null, index);
+        if (state === "selected" || state === "empty") return null;
+        if (state === "muted") {
+            return { state, message: "Muted, so nothing in it is compiled." };
+        }
+        if (state === "boundary_dropped") {
+            return { state, message: "Clipped at the window edge and dropped by"
+                + " the boundary threshold, so it is not compiled here." };
+        }
+        const scene = this._promptScenePayload();
+        if (scene && this._promptSectionWindowState(promptId, scene, index) !== "selected") {
+            return { state: "overlapped", message: "Overlapped by an earlier"
+                + " section on the lane, so it never compiles." };
+        }
+        return { state: "outside_window", message: "Outside the current render"
+            + " window. Contributions are shown with scene-wide numbering, which"
+            + " can differ from what this section will render." };
+    }
+
+    /** The scene-wide projection payload, or null when it does not apply. */
+    _promptScenePayload() {
+        const value = this._promptContextScenePayloadCache;
+        return value?._candidate_scene_id === this.activeSceneId ? value : null;
+    }
+
+    /**
+     * Which payload answers for one section — never a merge, never for editing.
+     *
+     * An EDITING surface (the attach dialog) must not take the scene payload:
+     * it renders each capability's live routing state from
+     * `attachment_capability_projections` and a standalone Time's resolved value
+     * from `attachment_channel_previews`, both of which the scene payload
+     * carries, and it would show a compile state the render will not produce
+     * with none of the disclosure a projection row gets. It also reads
+     * `setup_manifest`, which the scene payload drops.
+     */
+    _promptCandidateForSection(promptId, index = -1) {
+        const windowed = this._windowedPromptCandidate();
+        if (this._promptSectionWindowState(promptId, null, index) === "selected") {
+            return windowed;
+        }
+        return this._promptScenePayload() || windowed;
+    }
+
+    /**
+     * The same candidate, compiled over the WHOLE scene, for dormant sections.
+     *
+     * Fired from inside the windowed preview so both requests describe the same
+     * candidate by construction — two hand-built bodies is how a surface ends up
+     * answering about a scene the author is not looking at, which is the reason
+     * `_promptCompileRequestBody` exists at all.
+     *
+     * NOTE it passes a full-scene SELECTION, not a full-scene window. The
+     * server reads `window_start`/`window_end` only as defaults for the
+     * selection and resolves the real window from `selection ± context`, so
+     * window fields alone would have compiled the narrow window again. At a
+     * full-scene selection the context frames clamp to zero by arithmetic and
+     * the frame constraint moves `frame_count` rather than `render_end`, so
+     * both can be left exactly as the windowed request sends them.
+     */
+    _previewPromptContextScenePayload({ dirName, sceneId, candidate,
+        windowStart, windowEnd }) {
+        const duration = Math.max(1, Math.round(
+            candidate.duration_frames ?? this.totalFrames ?? 1));
+        // Bumped BEFORE the early return too: a fetch issued while a
+        // selection was active is still in flight when the selection clears, and
+        // without a new token it passes its own guard and repopulates a cache
+        // that was deliberately emptied.
+        const token = (this._promptContextScenePayloadToken || 0) + 1;
+        this._promptContextScenePayloadToken = token;
+        if (windowStart <= 0 && windowEnd >= duration) {
+            // The window IS the scene, so the two compiles would be identical.
+            this._promptContextScenePayloadCache = null;
+            return;
+        }
+        (async () => {
+            try {
+                const response = await fetch(api.apiURL(
+                    `/sonder-editor/project/${encodeURIComponent(dirName)}/scenes/${encodeURIComponent(sceneId)}/prompt-context/compile`
+                ), {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(this._promptCompileRequestBody({
+                        dirName, candidate, windowStart: 0, windowEnd: duration,
+                        selection: { selectionStart: 0, selectionEnd: duration },
+                    })),
+                });
+                if (token !== this._promptContextScenePayloadToken) return;
+                if (!response.ok) { this._promptContextScenePayloadCache = null; return; }
+                const payload = await response.json().catch(() => null);
+                if (token !== this._promptContextScenePayloadToken || !payload) return;
+                this._promptContextScenePayloadCache = {
+                    ...this._promptProjectionSubset(payload),
+                    _candidate_scene_id: sceneId,
+                    _stale: false,
+                };
+            } catch (error) {
+                // A dormant projection is an aid, not a result. Leaving the
+                // cache null degrades to the empty box this feature replaces
+                // rather than to a wrong one, so a failure is not reported.
+                if (token === this._promptContextScenePayloadToken) {
+                    this._promptContextScenePayloadCache = null;
+                }
+            }
+            // Deliberately NOT `refreshDiagnostics` and NOT `applyCandidate`.
+            // Diagnostics must stay windowed-only, and Reference Prompting
+            // derives from a `setup_manifest` this payload does not carry.
+            this._refreshInlinePromptProjections?.();
+            this._promptPanelHandle?.refreshProjections?.();
+        })();
+    }
+
     _previewPromptContextCandidate(scenePatch = {}, delay = 180) {
         const dirName = this._projectDirName();
         const sceneId = this.activeSceneId;
@@ -10953,6 +11153,14 @@ export class EditorWidget {
         const candidateSelection = resolvePromptCandidateSelection(
             this.selectionStart, this.selectionEnd,
             candidate.duration_frames ?? this.totalFrames ?? 0);
+        if (this._promptScenePayload()) {
+            // The same edge as the windowed cache below. Marked inside the
+            // debounce instead, a continuous typing burst never marked it at
+            // all, so dormant rows showed undimmed data from a superseded
+            // compile while the windowed rows beside them correctly dimmed.
+            this._promptContextScenePayloadCache = {
+                ...this._promptContextScenePayloadCache, _stale: true };
+        }
         if (this._promptContextCandidateCache?._candidate_scene_id === sceneId) {
             this._promptContextCandidateCache = {
                 ...this._promptContextCandidateCache,
@@ -10960,10 +11168,11 @@ export class EditorWidget {
             };
             this._promptPanelHandle?.refreshDiagnostics?.(
                 this._promptContextCandidateCache);
-            this._refreshInlinePromptProjections?.(
-                this._promptContextCandidateCache);
+            this._refreshInlinePromptProjections?.();
         }
         this._promptContextPreviewTimer = setTimeout(async () => {
+            this._previewPromptContextScenePayload({
+                dirName, sceneId, candidate, windowStart, windowEnd });
             try {
                 const response = await fetch(api.apiURL(
                     `/sonder-editor/project/${encodeURIComponent(dirName)}/scenes/${encodeURIComponent(sceneId)}/prompt-context/compile`
@@ -10992,7 +11201,7 @@ export class EditorWidget {
                 };
                 this._promptPanelHandle?.refreshDiagnostics?.(
                     this._promptContextCandidateCache);
-                this._refreshInlinePromptProjections?.(this._promptContextCandidateCache);
+                this._refreshInlinePromptProjections?.();
                 // Reference Prompting reads the setup manifest out of THIS
                 // payload, so diagnostics and inline projections alone left it
                 // showing every population at (0) until an unrelated full

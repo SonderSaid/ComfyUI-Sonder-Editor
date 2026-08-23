@@ -7,8 +7,14 @@ let sequence = 0;
 const isComposing = (event) => event?.isComposing === true || event?.keyCode === 229;
 
 /** Open one accessible menu stack. Returns an idempotent close function. */
-export function openContextMenu({ x = 0, y = 0, items = [], closeOnScroll = false } = {}) {
+export function openContextMenu({ x = 0, y = 0, items = [], closeOnScroll = false,
+    focusFirst = false } = {}) {
     activeClose?.();
+    // Whatever had focus when this opened. `focusFirst` moves focus INTO the
+    // menu, and without giving it back a keyboard user lands on <body> after
+    // Escape -- losing their tab position and, on a scope chip, the Backspace
+    // removal that is the chip's only other keyboard action.
+    const opener = focusFirst ? document.activeElement : null;
     const stack = [];
     const timers = new Set();
     let closed = false;
@@ -32,6 +38,7 @@ export function openContextMenu({ x = 0, y = 0, items = [], closeOnScroll = fals
         if (closeOnScroll) window.removeEventListener("scroll", scrollClose, true);
         keyOff?.();
         if (activeClose === close) activeClose = null;
+        if (opener?.isConnected) opener.focus?.({ preventScroll: true });
     };
     activeClose = close;
 
@@ -225,6 +232,17 @@ export function openContextMenu({ x = 0, y = 0, items = [], closeOnScroll = fals
     });
 
     const root = renderPanel(Array.isArray(items) ? items : [], Number(x) || 0, Number(y) || 0, 0);
+    // Opened from the KEYBOARD, nothing focuses a row: `focusRow` runs on
+    // hover, on a submenu opening, or from an arrow key, so `activeIndex` stays
+    // -1. Two things then misbehave, and both look like the menu ignoring the
+    // keyboard rather than like an off-by-one. `stepFocus` computes
+    // `Math.max(0, -1) + 1` and the first ArrowDown lands on the SECOND row;
+    // and Enter finds `rows[-1] === undefined`, returns false, and the event
+    // reaches the still-focused control that opened the menu, whose native
+    // activation opens it again. A caller that opens from a focusable control
+    // passes this; a right-click caller leaves it off so the pointer keeps its
+    // usual hover-to-highlight behaviour.
+    if (focusFirst) focusRow(root, 0);
     close.element = root.element;
     close.isOpen = () => !closed;
     setTimeout(() => {

@@ -18,6 +18,25 @@ const SHOT_LABEL_TEMPLATE = "[Shot {n}]";
 const TOKEN_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 const TOKEN_PATTERN = /@([a-z][a-z0-9_]{0,63})\(([A-Za-z0-9][A-Za-z0-9._:-]*)\)/g;
 
+// Mirror of `prompt_tokens._HANDLE_RE`, held in parity by
+// tests/test_prompt_tokens.py. The comment there carries the reasoning for
+// both guards and for the absence of a dotted qualifier; keep the two literals
+// identical rather than "equivalent".
+const HANDLE_PATTERN = /(?<![A-Za-z0-9_])@([A-Za-z][A-Za-z0-9_]{0,63})(?![A-Za-z0-9_(])/g;
+
+/** Every `@handle` run in authored prose, with its span, in source order. */
+export function promptHandleMentions(text) {
+    const value = String(text ?? "");
+    const out = [];
+    HANDLE_PATTERN.lastIndex = 0;
+    for (let match = HANDLE_PATTERN.exec(value); match;
+        match = HANDLE_PATTERN.exec(value)) {
+        out.push({ handle: match[1], start: match.index,
+            end: match.index + match[0].length });
+    }
+    return out;
+}
+
 function tokenDeclarations(raw) {
     if (raw == null) return PROMPT_TOKEN_KINDS;
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};

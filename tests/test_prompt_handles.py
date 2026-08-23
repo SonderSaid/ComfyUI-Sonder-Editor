@@ -2,7 +2,8 @@ import pytest
 
 from server import prompt_context, prompt_tokens, routes
 from server.timeline_state import (
-    Asset, PromptSection, ReferenceEntity, ReferenceMember, TimelineProject,
+    Asset, PromptSection, ReferenceEntity, ReferenceMember, Scene,
+    TimelineProject,
 )
 
 
@@ -15,6 +16,93 @@ def _project():
         reference_id="woman", name="Korean Woman", members=[ReferenceMember(
             member_id="portrait-member", asset_id="portrait", handle="KWoman")])]
     return project
+
+
+def _handle_only_scene(text):
+    """A scene whose ONLY Context is a handle typed in prose.
+
+    No attachments anywhere, and no anchor nodes — which is the whole point:
+    this is the shape that an anchors-only entry test cannot see.
+    """
+    project = _project()
+    scene = Scene(scene_id="scene-1", name="Scene 1", duration_frames=120)
+    scene.prompt_sections = [PromptSection(
+        start_frame=0, end_frame=120,
+        channel_docs={"visual": {"nodes": [{"type": "text", "text": text}]}})]
+    project.scenes = [scene]
+    return project, scene
+
+
+def test_a_handle_only_scene_still_reaches_the_compiler(monkeypatch):
+    """The entry predicate must count a typed handle as Context.
+
+    `get_prompt_for_range` gates the compiler on attachments and document
+    ANCHORS. Once a mention is plain text it is neither, so a handle-only scene
+    was routed straight past compilation into `compose_range_prompt`, which
+    reads the raw channel mirror and resolves nothing at all. The dormant node
+    card would then print `@KWoman` while the executed render printed the
+    resolved token — the two disagreeing about the same scene.
+
+    Asserted through `get_prompt_for_range` deliberately. A test that called
+    `compile_prompt_context` directly passes in every version of this code,
+    including the broken one, because the defect is in whether the compiler is
+    reached rather than in what it does.
+    """
+    project, scene = _handle_only_scene("a @KWoman walks past")
+    assert not scene.global_attachments
+    assert not any(section.attachments for section in scene.prompt_sections)
+    assert not any(prompt_context.document_has_anchors(document)
+                   for section in scene.prompt_sections
+                   for document in section.channel_docs.values())
+
+    # Asserted on whether the COMPILER RAN, not on the text. An unresolved
+    # handle is left exactly as authored by design, so the compiled output and
+    # the raw-mirror output are character-identical here — an assertion on the
+    # text passes in both worlds and proves nothing. This one was measured
+    # doing exactly that before it was rewritten.
+    reached = []
+    original = Scene.compile_prompt_context
+
+    def spy(self, *args, **kwargs):
+        reached.append(True)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Scene, "compile_prompt_context", spy)
+    composed = scene.get_prompt_for_range(0, 120)
+    assert reached, "a handle-only scene was routed past the compiler"
+    # And the prose survives untouched, because this handle names a member that
+    # is not staged in the window: never half-resolved.
+    assert "@KWoman" in composed
+    # The predicate itself, stated directly so a future refactor cannot satisfy
+    # the assertion above by accident.
+    assert prompt_context.document_has_handle_mentions(
+        {"nodes": [{"type": "text", "text": "a @KWoman walks"}]})
+    assert not prompt_context.document_has_handle_mentions(
+        {"nodes": [{"type": "text", "text": "no mention here"}]})
+
+
+def test_prose_with_no_handle_does_not_start_compiling(monkeypatch):
+    """The predicate must not become "always compile".
+
+    Widening it to every scene would put the compiler in front of prompts that
+    have no Context at all, and `compose_range_prompt` is the cheaper path they
+    are meant to take.
+    """
+    _, scene = _handle_only_scene("a woman walks past bob@example")
+    # Spied, not merely asserted on the predicate: checking
+    # `document_has_handle_mentions` alone passes with `has_context` hardcoded
+    # true, which is exactly the degenerate case the docstring claims to rule
+    # out. This is the mirror image of the test above.
+    reached = []
+    original = Scene.compile_prompt_context
+
+    def spy(self, *args, **kwargs):
+        reached.append(True)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Scene, "compile_prompt_context", spy)
+    scene.get_prompt_for_range(0, 120)
+    assert not reached, "a scene with no Context started compiling"
 
 
 def test_reference_member_handle_and_prompt_defaults_round_trip():

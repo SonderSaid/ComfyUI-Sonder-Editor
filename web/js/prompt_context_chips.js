@@ -8,7 +8,8 @@ import { EDITOR_COLORS as COLORS, chromeInputCss, setButtonDisabled,
     setButtonVariant } from "./editor_theme.js";
 import { PRESERVE_DEFAULT, PRIORITY as KEY_PRIORITY,
     register as registerKeyboardConsumer } from "./keyboard_ownership.js";
-import { promptToken, promptTokenDeclarationsFromProfile } from "./prompt_tokens.js";
+import { promptHandleMentions, promptToken,
+    promptTokenDeclarationsFromProfile } from "./prompt_tokens.js";
 import { notifyWarning } from "./editor_notifications.js";
 import { openContextMenu } from "./editor_context_menu.js";
 import { createDisclosureMemory } from "./disclosure_memory.js";
@@ -504,9 +505,15 @@ export function writingBlockNodeRanges(documentValue) {
     const ranges = [{ block: 0, firstIndex: 0, lastIndex: -1,
         tailIndex: -1, tailOffset: null }];
     nodes.forEach((node, index) => {
-        const breakStart = node.type === "text"
-            ? writingBreakRunStart(node.text) : -1;
-        if (breakStart >= 0) {
+        // EVERY break in the node, not just the first. `channelRegionsByNode`
+        // and `splitWritingPromptDocument` both count all of them, so reporting
+        // one meant a hand-typed multi-section draft — which lives in a single
+        // text node until something splits it — produced fewer ranges than
+        // blocks, and every block past the last range silently lost its
+        // decorations.
+        const breakStarts = node.type === "text"
+            ? writingBreakRunStarts(node.text) : [];
+        for (const breakStart of breakStarts) {
             // A break can share a node with the text on either side of it, so
             // the node counts as the tail of the closing block AND the head of
             // the next. That is right for MEMBERSHIP and wrong as an INSERTION
@@ -530,8 +537,8 @@ export function writingBlockNodeRanges(documentValue) {
             }
             ranges.push({ block: ranges.length, firstIndex: index,
                 lastIndex: index, tailIndex: index, tailOffset: null });
-            return;
         }
+        if (breakStarts.length) return;
         ranges.at(-1).lastIndex = index;
         ranges.at(-1).tailIndex = index;
         ranges.at(-1).tailOffset = null;
@@ -546,14 +553,14 @@ export function writingBlockNodeRanges(documentValue) {
  * belongs to the separator rather than to the block being closed — the same
  * rule `splitWritingPromptDocument` applies when it trims one back off.
  */
-function writingBreakRunStart(text) {
-    const lines = String(text || "").split("\n");
+function writingBreakRunStarts(text) {
+    const starts = [];
     let offset = 0;
-    for (const line of lines) {
-        if (line.trim() === "---") return offset > 0 ? offset - 1 : 0;
+    for (const line of String(text || "").split("\n")) {
+        if (line.trim() === "---") starts.push(offset > 0 ? offset - 1 : 0);
         offset += line.length + 1;
     }
-    return -1;
+    return starts;
 }
 
 /**
@@ -1479,16 +1486,76 @@ export function createPromptDocumentEditor({
         const direct = element === editor ? null : element?.closest?.("[data-node-id]");
         return direct && editor.contains(direct) ? direct : null;
     };
-    const logicalTextOffset = (textNode, rawOffset) => String(textNode?.nodeValue || "")
-        .slice(0, Math.max(0, rawOffset)).replaceAll("\u200b", "").length;
+    /**
+     *  Every descendant text node of a node span, in document order.
+     *
+     *  A text span used to hold exactly one text node, and four separate places
+     *  read `firstChild` on that assumption. Marking `@handle` runs as live
+     *  gives it CHILD SPANS, so each of those places now walks this instead —
+     *  the caret is the most safety-critical thing in this editor, and the bug
+     *  tracker records what a mis-resolved one produced last time: text
+     *  inserted at position 0, landing inside chip spans.
+     *
+     *  Decorations are skipped for the same reason `textWithoutDecorations`
+     *  skips them: they are host chrome and their characters are not the
+     *  author's.
+     */
+    const spanTextNodes = (element) => {
+        const out = [];
+        const walk = (node) => {
+            for (const child of node?.childNodes || []) {
+                if (child.nodeType === Node.TEXT_NODE) { out.push(child); continue; }
+                if (child instanceof HTMLElement
+                    && child.dataset.sonderDecoration !== "1") walk(child);
+            }
+        };
+        walk(element);
+        return out;
+    };
+    /** Logical offset of a DOM position, measured across the whole node span. */
+    const logicalOffsetWithin = (host, container, rawOffset) => {
+        let total = 0;
+        for (const textNode of spanTextNodes(host)) {
+            const value = String(textNode.nodeValue || "");
+            if (textNode === container) {
+                return total + value.slice(0, Math.max(0, rawOffset))
+                    .replaceAll("\u200b", "").length;
+            }
+            total += value.replaceAll("\u200b", "").length;
+        }
+        return total;
+    };
+    /** The DOM position a logical offset names inside a node span. */
+    const domPositionWithin = (host, wanted) => {
+        const nodes = spanTextNodes(host);
+        if (!nodes.length) return { container: host, offset: 0 };
+        let remaining = Math.max(0, Number(wanted) || 0);
+        for (const textNode of nodes) {
+            const value = String(textNode.nodeValue || "");
+            let logical = 0;
+            let raw = 0;
+            while (raw < value.length && logical < remaining) {
+                if (value[raw] !== "\u200b") logical += 1;
+                raw += 1;
+            }
+            if (logical >= remaining) return { container: textNode, offset: raw };
+            remaining -= logical;
+        }
+        const last = nodes[nodes.length - 1];
+        return { container: last, offset: String(last.nodeValue || "").length };
+    };
     const selectionBoundary = (container, offset) => {
         const direct = directNodeFor(container);
         if (direct) {
             if (direct.dataset.nodeType === "text") {
-                const textNode = direct.firstChild;
                 const logicalLength = String(direct.textContent || "").replaceAll("\u200b", "").length;
+                // ACROSS the span. `logicalTextOffset` measured within one
+                // text node, which was the same thing while a span held
+                // exactly one; with a handle marked live it holds several,
+                // and a caret after the handle reported the offset inside
+                // the trailing run instead of the offset in the prose.
                 const logicalOffset = container?.nodeType === Node.TEXT_NODE
-                    ? logicalTextOffset(container, offset)
+                    ? logicalOffsetWithin(direct, container, offset)
                     : (Number(offset) > 0 ? logicalLength : 0);
                 return { node_id: direct.dataset.nodeId || "",
                     offset: Math.max(0, Math.min(logicalLength, logicalOffset)) };
@@ -1543,17 +1610,10 @@ export function createPromptDocumentEditor({
             return index < 0 ? null : { container: editor,
                 offset: index + (Number(boundary.offset) > 0 ? 1 : 0) };
         }
-        const textNode = direct.firstChild;
-        if (!textNode) return { container: direct, offset: 0 };
-        const value = String(textNode.nodeValue || "");
-        const wanted = Math.max(0, Number(boundary.offset) || 0);
-        let logical = 0;
-        let raw = 0;
-        while (raw < value.length && logical < wanted) {
-            if (value[raw] !== "\u200b") logical += 1;
-            raw += 1;
-        }
-        return { container: textNode, offset: raw };
+        // Any descendant, not `firstChild`: a span carrying a live handle
+        // has several text nodes, and restoring past the first one landed
+        // the caret at the end of the first run instead.
+        return domPositionWithin(direct, boundary.offset);
     };
     const restoreSelection = (bookmark) => {
         if (!bookmark) return false;
@@ -1628,13 +1688,82 @@ export function createPromptDocumentEditor({
             element.addEventListener("mousedown", (event) => event.preventDefault());
         }
     };
+    /**
+     * Paint one text node's span, marking `@handle` runs as live.
+     *
+     * A handle is prose, not a chip — it round-trips through `readDom` as the
+     * characters the author typed, and this only changes how those characters
+     * LOOK. The span therefore holds child spans rather than one text node,
+     * which is why every caret site below walks a subtree instead of reading
+     * `firstChild`.
+     *
+     * `display:inline` is mandatory, not cosmetic: `readDom` reads `innerText`,
+     * which inserts a line break for any block-level child box, so an
+     * inline-block handle would persist a newline into the author's prose on
+     * every keystroke.
+     */
+    /**
+     * What the current model would paint as handles, as a comparable string.
+     *
+     * SPELLINGS, not offsets. An offset-based signature changed on every
+     * keystroke typed anywhere BEFORE a handle, so the author typed through a
+     * full teardown-and-rebuild of the editor — the thing not repainting per
+     * keystroke exists to avoid. Inserting a character into the unmarked text
+     * beside a handle leaves the painted span covering exactly the same
+     * characters, so nothing needs repainting; what needs it is a handle
+     * appearing, vanishing, or changing what it names.
+     *
+     * Cheap enough to run per keystroke: one regex pass over the text nodes,
+     * no DOM.
+     */
+    let paintedHandleSignature = "";
+    const handlePaintSignature = () => model.nodes
+        .map((node) => node.type !== "text" ? "" : promptHandleMentions(
+            node.text).map((run) => run.handle).join(","))
+        .join("|");
+    const paintTextSpan = (span, text) => {
+        // Every run is an explicit Text node, including the unmarked ones and
+        // including the no-handles case. Assigning `textContent` would be
+        // shorter, but it leaves the span's characters in a place the offset
+        // walker below cannot see — a browser materializes a Text node for it
+        // and the test DOM stores a string, so the two would disagree about
+        // where a caret is. One shape, both environments.
+        const runs = promptHandleMentions(text);
+        let cursor = 0;
+        for (const run of runs) {
+            if (run.start > cursor) {
+                span.appendChild(document.createTextNode(text.slice(cursor, run.start)));
+            }
+            const mark = document.createElement("span");
+            mark.dataset.sonderPromptHandle = "1";
+            // `display:inline` is mandatory, not cosmetic: `readDom` reads
+            // `innerText`, which injects a line break for any block-level child
+            // box, so an inline-block handle would persist a newline into the
+            // author's prose on every keystroke.
+            mark.style.cssText = `display:inline;color:${CHIP_PALETTE.text};`;
+            mark.appendChild(document.createTextNode(text.slice(run.start, run.end)));
+            span.appendChild(mark);
+            cursor = run.end;
+        }
+        if (cursor < text.length || !runs.length) {
+            span.appendChild(document.createTextNode(text.slice(cursor)));
+        }
+    };
     let decorationPlan = [];
     let lastPaintedIndex = -1;
-    const paintDecorations = (nodeIndex, { trailing = false } = {}) => {
+    const paintDecorations = (nodeIndex, { trailing = false, leading = false } = {}) => {
         for (const entry of decorationPlan) {
             const target = Number(entry?.afterIndex);
             const isTrailing = !Number.isFinite(target) || target >= model.nodes.length;
-            if (trailing ? !isTrailing : (isTrailing || target !== nodeIndex)) continue;
+            // A decoration can only be painted AFTER a node, which left nothing
+            // able to sit above the first one — so a channel the template lists
+            // FIRST, unwritten, landed inside the first channel the author did
+            // write. `afterIndex: -1` means "before everything", the mirror of
+            // the trailing slot that already existed.
+            const isLeading = Number.isFinite(target) && target < 0;
+            if (leading ? !isLeading : isLeading) continue;
+            if (!leading
+                && (trailing ? !isTrailing : (isTrailing || target !== nodeIndex))) continue;
             if (paintedDecorations.has(entry)) continue;
             paintedDecorations.add(entry);
             const element = entry?.element;
@@ -1651,6 +1780,7 @@ export function createPromptDocumentEditor({
         editor.textContent = "";
         decorationPlan = decorationFor();
         paintedDecorations = new Set();
+        paintDecorations(-1, { leading: true });
         const byId = attachmentById();
         model.nodes.forEach((node, nodeIndex) => {
             if (node.type === "text") {
@@ -1665,7 +1795,7 @@ export function createPromptDocumentEditor({
                 span.dataset.modelIndex = String(nodeIndex);
                 // A zero-width character keeps an empty stable text node
                 // addressable without entering the normalized projection.
-                span.textContent = node.text || "\u200b";
+                paintTextSpan(span, node.text || "\u200b");
                 editor.appendChild(span);
                 paintDecorations(nodeIndex);
                 return;
@@ -1778,6 +1908,9 @@ export function createPromptDocumentEditor({
             paintDecorations(nodeIndex);
         });
         paintDecorations(model.nodes.length - 1, { trailing: true });
+        // Stamped from the model the paint was built from, so the next
+        // `readDom` compares like with like.
+        paintedHandleSignature = handlePaintSignature();
         rendering = false;
         if (ownedFocus && bookmark) {
             editor.focus({ preventScroll: true });
@@ -1793,8 +1926,14 @@ export function createPromptDocumentEditor({
     // unhandled it makes the chip undeletable from the keyboard and lets the
     // browser default run instead.
     const adjacentModelElement = (element, direction) => {
+        // Model elements are EDITOR children. A nested span — the kind
+        // a live handle paints — would walk its siblings inside one
+        // text span and answer "no chip" for a chip that is right
+        // there, so climb before walking.
+        const from = element?.dataset?.nodeId ? element
+            : element?.closest?.("[data-node-id]") || element;
         let cursor = direction === "previous"
-            ? element.previousElementSibling : element.nextElementSibling;
+            ? from.previousElementSibling : from.nextElementSibling;
         while (cursor?.dataset?.sonderDecoration === "1") {
             cursor = direction === "previous"
                 ? cursor.previousElementSibling : cursor.nextElementSibling;
@@ -1849,6 +1988,15 @@ export function createPromptDocumentEditor({
         if (removedInline.size) attachments = attachments.filter((attachment) =>
             !removedInline.has(attachment.attachment_id));
         emit(removedInline.size ? "attachment" : "document");
+        // Repaint only when the set of handle runs actually CHANGED. `readDom`
+        // deliberately does not re-render — it runs on every keystroke and a
+        // render moves the caret — so without this a hand-typed `@KWoman` stayed
+        // unmarked until something unrelated forced a render, and the editor
+        // silently stopped telling the author which words are live. Comparing
+        // signatures keeps the render to the keystroke that completes or breaks
+        // a handle rather than every one.
+        const signature = handlePaintSignature();
+        if (signature !== paintedHandleSignature) render();
     };
 
     editor.addEventListener("compositionstart", () => {
@@ -1939,13 +2087,25 @@ export function createPromptDocumentEditor({
             }
             let chip = event.target?.dataset?.nodeType === "attachment" ? event.target : null;
             if (!chip && range?.collapsed) {
-                const host = range.startContainer.nodeType === Node.TEXT_NODE
-                    ? range.startContainer.parentElement : range.startContainer;
+                // `directNodeFor` CLIMBS to the node span. Reading
+                // `parentElement` gave the styled span of a live
+                // handle instead, so the test below failed and chip
+                // adjacency died wherever a handle sat beside a chip.
+                const host = directNodeFor(range.startContainer);
                 if (host?.dataset?.nodeType === "text") {
                     const length = String(host.textContent || "").replaceAll("\u200b", "").length;
-                    if (event.key === "Backspace" && range.startOffset === 0) {
+                    // Measured across the span for the same reason: a
+                    // raw offset of 0 inside a trailing run is not the
+                    // start of the prose. An ELEMENT container carries a
+                    // child index rather than a character offset, which is
+                    // the same distinction `selectionBoundary` makes.
+                    const at = range.startContainer?.nodeType === Node.TEXT_NODE
+                        ? logicalOffsetWithin(
+                            host, range.startContainer, range.startOffset)
+                        : (Number(range.startOffset) > 0 ? length : 0);
+                    if (event.key === "Backspace" && at === 0) {
                         chip = adjacentModelElement(host, "previous");
-                    } else if (event.key === "Delete" && range.startOffset >= length) {
+                    } else if (event.key === "Delete" && at >= length) {
                         chip = adjacentModelElement(host, "next");
                     }
                 }
@@ -2222,18 +2382,32 @@ export function createPromptDocumentEditor({
      * and `readDom` preserves each span's id. The caret is bookmarked to the
      * TAIL node explicitly, so it lands after the break rather than before it.
      */
-    editor.insertText = (rawText, { replaceSelection = false, asOwnNode = false } = {}) => {
+    editor.insertText = (rawText, { replaceSelection = false, asOwnNode = false,
+        replaceTextRange = null } = {}) => {
         if (disabled) return;
         const value = String(rawText ?? "");
         if (!value) return;
         editor.focus();
         const bookmark = selectionBookmark();
-        const from = modelPositionFor(bookmark?.start);
-        const to = modelPositionFor(bookmark?.end);
+        // The same option `insertAttachment` takes, for the same caller and the
+        // same reason: the mention menu has to remove the `@KWo` the author
+        // typed and put the accepted spelling in its place. Now that a mention
+        // is TEXT rather than a chip, that replacement has to be reachable from
+        // here too — without it the query survives beside its own completion.
+        // Given in `value` coordinates, so it is resolved before the caret is.
+        const ranged = replaceTextRange
+            && Number.isFinite(replaceTextRange.start)
+            && Number.isFinite(replaceTextRange.end)
+            && replaceTextRange.end > replaceTextRange.start
+            ? { start: modelPositionForTextOffset(replaceTextRange.start),
+                end: modelPositionForTextOffset(replaceTextRange.end) }
+            : null;
+        const from = ranged?.start || modelPositionFor(bookmark?.start);
+        const to = ranged?.end || modelPositionFor(bookmark?.end);
         pushHistory();
         let target = from;
         let removedAttachment = false;
-        if (replaceSelection && from && to
+        if ((replaceSelection || ranged) && from && to
                 && (to.index > from.index || to.offset > from.offset)) {
             const result = deleteModelSpan(from, to);
             target = { index: result.index, offset: result.offset };
@@ -2372,10 +2546,14 @@ export function createPromptDocumentEditor({
             const element = entry?.element;
             if (!(element instanceof HTMLElement)) continue;
             const target = Number(entry?.afterIndex);
-            // `render()` never paints a negative or out-of-range index inline;
-            // it falls to the trailing pass. Match that rather than inventing a
-            // second rule here.
-            const trailing = !Number.isFinite(target) || target < 0
+            // Match `render()` exactly. It paints an OUT-OF-RANGE index in the
+            // trailing pass but a NEGATIVE one in its own leading pass, and
+            // folding the two together here sent every leading decoration to the
+            // bottom of the draft — on this path only, which is the one a landed
+            // compile takes on every keystroke. So a channel the template lists
+            // first sat on top after a panel rebuild and underneath everything a
+            // moment later, with nothing in between to explain it.
+            const trailing = !Number.isFinite(target)
                 || target >= model.nodes.length;
             paintedDecorations.add(entry);
             decorateElement(element);
@@ -2417,9 +2595,24 @@ export function promptSelectionSnapshot(editor) {
         return { bookmark: promptInsertionBookmark(editor), text: "" };
     }
     const range = selection.getRangeAt(0);
-    const single = range.startContainer === range.endContainer
+    // The rule is "one model TEXT node", not "one DOM text node" — those were
+    // the same thing until a live `@handle` gave a span styled children, and
+    // then a selection crossing a handle silently stopped counting as prose.
+    // That is not a visible failure: the writing aid quietly degrades from
+    // WRAPPING the selection to inserting in front of it, which is the shipped
+    // "highlight a spoken line, pick Dialogue" behaviour going missing.
+    const nodeSpanFor = (container) => {
+        if (!container || !editor?.contains?.(container)) return null;
+        const element = container.nodeType === Node.TEXT_NODE
+            ? container.parentElement : container;
+        const span = element?.closest?.("[data-node-id]") || null;
+        return span?.dataset?.nodeType === "text" ? span : null;
+    };
+    const startSpan = nodeSpanFor(range.startContainer);
+    const single = startSpan
+        && startSpan === nodeSpanFor(range.endContainer)
         && range.startContainer?.nodeType === Node.TEXT_NODE
-        && editor?.contains?.(range.startContainer);
+        && range.endContainer?.nodeType === Node.TEXT_NODE;
     if (!single) return { bookmark: promptInsertionBookmark(editor), text: "" };
     // Chips are rendered with zero-width markers; they are structure, not prose.
     const text = String(range.toString() || "").replaceAll("\u200b", "");
@@ -3032,28 +3225,6 @@ export function handleAttachCapabilityRecord(profile, options = {}) {
 }
 
 /**
- * The derived capability this format renders where its anchor sits, or "".
- *
- * Declaration-driven: whichever kind declares `placement: "inline"` first, so
- * H3 Full Reference answers `mentions` and `generic@1` answers `derived_prompt`
- * without either name appearing here. A format declaring none has no way to
- * spell a Reference inside a sentence, and callers must refuse rather than fall
- * back — the fallback is a section-prefix capability that emits its own line
- * and renders nothing at the caret.
- *
- * `orderedReferenceDerived`'s missing-`order`-as-0 reading is COSMETIC here,
- * unlike in `handleAttachCapabilityRecord` above, where it decides whether a
- * record is written at all: every candidate this sees is already a live inline
- * capability, so a tie only picks a different correct answer.
- */
-export function inlineReferenceCapabilityKind(profile) {
-    for (const [kind, declaration] of orderedReferenceDerived(profile)) {
-        if (String(declaration?.placement || "") === "inline") return kind;
-    }
-    return "";
-}
-
-/**
  * The `Reference` row: attach a handle directly, or open the full dialog.
  *
  * Physical References now carry the same prompt defaults an identity does, so a
@@ -3164,9 +3335,163 @@ export function createPromptContextMenuItems({ editor, bookmark = null,
 }
 
 /** Install right-click and keyboard Context authoring on one prompt box. */
+/** Typeahead for `@handle` while writing prose, on ANY channel editor.
+ *
+ *  Accepting ATTACHES a Reference. It used to insert text, on the reasoning
+ *  that attaching per keystroke would make an undo step per character — which
+ *  confused a keystroke with an accept. The text version was worse than
+ *  incomplete: the compiler's grammar is `@kind(source_id)`, so a bare
+ *  `@KWoman` in prose compiles literally and never becomes `<Subject 1>`. Only
+ *  an attachment resolves.
+ *
+ *  `sources()` is called once per menu OPEN, not per keystroke: the only
+ *  builder of the shape it needs also reconciles block metadata and can clone
+ *  attachments, so calling it per input event would be both expensive and
+ *  side-effectful on the draft.
+ *
+ *  Returns a cleanup function, matching the module-host contract.
+ */
+export function installPromptMentionMenu(area, { sources, onAccepted } = {}) {
+    const menu = document.createElement("div");
+    menu.dataset.sonderPromptContextMenu = "1";
+    menu.setAttribute("role", "listbox");
+    // The Writing draft lives inside the panel overlay (z-index 10000), and
+    // dialogs above it use 12000 — a menu at 40 on `document.body` renders
+    // BEHIND all of it, which is indistinguishable from not opening at all.
+    // 12010 is the established "menu above panel chrome" tier. `fixed`, not
+    // `absolute`, because the anchor it is positioned from is itself fixed.
+    menu.style.cssText = `position:fixed;z-index:12010;display:none;min-width:150px;
+        max-height:180px;overflow:auto;border:1px solid ${COLORS.border};border-radius:6px;
+        background:${COLORS.panelRaised};box-shadow:0 6px 18px rgba(0,0,0,.45);padding:2px;`;
+    // The panel re-renders freely and builds a fresh draft area each time. Its
+    // callers cannot be relied on to run the returned cleanup, and a leaked
+    // menu is not merely garbage — it keeps a listener bound to a DETACHED
+    // editor, so a stale instance can still answer keys. Sweep any menu whose
+    // owner is gone before adding this one.
+    // "Owner is detached" is NOT the same as "owner is dead". Every panel here
+    // builds its editors detached and appends them afterwards, so at install
+    // time `isConnected` is false for a perfectly live editor. This menu is now
+    // installed once per CHANNEL editor rather than once per surface, and with
+    // the naive test each install disposed the previous one's listeners —
+    // measured: after installing a second editor, the first had zero input
+    // listeners left. Structured, the timeline bars and the global row all
+    // build several editors in a row, so only the LAST kept completion.
+    //
+    // So a menu is swept only once its owner has been SEEN connected and has
+    // since gone. An owner that never attaches is abandoned rather than
+    // reclaimed, which leaks one menu instead of silently disabling a live one.
+    for (const stale of document.querySelectorAll("[data-sonder-writing-mention='1']")) {
+        if (stale.__sonderOwner?.isConnected) stale.__sonderOwnerSeen = true;
+        if (!stale.__sonderOwner
+            || (stale.__sonderOwnerSeen && !stale.__sonderOwner.isConnected)) {
+            stale.__sonderDispose?.();
+            stale.remove();
+        }
+    }
+    menu.dataset.sonderWritingMention = "1";
+    menu.__sonderOwner = area;
+    menu.__sonderOwnerSeen = area?.isConnected === true;
+    document.body.appendChild(menu);
+    let rows = [];
+    let active = 0;
+    let query = null;
+
+    const close = () => { menu.style.display = "none"; rows = []; query = null; };
+    const paint = () => {
+        [...menu.children].forEach((row, index) => {
+            row.style.background = index === active ? COLORS.panelMuted : "transparent";
+            row.setAttribute("aria-selected", index === active ? "true" : "false");
+        });
+    };
+    const accept = (index) => {
+        const chosen = rows[index];
+        if (!chosen || !query) return close();
+        // An ineligible source is listed so the menu can explain itself, but it
+        // cannot be attached — accepting one would create a chip the compiler
+        // will refuse.
+        if (chosen.eligible === false) return;
+        const attached = onAccepted?.({
+            handle: chosen.handle,
+            value: chosen.value,
+            // In `value` coordinates, so the editor can delete the typed query
+            // and put the chip in its place. Leaving the text behind is what
+            // made a mention compile literally.
+            replaceTextRange: { start: query.start, end: query.end },
+        });
+        close();
+        return attached;
+    };
+    let sourceRows = [];
+    const refresh = () => {
+        const previous = query;
+        query = writingMentionQuery(area.value, area.promptTextOffset ?? -1);
+        if (!query || query.completingQualifier) return close();
+        // Once per OPEN. `sources()` reconciles block metadata and can clone
+        // attachments, so running it per keystroke would mutate the draft on
+        // every character typed.
+        if (!previous) sourceRows = sources?.() || [];
+        rows = handleMentionCandidates(query.handle, sourceRows);
+        if (!rows.length) return close();
+        menu.replaceChildren(...rows.map((row, index) => {
+            const item = document.createElement("div");
+            item.setAttribute("role", "option");
+            item.style.cssText = `padding:3px 7px;border-radius:4px;cursor:pointer;
+                color:${COLORS.text};font:11px system-ui,sans-serif;white-space:nowrap;`;
+            item.textContent = row.label === row.handle
+                ? `@${row.handle}` : `@${row.handle} — ${row.label}`;
+            item.addEventListener("mousedown", (event) => {
+                event.preventDefault();
+                accept(index);
+            });
+            return item;
+        }));
+        active = 0;
+        // Viewport coordinates, to match `position:fixed`. Flipped above the
+        // caret line when the menu would fall off the bottom of the window.
+        const box = area.getBoundingClientRect();
+        const height = Math.min(180, rows.length * 22 + 8);
+        const below = box.bottom + 2;
+        menu.style.left = `${Math.max(4, box.left)}px`;
+        menu.style.top = below + height > globalThis.innerHeight
+            ? `${Math.max(4, box.top - height - 2)}px` : `${below}px`;
+        menu.style.display = "block";
+        paint();
+    };
+
+    const onInput = () => refresh();
+    const onKeyDown = (event) => {
+        if (menu.style.display === "none") return false;
+        if (area.isPromptComposing?.() || event.isComposing || event.keyCode === 229) return false;
+        if (event.key === "Escape") { close(); return true; }
+        if (["ArrowDown", "ArrowUp"].includes(event.key)) {
+            active = (active + (event.key === "ArrowDown" ? 1 : rows.length - 1)) % rows.length;
+            paint();
+            return true;
+        }
+        if (["Enter", "Tab"].includes(event.key)) { accept(active); return true; }
+        return false;
+    };
+    area.addEventListener("input", onInput);
+    // NOT a raw keydown listener: `keyboard_ownership` owns these keys at
+    // capture on document and calls `stopImmediatePropagation`, so a listener
+    // on the element never runs. `addOwnedKeyHandler` is the editor's seam
+    // into that layer, and returning true marks the key consumed.
+    const removeOwned = area.addOwnedKeyHandler?.(onKeyDown) ?? (() => {});
+    area.addEventListener("blur", close);
+    const dispose = () => {
+        area.removeEventListener("input", onInput);
+        removeOwned();
+        area.removeEventListener("blur", close);
+        menu.__sonderDispose = null;
+        menu.remove();
+    };
+    menu.__sonderDispose = dispose;
+    return dispose;
+}
+
 export function installPromptContextMenu({ editor, allowedKinds = AUTHORING_KINDS,
     onCreate = null, writingAids = [], channelKey = "", profile = null,
-    referenceContext = null, onInserted = null } = {}) {
+    referenceContext = null, onInserted = null, onMentionAccepted = null } = {}) {
     if (!editor) return () => {};
     let closeMenu = null;
     const open = ({ x, y, pointCaret = false } = {}) => {
@@ -3207,11 +3532,42 @@ export function installPromptContextMenu({ editor, allowedKinds = AUTHORING_KIND
         }
         return false;
     }) || (() => {});
+    // `@` completion rides with the caret menu rather than being installed
+    // per surface. Both attach to the SAME editors and both need the same
+    // `referenceContext`, and a handle typed into any channel box now resolves
+    // at compile time — so a surface that had one menu but not the other would
+    // silently resolve handles it never offered to complete. Installing them
+    // together makes that shape unreachable.
+    //
+    // `onMentionAccepted` is the host's, because what an accept does to stored
+    // state differs per surface: a Writing draft saves to browser-local
+    // storage, a Structured channel commits to the project. The default writes
+    // the spelling and nothing else, which is right for a surface that already
+    // commits on input.
+    const disposeMentions = referenceContext ? installPromptMentionMenu(editor, {
+        sources: () => {
+            const context = typeof referenceContext === "function"
+                ? referenceContext() : referenceContext;
+            if (!context) return [];
+            return promptMentionCandidates({
+                options: promptReferenceSourceOptions(context),
+                references: context.references || [],
+                semanticUnits: context.semanticUnits || [],
+            });
+        },
+        onAccepted: ({ handle, replaceTextRange }) => {
+            const spelling = `@${handle}`;
+            editor.insertText(spelling, { replaceTextRange });
+            onMentionAccepted?.(spelling);
+            return spelling;
+        },
+    }) : () => {};
     const cleanup = () => {
         closeMenu?.();
         closeMenu = null;
         editor.removeEventListener("contextmenu", onContextMenu);
         removeOwned();
+        disposeMentions();
     };
     editor._sonderPromptContextMenuCleanup = cleanup;
     return cleanup;
@@ -4744,11 +5100,31 @@ export function createAttachmentChannelProjections({ channelKey = "", attachment
     return { beforeHost, afterHost };
 }
 
+/**
+ * One scope row, in three tiers: identity, chips, one `+ Attach`.
+ *
+ * It used to do eight jobs on one line. Each chip's holder carried up to four
+ * trailing buttons -- two of them both labelled "Unlink", meaning different
+ * things -- then a dead `+N`, then FOUR tail controls: a kind select, Attach, a
+ * reuse select whose options read `Reference: KWoman - section 2 [56-135] -
+ * used in 3 sections`, and Reuse. The chips are the content and were the least
+ * visible thing in it.
+ *
+ * So the chips are label-only and uniform, every per-chip action moves into a
+ * menu opened FROM the chip, and the four tail controls collapse into one
+ * `+ Attach` whose menu carries the kinds and a Reuse submenu. "Used in N
+ * sections" moves onto the chip it describes.
+ *
+ * Unlike the Writing contribution block, this is NOT mouse-only: a scope row is
+ * not a decoration and can hold focus, so a chip stays a real button, its menu
+ * opens on native Enter/Space as well as click, and `focusFirst` puts the
+ * keyboard on the first row rather than the second.
+ */
 export function createScopeChipRow({ attachments = [], previews = {}, disabled = false,
     onAdd = null, onActivate = null, onRemove = null, maxVisible = 6,
     allowedKinds = SCOPE_KINDS, attachmentLabelFor = null,
     reusableAttachments = [], onReuse = null, onUnlink = null,
-    onConvertPromptLinkCopy = null, profile = null,
+    onConvertPromptLinkCopy = null, profile = null, label = "Context",
     allSceneAttachments = [], reuseContext = {} } = {}) {
     const row = document.createElement("div");
     row.style.cssText = "display:flex;gap:4px;align-items:center;flex-wrap:wrap;min-width:0;";
@@ -4759,9 +5135,72 @@ export function createScopeChipRow({ attachments = [], previews = {}, disabled =
         groupCounts.set(value.emission_group_id,
             (groupCounts.get(value.emission_group_id) || 0) + 1);
     }
-    values.slice(0, maxVisible).forEach((attachment) => {
-        const holder = document.createElement("span");
-        holder.style.cssText = "display:flex;align-items:center;gap:3px;flex-wrap:wrap;min-width:0;max-width:100%;";
+    // Tier 1 -- identity. Rendered even at zero chips: that is the point of the
+    // tier, and it is what stops a chipless row reading as a stray button.
+    const caption = document.createElement("span");
+    caption.dataset.sonderScopeRowLabel = "1";
+    caption.textContent = values.length
+        ? `${label} (${values.length})` : label;
+    caption.style.cssText = `font:9px system-ui;color:${COLORS.textDim};`
+        + "text-transform:uppercase;letter-spacing:.04em;flex:0 0 auto;";
+    row.appendChild(caption);
+
+    // Tier 3's kind list, computed here so the chip menu and the Attach menu
+    // cannot disagree. Inline-only kinds are filtered CENTRALLY rather than at
+    // each caller, so Timeline, Structured and Writing all offer the same set;
+    // the format gate runs in the same place for the same reason.
+    const scopeKinds = promptContextGatedKinds(
+        allowedKinds.filter((value) => SCOPE_KINDS.includes(value)), profile);
+
+    /** Every action for one chip, as menu items. Each is gated on its callback. */
+    const chipMenuItems = (attachment, chipLabel) => {
+        const items = [];
+        const linkedCount = groupCounts.get(attachment.emission_group_id) || 0;
+        if (linkedCount > 1) {
+            // "Used in N sections" belongs ON the chip it describes -- it was
+            // buried in a reuse picker's option text, describing a chip you
+            // could not see from there.
+            items.push({ label: `Used in ${linkedCount} sections`, disabled: true });
+        }
+        if (INLINE_ONLY_KINDS.includes(attachment.kind)) {
+            items.push({ label: `${LABELS[attachment.kind] || attachment.kind}`
+                + " must be placed inline", disabled: true,
+                hint: "re-insert it in the prompt text, or remove it" });
+        }
+        if (onActivate) {
+            items.push({ label: "Configure\u2026",
+                hint: "fields, routing and per-chip overrides",
+                action: () => onActivate(attachment) });
+        }
+        if (attachment.kind === "prompt_link_scope" && onRemove) {
+            items.push({ type: "separator" });
+            items.push({ label: "Unlink this section",
+                hint: "drop the live dependency, keeping no text",
+                action: () => onRemove(attachment) });
+            if (onConvertPromptLinkCopy) {
+                items.push({ label: "Convert to copy",
+                    hint: "paste the source's current text here, then unlink",
+                    action: () => onConvertPromptLinkCopy(attachment) });
+            }
+        }
+        if (linkedCount > 1 && onUnlink) {
+            items.push({ type: "separator" });
+            items.push({ label: "Unlink from the other sections",
+                // Named apart from the Prompt Link action above, which the flat
+                // row could not do: both were a button reading "Unlink".
+                hint: "give only this chip its own emission group",
+                action: () => onUnlink(unlinkPromptAttachment(attachment), attachment) });
+        }
+        if (onRemove) {
+            items.push({ type: "separator" });
+            items.push({ label: `Remove ${chipLabel}`, danger: true,
+                action: () => onRemove(attachment) });
+        }
+        return items;
+    };
+
+    /** Tier 2 -- one chip, label only, its actions one click away. */
+    const makeChip = (attachment) => {
         const chip = document.createElement("button");
         chip.type = "button";
         chip.dataset.attachmentId = attachment.attachment_id;
@@ -4769,115 +5208,96 @@ export function createScopeChipRow({ attachments = [], previews = {}, disabled =
         // After the style, never before: assigning cssText would wipe the
         // dimming, and the flag alone leaves a control that looks live.
         setButtonDisabled(chip, disabled);
-        const label = attachmentLabel(attachment,
+        const chipLabel = attachmentLabel(attachment,
             previews?.[attachment.attachment_id] || "",
             attachmentLabelFor?.(attachment) || "");
-        chip.setAttribute("aria-label", `${label} Context chip`);
-        chip.appendChild(contextChipLabel(label));
+        chip.setAttribute("aria-label", `${chipLabel} Context chip`);
+        chip.setAttribute("aria-haspopup", "menu");
+        chip.appendChild(contextChipLabel(chipLabel));
         const inlineOnly = INLINE_ONLY_KINDS.includes(attachment.kind);
         chip.title = inlineOnly
-            ? `${label} — ${LABELS[attachment.kind] || attachment.kind} must be placed inline in the prompt text; re-insert or remove this chip.`
-            : `${label} — dynamic prompt context`;
+            ? `${chipLabel} \u2014 ${LABELS[attachment.kind] || attachment.kind} must be placed inline in the prompt text; re-insert or remove this chip.`
+            : `${chipLabel} \u2014 click for what you can do with it`;
         if (inlineOnly) {
             // A legacy scope row stays visible and reachable so it can be
             // rebound or removed; the compiler refuses the job meanwhile.
             chip.style.borderColor = COLORS.dangerBorder;
             chip.style.color = COLORS.dangerText;
         }
-        chip.addEventListener("click", () => onActivate?.(attachment));
-        chip.addEventListener("keydown", (event) => {
-            if (["Backspace", "Delete"].includes(event.key) && onRemove) {
-                event.preventDefault(); onRemove(attachment);
-            }
+        let menu = null;
+        chip.addEventListener("click", () => {
+            if (disabled) return;
+            const items = chipMenuItems(attachment, chipLabel);
+            if (!items.length) return;
+            const rect = chip.getBoundingClientRect();
+            // Anchored to the CHIP, not the pointer, so the keyboard path opens
+            // it in the same place the mouse does. `closeOnScroll` because the
+            // Prompt panel body is the scroller and a menu left behind would
+            // float away from the chip it belongs to.
+            menu = openContextMenu({ x: rect.left, y: rect.bottom + 2, items,
+                closeOnScroll: true, focusFirst: true });
         });
-        holder.appendChild(chip);
-        if (attachment.kind === "prompt_link_scope" && onRemove) {
-            const unlinkScope = document.createElement("button");
-            unlinkScope.type = "button";
-            unlinkScope.textContent = "Unlink";
-            unlinkScope.title = "Remove the live section dependency without copying its text.";
-            unlinkScope.style.cssText = `padding:2px 5px;border:1px solid ${COLORS.border};border-radius:4px;background:${COLORS.panelRaised};color:${CHIP_PALETTE.control};font:8px system-ui;cursor:pointer;`;
-            setButtonDisabled(unlinkScope, disabled);
-            unlinkScope.addEventListener("click", () => onRemove(attachment));
-            holder.appendChild(unlinkScope);
-            if (onConvertPromptLinkCopy) {
-                const copy = document.createElement("button");
-                copy.type = "button";
-                copy.textContent = "Convert to copy";
-                copy.title = "Copy the source's current authored channel text here, then remove the live link.";
-                copy.style.cssText = unlinkScope.style.cssText;
-                setButtonDisabled(copy, disabled);
-                copy.addEventListener("click", () => onConvertPromptLinkCopy(attachment));
-                holder.appendChild(copy);
-            }
-        }
+        chip.addEventListener("keydown", (event) => {
+            if (!["Backspace", "Delete"].includes(event.key) || !onRemove) return;
+            // Not while its own menu is open, or the chip deletes itself out
+            // from under the menu that is describing it.
+            if (menu?.isOpen?.()) return;
+            event.preventDefault();
+            onRemove(attachment);
+        });
+        return chip;
+    };
+
+    for (const attachment of values.slice(0, maxVisible)) {
+        const holder = document.createElement("span");
+        // Uniform: the holder's width is now the chip's width, because nothing
+        // else lives in it. The `linked` badge stays -- it is information about
+        // the chip, not an action on it.
+        holder.style.cssText = "display:flex;align-items:center;gap:3px;min-width:0;max-width:100%;";
+        holder.appendChild(makeChip(attachment));
         if ((groupCounts.get(attachment.emission_group_id) || 0) > 1) {
             const linked = document.createElement("span");
             linked.dataset.sonderLinkedAttachment = "1";
             linked.textContent = "linked";
             linked.title = "Edits to this configured chip propagate to every linked section.";
-            linked.style.cssText = `margin-left:3px;font:8px system-ui;color:${CHIP_PALETTE.linked};text-transform:uppercase;letter-spacing:.04em;`;
+            linked.style.cssText = `font:8px system-ui;color:${CHIP_PALETTE.linked};text-transform:uppercase;letter-spacing:.04em;`;
             holder.appendChild(linked);
-            if (onUnlink) {
-                const unlink = document.createElement("button");
-                unlink.type = "button";
-                unlink.textContent = "Unlink";
-                unlink.title = "Give only this chip an independent emission group.";
-                unlink.style.cssText = `flex:0 0 auto;min-width:16px;min-height:16px;border:0;border-radius:3px;background:transparent;color:${CHIP_PALETTE.control};font:9px/16px system-ui;cursor:pointer;padding:0 3px;outline-offset:1px;`;
-                setButtonDisabled(unlink, disabled);
-                unlink.addEventListener("click", () =>
-                    onUnlink(unlinkPromptAttachment(attachment), attachment));
-                holder.appendChild(unlink);
-            }
-        }
-        if (onRemove) {
-            const remove = document.createElement("button");
-            remove.type = "button";
-            remove.textContent = "×";
-            remove.title = `Remove ${label} Context chip`;
-            remove.setAttribute("aria-label", remove.title);
-            remove.style.cssText = `flex:0 0 auto;min-width:16px;min-height:16px;border:0;border-radius:3px;background:transparent;color:${CHIP_PALETTE.control};font:12px/16px system-ui;cursor:pointer;padding:0 3px;outline-offset:1px;`;
-            setButtonDisabled(remove, disabled);
-            remove.addEventListener("click", () => onRemove(attachment));
-            holder.appendChild(remove);
         }
         row.appendChild(holder);
-    });
+    }
     if (values.length > maxVisible) {
-        const count = document.createElement("span");
-        count.textContent = `+${values.length - maxVisible}`;
-        count.title = `${values.length - maxVisible} more Context chips`;
-        count.style.cssText = `font:10px system-ui;color:${COLORS.textDim};`;
-        row.appendChild(count);
+        // Was a dead `+N` label with no way to reach what it counted, and the
+        // caption above already says how many there are. Now it opens them.
+        const hidden = values.slice(maxVisible);
+        const more = document.createElement("button");
+        more.type = "button";
+        more.dataset.sonderScopeRowOverflow = "1";
+        more.textContent = `${hidden.length} more\u2026`;
+        more.setAttribute("aria-haspopup", "menu");
+        more.style.cssText = `font:10px system-ui;background:transparent;color:${CHIP_PALETTE.control};border:1px dashed ${CHIP_PALETTE.border};border-radius:999px;padding:1px 6px;cursor:pointer;`;
+        setButtonDisabled(more, disabled);
+        more.addEventListener("click", () => {
+            if (disabled) return;
+            const rect = more.getBoundingClientRect();
+            openContextMenu({
+                x: rect.left, y: rect.bottom + 2, closeOnScroll: true,
+                focusFirst: true,
+                items: hidden.map((attachment) => {
+                    const chipLabel = attachmentLabel(attachment,
+                        previews?.[attachment.attachment_id] || "",
+                        attachmentLabelFor?.(attachment) || "");
+                    return { label: `${LABELS[attachment.kind] || attachment.kind}: ${chipLabel}`,
+                        submenu: () => chipMenuItems(attachment, chipLabel) };
+                }),
+            });
+        });
+        row.appendChild(more);
     }
-    const kindSelect = document.createElement("select");
-    kindSelect.setAttribute("aria-label", "Scope Context chip type");
-    kindSelect.style.cssText = `cursor:pointer;${
-        chromeInputCss({ padding: "1px 3px", fontSize: "10px" })}`;
-    setButtonDisabled(kindSelect, disabled);
-    // Inline-only kinds are filtered here rather than at each caller, so every
-    // scope row in Timeline, Structured and Writing agrees. The format gate runs
-    // in the same place for the same reason: both authoring routes — this row
-    // and the caret menu — must offer exactly what the format declares.
-    const scopeKinds = promptContextGatedKinds(
-        allowedKinds.filter((value) => SCOPE_KINDS.includes(value)), profile);
-    for (const kind of scopeKinds) {
-        const option = document.createElement("option");
-        option.value = kind; option.textContent = LABELS[kind] || kind;
-        kindSelect.appendChild(option);
-    }
-    const add = document.createElement("button");
-    add.type = "button";
-    add.textContent = "Attach to this section/scene";
-    add.style.cssText = `font:10px system-ui;background:transparent;color:${CHIP_PALETTE.control};border:1px dashed ${CHIP_PALETTE.border};border-radius:999px;padding:1px 6px;cursor:pointer;`;
-    setButtonDisabled(add, disabled);
-    // Falling back to a hardcoded "custom" would attach a kind the format may
-    // not declare and this row may not even be offering.
-    add.addEventListener("click", () => {
-        const kind = kindSelect.value || scopeKinds[0] || "";
-        if (kind) onAdd?.(kind);
-    });
-    row.append(kindSelect, add);
+
+    // Tier 3 -- one control where four were. The reuse picker becomes a
+    // submenu, so its long option text ("- section 2 [56-135] - used in 1
+    // section") becomes a hint beside a short label instead of a select whose
+    // width the row had to carry.
     const reusableKinds = new Set(
         allowedKinds.filter((value) => SCOPE_KINDS.includes(value)));
     const reusable = normalizePromptAttachments(reusableAttachments).filter((value) =>
@@ -4885,39 +5305,54 @@ export function createScopeChipRow({ attachments = [], previews = {}, disabled =
         && !values.some((current) => current.attachment_id === value.attachment_id
             || current.emission_group_id === value.emission_group_id));
     const reusableGroups = dedupeReusableAttachments(reusable, reuseContext);
-    if (onReuse && reusableGroups.length) {
-        const reuseSelect = document.createElement("select");
-        reuseSelect.setAttribute("aria-label", "Reuse an existing Context chip");
-        reuseSelect.style.cssText = kindSelect.style.cssText;
-        setButtonDisabled(reuseSelect, disabled);
+    const reuseItems = () => {
         const labels = reusableGroups.map((entry) => attachmentReuseLabel(
             entry.attachment, { ...reuseContext, attachmentLabelFor }));
         const labelCounts = new Map();
-        for (const label of labels) {
-            labelCounts.set(label, (labelCounts.get(label) || 0) + 1);
+        for (const value of labels) {
+            labelCounts.set(value, (labelCounts.get(value) || 0) + 1);
         }
-        for (const [entryIndex, entry] of reusableGroups.entries()) {
-            const attachment = entry.attachment;
-            const option = document.createElement("option");
-            option.value = attachment.attachment_id;
+        return reusableGroups.map((entry, entryIndex) => {
             const baseLabel = labels[entryIndex];
             const origin = labelCounts.get(baseLabel) > 1 && entry.section_index >= 0
-                ? ` — section ${entry.section_index + 1} [${entry.start_frame}-${entry.end_frame}]`
-                : "";
-            option.textContent = `${LABELS[attachment.kind] || attachment.kind}: ${baseLabel}${origin} — used in ${entry.count} section${entry.count === 1 ? "" : "s"}`;
-            reuseSelect.appendChild(option);
-        }
-        const reuse = document.createElement("button");
-        reuse.type = "button";
-        reuse.textContent = "Reuse an existing chip";
-        reuse.style.cssText = add.style.cssText;
-        setButtonDisabled(reuse, disabled);
-        reuse.addEventListener("click", () => {
-            const source = reusableGroups.find((value) =>
-                value.attachment.attachment_id === reuseSelect.value)?.attachment;
-            if (source) onReuse(reusePromptAttachment(source), source);
+                ? `section ${entry.section_index + 1} [${entry.start_frame}-${entry.end_frame}], ` : "";
+            return {
+                label: `${LABELS[entry.attachment.kind] || entry.attachment.kind}: ${baseLabel}`,
+                hint: `${origin}used in ${entry.count} section${entry.count === 1 ? "" : "s"}`,
+                action: () => onReuse(reusePromptAttachment(entry.attachment),
+                    entry.attachment),
+            };
         });
-        row.append(reuseSelect, reuse);
-    }
+    };
+    const add = document.createElement("button");
+    add.type = "button";
+    add.dataset.sonderScopeRowAttach = "1";
+    add.textContent = "+ Attach";
+    add.setAttribute("aria-haspopup", "menu");
+    add.title = "Attach Context to this section or scene";
+    add.style.cssText = `font:10px system-ui;background:transparent;color:${CHIP_PALETTE.control};border:1px dashed ${CHIP_PALETTE.border};border-radius:999px;padding:1px 6px;cursor:pointer;`;
+    setButtonDisabled(add, disabled);
+    add.addEventListener("click", () => {
+        if (disabled) return;
+        const items = scopeKinds.map((kind) => ({
+            label: LABELS[kind] || kind,
+            action: () => onAdd?.(kind),
+        }));
+        if (onReuse && reusableGroups.length) {
+            items.push({ type: "separator" });
+            items.push({ label: "Reuse an existing chip",
+                hint: `${reusableGroups.length} available`,
+                submenu: reuseItems });
+        }
+        if (!items.length) return;
+        const rect = add.getBoundingClientRect();
+        openContextMenu({ x: rect.left, y: rect.bottom + 2, items,
+            closeOnScroll: true, focusFirst: true });
+    });
+    row.appendChild(add);
+    // The offered kinds, for anything that needs to know what this row allows
+    // without opening its menu. `INLINE_ONLY_KINDS` and the format gate are
+    // applied above, once, so no reader can re-derive them differently.
+    row.dataset.sonderScopeKinds = scopeKinds.join(",");
     return row;
 }

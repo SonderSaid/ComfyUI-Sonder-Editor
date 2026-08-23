@@ -7,7 +7,7 @@ from datetime import datetime
 import os
 from typing import Any
 
-from . import prompt_context, prompt_live_context, prompt_payload
+from . import prompt_context, prompt_live_context, prompt_payload, prompt_tokens
 from .lane_registry import VARIABLE_LANE_DESCRIPTORS, pad_lane_configs, pad_lane_recipes
 from .reference_resolution import REFERENCE_OUTPUT_NAMES
 
@@ -1588,11 +1588,29 @@ class Scene:
         # actually reaches.
         global_channels = None if global_hidden else dict(self.global_channels or {})
         sections = [] if sections_hidden else self.prompt_sections
-        has_context = bool(self.global_attachments or any(
-            getattr(section, "attachments", None)
-            or any(prompt_context.document_has_anchors(document)
-                   for document in getattr(section, "channel_docs", {}).values())
-            for section in sections))
+        # A HANDLE typed in prose is Context too, and it leaves no attachment
+        # and no anchor behind. An anchors-only test therefore routes a
+        # handle-only scene straight past the compiler into
+        # `compose_range_prompt`, which reads the raw mirror and resolves
+        # nothing — the dormant node card would print `@KWoman` while the render
+        # sent the resolved token. The global lane is asked the same question:
+        # its own documents can carry handles even when nothing is attached to
+        # them.
+        def carries_context(documents) -> bool:
+            return any(prompt_context.document_has_anchors(document)
+                       or prompt_context.document_has_handle_mentions(document)
+                       for document in (documents or {}).values())
+
+        has_context = bool(
+            self.global_attachments
+            or (not global_hidden and (
+                prompt_tokens.has_handle_mention(global_text)
+                or any(prompt_tokens.has_handle_mention(value)
+                       for value in (global_channels or {}).values())
+                or carries_context(getattr(self, "global_channel_docs", None))))
+            or any(getattr(section, "attachments", None)
+                   or carries_context(getattr(section, "channel_docs", None))
+                   for section in sections))
         if has_context:
             compiled = (self.compile_for_execution(
                 project, start, end, labels_on=labels_on, delimiter=delimiter,

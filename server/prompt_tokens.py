@@ -54,6 +54,55 @@ def find(text, declarations=None) -> list[str]:
     return [value["token"] for value in references(text, declarations)]
 
 
+# A handle mention written directly in authored prose. Same shape as
+# `prompt_context.PROMPT_HANDLE_RE`, which validates a handle at creation, so a
+# handle that cannot be written cannot be created either.
+#
+# Two guards, and both are load-bearing:
+#
+# * `(?<![A-Za-z0-9_])` — an `@` following a word character is an ADDRESS.
+#   `bob@example` must never be read as a mention. This mirrors the boundary
+#   test in `writingMentionQuery`, which is where the rule was first settled;
+#   anything else may precede an `@`, because prose reaches one after a full
+#   stop, a quote, a dash or an opening bracket far more often than after a
+#   bare space.
+# * `(?![A-Za-z0-9_(])` — the run must END where it ends. The `(` half is what
+#   keeps `@subject(id)`, the TOKEN grammar above, out of the handle scanner: a
+#   project is free to hold a handle spelled `subject`, and tokens win because
+#   they carry a stable id where a handle does not. The word-character half is
+#   NOT redundant with the greedy quantifier — without it the engine simply
+#   backtracks to a shorter run that clears the `(` guard, and `@subject(id)`
+#   was measured matching `subjec`. Both halves, or neither works.
+#
+# There is deliberately NO dotted qualifier here, unlike the completion probe in
+# the browser. A handle in prose is a MENTION and nothing else: mentions are
+# authored placements that emit per placement, while every other capability
+# keys dedupe on an owner that plain text cannot carry, so `@name.definitions`
+# in prose would emit a second definition beside a chip's with no
+# `conflicting_emission` to catch it.
+_HANDLE_RE = re.compile(r"(?<![A-Za-z0-9_])@([A-Za-z][A-Za-z0-9_]{0,63})(?![A-Za-z0-9_(])")
+
+
+def handle_mentions(text) -> list[dict]:
+    """Every `@handle` run in authored prose, with its span.
+
+    Spans rather than spellings, because the caller substitutes in place and
+    needs to know what to replace. Returned in source order.
+    """
+    return [{"handle": match.group(1), "start": match.start(), "end": match.end()}
+            for match in _HANDLE_RE.finditer(str(text or ""))]
+
+
+def has_handle_mention(text) -> bool:
+    """Whether prose carries anything the handle pass would resolve.
+
+    Separate from `handle_mentions` because the compile-entry predicate asks
+    only the yes/no question over every channel of every section, and building
+    span dicts to throw them away is the wrong shape for that.
+    """
+    return _HANDLE_RE.search(str(text or "")) is not None
+
+
 def _unit_label_ordinal(declaration, source_id: str, unit_source_labels) -> int | None:
     """Compatibility fallback for a semantic id with exactly one typed source."""
     template = str((declaration or {}).get("label_template") or "")

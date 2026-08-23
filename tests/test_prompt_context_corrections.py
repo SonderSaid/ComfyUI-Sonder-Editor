@@ -581,8 +581,8 @@ def _run_chip_dom_script(body):
 # keyboard consumer at import, so `window.addEventListener` must exist.
 _MINIMAL_DOM = """
 class N {
-  constructor(tag){ this.tagName=String(tag).toUpperCase(); this.children=[];
-    this.childNodes=this.children; this.style={cssText:"",setProperty(){}};
+  constructor(tag){ this.tagName=String(tag).toUpperCase(); this.childNodes=[];
+    this.style={cssText:"",setProperty(){}};
     this.dataset={}; this.attributes={}; this.options=[]; this.value="";
     this._text=""; this.title=""; this.disabled=false; this.multiple=false;
     this._handlers={}; }
@@ -590,17 +590,27 @@ class N {
   // reading it concatenates them. A stored string would make a test that
   // strips a nested element pass without the strip ever running.
   get textContent(){ return this._text
-    + this.children.map((c) => c.textContent ?? "").join(""); }
-  set textContent(v){ this.children.length = 0; this._text = String(v ?? ""); }
-  appendChild(c){ this.children.push(c); c.parentElement=this;
+    + this.childNodes.map((c) => c.textContent ?? c.nodeValue ?? "").join(""); }
+  // `children` is ELEMENTS ONLY; `childNodes` is everything, text nodes
+  // included. The stub aliased them, which was invisible while a text span
+  // held one text node and nothing else — and became a crash the moment a
+  // live `@handle` put text nodes beside element children.
+  get children(){ return this.childNodes.filter((c) => c && c.tagName); }
+  set textContent(v){ this.childNodes.length = 0; this._text = String(v ?? ""); }
+  appendChild(c){ this.childNodes.push(c); c.parentElement=this;
     if (c.tagName === "OPTION") this.options.push(c); return c; }
   insertBefore(c, ref){
-    const at = ref ? this.children.indexOf(ref) : -1;
+    const at = ref ? this.childNodes.indexOf(ref) : -1;
     if (at < 0) return this.appendChild(c);
-    this.children.splice(at, 0, c); c.parentElement=this; return c; }
+    this.childNodes.splice(at, 0, c); c.parentElement=this; return c; }
   append(...cs){ for (const c of cs) if (c && c.tagName) this.appendChild(c); }
   addEventListener(t,h){ (this._handlers[t] ||= []).push(h); }
-  removeEventListener(){}
+  // A real removal, not a no-op: disposal is otherwise unobservable, so a
+  // test could not tell a cleaned-up listener from a leaked one.
+  removeEventListener(t,h){ const list=this._handlers[t];
+    if (!list) return;
+    const at=list.indexOf(h);
+    if (at>=0) list.splice(at,1); }
   setAttribute(k,v){ this.attributes[k]=String(v); }
   getAttribute(k){ return this.attributes[k] ?? null; }
   cloneNode(deep){
@@ -608,7 +618,12 @@ class N {
     copy._text = this._text;
     copy.dataset = { ...this.dataset };
     copy.attributes = { ...this.attributes };
-    if (deep) for (const c of this.children) copy.appendChild(c.cloneNode(true));
+    // childNodes, not children: a deep clone that skipped text nodes
+    // silently emptied every span whose prose is Text rather than a
+    // stored string.
+    if (deep) for (const c of this.childNodes) {
+      copy.appendChild(c.cloneNode ? c.cloneNode(true)
+        : { nodeType: c.nodeType, nodeValue: c.nodeValue }); }
     return copy; }
   get nextSibling(){
     const kids = this.parentElement?.children || [];
@@ -627,7 +642,8 @@ class N {
     const inner = isAttr ? raw.slice(1, -1) : '';
     const eq = inner.indexOf('=');
     const rawName = eq < 0 ? inner : inner.slice(0, eq);
-    const rawValue = eq < 0 ? undefined : inner.slice(eq + 1).split('"').join('');
+    const rawValue = eq < 0 ? undefined
+      : inner.slice(eq + 1).split('"').join('').split("'").join('');
     const key = isAttr ? rawName.replace('data-', '').split('-').map((part, i) =>
       i ? part.charAt(0).toUpperCase() + part.slice(1) : part).join('') : '';
     const want = raw.toUpperCase();
@@ -649,9 +665,33 @@ class N {
   get selectedOptions(){ return this.options.filter((o) =>
     o.selected === true || (!this.multiple
       && String(o.value) === String(this.value))); }
-  closest(){ return null; }
+  // Walks ancestors for an attribute selector, which is the only form the
+  // editor uses. Returning null unconditionally silently disabled every
+  // path that climbs to a model node — including chip-adjacency deletion.
+  closest(sel){
+    const raw = String(sel).trim();
+    if (!(raw.startsWith('[') && raw.endsWith(']'))) return null;
+    const inner = raw.slice(1, -1);
+    const eq = inner.indexOf('=');
+    const rawName = eq < 0 ? inner : inner.slice(0, eq);
+    const want = eq < 0 ? undefined
+      : inner.slice(eq + 1).split('"').join('').split("'").join('');
+    const key = rawName.replace('data-', '').split('-').map((part, i) =>
+      i ? part.charAt(0).toUpperCase() + part.slice(1) : part).join('');
+    let node = this;
+    while (node) {
+      if (node.dataset && node.dataset[key] !== undefined
+          && (want === undefined || String(node.dataset[key]) === want)) return node;
+      node = node.parentElement;
+    }
+    return null; }
   focus(){}
-  remove(){ const kids = this.parentElement?.children;
+  // Layout is flat zero: nothing here measures, and every menu this stub opens
+  // is anchored to a control's rect. Absent, `openContextMenu` threw and no
+  // test could reach a menu at all.
+  getBoundingClientRect(){ return { left:0, top:0, right:0, bottom:0,
+    width:0, height:0, x:0, y:0 }; }
+  remove(){ const kids = this.parentElement?.childNodes;
     if (!kids) return;
     const at = kids.indexOf(this);
     if (at >= 0) kids.splice(at, 1);
@@ -661,8 +701,25 @@ globalThis.document = {
   createElement: (t) => new N(t),
   createTextNode: (t) => ({ nodeType: 3, nodeValue: t }),
   body: new N("body"), activeElement: null,
+  // Document-wide search, delegated to body — which is where everything the
+  // editor appends outside itself ends up. Its absence made any code that
+  // swept `document.querySelectorAll` throw rather than find nothing, so the
+  // stale-menu sweep was unreachable from every test.
+  querySelectorAll(sel){ return this.body.querySelectorAll(sel); },
+  querySelector(sel){ return this.body.querySelector(sel); },
+  // An open menu installs an outside-click dismisser on a 10ms timer. Without
+  // these the timer threw AFTER the snippet had already printed its result, so
+  // node exited non-zero on a test that had in fact passed -- a failure with no
+  // relationship to what was being asserted.
+  addEventListener(){}, removeEventListener(){},
 };
 globalThis.window = { addEventListener(){}, removeEventListener(){} };
+window.innerWidth = 1280;
+window.innerHeight = 800;
+// Runs the callback rather than dropping it: `openContextMenu` clamps its panel
+// to the viewport inside one, and a no-op would leave that path unexercised
+// while looking exercised.
+globalThis.requestAnimationFrame = (fn) => { fn(); return 0; };
 globalThis.Node = { TEXT_NODE: 3 };
 // Without this every `instanceof HTMLElement` guard throws, which silently
 // put `readDom` out of reach of every test using this stub.
@@ -762,7 +819,7 @@ def test_reference_routing_uses_human_placement_without_rewriting_inline():
         const savedMention = saved.capabilities.find((value) =>
             value.capability_id === "mentions");
 
-        document.body.children = [];
+        document.body.childNodes = [];
         open(["detailed_description"]);
         const anchoredRows = document.body.querySelectorAll("div")
             .filter((value) => value.className === "sonder-prompt-routing-row");
@@ -873,7 +930,7 @@ def test_reference_effective_values_distinguish_authority_and_reset_authored_emp
             .find((button) => button.textContent === "Attach");
         attach._handlers.click[0]();
         const saved = await pending;
-        document.body.children = [];
+        document.body.childNodes = [];
         const emptyPending = open();
         const emptyAttach = document.body.querySelectorAll("button")
             .find((button) => button.textContent === "Attach");
@@ -943,7 +1000,7 @@ def test_reference_chip_save_preserves_task_types_without_or_beyond_vocabulary()
             derived_prompt:{order:1,channel_key:"visual",placement:"inline",
                 label:"Reference prompt",fields:{}},
         }}}});
-        document.body.children = [];
+        document.body.childNodes = [];
         const unknownVocabulary = await save({
             attachment_id:"two", kind:"reference",
             source:{reference_item_id:"item"},
@@ -1004,7 +1061,7 @@ def test_reference_chip_says_when_declared_fields_could_not_resolve():
         // The catalog has not arrived: the chip receives no profile at all.
         mod.configurePromptAttachment(attachment(), {scene, profileId:"generic@1"});
         const unresolved = notices();
-        document.body.children = [];
+        document.body.childNodes = [];
         // A REAL format that declares a reference capability but no task types
         // or intents. Nothing is wrong here, so nothing should be said.
         mod.configurePromptAttachment(attachment(), {
@@ -1060,7 +1117,7 @@ def test_active_chip_intersects_recipe_union_but_keeps_saved_undeclared_parts():
             button.textContent === "Cancel")._handlers.click[0]();
         await freshPromise;
 
-        document.body.children = [];
+        document.body.childNodes = [];
         const savedPromise = open([{capability_id:"audio_relationship",kind:"audio_relationship",
             placement:"section_prefix",enabled:true}]);
         const savedRows = document.body.querySelectorAll("div")
@@ -1104,8 +1161,14 @@ def test_document_and_scope_chips_share_two_line_container_bounded_labels():
         const scopeLabel = scopeChip.children.find((value) =>
             value.dataset.sonderContextChipLabel === "1");
         const scopeHolder = scopeChip.parentElement;
-        const scopeRemove = scopeHolder.children.find((value) =>
-            String(value.attributes["aria-label"] || "").startsWith("Remove "));
+        // The remove control is no longer a sibling button -- a chip is
+        // label-only now, so its holder's width IS its width. It lives in the
+        // chip's menu, opened from the chip.
+        scopeChip._handlers.click[0]();
+        const menuRows = document.body.children.at(-1)
+            .querySelectorAll("div").filter((value) =>
+                value.attributes.role === "menuitem");
+        const scopeMenu = menuRows.map((value) => value.children[0].textContent);
         console.log(JSON.stringify({
             inlineAtomic: inlineChip.contentEditable,
             inlineChipCss: inlineChip.style.cssText,
@@ -1118,7 +1181,8 @@ def test_document_and_scope_chips_share_two_line_container_bounded_labels():
             scopeTitle: scopeChip.title,
             scopeAria: scopeChip.attributes["aria-label"],
             scopeHolderCss: scopeHolder.style.cssText,
-            scopeRemoveCss: scopeRemove.style.cssText,
+            scopeHolderButtons: scopeHolder.querySelectorAll("button").length,
+            scopeMenu,
         }));
     """)
     for key in ("inlineChipCss", "scopeChipCss"):
@@ -1135,28 +1199,50 @@ def test_document_and_scope_chips_share_two_line_container_bounded_labels():
     assert "Prompt link → Section 1" in result["scopeAria"]
     assert "flex:0 0 auto" in result["inlineRemoveCss"]
     assert "max-width:100%" in result["scopeHolderCss"]
-    assert "flex:0 0 auto" in result["scopeRemoveCss"]
+    # Uniform: exactly the chip, nothing trailing it.
+    assert result["scopeHolderButtons"] == 1, result
+    assert any(value.startswith("Remove ") for value in result["scopeMenu"]), result
 
 
 def test_scope_rows_never_offer_inline_only_kinds():
+    """`durable_rules.md`: the filter is CENTRAL, so Timeline, Structured and
+    Writing cannot disagree about what a scope row may attach.
+
+    The offered set used to be a `<select>`'s options and is now the `+ Attach`
+    menu's rows. What must not change is the SET, so this reads it from the
+    row's own record of what it computed -- one authority, which the menu is
+    then asserted to match.
+    """
     result = _run_chip_dom_script("""
-        const optionValues = (row) => row.querySelectorAll("select")
-            .flatMap((s) => s.options.map((o) => o.value));
-            const explicit = mod.createScopeChipRow({ allowedKinds: [
-                "shot","timestamp","reference","guide","vocal_event","prompt_link",
-                "prompt_link_scope","custom"] });
+        const kinds = (row) => (row.dataset.sonderScopeKinds || "").split(",")
+            .filter(Boolean);
+        const explicit = mod.createScopeChipRow({ allowedKinds: [
+            "shot","timestamp","reference","guide","vocal_event","prompt_link",
+            "prompt_link_scope","custom"] });
         const bare = mod.createScopeChipRow({});
         const legacy = mod.createScopeChipRow({ attachments: [
-            { attachment_id: "legacy", kind: "vocal_event", config: {} }] });
+            { attachment_id: "legacy", kind: "vocal_event", config: {} }],
+            onRemove() {} });
         const chip = legacy.querySelectorAll("button")
             .find((b) => /must be placed inline/.test(b.title || ""));
+        // What the + Attach menu actually renders, which must equal the set.
+        const attach = explicit.querySelectorAll("button")
+            .find((b) => b.dataset.sonderScopeRowAttach === "1");
+        attach._handlers.click[0]();
+        const offered = document.body.children.at(-1).querySelectorAll("div")
+            .filter((value) => value.attributes.role === "menuitem")
+            .map((value) => value.children[0].textContent);
         console.log(JSON.stringify({
             inlineOnly: mod.INLINE_ONLY_KINDS,
-            explicitlyRequested: optionValues(explicit),
-            byDefault: optionValues(bare),
+            explicitlyRequested: kinds(explicit),
+            byDefault: kinds(bare),
+            offered,
             legacyChipMarked: !!chip,
         }));
     """)
+    # The menu offers exactly the computed set, by label.
+    assert result["offered"] == ["Shot", "Time", "Reference",
+                                 "Section Prompt link", "Context"], result
     assert result["inlineOnly"] == ["prompt_link", "vocal_event"]
     # Asking for the inline-only kinds explicitly must still not offer them.
     assert result["explicitlyRequested"] == [
@@ -1176,9 +1262,24 @@ def test_section_scope_prompt_link_picker_defaults_all_channels_and_separates_ac
             attachments: [attachment], onRemove: () => { removed += 1; },
             onConvertPromptLinkCopy: () => { copied += 1; },
         });
-        const actionButtons = row.querySelectorAll("button");
-        actionButtons.find((button) => button.textContent === "Unlink")._handlers.click[0]();
-        actionButtons.find((button) => button.textContent === "Convert to copy")._handlers.click[0]();
+        // Both actions now live in the chip's menu. They used to be two buttons
+        // reading "Unlink" and "Convert to copy" side by side; the first shared
+        // its word with the emission-group action, which is why each carries a
+        // hint naming what it actually does.
+        const openChipMenu = () => {
+            row.querySelectorAll("button")
+                .find((button) => button.dataset.attachmentId)._handlers.click[0]();
+            return document.body.children.at(-1).querySelectorAll("div")
+                .filter((value) => value.attributes.role === "menuitem");
+        };
+        const linkRows = openChipMenu();
+        const rowLabels = linkRows.map((value) => value.children[0].textContent);
+        linkRows.find((value) =>
+            value.children[0].textContent === "Unlink this section")
+            ._handlers.click[0]();
+        openChipMenu().find((value) =>
+            value.children[0].textContent === "Convert to copy")
+            ._handlers.click[0]();
         const configuredPromise = mod.configurePromptAttachment({kind: "prompt_link_scope"}, {
             scene: {
                 _context_consumer_start: 10,
@@ -1439,7 +1540,14 @@ def test_reuse_and_unlink_keep_one_grouping_concept_with_fresh_ids():
     }
 
 
-def test_scope_row_shows_linked_badge_unlink_and_reuse_picker():
+def test_scope_row_shows_linked_badge_and_carries_its_actions_in_one_menu():
+    """Three tiers: a caption naming the row, chips, one `+ Attach`.
+
+    The `linked` BADGE stays in the row -- it is information about the chip, not
+    an action on it. Everything actionable moved into the chip's menu, and
+    "used in N sections" moved with it, onto the chip it describes rather than
+    buried in a reuse picker's option text describing a chip you could not see.
+    """
     result = _run_chip_dom_script("""
         const current = { attachment_id: "a", emission_group_id: "group",
             kind: "reference", source: {}, config: {} };
@@ -1448,20 +1556,120 @@ def test_scope_row_shows_linked_badge_unlink_and_reuse_picker():
         const reusable = { attachment_id: "c", emission_group_id: "other",
             kind: "reference", source: {}, config: {} };
         const row = mod.createScopeChipRow({ attachments: [current],
+            label: "Section 2 context",
             allSceneAttachments: [current, linked, reusable],
             reusableAttachments: [linked, reusable],
-            onReuse() {}, onUnlink() {}, attachmentLabelFor: () => "Granny" });
+            onReuse() {}, onUnlink() {}, onActivate() {}, onRemove() {},
+            attachmentLabelFor: () => "Granny" });
+        const buttons = row.querySelectorAll("button");
+        buttons.find((value) => value.dataset.attachmentId)._handlers.click[0]();
+        const menu = document.body.children.at(-1).querySelectorAll("div")
+            .filter((value) => value.attributes.role === "menuitem")
+            .map((value) => value.children[0].textContent);
         console.log(JSON.stringify({
+            caption: row.querySelectorAll("span").find((value) =>
+                value.dataset.sonderScopeRowLabel === "1").textContent,
             linkedBadges: row.querySelectorAll("span").filter((value) =>
                 value.dataset.sonderLinkedAttachment === "1").length,
-            buttons: row.querySelectorAll("button").map((value) => value.textContent),
+            buttons: buttons.map((value) => value.textContent),
             selectCount: row.querySelectorAll("select").length,
+            menu,
         }));
     """)
+    assert result["caption"] == "Section 2 context (1)", result
     assert result["linkedBadges"] == 1
-    assert "Unlink" in result["buttons"]
-    assert "Reuse an existing chip" in result["buttons"]
-    assert result["selectCount"] == 2
+    # One `+ Attach` and one chip. No selects at all -- four tail controls became
+    # one, which is the whole point of the tier.
+    assert result["selectCount"] == 0, result
+    assert result["buttons"] == ["Granny", "+ Attach"], result
+    assert result["menu"] == [
+        "Used in 2 sections", "Configure\u2026",
+        "Unlink from the other sections", "Remove Granny"], result
+
+
+def test_a_chip_menu_opens_with_the_keyboard_on_its_first_row():
+    """The scope row is NOT mouse-only, unlike the Writing contribution block.
+
+    A scope row is not a decoration and can hold focus, so moving the chip's
+    actions into a menu must not cost the keyboard. `openContextMenu` focuses a
+    row on hover, on a submenu opening, or from an arrow key -- never on open --
+    so `activeIndex` stayed -1 and two things misbehaved: `stepFocus` computes
+    `Math.max(0, -1) + 1`, so the first ArrowDown landed on the SECOND row; and
+    Enter found `rows[-1] === undefined`, returned false, and the event reached
+    the still-focused chip, whose native activation reopened the menu. `Escape`
+    is the only key that worked. Hence `focusFirst`.
+    """
+    result = _run_chip_dom_script("""
+        const attachment = { attachment_id: "a", emission_group_id: "g",
+            kind: "reference", source: {}, config: {} };
+        const row = mod.createScopeChipRow({ attachments: [attachment],
+            onActivate() {}, onRemove() {}, attachmentLabelFor: () => "Granny" });
+        const chip = row.querySelectorAll("button")
+            .find((value) => value.dataset.attachmentId);
+        chip._handlers.click[0]();
+        const rows = document.body.children.at(-1).querySelectorAll("div")
+            .filter((value) => value.attributes.role === "menuitem");
+        console.log(JSON.stringify({
+            labels: rows.map((value) => value.children[0].textContent),
+            // `tabIndex` is how `focusRow` marks the active row, and the only
+            // part of focus this stub can observe.
+            focused: rows.filter((value) => value.tabIndex === 0)
+                .map((value) => value.children[0].textContent),
+            // The chip advertises the menu, or a screen reader announces a
+            // button that appears to do nothing.
+            haspopup: chip.attributes["aria-haspopup"],
+        }));
+    """)
+    assert result["labels"][0].startswith("Configure"), result
+    # Exactly one row focused, and it is the first.
+    assert result["focused"] == [result["labels"][0]], result
+    assert result["haspopup"] == "menu", result
+
+
+def test_the_seventh_chip_is_reachable():
+    """`+N` was a dead label counting chips it gave no way to open.
+
+    `maxVisible` is 6 and no call site overrides it, so a section with seven
+    chips simply hid one. The identity caption now carries the count, which
+    makes a bare `+1` say the same thing twice; the overflow instead opens the
+    hidden chips, each with the same action menu it would have had in the row.
+    """
+    result = _run_chip_dom_script("""
+        const many = Array.from({ length: 7 }, (value, index) => ({
+            attachment_id: `a${index}`, emission_group_id: `g${index}`,
+            kind: "reference", source: {}, config: {} }));
+        const row = mod.createScopeChipRow({ attachments: many,
+            label: "Section 1 context",
+            onActivate() {}, onRemove() {},
+            attachmentLabelFor: (value) => `Chip ${value.attachment_id}` });
+        const overflow = row.querySelectorAll("button")
+            .find((value) => value.dataset.sonderScopeRowOverflow === "1");
+        overflow._handlers.click[0]();
+        const hidden = document.body.children.at(-1).querySelectorAll("div")
+            .filter((value) => value.attributes.role === "menuitem");
+        hidden[0]._handlers.click[0]();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const actions = document.body.children.at(-1).querySelectorAll("div")
+            .filter((value) => value.attributes.role === "menuitem")
+            .map((value) => value.children[0].textContent);
+        console.log(JSON.stringify({
+            caption: row.querySelectorAll("span").find((value) =>
+                value.dataset.sonderScopeRowLabel === "1").textContent,
+            chips: row.querySelectorAll("button")
+                .filter((value) => value.dataset.attachmentId).length,
+            overflowLabel: overflow.textContent,
+            hidden: hidden.map((value) => value.children[0].textContent),
+            actions,
+        }));
+    """)
+    # Six in the row, one behind the overflow, and the caption says seven.
+    assert result["caption"] == "Section 1 context (7)", result
+    assert result["chips"] == 6, result
+    assert result["overflowLabel"].startswith("1 more"), result
+    assert result["hidden"] == ["Reference: Chip a6"], result
+    # ...and it carries the same actions it would have had in the row.
+    assert result["actions"][0].startswith("Configure"), result
+    assert any(value.startswith("Remove ") for value in result["actions"]), result
 
 
 def test_scope_reuse_picker_respects_scope_and_template_kind_gates():
@@ -1479,13 +1687,32 @@ def test_scope_reuse_picker_respects_scope_and_template_kind_gates():
             ],
             onReuse() {}, attachmentLabelFor: (value) => value.attachment_id,
         });
-        const selects = row.querySelectorAll("select");
+        const attach = row.querySelectorAll("button")
+            .find((value) => value.dataset.sonderScopeRowAttach === "1");
+        attach._handlers.click[0]();
+        const items = document.body.children.at(-1).querySelectorAll("div")
+            .filter((value) => value.attributes.role === "menuitem");
+        // The Reuse row is a SUBMENU now; resolving it is what lists the chips.
+        const reuse = items.find((value) =>
+            value.children[0].textContent === "Reuse an existing chip");
+        reuse._handlers.click[0]();
+        // A submenu's items may be a function returning a promise, so the child
+        // panel lands a microtask later. Reading on the next line found the
+        // PARENT panel and compared it against the submenu's contents.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const reusableLabels = document.body.children.at(-1)
+            .querySelectorAll("div")
+            .filter((value) => value.attributes.role === "menuitem")
+            .map((value) => value.children[0].textContent);
         console.log(JSON.stringify({
-            selectCount: selects.length,
-            reusableValues: selects[1].children.map((value) => value.value),
+            selectCount: row.querySelectorAll("select").length,
+            reusableLabels,
         }));
     """)
-    assert result == {"selectCount": 2, "reusableValues": ["reference"]}
+    # Only a kind this row allows may be reused, and the picker is no longer a
+    # select competing with the chips for the row's width.
+    assert result == {"selectCount": 0,
+                      "reusableLabels": ["Reference: reference"]}
 
 
 def test_reuse_picker_disambiguates_identical_independent_groups_by_origin():
@@ -1503,12 +1730,27 @@ def test_reuse_picker_disambiguates_identical_independent_groups_by_origin():
             reusableAttachments:[first, second], allSceneAttachments:[first, second],
             reuseContext:{scene}, attachmentLabelFor:()=>"Korean Woman", onReuse() {},
         });
-        const select = row.querySelectorAll("select")[1];
-        console.log(JSON.stringify(select.options.map((option)=>option.textContent)));
+        row.querySelectorAll("button")
+            .find((value) => value.dataset.sonderScopeRowAttach === "1")
+            ._handlers.click[0]();
+        document.body.children.at(-1).querySelectorAll("div")
+            .filter((value) => value.attributes.role === "menuitem")
+            .find((value) => value.children[0].textContent === "Reuse an existing chip")
+            ._handlers.click[0]();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        console.log(JSON.stringify(document.body.children.at(-1)
+            .querySelectorAll("div")
+            .filter((value) => value.attributes.role === "menuitem")
+            .map((value) => [value.children[0].textContent,
+                value.querySelectorAll("span").find((span) =>
+                    span.dataset.sonderContextMenuHint === "1")?.textContent])));
     """)
+    # Two independent chips with the same label still need telling apart. The
+    # origin and the count are a HINT beside a short label now, rather than one
+    # long option string the row had to be wide enough to hold.
     assert result == [
-        "Reference: Korean Woman — section 1 [0-24] — used in 1 section",
-        "Reference: Korean Woman — section 2 [24-48] — used in 1 section",
+        ["Reference: Korean Woman", "section 1 [0-24], used in 1 section"],
+        ["Reference: Korean Woman", "section 2 [24-48], used in 1 section"],
     ]
 
 
@@ -1597,8 +1839,7 @@ def test_async_context_menu_restores_caret_bookmark_before_insert():
         // as a browser does, so materialize that one browser primitive here.
         const textNode = document.createTextNode(span.textContent);
         textNode.parentElement = span;
-        span.children = [textNode];
-        span.childNodes = span.children;
+        span.childNodes = [textNode];
         span.firstChild = textNode;
         documentEditor.contains = (node) => [documentEditor, span, textNode].includes(node);
         documentEditor.querySelectorAll = (selector) =>
@@ -2249,10 +2490,27 @@ def test_context_kind_is_offered_only_where_the_format_declares_it():
         const declaring = { capabilities: { custom: { formatter: "{text}" },
             reference: {}, shot: {} } };
         const notDeclaring = { capabilities: { reference: {}, shot: {} } };
+        // Read from the MENU the author actually sees. `sonderScopeKinds` is
+        // the row's own record of what it computed, and asserting only that
+        // would prove the row agrees with itself.
         const scopeKinds = (profile) => {
             const row = mod.createScopeChipRow({
                 allowedKinds: ["shot", "reference", "custom"], profile });
-            return row.querySelectorAll("select")[0].options.map((o) => o.value);
+            row.querySelectorAll("button")
+                .find((value) => value.dataset.sonderScopeRowAttach === "1")
+                ._handlers.click[0]();
+            const offered = document.body.children.at(-1).querySelectorAll("div")
+                .filter((value) => value.attributes.role === "menuitem")
+                .map((value) => value.children[0].textContent);
+            const mirror = (row.dataset.sonderScopeKinds || "").split(",")
+                .filter(Boolean);
+            // The two must agree, or one of them is lying about the gate.
+            const labels = { shot: "Shot", reference: "Reference",
+                custom: "Context" };
+            if (offered.join(",") !== mirror.map((k) => labels[k]).join(",")) {
+                throw new Error(`menu ${offered} vs row ${mirror}`);
+            }
+            return mirror;
         };
         console.log(JSON.stringify({
             menuDeclaring: mod.promptContextAuthoringKinds(
@@ -3185,6 +3443,671 @@ def test_a_channel_contribution_resolves_its_text_label_and_placement():
     assert byId["ref-1"]["atAnchor"] is False
 
 
+def test_accepting_a_mention_replaces_the_query_it_completes():
+    """The typed `@KWo` must go, or the completion lands beside it.
+
+    `insertAttachment` has taken `replaceTextRange` since the mention menu was
+    built; now that a mention is TEXT rather than a chip, `insertText` needs the
+    same option for the same caller. Without it the accepted spelling is
+    inserted at the caret while the partial query stays put, and the prose reads
+    `@KWo@KWoman` — which then resolves the second and leaves the first as
+    literal text.
+    """
+    result = _run_chip_dom_script("""
+        const editor = mod.createPromptDocumentEditor({
+            document: { nodes: [{ type: "text", node_id: "only",
+                text: "she meets @KWo here" }] },
+        });
+        editor.insertText("@KWoman", { replaceTextRange: { start: 10, end: 14 } });
+        console.log(JSON.stringify({
+            text: mod.promptDocumentText(editor.promptDocument),
+            nodes: editor.promptDocument.nodes.length,
+        }));
+    """)
+    assert result["text"] == "she meets @KWoman here", result
+    # Grown in place, not split: the id the caret is bookmarked against has to
+    # survive the re-render or the caret lands somewhere else.
+    assert result["nodes"] == 1, result
+
+
+def test_installing_a_second_channel_editor_does_not_disarm_the_first():
+    """Every channel editor keeps its `@` completion, not just the last one.
+
+    The menu sweeps stale menus so a detached editor cannot keep answering
+    keys, and it used to decide "stale" by `isConnected` alone. Every panel
+    here builds its editors DETACHED and appends them afterwards, and the menu
+    is now installed once per channel editor rather than once per surface — so
+    each install disposed the previous editor's listeners and only the last
+    channel in a Structured section, a timeline bar or the global row could
+    still complete a handle.
+
+    Behavioural on purpose. The source-grep version of this test — asserting
+    that `installPromptContextMenu` mentions `installPromptMentionMenu` — was
+    green throughout, which is the failure `durable_rules` warns about: a grep
+    proves the call exists, not that the feature survives a second caller.
+    """
+    result = _run_chip_dom_script("""
+        const editors = [];
+        const make = (id) => {
+            const editor = mod.createPromptDocumentEditor({
+                document: { nodes: [{ type: "text", node_id: id, text: "" }] },
+            });
+            // Detached at install time, exactly as every panel builds them.
+            editor.isConnected = false;
+            mod.installPromptContextMenu({ editor,
+                referenceContext: () => ({ scene: {}, references: [], semanticUnits: [],
+                    profileId: "generic@1", scope: "section", resolvedProfile: {} }) });
+            editors.push(editor);
+            return editor;
+        };
+        // The editor registers its own `input` handler (`readDom`), so the
+        // menu's is whatever sits ABOVE that baseline. Measured rather than
+        // hardcoded, so this cannot drift with the editor's own wiring.
+        const bare = mod.createPromptDocumentEditor({
+            document: { nodes: [{ type: "text", node_id: "bare", text: "" }] } });
+        const BASE = (bare._handlers.input || []).length;
+        const listeners = (editor) =>
+            (editor._handlers.input || []).length - BASE;
+        const a = make("a");
+        const afterFirst = listeners(a);
+        const b = make("b");
+        const afterSecond = [listeners(a), listeners(b)];
+        // A third, to prove it is not an off-by-one that spares exactly one.
+        const c = make("c");
+        console.log(JSON.stringify({
+            afterFirst,
+            afterSecond,
+            afterThird: [listeners(a), listeners(b), listeners(c)],
+            menus: document.body.querySelectorAll("[data-sonder-writing-mention]").length,
+        }));
+    """)
+    assert result["afterFirst"] == 1, result
+    # The first editor must still be armed once a second is installed...
+    assert result["afterSecond"] == [1, 1], result
+    # ...and a third must not disarm either of them.
+    assert result["afterThird"] == [1, 1, 1], result
+    # One menu per editor, so each has its own anchor and candidate list.
+    assert result["menus"] == 3, result
+
+
+def test_a_detached_editor_stops_answering_keys():
+    """The other half: the sweep must still reclaim a genuinely dead editor.
+
+    Loosening "stale" to protect editors that have not been attached YET must
+    not stop reclaiming ones that were attached and are now gone — a leaked
+    menu is not merely garbage, it keeps a live listener on a detached editor
+    that can still answer a keystroke.
+    """
+    result = _run_chip_dom_script("""
+        const bare = mod.createPromptDocumentEditor({
+            document: { nodes: [{ type: "text", node_id: "bare", text: "" }] } });
+        const BASE = (bare._handlers.input || []).length;
+        const armed = (editor) => (editor._handlers.input || []).length - BASE;
+        const install = (id, connected) => {
+            const editor = mod.createPromptDocumentEditor({
+                document: { nodes: [{ type: "text", node_id: id, text: "" }] },
+            });
+            editor.isConnected = connected;
+            mod.installPromptContextMenu({ editor,
+                referenceContext: () => ({ scene: {}, references: [], semanticUnits: [],
+                    profileId: "generic@1", scope: "section", resolvedProfile: {} }) });
+            return editor;
+        };
+        // Attached from the start, so the next install sees it live...
+        const live = install("live", true);
+        install("second", false);
+        const seenAlive = armed(live);
+        // ...and now it goes away, the way a re-rendered panel discards one.
+        live.isConnected = false;
+        install("third", false);
+        console.log(JSON.stringify({
+            seenAlive,
+            afterDetach: armed(live),
+        }));
+    """)
+    assert result["seenAlive"] == 1, result
+    # Swept: it was seen connected, and it is not any more.
+    assert result["afterDetach"] == 0, result
+
+
+def test_a_live_handle_is_painted_without_entering_the_document():
+    """A handle looks live and still round-trips as the characters typed.
+
+    This is the whole bargain of making a mention text: the author gets the
+    visual confirmation a chip gave them, while the model holds prose. If the
+    paint entered the document, `readDom` would persist markup into
+    `PromptSection.channels` and the prompt would carry span text.
+    """
+    result = _run_chip_dom_script("""
+        const editor = mod.createPromptDocumentEditor({
+            document: { nodes: [{ type: "text", node_id: "n1",
+                text: "she meets @KWoman and bob@example here" }] },
+        });
+        const span = editor.children.find((c) => c.dataset.nodeId === "n1");
+        const marks = span.querySelectorAll("[data-sonder-prompt-handle]");
+        console.log(JSON.stringify({
+            marked: marks.map((m) => m.textContent),
+            css: marks.map((m) => m.style.cssText),
+            roundTrip: mod.promptDocumentText(editor.promptDocument),
+        }));
+    """)
+    # The handle is marked; the address is not.
+    assert result["marked"] == ["@KWoman"], result
+    # `display:inline` is mandatory, not cosmetic: `readDom` reads `innerText`,
+    # which injects a line break for a block-level child box, so an
+    # inline-block handle would persist a newline into the prose per keystroke.
+    assert all("display:inline;" in css for css in result["css"]), result
+    # And the model is untouched prose.
+    assert result["roundTrip"] == "she meets @KWoman and bob@example here", result
+
+
+def test_typing_a_handle_marks_it_without_rendering_every_keystroke():
+    """The paint keeps up with typing, but not at the caret's expense.
+
+    `readDom` runs per keystroke and deliberately does NOT render — a render
+    tears the editor down and rebuilds it, and the caret goes with it. So a
+    hand-typed handle stayed unmarked until something unrelated forced a
+    render, and the editor silently stopped saying which words are live.
+
+    The repaint is therefore gated on the handle SPELLINGS changing. Offsets
+    were the first attempt and were wrong: every keystroke typed anywhere
+    before a handle shifted them, so the author typed through a full rebuild —
+    the exact thing not-repainting exists to avoid.
+
+    Four independent cases, because each is a separate claim, and span identity
+    is the render signal: `render()` replaces the editor's children.
+    """
+    result = _run_chip_dom_script("""
+        const NL = String.fromCharCode(10);
+        const probe = (text, edit) => {
+            const editor = mod.createPromptDocumentEditor({
+                document: { nodes: [{ type: "text", node_id: "n1", text }] },
+            });
+            const span = () => editor.children.find((c) => c.dataset.nodeId === "n1");
+            const marks = () => span()
+                .querySelectorAll("[data-sonder-prompt-handle]")
+                .map((m) => m.textContent).join("|");
+            const before = span();
+            const beforeMarks = marks();
+            // Typing mutates a Text node in place; it never rebuilds the span.
+            const texts = () => span().childNodes.filter((c) => c.nodeType === 3);
+            edit(texts());
+            for (const handler of editor._handlers.input || []) handler({});
+            return { beforeMarks, marks: marks(), repainted: span() !== before };
+        };
+        console.log(JSON.stringify({
+            // Ordinary prose, nothing to mark.
+            plain: probe("a b", (t) => { t.at(-1).nodeValue = "a bc"; }),
+            // The keystroke that TURNS an `@` into a handle. A bare `@` is not
+            // one — the grammar needs a letter — so this starts unmarked.
+            completing: probe("a @", (t) => { t.at(-1).nodeValue = "a @K"; }),
+            // A keystroke after an existing handle: the run is unchanged.
+            trailing: probe("a @KWoman b", (t) => {
+                t.at(-1).nodeValue = t.at(-1).nodeValue + "!"; }),
+            // A keystroke BEFORE one: shifts every offset, changes no spelling.
+            shifting: probe("a @KWoman b", (t) => {
+                t[0].nodeValue = "xx " + t[0].nodeValue; }),
+        }));
+    """)
+    plain, completing = result["plain"], result["completing"]
+    trailing, shifting = result["trailing"], result["shifting"]
+    # Prose paints nothing and costs nothing.
+    assert plain["marks"] == "" and plain["repainted"] is False, plain
+    # Completing a handle marks it, without waiting for an unrelated render.
+    assert completing["beforeMarks"] == "" and completing["marks"] == "@K", completing
+    assert completing["repainted"] is True, completing
+    # Typing after a handle leaves the painted span covering the same
+    # characters, so there is nothing to repaint.
+    assert trailing["marks"] == "@KWoman" and trailing["repainted"] is False, trailing
+    # And typing BEFORE one — the case offsets got wrong.
+    assert shifting["marks"] == "@KWoman" and shifting["repainted"] is False, shifting
+
+
+def test_a_caret_around_a_live_handle_resolves_to_the_right_offset():
+    """Offsets are measured across the SPAN, not inside one of its children.
+
+    A text span held exactly one text node until a handle was painted live.
+    Four places read `firstChild` or a single container on that assumption, and
+    a caret after a handle then reported its offset inside the trailing run —
+    so a keystroke landed several characters earlier than the author put it.
+    The bug tracker records where a mis-resolved caret ends up: text inserted at
+    position 0, inside chip spans.
+    """
+    result = _run_chip_dom_script("""
+        const editor = mod.createPromptDocumentEditor({
+            document: { nodes: [{ type: "text", node_id: "n1",
+                text: "a @KWoman b" }] },
+        });
+        const span = editor.children.find((c) => c.dataset.nodeId === "n1");
+        // Children after painting: "a ", <mark>@KWoman</mark>, " b".
+        const parts = span.childNodes;
+        const mark = span.querySelectorAll("[data-sonder-prompt-handle]")[0];
+        const probe = (container, offset) => {
+            globalThis.getSelection = () => ({ rangeCount: 1,
+                getRangeAt: () => ({ startContainer: container, startOffset: offset,
+                    endContainer: container, endOffset: offset, collapsed: true }),
+                removeAllRanges(){}, addRange(){} });
+            return editor.capturePromptSelection()?.start?.offset ?? null;
+        };
+        console.log(JSON.stringify({
+            childCount: parts.length,
+            beforeHandle: probe(parts[0], 2),
+            insideHandle: probe(mark.childNodes[0], 3),
+            afterHandle: probe(parts[2], 1),
+            endOfLine: probe(parts[2], 2),
+        }));
+    """)
+    # Three children: prose, the marked handle, prose.
+    assert result["childCount"] == 3, result
+    # "a " is 2 characters, so a caret at its end is offset 2 in the SPAN.
+    assert result["beforeHandle"] == 2, result
+    # Three characters into "@KWoman" is 2 + 3 = 5, not 3.
+    assert result["insideHandle"] == 5, result
+    # One character into " b" is 2 + 7 + 1 = 10, not 1.
+    assert result["afterHandle"] == 10, result
+    assert result["endOfLine"] == 11, result
+
+
+def test_a_caret_restores_into_the_child_that_holds_its_offset():
+    """The other direction: a logical offset has to find its DOM position.
+
+    `resolveBoundary` walked `firstChild` alone, so every offset past the first
+    run clamped to the end of that run — a caret restored after a re-render
+    would silently walk backwards to just before the handle.
+    """
+    result = _run_chip_dom_script("""
+        const editor = mod.createPromptDocumentEditor({
+            document: { nodes: [{ type: "text", node_id: "n1",
+                text: "a @KWoman b" }] },
+        });
+        const span = editor.children.find((c) => c.dataset.nodeId === "n1");
+        const parts = span.childNodes;
+        let placed = null;
+        globalThis.getSelection = () => ({ rangeCount: 1,
+            getRangeAt: () => ({ startContainer: parts[0], startOffset: 0,
+                endContainer: parts[0], endOffset: 0, collapsed: true }),
+            removeAllRanges(){},
+            addRange(range) { placed = range; } });
+        document.createRange = () => ({
+            setStart(container, offset) { this.startContainer = container; this.startOffset = offset; },
+            setEnd(container, offset) { this.endContainer = container; this.endOffset = offset; },
+            collapse() {} });
+        editor.isConnected = true;
+        const at = (offset) => {
+            editor.restorePromptSelection({ start: { node_id: "n1", offset },
+                end: { node_id: "n1", offset } });
+            const container = placed.startContainer;
+            // Named by WHERE it sits, not by index: a caret inside the handle
+            // resolves to the marked run's own text node, which is a
+            // grandchild of the span rather than one of `parts`.
+            const where = container.parentElement?.dataset?.sonderPromptHandle
+                ? "handle" : `part${parts.indexOf(container)}`;
+            return [where, placed.startOffset];
+        };
+        console.log(JSON.stringify({ two: at(2), five: at(5), ten: at(10) }));
+    """)
+    # Offset 2 is the boundary between the first run and the handle; either
+    # side is the same caret position, so both are accepted.
+    assert result["two"] in (["part0", 2], ["handle", 0]), result
+    # Offset 5 must land INSIDE the marked handle, not clamp to its start.
+    assert result["five"] == ["handle", 3], result
+    # Offset 10 must reach the trailing run.
+    assert result["ten"] == ["part2", 1], result
+
+
+def test_a_handle_beside_a_chip_stays_deletable_from_the_keyboard():
+    """The load-bearing guard the paint could have silently disabled.
+
+    Chip adjacency resolved its host with `startContainer.parentElement`, which
+    is the STYLED span once a handle is painted — so the `nodeType === "text"`
+    test failed and Backspace stopped reaching the chip at all. This is one of
+    the four guards `durable_rules` names, and the bug tracker records the class
+    of failure it prevents.
+    """
+    result = _run_chip_dom_script("""
+        const attachment = { attachment_id: "ref", kind: "reference",
+            source: {}, config: {} };
+        const editor = mod.createPromptDocumentEditor({
+            document: { nodes: [
+                { type: "attachment", node_id: "chip", attachment_id: "ref" },
+                { type: "text", node_id: "n1", text: "@KWoman follows" },
+            ] },
+            attachments: [attachment],
+        });
+        const span = editor.children.find((c) => c.dataset.nodeId === "n1");
+        const mark = span.querySelectorAll("[data-sonder-prompt-handle]")[0];
+        // Caret at the very start of the prose — which is INSIDE the marked
+        // handle's text node, because the handle opens the node.
+        const inner = mark.childNodes[0];
+        globalThis.getSelection = () => ({ rangeCount: 1,
+            getRangeAt: () => ({ startContainer: inner, startOffset: 0,
+                endContainer: inner, endOffset: 0, collapsed: true }),
+            removeAllRanges(){}, addRange(){} });
+        let prevented = false;
+        const event = { key: "Backspace", preventDefault(){ prevented = true; },
+            stopPropagation(){}, target: {} };
+        for (const handler of editor._handlers.keydown || []) handler(event);
+        console.log(JSON.stringify({ prevented,
+            nodes: editor.promptDocument.nodes.map((n) => n.type) }));
+    """)
+    assert result["prevented"] is True, result
+    # The chip is gone and the prose remains.
+    assert result["nodes"] == ["text"], result
+
+
+def test_every_separator_in_one_node_opens_its_own_block():
+    """A hand-typed draft keeps all its sections in a single text node.
+
+    `channelRegionsByNode` and `splitWritingPromptDocument` count every `---`
+    line; `writingBlockNodeRanges` counted only the FIRST per node. The Writing
+    decoration walks ranges and looks blocks up by index, so every block past
+    the last range silently lost its contributions — reachable by typing a
+    multi-section draft rather than rebuilding one from Reset, which is the
+    ordinary way to write one.
+    """
+    result = _run_chip_dom_script("""
+        const NL = String.fromCharCode(10);
+        const nodes = [{ type: "text", node_id: "a",
+            text: "one" + NL + "---" + NL + "two" + NL + "---" + NL + "three" }];
+        console.log(JSON.stringify({
+            ranges: mod.writingBlockNodeRanges({ nodes }).length,
+            blocks: mod.splitWritingPromptDocument({ nodes },
+                { keepEmpty: true }).length,
+            regions: mod.channelRegionsByNode({ nodes }, ["visual"],
+                { defaultKey: "visual" }).map((r) => r.block),
+        }));
+    """)
+    # Three sections by every reader, including this one.
+    assert result["ranges"] == 3, result
+    assert result["blocks"] == 3, result
+    assert result["regions"] == [0, 1, 2], result
+
+
+def test_a_decoration_can_sit_above_the_first_node():
+    """Otherwise a template-leading channel lands inside the first written one.
+
+    Decorations paint AFTER a node, so nothing could precede node 0. Under
+    MiniMax H3 the channels References feed — `subject_definitions` first — lead
+    the template, and an author who has only written `detailed_description` has
+    that heading as node 0. Anchoring at `firstIndex` therefore painted the
+    leading channel between that heading and its own paragraph: the wrong
+    channel region, which is the defect this whole pass is about.
+    """
+    result = _run_chip_dom_script("""
+        const first = document.createElement("div");
+        first.textContent = "LEADING";
+        const editor = mod.createPromptDocumentEditor({
+            document: { nodes: [
+                { type: "text", node_id: "n1", text: "detailed_description:" },
+                { type: "text", node_id: "n2", text: "She looks up." },
+            ] },
+            decorations: () => [{ afterIndex: -1, element: first }],
+        });
+        const order = editor.children.map((c) =>
+            c.dataset.sonderDecoration === "1" ? "D" : c.dataset.nodeId);
+        console.log(JSON.stringify({ order }));
+    """)
+    # Before everything, not after the first node.
+    assert result["order"] == ["D", "n1", "n2"], result
+
+
+def _window_states(sections, *, window, threshold=0.0):
+    compiled = prompt_context.compile_prompt_context(
+        sections=sections, window_start=window[0], window_end=window[1],
+        fps=24.0, boundary_threshold_pct=threshold)
+    return {row["prompt_id"]: row["state"]
+            for row in compiled["section_window_states"]}
+
+
+def test_the_compiler_says_why_each_section_is_not_compiled():
+    """Five answers, because four of them are only knowable server-side.
+
+    A section that does not reach the window compiles NOT AT ALL, so its chips
+    project nothing and the surface reads as "nothing is staged". The browser
+    cannot work out which sections those are: coverage is hold-until-next, so
+    the first section covers everything before it and the last holds forever,
+    and a section's authored frames therefore do not decide whether it is
+    selected.
+
+    The three non-obvious states each exist because the alternative is a FALSE
+    sentence. A muted section told "outside the render window" is wrong; so is
+    a section sitting squarely inside the selection that simply has no text.
+    """
+    muted = _section(0, 10, "one", prompt_id="p-muted")
+    muted.muted = True
+    sections = [
+        muted,
+        # Inside the window and holding nothing at all -- not "outside".
+        _section(10, 20, "", prompt_id="p-empty"),
+        _section(20, 30, "three", prompt_id="p-here"),
+        _section(30, 40, "four", prompt_id="p-there"),
+    ]
+    states = _window_states(sections, window=(20, 30))
+    assert states["p-muted"] == "muted", states
+    assert states["p-empty"] == "empty", states
+    assert states["p-here"] == "selected", states
+    assert states["p-there"] == "not_covered", states
+
+
+def test_a_section_holding_only_disabled_chips_is_empty_not_out_of_window():
+    """The case the four-state scheme got wrong, and the reason there are five.
+
+    `resolve_segments` drops a text-empty section before coverage, and the
+    sentinel that rescues an attachment-only one fires on ENABLED attachments
+    only. So a section sitting squarely inside the selection, holding nothing
+    but switched-off chips, is absent from both resolves exactly as an
+    out-of-window section is — and a scheme that inferred the reason from
+    absence would tell its author it is outside a window it is inside.
+    """
+    disabled = _section(0, 10, "", prompt_id="p-off", attachments=[{
+        "attachment_id": "chip", "kind": "reference", "enabled": False,
+        "source": {}, "config": {}}])
+    live = _section(0, 10, "", prompt_id="p-on", attachments=[{
+        "attachment_id": "chip2", "kind": "reference", "enabled": True,
+        "source": {}, "config": {}}])
+    # Each alone, in a window that plainly contains it.
+    off = _window_states([disabled], window=(0, 10))
+    on = _window_states([live], window=(0, 10))
+    assert off["p-off"] == "empty", off
+    # ...and the sentinel still rescues one whose chip is on, or the predicate
+    # would be reporting "empty" for a section that does compile.
+    assert on["p-on"] == "selected", on
+
+
+def test_a_section_dropped_at_the_window_edge_is_not_called_out_of_window():
+    """The boundary threshold is a different fact, and the one people misread.
+
+    A section clipped by the window edge below the threshold is dropped even
+    though it DOES reach the window -- `durable_rules.md`'s boundary rule. It
+    looks identical to "outside the window" from the outside, and it is the
+    drop authors most often report as a bug, so it must name itself. Isolated
+    by diffing a threshold=0 resolve, exactly as the timeline's used/dropped
+    highlight does.
+    """
+    sections = [_section(0, 100, "long", prompt_id="p-long"),
+                _section(100, 200, "spill", prompt_id="p-spill")]
+    # The window reaches 2 frames into a 100-frame section: 2% of its authored
+    # length, well under a 50% threshold.
+    dropped = _window_states(sections, window=(0, 102), threshold=50.0)
+    assert dropped["p-spill"] == "boundary_dropped", dropped
+    assert dropped["p-long"] == "selected", dropped
+    # The SAME window with no threshold keeps it -- proving the state tracks the
+    # threshold rather than the geometry.
+    kept = _window_states(sections, window=(0, 102), threshold=0.0)
+    assert kept["p-spill"] == "selected", kept
+
+
+def test_section_window_states_carry_the_id_the_client_knows():
+    """The compiler mints `__compile_section_N` for a section with no id.
+
+    That substitute exists so the compiler's own maps stay keyed and no client
+    has ever seen it, so reporting it would hand every surface an id it cannot
+    match. A section with no id reports an empty one and is matched by `index`.
+    """
+    unnamed = _section(0, 10, "one")
+    unnamed.prompt_id = ""
+    compiled = prompt_context.compile_prompt_context(
+        sections=[unnamed, _section(10, 20, "two", prompt_id="p-named")],
+        window_start=0, window_end=20, fps=24.0)
+    rows = compiled["section_window_states"]
+    assert [row["index"] for row in rows] == [0, 1], rows
+    assert rows[0]["prompt_id"] == "", rows
+    assert not rows[0]["prompt_id"].startswith("__compile_section"), rows
+    assert rows[1]["prompt_id"] == "p-named", rows
+
+
+def test_section_window_states_are_response_only():
+    """Presentation state about one window, never part of what a job renders.
+
+    Two things make that true and neither is automatic. `content_hash` is
+    computed over a fixed key set, so a new key must not join it -- otherwise
+    every queued job's identity changes. And the freeze in `routes.py` is a
+    DENYLIST: a key absent from it is copied into every frozen envelope.
+    """
+    sections = [_section(0, 10, "one", prompt_id="p-1")]
+    compiled = prompt_context.compile_prompt_context(
+        sections=sections, window_start=0, window_end=10, fps=24.0)
+    stripped = {key: value for key, value in compiled.items()
+                if key != "section_window_states"}
+    assert prompt_context.content_hash({
+        "prompt": stripped["prompt"], "channels": stripped["channels"],
+        "segments": stripped["segments"], "window": stripped["window"],
+        "profile_hash": stripped["profile_hash"],
+        "setup_manifest": stripped["setup_manifest"],
+    }) == compiled["content_hash"]
+    # And the freeze excludes it beside the two projection keys it belongs with.
+    source = (ROOT / "server" / "routes.py").read_text(encoding="utf-8")
+    freeze = source.split("job.compiled_prompt_context = {")[1][:400]
+    for key in ("attachment_channel_routes", "attachment_capability_projections",
+                "section_window_states"):
+        assert key in freeze, freeze
+
+
+def test_an_unusable_profile_still_answers_the_window_state_question():
+    """The contract is uniform across every exit, so no consumer branches.
+
+    `profile_error_result` is a compiled-SHAPED payload; a surface reading
+    `section_window_states` off it must not have to know which exit produced it.
+    An empty list means "nothing known", which every consumer treats as
+    `selected` -- i.e. today's behaviour, not a blank claim about the window.
+    """
+    result = prompt_context.profile_error_result(
+        prompt_context.ProfileResolutionError("nope"))
+    assert result["section_window_states"] == []
+
+
+def test_a_leading_anchor_is_the_blocks_own_not_the_documents():
+    """The producer half of the rule above, and the half that shipped wrong.
+
+    Source-level: the panel cannot be mounted here. `-1` is the DOCUMENT's
+    leading slot, so using it for every block stacked block 2's
+    template-leading channels at the very top of the draft. The consumer half
+    -- which of the two plausible per-block anchors is right -- is measured in
+    `test_a_later_blocks_leading_channel_paints_after_its_separator`.
+    """
+    panel = (ROOT / "web" / "js" / "editor_prompt_panel.js").read_text(
+        encoding="utf-8")
+    decorations = panel.split("const writingDecorations")[1].split(
+        "const writingContributionBlock")[0]
+    assert "let anchor = range.block === 0 ? -1 : range.firstIndex;" in decorations
+    # The two wrong answers, named so neither comes back: the document slot for
+    # every block, and the off-by-one that lands in the PREVIOUS block.
+    assert "let anchor = -1;" not in decorations
+    assert "range.firstIndex - 1" not in decorations
+    # Still advances to a written channel's own region.
+    assert "anchor = written.get(channelKey);" in decorations
+
+
+def test_a_later_blocks_leading_channel_paints_after_its_separator():
+    """`firstIndex`, not `firstIndex - 1`. The two differ by one block.
+
+    `joinWritingSectionDocuments` writes the separator as its OWN node, and
+    `writingBlockNodeRanges` gives the next block that node as its `firstIndex`.
+    So `firstIndex` paints between the separator and the block's first content
+    -- inside block 1 -- while `firstIndex - 1` paints before the separator,
+    inside block 0. Both read as "next to the right block" in a screenshot,
+    which is why this is measured rather than eyeballed.
+    """
+    result = _run_chip_dom_script("""
+        // Built by the REAL joiner, not by hand: the whole question is which
+        // node `firstIndex` lands on in a draft this project actually produces,
+        // and a hand-written array cannot answer that.
+        const text = (value) => ({ nodes: [{ type: "text", text: value }] });
+        const nodes = mod.joinWritingSectionDocuments([
+            { channel_docs: { visual: text("block zero") } },
+            { channel_docs: { visual: text("block one") } },
+        ], ["visual"]).nodes;
+        const ranges = mod.writingBlockNodeRanges({ nodes });
+        const paint = (afterIndex) => {
+            const mark = document.createElement("div");
+            mark.textContent = "D";
+            const editor = mod.createPromptDocumentEditor({
+                document: { nodes },
+                decorations: () => [{ afterIndex, element: mark }],
+            });
+            return editor.children.map((c) =>
+                c.dataset.sonderDecoration === "1" ? "D" : c.dataset.nodeId);
+        };
+        const firstIndex = ranges[1].firstIndex;
+        // Which node each id holds, so the assertions below name text rather
+        // than opaque generated ids.
+        const textAt = nodes.map((node) => node.text);
+        const idAt = nodes.map((node) => node.node_id);
+        console.log(JSON.stringify({
+            blocks: ranges.length,
+            textAt, firstIndex,
+            chosen: paint(firstIndex).map((v) => idAt.indexOf(v) < 0 ? v : textAt[idAt.indexOf(v)]),
+            rejected: paint(firstIndex - 1).map((v) => idAt.indexOf(v) < 0 ? v : textAt[idAt.indexOf(v)]),
+        }));
+    """)
+    assert result["blocks"] == 2, result
+    # The joiner writes the separator as its OWN node, which is the fact the
+    # anchor choice rests on. If this ever changes, the anchor must change too.
+    assert result["textAt"] == ["block zero", "\n---\n", "block one"], result
+    # ...and that node is block 1's `firstIndex`.
+    assert result["firstIndex"] == 1, result
+    # Chosen: after the separator, before block 1's own text.
+    assert result["chosen"] == ["block zero", "\n---\n", "D", "block one"], result
+    # Rejected: before the separator, i.e. inside block 0.
+    assert result["rejected"] == ["block zero", "D", "\n---\n", "block one"], result
+
+
+def test_a_landed_compile_keeps_a_leading_decoration_leading():
+    """`refreshDecorations` is the hot path, and it sent the leading slot last.
+
+    `render()` paints a negative `afterIndex` in its own leading pass and an
+    out-of-range one in the trailing pass; `refreshDecorations` folded both into
+    "trailing". A panel rebuild therefore put a template-leading channel on top
+    and the very next landed compile -- one per debounced keystroke -- put it
+    underneath everything, with nothing in between to explain the jump.
+    """
+    result = _run_chip_dom_script("""
+        const order = () => editor.children.map((c) =>
+            c.dataset.sonderDecoration === "1"
+                ? c.textContent : c.dataset.nodeId);
+        const decorations = () => [
+            { afterIndex: -1, element: Object.assign(
+                document.createElement("div"), { textContent: "LEAD" }) },
+            { afterIndex: 99, element: Object.assign(
+                document.createElement("div"), { textContent: "TAIL" }) },
+        ];
+        const editor = mod.createPromptDocumentEditor({
+            document: { nodes: [
+                { type: "text", node_id: "n1", text: "detailed_description:" },
+                { type: "text", node_id: "n2", text: "She looks up." },
+            ] },
+            decorations,
+        });
+        const rendered = order();
+        editor.refreshDecorations();
+        console.log(JSON.stringify({ rendered, refreshed: order() }));
+    """)
+    # The two paths must agree, and both must put the leading slot first.
+    assert result["rendered"] == ["LEAD", "n1", "n2", "TAIL"], result
+    assert result["refreshed"] == result["rendered"], result
+
+
+
 def test_a_block_anchors_insertions_before_its_closing_break():
     """`lastIndex` answers membership; it cannot answer "where does this block end".
 
@@ -3241,14 +4164,24 @@ def test_a_block_anchors_insertions_before_its_closing_break():
     assert single == [[0, 1, 1, None]], single
 
 
-def test_a_disabled_capability_is_not_listed_as_a_contribution():
-    """What the author turned off is not something their References contribute.
+def test_a_disabled_capability_stays_visible_so_it_can_be_turned_back_on():
+    """Hiding a switched-off contribution is a one-way trap, not tidiness.
 
-    `channelContributionRows` still REPORTS a disabled row — the pill strip needs
-    it, since re-enabling happens there — so the filter belongs to the Writing
-    decoration. Without it a converted contribution kept sitting under the
-    heading as "disabled and contributes no text", which reads as a Convert that
-    failed rather than one that worked.
+    The Writing draft is a browser-local FORK of the scene, and the Structured
+    pill that would re-enable a capability reads the saved scene — so between
+    turning one off in Writing and applying the draft, a hidden row has no
+    surface anywhere that can turn it back on. For a chip that exists only in
+    the draft that is unrecoverable short of discarding the draft.
+
+    So a disabled row stays, dimmed, and its menu offers the inverse. What is
+    gated instead is the HEADER: a block appears when something in it emits, or
+    a channel contributing nothing would still announce itself — six of them
+    under H3 — **or when something in it was switched off**. That second half is
+    the whole point: gating on emitted text alone deleted the entire block the
+    moment the last contributing capability was disabled, taking the row and its
+    inverse with it. Keeping the row and dropping its block is the same trap one
+    level up, and an earlier version of this test asserted the gate that
+    produced it.
     """
     result = _run_chip_dom_script("""
         const rows = mod.channelContributionRows({
@@ -3265,45 +4198,25 @@ def test_a_disabled_capability_is_not_listed_as_a_contribution():
         });
         console.log(JSON.stringify(rows.map((r) => [r.state, r.emitting])));
     """)
-    # The resolver keeps reporting it...
+    # The resolver reports it, and the Writing block no longer drops it.
     assert result == [["disabled", False]], result
-    # ...and the Writing decoration is the thing that drops it.
     panel = (ROOT / "web" / "js" / "editor_prompt_panel.js").read_text(
         encoding="utf-8")
     decorations = panel.split("const writingDecorations")[1].split(
-        "const writingDecorationElement")[0]
-    assert '.filter((contribution) => contribution.state !== "disabled")' in decorations
-
-
-def test_convert_disables_every_chip_in_the_emission_group():
-    """A per-chip disable promotes a linked sibling instead of silencing it.
-
-    Dedupe keys on `(emission_group_id, capability_id, kind, channel)`, so with
-    the same Reference staged on three sections only one chip emits and the
-    others read "equivalent output already emitted". Turning off the emitter
-    hands the emission to a sibling, and the definition still reaches the
-    prompt — now twice, once as the author's new prose.
-
-    The group is enumerated from the candidate the panel already holds, matched
-    on capability rather than channel: a linked group is one chip cloned, so a
-    sibling whose record pins a different channel must not slip through.
-    """
-    panel = (ROOT / "web" / "js" / "editor_prompt_panel.js").read_text(
-        encoding="utf-8")
-    convert = panel.split("const convertContributionToProse")[1].split(
-        "const writingDecorations")[0]
-    assert "emission_group_id" in convert
-    assert "groupAttachmentIds" in convert
-    # Both homes, over the whole group. A section-scoped chip never reaches the
-    # editor registry, and `writingSectionsFromDraft` reads it from blockMeta.
-    registry, scoped = convert.split("for (const meta of writingState.blockMeta")
-    assert "groupAttachmentIds.has(value.attachment_id)" in registry
-    assert "groupAttachmentIds.has(value.attachment_id)" in scoped
-    # Silencing three chips is never silent: the count is in the question, not
-    # in a toast after the fact.
-    question = convert.split("window.confirm(")[1].split("return false;")[0]
-    assert "groupAttachmentIds.size" in convert.split("window.confirm(")[0]
-    assert "linked" in question
+        "const writingContributionBlock")[0]
+    assert '.filter((contribution) => contribution.state !== "disabled")'         not in decorations
+    # A header still needs content — but a switched-off row IS content here,
+    # because it is the only surface carrying the way back.
+    assert 'line.text\n                        || line.state === "disabled"' in decorations
+    assert "if (!lines.some((line) => line.text)) continue;" not in decorations
+    # And the menu offers the way back rather than only the way out.
+    block = panel.split("const writingContributionBlock")[1].split(
+        "const materialiseChannelHeading")[0]
+    assert "Contribute here again" in block
+    assert 'line.state === "disabled"' in block
+    # And the way to make the channel real is in the menu too, not only behind a
+    # double-click on a hint line.
+    assert '"Write here too"' in block
 
 
 def test_a_focused_mention_control_reflows_instead_of_covering_the_prose():

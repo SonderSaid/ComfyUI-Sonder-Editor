@@ -61,6 +61,109 @@ def _reference_attachment(capability, config):
     })
 
 
+HANDLE_CASES = [
+    # (prose, expected handles)
+    ("@KWoman is here", ["KWoman"]),
+    # An `@` after a word character is an ADDRESS, never a mention.
+    ("write to bob@example today", []),
+    # ...but prose reaches `@` after punctuation far more often than after a
+    # bare space, and an allowlist of openers refused most real sentences.
+    ('she said "@KWoman" and left', ["KWoman"]),
+    ("(@KWoman) turns", ["KWoman"]),
+    ("...@KWoman turns", ["KWoman"]),
+    # The run ends at the apostrophe, so possessives survive intact.
+    ("@KWoman's jacket", ["KWoman"]),
+    # A sentence-ending full stop is punctuation, not a qualifier, and a
+    # qualifier is not supported in prose AT ALL: a handle in prose is a
+    # mention. `KWoman` matches and `.retention` stays literal prose.
+    ("I saw @KWoman.", ["KWoman"]),
+    ("@KWoman.retention", ["KWoman"]),
+    # The token grammar wins over the handle grammar, because a token carries a
+    # stable id and a handle does not. A project may hold a handle named
+    # `subject`; without this guard the scanner would eat the kind and strand
+    # `(id)` as prose.
+    ("@subject(abc-123) walks", []),
+    ("@shot(s1) then @KWoman", ["KWoman"]),
+    # An email-shaped run with no matching handle still SCANS as one; passing
+    # it through unresolved is the resolver's job, not the scanner's.
+    ("mail @mail.com now", ["mail"]),
+    # Digits and underscores inside, never leading.
+    ("@K_Woman2 and @2Woman", ["K_Woman2"]),
+    ("", []),
+    ("no handles here", []),
+    ("@@KWoman", ["KWoman"]),
+    ("@KWoman @Beggar", ["KWoman", "Beggar"]),
+]
+
+
+def test_python_and_javascript_handle_grammars_match():
+    """The handle scanner is a mirrored pair and must not drift.
+
+    Prose is resolved by Python at compile time and decorated by JavaScript in
+    the editor. If the two disagree, the editor paints a handle the compiler
+    ignores, or leaves plain a run the compiler rewrites — and the second is
+    silent prose corruption, since authored text would change meaning with no
+    visible cause.
+
+    Both guards are asserted through real cases rather than by comparing the
+    two regex sources, because equal sources with different flags or engines
+    would still pass a source comparison.
+    """
+    expected = {}
+    for text, handles in HANDLE_CASES:
+        assert [row["handle"] for row in prompt_tokens.handle_mentions(text)] \
+            == handles, text
+        expected[text] = handles
+        # The cheap predicate must agree with the full scan; the compile-entry
+        # gate uses it over every channel of every section.
+        assert prompt_tokens.has_handle_mention(text) == bool(handles), text
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for handle grammar parity")
+    script = (
+        f"const mod = await import("
+        f"{json.dumps((ROOT / 'web/js/prompt_tokens.js').as_uri())});\n"
+        f"const cases = {json.dumps([text for text, _ in HANDLE_CASES])};\n"
+        "console.log(JSON.stringify(Object.fromEntries(cases.map((text) =>"
+        " [text, mod.promptHandleMentions(text).map((row) => row.handle)]))));\n")
+    result = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+    assert result == expected
+
+
+def test_a_handle_mention_reports_the_span_it_occupies():
+    """Spans, not spellings: the resolver substitutes in place.
+
+    Returning only the handle would make the caller re-find it, and a second
+    search is a second grammar — the exact drift this pair exists to prevent.
+    """
+    text = "a @KWoman walks past @Beggar."
+    rows = prompt_tokens.handle_mentions(text)
+    assert [text[row["start"]:row["end"]] for row in rows] == ["@KWoman", "@Beggar"]
+    # Source order, so a caller replacing from the end backwards keeps every
+    # earlier span valid.
+    assert rows[0]["start"] < rows[1]["start"]
+
+
+def test_a_handle_that_cannot_be_created_cannot_be_written():
+    """The scanner and the creation validator agree on what a handle is.
+
+    `PROMPT_HANDLE_RE` gates handle creation. A scanner that accepted MORE than
+    it would resolve prose nobody can ever bind; one that accepted less would
+    leave a legally created handle unusable in prose.
+    """
+    for candidate in ["KWoman", "K_Woman2", "a", "A" + "b" * 63]:
+        assert prompt_context.PROMPT_HANDLE_RE.fullmatch(candidate), candidate
+        assert [row["handle"] for row in
+                prompt_tokens.handle_mentions(f"x @{candidate} y")] == [candidate]
+    for candidate in ["2Woman", "_Woman", "A" + "b" * 64]:
+        assert not prompt_context.PROMPT_HANDLE_RE.fullmatch(candidate), candidate
+        assert [row["handle"] for row in prompt_tokens.handle_mentions(
+            f"x @{candidate} y")] != [candidate], candidate
+
+
 def test_python_and_javascript_token_vocabularies_match():
     node = shutil.which("node")
     if not node:

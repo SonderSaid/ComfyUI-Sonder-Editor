@@ -1598,6 +1598,496 @@ def test_a_converted_mention_that_only_seeds_its_kind_routes_away():
     assert "<Subject 1>" not in compiled["channels"]["subject_definitions"]
 
 
+def _handle_prose_scene(text, *, unit_handle="KWoman", member_handle="Sheet"):
+    """One staged Subject and one staged Picture, with prose instead of chips."""
+    entity = ReferenceEntity(reference_id="e", name="Woman", members=[
+        ReferenceMember(member_id="mp", asset_id="img_a", handle=member_handle,
+                        prompt="the young woman with long dark hair")])
+    recipes = [ReferenceLaneRecipe(lane_id="lp", media_kind="image",
+                                   recipe=PICTURE_RECIPE)]
+    items = [ReferenceItem(reference_item_id="ip", lane_index=0, start_frame=0,
+                           end_frame=WINDOW_END, members=[
+                               {"entity_id": "e", "member_id": "mp",
+                                "role": "identity", "visual_intent": "preserve"}])]
+    units = [{"semantic_unit_id": "u", "name": "Woman", "handle": unit_handle,
+              "order": 0, "sources": [{"entity_id": "e", "member_id": "mp"}]}]
+    resolved = _resolve(setup={"mode": "reference", "picture_lane_ids": ["lp"]},
+                        entities=[entity], items=items, recipes=recipes, units=units)
+    document = {"nodes": [{"type": "text", "text": text}]}
+    return prompt_context.compile_prompt_context(
+        sections=[PromptSection(0, WINDOW_END,
+                                channel_docs={"detailed_description": document})],
+        window_start=0, window_end=WINDOW_END, fps=24.0,
+        template="minimax_h3_ref", profile="minimax_h3_ref@1",
+        context={
+            "setup_manifest": resolved["setup_manifest"],
+            "ordinal_manifest": resolved["ordinal_manifest"],
+            "unit_picture_ordinals": resolved.get("unit_picture_ordinals", {}),
+            "unit_source_labels": resolved.get("unit_source_labels", {}),
+            "unit_source_members": resolved.get("unit_source_members", {}),
+            "semantic_units": units,
+            "references": [entity.to_dict() if hasattr(entity, "to_dict") else entity],
+        }, labels_on=True)
+
+
+def test_a_handle_written_in_prose_resolves_where_it_sits():
+    """The whole point: a mention is text now, and text renders in place.
+
+    A handle carries no routing of its own, so it cannot be misrouted the way a
+    chip could — it emits at the position the author typed it, in the channel
+    they typed it in. That is exactly the `mentions` semantics the compiler
+    already describes as "authored placements", which is why prose is allowed to
+    express it and nothing else.
+    """
+    compiled = _handle_prose_scene("a @KWoman walks past the window")
+    described = compiled["channels"]["detailed_description"]
+    assert "<Subject 1> walks past the window" in described, described
+    # The handle spelling is GONE, replaced in place — not appended, not
+    # duplicated, and not left beside its own resolution.
+    assert "@KWoman" not in described, described
+
+
+def test_a_possessive_handle_keeps_its_suffix():
+    """`@KWoman's jacket` is a mention plus prose, not a handle named KWomans."""
+    described = _handle_prose_scene(
+        "@KWoman's jacket is red")["channels"]["detailed_description"]
+    assert described.startswith("<Subject 1>'s jacket is red"), described
+
+
+def test_case_does_not_change_what_a_handle_names():
+    """Handle uniqueness is enforced case-insensitively when one is created.
+
+    So two spellings cannot name two different things, and prose must not be the
+    one surface that pretends they can.
+    """
+    described = _handle_prose_scene(
+        "@kwoman and @KWOMAN")["channels"]["detailed_description"]
+    assert described == "<Subject 1> and <Subject 1>", described
+
+
+def test_an_unmatched_handle_is_left_exactly_as_written():
+    """Three cases that must not be told apart, and must never half-resolve.
+
+    An `@` that was never a handle; a handle for a Reference that does not exist
+    yet — late binding, which is what lets prose be drafted before the
+    References are staged and wire itself up when they are; and a handle whose
+    entity is not staged in this window. Rendering a partial label in any of
+    them puts a number in the prompt that staging does not agree with.
+    """
+    described = _handle_prose_scene(
+        "write to bob@example about @Nobody at @mail.com"
+    )["channels"]["detailed_description"]
+    assert described == "write to bob@example about @Nobody at @mail.com", described
+
+
+def test_a_physical_member_handle_resolves_to_its_population_label():
+    """Both namespaces work in prose, not only semantic identities."""
+    described = _handle_prose_scene(
+        "framed like @Sheet")["channels"]["detailed_description"]
+    assert "<Picture 1>" in described, described
+    assert "@Sheet" not in described, described
+
+
+def test_a_handle_resolves_in_every_physical_population_not_only_the_first():
+    """Which population a member belongs to is the manifest's answer.
+
+    `_handle_sources` walked every member under each declaration in turn and
+    kept the first claim, so with H3 declaring pictures, videos and standalone
+    audio in that order, EVERY member handle was filed as a picture. A video or
+    audio handle then resolved against `ordinal_manifest["pictures"]`, missed,
+    produced no label, and shipped to the model as literal `@text`.
+
+    That failure is invisible by construction: it is indistinguishable from the
+    deliberate silence for a handle that is not staged or does not exist. So
+    this stages one member of each kind and asserts all three, rather than
+    asserting "a physical handle works" from a picture alone.
+    """
+    entity = ReferenceEntity(reference_id="e", name="Cast", members=[
+        ReferenceMember(member_id="mp", asset_id="img_a", handle="Sheet",
+                        prompt="the young woman"),
+        ReferenceMember(member_id="mv", asset_id="vid_a", handle="Clip",
+                        prompt="the walk cycle"),
+        ReferenceMember(member_id="ma", asset_id="aud_a", handle="Track",
+                        prompt="the room tone")])
+    recipes = [
+        ReferenceLaneRecipe(lane_id="lp", media_kind="image", recipe=PICTURE_RECIPE),
+        ReferenceLaneRecipe(lane_id="lv", media_kind="video", recipe=VIDEO_RECIPE),
+        ReferenceLaneRecipe(lane_id="la", media_kind="audio", recipe=AUDIO_RECIPE)]
+    items = [
+        ReferenceItem(reference_item_id="ip", lane_index=0, start_frame=0,
+                      end_frame=WINDOW_END, members=[
+                          {"entity_id": "e", "member_id": "mp",
+                           "role": "identity", "visual_intent": "preserve"}]),
+        ReferenceItem(reference_item_id="iv", lane_index=1, start_frame=0,
+                      end_frame=WINDOW_END, members=[
+                          {"entity_id": "e", "member_id": "mv",
+                           "role": "identity", "visual_intent": "preserve"}]),
+        ReferenceItem(reference_item_id="ia", lane_index=2, start_frame=0,
+                      end_frame=WINDOW_END, members=[
+                          {"entity_id": "e", "member_id": "ma",
+                           "role": "identity", "audio_intent": "reference"}])]
+    resolved = _resolve(setup={"mode": "reference"}, entities=[entity],
+                        items=items, recipes=recipes, units=[])
+    document = {"nodes": [{"type": "text",
+                           "text": "pic @Sheet vid @Clip aud @Track"}]}
+    compiled = prompt_context.compile_prompt_context(
+        sections=[PromptSection(0, WINDOW_END,
+                                channel_docs={"detailed_description": document})],
+        window_start=0, window_end=WINDOW_END, fps=24.0,
+        template="minimax_h3_ref", profile="minimax_h3_ref@1",
+        context={
+            "setup_manifest": resolved["setup_manifest"],
+            "ordinal_manifest": resolved["ordinal_manifest"],
+            "unit_picture_ordinals": resolved.get("unit_picture_ordinals", {}),
+            "unit_source_labels": resolved.get("unit_source_labels", {}),
+            "unit_source_members": resolved.get("unit_source_members", {}),
+            "semantic_units": [],
+            # Dicts, not dataclasses: `_members_by_id` calls `.get`.
+            "references": [entity.to_dict()],
+        }, labels_on=True)
+    described = compiled["channels"]["detailed_description"]
+    # Every population, not just the one declared first.
+    assert "<Picture 1>" in described, described
+    assert "<Video 1>" in described, described
+    assert "<Audio 1>" in described, described
+    # And nothing was left as literal text.
+    assert "@" not in described, described
+
+
+MENTION_PARITY_CASES = [
+    # (capability kind, chip config, what the rendered line should contain)
+    ("mentions", {}, "<Subject 1>"),
+    ("mentions", {"text": "the woman in red"}, "the woman in red"),
+    ("summary", {"summary": "A quiet corridor."}, "A quiet corridor."),
+    ("summary", {"summary": ""}, ""),
+    ("audio_relationship",
+     {"audio_relationship": "<Audio 1> is the voice for <Subject 1>."},
+     "voice for"),
+]
+
+
+def test_every_copyable_capability_assembles_to_its_rendered_line():
+    """Segments must rebuild the rendered line byte for byte.
+
+    `definitions` and `retention` were always segment-assembled, and the
+    existing coverage compares their segments against
+    `reference_capability_lines` — which is built from the same parts, so it can
+    only prove self-consistency. `mentions`, `summary` and `audio_relationship`
+    are different: `_render_reference` produces them as flat strings by a
+    separate path, and the new builders have to agree with THAT.
+
+    A one-character disagreement is not cosmetic. Copy puts the segment
+    assembly on the clipboard while the prompt carries the rendered line, so a
+    drift means pasting something subtly different from what the chip emits —
+    silently, and only visible by comparing two prompts.
+    """
+    entity = ReferenceEntity(reference_id="e", name="Woman", members=[
+        ReferenceMember(member_id="mp", asset_id="img_a", handle="Sheet",
+                        prompt="the young woman with long dark hair")])
+    recipes = [ReferenceLaneRecipe(lane_id="lp", media_kind="image",
+                                   recipe=PICTURE_RECIPE)]
+    items = [ReferenceItem(reference_item_id="ip", lane_index=0, start_frame=0,
+                           end_frame=WINDOW_END, members=[
+                               {"entity_id": "e", "member_id": "mp",
+                                "role": "identity", "visual_intent": "preserve"}])]
+    units = [{"semantic_unit_id": "u", "name": "Woman", "handle": "KWoman",
+              "order": 0, "sources": [{"entity_id": "e", "member_id": "mp"}]}]
+    resolved = _resolve(setup={"mode": "reference", "picture_lane_ids": ["lp"]},
+                        entities=[entity], items=items, recipes=recipes, units=units)
+    context = {
+        "setup_manifest": resolved["setup_manifest"],
+        "ordinal_manifest": resolved["ordinal_manifest"],
+        "unit_source_labels": resolved.get("unit_source_labels", {}),
+        "unit_source_members": resolved.get("unit_source_members", {}),
+        "semantic_units_by_id": {u["semantic_unit_id"]: u for u in units},
+        "references": [entity.to_dict()],
+        "profile": prompt_context.BUILTIN_PROFILES["minimax_h3_ref@1"],
+    }
+    compared = 0
+    for capability_kind, config, expected in MENTION_PARITY_CASES:
+        chip = _reference_chip("chip-1", {"semantic_unit_ids": ["u"]}, dict(config),
+                               capabilities=(capability_kind,))
+        capability = next(value for value in chip["capabilities"]
+                          if value["capability_id"] == capability_kind)
+        rendered = prompt_context._render_reference_capability(
+            chip, capability, context)
+        parts = prompt_context.reference_capability_segments(chip, capability, context)
+        assembled = "".join(
+            prompt_context.segments_text(segments) for _owner, segments in parts)
+        assert assembled == rendered, (capability_kind, config, assembled, rendered)
+        if expected:
+            assert expected in rendered, (capability_kind, rendered)
+        compared += 1
+    assert compared == len(MENTION_PARITY_CASES)
+
+
+def test_a_mention_carries_the_id_that_spells_it_live():
+    """Copy must be able to write a handle, not a number.
+
+    A mention's labels are `<Subject 1>` / `<Picture 1>` — ordinals, which the
+    invariant forbids putting into stored text. Each therefore has to arrive as
+    a LABEL segment carrying the id behind it, so the browser can resolve the
+    handle. A segment with the right TEXT and no id is the silent failure: Copy
+    would fall back to freezing the number.
+    """
+    entity = ReferenceEntity(reference_id="e", name="Woman", members=[
+        ReferenceMember(member_id="mp", asset_id="img_a", handle="Sheet",
+                        prompt="the young woman")])
+    recipes = [ReferenceLaneRecipe(lane_id="lp", media_kind="image",
+                                   recipe=PICTURE_RECIPE)]
+    items = [ReferenceItem(reference_item_id="ip", lane_index=0, start_frame=0,
+                           end_frame=WINDOW_END, members=[
+                               {"entity_id": "e", "member_id": "mp",
+                                "role": "identity", "visual_intent": "preserve"}])]
+    units = [{"semantic_unit_id": "u", "name": "Woman", "handle": "KWoman",
+              "order": 0, "sources": [{"entity_id": "e", "member_id": "mp"}]}]
+    resolved = _resolve(setup={"mode": "reference", "picture_lane_ids": ["lp"]},
+                        entities=[entity], items=items, recipes=recipes, units=units)
+    context = {
+        "setup_manifest": resolved["setup_manifest"],
+        "ordinal_manifest": resolved["ordinal_manifest"],
+        "unit_source_labels": resolved.get("unit_source_labels", {}),
+        "unit_source_members": resolved.get("unit_source_members", {}),
+        "semantic_units_by_id": {u["semantic_unit_id"]: u for u in units},
+        "references": [entity.to_dict()],
+        "profile": prompt_context.BUILTIN_PROFILES["minimax_h3_ref@1"],
+    }
+    # A chip naming BOTH namespaces at once.
+    chip = _reference_chip(
+        "chip-1", {"semantic_unit_ids": ["u"], "picture_ids": ["mp"]}, {},
+        capabilities=("mentions",))
+    capability = chip["capabilities"][0]
+    parts = prompt_context.reference_capability_segments(chip, capability, context)
+    segments = parts[0][1]
+    labels = [seg for seg in segments
+              if seg["kind"] == prompt_context.SEGMENT_LABEL]
+    assert [seg["text"] for seg in labels] == ["<Subject 1>", "<Picture 1>"], segments
+    # The semantic identity carries its unit id, the physical member its member
+    # id — the two spellings a handle can have.
+    assert labels[0].get("unit_id") == "u", labels[0]
+    assert labels[1].get("member_id") == "mp", labels[1]
+    # Neither is a bare text segment, which is what would let a number freeze.
+    assert all(seg.get("unit_id") or seg.get("member_id") for seg in labels), labels
+    # And the assembly still rebuilds the rendered line exactly — the separator
+    # between two labels is part of that line, so dropping it is a silent drift
+    # that a single-label case cannot see.
+    rendered = prompt_context._render_reference_capability(chip, capability, context)
+    assert prompt_context.segments_text(segments) == rendered, (segments, rendered)
+    assert rendered == "<Subject 1> <Picture 1>", rendered
+
+
+def test_a_copy_plan_spells_a_mention_as_handles_in_both_namespaces():
+    """Copy must never put an ordinal on the clipboard.
+
+    A mention renders `<Subject 1> <Picture 1>` — two numbers that staging can
+    change. Both have a live spelling: the identity through its unit, the
+    physical member through its own handle. The plan therefore returns two
+    HANDLE parts with the ids behind them, and the browser resolves the
+    spellings, which is the same division of labour the definition path already
+    uses.
+
+    A physical DEFINITION label still blocks, and that is not inconsistent: its
+    owner is keyed by the rendered label itself, so there is no id to hand back.
+    """
+    entity = ReferenceEntity(reference_id="e", name="Woman", members=[
+        ReferenceMember(member_id="mp", asset_id="img_a", handle="Sheet",
+                        prompt="the young woman")])
+    recipes = [ReferenceLaneRecipe(lane_id="lp", media_kind="image",
+                                   recipe=PICTURE_RECIPE)]
+    items = [ReferenceItem(reference_item_id="ip", lane_index=0, start_frame=0,
+                           end_frame=WINDOW_END, members=[
+                               {"entity_id": "e", "member_id": "mp",
+                                "role": "identity", "visual_intent": "preserve"}])]
+    units = [{"semantic_unit_id": "u", "name": "Woman", "handle": "KWoman",
+              "order": 0, "sources": [{"entity_id": "e", "member_id": "mp"}]}]
+    resolved = _resolve(setup={"mode": "reference", "picture_lane_ids": ["lp"]},
+                        entities=[entity], items=items, recipes=recipes, units=units)
+    chip = _reference_chip(
+        "chip-1", {"semantic_unit_ids": ["u"], "picture_ids": ["mp"]}, {},
+        capabilities=("mentions",), placement="inline")
+    compiled = prompt_context.compile_prompt_context(
+        sections=[PromptSection(0, WINDOW_END,
+                                channels={"detailed_description": "She looks up."},
+                                attachments=[chip])],
+        window_start=0, window_end=WINDOW_END, fps=24.0,
+        template="minimax_h3_ref", profile="minimax_h3_ref@1",
+        context={
+            "setup_manifest": resolved["setup_manifest"],
+            "ordinal_manifest": resolved["ordinal_manifest"],
+            "unit_source_labels": resolved.get("unit_source_labels", {}),
+            "unit_source_members": resolved.get("unit_source_members", {}),
+            "semantic_units": units,
+            "references": [entity.to_dict()],
+        }, labels_on=True,
+        convert_plan_for={"attachment_id": "chip-1", "capability_id": "mentions"})
+    plan = compiled["convert_plan"]
+    assert not plan["refused"], plan
+    parts = plan["lines"][0]["parts"]
+    handles = [part for part in parts if part["kind"] == "handle"]
+    assert [(h["source"], h["id"]) for h in handles] == [
+        ("unit", "u"), ("member", "mp")], parts
+    # The rendered ordinals ride along for the refusal message only; nothing in
+    # the plan asks the browser to write them.
+    assert [h["rendered"] for h in handles] == ["<Subject 1>", "<Picture 1>"], parts
+    assert not any(part["kind"] == "text" and "<" in part["text"]
+                   for part in parts), parts
+
+
+def test_an_unresolved_handle_is_reported_without_blocking():
+    """Silence was a typo's only signal.
+
+    Prose may name a handle before its Reference exists — that is the late
+    binding an LLM-drafted scene depends on — so this cannot be an error. But a
+    typo (`@KWomn`) is indistinguishable from that by construction, and without
+    a diagnostic it reached the model as literal text with nothing anywhere
+    saying so. A handle carries no `attachment_id`, so the advisory is
+    channel-level, like the one the token grammar beside it already uses.
+    """
+    compiled = _handle_prose_scene("a @KWoman meets @Nobody at bob@example")
+    codes = [w.get("code") for w in compiled["warnings"]]
+    assert "unresolved_handle_mention" in codes, compiled["warnings"]
+    row = next(w for w in compiled["warnings"]
+               if w["code"] == "unresolved_handle_mention")
+    # Only the unresolved one is named. `@KWoman` resolved, and `bob@example`
+    # was never a mention.
+    assert "@Nobody" in row["message"], row
+    assert "@KWoman" not in row["message"], row
+    assert "bob" not in row["message"], row
+    assert row["channel_key"] == "detailed_description", row
+    # Non-blocking: nothing here may stop a render.
+    assert not compiled["errors"], compiled["errors"]
+
+
+def test_prose_whose_handles_all_resolve_says_nothing():
+    """An advisory that always fires is noise, and noise is ignored."""
+    compiled = _handle_prose_scene("a @KWoman walks past")
+    assert not [w for w in compiled["warnings"]
+                if w.get("code") == "unresolved_handle_mention"], compiled["warnings"]
+
+
+def test_copy_refuses_a_capability_whose_contribution_the_render_refuses():
+    """The clipboard must not carry what the prompt does not.
+
+    `_render_reference_capability` short-circuits on a capability the format
+    does not declare and on one holding a value outside its declared
+    vocabulary. The segment builders behind Copy had neither check, so a chip
+    whose `summary` names an unknown task type contributed NOTHING to the
+    prompt while Copy still offered `[reference generation] body` — text the
+    render had refused, handed to the author as if it were live.
+    """
+    entity = ReferenceEntity(reference_id="e", name="Woman", members=[
+        ReferenceMember(member_id="mp", asset_id="img_a", handle="Sheet",
+                        prompt="the young woman")])
+    recipes = [ReferenceLaneRecipe(lane_id="lp", media_kind="image",
+                                   recipe=PICTURE_RECIPE)]
+    items = [ReferenceItem(reference_item_id="ip", lane_index=0, start_frame=0,
+                           end_frame=WINDOW_END, members=[
+                               {"entity_id": "e", "member_id": "mp",
+                                "role": "identity", "visual_intent": "preserve"}])]
+    units = [{"semantic_unit_id": "u", "name": "Woman", "handle": "KWoman",
+              "order": 0, "sources": [{"entity_id": "e", "member_id": "mp"}]}]
+    resolved = _resolve(setup={"mode": "reference", "picture_lane_ids": ["lp"]},
+                        entities=[entity], items=items, recipes=recipes, units=units)
+    context = {
+        "setup_manifest": resolved["setup_manifest"],
+        "ordinal_manifest": resolved["ordinal_manifest"],
+        "unit_source_labels": resolved.get("unit_source_labels", {}),
+        "unit_source_members": resolved.get("unit_source_members", {}),
+        "semantic_units_by_id": {u["semantic_unit_id"]: u for u in units},
+        "references": [entity.to_dict()],
+        "profile": prompt_context.BUILTIN_PROFILES["minimax_h3_ref@1"],
+    }
+    chip = _reference_chip("chip-1", {"semantic_unit_ids": ["u"]},
+                           {"summary": "body", "task_types": ["not_a_role"]},
+                           capabilities=("summary",))
+    capability = chip["capabilities"][0]
+    # The render refuses it outright...
+    assert prompt_context.reference_capability_errors(
+        chip, capability, context), "fixture no longer triggers the refusal"
+    assert prompt_context._render_reference_capability(
+        chip, capability, context) == ""
+    # ...so the segments behind Copy must be empty too, or the two disagree
+    # about what this chip contributes.
+    assert prompt_context.reference_capability_segments(
+        chip, capability, context) == []
+
+    # A stored record naming a capability the ACTIVE format does not declare —
+    # reachable whenever a scene changes format, since records are preserved at
+    # rest rather than purged. No explicit guard handles this: it is measured
+    # here because `effective_reference_config` resolves through the
+    # declarations, so an undeclared capability arrives with no config and the
+    # builders fall through on their own. Pinned so that stays true rather than
+    # being re-guarded by someone who assumes it does not.
+    generic = dict(context)
+    generic["profile"] = prompt_context.BUILTIN_PROFILES["generic@1"]
+    stale = _reference_chip("chip-2", {"semantic_unit_ids": ["u"]},
+                            {"text": "left over"}, capabilities=("mentions",))
+    stale_capability = stale["capabilities"][0]
+    assert "mentions" not in prompt_context._reference_derived_view(
+        generic["profile"]), "generic@1 declares mentions now; pick another kind"
+    assert prompt_context._render_reference_capability(
+        stale, stale_capability, generic) == ""
+    assert prompt_context.reference_capability_segments(
+        stale, stale_capability, generic) == []
+
+
+def test_an_identity_handle_that_resolves_to_nothing_is_reported():
+    """The one case that used to have no signal whatsoever.
+
+    Physical member handles were scoped to the window by reading the ordinal
+    manifest, so an unstaged one fell out of the known map and the advisory
+    named it. Semantic units were filed regardless — so a real, correctly
+    spelled identity handle with no ordinal in this window produced no label
+    (the prose stayed literal) AND no warning, because the advisory saw it in
+    the map. Silence was the only thing distinguishing it from a typo.
+    """
+    entity = ReferenceEntity(reference_id="e", name="Woman", members=[
+        ReferenceMember(member_id="mp", asset_id="img_a", handle="Sheet",
+                        prompt="the young woman")])
+    recipes = [ReferenceLaneRecipe(lane_id="lp", media_kind="image",
+                                   recipe=PICTURE_RECIPE)]
+    items = [ReferenceItem(reference_item_id="ip", lane_index=0, start_frame=0,
+                           end_frame=WINDOW_END, members=[
+                               {"entity_id": "e", "member_id": "mp",
+                                "role": "identity", "visual_intent": "preserve"}])]
+    units = [
+        {"semantic_unit_id": "u", "name": "Woman", "handle": "KWoman",
+         "order": 0, "sources": [{"entity_id": "e", "member_id": "mp"}]},
+        # Declared, handled, and sourced from a member nothing stages — so it
+        # has no ordinal here and therefore no label.
+        {"semantic_unit_id": "u2", "name": "Ghost", "handle": "Ghost",
+         "order": 1, "sources": [{"entity_id": "e", "member_id": "absent"}]},
+    ]
+    resolved = _resolve(setup={"mode": "reference", "picture_lane_ids": ["lp"]},
+                        entities=[entity], items=items, recipes=recipes, units=units)
+    document = {"nodes": [{"type": "text", "text": "a @KWoman meets @Ghost"}]}
+    compiled = prompt_context.compile_prompt_context(
+        sections=[PromptSection(0, WINDOW_END,
+                                channel_docs={"detailed_description": document})],
+        window_start=0, window_end=WINDOW_END, fps=24.0,
+        template="minimax_h3_ref", profile="minimax_h3_ref@1",
+        context={
+            "setup_manifest": resolved["setup_manifest"],
+            "ordinal_manifest": resolved["ordinal_manifest"],
+            "unit_source_labels": resolved.get("unit_source_labels", {}),
+            "unit_source_members": resolved.get("unit_source_members", {}),
+            "semantic_units": units,
+            "references": [entity.to_dict()],
+        }, labels_on=True)
+    described = compiled["channels"]["detailed_description"]
+    rows = [w for w in compiled["warnings"]
+            if w.get("code") == "unresolved_handle_mention"]
+    if "@Ghost" in described:
+        # It did not resolve, so it must be reported — the whole point.
+        assert rows and "@Ghost" in rows[0]["message"], (described, compiled["warnings"])
+        # And the one that DID resolve is not named.
+        assert "@KWoman" not in rows[0]["message"], rows[0]
+    else:
+        # If staging gives it a label after all the fixture is wrong, not the
+        # rule — say so rather than passing quietly.
+        raise AssertionError(f"fixture resolved @Ghost: {described}")
+
+
 def test_a_compile_without_a_convert_request_carries_no_plan():
     """The field appears only when asked for; every other compile is unchanged."""
     compiled = prompt_context.compile_prompt_context(

@@ -973,6 +973,22 @@ def document_has_anchors(document) -> bool:
                for node in normalize_prompt_document(document)["nodes"])
 
 
+def document_has_handle_mentions(document) -> bool:
+    """Whether a document's authored prose names a handle.
+
+    The sibling of `document_has_anchors`, and it exists for the same caller: a
+    scene whose only Context is typed handles has NO attachments and NO anchors,
+    so an anchors-only entry test routes it around the compiler entirely and it
+    is composed from the raw mirror instead — the dormant node card would show
+    `@KWoman` while the render sends the resolved token. Whether the handle
+    actually resolves is not asked here; an unresolved one still has to reach
+    the compiler to be left alone deliberately rather than by never arriving.
+    """
+    return any(node.get("type") == "text"
+               and prompt_tokens.has_handle_mention(node.get("text"))
+               for node in normalize_prompt_document(document)["nodes"])
+
+
 def normalize_channel_documents(raw, channels=None, keys=None) -> dict:
     source = raw if isinstance(raw, dict) else {}
     mirrors = channels if isinstance(channels, dict) else {}
@@ -2145,8 +2161,19 @@ def _render_vocal_event(attachment, speaker_numbers, speaker_policy=None):
     return f"{prefix} narrates: <d>[{language}] {text}</d>".strip()
 
 
-def _reference_labels(attachment, context):
-    labels = []
+def _reference_label_pairs(attachment, context) -> list[tuple]:
+    """`(label, source)` for everything a chip names, in render order.
+
+    The single walk behind both `_reference_labels` (which drops the source) and
+    the `mentions` segment builder (which needs it to spell a live handle). Two
+    views of one authority, because a second walk that agreed today would be a
+    second thing to keep in agreement forever.
+
+    `source` is `{"unit_id": …}`, `{"member_id": …}`, or `None` for a label with
+    no stable id behind it — an audio source label carried along with its unit,
+    which is a rendered string rather than a thing that can be named.
+    """
+    pairs = []
     manifest = context.get("ordinal_manifest") or {}
     profile = context.get("profile") or {}
     units = context.get("semantic_units_by_id") or {}
@@ -2156,6 +2183,7 @@ def _reference_labels(attachment, context):
         if str(declaration.get("token_kind") or "") == "audio"
         and declared_label_prefix(declaration)
     ]
+    seen = set()
     for source_id in attachment["source"].get("semantic_unit_ids") or []:
         unit = units.get(str(source_id)) or {}
         kind = str(unit.get("kind") or "subject")
@@ -2165,11 +2193,13 @@ def _reference_labels(attachment, context):
                        else "referenced_label_template")
         label = declared_label(declaration, number, label_field)
         if label:
-            labels.append(label)
-            for label in context.get("unit_source_labels", {}).get(str(source_id)) or []:
-                if (any(str(label).startswith(prefix) for prefix in audio_prefixes)
-                        and label not in labels):
-                    labels.append(str(label))
+            pairs.append((label, {"unit_id": str(source_id)}))
+            seen.add(label)
+            for extra in context.get("unit_source_labels", {}).get(str(source_id)) or []:
+                if (any(str(extra).startswith(prefix) for prefix in audio_prefixes)
+                        and str(extra) not in seen):
+                    pairs.append((str(extra), None))
+                    seen.add(str(extra))
     for declaration in physical_population_declarations(profile):
         source_key = str(declaration.get("source_key") or "")
         ordinal_key = str(declaration.get("ordinal_key") or "")
@@ -2177,8 +2207,12 @@ def _reference_labels(attachment, context):
             number = (manifest.get(ordinal_key) or {}).get(str(source_id))
             label = declared_label(declaration, number)
             if label:
-                labels.append(label)
-    return labels
+                pairs.append((label, {"member_id": str(source_id)}))
+    return pairs
+
+
+def _reference_labels(attachment, context):
+    return [label for label, _source in _reference_label_pairs(attachment, context)]
 
 
 def _minimax_task_types(context, configured=(), profile=None):
@@ -2567,18 +2601,22 @@ def convert_capability_plan(attachment, capability, context) -> dict:
                 if text:
                     parts.append({"kind": "text", "text": text})
             elif kind == SEGMENT_LABEL:
+                # Two spellings a label can have. A `mentions` label names a
+                # physical MEMBER directly and that member's handle is a live
+                # spelling, so it is not the ordinal-as-identity problem below;
+                # a `definitions` label for a physical slot still is, because
+                # its owner is keyed by the rendered `<Picture 1>` itself.
                 unit_id = str(segment.get("unit_id") or "")
-                if not unit_id:
-                    # A PHYSICAL definition's label has no semantic unit behind
-                    # it — the owner is keyed by the rendered `<Picture 1>`
-                    # itself, which is the ordinal-as-identity problem recorded
-                    # in the withdrawn materializer plan. With no id there is no
-                    # handle to emit and the only alternative is freezing the
-                    # ordinal, so the line blocks like any other.
+                member_id = str(segment.get("member_id") or "")
+                if not unit_id and not member_id:
+                    # No id means no handle to emit, and the only alternative is
+                    # freezing the ordinal — recorded in the withdrawn
+                    # materializer plan as the reason this blocks.
                     blockers.add("an entity with no stable id")
                     continue
-                parts.append({"kind": "handle", "source": "unit",
-                              "id": unit_id, "rendered": text})
+                parts.append({"kind": "handle",
+                              "source": "unit" if unit_id else "member",
+                              "id": unit_id or member_id, "rendered": text})
             elif kind == SEGMENT_SOURCES:
                 parts.append({"kind": "sources", "rendered": text,
                               "member_ids": [str(value) for value
@@ -2641,6 +2679,20 @@ def _reference_capability_parts(attachment, capability, context) -> list[tuple]:
     owner key must be the semantic unit or physical slot, not the chip.
     """
     kind = capability.get("kind") or capability.get("capability_id")
+    # The same refusal `_render_reference_capability` applies for a value
+    # outside the declared vocabulary. Without it a chip whose `summary` names
+    # an unknown task type contributes NOTHING to the prompt while Copy still
+    # hands the author its text — the clipboard carrying what the render
+    # refused.
+    #
+    # Its sibling guard there — `kind not in _reference_derived_view(profile)` —
+    # is deliberately NOT mirrored: `effective_reference_config` resolves through
+    # the declarations, so an undeclared capability arrives with no config and
+    # every branch below already falls through to `[]`. Measured, not assumed. A
+    # guard no test can make fail is a guard nobody can later prove is safe to
+    # remove.
+    if reference_capability_errors(attachment, capability, context):
+        return []
     config = effective_reference_config(attachment, capability, context)
     labels = _reference_labels(attachment, context)
     units = context.get("semantic_units_by_id") or {}
@@ -2889,6 +2941,64 @@ def _reference_capability_parts(attachment, capability, context) -> list[tuple]:
                 segments.append(_segment(SEGMENT_TEXT, detail, authored=True))
             lines.append((owner, segments))
         return lines
+    if kind == "mentions":
+        # A mention's whole content is the labels it names, so every one is a
+        # LABEL segment carrying the id that spells it live. An authored `text`
+        # override replaces them wholesale — it is the author's own words, and
+        # `_render_reference` treats it the same way.
+        # `or`, then strip — the SAME order `_render_reference_capability`
+        # uses. Stripping first makes a whitespace-only override falsy and
+        # falls through to the labels, so the chip emitted nothing while
+        # Copy offered `@KWoman`. One character of difference in the
+        # expression, a whole line of difference in what the author gets.
+        authored_raw = str(config.get("text") or "")
+        if authored_raw:
+            authored = authored_raw.strip()
+            if not authored:
+                return []
+            return [(("mention", attachment["attachment_id"]),
+                     [_segment(SEGMENT_TEXT, authored, authored=True)])]
+        segments = []
+        for label, source in _reference_label_pairs(attachment, context):
+            if segments:
+                segments.append(_segment(SEGMENT_TEXT, " "))
+            segments.append(_segment(SEGMENT_LABEL, label,
+                                     **(source or {})))
+        if not segments:
+            return []
+        return [(("mention", attachment["attachment_id"]), segments)]
+    if kind == "summary":
+        # The `[task + types]` prefix is derived from staged ROLES, not from an
+        # ordinal — so like a retention marker it may be frozen, losing the link
+        # to staging without writing anything positional to disk. Disclosed,
+        # never silent.
+        task_types = _minimax_task_types(
+            context, config.get("task_types") or [], context.get("profile"))
+        prefix = f"[{' + '.join(task_types)}] " if task_types else ""
+        body = str(config.get("summary") or "").strip()
+        segments = []
+        if prefix:
+            segments.append(_segment(SEGMENT_MARKER, prefix, task_types=list(task_types)))
+        if body:
+            segments.append(_segment(SEGMENT_TEXT, body, authored=True))
+        if not segments:
+            return []
+        # `_render_reference` strips the whole line, so a prefix with no body
+        # loses its trailing space. Mirror that here or the two disagree by one
+        # character, which is exactly what the byte-identity invariant catches.
+        if prefix and not body:
+            segments[0] = _segment(SEGMENT_MARKER, prefix.strip(),
+                                   task_types=list(task_types))
+        return [(("summary", attachment["emission_group_id"]), segments)]
+    if kind == "audio_relationship":
+        # Authored prose end to end: `_render_reference` returns the configured
+        # string with nothing derived around it, so there is nothing here that
+        # could freeze an ordinal.
+        body = str(config.get("audio_relationship") or "").strip()
+        if not body:
+            return []
+        return [(("audio_relationship", attachment["emission_group_id"]),
+                 [_segment(SEGMENT_TEXT, body, authored=True)])]
     return []
 
 
@@ -3050,11 +3160,106 @@ def reference_capability_errors(attachment, capability, context) -> list[dict]:
     return errors
 
 
-def _document_render(document, attachment_by_id, render_anchor):
+def _handle_sources(context) -> dict:
+    """`handle` (casefolded) -> the `source` bag naming what it points at.
+
+    Casefolded because handle uniqueness is enforced case-insensitively when one
+    is created, so `@kwoman` and `@KWoman` are the same handle and prose must
+    not care which the author typed.
+
+    A semantic unit wins a collision over a physical member. The two namespaces
+    are separately unique but not unique against each other, and an identity is
+    the more specific thing to have named.
+    """
+    cached = context.get("_handle_sources")
+    if isinstance(cached, dict):
+        return cached
+    result = {}
+    members = _members_by_id(context)
+    manifest = context.get("ordinal_manifest") or {}
+    for declaration in physical_population_declarations(context.get("profile") or {}):
+        source_key = str(declaration.get("source_key") or "")
+        ordinal_key = str(declaration.get("ordinal_key") or "")
+        if not source_key or not ordinal_key:
+            continue
+        # Which population a member belongs to is answered by the MANIFEST, not
+        # by declaration order. Walking every member under each declaration in
+        # turn filed all of them under the first one — `pictures` under H3 — so
+        # a video or audio handle resolved against `ordinal_manifest["pictures"]`,
+        # missed, produced no label, and shipped to the model as literal `@text`.
+        # Indistinguishable from the deliberate not-a-handle silence, so the
+        # author got no signal at all.
+        #
+        # This also scopes handles to what is STAGED IN THIS WINDOW, which is
+        # the behaviour the unresolved branch documents: a member outside the
+        # window has no ordinal, so its handle stays as written.
+        for member_id in manifest.get(ordinal_key) or {}:
+            member = members.get(str(member_id)) or {}
+            handle = str(member.get("handle") or "").strip().casefold()
+            if handle and handle not in result:
+                result[handle] = {source_key: [str(member_id)]}
+    for unit_id, unit in (context.get("semantic_units_by_id") or {}).items():
+        handle = str(unit.get("handle") or "").strip().casefold()
+        if not handle:
+            continue
+        # Only if it actually RESOLVES here. Filing every declared unit made an
+        # unstaged identity the one case with no signal at all: the resolver
+        # produced no label so the prose stayed literal, while the advisory saw
+        # the handle in this map and said nothing. Physical members were already
+        # scoped to the window by reading the manifest; this is the same rule
+        # for the other namespace, asked through the label authority rather than
+        # by re-deriving what "staged" means.
+        source = {"semantic_unit_ids": [str(unit_id)]}
+        if not _reference_labels({"source": source}, context):
+            continue
+        result[handle] = source
+    context["_handle_sources"] = result
+    return result
+
+
+def _resolve_handle_mentions(text, context) -> str:
+    """Replace `@handle` runs in authored prose with this format's mention label.
+
+    A handle written in prose IS a mention — an authored placement that emits
+    where it sits — so this reuses `_reference_labels` rather than growing a
+    second label authority beside it: the synthesized `source` bag is exactly
+    what a mention chip would have carried.
+
+    Anything that does not resolve is left EXACTLY as authored. That covers
+    three cases which must not be told apart here: an `@` that was never a
+    handle (`@mail.com`), a handle for a Reference that does not exist yet
+    (late binding — prose may name handles before the References are staged and
+    wires itself up when they are), and a real handle whose entity is not staged
+    in this window. Rendering a partial label in any of them would put a number
+    into the prompt that staging does not agree with.
+
+    Replaced from the END backwards so each earlier span stays valid.
+    """
+    value = str(text or "")
+    mentions = prompt_tokens.handle_mentions(value)
+    if not mentions:
+        return value
+    sources = _handle_sources(context)
+    for row in reversed(mentions):
+        source = sources.get(str(row["handle"]).casefold())
+        if not source:
+            continue
+        labels = _reference_labels({"source": source}, context)
+        if not labels:
+            continue
+        value = value[:row["start"]] + " ".join(labels) + value[row["end"]:]
+    return value
+
+
+def _document_render(document, attachment_by_id, render_anchor, context=None):
     parts = []
     for node in normalize_prompt_document(document)["nodes"]:
         if node["type"] == "text":
-            parts.append(node["text"])
+            # Authored prose, so handles resolve HERE rather than in the
+            # attachment pass — a text handle has no attachment and never
+            # will.
+            parts.append(node["text"] if context is None
+                         else _resolve_handle_mentions(node["text"], context))
             continue
         attachment = attachment_by_id.get(node["attachment_id"])
         if attachment and attachment["enabled"]:
@@ -3200,6 +3405,10 @@ def profile_error_result(exc, *, window_start=0, window_end=1, fps=24.0) -> dict
         "attachment_channel_previews": {},
         "attachment_channel_routes": {},
         "attachment_capability_projections": [],
+        # Empty, not absent. A surface reading this key must not have to know
+        # which of the compile's exits produced the payload; an empty list means
+        # "nothing known", which every consumer already treats as `selected`.
+        "section_window_states": [],
         "managed_speaker_subject_ids": [],
         "setup_manifest": {}, "ordinal_manifest": {},
         "profile": {}, "profile_hash": "",
@@ -3308,6 +3517,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                         "give it prompt text under Defaults."),
                 })
     raw_sections = []
+    original_prompt_ids = []
     global_attachment_values = normalize_attachments(global_attachments)
     for attachment in global_attachment_values:
         if attachment.get("kind") in {"shot", "timestamp", "prompt_link",
@@ -3341,6 +3551,11 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 "attachments": getattr(raw, "attachments", []),
                 "global_channel_exceptions": getattr(raw, "global_channel_exceptions", []),
             }
+        # The id the CLIENT knows this section by, captured before the
+        # synthetic one below replaces it. `section_window_states` reports it so
+        # a browser surface can match; the synthetic id exists only so the
+        # compiler's own maps stay keyed, and no client has ever seen it.
+        original_prompt_ids.append(str(value.get("prompt_id") or ""))
         if not str(value.get("prompt_id") or ""):
             value["prompt_id"] = f"__compile_section_{raw_index}"
         value["attachments"] = normalize_attachments(value.get("attachments"))
@@ -3357,11 +3572,25 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     # keeps attachment-only sections in the same first-wins/hold/threshold
     # resolver without leaking into authored output.
     preliminary = []
+    # Why each section is or is not compiled, in raw order. Four of the five
+    # answers are only knowable HERE: `resolve_segments` drops muted and
+    # text-empty sections before coverage, and coverage itself is
+    # hold-until-next -- the first section covers everything before it and the
+    # last holds forever -- so a section's authored frames do not decide whether
+    # it is selected. A browser that intersected frames with the window would be
+    # wrong in both directions.
+    section_states = []
     for section in raw_sections:
         mirrors = channel_document_mirrors(section["channel_docs"])
         has_attachment = any(value["enabled"] for value in section["attachments"])
-        if has_attachment and not any(str(mirrors.get(key) or "").strip()
-                                      for key in keys) and keys:
+        has_text = any(str(mirrors.get(key) or "").strip() for key in keys)
+        # Same predicate the sentinel below fires on, deliberately: whatever
+        # counts as "this section has authored text" must be one answer, or a
+        # section could be reported empty and still compile.
+        section_states.append(
+            "muted" if section.get("muted") else
+            ("empty" if not (has_text or has_attachment) else ""))
+        if has_attachment and not has_text and keys:
             mirrors[keys[0]] = "\ue000"
         preliminary.append({
             "prompt_id": str(section.get("prompt_id") or ""),
@@ -3382,6 +3611,36 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     selected_sections = [value for value in raw_sections
                          if str(value.get("prompt_id") or "")
                          in selected_prompt_ids]
+    # A section clipped at the window edge and dropped by the boundary threshold
+    # is a different fact from one the window never reached, and telling an
+    # author the wrong one sends them looking for a bug. Diffing a threshold=0
+    # resolve isolates exactly the spill drops -- the same technique the
+    # timeline's used/dropped highlight uses. At threshold 0 the two runs are
+    # identical by construction (pass 4 is skipped outright), so the second
+    # resolve is skipped with them.
+    if boundary_threshold_pct > 0:
+        unthresholded = prompt_payload.resolve_segments(
+            preliminary, window_start, window_end,
+            prompt_channel_templates.template_labels_on(resolved_template, labels_on),
+            0.0, resolved_template)
+        covered_prompt_ids = {str(value.get("prompt_id") or "")
+                              for value in unthresholded}
+    else:
+        covered_prompt_ids = selected_prompt_ids
+    section_window_states = []
+    for index, value in enumerate(raw_sections):
+        prompt_id = str(value.get("prompt_id") or "")
+        state = section_states[index]
+        if not state:
+            state = ("selected" if prompt_id in selected_prompt_ids
+                     else ("boundary_dropped" if prompt_id in covered_prompt_ids
+                           else "not_covered"))
+        section_window_states.append({
+            "index": index,
+            "prompt_id": (original_prompt_ids[index]
+                          if index < len(original_prompt_ids) else ""),
+            "state": state,
+        })
     selected_sections.sort(key=lambda row: (
         int(row.get("start_frame", 0)), str(row.get("prompt_id") or "")))
     all_attachments = list(global_attachment_values)
@@ -3850,6 +4109,44 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     reference_group_shots = defaultdict(list)
     reference_unit_shots = defaultdict(list)
     # `@shot(id)` resolves against the SAME counter that numbers the markers and
+    def warn_unresolved_handles(origin, documents):
+        """Say when authored prose names something this window cannot spell.
+
+        A handle carries no `attachment_id`, so it cannot use the chip-keyed
+        diagnostic path — this is the channel-level form, the same shape
+        `warn_authored_prompt_tokens` uses for the token grammar beside it.
+
+        Deliberately NON-BLOCKING and deliberately vague about which of the
+        three unresolved cases applies. Prose naming a handle before its
+        Reference exists is a supported way to work — an LLM can draft a scene
+        against handles and have it wire itself up later — so this must not
+        read as an error. But a typo is indistinguishable from that by
+        construction, and silence was its only signal: without this, `@KWomn`
+        reached the model as literal text with nothing anywhere saying so.
+        """
+        known = _handle_sources(context)
+        for channel_key, document in (documents or {}).items():
+            unresolved = [f"@{row['handle']}" for row
+                          in prompt_tokens.handle_mentions(
+                              prompt_document_text(document))
+                          if str(row["handle"]).casefold() not in known]
+            if not unresolved:
+                continue
+            warnings.append({
+                "code": "unresolved_handle_mention",
+                "origin": str(origin or ""),
+                "channel_key": str(channel_key or ""),
+                "message": (f"{', '.join(dict.fromkeys(unresolved))} does not "
+                            "name anything staged in this window, so it stays "
+                            "as written. That is expected if the Reference does "
+                            "not exist yet."),
+            })
+
+    warn_unresolved_handles("global", global_docs)
+    for section in selected_sections:
+        warn_unresolved_handles(
+            section.get("prompt_id", ""), section.get("channel_docs") or {})
+
     # feeds `(appears in [Shot N])`, keyed by the Shot attachment that opens the
     # shot. A section may carry more than one Shot attachment; each of them cites
     # the single shot that section opens.
@@ -4197,7 +4494,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 source_index, trail + (cache_key,), attachment["attachment_id"]))
         document_value = _document_render(
             source["channel_docs"].get(channel_key), attachment_by_id,
-            render_link_anchor)
+            render_link_anchor, context)
         value = _join_emissions(
             scope_prefixes + [document_value],
             resolved_profile.get("separators", {}).get("attachment", " "))
@@ -4395,7 +4692,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             mirrors[key] = _document_render(
                 section["channel_docs"].get(key), attachment_by_id,
                 lambda attachment, capability_id, anchor_node_id, key=key:
-                    anchor_renderer(attachment, capability_id, key, anchor_node_id))
+                    anchor_renderer(attachment, capability_id, key, anchor_node_id),
+                context)
 
         # Scope attachments are emitted by placement. Inline attachment nodes
         # already emitted above and are not emitted again here.
@@ -4560,7 +4858,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             global_docs.get(key), global_by_id,
             lambda attachment, capability_id, anchor_node_id, key=key:
                 global_anchor_renderer(
-                    attachment, capability_id, key, anchor_node_id))
+                    attachment, capability_id, key, anchor_node_id),
+            context)
     for attachment in global_by_id.values():
         if not attachment["enabled"] or attachment["attachment_id"] in global_anchored:
             continue
@@ -4902,6 +5201,11 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         },
         "attachment_capability_projections": copy.deepcopy(
             attachment_capability_projections),
+        # Response-only, like the two above it: presentation state describing
+        # this window, not part of what a job renders. It must therefore be
+        # named in the freeze DENYLIST in `routes.py`, which excludes rather
+        # than allows -- silence there puts a key in every frozen envelope.
+        "section_window_states": section_window_states,
         # This is the compiler's effective-window speaker domain after section
         # holding, overlap resolution, clipping and boundary threshold. The UI
         # consumes it rather than approximating eligibility from authored bars.
