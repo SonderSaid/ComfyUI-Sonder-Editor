@@ -177,6 +177,39 @@ export function promptReferencePickerLabel(reference = {}, member = {}) {
     return handle ? `@${handle} — ${name}` : name;
 }
 
+export function promptIdentitySourceGroup(assetType, reference = {}, member = {}) {
+    const kind = String(assetType || "");
+    if (kind === "audio") return "audio";
+    if (kind !== "video") return "appearance";
+    const memberAudioIntent = String(member?.audio_intent || "");
+    const entityAudioIntent = String(reference?.audio_intent || "");
+    return memberAudioIntent || (entityAudioIntent
+        && entityAudioIntent !== "reference_characteristics")
+        ? "audio" : "appearance";
+}
+
+export function legacyVoiceBindingRepair(identity = {}, references = []) {
+    const memberId = String(identity?.voice?.member_id || "");
+    if (!memberId || (identity?.sources || []).some((source) =>
+        String(source?.member_id || "") === memberId)) return null;
+    let owner = null;
+    let member = null;
+    for (const reference of references || []) {
+        const found = (reference?.members || []).find((value) =>
+            String(value?.member_id || "") === memberId);
+        if (found) { owner = reference; member = found; break; }
+    }
+    if (!owner || !member) return null;
+    const next = structuredClone(identity);
+    next.sources = [...(next.sources || []), {
+        entity_id: String(owner.reference_id || ""),
+        member_id: memberId,
+        contribution: "",
+    }];
+    delete next.voice;
+    return { identity: next, reference: owner, member };
+}
+
 export function promptIdentityAttachmentOwner(unit = {}) {
     const storedHandle = String(unit?.handle || "").trim();
     return {
@@ -193,7 +226,6 @@ export function promptIdentityDependents(identityId, scenes = [], identity = nul
     const counts = {
         reference_chips: 0,
         vocal_events: 0,
-        audio_speaker_bindings: 0,
         source_relationships: Array.isArray(identity?.sources) ? identity.sources.length : 0,
     };
     const visit = (value) => {
@@ -206,9 +238,6 @@ export function promptIdentityDependents(identityId, scenes = [], identity = nul
         if (value.kind === "vocal_event"
                 && (value.source?.subject_ids || []).map(String).includes(identityId)) {
             counts.vocal_events += 1;
-        }
-        if (String(value.config?.audio_speaker_subject_id || "") === identityId) {
-            counts.audio_speaker_bindings += 1;
         }
         Object.values(value).forEach(visit);
     };
@@ -636,6 +665,11 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
     retentionDefault.rows = 2; retentionDefault.style.cssText = chromeInputCss();
     retentionDefault.placeholder = "Default preservation detail (optional)";
     retentionDefault.value = attachmentDefaults.retention_detail || "";
+    const audioRetentionDefault = document.createElement("textarea");
+    audioRetentionDefault.rows = 2;
+    audioRetentionDefault.style.cssText = chromeInputCss();
+    audioRetentionDefault.placeholder = "Default audio preservation detail (optional)";
+    audioRetentionDefault.value = attachmentDefaults.audio_retention_detail || "";
     const audioDefinitionDefault = document.createElement("textarea");
     audioDefinitionDefault.rows = 2; audioDefinitionDefault.style.cssText = chromeInputCss();
     audioDefinitionDefault.placeholder = "Default audio definition (optional)";
@@ -675,12 +709,36 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
         if (!sourceMap.has(key)) sourceMap.set(key, {
             entity_id: seedSource.reference.reference_id,
             member_id: seedSource.member.member_id,
-            contribution: "", inherit_description: false,
+            contribution: "",
         });
     }
     const sourceRows = [];
     const sources = document.createElement("div");
     sources.style.cssText = `display:flex;flex-direction:column;gap:4px;max-height:220px;overflow:auto;padding:6px;border:1px solid ${COLORS.border};border-radius:5px;`;
+    const sourceGroup = (key, title, description) => {
+        const group = document.createElement("div");
+        group.dataset.sonderIdentitySourceGroup = key;
+        group.style.cssText = `display:flex;flex-direction:column;gap:4px;padding:5px;border:1px solid ${COLORS.border};border-radius:5px;`;
+        const heading = document.createElement("strong");
+        heading.textContent = title;
+        const help = document.createElement("span");
+        help.textContent = description;
+        help.style.cssText = `font:9px/1.3 system-ui;color:${COLORS.textDim};`;
+        const body = document.createElement("div");
+        body.style.cssText = "display:flex;flex-direction:column;gap:4px;";
+        group.append(heading, help, body);
+        sources.appendChild(group);
+        return body;
+    };
+    const appearanceSources = sourceGroup(
+        "appearance", "Appearance sources",
+        "Images and ordinary videos declare appearance, motion, and composition.");
+    const audioSources = sourceGroup(
+        "audio", "Voice / audio sources",
+        "Audio sources declare this character's voice.");
+    const missingSources = sourceGroup(
+        "missing", "Missing saved sources",
+        "Saved relationships whose physical Reference is no longer available.");
     const sourceSearch = document.createElement("input");
     sourceSearch.type = "search";
     sourceSearch.placeholder = "Search physical References…";
@@ -690,26 +748,25 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
             const key = `${reference.reference_id}:${member.member_id}`;
             const current = sourceMap.get(key) || {};
             const row = document.createElement("div");
-            row.style.cssText = "display:grid;grid-template-columns:auto minmax(120px,1fr) minmax(130px,.8fr) auto;gap:5px;align-items:center;";
+            row.style.cssText = "display:grid;grid-template-columns:auto minmax(120px,1fr) minmax(130px,.8fr);gap:5px;align-items:center;";
             const enabled = document.createElement("input"); enabled.type = "checkbox";
             enabled.checked = sourceMap.has(key);
             const label = document.createElement("span");
             label.textContent = promptReferencePickerLabel(reference, member);
             const asset = (assets || []).find((value) =>
                 String(value?.asset_id || "") === String(member.asset_id || ""));
+            const groupBody = promptIdentitySourceGroup(
+                asset?.asset_type, reference, member) === "audio"
+                ? audioSources : appearanceSources;
             const populationKeys = (profile?.physical_populations || [])
                 .filter((value) => (value?.media_kinds || []).includes(asset?.asset_type))
                 .map((value) => String(value.key || "")).filter(Boolean);
             const contributions = [["", "Unattributed"],
                 ...contributionValues(profile, populationKeys)];
             const contribution = makeSelect(contributions, current.contribution || "");
-            const inheritLabel = document.createElement("label");
-            const inherit = document.createElement("input"); inherit.type = "checkbox";
-            inherit.checked = current.inherit_description === true;
-            inheritLabel.append(inherit, " Inherit description");
-            row.append(enabled, label, contribution, inheritLabel);
-            sources.appendChild(row);
-            sourceRows.push({ enabled, contribution, inherit, reference, member,
+            row.append(enabled, label, contribution);
+            groupBody.appendChild(row);
+            sourceRows.push({ enabled, contribution, reference, member,
                 element: row, searchText: `${member.handle || ""} ${member.name || ""} ${reference.name || ""}`.toLocaleLowerCase() });
         }
     }
@@ -718,7 +775,7 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
     for (const [key, current] of sourceMap) {
         if (resolvedSourceKeys.has(key)) continue;
         const row = document.createElement("div");
-        row.style.cssText = "display:grid;grid-template-columns:auto minmax(120px,1fr) minmax(130px,.8fr) auto;gap:5px;align-items:center;";
+        row.style.cssText = "display:grid;grid-template-columns:auto minmax(120px,1fr) minmax(130px,.8fr);gap:5px;align-items:center;";
         const enabled = document.createElement("input");
         enabled.type = "checkbox"; enabled.checked = true;
         const label = document.createElement("span");
@@ -726,16 +783,15 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
         label.style.color = COLORS.dangerText;
         const contribution = makeSelect([["", "Unattributed"],
             ...contributionValues(profile)], current.contribution || "");
-        const inheritLabel = document.createElement("label");
-        const inherit = document.createElement("input");
-        inherit.type = "checkbox"; inherit.checked = current.inherit_description === true;
-        inheritLabel.append(inherit, " Inherit description");
-        row.append(enabled, label, contribution, inheritLabel);
-        sources.appendChild(row);
-        sourceRows.push({ enabled, contribution, inherit,
+        row.append(enabled, label, contribution);
+        missingSources.appendChild(row);
+        sourceRows.push({ enabled, contribution,
             reference: { reference_id: current.entity_id || "" },
             member: { member_id: current.member_id || "" },
             element: row, searchText: label.textContent.toLocaleLowerCase() });
+    }
+    if (!missingSources.children.length) {
+        missingSources.parentElement.style.display = "none";
     }
     if (!sourceRows.length) {
         const empty = document.createElement("span");
@@ -753,10 +809,11 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
     sourceSearch.addEventListener("input", filterSources);
     sourceRows.forEach((row) => row.enabled.addEventListener("change", filterSources));
     filterSources();
-    const voice = makeSelect([["", "No voice reference"], ...sourceRows
-        .map(({ reference, member }) => [String(member.member_id),
-            promptReferencePickerLabel(reference, member)])],
-    identity?.voice?.member_id || "");
+    // Temporary repair UI for project data authored before voice became a
+    // normal physical source. Remove with the server tolerance after this
+    // batch has been in use and this affordance stops appearing.
+    const legacyVoiceRepair = identity
+        ? legacyVoiceBindingRepair(identity, references) : null;
     const requiredNotice = document.createElement("div");
     requiredNotice.dataset.sonderIdentityRequired = "1";
     requiredNotice.style.cssText = `display:none;padding:6px 8px;border:1px solid ${COLORS.dangerBorder};border-radius:5px;color:${COLORS.dangerText};background:${COLORS.dangerSoft};`;
@@ -777,9 +834,10 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
         onClose?.();
     };
     const draftGuard = createModalDraftGuard({
-        controls: () => [kind, handle, name, definition, voice,
+        controls: () => [kind, handle, name, definition,
             visual, audio, summaryDefault, retentionDefault,
-            audioDefinitionDefault, taskTypesDefault, ...capabilityBoxes.values()],
+            audioRetentionDefault, audioDefinitionDefault, taskTypesDefault,
+            ...capabilityBoxes.values()],
         confirm: confirmDismiss,
         message: "Discard this prompt identity draft? Your unsaved changes will be lost.",
     });
@@ -788,7 +846,7 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
     backdrop.addEventListener("click", (event) => {
         if (event.target === backdrop && draftGuard.confirmDismiss()) close();
     });
-    save.addEventListener("click", async () => {
+    const persistIdentity = async ({ repairLegacy = false } = {}) => {
         const missing = [
             [kind, "Kind", String(kind.value || "").trim()],
             [handle, "Handle", handle.value.trim()],
@@ -801,7 +859,7 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
             requiredNotice.style.display = "block";
             missing.forEach(([control]) => control.setAttribute("aria-invalid", "true"));
             missing[0][0].focus?.();
-            return;
+            return false;
         }
         requiredNotice.style.display = "none";
         const nextAttachmentDefaults = { ...attachmentDefaults };
@@ -810,6 +868,8 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
         }
         if (derivedDeclarations.retention) {
             nextAttachmentDefaults.retention_detail = retentionDefault.value;
+            nextAttachmentDefaults.audio_retention_detail =
+                audioRetentionDefault.value;
         }
         if (derivedDeclarations.definitions) {
             nextAttachmentDefaults.audio_definition = audioDefinitionDefault.value;
@@ -830,9 +890,7 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
                 entity_id: row.reference.reference_id,
                 member_id: row.member.member_id,
                 contribution: row.contribution.value,
-                inherit_description: row.inherit.checked,
             })),
-            voice: { member_id: voice.value || null },
             // Preserve ids this format does not declare: the identity may also
             // be used under another format that owns them.
             disabled_capabilities: [
@@ -844,8 +902,17 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
         };
         if (visual) next.visual_intent = visual.value;
         if (audio) next.audio_intent = audio.value;
-        try { await onSave?.(next); close(); } catch (error) { onError?.(error); }
-    });
+        if (repairLegacy) delete next.voice;
+        try {
+            await onSave?.(next);
+            close();
+            return true;
+        } catch (error) {
+            onError?.(error);
+            return false;
+        }
+    };
+    save.addEventListener("click", () => persistIdentity());
     remove?.addEventListener("click", async () => {
         try { if (await onDelete?.(identity)) close(); } catch (error) { onError?.(error); }
     });
@@ -881,18 +948,38 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
     const physicalGroup = disclosureGroup({
         title: "Physical sources — optional",
         description: "Attach media that contributes appearance, motion, composition, or voice traits.",
-        open: Boolean(seedSource || sourceMap.size), memory: disclosureMemory,
+        open: Boolean(seedSource || sourceMap.size || legacyVoiceRepair),
+        memory: disclosureMemory,
         key: "physical_sources",
     });
+    if (legacyVoiceRepair) physicalGroup.details.open = true;
     physicalGroup.body.append(sourceSearch, sources);
-
-    const voiceGroup = disclosureGroup({
-        title: "Voice — optional",
-        description: "Bind one physical member as this identity's voice reference.",
-        open: Boolean(identity?.voice?.member_id), memory: disclosureMemory,
-        key: "voice",
-    });
-    voiceGroup.body.append(fieldRow("Voice reference", voice));
+    if (legacyVoiceRepair) {
+        const repair = document.createElement("div");
+        repair.dataset.sonderLegacyVoiceRepair = "1";
+        repair.style.cssText = `display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 8px;border:1px solid ${COLORS.border};border-radius:5px;`;
+        const repairText = document.createElement("span");
+        repairText.textContent = `Legacy voice binding for @${
+            identity.handle || identity.name || identity.semantic_unit_id} — add ${
+            promptReferencePickerLabel(legacyVoiceRepair.reference,
+                legacyVoiceRepair.member)} as a physical source.`;
+        const repairButton = makeButton("Add physical source", "Repair this retired binding in one save", "accentSoft");
+        repairButton.addEventListener("click", async () => {
+            setButtonDisabled(repairButton, true);
+            const sourceRow = sourceRows.find((row) =>
+                String(row.member?.member_id || "")
+                    === String(legacyVoiceRepair.member?.member_id || ""));
+            if (sourceRow) {
+                sourceRow.enabled.checked = true;
+                sourceRow.contribution.value = "";
+            }
+            if (!await persistIdentity({ repairLegacy: true })) {
+                setButtonDisabled(repairButton, false);
+            }
+        });
+        repair.append(repairText, repairButton);
+        physicalGroup.body.prepend(repair);
+    }
 
     // Name the rung and say who consumes it. This group and the chip's own
     // fieldset are the same declared fields at two levels of one ladder, but
@@ -927,6 +1014,10 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
         "Retention default", retentionDefault,
         { help: declarationGuidance(derivedDeclarations.retention,
             "Inherited preservation detail for chips with no local override.") }));
+    if (derivedDeclarations.retention) advancedGroup.body.append(fieldRow(
+        "Audio retention default", audioRetentionDefault,
+        { help: declarationGuidance(derivedDeclarations.retention,
+            "Inherited audio preservation detail for chips with no local override.") }));
     if (derivedDeclarations.definitions) advancedGroup.body.append(fieldRow(
         "Audio definition default", audioDefinitionDefault,
         { help: declarationGuidance(derivedDeclarations.definitions,
@@ -940,7 +1031,8 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
     }
     const ownedDefaultFields = new Set([
         ...(derivedDeclarations.summary ? ["summary"] : []),
-        ...(derivedDeclarations.retention ? ["retention_detail"] : []),
+        ...(derivedDeclarations.retention
+            ? ["retention_detail", "audio_retention_detail"] : []),
         ...(derivedDeclarations.definitions ? ["audio_definition"] : []),
         ...(taskDeclaration ? ["task_types"] : []),
     ]);
@@ -986,7 +1078,7 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
     }
 
     modal.append(title, requiredNotice, core, physicalGroup.details,
-        voiceGroup.details, advancedGroup.details, routingGroup.details, footer);
+        advancedGroup.details, routingGroup.details, footer);
     backdrop.appendChild(modal);
     document.body.appendChild(backdrop);
     unregisterKeys = registerKeyboardConsumer({

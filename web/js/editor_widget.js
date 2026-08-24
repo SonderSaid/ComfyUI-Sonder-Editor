@@ -3164,7 +3164,7 @@ export class EditorWidget {
                 this._promptSemanticUnits = [
                     ...(this._promptSemanticUnits || []),
                     { ...structuredClone(intent.unit), handle: "", order: 0,
-                        sources: [], voice: { member_id: null } },
+                        sources: [] },
                 ];
             }
         }

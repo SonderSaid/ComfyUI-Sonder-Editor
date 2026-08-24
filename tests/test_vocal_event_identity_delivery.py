@@ -118,9 +118,10 @@ def test_selected_identity_uses_full_reference_label_and_base_definition():
     assert "Anna in red (S1) says:" in assetless["prompt"]
 
 
-def test_full_reference_selected_identity_blocks_when_not_staged():
+def test_full_reference_selected_identity_falls_back_when_source_is_unstaged():
     compiled = _compile(_event(["u"]), units=[_unit()])
-    assert "vocal_identity_not_applicable" in _codes(compiled)
+    assert "vocal_identity_not_applicable" not in _codes(compiled)
+    assert "Anna in red (S1) says:" in compiled["prompt"]
 
 
 def test_custom_selected_policy_blocks_a_sourced_identity_without_a_label():

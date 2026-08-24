@@ -96,3 +96,16 @@ export function referenceRoleChoices(profile = {}, population = "") {
     }
     return result;
 }
+
+export function referenceSelectionPopulation(profile = {}, selected = "") {
+    const match = String(selected || "").match(
+        /^physical:([a-z][a-z0-9_]*):.+$/);
+    if (!match) return null;
+    const selector = match[1];
+    const populations = Array.isArray(profile?.physical_populations)
+        ? profile.physical_populations : [];
+    return populations.find((value) => String(value?.key || "") === selector)
+        || populations.find((value) =>
+            String(value?.token_kind || "") === selector)
+        || null;
+}

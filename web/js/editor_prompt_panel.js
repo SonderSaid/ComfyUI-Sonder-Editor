@@ -1076,7 +1076,7 @@ export function mountPromptManagementPanel(host) {
         ...(host._promptSemanticUnits || []),
         ...writingState.pendingSemanticUnitCreates.map((intent) => ({
             ...structuredClone(intent.unit || {}),
-            handle: "", sources: [], voice: { member_id: null },
+            handle: "", sources: [],
             _pending_create: true,
         })),
     ];

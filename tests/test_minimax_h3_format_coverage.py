@@ -205,6 +205,147 @@ def test_global_h3_summary_owns_the_scene_wide_summary_key():
             if row["code"] == "conflicting_emission"] == ["section-summary"]
 
 
+def _summary_union_fixture():
+    entity = ReferenceEntity(reference_id="e", name="Woman", members=[
+        ReferenceMember(member_id="mp", asset_id="img_a"),
+        ReferenceMember(member_id="ma", asset_id="aud_a")])
+    recipes = [
+        ReferenceLaneRecipe(lane_id="lp", media_kind="image", recipe=PICTURE_RECIPE),
+        ReferenceLaneRecipe(lane_id="la", media_kind="audio", recipe=AUDIO_RECIPE)]
+    items = [
+        ReferenceItem(reference_item_id="ip", lane_index=0, start_frame=0,
+                      end_frame=WINDOW_END, members=[
+                          {"entity_id": "e", "member_id": "mp", "role": "identity"}]),
+        ReferenceItem(reference_item_id="ia", lane_index=1, start_frame=0,
+                      end_frame=WINDOW_END, members=[
+                          {"entity_id": "e", "member_id": "ma", "role": "timbre"}])]
+    units = [{"semantic_unit_id": "u", "name": "Woman", "definition": "a woman",
+              "sources": [{"entity_id": "e", "member_id": "mp"}]}]
+    resolved = _resolve(
+        setup={"mode": "reference", "picture_lane_ids": ["lp"],
+               "audio_lane_ids": ["la"]}, entities=[entity], items=items,
+        recipes=recipes, units=units)
+    context = {
+        "setup_manifest": resolved["setup_manifest"],
+        "ordinal_manifest": resolved["ordinal_manifest"],
+        "unit_source_labels": resolved.get("unit_source_labels", {}),
+        "unit_source_members": resolved.get("unit_source_members", {}),
+        "semantic_units": units,
+    }
+    return entity, resolved, units, context
+
+
+def test_two_chips_declaring_task_types_union_instead_of_conflicting():
+    _entity, resolved, units, _context = _summary_union_fixture()
+    subject = _reference_chip(
+        "subject-summary", {"semantic_unit_ids": ["u"]},
+        {"task_types": ["reference generation"]}, capabilities=("summary",))
+    audio = _reference_chip(
+        "audio-summary", {"audio_ids": ["ma"]},
+        {"task_types": ["audio reference"]}, capabilities=("summary",))
+    compiled = _compile(resolved, units, [PromptSection(
+        0, WINDOW_END, channels={"detailed_description": "scene"},
+        attachments=[subject, audio])])
+    assert compiled["channels"]["summary"] == (
+        "[reference generation + audio reference]")
+    assert not any(value["code"] == "conflicting_emission"
+                   for value in compiled["errors"])
+
+
+def test_explicit_summary_task_type_still_suppresses_role_derivation():
+    _entity, resolved, units, _context = _summary_union_fixture()
+    subject = _reference_chip(
+        "subject-summary", {"semantic_unit_ids": ["u"]},
+        {"task_types": ["reference generation"]}, capabilities=("summary",))
+    compiled = _compile(resolved, units, [PromptSection(
+        0, WINDOW_END, channels={"detailed_description": "scene"},
+        attachments=[subject])])
+    assert compiled["channels"]["summary"] == "[reference generation]"
+    assert "audio reference" not in compiled["channels"]["summary"]
+
+
+def test_summary_union_clears_stale_context_when_current_chips_are_blank():
+    _entity, _resolved, units, context = _summary_union_fixture()
+    context["h3_summary_task_types"] = ["audio reference"]
+    subject = _reference_chip(
+        "subject-summary", {"semantic_unit_ids": ["u"]}, {},
+        capabilities=("summary",))
+    compiled = prompt_context.compile_prompt_context(
+        sections=[PromptSection(
+            0, WINDOW_END, channels={"detailed_description": "scene"},
+            attachments=[subject])],
+        window_start=0, window_end=WINDOW_END, fps=24.0,
+        template="minimax_h3_ref", profile="minimax_h3_ref@1",
+        context=context, labels_on=True)
+    assert compiled["channels"]["summary"] == (
+        "[reference generation + audio reference]")
+
+
+def test_stale_h3_summary_union_cannot_override_non_h3_profile_config():
+    _entity, _resolved, _units, context = _summary_union_fixture()
+    context["h3_summary_task_types"] = ["audio reference"]
+    profile = copy.deepcopy(H3_PROFILE)
+    profile.update({
+        "profile_id": "custom_non_h3_summary", "version": "1",
+        "name": "Custom non-H3 summary", "builtin": False,
+        "validators": [],
+    })
+    profile.pop("content_hash", None)
+    subject = _reference_chip(
+        "subject-summary", {"semantic_unit_ids": ["u"]},
+        {"task_types": ["reference generation"]}, capabilities=("summary",))
+    compiled = prompt_context.compile_prompt_context(
+        sections=[PromptSection(
+            0, WINDOW_END, channels={"detailed_description": "scene"},
+            attachments=[subject])],
+        window_start=0, window_end=WINDOW_END, fps=24.0,
+        template="minimax_h3_ref", profile=profile,
+        context=context, labels_on=True)
+    assert compiled["channels"]["summary"] == "[reference generation]"
+
+
+def test_h3_summary_singleton_ignores_arbitrary_capability_ids():
+    _entity, resolved, units, _context = _summary_union_fixture()
+    subject = _reference_chip(
+        "subject-summary", {"semantic_unit_ids": ["u"]},
+        {"task_types": ["reference generation"]}, capabilities=("summary",))
+    audio = _reference_chip(
+        "audio-summary", {"audio_ids": ["ma"]},
+        {"task_types": ["audio reference"]}, capabilities=("summary",))
+    subject["capabilities"][0]["capability_id"] = "summary-a"
+    audio["capabilities"][0]["capability_id"] = "summary-b"
+    compiled = _compile(resolved, units, [PromptSection(
+        0, WINDOW_END, channels={"detailed_description": "scene"},
+        attachments=[subject, audio])])
+    assert compiled["channels"]["summary"] == (
+        "[reference generation + audio reference]")
+    assert len([value for value in compiled["emissions"]
+                if value["channel_key"] == "summary"]) == 1
+    assert not any(value["code"] == "conflicting_emission"
+                   for value in compiled["errors"])
+
+
+def test_summary_prefix_matches_render_and_segments_under_union():
+    entity, resolved, units, context = _summary_union_fixture()
+    chip = _reference_chip(
+        "subject-summary", {"semantic_unit_ids": ["u"]}, {},
+        capabilities=("summary",))
+    capability = chip["capabilities"][0]
+    context.update({
+        "profile": H3_PROFILE,
+        "semantic_units_by_id": {"u": units[0]},
+        "references": [entity.to_dict()],
+        "h3_summary_task_types": ["reference generation", "audio reference"],
+    })
+    rendered = prompt_context._render_reference_capability(
+        chip, capability, context)
+    parts = prompt_context.reference_capability_segments(
+        chip, capability, context)
+    assembled = "".join(prompt_context.segments_text(segments)
+                        for _owner, segments in parts)
+    assert rendered == assembled == "[reference generation + audio reference]"
+
+
 def scene_composite_subject():
     """One Subject spanning a Picture and a Video (A2, E1, A5, C3, E4, G3)."""
     entity = ReferenceEntity(reference_id="e", name="Woman", members=[
@@ -481,7 +622,6 @@ def scene_audio_and_speakers():
                      phrase="they"),
         _reference_chip("ca", {"semantic_unit_ids": ["ua"]}, {
             "audio_definition": "the voice-timbre reference",
-            "audio_speaker_subject_id": "ua",
             "retention_details": {"<Subject 1>": "face preserved",
                                   "<Audio 1>": "timbre only"}}),
         _reference_chip("cb", {"semantic_unit_ids": ["ub"]},
@@ -738,7 +878,7 @@ def test_audio_roles_exist_in_the_authoring_catalog(item, role):
     assert role in AUDIO_ROLE_VALUES
 
 
-def test_d3_voice_timbre_reuses_the_target_speaker_id(compiled):
+def test_d3_voice_timbre_derives_the_owning_identity_speaker_id(compiled):
     """D3/E2 — `<Audio N> is ... for <Subject N> (Sx)`, never a new number."""
     value = _channel(compiled, "audio_and_speakers", "subject_definitions")
     match = re.search(r"<Audio 1> is .*? for <Subject (\d+)> \(S(\d+)\)", value)
@@ -953,8 +1093,8 @@ def test_g_partially_preserved_marker_reaches_output(compiled):
 
 
 AUDIO_MARKERS = [
-    ("G4", "video_edit_with_audio", r"<Audio 1>[^:]*: fully_copy - "),
-    ("G5", "audio_and_speakers", r"<Audio 2>[^:]*: partially_copy - "),
+    ("G4", "video_edit_with_audio", r"<Audio 1>[^:]*: fully_copy(?:\n|$)"),
+    ("G5", "audio_and_speakers", r"<Audio 2>[^:]*: partially_copy(?:\n|$)"),
     ("G6", "audio_and_speakers", r"<Audio 1>[^:]*: reference - "),
 ]
 
@@ -981,6 +1121,83 @@ def test_speaker_ids_never_appear_in_retention_analysis(compiled):
     for name in SCENES:
         value = _channel(compiled, name, "retention_analysis")
         assert not re.search(r"\(S\d+", value), name
+
+
+def _compile_voiced_identity_retention(config, *, identity_defaults=None):
+    entity = ReferenceEntity(reference_id="e", name="Woman", members=[
+        ReferenceMember(member_id="mp", asset_id="img_a", prompt="a woman"),
+        ReferenceMember(member_id="ma", asset_id="aud_a", prompt="a soft voice")])
+    recipes = [
+        ReferenceLaneRecipe(lane_id="lp", media_kind="image", recipe=PICTURE_RECIPE),
+        ReferenceLaneRecipe(lane_id="la", media_kind="audio", recipe=AUDIO_RECIPE)]
+    items = [
+        ReferenceItem(reference_item_id="ip", lane_index=0, start_frame=0,
+                      end_frame=WINDOW_END, members=[
+                          {"entity_id": "e", "member_id": "mp", "role": "identity",
+                           "visual_intent": "preserve"}]),
+        ReferenceItem(reference_item_id="ia", lane_index=1, start_frame=0,
+                      end_frame=WINDOW_END, members=[
+                          {"entity_id": "e", "member_id": "ma", "role": "timbre",
+                           "audio_intent": "reference_characteristics"}])]
+    units = [{
+        "semantic_unit_id": "u", "name": "Woman", "definition": "a woman",
+        "sources": [{"entity_id": "e", "member_id": "mp"},
+                    {"entity_id": "e", "member_id": "ma"}],
+        "attachment_defaults": dict(identity_defaults or {}),
+    }]
+    resolved = _resolve(
+        setup={"mode": "reference", "picture_lane_ids": ["lp"],
+               "audio_lane_ids": ["la"]}, entities=[entity], items=items,
+        recipes=recipes, units=units)
+    chip = _reference_chip(
+        "retention", {"semantic_unit_ids": ["u"]}, dict(config),
+        capabilities=("retention",))
+    return _compile(resolved, units, [PromptSection(
+        0, WINDOW_END, channels={"detailed_description": "scene"},
+        attachments=[chip])])
+
+
+def test_audio_retention_detail_does_not_land_on_the_subject_row():
+    compiled = _compile_voiced_identity_retention({
+        "retention_detail": "appearance prose",
+        "audio_retention_detail": "voice prose",
+    })
+    value = compiled["channels"]["retention_analysis"]
+    assert "<Subject 1>: fully_preserved - appearance prose" in value
+    assert "<Audio 1>: reference - voice prose" in value
+    assert "<Subject 1>: fully_preserved - voice prose" not in value
+    assert "<Audio 1>: reference - appearance prose" not in value
+
+
+def test_shared_retention_detail_does_not_fall_through_to_audio():
+    compiled = _compile_voiced_identity_retention({
+        "retention_detail": "appearance prose",
+    })
+    lines = compiled["channels"]["retention_analysis"].splitlines()
+    assert "<Subject 1>: fully_preserved - appearance prose" in lines
+    assert "<Audio 1>: reference" in lines
+    assert not any(line.startswith("<Audio 1>:") and " - " in line
+                   for line in lines)
+
+
+def test_retention_details_label_map_outranks_audio_sibling():
+    compiled = _compile_voiced_identity_retention({
+        "audio_retention_detail": "media sibling",
+        "retention_details": {"<Audio 1>": "per-label prose"},
+    })
+    value = compiled["channels"]["retention_analysis"]
+    assert "<Audio 1>: reference - per-label prose" in value
+    assert "media sibling" not in value
+
+
+def test_audio_retention_detail_inherits_from_identity_defaults():
+    compiled = _compile_voiced_identity_retention({}, identity_defaults={
+        "retention_detail": "identity appearance",
+        "audio_retention_detail": "identity voice",
+    })
+    value = compiled["channels"]["retention_analysis"]
+    assert "<Subject 1>: fully_preserved - identity appearance" in value
+    assert "<Audio 1>: reference - identity voice" in value
 
 
 @pytest.mark.xfail(strict=True, reason=(
@@ -1330,8 +1547,8 @@ def test_copy_keeps_the_entity_and_its_sources_live(monkeypatch):
             for part in line["parts"]:
                 if part["kind"] == "handle":
                     # A handle with no id would resolve to nothing and the
-                    # copy would silently drop the entity.
-                    assert part["source"] == "unit"
+                    # copy would silently drop the entity or audio member.
+                    assert part["source"] in {"unit", "member"}
                     assert part["id"], part
                     seen_handle += 1
                 if part["kind"] == "sources":
@@ -1881,16 +2098,30 @@ def test_every_copyable_capability_assembles_to_its_rendered_line():
     """
     entity = ReferenceEntity(reference_id="e", name="Woman", members=[
         ReferenceMember(member_id="mp", asset_id="img_a", handle="Sheet",
-                        prompt="the young woman with long dark hair")])
-    recipes = [ReferenceLaneRecipe(lane_id="lp", media_kind="image",
-                                   recipe=PICTURE_RECIPE)]
-    items = [ReferenceItem(reference_item_id="ip", lane_index=0, start_frame=0,
-                           end_frame=WINDOW_END, members=[
-                               {"entity_id": "e", "member_id": "mp",
-                                "role": "identity", "visual_intent": "preserve"}])]
+                        prompt="the young woman with long dark hair"),
+        ReferenceMember(member_id="ma", asset_id="aud_a", handle="Voice",
+                        prompt="a soft voice")])
+    recipes = [
+        ReferenceLaneRecipe(lane_id="lp", media_kind="image",
+                            recipe=PICTURE_RECIPE),
+        ReferenceLaneRecipe(lane_id="la", media_kind="audio",
+                            recipe=AUDIO_RECIPE)]
+    items = [
+        ReferenceItem(reference_item_id="ip", lane_index=0, start_frame=0,
+                      end_frame=WINDOW_END, members=[
+                          {"entity_id": "e", "member_id": "mp",
+                           "role": "identity", "visual_intent": "preserve"}]),
+        ReferenceItem(reference_item_id="ia", lane_index=1, start_frame=0,
+                      end_frame=WINDOW_END, members=[
+                          {"entity_id": "e", "member_id": "ma",
+                           "role": "timbre",
+                           "audio_intent": "reference_characteristics"}])]
     units = [{"semantic_unit_id": "u", "name": "Woman", "handle": "KWoman",
-              "order": 0, "sources": [{"entity_id": "e", "member_id": "mp"}]}]
-    resolved = _resolve(setup={"mode": "reference", "picture_lane_ids": ["lp"]},
+              "order": 0, "sources": [
+                  {"entity_id": "e", "member_id": "mp"},
+                  {"entity_id": "e", "member_id": "ma"}]}]
+    resolved = _resolve(setup={"mode": "reference", "picture_lane_ids": ["lp"],
+                               "audio_lane_ids": ["la"]},
                         entities=[entity], items=items, recipes=recipes, units=units)
     context = {
         "setup_manifest": resolved["setup_manifest"],
@@ -1917,6 +2148,95 @@ def test_every_copyable_capability_assembles_to_its_rendered_line():
             assert expected in rendered, (capability_kind, rendered)
         compared += 1
     assert compared == len(MENTION_PARITY_CASES)
+
+
+def test_a_mention_of_a_voiced_identity_spells_only_the_identity():
+    entity = ReferenceEntity(reference_id="e", name="Woman", members=[
+        ReferenceMember(member_id="mp", asset_id="img_a", prompt="a woman"),
+        ReferenceMember(member_id="ma", asset_id="aud_a", prompt="a soft voice")])
+    recipes = [
+        ReferenceLaneRecipe(lane_id="lp", media_kind="image", recipe=PICTURE_RECIPE),
+        ReferenceLaneRecipe(lane_id="la", media_kind="audio", recipe=AUDIO_RECIPE)]
+    items = [
+        ReferenceItem(reference_item_id="ip", lane_index=0, start_frame=0,
+                      end_frame=WINDOW_END, members=[
+                          {"entity_id": "e", "member_id": "mp", "role": "identity"}]),
+        ReferenceItem(reference_item_id="ia", lane_index=1, start_frame=0,
+                      end_frame=WINDOW_END, members=[
+                          {"entity_id": "e", "member_id": "ma", "role": "timbre"}])]
+    units = [{"semantic_unit_id": "u", "name": "Woman", "handle": "KWoman",
+              "definition": "a woman", "sources": [
+                  {"entity_id": "e", "member_id": "mp"},
+                  {"entity_id": "e", "member_id": "ma"}]}]
+    resolved = _resolve(
+        setup={"mode": "reference", "picture_lane_ids": ["lp"],
+               "audio_lane_ids": ["la"]}, entities=[entity], items=items,
+        recipes=recipes, units=units)
+    chip = _reference_chip(
+        "retention", {"semantic_unit_ids": ["u"]},
+        {"retention_detail": "appearance preserved"},
+        capabilities=("retention",))
+    compiled = _compile(resolved, units, [PromptSection(
+        0, WINDOW_END,
+        channel_docs={"detailed_description": {
+            "nodes": [{"type": "text", "text": "@KWoman walks forward."}]}},
+        attachments=[chip])])
+    assert compiled["channels"]["detailed_description"] == (
+        "<Subject 1> walks forward.")
+    assert "<Audio 1>:" in compiled["channels"]["retention_analysis"]
+    assert "<Audio 1> walks" not in compiled["prompt"]
+
+
+def test_a_mention_does_not_freeze_an_audio_ordinal():
+    entity = ReferenceEntity(reference_id="e", name="Woman", members=[
+        ReferenceMember(member_id="mp", asset_id="img_a", handle="Sheet"),
+        ReferenceMember(member_id="ma", asset_id="aud_a", handle="Voice")])
+    recipes = [
+        ReferenceLaneRecipe(lane_id="lp", media_kind="image", recipe=PICTURE_RECIPE),
+        ReferenceLaneRecipe(lane_id="la", media_kind="audio", recipe=AUDIO_RECIPE)]
+    items = [
+        ReferenceItem(reference_item_id="ip", lane_index=0, start_frame=0,
+                      end_frame=WINDOW_END, members=[
+                          {"entity_id": "e", "member_id": "mp", "role": "identity"}]),
+        ReferenceItem(reference_item_id="ia", lane_index=1, start_frame=0,
+                      end_frame=WINDOW_END, members=[
+                          {"entity_id": "e", "member_id": "ma", "role": "timbre"}])]
+    units = [{"semantic_unit_id": "u", "name": "Woman", "handle": "KWoman",
+              "definition": "a woman", "sources": [
+                  {"entity_id": "e", "member_id": "mp"},
+                  {"entity_id": "e", "member_id": "ma"}]}]
+    resolved = _resolve(
+        setup={"mode": "reference", "picture_lane_ids": ["lp"],
+               "audio_lane_ids": ["la"]}, entities=[entity], items=items,
+        recipes=recipes, units=units)
+    context = {
+        "setup_manifest": resolved["setup_manifest"],
+        "ordinal_manifest": resolved["ordinal_manifest"],
+        "unit_source_labels": resolved["unit_source_labels"],
+        "unit_source_members": resolved["unit_source_members"],
+        "semantic_units_by_id": {"u": units[0]},
+        "references": [entity.to_dict()], "profile": H3_PROFILE,
+    }
+    mention = _reference_chip(
+        "mention", {"semantic_unit_ids": ["u"]}, {}, capabilities=("mentions",))
+    mention_plan = prompt_context.copy_capability_plan(
+        mention, mention["capabilities"][0], context)
+    assert mention_plan["frozen_ordinal"] == []
+    assert [part for part in mention_plan["lines"][0]["parts"]
+            if part["kind"] == "handle"] == [{
+                "kind": "handle", "source": "unit", "id": "u",
+                "rendered": "<Subject 1>"}]
+
+    definitions = _reference_chip(
+        "definitions", {"semantic_unit_ids": ["u"]},
+        {"audio_definition": "a soft voice"},
+        capabilities=("definitions",))
+    definition_plan = prompt_context.copy_capability_plan(
+        definitions, definitions["capabilities"][0], context)
+    assert any(
+        part.get("kind") == "handle" and part.get("source") == "member"
+        and part.get("id") == "ma" and part.get("rendered") == "<Audio 1>"
+        for line in definition_plan["lines"] for part in line["parts"])
 
 
 def test_a_mention_carries_the_id_that_spells_it_live():

@@ -31,7 +31,6 @@ export function promptIdentityMatchesCreateIntent(unit, intent) {
         && Boolean(String(unit.handle || ""))
         && Number.isFinite(Number(unit.order))
         && !(unit.sources || []).length
-        && !String(unit.voice?.member_id || "")
         && (!attachmentDefaults || !Object.keys(attachmentDefaults).length)
         && (!disabledCapabilities || !disabledCapabilities.length)
         && !String(unit.visual_intent || "")

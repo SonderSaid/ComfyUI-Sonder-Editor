@@ -2229,7 +2229,7 @@ def test_ad_hoc_prompt_identity_is_created_atomically_with_server_handle_and_ord
     assert created["handle"] == "Narrator2"
     assert created["order"] == 8
     assert created["sources"] == []
-    assert created["voice"] == {"member_id": None}
+    assert "voice" not in created
     assert payload["prompt_semantic_units"][-1] == created
     assert scene.global_attachments[0]["source"]["subject_ids"] == ["other-1"]
 
@@ -2378,9 +2378,11 @@ def test_guarded_prompt_identity_cleanup_deletes_only_unchanged_unreferenced_uni
         "type": "delete_prompt_semantic_unit_if_unreferenced",
         "semantic_unit_id": "other-1", "expected": expected,
     })
-    assert audio_override["reason"] == "referenced"
+    assert audio_override["deleted"] is True
+    assert project.prompt_semantic_units == []
 
     scene.global_attachments = []
+    project.prompt_semantic_units = [copy.deepcopy(unit)]
     project.prompt_semantic_units[0]["definition"] = "User edited this"
     changed = route_module._apply_scene_mutation_operation(project, scene, {
         "type": "delete_prompt_semantic_unit_if_unreferenced",

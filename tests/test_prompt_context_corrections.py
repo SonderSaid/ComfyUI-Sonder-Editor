@@ -901,7 +901,7 @@ def test_browser_semantic_dependency_mirror_matches_server_authority():
         console.log(JSON.stringify(mod.semanticIdentityDependencyIds(
             {json.dumps(attachments)})));
     """)
-    assert expected == ["reference", "shared", "speaker", "voiceover-subject"]
+    assert expected == ["reference", "shared", "speaker"]
     assert result == expected
 
 
@@ -1137,6 +1137,39 @@ def test_reference_effective_values_distinguish_authority_and_reset_authored_emp
     assert result["emptySavedOverrides"]["summary"] == ""
     assert result["savedCapabilityConfig"] == {"future_value": "preserved"}
     assert result["emptySavedCapabilityConfig"] == {"future_value": "preserved"}
+
+
+def test_reference_chip_retires_audio_target_control_and_self_heals_saved_key():
+    result = _run_chip_dom_script("""
+        const pending = mod.configurePromptAttachment({
+          attachment_id:"chip",kind:"reference",
+          source:{semantic_unit_ids:["lead"]},
+          config:{audio_speaker_subject_id:"stale",overrides:{}},
+          capabilities:[{capability_id:"definitions",kind:"definitions"}],
+        }, {
+          scene:{duration_frames:20,_context_channel_keys:["visual"],
+            reference_lane_count:1,reference_lane_configs:[],
+            reference_lane_recipes:[],reference_items:[]},
+          profileId:"probe@1",
+          profile:{profile_id:"probe",version:"1",
+            identity_kinds:[{key:"subject",label:"Subject"}],
+            capabilities:{reference:{derived:{definitions:{
+              order:1,label:"Definitions",channel_key:"visual",
+              placement:"section_prefix",fields:{},
+            }}}}},
+          semanticUnits:[{semantic_unit_id:"lead",name:"Lead",kind:"subject",
+            sources:[],definition:"the lead"}],
+          placementPhases:[{value:"section_prefix",label:"Section prefix"}],
+        });
+        const labels=document.body.querySelectorAll("label").map((value)=>
+          value.attributes["aria-label"] || value.textContent);
+        document.body.querySelectorAll("button").find((value)=>
+          value.textContent==="Attach")._handlers.click[0]();
+        const saved=await pending;
+        console.log(JSON.stringify({labels,config:saved.attachment.config}));
+    """)
+    assert not any("Audio target speaker" in value for value in result["labels"])
+    assert "audio_speaker_subject_id" not in result["config"]
 
 
 def test_reference_chip_save_preserves_task_types_without_or_beyond_vocabulary():
@@ -2365,20 +2398,14 @@ def test_vocal_event_delivery_editor_counts_unicode_codepoints_not_utf16_units()
     assert result["utf16"] == 512
 
 
-def test_vocal_event_voice_conversion_is_explicit_and_unsupported_delivery_blocks_until_clear():
+def test_vocal_event_stable_key_stays_separate_and_unsupported_delivery_blocks():
     result = _run_chip_dom_script("""
-        const units = [
-            {semantic_unit_id:"alice",name:"Alice",kind:"subject",
-                voice:{member_id:"shared-key"}},
-            {semantic_unit_id:"bob",name:"Bob",kind:"subject",
-                voice:{member_id:"shared-key"}},
-        ];
         const pending = mod.configurePromptAttachment({kind:"vocal_event",
             source:{voice_id:"shared-key"}, config:{delivery:"whispering"}}, {
             profile:{profile_id:"explicit",identity_kinds:[
                 {key:"subject",label:"Subject",speaks:true},
             ],capabilities:{}},
-            semanticUnits:units,
+            semanticUnits:[],
         });
         const labels = document.body.querySelectorAll("label");
         const controls = [
@@ -2388,18 +2415,10 @@ def test_vocal_event_voice_conversion_is_explicit_and_unsupported_delivery_block
         ];
         const control = (name) => controls.find((value) =>
             value.attributes["aria-label"] === name);
-        const conversion = document.body.querySelectorAll("select").find((select) =>
-            select.options[0]?.textContent === "Choose an identity explicitly…");
         const before = {
-            selected: conversion.value,
-            matches: conversion.options.map((option) => option.textContent),
             speaker: control("Speaker").value,
             voice: control("Stable voice key (advanced)").value,
         };
-        conversion.value = "bob";
-        conversion._handlers.change[0]();
-        const after = {speaker:control("Speaker").value,
-            voice:control("Stable voice key (advanced)").value};
         const attach = document.body.querySelectorAll("button")
             .find((button) => button.textContent === "Attach");
         attach._handlers.click[0]();
@@ -2411,20 +2430,17 @@ def test_vocal_event_voice_conversion_is_explicit_and_unsupported_delivery_block
         clear._handlers.click[0]();
         attach._handlers.click[0]();
         const configured = await pending;
-        console.log(JSON.stringify({before, after, blocked,
+        console.log(JSON.stringify({before, blocked,
             config:configured.attachment.config,
             source:configured.attachment.source}));
     """)
     assert result["before"] == {
-        "selected": "",
-        "matches": ["Choose an identity explicitly…", "Alice", "Bob"],
         "speaker": "",
         "voice": "shared-key",
     }
-    assert result["after"] == {"speaker": "bob", "voice": "shared-key"}
     assert result["blocked"] == "block"
     assert result["config"]["delivery"] == ""
-    assert result["source"] == {"voice_id": "shared-key", "subject_ids": ["bob"]}
+    assert result["source"] == {"voice_id": "shared-key", "subject_ids": []}
 
 
 def test_vocal_event_modal_blocks_legacy_invalid_speakers_even_with_voice_key():
@@ -2799,7 +2815,8 @@ def test_reference_fieldset_renders_only_declared_fields_with_declared_copy():
     # Declared capabilities contribute their value fields; undeclared ones
     # (summary, mentions, audio_relationship) contribute nothing at all.
     assert set(result["fields"]) == {
-        "definition", "audio_definition", "retention_detail", "visual_intent"}
+        "definition", "audio_definition", "retention_detail",
+        "audio_retention_detail", "visual_intent"}
     assert "summary" not in by_field
     assert "task_types" not in by_field
     assert "text" not in by_field
@@ -2883,11 +2900,12 @@ def test_reference_fieldset_collapses_following_fields_but_never_an_override():
     assert result["collapsed"] == ["retention_detail"]
     # Expanding shows every declared field.
     assert set(result["openedUp"]) == {
-        "definition", "audio_definition", "retention_detail", "visual_intent"}
+        "definition", "audio_definition", "retention_detail",
+        "audio_retention_detail", "visual_intent"}
     # A newly authored field joins the visible set without expanding.
     assert set(result["afterOverriding"]) == {"definition", "retention_detail"}
-    assert "3 fields following" in result["summaryWhenCollapsed"]
-    assert "2 fields following" in result["summaryAfter"]
+    assert "4 fields following" in result["summaryWhenCollapsed"]
+    assert "3 fields following" in result["summaryAfter"]
 
 
 def test_collapsed_summary_names_the_most_specific_source_not_a_count():
@@ -2925,12 +2943,114 @@ def test_collapsed_summary_names_the_most_specific_source_not_a_count():
         }}));
     """)
     # The member tier outranks both format tiers present, so it is named.
-    assert result["mixed"].startswith("4 fields following Physical Reference default · @Portrait")
+    assert result["mixed"].startswith("5 fields following Physical Reference default · @Portrait")
     # The others are counted, not listed — the point is to name one, not all.
     assert "+2 more" in result["mixed"]
     assert "sources" not in result["mixed"]
     # With a single source there is nothing to disambiguate and no suffix.
-    assert result["single"] == "4 fields following Prompt Format default · Probe Format"
+    assert result["single"] == "5 fields following Prompt Format default · Probe Format"
+
+
+def test_reference_fieldset_tracks_media_kind_and_preserves_wrong_kind_override():
+    result = _run_chip_dom_script("""
+        const profile = {
+          name:"Media Probe",
+          physical_populations:[
+            {key:"pictures",token_kind:"picture",label:"Picture"},
+            {key:"videos",token_kind:"video",label:"Video"},
+            {key:"standalone_audios",token_kind:"audio",label:"Audio"},
+          ],
+          capabilities:{reference:{derived:{
+            definitions:{order:1,fields:{}},
+            retention:{order:2,fields:{
+              visual_intent:{type:"enum",values:["preserve"]},
+              audio_intent:{type:"enum",values:["reference_characteristics"]},
+            }},
+          }}},
+        };
+        const visible = (fieldset) => fieldset.fields.filter((field) =>
+          fieldset.row(field).style.display !== "none");
+        const fieldset = mod.createReferenceOverrideFieldset({
+          profile, selected:"physical:audio:a",
+        });
+        fieldset.setExpanded(true);
+        const audio = visible(fieldset);
+        fieldset.refresh("physical:pictures:p");
+        const picture = visible(fieldset);
+        fieldset.refresh("physical:video:v");
+        const video = visible(fieldset);
+        fieldset.refresh("identity-id");
+        const identity = visible(fieldset);
+
+        const stored = mod.createReferenceOverrideFieldset({
+          profile, selected:"physical:audio:a",
+          overrides:{definition:"legacy visual prose"},
+        });
+        const storedRow = stored.row("definition");
+        const note = storedRow.querySelectorAll("span").find((value) =>
+          value.dataset.sonderWrongMediaOverride === "definition");
+        const before = {visible:storedRow.style.display,
+          note:note.textContent, collected:{...stored.collect()}};
+        storedRow.querySelectorAll("button").find((value) =>
+          value.textContent === "Reset")._handlers.click[0]();
+        const after = {visible:storedRow.style.display,
+          collected:{...stored.collect()}};
+
+        const refs=[{reference_id:"ref",members:[{
+          member_id:"member",handle:"Voice",prompt:"soft contralto"}]}];
+        const audioDefaults=mod.referencePromptDefaults(
+          "physical:audio:member",{profile,references:refs});
+        const pictureDefaults=mod.referencePromptDefaults(
+          "physical:picture:member",{profile,references:refs});
+        console.log(JSON.stringify({audio,picture,video,identity,before,after,
+          audioDefaults:audioDefaults.values,
+          pictureDefaults:pictureDefaults.values}));
+    """)
+    assert "definition" not in result["audio"]
+    assert not {"retention_detail", "visual_intent"}.intersection(result["audio"])
+    assert {"audio_definition", "audio_retention_detail", "audio_intent"}.issubset(
+        result["audio"])
+    assert "definition" in result["picture"]
+    assert not {"audio_definition", "audio_retention_detail", "audio_intent"}.intersection(
+        result["picture"])
+    assert "definition" in result["video"]
+    assert "audio_intent" in result["video"]
+    assert "audio_definition" not in result["video"]
+    assert {"definition", "audio_definition", "audio_retention_detail",
+            "audio_intent"}.issubset(result["identity"])
+    assert result["before"]["visible"] == "grid"
+    assert "not read for an audio" in result["before"]["note"]
+    assert result["before"]["collected"]["definition"] == "legacy visual prose"
+    assert result["after"]["visible"] == "none"
+    assert "definition" not in result["after"]["collected"]
+    assert result["audioDefaults"]["audio_definition"] == "soft contralto"
+    assert "definition" not in result["audioDefaults"]
+    assert result["pictureDefaults"]["definition"] == "soft contralto"
+
+
+def test_reference_selection_population_prefers_key_before_token_kind():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for declaration projection coverage")
+    module_url = (ROOT / "web/js/prompt_profile_declarations.js").as_uri()
+    script = f"""
+const mod=await import({json.dumps(module_url)});
+const profile={{physical_populations:[
+  {{key:"audio",token_kind:"picture"}},
+  {{key:"standalone",token_kind:"audio"}},
+]}};
+console.log(JSON.stringify({{
+  byKey:mod.referenceSelectionPopulation(profile,"physical:audio:m"),
+  byToken:mod.referenceSelectionPopulation(profile,"physical:picture:m"),
+  identity:mod.referenceSelectionPopulation(profile,"identity"),
+}}));
+"""
+    result = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+    assert result["byKey"]["key"] == "audio"
+    assert result["byToken"]["key"] == "audio"
+    assert result["identity"] is None
 
 
 _CAMERA_AID = """{

@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from server import prompt_context
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -24,6 +26,15 @@ def _run_node(script: str):
     return json.loads(subprocess.run(
         [node, "--input-type=module", "-e", script], capture_output=True,
         text=True, encoding="utf-8", check=True).stdout)
+
+
+def test_reference_override_fields_mirror_matches_the_server():
+    chips_url = (ROOT / "web/js/prompt_context_chips.js").as_uri()
+    client = _run_node(f"""
+const {{REFERENCE_OVERRIDE_FIELDS}}=await import({json.dumps(chips_url)});
+console.log(JSON.stringify(REFERENCE_OVERRIDE_FIELDS));
+""")
+    assert set(client) == set(prompt_context.REFERENCE_OVERRIDE_FIELDS)
 
 
 def _method(source: str, name: str, next_name: str) -> str:
@@ -181,6 +192,7 @@ mod.mountPromptIdentityPanel(root, {{
   assets:[{{asset_id:"asset",asset_type:"image"}}],
   semanticUnits:[{{semantic_unit_id:"unit",kind:"subject",name:"Lead",handle:"Lead",
     visual_intent:"future_visual",audio_intent:"future_audio",
+    attachment_defaults:{{audio_retention_detail:"Keep the exact voice"}},
     sources:[{{entity_id:"ref",member_id:"member",contribution:"future_contribution"}}],
     voice:{{member_id:"missing_voice"}}}}],
   saveSemanticUnitChange: async (change) => {{ saved=change.value; }},
@@ -193,19 +205,135 @@ const nodes=walk(modal);
 const unsupported=nodes.filter((n)=>n.tagName==="OPTION"
   && n.textContent.startsWith("Unsupported saved value:"))
   .map((n)=>n.value).sort();
+const audioRetention=nodes.find((n)=>n.tagName==="TEXTAREA"
+  && n.placeholder==="Default audio preservation detail (optional)");
+const preserved=nodes.find((n)=>n.dataset.sonderPreservedIdentityDefaults==="1");
 const save=nodes.find((n)=>n.tagName==="BUTTON" && n.textContent==="Save identity");
 await save._handlers.click[0]();
-console.log(JSON.stringify({{unsupported,saved}}));
+console.log(JSON.stringify({{unsupported,saved,audioRetention:audioRetention?.value || "",
+  preserved:preserved?.textContent || ""}}));
 """
     result = json.loads(subprocess.run(
         [node, "--input-type=module", "-e", script], capture_output=True,
         text=True, encoding="utf-8", check=True).stdout)
     assert result["unsupported"] == [
-        "future_audio", "future_contribution", "future_visual", "missing_voice"]
+        "future_audio", "future_contribution", "future_visual"]
+    assert result["saved"]["voice"] == {"member_id": "missing_voice"}
+    assert result["audioRetention"] == "Keep the exact voice"
+    assert result["preserved"] == ""
+    assert result["saved"]["attachment_defaults"]["audio_retention_detail"] == (
+        "Keep the exact voice")
     assert result["saved"]["visual_intent"] == "future_visual"
     assert result["saved"]["audio_intent"] == "future_audio"
     assert result["saved"]["sources"][0]["contribution"] == "future_contribution"
     assert result["saved"]["voice"]["member_id"] == "missing_voice"
+
+
+def test_legacy_voice_repair_is_explicit_idempotent_and_one_save():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for legacy voice repair coverage")
+    module_url = (ROOT / "web/js/prompt_identity_panel.js").as_uri()
+    script = f"""
+class N {{
+  constructor(tag) {{ this.tagName=String(tag).toUpperCase(); this.children=[];
+    this.options=[]; this.style={{cssText:""}}; this.dataset={{}}; this.attributes={{}};
+    this.value=""; this.textContent=""; this.disabled=false; this.checked=false;
+    this.open=false; this.multiple=false; this.selected=false; this._handlers={{}}; }}
+  appendChild(c) {{ if(typeof c==="string"){{const t=new N("#text");t.textContent=c;c=t;}}
+    this.children.push(c); c.parentElement=this;
+    if(c.tagName==="OPTION") this.options.push(c); return c; }}
+  append(...cs) {{ cs.forEach((c)=>c!=null && this.appendChild(c)); }}
+  prepend(...cs) {{ [...cs].reverse().forEach((c)=>{{ if(typeof c==="string"){{const t=new N("#text");t.textContent=c;c=t;}}
+    this.children.unshift(c); c.parentElement=this; }}); }}
+  addEventListener(t,h) {{ (this._handlers[t] ||= []).push(h); }}
+  setAttribute(k,v) {{ this.attributes[k]=String(v); }}
+  removeAttribute(k) {{ delete this.attributes[k]; }}
+  querySelector() {{ return null; }}
+  remove() {{ if(this.parentElement) this.parentElement.children =
+    this.parentElement.children.filter((c)=>c!==this); }}
+  focus() {{ globalThis.document.activeElement=this; }}
+  get selectedOptions() {{ return this.options.filter((option)=>option.selected); }}
+}}
+globalThis.document={{createElement:(t)=>new N(t),createTextNode:(v)=>{{const n=new N("#text");n.textContent=String(v);return n;}},body:new N("body"),activeElement:null}};
+globalThis.window={{addEventListener(){{}},removeEventListener(){{}}}};
+globalThis.localStorage={{getItem(){{return null;}},setItem(){{}}}};
+globalThis.CSS={{escape:(v)=>String(v)}};
+const mod=await import({json.dumps(module_url)});
+const legacy={{semantic_unit_id:"unit",kind:"subject",name:"Lead",handle:"Lead",
+  definition:"Lead",sources:[],voice:{{member_id:"voice-member"}}}};
+const references=[{{reference_id:"ref",name:"Voice Ref",members:[{{
+  member_id:"voice-member",asset_id:"asset",name:"Voice Clip"}}]}}];
+const pure=mod.legacyVoiceBindingRepair(legacy,references);
+const repeated=mod.legacyVoiceBindingRepair(pure.identity,references);
+const already=mod.legacyVoiceBindingRepair({{...legacy,sources:[{{
+  entity_id:"ref",member_id:"voice-member",contribution:""}}]}},references);
+const root=new N("div"); let saves=[];
+mod.mountPromptIdentityPanel(root, {{
+  profile:{{identity_kinds:[{{key:"subject",label:"Subject"}}],
+    physical_populations:[{{key:"audios",media_kinds:["audio"]}}]}},
+  references,assets:[{{asset_id:"asset",asset_type:"audio"}}],
+  semanticUnits:[legacy],candidate:{{setup_manifest:{{}}}},
+  saveSemanticUnitChange:async(change)=>{{saves.push(change.value);}},
+}});
+const walk=(n,out=[])=>{{out.push(n);n.children.forEach((c)=>walk(c,out));return out;}};
+walk(root).find((n)=>n.tagName==="BUTTON" && n.textContent==="Edit")._handlers.click[0]();
+const modal=globalThis.document.body.children.at(-1);
+const nodes=walk(modal);
+const repair=nodes.find((n)=>n.dataset.sonderLegacyVoiceRepair==="1");
+const repairButton=nodes.find((n)=>n.tagName==="BUTTON" && n.textContent==="Add physical source");
+const repairDetails=nodes.find((n)=>n.tagName==="DETAILS"
+  && walk(n,[]).includes(repair));
+nodes.find((n)=>n.tagName==="INPUT" && n.placeholder==="Identity name").value="Edited Lead";
+await repairButton._handlers.click[0]();
+console.log(JSON.stringify({{pure,repeated,already,repair:!!repair,
+  repairOpen:repairDetails?.open===true,saves}}));
+"""
+    result = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+    assert result["pure"]["identity"]["sources"] == [{
+        "entity_id": "ref", "member_id": "voice-member", "contribution": ""}]
+    assert "voice" not in result["pure"]["identity"]
+    assert result["repeated"] is None
+    assert result["already"] is None
+    assert result["repair"] is True
+    assert result["repairOpen"] is True
+    assert len(result["saves"]) == 1
+    assert result["saves"][0]["name"] == "Edited Lead"
+    assert result["saves"][0]["sources"] == result["pure"]["identity"]["sources"]
+    assert "voice" not in result["saves"][0]
+
+
+def test_identity_source_groups_follow_asset_kind_with_video_audio_exception():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for identity source grouping coverage")
+    module_url = (ROOT / "web/js/prompt_identity_panel.js").as_uri()
+    script = f"""
+const mod=await import({json.dumps(module_url)});
+console.log(JSON.stringify({{
+  image:mod.promptIdentitySourceGroup("image",{{}},{{}}),
+  audio:mod.promptIdentitySourceGroup("audio",{{}},{{}}),
+  videoDefault:mod.promptIdentitySourceGroup("video",
+    {{audio_intent:"reference_characteristics"}},{{}}),
+  videoEntityAudio:mod.promptIdentitySourceGroup("video",
+    {{audio_intent:"copy_full"}},{{}}),
+  videoMemberAudio:mod.promptIdentitySourceGroup("video",
+    {{audio_intent:"reference_characteristics"}},
+    {{audio_intent:"reference_loosely"}}),
+}}));
+"""
+    result = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+    assert result == {
+        "image": "appearance", "audio": "audio",
+        "videoDefault": "appearance", "videoEntityAudio": "audio",
+        "videoMemberAudio": "audio",
+    }
+    source = _source("web/js/prompt_identity_panel.js")
+    assert "Audio sources declare this character's voice." in source
 
 
 def test_identity_editor_progressive_disclosure_search_feedback_and_routing():
@@ -382,7 +510,6 @@ console.log(JSON.stringify({details,kindHelp,before,after,routing,taskLabels,sav
         text=True, encoding="utf-8", check=True).stdout)
     assert result["details"] == [
         {"title": "Physical sources — optional", "open": False},
-        {"title": "Voice — optional", "open": False},
         # Names the rung and, when the project has any, how many attachments
         # follow it. "Advanced" said nothing about which direction inheritance
         # ran, which is why this group and the chip's own fieldset read as two
@@ -1990,7 +2117,7 @@ def test_every_reference_chip_surface_uses_runtime_identity_and_authoring_contro
     assert panel.count("attachmentLabelFor,") == 11
     assert "Shared identity default · @" in chips
     assert "Prompt Format default ·" in chips
-    assert "no managed Vocal Event in this window" in chips
+    assert "Audio target speaker" not in chips
     assert "managedVocalEventSubjectIds" not in chips
     assert widget.count("managedSpeakerSubjectIds:") == 3
     assert panel.count("managedSpeakerSubjectIds:") == 7
@@ -2031,7 +2158,6 @@ def test_reference_backed_subject_dependency_audit_and_delete_guard_contract():
         text=True, encoding="utf-8", check=True).stdout)
     assert result == {
         "reference_chips": 1, "vocal_events": 1,
-        "audio_speaker_bindings": 1,
         "source_relationships": 2,
     }
     assert "Bound chips and Vocal Events remain visible as broken links" in identity_source
@@ -4857,4 +4983,4 @@ class Harness {{
 const h=new Harness(); h._savePromptTemplate("Vocal");
 console.log(JSON.stringify(h.saved.prompt_semantic_units.map((value)=>value.semantic_unit_id)));
 """)
-    assert result == ["speaker", "narrator"]
+    assert result == ["speaker"]

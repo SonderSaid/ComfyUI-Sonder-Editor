@@ -2650,7 +2650,6 @@ def _apply_create_prompt_semantic_unit(
             and str(existing.get("kind") or "subject") == kind
             and str(existing.get("definition") or "") == definition
             and not (existing.get("sources") or [])
-            and not str((existing.get("voice") or {}).get("member_id") or "")
             and not (existing.get("attachment_defaults") or {})
             and not (existing.get("disabled_capabilities") or [])
             and not str(existing.get("visual_intent") or "")
@@ -2675,10 +2674,9 @@ def _apply_create_prompt_semantic_unit(
         "kind": kind,
         "definition": definition,
         "order": next_order,
-        # Other speakers are semantic-only by contract.  Do not accept a
-        # browser-supplied physical source or voice binding on this route.
+        # Other speakers are semantic-only by contract. Do not accept a
+        # browser-supplied physical source on this route.
         "sources": [],
-        "voice": {"member_id": None},
     })
     project.prompt_semantic_units.append(unit)
     return {"type": "create_prompt_semantic_unit", "created": True,
@@ -5211,7 +5209,6 @@ def _reconcile_staged_reference_members(project: TimelineProject, removed_member
             affected_scene_ids.append(scene.scene_id)
     affected_identity_ids = []
     pruned_source_count = 0
-    cleared_voice_count = 0
     for unit in project.prompt_semantic_units or []:
         if not isinstance(unit, dict):
             continue
@@ -5225,8 +5222,10 @@ def _reconcile_staged_reference_members(project: TimelineProject, removed_member
             unit["sources"] = kept_sources
         voice = unit.get("voice") if isinstance(unit.get("voice"), dict) else {}
         if str(voice.get("member_id") or "") in removed_member_ids:
-            unit["voice"] = {"member_id": None}
-            cleared_voice_count += 1
+            # Temporary cleanup companion to normalize_semantic_unit's legacy
+            # preservation. Remove with that tolerance once no circulating
+            # project still carries the retired binding.
+            unit.pop("voice", None)
             changed = True
         if changed:
             affected_identity_ids.append(str(unit.get("semantic_unit_id") or ""))
@@ -5236,7 +5235,6 @@ def _reconcile_staged_reference_members(project: TimelineProject, removed_member
         "thinned_reference_item_ids": thinned_item_ids,
         "affected_prompt_identity_ids": affected_identity_ids,
         "pruned_prompt_identity_sources": pruned_source_count,
-        "cleared_prompt_identity_voices": cleared_voice_count,
     }
 
 

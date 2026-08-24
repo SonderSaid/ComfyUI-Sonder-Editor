@@ -2486,7 +2486,7 @@ class TimelineProject:
             unit = dict(raw_unit)
             if "sources" not in unit and isinstance(unit.get("source_members"), list):
                 unit["sources"] = [
-                    {**source, "contribution": "", "inherit_description": False}
+                    {**source, "contribution": ""}
                     for source in unit["source_members"] if isinstance(source, dict)
                 ]
             unit.pop("source_members", None)

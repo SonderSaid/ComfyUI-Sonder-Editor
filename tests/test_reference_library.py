@@ -95,7 +95,7 @@ def test_unreleased_source_members_convert_once_without_losing_contributions(tmp
     loaded = TimelineProject.from_dict(raw, str(tmp_path / "loaded"))
     assert loaded.prompt_semantic_units[0]["sources"] == [{
         "entity_id": "ref-1", "member_id": "member-1",
-        "contribution": "", "inherit_description": False,
+        "contribution": "",
     }]
     assert "source_members" not in loaded.prompt_semantic_units[0]
 
@@ -216,7 +216,7 @@ def test_blank_legacy_member_suffix_is_optional_in_delete_expected(tmp_path):
     assert project.references[0].members == []
 
 
-def test_reference_and_member_deletion_prune_identity_sources_and_voice(tmp_path):
+def test_reference_and_member_deletion_prune_sources_and_legacy_voice(tmp_path):
     project = _project(tmp_path)
     project.references = [ReferenceEntity(
         reference_id="ref-1", name="Lead", members=[
@@ -255,7 +255,7 @@ def test_reference_and_member_deletion_prune_identity_sources_and_voice(tmp_path
         },
     }])
     assert unit["sources"] == []
-    assert unit["voice"] == {"member_id": None}
+    assert "voice" not in unit
     assert unit["definition"] == "a lead"
 
 

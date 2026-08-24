@@ -467,40 +467,239 @@ def test_invalid_attachment_route_diagnostic_targets_the_chip():
     assert diagnostic["attachment_id"] == attachment["attachment_id"]
 
 
-def test_audio_definition_reuses_but_never_creates_speaker_identity():
+def test_audio_definition_derives_speaker_from_its_owning_identity():
     reference = prompt_context.normalize_attachment({
         "kind": "reference", "source": {"semantic_unit_ids": ["granny"]},
         "capabilities": [{"capability_id": "definitions", "kind": "definitions",
                           "channel_key": "subject_definitions", "placement": "section_prefix",
-                          "config": {"definition": "Granny", "audio_definition": "warm voice",
-                                     "audio_speaker_subject_id": "granny"}}],
+                          "config": {"definition": "Granny",
+                                     "audio_definition": "warm voice"}}],
     })
     base_context = {
         "semantic_units": [{"semantic_unit_id": "granny", "name": "Granny",
-                            "sources": [{"member_id": "voice"}]}],
+                            "sources": [{"entity_id": "e",
+                                         "member_id": "voice"}]}],
         "ordinal_manifest": {"subjects": {"granny": 1}},
         "unit_source_labels": {"granny": ["<Audio 1>"]},
+        "unit_source_members": {"granny": ["voice"]},
     }
     without_event = prompt_context.compile_prompt_context(
         global_channels={}, sections=[_section(0, 10, "wait", attachments=[reference])],
         window_start=0, window_end=10, fps=24, template="minimax_h3_ref",
+        profile="minimax_h3_ref@1",
         context={**base_context, "setup_manifest": {
             "setup": {"mode": "reference"}}})
-    assert any(value["code"] == "unresolved_audio_speaker_binding"
-               for value in without_event["errors"])
+    assert "<Audio 1> is warm voice" in without_event["prompt"]
+    assert "<Audio 1> is warm voice for" not in without_event["prompt"]
+    assert without_event["errors"] == []
+    assert not any(value["code"] == "stable_voice_event_not_identity_speaker"
+                   for value in without_event["warnings"])
 
     vocal = prompt_context.normalize_attachment({
         "kind": "vocal_event", "source": {"subject_ids": ["granny"]},
         "config": {"event_type": "dialogue", "text": "Hello"}})
     with_event = prompt_context.compile_prompt_context(
         global_channels={},
-        sections=[_section(0, 10, "wait", attachments=[reference, vocal])],
+        sections=[PromptSection(
+            0, 10, attachments=[reference, vocal],
+            channel_docs={"detailed_description": {"nodes": [
+                {"type": "text", "text": "wait "},
+                {"type": "attachment", "node_id": "vocal",
+                 "attachment_id": vocal["attachment_id"]},
+            ]}})],
         window_start=0, window_end=10, fps=24, template="minimax_h3_ref",
+        profile="minimax_h3_ref@1",
         context={**base_context, "setup_manifest": {
             "setup": {"mode": "reference"}}})
-    assert not any(value["code"] == "unresolved_audio_speaker_binding"
-                   for value in with_event["errors"])
     assert "<Audio 1> is warm voice for <Subject 1> (S1)" in with_event["prompt"]
+
+
+def test_stale_audio_speaker_binding_is_advisory_and_ignored():
+    reference = prompt_context.normalize_attachment({
+        "kind": "reference", "source": {"semantic_unit_ids": ["owner"]},
+        "config": {"audio_speaker_subject_id": "other"},
+        "capabilities": [{"capability_id": "definitions", "kind": "definitions",
+                          "channel_key": "subject_definitions",
+                          "placement": "section_prefix",
+                          "config": {"definition": "Owner",
+                                     "audio_definition": "owner voice"}}],
+    })
+    vocal = prompt_context.normalize_attachment({
+        "kind": "vocal_event", "source": {"subject_ids": ["owner"]},
+        "config": {"event_type": "dialogue", "text": "Hello"}})
+    compiled = prompt_context.compile_prompt_context(
+        global_channels={}, sections=[PromptSection(
+            0, 10, attachments=[reference, vocal],
+            channel_docs={"detailed_description": {"nodes": [
+                {"type": "text", "text": "wait "},
+                {"type": "attachment", "node_id": "vocal",
+                 "attachment_id": vocal["attachment_id"]},
+            ]}})],
+        window_start=0, window_end=10, fps=24, template="minimax_h3_ref",
+        profile="minimax_h3_ref@1",
+        context={
+            "semantic_units": [
+                {"semantic_unit_id": "owner", "name": "Owner",
+                 "sources": [{"entity_id": "e", "member_id": "voice"}]},
+                {"semantic_unit_id": "other", "name": "Other", "sources": []}],
+            "ordinal_manifest": {"subjects": {"owner": 1, "other": 2}},
+            "unit_source_labels": {"owner": ["<Audio 1>"]},
+            "unit_source_members": {"owner": ["voice"]},
+            "setup_manifest": {"setup": {"mode": "reference"}},
+        })
+    assert "<Audio 1> is owner voice for <Subject 1> (S1)" in compiled["prompt"]
+    assert compiled["errors"] == []
+    assert [value["code"] for value in compiled["warnings"]].count(
+        "stale_audio_speaker_binding") == 1
+
+
+def test_stale_audio_speaker_binding_on_standalone_audio_is_advisory():
+    reference = prompt_context.normalize_attachment({
+        "kind": "reference", "source": {"audio_ids": ["voice"]},
+        "config": {"audio_speaker_subject_id": "speaker"},
+        "capabilities": [{"capability_id": "definitions", "kind": "definitions",
+                          "channel_key": "subject_definitions",
+                          "placement": "section_prefix",
+                          "config": {"audio_definition": "warm voice"}}],
+    })
+    compiled = prompt_context.compile_prompt_context(
+        global_channels={}, sections=[PromptSection(
+            0, 10, attachments=[reference],
+            channels={"detailed_description": "scene"})],
+        window_start=0, window_end=10, fps=24, template="minimax_h3_ref",
+        profile="minimax_h3_ref@1",
+        context={
+            "references": [{
+                "reference_id": "entity", "name": "Voice", "members": [{
+                    "member_id": "voice", "asset_id": "audio",
+                    "prompt": "warm voice"}]}],
+            "setup_manifest": {
+                "setup": {"mode": "reference"},
+                "standalone_audios": [{"member_id": "voice", "audio_ordinal": 1}],
+                "presentation": [{"kind": "audio", "member_id": "voice",
+                                  "member_prompt": "warm voice",
+                                  "audio_ordinal": 1}],
+            },
+            "ordinal_manifest": {"audios": {"voice": 1}},
+        })
+    assert compiled["errors"] == []
+    assert [value["code"] for value in compiled["warnings"]].count(
+        "stale_audio_speaker_binding") == 1
+
+
+def test_stable_voice_key_event_does_not_claim_an_identity_speaker():
+    reference = prompt_context.normalize_attachment({
+        "kind": "reference", "source": {"semantic_unit_ids": ["owner"]},
+        "capabilities": [{"capability_id": "definitions", "kind": "definitions",
+                          "channel_key": "subject_definitions",
+                          "placement": "section_prefix",
+                          "config": {"definition": "Owner",
+                                     "audio_definition": "owner voice"}}],
+    })
+    vocal = prompt_context.normalize_attachment({
+        "kind": "vocal_event", "source": {"voice_id": "provider-key"},
+        "config": {"event_type": "dialogue", "text": "Hello"}})
+    compiled = prompt_context.compile_prompt_context(
+        global_channels={}, sections=[PromptSection(
+            0, 10, attachments=[reference, vocal],
+            channel_docs={"detailed_description": {"nodes": [
+                {"type": "text", "text": "wait "},
+                {"type": "attachment", "node_id": "vocal",
+                 "attachment_id": vocal["attachment_id"]},
+            ]}})],
+        window_start=0, window_end=10, fps=24, template="minimax_h3_ref",
+        profile="minimax_h3_ref@1",
+        context={
+            "semantic_units": [{
+                "semantic_unit_id": "owner", "name": "Owner",
+                "sources": [{"entity_id": "e", "member_id": "voice"}]}],
+            "ordinal_manifest": {"subjects": {"owner": 1}},
+            "unit_source_labels": {"owner": ["<Audio 1>"]},
+            "unit_source_members": {"owner": ["voice"]},
+            "setup_manifest": {"setup": {"mode": "reference"}},
+        })
+    assert "<Audio 1> is owner voice for" not in compiled["prompt"]
+    assert compiled["errors"] == []
+    advisory = next(value for value in compiled["warnings"]
+                    if value["code"] == "stable_voice_event_not_identity_speaker")
+    assert advisory["attachment_id"] == vocal["attachment_id"]
+    assert advisory["attachment_id"] != reference["attachment_id"]
+
+
+def test_stable_voice_key_advisory_is_not_emitted_for_h3_base():
+    vocal = prompt_context.normalize_attachment({
+        "kind": "vocal_event", "source": {"voice_id": "provider-key"},
+        "config": {"event_type": "dialogue", "text": "Hello"}})
+    compiled = prompt_context.compile_prompt_context(
+        global_channels={}, sections=[PromptSection(
+            0, 10, attachments=[vocal],
+            channel_docs={"detailed_description": {"nodes": [
+                {"type": "attachment", "node_id": "vocal",
+                 "attachment_id": vocal["attachment_id"]},
+            ]}})],
+        window_start=0, window_end=10, fps=24, template="minimax_h3_base",
+        profile="minimax_h3_base@1",
+        context={"setup_manifest": {}, "ordinal_manifest": {}},
+    )
+    assert not any(value["code"] == "stable_voice_event_not_identity_speaker"
+                   for value in compiled["warnings"])
+
+
+def test_identity_dependency_closure_ignores_stored_audio_speaker_residue():
+    attachments = [{
+        "kind": "reference", "source": {"semantic_unit_ids": ["owner"]},
+        "config": {"audio_speaker_subject_id": "stale"},
+    }]
+    assert prompt_context.semantic_identity_dependency_ids(attachments) == ["owner"]
+
+
+def test_legacy_voice_is_preserved_unread_and_inherit_description_is_retired():
+    unit = prompt_context.normalize_semantic_unit({
+        "semantic_unit_id": "legacy", "name": "Legacy",
+        "sources": [{
+            "entity_id": "ref", "member_id": "member",
+            "contribution": "appearance", "inherit_description": True,
+        }],
+        "voice": {"member_id": "member"},
+    })
+    assert unit["voice"] == {"member_id": "member"}
+    assert "inherit_description" not in unit["sources"][0]
+    compiled = prompt_context.compile_prompt_context(
+        sections=[], window_start=0, window_end=10, fps=24,
+        template="minimax_h3_ref", profile="minimax_h3_ref@1",
+        context={"semantic_units": [unit],
+                 "setup_manifest": {"setup": {"mode": "reference"}}})
+    warning = next(value for value in compiled["warnings"]
+                   if value["code"] == "legacy_voice_binding")
+    assert warning["semantic_unit_id"] == "legacy"
+
+
+def test_speaking_identity_with_unstaged_durable_source_stays_applicable():
+    vocal = prompt_context.normalize_attachment({
+        "kind": "vocal_event", "source": {"subject_ids": ["other"]},
+        "config": {"event_type": "dialogue", "text": "Still here"},
+    })
+    compiled = prompt_context.compile_prompt_context(
+        sections=[PromptSection(
+            0, 10, attachments=[vocal],
+            channel_docs={"detailed_description": {"nodes": [{
+                "type": "attachment", "node_id": "vocal",
+                "attachment_id": vocal["attachment_id"],
+            }]}})],
+        window_start=0, window_end=10, fps=24,
+        template="minimax_h3_ref", profile="minimax_h3_ref@1",
+        context={
+            "semantic_units": [{
+                "semantic_unit_id": "other", "handle": "Other",
+                "name": "Other", "definition": "the off-screen guide",
+                "sources": [{"entity_id": "ref", "member_id": "unstaged"}],
+            }],
+            "unit_source_labels": {}, "unit_source_members": {},
+            "ordinal_manifest": {},
+            "setup_manifest": {"setup": {"mode": "reference"}},
+        })
+    assert compiled["errors"] == []
+    assert "the off-screen guide (S1) says" in compiled["prompt"]
 
 
 def test_managed_speaker_catalog_uses_effective_held_prompt_segments():
@@ -1056,6 +1255,7 @@ def test_h3_subject_definition_inherits_contributing_library_member_prompt():
             "ordinal_manifest": {
                 "subjects": {"subject": 1}, "pictures": {"portrait": 1}},
             "unit_source_labels": {"subject": ["<Picture 1>"]},
+            "unit_source_members": {"subject": ["portrait"]},
             "semantic_units": [{
                 "semantic_unit_id": "subject", "name": "Korean Woman",
                 "definition": "", "sources": [{
@@ -1070,10 +1270,105 @@ def test_h3_subject_definition_inherits_contributing_library_member_prompt():
         "<Subject 1> is a poised Korean woman in a blue coat from <Picture 1>")
 
 
+def test_h3_audio_member_prose_stays_out_of_the_visual_definition():
+    reference = prompt_context.normalize_attachment({
+        "kind": "reference", "source": {"semantic_unit_ids": ["subject"]},
+        "capabilities": [{"capability_id": "definitions", "kind": "definitions",
+                          "channel_key": "subject_definitions",
+                          "placement": "section_prefix"}],
+    })
+    compiled = prompt_context.compile_prompt_context(
+        global_channels={}, sections=[_section(
+            0, 10, "move", attachments=[reference])],
+        window_start=0, window_end=10, fps=24, template="minimax_h3_ref",
+        context={
+            "setup_manifest": {
+                "setup": {"mode": "reference"},
+                "pictures": [{"member_id": "portrait", "picture_ordinal": 1}],
+                "standalone_audios": [{"member_id": "voice", "audio_ordinal": 1}],
+                "presentation": [
+                    {"kind": "picture", "member_id": "portrait",
+                     "member_prompt": "a poised Korean woman in a blue coat",
+                     "picture_ordinal": 1},
+                    {"kind": "audio", "member_id": "voice",
+                     "member_prompt": "a soft voice with a slight Korean accent",
+                     "audio_ordinal": 1},
+                ],
+            },
+            "ordinal_manifest": {
+                "subjects": {"subject": 1}, "pictures": {"portrait": 1},
+                "audios": {"voice": 1}},
+            "unit_source_labels": {
+                "subject": ["<Picture 1>", "<Audio 1>"]},
+            "unit_source_members": {"subject": ["portrait", "voice"]},
+            "semantic_units": [{
+                "semantic_unit_id": "subject", "name": "Korean Woman",
+                "definition": "", "sources": [
+                    {"entity_id": "woman", "member_id": "portrait"},
+                    {"entity_id": "woman", "member_id": "voice"}],
+            }],
+        })
+    assert compiled["channels"]["subject_definitions"].splitlines() == [
+        "<Subject 1> is a poised Korean woman in a blue coat from <Picture 1>",
+        "<Audio 1> is a soft voice with a slight Korean accent",
+    ]
+    assert not any(value["code"] == "missing_h3_audio_definition"
+                   for value in compiled["errors"] + compiled["warnings"])
+
+
+def test_h3_each_audio_member_needs_definition_prose():
+    reference = prompt_context.normalize_attachment({
+        "kind": "reference", "source": {"semantic_unit_ids": ["subject"]},
+        "capabilities": [{"capability_id": "definitions", "kind": "definitions",
+                          "channel_key": "subject_definitions",
+                          "placement": "section_prefix"}],
+    })
+    compiled = prompt_context.compile_prompt_context(
+        global_channels={}, sections=[_section(
+            0, 10, "move", attachments=[reference])],
+        window_start=0, window_end=10, fps=24, template="minimax_h3_ref",
+        context={
+            "setup_manifest": {
+                "setup": {"mode": "reference"},
+                "standalone_audios": [
+                    {"member_id": "voice-one", "audio_ordinal": 1},
+                    {"member_id": "voice-two", "audio_ordinal": 2}],
+                "presentation": [
+                    {"kind": "audio", "member_id": "voice-one",
+                     "member_prompt": "the first voice", "audio_ordinal": 1},
+                    {"kind": "audio", "member_id": "voice-two",
+                     "member_prompt": "", "audio_ordinal": 2}],
+            },
+            "ordinal_manifest": {
+                "subjects": {"subject": 1},
+                "audios": {"voice-one": 1, "voice-two": 2}},
+            "unit_source_labels": {
+                "subject": ["<Audio 1>", "<Audio 2>"]},
+            "unit_source_members": {
+                "subject": ["voice-one", "voice-two"]},
+            "semantic_units": [{
+                "semantic_unit_id": "subject", "name": "Speaker",
+                "definition": "authored appearance", "sources": [
+                    {"entity_id": "speaker", "member_id": "voice-one"},
+                    {"entity_id": "speaker", "member_id": "voice-two"}],
+            }],
+        })
+    assert "<Audio 1> is the first voice" in compiled["channels"][
+        "subject_definitions"]
+    assert "<Audio 2>" not in compiled["channels"]["subject_definitions"]
+    assert any(value["code"] == "missing_h3_audio_definition"
+               for value in compiled["warnings"])
+
+
 def test_h3_subject_definition_precedence_is_chip_then_subject_then_member():
-    context = {"setup_manifest": {"presentation": [{
-        "member_id": "portrait", "member_prompt": "member prose"}]}}
-    unit = {"definition": "subject prose",
+    context = {
+        "profile": prompt_context.BUILTIN_PROFILES["minimax_h3_ref@1"],
+        "setup_manifest": {"presentation": [{
+            "member_id": "portrait", "member_prompt": "member prose"}]},
+        "unit_source_labels": {"subject": ["<Picture 1>"]},
+        "unit_source_members": {"subject": ["portrait"]},
+    }
+    unit = {"semantic_unit_id": "subject", "definition": "subject prose",
             "sources": [{"member_id": "portrait"}]}
     assert prompt_context._subject_definition(
         {"definition": "chip prose"}, unit, context) == ("chip prose", "chip")

@@ -1337,6 +1337,7 @@ def normalize_capability(raw, *, index=0) -> dict:
 
 REFERENCE_OVERRIDE_FIELDS = frozenset({
     "definition", "summary", "task_types", "retention_detail",
+    "audio_retention_detail",
     "retention_details", "audio_definition", "audio_relationship", "text",
     "visual_intent", "audio_intent",
 })
@@ -1414,10 +1415,11 @@ def normalize_attachments(raw) -> list:
 def semantic_identity_dependency_ids(attachments) -> list[str]:
     """Stable Prompt Identity dependency closure for authored attachments.
 
-    Reference identities use ``semantic_unit_ids``; Vocal Events use
-    ``subject_ids`` and the optional audio-speaker subject override. Provider
-    voice keys deliberately remain a separate namespace and are never treated
-    as Prompt Identity ids.
+    Reference identities use ``semantic_unit_ids`` and Vocal Events use
+    ``subject_ids``. Provider voice keys deliberately remain a separate
+    namespace and are never treated as Prompt Identity ids. An audio definition
+    belongs to its selected identity, so no second stored speaker binding enters
+    this closure.
     """
     result = []
     seen = set()
@@ -1426,14 +1428,11 @@ def semantic_identity_dependency_ids(attachments) -> list[str]:
             continue
         source = attachment.get("source")
         source = source if isinstance(source, dict) else {}
-        config = attachment.get("config")
-        config = config if isinstance(config, dict) else {}
         values = []
         for key in ("semantic_unit_ids", "subject_ids"):
             raw_values = source.get(key)
             if isinstance(raw_values, list):
                 values.extend(raw_values)
-        values.append(config.get("audio_speaker_subject_id"))
         for value in values:
             unit_id = str(value or "")
             if not unit_id or unit_id in seen:
@@ -1542,7 +1541,6 @@ def normalize_semantic_unit(raw) -> dict:
         contributions.append({
             "entity_id": key[0], "member_id": key[1],
             "contribution": str(value.get("contribution") or ""),
-            "inherit_description": value.get("inherit_description") is True,
         })
     try:
         # Authored/API data reaches this normalizer outside any handler, so a
@@ -1550,8 +1548,6 @@ def normalize_semantic_unit(raw) -> dict:
         order = int(raw.get("order") or 0)
     except (TypeError, ValueError):
         order = 0
-    voice = raw.get("voice") if isinstance(raw.get("voice"), dict) else {}
-    voice_member_id = str(voice.get("member_id") or "").strip() or None
     result = {
         "semantic_unit_id": str(raw.get("semantic_unit_id") or "").strip()
                             or _new_id(),
@@ -1564,12 +1560,17 @@ def normalize_semantic_unit(raw) -> dict:
         "attachment_defaults": copy.deepcopy(raw.get("attachment_defaults"))
                                if isinstance(raw.get("attachment_defaults"), dict)
                                else {},
-        "voice": {"member_id": voice_member_id},
         # Prompt parts this identity does not contribute by default. Sparse:
         # an empty list is the ordinary "everything the format declares".
         "disabled_capabilities": normalize_disabled_capabilities(
             raw.get("disabled_capabilities")),
     }
+    # Temporary project-data tolerance only. The retired `voice` binding is
+    # unread by prompt rendering; the identity editor offers an explicit repair
+    # into `sources[]`. Remove this preservation after this batch has been in
+    # use and the repair affordance no longer appears in projects in circulation.
+    if "voice" in raw:
+        result["voice"] = copy.deepcopy(raw.get("voice"))
     # Identity intent vocabulary belongs to the active Prompt Format. Keep the
     # authored value sparse and preserved—even when a future/other format owns
     # it—instead of synthesizing MiniMax defaults into every identity. The
@@ -2407,7 +2408,18 @@ def _vocal_identity_expression(unit_id, attachment, context) -> str:
     validators = {str(value) for value in
                   (context.get("profile") or {}).get("validators") or []
                   if isinstance(value, str)}
-    if unit.get("sources") and "minimax_base_setup" not in validators:
+    # A durable source can be outside this compile window. In that case the
+    # identity still behaves like an assetless speaker for this window; the
+    # explicit repair from a legacy voice binding must not make dialogue fail
+    # merely because no effective source label was assigned in this window.
+    # Keep that fallback H3 Reference-only; other selected-identity formats
+    # retain the existing refusal so setup conflicts remain visible.
+    has_staged_source = bool(
+        (context.get("unit_source_labels") or {}).get(unit_id))
+    h3_unstaged_repair_case = (
+        "minimax_reference_setup" in validators and not has_staged_source)
+    if (unit.get("sources") and not h3_unstaged_repair_case
+            and "minimax_base_setup" not in validators):
         return ""
     definition, _source = _subject_definition(
         attachment.get("config") or {}, unit, context)
@@ -2440,7 +2452,8 @@ def _adjacent_live_identity_handle(attachment, context) -> bool:
     return [str(value) for value in source.get("semantic_unit_ids") or []] == subject_ids
 
 
-def _reference_label_pairs(attachment, context) -> list[tuple]:
+def _reference_label_pairs(
+        attachment, context, *, include_unit_audio=True) -> list[tuple]:
     """`(label, source)` for everything a chip names, in render order.
 
     The single walk behind both `_reference_labels` (which drops the source) and
@@ -2448,9 +2461,11 @@ def _reference_label_pairs(attachment, context) -> list[tuple]:
     views of one authority, because a second walk that agreed today would be a
     second thing to keep in agreement forever.
 
-    `source` is `{"unit_id": …}`, `{"member_id": …}`, or `None` for a label with
-    no stable id behind it — an audio source label carried along with its unit,
-    which is a rendered string rather than a thing that can be named.
+    `source` is `{"unit_id": …}`, `{"member_id": …}`, or `None`. Unit audio is
+    included for retention by default, but excluded from mentions: naming an
+    identity names the identity, not every physical medium that contributes to
+    it. The id-less audio retention row is a rendered label, not a second
+    mention target.
     """
     pairs = []
     manifest = context.get("ordinal_manifest") or {}
@@ -2474,11 +2489,14 @@ def _reference_label_pairs(attachment, context) -> list[tuple]:
         if label:
             pairs.append((label, {"unit_id": str(source_id)}))
             seen.add(label)
-            for extra in context.get("unit_source_labels", {}).get(str(source_id)) or []:
-                if (any(str(extra).startswith(prefix) for prefix in audio_prefixes)
-                        and str(extra) not in seen):
-                    pairs.append((str(extra), None))
-                    seen.add(str(extra))
+            if include_unit_audio:
+                for extra in context.get("unit_source_labels", {}).get(
+                        str(source_id)) or []:
+                    if (any(str(extra).startswith(prefix)
+                            for prefix in audio_prefixes)
+                            and str(extra) not in seen):
+                        pairs.append((str(extra), None))
+                        seen.add(str(extra))
     for declaration in physical_population_declarations(profile):
         source_key = str(declaration.get("source_key") or "")
         ordinal_key = str(declaration.get("ordinal_key") or "")
@@ -2490,8 +2508,11 @@ def _reference_label_pairs(attachment, context) -> list[tuple]:
     return pairs
 
 
-def _reference_labels(attachment, context):
-    return [label for label, _source in _reference_label_pairs(attachment, context)]
+def _reference_labels(attachment, context, *, include_unit_audio=True):
+    return [
+        label for label, _source in _reference_label_pairs(
+            attachment, context, include_unit_audio=include_unit_audio)
+    ]
 
 
 def _minimax_task_types(context, configured=(), profile=None):
@@ -2503,6 +2524,8 @@ def _minimax_task_types(context, configured=(), profile=None):
     resolved_profile = profile or context.get("profile") or {}
     field = declared_reference_field(resolved_profile, "summary", "task_types")
     declared = [choice["value"] for choice in declared_field_choices(field)]
+    configured = (context.get("h3_summary_task_types")
+                  if "h3_summary_task_types" in context else configured)
     explicit = {str(raw or "").strip().lower() for raw in configured or []}
     explicit.intersection_update(declared)
     if explicit:
@@ -2561,6 +2584,53 @@ def _definition_before_source(definition: str, source: str) -> str:
     return value[:-1].rstrip()
 
 
+def _unit_visual_source_pairs(unit_id, context) -> list[tuple[str, str]]:
+    """Return the unit's visual labels and their index-parallel member ids."""
+    visual_prefixes = [
+        declared_label_prefix(declaration)
+        for declaration in physical_population_declarations(
+            context.get("profile") or {})
+        if str(declaration.get("token_kind") or "") in {"picture", "video"}
+        and declared_label_prefix(declaration)
+    ]
+    source_labels = context.get("unit_source_labels", {}).get(str(unit_id)) or []
+    source_members = context.get("unit_source_members", {}).get(str(unit_id)) or []
+    return [
+        (str(label), str(source_members[index]) if index < len(source_members) else "")
+        for index, label in enumerate(source_labels)
+        if any(str(label).startswith(prefix) for prefix in visual_prefixes)
+    ]
+
+
+def _unit_audio_source_pairs(unit_id, context) -> list[tuple[str, str]]:
+    """Return the unit's audio labels and their index-parallel member ids."""
+    audio_prefixes = [
+        declared_label_prefix(declaration)
+        for declaration in physical_population_declarations(
+            context.get("profile") or {})
+        if str(declaration.get("token_kind") or "") == "audio"
+        and declared_label_prefix(declaration)
+    ]
+    source_labels = context.get("unit_source_labels", {}).get(str(unit_id)) or []
+    source_members = context.get("unit_source_members", {}).get(str(unit_id)) or []
+    return [
+        (str(label), str(source_members[index]) if index < len(source_members) else "")
+        for index, label in enumerate(source_labels)
+        if any(str(label).startswith(prefix) for prefix in audio_prefixes)
+    ]
+
+
+def _setup_member_prompt(member_id, context) -> str:
+    """Return one staged member's authored Library prose."""
+    member_id = str(member_id or "")
+    for row in (context.get("setup_manifest", {}).get("presentation") or []):
+        row_member_id = str(
+            row.get("member_id") or row.get("video_member_id") or "")
+        if row_member_id == member_id:
+            return str(row.get("member_prompt") or "").strip()
+    return ""
+
+
 def _subject_definition(config, unit, context) -> tuple[str, str]:
     """Resolve authored Subject prose and its inheritance source."""
     configured = str(config.get("definition") or "").strip()
@@ -2569,9 +2639,11 @@ def _subject_definition(config, unit, context) -> tuple[str, str]:
     unit_definition = str(unit.get("definition") or "").strip()
     if unit_definition:
         return unit_definition, "subject"
-    member_ids = {str(value.get("member_id") or "")
-                  for value in unit.get("sources") or []
-                  if isinstance(value, dict)}
+    unit_id = str(unit.get("semantic_unit_id") or "")
+    member_ids = {
+        member_id for _label, member_id in
+        _unit_visual_source_pairs(unit_id, context) if member_id
+    }
     prompts = []
     for row in (context.get("setup_manifest", {}).get("presentation") or []):
         member_id = str(row.get("member_id") or row.get("video_member_id") or "")
@@ -2764,7 +2836,10 @@ def _render_reference_capability(attachment, capability, context):
     if reference_capability_errors(attachment, capability, context):
         return ""
     config = effective_reference_config(attachment, capability, context)
-    labels = _reference_labels(attachment, context)
+    # Only the mentions branch below consumes this list. Definitions and
+    # retention return through `reference_capability_lines`, which computes the
+    # retention-inclusive labels independently.
+    labels = _reference_labels(attachment, context, include_unit_audio=False)
     if kind == "derived_prompt":
         item_id = str(attachment.get("source", {}).get("reference_item_id") or "")
         row = (context.get("generic_references") or {}).get(item_id) or {}
@@ -2952,18 +3027,6 @@ def _reference_capability_parts(attachment, capability, context) -> list[tuple]:
     labels = _reference_labels(attachment, context)
     units = context.get("semantic_units_by_id") or {}
     profile = context.get("profile") or {}
-    visual_prefixes = [
-        declared_label_prefix(declaration)
-        for declaration in physical_population_declarations(profile)
-        if str(declaration.get("token_kind") or "") in {"picture", "video"}
-        and declared_label_prefix(declaration)
-    ]
-    audio_prefixes = [
-        declared_label_prefix(declaration)
-        for declaration in physical_population_declarations(profile)
-        if str(declaration.get("token_kind") or "") == "audio"
-        and declared_label_prefix(declaration)
-    ]
     if kind == "definitions":
         lines = []
         for unit_id in attachment["source"].get("semantic_unit_ids") or []:
@@ -2983,15 +3046,10 @@ def _reference_capability_parts(attachment, capability, context) -> list[tuple]:
             source = ""
             source_labels = context.get("unit_source_labels", {}).get(str(unit_id)) or []
             source_members = context.get("unit_source_members", {}).get(str(unit_id)) or []
-            # Filter both together so the member list stays aligned with the
-            # labels it describes; the two are index-parallel by construction
-            # and every filter has to preserve that or a source resolves to the
-            # wrong Reference.
-            visual_pairs = [(str(label), str(source_members[index])
-                             if index < len(source_members) else "")
-                            for index, label in enumerate(source_labels)
-                            if any(str(label).startswith(prefix)
-                                   for prefix in visual_prefixes)]
+            # Keep the definition fallback and source citation on one media
+            # classifier. A voice member is a source of the identity, but its
+            # prose never becomes part of the identity's visual definition.
+            visual_pairs = _unit_visual_source_pairs(unit_id, context)
             visual_labels = [label for label, _member in visual_pairs]
             if visual_labels:
                 if len(visual_labels) == 1:
@@ -3032,38 +3090,30 @@ def _reference_capability_parts(attachment, capability, context) -> list[tuple]:
                     lines.append((("identity_definition", str(unit_id)),
                                   [_segment(SEGMENT_TEXT, definition,
                                             authored=True)]))
-            audio_definition = str(config.get("audio_definition") or "").strip()
-            speaker_subject_id = str(config.get("audio_speaker_subject_id") or "")
+            configured_audio_definition = str(
+                config.get("audio_definition") or "").strip()
             speaker_suffix = ""
-            if speaker_subject_id:
-                speaker_unit = units.get(speaker_subject_id) or {}
-                speaker_kind = str(speaker_unit.get("kind") or "subject")
-                speaker_declaration = identity_kind_for(
-                    context.get("profile") or {}, speaker_kind)
-                speaker_subject_number = (context.get("ordinal_manifest", {}).get(
-                    identity_ordinal_key(speaker_kind)) or {}).get(speaker_subject_id)
-                speaker_number = (context.get("speaker_order") or {}).get(
-                    speaker_subject_id)
-                speaker_label = declared_label(
-                    speaker_declaration, speaker_subject_number,
-                    "referenced_label_template")
-                speaker_token = declared_label(
-                    effective_speaker_policy(context.get("profile") or {}),
-                    speaker_number, "token_template")
-                if speaker_label and speaker_token:
-                    speaker_suffix = f" for {speaker_label} {speaker_token}"
-            for audio_label in (value for value in source_labels
-                                if any(str(value).startswith(prefix)
-                                       for prefix in audio_prefixes)):
+            speaker_number = (context.get("speaker_order") or {}).get(
+                str(unit_id))
+            speaker_token = declared_label(
+                effective_speaker_policy(context.get("profile") or {}),
+                speaker_number, "token_template")
+            if identity_label and speaker_token:
+                speaker_suffix = f" for {identity_label} {speaker_token}"
+            for audio_label, member_id in _unit_audio_source_pairs(
+                    unit_id, context):
+                audio_definition = (configured_audio_definition
+                                    or _setup_member_prompt(member_id, context))
                 if audio_definition:
                     lines.append((("audio_definition", str(audio_label)), [
-                        _segment(SEGMENT_LABEL, audio_label),
+                        _segment(SEGMENT_LABEL, audio_label,
+                                 member_id=member_id),
                         _segment(SEGMENT_TEXT, " is "),
                         _segment(SEGMENT_TEXT, audio_definition, authored=True),
                         # Carries BOTH a renumbering label and a document-order
                         # speaker token, so it is derived twice over.
                         _segment(SEGMENT_SPEAKER, speaker_suffix,
-                                 subject_id=speaker_subject_id),
+                                 subject_id=str(unit_id)),
                     ]))
         manifest = context.get("ordinal_manifest") or {}
         for declaration in physical_population_declarations(
@@ -3176,7 +3226,10 @@ def _reference_capability_parts(attachment, capability, context) -> list[tuple]:
             detail = ""
             if isinstance(details, dict):
                 detail = str(details.get(label) or "").strip()
-            detail = detail or str(config.get("retention_detail") or "").strip()
+            if not detail:
+                detail = str(config.get(
+                    "audio_retention_detail" if is_audio
+                    else "retention_detail") or "").strip()
             owner = (("retention_subject", str(unit_id))
                      if identity_declaration is not None
                      else ("retention_physical", str(label)))
@@ -3214,7 +3267,8 @@ def _reference_capability_parts(attachment, capability, context) -> list[tuple]:
             return [(("mention", attachment["attachment_id"]),
                      [_segment(SEGMENT_TEXT, authored, authored=True)])]
         segments = []
-        for label, source in _reference_label_pairs(attachment, context):
+        for label, source in _reference_label_pairs(
+                attachment, context, include_unit_audio=False):
             if segments:
                 segments.append(_segment(SEGMENT_TEXT, " "))
             segments.append(_segment(SEGMENT_LABEL, label,
@@ -3480,7 +3534,8 @@ def _handle_sources(context) -> dict:
         # for the other namespace, asked through the label authority rather than
         # by re-deriving what "staged" means.
         source = {"semantic_unit_ids": [str(unit_id)]}
-        if not _reference_labels({"source": source}, context):
+        if not _reference_labels(
+                {"source": source}, context, include_unit_audio=False):
             continue
         result[handle] = source
     context["_handle_sources"] = result
@@ -3514,7 +3569,8 @@ def _resolve_handle_mentions(text, context) -> str:
         source = sources.get(str(row["handle"]).casefold())
         if not source:
             continue
-        labels = _reference_labels({"source": source}, context)
+        labels = _reference_labels(
+            {"source": source}, context, include_unit_audio=False)
         if not labels:
             continue
         value = value[:row["start"]] + " ".join(labels) + value[row["end"]:]
@@ -4016,6 +4072,19 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         for unit in (normalize_semantic_unit(value)
                      for value in context.get("semantic_units") or [])
     }
+    for unit in context["semantic_units_by_id"].values():
+        legacy_voice = (unit.get("voice")
+                        if isinstance(unit.get("voice"), dict) else {})
+        if not str(legacy_voice.get("member_id") or ""):
+            continue
+        warnings.append({
+            "code": "legacy_voice_binding",
+            "semantic_unit_id": str(unit.get("semantic_unit_id") or ""),
+            "message": (
+                "This Prompt identity carries a retired voice binding. It is "
+                "preserved but ignored; open the identity to add that member "
+                "as a physical source when the repair action is available."),
+        })
 
     # Resolve the tri-state capability `enabled` ONCE, into the in-memory
     # compile only. Storage stays sparse — absent means inherit the shared
@@ -4063,6 +4132,53 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         event["node_order"], event["attachment"]["attachment_id"]))
     speaker_order = _speaker_bindings(vocal_events)
     context["speaker_order"] = speaker_order
+    # Compiler-owned scratch state must never leak across a reused/injected
+    # context, including when the next compile resolves a non-H3 profile.
+    context.pop("h3_summary_task_types", None)
+    if is_h3_reference_profile:
+        # Summary is a scene singleton. Collect explicit selections across the
+        # effective window before any chip renders, so each chip sees the same
+        # canonical prefix instead of whichever chip happened to compile first.
+        # The window scope deliberately matches role-derived task types.
+        explicit_summary_task_types = []
+        has_explicit_summary_task_types = False
+        for attachment in all_attachments:
+            if (not attachment.get("enabled", True)
+                    or attachment.get("kind") != "reference"):
+                continue
+            for capability in _enabled_capabilities(
+                    attachment, resolved_profile):
+                kind = str(capability.get("kind")
+                           or capability.get("capability_id") or "")
+                if kind != "summary":
+                    continue
+                config = effective_reference_config(
+                    attachment, capability, context)
+                values = config.get("task_types")
+                if not isinstance(values, list):
+                    continue
+                normalized = [str(value or "").strip()
+                              for value in values if str(value or "").strip()]
+                if normalized:
+                    has_explicit_summary_task_types = True
+                    explicit_summary_task_types.extend(normalized)
+        if has_explicit_summary_task_types:
+            context["h3_summary_task_types"] = _minimax_task_types(
+                context, explicit_summary_task_types, resolved_profile)
+    if is_h3_reference_profile:
+        for event in vocal_events:
+            source = event["attachment"].get("source") or {}
+            if source.get("subject_ids") or not str(source.get("voice_id") or ""):
+                continue
+            warnings.append({
+                "code": "stable_voice_event_not_identity_speaker",
+                "attachment_id": event["attachment"]["attachment_id"],
+                "message": (
+                    "A Vocal Event using only a stable voice key creates no "
+                    "Prompt identity relationship; select an identity in that "
+                    "event if its audio definition should carry this speaker "
+                    "suffix."),
+            })
     speakers_by_attachment = {
         event["attachment"]["attachment_id"]: event.get("speaker_numbers", [])
         for event in vocal_events
@@ -4233,13 +4349,16 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 if isinstance(value, int) and not isinstance(value, bool)
                 and value > 0}
         next_number = 1
-        assetless_units = sorted(
+        effectively_assetless_units = sorted(
             (unit for unit in context["semantic_units_by_id"].values()
              if str(unit.get("kind") or "subject") == kind
-             and not unit.get("sources")),
+             and (not unit.get("sources")
+                  or (is_h3_reference_profile
+                      and not (context.get("unit_source_labels") or {}).get(
+                          str(unit.get("semantic_unit_id") or ""))))),
             key=lambda unit: (int(unit.get("order") or 0),
                               str(unit.get("semantic_unit_id") or "")))
-        for unit in assetless_units:
+        for unit in effectively_assetless_units:
             unit_id = str(unit.get("semantic_unit_id") or "")
             if not unit_id or unit_id in target:
                 continue
@@ -4306,6 +4425,19 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             for capability in _enabled_capabilities(attachment, resolved_profile):
                 config.update(effective_reference_config(
                     attachment, capability, context))
+            stored_audio_speaker_id = str(
+                config.get("audio_speaker_subject_id") or "")
+            audio_unit_ids = [
+                unit_id for unit_id in unit_ids
+                if _unit_audio_source_pairs(unit_id, context)
+            ]
+            if (stored_audio_speaker_id
+                    and (len(audio_unit_ids) != 1
+                         or stored_audio_speaker_id != audio_unit_ids[0])):
+                reference_warning(
+                    "stale_audio_speaker_binding",
+                    "This saved Audio target speaker is ignored. Identity-owned audio now follows its owning Prompt identity; standalone audio has no speaker target.",
+                    attachment["attachment_id"])
             for unit_id in unit_ids:
                 unit = context["semantic_units_by_id"].get(unit_id)
                 if unit is None:
@@ -4367,25 +4499,17 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                         "missing_h3_subject_definition",
                         f"Reference Subject {unit.get('name') or unit_id!r} needs an authored definition.",
                         attachment["attachment_id"])
-                audio_prefixes = [
-                    declared_label_prefix(declaration)
-                    for declaration in physical_population_declarations(resolved_profile)
-                    if str(declaration.get("token_kind") or "") == "audio"
-                    and declared_label_prefix(declaration)
-                ]
-                if (any(any(str(value).startswith(prefix)
-                            for prefix in audio_prefixes) for value in
-                         context.get("unit_source_labels", {}).get(unit_id) or [])
-                        and not str(config.get("audio_definition") or "").strip()):
+                audio_pairs = _unit_audio_source_pairs(unit_id, context)
+                has_audio_definition = bool(
+                    str(config.get("audio_definition") or "").strip()
+                    or (audio_pairs and all(
+                        _setup_member_prompt(member_id, context)
+                        for _label, member_id in audio_pairs))
+                )
+                if audio_pairs and not has_audio_definition:
                     reference_warning(
                         "missing_h3_audio_definition",
                         f"Reference Subject {unit.get('name') or unit_id!r} includes audio and needs an authored Audio definition.",
-                        attachment["attachment_id"])
-                speaker_subject_id = str(config.get("audio_speaker_subject_id") or "")
-                if speaker_subject_id and speaker_subject_id not in speaker_order:
-                    reference_error(
-                        "unresolved_audio_speaker_binding",
-                        "An Audio definition can reuse only a Subject that has an actual managed Vocal Event in this window.",
                         attachment["attachment_id"])
                 member_ids = {str(value.get("member_id") or "")
                               for value in unit.get("sources") or []
@@ -4578,6 +4702,29 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     # author just cannot see the repetition from either chip.
     emitted_group_text = {}
     unresolved_prompt_tokens = set()
+    unresolved_attachment_handles = set()
+
+    def resolve_attachment_handles(value, attachment, channel_key):
+        """Resolve chip prose handles and report late-bound values in place."""
+        known = _handle_sources(context)
+        for row in prompt_tokens.handle_mentions(value):
+            handle = str(row["handle"])
+            if handle.casefold() in known:
+                continue
+            diagnostic_key = (attachment["attachment_id"], handle.casefold())
+            if diagnostic_key in unresolved_attachment_handles:
+                continue
+            unresolved_attachment_handles.add(diagnostic_key)
+            warnings.append({
+                "code": "unresolved_handle_mention",
+                "attachment_id": attachment["attachment_id"],
+                "channel_key": str(channel_key or ""),
+                "message": (
+                    f"@{handle} does not name anything staged in this window, "
+                    "so this chip text stays as written. That is expected if "
+                    "the Reference does not exist yet."),
+            })
+        return _resolve_handle_mentions(value, context)
 
     def resolve_attachment_tokens(value, attachment):
         declarations = prompt_token_declarations(resolved_profile)
@@ -4671,6 +4818,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                     attachment, capability, render_context):
                 # Resolve before owner-level dedupe so stable-id aliases that
                 # name the same Subject/slot compare as the same emission.
+                line = resolve_attachment_handles(
+                    line, attachment, channel)
                 line = resolve_attachment_tokens(line, attachment)
                 resolved_lines.append(line)
                 line_identity = (capability_kind, owner, channel)
@@ -4726,7 +4875,11 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 set_projection_state(projection, "empty", reason=
                                      "This capability resolved to no text.")
             return value
-        identity = (identity_owner, capability["capability_id"],
+        capability_identity = (
+            "summary" if is_h3_reference_profile
+            and capability_kind == "summary"
+            else capability["capability_id"])
+        identity = (identity_owner, capability_identity,
                     capability.get("kind"), channel)
         value = _render_generic(
             attachment, capability, render_context,
@@ -4735,6 +4888,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             # Custom enum substitution is already complete here. The token pass
             # remains a separate stable-id-only operation and cannot expose a
             # general formatter or arbitrary field interpolation path.
+            value = resolve_attachment_handles(value, attachment, channel)
             value = resolve_attachment_tokens(value, attachment)
         if len(value.encode("utf-8")) > MAX_ATTACHMENT_OUTPUT:
             errors.append({"code": "attachment_output_limit",

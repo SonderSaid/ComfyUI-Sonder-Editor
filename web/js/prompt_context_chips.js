@@ -18,6 +18,7 @@ import {
     orderedReferenceDerived,
     referenceDerivedDeclarations,
     referenceFieldDeclaration,
+    referenceSelectionPopulation,
 } from "./prompt_profile_declarations.js";
 import { promptCandidateVisuallyStale } from "./prompt_context_diagnostics.js";
 
@@ -63,13 +64,15 @@ const DIALOGUE_LANGUAGES = ["English", "Spanish", "French", "German", "Italian",
     "Japanese", "Korean", "Chinese", "Portuguese", "Hindi"];
 export const REFERENCE_OVERRIDE_FIELDS = Object.freeze([
     "definition", "summary", "task_types", "retention_detail",
+    "audio_retention_detail",
     "retention_details", "audio_definition", "audio_relationship", "text",
     "visual_intent", "audio_intent",
 ]);
 const REFERENCE_CAPABILITY_VALUE_FIELDS = Object.freeze({
     definitions: Object.freeze(["definition", "audio_definition"]),
     summary: Object.freeze(["summary", "task_types"]),
-    retention: Object.freeze(["retention_detail", "visual_intent", "audio_intent"]),
+    retention: Object.freeze(["retention_detail", "audio_retention_detail",
+        "visual_intent", "audio_intent"]),
     mentions: Object.freeze(["text"]),
     audio_relationship: Object.freeze(["audio_relationship"]),
     derived_prompt: Object.freeze([]),
@@ -77,7 +80,9 @@ const REFERENCE_CAPABILITY_VALUE_FIELDS = Object.freeze({
 const REFERENCE_VALUE_LABELS = Object.freeze({
     definition: "Definition", audio_definition: "Audio definition",
     summary: "Summary", task_types: "Summary task types",
-    retention_detail: "Preservation detail", visual_intent: "Visual handling",
+    retention_detail: "Preservation detail",
+    audio_retention_detail: "Audio preservation detail",
+    visual_intent: "Visual handling",
     audio_intent: "Audio handling", text: "Inline mention",
     audio_relationship: "Audio relationship",
 });
@@ -113,7 +118,7 @@ function authoritySource(label, kind) {
 // needs a renderer-side shape, because there is nothing else to ask.
 const REFERENCE_MULTILINE_FIELDS = Object.freeze(new Set([
     "definition", "audio_definition", "summary", "retention_detail",
-    "audio_relationship",
+    "audio_retention_detail", "audio_relationship",
 ]));
 // Floor fields that are enums rather than prose. They render ONLY when the
 // format declares their vocabulary — there is no renderer-side value list to
@@ -699,13 +704,10 @@ export function semanticIdentityDependencyIds(attachments) {
         if (!attachment || typeof attachment !== "object") continue;
         const source = attachment.source && typeof attachment.source === "object"
             ? attachment.source : {};
-        const config = attachment.config && typeof attachment.config === "object"
-            ? attachment.config : {};
         const values = [];
         for (const key of ["semantic_unit_ids", "subject_ids"]) {
             if (Array.isArray(source[key])) values.push(...source[key]);
         }
-        values.push(config.audio_speaker_subject_id);
         for (const value of values) {
             const id = String(value || "");
             if (!id || seen.has(id)) continue;
@@ -973,6 +975,9 @@ export function referencePromptDefaults(selected, {
     const value = String(selected || "");
     const physical = value.match(/^physical:[a-z][a-z0-9_]*:(.+)$/);
     if (physical) {
+        const population = referenceSelectionPopulation(profile, value);
+        const proseField = String(population?.token_kind || "") === "audio"
+            ? "audio_definition" : "definition";
         const memberId = physical[1];
         const rows = stagedRowsFor([memberId]);
         for (const reference of references || []) {
@@ -998,7 +1003,7 @@ export function referencePromptDefaults(selected, {
             }
             // Authored Library prose is the definition of last resort, so a
             // blank chip FOLLOWS the member instead of emitting nothing.
-            withSemanticFallback(values, fieldSources, "definition",
+            withSemanticFallback(values, fieldSources, proseField,
                 String(member.prompt || "").trim(),
                 authoritySource(memberSource, "member"));
             // Intent resolution mirrors the server setup manifest exactly:
@@ -3783,6 +3788,33 @@ export function createReferenceOverrideFieldset({
         ? structuredClone(overrides) : {};
     const overriddenFields = new Set(Object.keys(working));
     let currentSelection = String(selected || "");
+    const populationForSelection = () =>
+        referenceSelectionPopulation(profile, currentSelection);
+    const fieldApplicability = (field) => {
+        const population = populationForSelection();
+        if (!population) return { applicable: true, note: "" };
+        const tokenKind = String(population.token_kind || "");
+        const label = String(population.label || tokenKind || "physical");
+        const visualField = ["definition", "retention_detail", "visual_intent"]
+            .includes(field);
+        if (tokenKind === "audio" && visualField) {
+            return {
+                applicable: false,
+                note: `${REFERENCE_VALUE_LABELS[field] || field} is not read for an audio ${label} Reference. Reset this saved override to hide it.`,
+            };
+        }
+        const visualOnly = tokenKind && tokenKind !== "audio";
+        const audioField = ["audio_definition", "audio_retention_detail"]
+            .includes(field)
+            || (field === "audio_intent" && tokenKind !== "video");
+        if (visualOnly && audioField) {
+            return {
+                applicable: false,
+                note: `${REFERENCE_VALUE_LABELS[field] || field} is not read for this ${label} Reference. Reset this saved override to hide it.`,
+            };
+        }
+        return { applicable: true, note: "" };
+    };
 
     const inheritedFor = (field) => referencePromptDefaults(currentSelection, {
         references, semanticUnits, profile, setupManifest,
@@ -3910,7 +3942,10 @@ export function createReferenceOverrideFieldset({
                 { padding: "3px 6px", fontSize: "9px", lineHeight: "1.3" });
             const state = document.createElement("span");
             state.style.cssText = "grid-column:1/-1;font:9px/1.25 system-ui;";
-            statuses.set(field, { state, reset });
+            const mediaNote = document.createElement("span");
+            mediaNote.dataset.sonderWrongMediaOverride = field;
+            mediaNote.style.cssText = `grid-column:1/-1;display:none;font:9px/1.3 system-ui;color:${COLORS.warningText};`;
+            statuses.set(field, { state, reset, mediaNote });
 
             const markOverride = () => {
                 overriddenFields.add(field);
@@ -3931,7 +3966,7 @@ export function createReferenceOverrideFieldset({
                 applyDisclosure();
                 onOverrideChange?.(field);
             });
-            wrapper.append(control, reset, state);
+            wrapper.append(control, reset, state, mediaNote);
             rows.set(field, fieldRow(label, wrapper, help, { visibleHelp: true }));
             refreshOverrideStatus(field);
         }
@@ -3955,13 +3990,23 @@ export function createReferenceOverrideFieldset({
     summaryToggle.style.flex = "0 0 auto";
     summaryRow.append(summaryText, summaryToggle);
 
-    const inheritingFields = () => fields.filter(
-        (field) => !overriddenFields.has(field));
+    const inheritingFields = () => fields.filter((field) =>
+        fieldApplicability(field).applicable && !overriddenFields.has(field));
     const applyDisclosure = () => {
         const following = inheritingFields();
         for (const [field, row] of rows) {
-            row.style.display = (expanded || overriddenFields.has(field))
+            const applicability = fieldApplicability(field);
+            const storedWrongMedia = !applicability.applicable
+                && overriddenFields.has(field);
+            row.style.display = (storedWrongMedia
+                    || (applicability.applicable
+                        && (expanded || overriddenFields.has(field))))
                 ? "grid" : "none";
+            const mediaNote = statuses.get(field)?.mediaNote;
+            if (mediaNote) {
+                mediaNote.textContent = applicability.note;
+                mediaNote.style.display = storedWrongMedia ? "block" : "none";
+            }
         }
         // Name the MOST SPECIFIC source in play, not a count. Mixed tiers are
         // the normal case for a physical member — format defaults for most
@@ -3982,7 +4027,9 @@ export function createReferenceOverrideFieldset({
         const origin = ranked.length
             ? `${ranked[0][0]}${ranked.length > 1 ? ` +${ranked.length - 1} more` : ""}`
             : "its defaults";
-        const overrideCount = fields.length - following.length;
+        const relevantFields = fields.filter((field) =>
+            fieldApplicability(field).applicable || overriddenFields.has(field));
+        const overrideCount = relevantFields.length - following.length;
         summaryText.textContent = following.length
             ? `${following.length} field${following.length === 1 ? "" : "s"} following ${origin}`
             : "Every field on this attachment is overridden.";
@@ -4008,6 +4055,7 @@ export function createReferenceOverrideFieldset({
         rows,
         summaryRow,
         has: (field) => controls.has(field),
+        isApplicable: (field) => fieldApplicability(field).applicable,
         row: (field) => rows.get(field) || null,
         isExpanded: () => expanded,
         setExpanded: (value) => { expanded = !!value; applyDisclosure(); },
@@ -4430,59 +4478,6 @@ export function configurePromptAttachment(rawAttachment, {
                 deliveryRow.appendChild(toggleDelivery);
             }
 
-            const voiceConversion = document.createElement("div");
-            voiceConversion.style.cssText = "display:none;grid-template-columns:130px 1fr;gap:6px 8px;align-items:center;";
-            const voiceConversionLabel = document.createElement("span");
-            voiceConversionLabel.textContent = "Convert voice key";
-            voiceConversionLabel.style.cssText = `font:10px system-ui;color:${COLORS.textSecondary};`;
-            controls.voiceConversion = selectField([["", "Keep voice key only"]], "");
-            voiceConversion.append(voiceConversionLabel, controls.voiceConversion);
-            controls.voiceConversionRow = voiceConversion;
-            const voiceMatches = () => (semanticUnits || []).filter((unit) =>
-                String(unit?.voice?.member_id || "")
-                && String(unit.voice.member_id) === controls.voice.value.trim());
-            const refreshVoiceConversion = () => {
-                const matches = voiceMatches();
-                controls.voiceConversion.textContent = "";
-                // `options` is a live collection in browsers; the explicit
-                // length assignment also keeps the tiny DOM used by tests
-                // honest instead of retaining removed choices.
-                controls.voiceConversion.options.length = 0;
-                const keep = document.createElement("option");
-                keep.value = "";
-                keep.textContent = matches.length
-                    ? "Choose an identity explicitly…" : "No matching Prompt Identity";
-                controls.voiceConversion.appendChild(keep);
-                for (const unit of matches) {
-                    const option = document.createElement("option");
-                    option.value = String(unit.semantic_unit_id);
-                    const canSpeak = validSpeakerIds.has(option.value);
-                    option.textContent = (unit.handle
-                        ? `@${unit.handle} — ${unit.name || unit.semantic_unit_id}`
-                        : String(unit.name || unit.semantic_unit_id))
-                        + (canSpeak ? "" : " — cannot speak in this format");
-                    option.disabled = !canSpeak;
-                    controls.voiceConversion.appendChild(option);
-                }
-                controls.voiceConversion.value = "";
-                voiceConversion.style.display = controls.voice.value.trim() ? "grid" : "none";
-            };
-            controls.voice.addEventListener("input", refreshVoiceConversion);
-            controls.voiceConversion.addEventListener("change", () => {
-                const value = controls.voiceConversion.value;
-                if (!value) return;
-                if (controls.eventType.value === "group_speech") {
-                    for (const option of controls.groupSpeakers.options) {
-                        if (option.value === value) option.checked = true;
-                    }
-                } else {
-                    controls.ordinarySpeaker.value = value;
-                }
-                controls.voiceConversion.value = "";
-                controls.otherBox.style.display = "none";
-            });
-            refreshVoiceConversion();
-
             const refreshVocalMode = () => {
                 const group = controls.eventType.value === "group_speech";
                 speakerRow.style.display = group ? "none" : "grid";
@@ -4517,7 +4512,6 @@ export function configurePromptAttachment(rawAttachment, {
                 phraseRow, deliveryRow, controls.deliveryNotice,
                 fieldRow("Stable voice key (advanced)", controls.voice,
                     "Alternative integration key for a voice. It is not a provider or model ID and is never removed during identity conversion."),
-                voiceConversion,
                 controls.bindingNotice,
                 fieldRow("Words", controls.text));
         } else if (attachment.kind === "reference") {
@@ -4575,7 +4569,11 @@ export function configurePromptAttachment(rawAttachment, {
                     scene, references, semanticUnits,
                 });
                 const isPhysical = /^physical:/.test(controls.reference.value);
-                if (definitionControl) {
+                const definitionApplicable = Boolean(definitionControl)
+                    && referenceFieldset.isApplicable("definition");
+                inheritanceNotice.style.display = definitionApplicable
+                    ? "block" : "none";
+                if (definitionApplicable) {
                     definitionControl.placeholder = inherited.value
                         || "Describe this Subject for prompt use…";
                 }
@@ -4587,27 +4585,6 @@ export function configurePromptAttachment(rawAttachment, {
                 inheritanceNotice.style.color = inherited.value
                     ? COLORS.textSecondary : COLORS.dangerText;
             };
-            const managedSpeakers = new Set((managedSpeakerSubjectIds || []).map(String));
-            const currentSpeaker = String(attachment.config.audio_speaker_subject_id || "");
-            const speakerOptions = [["", "No target speaker binding", true],
-                ...(semanticUnits || []).map((value) => {
-                    const unitId = String(value.semantic_unit_id || "");
-                    const available = managedSpeakers.has(unitId);
-                    return [unitId, `${value.name || unitId}${available
-                        ? "" : " — no managed Vocal Event in this window"}`, available];
-                })];
-            if (currentSpeaker && !speakerOptions.some((row) => row[0] === currentSpeaker)) {
-                speakerOptions.push([currentSpeaker,
-                    `Unavailable: ${currentSpeaker} — no managed Vocal Event in this window`, false]);
-            }
-            controls.audioSpeaker = selectField([
-                ...speakerOptions,
-            ], currentSpeaker);
-            speakerOptions.forEach((value, index) => {
-                if (controls.audioSpeaker.options[index]) {
-                    controls.audioSpeaker.options[index].disabled = value[2] === false;
-                }
-            });
             const summaryControl = referenceFieldset.controls.get("summary") || null;
             const tokenStrip = document.createElement("div");
             tokenStrip.style.cssText = "grid-column:2;display:flex;gap:4px;align-items:center;flex-wrap:wrap;margin-top:-3px;";
@@ -4694,8 +4671,6 @@ export function configurePromptAttachment(rawAttachment, {
                 referenceRows.push(inheritanceNotice);
             }
             referenceFieldset.pushRow(referenceRows, "audio_definition");
-            referenceRows.push(referenceFieldRow("Audio target speaker", controls.audioSpeaker,
-                "Reuses the (Sx) assigned by that Subject's first managed Vocal Event; it never creates speaker order."));
             if (referenceFieldset.pushRow(referenceRows, "summary")) {
                 referenceRows.push(tokenStrip);
                 const otherSummaryOwners = [
@@ -4716,6 +4691,7 @@ export function configurePromptAttachment(rawAttachment, {
                 }
             }
             for (const field of ["task_types", "text", "retention_detail",
+                "audio_retention_detail",
                 "audio_relationship", "visual_intent", "audio_intent"]) {
                 referenceFieldset.pushRow(referenceRows, field);
             }
@@ -5017,13 +4993,13 @@ export function configurePromptAttachment(rawAttachment, {
             };
             controls.reference.addEventListener("change", () => {
                 renderCapabilities();
-                updateInheritance();
                 refreshInheritedFields();
+                updateInheritance();
                 renderTokenStrip();
             });
             renderCapabilities();
-            updateInheritance();
             refreshInheritedFields();
+            updateInheritance();
             renderTokenStrip();
         }
 
@@ -5192,7 +5168,7 @@ export function configurePromptAttachment(rawAttachment, {
                     attachment.source.semantic_unit_ids = [controls.reference.value];
                     delete attachment.source.reference_item_id;
                 }
-                attachment.config.audio_speaker_subject_id = controls.audioSpeaker.value;
+                delete attachment.config.audio_speaker_subject_id;
                 // Collected from the SAME control map the rows were built from.
                 // A fixed field list here dereferenced controls that a
                 // declaration gate had legitimately never created, throwing

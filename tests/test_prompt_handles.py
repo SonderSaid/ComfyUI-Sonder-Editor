@@ -128,7 +128,10 @@ def test_identity_contributions_and_attachment_defaults_survive_round_trip():
     normalized = prompt_context.normalize_semantic_unit(raw)
     restored = prompt_context.normalize_semantic_unit(normalized)
     assert restored == normalized
-    assert restored["sources"] == raw["sources"]
+    assert restored["sources"] == [{
+        "entity_id": "woman", "member_id": "portrait-member",
+        "contribution": "appearance",
+    }]
     assert restored["attachment_defaults"] == raw["attachment_defaults"]
 
 
@@ -173,6 +176,133 @@ def test_handle_namespace_is_case_insensitive_across_physical_and_identity():
             project, "kwoman", "prompt identity", "other",
             semantic_units=units)
     assert identity_collision.value.code == "handle_collision"
+
+
+def _compile_chip_handle_prose(text):
+    chip = prompt_context.normalize_attachment({
+        "kind": "reference", "source": {"audio_ids": ["voice"]},
+        "config": {"audio_relationship": text},
+        "capabilities": [{
+            "capability_id": "audio_relationship", "kind": "audio_relationship",
+            "channel_key": "summary", "placement": "section_prefix",
+        }],
+    })
+    context = {
+        "setup_manifest": {
+            "setup": {"mode": "reference"},
+            "standalone_audios": [{"member_id": "voice", "audio_ordinal": 1}],
+            "presentation": [{"kind": "audio", "member_id": "voice",
+                              "audio_ordinal": 1}],
+        },
+        "ordinal_manifest": {
+            "subjects": {"woman": 1}, "audios": {"voice": 1}},
+        "unit_source_labels": {"woman": ["<Audio 1>"]},
+        "unit_source_members": {"woman": ["voice"]},
+        "semantic_units": [{
+            "semantic_unit_id": "woman", "handle": "KWoman", "name": "Woman",
+            "definition": "a woman", "sources": [
+                {"entity_id": "woman-ref", "member_id": "voice"}],
+        }],
+    }
+    compiled = prompt_context.compile_prompt_context(
+        sections=[PromptSection(
+            0, 24, channels={"detailed_description": "scene"},
+            attachments=[chip])],
+        window_start=0, window_end=24, fps=24,
+        template="minimax_h3_ref", profile="minimax_h3_ref@1",
+        context=context, labels_on=True)
+    return chip, context, compiled
+
+
+def test_handle_in_chip_config_prose_resolves_to_identity_only():
+    chip, context, compiled = _compile_chip_handle_prose(
+        "the voice timbre of @KWoman")
+    assert compiled["channels"]["summary"] == (
+        "the voice timbre of <Subject 1>")
+    assert "<Subject 1> <Audio 1>" not in compiled["channels"]["summary"]
+    capability = chip["capabilities"][0]
+    context.update({
+        "profile": prompt_context.BUILTIN_PROFILES["minimax_h3_ref@1"],
+        "semantic_units_by_id": {"woman": context["semantic_units"][0]},
+    })
+    plan = prompt_context.copy_capability_plan(chip, capability, context)
+    assert any(part.get("text") == "the voice timbre of @KWoman"
+               for line in plan["lines"] for part in line["parts"])
+
+
+def test_unresolved_handle_in_chip_prose_warns_without_blocking():
+    chip, _context, compiled = _compile_chip_handle_prose(
+        "the voice timbre of @Missing and @Missing")
+    assert compiled["channels"]["summary"] == (
+        "the voice timbre of @Missing and @Missing")
+    assert compiled["errors"] == []
+    diagnostics = [value for value in compiled["warnings"]
+                   if value["code"] == "unresolved_handle_mention"]
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["attachment_id"] == chip["attachment_id"]
+    assert diagnostics[0]["channel_key"] == "summary"
+
+
+def test_chip_prose_handle_resolution_is_case_insensitive():
+    _chip, _context, compiled = _compile_chip_handle_prose(
+        "the voice timbre of @kWoMaN")
+    assert compiled["channels"]["summary"] == (
+        "the voice timbre of <Subject 1>")
+
+
+def test_inherited_definition_handles_resolve_at_line_seam_but_copy_stays_live():
+    chip = prompt_context.normalize_attachment({
+        "attachment_id": "definition-chip", "kind": "reference",
+        "source": {"semantic_unit_ids": ["woman"]},
+        "capabilities": [{
+            "capability_id": "definitions", "kind": "definitions",
+            "channel_key": "subject_definitions", "placement": "section_prefix",
+        }],
+    })
+    unit = {
+        "semantic_unit_id": "woman", "handle": "KWoman", "name": "Woman",
+        "kind": "subject", "sources": [
+            {"entity_id": "portrait-ref", "member_id": "portrait"}],
+    }
+    compiled = prompt_context.compile_prompt_context(
+        sections=[PromptSection(
+            0, 24, channels={"detailed_description": "scene"},
+            attachments=[chip])],
+        window_start=0, window_end=24, fps=24,
+        template="minimax_h3_ref", profile="minimax_h3_ref@1",
+        context={
+            "setup_manifest": {
+                "setup": {"mode": "reference"},
+                "pictures": [{"member_id": "portrait", "picture_ordinal": 1}],
+                "presentation": [{
+                    "kind": "picture", "member_id": "portrait",
+                    "picture_ordinal": 1,
+                    "member_prompt": (
+                        "portrait of @KWoman beside @Missing and @Missing"),
+                }],
+            },
+            "ordinal_manifest": {
+                "subjects": {"woman": 1}, "pictures": {"portrait": 1}},
+            "unit_source_labels": {"woman": ["<Picture 1>"]},
+            "unit_source_members": {"woman": ["portrait"]},
+            "semantic_units": [unit],
+        }, labels_on=True,
+        copy_plan_for={
+            "attachment_id": "definition-chip",
+            "capability_id": "definitions",
+        })
+    rendered = compiled["channels"]["subject_definitions"]
+    assert "portrait of <Subject 1> beside @Missing and @Missing" in rendered
+    diagnostics = [value for value in compiled["warnings"]
+                   if value["code"] == "unresolved_handle_mention"]
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["attachment_id"] == "definition-chip"
+    assert diagnostics[0]["channel_key"] == "subject_definitions"
+    copy_text = "".join(
+        part.get("text", "")
+        for line in compiled["copy_plan"]["lines"]
+        for part in line["parts"])
+    assert "portrait of @KWoman beside @Missing and @Missing" in copy_text
 
 
 def test_member_update_and_delete_expected_use_stored_handle_not_suggestion():
