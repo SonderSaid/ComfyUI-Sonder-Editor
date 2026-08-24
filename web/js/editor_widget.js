@@ -11204,11 +11204,10 @@ export class EditorWidget {
     }
 
     /**
-     * Warn when a Reference lane resolves for some chunks of a batch but not
-     * others. A `has_reference` 1→0 flip mid-batch changes the inferred task
-     * mode of connectivity-driven mechanisms (Bernini-R infers t2v/r2v from
-     * which sockets are wired), so one continuous shot can render under two
-     * different modes with nothing on screen explaining why.
+     * Warn when a staged Reference lane resolves for some chunks of a batch but
+     * not others. A multi-lane Selector can keep aggregate `has_reference` on,
+     * so the actionable fact is lane-local: any Selector that includes the lane
+     * will emit its reserved unused fallbacks for the chunks where it drops.
      */
     _warnOnReferenceFlipAcrossBatch(chunks) {
         const scene = this.activeScene;
@@ -11238,28 +11237,28 @@ export class EditorWidget {
         const scopeFlips = flipping.filter(
             (lane) => lane.causeCounts[REFERENCE_LANE_CAUSE.OUTSIDE] > 0);
 
-        // Both cases flip `has_reference` 1->0 mid-batch and both change the
-        // inferred task mode, so neither is silent. They differ in whether the
-        // user chose it: a scoped item dropping outside its own range is the
-        // feature working, while the threshold dropping a chunk it does overlap
-        // is a setting the user probably did not mean to hit. Sticky for the
-        // one worth stopping over, transient for the one worth knowing.
+        // Both cases leave that lane's reserved block unused for some chunks,
+        // so neither is silent. They differ in whether the user chose it: a
+        // scoped item dropping outside its own range is the feature working,
+        // while the threshold dropping a chunk it does overlap is a setting the
+        // user probably did not mean to hit. Sticky for the one worth stopping
+        // over, transient for the one worth knowing.
         if (thresholdFlips.length) {
             notifyWarning(
                 `${named(thresholdFlips, REFERENCE_LANE_CAUSE.BELOW_THRESHOLD)} — dropped from chunks this `
                 + "item does overlap, because each chunk covers too little of its own span for the current "
-                + "Reference Threshold. Those chunks lose the reference, and mechanisms that infer their task "
-                + "from which sockets are connected will run them in a different mode. Lower the Reference "
-                + "Threshold in Settings, or widen the staged item.",
+                + "Reference Threshold. If a Reference Selector includes this lane, its reserved Bridge slots "
+                + "emit unused fallbacks in those chunks. Lower the Reference Threshold in Settings, or widen "
+                + "the staged item.",
                 { source: "reference-batch-flip", duration: 0 },
             );
         }
         if (scopeFlips.length) {
             notifyInfo(
                 `${named(scopeFlips, REFERENCE_LANE_CAUSE.OUTSIDE)} — chunks outside the staged range carry no `
-                + "reference, which is what scoping the item does. Mechanisms that infer their task from which "
-                + "sockets are connected will run those chunks in a different mode. Widen the staged range if "
-                + "the whole batch should match.",
+                + "reference, which is what scoping the item does. If a Reference Selector includes this lane, "
+                + "its reserved Bridge slots emit unused fallbacks there. Widen the staged range if the whole "
+                + "batch should match.",
                 { source: "reference-batch-scope" },
             );
         }

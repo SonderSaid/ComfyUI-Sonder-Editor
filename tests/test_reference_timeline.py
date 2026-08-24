@@ -714,6 +714,7 @@ def test_reference_library_can_explain_a_refused_drag():
 def test_reference_bridge_shape_tracks_project_writes_and_recipe_liveness():
     """Durable writes and browser-local render-window changes refresh slots."""
     bridge = (ROOT / "web" / "js" / "reference_bridge.js").read_text(encoding="utf-8")
+    shape = (ROOT / "web" / "js" / "reference_bridge_shape.js").read_text(encoding="utf-8")
     client = (ROOT / "web" / "js" / "api_client.js").read_text(encoding="utf-8")
     controller = (ROOT / "web" / "js" / "editor_node_controller.js").read_text(encoding="utf-8")
     window_events = (ROOT / "web" / "js" / "editor_render_window_events.js").read_text(encoding="utf-8")
@@ -724,9 +725,10 @@ def test_reference_bridge_shape_tracks_project_writes_and_recipe_liveness():
     for field in ("scene_id", "selection_start", "selection_end",
                   "pre_context_frames", "post_context_frames"):
         assert f'"{field}"' in window_events
-    assert "lane.image_slot_count" in bridge
-    assert "lane.audio_slot_count" in bridge
-    assert "lane.prompt_slot_count" in bridge
+    assert "mergedBridgeShape({" in bridge
+    assert "lane?.image_slot_count" in shape
+    assert "lane?.audio_slot_count" in shape
+    assert "lane?.prompt_slot_count" in shape
     assert "BRIDGES.has(nodeType(target))" in bridge
     assert "controller.whenProjectReady(() => refreshShape(node));" in bridge
     assert "Refresh reference slots" in bridge
@@ -740,9 +742,11 @@ def test_reference_bridge_shape_tracks_project_writes_and_recipe_liveness():
     policy_callback = policy_callback.split("const originalMenu", 1)[0]
     assert "unusedSlotsWidget.callback = function" in policy_callback
     assert "window.setTimeout(() => refreshShape(node), 0);" in policy_callback
-    # Every "we don't know" path resolves to the full shape, never a subset: an
-    # unwired selector, an unresolved project, a missing lane and a failed fetch.
-    assert bridge.count("return FULL_SHAPE;") == 4
+    # Every transport/source "we don't know" path resolves to the full shape,
+    # never a subset: an unwired selector, an unresolved project, or failed
+    # project readiness. Orphan-only selections reach the same fail-open result
+    # through mergedBridgeShape's null liveness contract.
+    assert bridge.count("return FULL_SHAPE;") == 3
     assert "applyReferenceBridgeShape(node, FULL_SHAPE)" in bridge
     assert "export function onProjectVersionChanged(callback)" in client
     assert "if (next !== current) emitProjectVersionChanged(normalizedProjectId, next);" in client
@@ -924,10 +928,14 @@ def test_bridge_references_gates_the_prompt_block_apart_from_the_r_block(monkeyp
     both = _bridge_reference_rows(monkeypatch, "sonder:wan_bernini")
     assert both["image_slot_count"] == 2 and both["prompt_slot_count"] == 2
     assert both["audio_slot_count"] == 0
+    assert both["reserved_member_span"] == 2
+    assert both["image_slot_labels"] == both["slot_labels"]
 
     assembled = _bridge_reference_rows(monkeypatch, "sonder:wan_vace")
     assert assembled["image_slot_count"] == 1
     assert assembled["prompt_slot_count"] == 2
+    assert assembled["image_slot_labels"] == [
+        "Assembled · Subject (subject) + Subject (subject)"]
 
     audio = _bridge_reference_rows(monkeypatch, "sonder:ltx_id_lora_audio", member_count=3)
     assert audio["media_kind"] == "audio"
@@ -935,22 +943,80 @@ def test_bridge_references_gates_the_prompt_block_apart_from_the_r_block(monkeyp
     assert audio["audio_slot_count"] == 3 and audio["prompt_slot_count"] == 3
     return
 
-    # Drives both blocks: counts agree.
-    both = _bridge_reference_rows(monkeypatch, "sonder:wan_bernini")
-    assert both["slot_count"] == 2 and both["prompt_slot_count"] == 2
 
-    # Drives text but never the r-block — the reported bug.
-    text_only = _bridge_reference_rows(monkeypatch, "sonder:wan_vace")
-    assert text_only["slot_count"] == 0, "VACE composites; it drives no r-slot"
-    assert text_only["prompt_slot_count"] == 2, "but its per-member text is real"
+def test_bridge_references_reserves_the_widest_item_and_labels_assembled_payloads_per_lane(monkeypatch):
+    import importlib
+    from types import SimpleNamespace
 
-    # The audio lane is NOT the same case: decode_reference_set's audio branch
-    # passes no slot_prompts, so its p-block genuinely is empty.
-    audio = _bridge_reference_rows(monkeypatch, "sonder:ltx_id_lora_audio", member_count=1)
-    assert audio["media_kind"] == "audio"
-    assert "reference_prompt" in audio["live_outputs"]
-    assert audio["slot_count"] == 0 and audio["prompt_slot_count"] == 0
+    from aiohttp import web
+    from aiohttp.test_utils import make_mocked_request
 
+    import server
+    import server.routes as routes_module
+    from server.timeline_state import REFERENCE_RECIPE_PRESETS
+
+    monkeypatch.setattr(
+        server, "PromptServer",
+        SimpleNamespace(instance=SimpleNamespace(routes=web.RouteTableDef())),
+        raising=False)
+    module = importlib.reload(routes_module)
+    preset = next(p for p in REFERENCE_RECIPE_PRESETS if p["id"] == "sonder:wan_vace")
+    assets, references = [], []
+    for index in range(4):
+        assets.append(Asset(
+            asset_id=f"asset-{index}", name=f"Asset {index}", asset_type="image",
+            path=f"media/{index}.png"))
+        references.append(ReferenceEntity(
+            reference_id=f"entity-{index}", name=f"Lane {index // 2} member {index % 2}",
+            members=[ReferenceMember(member_id=f"member-{index}", asset_id=f"asset-{index}")]))
+
+    def recipe(index):
+        return ReferenceLaneRecipe(
+            lane_id=f"lane-{index}", media_kind=preset["media_kind"], recipe_id=preset["id"],
+            recipe={key: value for key, value in preset.items() if key != "id"})
+
+    scene = Scene(
+        scene_id="scene-1", duration_frames=100, reference_lane_count=2,
+        reference_lane_configs=[LaneConfig(), LaneConfig()],
+        reference_lane_recipes=[recipe(0), recipe(1)],
+        reference_items=[
+            ReferenceItem(
+                reference_item_id="lane-0-now", lane_index=0, start_frame=0, end_frame=40,
+                members=[{"entity_id": "entity-0", "member_id": "member-0"}]),
+            ReferenceItem(
+                reference_item_id="lane-0-later", lane_index=0, start_frame=40, end_frame=-1,
+                members=[
+                    {"entity_id": "entity-0", "member_id": "member-0"},
+                    {"entity_id": "entity-1", "member_id": "member-1"},
+                ]),
+            ReferenceItem(
+                reference_item_id="lane-1-now", lane_index=1, start_frame=0, end_frame=-1,
+                members=[
+                    {"entity_id": "entity-2", "member_id": "member-2"},
+                    {"entity_id": "entity-3", "member_id": "member-3"},
+                ]),
+        ],
+    )
+    project = TimelineProject(
+        project_id="project-1", assets=assets, references=references, scenes=[scene])
+    monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
+    handler = next(r.handler for r in module.routes
+                   if r.method == "GET" and r.path.endswith("/bridge-references"))
+    request = make_mocked_request(
+        "GET", "/sonder-editor/project/project-1/scenes/scene-1/bridge-references"
+               "?selection_start=5&selection_end=20")
+    request.match_info.update({"project_id": "project-1", "scene_id": "scene-1"})
+    response = asyncio.run(handler(request))
+    assert response.status == 200
+    lane_0, lane_1 = json.loads(response.text)["references"]
+
+    assert lane_0["member_count"] == 1
+    assert lane_0["reserved_member_span"] == 2
+    assert lane_0["slot_labels"] == ["Lane 0 member 0 (subject)", "(unused)"]
+    assert lane_0["image_slot_count"] == 1
+    assert lane_0["image_slot_labels"] == ["Assembled · Lane 0 member 0 (subject)"]
+    assert lane_1["image_slot_labels"] == [
+        "Assembled · Lane 1 member 0 (subject) + Lane 1 member 1 (subject)"]
 
 def test_bridge_references_uses_effective_window_and_h3_video_image_labels(monkeypatch):
     import importlib
@@ -1031,8 +1097,10 @@ def test_bridge_references_uses_effective_window_and_h3_video_image_labels(monke
 
     absent = payload(40, 50)["references"][0]
     assert absent["member_count"] == 0
-    assert absent["image_slot_count"] == 0
-    assert absent["slot_labels"] == []
+    assert absent["reserved_member_span"] == 1
+    assert absent["image_slot_count"] == 1
+    assert absent["slot_labels"] == ["(unused)"]
+    assert absent["image_slot_labels"] == ["(unused)"]
 
     project.generation_queue = [GenerationJob(
         job_id="running", scene_id="scene-1", status="running",

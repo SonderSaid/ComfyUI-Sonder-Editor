@@ -63,8 +63,9 @@ export function memberPromptFragment(pattern, index, prompt, name, registryNumbe
     const numbers = registryNumbers && typeof registryNumbers === "object" ? registryNumbers : {};
     // split/join, not String.replace: a string-literal replace substitutes only
     // the first occurrence, while Python's str.replace substitutes every one.
-    // `{n}` stays lane-local; the four project-scoped tokens come from the
-    // cross-lane registry so one entity numbers the same on every lane.
+    // `index` is the emitted slot position supplied by the caller, while the
+    // four project-scoped tokens come from the cross-lane registry so one
+    // entity numbers the same on every lane.
     const expand = (promptValue) => String(pattern)
         .split("{subject_n}").join(String(numbers.subject_n || 0))
         .split("{picture_n}").join(String(numbers.picture_n || 0))
@@ -94,8 +95,11 @@ export function deriveReferencePrompt({ promptOverride = "", members = [], soft 
     const tokenPattern = String(soft?.prompt_tokens || "");
     const values = [];
     (Array.isArray(members) ? members : []).forEach((entry, index) => {
+        const slotIndex = Number.isInteger(entry?.slot_index) && entry.slot_index >= 0
+            ? entry.slot_index
+            : index;
         const fragment = memberPromptFragment(
-            tokenPattern, index, entry?.prompt,
+            tokenPattern, slotIndex, entry?.prompt,
             entry?.entity_name || entry?.name,
             entry?.registry_numbers || null,
             entry?.member_name || "",

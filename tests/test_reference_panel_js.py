@@ -572,55 +572,151 @@ SLOT_NAMES = [f"r{index:02d}" for index in range(1, 17)]
 PROMPT_SLOT_NAMES = [f"p{index:02d}" for index in range(1, 17)]
 
 
-def test_selector_panel_view_keeps_an_orphaned_lane_visible():
-    """The dropdown must never read as a lane other than the INT actually holds."""
+def test_selector_panel_view_parses_and_explains_multi_lane_selection(monkeypatch):
     node_bin = shutil.which("node")
     if not node_bin:
         pytest.skip("node is required for the selector view test")
+    shared_recipe = {"hard": {"assembly": "slots", "max_members": 4}}
     lanes = [
-        {"lane_index": 0, "lane_name": "Reference 1", "recipe_name": "Wan VACE Reference Sheet",
-         "media_kind": "image", "item_count": 2, "member_count": 3, "hidden": False,
+        {"lane_index": 0, "lane_name": "Reference 1", "recipe_name": "Wan Reference Slots",
+         "recipe_id": "slots", "recipe": shared_recipe,
+         "media_kind": "image", "item_count": 1, "member_count": 2,
+         "reserved_member_span": 3, "strength": 1.0, "prompt_override": "alpha", "hidden": False,
          "live_outputs": ["image_slots", "reference_prompt", "reference_names"],
          "member_tags": ["sonder:face_closeup", "sonder:location"]},
         {"lane_index": 1, "lane_name": "Voices", "recipe_name": "LTX ID-LoRA Voice Identity",
-         "media_kind": "audio", "item_count": 1, "member_count": 1, "hidden": True,
+         "recipe_id": "audio", "recipe": {"hard": {"assembly": "audio", "max_members": 4}},
+         "media_kind": "audio", "item_count": 1, "member_count": 1,
+         "reserved_member_span": 1, "strength": 1.0, "hidden": True,
          "live_outputs": ["audio_slots"], "member_tags": []},
+        {"lane_index": 2, "lane_name": "Villain", "recipe_name": "Wan Reference Slots",
+         "recipe_id": "slots", "recipe": shared_recipe,
+         "media_kind": "image", "item_count": 1, "member_count": 1,
+         "reserved_member_span": 1, "strength": 0.8, "prompt_override": "beta", "hidden": False,
+         "live_outputs": ["image_slots", "reference_prompt", "reference_names"],
+         "member_tags": ["sonder:villain"]},
+        {"lane_index": 3, "lane_name": "Different", "recipe_name": "Other",
+         "recipe_id": "other", "recipe": {"hard": {"assembly": "sheet", "max_members": 4}},
+         "media_kind": "image", "item_count": 0, "member_count": 0,
+         "reserved_member_span": 1, "strength": 0, "hidden": False,
+         "live_outputs": ["image_slots"], "member_tags": []},
+        {"lane_index": 4, "lane_name": "Later", "recipe_name": "Wan Reference Slots",
+         "recipe_id": "slots", "recipe": shared_recipe,
+         "media_kind": "image", "item_count": 0, "member_count": 0,
+         "reserved_member_span": 1, "strength": 0, "hidden": False,
+         "live_outputs": ["image_slots", "reference_prompt", "reference_names"],
+         "member_tags": []},
     ]
     module_url = (ROOT / "web" / "js" / "reference_bridge_shape.js").as_uri()
     script = f"""
-const {{ selectorPanelView }} = await import({json.dumps(module_url)});
+const {{ parseLaneSelection, selectorPanelView }} = await import({json.dumps(module_url)});
 const lanes = {json.dumps(lanes)};
+const huge = '9'.repeat(5000);
+const parsed = parseLaneSelection(`2, 0 2 garbage -1 1_0 +3 ١ 9007199254740992 ${{huge}}`);
+const separators = parseLaneSelection(`0\u001c1, 2\ufeff3 4\t5`);
 console.log(JSON.stringify({{
-  first: selectorPanelView({{ lanes, laneIndex: 0 }}),
-  hiddenAudio: selectorPanelView({{ lanes, laneIndex: 1 }}),
-  orphan: selectorPanelView({{ lanes, laneIndex: 7, sceneName: 'Act One' }}),
-  frozen: selectorPanelView({{ lanes, laneIndex: 0, source: 'snapshot' }}),
-  unresolved: selectorPanelView({{ lanes: [], laneIndex: 0, status: 'Connect a Sonder Editor project.' }}),
+  parsed,
+  separators,
+  selected: selectorPanelView({{ lanes, ...parsed, laneIndices: [2, 0, 7], sceneName: 'Act One' }}),
+  anchoredAfterOrphan: selectorPanelView({{ lanes, laneIndices: [7, 2], sceneName: 'Act One' }}),
+  inert: selectorPanelView({{ lanes, laneIndices: [0, 4] }}),
+  overrideConflict: selectorPanelView({{ lanes, laneIndices: [0] }}),
+  frozen: selectorPanelView({{ lanes, laneIndices: [0], source: 'snapshot' }}),
+  unresolved: selectorPanelView({{ lanes: [], laneIndices: [0], status: 'Connect a Sonder Editor project.' }}),
 }}));
 """
     out = json.loads(subprocess.run(
         [node_bin, "--input-type=module", "-e", script], capture_output=True, text=True, encoding="utf-8", check=True,
     ).stdout)
 
-    assert out["first"]["options"][0]["label"] == "Reference 1 — Wan VACE Reference Sheet"
-    assert out["first"]["status"] == "image · 2 items · 3 members"
-    assert out["first"]["outputs"] == [
+    core = _import_reference_core(monkeypatch)
+    authored = "2, 0 2 garbage -1 1_0 +3 ١ 9007199254740992 " + "9" * 5000
+    assert out["parsed"]["laneIndices"] == core.parse_lane_selection(authored) == [0, 2]
+    assert out["parsed"]["invalidTokens"] == [
+        "garbage", "1_0", "+3", "١", "9007199254740992", "9" * 5000,
+    ]
+    assert out["separators"]["laneIndices"] == core.parse_lane_selection(
+        "0\u001c1, 2\ufeff3 4\t5") == [4, 5]
+    assert out["separators"]["invalidTokens"] == ["0\u001c1", "2\ufeff3"]
+    selected = out["selected"]
+    assert [row["laneIndex"] for row in selected["rows"]] == [0, 2, 7]
+    assert selected["rows"][0]["label"] == "Reference 1 — Wan Reference Slots"
+    assert selected["rows"][0]["status"] == "image · 1 item · 2 members · 3 reserved"
+    assert selected["rows"][-1]["orphan"] is True
+    assert selected["rows"][-1]["status"] == "Lane 7 is not in Act One."
+    assert selected["outputs"] == [
         "Image Bridge r01..r16",
         "Prompt Bridge aggregate + p01..p16",
         "Prompt Bridge reference_names",
     ]
-    # Tags identify WHICH references the lane carries; the namespace is dropped.
-    assert out["first"]["tags"] == ["face_closeup", "location"]
-    assert out["hiddenAudio"]["tags"] == []
-    assert out["orphan"]["tags"] == []
-    assert out["hiddenAudio"]["status"] == "audio · 1 item · 1 member · lane hidden"
-    # The orphan option keeps the real INT value selectable and says why.
-    assert out["orphan"]["options"][-1] == {"value": 7, "label": "Reference 8 — no such lane in this scene", "orphan": True}
-    assert out["orphan"]["selectedValue"] == 7
-    assert out["orphan"]["status"] == "Lane 7 is not in Act One."
-    assert out["frozen"]["status"].endswith("frozen job")
+    assert selected["tags"] == ["face_closeup", "location", "villain"]
+    assert any("different strengths" in value for value in selected["disclosures"])
+    assert any("unparseable" in value for value in selected["disclosures"])
+    assert all(entry["disabled"] for entry in selected["addable"])
+    enabled = [entry["laneIndex"] for entry in out["anchoredAfterOrphan"]["addable"] if not entry["disabled"]]
+    assert enabled == [4], "the first resolvable selected lane anchors compatibility and override parity"
+    assert any("inactive in this window" in value for value in out["inert"]["disclosures"])
+    override_entry = next(
+        entry for entry in out["overrideConflict"]["addable"] if entry["laneIndex"] == 2)
+    assert override_entry["disabled"] is True
+    assert "Prompt override" in override_entry["reason"]
+    assert out["frozen"]["rows"][0]["status"].endswith("frozen job")
     assert out["unresolved"]["disabled"] is True
     assert out["unresolved"]["status"] == "Connect a Sonder Editor project."
+
+
+def test_merged_bridge_shape_uses_payload_labels_in_lane_index_order():
+    node_bin = shutil.which("node")
+    if not node_bin:
+        pytest.skip("node is required for merged Reference Bridge shaping")
+    module_url = (ROOT / "web" / "js" / "reference_bridge_shape.js").as_uri()
+    script = f"""
+const {{ canonicalOutputOrder, mergedBridgeShape, resolveBridgeOutputs }} = await import({json.dumps(module_url)});
+const lanes = [
+  {{lane_index: 0, reserved_member_span: 3, image_slot_count: 1, audio_slot_count: 0,
+    prompt_slot_count: 3, live_outputs: ['image_slots', 'reference_prompt', 'reference_names'],
+    slot_labels: ['Lane 0 A', 'Lane 0 B', '(unused)'], image_slot_labels: ['Assembled · Lane 0 A + Lane 0 B']}},
+  {{lane_index: 1, reserved_member_span: 2, image_slot_count: 1, audio_slot_count: 0,
+    prompt_slot_count: 2, live_outputs: ['image_slots', 'reference_prompt', 'reference_names'],
+    slot_labels: ['Lane 1 A', '(unused)'], image_slot_labels: ['Assembled · Lane 1 A']}},
+];
+const shape = mergedBridgeShape({{ lanes, laneIndices: [1, 0] }});
+const emptyShape = mergedBridgeShape({{ lanes, laneIndices: [] }});
+const node = {{
+  type: 'SonderReferenceImageBridge', comfyClass: 'SonderReferenceImageBridge',
+  outputs: canonicalOutputOrder('SonderReferenceImageBridge').map((name) => ({{name, type: 'IMAGE', links: []}})),
+  addOutput(name, type, options) {{ this.outputs.push({{name, type, links: [], ...options}}); }},
+  removeOutput(index) {{ this.outputs.splice(index, 1); }},
+}};
+resolveBridgeOutputs(node, shape);
+const emptyNode = {{
+  type: 'SonderReferenceImageBridge', comfyClass: 'SonderReferenceImageBridge',
+  outputs: canonicalOutputOrder('SonderReferenceImageBridge').map((name) => ({{name, type: 'IMAGE', links: []}})),
+  addOutput(name, type, options) {{ this.outputs.push({{name, type, links: [], ...options}}); }},
+  removeOutput(index) {{ this.outputs.splice(index, 1); }},
+}};
+resolveBridgeOutputs(emptyNode, emptyShape);
+console.log(JSON.stringify({{ shape, labels: node.outputs.map((slot) => slot.label), emptyShape,
+  emptyLabels: emptyNode.outputs.map((slot) => slot.label) }}));
+"""
+    out = json.loads(subprocess.run(
+        [node_bin, "--input-type=module", "-e", script],
+        capture_output=True, text=True, encoding="utf-8", check=True,
+    ).stdout)
+    assert out["shape"]["imageSlotCount"] == 2
+    assert out["shape"]["promptSlotCount"] == 5
+    assert out["shape"]["slotLabels"] == [
+        "Lane 0 A", "Lane 0 B", "(unused)", "Lane 1 A", "(unused)",
+    ]
+    assert out["shape"]["imageSlotLabels"] == [
+        "Assembled · Lane 0 A + Lane 0 B", "Assembled · Lane 1 A",
+    ]
+    assert out["labels"] == [
+        "r01 · Assembled · Lane 0 A + Lane 0 B",
+        "r02 · Assembled · Lane 1 A",
+    ]
+    assert out["emptyShape"]["liveOutputs"] == []
+    assert out["emptyLabels"] == []
 
 
 def test_lane_bar_gives_names_priority_over_tags():
@@ -1036,6 +1132,7 @@ export const app = {
         "api.mjs": "export const api = { apiURL: (value) => value };\n",
         "client.mjs": "export const onProjectVersionChanged = () => {};\n",
         "events.mjs": "export const onEditorRenderWindowChanged = () => {};\n",
+        "keyboard.mjs": "export const PRIORITY = { OVERLAY: 100 }; export const register = () => () => {};\n",
         "resolver.mjs": """
 const keyed = (value, key) => value?.[key] ?? value?.[String(key)] ?? null;
 export const getGraphLink = (graph, id) => graph?.getLink?.(id) ?? keyed(graph?.links, id);
@@ -1054,6 +1151,7 @@ export const resolveProjectSource = () => ({ status: 'unresolved' });
         "./project_source_resolver.js": (tmp_path / "resolver.mjs").as_uri(),
         "./api_client.js": (tmp_path / "client.mjs").as_uri(),
         "./editor_render_window_events.js": (tmp_path / "events.mjs").as_uri(),
+        "./keyboard_ownership.js": (tmp_path / "keyboard.mjs").as_uri(),
         "./reference_bridge_shape.js": shape_url,
     }
     for old, new in replacements.items():
@@ -1195,6 +1293,206 @@ console.log(JSON.stringify({{
     assert out["clearedByCallback"] == "r02"
 
 
+def test_multi_lane_selector_panel_add_remove_menu_and_growth(tmp_path):
+    node_bin = shutil.which("node")
+    if not node_bin:
+        pytest.skip("node is required for the multi-lane selector panel test")
+
+    bridge_source = (ROOT / "web" / "js" / "reference_bridge.js").read_text(encoding="utf-8")
+    shape_url = (ROOT / "web" / "js" / "reference_bridge_shape.js").as_uri()
+    modules = {
+        "app.mjs": """
+export const app = {
+  graph: { setDirtyCanvas() {} },
+  registerExtension(extension) { globalThis.__referenceBridgeExtension = extension; },
+};
+""",
+        "api.mjs": "export const api = { apiURL: (value) => value };\n",
+        "client.mjs": "export const onProjectVersionChanged = () => {};\n",
+        "events.mjs": "export const onEditorRenderWindowChanged = () => {};\n",
+        "keyboard.mjs": """
+export const PRIORITY = { OVERLAY: 100 };
+export function register(consumer) {
+  globalThis.__keyboardConsumer = consumer;
+  globalThis.__keyboardRegisters = (globalThis.__keyboardRegisters || 0) + 1;
+  let active = true;
+  return () => {
+    if (!active) return;
+    active = false;
+    globalThis.__keyboardUnregisters = (globalThis.__keyboardUnregisters || 0) + 1;
+  };
+}
+""",
+        "resolver.mjs": """
+export const getGraphLink = () => null;
+export const getGraphNode = () => null;
+export const resolveProjectSource = () => ({
+  status: 'resolved',
+  editor: { _sonderController: { state: { projectDir: 'Project', sceneId: 'Scene' } } },
+});
+""",
+    }
+    for name, source in modules.items():
+        (tmp_path / name).write_text(source, encoding="utf-8")
+    replacements = {
+        "/scripts/app.js": (tmp_path / "app.mjs").as_uri(),
+        "/scripts/api.js": (tmp_path / "api.mjs").as_uri(),
+        "./project_source_resolver.js": (tmp_path / "resolver.mjs").as_uri(),
+        "./api_client.js": (tmp_path / "client.mjs").as_uri(),
+        "./editor_render_window_events.js": (tmp_path / "events.mjs").as_uri(),
+        "./keyboard_ownership.js": (tmp_path / "keyboard.mjs").as_uri(),
+        "./reference_bridge_shape.js": shape_url,
+    }
+    for old, new in replacements.items():
+        bridge_source = bridge_source.replace(f'"{old}"', json.dumps(new))
+    bridge_path = tmp_path / "reference_bridge.mjs"
+    bridge_path.write_text(bridge_source, encoding="utf-8")
+
+    lanes = []
+    for index in range(8):
+        recipe = {"hard": {"assembly": "slots", "max_members": 16}, "soft": {}}
+        if index == 1:
+            recipe = {"hard": {"assembly": "sheet", "max_members": 16}, "soft": {}}
+        lanes.append({
+            "lane_index": index,
+            "lane_name": f"Reference {index + 1}",
+            "recipe_id": "recipe",
+            "recipe_name": "Slots",
+            "recipe": recipe,
+            "media_kind": "image",
+            "item_count": 1,
+            "member_count": 1,
+            "reserved_member_span": 1,
+            "live_outputs": ["image_slots"],
+            "member_tags": [],
+            "prompt_override": "",
+            "strength": 1,
+        })
+    script = r"""
+class Element {
+  constructor(tag) {
+    this.tagName = String(tag).toUpperCase(); this.children = []; this.parentElement = null;
+    this.style = { cssText: '' }; this.attributes = {}; this._handlers = {};
+    this.textContent = ''; this.title = ''; this.disabled = false; this.type = '';
+  }
+  appendChild(child) { this.children.push(child); child.parentElement = this; return child; }
+  append(...children) { children.forEach((child) => this.appendChild(child)); }
+  replaceChildren(...children) { this.children = []; children.forEach((child) => this.appendChild(child)); }
+  addEventListener(type, handler) { (this._handlers[type] ||= []).push(handler); }
+  setAttribute(name, value) { this.attributes[name] = String(value); }
+  contains(target) { for (let value = target; value; value = value.parentElement) if (value === this) return true; return false; }
+  click() { for (const handler of this._handlers.click || []) handler({ target: this }); }
+}
+const windowHandlers = {};
+globalThis.document = { createElement: (tag) => new Element(tag) };
+globalThis.window = {
+  setTimeout(callback) { callback(); return 1; },
+  addEventListener(type, handler) { (windowHandlers[type] ||= []).push(handler); },
+  removeEventListener(type, handler) { windowHandlers[type] = (windowHandlers[type] || []).filter((value) => value !== handler); },
+};
+globalThis.fetch = async () => ({ ok: true, json: async () => ({
+  scene_name: 'Act One', source: 'live', references: __LANES__,
+}) });
+const { app } = await import(__APP_URL__);
+await import(__BRIDGE_URL__);
+const extension = globalThis.__referenceBridgeExtension;
+let callbackCalls = 0;
+const widget = { name: 'reference_lanes', value: '2, bad', callback() { callbackCalls += 1; } };
+let domWidget = null;
+const node = {
+  id: 44, type: 'SonderReferenceSelector', comfyClass: 'SonderReferenceSelector',
+  widgets: [widget], outputs: [{ name: 'reference_set', links: [] }], size: [280, 120],
+  addDOMWidget(name, type, element, options) { domWidget = { name, type, element, options }; return domWidget; },
+  computeSize() { return [280, 30 + (domWidget?.computeSize?.(280)?.[1] || 0)]; },
+  setSize(value) { this.size = value; },
+};
+extension.nodeCreated(node);
+for (let index = 0; index < 8; index += 1) await Promise.resolve();
+const walk = (root, out = []) => { out.push(root); root.children.forEach((child) => walk(child, out)); return out; };
+const findButton = (text) => walk(domWidget.element).find((entry) => entry.tagName === 'BUTTON' && entry.textContent === text);
+const add = findButton('+');
+const authoredAfterRender = widget.value;
+const disclosureShown = walk(domWidget.element).some((entry) => entry.textContent.includes('Ignored unparseable lane token'));
+
+add.click();
+const menu = walk(domWidget.element).find((entry) => entry.attributes.role === 'menu');
+const opened = menu.style.display;
+add.click();
+const triggerClosed = menu.style.display;
+
+add.click();
+const outside = new Element('div');
+windowHandlers.pointerdown.at(-1)({ target: outside });
+const outsideClosed = menu.style.display;
+
+add.click();
+const escapeClaimed = globalThis.__keyboardConsumer.keydown({ key: 'Escape', isComposing: false });
+const escapeClosed = menu.style.display;
+
+add.click();
+const addLaneZero = findButton('Reference 1 — Slots');
+const incompatible = findButton('Reference 2 — Slots');
+addLaneZero.click();
+for (let index = 0; index < 8; index += 1) await Promise.resolve();
+const afterAdd = widget.value;
+const removeLaneTwo = walk(domWidget.element).find((entry) => entry.title === 'Remove lane 2');
+removeLaneTwo.click();
+for (let index = 0; index < 8; index += 1) await Promise.resolve();
+const afterRemove = widget.value;
+
+widget.value = '0,1,2,3';
+widget.callback(widget.value);
+for (let index = 0; index < 8; index += 1) await Promise.resolve();
+const beforeMaxHeight = domWidget.options.getHeight();
+const beforeMaxOverflow = domWidget.element.children[1].style.overflowY;
+widget.value = '0,1,2,3,4,5,6,7';
+widget.callback(widget.value);
+for (let index = 0; index < 8; index += 1) await Promise.resolve();
+const grownHeight = domWidget.options.getHeight();
+const rows = domWidget.element.children[1];
+add.click();
+const noOtherLanes = findButton('No other lanes');
+add.click();
+const allSelectedTriggerClosed = menu.style.display;
+node.onRemoved();
+
+console.log(JSON.stringify({
+  authoredAfterRender, disclosureShown, opened, triggerClosed, outsideClosed,
+  escapeClaimed, escapeClosed, incompatibleDisabled: incompatible.disabled,
+  afterAdd, afterRemove, callbackCalls, beforeMaxHeight, beforeMaxOverflow, grownHeight,
+  maxHeight: domWidget.options.getMaxHeight(), rowsOverflow: rows.style.overflowY,
+  noOtherDisabled: noOtherLanes.disabled, allSelectedTriggerClosed,
+  keyboardRegisters: globalThis.__keyboardRegisters,
+  keyboardUnregisters: globalThis.__keyboardUnregisters,
+}));
+"""
+    script = (script
+              .replace("__LANES__", json.dumps(lanes))
+              .replace("__APP_URL__", json.dumps((tmp_path / "app.mjs").as_uri()))
+              .replace("__BRIDGE_URL__", json.dumps(bridge_path.as_uri())))
+    out = json.loads(subprocess.run(
+        [node_bin, "--input-type=module", "-e", script],
+        capture_output=True, text=True, encoding="utf-8", check=True,
+    ).stdout)
+
+    assert out["authoredAfterRender"] == "2, bad", "render must not normalize the workflow widget"
+    assert out["disclosureShown"] is True
+    assert out["opened"] == "flex"
+    assert out["triggerClosed"] == out["outsideClosed"] == out["escapeClosed"] == "none"
+    assert out["escapeClaimed"] is True
+    assert out["incompatibleDisabled"] is True
+    assert out["afterAdd"] == "0, 2"
+    assert out["afterRemove"] == "0"
+    assert out["callbackCalls"] >= 3
+    assert out["beforeMaxHeight"] < 260
+    assert out["beforeMaxOverflow"] == "hidden"
+    assert out["grownHeight"] == out["maxHeight"] == 260
+    assert out["rowsOverflow"] == "auto"
+    assert out["noOtherDisabled"] is True
+    assert out["allSelectedTriggerClosed"] == "none"
+    assert out["keyboardRegisters"] == out["keyboardUnregisters"]
+
+
 def test_bridge_shape_module_stays_free_of_browser_imports():
     """It is a separate module so these rules are testable without a browser."""
     source = (ROOT / "web" / "js" / "reference_bridge_shape.js").read_text(encoding="utf-8")
@@ -1203,6 +1501,9 @@ def test_bridge_shape_module_stays_free_of_browser_imports():
     bridge = (ROOT / "web" / "js" / "reference_bridge.js").read_text(encoding="utf-8")
     assert 'from "./reference_bridge_shape.js"' in bridge
     assert bridge.count("FULL_SHAPE") >= 5
+    assert 'findWidget(selector, "reference_lanes")' in bridge
+    assert "mergedBridgeShape({" in bridge
+    assert "reference_lane_index" not in bridge
 
 
 # One fixture set, resolved in Python and in node. A lane of two items where the
@@ -1418,7 +1719,9 @@ def test_threshold_batch_warnings_name_the_lane_the_count_and_the_right_remedy()
     assert "of ${total}" in block
     assert "dropped from all ${total} chunks" in block
     # Each cause carries its own remedy and its own count.
-    assert "Threshold in Settings, or widen the staged item." in block
+    assert "reserved Bridge slots" in block
+    assert "Lower the Reference Threshold in Settings" in block
+    assert "the staged item." in block
     assert "Lower it in Settings, or widen the staged item." in block
     assert "does not overlap this batch" in block
     assert "Unmute the item or unhide the " in block

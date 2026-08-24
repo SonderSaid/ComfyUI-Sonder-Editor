@@ -184,6 +184,67 @@ def _multi_member_project(tmp_path, recipe, colors, *, tags=()):
     return project
 
 
+def _multi_lane_project(tmp_path, recipe, member_counts, *, windows=None, strengths=None):
+    """Distinct members and items for each lane under one materialized recipe."""
+    media_dir = tmp_path / "media"
+    media_dir.mkdir(parents=True)
+    windows = windows or [(0, -1)] * len(member_counts)
+    strengths = strengths or [1.0] * len(member_counts)
+    assets, references, items = [], [], []
+    palette = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
+    member_number = 0
+    for lane_index, member_count in enumerate(member_counts):
+        lane_members = []
+        for local_index in range(member_count):
+            color = palette[lane_index % len(palette)]
+            path = media_dir / f"lane{lane_index}-member{local_index}.png"
+            image = np.zeros((24, 40, 3), dtype=np.uint8)
+            image[:, :] = color[::-1]
+            assert cv2.imwrite(str(path), image)
+            asset_id = f"asset-{member_number}"
+            member_id = f"member-{member_number}"
+            entity_id = f"entity-{member_number}"
+            assets.append(Asset(
+                asset_id=asset_id, name=f"Lane {lane_index} member {local_index}",
+                asset_type="image", path=f"media/{path.name}", width=40, height=24,
+            ))
+            references.append(ReferenceEntity(
+                reference_id=entity_id, name=f"Lane{lane_index}Member{local_index}",
+                members=[ReferenceMember(
+                    member_id=member_id, asset_id=asset_id,
+                    prompt=f"lane {lane_index} member {local_index}",
+                )],
+            ))
+            lane_members.append({"entity_id": entity_id, "member_id": member_id})
+            member_number += 1
+        start, end = windows[lane_index]
+        items.append(ReferenceItem(
+            reference_item_id=f"item-{lane_index}", lane_index=lane_index,
+            start_frame=start, end_frame=end, members=lane_members,
+            strength=strengths[lane_index],
+        ))
+
+    def cloned_recipe(index):
+        return ReferenceLaneRecipe(
+            lane_id=f"lane-{index}", media_kind=recipe.media_kind,
+            recipe_id=recipe.recipe_id, recipe=dict(recipe.recipe),
+        )
+
+    scene = Scene(
+        scene_id="scene", duration_frames=60, width=64, height=48,
+        reference_lane_count=len(member_counts),
+        reference_lane_configs=[LaneConfig() for _ in member_counts],
+        reference_lane_recipes=[cloned_recipe(index) for index in range(len(member_counts))],
+        reference_items=items,
+    )
+    project = TimelineProject(
+        project_dir=str(tmp_path), project_id="project", resolution=(64, 48),
+        scenes=[scene], assets=assets, references=references,
+    )
+    project._execution_context = {"scene_id": "scene", "context_start": 12, "context_end": 30}
+    return project
+
+
 def test_msr_places_each_reference_on_a_contiguous_grid_segment_from_index_zero(monkeypatch, tmp_path):
     core = _import_module(monkeypatch, "reference_core")
     monkeypatch.setattr(core, "resolve_existing_project_path", lambda project, path, **_kwargs: str(Path(project.project_dir) / path))
@@ -318,7 +379,7 @@ def test_selector_is_effective_in_window_and_cache_identity_tracks_window(monkey
     project = _project(tmp_path, recipe)
     selected = core.resolve_reference_set(project, 0)
     assert selected["has_reference"] == 1
-    assert selected["item"]["reference_item_id"] == "item"
+    assert selected["lanes"][0]["item"]["reference_item_id"] == "item"
     assert core.resolve_reference_set(project, 1)["has_reference"] == 0
     first = core.reference_fingerprint(project, 0)
     project._execution_context["context_start"] = 31
@@ -362,7 +423,7 @@ def test_selector_uses_frozen_explicit_snapshot_end_after_scene_shrinks(monkeypa
     })
     selected = core.resolve_reference_set(project, 0)
     assert selected["source"] == "snapshot"
-    assert selected["item"]["reference_item_id"] == "frozen"
+    assert selected["lanes"][0]["item"]["reference_item_id"] == "frozen"
     assert selected["pegs"]["fps"] == 30.0
     assert core._reference_frame_rate(core._reference_decode_context(selected, "image")) == 30.0
 
@@ -408,6 +469,222 @@ def test_selector_excludes_hidden_lane(monkeypatch, tmp_path):
     core = _import_module(monkeypatch, "reference_core")
     project = _project(tmp_path, ReferenceLaneRecipe(), hidden=True)
     assert core.resolve_reference_set(project, 0)["has_reference"] == 0
+
+
+def test_lane_selection_parser_and_first_effective_strength(monkeypatch, tmp_path):
+    core = _import_module(monkeypatch, "reference_core")
+    recipe = ReferenceLaneRecipe(
+        recipe_id="slots", recipe={
+            "soft": {"prompt_prefix": "References"},
+            "hard": {"assembly": "slots", "max_members": 16},
+        },
+    )
+    project = _multi_lane_project(
+        tmp_path, recipe, [1, 1], windows=[(40, -1), (0, -1)], strengths=[0.2, 0.8],
+    )
+    assert core.parse_lane_selection(
+        "2, 0 1 2 garbage -1 1_0 +3 ١ 9007199254740992 " + "9" * 5000
+    ) == [0, 1, 2]
+    assert core.parse_lane_selection("0" * 5000 + "6") == [6]
+    assert core.parse_lane_selection("0\u001c1, 2\ufeff3 4\t5") == [4, 5]
+    selected = core.resolve_reference_set(project, "9, 1 0 garbage -2 1")
+    assert [lane["lane_index"] for lane in selected["lanes"]] == [0, 1]
+    assert selected["has_reference"] == 1
+    assert selected["strength"] == pytest.approx(0.8)
+    assert core.resolve_reference_set(project, "")["lanes"] == []
+    assert core.resolve_reference_set(project, "")["has_reference"] == 0
+    assert core.reference_fingerprint(project, "0") != core.reference_fingerprint(project, "0,1")
+
+
+def test_two_slot_lanes_concatenate_in_lane_order_not_authored_order(monkeypatch, tmp_path):
+    core = _import_module(monkeypatch, "reference_core")
+    recipe = ReferenceLaneRecipe(
+        recipe_id="slots", recipe={
+            "soft": {"prompt_tokens": "reference {n}"},
+            "hard": {"assembly": "slots", "max_members": 16},
+        },
+    )
+    project = _multi_lane_project(tmp_path, recipe, [1, 1])
+    monkeypatch.setattr(
+        core, "resolve_existing_project_path",
+        lambda project, path, **_kwargs: str(Path(project.project_dir) / path),
+    )
+    selected = core.resolve_reference_set(project, "1, 0")
+    assert [lane["lane_index"] for lane in selected["lanes"]] == [0, 1]
+    images = core.decode_reference_images(selected)
+    assert images[0].mean(dim=(0, 1, 2)).argmax().item() == 0
+    assert images[1].mean(dim=(0, 1, 2)).argmax().item() == 1
+    prompts = core.decode_reference_prompts(selected)
+    assert prompts[2].startswith("reference 1")
+    assert prompts[3].startswith("reference 2")
+
+
+@pytest.mark.parametrize("inert_cause", ["hidden", "muted", "out_of_window", "threshold"])
+def test_inert_lane_keeps_reserved_image_slot_under_both_policies(
+        monkeypatch, tmp_path, inert_cause):
+    core = _import_module(monkeypatch, "reference_core")
+    recipe = ReferenceLaneRecipe(
+        recipe_id="slots", recipe={
+            "soft": {"prompt_prefix": "References"},
+            "hard": {"assembly": "slots", "max_members": 16},
+        },
+    )
+    windows = [(12, 30), (0, -1)] if inert_cause == "threshold" else [(0, -1), (0, -1)]
+    if inert_cause == "out_of_window":
+        windows[1] = (40, -1)
+    project = _multi_lane_project(tmp_path, recipe, [1, 1], windows=windows)
+    if inert_cause == "hidden":
+        project.scenes[0].reference_lane_configs[1].hidden = True
+    elif inert_cause == "muted":
+        project.scenes[0].reference_items[1].muted = True
+    elif inert_cause == "threshold":
+        project.metadata["reference_frame_threshold"] = 50
+    monkeypatch.setattr(
+        core, "resolve_existing_project_path",
+        lambda project, path, **_kwargs: str(Path(project.project_dir) / path),
+    )
+    selected = core.resolve_reference_set(project, "0,1")
+    assert [lane["reserved_span"] for lane in selected["lanes"]] == [1, 1]
+    assert [lane["has_reference"] for lane in selected["lanes"]] == [1, 0]
+    placeholder = core.decode_reference_images(selected, "placeholder")
+    nothing = core.decode_reference_images(selected, "nothing")
+    assert float(placeholder[0].abs().max()) > 0.0
+    assert float(placeholder[1].abs().max()) == 0.0
+    assert nothing[0] is not None and nothing[1] is None
+    assert core.decode_reference_prompts(selected) != ("", "", *("" for _ in range(16)))
+
+    project.scenes[0].reference_lane_configs[0].hidden = True
+    absent = core.resolve_reference_set(project, "0,1")
+    assert core.decode_reference_prompts(absent) == ("", "", *("" for _ in range(16)))
+
+
+def test_lane_reservation_uses_widest_authored_item_across_batch_windows(monkeypatch, tmp_path):
+    core = _import_module(monkeypatch, "reference_core")
+    recipe = ReferenceLaneRecipe(
+        recipe_id="slots", recipe={"hard": {"assembly": "slots", "max_members": 4}},
+    )
+    project = _multi_lane_project(tmp_path, recipe, [3])
+    scene = project.scenes[0]
+    all_members = list(scene.reference_items[0].members)
+    scene.reference_items[0].members = all_members[:2]
+    scene.reference_items[0].start_frame = 0
+    scene.reference_items[0].end_frame = 30
+    scene.reference_items.append(ReferenceItem(
+        reference_item_id="later", lane_index=0, start_frame=30, end_frame=-1,
+        members=all_members,
+    ))
+    monkeypatch.setattr(
+        core, "resolve_existing_project_path",
+        lambda project, path, **_kwargs: str(Path(project.project_dir) / path),
+    )
+    project._execution_context.update({"context_start": 10, "context_end": 20})
+    early = core.resolve_reference_set(project, "0")
+    early_values = core.decode_reference_images(early)
+    project._execution_context.update({"context_start": 35, "context_end": 45})
+    late = core.resolve_reference_set(project, "0")
+    late_values = core.decode_reference_images(late)
+    assert early["lanes"][0]["reserved_span"] == late["lanes"][0]["reserved_span"] == 3
+    assert float(early_values[2].abs().max()) == 0.0
+    assert float(late_values[2].abs().max()) > 0.0
+
+
+def test_two_nine_member_sheet_lanes_fit_images_but_overflow_prompt_block(monkeypatch, tmp_path):
+    core = _import_module(monkeypatch, "reference_core")
+    recipe = ReferenceLaneRecipe(
+        recipe_id="sheet", recipe={
+            "soft": {"prompt_tokens": "reference {n}"},
+            "hard": {"assembly": "sheet", "max_members": 9},
+        },
+    )
+    project = _multi_lane_project(tmp_path, recipe, [9, 9])
+    monkeypatch.setattr(
+        core, "resolve_existing_project_path",
+        lambda project, path, **_kwargs: str(Path(project.project_dir) / path),
+    )
+    selected = core.resolve_reference_set(project, "0,1")
+    images = core.decode_reference_images(selected)
+    assert float(images[0].abs().max()) > 0.0
+    assert float(images[1].abs().max()) > 0.0
+    with pytest.raises(RuntimeError, match=r"Prompt Bridge requires 18 slots.*0, 1"):
+        core.decode_reference_prompts(selected)
+
+    for config in project.scenes[0].reference_lane_configs:
+        config.hidden = True
+    inactive = core.resolve_reference_set(project, "0,1")
+    assert inactive["has_reference"] == 0
+    with pytest.raises(RuntimeError, match=r"Prompt Bridge requires 18 slots.*0, 1"):
+        core.decode_reference_prompts(inactive)
+
+
+def test_multi_lane_conflicts_name_materialized_kind_override_and_detached_lanes(
+        monkeypatch, tmp_path):
+    core = _import_module(monkeypatch, "reference_core")
+    recipe = ReferenceLaneRecipe(
+        recipe_id="slots", recipe={"hard": {"assembly": "slots", "max_members": 16}},
+    )
+
+    project = _multi_lane_project(tmp_path / "recipe", recipe, [1, 1])
+    project.scenes[0].reference_lane_recipes[1].recipe = {
+        "hard": {"assembly": "slots", "max_members": 15},
+    }
+    conflict = core.resolve_reference_set(project, "0,1")
+    assert "lane 1" in core._conflict_message(conflict)
+    assert "materialized recipe" in core._conflict_message(conflict)
+
+    project = _multi_lane_project(tmp_path / "kind", recipe, [1, 1])
+    project.scenes[0].reference_lane_recipes[1].media_kind = "audio"
+    assert "media kind" in core._conflict_message(core.resolve_reference_set(project, "0,1"))
+
+    project = _multi_lane_project(tmp_path / "override", recipe, [1, 1])
+    project.scenes[0].reference_items[1].prompt_override = "different"
+    assert "prompt override" in core._conflict_message(core.resolve_reference_set(project, "0,1"))
+
+    detached = ReferenceLaneRecipe(recipe={"hard": {"assembly": "slots", "max_members": 16}})
+    project = _multi_lane_project(tmp_path / "detached", detached, [1, 1])
+    assert "detached" in core._conflict_message(core.resolve_reference_set(project, "0,1"))
+
+
+def test_selector_execute_refuses_conflicting_lanes_and_names_them(monkeypatch, tmp_path):
+    _install_io(monkeypatch)
+    module = _import_module(monkeypatch, "reference_bridge_v3")
+    recipe = ReferenceLaneRecipe(
+        recipe_id="slots", recipe={"hard": {"assembly": "slots", "max_members": 16}},
+    )
+    project = _multi_lane_project(tmp_path, recipe, [1, 1])
+    project.scenes[0].reference_lane_recipes[1].recipe = {
+        "hard": {"assembly": "slots", "max_members": 15},
+    }
+    with pytest.raises(RuntimeError, match=r"lane indices 0, 1.*lane 1"):
+        module.SonderReferenceSelector.execute(project, "0,1")
+
+
+def test_multi_lane_resolution_uses_the_complete_frozen_snapshot(monkeypatch, tmp_path):
+    core = _import_module(monkeypatch, "reference_core")
+    recipe = ReferenceLaneRecipe(
+        recipe_id="slots", recipe={"hard": {"assembly": "slots", "max_members": 16}},
+    )
+    project = _multi_lane_project(tmp_path, recipe, [1, 1])
+    scene = project.scenes[0]
+    frozen_references = [reference.to_dict() for reference in project.references]
+    frozen_assets = [asset.to_dict() for asset in project.assets]
+    project.generation_queue = [GenerationJob(
+        job_id="queued", scene_id="scene", params={"snapshot_version": 1},
+        reference_lane_count=2,
+        reference_lane_configs=[value.to_dict() for value in scene.reference_lane_configs],
+        reference_lane_recipes=[value.to_dict() for value in scene.reference_lane_recipes],
+        reference_item_snapshots=[value.to_dict() for value in scene.reference_items],
+        reference_input_snapshots=[
+            *({"kind": "reference", "value": value} for value in frozen_references),
+            *({"kind": "asset", "value": value} for value in frozen_assets),
+        ],
+    )]
+    project._execution_context["queue_job_ref_id"] = "queued"
+    project.references[1].name = "CHANGED"
+    project.assets[1].path = "media/missing.png"
+    selected = core.resolve_reference_set(project, "0,1")
+    assert selected["source"] == "snapshot"
+    assert [lane["item"]["reference_item_id"] for lane in selected["lanes"]] == ["item-0", "item-1"]
+    assert selected["project"].references[1].name == "Lane1Member0"
 
 
 def test_bridge_absent_fallback_and_present_slot_assembly(monkeypatch, tmp_path):
@@ -610,9 +887,9 @@ def test_v3_schema_freezes_selector_and_homogeneous_bridge_socket_names(monkeypa
     prompt = module.SonderReferencePromptBridge.define_schema()
     assert selector.node_id == "SonderReferenceSelector"
     assert selector.category == "Sonder"
-    assert [value.id for value in selector.inputs] == ["project", "reference_lane_index"]
+    assert [value.id for value in selector.inputs] == ["project", "reference_lanes"]
     assert [value.display_name for value in selector.outputs] == ["reference_set", "has_reference", "reference_strength"]
-    assert [value.socket_type for value in selector.inputs] == ["SONDER_PROJECT", "INT"]
+    assert [value.socket_type for value in selector.inputs] == ["SONDER_PROJECT", "STRING"]
     assert [value.socket_type for value in selector.outputs] == [
         "SONDER_REFERENCE_SET", "INT", "FLOAT"]
     assert image.node_id == "SonderReferenceImageBridge"

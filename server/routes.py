@@ -10663,6 +10663,9 @@ if routes is not None:
             effective_item = winner.get("item") if winner else None
             member_refs = list(getattr(effective_item, "members", []) or [])
             member_count = len(member_refs)
+            reserved_member_span = max((
+                len(getattr(item, "members", []) or []) for item in lane_items
+            ), default=0)
             # Tags and labels describe only the winner for this render window.
             lane_tags: list[str] = []
             for ref in member_refs:
@@ -10678,7 +10681,10 @@ if routes is not None:
             assembly = str(hard.get("assembly", "batch") or "batch")
             lane_id = str(getattr(recipe, "lane_id", "") or "")
             slot_labels = []
-            for slot_index in range(min(16, member_count)):
+            for slot_index in range(reserved_member_span):
+                if slot_index >= member_count:
+                    slot_labels.append("(unused)")
+                    continue
                 member_id = str((member_refs[slot_index] or {}).get("member_id", "") or "")
                 reference = references_by_member_id.get(member_id)
                 if reference is None:
@@ -10689,6 +10695,16 @@ if routes is not None:
                     display = f"{name} ({role})"
                 physical = physical_labels.get((lane_id, member_id), "")
                 slot_labels.append(f"{physical} · {display}" if physical else display)
+            if assembly == "slots":
+                image_slot_labels = list(slot_labels)
+            elif reserved_member_span <= 0:
+                image_slot_labels = []
+            elif member_count <= 0:
+                image_slot_labels = ["(unused)"]
+            else:
+                image_slot_labels = [
+                    "Assembled · " + " + ".join(slot_labels[:member_count])
+                ]
             rows.append({
                 "lane_index": lane_index,
                 "lane_name": getattr(configs[lane_index], "name", "") or f"Reference {lane_index + 1}",
@@ -10696,25 +10712,32 @@ if routes is not None:
                 "media_kind": media_kind,
                 "recipe_id": getattr(recipe, "recipe_id", ""),
                 "recipe_name": str(materialized.get("name", "") or "Detached / Custom"),
+                "recipe": materialized,
                 "item_count": int(effective_item is not None),
                 "authored_item_count": len(lane_items),
                 "member_count": min(16, member_count),
+                "reserved_member_span": reserved_member_span,
+                "strength": float(getattr(effective_item, "strength", 0.0) or 0.0)
+                    if effective_item is not None else 0.0,
+                "prompt_override": str(getattr(effective_item, "prompt_override", "") or "")
+                    if effective_item is not None else "",
                 # Non-slot image assemblies produce one assembled payload on
                 # r01. Slot recipes and audio/prompt bridges grow per member.
                 "image_slot_count": (
-                    (min(16, member_count) if assembly == "slots" else int(member_count > 0))
+                    (reserved_member_span if assembly == "slots" else int(reserved_member_span > 0))
                     if "image_slots" in live and media_kind == "image" else 0
                 ),
                 "audio_slot_count": (
-                    min(16, member_count)
+                    reserved_member_span
                     if "audio_slots" in live and media_kind == "audio" else 0
                 ),
                 "prompt_slot_count": (
-                    min(16, member_count) if "reference_prompt" in live else 0
+                    reserved_member_span if "reference_prompt" in live else 0
                 ),
                 "live_outputs": sorted(live),
                 "member_tags": lane_tags,
                 "slot_labels": slot_labels,
+                "image_slot_labels": image_slot_labels,
             })
         return web.json_response({
             "window_start": window_start,

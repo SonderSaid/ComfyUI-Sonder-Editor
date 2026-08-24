@@ -10,7 +10,7 @@
 //   1. A connected-but-unstaged slot survives and is MARKED unused. Wiring says
 //      the user connected something, not that the recipe currently drives it.
 //   2. No liveness declaration means show everything unmarked. An unresolved
-//      project, an unwired selector, a lane index pointing at nothing and a
+//      project, an unwired selector, a selection containing only orphan lanes and a
 //      failed fetch are all "we don't know", not "this recipe drives nothing" —
 //      a slow load must not look like a broken node.
 //
@@ -133,60 +133,179 @@ export function canonicalOutputOrder(bridgeType = "SonderReferenceImageBridge") 
     ];
 }
 
+export function parseLaneSelection(value) {
+    const authored = String(value ?? "");
+    const laneIndices = [];
+    const invalidTokens = [];
+    const seen = new Set();
+    for (const token of authored.trim().split(/[, \t\r\n\f\v]+/).filter(Boolean)) {
+        if (/^-[0-9]+$/.test(token)) continue;
+        if (!/^[0-9]+$/.test(token)) {
+            invalidTokens.push(token);
+            continue;
+        }
+        const index = Number(token);
+        if (!Number.isSafeInteger(index)) {
+            invalidTokens.push(token);
+            continue;
+        }
+        if (!seen.has(index)) {
+            seen.add(index);
+            laneIndices.push(index);
+        }
+    }
+    laneIndices.sort((left, right) => left - right);
+    return { authored, laneIndices, invalidTokens };
+}
+
+const stableJson = (value) => {
+    if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+    if (value && typeof value === "object") {
+        return `{${Object.keys(value).sort().map((key) => (
+            `${JSON.stringify(key)}:${stableJson(value[key])}`
+        )).join(",")}}`;
+    }
+    return JSON.stringify(value);
+};
+
+const laneReservedSpan = (lane) => Math.max(0, parseInt(lane?.reserved_member_span, 10) || 0);
+const laneMemberCap = (lane) => Math.max(
+    1,
+    Math.min(MAX_REFERENCE_SLOTS, parseInt(lane?.recipe?.hard?.max_members, 10) || MAX_REFERENCE_SLOTS),
+);
+
+const selectedLaneRows = (lanes, laneIndices) => {
+    const byIndex = new Map(lanes.map((lane) => [Number(lane?.lane_index), lane]));
+    return laneIndices.map((laneIndex) => ({ laneIndex, lane: byIndex.get(laneIndex) || null }));
+};
+
 /**
  * What the Reference Selector panel should display for a lane payload.
  *
- * Pure so the two cases that actually matter are testable: a selected lane the
- * scene no longer has (which must stay visible, or the dropdown would read as a
- * different lane than the INT holds), and the status line.
+ * Pure so orphaned authored indices remain visible instead of making the panel
+ * appear to select different lanes than the workflow string actually names.
  */
-export function selectorPanelView({ lanes = [], laneIndex = 0, status = "", sceneName = "", source = "live" } = {}) {
-    const rows = Array.isArray(lanes) ? lanes : [];
-    const selected = Math.max(0, parseInt(laneIndex, 10) || 0);
-    const options = rows.map((lane) => ({
-        value: lane.lane_index,
-        label: `${lane.lane_name} — ${lane.recipe_name}`,
-        orphan: false,
-    }));
-    if (rows.length && !rows.some((lane) => lane.lane_index === selected)) {
-        options.push({
-            value: selected,
-            label: `Reference ${selected + 1} — no such lane in this scene`,
-            orphan: true,
-        });
-    }
-    const lane = rows.find((entry) => entry.lane_index === selected) || null;
-    let statusText;
-    if (status) {
-        statusText = status;
-    } else if (!lane) {
-        statusText = `Lane ${selected} is not in ${sceneName || "this scene"}.`;
-    } else {
+export function selectorPanelView({
+    lanes = [], laneIndices = [], invalidTokens = [], status = "", sceneName = "", source = "live",
+} = {}) {
+    const available = Array.isArray(lanes) ? lanes : [];
+    const selected = [...new Set((Array.isArray(laneIndices) ? laneIndices : [])
+        .map((value) => parseInt(value, 10)).filter((value) => Number.isInteger(value) && value >= 0))]
+        .sort((left, right) => left - right);
+    const selectedRows = selectedLaneRows(available, selected).map(({ laneIndex, lane }) => {
+        if (!lane) {
+            return {
+                laneIndex, lane: null, orphan: true,
+                label: `Reference ${laneIndex + 1} — no such lane in ${sceneName || "this scene"}`,
+                status: `Lane ${laneIndex} is not in ${sceneName || "this scene"}.`,
+            };
+        }
+        const reserved = laneReservedSpan(lane);
         const parts = [
             String(lane.media_kind || "image"),
             `${lane.item_count} item${lane.item_count === 1 ? "" : "s"}`,
             `${lane.member_count} member${lane.member_count === 1 ? "" : "s"}`,
+            `${reserved} reserved`,
         ];
         if (lane.hidden) parts.push("lane hidden");
-        // A running job froze this lane, so the panel is describing the snapshot
-        // rather than what the timeline currently shows.
         if (source === "snapshot") parts.push("frozen job");
-        statusText = parts.join(" · ");
+        return {
+            laneIndex, lane, orphan: false,
+            label: `${lane.lane_name} — ${lane.recipe_name}`,
+            status: parts.join(" · "),
+        };
+    });
+    const anchor = selectedRows.find((row) => row.lane)?.lane || null;
+    const effectiveAnchor = selectedRows.find((row) => row.lane?.item_count)?.lane || null;
+    const selectedTotal = selectedRows.reduce((total, row) => total + laneReservedSpan(row.lane), 0);
+    const anchorRecipe = anchor?.recipe && typeof anchor.recipe === "object" ? anchor.recipe : {};
+    const anchorDetached = Boolean(anchor) && (!String(anchor.recipe_id || "") || !Object.keys(anchorRecipe).length);
+    const budget = anchor ? Math.min(MAX_REFERENCE_SLOTS, laneMemberCap(anchor)) : MAX_REFERENCE_SLOTS;
+    const selectedSet = new Set(selected);
+    const addable = available
+        .filter((lane) => !selectedSet.has(Number(lane?.lane_index)))
+        .map((lane) => {
+            const reasons = [];
+            const candidateRecipe = lane?.recipe && typeof lane.recipe === "object" ? lane.recipe : {};
+            const candidateDetached = !String(lane?.recipe_id || "") || !Object.keys(candidateRecipe).length;
+            if (anchorDetached) reasons.push("The selected blank or detached recipe must stay alone.");
+            if (anchor && String(lane?.media_kind || "image") !== String(anchor.media_kind || "image")) {
+                reasons.push("Media kind differs from the selected lanes.");
+            }
+            if (anchor && stableJson(candidateRecipe) !== stableJson(anchorRecipe)) {
+                reasons.push("Materialized recipe differs from the selected lanes.");
+            }
+            if (anchor && candidateDetached) reasons.push("A blank or detached recipe can only be selected alone.");
+            if (effectiveAnchor && lane?.item_count
+                    && String(lane?.prompt_override || "") !== String(effectiveAnchor.prompt_override || "")) {
+                reasons.push("Prompt override differs from the effective selected lanes.");
+            }
+            const nextTotal = selectedTotal + laneReservedSpan(lane);
+            if (nextTotal > budget || laneReservedSpan(lane) > laneMemberCap(lane)) {
+                reasons.push(`The reserved total would exceed ${budget} slots.`);
+            }
+            return {
+                laneIndex: Number(lane?.lane_index), lane,
+                label: `${lane?.lane_name || `Reference ${Number(lane?.lane_index) + 1}`} — ${lane?.recipe_name || "Detached / Custom"}`,
+                disabled: reasons.length > 0,
+                reason: reasons.join(" "),
+            };
+        });
+    const disclosures = [];
+    for (const row of selectedRows) {
+        if (row.lane && !row.lane.item_count && laneReservedSpan(row.lane) > 0) {
+            disclosures.push(`Lane ${row.laneIndex} is inactive in this window; its ${laneReservedSpan(row.lane)} slots remain reserved.`);
+        }
     }
+    const strengths = selectedRows
+        .filter((row) => row.lane?.item_count)
+        .map((row) => Number(row.lane?.strength || 0));
+    if (new Set(strengths.map((value) => String(value))).size > 1) {
+        disclosures.push("Effective selected lanes use different strengths; the first effective lane drives reference_strength.");
+    }
+    if (invalidTokens.length) {
+        disclosures.push(`Ignored unparseable lane token${invalidTokens.length === 1 ? "" : "s"}: ${invalidTokens.join(", ")}.`);
+    }
+    const selectedLanes = selectedRows.map((row) => row.lane).filter(Boolean);
     return {
-        options,
-        selectedValue: selected,
-        disabled: !rows.length,
-        status: statusText,
-        outputs: (lane?.live_outputs || []).map((name) => ({
+        laneIndices: selected,
+        rows: selectedRows,
+        addable,
+        disabled: !available.length,
+        status: status || (!selected.length ? "No Reference lanes selected." : ""),
+        disclosures,
+        outputs: [...new Set(selectedLanes.flatMap((lane) => lane?.live_outputs || []))].map((name) => ({
             image_slots: "Image Bridge r01..r16",
             audio_slots: "Audio Bridge a01..a16",
             reference_prompt: "Prompt Bridge aggregate + p01..p16",
             reference_names: "Prompt Bridge reference_names",
         }[name] || name)),
-        // The `sonder:` namespace is noise on a node this small; the tag name is
-        // what identifies the reference.
-        tags: (lane?.member_tags || []).map((tag) => String(tag).replace(/^sonder:/, "")),
+        tags: [...new Set(selectedLanes.flatMap((lane) => lane?.member_tags || []))]
+            .map((tag) => String(tag).replace(/^sonder:/, "")),
+    };
+}
+
+export function mergedBridgeShape({ lanes = [], laneIndices = [] } = {}) {
+    const available = Array.isArray(lanes) ? lanes : [];
+    const selected = [...new Set((Array.isArray(laneIndices) ? laneIndices : [])
+        .map((value) => parseInt(value, 10)).filter((value) => Number.isInteger(value) && value >= 0))]
+        .sort((left, right) => left - right);
+    const resolved = selectedLaneRows(available, selected).map((row) => row.lane).filter(Boolean);
+    const padLabels = (values, count) => Array.from(
+        { length: Math.max(0, count) }, (_, index) => String(values?.[index] || "(unused)"),
+    );
+    return {
+        imageSlotCount: resolved.reduce((total, lane) => total + Math.max(0, parseInt(lane?.image_slot_count, 10) || 0), 0),
+        audioSlotCount: resolved.reduce((total, lane) => total + Math.max(0, parseInt(lane?.audio_slot_count, 10) || 0), 0),
+        promptSlotCount: resolved.reduce((total, lane) => total + Math.max(0, parseInt(lane?.prompt_slot_count, 10) || 0), 0),
+        liveOutputs: resolved.length
+            ? [...new Set(resolved.flatMap((lane) => lane?.live_outputs || []))]
+            : (selected.length ? null : []),
+        slotLabels: resolved.flatMap((lane) => padLabels(lane?.slot_labels, laneReservedSpan(lane))),
+        imageSlotLabels: resolved.flatMap((lane) => padLabels(
+            lane?.image_slot_labels,
+            Math.max(0, parseInt(lane?.image_slot_count, 10) || 0),
+        )),
     };
 }
 
@@ -278,7 +397,10 @@ export function resolveBridgeOutputs(node, shape = {}, { metadata = null, order 
         const ceiling = live === null
             ? MAX_REFERENCE_SLOTS
             : Math.max(connected, live.has(config.liveName) ? requested : 0);
-        const slotLabels = Array.isArray(shape?.slotLabels) ? shape.slotLabels : [];
+        const labelKey = config.prefix === "r" ? "imageSlotLabels" : "slotLabels";
+        const slotLabels = Array.isArray(shape?.[labelKey])
+            ? shape[labelKey]
+            : Array.isArray(shape?.slotLabels) ? shape.slotLabels : [];
         const unusedSlots = String(shape?.unusedSlots || "placeholder");
         const requiredConsumerSlots = new Set(
             Array.isArray(shape?.requiredConsumerSlots) ? shape.requiredConsumerSlots : [],

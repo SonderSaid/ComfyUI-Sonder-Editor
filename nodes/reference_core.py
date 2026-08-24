@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from typing import Any
 
 import cv2
@@ -48,6 +49,27 @@ from ..server.timeline_state import (
 
 
 MAX_REFERENCE_SLOTS = 16
+MAX_SAFE_LANE_INDEX = 9_007_199_254_740_991
+_MAX_SAFE_LANE_INDEX_TEXT = str(MAX_SAFE_LANE_INDEX)
+_LANE_SELECTION_SEPARATORS = re.compile(r"[, \t\r\n\f\v]+")
+
+
+def parse_lane_selection(value) -> list[int]:
+    """Return sorted unique non-negative lane indices from an authored value."""
+
+    tokens = _LANE_SELECTION_SEPARATORS.split(
+        str(value if value is not None else "").strip(" \t\r\n\f\v,"))
+    indices = set()
+    for token in tokens:
+        if not re.fullmatch(r"[0-9]+", token or ""):
+            continue
+        canonical = token.lstrip("0") or "0"
+        if len(canonical) > len(_MAX_SAFE_LANE_INDEX_TEXT) \
+                or (len(canonical) == len(_MAX_SAFE_LANE_INDEX_TEXT)
+                    and canonical > _MAX_SAFE_LANE_INDEX_TEXT):
+            continue
+        indices.add(int(canonical))
+    return sorted(indices)
 
 
 def _int(value, default=0) -> int:
@@ -202,10 +224,66 @@ def registry_numbers_for(registry, reference, member) -> dict:
     }
 
 
-def resolve_reference_set(project, reference_lane_index=0) -> dict[str, Any]:
-    """Resolve one lane against the current execution window without decoding."""
+def _plain_dict(value) -> dict:
+    if hasattr(value, "to_dict"):
+        return value.to_dict()
+    return dict(value) if isinstance(value, dict) else {}
 
-    lane_index = max(0, _int(reference_lane_index, 0))
+
+def _item_lane_index(item) -> int:
+    return _int(item.get("lane_index", -1), -1) if isinstance(item, dict) \
+        else _int(getattr(item, "lane_index", -1), -1)
+
+
+def _reserved_lane_span(items, lane_index: int) -> int:
+    return max((
+        len((_plain_dict(item).get("members") or []))
+        for item in items
+        if _item_lane_index(item) == lane_index
+    ), default=0)
+
+
+def _reference_conflicts(lanes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if len(lanes) <= 1:
+        return []
+    conflicts: dict[int, list[str]] = {}
+
+    def add(lane_index, reason):
+        conflicts.setdefault(int(lane_index), []).append(reason)
+
+    base = lanes[0]
+    base_wrapper = base["recipe"]
+    base_kind = str(base_wrapper.get("media_kind") or "image")
+    base_recipe = base_wrapper.get("recipe") if isinstance(base_wrapper.get("recipe"), dict) else {}
+    for lane in lanes:
+        wrapper = lane["recipe"]
+        if not str(wrapper.get("recipe_id") or "") or not isinstance(wrapper.get("recipe"), dict) \
+                or not wrapper.get("recipe"):
+            add(lane["lane_index"], "blank or detached recipes can only be selected alone")
+    for lane in lanes[1:]:
+        wrapper = lane["recipe"]
+        if str(wrapper.get("media_kind") or "image") != base_kind:
+            add(lane["lane_index"], f"media kind differs from lane {base['lane_index']}")
+        recipe = wrapper.get("recipe") if isinstance(wrapper.get("recipe"), dict) else {}
+        if recipe != base_recipe:
+            add(lane["lane_index"], f"materialized recipe differs from lane {base['lane_index']}")
+
+    effective = [lane for lane in lanes if lane["has_reference"]]
+    if len(effective) > 1:
+        base_override = str(effective[0]["item"].get("prompt_override") or "")
+        for lane in effective[1:]:
+            if str(lane["item"].get("prompt_override") or "") != base_override:
+                add(lane["lane_index"], f"prompt override differs from lane {effective[0]['lane_index']}")
+    return [
+        {"lane_index": lane_index, "reasons": reasons}
+        for lane_index, reasons in sorted(conflicts.items())
+    ]
+
+
+def resolve_reference_set(project, reference_lanes="0") -> dict[str, Any]:
+    """Resolve selected lanes against the current window without decoding."""
+
+    lane_indices = parse_lane_selection(reference_lanes)
     scene = _active_scene(project)
     render_start, render_end, width, height = _render_window(project, scene)
     source = _source(project, scene)
@@ -218,35 +296,44 @@ def resolve_reference_set(project, reference_lane_index=0) -> dict[str, Any]:
         _int(getattr(scene, "duration_frames", 0), render_end),
         *(end for end in explicit_item_ends if end >= 0),
     )
-    selected = None
-    registry = {"subjects": {}, "pictures": {}, "audios": {}, "speakers": {}}
-    if lane_index < source["lane_count"]:
-        resolved = resolve_effective_references(
-            reference_items=source["items"],
-            window_start=render_start,
-            window_end=render_end,
-            scene_duration=duration,
-            lane_configs=source["configs"],
-            lane_count=source["lane_count"],
-            frame_threshold_pct=source["frame_threshold_pct"],
-        )
+    resolved = resolve_effective_references(
+        reference_items=source["items"],
+        window_start=render_start,
+        window_end=render_end,
+        scene_duration=duration,
+        lane_configs=source["configs"],
+        lane_count=source["lane_count"],
+        frame_threshold_pct=source["frame_threshold_pct"],
+    )
+    # Project-scoped ordinals remain stable when a Selector changes which
+    # lanes it exposes, so the registry still spans every resolved lane.
+    registry = build_reference_registry(source["catalog_project"], resolved)
+    lanes = []
+    for lane_index in lane_indices:
+        if lane_index >= source["lane_count"]:
+            continue
         lane_value = resolved[lane_index] if lane_index < len(resolved) else None
         selected = lane_value.get("item") if isinstance(lane_value, dict) else None
-        # Over ALL lanes, not just this one: resolve_effective_references
-        # already returns every lane, and the registry must be cross-lane so an
-        # image lane and an audio lane staging the same entity agree.
-        registry = build_reference_registry(source["catalog_project"], resolved)
-    recipe = source["recipes"][lane_index] if lane_index < len(source["recipes"]) else ReferenceLaneRecipe()
-    item_dict = selected.to_dict() if hasattr(selected, "to_dict") else dict(selected or {})
-    recipe_dict = recipe.to_dict() if hasattr(recipe, "to_dict") else dict(recipe or {})
+        item_dict = _plain_dict(selected)
+        recipe_dict = _plain_dict(source["recipes"][lane_index])
+        lanes.append({
+            "lane_index": lane_index,
+            "item": item_dict,
+            "recipe": recipe_dict,
+            "has_reference": int(bool(item_dict)),
+            "strength": _float(item_dict.get("strength"), 1.0) if item_dict else 0.0,
+            "reserved_span": _reserved_lane_span(source["items"], lane_index),
+        })
+    conflicts = _reference_conflicts(lanes)
+    effective = next((lane for lane in lanes if lane["has_reference"]), None)
     return {
         "project": source["catalog_project"],
         "source": source["source"],
-        "lane_index": lane_index,
-        "has_reference": int(bool(item_dict)),
-        "strength": _float(item_dict.get("strength"), 1.0) if item_dict else 0.0,
-        "item": item_dict,
-        "recipe": recipe_dict,
+        "lanes": lanes,
+        "has_reference": int(effective is not None),
+        "strength": float(effective["strength"]) if effective is not None else 0.0,
+        "recipe": lanes[0]["recipe"] if lanes else {},
+        "conflicts": conflicts,
         "render_start": render_start,
         "render_end": render_end,
         "width": width,
@@ -262,13 +349,13 @@ def resolve_reference_set(project, reference_lane_index=0) -> dict[str, Any]:
     }
 
 
-def reference_fingerprint(project, reference_lane_index=0):
+def reference_fingerprint(project, reference_lanes="0"):
     """Return deterministic cache identity, or NaN when V3 hides the context."""
 
     if project is None:
         return float("nan")
     try:
-        ref = resolve_reference_set(project, reference_lane_index)
+        ref = resolve_reference_set(project, reference_lanes)
         stable = {key: value for key, value in ref.items() if key != "project"}
         # The item snapshot intentionally keeps member ids, while the Library
         # metadata and media records remain live until execution. Include the
@@ -598,8 +685,9 @@ def member_prompt_fragment(pattern: str, index: int, prompt: str, name: str,
     after the expanded pattern, which is what the original `token: label` form
     did and is why existing recipes keep composing identically.
 
-    `{n}` stays LANE-LOCAL — the member's order within this item. The four
-    project-scoped tokens (`{subject_n}`, `{picture_n}`, `{audio_n}`,
+    `{n}` is the member's zero-gap slot position within the emitted set, so it
+    remains aligned with p01..p16 even when an earlier inert lane reserves
+    unused slots. The four project-scoped tokens (`{subject_n}`, `{picture_n}`, `{audio_n}`,
     `{speaker_n}`) come from the cross-lane registry instead, so the same
     entity gets the same number on an image lane and an audio lane. They are
     collision-free against `{n}` under both the Python `.replace` chain and the
@@ -617,6 +705,7 @@ def _formatted_prompts(item: dict, records: list[dict[str, Any]], recipe: dict,
         "member_name": getattr(record["member"], "name", ""),
         "registry_numbers": registry_numbers_for(
             registry, record["reference"], record["member"]),
+        "slot_index": record.get("slot_index"),
     } for record in records]
     return format_reference_prompt(item=item, members=members, recipe=recipe)
 
@@ -644,20 +733,43 @@ def _audio_output(record: dict[str, Any]) -> dict:
     return {"waveform": torch.from_numpy(waveform).unsqueeze(0), "sample_rate": int(sample_rate)}
 
 
-def _reference_decode_context(reference_set, expected_media_kind: str | None = None) -> dict[str, Any]:
+def _reference_lane_values(ref: dict[str, Any]) -> list[dict[str, Any]]:
+    lanes = ref.get("lanes")
+    if isinstance(lanes, list):
+        return [lane for lane in lanes if isinstance(lane, dict)]
+    return []
+
+
+def _conflict_message(ref: dict[str, Any]) -> str:
+    conflicts = ref.get("conflicts") if isinstance(ref.get("conflicts"), list) else []
+    selected = [lane.get("lane_index") for lane in _reference_lane_values(ref)]
+    details = []
+    for conflict in conflicts:
+        if not isinstance(conflict, dict):
+            continue
+        lane_index = conflict.get("lane_index")
+        reasons = ", ".join(str(reason) for reason in conflict.get("reasons", []) if reason)
+        details.append(f"lane {lane_index}: {reasons}" if reasons else f"lane {lane_index}")
+    lanes = ", ".join(str(index) for index in selected)
+    return f"Reference lane indices {lanes} cannot be co-selected: {'; '.join(details)}"
+
+
+def _reference_decode_context(reference_set, expected_media_kind: str | None = None,
+                              lane: dict[str, Any] | None = None) -> dict[str, Any]:
     ref = reference_set if isinstance(reference_set, dict) else {}
     width = max(1, _int(ref.get("width"), 1280))
     height = max(1, _int(ref.get("height"), 720))
-    if not ref.get("has_reference"):
-        return {"present": False, "ref": ref, "width": width, "height": height}
-
-    recipe_wrapper = ref.get("recipe") if isinstance(ref.get("recipe"), dict) else {}
+    if lane is None:
+        lane = next(iter(_reference_lane_values(ref)), {})
+    lane_index = max(0, _int(lane.get("lane_index"), 0))
+    recipe_wrapper = lane.get("recipe") if isinstance(lane.get("recipe"), dict) else {}
     media_kind = "audio" if recipe_wrapper.get("media_kind") == "audio" else "image"
     if expected_media_kind and media_kind != expected_media_kind:
         bridge_name = "Image" if expected_media_kind == "image" else "Audio"
         article = "an" if media_kind[:1].lower() in "aeiou" else "a"
         raise RuntimeError(
-            f"Sonder Reference {bridge_name} Bridge cannot decode {article} {media_kind} Reference lane. "
+            f"Sonder Reference {bridge_name} Bridge cannot decode {article} {media_kind} "
+            f"Reference lane at lane {lane_index}. "
             f"Connect this Selector to the {media_kind.title()} Bridge instead."
         )
 
@@ -666,15 +778,26 @@ def _reference_decode_context(reference_set, expected_media_kind: str | None = N
         recipe.get("hard") if isinstance(recipe.get("hard"), dict) else {},
         ref.get("pegs") if isinstance(ref.get("pegs"), dict) else {},
     )
-    item = ref.get("item") if isinstance(ref.get("item"), dict) else {}
-    records = _member_records(ref.get("project"), item)
+    item = lane.get("item") if isinstance(lane.get("item"), dict) else {}
+    present = bool(lane.get("has_reference"))
+    records = _member_records(ref.get("project"), item) if present else []
     cap = min(MAX_REFERENCE_SLOTS, max(1, _int(hard.get("max_members"), MAX_REFERENCE_SLOTS)))
+    reserved_span = max(0, _int(lane.get("reserved_span"), 0))
+    if reserved_span > cap:
+        raise RuntimeError(
+            f"Reference lane {lane_index} recipe accepts at most {cap} members, but its widest "
+            f"staged item reserves {reserved_span}."
+        )
     if len(records) > cap:
-        raise RuntimeError(f"Reference recipe accepts at most {cap} members; {len(records)} were staged.")
+        raise RuntimeError(
+            f"Reference lane {lane_index} recipe accepts at most {cap} members; "
+            f"{len(records)} were staged."
+        )
 
     return {
-        "present": True,
+        "present": present,
         "ref": ref,
+        "lane_index": lane_index,
         "width": width,
         "height": height,
         "item": item,
@@ -683,7 +806,29 @@ def _reference_decode_context(reference_set, expected_media_kind: str | None = N
         "live": reference_live_outputs(hard),
         "records": records,
         "media_kind": media_kind,
+        "reserved_span": reserved_span,
     }
+
+
+def _reference_decode_contexts(reference_set, expected_media_kind=None) -> list[dict[str, Any]]:
+    ref = reference_set if isinstance(reference_set, dict) else {}
+    if ref.get("conflicts"):
+        raise RuntimeError(_conflict_message(ref))
+    return [
+        _reference_decode_context(ref, expected_media_kind, lane)
+        for lane in _reference_lane_values(ref)
+    ]
+
+
+def _ensure_block_capacity(contexts, block_name: str, reservations) -> None:
+    total = sum(max(0, _int(value, 0)) for value in reservations)
+    if total <= MAX_REFERENCE_SLOTS:
+        return
+    lanes = ", ".join(str(context["lane_index"]) for context in contexts)
+    raise RuntimeError(
+        f"Sonder Reference {block_name} Bridge requires {total} slots across lane indices "
+        f"{lanes}; the maximum is {MAX_REFERENCE_SLOTS}."
+    )
 
 
 def _reference_frame_rate(context: dict[str, Any]) -> float:
@@ -717,13 +862,9 @@ def _member_tensor_batch(
     return torch.stack([_to_tensor(frame, width, height) for frame in frames], dim=0)
 
 
-def decode_reference_images(reference_set, unused_slots="placeholder") -> tuple:
-    """Return the fixed r01..r16 IMAGE tuple for an image Reference lane."""
-    context = _reference_decode_context(reference_set, "image")
-    fallback = None if unused_slots == "nothing" else _empty_image(context["width"], context["height"])
+def _decode_lane_images(context) -> list[torch.Tensor]:
     if not context["present"] or "image_slots" not in context.get("live", set()):
-        return tuple(fallback for _ in range(MAX_REFERENCE_SLOTS))
-
+        return []
     hard = context["hard"]
     records = list(context["records"])
     assembly = str(hard.get("assembly", "batch") or "batch")
@@ -799,47 +940,100 @@ def decode_reference_images(reference_set, unused_slots="placeholder") -> tuple:
         # that is the pre-existing schema gap recorded by the plan.
         values = [torch.cat(ordered, dim=0)]
 
-    return tuple(
-        values[index] if index < len(values) else fallback
-        for index in range(MAX_REFERENCE_SLOTS)
-    )
+    return values
+
+
+def _image_reserved_slots(context) -> int:
+    if context["media_kind"] != "image" or "image_slots" not in context.get("live", set()):
+        return 0
+    assembly = str(context["hard"].get("assembly", "batch") or "batch")
+    return context["reserved_span"] if assembly == "slots" else int(context["reserved_span"] > 0)
+
+
+def decode_reference_images(reference_set, unused_slots="placeholder") -> tuple:
+    """Return r01..r16 with each selected lane occupying a stable span."""
+    ref = reference_set if isinstance(reference_set, dict) else {}
+    contexts = _reference_decode_contexts(ref, "image")
+    width = max(1, _int(ref.get("width"), 1280))
+    height = max(1, _int(ref.get("height"), 720))
+    fallback = None if unused_slots == "nothing" else _empty_image(width, height)
+    reservations = [_image_reserved_slots(context) for context in contexts]
+    _ensure_block_capacity(contexts, "Image", reservations)
+    values = []
+    for context, reserved in zip(contexts, reservations):
+        lane_values = _decode_lane_images(context)
+        values.extend(lane_values[:reserved])
+        values.extend(fallback for _ in range(max(0, reserved - len(lane_values))))
+    values.extend(fallback for _ in range(MAX_REFERENCE_SLOTS - len(values)))
+    return tuple(values)
+
+
+def _decode_lane_audios(context) -> list[dict]:
+    if not context["present"] or "audio_slots" not in context.get("live", set()):
+        return []
+    return [_audio_output(record) for record in context["records"]]
 
 
 def decode_reference_audios(reference_set, unused_slots="placeholder") -> tuple:
-    """Return the fixed a01..a16 AUDIO tuple, one trimmed member per slot."""
-    context = _reference_decode_context(reference_set, "audio")
+    """Return a01..a16 with each selected lane occupying a stable span."""
+    ref = reference_set if isinstance(reference_set, dict) else {}
+    contexts = _reference_decode_contexts(ref, "audio")
     fallback = (lambda: None) if unused_slots == "nothing" else _silent_audio
-    if not context["present"] or "audio_slots" not in context.get("live", set()):
-        return tuple(fallback() for _ in range(MAX_REFERENCE_SLOTS))
-    values = [_audio_output(record) for record in context["records"]]
-    return tuple(
-        values[index] if index < len(values) else fallback()
-        for index in range(MAX_REFERENCE_SLOTS)
-    )
+    reservations = [
+        context["reserved_span"]
+        if context["media_kind"] == "audio" and "audio_slots" in context.get("live", set())
+        else 0
+        for context in contexts
+    ]
+    _ensure_block_capacity(contexts, "Audio", reservations)
+    values = []
+    for context, reserved in zip(contexts, reservations):
+        lane_values = _decode_lane_audios(context)
+        values.extend(lane_values[:reserved])
+        values.extend(fallback() for _ in range(max(0, reserved - len(lane_values))))
+    values.extend(fallback() for _ in range(MAX_REFERENCE_SLOTS - len(values)))
+    return tuple(values)
 
 
 def decode_reference_prompts(reference_set) -> tuple:
     """Return aggregate prompt/names followed by p01..p16."""
-    context = _reference_decode_context(reference_set)
-    if not context["present"]:
+    ref = reference_set if isinstance(reference_set, dict) else {}
+    contexts = _reference_decode_contexts(ref)
+    if not contexts:
         return ("", "", *("" for _ in range(MAX_REFERENCE_SLOTS)))
-    live = context["live"]
-    records = context["records"]
-    ref = context["ref"]
+    live = contexts[0]["live"]
+    reservations = [
+        context["reserved_span"] if "reference_prompt" in context.get("live", set()) else 0
+        for context in contexts
+    ]
+    _ensure_block_capacity(contexts, "Prompt", reservations)
+    if not any(context["present"] for context in contexts):
+        return ("", "", *("" for _ in range(MAX_REFERENCE_SLOTS)))
+    records = []
+    slot_index = 0
+    for context, reserved in zip(contexts, reservations):
+        for offset, record in enumerate(context["records"]):
+            records.append({**record, "slot_index": slot_index + offset})
+        slot_index += reserved
     registry = ref.get("registry") if isinstance(ref.get("registry"), dict) else None
+    override = next((
+        str(context["item"].get("prompt_override") or "")
+        for context in contexts if context["present"] and context["item"].get("prompt_override")
+    ), "")
     prompt, slot_prompts = _formatted_prompts(
-        context["item"], records, context["recipe"], registry)
+        {"prompt_override": override}, records, contexts[0]["recipe"], registry)
     names = ", ".join(reference_member_labels(
         getattr(record["reference"], "name", ""),
         getattr(record["member"], "name", ""),
     )["name"] for record in records)
+    prompt_slots = [""] * MAX_REFERENCE_SLOTS
+    if "reference_prompt" in live:
+        for record, fragment in zip(records, slot_prompts):
+            index = max(0, _int(record.get("slot_index"), 0))
+            if index < MAX_REFERENCE_SLOTS:
+                prompt_slots[index] = fragment
     return (
         prompt if "reference_prompt" in live else "",
         names if "reference_names" in live else "",
-        *(
-            slot_prompts[index]
-            if "reference_prompt" in live and index < len(slot_prompts)
-            else ""
-            for index in range(MAX_REFERENCE_SLOTS)
-        ),
+        *prompt_slots,
     )

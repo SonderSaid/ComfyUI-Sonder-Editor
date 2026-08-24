@@ -37,47 +37,52 @@ class SonderReferenceSelector(io.ComfyNode):
             display_name="Sonder Reference Selector",
             category="Sonder",
             description=(
-                "Resolves one Reference lane for the active editor window without decoding media. "
+                "Resolves selected Reference lanes for the active editor window without decoding media. "
                 "Use has_reference to gate the branch that contains the required Reference Bridges."
             ),
             inputs=[
                 ProjectType.Input("project", tooltip="Wire from the Sonder Editor project output."),
-                io.Int.Input(
-                    "reference_lane_index",
-                    default=0,
-                    min=0,
-                    max=999,
-                    step=1,
-                    display_mode=io.NumberDisplay.number,
-                    tooltip="Zero-based Reference lane. Missing lanes do not fall back to lane zero.",
+                io.String.Input(
+                    "reference_lanes",
+                    default="0",
+                    tooltip=(
+                        "Comma-separated zero-based Reference lanes. Missing lanes are skipped and do "
+                        "not fall back to lane zero. Use the Selector panel to edit this list."
+                    ),
                 ),
             ],
             outputs=[
                 ReferenceSetType.Output(
                     display_name="reference_set",
-                    tooltip="Resolved Reference set for the selected lane. Fan out to the required Reference Bridges.",
+                    tooltip="Resolved Reference set for the selected lanes. Fan out to the required Reference Bridges.",
                 ),
                 io.Int.Output(
                     display_name="has_reference",
                     tooltip=(
-                        "0 when no staged item is effective for this window, 1 when one is. "
+                        "0 when no selected lane has a staged item effective for this window, 1 when any does. "
                         "Gate the branch containing the Bridge on this so it genuinely does not execute."
                     ),
                 ),
                 io.Float.Output(
                     display_name="reference_strength",
-                    tooltip="Authored strength of the effective Reference item, or 0.0 when none is effective.",
+                    tooltip=(
+                        "Authored strength of the first effective selected lane in lane-index order, "
+                        "or 0.0 when none is effective."
+                    ),
                 ),
             ],
         )
 
     @classmethod
-    def fingerprint_inputs(cls, project=None, reference_lane_index=0, **_kwargs):
-        return reference_fingerprint(project, reference_lane_index)
+    def fingerprint_inputs(cls, project=None, reference_lanes="0", **_kwargs):
+        return reference_fingerprint(project, reference_lanes)
 
     @classmethod
-    def execute(cls, project, reference_lane_index=0) -> io.NodeOutput:
-        result = resolve_reference_set(project, reference_lane_index)
+    def execute(cls, project, reference_lanes="0") -> io.NodeOutput:
+        result = resolve_reference_set(project, reference_lanes)
+        if result.get("conflicts"):
+            from .reference_core import _conflict_message
+            raise RuntimeError(_conflict_message(result))
         return io.NodeOutput(result, int(result["has_reference"]), float(result.get("strength", 0.0)))
 
 
@@ -100,8 +105,8 @@ class SonderReferenceImageBridge(io.ComfyNode):
             display_name="Sonder Reference Image Bridge",
             category="Sonder",
             description=(
-                "Decodes an image Reference lane. Non-slot assemblies emit their one assembled batch "
-                "or sequence on r01; slot recipes emit one member per output."
+                "Decodes selected homogeneous image Reference lanes in lane-index order. Non-slot "
+                "assemblies emit one payload per lane; slot recipes emit one member per output."
             ),
             inputs=[
                 ReferenceSetType.Input("reference_set", tooltip="Wire from Sonder Reference Selector."),
@@ -133,7 +138,10 @@ class SonderReferenceAudioBridge(io.ComfyNode):
             node_id=AUDIO_BRIDGE_NODE_ID,
             display_name="Sonder Reference Audio Bridge",
             category="Sonder",
-            description="Decodes an audio Reference lane into one trimmed AUDIO output per staged member.",
+            description=(
+                "Decodes selected homogeneous audio Reference lanes in lane-index order, with one "
+                "trimmed AUDIO output per staged member."
+            ),
             inputs=[
                 ReferenceSetType.Input("reference_set", tooltip="Wire from Sonder Reference Selector."),
                 io.Combo.Input(
@@ -164,7 +172,10 @@ class SonderReferencePromptBridge(io.ComfyNode):
             node_id=PROMPT_BRIDGE_NODE_ID,
             display_name="Sonder Reference Prompt Bridge",
             category="Sonder",
-            description="Exports the aggregate Reference prompt and names, followed by per-member prompts.",
+            description=(
+                "Exports one aggregate prompt and name list for all selected homogeneous lanes, "
+                "followed by per-member prompts in reserved lane-index order."
+            ),
             inputs=[ReferenceSetType.Input("reference_set", tooltip="Wire from Sonder Reference Selector.")],
             outputs=[
                 io.String.Output(

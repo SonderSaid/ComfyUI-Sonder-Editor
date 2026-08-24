@@ -15,12 +15,15 @@ import { api } from "/scripts/api.js";
 import { resolveProjectSource, getGraphLink, getGraphNode } from "./project_source_resolver.js";
 import { onProjectVersionChanged } from "./api_client.js";
 import { onEditorRenderWindowChanged } from "./editor_render_window_events.js";
+import { PRIORITY as KEY_PRIORITY, register as registerKeyboardConsumer } from "./keyboard_ownership.js";
 import {
     MAX_REFERENCE_SLOTS,
     SLOT_NAME_RE,
     canonicalOutputOrder,
     distillInputDefinition,
     inputRequirement,
+    mergedBridgeShape,
+    parseLaneSelection,
     resolveBridgeOutputs,
     selectorPanelView,
 } from "./reference_bridge_shape.js";
@@ -140,6 +143,7 @@ const FULL_SHAPE = {
     promptSlotCount: MAX_REFERENCE_SLOTS,
     liveOutputs: null,
     slotLabels: [],
+    imageSlotLabels: [],
 };
 
 async function referenceShapeForBridge(node) {
@@ -166,20 +170,11 @@ async function referenceShapeForBridge(node) {
     ));
     if (!response.ok) throw new Error(`Reference bridge shape fetch failed: ${response.status}`);
     const payload = await response.json();
-    const laneIndex = Math.max(0, parseInt(findWidget(selector, "reference_lane_index")?.value, 10) || 0);
-    const lane = (payload?.references || []).find((row) => row?.lane_index === laneIndex);
-    // A lane index pointing at no lane is an authoring mistake, not a recipe
-    // statement, so it shows everything rather than an empty node.
-    if (!lane) return FULL_SHAPE;
-    return {
-        // Each count is independently gated by the matching liveness group.
-        imageSlotCount: Math.max(0, parseInt(lane.image_slot_count, 10) || 0),
-        audioSlotCount: Math.max(0, parseInt(lane.audio_slot_count, 10) || 0),
-        // The p-block is gated on reference_prompt, independently of media kind.
-        promptSlotCount: Math.max(0, parseInt(lane.prompt_slot_count, 10) || 0),
-        liveOutputs: Array.isArray(lane.live_outputs) ? lane.live_outputs : null,
-        slotLabels: Array.isArray(lane.slot_labels) ? lane.slot_labels : [],
-    };
+    const selection = parseLaneSelection(findWidget(selector, "reference_lanes")?.value);
+    return mergedBridgeShape({
+        lanes: Array.isArray(payload?.references) ? payload.references : [],
+        laneIndices: selection.laneIndices,
+    });
 }
 
 function refreshShape(node) {
@@ -233,26 +228,90 @@ function refreshDownstreamBridges(selector) {
 }
 
 // ── Selector lane panel ───────────────────────────────────────────────
-// A bare INT tells the user nothing about which lane they picked. This mirrors
-// SonderDriverSelector's panel (bridge_nodes.js): a lane dropdown, a status
-// line, and the staged items. The INT stays the serialized workflow state — the
-// panel only writes it, so the node contract is unchanged.
+// The STRING widget is the sole workflow-embedded authority. Rendering parses
+// but never rewrites its authored text; only explicit add/remove actions write
+// the canonical sorted selection back. Menu/list state is ephemeral UI state.
 
 const style = (element, css) => { element.style.cssText = css; return element; };
+const SELECTOR_PANEL_MIN_HEIGHT = 96;
+const SELECTOR_PANEL_MAX_HEIGHT = 260;
 
 function selectorState(node) {
-    if (!node[SELECTOR_STATE]) node[SELECTOR_STATE] = { installed: false, refreshToken: 0 };
+    if (!node[SELECTOR_STATE]) {
+        node[SELECTOR_STATE] = {
+            installed: false,
+            refreshToken: 0,
+            panelHeight: SELECTOR_PANEL_MIN_HEIGHT,
+            menuOpen: false,
+            unregisterKeyboard: null,
+            outsidePointer: null,
+        };
+    }
     return node[SELECTOR_STATE];
 }
 
-function setSelectorLane(node, value) {
-    const widget = findWidget(node, "reference_lane_index");
+function setSelectorLanes(node, values) {
+    const widget = findWidget(node, "reference_lanes");
     if (!widget) return;
-    const laneIndex = Math.max(0, parseInt(value, 10) || 0);
-    if (widget.value === laneIndex) return;
-    widget.value = laneIndex;
-    widget.callback?.(laneIndex);
+    const laneIndices = [...new Set((Array.isArray(values) ? values : [])
+        .map((value) => Number(value))
+        .filter((value) => Number.isSafeInteger(value) && value >= 0))]
+        .sort((left, right) => left - right);
+    const authored = laneIndices.join(", ");
+    if (String(widget.value ?? "") === authored) return;
+    widget.value = authored;
+    widget.callback?.(authored);
     app.graph?.setDirtyCanvas?.(true, true);
+}
+
+function closeSelectorMenu(node) {
+    const state = selectorState(node);
+    if (!state.menuOpen) return;
+    state.menuOpen = false;
+    if (state.menu) state.menu.style.display = "none";
+    state.addButton?.setAttribute?.("aria-expanded", "false");
+    state.unregisterKeyboard?.();
+    state.unregisterKeyboard = null;
+    if (state.outsidePointer) window.removeEventListener("pointerdown", state.outsidePointer, true);
+    state.outsidePointer = null;
+}
+
+function openSelectorMenu(node) {
+    const state = selectorState(node);
+    if (!state.menu || state.menuOpen) return;
+    state.menuOpen = true;
+    state.menu.style.display = "flex";
+    state.addButton?.setAttribute?.("aria-expanded", "true");
+    state.outsidePointer = (event) => {
+        if (state.menu?.contains?.(event.target) || state.addButton?.contains?.(event.target)) return;
+        closeSelectorMenu(node);
+    };
+    window.addEventListener("pointerdown", state.outsidePointer, true);
+    state.unregisterKeyboard = registerKeyboardConsumer({
+        id: `reference-selector-menu:${node.id ?? "unassigned"}`,
+        priority: KEY_PRIORITY.OVERLAY,
+        keydown(event) {
+            if (event?.isComposing || event?.key !== "Escape") return false;
+            closeSelectorMenu(node);
+            return true;
+        },
+    });
+}
+
+function toggleSelectorMenu(node) {
+    const state = selectorState(node);
+    if (state.menuOpen) closeSelectorMenu(node);
+    else openSelectorMenu(node);
+}
+
+function selectorPanelHeight(view) {
+    const rows = Math.max(1, view.rows.length);
+    const disclosures = view.disclosures.length;
+    const chips = view.outputs.length || view.tags.length ? 24 : 0;
+    return Math.max(
+        SELECTOR_PANEL_MIN_HEIGHT,
+        Math.min(SELECTOR_PANEL_MAX_HEIGHT, 68 + (rows * 34) + (disclosures * 18) + chips),
+    );
 }
 
 async function selectorLanePayload(node) {
@@ -287,27 +346,62 @@ async function selectorLanePayload(node) {
 
 function renderSelectorPanel(node, payload) {
     const state = selectorState(node);
-    if (!state.select) return;
+    if (!state.rows) return;
+    const selection = parseLaneSelection(findWidget(node, "reference_lanes")?.value);
     const view = selectorPanelView({
         lanes: payload.lanes,
-        laneIndex: findWidget(node, "reference_lane_index")?.value,
+        laneIndices: selection.laneIndices,
+        invalidTokens: selection.invalidTokens,
         status: payload.status,
         sceneName: payload.sceneName,
         source: payload.source,
     });
+    state.view = view;
 
-    state.select.replaceChildren();
-    for (const entry of view.options) {
-        const option = document.createElement("option");
-        option.value = String(entry.value);
-        option.textContent = entry.label;
-        state.select.appendChild(option);
+    state.rows.replaceChildren();
+    if (!view.rows.length) {
+        const empty = style(document.createElement("div"), "color:#7f8d9b;font-size:10px;line-height:1.25;padding:3px 1px;");
+        empty.textContent = "No Reference lanes selected.";
+        state.rows.appendChild(empty);
     }
-    state.select.value = String(view.selectedValue);
-    state.select.disabled = view.disabled;
+    for (const row of view.rows) {
+        const line = style(document.createElement("div"), `
+            display:flex;align-items:flex-start;gap:5px;padding:4px 5px;box-sizing:border-box;
+            border:1px solid rgba(126,168,201,0.3);border-radius:5px;background:rgba(14,19,25,0.92);
+        `);
+        const copy = style(document.createElement("div"), "min-width:0;flex:1;");
+        const label = style(document.createElement("div"), "color:#cfd7df;font-size:10px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;");
+        label.textContent = row.label;
+        label.title = row.label;
+        const detail = style(document.createElement("div"), "color:#7f8d9b;font-size:9px;line-height:1.25;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;");
+        detail.textContent = row.status;
+        detail.title = row.status;
+        copy.append(label, detail);
+        const remove = style(document.createElement("button"), `
+            flex:0 0 auto;border:1px solid rgba(190,125,157,0.42);border-radius:5px;
+            background:rgba(14,19,25,0.92);color:#d9bcca;font-size:11px;padding:1px 5px;cursor:pointer;
+        `);
+        remove.type = "button";
+        remove.textContent = "×";
+        remove.title = `Remove lane ${row.laneIndex}`;
+        remove.addEventListener("click", () => {
+            closeSelectorMenu(node);
+            setSelectorLanes(node, view.laneIndices.filter((value) => value !== row.laneIndex));
+            refreshSelectorPanel(node);
+        });
+        line.append(copy, remove);
+        state.rows.appendChild(line);
+    }
     state.status.textContent = view.status;
 
-    state.list.replaceChildren();
+    state.disclosures.replaceChildren();
+    for (const disclosure of view.disclosures) {
+        const line = style(document.createElement("div"), "color:#d9bcca;font-size:9px;line-height:1.25;");
+        line.textContent = disclosure;
+        state.disclosures.appendChild(line);
+    }
+
+    state.chips.replaceChildren();
     for (const tag of view.tags) {
         const chip = style(document.createElement("span"), `
             display:inline-block; font-size:9px; padding:1px 5px; margin:1px;
@@ -315,7 +409,7 @@ function renderSelectorPanel(node, payload) {
         `);
         chip.textContent = tag;
         chip.title = "Tag on a member staged in this lane";
-        state.list.appendChild(chip);
+        state.chips.appendChild(chip);
     }
     for (const name of view.outputs) {
         const chip = style(document.createElement("span"), `
@@ -324,8 +418,43 @@ function renderSelectorPanel(node, payload) {
         `);
         chip.textContent = name;
         chip.title = "Output this recipe drives";
-        state.list.appendChild(chip);
+        state.chips.appendChild(chip);
     }
+
+    state.menu.replaceChildren();
+    const entries = view.addable.length ? view.addable : [{
+        label: payload.linked ? "No other lanes" : "No lanes available",
+        disabled: true,
+        reason: payload.status || "There are no additional Reference lanes in this scene.",
+    }];
+    for (const entry of entries) {
+        const option = style(document.createElement("button"), `
+            width:100%;box-sizing:border-box;text-align:left;border:0;border-radius:5px;
+            background:rgba(14,19,25,0.92);color:#cfd7df;font-size:10px;padding:5px 7px;cursor:pointer;
+        `);
+        option.type = "button";
+        option.textContent = entry.label;
+        option.disabled = Boolean(entry.disabled);
+        option.title = entry.reason || "Add this Reference lane";
+        if (!option.disabled) {
+            option.addEventListener("click", () => {
+                closeSelectorMenu(node);
+                setSelectorLanes(node, [...view.laneIndices, entry.laneIndex]);
+                refreshSelectorPanel(node);
+            });
+        }
+        state.menu.appendChild(option);
+    }
+
+    state.panelHeight = selectorPanelHeight(view);
+    const panelOverhead = 68 + (view.disclosures.length * 18)
+        + ((view.outputs.length || view.tags.length) ? 24 : 0);
+    const availableRowsHeight = Math.max(34, state.panelHeight - panelOverhead);
+    state.rows.style.maxHeight = `${availableRowsHeight}px`;
+    state.rows.style.overflowY = view.rows.length * 34 > availableRowsHeight ? "auto" : "hidden";
+    const computed = node.computeSize?.();
+    if (Array.isArray(computed)) node.setSize?.([node.size?.[0] || computed[0], computed[1]]);
+    app.graph?.setDirtyCanvas?.(true, true);
 }
 
 function refreshSelectorPanel(node) {
@@ -348,42 +477,58 @@ function installSelectorPanel(node) {
     if (nodeType(node) !== SELECTOR || typeof node.addDOMWidget !== "function") return;
     const state = selectorState(node);
     if (state.panel) return;
-    const wrapper = style(document.createElement("div"), "display:flex;flex-direction:column;gap:5px;width:100%;box-sizing:border-box;padding-top:2px;");
+    const wrapper = style(document.createElement("div"), "display:flex;flex-direction:column;gap:5px;width:100%;box-sizing:border-box;padding-top:2px;position:relative;");
     const header = style(document.createElement("div"), "display:flex;justify-content:space-between;align-items:center;gap:6px;color:#cfd7df;font-size:10px;font-weight:700;");
     const title = document.createElement("span");
     title.textContent = "Reference Selector";
+    const actions = style(document.createElement("div"), "display:flex;align-items:center;gap:4px;");
+    const addButton = style(document.createElement("button"), `
+        border:1px solid rgba(126,168,201,0.35);border-radius:5px;background:rgba(14,19,25,0.92);
+        color:#dbe4ed;font-size:11px;padding:1px 7px;cursor:pointer;
+    `);
+    addButton.type = "button";
+    addButton.textContent = "+";
+    addButton.title = "Add a Reference lane";
+    addButton.setAttribute("aria-haspopup", "menu");
+    addButton.setAttribute("aria-expanded", "false");
+    addButton.addEventListener("click", () => toggleSelectorMenu(node));
     const refreshBtn = style(document.createElement("button"), `
         border:1px solid rgba(126,168,201,0.35); border-radius:5px; background:rgba(14,19,25,0.92);
         color:#dbe4ed; font-size:10px; padding:2px 6px; cursor:pointer;
     `);
     refreshBtn.textContent = "Refresh";
     refreshBtn.addEventListener("click", () => refreshSelectorPanel(node));
-    header.append(title, refreshBtn);
+    actions.append(addButton, refreshBtn);
+    header.append(title, actions);
 
-    const select = style(document.createElement("select"), `
-        width:100%; box-sizing:border-box; background:#17202a; color:#e6edf3;
-        border:1px solid rgba(126,168,201,0.35); border-radius:5px; padding:3px 5px; font-size:10px;
-    `);
-    select.addEventListener("change", () => {
-        setSelectorLane(node, select.value);
-        refreshSelectorPanel(node);
-    });
+    const rows = style(document.createElement("div"), "display:flex;flex-direction:column;gap:4px;min-height:0;");
     const status = style(document.createElement("div"), "color:#7f8d9b;font-size:10px;line-height:1.25;");
-    const list = style(document.createElement("div"), "display:flex;flex-wrap:wrap;max-height:64px;overflow:auto;");
-    wrapper.append(header, select, status, list);
+    const disclosures = style(document.createElement("div"), "display:flex;flex-direction:column;gap:2px;");
+    const chips = style(document.createElement("div"), "display:flex;flex-wrap:wrap;max-height:48px;overflow:auto;");
+    const menu = style(document.createElement("div"), `
+        display:none;flex-direction:column;gap:2px;position:absolute;right:0;top:24px;z-index:10;
+        width:min(250px,100%);max-height:170px;overflow:auto;padding:4px;box-sizing:border-box;
+        border:1px solid rgba(126,168,201,0.35);border-radius:5px;background:#17202a;
+    `);
+    menu.setAttribute("role", "menu");
+    wrapper.append(header, rows, status, disclosures, chips, menu);
 
     const domWidget = node.addDOMWidget("sonder_reference_selector_panel", "SonderReferenceSelectorPanel", wrapper, {
         serialize: false,
         hideOnZoom: false,
-        getMinHeight: () => 86,
-        getMaxHeight: () => 168,
-        getHeight: () => 132,
+        getMinHeight: () => SELECTOR_PANEL_MIN_HEIGHT,
+        getMaxHeight: () => SELECTOR_PANEL_MAX_HEIGHT,
+        getHeight: () => state.panelHeight,
     });
-    domWidget.computeSize = (width) => [width, 132];
+    domWidget.computeSize = (width) => [width, state.panelHeight];
     state.panel = wrapper;
-    state.select = select;
+    state.domWidget = domWidget;
+    state.addButton = addButton;
+    state.rows = rows;
     state.status = status;
-    state.list = list;
+    state.disclosures = disclosures;
+    state.chips = chips;
+    state.menu = menu;
     refreshSelectorPanel(node);
 }
 
@@ -393,7 +538,7 @@ function installSelector(node) {
     installSelectorPanel(node);
     if (state.installed) return;
     state.installed = true;
-    const laneWidget = findWidget(node, "reference_lane_index");
+    const laneWidget = findWidget(node, "reference_lanes");
     if (laneWidget) {
         const originalCallback = laneWidget.callback;
         laneWidget.callback = function (...args) {
@@ -414,6 +559,11 @@ function installSelector(node) {
             refreshSelectorPanel(this);
         }, 0);
         return result;
+    };
+    const originalRemoved = node.onRemoved;
+    node.onRemoved = function (...args) {
+        closeSelectorMenu(this);
+        return originalRemoved?.apply(this, args);
     };
 }
 

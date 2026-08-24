@@ -148,8 +148,8 @@ def test_project_scoped_tokens_expand_from_the_registry(monkeypatch):
         0, "a redhead woman", "Chloe",
         {"subject_n": 3, "picture_n": 2, "audio_n": 0, "speaker_n": 1},
     )
-    # {n} stays LANE-LOCAL (member order within the item); the rest are
-    # project-scoped.
+    # The supplied index is the emitted slot position; registry ordinals are
+    # independently project-scoped.
     assert fragment == "<Subject 3> is a redhead woman, from <Picture 2> (1)"
 
 
@@ -243,6 +243,25 @@ def test_member_prompt_fragment_matches_between_python_and_javascript(monkeypatc
     # Anti-vacuity: the fixtures must exercise real expansions, not all-empty.
     assert len([value for value in expected if value]) >= 7
     assert "<Subject 3>" in expected[0]
+
+
+def test_javascript_derived_prompt_honors_emitted_slot_index():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for emitted-slot prompt coverage")
+    module_url = (ROOT / "web" / "js" / "reference_resolution.js").as_uri()
+    script = f"""
+const {{ deriveReferencePrompt }} = await import({json.dumps(module_url)});
+console.log(JSON.stringify(deriveReferencePrompt({{
+  members: [{{prompt: 'villain', entity_name: 'Villain', slot_index: 4}}],
+  soft: {{prompt_tokens: 'reference {{n}}'}},
+}})));
+"""
+    actual = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        capture_output=True, text=True, encoding="utf-8", check=True,
+    ).stdout)
+    assert actual == "reference 5: villain"
 
 
 def test_token_vocabulary_matches_between_python_and_javascript(monkeypatch):

@@ -76,7 +76,10 @@ def format_reference_prompt(*, item=None, members=None, recipe=None) -> tuple[st
     soft = recipe.get("soft") if isinstance(recipe.get("soft"), dict) else {}
     pattern = str(soft.get("prompt_tokens") or "")
     fragments = [member_prompt_fragment(
-        pattern, index, str(record.get("prompt") or ""),
+        pattern,
+        int(record.get("slot_index")) if isinstance(record.get("slot_index"), int)
+        and record.get("slot_index") >= 0 else index,
+        str(record.get("prompt") or ""),
         str(record.get("entity_name") or record.get("name") or ""),
         record.get("registry_numbers") if isinstance(record, dict) else None,
         str(record.get("member_name") or ""))
