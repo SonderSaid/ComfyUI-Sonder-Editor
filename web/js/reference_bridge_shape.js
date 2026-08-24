@@ -14,8 +14,9 @@
 //      failed fetch are all "we don't know", not "this recipe drives nothing" —
 //      a slow load must not look like a broken node.
 //
-// The backend is untouched either way: it always returns the full tuple with
-// its documented fallbacks, so AUDIO still never returns None.
+// The backend always returns the full tuple. Each Image/Audio Bridge's
+// workflow-embedded emission policy decides whether a dead slot carries its
+// type-correct placeholder or no value.
 
 export const MAX_REFERENCE_SLOTS = 16;
 export const SLOT_NAME_RE = /^[rap](0[1-9]|1[0-6])$/;
@@ -51,6 +52,76 @@ export function connectedSlotCeiling(node, prefix = null) {
     return Math.max(0, ...(node?.outputs || [])
         .filter((slot) => outputConnected(slot) && (!prefix || String(slot?.name || "").startsWith(prefix)))
         .map(slotNumber));
+}
+
+const namedEntries = (value) => (
+    value && typeof value === "object" && !Array.isArray(value) ? Object.entries(value) : []
+);
+
+/** Reduce one /object_info node definition to the input facts this module models. */
+export function distillInputDefinition(nodeData = {}) {
+    const input = nodeData?.input && typeof nodeData.input === "object" ? nodeData.input : {};
+    const requiredEntries = namedEntries(input.required);
+    const optionalEntries = namedEntries(input.optional);
+    const autogrow = [];
+    for (const [, value] of [...requiredEntries, ...optionalEntries]) {
+        const options = Array.isArray(value) && value[1] && typeof value[1] === "object" ? value[1] : null;
+        const template = options?.template;
+        if (!template || typeof template !== "object") continue;
+
+        let templateRequired = null;
+        for (const [category, entries] of namedEntries(template.input)) {
+            if (!entries || typeof entries !== "object" || !Object.keys(entries).length) continue;
+            templateRequired = category === "required";
+            break;
+        }
+        // An Autogrow shape with no readable template input is unknown. Failing
+        // quiet is safer than labelling a valid graph as broken.
+        if (templateRequired === null) continue;
+
+        const names = Array.isArray(template.names)
+            ? template.names.map((name) => String(name))
+            : null;
+        const prefix = typeof template.prefix === "string" ? template.prefix : null;
+        if (!names && prefix === null) continue;
+        const parsedMin = Number(template.min);
+        const parsedMax = Number(template.max);
+        autogrow.push({
+            prefix,
+            names,
+            min: Number.isInteger(parsedMin) && parsedMin >= 0 ? parsedMin : 0,
+            max: names
+                ? names.length
+                : (Number.isInteger(parsedMax) && parsedMax >= 1 ? parsedMax : 0),
+            required: templateRequired,
+        });
+    }
+    return {
+        required: new Set(requiredEntries.map(([name]) => name)),
+        optional: new Set(optionalEntries.map(([name]) => name)),
+        autogrow,
+    };
+}
+
+/** Return required/optional only when the captured input shape proves it. */
+export function inputRequirement(definition, inputName) {
+    const name = String(inputName || "");
+    if (!definition || !name) return "unknown";
+    if (definition.required instanceof Set && definition.required.has(name)) return "required";
+    if (definition.optional instanceof Set && definition.optional.has(name)) return "optional";
+    for (const template of Array.isArray(definition.autogrow) ? definition.autogrow : []) {
+        let index = -1;
+        if (Array.isArray(template?.names)) {
+            index = template.names.indexOf(name);
+        } else if (typeof template?.prefix === "string" && name.startsWith(template.prefix)) {
+            const suffix = name.slice(template.prefix.length);
+            if (/^\d+$/.test(suffix)) index = Number(suffix);
+            if (!Number.isInteger(index) || index < 0 || index >= Number(template.max)) index = -1;
+        }
+        if (index < 0) continue;
+        return template.required && index < Number(template.min) ? "required" : "optional";
+    }
+    return "unknown";
 }
 
 /** Canonical tuple order for one homogeneous bridge. */
@@ -136,6 +207,7 @@ function ensureOutput(node, name, metadata, order) {
 }
 
 export const UNUSED_SUFFIX = " (unused)";
+export const UNUSED_REQUIRED_SUFFIX = " (unused · required input)";
 
 /**
  * Mark a dead output without touching its index, name or type.
@@ -147,9 +219,14 @@ export const UNUSED_SUFFIX = " (unused)";
  *
  * `ignoreConnection` decouples marking from wiring. A connected slot must
  * survive, but a connected output the recipe does not drive is exactly the case
- * worth announcing because it emits its type-correct fallback into a live link.
+ * worth announcing because its selected fallback reaches a live link.
  */
-function markOutput(slot, live, metadata, { ignoreConnection = false, authoredLabel = "" } = {}) {
+function markOutput(
+    slot,
+    live,
+    metadata,
+    { ignoreConnection = false, authoredLabel = "", deadSuffix = UNUSED_SUFFIX } = {},
+) {
     if (!slot) return false;
     const meta = metadata?.get(slot.name);
     const captured = meta?.label ?? meta?.localized_name ?? slot.name;
@@ -161,7 +238,7 @@ function markOutput(slot, live, metadata, { ignoreConnection = false, authoredLa
         ? String(captured).slice(0, -UNUSED_SUFFIX.length)
         : captured);
     const dead = live && !live.has(slot.name) && (ignoreConnection || !outputConnected(slot));
-    const label = dead ? `${original}${UNUSED_SUFFIX}` : original;
+    const label = dead ? `${original}${deadSuffix}` : original;
     if (slot.label === label && slot.localized_name === label) return false;
     slot.label = label;
     slot.localized_name = label;
@@ -178,6 +255,8 @@ function markOutput(slot, live, metadata, { ignoreConnection = false, authoredLa
  * @param shape.audioSlotCount   staged member count for the a-block
  * @param shape.promptSlotCount  staged member count for the p-block
  * @param shape.liveOutputs      fixed output names the recipe drives, or null for "show everything"
+ * @param shape.unusedSlots      workflow policy: placeholder or nothing
+ * @param shape.requiredConsumerSlots numbered outputs wired to proven-required inputs
  * @param options.metadata       Map of name -> {type,label,tooltip} captured at node creation
  * @param options.order          canonical name order; defaults to the tuple order
  * @returns true when anything visible changed
@@ -200,6 +279,10 @@ export function resolveBridgeOutputs(node, shape = {}, { metadata = null, order 
             ? MAX_REFERENCE_SLOTS
             : Math.max(connected, live.has(config.liveName) ? requested : 0);
         const slotLabels = Array.isArray(shape?.slotLabels) ? shape.slotLabels : [];
+        const unusedSlots = String(shape?.unusedSlots || "placeholder");
+        const requiredConsumerSlots = new Set(
+            Array.isArray(shape?.requiredConsumerSlots) ? shape.requiredConsumerSlots : [],
+        );
 
         for (const name of config.fixed) {
             ensureOutput(node, name, metadata, canonical);
@@ -226,11 +309,20 @@ export function resolveBridgeOutputs(node, shape = {}, { metadata = null, order 
             const labelSuffix = String(slotLabels[index - 1] || "").trim();
             const authoredLabel = labelSuffix ? `${name} · ${labelSuffix}` : name;
             const numberedLive = live === null || (live.has(config.liveName) && index <= requested);
+            const slot = node.outputs[outputIndex(node, name)];
+            const warnsRequired = !numberedLive
+                && unusedSlots === "nothing"
+                && outputConnected(slot)
+                && requiredConsumerSlots.has(name);
             markOutput(
-                node.outputs[outputIndex(node, name)],
+                slot,
                 numberedLive ? null : new Set(),
                 metadata,
-                { ignoreConnection: true, authoredLabel },
+                {
+                    ignoreConnection: true,
+                    authoredLabel,
+                    deadSuffix: warnsRequired ? UNUSED_REQUIRED_SUFFIX : UNUSED_SUFFIX,
+                },
             );
         }
         return signature() !== before;

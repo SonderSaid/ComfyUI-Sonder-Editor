@@ -670,18 +670,12 @@ def test_dimension_constraint_is_frozen_and_old_projects_self_heal():
     assert "JSON.stringify({ dimension_constraint: expected })" in heal
 
 
-FIXED_OUTPUT_NAMES = [name for name in REFERENCE_OUTPUT_NAMES if name != "slots"]
-SLOT_NAMES = [f"r{index:02d}" for index in range(1, 17)]
-PROMPT_SLOT_NAMES = [f"p{index:02d}" for index in range(1, 17)]
+def test_bridge_shape_preserves_homogeneous_output_positions_and_labels():
+    """A connected ceiling must preserve slot identity in each bridge tuple.
 
-
-def test_bridge_never_removes_a_fixed_output_because_slot_index_is_the_contract():
-    """Regression: a dead MIDDLE output must not be removed.
-
-    ComfyUI validates a connection against the static /object_info definition by
-    slot index. Removing `reference_audio` (index 3) slid `r01` into index 3, so
-    dragging from a slot labelled r01 was refused as AUDIO. Dead fixed outputs
-    are relabelled instead; only the r-block, a contiguous tail, shrinks.
+    The Image, Audio, and Prompt Bridges own separate type-homogeneous tuples.
+    Their numbered blocks may shrink only from the true tail, never across a
+    connected slot; dead survivors are relabelled without changing position.
     """
     node_bin = shutil.which("node")
     if not node_bin:
@@ -739,126 +733,119 @@ console.log(JSON.stringify({{
     assert split["audioNames"] == ["a01", "a02", "a03"]
     assert split["promptNames"] == ["reference_prompt", "reference_names", "p01", "p02"]
     assert split["deadNamesLabel"].endswith(split["suffix"])
-    return
-
     script = rf"""
-const {{ resolveBridgeOutputs, canonicalOutputOrder, FIXED_OUTPUT_NAMES, UNUSED_SUFFIX }} =
+const {{ resolveBridgeOutputs, canonicalOutputOrder, UNUSED_SUFFIX }} =
   await import({json.dumps(module_url)});
-const order = canonicalOutputOrder();
-const types = new Map(order.map((name) => [name, name === 'reference_idx' ? 'INT'
-  : name === 'reference_strength' ? 'FLOAT'
-  : name === 'reference_audio' ? 'AUDIO'
-  : name.startsWith('reference_prompt') || name.startsWith('reference_names') ? 'STRING' : 'IMAGE']));
-const metadata = new Map(order.map((name) => [name, {{ type: types.get(name) }}]));
-const makeNode = (names) => ({{
-  outputs: names.map((name) => ({{ name, type: types.get(name), link: null, links: [] }})),
-  addOutput(name, type, opts) {{ this.outputs.push({{ name, type, link: null, links: [], ...opts }}); }},
+const makeNode = (type) => ({{
+  type,
+  comfyClass: type,
+  outputs: canonicalOutputOrder(type).map((name) => ({{
+    name,
+    type: type.includes('Audio') ? 'AUDIO' : type.includes('Prompt') ? 'STRING' : 'IMAGE',
+    link: null,
+    links: [],
+  }})),
+  addOutput(name, slotType, opts) {{ this.outputs.push({{ name, type: slotType, link: null, links: [], ...opts }}); }},
   removeOutput(index) {{ this.outputs.splice(index, 1); }},
 }});
 // `meta` is overridable so a test can mimic ensureState() re-capturing metadata
 // from already-marked live outputs after a graph reload.
-const shape = (node, s, meta = metadata) => resolveBridgeOutputs(node, s, {{ metadata: meta, order }});
+const metadataFor = (node) => new Map(node.outputs.map((slot) => [slot.name, {{
+  type: slot.type,
+  label: slot.label,
+  localized_name: slot.localized_name,
+}}]));
+const shape = (node, s, meta = metadataFor(node)) => resolveBridgeOutputs(
+  node,
+  s,
+  {{ metadata: meta, order: canonicalOutputOrder(node.comfyClass) }},
+);
 const describe = (node) => node.outputs.map((slot, i) => [i, slot.name, slot.type, slot.label ?? null]);
 const results = {{}};
+const promptType = 'SonderReferencePromptBridge';
 
-// The reported bug, exactly: a recipe driving only prompt/names/context/slots.
-const lean = makeNode([...FIXED_OUTPUT_NAMES, 'r01']);
-shape(lean, {{ slotCount: 1, liveOutputs: ['reference_prompt', 'reference_names', 'context', 'slots'] }});
-results.lean = describe(lean);
-
-// Numbered slots past the staged count are MARKED, never removed: the p-block
-// sits behind the r-block, so trimming an r-slot used to slide p01 into an
-// r-block position and deliver an image tensor from a STRING socket.
-const trimmed = makeNode([...FIXED_OUTPUT_NAMES]);
-shape(trimmed, {{ slotCount: 1, promptSlotCount: 1, liveOutputs: ['slots', 'reference_prompt'] }});
-results.slotNames = trimmed.outputs.map((s) => s.name);
-results.r02Label = trimmed.outputs.find((s) => s.name === 'r02').label;
-results.p01Label = trimmed.outputs.find((s) => s.name === 'p01').label;
-results.p02Label = trimmed.outputs.find((s) => s.name === 'p02').label;
+// A connected p02 pins the homogeneous Prompt Bridge ceiling while one staged
+// member leaves that slot visibly unused. The two fixed STRING outputs retain
+// their leading tuple positions.
+const trimmed = makeNode(promptType);
+trimmed.outputs.find((s) => s.name === 'p02').links = [2];
+shape(trimmed, {{ promptSlotCount: 1, liveOutputs: ['reference_prompt'] }});
+results.trimmed = describe(trimmed);
 
 // The five presets that drive per-member TEXT without touching the r-block:
 // Ingredients, Best Face ID, VACE, Phantom and SCAIL. The p-block is gated on
 // reference_prompt alone, so it must go live while every r-slot stays marked.
-const promptOnly = makeNode([...FIXED_OUTPUT_NAMES]);
-shape(promptOnly, {{ slotCount: 0, promptSlotCount: 2,
-                     liveOutputs: ['reference_frames', 'reference_prompt', 'reference_names'] }});
-results.promptOnly = ['p01', 'p02', 'p03', 'r01'].map(
+const promptOnly = makeNode(promptType);
+promptOnly.outputs.find((s) => s.name === 'p03').links = [3];
+shape(promptOnly, {{ promptSlotCount: 2, liveOutputs: ['reference_prompt', 'reference_names'] }});
+results.promptOnly = ['p01', 'p02', 'p03'].map(
   (n) => promptOnly.outputs.find((s) => s.name === n).label);
 
 // Relaxing the COUNT on an absent promptSlotCount must not relax the LIVENESS.
 // A recipe that genuinely omits reference_prompt still marks the whole p-block.
-const noPromptLive = makeNode([...FIXED_OUTPUT_NAMES]);
-shape(noPromptLive, {{ slotCount: 1, liveOutputs: ['slots', 'reference_names'] }});
+const noPromptLive = makeNode(promptType);
+noPromptLive.outputs.find((s) => s.name === 'p16').links = [16];
+shape(noPromptLive, {{ promptSlotCount: 1, liveOutputs: ['reference_names'] }});
 results.noPromptLive = ['p01', 'p16'].map(
   (n) => noPromptLive.outputs.find((s) => s.name === n).label);
-
-// A payload with no promptSlotCount at all is "we don't know", not "zero" —
-// the old server field, or a response in flight across a version change.
-const absentCount = makeNode([...FIXED_OUTPUT_NAMES]);
-shape(absentCount, {{ slotCount: 0, liveOutputs: ['reference_prompt'] }});
-results.absentCount = ['p01', 'p16', 'r01'].map(
-  (n) => absentCount.outputs.find((s) => s.name === n).label);
-
-// The audio lane: routes reports 0 because decode_reference_set's audio branch
-// passes no slot_prompts, so the p-block really is empty and must say so.
-const audioLane = makeNode([...FIXED_OUTPUT_NAMES]);
-shape(audioLane, {{ slotCount: 0, promptSlotCount: 0,
-                    liveOutputs: ['reference_audio', 'reference_prompt', 'reference_names'] }});
-results.audioLane = ['p01', 'p02'].map(
-  (n) => audioLane.outputs.find((s) => s.name === n).label);
 
 // A connected dead FIXED output is still marked. Wiring says the user
 // connected something, not that the recipe drives it — the slot emits a
 // type-correct fallback into a live link, which is the case most worth
 // naming. Only removal is gated on connection.
-const wired = makeNode([...FIXED_OUTPUT_NAMES]);
-wired.outputs.find((s) => s.name === 'reference_audio').links = [7];
-shape(wired, {{ slotCount: 0, liveOutputs: ['reference_frames'] }});
-results.wiredLabel = wired.outputs.find((s) => s.name === 'reference_audio').label;
+const wired = makeNode(promptType);
+wired.outputs.find((s) => s.name === 'reference_names').links = [7];
+shape(wired, {{ promptSlotCount: 0, liveOutputs: ['reference_prompt'] }});
+results.wiredLabel = wired.outputs.find((s) => s.name === 'reference_names').label;
 
 // Reloading a graph captures metadata from the LIVE outputs, so a node saved
 // while marked must not accumulate a second suffix on the next shape pass.
-const reloaded = makeNode([...FIXED_OUTPUT_NAMES]);
-shape(reloaded, {{ slotCount: 0, liveOutputs: ['reference_frames'] }});
+const reloaded = makeNode(promptType);
+shape(reloaded, {{ promptSlotCount: 0, liveOutputs: ['reference_prompt'] }});
 const reloadedMeta = new Map(reloaded.outputs.map((s) => [
   s.name, {{ type: s.type, label: s.label, localized_name: s.localized_name }},
 ]));
-shape(reloaded, {{ slotCount: 0, liveOutputs: ['reference_frames'] }}, reloadedMeta);
-results.reloadedLabel = reloaded.outputs.find((s) => s.name === 'reference_audio').label;
+shape(reloaded, {{ promptSlotCount: 0, liveOutputs: ['reference_prompt'] }}, reloadedMeta);
+results.reloadedLabel = reloaded.outputs.find((s) => s.name === 'reference_names').label;
 // And the mark still clears when the recipe revives the output.
-shape(reloaded, {{ slotCount: 0, liveOutputs: null }}, reloadedMeta);
-results.reloadedRevived = reloaded.outputs.find((s) => s.name === 'reference_audio').label;
+shape(reloaded, {{ promptSlotCount: 0, liveOutputs: null }}, reloadedMeta);
+results.reloadedRevived = reloaded.outputs.find((s) => s.name === 'reference_names').label;
 
 // No declaration: everything present and nothing marked.
-const unknown = makeNode([...FIXED_OUTPUT_NAMES]);
-shape(unknown, {{ slotCount: 0, liveOutputs: null }});
-results.unknownLabels = unknown.outputs.slice(0, FIXED_OUTPUT_NAMES.length).map((s) => s.label);
-results.unknownSlotLabels = ['r01', 'r16', 'p01', 'p16']
+const unknown = makeNode(promptType);
+shape(unknown, {{ promptSlotCount: 0, liveOutputs: null }});
+results.unknownNames = unknown.outputs.map((s) => s.name);
+results.unknownLabels = unknown.outputs.map((s) => s.label);
+results.unknownSlotLabels = ['p01', 'p16']
   .map((n) => unknown.outputs.find((s) => s.name === n).label);
 
-// The reported `slots` serve mode: reference_frames is dead and unwired, so it
-// must read as unused on BOTH renderers - label for legacy, localized_name for
-// Nodes 2.0. Setting only one leaves the other showing the bare name.
-const slotsMode = makeNode([...FIXED_OUTPUT_NAMES, 'r01']);
-shape(slotsMode, {{ slotCount: 1, liveOutputs: ['slots', 'reference_prompt', 'reference_names'] }});
-const frames = slotsMode.outputs.find((s) => s.name === 'reference_frames');
-results.slotsMode = [frames.label, frames.localized_name];
+// A connected-but-unstaged image slot reads unused on BOTH renderers - label
+// for legacy, localized_name for Nodes 2.0.
+const slotsMode = makeNode('SonderReferenceImageBridge');
+slotsMode.outputs.find((s) => s.name === 'r02').links = [2];
+shape(slotsMode, {{ imageSlotCount: 1, liveOutputs: ['image_slots'] }});
+const secondImage = slotsMode.outputs.find((s) => s.name === 'r02');
+results.slotsMode = [secondImage.label, secondImage.localized_name];
 
 // Marks clear again when the recipe changes back.
-const revived = makeNode([...FIXED_OUTPUT_NAMES]);
-shape(revived, {{ slotCount: 0, liveOutputs: ['reference_frames'] }});
-const markedFixed = () => revived.outputs
-  .slice(0, FIXED_OUTPUT_NAMES.length)
+const revived = makeNode(promptType);
+shape(revived, {{ promptSlotCount: 0, liveOutputs: ['reference_prompt'] }});
+const markedFixed = () => revived.outputs.slice(0, 2)
   .filter((s) => String(s.label).endsWith(UNUSED_SUFFIX)).length;
 const markedCount = markedFixed();
-shape(revived, {{ slotCount: 0, liveOutputs: null }});
+shape(revived, {{ promptSlotCount: 0, liveOutputs: null }});
 results.markCycle = [markedCount, markedFixed()];
 
 // Idempotent.
-const stable = makeNode([...FIXED_OUTPUT_NAMES]);
-shape(stable, {{ slotCount: 2, promptSlotCount: 2, liveOutputs: ['reference_frames'] }});
-results.secondRunChanged = shape(stable, {{ slotCount: 2, promptSlotCount: 2,
-                                            liveOutputs: ['reference_frames'] }});
+const stable = makeNode(promptType);
+stable.outputs.find((s) => s.name === 'p02').links = [2];
+const stableMeta = metadataFor(stable);
+shape(stable, {{ promptSlotCount: 1, liveOutputs: ['reference_prompt'] }}, stableMeta);
+results.secondRunChanged = shape(
+  stable,
+  {{ promptSlotCount: 1, liveOutputs: ['reference_prompt'] }},
+  stableMeta,
+);
 
 console.log(JSON.stringify(results));
 """
@@ -866,49 +853,346 @@ console.log(JSON.stringify(results));
         [node_bin, "--input-type=module", "-e", script], capture_output=True, text=True, encoding="utf-8", check=True,
     ).stdout)
 
-    # Every fixed output keeps its canonical index and its declared type.
-    for index, name in enumerate(FIXED_OUTPUT_NAMES):
-        assert out["lean"][index][0] == index
-        assert out["lean"][index][1] == name
-    assert out["lean"][3][1:3] == ["reference_audio", "AUDIO"], "index 3 must stay AUDIO"
-    assert out["lean"][7][1:3] == ["r01", "IMAGE"], "r01 must sit at index 7, not 3"
-    # Dead ones read as unused; live ones read normally.
-    assert out["lean"][3][3] == "reference_audio (unused)"
-    assert out["lean"][0][3] == "reference_frames (unused)"
-    assert out["lean"][4][3] == "reference_prompt"
-
-    # Every declared output is present, in canonical order, at every shape.
-    assert out["slotNames"] == FIXED_OUTPUT_NAMES + SLOT_NAMES + PROMPT_SLOT_NAMES
-    # One staged member: slot 1 is live, slot 2 reads unused on both blocks.
-    assert out["r02Label"] == "r02 (unused)" and out["p02Label"] == "p02 (unused)"
-    assert out["p01Label"] == "p01"
+    # The homogeneous Prompt Bridge retains its two fixed STRING positions, and
+    # the connected p02 pins a contiguous two-slot block behind them.
+    assert [entry[1:3] for entry in out["trimmed"]] == [
+        ["reference_prompt", "STRING"],
+        ["reference_names", "STRING"],
+        ["p01", "STRING"],
+        ["p02", "STRING"],
+    ]
+    assert out["trimmed"][2][3] == "p01"
+    assert out["trimmed"][3][3] == "p02 (unused)"
     # Rule 2 still holds for the numbered blocks: with no liveness declaration
     # every slot shows unmarked rather than looking broken during a slow load.
-    assert out["unknownSlotLabels"] == ["r01", "r16", "p01", "p16"]
+    assert out["unknownSlotLabels"] == ["p01", "p16"]
     # Wiring gates REMOVAL, not marking. A wired output the recipe does not
     # drive still emits its fallback into that link, so it must say so —
-    # `reference_frames` is wired in almost every real workflow and was
-    # therefore the one output the old connection guard could never mark.
-    assert out["wiredLabel"] == "reference_audio (unused)", "a wired dead output still marks"
+    assert out["wiredLabel"] == "reference_names (unused)", "a wired dead output still marks"
     # Re-capturing metadata from marked outputs must not stack suffixes.
-    assert out["reloadedLabel"] == "reference_audio (unused)", "no doubled suffix after reload"
-    assert out["reloadedRevived"] == "reference_audio", "reload-captured marks still clear"
-    assert out["unknownLabels"] == FIXED_OUTPUT_NAMES
-    assert out["slotsMode"] == ["reference_frames (unused)", "reference_frames (unused)"]
-    assert out["markCycle"] == [6, 0], "marks must clear when liveness is unknown again"
+    assert out["reloadedLabel"] == "reference_names (unused)", "no doubled suffix after reload"
+    assert out["reloadedRevived"] == "reference_names", "reload-captured marks still clear"
+    assert out["unknownNames"] == ["reference_prompt", "reference_names"] + PROMPT_SLOT_NAMES
+    assert out["unknownLabels"] == out["unknownNames"]
+    assert out["slotsMode"] == ["r02 (unused)", "r02 (unused)"]
+    assert out["markCycle"] == [1, 0], "marks must clear when liveness is unknown again"
     assert out["secondRunChanged"] is False
 
     # The p-block is gated on reference_prompt ALONE. Five presets drive
     # per-member text without the r-block; folding both into one count marked
     # real output unused (nodes/reference_core.py fills p01..pN whenever
     # reference_prompt is live, independent of slots).
-    assert out["promptOnly"] == ["p01", "p02", "p03 (unused)", "r01 (unused)"]
-    # Absent means "we don't know", so only the COUNT relaxes. Liveness is
-    # untouched: a recipe omitting reference_prompt still marks the whole block.
+    assert out["promptOnly"] == ["p01", "p02", "p03 (unused)"]
+    # A recipe omitting reference_prompt still marks the whole connected block.
     assert out["noPromptLive"] == ["p01 (unused)", "p16 (unused)"]
-    assert out["absentCount"] == ["p01", "p16", "r01 (unused)"]
-    # An audio lane's p-block genuinely is empty and must keep saying so.
-    assert out["audioLane"] == ["p01 (unused)", "p02 (unused)"]
+
+
+def test_bridge_unused_slot_required_input_advisory_is_proven_and_fails_quiet():
+    node_bin = shutil.which("node")
+    if not node_bin:
+        pytest.skip("node is required for the bridge advisory test")
+    module_url = (ROOT / "web" / "js" / "reference_bridge_shape.js").as_uri()
+    script = rf"""
+const {{
+  UNUSED_REQUIRED_SUFFIX,
+  canonicalOutputOrder,
+  distillInputDefinition,
+  inputRequirement,
+  resolveBridgeOutputs,
+}} = await import({json.dumps(module_url)});
+
+const autogrow = (template) => distillInputDefinition({{
+  input: {{ optional: {{ values: ['COMFY_AUTOGROW_V3', {{ template }}] }} }},
+}});
+const direct = distillInputDefinition({{
+  input: {{
+    required: {{ hard: ['IMAGE', {{}}] }},
+    optional: {{ soft: ['IMAGE', {{}}] }},
+  }},
+}});
+const prefixMinZero = autogrow({{
+  input: {{ required: {{ value: ['IMAGE', {{}}] }} }},
+  prefix: 'ref_image_', min: 0, max: 4,
+}});
+const prefixMinTwo = autogrow({{
+  input: {{ required: {{ value: ['IMAGE', {{}}] }} }},
+  prefix: 'required_', min: 2, max: 4,
+}});
+const optionalTemplate = autogrow({{
+  input: {{ required: {{}}, optional: {{ value: ['IMAGE', {{}}] }} }},
+  prefix: 'optional_', min: 2, max: 4,
+}});
+const namedTemplate = autogrow({{
+  input: {{ required: {{ value: ['IMAGE', {{}}] }} }},
+  names: ['first', 'second'], min: 1,
+}});
+const unreadableTemplate = autogrow({{
+  input: {{ required: {{}}, optional: {{}} }},
+  prefix: 'unknown_', min: 1, max: 2,
+}});
+
+const makeNode = () => ({{
+  type: 'SonderReferenceImageBridge',
+  comfyClass: 'SonderReferenceImageBridge',
+  outputs: canonicalOutputOrder('SonderReferenceImageBridge').map((name) => ({{
+    name, type: 'IMAGE', links: [],
+  }})),
+  addOutput(name, type, opts) {{ this.outputs.push({{ name, type, links: [], ...opts }}); }},
+  removeOutput(index) {{ this.outputs.splice(index, 1); }},
+}});
+const shape = {{
+  imageSlotCount: 1,
+  liveOutputs: ['image_slots'],
+  unusedSlots: 'nothing',
+  requiredConsumerSlots: ['r02'],
+}};
+const warned = makeNode();
+warned.outputs.find((slot) => slot.name === 'r02').links = [2];
+resolveBridgeOutputs(warned, shape);
+const firstWarning = warned.outputs.find((slot) => slot.name === 'r02').label;
+const reloadMetadata = new Map(warned.outputs.map((slot) => [slot.name, {{
+  type: slot.type, label: slot.label, localized_name: slot.localized_name,
+}}]));
+resolveBridgeOutputs(warned, shape, {{ metadata: reloadMetadata }});
+const secondWarning = warned.outputs.find((slot) => slot.name === 'r02').label;
+resolveBridgeOutputs(warned, {{ ...shape, imageSlotCount: 2 }}, {{ metadata: reloadMetadata }});
+const revived = warned.outputs.find((slot) => slot.name === 'r02').label;
+
+const placeholder = makeNode();
+placeholder.outputs.find((slot) => slot.name === 'r02').links = [2];
+resolveBridgeOutputs(placeholder, {{ ...shape, unusedSlots: 'placeholder' }});
+const placeholderLabel = placeholder.outputs.find((slot) => slot.name === 'r02').label;
+
+const optionalConsumer = makeNode();
+optionalConsumer.outputs.find((slot) => slot.name === 'r02').links = [2];
+resolveBridgeOutputs(optionalConsumer, {{ ...shape, requiredConsumerSlots: [] }});
+const optionalLabel = optionalConsumer.outputs.find((slot) => slot.name === 'r02').label;
+
+console.log(JSON.stringify({{
+  requirements: {{
+    directRequired: inputRequirement(direct, 'hard'),
+    directOptional: inputRequirement(direct, 'soft'),
+    minZero: inputRequirement(prefixMinZero, 'ref_image_0'),
+    minTwoFirst: inputRequirement(prefixMinTwo, 'required_0'),
+    minTwoSecond: inputRequirement(prefixMinTwo, 'required_1'),
+    minTwoTail: inputRequirement(prefixMinTwo, 'required_2'),
+    prefixBeyondMax: inputRequirement(prefixMinTwo, 'required_4'),
+    emptyRequiredGuard: inputRequirement(optionalTemplate, 'optional_0'),
+    namedFirst: inputRequirement(namedTemplate, 'first'),
+    namedSecond: inputRequirement(namedTemplate, 'second'),
+    unregistered: inputRequirement(undefined, 'anything'),
+    unreadable: inputRequirement(unreadableTemplate, 'unknown_0'),
+  }},
+  firstWarning,
+  secondWarning,
+  revived,
+  placeholderLabel,
+  optionalLabel,
+  suffix: UNUSED_REQUIRED_SUFFIX,
+}}));
+"""
+    out = json.loads(subprocess.run(
+        [node_bin, "--input-type=module", "-e", script],
+        capture_output=True, text=True, encoding="utf-8", check=True,
+    ).stdout)
+
+    assert out["requirements"] == {
+        "directRequired": "required",
+        "directOptional": "optional",
+        "minZero": "optional",
+        "minTwoFirst": "required",
+        "minTwoSecond": "required",
+        "minTwoTail": "optional",
+        "prefixBeyondMax": "unknown",
+        "emptyRequiredGuard": "optional",
+        "namedFirst": "required",
+        "namedSecond": "optional",
+        "unregistered": "unknown",
+        "unreadable": "unknown",
+    }
+    assert out["firstWarning"] == f"r02{out['suffix']}"
+    # Regression guard on the existing authored-label invariant: numbered slots
+    # rebuild from rNN, so a reload cannot double either suffix.
+    assert out["secondWarning"] == out["firstWarning"]
+    assert out["revived"] == "r02", "a live slot emits content and never warns"
+    assert out["placeholderLabel"] == "r02 (unused)"
+    assert out["optionalLabel"] == "r02 (unused)", "unknown/optional consumers fail quiet"
+
+
+def test_reference_bridge_extension_wires_definitions_graphs_and_policy_callback(tmp_path):
+    node_bin = shutil.which("node")
+    if not node_bin:
+        pytest.skip("node is required for the bridge extension test")
+
+    bridge_source = (ROOT / "web" / "js" / "reference_bridge.js").read_text(encoding="utf-8")
+    shape_url = (ROOT / "web" / "js" / "reference_bridge_shape.js").as_uri()
+    modules = {
+        "app.mjs": """
+export const app = {
+  graph: null,
+  registerExtension(extension) { globalThis.__referenceBridgeExtension = extension; },
+};
+""",
+        "api.mjs": "export const api = { apiURL: (value) => value };\n",
+        "client.mjs": "export const onProjectVersionChanged = () => {};\n",
+        "events.mjs": "export const onEditorRenderWindowChanged = () => {};\n",
+        "resolver.mjs": """
+const keyed = (value, key) => value?.[key] ?? value?.[String(key)] ?? null;
+export const getGraphLink = (graph, id) => graph?.getLink?.(id) ?? keyed(graph?.links, id);
+export const getGraphNode = (graph, id) => graph?.getNodeById?.(id)
+  ?? keyed(graph?._nodes_by_id, id)
+  ?? (graph?._nodes || []).find((node) => String(node?.id) === String(id))
+  ?? null;
+export const resolveProjectSource = () => ({ status: 'unresolved' });
+""",
+    }
+    for name, source in modules.items():
+        (tmp_path / name).write_text(source, encoding="utf-8")
+    replacements = {
+        "/scripts/app.js": (tmp_path / "app.mjs").as_uri(),
+        "/scripts/api.js": (tmp_path / "api.mjs").as_uri(),
+        "./project_source_resolver.js": (tmp_path / "resolver.mjs").as_uri(),
+        "./api_client.js": (tmp_path / "client.mjs").as_uri(),
+        "./editor_render_window_events.js": (tmp_path / "events.mjs").as_uri(),
+        "./reference_bridge_shape.js": shape_url,
+    }
+    for old, new in replacements.items():
+        bridge_source = bridge_source.replace(f'"{old}"', json.dumps(new))
+    bridge_path = tmp_path / "reference_bridge.mjs"
+    bridge_path.write_text(bridge_source, encoding="utf-8")
+
+    script = rf"""
+const scheduled = [];
+globalThis.window = {{
+  setTimeout(callback) {{ scheduled.push(callback); return scheduled.length; }},
+}};
+globalThis.fetch = async () => ({{ ok: true, json: async () => ({{ references: [] }}) }});
+const {{ app }} = await import({json.dumps((tmp_path / 'app.mjs').as_uri())});
+const bridgeModule = await import({json.dumps(bridge_path.as_uri())});
+const extension = globalThis.__referenceBridgeExtension;
+
+const directDefinition = (name, category, inputName) => extension.beforeRegisterNodeDef(null, {{
+  name,
+  input: {{ [category]: {{ [inputName]: ['IMAGE', {{}}] }} }},
+}});
+const autogrowDefinition = (name, prefix, min) => extension.beforeRegisterNodeDef(null, {{
+  name,
+  input: {{ optional: {{ values: ['COMFY_AUTOGROW_V3', {{ template: {{
+    input: {{ required: {{ value: ['IMAGE', {{}}] }} }},
+    prefix, min, max: 4,
+  }} }}] }} }},
+}});
+directDefinition('RequiredDirect', 'required', 'image');
+directDefinition('OptionalDirect', 'optional', 'image');
+autogrowDefinition('OptionalAutogrow', 'ref_image_', 0);
+autogrowDefinition('RequiredAutogrow', 'required_', 2);
+
+const makeBridge = (graph, linkId, policy = 'nothing') => {{
+  let originalCalls = 0;
+  const widget = {{
+    name: 'unused_slots', value: policy,
+    callback() {{ originalCalls += 1; }},
+  }};
+  const node = {{
+    id: `bridge-${{linkId}}`,
+    type: 'SonderReferenceImageBridge',
+    comfyClass: 'SonderReferenceImageBridge',
+    graph,
+    widgets: [widget],
+    inputs: [{{ name: 'reference_set', link: null }}],
+    outputs: Array.from({{ length: 16 }}, (_, index) => ({{
+      name: `r${{String(index + 1).padStart(2, '0')}}`,
+      type: 'IMAGE',
+      links: index === 1 ? [linkId] : [],
+    }})),
+    addOutput(name, type, options) {{ this.outputs.push({{ name, type, links: [], ...options }}); }},
+    removeOutput(index) {{ this.outputs.splice(index, 1); }},
+    computeSize() {{ return [280, 100]; }},
+    setSize() {{}},
+  }};
+  return {{ node, widget, originalCalls: () => originalCalls }};
+}};
+const target = (id, type, inputName) => ({{
+  id, type, comfyClass: type, inputs: [{{ name: inputName }}],
+}});
+const legacyGraph = (linkId, targetNode) => ({{
+  links: {{ [linkId]: {{ target_id: targetNode.id, target_slot: 0 }} }},
+  _nodes_by_id: {{ [targetNode.id]: targetNode }},
+}});
+const modernGraph = (linkId, targetNode) => {{
+  const link = {{ target_id: targetNode.id, target_slot: 0 }};
+  return {{
+    getLink(id) {{ return String(id) === String(linkId) ? link : null; }},
+    getNodeById(id) {{ return String(id) === String(targetNode.id) ? targetNode : null; }},
+  }};
+}};
+const deadShape = {{ imageSlotCount: 1, liveOutputs: ['image_slots'], slotLabels: [] }};
+
+const requiredTarget = target(10, 'RequiredDirect', 'image');
+const requiredBridge = makeBridge(legacyGraph(1, requiredTarget), 1);
+app.graph = requiredBridge.node.graph;
+bridgeModule.applyReferenceBridgeShape(requiredBridge.node, deadShape);
+const directWarning = requiredBridge.node.outputs.find((slot) => slot.name === 'r02').label;
+
+const optionalTarget = target(20, 'OptionalDirect', 'image');
+const optionalBridge = makeBridge(legacyGraph(2, optionalTarget), 2);
+bridgeModule.applyReferenceBridgeShape(optionalBridge.node, deadShape);
+const directOptional = optionalBridge.node.outputs.find((slot) => slot.name === 'r02').label;
+
+const h3Target = target(30, 'OptionalAutogrow', 'ref_image_0');
+const h3Bridge = makeBridge(modernGraph(3, h3Target), 3);
+bridgeModule.applyReferenceBridgeShape(h3Bridge.node, deadShape);
+const minZeroOptional = h3Bridge.node.outputs.find((slot) => slot.name === 'r02').label;
+
+const requiredGrowTarget = target(40, 'RequiredAutogrow', 'required_1');
+const requiredGrowBridge = makeBridge(modernGraph(4, requiredGrowTarget), 4);
+bridgeModule.applyReferenceBridgeShape(requiredGrowBridge.node, deadShape);
+const autogrowWarning = requiredGrowBridge.node.outputs.find((slot) => slot.name === 'r02').label;
+
+// Reusing the same server shape across nodes must not stamp node-local graph or
+// widget facts onto it (the production FULL_SHAPE has the same sharing hazard).
+const sharedShape = {{ ...deadShape }};
+bridgeModule.applyReferenceBridgeShape(requiredBridge.node, sharedShape);
+bridgeModule.applyReferenceBridgeShape(optionalBridge.node, sharedShape);
+const sharedKeys = Object.keys(sharedShape).sort();
+
+// Install the real callback wrapper, discard only its initial refresh, then
+// execute the refresh scheduled by changing the policy widget.
+extension.nodeCreated(requiredBridge.node);
+scheduled.length = 0;
+requiredBridge.widget.value = 'placeholder';
+requiredBridge.widget.callback('placeholder');
+const callbackScheduled = scheduled.length;
+scheduled.shift()?.();
+await Promise.resolve();
+await Promise.resolve();
+const clearedByCallback = requiredBridge.node.outputs.find((slot) => slot.name === 'r02').label;
+
+console.log(JSON.stringify({{
+  directWarning,
+  directOptional,
+  minZeroOptional,
+  autogrowWarning,
+  sharedKeys,
+  callbackScheduled,
+  originalCalls: requiredBridge.originalCalls(),
+  clearedByCallback,
+}}));
+"""
+    out = json.loads(subprocess.run(
+        [node_bin, "--input-type=module", "-e", script],
+        capture_output=True, text=True, encoding="utf-8", check=True,
+    ).stdout)
+
+    warning = "r02 (unused · required input)"
+    assert out["directWarning"] == warning
+    assert out["autogrowWarning"] == warning
+    assert out["directOptional"] == "r02 (unused)"
+    assert out["minZeroOptional"] == "r02 (unused)"
+    assert out["sharedKeys"] == ["imageSlotCount", "liveOutputs", "slotLabels"]
+    assert out["callbackScheduled"] == 1
+    assert out["originalCalls"] == 1
+    assert out["clearedByCallback"] == "r02"
 
 
 def test_bridge_shape_module_stays_free_of_browser_imports():

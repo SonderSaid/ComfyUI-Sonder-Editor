@@ -717,12 +717,12 @@ def _member_tensor_batch(
     return torch.stack([_to_tensor(frame, width, height) for frame in frames], dim=0)
 
 
-def decode_reference_images(reference_set) -> tuple:
+def decode_reference_images(reference_set, unused_slots="placeholder") -> tuple:
     """Return the fixed r01..r16 IMAGE tuple for an image Reference lane."""
     context = _reference_decode_context(reference_set, "image")
-    empty = _empty_image(context["width"], context["height"])
+    fallback = None if unused_slots == "nothing" else _empty_image(context["width"], context["height"])
     if not context["present"] or "image_slots" not in context.get("live", set()):
-        return tuple(empty for _ in range(MAX_REFERENCE_SLOTS))
+        return tuple(fallback for _ in range(MAX_REFERENCE_SLOTS))
 
     hard = context["hard"]
     records = list(context["records"])
@@ -800,19 +800,20 @@ def decode_reference_images(reference_set) -> tuple:
         values = [torch.cat(ordered, dim=0)]
 
     return tuple(
-        values[index] if index < len(values) else empty
+        values[index] if index < len(values) else fallback
         for index in range(MAX_REFERENCE_SLOTS)
     )
 
 
-def decode_reference_audios(reference_set) -> tuple:
+def decode_reference_audios(reference_set, unused_slots="placeholder") -> tuple:
     """Return the fixed a01..a16 AUDIO tuple, one trimmed member per slot."""
     context = _reference_decode_context(reference_set, "audio")
+    fallback = (lambda: None) if unused_slots == "nothing" else _silent_audio
     if not context["present"] or "audio_slots" not in context.get("live", set()):
-        return tuple(_silent_audio() for _ in range(MAX_REFERENCE_SLOTS))
+        return tuple(fallback() for _ in range(MAX_REFERENCE_SLOTS))
     values = [_audio_output(record) for record in context["records"]]
     return tuple(
-        values[index] if index < len(values) else _silent_audio()
+        values[index] if index < len(values) else fallback()
         for index in range(MAX_REFERENCE_SLOTS)
     )
 

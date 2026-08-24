@@ -7,7 +7,8 @@
 //      different question than liveness.
 //   2. An unresolved project shows everything — a slow project load must not
 //      look like a broken node.
-//   3. The backend fallback is untouched; hiding is presentation only.
+//   3. The workflow widget owns dead-slot emission; the canvas only explains
+//      when `nothing` would feed a required consumer.
 
 import { app } from "/scripts/app.js";
 import { api } from "/scripts/api.js";
@@ -16,7 +17,10 @@ import { onProjectVersionChanged } from "./api_client.js";
 import { onEditorRenderWindowChanged } from "./editor_render_window_events.js";
 import {
     MAX_REFERENCE_SLOTS,
+    SLOT_NAME_RE,
     canonicalOutputOrder,
+    distillInputDefinition,
+    inputRequirement,
     resolveBridgeOutputs,
     selectorPanelView,
 } from "./reference_bridge_shape.js";
@@ -30,6 +34,7 @@ const BRIDGES = new Set([
 ]);
 const STATE = Symbol("sonderReferenceBridgeState");
 const SELECTOR_STATE = Symbol("sonderReferenceSelectorState");
+const INPUT_DEFINITIONS = new Map();
 
 const nodeType = (node) => String(node?.comfyClass || node?.type || "");
 const findWidget = (node, name) => (node?.widgets || []).find((widget) => widget?.name === name) || null;
@@ -78,12 +83,45 @@ function ensureState(node) {
 export function applyReferenceBridgeShape(node, shape = {}) {
     if (!BRIDGES.has(nodeType(node))) return;
     const state = ensureState(node);
-    const changed = resolveBridgeOutputs(node, shape, { metadata: state.metadata, order: state.order });
+    const resolvedShape = {
+        ...shape,
+        unusedSlots: String(findWidget(node, "unused_slots")?.value || "placeholder"),
+        requiredConsumerSlots: requiredConsumerSlotNames(node),
+    };
+    const changed = resolveBridgeOutputs(
+        node,
+        resolvedShape,
+        { metadata: state.metadata, order: state.order },
+    );
     // Project writes are frequent and mostly unrelated to this node; only a real
     // slot change earns a resize and a canvas repaint.
     if (!changed) return;
     node.setSize?.([node.size?.[0] || 280, Math.max(node.computeSize?.()[1] || 0, 90)]);
     app.graph?.setDirtyCanvas?.(true, true);
+}
+
+function requiredConsumerSlotNames(node) {
+    if (!findWidget(node, "unused_slots")) return [];
+    const graph = node?.graph || app.graph;
+    const required = new Set();
+    for (const output of node?.outputs || []) {
+        const slotName = String(output?.name || "");
+        if (!SLOT_NAME_RE.test(slotName)) continue;
+        const linkIds = Array.isArray(output?.links)
+            ? output.links
+            : (output?.link != null ? [output.link] : []);
+        for (const linkId of linkIds) {
+            const link = getGraphLink(graph, linkId);
+            const target = getGraphNode(graph, link?.target_id);
+            const targetInput = target?.inputs?.[Number(link?.target_slot)];
+            const definition = INPUT_DEFINITIONS.get(nodeType(target));
+            if (inputRequirement(definition, targetInput?.name) === "required") {
+                required.add(slotName);
+                break;
+            }
+        }
+    }
+    return [...required];
 }
 
 function upstreamSelector(node) {
@@ -390,6 +428,15 @@ function install(node) {
         window.setTimeout(() => refreshShape(this), 0);
         return result;
     };
+    const unusedSlotsWidget = findWidget(node, "unused_slots");
+    if (unusedSlotsWidget) {
+        const originalCallback = unusedSlotsWidget.callback;
+        unusedSlotsWidget.callback = function (...args) {
+            const result = originalCallback?.apply(this, args);
+            window.setTimeout(() => refreshShape(node), 0);
+            return result;
+        };
+    }
     const originalMenu = node.getExtraMenuOptions;
     node.getExtraMenuOptions = function (canvas, options) {
         const result = originalMenu?.apply(this, arguments);
@@ -404,6 +451,10 @@ function install(node) {
 
 app.registerExtension({
     name: EXT_NAME,
+    beforeRegisterNodeDef(_nodeType, nodeData) {
+        const name = String(nodeData?.name || "");
+        if (name) INPUT_DEFINITIONS.set(name, distillInputDefinition(nodeData));
+    },
     setup() {
         onProjectVersionChanged(refreshAllBridges);
         onEditorRenderWindowChanged(refreshAllBridges);

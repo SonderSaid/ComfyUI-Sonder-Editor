@@ -103,13 +103,27 @@ class SonderReferenceImageBridge(io.ComfyNode):
                 "Decodes an image Reference lane. Non-slot assemblies emit their one assembled batch "
                 "or sequence on r01; slot recipes emit one member per output."
             ),
-            inputs=[ReferenceSetType.Input("reference_set", tooltip="Wire from Sonder Reference Selector.")],
+            inputs=[
+                ReferenceSetType.Input("reference_set", tooltip="Wire from Sonder Reference Selector."),
+                io.Combo.Input(
+                    "unused_slots",
+                    options=["placeholder", "nothing"],
+                    default="placeholder",
+                    optional=True,
+                    tooltip=(
+                        "What a slot this recipe does not drive emits. 'placeholder' emits a black "
+                        "image at scene size, which a node with a required input needs. 'nothing' "
+                        "emits no value at all, which a node with an optional input skips entirely — "
+                        "use it when a placeholder would otherwise be treated as real content."
+                    ),
+                ),
+            ],
             outputs=_numbered_outputs(io.Image, "r", "Image"),
         )
 
     @classmethod
-    def execute(cls, reference_set) -> io.NodeOutput:
-        return io.NodeOutput(*decode_reference_images(reference_set))
+    def execute(cls, reference_set, unused_slots="placeholder") -> io.NodeOutput:
+        return io.NodeOutput(*decode_reference_images(reference_set, unused_slots))
 
 
 class SonderReferenceAudioBridge(io.ComfyNode):
@@ -120,13 +134,27 @@ class SonderReferenceAudioBridge(io.ComfyNode):
             display_name="Sonder Reference Audio Bridge",
             category="Sonder",
             description="Decodes an audio Reference lane into one trimmed AUDIO output per staged member.",
-            inputs=[ReferenceSetType.Input("reference_set", tooltip="Wire from Sonder Reference Selector.")],
+            inputs=[
+                ReferenceSetType.Input("reference_set", tooltip="Wire from Sonder Reference Selector."),
+                io.Combo.Input(
+                    "unused_slots",
+                    options=["placeholder", "nothing"],
+                    default="placeholder",
+                    optional=True,
+                    tooltip=(
+                        "What a slot this recipe does not drive emits. 'placeholder' emits a one-second "
+                        "silent stereo track, which a node with a required input needs. 'nothing' emits "
+                        "no value at all, which a node with an optional input skips entirely — use it "
+                        "when a placeholder would otherwise be treated as real content."
+                    ),
+                ),
+            ],
             outputs=_numbered_outputs(io.Audio, "a", "Audio"),
         )
 
     @classmethod
-    def execute(cls, reference_set) -> io.NodeOutput:
-        return io.NodeOutput(*decode_reference_audios(reference_set))
+    def execute(cls, reference_set, unused_slots="placeholder") -> io.NodeOutput:
+        return io.NodeOutput(*decode_reference_audios(reference_set, unused_slots))
 
 
 class SonderReferencePromptBridge(io.ComfyNode):

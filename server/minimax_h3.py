@@ -386,8 +386,15 @@ def resolve_setup(*, setup, guide_frames=None, reference_items=None,
                     row["recommended_duration_max_sec"] = 0.0
             rows.extend(lane_rows)
         if len(rows) > cap:
-            errors.append({"code": f"{population}_slot_cap", "message":
-                           f"MiniMax H3 accepts at most {cap} {population} slots."})
+            label = str((declaration or {}).get("label") or population).strip()
+            warnings.append({
+                "code": f"{population}_slot_cap",
+                "message": (
+                    f"MiniMax H3 exposes {cap} {label} inputs; only the first {cap} "
+                    "resolved slots receive ordinals. Review the node wiring and stage "
+                    "only the references that should receive ordinals."
+                ),
+            })
         rows = rows[:cap]
         for row in rows:
             if row["asset_type"] not in expected_types:

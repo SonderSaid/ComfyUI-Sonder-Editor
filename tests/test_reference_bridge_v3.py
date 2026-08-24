@@ -70,6 +70,7 @@ def _install_io(monkeypatch):
         Int=typed("INT"),
         Float=typed("FLOAT"),
         String=typed("STRING"),
+        Combo=typed("COMBO"),
         Image=typed("IMAGE"),
         Audio=typed("AUDIO"),
         NumberDisplay=types.SimpleNamespace(number="number"),
@@ -434,6 +435,98 @@ def test_bridge_absent_fallback_and_present_slot_assembly(monkeypatch, tmp_path)
     assert tuple(present[1].shape) == (1, 48, 64, 3)
 
 
+@pytest.mark.parametrize("assembly", ["slots", "sheet", "batch", "temporal"])
+def test_image_bridge_nothing_preserves_live_payload_and_omits_every_dead_slot(
+        monkeypatch, tmp_path, assembly):
+    core = _import_module(monkeypatch, "reference_core")
+    hard = {
+        "assembly": assembly,
+        "max_members": 4,
+        "live_outputs": ["image_slots"],
+        "output_size": "scene",
+    }
+    if assembly == "temporal":
+        hard.update({"frame_step": 8, "frame_offset": 1, "allowed_frame_counts": [9, 17]})
+    project = _multi_member_project(
+        tmp_path,
+        ReferenceLaneRecipe(recipe={"hard": hard}),
+        [(255, 0, 0)],
+    )
+    monkeypatch.setattr(
+        core,
+        "resolve_existing_project_path",
+        lambda project, path, **_kwargs: str(Path(project.project_dir) / path),
+    )
+
+    values = core.decode_reference_images(core.resolve_reference_set(project, 0), "nothing")
+    assert len(values) == 16
+    assert float(values[0].abs().max()) > 0.0
+    assert values[1:] == (None,) * 15
+
+
+def test_image_bridge_nothing_covers_absent_and_dead_blocks_and_unknown_policy(
+        monkeypatch, tmp_path):
+    core = _import_module(monkeypatch, "reference_core")
+    absent = {"has_reference": 0, "width": 64, "height": 48}
+    assert core.decode_reference_images(absent, "nothing") == (None,) * 16
+
+    project = _project(tmp_path, ReferenceLaneRecipe(recipe={"hard": {
+        "assembly": "slots", "max_members": 4, "live_outputs": [],
+    }}))
+    dead = core.decode_reference_images(core.resolve_reference_set(project, 0), "nothing")
+    assert dead == (None,) * 16
+
+    tolerant = core.decode_reference_images(absent, "unrecognised")
+    assert len(tolerant) == 16
+    assert all(tuple(value.shape) == (1, 48, 64, 3) for value in tolerant)
+
+
+def test_audio_bridge_nothing_preserves_live_payload_and_omits_fallbacks(
+        monkeypatch, tmp_path):
+    core = _import_module(monkeypatch, "reference_core")
+
+    def audio_project(path, live_outputs):
+        project = _multi_member_project(
+            path,
+            ReferenceLaneRecipe(
+                media_kind="audio",
+                recipe={"hard": {
+                    "assembly": "audio",
+                    "max_members": 16,
+                    "live_outputs": live_outputs,
+                }},
+            ),
+            [(255, 0, 0)],
+        )
+        for asset in project.assets:
+            asset.asset_type = "audio"
+        return project
+
+    monkeypatch.setattr(core, "_audio_output", lambda record: {
+        "waveform": record["member"].member_id,
+        "sample_rate": 44100,
+    })
+    live_project = audio_project(tmp_path / "live", ["audio_slots"])
+    live = core.decode_reference_audios(core.resolve_reference_set(live_project, 0), "nothing")
+    assert live[0] == {"waveform": "member0", "sample_rate": 44100}
+    assert live[1:] == (None,) * 15
+
+    absent = {"has_reference": 0, "width": 64, "height": 48}
+    assert core.decode_reference_audios(absent, "nothing") == (None,) * 16
+    dead_project = audio_project(tmp_path / "dead", [])
+    assert core.decode_reference_audios(
+        core.resolve_reference_set(dead_project, 0), "nothing") == (None,) * 16
+
+    tolerant = core.decode_reference_audios(absent, "unrecognised")
+    assert len(tolerant) == 16
+    assert all(value["sample_rate"] == 44100 for value in tolerant)
+    assert all(tuple(value["waveform"].shape) == (1, 2, 44100) for value in tolerant)
+    assert tolerant[0] is not tolerant[1]
+    assert tolerant[0]["waveform"] is not tolerant[1]["waveform"]
+    tolerant[0]["waveform"][0, 0, 0] = 1.0
+    assert float(tolerant[1]["waveform"][0, 0, 0]) == 0.0
+
+
 def test_prompt_bridge_member_slot_agrees_with_h3_subject_definition(
         monkeypatch, tmp_path):
     core = _import_module(monkeypatch, "reference_core")
@@ -533,9 +626,23 @@ def test_v3_schema_freezes_selector_and_homogeneous_bridge_socket_names(monkeypa
     assert [value.socket_type for value in image.outputs] == ["IMAGE"] * 16
     assert [value.socket_type for value in audio.outputs] == ["AUDIO"] * 16
     assert [value.socket_type for value in prompt.outputs] == ["STRING"] * 18
-    assert [value.id for value in image.inputs] == ["reference_set"]
-    assert [value.id for value in audio.inputs] == ["reference_set"]
+    assert [value.id for value in image.inputs] == ["reference_set", "unused_slots"]
+    assert [value.id for value in audio.inputs] == ["reference_set", "unused_slots"]
     assert [value.id for value in prompt.inputs] == ["reference_set"]
+    for policy in (image.inputs[1], audio.inputs[1]):
+        assert policy.socket_type == "COMBO"
+        assert policy.options == ["placeholder", "nothing"]
+        assert policy.default == "placeholder"
+        assert policy.optional is True
+        assert policy.tooltip
+    assert module.SonderReferenceImageBridge.execute(
+        {"has_reference": 0, "width": 64, "height": 48}, "nothing").values == (None,) * 16
+    assert module.SonderReferenceAudioBridge.execute(
+        {"has_reference": 0, "width": 64, "height": 48}, "nothing").values == (None,) * 16
+    assert tuple(module.SonderReferenceImageBridge.execute(
+        {"has_reference": 0, "width": 64, "height": 48}).values[0].shape) == (1, 48, 64, 3)
+    assert module.SonderReferencePromptBridge.execute({"has_reference": 0}).values == (
+        "", "", *("" for _ in range(16)))
     assert all(schema.category == "Sonder" for schema in (selector, image, audio, prompt))
     assert all(callable(getattr(cls, "execute", None)) for cls in (
         module.SonderReferenceSelector, module.SonderReferenceImageBridge,

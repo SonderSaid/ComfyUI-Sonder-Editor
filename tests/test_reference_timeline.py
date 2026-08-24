@@ -410,7 +410,7 @@ def test_h3_lane_declaring_a_population_under_a_foreign_format_is_refused():
     assert resolved["setup_manifest"]["pictures"] == []
 
 
-def test_h3_picture_cap_is_reported_across_lanes_not_silently_truncated():
+def test_h3_picture_cap_is_advisory_across_lanes_not_silently_truncated():
     """Newly reachable: no registration limited a population to one lane."""
     references, assets, items, recipes = [], [], [], []
     for lane_index in range(2):
@@ -428,8 +428,54 @@ def test_h3_picture_cap_is_reported_across_lanes_not_silently_truncated():
 
     resolved = _h3_resolve(_h3_scene(recipes, items), references, assets)
 
-    assert any(error["code"] == "pictures_slot_cap" for error in resolved["errors"])
+    assert not any(error["code"] == "pictures_slot_cap" for error in resolved["errors"])
+    assert any(warning["code"] == "pictures_slot_cap"
+               for warning in resolved["warnings"])
     assert len(resolved["setup_manifest"]["pictures"]) == 9
+
+
+def test_h3_standalone_audio_cap_is_prompt_advice_not_a_blocker():
+    references, assets, members = [], [], []
+    for index in range(4):
+        member_id = f"audio-{index}"
+        asset_id = f"asset-{member_id}"
+        references.append(ReferenceEntity(
+            reference_id=f"entity-{index}", name=f"Audio {index + 1}",
+            members=[ReferenceMember(member_id=member_id, asset_id=asset_id)],
+        ))
+        assets.append(Asset(asset_id=asset_id, asset_type="audio"))
+        members.append({"entity_id": f"entity-{index}", "member_id": member_id})
+    scene = _h3_scene(
+        [_h3_lane_recipe("audio-lane", "standalone_audios")],
+        [ReferenceItem(
+            reference_item_id="audio-item", lane_index=0,
+            start_frame=0, end_frame=-1, members=members,
+        )],
+    )
+
+    resolved = _h3_resolve(scene, references, assets)
+
+    assert resolved["errors"] == []
+    assert [row["audio_ordinal"] for row in
+            resolved["setup_manifest"]["standalone_audios"]] == [1, 2, 3]
+    warning = next(value for value in resolved["warnings"]
+                   if value["code"] == "standalone_audios_slot_cap")
+    assert "3 Audio inputs" in warning["message"]
+    assert "standalone_audios" not in warning["message"]
+
+    scene.prompt_context_profile_id = "minimax_h3_ref@1"
+    project = TimelineProject(
+        project_id="project", scenes=[scene], references=references, assets=assets,
+    )
+    compiled = routes.compile_live_scene_prompt_context(
+        project, scene,
+        template=prompt_channel_templates.get_channel_template("minimax_h3_ref"),
+        window_start=0, window_end=scene.duration_frames, fps=24.0,
+    )
+    assert not any(value["code"] == "standalone_audios_slot_cap"
+                   for value in compiled["errors"])
+    assert any(value["code"] == "standalone_audios_slot_cap"
+               for value in compiled["warnings"])
 
 
 def test_reference_lane_config_save_preserves_lane_id_and_population():
@@ -684,6 +730,16 @@ def test_reference_bridge_shape_tracks_project_writes_and_recipe_liveness():
     assert "BRIDGES.has(nodeType(target))" in bridge
     assert "controller.whenProjectReady(() => refreshShape(node));" in bridge
     assert "Refresh reference slots" in bridge
+    assert "beforeRegisterNodeDef(_nodeType, nodeData)" in bridge
+    assert "INPUT_DEFINITIONS.set(name, distillInputDefinition(nodeData))" in bridge
+    assert "inputRequirement(definition, targetInput?.name) === \"required\"" in bridge
+    assert "requiredConsumerSlots: requiredConsumerSlotNames(node)" in bridge
+    assert "...shape," in bridge, "node-local advisory data must not mutate shared FULL_SHAPE"
+    policy_callback = bridge.split(
+        'const unusedSlotsWidget = findWidget(node, "unused_slots");', 1)[1]
+    policy_callback = policy_callback.split("const originalMenu", 1)[0]
+    assert "unusedSlotsWidget.callback = function" in policy_callback
+    assert "window.setTimeout(() => refreshShape(node), 0);" in policy_callback
     # Every "we don't know" path resolves to the full shape, never a subset: an
     # unwired selector, an unresolved project, a missing lane and a failed fetch.
     assert bridge.count("return FULL_SHAPE;") == 4

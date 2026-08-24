@@ -1000,8 +1000,10 @@ def test_h1_per_group_caps():
             minimax_h3.MAX_STANDALONE_AUDIO) == (9, 3, 3)
     resolved = scene_dense_setup()
     assert len(resolved["setup_manifest"]["pictures"]) == 9
+    assert not any(value["code"] == "pictures_slot_cap"
+                   for value in resolved["errors"])
     assert any(value["code"] == "pictures_slot_cap"
-               for value in resolved["errors"])
+               for value in resolved["warnings"])
 
 
 def test_h3_presentation_order_is_pictures_then_videos_then_audio():
