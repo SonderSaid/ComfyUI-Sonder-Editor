@@ -729,6 +729,7 @@ function normalizeBuiltinOverrides(raw) {
 // NOTE: defined ABOVE the eager normalizeEditorSettings init (TDZ trap).
 const WRITING_DRAFT_MAP_CAP = 40;
 const WRITING_DRAFT_TEXT_CAP = 20000;
+const WRITING_PENDING_IDENTITY_CAP = 64;
 
 // One draft record. `withStash` is false for the stash itself, so a stash can
 // never carry its own stash and nest without bound.
@@ -744,6 +745,8 @@ function normalizeWritingDraftRecord(value, { withStash = true } = {}) {
             && !Array.isArray(value.document) ? structuredClone(value.document) : null,
         attachments: cloneRecordArray(value.attachments),
         blockMeta: cloneRecordArray(value.blockMeta),
+        pendingSemanticUnitCreates: cloneRecordArray(
+            value.pendingSemanticUnitCreates).slice(0, WRITING_PENDING_IDENTITY_CAP),
         baseModifiedAt: String(value.baseModifiedAt || ""),
         allocations: Array.isArray(value.allocations)
             ? value.allocations.map((a) => ({
@@ -772,7 +775,15 @@ function normalizeWritingDraftRecord(value, { withStash = true } = {}) {
 }
 
 function writingDraftHasContent(value) {
-    return !!(String(value?.draft || "").trim() || value?.document);
+    if (String(value?.draft || "").trim()) return true;
+    const nodes = Array.isArray(value?.document?.nodes) ? value.document.nodes : [];
+    if (nodes.some((node) => node?.type === "attachment"
+            || (node?.type === "text" && String(node?.text || "").trim()))) return true;
+    if (Array.isArray(value?.attachments) && value.attachments.length) return true;
+    if ((Array.isArray(value?.blockMeta) ? value.blockMeta : []).some(
+        (meta) => Array.isArray(meta?.attachments) && meta.attachments.length)) return true;
+    return !!(Array.isArray(value?.pendingSemanticUnitCreates)
+        && value.pendingSemanticUnitCreates.length);
 }
 
 function normalizeWritingDrafts(raw) {

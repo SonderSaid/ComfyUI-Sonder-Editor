@@ -170,7 +170,8 @@ console.log(JSON.stringify({
     assert result["placements"] == [row["value"] for row in catalog["placement_phases"]]
     assert result["kinds"] == [row["value"] for row in catalog["reference_capability_kinds"]]
     assert result["groups"] == ["derived", "populations", "identity_kinds",
-                                "vocabularies", "speaker_policy"]
+                                "vocabularies", "speaker_policy",
+                                "vocal_event_policy"]
     # A generic format must show nothing MiniMax-specific.
     lowered = result["rendered"].lower()
     for literal in ("minimax", "reference generation", "video editing",
@@ -372,6 +373,45 @@ console.log(JSON.stringify(editor.collect()));
     assert prompt_context.effective_speaker_policy({}) == {
         "enabled": False, "token_template": "", "compound_join": ",",
         "compound_order": "authored"}
+
+
+def test_vocal_event_policy_editor_collects_one_closed_complete_group():
+    declared = _run_node(_mount_script({}, body=r"""
+const toggle = nodes.find((n) => n.attributes["aria-label"]
+  === "Declare a Vocal Event policy");
+toggle.checked = true; toggle.dispatch("change");
+const prefix = nodes.find((n) => n.attributes["aria-label"]
+  === "Vocal Event identity prefix");
+prefix.value = "selected";
+const delivery = nodes.find((n) => n.attributes["aria-label"]
+  === "Vocal Events support delivery prose");
+delivery.checked = true;
+console.log(JSON.stringify(editor.collect()));
+"""))
+    assert declared["capabilities"]["vocal_event"]["event_policy"] == {
+        "identity_prefix": "selected",
+        "delivery": True,
+        "voiceover_subject_override": False,
+    }
+
+    absent = _run_node(_mount_script({}, body=
+        "console.log(JSON.stringify(editor.collect()));\n"))
+    assert "vocal_event" not in absent.get("capabilities", {})
+
+
+@pytest.mark.parametrize("raw_policy", [
+    {"identity_prefix": "selected", "delivery": True,
+     "voiceover_subject_override": True, "future_flag": "keep-me"},
+    {"identity_prefix": "selected"},
+    "malformed-but-preserved",
+])
+def test_untouched_malformed_vocal_event_policy_round_trips_byte_for_byte(
+        raw_policy):
+    seed = {"capabilities": {"vocal_event": {
+        "placement": "inline", "event_policy": raw_policy}}}
+    collected = _run_node(_mount_script(
+        seed, body="console.log(JSON.stringify(editor.collect()));\n"))
+    assert collected["capabilities"]["vocal_event"]["event_policy"] == raw_policy
 
 
 def test_a_custom_format_declaring_its_own_vocabulary_compiles_with_no_fallback():

@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import importlib
 import json
 import os
@@ -13,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import server
 import server.routes as routes
 from server import prompt_context
-from server.timeline_state import Asset, AudioTrack, ClipReference, GenerationJob, GuideFrame, LaneConfig, PromptSection, Scene, TimelineProject
+from server.timeline_state import Asset, AudioTrack, ClipReference, GenerationJob, GuideFrame, LaneConfig, PromptSection, ReferenceEntity, ReferenceMember, Scene, TimelineProject
 
 
 class DummyRequest(dict):
@@ -127,6 +128,141 @@ def test_prompt_context_candidate_uses_constraint_aware_execution_window(monkeyp
     assert payload["execution_window"] == expected
     assert payload["window"]["start_frame"] == expected["render_start"]
     assert payload["window"]["end_frame"] == expected["render_end"]
+
+
+def test_prompt_context_candidate_compiles_transient_pending_identity_without_mutation(monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    event = prompt_context.normalize_attachment({
+        "attachment_id": "vocal-1", "kind": "vocal_event",
+        "source": {"subject_ids": ["pending-1"]},
+        "config": {"event_type": "dialogue", "language": "English",
+                   "text": "Hello there."},
+    })
+    scene = Scene(scene_id="scene", duration_frames=24,
+                  prompt_context_profile_id="minimax_h3_ref@1")
+    scene.prompt_sections = [PromptSection(
+        0, 24, attachments=[event], channel_docs={"detailed_description": {
+            "nodes": [{"type": "attachment", "node_id": "anchor",
+                       "attachment_id": "vocal-1"}],
+        }})]
+    project = TimelineProject(project_id="proj", scenes=[scene], fps=24.0)
+    project.metadata["prompt_channel_template"] = "minimax_h3_ref"
+    monkeypatch.setattr(route_module, "_load_project_from_request",
+                        lambda request, **_kwargs: project)
+    handler = _route_handler(
+        route_module, "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/prompt-context/compile")
+    body = {
+        "scene": scene.to_dict(),
+        "channel_template": "minimax_h3_ref",
+        "selection_start": 0, "selection_end": 24,
+        "prompt_semantic_unit_creates": [{
+            "type": "create_prompt_semantic_unit",
+            "handle_suggestion": "Narrator",
+            "unit": {"semantic_unit_id": "pending-1", "name": "Narrator",
+                     "kind": "subject", "definition": "A calm narrator"},
+        }],
+    }
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene"}, body=body)))
+    payload = _response_json(response)
+
+    assert response.status == 200
+    assert "broken_vocal_identity" not in {
+        value["code"] for value in payload["errors"]}
+    assert "A calm narrator" in payload["prompt"]
+    assert project.prompt_semantic_units == []
+
+
+def test_prompt_context_candidate_pending_identity_collision_refuses(monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene", duration_frames=24,
+                  prompt_context_profile_id="minimax_h3_ref@1")
+    project = TimelineProject(project_id="proj", scenes=[scene], fps=24.0)
+    project.metadata["prompt_channel_template"] = "minimax_h3_ref"
+    project.prompt_semantic_units = [prompt_context.normalize_semantic_unit({
+        "semantic_unit_id": "pending-1", "name": "Existing",
+        "handle": "Existing", "kind": "subject", "definition": "Existing",
+    })]
+    monkeypatch.setattr(route_module, "_load_project_from_request",
+                        lambda request, **_kwargs: project)
+    handler = _route_handler(
+        route_module, "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/prompt-context/compile")
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene"}, body={
+            "scene": scene.to_dict(), "channel_template": "minimax_h3_ref",
+            "prompt_semantic_unit_creates": [{
+                "type": "create_prompt_semantic_unit",
+                "unit": {"semantic_unit_id": "pending-1", "name": "Different",
+                         "kind": "subject"},
+            }],
+        })))
+
+    assert response.status == 409
+    assert _response_json(response)["code"] == "prompt_semantic_unit_collision"
+    assert project.prompt_semantic_units[0]["name"] == "Existing"
+
+
+def test_prompt_context_candidate_pending_identity_overlay_is_bounded(monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene", duration_frames=24)
+    project = TimelineProject(project_id="proj", scenes=[scene], fps=24.0)
+    monkeypatch.setattr(route_module, "_load_project_from_request",
+                        lambda request, **_kwargs: project)
+    handler = _route_handler(
+        route_module, "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/prompt-context/compile")
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene"}, body={
+            "scene": scene.to_dict(),
+            "prompt_semantic_unit_creates": [
+                {"type": "create_prompt_semantic_unit",
+                 "unit": {"semantic_unit_id": f"pending-{index}",
+                          "name": f"Speaker {index}", "kind": "subject"}}
+                for index in range(65)
+            ],
+        })))
+
+    assert response.status == 400
+    assert _response_json(response)["code"] == "prompt_semantic_unit_overlay_too_large"
+    assert project.prompt_semantic_units == []
+
+
+def test_prompt_context_candidate_create_and_compile_share_requested_template(monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene", duration_frames=24)
+    project = TimelineProject(project_id="proj", scenes=[scene], fps=24.0)
+    monkeypatch.setattr(route_module, "_load_project_from_request",
+                        lambda request, **_kwargs: project)
+    seen = {}
+
+    def apply_create(_project, _scene, _op, *, template=None):
+        seen["create"] = template
+        return {"created": True}
+
+    def compile_candidate(_project, _scene, *, template=None, **_kwargs):
+        seen["compile"] = template
+        return {"prompt": "", "errors": []}
+
+    monkeypatch.setattr(route_module, "_apply_create_prompt_semantic_unit", apply_create)
+    monkeypatch.setattr(route_module, "compile_live_scene_prompt_context", compile_candidate)
+    handler = _route_handler(
+        route_module, "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/prompt-context/compile")
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene"}, body={
+            "scene": scene.to_dict(), "channel_template": "standard",
+            "prompt_semantic_unit_creates": [{
+                "type": "create_prompt_semantic_unit",
+                "unit": {"semantic_unit_id": "pending", "name": "Narrator",
+                         "kind": "subject"},
+            }],
+        })))
+
+    assert response.status == 200
+    assert seen["create"] is seen["compile"]
+    assert seen["compile"]["id"] == "standard"
 
 
 def _apply_scene_operations(route_module, monkeypatch, project, scene_id, operations, saves):
@@ -1955,3 +2091,334 @@ def test_prompt_template_dependency_collision_blocks_instead_of_overwriting(monk
     assert response.status == 409
     assert saves == []
     assert project.prompt_semantic_units[0]["name"] == "Existing"
+
+
+@pytest.mark.parametrize(("profiles", "semantic_units"), [
+    ([], ["not-an-object"]),
+    ([], [{"name": "Missing stable id", "handle": "MissingId"}]),
+    (["not-an-object"], []),
+    ([{"capabilities": {}, "name": "Missing exact profile key"}], []),
+])
+def test_prompt_template_dependency_import_rejects_malformed_entries_atomically(
+        monkeypatch, profiles, semantic_units):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=24)
+    project = TimelineProject(project_dir="", name="Project", scenes=[scene])
+    project.project_id = "proj"
+    saves = []
+
+    response = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "import_prompt_context_dependencies", "profiles": profiles,
+        "semantic_units": semantic_units,
+    }, {
+        "type": "update_scene_fields", "fields": {"name": "Must not land"},
+    }], saves)
+
+    assert response.status == 400
+    assert _response_json(response)["code"] == "invalid_prompt_context_dependencies"
+    assert saves == []
+    assert project.prompt_semantic_units == []
+    assert scene.name == "Scene"
+
+
+@pytest.mark.parametrize("owner", ["semantic", "physical", "same-import"])
+def test_prompt_template_dependency_import_refuses_exact_handle_collisions(
+        monkeypatch, owner):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=24)
+    project = TimelineProject(project_dir="", name="Project", scenes=[scene])
+    project.project_id = "proj"
+    imported = [prompt_context.normalize_semantic_unit({
+        "semantic_unit_id": "imported-1", "name": "Imported",
+        "handle": "Narrator", "kind": "subject", "sources": [],
+    })]
+    if owner == "semantic":
+        project.prompt_semantic_units = [prompt_context.normalize_semantic_unit({
+            "semantic_unit_id": "existing", "name": "Existing",
+            "handle": "narrator", "kind": "subject", "sources": [],
+        })]
+    elif owner == "physical":
+        project.references = [ReferenceEntity(
+            reference_id="ref", name="Voice", members=[ReferenceMember(
+                member_id="member", asset_id="asset", handle="NARRATOR")])]
+    else:
+        imported.append(prompt_context.normalize_semantic_unit({
+            "semantic_unit_id": "imported-2", "name": "Second",
+            "handle": "narrator", "kind": "subject", "sources": [],
+        }))
+    original_units = copy.deepcopy(project.prompt_semantic_units)
+    saves = []
+
+    response = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "import_prompt_context_dependencies", "profiles": [],
+        "semantic_units": imported,
+    }], saves)
+
+    assert response.status == 409
+    assert _response_json(response)["code"] == "handle_collision"
+    assert saves == []
+    assert project.prompt_semantic_units == original_units
+
+
+def test_cross_project_template_imports_assetless_vocal_identity_with_sections(monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=24)
+    project = TimelineProject(project_dir="", name="Project", scenes=[scene])
+    project.project_id = "proj"
+    saves = []
+    unit = route_module.prompt_context.normalize_semantic_unit({
+        "semantic_unit_id": "narrator", "handle": "Narrator",
+        "name": "Narrator", "kind": "subject", "definition": "Off screen",
+        "sources": [], "voice": {"member_id": None},
+    })
+    event = route_module.prompt_context.normalize_attachment({
+        "attachment_id": "vocal", "kind": "vocal_event",
+        "source": {"subject_ids": ["narrator"]},
+        "config": {"event_type": "dialogue", "text": "Hello"},
+    })
+    response = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [
+        {"type": "import_prompt_context_dependencies", "profiles": [],
+         "semantic_units": [unit]},
+        {"type": "replace_prompt_sections", "sections": [{
+            "prompt_id": "p", "start_frame": 0, "end_frame": 24,
+            "channels": {"visual": ""}, "attachments": [event],
+        }]},
+    ], saves)
+
+    assert response.status == 200
+    assert len(saves) == 1
+    assert project.prompt_semantic_units[0]["semantic_unit_id"] == "narrator"
+    assert scene.prompt_sections[0].attachments[0]["source"]["subject_ids"] == [
+        "narrator"]
+
+
+def test_ad_hoc_prompt_identity_is_created_atomically_with_server_handle_and_order(monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=24)
+    project = TimelineProject(project_dir="", name="Project", scenes=[scene])
+    project.project_id = "proj"
+    project.metadata["prompt_channel_template"] = "minimax_h3_ref"
+    scene.prompt_context_profile_id = "minimax_h3_ref@1"
+    project.prompt_semantic_units = [{
+        "semantic_unit_id": "existing", "handle": "Narrator", "name": "Existing",
+        "kind": "subject", "order": 7, "sources": [], "definition": "",
+        "voice": {"member_id": None}, "attachment_defaults": {},
+        "disabled_capabilities": [],
+    }]
+    saves = []
+    attachment = {
+        "attachment_id": "vocal-1", "emission_group_id": "vocal-1",
+        "kind": "vocal_event", "source": {"subject_ids": ["other-1"]},
+        "config": {"event_type": "dialogue", "text": "Hello"},
+        "capabilities": [],
+    }
+
+    response = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [
+        {"type": "create_prompt_semantic_unit", "handle_suggestion": "Narrator",
+         "unit": {"semantic_unit_id": "other-1", "name": "Narrator",
+                  "kind": "subject", "definition": "Off screen"}},
+        {"type": "update_scene_fields", "fields": {
+            "global_attachments": [attachment]}},
+    ], saves)
+
+    assert response.status == 200
+    assert len(saves) == 1
+    payload = _response_json(response)
+    created = payload["results"][0]["unit"]
+    assert created["semantic_unit_id"] == "other-1"
+    assert created["handle"] == "Narrator2"
+    assert created["order"] == 8
+    assert created["sources"] == []
+    assert created["voice"] == {"member_id": None}
+    assert payload["prompt_semantic_units"][-1] == created
+    assert scene.global_attachments[0]["source"]["subject_ids"] == ["other-1"]
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("attachment_defaults", {"summary": "edited"}),
+    ("disabled_capabilities", ["summary"]),
+    ("visual_intent", "transform"),
+    ("audio_intent", "replace"),
+])
+def test_ad_hoc_prompt_identity_replay_refuses_edited_creation_footprint(
+        monkeypatch, field, value):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=24)
+    project = TimelineProject(project_dir="", name="Project", scenes=[scene])
+    project.project_id = "proj"
+    project.metadata["prompt_channel_template"] = "minimax_h3_ref"
+    scene.prompt_context_profile_id = "minimax_h3_ref@1"
+    unit = prompt_context.normalize_semantic_unit({
+        "semantic_unit_id": "other-1", "handle": "Narrator",
+        "name": "Narrator", "kind": "subject", "definition": "Off screen",
+        "order": 0, "sources": [], "voice": {"member_id": None},
+    })
+    unit[field] = copy.deepcopy(value)
+    project.prompt_semantic_units = [unit]
+    saves = []
+
+    response = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "create_prompt_semantic_unit", "handle_suggestion": "Narrator",
+        "unit": {"semantic_unit_id": "other-1", "name": "Narrator",
+                 "kind": "subject", "definition": "Off screen"},
+    }], saves)
+
+    assert response.status == 409
+    assert _response_json(response)["code"] == "prompt_semantic_unit_collision"
+    assert saves == []
+    assert project.prompt_semantic_units == [unit]
+
+
+def test_multiple_ad_hoc_prompt_identities_and_sections_commit_in_one_mutation(monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=24)
+    project = TimelineProject(project_dir="", name="Project", scenes=[scene])
+    project.project_id = "proj"
+    project.metadata["prompt_channel_template"] = "minimax_h3_ref"
+    scene.prompt_context_profile_id = "minimax_h3_ref@1"
+    saves = []
+    operations = [
+        {"type": "create_prompt_semantic_unit", "handle_suggestion": name,
+         "unit": {"semantic_unit_id": identity_id, "name": name,
+                  "kind": "subject", "definition": ""}}
+        for identity_id, name in (("other-1", "One"), ("other-2", "Two"))
+    ]
+    operations.append({"type": "replace_prompt_sections", "sections": [{
+        "prompt_id": "section-1", "start_frame": 0, "end_frame": 24,
+        "channels": {"detailed_description": "A conversation."},
+        "attachments": [{
+            "attachment_id": "vocal-1", "kind": "vocal_event",
+            "source": {"subject_ids": ["other-1", "other-2"]},
+            "config": {"event_type": "group_speech", "text": "Together"},
+        }],
+    }]})
+
+    response = _apply_scene_operations(
+        route_module, monkeypatch, project, "scene-1", operations, saves)
+
+    assert response.status == 200
+    assert len(saves) == 1
+    assert [unit["semantic_unit_id"] for unit in project.prompt_semantic_units] == [
+        "other-1", "other-2"]
+    assert scene.prompt_sections[0].attachments[0]["source"]["subject_ids"] == [
+        "other-1", "other-2"]
+
+
+def test_ad_hoc_prompt_identity_create_is_idempotent_but_id_collision_refuses(monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=24)
+    project = TimelineProject(project_dir="", name="Project", scenes=[scene])
+    project.project_id = "proj"
+    project.metadata["prompt_channel_template"] = "minimax_h3_ref"
+    scene.prompt_context_profile_id = "minimax_h3_ref@1"
+    project.prompt_semantic_units = [route_module.prompt_context.normalize_semantic_unit({
+        "semantic_unit_id": "other-1", "handle": "Narrator", "name": "Narrator",
+        "kind": "subject", "definition": "Off screen", "sources": [],
+    })]
+
+    same = route_module._apply_scene_mutation_operation(project, scene, {
+        "type": "create_prompt_semantic_unit", "handle_suggestion": "ignored",
+        "unit": {"semantic_unit_id": "other-1", "name": "Narrator",
+                 "kind": "subject", "definition": "Off screen"},
+    })
+    assert same["created"] is False
+
+    with pytest.raises(route_module.ProjectMutationRequestError) as raised:
+        route_module._apply_scene_mutation_operation(project, scene, {
+            "type": "create_prompt_semantic_unit", "handle_suggestion": "Someone",
+            "unit": {"semantic_unit_id": "other-1", "name": "Someone else",
+                     "kind": "subject"},
+        })
+    assert raised.value.code == "prompt_semantic_unit_collision"
+
+
+def test_ad_hoc_prompt_identity_create_refuses_non_speaking_kind(monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=24)
+    project = TimelineProject(project_dir="", name="Project", scenes=[scene])
+
+    with pytest.raises(route_module.ProjectMutationRequestError) as raised:
+        route_module._apply_scene_mutation_operation(project, scene, {
+            "type": "create_prompt_semantic_unit", "handle_suggestion": "Kitchen",
+            "unit": {"semantic_unit_id": "place-1", "name": "Kitchen",
+                     "kind": "place", "definition": "A tiled kitchen"},
+        })
+    assert raised.value.code == "prompt_identity_kind_cannot_speak"
+    assert project.prompt_semantic_units == []
+
+
+def test_guarded_prompt_identity_cleanup_deletes_only_unchanged_unreferenced_unit(monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=24)
+    project = TimelineProject(project_dir="", name="Project", scenes=[scene])
+    unit = route_module.prompt_context.normalize_semantic_unit({
+        "semantic_unit_id": "other-1", "handle": "Other", "name": "Other",
+        "kind": "subject", "definition": "",
+    })
+    project.prompt_semantic_units = [unit]
+    expected = copy.deepcopy(unit)
+
+    scene.global_attachments = [{
+        "attachment_id": "vocal-1", "emission_group_id": "vocal-1",
+        "kind": "vocal_event", "source": {"subject_ids": ["other-1"]},
+        "config": {}, "capabilities": [],
+    }]
+    referenced = route_module._apply_scene_mutation_operation(project, scene, {
+        "type": "delete_prompt_semantic_unit_if_unreferenced",
+        "semantic_unit_id": "other-1", "expected": expected,
+    })
+    assert referenced == {
+        "type": "delete_prompt_semantic_unit_if_unreferenced",
+        "semantic_unit_id": "other-1", "deleted": False, "reason": "referenced"}
+
+    scene.global_attachments[0]["source"] = {"voice_id": "provider-key"}
+    scene.global_attachments[0]["config"] = {
+        "audio_speaker_subject_id": "other-1"}
+    audio_override = route_module._apply_scene_mutation_operation(project, scene, {
+        "type": "delete_prompt_semantic_unit_if_unreferenced",
+        "semantic_unit_id": "other-1", "expected": expected,
+    })
+    assert audio_override["reason"] == "referenced"
+
+    scene.global_attachments = []
+    project.prompt_semantic_units[0]["definition"] = "User edited this"
+    changed = route_module._apply_scene_mutation_operation(project, scene, {
+        "type": "delete_prompt_semantic_unit_if_unreferenced",
+        "semantic_unit_id": "other-1", "expected": expected,
+    })
+    assert changed["reason"] == "changed"
+    assert project.prompt_semantic_units
+
+    project.prompt_semantic_units[0]["definition"] = ""
+    deleted = route_module._apply_scene_mutation_operation(project, scene, {
+        "type": "delete_prompt_semantic_unit_if_unreferenced",
+        "semantic_unit_id": "other-1", "expected": expected,
+    })
+    assert deleted["deleted"] is True
+    assert project.prompt_semantic_units == []
+
+
+def test_guarded_prompt_identity_cleanup_rejects_partial_snapshot(monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=24)
+    project = TimelineProject(project_dir="", name="Project", scenes=[scene])
+    unit = route_module.prompt_context.normalize_semantic_unit({
+        "semantic_unit_id": "other-1", "handle": "Other", "name": "Other",
+        "kind": "subject", "definition": "",
+    })
+    project.prompt_semantic_units = [unit]
+
+    result = route_module._apply_scene_mutation_operation(project, scene, {
+        "type": "delete_prompt_semantic_unit_if_unreferenced",
+        "semantic_unit_id": "other-1",
+        "expected": {"semantic_unit_id": "other-1", "name": "Other"},
+    })
+    assert result["reason"] == "changed"
+    assert project.prompt_semantic_units == [unit]
+
+    with pytest.raises(route_module.ProjectMutationRequestError) as raised:
+        route_module._apply_scene_mutation_operation(project, scene, {
+            "type": "delete_prompt_semantic_unit_if_unreferenced",
+            "semantic_unit_id": "other-1",
+        })
+    assert raised.value.code == "invalid_prompt_semantic_unit_cleanup"

@@ -62,11 +62,13 @@ import {
     normalizePromptAttachments,
     normalizePromptDocument,
     promptAttachmentAnchoredChannels,
+    promptAttachmentConfiguration,
     propagateLinkedPromptAttachment,
     promptDocumentText,
     resolveReferenceAttachmentIdentity,
     sceneWithDraftGlobal,
     sceneWithDraftSection,
+    semanticIdentityDependencyIds,
     splitPromptDocumentChannels,
     normalizePromptAttachment,
     splitWritingPromptDocument,
@@ -94,6 +96,7 @@ import {
 
 const WRITING_BREAK = "---";
 const WRITING_DRAFT_TEXT_CAP = 20000;
+const WRITING_PENDING_IDENTITY_CAP = 64;
 const COPY_CAPABILITY_KINDS = new Set([
     "definitions", "retention", "mentions", "summary", "audio_relationship",
 ]);
@@ -749,9 +752,63 @@ export const writingDraftHasContent = (value) => {
     if (promptDocumentText(documentValue).trim()) return true;
     if (documentValue.nodes.some((node) => node.type === "attachment")) return true;
     if (normalizePromptAttachments(value?.attachments).length) return true;
+    if (Array.isArray(value?.pendingSemanticUnitCreates)
+            && value.pendingSemanticUnitCreates.length) return true;
     return (Array.isArray(value?.blockMeta) ? value.blockMeta : []).some(
         (meta) => normalizePromptAttachments(meta?.attachments).length);
 };
+
+/** Decide draft/stash restoration without letting an empty current draft hide
+ * recoverable work. Kept pure so Apply -> reload -> Restore is testable. */
+export function writingDraftLoadState(saved) {
+    return {
+        useSavedDraft: !!(saved && writingDraftHasContent(saved)),
+        stash: saved?.stash && writingDraftHasContent(saved.stash)
+            ? structuredClone(saved.stash) : null,
+    };
+}
+
+/** Apply materialized every reachable create. Restore keeps authored
+ * attachments, but must not resurrect already-committed create intents. */
+export function writingAppliedRestoreSnapshot(snapshot) {
+    return { ...structuredClone(snapshot || {}), pendingSemanticUnitCreates: [] };
+}
+
+export function stageWritingSemanticUnitCreate(
+    creates, intent, cap = WRITING_PENDING_IDENTITY_CAP,
+) {
+    const current = Array.isArray(creates) ? structuredClone(creates) : [];
+    const id = String(intent?.unit?.semantic_unit_id || "");
+    if (!id) return { accepted: true, creates: current };
+    const withoutSameId = current.filter((value) =>
+        String(value?.unit?.semantic_unit_id || "") !== id);
+    if (withoutSameId.length === current.length && current.length >= cap) {
+        return { accepted: false, creates: current };
+    }
+    return { accepted: true, creates: [...withoutSameId, structuredClone(intent)] };
+}
+
+const promptIdentityIdsInAttachments = (attachments = []) => {
+    return new Set(semanticIdentityDependencyIds(
+        normalizePromptAttachments(attachments)));
+};
+
+/** Pending identity creates still reachable from the browser-local draft. */
+export function reachableWritingSemanticUnitCreates(
+        creates = [], attachments = [], blockMeta = []) {
+    const referenced = promptIdentityIdsInAttachments([
+        ...normalizePromptAttachments(attachments),
+        ...(Array.isArray(blockMeta) ? blockMeta : []).flatMap((value) =>
+            normalizePromptAttachments(value?.attachments)),
+    ]);
+    const seen = new Set();
+    return (Array.isArray(creates) ? creates : []).filter((intent) => {
+        const id = String(intent?.unit?.semantic_unit_id || "");
+        if (!id || seen.has(id) || !referenced.has(id)) return false;
+        seen.add(id);
+        return true;
+    }).map((intent) => structuredClone(intent));
+}
 
 function scopedAttachmentIdentity(attachment) {
     const semantic = structuredClone(attachment || {});
@@ -862,6 +919,24 @@ export function writingSectionsFromDraft({
 }
 
 export function mountPromptManagementPanel(host) {
+    const acceptDurableConfiguration = (result) =>
+        host._acceptPromptAttachmentConfiguration?.(result)
+        || promptAttachmentConfiguration(result).attachment;
+    const acceptDraftConfiguration = (result) => {
+        const configured = promptAttachmentConfiguration(result);
+        const intent = configured.identityCreateIntent;
+        if (intent?.unit?.semantic_unit_id) {
+            const staged = stageWritingSemanticUnitCreate(
+                writingState.pendingSemanticUnitCreates, intent);
+            if (!staged.accepted) {
+                notifyWarning("A Writing draft can hold at most 64 pending Prompt Identities. Apply or remove one before adding another.",
+                    { source: "prompt-writing-pending-identity-cap" });
+                return null;
+            }
+            writingState.pendingSemanticUnitCreates = staged.creates;
+        }
+        return configured.attachment;
+    };
     const backdrop = document.createElement("div");
     backdrop.style.cssText = `
         position: fixed; inset: 0; z-index: 10000;
@@ -963,6 +1038,7 @@ export function mountPromptManagementPanel(host) {
     const writingState = {
         key: "", draft: "", document: null, attachments: [],
         allocations: [], blockMeta: [], baseModifiedAt: "",
+        pendingSemanticUnitCreates: [],
         // Pre-Reset snapshot. Reset is the ONLY escape offered when Apply is
         // staleness-blocked, so without this the one control a stuck author can
         // reach is also the one that destroys their unapplied work.
@@ -985,7 +1061,25 @@ export function mountPromptManagementPanel(host) {
         blockMeta: structuredClone(writingState.blockMeta),
         allocations: writingState.allocations.map((a) => ({ length: a.length, dirty: !!a.dirty })),
         defaultDraftChannel: writingState.defaultDraftChannel,
+        pendingSemanticUnitCreates:
+            structuredClone(writingState.pendingSemanticUnitCreates),
     });
+    const pruneWritingSemanticUnitCreates = () => {
+        writingState.pendingSemanticUnitCreates =
+            reachableWritingSemanticUnitCreates(
+                writingState.pendingSemanticUnitCreates,
+                writingState.attachments,
+                writingState.blockMeta);
+        return structuredClone(writingState.pendingSemanticUnitCreates);
+    };
+    const writingSemanticUnits = () => [
+        ...(host._promptSemanticUnits || []),
+        ...writingState.pendingSemanticUnitCreates.map((intent) => ({
+            ...structuredClone(intent.unit || {}),
+            handle: "", sources: [], voice: { member_id: null },
+            _pending_create: true,
+        })),
+    ];
     // Where this draft's unheadered text actually goes. One accessor for the
     // hint and both split call sites, so what the panel promises and what Apply
     // does cannot disagree. A stamp naming a channel the template no longer
@@ -1046,6 +1140,7 @@ export function mountPromptManagementPanel(host) {
         writingState.draft = promptDocumentText(writingState.document);
         writingState.attachments = normalizePromptAttachments(
             sections.flatMap((section) => section.attachments || []));
+        writingState.pendingSemanticUnitCreates = [];
         writingState.allocations = sections.map((s) => ({
             length: Math.max(1, (s.end_frame || 0) - (s.start_frame || 0)),
             dirty: false,
@@ -1077,10 +1172,11 @@ export function mountPromptManagementPanel(host) {
         if (writingState.key === key) return;
         writingState.key = key;
         const saved = host._settings?.prompts?.writingDraftByProjectScene?.[key];
+        const loadState = writingDraftLoadState(saved);
         // The one predicate, not a copy of it. This site had its own inlined
         // version of the same expression and is how an emptied draft came to be
         // restored as though it were real work.
-        if (saved && writingDraftHasContent(saved)) {
+        if (loadState.useSavedDraft) {
             const currentSectionsById = new Map(
                 (host.activeScene?.prompt_sections || []).map((section) => [
                     String(section.prompt_id || ""), section,
@@ -1089,6 +1185,9 @@ export function mountPromptManagementPanel(host) {
                 saved.document, String(saved.draft || ""));
             writingState.draft = promptDocumentText(writingState.document);
             writingState.attachments = normalizePromptAttachments(saved.attachments);
+            writingState.pendingSemanticUnitCreates = Array.isArray(
+                saved.pendingSemanticUnitCreates)
+                ? structuredClone(saved.pendingSemanticUnitCreates) : [];
             writingState.allocations = (saved.allocations || []).map((a) => ({
                 length: Math.max(0, parseInt(a?.length, 10) || 0),
                 dirty: !!a?.dirty,
@@ -1116,15 +1215,14 @@ export function mountPromptManagementPanel(host) {
             writingState.baseModifiedAt = String(saved.baseModifiedAt || "");
             // No stamp means a pre-declaration draft: keep channel 1.
             writingState.defaultDraftChannel = String(saved.defaultDraftChannel || "");
-            writingState.stash = saved.stash && writingDraftHasContent(saved.stash)
-                ? structuredClone(saved.stash) : null;
         } else {
-            writingState.stash = null;
             reconstructDraftFromSections();
         }
+        writingState.stash = loadState.stash;
     };
     const saveWritingState = () => {
         if (!writingState.key) return;
+        pruneWritingSemanticUnitCreates();
         if (writingState.draft.length > WRITING_DRAFT_TEXT_CAP) {
             notifyWarning("Writing draft exceeds the 20k browser-draft guidance.", { source: "prompt-writing-draft-cap" });
         }
@@ -1154,7 +1252,8 @@ export function mountPromptManagementPanel(host) {
         host._updateSettings({ prompts: { writingDraftByProjectScene: {
             [writingState.key]: { ts: Date.now(), draft: "", document: null,
                 attachments: [], allocations: [], blockMeta: [], baseModifiedAt: "",
-                stash: applied, defaultDraftChannel: "" },
+                stash: applied, defaultDraftChannel: "",
+                pendingSemanticUnitCreates: [] },
         } } });
         writingState.stash = applied;
         writingState.key = ""; // force reload (reconstruct) on next render
@@ -1551,7 +1650,8 @@ export function mountPromptManagementPanel(host) {
             sectionDormancy(writingBlockPromptId(blockIndex, blockCount));
         const previewWritingBlocks = (blockDocuments) => {
             host._previewPromptContextCandidate?.(
-                buildWritingCandidatePatch(blockDocuments));
+                buildWritingCandidatePatch(blockDocuments), 180,
+                pruneWritingSemanticUnitCreates());
         };
 
         // This is a browser-local presentation preference. Both tabs read the
@@ -1633,7 +1733,7 @@ export function mountPromptManagementPanel(host) {
             return configurePromptAttachment(attachment, {
                 scene: context.scene,
                 references: host._references || [],
-                semanticUnits: host._promptSemanticUnits || [],
+                semanticUnits: writingSemanticUnits(),
                 profileId: scene?.prompt_context_profile_id
                     || host._channelTemplate().default_context_profile || "generic@1",
                 scope: "section",
@@ -2115,8 +2215,9 @@ export function mountPromptManagementPanel(host) {
                 draftTimer = setTimeout(() => updateStrip(), 300);
             },
             onActivateAttachment: async (attachment, node) => {
-                const configured = await configureDraftAttachment(
-                    attachment, String(node?.node_id || ""));
+                const configured = acceptDraftConfiguration(
+                    await configureDraftAttachment(
+                        attachment, String(node?.node_id || "")));
                 if (configured) draftArea.replaceAttachment(configured);
             },
             getHostSnapshot: () => writingState.blockMeta,
@@ -2298,6 +2399,9 @@ export function mountPromptManagementPanel(host) {
                 dirty: !!a?.dirty,
             }));
             writingState.blockMeta = normalizeWritingBlockMeta(stash.blockMeta);
+            writingState.pendingSemanticUnitCreates = Array.isArray(
+                stash.pendingSemanticUnitCreates)
+                ? structuredClone(stash.pendingSemanticUnitCreates) : [];
             writingState.baseModifiedAt = String(stash.baseModifiedAt || "");
             // The stamp travels with the draft. Without it a restored
             // pre-declaration draft picks up the CURRENT default and its
@@ -2313,6 +2417,21 @@ export function mountPromptManagementPanel(host) {
         toolRow.append(splitBtn, equalizeBtn, resetBtn,
             ...(restoreBtn ? [restoreBtn] : []), applyBtn);
         bodyEl.appendChild(toolRow);
+
+        const pendingIdentityNotice = document.createElement("div");
+        pendingIdentityNotice.style.cssText =
+            `font-size:10px;color:${COLORS.textSecondary};`;
+        const refreshPendingIdentityNotice = () => {
+            const pendingNames = writingState.pendingSemanticUnitCreates.map((intent) =>
+                String(intent?.unit?.name
+                    || intent?.unit?.semantic_unit_id || "Prompt Identity"));
+            pendingIdentityNotice.textContent = pendingNames.length
+                ? `Pending identities: ${pendingNames.map((name) =>
+                    `${name} (pending)`).join(", ")}` : "";
+            pendingIdentityNotice.style.display = pendingNames.length ? "block" : "none";
+        };
+        refreshPendingIdentityNotice();
+        bodyEl.appendChild(pendingIdentityNotice);
 
         const readout = document.createElement("div");
         readout.style.cssText = `font-size:10px; color:${COLORS.textDim};`;
@@ -2356,6 +2475,8 @@ export function mountPromptManagementPanel(host) {
         };
 
         const updateStrip = () => {
+            pruneWritingSemanticUnitCreates();
+            refreshPendingIdentityNotice();
             const blockDocuments = reconcileWritingBlockMeta(
                 splitWritingPromptDocument(writingState.document, {
                     keepEmpty: writingState.blockMeta.length > 0,
@@ -2457,10 +2578,11 @@ export function mountPromptManagementPanel(host) {
                             previewWritingBlocks(blockDocuments);
                         },
                         onAdd: async (kind) => {
-                            const configured = await configurePromptAttachment({ kind }, {
+                            const configured = acceptDraftConfiguration(
+                                await configurePromptAttachment({ kind }, {
                                 scene: attachmentScene,
                                 references: host._references || [],
-                                semanticUnits: host._promptSemanticUnits || [],
+                                semanticUnits: writingSemanticUnits(),
                                 profileId: scene?.prompt_context_profile_id
                                     || host._channelTemplate().default_context_profile || "generic@1",
                                 scope: "section",
@@ -2470,7 +2592,7 @@ export function mountPromptManagementPanel(host) {
                                 managedSpeakerSubjectIds: currentManagedSpeakerSubjectIds(),
                                 ordinalManifest: currentCandidatePayload()?.ordinal_manifest || {},
                                 candidate: currentCandidatePayload(),
-                            });
+                            }));
                             if (!configured) return;
                             const nextRegistry = normalizePromptAttachments([
                                 ...writingState.attachments, configured]);
@@ -2481,10 +2603,11 @@ export function mountPromptManagementPanel(host) {
                             previewWritingBlocks(blockDocuments);
                         },
                         onActivate: async (attachment) => {
-                            const configured = await configurePromptAttachment(attachment, {
+                            const configured = acceptDraftConfiguration(
+                                await configurePromptAttachment(attachment, {
                                 scene: attachmentScene,
                                 references: host._references || [],
-                                semanticUnits: host._promptSemanticUnits || [],
+                                semanticUnits: writingSemanticUnits(),
                                 profileId: scene?.prompt_context_profile_id
                                     || host._channelTemplate().default_context_profile || "generic@1",
                                 scope: "section",
@@ -2494,7 +2617,7 @@ export function mountPromptManagementPanel(host) {
                                 managedSpeakerSubjectIds: currentManagedSpeakerSubjectIds(),
                                 candidate: currentCandidatePayload(),
                                 ordinalManifest: currentCandidatePayload()?.ordinal_manifest || {},
-                            });
+                            }));
                             if (!configured) return;
                             const groupId = attachment.emission_group_id;
                             const linked = writingState.attachments.filter((value) =>
@@ -2583,6 +2706,7 @@ export function mountPromptManagementPanel(host) {
             });
             const sceneDur = host.activeScene?.duration_frames || host.totalFrames || 0;
             const extendDurationTo = cursor > sceneDur ? cursor : 0;
+            const promptSemanticUnitCreates = pruneWritingSemanticUnitCreates();
             // The writing tool rewrites SECTIONS only, so the scene-global text
             // has to be handed back untouched. Passing just `global` is not that:
             // it is the label-free mirror over the LEGACY three channels, so it
@@ -2603,6 +2727,7 @@ export function mountPromptManagementPanel(host) {
                     source_channel_template: host._channelTemplate(),
                     sections,
                     extendDurationTo,
+                    prompt_semantic_unit_creates: promptSemanticUnitCreates,
                 });
             } catch (error) {
                 notifyWarning(error?.message || "Writing draft Apply was refused.",
@@ -2614,8 +2739,30 @@ export function mountPromptManagementPanel(host) {
             // normally, so without this the draft, its chips, its block
             // metadata and the Restore stash were all discarded and the author
             // was told "Applied N section(s)" while nothing had landed.
-            if (!applied) return;
-            clearWritingState({ keepAsStash: writingDraftSnapshot() });
+            const appliedSuccessfully = typeof applied === "object"
+                ? applied?.applied === true : applied === true;
+            if (!appliedSuccessfully) {
+                const adopted = new Set((applied?.adopted_prompt_semantic_unit_ids || [])
+                    .map(String));
+                if (adopted.size) {
+                    writingState.pendingSemanticUnitCreates =
+                        writingState.pendingSemanticUnitCreates.filter((intent) =>
+                            !adopted.has(String(intent?.unit?.semantic_unit_id || "")));
+                    saveWritingState();
+                    notifyInfo(`${adopted.size === 1 ? "The pending identity was" : `${adopted.size} pending identities were`} created, but the lane changed before reconciliation. The draft remains retryable.`,
+                        { source: "prompt-writing-partial-reconcile" });
+                    render();
+                }
+                const conflicts = applied?.conflicting_prompt_semantic_unit_ids || [];
+                if (conflicts.length) {
+                    notifyWarning("A pending identity ID now belongs to different content. Remove or replace the conflicting speaker before retrying Apply.",
+                        { source: "prompt-writing-identity-conflict" });
+                }
+                return;
+            }
+            clearWritingState({
+                keepAsStash: writingAppliedRestoreSnapshot(writingDraftSnapshot()),
+            });
             // Disclosure, not a gate. Replacing the lane is exactly what Apply
             // was asked to do, so it is reported, never confirmed.
             const reshaped = previousCount && previousCount !== sections.length
@@ -3490,7 +3637,8 @@ export function mountPromptManagementPanel(host) {
                     }
                 },
                 onActivateAttachment: async (attachment) => {
-                    const configured = await configureGlobalAttachment(attachment);
+                    const configured = acceptDurableConfiguration(
+                        await configureGlobalAttachment(attachment));
                     if (configured) input.replaceAttachment(configured);
                 },
             });
@@ -3519,7 +3667,12 @@ export function mountPromptManagementPanel(host) {
             installPromptContextMenu({
                 editor: input,
                 allowedKinds: ["reference", "custom"],
-                onInserted: ({ type }) => type === "writing_aid" ? commitGlobal() : null,
+                onInserted: ({ type, attachment, identityCreateIntent }) => {
+                    if (identityCreateIntent) acceptDurableConfiguration({
+                        attachment, identityCreateIntent,
+                    });
+                    return type === "writing_aid" ? commitGlobal() : null;
+                },
                 onCreate: configureGlobalAttachment,
                 profile: host._resolvedPromptContextProfile?.(),
                 referenceContext: () => ({
@@ -3553,9 +3706,10 @@ export function mountPromptManagementPanel(host) {
                     candidate: payload,
                     attachmentLabelFor,
                     onActivate: async (attachment) => {
-                        const configured = await configureGlobalAttachment(
-                            attachment, promptAttachmentAnchoredChannels(
-                                globalDocuments, attachment.attachment_id));
+                        const configured = acceptDurableConfiguration(
+                            await configureGlobalAttachment(
+                                attachment, promptAttachmentAnchoredChannels(
+                                    globalDocuments, attachment.attachment_id)));
                         if (configured) input.replaceAttachment(configured);
                     },
                     onSetCapabilityEnabled: (attachment, projection, enabled) => {
@@ -3619,13 +3773,15 @@ export function mountPromptManagementPanel(host) {
                 profile: host._resolvedPromptContextProfile?.(),
                 allowedKinds: ["reference", "custom"],
                 onAdd: async (kind) => {
-                    const configured = await configureGlobalScope({ kind });
+                    const configured = acceptDurableConfiguration(
+                        await configureGlobalScope({ kind }));
                     if (!configured) return;
                     globalInputs[globalKeys[0]]?.transactPromptAttachments?.(
                         [...globalAttachments, configured]);
                 },
                 onActivate: async (attachment) => {
-                    const configured = await configureGlobalScope(attachment);
+                    const configured = acceptDurableConfiguration(
+                        await configureGlobalScope(attachment));
                     if (!configured) return;
                     globalInputs[globalKeys[0]]?.transactPromptAttachments?.(
                         globalAttachments.map((value) =>
@@ -3802,7 +3958,8 @@ export function mountPromptManagementPanel(host) {
                         }
                     },
                     onActivateAttachment: async (attachment) => {
-                        const configured = await configureChannelAttachment(attachment);
+                        const configured = acceptDurableConfiguration(
+                            await configureChannelAttachment(attachment));
                         if (!configured) return;
                         if (isLinkedAttachment(attachment)) {
                             await host._updateLinkedPromptAttachment?.(
@@ -3818,7 +3975,12 @@ export function mountPromptManagementPanel(host) {
                 channelInputs[key] = input;
                 installPromptContextMenu({
                     editor: input,
-                    onInserted: ({ type }) => type === "writing_aid" ? commitChannels() : null,
+                    onInserted: ({ type, attachment, identityCreateIntent }) => {
+                        if (identityCreateIntent) acceptDurableConfiguration({
+                            attachment, identityCreateIntent,
+                        });
+                        return type === "writing_aid" ? commitChannels() : null;
+                    },
                     onCreate: configureChannelAttachment,
                     profile: host._resolvedPromptContextProfile?.(),
                     referenceContext: () => ({
@@ -3855,9 +4017,10 @@ export function mountPromptManagementPanel(host) {
                         candidate: payload,
                         attachmentLabelFor,
                         onActivate: async (attachment) => {
-                            const configured = await configureChannelAttachment(
-                                attachment, promptAttachmentAnchoredChannels(
-                                    channelDocuments, attachment.attachment_id));
+                            const configured = acceptDurableConfiguration(
+                                await configureChannelAttachment(
+                                    attachment, promptAttachmentAnchoredChannels(
+                                        channelDocuments, attachment.attachment_id)));
                             if (!configured) return;
                             if (isLinkedAttachment(attachment)) {
                                 await host._updateLinkedPromptAttachment?.(
@@ -3960,13 +4123,15 @@ export function mountPromptManagementPanel(host) {
                             [...sectionAttachments, configured]);
                     },
                     onAdd: async (kind) => {
-                        const configured = await configureScope({ kind });
+                        const configured = acceptDurableConfiguration(
+                            await configureScope({ kind }));
                         if (!configured) return;
                         channelInputs[wideKey]?.transactPromptAttachments?.(
                             [...sectionAttachments, configured]);
                     },
                     onActivate: async (attachment) => {
-                        const configured = await configureScope(attachment);
+                        const configured = acceptDurableConfiguration(
+                            await configureScope(attachment));
                         if (!configured) return;
                         if (isLinkedAttachment(attachment)) {
                             await host._updateLinkedPromptAttachment?.(

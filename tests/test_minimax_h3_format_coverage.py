@@ -804,10 +804,6 @@ def test_e7_group_speech_uses_one_compound_speaker_token(compiled):
     assert set(compound.group(1).split(",")) == {"S1", "S2"}
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "PR-16: compound speaker tokens follow the chip's subject selection order, "
-    "so a group whose members were numbered out of selection order renders "
-    "(S2,S1). base guide 4.4 writes compound ids ascending."))
 def test_e7_compound_speaker_token_is_ascending(compiled):
     value = _channel(compiled, "audio_and_speakers", "detailed_description")
     assert "(S1,S2)" in value

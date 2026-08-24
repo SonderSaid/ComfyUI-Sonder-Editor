@@ -649,6 +649,44 @@ def test_prompt_history_separates_task_mode_and_setup_for_identical_text():
     assert len(project.metadata["prompt_history"]) == 3
 
 
+def test_assetless_vocal_identity_survives_queue_history_and_project_reload():
+    unit = prompt_context.normalize_semantic_unit({
+        "semantic_unit_id": "narrator", "handle": "Narrator",
+        "name": "Narrator", "kind": "subject", "definition": "Off screen",
+        "sources": [], "voice": {"member_id": None},
+    })
+    event = prompt_context.normalize_attachment({
+        "attachment_id": "vocal", "kind": "vocal_event",
+        "source": {"subject_ids": ["narrator"], "voice_id": "provider-voice"},
+        "config": {"event_type": "dialogue", "text": "Hello"},
+    })
+    section = PromptSection(0, 24, attachments=[event])
+    scene = Scene(scene_id="scene", duration_frames=24, prompt_sections=[section])
+    project = TimelineProject(project_id="project", scenes=[scene])
+    project.prompt_semantic_units = [unit]
+    job = GenerationJob(
+        scene_id="scene", selection_start=0, selection_end=24,
+        params={"prompt_context_format": prompt_context.FORMAT_VERSION},
+        prompt_sections=[section.to_dict()],
+        compiled_prompt_context={"profile": prompt_context.BUILTIN_PROFILES["generic@1"]},
+    )
+
+    routes._freeze_reference_input_snapshots(project, job, {}, "free")
+    frozen_ids = [entry["value"]["semantic_unit_id"]
+                  for entry in job.reference_input_snapshots
+                  if entry.get("kind") == "semantic_unit"]
+    assert frozen_ids == ["narrator"]
+
+    routes._record_prompt_history(project, [job])
+    assert project.metadata["prompt_history"][0]["prompt_semantic_units"][0][
+        "semantic_unit_id"] == "narrator"
+
+    reloaded = TimelineProject.from_dict(project.to_dict())
+    assert reloaded.prompt_semantic_units[0]["semantic_unit_id"] == "narrator"
+    assert reloaded.scenes[0].prompt_sections[0].attachments[0]["source"][
+        "subject_ids"] == ["narrator"]
+
+
 # 19 — over-cap authored data is refused rather than sliced.
 
 def test_attachment_and_capability_overflow_is_preserved_then_refused():
@@ -846,6 +884,25 @@ globalThis.Node = { TEXT_NODE: 3 };
 globalThis.HTMLElement = N;
 globalThis.getSelection = () => null;
 """
+
+
+def test_browser_semantic_dependency_mirror_matches_server_authority():
+    attachments = [
+        {"kind": "reference", "source": {
+            "semantic_unit_ids": ["reference", "shared"],
+            "voice_id": "provider-reference-voice"}},
+        {"kind": "vocal_event", "source": {
+            "subject_ids": ["speaker", "shared"],
+            "voice_id": "provider-vocal-voice"},
+         "config": {"audio_speaker_subject_id": "voiceover-subject"}},
+    ]
+    expected = prompt_context.semantic_identity_dependency_ids(attachments)
+    result = _run_chip_dom_script(f"""
+        console.log(JSON.stringify(mod.semanticIdentityDependencyIds(
+            {json.dumps(attachments)})));
+    """)
+    assert expected == ["reference", "shared", "speaker", "voiceover-subject"]
+    assert result == expected
 
 
 def test_reference_routing_uses_human_placement_without_rewriting_inline():
@@ -2184,7 +2241,380 @@ def test_vocal_event_editor_requires_a_subject_or_voice():
     chips = (ROOT / "web" / "js" / "prompt_context_chips.js").read_text(
         encoding="utf-8")
     assert "bindingNotice" in chips
-    assert "if (!subjectIds.length && !voiceId) {" in chips
+    assert "if (!distinctSubjectIds.length && !voiceId) {" in chips
+
+
+def test_vocal_event_modal_authors_other_speaker_delivery_and_identity_intent():
+    result = _run_chip_dom_script("""
+        const profile = {
+            profile_id:"selected", identity_kinds:[
+                {key:"subject",label:"Subject",speaks:true},
+                {key:"creature",label:"Creature",speaks:true},
+                {key:"place",label:"Place",speaks:false},
+            ], capabilities:{vocal_event:{event_policy:{
+                identity_prefix:"selected", delivery:true,
+                voiceover_subject_override:true,
+            }}},
+        };
+        const pending = mod.configurePromptAttachment({kind:"vocal_event"}, {
+            profile, profileId:"selected@1", semanticUnits:[
+                {semantic_unit_id:"alice",name:"Alice",handle:"Alice",kind:"subject",
+                    voice:{member_id:"voice-key"}},
+                {semantic_unit_id:"bob",name:"Bob",kind:"subject",
+                    voice:{member_id:"voice-key"}},
+                {semantic_unit_id:"place",name:"Kitchen",kind:"place"},
+            ],
+        });
+        const labels = document.body.querySelectorAll("label");
+        const controls = [
+            ...document.body.querySelectorAll("input"),
+            ...document.body.querySelectorAll("select"),
+            ...document.body.querySelectorAll("textarea"),
+        ];
+        const control = (name) => controls.find((value) =>
+            value.attributes["aria-label"] === name);
+        const event = control("Event");
+        const speaker = control("Speaker");
+        event.value = "voiceover";
+        event._handlers.change[0]();
+        speaker.value = "__other__";
+        speaker._handlers.change[0]();
+        control("Name").value = "Forest Spirit";
+        control("Description").value = "A gentle ancient spirit";
+        control("Kind").value = "creature";
+        control("On-screen subject override").value = "the child in frame";
+        control("Delivery / performance direction").value = "softly, almost singing";
+        control("Stable voice key (advanced)").value = "voice-key";
+        control("Words").value = "Come closer.";
+        document.body.querySelectorAll("button")
+            .find((button) => button.textContent === "Attach")._handlers.click[0]();
+        const configured = await pending;
+        console.log(JSON.stringify({
+            attachment: configured.attachment,
+            intent: configured.identityCreateIntent,
+            speakerOptions: speaker.options.map((option) => option.textContent),
+            kindOptions: control("Kind").options.map((option) => option.textContent),
+            phraseVisible: labels.find((row) =>
+                row.children[0]?.textContent === "On-screen subject override").style.display,
+        }));
+    """)
+    attachment = result["attachment"]
+    intent = result["intent"]
+    assert attachment["config"] == {
+        "event_type": "voiceover",
+        "language": "English",
+        "subject_phrase": "the child in frame",
+        "delivery": "softly, almost singing",
+        "text": "Come closer.",
+    }
+    assert attachment["source"]["voice_id"] == "voice-key"
+    assert attachment["source"]["subject_ids"] == [
+        intent["unit"]["semantic_unit_id"]]
+    assert intent["type"] == "create_prompt_semantic_unit"
+    assert intent["handle_suggestion"] == "ForestSpirit"
+    assert intent["unit"]["name"] == "Forest Spirit"
+    assert intent["unit"]["definition"] == "A gentle ancient spirit"
+    assert intent["unit"]["kind"] == "creature"
+    assert "Kitchen" not in " ".join(result["speakerOptions"])
+    assert result["kindOptions"] == ["Subject", "Creature"]
+    assert result["phraseVisible"] == "grid"
+
+
+def test_vocal_event_delivery_editor_counts_unicode_codepoints_not_utf16_units():
+    result = _run_chip_dom_script("""
+        const profile = {profile_id:"selected",identity_kinds:[
+            {key:"subject",label:"Subject",speaks:true},
+        ],capabilities:{vocal_event:{event_policy:{
+            identity_prefix:"selected",delivery:true,
+        }}}};
+        const pending = mod.configurePromptAttachment({kind:"vocal_event"}, {
+            profile, profileId:"selected@1", semanticUnits:[
+                {semantic_unit_id:"alice",name:"Alice",handle:"Alice",kind:"subject"},
+            ],
+        });
+        const controls = [
+            ...document.body.querySelectorAll("input"),
+            ...document.body.querySelectorAll("select"),
+            ...document.body.querySelectorAll("textarea"),
+        ];
+        const control = (name) => controls.find((value) =>
+            value.attributes["aria-label"] === name);
+        control("Speaker").value = "alice";
+        control("Words").value = "Hello";
+        const delivery = control("Delivery / performance direction");
+        const attach = document.body.querySelectorAll("button")
+            .find((button) => button.textContent === "Attach");
+        delivery.value = "😀".repeat(257);
+        attach._handlers.click[0]();
+        const notice = document.body.querySelectorAll("div").find((div) =>
+            div.textContent === "Delivery may contain at most 256 Unicode code points.");
+        const blocked = {display:notice.style.display,text:notice.textContent,
+            maxLength:delivery.maxLength ?? null};
+        delivery.value = "😀".repeat(256);
+        attach._handlers.click[0]();
+        const configured = await pending;
+        console.log(JSON.stringify({blocked,
+            codepoints:[...configured.attachment.config.delivery].length,
+            utf16:configured.attachment.config.delivery.length}));
+    """)
+    assert result["blocked"]["display"] == "block"
+    assert result["blocked"]["text"] == (
+        "Delivery may contain at most 256 Unicode code points.")
+    assert result["blocked"]["maxLength"] is None
+    assert result["codepoints"] == 256
+    assert result["utf16"] == 512
+
+
+def test_vocal_event_voice_conversion_is_explicit_and_unsupported_delivery_blocks_until_clear():
+    result = _run_chip_dom_script("""
+        const units = [
+            {semantic_unit_id:"alice",name:"Alice",kind:"subject",
+                voice:{member_id:"shared-key"}},
+            {semantic_unit_id:"bob",name:"Bob",kind:"subject",
+                voice:{member_id:"shared-key"}},
+        ];
+        const pending = mod.configurePromptAttachment({kind:"vocal_event",
+            source:{voice_id:"shared-key"}, config:{delivery:"whispering"}}, {
+            profile:{profile_id:"explicit",identity_kinds:[
+                {key:"subject",label:"Subject",speaks:true},
+            ],capabilities:{}},
+            semanticUnits:units,
+        });
+        const labels = document.body.querySelectorAll("label");
+        const controls = [
+            ...document.body.querySelectorAll("input"),
+            ...document.body.querySelectorAll("select"),
+            ...document.body.querySelectorAll("textarea"),
+        ];
+        const control = (name) => controls.find((value) =>
+            value.attributes["aria-label"] === name);
+        const conversion = document.body.querySelectorAll("select").find((select) =>
+            select.options[0]?.textContent === "Choose an identity explicitly…");
+        const before = {
+            selected: conversion.value,
+            matches: conversion.options.map((option) => option.textContent),
+            speaker: control("Speaker").value,
+            voice: control("Stable voice key (advanced)").value,
+        };
+        conversion.value = "bob";
+        conversion._handlers.change[0]();
+        const after = {speaker:control("Speaker").value,
+            voice:control("Stable voice key (advanced)").value};
+        const attach = document.body.querySelectorAll("button")
+            .find((button) => button.textContent === "Attach");
+        attach._handlers.click[0]();
+        const blockedNotice = document.body.querySelectorAll("div").find((div) =>
+            div.textContent.startsWith("Stored delivery is preserved"));
+        const blocked = blockedNotice.style.display;
+        const clear = document.body.querySelectorAll("button")
+            .find((button) => button.textContent === "Clear");
+        clear._handlers.click[0]();
+        attach._handlers.click[0]();
+        const configured = await pending;
+        console.log(JSON.stringify({before, after, blocked,
+            config:configured.attachment.config,
+            source:configured.attachment.source}));
+    """)
+    assert result["before"] == {
+        "selected": "",
+        "matches": ["Choose an identity explicitly…", "Alice", "Bob"],
+        "speaker": "",
+        "voice": "shared-key",
+    }
+    assert result["after"] == {"speaker": "bob", "voice": "shared-key"}
+    assert result["blocked"] == "block"
+    assert result["config"]["delivery"] == ""
+    assert result["source"] == {"voice_id": "shared-key", "subject_ids": ["bob"]}
+
+
+def test_vocal_event_modal_blocks_legacy_invalid_speakers_even_with_voice_key():
+    result = _run_chip_dom_script("""
+        const profile = {profile_id:"selected", identity_kinds:[
+            {key:"subject",label:"Subject",speaks:true},
+            {key:"place",label:"Place",speaks:false},
+        ], capabilities:{vocal_event:{event_policy:{
+            identity_prefix:"selected", delivery:true,
+            voiceover_subject_override:false,
+        }}}};
+        const units = [
+            {semantic_unit_id:"alice",name:"Alice",kind:"subject"},
+            {semantic_unit_id:"bob",name:"Bob",kind:"subject"},
+            {semantic_unit_id:"kitchen",name:"Kitchen",kind:"place"},
+        ];
+        const inspect = async (subjectIds) => {
+            const pending = mod.configurePromptAttachment({kind:"vocal_event",
+                source:{subject_ids:subjectIds,voice_id:"stable-key"}}, {profile,
+                semanticUnits:units});
+            const controls = [
+                ...document.body.querySelectorAll("input"),
+                ...document.body.querySelectorAll("select"),
+                ...document.body.querySelectorAll("textarea"),
+            ];
+            const control = (name) => controls.find((value) =>
+                value.attributes["aria-label"] === name);
+            const speaker = control("Speaker");
+            document.body.querySelectorAll("button")
+                .find((button) => button.textContent === "Attach")._handlers.click[0]();
+            const notice = document.body.querySelectorAll("div").find((div) =>
+                div.textContent.startsWith("The stored Speaker cannot speak"));
+            const snapshot = {value:speaker.value,
+                options:speaker.options.map((option) => option.textContent),
+                blocked:notice?.style.display || ""};
+            document.body.querySelectorAll("button")
+                .find((button) => button.textContent === "Cancel")._handlers.click[0]();
+            await pending;
+            return snapshot;
+        };
+        console.log(JSON.stringify({many:await inspect(["alice","bob"]),
+            wrongKind:await inspect(["kitchen"])}));
+    """)
+    assert result["many"]["value"] == "__invalid_current_speakers__"
+    assert "2 stored speakers" in " ".join(result["many"]["options"])
+    assert result["many"]["blocked"] == "block"
+    assert "identity kind cannot speak" in " ".join(result["wrongKind"]["options"])
+    assert result["wrongKind"]["blocked"] == "block"
+
+
+def test_vocal_event_group_all_selects_declared_speakers_but_not_other():
+    result = _run_chip_dom_script("""
+        const profile = {profile_id:"selected", identity_kinds:[
+            {key:"subject",label:"Subject",speaks:true},
+        ], capabilities:{vocal_event:{event_policy:{
+            identity_prefix:"selected", delivery:true,
+            voiceover_subject_override:false,
+        }}}};
+        const pending = mod.configurePromptAttachment({kind:"vocal_event"}, {
+            profile, semanticUnits:[
+                {semantic_unit_id:"alice",name:"Alice",kind:"subject"},
+                {semantic_unit_id:"bob",name:"Bob",kind:"subject"},
+            ],
+        });
+        const controls = [
+            ...document.body.querySelectorAll("input"),
+            ...document.body.querySelectorAll("select"),
+            ...document.body.querySelectorAll("textarea"),
+        ];
+        const control = (name) => controls.find((value) =>
+            value.attributes["aria-label"] === name);
+        control("Event").value = "group_speech";
+        control("Event")._handlers.change[0]();
+        document.body.querySelectorAll("button")
+            .find((button) => button.textContent === "All")._handlers.click[0]();
+        const speakersRow = document.body.querySelectorAll("label").find((row) =>
+            row.children[0]?.textContent === "Speakers");
+        const selected = [...speakersRow.children[1].selectedOptions]
+            .map((option) => option.value);
+        const other = control("Other speaker…").checked;
+        document.body.querySelectorAll("button")
+            .find((button) => button.textContent === "Cancel")._handlers.click[0]();
+        await pending;
+        console.log(JSON.stringify({selected,other}));
+    """)
+    assert result == {"selected": ["alice", "bob"], "other": False}
+
+
+def test_vocal_event_modal_discloses_reusable_pending_draft_identity():
+    result = _run_chip_dom_script("""
+        const pending = mod.configurePromptAttachment({kind:"vocal_event"}, {
+            profile:{profile_id:"selected",identity_kinds:[
+                {key:"subject",label:"Subject",speaks:true},
+            ],capabilities:{vocal_event:{event_policy:{
+                identity_prefix:"selected",delivery:true,
+                voiceover_subject_override:false,
+            }}}},
+            semanticUnits:[{semantic_unit_id:"pending-1",name:"Narrator",
+                kind:"subject",handle:"",_pending_create:true}],
+        });
+        const speaker = document.body.querySelectorAll("select").find((value) =>
+            value.attributes["aria-label"] === "Speaker");
+        const labels = speaker.options.map((option) => option.textContent);
+        speaker.value = "pending-1";
+        document.body.querySelectorAll("button")
+            .find((button) => button.textContent === "Attach")._handlers.click[0]();
+        const configured = await pending;
+        console.log(JSON.stringify({labels,
+            ids:configured.attachment.source.subject_ids,
+            intent:configured.identityCreateIntent || null}));
+    """)
+    assert "Narrator (pending)" in result["labels"]
+    assert result["ids"] == ["pending-1"]
+    assert result["intent"] is None
+
+
+def test_vocal_event_compact_label_and_tooltip_use_identity_event_and_codepoint_preview():
+    result = _run_chip_dom_script("""
+        const attachment = {kind:"vocal_event", source:{subject_ids:["alice"]},
+            config:{event_type:"group_speech",language:"Spanish",
+                delivery:"urgently",subject_phrase:"the masked figure",
+                text:"😀1234567890123456789012345678901234567890tail"}};
+        const units = [{semantic_unit_id:"alice",handle:"Alice",name:"Alice"}];
+        const identity = mod.resolveReferenceAttachmentIdentity(attachment,
+            {semanticUnits:units});
+        console.log(JSON.stringify({identity,
+            label:mod.attachmentLabel(attachment,"ignored",identity),
+            tooltip:mod.attachmentTooltip(attachment,identity)}));
+    """)
+    assert result["identity"] == "@Alice"
+    assert result["label"].startswith("@Alice · group speech · 😀123")
+    # 40 Unicode code points plus one ellipsis; the emoji is not split.
+    preview = result["label"].split(" · ")[-1]
+    assert len(preview) == 41
+    assert preview.endswith("…")
+    assert "Language: Spanish" in result["tooltip"]
+    assert "Delivery: urgently" in result["tooltip"]
+    assert "Words: 😀123" in result["tooltip"]
+
+
+def test_prompt_identity_apply_reconciliation_and_redo_plan_are_conflict_safe():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for Prompt Identity transaction coverage")
+    module_url = (ROOT / "web/js/prompt_identity_transactions.js").as_uri()
+    script = f"""
+const mod = await import({json.dumps(module_url)});
+const intent = (id, name) => ({{type:"create_prompt_semantic_unit",
+  handle_suggestion:name,unit:{{semantic_unit_id:id,name,kind:"subject",definition:""}}}});
+const unit = (id, name) => ({{semantic_unit_id:id,handle:name,name,kind:"subject",
+  definition:"",order:0,sources:[],voice:{{member_id:null}},
+  attachment_defaults:{{}},disabled_capabilities:[]}});
+const intents=[intent("one","One"),intent("two","Two")];
+const sections=[{{prompt_id:"p",start_frame:0,end_frame:24,
+  channels:{{visual:"hello"}},channel_docs:{{visual:{{nodes:[
+    {{type:"text",node_id:"t",text:"hello"}}]}}}},attachments:[],muted:false,
+  global_channel_exceptions:[]}}];
+const success=mod.reconcilePromptIdentityCreateOutcome({{
+  units:[unit("one","One"),unit("two","Two")],intents,
+  expectedSections:sections,actualSections:sections.map((value)=>({{...value,prompt:"hello"}})),
+}});
+const laterScene=mod.reconcilePromptIdentityCreateOutcome({{
+  units:[unit("one","One"),unit("two","Two")],intents,
+  expectedSections:sections,actualSections:[{{...sections[0],end_frame:25}}],
+}});
+const collision=mod.reconcilePromptIdentityCreateOutcome({{
+  units:[unit("one","Different")],intents:[intents[0]],
+  expectedSections:sections,actualSections:sections,
+}});
+const redo=mod.promptIdentityRedoPlan(
+  [unit("one","One")],[intents[0],intents[1]]);
+const blockedRedo=mod.promptIdentityRedoPlan(
+  [unit("one","Changed")],[intents[0]]);
+console.log(JSON.stringify({{success,laterScene,collision,
+  redo:{{create:redo.createIntents.map((value)=>value.unit.semantic_unit_id),
+    reused:redo.reusedIds,conflicts:redo.conflictIds}},
+  blockedRedo:blockedRedo.conflictIds}}));
+"""
+    result = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+    assert result["success"]["applied"] is True
+    assert result["success"]["adopted_prompt_semantic_unit_ids"] == ["one", "two"]
+    assert result["laterScene"]["applied"] is False
+    assert result["laterScene"]["sections_match"] is False
+    assert result["laterScene"]["adopted_prompt_semantic_unit_ids"] == ["one", "two"]
+    assert result["collision"]["conflicting_prompt_semantic_unit_ids"] == ["one"]
+    assert result["redo"] == {
+        "create": ["two"], "reused": ["one"], "conflicts": []}
+    assert result["blockedRedo"] == ["one"]
     # A stray grep for the Reference save block's `audio_relationship` line
     # used to live here. It belonged to neither this test's subject nor a
     # behavioural check, and the field list it pinned is now declaration-driven;

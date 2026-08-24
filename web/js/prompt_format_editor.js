@@ -152,6 +152,14 @@ export function assemblePromptFormatDefinition(base, edits = {}) {
         if (edits.speaker_policy === null) delete definition.speaker_policy;
         else definition.speaker_policy = structuredClone(edits.speaker_policy);
     }
+    if (edits.vocal_event_policy !== undefined) {
+        const vocal = structuredClone(capabilities.vocal_event || {});
+        if (edits.vocal_event_policy === null) delete vocal.event_policy;
+        else vocal.event_policy = structuredClone(edits.vocal_event_policy);
+        if (Object.keys(vocal).length) capabilities.vocal_event = vocal;
+        else delete capabilities.vocal_event;
+        definition.capabilities = capabilities;
+    }
     return definition;
 }
 
@@ -673,6 +681,54 @@ export function mountPromptFormatDeclarationEditor({ definition, template,
         hint: "Unchecked stores the server default. There is no partial speaker policy — turn speakers off with the checkbox below, not by leaving this one unchecked.",
     }), policyFields);
 
+    // ---- Vocal Event policy ---------------------------------------------
+    const vocalPolicySource = source.capabilities?.vocal_event?.event_policy;
+    const vocalBody = group("vocal_event_policy", "Vocal events", {
+        description: "Whether Vocal Events require an authored speaker phrase or derive it from selected speaking identities, and which optional prose they support.",
+    });
+    const vocalPolicyToggle = document.createElement("input");
+    vocalPolicyToggle.type = "checkbox";
+    vocalPolicyToggle.checked = vocalPolicySource !== undefined
+        && vocalPolicySource !== null;
+    vocalPolicyToggle.setAttribute("aria-label", "Declare a Vocal Event policy");
+    const vocalIdentityPrefix = select([
+        { value: "explicit", label: "Explicit authored phrase" },
+        { value: "selected", label: "Selected Prompt Identity" },
+    ], vocalPolicySource?.identity_prefix || "explicit", {
+        ariaLabel: "Vocal Event identity prefix",
+    });
+    const vocalDelivery = document.createElement("input");
+    vocalDelivery.type = "checkbox";
+    vocalDelivery.checked = !!vocalPolicySource?.delivery;
+    vocalDelivery.setAttribute("aria-label", "Vocal Events support delivery prose");
+    const vocalVoiceoverOverride = document.createElement("input");
+    vocalVoiceoverOverride.type = "checkbox";
+    vocalVoiceoverOverride.checked = !!vocalPolicySource?.voiceover_subject_override;
+    vocalVoiceoverOverride.setAttribute(
+        "aria-label", "Voiceover supports an on-screen subject override");
+    let vocalPolicyTouched = false;
+    const touchVocalPolicy = () => { vocalPolicyTouched = true; };
+    vocalIdentityPrefix.addEventListener("change", touchVocalPolicy);
+    vocalDelivery.addEventListener("change", touchVocalPolicy);
+    vocalVoiceoverOverride.addEventListener("change", touchVocalPolicy);
+    const vocalPolicyFields = document.createElement("div");
+    vocalPolicyFields.style.cssText = "display:flex;flex-direction:column;gap:5px;";
+    vocalPolicyFields.append(
+        labelled("Identity prefix", vocalIdentityPrefix),
+        labelled("Delivery prose", vocalDelivery),
+        labelled("Voiceover override", vocalVoiceoverOverride));
+    const syncVocalPolicy = () => {
+        vocalPolicyFields.style.display = vocalPolicyToggle.checked ? "flex" : "none";
+    };
+    vocalPolicyToggle.addEventListener("change", () => {
+        touchVocalPolicy();
+        syncVocalPolicy();
+    });
+    syncVocalPolicy();
+    vocalBody.append(labelled("Own Vocal Event policy", vocalPolicyToggle, {
+        hint: "Unchecked preserves explicit phrase behavior. A declared policy is always stored as one closed, complete object.",
+    }), vocalPolicyFields);
+
     const collect = () => {
         const roleCatalogs = {};
         for (const [population, text] of roleText) {
@@ -700,6 +756,13 @@ export function mountPromptFormatDeclarationEditor({ definition, template,
                 compound_join: policyJoin.value,
                 compound_order: policyOrder.value,
             } : null,
+            vocal_event_policy: vocalPolicyTouched
+                ? (vocalPolicyToggle.checked ? {
+                    identity_prefix: vocalIdentityPrefix.value,
+                    delivery: vocalDelivery.checked,
+                    voiceover_subject_override: vocalVoiceoverOverride.checked,
+                } : null)
+                : undefined,
         });
     };
 

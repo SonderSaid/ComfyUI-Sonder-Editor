@@ -44,6 +44,7 @@ const CHIP_PALETTE = Object.freeze({
 
 export const PROMPT_DOCUMENT_SCHEMA = "prompt_document_v1";
 export const PROMPT_CONTEXT_FORMAT = "prompt_context_v1";
+export const MAX_VOCAL_DELIVERY_CODEPOINTS = 256;
 
 const AUTHORING_KINDS = ["shot", "timestamp", "reference", "vocal_event", "prompt_link", "prompt_link_scope", "custom"];
 export const SCOPE_ONLY_KINDS = ["timestamp", "prompt_link_scope"];
@@ -689,6 +690,31 @@ export function normalizePromptAttachments(raw) {
     return result;
 }
 
+/** Browser mirror of the server-owned Prompt Identity dependency closure.
+ * Voice ids are provider keys and intentionally excluded. */
+export function semanticIdentityDependencyIds(attachments) {
+    const result = [];
+    const seen = new Set();
+    for (const attachment of Array.isArray(attachments) ? attachments : []) {
+        if (!attachment || typeof attachment !== "object") continue;
+        const source = attachment.source && typeof attachment.source === "object"
+            ? attachment.source : {};
+        const config = attachment.config && typeof attachment.config === "object"
+            ? attachment.config : {};
+        const values = [];
+        for (const key of ["semantic_unit_ids", "subject_ids"]) {
+            if (Array.isArray(source[key])) values.push(...source[key]);
+        }
+        values.push(config.audio_speaker_subject_id);
+        for (const value of values) {
+            const id = String(value || "");
+            if (!id || seen.has(id)) continue;
+            seen.add(id); result.push(id);
+        }
+    }
+    return result;
+}
+
 export function reusePromptAttachment(raw) {
     const source = normalizePromptAttachment(raw);
     return normalizePromptAttachment({
@@ -1142,6 +1168,17 @@ export function referenceCapabilityInputProjection(capabilityKind, {
 export function resolveReferenceAttachmentIdentity(attachment, {
     scene = null, references = [], semanticUnits = [],
 } = {}) {
+    if (attachment?.kind === "vocal_event") {
+        const byId = new Map((semanticUnits || []).map((unit) => [
+            String(unit?.semantic_unit_id || ""), unit,
+        ]));
+        return [...new Set((attachment?.source?.subject_ids || []).map((value) => {
+            const unit = byId.get(String(value));
+            const handle = String(unit?.handle || "").trim();
+            return handle ? `@${handle}`
+                : String(unit?.name || unit?.semantic_unit_id || value || "").trim();
+        }).filter(Boolean))].join(" + ");
+    }
     if (attachment?.kind !== "reference") return "";
     const unitNames = (attachment?.source?.semantic_unit_ids || []).map((id) => {
         const unit = (semanticUnits || []).find((row) =>
@@ -1281,9 +1318,47 @@ export function attachmentLabel(attachment, preview = "", identityLabel = "", co
         return attachment?.config?.label || "Linked prompt";
     }
     if (attachment?.kind === "vocal_event") {
-        return attachment?.config?.event_type || base;
+        const eventType = String(attachment?.config?.event_type || "speech")
+            .replaceAll("_", " ");
+        const words = String(attachment?.config?.text || "").trim().replace(/\s+/g, " ");
+        const points = [...words];
+        const wordsPreview = points.length > 40
+            ? `${points.slice(0, 40).join("")}…` : words;
+        return [identityLabel, eventType, wordsPreview].filter(Boolean).join(" · ");
     }
     return preview || attachment?.config?.label || base;
+}
+
+export function attachmentTooltip(attachment, identityLabel = "", preview = "") {
+    if (attachment?.kind !== "vocal_event") {
+        return attachmentLabel(attachment, preview, identityLabel);
+    }
+    const lines = [
+        `Speaker: ${identityLabel || "stable voice key only"}`,
+        `Event: ${String(attachment?.config?.event_type || "speech").replaceAll("_", " ")}`,
+        `Language: ${String(attachment?.config?.language || "English")}`,
+    ];
+    const delivery = String(attachment?.config?.delivery || "");
+    const phrase = String(attachment?.config?.subject_phrase || "");
+    const voice = String(attachment?.source?.voice_id || "");
+    if (delivery) lines.push(`Delivery: ${delivery}`);
+    if (phrase) lines.push(`Subject override / phrase: ${phrase}`);
+    if (voice) lines.push(`Stable voice key: ${voice}`);
+    lines.push(`Words: ${String(attachment?.config?.text || "")}`);
+    return lines.join("\n");
+}
+
+export function promptAttachmentConfiguration(result) {
+    if (!result) return { attachment: null, identityCreateIntent: null };
+    if (result.attachment) {
+        return {
+            attachment: result.attachment,
+            identityCreateIntent: result.identityCreateIntent || null,
+        };
+    }
+    // Temporary compatibility for callers outside this repository that still
+    // provide an already-configured attachment to the shared helper.
+    return { attachment: result, identityCreateIntent: null };
 }
 
 /** Project one capability row back onto its stored record.
@@ -1823,11 +1898,14 @@ export function createPromptDocumentEditor({
             const label = attachmentLabel(attachment,
                 previews?.[attachment.attachment_id] || "",
                 attachmentLabelFor?.(attachment) || "", attachmentContext);
+            const tooltip = attachmentTooltip(
+                attachment, attachmentLabelFor?.(attachment) || "",
+                previews?.[attachment.attachment_id] || "");
             const handle = isHandleLabel(identityLabel);
             chip.style.cssText = handle ? handleCss() : chipCss();
             chip.setAttribute("role", "button");
             chip.tabIndex = 0;
-            chip.title = `${label} — dynamic context; activate to configure`;
+            chip.title = `${tooltip} — dynamic context; activate to configure`;
             chip.setAttribute("aria-label", `${label} context chip; activate to configure`);
             const chipLabel = contextChipLabel(handle ? identityLabel : label,
                 { inline: handle });
@@ -3242,11 +3320,14 @@ function referenceAttachItem(editor, bookmark, referenceContext, onCreate,
     onInserted, channelKey = "") {
     const openDialog = async () => {
         const attachment = normalizePromptAttachment({ kind: "reference" });
-        const configured = onCreate ? await onCreate(attachment) : attachment;
+        const result = onCreate ? await onCreate(attachment) : { attachment };
+        const configured = promptAttachmentConfiguration(result);
         if (!restorePromptInsertion(editor, bookmark)) return;
-        if (configured) {
-            editor?.insertAttachment?.(configured);
-            await onInserted?.({ type: "attachment", attachment: configured });
+        if (configured.attachment) {
+            editor?.insertAttachment?.(configured.attachment);
+            await onInserted?.({ type: "attachment",
+                attachment: configured.attachment,
+                identityCreateIntent: configured.identityCreateIntent });
         }
     };
     if (!referenceContext) {
@@ -3314,11 +3395,14 @@ export function createPromptContextMenuItems({ editor, bookmark = null,
                 kind,
                 action: async () => {
                     const attachment = normalizePromptAttachment({ kind });
-                    const configured = onCreate ? await onCreate(attachment) : attachment;
+                    const result = onCreate ? await onCreate(attachment) : { attachment };
+                    const configured = promptAttachmentConfiguration(result);
                     if (!restorePromptInsertion(editor, bookmark)) return;
-                    if (configured) {
-                        editor?.insertAttachment?.(configured);
-                        await onInserted?.({ type: "attachment", attachment: configured });
+                    if (configured.attachment) {
+                        editor?.insertAttachment?.(configured.attachment);
+                        await onInserted?.({ type: "attachment",
+                            attachment: configured.attachment,
+                            identityCreateIntent: configured.identityCreateIntent });
                     }
                 },
             }),
@@ -4152,6 +4236,7 @@ export function configurePromptAttachment(rawAttachment, {
         hint.style.cssText = `font:10px system-ui;color:${COLORS.textDim};`;
         panel.append(heading, hint);
         const controls = {};
+        let identityCreateIntent = null;
 
         if (attachment.kind === "shot") {
             controls.shotTimestamp = document.createElement("input");
@@ -4215,6 +4300,42 @@ export function configurePromptAttachment(rawAttachment, {
                     fieldRow("Source channel", controls.channel));
             }
         } else if (attachment.kind === "vocal_event") {
+            const rawPolicy = resolvedProfile?.capabilities?.vocal_event?.event_policy;
+            const eventPolicy = rawPolicy && typeof rawPolicy === "object"
+                ? {
+                    identity_prefix: rawPolicy.identity_prefix === "selected"
+                        ? "selected" : "explicit",
+                    delivery: rawPolicy.delivery === true,
+                    voiceover_subject_override:
+                        rawPolicy.voiceover_subject_override === true,
+                }
+                : { identity_prefix: "explicit", delivery: false,
+                    voiceover_subject_override: false };
+            const speakingKinds = (resolvedProfile?.identity_kinds || [])
+                .filter((value) => value?.key && value?.speaks === true);
+            const speakingKindKeys = new Set(speakingKinds.map((value) =>
+                String(value.key)));
+            const speakerUnits = (semanticUnits || []).filter((value) =>
+                speakingKindKeys.has(String(value?.kind || "subject")));
+            const validSpeakerIds = new Set(speakerUnits.map((value) =>
+                String(value.semantic_unit_id)));
+            controls.validSpeakerIds = validSpeakerIds;
+            const currentSubjectIds = (attachment.source.subject_ids || []).map(String);
+            const unitOptions = speakerUnits.map((value) => [
+                String(value.semantic_unit_id),
+                String(value.handle ? `@${value.handle} — ${value.name || value.semantic_unit_id}`
+                    : (value.name || value.semantic_unit_id))
+                    + (value._pending_create ? " (pending)" : ""),
+            ]);
+            for (const subjectId of currentSubjectIds) {
+                if (!unitOptions.some(([value]) => value === subjectId)) {
+                    const unit = (semanticUnits || []).find((value) =>
+                        String(value?.semantic_unit_id || "") === subjectId);
+                    unitOptions.push([subjectId,
+                        `Unavailable: ${unit?.name || subjectId} — identity kind cannot speak`]);
+                }
+            }
+            const allowOther = speakingKinds.length > 0;
             controls.eventType = selectField(
                 ["dialogue", "singing", "narration", "voiceover", "group_speech"],
                 attachment.config.event_type || "dialogue");
@@ -4223,27 +4344,180 @@ export function configurePromptAttachment(rawAttachment, {
             controls.subjectPhrase = textField(attachment.config.subject_phrase || "");
             controls.text = textField(attachment.config.text, true);
             controls.voice = textField(attachment.source.voice_id || "");
-            controls.subjects = checkboxListField(
-                (semanticUnits || []).map((value) => [
-                    value.semantic_unit_id, value.name || value.semantic_unit_id,
-                ]),
-                (attachment.source.subject_ids || []).map(String),
-                { allLabel: "All" });
+            controls.delivery = textField(attachment.config.delivery || "", true);
+            const invalidOrdinaryBinding = currentSubjectIds.length > 1
+                ? "__invalid_current_speakers__" : "";
+            controls.ordinarySpeaker = selectField([
+                ["", "Choose a speaker…"],
+                ...(invalidOrdinaryBinding ? [[invalidOrdinaryBinding,
+                    `Unavailable: ${currentSubjectIds.length} stored speakers — choose one`]] : []),
+                ...unitOptions,
+                ...(allowOther ? [["__other__", "Other speaker…"]] : []),
+            ], invalidOrdinaryBinding
+                || (currentSubjectIds.length === 1 ? currentSubjectIds[0] : ""));
+            controls.groupSpeakers = checkboxListField(unitOptions,
+                currentSubjectIds, { allLabel: "All" });
+            controls.groupOther = document.createElement("input");
+            controls.groupOther.type = "checkbox";
+            controls.groupOther.checked = false;
+            const groupOtherRow = fieldRow("Other speaker…", controls.groupOther,
+                "Create one new assetless Prompt Identity for this group.");
+            groupOtherRow.style.display = "none";
+
+            const speakerRow = fieldRow("Speaker", controls.ordinarySpeaker,
+                "Choose one Prompt Identity for ordinary speech.");
+            const groupSpeakerRow = fieldRow("Speakers", controls.groupSpeakers,
+                "Group speech requires at least two distinct Prompt Identities.");
+            const otherBox = document.createElement("div");
+            otherBox.style.cssText = `display:none;flex-direction:column;gap:6px;padding:8px;border:1px solid ${COLORS.border};border-radius:5px;background:${COLORS.panel};`;
+            controls.otherName = textField("");
+            controls.otherName.placeholder = "Required name";
+            controls.otherDescription = textField("", true);
+            controls.otherDescription.placeholder = "Optional prompt description";
+            controls.otherKind = selectField(speakingKinds.map((value) => [
+                String(value.key), String(value.label || value.key),
+            ]), speakingKinds[0]?.key || "subject");
+            otherBox.append(fieldRow("Name", controls.otherName),
+                fieldRow("Description", controls.otherDescription));
+            if (speakingKinds.length > 1) {
+                otherBox.append(fieldRow("Kind", controls.otherKind));
+            }
+            controls.otherBox = otherBox;
+            controls.otherNotice = document.createElement("div");
+            controls.otherNotice.textContent = "Name is required for Other speaker.";
+            controls.otherNotice.style.cssText =
+                `display:none;font:10px system-ui;color:${COLORS.dangerText};`;
+
+            const phraseRow = fieldRow(
+                eventPolicy.identity_prefix === "explicit"
+                    ? "Speaker phrase"
+                    : "On-screen subject override",
+                controls.subjectPhrase,
+                eventPolicy.identity_prefix === "explicit"
+                    ? "Authored identifying phrase placed before the spoken words."
+                    : "Optional free text for voiceover when the on-screen subject differs from the speaker.");
+            controls.phraseRow = phraseRow;
+            const deliverySupported = eventPolicy.delivery;
+            const storedUnsupportedDelivery = !deliverySupported
+                && String(attachment.config.delivery || "").length > 0;
+            const deliveryLabel = deliverySupported
+                ? "Delivery / performance direction"
+                : "Delivery (preserved — not used by this format)";
+            const deliveryRow = fieldRow(deliveryLabel, controls.delivery,
+                deliverySupported
+                    ? "Example: quietly, with a trembling laugh. Do not add quotes or a trailing colon."
+                    : "Clear this stored value to attach, or restore a format that supports delivery.");
+            controls.deliveryNotice = document.createElement("div");
+            controls.deliveryNotice.textContent =
+                "Stored delivery is preserved but unsupported by this format. Clear it or restore a supporting format.";
+            controls.deliveryNotice.style.cssText =
+                `display:none;font:10px/1.35 system-ui;color:${COLORS.dangerText};`;
+            if (storedUnsupportedDelivery) {
+                const initialDelivery = String(attachment.config.delivery || "");
+                const toggleDelivery = chipButton("Clear", "Clear unsupported stored delivery",
+                    { padding: "3px 7px", fontSize: "10px" });
+                toggleDelivery.addEventListener("click", () => {
+                    if (controls.delivery.value) {
+                        controls.delivery.value = "";
+                        toggleDelivery.textContent = "Restore";
+                        toggleDelivery.title = "Restore the preserved delivery draft";
+                    } else {
+                        controls.delivery.value = initialDelivery;
+                        toggleDelivery.textContent = "Clear";
+                        toggleDelivery.title = "Clear unsupported stored delivery";
+                    }
+                });
+                deliveryRow.appendChild(toggleDelivery);
+            }
+
+            const voiceConversion = document.createElement("div");
+            voiceConversion.style.cssText = "display:none;grid-template-columns:130px 1fr;gap:6px 8px;align-items:center;";
+            const voiceConversionLabel = document.createElement("span");
+            voiceConversionLabel.textContent = "Convert voice key";
+            voiceConversionLabel.style.cssText = `font:10px system-ui;color:${COLORS.textSecondary};`;
+            controls.voiceConversion = selectField([["", "Keep voice key only"]], "");
+            voiceConversion.append(voiceConversionLabel, controls.voiceConversion);
+            controls.voiceConversionRow = voiceConversion;
+            const voiceMatches = () => (semanticUnits || []).filter((unit) =>
+                String(unit?.voice?.member_id || "")
+                && String(unit.voice.member_id) === controls.voice.value.trim());
+            const refreshVoiceConversion = () => {
+                const matches = voiceMatches();
+                controls.voiceConversion.textContent = "";
+                // `options` is a live collection in browsers; the explicit
+                // length assignment also keeps the tiny DOM used by tests
+                // honest instead of retaining removed choices.
+                controls.voiceConversion.options.length = 0;
+                const keep = document.createElement("option");
+                keep.value = "";
+                keep.textContent = matches.length
+                    ? "Choose an identity explicitly…" : "No matching Prompt Identity";
+                controls.voiceConversion.appendChild(keep);
+                for (const unit of matches) {
+                    const option = document.createElement("option");
+                    option.value = String(unit.semantic_unit_id);
+                    const canSpeak = validSpeakerIds.has(option.value);
+                    option.textContent = (unit.handle
+                        ? `@${unit.handle} — ${unit.name || unit.semantic_unit_id}`
+                        : String(unit.name || unit.semantic_unit_id))
+                        + (canSpeak ? "" : " — cannot speak in this format");
+                    option.disabled = !canSpeak;
+                    controls.voiceConversion.appendChild(option);
+                }
+                controls.voiceConversion.value = "";
+                voiceConversion.style.display = controls.voice.value.trim() ? "grid" : "none";
+            };
+            controls.voice.addEventListener("input", refreshVoiceConversion);
+            controls.voiceConversion.addEventListener("change", () => {
+                const value = controls.voiceConversion.value;
+                if (!value) return;
+                if (controls.eventType.value === "group_speech") {
+                    for (const option of controls.groupSpeakers.options) {
+                        if (option.value === value) option.checked = true;
+                    }
+                } else {
+                    controls.ordinarySpeaker.value = value;
+                }
+                controls.voiceConversion.value = "";
+                controls.otherBox.style.display = "none";
+            });
+            refreshVoiceConversion();
+
+            const refreshVocalMode = () => {
+                const group = controls.eventType.value === "group_speech";
+                speakerRow.style.display = group ? "none" : "grid";
+                groupSpeakerRow.style.display = group ? "grid" : "none";
+                groupOtherRow.style.display = group && allowOther ? "grid" : "none";
+                const otherSelected = group
+                    ? controls.groupOther.checked
+                    : controls.ordinarySpeaker.value === "__other__";
+                controls.otherBox.style.display = otherSelected ? "flex" : "none";
+                const phraseVisible = eventPolicy.identity_prefix === "explicit"
+                    || String(controls.subjectPhrase.value || "").length > 0
+                    || (controls.eventType.value === "voiceover"
+                        && eventPolicy.voiceover_subject_override);
+                phraseRow.style.display = phraseVisible ? "grid" : "none";
+            };
+            controls.eventType.addEventListener("change", refreshVocalMode);
+            controls.ordinarySpeaker.addEventListener("change", refreshVocalMode);
+            controls.groupSpeakers.addEventListener("change", refreshVocalMode);
+            controls.groupOther.addEventListener("change", refreshVocalMode);
+            refreshVocalMode();
             // A Vocal Event with no Subject and no voice key has nothing to
             // number: the speaker id would be minted from the chip's own id and
             // would name no one in the scene.
             controls.bindingNotice = document.createElement("div");
             controls.bindingNotice.textContent =
-                "Choose at least one Subject, or enter a stable Voice ID.";
+                "Choose a Speaker, or enter a stable voice key.";
             controls.bindingNotice.style.cssText =
                 `grid-column:1/-1;font:10px system-ui;color:${COLORS.dangerText};display:none;`;
             panel.append(fieldRow("Event", controls.eventType),
                 fieldRow("Language", controls.language),
-                fieldRow("Speaker / on-screen subject", controls.subjectPhrase,
-                    "Authored identifying phrase placed before the managed (Sx); required for MiniMax voiceover."),
-                fieldRow("Subjects", controls.subjects,
-                    "One or more stable Subject units. Speaker IDs are late-bound by first vocal event."),
-                fieldRow("Voice ID", controls.voice, "A stable project voice key; speaker numbers are assigned by event order."),
+                speakerRow, groupSpeakerRow, groupOtherRow, otherBox, controls.otherNotice,
+                phraseRow, deliveryRow, controls.deliveryNotice,
+                fieldRow("Stable voice key (advanced)", controls.voice,
+                    "Alternative integration key for a voice. It is not a provider or model ID and is never removed during identity conversion."),
+                voiceConversion,
                 controls.bindingNotice,
                 fieldRow("Words", controls.text));
         } else if (attachment.kind === "reference") {
@@ -4801,21 +5075,103 @@ export function configurePromptAttachment(rawAttachment, {
                     delete attachment.source.channel_keys;
                 }
             } else if (attachment.kind === "vocal_event") {
-                const subjectIds = [...controls.subjects.selectedOptions]
-                    .map((option) => option.value).filter(Boolean);
-                const voiceId = controls.voice.value.trim();
-                if (!subjectIds.length && !voiceId) {
+                const group = controls.eventType.value === "group_speech";
+                const selectedValues = group
+                    ? [...controls.groupSpeakers.selectedOptions]
+                        .map((option) => option.value).filter(Boolean)
+                    : [controls.ordinarySpeaker.value].filter(Boolean);
+                const wantsOther = group
+                    ? controls.groupOther.checked
+                    : selectedValues.includes("__other__");
+                const subjectIds = selectedValues.filter((value) =>
+                    value !== "__other__" && value !== "__invalid_current_speakers__");
+                identityCreateIntent = null;
+                if (selectedValues.includes("__invalid_current_speakers__")
+                        || subjectIds.some((value) =>
+                            !controls.validSpeakerIds.has(value))) {
+                    controls.bindingNotice.textContent =
+                        "The stored Speaker cannot speak in this format. Choose a supported Prompt Identity.";
                     controls.bindingNotice.style.display = "block";
-                    controls.subjects.focus();
+                    (group ? controls.groupSpeakers : controls.ordinarySpeaker).focus();
+                    return;
+                }
+                if (wantsOther) {
+                    const name = controls.otherName.value.trim();
+                    if (!name) {
+                        controls.otherNotice.style.display = "block";
+                        controls.otherName.focus();
+                        return;
+                    }
+                    controls.otherNotice.style.display = "none";
+                    const unitId = `promptidentity${uid()}`;
+                    const words = String(name).normalize("NFKD")
+                        .replace(/[\u0300-\u036f]/g, "")
+                        .match(/[A-Za-z0-9]+/g) || [];
+                    let handleSuggestion = words.map((word) =>
+                        word[0]?.toUpperCase() + word.slice(1)).join("") || "Speaker";
+                    if (!/^[A-Za-z]/.test(handleSuggestion)) {
+                        handleSuggestion = `Speaker${handleSuggestion}`;
+                    }
+                    handleSuggestion = handleSuggestion.replace(/[^A-Za-z0-9]/g, "")
+                        .slice(0, 64) || "Speaker";
+                    identityCreateIntent = {
+                        type: "create_prompt_semantic_unit",
+                        handle_suggestion: handleSuggestion,
+                        unit: {
+                            semantic_unit_id: unitId,
+                            name,
+                            definition: controls.otherDescription.value,
+                            kind: controls.otherKind.value || "subject",
+                        },
+                    };
+                    subjectIds.push(unitId);
+                }
+                const distinctSubjectIds = [...new Set(subjectIds)];
+                const voiceId = controls.voice.value.trim();
+                if (!distinctSubjectIds.length && !voiceId) {
+                    controls.bindingNotice.style.display = "block";
+                    (group ? controls.groupSpeakers : controls.ordinarySpeaker).focus();
+                    return;
+                }
+                if (group && distinctSubjectIds.length < 2) {
+                    controls.bindingNotice.textContent =
+                        "Group speech requires at least two distinct Speakers.";
+                    controls.bindingNotice.style.display = "block";
+                    controls.groupSpeakers.focus();
+                    return;
+                }
+                if (!group && distinctSubjectIds.length > 1) {
+                    controls.bindingNotice.textContent =
+                        "Ordinary Vocal Events use exactly one Speaker.";
+                    controls.bindingNotice.style.display = "block";
+                    controls.ordinarySpeaker.focus();
+                    return;
+                }
+                const deliveryCodepoints = [...String(controls.delivery.value || "")].length;
+                if (deliveryCodepoints > MAX_VOCAL_DELIVERY_CODEPOINTS) {
+                    controls.deliveryNotice.textContent =
+                        `Delivery may contain at most ${MAX_VOCAL_DELIVERY_CODEPOINTS} Unicode code points.`;
+                    controls.deliveryNotice.style.display = "block";
+                    controls.delivery.focus();
+                    return;
+                }
+                if (!resolvedProfile?.capabilities?.vocal_event?.event_policy?.delivery
+                        && controls.delivery.value) {
+                    controls.deliveryNotice.textContent =
+                        "Stored delivery is preserved but unsupported by this format. Clear it or restore a supporting format.";
+                    controls.deliveryNotice.style.display = "block";
+                    controls.delivery.focus();
                     return;
                 }
                 controls.bindingNotice.style.display = "none";
+                controls.deliveryNotice.style.display = "none";
                 attachment.config.event_type = controls.eventType.value;
                 attachment.config.language = controls.language.value.trim() || "English";
                 attachment.config.subject_phrase = controls.subjectPhrase.value.trim();
+                attachment.config.delivery = controls.delivery.value;
                 attachment.config.text = controls.text.value;
                 attachment.source.voice_id = voiceId;
-                attachment.source.subject_ids = subjectIds;
+                attachment.source.subject_ids = distinctSubjectIds;
             } else if (attachment.kind === "reference") {
                 if (!controls.reference.value) return;
                 if (controls.reference.selectedOptions[0]?.disabled) return;
@@ -4851,7 +5207,11 @@ export function configurePromptAttachment(rawAttachment, {
                         placement: row.placement.value,
                     }));
             }
-            finish(attachment);
+            // The named fields are the new module/host contract.  Mirroring the
+            // attachment's own fields at top level keeps older embedders that
+            // only read `config`/`source` functional during the transition;
+            // repository hosts always unwrap through promptAttachmentConfiguration.
+            finish(Object.assign({ attachment, identityCreateIntent }, attachment));
         });
     });
 }
@@ -5290,9 +5650,10 @@ export function createScopeChipRow({ attachments = [], previews = {}, disabled =
         chip.setAttribute("aria-haspopup", "menu");
         chip.appendChild(contextChipLabel(chipLabel));
         const inlineOnly = INLINE_ONLY_KINDS.includes(attachment.kind);
+        const tooltip = attachmentTooltip(attachment, identityLabel, preview);
         chip.title = inlineOnly
-            ? `${previewedLabel} \u2014 ${LABELS[attachment.kind] || attachment.kind} must be placed inline in the prompt text; re-insert or remove this chip.`
-            : `${previewedLabel} \u2014 click for what you can do with it`;
+            ? `${tooltip} \u2014 ${LABELS[attachment.kind] || attachment.kind} must be placed inline in the prompt text; re-insert or remove this chip.`
+            : `${tooltip} \u2014 click for what you can do with it`;
         if (inlineOnly) {
             // A legacy scope row stays visible and reachable so it can be
             // rebound or removed; the compiler refuses the job meanwhile.

@@ -53,9 +53,11 @@ def test_prompt_menu_preserves_caret_focus_and_surface_specific_commit_contracts
     assert "restorePromptInsertion(editor, bookmark)" in chips
     assert 'label: "Insert at cursor"' in chips
     assert 'label: "Writing aid"' in chips
-    assert 'onInserted: async () => { await onEnter?.({ close: false }); }' in widget
-    assert 'onInserted: ({ type }) => type === "writing_aid" ? commitGlobal() : null' in panel
-    assert 'onInserted: ({ type }) => type === "writing_aid" ? commitChannels() : null' in panel
+    assert 'onInserted: async ({ attachment, identityCreateIntent })' in widget
+    assert 'await onEnter?.({ close: false });' in widget
+    assert 'onInserted: ({ type, attachment, identityCreateIntent })' in panel
+    assert 'return type === "writing_aid" ? commitGlobal() : null' in panel
+    assert 'return type === "writing_aid" ? commitChannels() : null' in panel
     assert "createContextPicker" not in chips + panel + widget
     assert "data-sonder-prompt-context-menu='1'" in panel
     assert "data-sonder-prompt-context-menu='1'" in widget

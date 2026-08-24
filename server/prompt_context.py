@@ -190,6 +190,20 @@ DEFAULT_SPEAKER_POLICY = {
     "compound_join": ",", "compound_order": "authored",
 }
 
+DEFAULT_VOCAL_EVENT_POLICY = {
+    "identity_prefix": "explicit",
+    "delivery": False,
+    "voiceover_subject_override": False,
+}
+
+MINIMAX_VOCAL_EVENT_POLICY = {
+    "identity_prefix": "selected",
+    "delivery": True,
+    "voiceover_subject_override": True,
+}
+
+MAX_VOCAL_DELIVERY_CODEPOINTS = 256
+
 # Server-owned staged-member role vocabulary.  Recipes declare which fields
 # they expose; the selected prompt format and physical model input declare the
 # values those fields accept.  Keeping this catalog here gives the compiler,
@@ -733,6 +747,43 @@ def profile_declaration_errors(profile, *, template=None) -> list[dict]:
         if not isinstance(raw.get("speaks"), bool):
             add("unsupported_identity_kind", "Identity-kind speaks must be boolean.", field)
 
+    vocal_declaration = ((value.get("capabilities") or {}).get("vocal_event"))
+    if isinstance(vocal_declaration, dict) and "event_policy" in vocal_declaration:
+        policy = vocal_declaration.get("event_policy")
+        field = "capabilities.vocal_event.event_policy"
+        allowed = {"identity_prefix", "delivery", "voiceover_subject_override"}
+        if not isinstance(policy, dict):
+            add("invalid_vocal_event_policy",
+                "Vocal Event policy must be an object.", field)
+        else:
+            unknown = set(policy).difference(allowed)
+            missing = allowed.difference(policy)
+            if unknown or missing:
+                details = []
+                if unknown:
+                    details.append(f"unsupported fields: {', '.join(sorted(unknown))}")
+                if missing:
+                    details.append(f"missing fields: {', '.join(sorted(missing))}")
+                add("invalid_vocal_event_policy",
+                    "Vocal Event policy must be closed and complete ("
+                    + "; ".join(details) + ").", field)
+            identity_prefix = policy.get("identity_prefix")
+            if identity_prefix not in {"explicit", "selected"}:
+                add("invalid_vocal_event_policy",
+                    "Vocal Event identity_prefix must be explicit or selected.",
+                    field)
+            for name in ("delivery", "voiceover_subject_override"):
+                if not isinstance(policy.get(name), bool):
+                    add("invalid_vocal_event_policy",
+                        f"Vocal Event {name} must be boolean.", field)
+            if (identity_prefix == "selected"
+                    and not any(isinstance(entry, dict)
+                                and entry.get("speaks") is True
+                                for entry in identity_kinds)):
+                add("invalid_vocal_event_policy",
+                    "Selected Vocal Event identity requires at least one speaking identity kind.",
+                    field)
+
     if "contribution_catalog" in value:
         catalog = value.get("contribution_catalog")
         if not isinstance(catalog, dict) or len(catalog) > MAX_PHYSICAL_POPULATIONS + 1:
@@ -815,6 +866,15 @@ def effective_speaker_policy(profile) -> dict:
     if not isinstance(value, dict):
         return {"enabled": False, "token_template": "",
                 "compound_join": ",", "compound_order": "authored"}
+    return copy.deepcopy(value)
+
+
+def effective_vocal_event_policy(profile) -> dict:
+    declaration = ((profile or {}).get("capabilities") or {}).get("vocal_event")
+    value = (declaration or {}).get("event_policy") \
+        if isinstance(declaration, dict) else None
+    if not isinstance(value, dict):
+        return copy.deepcopy(DEFAULT_VOCAL_EVENT_POLICY)
     return copy.deepcopy(value)
 
 
@@ -1351,6 +1411,38 @@ def normalize_attachments(raw) -> list:
     return result
 
 
+def semantic_identity_dependency_ids(attachments) -> list[str]:
+    """Stable Prompt Identity dependency closure for authored attachments.
+
+    Reference identities use ``semantic_unit_ids``; Vocal Events use
+    ``subject_ids`` and the optional audio-speaker subject override. Provider
+    voice keys deliberately remain a separate namespace and are never treated
+    as Prompt Identity ids.
+    """
+    result = []
+    seen = set()
+    for attachment in attachments if isinstance(attachments, list) else []:
+        if not isinstance(attachment, dict):
+            continue
+        source = attachment.get("source")
+        source = source if isinstance(source, dict) else {}
+        config = attachment.get("config")
+        config = config if isinstance(config, dict) else {}
+        values = []
+        for key in ("semantic_unit_ids", "subject_ids"):
+            raw_values = source.get(key)
+            if isinstance(raw_values, list):
+                values.extend(raw_values)
+        values.append(config.get("audio_speaker_subject_id"))
+        for value in values:
+            unit_id = str(value or "")
+            if not unit_id or unit_id in seen:
+                continue
+            seen.add(unit_id)
+            result.append(unit_id)
+    return result
+
+
 def attachment_limit_errors(attachments) -> list[dict]:
     """Report over-cap attachment/capability counts as controlled diagnostics."""
     values = [value for value in (attachments if isinstance(attachments, list)
@@ -1713,12 +1805,15 @@ BUILTIN_PROFILES = {
             "prompt_link": {"placement": "inline"},
             "prompt_link_scope": {"placement": "section_prefix"},
             "vocal_event": {"channel_key": "integrated_multimodal_description",
-                            "placement": "inline"},
+                            "placement": "inline",
+                            "event_policy": copy.deepcopy(
+                                MINIMAX_VOCAL_EVENT_POLICY)},
         }, writing_aids=_minimax_aids("integrated_multimodal_description"),
         validators=["minimax_base_setup", "managed_speakers"],
         identity_kinds=[{**MINIMAX_SUBJECT_KIND,
                          "referenced_label_template": ""}],
-        speaker_policy=DEFAULT_SPEAKER_POLICY),
+        speaker_policy={**DEFAULT_SPEAKER_POLICY,
+                        "compound_order": "ascending"}),
     "minimax_h3_ref@1": _profile(
         "minimax_h3_ref", "MiniMax H3 Full Reference", "minimax_h3_ref",
         capabilities={
@@ -1799,13 +1894,16 @@ BUILTIN_PROFILES = {
                 },
             },
             "vocal_event": {"channel_key": "detailed_description",
-                            "placement": "inline"},
+                            "placement": "inline",
+                            "event_policy": copy.deepcopy(
+                                MINIMAX_VOCAL_EVENT_POLICY)},
         }, writing_aids=_minimax_aids("detailed_description"),
         validators=["minimax_reference_setup", "managed_speakers"],
         role_catalogs=MINIMAX_H3_ROLE_CATALOGS,
         physical_populations=MINIMAX_H3_PHYSICAL_POPULATIONS,
         identity_kinds=[MINIMAX_SUBJECT_KIND],
-        speaker_policy=DEFAULT_SPEAKER_POLICY),
+        speaker_policy={**DEFAULT_SPEAKER_POLICY,
+                        "compound_order": "ascending"}),
 }
 
 
@@ -2267,10 +2365,10 @@ def _render_vocal_event(attachment, speaker_numbers, speaker_policy=None):
                       for value in speaker_numbers]
     speaker_tokens = [value for value in speaker_tokens if value]
     joiner = str(policy.get("compound_join") or ",")
+    if policy.get("compound_order") == "ascending":
+        speaker_tokens = [value for _number, value in sorted(
+            zip(speaker_numbers, speaker_tokens), key=lambda pair: pair[0])]
     if len(speaker_tokens) > 1:
-        # The format declares its intended compound order, but PR-16 deliberately
-        # remains the tracked behavior until its focused fix; preserve authored
-        # selection order here so this declaration migration is byte-identical.
         speaker_token = joiner.join(
             value[1:-1] if value.startswith("(") and value.endswith(")") else value
             for value in speaker_tokens)
@@ -2281,17 +2379,65 @@ def _render_vocal_event(attachment, speaker_numbers, speaker_policy=None):
         speaker_token = speaker_tokens[0] if speaker_tokens else ""
     subject_phrase = str(config.get("subject_phrase") or "").strip()
     prefix = " ".join(value for value in (subject_phrase, speaker_token) if value)
+    delivery = " ".join(str(config.get("delivery") or "").split())
+    delivery_clause = f" {delivery}" if delivery else ""
     if event_type == "dialogue":
-        return f"{prefix} says: <d>[{language}] {text}</d>".strip()
+        return f"{prefix} says{delivery_clause}: <d>[{language}] {text}</d>".strip()
     if event_type == "group_speech":
-        return f"{prefix} say together: <d>[{language}] {text}</d>".strip()
+        return f"{prefix} say together{delivery_clause}: <d>[{language}] {text}</d>".strip()
     if event_type == "singing":
-        return f"{prefix} sings: <d>[{language}] {text}</d>".strip()
+        return f"{prefix} sings{delivery_clause}: <d>[{language}] {text}</d>".strip()
     if event_type == "voiceover":
-        return (f"{prefix} says in an off-screen voiceover: "
+        return (f"{prefix} says in an off-screen voiceover{delivery_clause}: "
                 f"<d>[{language}] {text}</d> while the corresponding on-screen "
                 "character's lips remain completely closed.").strip()
-    return f"{prefix} narrates: <d>[{language}] {text}</d>".strip()
+    return f"{prefix} narrates{delivery_clause}: <d>[{language}] {text}</d>".strip()
+
+
+def _vocal_identity_expression(unit_id, attachment, context) -> str:
+    """Resolve one selected speaker through the canonical identity-label path."""
+    unit_id = str(unit_id or "")
+    unit = (context.get("semantic_units_by_id") or {}).get(unit_id) or {}
+    if not unit:
+        return ""
+    for label, source in _reference_label_pairs(
+            {"source": {"semantic_unit_ids": [unit_id]}}, context):
+        if isinstance(source, dict) and str(source.get("unit_id") or "") == unit_id:
+            return str(label)
+    validators = {str(value) for value in
+                  (context.get("profile") or {}).get("validators") or []
+                  if isinstance(value, str)}
+    if unit.get("sources") and "minimax_base_setup" not in validators:
+        return ""
+    definition, _source = _subject_definition(
+        attachment.get("config") or {}, unit, context)
+    return definition or str(unit.get("name") or "").strip()
+
+
+def _join_vocal_identity_expressions(values) -> str:
+    values = [str(value).strip() for value in values if str(value).strip()]
+    if len(values) < 2:
+        return values[0] if values else ""
+    if len(values) == 2:
+        return f"{values[0]} and {values[1]}"
+    return f"{', '.join(values[:-1])}, and {values[-1]}"
+
+
+def _adjacent_live_identity_handle(attachment, context) -> bool:
+    subject_ids = [str(value) for value in
+                   (attachment.get("source") or {}).get("subject_ids") or []
+                   if str(value)]
+    if len(subject_ids) != 1:
+        return False
+    unit = (context.get("semantic_units_by_id") or {}).get(subject_ids[0]) or {}
+    handle = str(unit.get("handle") or "").strip()
+    adjacent = str(context.get("adjacent_raw_text") or "")
+    mentions = prompt_tokens.handle_mentions(adjacent)
+    if (not handle or not mentions or mentions[-1]["end"] != len(adjacent)
+            or str(mentions[-1]["handle"]).casefold() != handle.casefold()):
+        return False
+    source = _handle_sources(context).get(handle.casefold()) or {}
+    return [str(value) for value in source.get("semantic_unit_ids") or []] == subject_ids
 
 
 def _reference_label_pairs(attachment, context) -> list[tuple]:
@@ -3117,8 +3263,21 @@ def _render_generic(attachment, capability, context, speaker_numbers=None):
               if kind == "reference" else
               {**attachment.get("config", {}), **capability.get("config", {})})
     if kind == "vocal_event":
-        rendered_attachment = attachment
-        if not str(config.get("subject_phrase") or "").strip():
+        rendered_attachment = copy.deepcopy(attachment)
+        rendered_config = rendered_attachment.setdefault("config", {})
+        event_policy = effective_vocal_event_policy(context.get("profile") or {})
+        adjacent_identity = False
+        if (event_policy.get("identity_prefix") == "selected"
+                and not str(config.get("subject_phrase") or "").strip()):
+            subject_ids = [str(value) for value in
+                           attachment.get("source", {}).get("subject_ids") or []
+                           if str(value)]
+            adjacent_identity = _adjacent_live_identity_handle(attachment, context)
+            if not adjacent_identity:
+                rendered_config["subject_phrase"] = _join_vocal_identity_expressions(
+                    _vocal_identity_expression(unit_id, attachment, context)
+                    for unit_id in subject_ids)
+        elif not str(config.get("subject_phrase") or "").strip():
             subject_ids = [str(value) for value in
                            attachment.get("source", {}).get("subject_ids") or []
                            if str(value)]
@@ -3126,12 +3285,14 @@ def _render_generic(attachment, capability, context, speaker_numbers=None):
                 unit = (context.get("semantic_units_by_id") or {}).get(
                     subject_ids[0]) or {}
                 if not unit.get("sources") and str(unit.get("definition") or "").strip():
-                    rendered_attachment = copy.deepcopy(attachment)
-                    rendered_attachment.setdefault("config", {})["subject_phrase"] = str(
+                    rendered_config["subject_phrase"] = str(
                         unit.get("definition") or "").strip()
-        return _render_vocal_event(
+        if event_policy.get("delivery") is not True:
+            rendered_config.pop("delivery", None)
+        rendered = _render_vocal_event(
             rendered_attachment, speaker_numbers or [],
             effective_speaker_policy(context.get("profile") or {}))
+        return rendered
     if kind == "reference":
         return _render_reference_capability(attachment, capability, context)
     if kind == "custom":
@@ -3362,6 +3523,7 @@ def _resolve_handle_mentions(text, context) -> str:
 
 def _document_render(document, attachment_by_id, render_anchor, context=None):
     parts = []
+    adjacent_raw_text = ""
     for node in normalize_prompt_document(document)["nodes"]:
         if node["type"] == "text":
             # Authored prose, so handles resolve HERE rather than in the
@@ -3369,11 +3531,14 @@ def _document_render(document, attachment_by_id, render_anchor, context=None):
             # will.
             parts.append(node["text"] if context is None
                          else _resolve_handle_mentions(node["text"], context))
+            adjacent_raw_text = str(node.get("text") or "")
             continue
         attachment = attachment_by_id.get(node["attachment_id"])
         if attachment and attachment["enabled"]:
             parts.append(render_anchor(
-                attachment, node.get("capability_id"), node.get("node_id")))
+                attachment, node.get("capability_id"), node.get("node_id"),
+                adjacent_raw_text))
+        adjacent_raw_text = ""
     return "".join(parts).strip()
 
 
@@ -3871,6 +4036,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     is_h3_reference_profile = "minimax_reference_setup" in profile_validator_ids
     is_h3_base_profile = "minimax_base_setup" in profile_validator_ids
     is_h3_profile = is_h3_reference_profile or is_h3_base_profile
+    vocal_event_policy = effective_vocal_event_policy(resolved_profile)
 
     # Speaker ordering is selected-window chronological, then document order.
     vocal_events = []
@@ -3912,19 +4078,36 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     for event in vocal_events:
         attachment = event["attachment"]
         source = attachment.get("source") or {}
-        bound = [str(value) for value in source.get("subject_ids") or []
-                 if str(value)] or ([str(source.get("voice_id"))]
-                                    if str(source.get("voice_id") or "") else [])
-        if not bound:
+        subject_ids = [str(value) for value in source.get("subject_ids") or []
+                       if str(value)]
+        distinct_subject_ids = list(dict.fromkeys(subject_ids))
+        voice_id = str(source.get("voice_id") or "")
+        if not subject_ids and not voice_id:
             # `_speaker_bindings` would otherwise invent `event:<attachment_id>`,
             # producing an (Sx) number that names nothing in the scene.
             errors.append({
                 "code": "missing_vocal_binding",
                 "attachment_id": attachment["attachment_id"],
                 "message": ("A Vocal Event must name at least one Subject or a "
-                            "stable voice; this one is unbound."),
+                             "stable voice; this one is unbound."),
             })
-        for unit_id in bound:
+        event_type = str(attachment.get("config", {}).get("event_type")
+                         or "dialogue")
+        invalid_cardinality = (
+            len(distinct_subject_ids) != len(subject_ids)
+            or (event_type == "group_speech" and len(distinct_subject_ids) < 2)
+            or (event_type != "group_speech" and bool(distinct_subject_ids)
+                and len(distinct_subject_ids) != 1)
+        )
+        if invalid_cardinality:
+            expected = ("at least two Prompt Identities" if event_type == "group_speech"
+                        else "exactly one Prompt Identity")
+            errors.append({
+                "code": "invalid_vocal_speaker_cardinality",
+                "attachment_id": attachment["attachment_id"],
+                "message": f"This Vocal Event requires {expected}.",
+            })
+        for unit_id in subject_ids:
             unit = context["semantic_units_by_id"].get(unit_id)
             if unit is None:
                 errors.append({
@@ -3947,6 +4130,17 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                     "attachment_id": attachment["attachment_id"],
                     "message": f"Prompt identity {unit.get('name') or unit_id!r} cannot own a Vocal Event in this format.",
                 })
+            elif (vocal_event_policy.get("identity_prefix") == "selected"
+                  and unit.get("sources")
+                  and not _vocal_identity_expression(unit_id, attachment,
+                                                     {**context,
+                                                      "profile": resolved_profile})):
+                errors.append({
+                    "code": "vocal_identity_not_applicable",
+                    "attachment_id": attachment["attachment_id"],
+                    "message": (f"Prompt identity {unit.get('name') or unit_id!r} "
+                                "has no winning setup member in this window."),
+                })
         language = str(attachment.get("config", {}).get("language") or "English")
         if language not in DIALOGUE_LANGUAGES:
             errors.append({
@@ -3954,9 +4148,24 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 "attachment_id": attachment["attachment_id"],
                 "message": f"Managed Vocal Event language {language!r} is not in the bounded language list.",
             })
+        delivery = str(attachment.get("config", {}).get("delivery") or "")
+        if len(delivery) > MAX_VOCAL_DELIVERY_CODEPOINTS:
+            errors.append({
+                "code": "vocal_delivery_too_long",
+                "attachment_id": attachment["attachment_id"],
+                "message": (f"Vocal Event delivery may contain at most "
+                            f"{MAX_VOCAL_DELIVERY_CODEPOINTS} Unicode code points."),
+            })
+        elif delivery.strip() and vocal_event_policy.get("delivery") is not True:
+            errors.append({
+                "code": "unsupported_vocal_delivery",
+                "attachment_id": attachment["attachment_id"],
+                "message": ("This Prompt Format preserves Vocal Event delivery "
+                            "but does not use it; clear the field or restore a supporting format."),
+            })
         if (is_h3_profile
-                and str(attachment.get("config", {}).get("event_type") or "")
-                == "voiceover"
+                and event_type == "voiceover"
+                and vocal_event_policy.get("identity_prefix") != "selected"
                 and not str(attachment.get("config", {}).get(
                     "subject_phrase") or "").strip()):
             errors.append({
@@ -4425,7 +4634,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         elif reason:
             projection["state_reason"] = reason
 
-    def render(attachment, capability, *, origin, channel, projection=None):
+    def render(attachment, capability, *, origin, channel, projection=None,
+               adjacent_raw_text=""):
         capability = capability or _default_capability(attachment, resolved_profile)
         capability_kind = capability.get("kind") or capability.get("capability_id")
         # Mentions are authored placements and therefore emit at each placement;
@@ -4441,7 +4651,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         else:
             identity_owner = attachment["emission_group_id"]
         render_context = {**context, "origin": origin, "channel_key": channel,
-                          "profile": resolved_profile}
+                          "profile": resolved_profile,
+                          "adjacent_raw_text": adjacent_raw_text}
         if (attachment["kind"] == "reference"
                 and reference_capability_errors(
                     attachment, capability, render_context)):
@@ -4577,6 +4788,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     # source section and again as the consumer fallback.
     present_origins = set()
     link_fallbacks_emitted = set()
+    refused_vocal_exports = set()
 
     def warn_empty_link(prompt_id, channel_key, attachment_id):
         diagnostic_key = (prompt_id, channel_key, attachment_id)
@@ -4617,7 +4829,20 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             return ""
         attachment_by_id = _attachment_map(source.get("attachments"))
 
-        def render_link_anchor(attachment, capability_id, _anchor_node_id=None):
+        def render_link_anchor(attachment, capability_id, _anchor_node_id=None,
+                               adjacent_raw_text=""):
+            if (attachment["kind"] == "vocal_event"
+                    and attachment.get("link_exportable")):
+                attachment_id = str(attachment.get("attachment_id") or "")
+                if attachment_id not in refused_vocal_exports:
+                    refused_vocal_exports.add(attachment_id)
+                    errors.append({
+                        "code": "vocal_event_not_link_exportable",
+                        "attachment_id": attachment_id,
+                        "message": ("Vocal Events are chronological inline anchors "
+                                    "and cannot be exported through Prompt Links."),
+                    })
+                return ""
             if attachment["kind"] == "prompt_link" and attachment.get("link_exportable"):
                 target = str(attachment["source"].get("prompt_id") or "")
                 target_channel = str(attachment["source"].get("channel_key") or channel_key)
@@ -4630,7 +4855,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 if capability is None and attachment.get("capabilities"):
                     return ""
                 return _render_generic(attachment, capability or _default_capability(
-                    attachment, resolved_profile), context,
+                    attachment, resolved_profile),
+                    {**context, "adjacent_raw_text": adjacent_raw_text},
                     speakers_by_attachment.get(attachment["attachment_id"], []))
             return ""
 
@@ -4745,7 +4971,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                        if node.get("type") == "attachment"}
     global_phase_parts = defaultdict(lambda: defaultdict(list))
 
-    def global_anchor_renderer(attachment, capability_id, channel_key, anchor_node_id):
+    def global_anchor_renderer(attachment, capability_id, channel_key, anchor_node_id,
+                               adjacent_raw_text=""):
         capabilities = _capabilities(attachment, resolved_profile)
         if capability_id:
             capabilities = [cap for cap in capabilities
@@ -4771,7 +4998,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             if route == channel_key and capability["placement"] == "inline":
                 inline_values.append(render(attachment, capability,
                                             origin="global", channel=channel_key,
-                                            projection=projection))
+                                            projection=projection,
+                                            adjacent_raw_text=adjacent_raw_text))
             else:
                 global_phase_parts[route][capability["placement"]].append(
                     (attachment, capability, projection))
@@ -4782,9 +5010,11 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     for key in keys:
         global_mirror[key] = _document_render(
             global_docs.get(key), global_by_id,
-            lambda attachment, capability_id, anchor_node_id, key=key:
+            lambda attachment, capability_id, anchor_node_id, adjacent_raw_text,
+            key=key:
                 global_anchor_renderer(
-                    attachment, capability_id, key, anchor_node_id),
+                    attachment, capability_id, key, anchor_node_id,
+                    adjacent_raw_text),
             context)
     for attachment in global_by_id.values():
         if not attachment["enabled"] or attachment["attachment_id"] in global_anchored:
@@ -4856,7 +5086,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         phase_parts = defaultdict(lambda: defaultdict(list))
         scope_link_prefixes = defaultdict(list)
 
-        def anchor_renderer(attachment, capability_id, channel_key, anchor_node_id):
+        def anchor_renderer(attachment, capability_id, channel_key, anchor_node_id,
+                            adjacent_raw_text=""):
             if attachment["kind"] == "prompt_link":
                 capabilities = _capabilities(attachment, resolved_profile)
                 if capability_id:
@@ -4907,13 +5138,24 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                         projection["rendered_at_anchor"] = anchor_node_id != "scope"
                     inline_values.append(render(
                         attachment, capability, origin=section.get("prompt_id", ""),
-                        channel=channel_key, projection=projection))
+                        channel=channel_key, projection=projection,
+                        adjacent_raw_text=adjacent_raw_text))
                 else:
                     phase_parts[route][capability["placement"]].append(
                         (attachment, capability, projection))
-            return _join_emissions(inline_values,
-                                   resolved_profile.get("separators", {}).get(
-                                       "attachment", " "))
+            joined = _join_emissions(
+                inline_values,
+                resolved_profile.get("separators", {}).get("attachment", " "))
+            if (joined and attachment.get("kind") == "vocal_event"
+                    and not str((attachment.get("config") or {}).get(
+                        "subject_phrase") or "").strip()
+                    and effective_vocal_event_policy(
+                        resolved_profile).get("identity_prefix") == "selected"
+                    and _adjacent_live_identity_handle(
+                        attachment, {**context, "profile": resolved_profile,
+                                     "adjacent_raw_text": adjacent_raw_text})):
+                return f" {joined}"
+            return joined
 
         anchored = {node.get("attachment_id")
                     for document in section["channel_docs"].values()
@@ -4971,8 +5213,10 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         for key in keys:
             mirrors[key] = _document_render(
                 section["channel_docs"].get(key), attachment_by_id,
-                lambda attachment, capability_id, anchor_node_id, key=key:
-                    anchor_renderer(attachment, capability_id, key, anchor_node_id),
+                lambda attachment, capability_id, anchor_node_id, adjacent_raw_text,
+                key=key: anchor_renderer(
+                    attachment, capability_id, key, anchor_node_id,
+                    adjacent_raw_text),
                 context)
 
         # Scope attachments are emitted by placement. Inline attachment nodes

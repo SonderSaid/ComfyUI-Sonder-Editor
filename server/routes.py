@@ -2523,22 +2523,39 @@ def _apply_prompt_context_dependencies(project: TimelineProject, op: dict) -> di
     if not isinstance(raw_profiles, list) or not isinstance(raw_units, list):
         _mutation_error("Prompt Context dependencies must be lists", 400,
                         "invalid_prompt_context_dependencies")
+    if any(not isinstance(value, dict) for value in raw_profiles):
+        _mutation_error("Every Prompt Context profile dependency must be an object",
+                        400, "invalid_prompt_context_dependencies")
+    if any(not isinstance(value, dict) for value in raw_units):
+        _mutation_error("Every Prompt Identity dependency must be an object", 400,
+                        "invalid_prompt_context_dependencies")
+    if any(not str(value.get("profile_id") or "").strip()
+           or not str(value.get("version") or "").strip()
+           for value in raw_profiles):
+        _mutation_error(
+            "Every Prompt Context profile dependency needs an exact id and version",
+            400, "invalid_prompt_context_dependencies")
+    if any(not str(value.get("semantic_unit_id") or "").strip()
+           for value in raw_units):
+        _mutation_error(
+            "Every Prompt Identity dependency needs an exact stable id", 400,
+            "invalid_prompt_context_dependencies")
 
     profiles = []
     try:
         profiles = [prompt_context.normalize_profile(value)
-                    for value in raw_profiles if isinstance(value, dict)]
+                    for value in raw_profiles]
     except ValueError as exc:
         _mutation_error(f"Invalid Prompt Context profile dependency: {exc}", 400,
                         "invalid_prompt_context_dependencies")
     units = [prompt_context.normalize_semantic_unit(value)
-             for value in raw_units if isinstance(value, dict)]
+             for value in raw_units]
 
     profile_by_key = {
         f"{value.get('profile_id')}@{value.get('version')}": value
         for value in project.prompt_context_profiles if isinstance(value, dict)
     }
-    imported_profiles = 0
+    imported_profiles = []
     for profile in profiles:
         key = f"{profile.get('profile_id')}@{profile.get('version')}"
         current = profile_by_key.get(key)
@@ -2547,15 +2564,14 @@ def _apply_prompt_context_dependencies(project: TimelineProject, op: dict) -> di
                 f"Prompt Context profile {key!r} already has a different definition; rebind it.",
                 409, "prompt_context_dependency_conflict")
         if current is None:
-            project.prompt_context_profiles.append(profile)
             profile_by_key[key] = profile
-            imported_profiles += 1
+            imported_profiles.append(profile)
 
     unit_by_id = {
         str(value.get("semantic_unit_id") or ""): value
         for value in project.prompt_semantic_units if isinstance(value, dict)
     }
-    imported_units = 0
+    imported_units = []
     for unit in units:
         unit_id = unit["semantic_unit_id"]
         current = unit_by_id.get(unit_id)
@@ -2564,11 +2580,157 @@ def _apply_prompt_context_dependencies(project: TimelineProject, op: dict) -> di
                 f"Prompt Subject {unit_id!r} already has a different definition; rebind it.",
                 409, "prompt_context_dependency_conflict")
         if current is None:
-            project.prompt_semantic_units.append(unit)
             unit_by_id[unit_id] = unit
-            imported_units += 1
+            imported_units.append(unit)
+
+    # Dependency transport preserves exact stable ids and handles. Preflight
+    # the complete prospective unit set before mutating the project, including
+    # other units in this import and project-owned physical Reference handles.
+    prospective_units = list(unit_by_id.values())
+    for unit in imported_units:
+        _require_prompt_handle_available(
+            project, unit.get("handle", ""), "prompt identity",
+            unit["semantic_unit_id"], semantic_units=prospective_units)
+
+    project.prompt_context_profiles.extend(imported_profiles)
+    project.prompt_semantic_units.extend(imported_units)
     return {"type": "import_prompt_context_dependencies",
-            "profiles": imported_profiles, "semantic_units": imported_units}
+            "profiles": len(imported_profiles),
+            "semantic_units": len(imported_units)}
+
+
+def _apply_create_prompt_semantic_unit(
+        project: TimelineProject, scene: Scene, op: dict, *, template=None) -> dict:
+    """Create one assetless Prompt Identity inside the scene transaction.
+
+    The browser owns the stable id and a handle *suggestion*.  The locked
+    project mutation owns the collision check, final handle, and ordering so
+    two editors cannot materialize the same visible identity concurrently.
+    This operation is intentionally narrower than dependency import: imports
+    preserve exact handles and refuse collisions, while ad-hoc authoring may
+    derive a collision-free suffix.
+    """
+    raw = op.get("unit") if isinstance(op.get("unit"), dict) else {}
+    unit_id = str(raw.get("semantic_unit_id") or "").strip()
+    if not unit_id:
+        _mutation_error("A client-stable Prompt Identity id is required", 400,
+                        "invalid_prompt_semantic_unit")
+    name = str(raw.get("name") or "").strip()
+    if not name:
+        _mutation_error("Prompt Identity name is required", 400,
+                        "invalid_prompt_semantic_unit")
+    kind = str(raw.get("kind") or "subject").strip() or "subject"
+    definition = str(raw.get("definition") or "")
+    if template is None:
+        template = prompt_channel_templates.resolve_channel_template(project.metadata)
+    try:
+        profile = prompt_context.resolve_profile(
+            _scene_prompt_context_profile_key(project, scene),
+            template=template,
+            custom_profiles=getattr(project, "prompt_context_profiles", []),
+        )
+    except prompt_context.ProfileResolutionError as exc:
+        _mutation_error(
+            f"The active prompt format cannot create a speaking identity: {exc}",
+            409, "invalid_prompt_context_profile")
+    declaration = prompt_context.identity_kind_for(profile, kind)
+    if not declaration or declaration.get("speaks") is not True:
+        _mutation_error(
+            f"Identity kind {kind!r} cannot speak in the active prompt format.",
+            400, "prompt_identity_kind_cannot_speak")
+    existing = next((value for value in project.prompt_semantic_units
+                     if isinstance(value, dict)
+                     and str(value.get("semantic_unit_id") or "") == unit_id), None)
+    if existing is not None:
+        # Version-conflict retries can replay an already-committed client id.
+        # Treat only the same immutable creation intent as idempotent; a
+        # different identity using that id is a collision, never a rebind.
+        same_intent = (
+            str(existing.get("name") or "") == name
+            and str(existing.get("kind") or "subject") == kind
+            and str(existing.get("definition") or "") == definition
+            and not (existing.get("sources") or [])
+            and not str((existing.get("voice") or {}).get("member_id") or "")
+            and not (existing.get("attachment_defaults") or {})
+            and not (existing.get("disabled_capabilities") or [])
+            and not str(existing.get("visual_intent") or "")
+            and not str(existing.get("audio_intent") or "")
+        )
+        if not same_intent:
+            _mutation_error(
+                f"Prompt Identity id {unit_id!r} already has a different definition.",
+                409, "prompt_semantic_unit_collision")
+        return {"type": "create_prompt_semantic_unit", "created": False,
+                "semantic_unit_id": unit_id, "unit": copy.deepcopy(existing)}
+
+    handle = _materialized_prompt_handle(
+        project, op.get("handle_suggestion"), "prompt identity", unit_id)
+    next_order = max(
+        [int(value.get("order") or 0) for value in project.prompt_semantic_units
+         if isinstance(value, dict)] or [-1]) + 1
+    unit = prompt_context.normalize_semantic_unit({
+        "semantic_unit_id": unit_id,
+        "handle": handle,
+        "name": name,
+        "kind": kind,
+        "definition": definition,
+        "order": next_order,
+        # Other speakers are semantic-only by contract.  Do not accept a
+        # browser-supplied physical source or voice binding on this route.
+        "sources": [],
+        "voice": {"member_id": None},
+    })
+    project.prompt_semantic_units.append(unit)
+    return {"type": "create_prompt_semantic_unit", "created": True,
+            "semantic_unit_id": unit_id, "unit": copy.deepcopy(unit)}
+
+
+def _prompt_semantic_unit_is_referenced(project: TimelineProject,
+                                        unit_id: str) -> bool:
+    """Whether a live authored scene still names one Prompt Identity."""
+    for scene in project.scenes:
+        attachments = list(getattr(scene, "global_attachments", []) or [])
+        for section in getattr(scene, "prompt_sections", []) or []:
+            attachments.extend(getattr(section, "attachments", []) or [])
+        if unit_id in prompt_context.semantic_identity_dependency_ids(attachments):
+            return True
+    return False
+
+
+def _apply_delete_prompt_semantic_unit_if_unreferenced(
+        project: TimelineProject, op: dict) -> dict:
+    """Best-effort cleanup for history without deleting shared user data."""
+    unit_id = str(op.get("semantic_unit_id") or "").strip()
+    if not unit_id:
+        _mutation_error("Prompt Identity id is required", 400,
+                        "invalid_prompt_semantic_unit")
+    index = next((index for index, value in enumerate(project.prompt_semantic_units)
+                  if isinstance(value, dict)
+                  and str(value.get("semantic_unit_id") or "") == unit_id), -1)
+    if index < 0:
+        return {"type": "delete_prompt_semantic_unit_if_unreferenced",
+                "semantic_unit_id": unit_id, "deleted": False,
+                "reason": "missing"}
+    unit = project.prompt_semantic_units[index]
+    expected = op.get("expected")
+    if not isinstance(expected, dict) or not expected:
+        _mutation_error(
+            "Guarded Prompt Identity cleanup requires the complete created unit snapshot.",
+            400, "invalid_prompt_semantic_unit_cleanup")
+    # History may clean up only the exact server-owned record it created.
+    # A partial projection would turn omitted fields into an authorization to
+    # delete later user edits, which is precisely what this guard prevents.
+    if expected != unit:
+        return {"type": "delete_prompt_semantic_unit_if_unreferenced",
+                "semantic_unit_id": unit_id, "deleted": False,
+                "reason": "changed"}
+    if _prompt_semantic_unit_is_referenced(project, unit_id):
+        return {"type": "delete_prompt_semantic_unit_if_unreferenced",
+                "semantic_unit_id": unit_id, "deleted": False,
+                "reason": "referenced"}
+    project.prompt_semantic_units.pop(index)
+    return {"type": "delete_prompt_semantic_unit_if_unreferenced",
+            "semantic_unit_id": unit_id, "deleted": True}
 
 
 _REFERENCE_ITEM_FIELDS = {
@@ -3313,6 +3475,10 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
         return {"type": op_type, "count": len(sections)}
     if op_type == "import_prompt_context_dependencies":
         return _apply_prompt_context_dependencies(project, op)
+    if op_type == "create_prompt_semantic_unit":
+        return _apply_create_prompt_semantic_unit(project, scene, op)
+    if op_type == "delete_prompt_semantic_unit_if_unreferenced":
+        return _apply_delete_prompt_semantic_unit_if_unreferenced(project, op)
     if op_type == "swap_prompt_sections":
         section_a, section_b = _apply_swap_prompt_sections(scene, op)
         return {
@@ -3353,7 +3519,11 @@ def _apply_scene_mutations_sync(request: web.Request, scene_id: str, operations:
         "results": results,
         "scene": scene.to_dict(),
     }
-    if any(str(operation.get("type") or "") == "import_prompt_context_dependencies"
+    if any(str(operation.get("type") or "") in {
+               "import_prompt_context_dependencies",
+               "create_prompt_semantic_unit",
+               "delete_prompt_semantic_unit_if_unreferenced",
+           }
            for operation in operations if isinstance(operation, dict)):
         payload["prompt_context_profiles"] = [
             dict(value) for value in project.prompt_context_profiles]
@@ -3547,14 +3717,8 @@ def _freeze_reference_input_snapshots(
           for section in (getattr(source_scene, "prompt_sections", []) or [])
           for attachment in (getattr(section, "attachments", []) or [])),
     ]
-    semantic_unit_ids = {
-        str(unit_id)
-        for attachment in source_attachments
-        if isinstance(attachment, dict)
-        for unit_id in ((attachment.get("source") or {}).get(
-            "semantic_unit_ids", []) or [])
-        if str(unit_id)
-    }
+    semantic_unit_ids = set(
+        prompt_context.semantic_identity_dependency_ids(source_attachments))
     semantic_unit_ids.update(
         str(unit.get("semantic_unit_id") or "")
         for unit in project.prompt_semantic_units
@@ -3921,13 +4085,8 @@ def _record_prompt_history(project: TimelineProject, jobs: list) -> None:
             *(attachment for section in sections
               for attachment in section.get("attachments", [])),
         ]
-        semantic_unit_ids = {
-            str(unit_id)
-            for attachment in dependency_attachments if isinstance(attachment, dict)
-            for unit_id in (attachment.get("source") or {}).get(
-                "semantic_unit_ids", [])
-            if str(unit_id)
-        }
+        semantic_unit_ids = set(
+            prompt_context.semantic_identity_dependency_ids(dependency_attachments))
         frozen_units = {
             str(entry.get("value", {}).get("semantic_unit_id") or ""):
                 copy.deepcopy(entry.get("value"))
@@ -8097,6 +8256,35 @@ if routes is not None:
         template = (prompt_channel_templates.get_channel_template(raw_template)
                     if raw_template is not None else
                     prompt_channel_templates.resolve_channel_template(project.metadata))
+
+        raw_creates = body.get("prompt_semantic_unit_creates", [])
+        if not isinstance(raw_creates, list):
+            return web.json_response({
+                "error": "prompt_semantic_unit_creates must be a list",
+                "code": "invalid_prompt_semantic_unit_overlay",
+            }, status=400)
+        if len(raw_creates) > 64:
+            return web.json_response({
+                "error": "Prompt Identity preview overlay exceeds 64 creates",
+                "code": "prompt_semantic_unit_overlay_too_large",
+            }, status=400)
+        compile_project = project
+        if raw_creates:
+            # Preview overlays are transient by contract. Materialize through
+            # the same collision, speaking-kind, handle and normalization
+            # authority as Apply, but only on a deep copy of project state.
+            compile_project = copy.deepcopy(project)
+            try:
+                for raw_create in raw_creates:
+                    if (not isinstance(raw_create, dict)
+                            or raw_create.get("type") != "create_prompt_semantic_unit"):
+                        _mutation_error(
+                            "Invalid Prompt Identity preview create", 400,
+                            "invalid_prompt_semantic_unit_overlay")
+                    _apply_create_prompt_semantic_unit(
+                        compile_project, candidate, raw_create, template=template)
+            except ProjectMutationRequestError as exc:
+                return _mutation_json_error(exc)
         try:
             raw_window_start = max(0, int(body.get("window_start", 0) or 0))
             raw_window_end = int(body.get(
@@ -8134,7 +8322,7 @@ if routes is not None:
                 "prompt_section_delimiter",
                 prompt_payload.DEFAULT_SECTION_DELIMITER)) or "")
         compiled = compile_live_scene_prompt_context(
-            project, candidate, template=template,
+            compile_project, candidate, template=template,
             window_start=window_start, window_end=window_end, fps=fps,
             labels_on=body.get("labels_on", False) is True,
             delimiter=delimiter, prompt_threshold=prompt_threshold,

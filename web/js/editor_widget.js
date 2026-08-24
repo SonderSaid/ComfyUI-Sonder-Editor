@@ -264,12 +264,14 @@ import {
     normalizePromptAttachments,
     normalizePromptDocument,
     promptAttachmentAnchoredChannels,
+    promptAttachmentConfiguration,
     propagateLinkedPromptAttachment,
     promptDocumentText,
     resolveReferenceAttachmentIdentity,
     retargetChannelDocuments,
     sceneWithDraftGlobal,
     sceneWithDraftSection,
+    semanticIdentityDependencyIds,
     setPromptAttachmentCapabilityEnabled,
     PROMPT_CONTEXT_FORMAT,
 } from "./prompt_context_chips.js";
@@ -370,6 +372,11 @@ import {
 } from "./asset_refresh_coordinator.js";
 import { ProjectMutationQueue } from "./project_mutation_queue.js";
 import { applyPromptIdentityChange, sameIdentitySnapshot } from "./prompt_identity_panel.js";
+import {
+    promptIdentityCleanupPlan,
+    promptIdentityRedoPlan,
+    reconcilePromptIdentityCreateOutcome,
+} from "./prompt_identity_transactions.js";
 import {
     findConstrainedSelectionEndpoint,
     isSelectionDurationWithinRecommendation,
@@ -3139,6 +3146,79 @@ export class EditorWidget {
                 );
             },
         });
+    }
+
+    _acceptPromptAttachmentConfiguration(result) {
+        const configured = promptAttachmentConfiguration(result);
+        const intent = configured.identityCreateIntent;
+        const attachmentId = String(configured.attachment?.attachment_id || "");
+        if (intent?.unit?.semantic_unit_id) {
+            this._pendingPromptIdentityCreateIntents ||= new Map();
+            const unitId = String(intent.unit.semantic_unit_id);
+            this._pendingPromptIdentityCreateIntents.set(
+                unitId, { attachmentId, intent: structuredClone(intent) });
+            // Optimistic name-only projection: the server owns the final
+            // collision-free handle and order, so neither is guessed here.
+            if (!(this._promptSemanticUnits || []).some((unit) =>
+                    String(unit?.semantic_unit_id || "") === unitId)) {
+                this._promptSemanticUnits = [
+                    ...(this._promptSemanticUnits || []),
+                    { ...structuredClone(intent.unit), handle: "", order: 0,
+                        sources: [], voice: { member_id: null } },
+                ];
+            }
+        }
+        return configured.attachment;
+    }
+
+    _takePromptIdentityCreateIntents(attachments = []) {
+        const committedAttachmentIds = new Set((attachments || [])
+            .filter((value) => value && typeof value === "object")
+            .map((value) => String(value.attachment_id || ""))
+            .filter(Boolean));
+        const intents = [];
+        for (const [unitId, pending] of
+                (this._pendingPromptIdentityCreateIntents?.entries?.() || [])) {
+            if (!committedAttachmentIds.has(String(pending?.attachmentId || ""))) continue;
+            intents.push(structuredClone(pending.intent));
+            this._pendingPromptIdentityCreateIntents.delete(unitId);
+        }
+        return intents;
+    }
+
+    _adoptPromptIdentitiesFromMutation(result) {
+        const units = result?.payload?.prompt_semantic_units;
+        if (Array.isArray(units)) {
+            this._promptSemanticUnits = structuredClone(units);
+            return true;
+        }
+        return false;
+    }
+
+    _finalizePromptIdentityCreationHistory(entry, result) {
+        const createdIds = new Set();
+        if (!entry?.promptIdentityCreateIntents?.length) return createdIds;
+        const outcomes = new Map((result?.payload?.results || [])
+            .filter((value) => value?.type === "create_prompt_semantic_unit"
+                && value?.unit?.semantic_unit_id)
+            .map((value) => [String(value.unit.semantic_unit_id), value]));
+        for (const intent of entry.promptIdentityCreateIntents) {
+            const id = String(intent?.unit?.semantic_unit_id || "");
+            const outcome = outcomes.get(id);
+            if (outcome?.created === true) {
+                intent.cleanup_expected = structuredClone(outcome.unit);
+                delete intent.cleanup_unproven;
+                delete intent.reconciled_expected;
+                createdIds.add(id);
+            } else if (outcome) {
+                // An idempotent replay or race proves that the identity exists,
+                // not that this history entry created its current record.
+                delete intent.cleanup_expected;
+                intent.cleanup_unproven = true;
+                intent.reconciled_expected = structuredClone(outcome.unit);
+            }
+        }
+        return createdIds;
     }
 
     _mergeQueueMutationIntents(oldIntent, nextIntent) {
@@ -10072,7 +10152,8 @@ export class EditorWidget {
                     });
                 },
                 onActivateAttachment: async (attachment) => {
-                    const configured = await configure(attachment);
+                    const configured = this._acceptPromptAttachmentConfiguration(
+                        await configure(attachment));
                     if (configured) {
                         if (consumerSection && isLinkedAttachment(attachment)) {
                             await this._updateLinkedPromptAttachment(
@@ -10123,7 +10204,14 @@ export class EditorWidget {
                     scope: consumerSection ? "section" : "global",
                     resolvedProfile: this._resolvedPromptContextProfile(),
                 }),
-                onInserted: async () => { await onEnter?.({ close: false }); },
+                onInserted: async ({ attachment, identityCreateIntent }) => {
+                    if (identityCreateIntent) {
+                        this._acceptPromptAttachmentConfiguration({
+                            attachment, identityCreateIntent,
+                        });
+                    }
+                    await onEnter?.({ close: false });
+                },
                 writingAids: this._promptContextWritingAids(
                     this.activeScene?.prompt_context_profile_id
                         || template.default_context_profile || "generic@1"),
@@ -10192,7 +10280,8 @@ export class EditorWidget {
                     candidate,
                     attachmentLabelFor,
                     onActivate: async (attachment) => {
-                        const configured = await configurePromptAttachment(attachment, {
+                        const configured = this._acceptPromptAttachmentConfiguration(
+                            await configurePromptAttachment(attachment, {
                             scene: { ...(this.activeScene || {}), _context_channel_keys: keys,
                                 _context_consumer_start: consumerSection?.start_frame ?? Infinity,
                                 _context_consumer_end: consumerSection?.end_frame
@@ -10219,7 +10308,7 @@ export class EditorWidget {
                             ordinalManifest: this._windowedPromptCandidate()
                                 ?.ordinal_manifest || {},
                             candidate: this._windowedPromptCandidate(),
-                        });
+                        }));
                         if (!configured) return;
                         if (consumerSection && isLinkedAttachment(attachment)) {
                             await this._updateLinkedPromptAttachment(
@@ -10336,14 +10425,16 @@ export class EditorWidget {
                     await onEnter?.({ close: false });
                 },
                 onAdd: async (kind) => {
-                    const configured = await configureScope({ kind });
+                    const configured = this._acceptPromptAttachmentConfiguration(
+                        await configureScope({ kind }));
                     if (!configured) return;
                     inputs[keys.includes(activeKey) ? activeKey : wideKey]?.transactPromptAttachments?.(
                         [...sharedAttachments, configured]);
                     await onEnter?.({ close: false });
                 },
                 onActivate: async (attachment) => {
-                    const configured = await configureScope(attachment);
+                    const configured = this._acceptPromptAttachmentConfiguration(
+                        await configureScope(attachment));
                     if (!configured) return;
                     if (consumerSection && isLinkedAttachment(attachment)) {
                         await this._updateLinkedPromptAttachment(
@@ -10498,24 +10589,33 @@ export class EditorWidget {
             attachments,
             muted: false,
         };
-        this._pushUndo(undoLabel);
+        const identityCreateIntents = this._takePromptIdentityCreateIntents(attachments);
+        const undoEntry = this._pushUndo(undoLabel,
+            { promptIdentityCreateIntents: identityCreateIntents });
         this._applyLocalPromptCreate(fields);
         this._hidePromptEditor();
         this._renderSceneAfterLocalMutation({ viewport: false });
 
         try {
-            await this._runSceneMutation(
-                [{ type: "create_prompt_section", fields }],
+            const result = await this._runSceneMutation(
+                [...identityCreateIntents,
+                    { type: "create_prompt_section", fields }],
                 {
                     key: `prompt:${this.activeSceneId}:create:${Date.now()}`,
                     label: "add prompt",
                     coalesce: false,
                 }
             );
+            this._adoptPromptIdentitiesFromMutation(result);
+            this._finalizePromptIdentityCreationHistory(undoEntry, result);
         } catch (e) {
             this._discardLastUndo(undoLabel);
             notifyWarning(e?.message || "Prompt section was refused.", { source: "prompt-create-refused" });
             await this._fetchScenes({ ignoreMutationGate: true, reason: "add_prompt_error" });
+            if (identityCreateIntents.length) {
+                await this._fetchReferences({ ignoreMutationGate: true,
+                    reason: "add_prompt_identity_error", force: true });
+            }
             console.warn("[Sonder] Failed to create prompt section:", e);
         }
     }
@@ -10758,22 +10858,27 @@ export class EditorWidget {
         };
         const next = normalizeChannels(channels);
         const undoLabel = "edit global prompt context";
-        this._pushUndo(undoLabel);
+        const identityCreateIntents = this._takePromptIdentityCreateIntents(attachments);
+        const undoEntry = this._pushUndo(undoLabel,
+            { promptIdentityCreateIntents: identityCreateIntents });
         sceneRef.global_channels = next;
         sceneRef.global_channel_docs = structuredClone(channelDocs || {});
         sceneRef.global_attachments = structuredClone(attachments || []);
         sceneRef.prompt = composeSectionText(next, false);
         this._renderSceneAfterLocalMutation({ viewport: false });
         try {
-            await this._runSceneMutation(
-                [{ type: "update_scene_fields", fields: {
+            const result = await this._runSceneMutation(
+                [...identityCreateIntents, { type: "update_scene_fields", fields: {
                     global_channels: next,
                     global_channel_docs: channelDocs,
                     global_attachments: attachments,
                 } }],
                 { key: `scene:${this.activeSceneId}:global_prompt_context`,
-                    label: "global prompt context", coalesce: true,
-                    refreshScenes: false });
+                    label: "global prompt context",
+                    refreshScenes: false,
+                    coalesce: identityCreateIntents.length === 0 });
+            this._adoptPromptIdentitiesFromMutation(result);
+            this._finalizePromptIdentityCreationHistory(undoEntry, result);
         } catch (error) {
             this._discardLastUndo(undoLabel);
             Object.assign(sceneRef, previous);
@@ -10787,6 +10892,10 @@ export class EditorWidget {
             // user has started typing in another box, and the gate defers
             // instead of discarding that edit.
             this._refreshPromptContextDependencyConsumers();
+            if (identityCreateIntents.length) {
+                await this._fetchReferences({ ignoreMutationGate: true,
+                    reason: "global_prompt_identity_error", force: true });
+            }
         }
     }
 
@@ -11284,7 +11393,8 @@ export class EditorWidget {
      * because the two callers disagreed about it silently.
      */
     _promptCompileRequestBody({ dirName, candidate, windowStart, windowEnd,
-        selection = null, labelsOn = false } = {}) {
+        selection = null, labelsOn = false,
+        promptSemanticUnitCreates = [] } = {}) {
         return {
             base_modified_at: getProjectVersion(dirName),
             scene: candidate,
@@ -11300,6 +11410,8 @@ export class EditorWidget {
             frame_constraint: this._getActiveFrameConstraint(),
             fps: this._effectiveFps || 24,
             labels_on: labelsOn,
+            prompt_semantic_unit_creates:
+                structuredClone(promptSemanticUnitCreates || []),
         };
     }
 
@@ -11434,7 +11546,7 @@ export class EditorWidget {
      * both can be left exactly as the windowed request sends them.
      */
     _previewPromptContextScenePayload({ dirName, sceneId, candidate,
-        windowStart, windowEnd }) {
+        windowStart, windowEnd, promptSemanticUnitCreates = [] }) {
         const duration = Math.max(1, Math.round(
             candidate.duration_frames ?? this.totalFrames ?? 1));
         // Bumped BEFORE the early return too: a fetch issued while a
@@ -11459,6 +11571,7 @@ export class EditorWidget {
                     body: JSON.stringify(this._promptCompileRequestBody({
                         dirName, candidate, windowStart: 0, windowEnd: duration,
                         selection: { selectionStart: 0, selectionEnd: duration },
+                        promptSemanticUnitCreates,
                     })),
                 });
                 if (token !== this._promptContextScenePayloadToken) return;
@@ -11500,7 +11613,8 @@ export class EditorWidget {
         })();
     }
 
-    _previewPromptContextCandidate(scenePatch = {}, delay = 180) {
+    _previewPromptContextCandidate(scenePatch = {}, delay = 180,
+        promptSemanticUnitCreates = []) {
         const dirName = this._projectDirName();
         const sceneId = this.activeSceneId;
         if (!dirName || !sceneId || !this.activeScene) return;
@@ -11575,7 +11689,8 @@ export class EditorWidget {
         }
         this._promptContextPreviewTimer = setTimeout(async () => {
             this._previewPromptContextScenePayload({
-                dirName, sceneId, candidate, windowStart, windowEnd });
+                dirName, sceneId, candidate, windowStart, windowEnd,
+                promptSemanticUnitCreates });
             try {
                 const response = await fetch(api.apiURL(
                     `/sonder-editor/project/${encodeURIComponent(dirName)}/scenes/${encodeURIComponent(sceneId)}/prompt-context/compile`
@@ -11585,6 +11700,7 @@ export class EditorWidget {
                     body: JSON.stringify(this._promptCompileRequestBody({
                         dirName, candidate, windowStart, windowEnd,
                         selection: candidateSelection,
+                        promptSemanticUnitCreates,
                     })),
                 });
                 const payload = await response.json().catch(() => null);
@@ -11900,6 +12016,57 @@ export class EditorWidget {
         }
     }
 
+    _reconcilePromptSetupIdentityCreates(entry, intents, expectedSections) {
+        const outcome = reconcilePromptIdentityCreateOutcome({
+            units: this._promptSemanticUnits || [], intents,
+            expectedSections,
+            actualSections: this.activeScene?.prompt_sections || [],
+        });
+        const units = new Map((this._promptSemanticUnits || []).map((unit) => [
+            String(unit?.semantic_unit_id || ""), unit,
+        ]));
+        for (const intent of intents || []) {
+            const id = String(intent?.unit?.semantic_unit_id || "");
+            if (outcome.adopted_prompt_semantic_unit_ids.includes(id)) {
+                // A refresh can prove the Apply landed, but the dropped response
+                // means it cannot prove which server-owned handle/order snapshot
+                // this transaction created. Never turn the refreshed current
+                // unit (which another session may have edited) into delete auth.
+                delete intent.cleanup_expected;
+                intent.cleanup_unproven = true;
+                intent.reconciled_expected = structuredClone(units.get(id));
+            }
+        }
+        if (outcome.applied) {
+            entry.promptIdentityCreateIntents = structuredClone(intents || []);
+            this._commitUndoEntry(entry);
+        }
+        return outcome;
+    }
+
+    async _refreshAndReconcilePromptSetupIdentityCreates(
+        entry, intents, expectedSections,
+    ) {
+        const scenesRefreshed = await this._fetchScenes({
+            ignoreMutationGate: true, reason: "apply_prompt_identity_reconcile",
+        });
+        const referencesPayload = await this._fetchReferences({
+            ignoreMutationGate: true,
+            reason: "apply_prompt_identity_reconcile", force: true,
+        });
+        if (!scenesRefreshed || !referencesPayload) {
+            return {
+                applied: false,
+                outcome_unknown: true,
+                adopted_prompt_semantic_unit_ids: [],
+                conflicting_prompt_semantic_unit_ids: [],
+                sections_match: false,
+            };
+        }
+        return this._reconcilePromptSetupIdentityCreates(
+            entry, intents, expectedSections);
+    }
+
     /** Replace the scene's prompt state with a history entry / template:
      *  ONE mutation request (deletes high-index-first, then creates, then the
      *  global text) so the apply is a single save and a single undo step. */
@@ -11914,7 +12081,9 @@ export class EditorWidget {
                               minimax_h3_conditioning_setups: minimaxSetups = null,
                               active_minimax_h3_setup_id: activeMinimaxSetupId = null,
                               prompt_context_profiles: promptContextProfiles = null,
-                              prompt_semantic_units: promptSemanticUnits = null } = {}) {
+                              prompt_semantic_units: promptSemanticUnits = null,
+                              prompt_semantic_unit_creates:
+                                  promptSemanticUnitCreates = [] } = {}) {
         if (!this.activeScene || !this.projectDir) return;
         if (this._isPromptTrackLocked() || this._isGlobalPromptTrackLocked()) {
             notifyWarning("Prompt track is locked.", { source: "prompt-apply-refused" });
@@ -11950,8 +12119,14 @@ export class EditorWidget {
         };
         const sceneRef = this.activeScene;
         const undoLabel = "apply prompt setup";
-        this._pushUndo(undoLabel);
+        const identityCreateIntents = Array.isArray(promptSemanticUnitCreates)
+            ? structuredClone(promptSemanticUnitCreates) : [];
         const operations = [];
+        operations.push(...identityCreateIntents.map((intent) => ({
+            type: "create_prompt_semantic_unit",
+            handle_suggestion: intent.handle_suggestion,
+            unit: structuredClone(intent.unit || {}),
+        })));
         if (Array.isArray(promptContextProfiles) || Array.isArray(promptSemanticUnits)) {
             operations.push({
                 type: "import_prompt_context_dependencies",
@@ -12036,43 +12211,75 @@ export class EditorWidget {
         if (willExtend) sceneFields.duration_frames = nextDuration;
         operations.push({ type: "update_scene_fields", fields: sceneFields });
 
-        if (sceneFields.global_channels) {
-            sceneRef.global_channels = normalizeChannels(sceneFields.global_channels);
-            if (sceneFields.global_channel_docs) {
-                sceneRef.global_channel_docs = structuredClone(sceneFields.global_channel_docs);
+        // A lost response may have left the prior Apply outcome unknown. Never
+        // take a second baseline until both authoritative refreshes can prove
+        // whether that transaction landed.
+        const pendingIdentityApply = [...(this._undoStack || [])].reverse().find(
+            (entry) => entry?.pending && entry?.promptIdentityExpectedSections
+                && entry?.promptIdentityCreateIntents?.length);
+        if (pendingIdentityApply) {
+            const pendingOutcome = await this._refreshAndReconcilePromptSetupIdentityCreates(
+                pendingIdentityApply,
+                pendingIdentityApply.promptIdentityCreateIntents,
+                pendingIdentityApply.promptIdentityExpectedSections);
+            if (!pendingOutcome.outcome_unknown && !pendingOutcome.applied) {
+                this._discardUndoEntry(pendingIdentityApply);
             }
-            if (sceneFields.global_attachments) {
-                sceneRef.global_attachments = structuredClone(sceneFields.global_attachments);
+            if (pendingOutcome.outcome_unknown) {
+                notifyWarning("The previous Apply outcome is still unknown. Prompt history and the draft were preserved; retry when the project can be refreshed.",
+                    { source: "prompt-apply-outcome-unknown" });
             }
-            sceneRef.prompt = composeSectionText(sceneRef.global_channels, false);
-        } else {
-            sceneRef.prompt = String(globalText ?? "");
+            return pendingOutcome;
         }
-        if (promptContextProfileId !== null) {
-            sceneRef.prompt_context_profile_id = String(promptContextProfileId || "");
-        }
-        if (promptContextProfileConfig !== null) {
-            sceneRef.prompt_context_profile_config = structuredClone(promptContextProfileConfig || {});
-        }
-        if (minimaxSetups !== null) {
-            sceneRef.minimax_h3_conditioning_setups = structuredClone(minimaxSetups || []);
-        }
-        if (activeMinimaxSetupId !== null) {
-            sceneRef.active_minimax_h3_setup_id = String(activeMinimaxSetupId || "");
-        }
-        sceneRef.prompt_sections = [...nextSections].sort((a, b) => (a.start_frame || 0) - (b.start_frame || 0));
-        if (willExtend) {
-            sceneRef.duration_frames = nextDuration;
-            this.totalFrames = nextDuration;
-            this._clampTimelineStateToDuration();
-            this._refreshDurationInput();
-        }
-        this._renderSceneAfterLocalMutation({ viewport: false });
-        if (willExtend) {
-            this._updateToolbar();
-            this._updateTransportUI();
+
+        // Keep the history entry pending only while an outcome is unknown. All
+        // fallible setup work above happens before it exists; everything from
+        // the optimistic mutation onward is covered by the reconciliation path.
+        const undoEntry = this._pushUndo(undoLabel, {
+            promptIdentityCreateIntents: identityCreateIntents,
+            pending: identityCreateIntents.length > 0,
+        });
+        if (undoEntry && identityCreateIntents.length) {
+            undoEntry.promptIdentityExpectedSections = structuredClone(nextSections);
         }
         try {
+            if (sceneFields.global_channels) {
+                sceneRef.global_channels = normalizeChannels(sceneFields.global_channels);
+                if (sceneFields.global_channel_docs) {
+                    sceneRef.global_channel_docs = structuredClone(sceneFields.global_channel_docs);
+                }
+                if (sceneFields.global_attachments) {
+                    sceneRef.global_attachments = structuredClone(sceneFields.global_attachments);
+                }
+                sceneRef.prompt = composeSectionText(sceneRef.global_channels, false);
+            } else {
+                sceneRef.prompt = String(globalText ?? "");
+            }
+            if (promptContextProfileId !== null) {
+                sceneRef.prompt_context_profile_id = String(promptContextProfileId || "");
+            }
+            if (promptContextProfileConfig !== null) {
+                sceneRef.prompt_context_profile_config = structuredClone(promptContextProfileConfig || {});
+            }
+            if (minimaxSetups !== null) {
+                sceneRef.minimax_h3_conditioning_setups = structuredClone(minimaxSetups || []);
+            }
+            if (activeMinimaxSetupId !== null) {
+                sceneRef.active_minimax_h3_setup_id = String(activeMinimaxSetupId || "");
+            }
+            sceneRef.prompt_sections = [...nextSections]
+                .sort((a, b) => (a.start_frame || 0) - (b.start_frame || 0));
+            if (willExtend) {
+                sceneRef.duration_frames = nextDuration;
+                this.totalFrames = nextDuration;
+                this._clampTimelineStateToDuration();
+                this._refreshDurationInput();
+            }
+            this._renderSceneAfterLocalMutation({ viewport: false });
+            if (willExtend) {
+                this._updateToolbar();
+                this._updateTransportUI();
+            }
             const result = await this._runSceneMutation(operations, {
                 key: `prompt:${this.activeSceneId}:apply:${Date.now()}`,
                 label: "apply prompt setup",
@@ -12093,11 +12300,31 @@ export class EditorWidget {
             if (Array.isArray(result?.payload?.prompt_semantic_units)) {
                 this._promptSemanticUnits = result.payload.prompt_semantic_units;
             }
+            if (identityCreateIntents.length) {
+                this._finalizePromptIdentityCreationHistory(undoEntry, result);
+                this._commitUndoEntry(undoEntry);
+            }
             return true;
         } catch (e) {
-            this._discardLastUndo(undoLabel);
-            notifyWarning(e?.message || "Apply prompt setup was refused.", { source: "prompt-apply-refused" });
+            if (identityCreateIntents.length) {
+                const knownRefusal = Number(e?.status) >= 400 && Number(e?.status) < 500;
+                const reconciled = await this._refreshAndReconcilePromptSetupIdentityCreates(
+                    undoEntry, identityCreateIntents, nextSections);
+                if (reconciled.applied) return reconciled;
+                if (reconciled.outcome_unknown && !knownRefusal) {
+                    notifyWarning("Apply may have completed, but its outcome could not be verified. Prompt history and the draft were preserved for reconciliation.",
+                        { source: "prompt-apply-outcome-unknown" });
+                    return reconciled;
+                }
+                this._discardUndoEntry(undoEntry);
+                notifyWarning(e?.message || "Apply prompt setup was refused.",
+                    { source: "prompt-apply-refused" });
+                return reconciled;
+            }
+            notifyWarning(e?.message || "Apply prompt setup was refused.",
+                { source: "prompt-apply-refused" });
             await this._fetchScenes({ ignoreMutationGate: true, reason: "apply_prompt_error" });
+            this._discardUndoEntry(undoEntry);
             // Reports the outcome instead of rethrowing: two other callers
             // simply `await` this and re-render, and turning their click
             // handlers into unhandled rejections would be a regression. The
@@ -12123,8 +12350,8 @@ export class EditorWidget {
             ...(scene.global_attachments || []),
             ...(scene.prompt_sections || []).flatMap((section) => section.attachments || []),
         ];
-        const semanticUnitIds = new Set(sceneAttachments.flatMap((attachment) =>
-            attachment?.source?.semantic_unit_ids || []).map(String));
+        const semanticUnitIds = new Set(
+            semanticIdentityDependencyIds(sceneAttachments));
         const profileId = String(scene.prompt_context_profile_id || "");
         const template = {
             id: `pt-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 6)}`,
@@ -12237,7 +12464,10 @@ export class EditorWidget {
         if (!this.activeScene || !this.projectDir) return;
         if (this._isPromptTrackLocked()) return;
         const undoLabel = "edit prompt";
-        this._pushUndo(undoLabel);
+        const identityCreateIntents = this._takePromptIdentityCreateIntents(
+            Array.isArray(updates?.attachments) ? updates.attachments : []);
+        const undoEntry = this._pushUndo(undoLabel,
+            { promptIdentityCreateIntents: identityCreateIntents });
         const section = (this.activeScene.prompt_sections || [])[idx];
         const expected = section ? {
             start_frame: section.start_frame,
@@ -12248,8 +12478,8 @@ export class EditorWidget {
         this._renderSceneAfterLocalMutation({ viewport: false });
 
         try {
-            await this._runSceneMutation(
-                [{
+            const result = await this._runSceneMutation(
+                [...identityCreateIntents, {
                     type: "update_prompt_section",
                     index: idx,
                     expected,
@@ -12258,9 +12488,11 @@ export class EditorWidget {
                 {
                     key: `prompt:${this.activeSceneId}:${idx}:fields:${Object.keys(updates || {}).sort().join("-")}`,
                     label: "edit prompt",
-                    coalesce: true,
+                    coalesce: identityCreateIntents.length === 0,
                     merge: (oldIntent, nextIntent) => {
-                        if (!oldIntent?.operations?.[0] || !nextIntent?.operations?.[0]) return nextIntent;
+                        if (identityCreateIntents.length
+                                || !oldIntent?.operations?.[0]
+                                || !nextIntent?.operations?.[0]) return nextIntent;
                         return {
                             ...nextIntent,
                             operations: [{
@@ -12274,6 +12506,8 @@ export class EditorWidget {
                     },
                 }
             );
+            this._adoptPromptIdentitiesFromMutation(result);
+            this._finalizePromptIdentityCreationHistory(undoEntry, result);
         } catch (e) {
             this._discardLastUndo(undoLabel);
             notifyWarning(e?.message || "Prompt edit was refused.", { source: "prompt-edit-refused" });
@@ -12281,6 +12515,10 @@ export class EditorWidget {
             // `_fetchScenes` restores the scene but reaches the Prompt panel
             // through no seam, so an open panel keeps showing the refused edit.
             this._refreshPromptContextDependencyConsumers();
+            if (identityCreateIntents.length) {
+                await this._fetchReferences({ ignoreMutationGate: true,
+                    reason: "edit_prompt_identity_error", force: true });
+            }
             console.warn("[Sonder] Failed to update prompt section:", e);
         }
     }
@@ -12322,7 +12560,10 @@ export class EditorWidget {
         });
         if (!operations.length) return false;
         const undoLabel = "edit linked Context chip";
-        this._pushUndo(undoLabel);
+        const identityCreateIntents = this._takePromptIdentityCreateIntents(
+            operations.flatMap((operation) => operation.fields?.attachments || []));
+        const undoEntry = this._pushUndo(undoLabel,
+            { promptIdentityCreateIntents: identityCreateIntents });
         for (const operation of operations) {
             this._applyLocalPromptUpdate(operation.index, {
                 attachments: structuredClone(operation.fields.attachments),
@@ -12330,7 +12571,8 @@ export class EditorWidget {
         }
         this._renderSceneAfterLocalMutation({ viewport: false });
         try {
-            await this._runSceneMutation(operations, {
+            const result = await this._runSceneMutation(
+                [...identityCreateIntents, ...operations], {
                 key: `prompt:${this.activeSceneId}:linked:${groupId}`,
                 label: undoLabel,
                 coalesce: false,
@@ -12338,6 +12580,8 @@ export class EditorWidget {
                 // replay the stale attachment edit onto freshly fetched state.
                 retryOnConflict: false,
             });
+            this._adoptPromptIdentitiesFromMutation(result);
+            this._finalizePromptIdentityCreationHistory(undoEntry, result);
             return true;
         } catch (error) {
             this._discardLastUndo(undoLabel);
@@ -12346,6 +12590,10 @@ export class EditorWidget {
             });
             await this._fetchScenes({ ignoreMutationGate: true,
                 reason: "edit_linked_prompt_error" });
+            if (identityCreateIntents.length) {
+                await this._fetchReferences({ ignoreMutationGate: true,
+                    reason: "linked_prompt_identity_error", force: true });
+            }
             console.warn("[Sonder] Failed to update linked Context group:", error);
             return false;
         }
@@ -17306,6 +17554,7 @@ export class EditorWidget {
     _pushUndo(label = "edit", {
         referenceOperations = [], inverseReferenceOperations = [],
         promptIdentityChange = null, inversePromptIdentityChange = null,
+        promptIdentityCreateIntents = [],
         pending = false,
     } = {}) {
         if (!this.activeScene || !this.activeSceneId) return;
@@ -17321,6 +17570,8 @@ export class EditorWidget {
                 ? structuredClone(promptIdentityChange) : null,
             inversePromptIdentityChange: inversePromptIdentityChange
                 ? structuredClone(inversePromptIdentityChange) : null,
+            promptIdentityCreateIntents:
+                structuredClone(promptIdentityCreateIntents || []),
             pending: Boolean(pending),
         };
         this._undoStack.push(entry);
@@ -17544,7 +17795,9 @@ export class EditorWidget {
             return;
         }
 
-        const opposite = (this.activeScene && this.activeSceneId === entry.sceneId) ? {
+        const opposite = entry.retryOpposite
+            ? structuredClone(entry.retryOpposite)
+            : (this.activeScene && this.activeSceneId === entry.sceneId) ? {
             sceneId: this.activeSceneId,
             snapshot: JSON.parse(JSON.stringify(this.activeScene)),
             label: entry.label,
@@ -17554,6 +17807,8 @@ export class EditorWidget {
                 ? structuredClone(entry.inversePromptIdentityChange) : null,
             inversePromptIdentityChange: entry.promptIdentityChange
                 ? structuredClone(entry.promptIdentityChange) : null,
+            promptIdentityCreateIntents:
+                structuredClone(entry.promptIdentityCreateIntents || []),
         } : null;
         let referencesApplied = false;
         let promptIdentityApplied = false;
@@ -17569,12 +17824,53 @@ export class EditorWidget {
                 promptIdentityApplied = true;
             }
             await this._restoreScene(entry.sceneId, entry.snapshot);
+            if (entry.promptIdentityCreateIntents?.length) {
+                const cleanupPlan = promptIdentityCleanupPlan(
+                    entry.promptIdentityCreateIntents);
+                if (cleanupPlan.retainedUnprovenIds.length) {
+                    notifyInfo(`${cleanupPlan.retainedUnprovenIds.length} Prompt Identit${
+                        cleanupPlan.retainedUnprovenIds.length === 1 ? "y was" : "ies were"} retained because this history entry could not prove it created the current record.`,
+                    { source: "undo-prompt-identity-unproven" });
+                }
+                try {
+                    const cleanupResult = cleanupPlan.operations.length
+                        ? await this._runSceneMutation(cleanupPlan.operations, {
+                        key: `prompt:${entry.sceneId}:identity-cleanup:${Date.now()}`,
+                        label: `undo ${entry.label || "Other speaker"}`,
+                        coalesce: false,
+                        refreshScenes: false,
+                        sceneId: entry.sceneId,
+                    }) : null;
+                    if (cleanupResult) this._adoptPromptIdentitiesFromMutation(cleanupResult);
+                    const retained = (cleanupResult?.payload?.results || []).filter(
+                        (value) => value?.type
+                            === "delete_prompt_semantic_unit_if_unreferenced"
+                            && value?.deleted === false
+                            && ["referenced", "changed"].includes(value?.reason));
+                    if (retained.length) {
+                        notifyInfo(`${retained.length} created Prompt Identit${
+                            retained.length === 1 ? "y was" : "ies were"} retained because ${
+                            retained.length === 1 ? "it is" : "they are"} still used or changed.`,
+                        { source: "undo-prompt-identity-retained" });
+                    }
+                } catch (cleanupError) {
+                    const refreshed = await this._fetchReferences({
+                        ignoreMutationGate: true,
+                        reason: "undo_prompt_identity_cleanup_reconcile", force: true,
+                    });
+                    if (opposite) opposite.promptIdentityRefreshRequired = !refreshed;
+                    notifyInfo("The scene was undone, but created Prompt Identity cleanup could not be confirmed. Any retained identities will be reused safely by Redo.",
+                        { source: "undo-prompt-identity-cleanup-unknown" });
+                }
+            }
+            delete entry.retryOpposite;
             if (opposite) this._redoStack.push(opposite);
         } catch (error) {
             // The source entry remains authoritative until every durable
             // participant has completed. Requeue it before attempting
             // best-effort compensation so a second failure cannot erase the
             // user's only retry path.
+            if (opposite) entry.retryOpposite = structuredClone(opposite);
             this._undoStack.push(entry);
             const compensationErrors = [];
             if (promptIdentityApplied && entry.inversePromptIdentityChange) {
@@ -17712,7 +18008,9 @@ export class EditorWidget {
             return;
         }
 
-        const opposite = (this.activeScene && this.activeSceneId === entry.sceneId) ? {
+        const opposite = entry.retryOpposite
+            ? structuredClone(entry.retryOpposite)
+            : (this.activeScene && this.activeSceneId === entry.sceneId) ? {
             sceneId: this.activeSceneId,
             snapshot: JSON.parse(JSON.stringify(this.activeScene)),
             label: entry.label,
@@ -17722,9 +18020,12 @@ export class EditorWidget {
                 ? structuredClone(entry.inversePromptIdentityChange) : null,
             inversePromptIdentityChange: entry.promptIdentityChange
                 ? structuredClone(entry.promptIdentityChange) : null,
+            promptIdentityCreateIntents:
+                structuredClone(entry.promptIdentityCreateIntents || []),
         } : null;
         let referencesApplied = false;
         let promptIdentityApplied = false;
+        let promptIdentityCreatesApplied = [];
         try {
             if (entry.referenceOperations?.length) {
                 await this._applyReferenceHistoryOperations(entry.referenceOperations,
@@ -17736,9 +18037,50 @@ export class EditorWidget {
                     `redo ${entry.label || "prompt attachment"}`, { recordUndo: false });
                 promptIdentityApplied = true;
             }
+            if (entry.promptIdentityCreateIntents?.length) {
+                const refreshed = await this._fetchReferences({
+                    ignoreMutationGate: true,
+                    reason: "redo_prompt_identity_plan", force: true,
+                });
+                if (!refreshed) {
+                    throw new Error("Redo could not refresh Prompt Identities; try again.");
+                }
+                const redoPlan = promptIdentityRedoPlan(
+                    this._promptSemanticUnits || [],
+                    entry.promptIdentityCreateIntents);
+                const createIntents = redoPlan.createIntents;
+                if (redoPlan.conflictIds.length) {
+                    throw new Error("Redo refused because a retained Prompt Identity changed.");
+                }
+                const createResult = createIntents.length
+                    ? await this._runSceneMutation(createIntents.map((intent) => ({
+                        type: "create_prompt_semantic_unit",
+                        handle_suggestion: intent.handle_suggestion,
+                        unit: structuredClone(intent.unit || {}),
+                    })), {
+                        key: `prompt:${entry.sceneId}:identity-redo:${Date.now()}`,
+                        label: `redo ${entry.label || "Other speaker"}`,
+                        coalesce: false,
+                        refreshScenes: false,
+                        sceneId: entry.sceneId,
+                    }) : null;
+                if (createResult) {
+                    this._adoptPromptIdentitiesFromMutation(createResult);
+                    const createdIds = this._finalizePromptIdentityCreationHistory(
+                        entry, createResult);
+                    promptIdentityCreatesApplied = createIntents.filter((intent) =>
+                        createdIds.has(String(intent?.unit?.semantic_unit_id || "")));
+                }
+                if (opposite) {
+                    opposite.promptIdentityCreateIntents = structuredClone(
+                        entry.promptIdentityCreateIntents || []);
+                }
+            }
             await this._restoreScene(entry.sceneId, entry.snapshot);
+            delete entry.retryOpposite;
             if (opposite) this._undoStack.push(opposite);
         } catch (error) {
+            if (opposite) entry.retryOpposite = structuredClone(opposite);
             this._redoStack.push(entry);
             const compensationErrors = [];
             if (promptIdentityApplied && entry.inversePromptIdentityChange) {
@@ -17746,6 +18088,21 @@ export class EditorWidget {
                     await this._applyPromptIdentityChange(entry.inversePromptIdentityChange,
                         `restore failed redo ${entry.label || "prompt attachment"}`,
                         { recordUndo: false });
+                } catch (compensationError) {
+                    compensationErrors.push(compensationError);
+                }
+            }
+            if (promptIdentityCreatesApplied.length) {
+                try {
+                    const cleanupResult = await this._runSceneMutation(
+                        promptIdentityCleanupPlan(promptIdentityCreatesApplied).operations, {
+                            key: `prompt:${entry.sceneId}:identity-redo-compensation:${Date.now()}`,
+                            label: "restore failed redo identity cleanup",
+                            coalesce: false,
+                            refreshScenes: false,
+                            sceneId: entry.sceneId,
+                        });
+                    this._adoptPromptIdentitiesFromMutation(cleanupResult);
                 } catch (compensationError) {
                     compensationErrors.push(compensationError);
                 }

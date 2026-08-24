@@ -341,6 +341,11 @@ def test_writing_projection_state_survives_settings_normalization():
         "blockMeta": [{"block_id": "block", "source_prompt_id": "section"}],
         "baseModifiedAt": "project-version",
         "allocations": [{"length": 24, "dirty": True}],
+        "pendingSemanticUnitCreates": [{
+            "type": "create_prompt_semantic_unit", "handle_suggestion": "Narrator",
+            "unit": {"semantic_unit_id": "pending-1", "name": "Narrator",
+                     "kind": "subject"},
+        }],
     }
     settings = _normalize_settings({"prompts": {
         "writingView": "compiled",
@@ -378,6 +383,8 @@ def test_reset_stash_survives_normalization_and_never_nests():
     stashed = {
         "ts": 7, "draft": "the draft Reset replaced",
         "document": {"nodes": [{"type": "text", "node_id": "t", "text": "hi"}]},
+        "pendingSemanticUnitCreates": [{"type": "create_prompt_semantic_unit",
+            "unit": {"semantic_unit_id": "pending-1", "name": "Narrator"}}],
         "stash": {"ts": 1, "draft": "an older stash that must be dropped"},
     }
     restored = _normalize_settings({"prompts": {
@@ -387,6 +394,8 @@ def test_reset_stash_survives_normalization_and_never_nests():
     }})["prompts"]["writingDraftByProjectScene"]["project::scene"]
     assert restored["stash"]["draft"] == "the draft Reset replaced"
     assert restored["stash"]["document"]["nodes"][0]["text"] == "hi"
+    assert restored["stash"]["pendingSemanticUnitCreates"][0]["unit"][
+        "semantic_unit_id"] == "pending-1"
     assert "stash" not in restored["stash"]
 
 
@@ -403,6 +412,39 @@ def test_a_stash_alone_keeps_its_record_alive():
     }})["prompts"]["writingDraftByProjectScene"]
     assert restored["stashed::scene"]["stash"]["draft"] == "recoverable"
     assert not [key for key in restored if key.startswith("cleared::")]
+
+
+def test_pending_identity_alone_keeps_its_writing_record_alive():
+    drafts = {"pending::scene": {"ts": 1, "draft": "",
+        "pendingSemanticUnitCreates": [{
+            "type": "create_prompt_semantic_unit",
+            "unit": {"semantic_unit_id": "pending-1", "name": "Narrator"},
+        }]}}
+    for index in range(60):
+        drafts[f"cleared::{index}"] = {"ts": 100 + index, "draft": ""}
+    restored = _normalize_settings({"prompts": {
+        "writingDraftByProjectScene": drafts,
+    }})["prompts"]["writingDraftByProjectScene"]
+    assert restored["pending::scene"]["pendingSemanticUnitCreates"][0][
+        "unit"]["semantic_unit_id"] == "pending-1"
+    assert not [key for key in restored if key.startswith("cleared::")]
+
+
+def test_structurally_empty_writing_documents_do_not_consume_lru_slots():
+    drafts = {"unapplied::scene": {"ts": 1, "draft": "real work"}}
+    for index in range(60):
+        drafts[f"empty-doc::{index}"] = {
+            "ts": 100 + index, "draft": "",
+            "document": {"nodes": [{"type": "text", "node_id": "t", "text": "  "}]},
+        }
+    restored = _normalize_settings({"prompts": {
+        "writingDraftByProjectScene": drafts,
+    }})["prompts"]["writingDraftByProjectScene"]
+    assert restored == {"unapplied::scene": {
+        "ts": 1, "draft": "real work", "document": None,
+        "attachments": [], "blockMeta": [], "pendingSemanticUnitCreates": [],
+        "baseModifiedAt": "", "allocations": [],
+    }}
 
 
 def test_channel_template_catalog_keeps_builtins_read_only_and_customs_owned():

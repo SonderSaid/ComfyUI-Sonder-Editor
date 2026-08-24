@@ -2758,6 +2758,199 @@ console.log(JSON.stringify({{during,after:h._redoStack.map((value)=>value.label)
     }
 
 
+def test_prompt_identity_history_keeps_polarity_across_cleanup_and_refresh_failures():
+    widget = _source("web/js/editor_widget.js")
+    undo = _method(widget, "_undo", "_redo")
+    redo = _method(widget, "_redo", "_restoreScene")
+    transactions_url = (ROOT / "web/js/prompt_identity_transactions.js").as_uri()
+    result = _run_node(f"""
+const {{promptIdentityCleanupPlan,promptIdentityRedoPlan}}=
+  await import({json.dumps(transactions_url)});
+globalThis.document={{activeElement:null}};
+globalThis.describeKeyboardDebugElement=()=>({{}});
+const notices=[]; globalThis.notifyInfo=(message)=>notices.push(message);
+globalThis.notifyWarning=(message)=>notices.push(message);
+class Harness {{
+{undo}
+{redo}
+  constructor() {{
+    this.activeSceneId="scene"; this.activeScene={{scene_id:"scene",value:"applied"}};
+    this._promptSemanticUnits=[{{semantic_unit_id:"one",handle:"One",name:"One",
+      kind:"subject",definition:"",sources:[],voice:{{member_id:null}}}}];
+    this._undoStack=[{{sceneId:"scene",snapshot:{{scene_id:"scene",value:"old"}},
+      label:"apply prompt setup",promptIdentityCreateIntents:[{{
+        type:"create_prompt_semantic_unit",handle_suggestion:"One",
+        unit:{{semantic_unit_id:"one",name:"One",kind:"subject",definition:""}},
+        cleanup_expected:this._promptSemanticUnits[0]}}]}}];
+    this._redoStack=[]; this._editorFocused=false; this._sceneHistoryLifecycleOwner=null;
+    this._historyOperationInFlight=false; this.refreshWorks=false;
+    this.restores=[]; this.cleanupAttempts=0; this.createAttempts=0;
+  }}
+  _hasPendingHistoryCommit() {{ return false; }}
+  _finishHistoryOperation() {{ this._historyOperationInFlight=false; }}
+  _keyboardDebug() {{}}
+  async _applyReferenceHistoryOperations() {{}}
+  async _applyPromptIdentityChange() {{}}
+  async _restoreScene(_id,snapshot) {{
+    this.restores.push(snapshot.value); this.activeScene=structuredClone(snapshot);
+  }}
+  async _runSceneMutation(operations) {{
+    if(operations[0]?.type==="delete_prompt_semantic_unit_if_unreferenced") {{
+      this.cleanupAttempts += 1; throw new Error("cleanup response lost");
+    }}
+    this.createAttempts += 1;
+    return {{payload:{{results:[],prompt_semantic_units:this._promptSemanticUnits}}}};
+  }}
+  async _fetchReferences() {{ return this.refreshWorks ? {{ok:true}} : null; }}
+  _adoptPromptIdentitiesFromMutation() {{}}
+  _finalizePromptIdentityCreationHistory() {{}}
+}}
+const h=new Harness();
+await h._undo();
+const afterUndo={{undo:h._undoStack.length,redo:h._redoStack.length,
+  redoSnapshot:h._redoStack[0].snapshot.value,
+  refreshRequired:h._redoStack[0].promptIdentityRefreshRequired===true}};
+await h._redo();
+const afterFailedRedo={{undo:h._undoStack.length,redo:h._redoStack.length,
+  retrySnapshot:h._redoStack[0].retryOpposite.snapshot.value,
+  restores:[...h.restores],creates:h.createAttempts}};
+h.refreshWorks=true;
+await h._redo();
+console.log(JSON.stringify({{afterUndo,afterFailedRedo,afterSuccess:{{
+  undo:h._undoStack.length,redo:h._redoStack.length,
+  undoSnapshot:h._undoStack[0].snapshot.value,
+  restores:h.restores,creates:h.createAttempts}},notices}}));
+""")
+    assert result["afterUndo"] == {
+        "undo": 0, "redo": 1, "redoSnapshot": "applied", "refreshRequired": True}
+    assert result["afterFailedRedo"] == {
+        "undo": 0, "redo": 1, "retrySnapshot": "old",
+        "restores": ["old"], "creates": 0}
+    assert result["afterSuccess"] == {
+        "undo": 1, "redo": 0, "undoSnapshot": "old",
+        "restores": ["old", "applied"], "creates": 0}
+    assert any("cleanup could not be confirmed" in notice for notice in result["notices"])
+
+
+def test_unknown_prompt_apply_keeps_pending_history_until_authoritative_reconciliation():
+    widget = _source("web/js/editor_widget.js")
+    methods_start = widget.index("    _reconcilePromptSetupIdentityCreates(")
+    methods_end = widget.index("    async _applyPromptSetup(", methods_start)
+    methods = widget[methods_start:methods_end]
+    transactions_url = (ROOT / "web/js/prompt_identity_transactions.js").as_uri()
+    result = _run_node(f"""
+const {{promptIdentityCleanupPlan,reconcilePromptIdentityCreateOutcome}}=
+  await import({json.dumps(transactions_url)});
+class Harness {{
+{methods}
+  constructor() {{
+    this.refreshWorks=false; this.commits=0;
+    this._promptSemanticUnits=[{{semantic_unit_id:"one",handle:"One",name:"One",
+      kind:"subject",definition:"",order:0,sources:[],voice:{{member_id:null}},
+      attachment_defaults:{{}},disabled_capabilities:[]}}];
+    this.activeScene={{prompt_sections:[{{prompt_id:"p",start_frame:0,end_frame:24,
+      channels:{{visual:"hello"}},channel_docs:{{visual:{{nodes:[
+        {{type:"text",node_id:"t",text:"hello"}}]}}}},attachments:[],muted:false,
+      global_channel_exceptions:[]}}]}};
+  }}
+  async _fetchScenes() {{ return this.refreshWorks; }}
+  async _fetchReferences() {{ return this.refreshWorks ? {{ok:true}} : null; }}
+  _commitUndoEntry(entry) {{ entry.pending=false; this.commits += 1; return true; }}
+}}
+const h=new Harness();
+const intent={{type:"create_prompt_semantic_unit",handle_suggestion:"One",
+  unit:{{semantic_unit_id:"one",name:"One",kind:"subject",definition:""}}}};
+const expected=structuredClone(h.activeScene.prompt_sections);
+const entry={{pending:true,promptIdentityCreateIntents:[intent],
+  promptIdentityExpectedSections:expected}};
+const unknown=await h._refreshAndReconcilePromptSetupIdentityCreates(
+  entry,[intent],expected);
+h.refreshWorks=true;
+const applied=await h._refreshAndReconcilePromptSetupIdentityCreates(
+  entry,[intent],expected);
+const cleanup=promptIdentityCleanupPlan(entry.promptIdentityCreateIntents);
+const edited=reconcilePromptIdentityCreateOutcome({{
+  units:[{{...h._promptSemanticUnits[0],attachment_defaults:{{summary:"changed"}}}}],
+  intents:[intent],expectedSections:expected,actualSections:expected}});
+console.log(JSON.stringify({{unknown,applied,pending:entry.pending,commits:h.commits,
+  cleanupExpected:Boolean(entry.promptIdentityCreateIntents[0].cleanup_expected),
+  cleanupUnproven:entry.promptIdentityCreateIntents[0].cleanup_unproven,
+  reconciledExpected:entry.promptIdentityCreateIntents[0].reconciled_expected,
+  cleanupOperations:cleanup.operations.length,
+  retainedUnprovenIds:cleanup.retainedUnprovenIds,edited}}));
+""")
+    assert result["unknown"]["outcome_unknown"] is True
+    assert result["unknown"]["applied"] is False
+    assert result["applied"]["applied"] is True
+    assert result["pending"] is False
+    assert result["commits"] == 1
+    assert result["cleanupExpected"] is False
+    assert result["cleanupUnproven"] is True
+    assert result["reconciledExpected"]["semantic_unit_id"] == "one"
+    assert result["cleanupOperations"] == 0
+    assert result["retainedUnprovenIds"] == ["one"]
+    assert result["edited"]["applied"] is False
+    assert result["edited"]["conflicting_prompt_semantic_unit_ids"] == ["one"]
+
+    apply_start = widget.index("    async _applyPromptSetup(")
+    apply_end = widget.index("    _getPromptTemplates()", apply_start)
+    apply_method = widget[apply_start:apply_end]
+    preserve = apply_method.index("if (reconciled.outcome_unknown && !knownRefusal)")
+    discard = apply_method.index("this._discardUndoEntry(undoEntry)", preserve)
+    assert preserve < discard
+
+
+def test_prompt_identity_history_authorizes_cleanup_only_for_created_true_result():
+    widget = _source("web/js/editor_widget.js")
+    start = widget.index("    _finalizePromptIdentityCreationHistory(")
+    end = widget.index("    _mergeQueueMutationIntents(", start)
+    method = widget[start:end]
+    result = _run_node(f"""
+class Harness {{
+{method}
+}}
+const intent={{unit:{{semantic_unit_id:"one",name:"One",kind:"subject",definition:""}},
+  cleanup_expected:{{semantic_unit_id:"stale"}}}};
+const entry={{promptIdentityCreateIntents:[intent]}};
+const h=new Harness();
+const replay=h._finalizePromptIdentityCreationHistory(entry,{{payload:{{results:[{{
+  type:"create_prompt_semantic_unit",created:false,unit:{{semantic_unit_id:"one",
+  handle:"One",name:"One",kind:"subject",definition:"",order:0,sources:[],
+  voice:{{member_id:null}},attachment_defaults:{{summary:"edited"}},
+  disabled_capabilities:[]}}}}]}}}});
+const afterReplay={{cleanupExpected:Boolean(intent.cleanup_expected),
+  cleanupUnproven:intent.cleanup_unproven,
+  reconciledExpected:intent.reconciled_expected,created:[...replay]}};
+const created=h._finalizePromptIdentityCreationHistory(entry,{{payload:{{results:[{{
+  type:"create_prompt_semantic_unit",created:true,unit:{{semantic_unit_id:"one",
+  handle:"One",name:"One",kind:"subject",definition:"",order:0,sources:[],
+  voice:{{member_id:null}},attachment_defaults:{{}},disabled_capabilities:[]}}}}]}}}});
+console.log(JSON.stringify({{afterReplay,afterCreated:{{
+  cleanupExpected:intent.cleanup_expected,cleanupUnproven:Boolean(intent.cleanup_unproven),
+  created:[...created]}}}}));
+""")
+    assert result["afterReplay"] == {
+        "cleanupExpected": False,
+        "cleanupUnproven": True,
+        "reconciledExpected": {
+            "semantic_unit_id": "one",
+            "handle": "One",
+            "name": "One",
+            "kind": "subject",
+            "definition": "",
+            "order": 0,
+            "sources": [],
+            "voice": {"member_id": None},
+            "attachment_defaults": {"summary": "edited"},
+            "disabled_capabilities": [],
+        },
+        "created": [],
+    }
+    assert result["afterCreated"]["cleanupExpected"]["semantic_unit_id"] == "one"
+    assert result["afterCreated"]["cleanupUnproven"] is False
+    assert result["afterCreated"]["created"] == ["one"]
+
+
 def test_undo_and_redo_share_a_non_reentrant_history_gate():
     widget = _source("web/js/editor_widget.js")
     undo = _method(widget, "_undo", "_redo")
@@ -4249,11 +4442,12 @@ def test_apply_clears_the_draft_only_when_the_write_landed():
     # The panel gates the destructive half on that outcome.
     gated = panel[panel.index("let applied = false;"):]
     gated = gated[:gated.index("clearWritingState(")]
-    assert "if (!applied) return;" in gated, gated
+    assert 'typeof applied === "object"' in gated, gated
+    assert "if (!appliedSuccessfully)" in gated, gated
 
     # And Apply now leaves the applied draft restorable rather than dropping
     # the stash with it — it is the only irreversible act on this surface.
-    assert "clearWritingState({ keepAsStash: writingDraftSnapshot() });" in panel
+    assert "keepAsStash: writingAppliedRestoreSnapshot(writingDraftSnapshot())" in panel
 
 
 def test_carriage_returns_never_reach_a_document_or_its_channels():
@@ -4551,3 +4745,116 @@ def test_an_empty_draft_is_not_mistaken_for_authored_work():
     assert result["inlineChipOnly"] is True
     assert result["registryChipOnly"] is True
     assert result["sectionScopedOnly"] is True
+
+
+def test_writing_pending_identity_create_is_reachable_only_while_draft_references_it():
+    result = _run_panel_script(r"""
+        const create = (id, name) => ({type:"create_prompt_semantic_unit",
+            handle_suggestion:name, unit:{semantic_unit_id:id,name,kind:"subject"}});
+        const vocal = (attachmentId, ids) => ({attachment_id:attachmentId,
+            emission_group_id:attachmentId,kind:"vocal_event",
+            source:{subject_ids:ids},config:{},capabilities:[]});
+        const creates = [create("one","One"),create("two","Two")];
+        const direct = mod.reachableWritingSemanticUnitCreates(creates,
+            [vocal("a",["one"])], []);
+        const scoped = mod.reachableWritingSemanticUnitCreates(creates, [],
+            [{attachments:[vocal("b",["two"])]}]);
+        const removed = mod.reachableWritingSemanticUnitCreates(creates, [], []);
+        console.log(JSON.stringify({
+            direct:direct.map((value)=>value.unit.semantic_unit_id),
+            scoped:scoped.map((value)=>value.unit.semantic_unit_id),
+            removed,
+            content:mod.writingDraftHasContent({pendingSemanticUnitCreates:creates}),
+        }));
+    """)
+    assert result == {
+        "direct": ["one"], "scoped": ["two"], "removed": [],
+        "content": True,
+    }
+
+
+def test_writing_apply_restore_survives_empty_current_reload_without_pending_creates():
+    result = _run_panel_script(r"""
+        const create = {type:"create_prompt_semantic_unit",
+            unit:{semantic_unit_id:"pending-1",name:"Narrator",kind:"subject"}};
+        const authored = {draft:"hello",document:{nodes:[{type:"text",node_id:"t",text:"hello"}]},
+            pendingSemanticUnitCreates:[create]};
+        const appliedStash = mod.writingAppliedRestoreSnapshot(authored);
+        const load = mod.writingDraftLoadState({draft:"",document:null,stash:appliedStash});
+        const full = Array.from({length:64},(_,index)=>({type:"create_prompt_semantic_unit",
+            unit:{semantic_unit_id:`pending-${index}`,name:`Speaker ${index}`,kind:"subject"}}));
+        const refused = mod.stageWritingSemanticUnitCreate(full,{type:"create_prompt_semantic_unit",
+            unit:{semantic_unit_id:"pending-65",name:"Speaker 65",kind:"subject"}});
+        const replacement = mod.stageWritingSemanticUnitCreate(full,{type:"create_prompt_semantic_unit",
+            unit:{semantic_unit_id:"pending-5",name:"Renamed",kind:"subject"}});
+        console.log(JSON.stringify({load,appliedStash,
+            refused:{accepted:refused.accepted,length:refused.creates.length},
+            replacement:{accepted:replacement.accepted,length:replacement.creates.length,
+                name:replacement.creates.at(-1).unit.name}}));
+    """)
+    assert result["load"]["useSavedDraft"] is False
+    assert result["load"]["stash"]["draft"] == "hello"
+    assert result["appliedStash"]["pendingSemanticUnitCreates"] == []
+    assert result["refused"] == {"accepted": False, "length": 64}
+    assert result["replacement"] == {
+        "accepted": True, "length": 64, "name": "Renamed"}
+
+
+def test_writing_pending_identity_overlay_uses_shared_preview_and_atomic_apply_paths():
+    panel = _source("web/js/editor_prompt_panel.js")
+    widget = _source("web/js/editor_widget.js")
+    builder_start = widget.index("    _promptCompileRequestBody({")
+    builder_end = widget.index("    _promptProjectionSubset(", builder_start)
+    scene_start = widget.index("    _previewPromptContextScenePayload({")
+    window_start = widget.index("    _previewPromptContextCandidate(", scene_start)
+    window_end = widget.index("    _refreshPromptUsageHighlight(", window_start)
+    builder = widget[builder_start:builder_end]
+    scene_preview = widget[scene_start:window_start]
+    window_preview = widget[window_start:window_end]
+    apply = widget[widget.index("async _applyPromptSetup("):
+                   widget.index("/** Browser-local prompt template library")]
+
+    assert "prompt_semantic_unit_creates:" in builder
+    assert "promptSemanticUnitCreates" in scene_preview
+    assert "promptSemanticUnitCreates" in window_preview
+    assert "pruneWritingSemanticUnitCreates())" in panel
+    assert "prompt_semantic_unit_creates: promptSemanticUnitCreates" in panel
+    create_at = apply.index('type: "create_prompt_semantic_unit"')
+    replace_at = apply.index('type: "replace_prompt_sections"')
+    assert create_at < replace_at
+    assert "pending: identityCreateIntents.length > 0" in apply
+    assert "_refreshAndReconcilePromptSetupIdentityCreates" in apply
+
+
+def test_cross_project_prompt_template_exports_vocal_identity_dependency_closure():
+    widget = _source("web/js/editor_widget.js")
+    save = _method(widget, "_savePromptTemplate", "_deletePromptTemplate")
+    chips_url = (ROOT / "web/js/prompt_context_chips.js").as_uri()
+    result = _run_node(f"""
+const {{semanticIdentityDependencyIds}}=await import({json.dumps(chips_url)});
+const normalizeChannels=(value)=>value||{{}};
+const normalizeChannelExceptions=(value)=>value||[];
+const templateFreezeValue=(value)=>value;
+globalThis.notifySuccess=()=>{{}};
+class Harness {{
+{save}
+  constructor() {{
+    this.activeScene={{prompt:"",global_channels:{{}},global_channel_docs:{{}},
+      global_attachments:[],prompt_context_profile_id:"",prompt_sections:[{{
+        prompt_id:"p",start_frame:0,end_frame:24,channels:{{visual:"hello"}},
+        attachments:[{{kind:"vocal_event",source:{{subject_ids:["speaker"],
+          voice_id:"provider-voice"}},config:{{audio_speaker_subject_id:"narrator"}}}}]
+      }}]}};
+    this._promptContextProfiles=[]; this._effectiveFps=24;
+    this._promptSemanticUnits=["speaker","narrator","provider-voice"].map((id)=>({{
+      semantic_unit_id:id,name:id,kind:"subject"}}));
+    this.saved=null;
+  }}
+  _channelTemplate() {{ return {{id:"standard",channels:[{{key:"visual"}}]}}; }}
+  _getPromptTemplates() {{ return []; }}
+  _updateSettings(value) {{ this.saved=value.promptTemplates[0]; }}
+}}
+const h=new Harness(); h._savePromptTemplate("Vocal");
+console.log(JSON.stringify(h.saved.prompt_semantic_units.map((value)=>value.semantic_unit_id)));
+""")
+    assert result == ["speaker", "narrator"]
