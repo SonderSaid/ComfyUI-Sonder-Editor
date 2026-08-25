@@ -123,6 +123,26 @@ export function mountReferenceLibrary(container, host) {
         error: "",
         destroyed: false,
     };
+    const scrollSnapshots = new Map();
+    const containerIsVisible = () => typeof container.getClientRects === "function"
+        ? container.getClientRects().length > 0
+        : container.style.display !== "none";
+    const rememberScroll = (key, top) => {
+        if (!key) return;
+        scrollSnapshots.delete(key);
+        scrollSnapshots.set(key, Math.max(0, Number(top) || 0));
+        while (scrollSnapshots.size > 12) {
+            scrollSnapshots.delete(scrollSnapshots.keys().next().value);
+        }
+    };
+    const restoreScroll = () => {
+        const body = container.querySelector?.('[data-reference-library-body="true"]');
+        if (!containerIsVisible() || body?.dataset?.referenceListView !== "true") return false;
+        const key = body.dataset.referenceScrollKey || "";
+        if (!scrollSnapshots.has(key)) return false;
+        body.scrollTop = scrollSnapshots.get(key);
+        return true;
+    };
     container.style.cssText = "display:flex;flex-direction:column;min-height:0;overflow:hidden;height:100%;background:#11161b;color:#e6ebf0;";
 
     const dragPayload = (reference, member = null) => ({
@@ -175,6 +195,7 @@ export function mountReferenceLibrary(container, host) {
     };
 
     const reset = () => {
+        scrollSnapshots.clear();
         state.query = "";
         state.selectedReferenceId = "";
         state.entityDraft = null;
@@ -451,8 +472,20 @@ export function mountReferenceLibrary(container, host) {
 
     const render = () => {
         if (state.destroyed) return;
-        container.innerHTML = "";
         const data = host.getData();
+        const visible = containerIsVisible();
+        const draftMode = state.entityDraft
+            ? `entity:${state.entityDraft.reference_id || "new"}`
+            : (state.memberDraft ? `member:${state.memberMode || "create"}` : "list");
+        const scrollKey = JSON.stringify([
+            String(data.projectKey || ""), state.query, state.manage, draftMode,
+        ]);
+        const priorBody = container.querySelector?.('[data-reference-library-body="true"]');
+        if (visible && priorBody?.dataset?.referenceListView === "true"
+                && priorBody.dataset.referenceScrollVisible === "true") {
+            rememberScroll(priorBody.dataset.referenceScrollKey, priorBody.scrollTop);
+        }
+        container.innerHTML = "";
         const toolbar = el("div", "", "padding:8px;border-bottom:1px solid #303841;display:flex;gap:6px;flex:0 0 auto;");
         const search = el("input", "", `${css.input}flex:1;min-width:0;`);
         search.type = "search";
@@ -477,12 +510,25 @@ export function mountReferenceLibrary(container, host) {
         toolbar.append(search, manage, add);
         container.appendChild(toolbar);
         const body = el("div", "", "flex:1;min-height:0;overflow:auto;padding:8px;box-sizing:border-box;");
+        body.dataset.referenceLibraryBody = "true";
         container.appendChild(body);
         if (data.loading) { body.appendChild(el("div", "Loading references…", "color:#98a5b2;padding:18px;text-align:center;font-size:11px;")); return; }
         if (data.error) body.appendChild(el("div", data.error, "color:#e39a9a;margin-bottom:8px;font-size:11px;"));
         if (state.error) body.appendChild(el("div", state.error, "color:#e39a9a;margin-bottom:8px;font-size:11px;"));
-        if (state.entityDraft) { renderEntityEditor(body, data.references.find((entry) => entry.reference_id === state.entityDraft.reference_id)); return; }
+        if (state.entityDraft) {
+            // An entity editor is a different tree. Do not carry a list offset
+            // through it and later apply that offset to a newly rebuilt list.
+            scrollSnapshots.clear();
+            renderEntityEditor(body, data.references.find((entry) => entry.reference_id === state.entityDraft.reference_id));
+            return;
+        }
+        body.dataset.referenceListView = "true";
+        body.dataset.referenceScrollKey = scrollKey;
+        body.dataset.referenceScrollVisible = visible ? "true" : "false";
         const allAssets = data.assets || [];
+        body.addEventListener("scroll", () => {
+            if (containerIsVisible()) rememberScroll(scrollKey, body.scrollTop);
+        });
         const references = filterReferences(data.references, state.query, allAssets);
         if (!references.length) body.appendChild(el("div", data.references.length ? "No references match." : "No references yet.", "color:#788692;padding:18px;text-align:center;font-size:11px;"));
         for (const reference of references) {
@@ -639,6 +685,10 @@ export function mountReferenceLibrary(container, host) {
             }
             body.appendChild(card);
         }
+        if (visible) {
+            restoreScroll();
+            rememberScroll(scrollKey, body.scrollTop);
+        }
     };
 
     const reorder = (reference, member, direction) => {
@@ -652,6 +702,7 @@ export function mountReferenceLibrary(container, host) {
     render();
     return {
         render,
+        restoreScroll,
         reset,
         destroy() { state.destroyed = true; activeReferenceDrag = null; container.innerHTML = ""; },
     };

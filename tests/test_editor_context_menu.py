@@ -51,13 +51,18 @@ def test_prompt_menu_preserves_caret_focus_and_surface_specific_commit_contracts
     assert "caretRangeFromPoint" in chips and "caretPositionFromPoint" in chips
     assert "promptInsertionBookmark(editor)" in chips
     assert "restorePromptInsertion(editor, bookmark)" in chips
+    assert 'label: "Mention"' in chips
+    assert 'label: "Attach"' in chips
     assert 'label: "Insert at cursor"' in chips
     assert 'label: "Writing aid"' in chips
+    # Timeline inline and Writing already commit every inserted menu action.
     assert 'onInserted: async ({ attachment, identityCreateIntent })' in widget
     assert 'await onEnter?.({ close: false });' in widget
+    writing_insert = panel.split("onInserted: () => {", 1)[1].split("},", 1)[0]
+    assert "saveWritingState();" in writing_insert
+    # Global and Structured deliberately gate durable writes by insertion type.
     assert 'onInserted: ({ type, attachment, identityCreateIntent })' in panel
-    assert 'return type === "writing_aid" ? commitGlobal() : null' in panel
-    assert 'return type === "writing_aid" ? commitChannels() : null' in panel
+    assert panel.count('["writing_aid", "mention"].includes(type)') == 2
     assert "createContextPicker" not in chips + panel + widget
     assert "data-sonder-prompt-context-menu='1'" in panel
     assert "data-sonder-prompt-context-menu='1'" in widget

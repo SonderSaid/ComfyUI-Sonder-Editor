@@ -762,6 +762,10 @@ class N {
     if (at < 0) return this.appendChild(c);
     this.childNodes.splice(at, 0, c); c.parentElement=this; return c; }
   append(...cs){ for (const c of cs) if (c && c.tagName) this.appendChild(c); }
+  replaceChildren(...cs){
+    this.childNodes.length = 0; this._text = "";
+    for (const c of cs) if (c && c.tagName) this.appendChild(c);
+  }
   addEventListener(t,h){ (this._handlers[t] ||= []).push(h); }
   // A real removal, not a no-op: disposal is otherwise unobservable, so a
   // test could not tell a cleaned-up listener from a leaked one.
@@ -2103,7 +2107,7 @@ def test_async_context_menu_restores_caret_bookmark_before_insert():
                 return attachment;
             },
         });
-        await items[0].submenu[0].action();
+        await items.find((item) => item.label === "Attach").action();
 
         const cancelCalls = [];
         const cancelEditor = {
@@ -2116,7 +2120,7 @@ def test_async_context_menu_restores_caret_bookmark_before_insert():
             bookmark: mod.promptInsertionBookmark(cancelEditor),
             onCreate: async () => { cancelCalls.push("configure"); return null; },
         });
-        await cancelItems[0].submenu[0].action();
+        await cancelItems.find((item) => item.label === "Attach").action();
 
         const staleCalls = [];
         const staleEditor = {
@@ -2132,7 +2136,7 @@ def test_async_context_menu_restores_caret_bookmark_before_insert():
                 return attachment;
             },
         });
-        await staleItems[0].submenu[0].action();
+        await staleItems.find((item) => item.label === "Attach").action();
 
         const aidCalls = [];
         const aidEditor = {
@@ -2149,7 +2153,7 @@ def test_async_context_menu_restores_caret_bookmark_before_insert():
         // prompt. The dialog is built synchronously, so it can be driven before
         // awaiting the action it belongs to.
         globalThis.prompt = () => { throw new Error("native prompt must not be used"); };
-        const aidPromise = aidItems[1].submenu
+        const aidPromise = aidItems.find((item) => item.label === "Writing aid").submenu
             .find((item) => item.writingAidId === "cancel_aid").action();
         const aidBackdrop = document.body.children.at(-1);
         const aidDialogButtons = aidBackdrop.querySelectorAll("button")
@@ -3087,10 +3091,10 @@ def test_writing_aid_menu_shape_follows_what_the_aid_still_needs():
         const withSelection = mod.createPromptContextMenuItems({{
             editor, writingAids: aids,
             selection: {{ bookmark: null, text: "Hey, I am over here" }},
-        }})[1].submenu;
+        }}).find((item) => item.label === "Writing aid").submenu;
         const withoutSelection = mod.createPromptContextMenuItems({{
             editor, writingAids: aids,
-        }})[1].submenu;
+        }}).find((item) => item.label === "Writing aid").submenu;
         const shape = (rows) => rows.map((row) => ({{
             label: row.label,
             kind: row.submenu ? "submenu" : "action",
@@ -3139,7 +3143,7 @@ def test_single_optional_choice_offers_not_set_in_the_submenu():
                 { id: "opt", label: "Optional", text: "a {v}",
                   fields: { v: { type: "enum", optional: true, values: ["x"] } } },
             ],
-        })[1].submenu;
+        }).find((item) => item.label === "Writing aid").submenu;
         console.log(JSON.stringify(Object.fromEntries(
             rows.map((row) => [row.label, row.submenu.map((e) => e.label)]))));
     """)
@@ -3167,12 +3171,12 @@ def test_writing_aid_wraps_a_selection_and_closes_up_omitted_fields():
                 text: "<d>[{{language}}] {{text}}</d>",
                 fields: {{ language: {{ type: "enum", values: ["English"] }} }} }}],
             selection: {{ bookmark: null, text: "Hey, I am over here" }},
-        }})[1].submenu[0];
+        }}).find((item) => item.label === "Writing aid").submenu[0];
         await wrapRows.submenu.find((e) => e.label === "English").action();
 
         const cameraRows = mod.createPromptContextMenuItems({{
             editor, writingAids: [{_CAMERA_AID}],
-        }})[1].submenu[0];
+        }}).find((item) => item.label === "Writing aid").submenu[0];
         const cameraPromise = cameraRows.action();
         const backdrop = document.body.children.at(-1);
         const selects = backdrop.querySelectorAll("select");
@@ -3202,7 +3206,7 @@ def test_writing_aid_with_an_undeclared_vocabulary_reports_instead_of_no_op():
             editor,
             writingAids: [{ id: "broken", label: "Broken", text: "a {v}",
                 fields: { v: { type: "enum", values: [] } } }],
-        })[1].submenu[0];
+        }).find((item) => item.label === "Writing aid").submenu[0];
         await row.action();
         console.log(JSON.stringify({ calls, kind: row.submenu ? "submenu" : "action" }));
     """)
@@ -3227,7 +3231,8 @@ def test_writing_aids_are_hidden_outside_the_channels_they_declare():
         ];
         const row = (channelKey) => {
             const entry = mod.createPromptContextMenuItems({
-                editor, writingAids, channelKey })[1];
+                editor, writingAids, channelKey }).find(
+                    (item) => item.label === "Writing aid");
             return { labels: entry.submenu.map((e) => e.label),
                 disabled: Boolean(entry.disabled), hint: entry.hint || "" };
         };
@@ -3254,7 +3259,8 @@ def test_a_channel_with_no_aids_says_so_instead_of_showing_a_dead_row():
         };
         const entry = (writingAids, channelKey) => {
             const row = mod.createPromptContextMenuItems({
-                editor, writingAids, channelKey })[1];
+                editor, writingAids, channelKey }).find(
+                    (item) => item.label === "Writing aid");
             return { disabled: Boolean(row.disabled), hint: row.hint || "" };
         };
         console.log(JSON.stringify({
@@ -3328,135 +3334,203 @@ def test_no_builtin_format_offers_the_context_kind():
 
 
 _ATTACH_SCENE = """{
-    duration_frames: 100, reference_lane_count: 1,
-    reference_lane_configs: [{}],
-    _context_consumer_start: 0, _context_consumer_end: 100,
+    duration_frames: 100, reference_lane_count: 2,
+    reference_lane_configs: [{}, {}],
+    _context_consumer_start: 50, _context_consumer_end: 100,
     reference_lane_recipes: [
-        { lane_id: "lane0", recipe: { soft: { compatible_profiles: ["generic@1"] } } },
-        { lane_id: "lane1", recipe: { soft: { compatible_profiles: ["other@1"] } } },
+        { lane_id: "lane0", recipe: { soft: { compatible_profiles: ["generic@1"], physical_population: "pictures" } } },
+        { lane_id: "lane1", recipe: { soft: { compatible_profiles: ["generic@1"], physical_population: "pictures" } } },
     ],
     reference_items: [
         { reference_item_id: "hero", lane_index: 0, start_frame: 0, end_frame: 100,
-          members: [{ member_id: "m1", entity_id: "e1" }] },
-        { reference_item_id: "wrong", lane_index: 1, start_frame: 0, end_frame: 100,
+          members: [{ member_id: "m1", entity_id: "e1" },
+                    { member_id: "m3", entity_id: "e3" }] },
+        { reference_item_id: "wrong", lane_index: 1, start_frame: 0, end_frame: 40,
           members: [{ member_id: "m2", entity_id: "e2" }] },
     ],
 }"""
 
 
-def test_reference_row_attaches_a_handle_without_the_dialog():
+def test_menu_mentions_insert_text_and_attach_keeps_the_caret_dialog_path():
     result = _run_chip_dom_script(f"""
-        const inserted = [];
+        const texts = [];
+        const attachments = [];
+        const insertedEvents = [];
+        const restored = [];
+        const bookmark = {{ start: {{ node_id: "body", offset: 7 }} }};
         const editor = {{
-            capturePromptSelection: () => null,
-            restorePromptSelection: () => true,
-            insertAttachment(value) {{ inserted.push(value); }},
+            restorePromptSelection(value) {{ restored.push(value); return true; }},
+            insertText(value) {{ texts.push(value); }},
+            insertAttachment(value) {{ attachments.push(value); }},
         }};
         let dialogOpened = 0;
-        const row = mod.createPromptContextMenuItems({{
-            editor, allowedKinds: ["reference"],
-            onCreate: async (a) => {{ dialogOpened += 1; return a; }},
+        const items = mod.createPromptContextMenuItems({{
+            editor, bookmark, allowedKinds: ["reference", "shot"],
+            onCreate: async (attachment) => {{
+                dialogOpened += 1;
+                return {{ attachment }};
+            }},
+            onInserted: async (event) => insertedEvents.push(event),
             referenceContext: {{
                 scene: {_ATTACH_SCENE},
-                references: [{{ reference_id: "e1", name: "Hero" }},
-                            {{ reference_id: "e2", name: "Wrong" }}],
-                semanticUnits: [], profileId: "generic@1", scope: "section",
-                resolvedProfile: {{ profile_id: "generic" }},
+                references: [
+                    {{ reference_id: "e1", name: "Hero", members: [
+                        {{ member_id: "m1", handle: "HeroPhysical" }}] }},
+                    {{ reference_id: "e2", name: "Wrong", members: [
+                        {{ member_id: "m2", handle: "WrongPhysical" }}] }},
+                    {{ reference_id: "e3", name: "Unnamed", members: [
+                        {{ member_id: "m3", handle: "" }}] }},
+                ],
+                semanticUnits: [{{ semantic_unit_id: "unit-hero",
+                    name: "Hero identity", handle: "HeroIdentity",
+                    sources: [{{ entity_id: "e1", member_id: "m1" }}] }}],
+                profileId: "generic@1", scope: "section",
+                resolvedProfile: {{ profile_id: "generic",
+                    physical_populations: [{{ key: "pictures" }}],
+                    identity_kinds: [{{ key: "subject" }}] }},
             }},
-        }})[0].submenu[0];
-        const entries = row.submenu.map((e) => ({{
-            label: e.label || "", disabled: Boolean(e.disabled),
-            separator: e.type === "separator",
+        }});
+        const mention = items.find((item) => item.label === "Mention");
+        const attach = items.find((item) => item.label === "Attach");
+        const insert = items.find((item) => item.label === "Insert at cursor");
+        const entries = mention.submenu.map((entry) => ({{
+            label: entry.label || "", hint: entry.hint || "",
+            disabled: Boolean(entry.disabled), separator: entry.type === "separator",
         }}));
-        await row.submenu.find((e) => (e.label || "").includes("Hero")).action();
-        console.log(JSON.stringify({{ entries, inserted, dialogOpened }}));
-    """)
-    labels = [entry["label"] for entry in result["entries"]]
-    # The dialog is one row away, not gone.
-    assert labels[0] == "Configure…"
-    assert result["dialogOpened"] == 0
-
-    hero = next(e for e in result["entries"] if "Hero" in e["label"])
-    wrong = next(e for e in result["entries"] if "Wrong" in e["label"])
-    assert not hero["disabled"]
-    # Ineligible sources stay visible and dimmed, carrying the dialog's reason.
-    assert wrong["disabled"]
-    assert "incompatible prompt format" in wrong["label"]
-
-    # The chip is inserted with no overrides, so it FOLLOWS its Reference
-    # defaults rather than freezing a copy of them at attach time. This stub
-    # profile declares no capabilities at all, so nothing is seeded either —
-    # the mention seed is covered by the test below.
-    assert len(result["inserted"]) == 1
-    chip = result["inserted"][0]
-    assert chip["kind"] == "reference"
-    assert chip["source"]["reference_item_id"] == "hero"
-    assert chip["capabilities"] == []
-    assert not chip["config"].get("overrides")
-
-
-_MENTION_PROFILE = """{
-    profile_id: "mentions_format", version: "1",
-    capabilities: { reference: { derived: {
-        definitions: { order: 1, channel_key: "subject_definitions",
-                       placement: "section_prefix", label: "Definition" },
-        mentions: { order: 4, channel_key: "detailed_description",
-                    placement: "inline", label: "Scene mention" },
-    } } },
-}"""
-_NO_MENTION_PROFILE = """{
-    profile_id: "generic", version: "1",
-    capabilities: { reference: { derived: {
-        derived_prompt: { order: 1, channel_key: "visual",
-                          placement: "inline", label: "Reference prompt" },
-    } } },
-}"""
-
-
-def test_a_handle_attach_seeds_the_declared_mention_capability():
-    """A handle is a MENTION, not a definition block.
-
-    `@KWoman is leaning then @Doggo appears` wants each handle resolved to the
-    format's canonical token inside the sentence. Seeding no capability made
-    the compiler fall back to the LOWEST-`order` declaration instead, which is
-    `definitions` — so a handle emitted a definition line into another channel.
-    """
-    result = _run_chip_dom_script(f"""
-        const inserted = [];
-        const editor = {{
-            capturePromptSelection: () => null,
-            restorePromptSelection: () => true,
-            insertAttachment(value) {{ inserted.push(value); }},
-        }};
-        const attach = async (resolvedProfile) => {{
-            const row = mod.createPromptContextMenuItems({{
-                editor, allowedKinds: ["reference"],
-                referenceContext: {{
-                    scene: {_ATTACH_SCENE},
-                    references: [{{ reference_id: "e1", name: "Hero" }}],
-                    semanticUnits: [], profileId: "generic@1", scope: "section",
-                    resolvedProfile,
-                }},
-            }})[0].submenu[0];
-            await row.submenu.find((e) => (e.label || "").includes("Hero")).action();
-            return inserted[inserted.length - 1];
-        }};
-        const declaring = await attach({_MENTION_PROFILE});
-        const notDeclaring = await attach({_NO_MENTION_PROFILE});
+        await mention.submenu.find((entry) => entry.label === "@HeroIdentity").action();
+        await mention.submenu.find((entry) => entry.label === "@WrongPhysical").action();
+        const beforeAttach = {{ attachmentCount: attachments.length, dialogOpened }};
+        await attach.action();
         console.log(JSON.stringify({{
-            declaring: declaring.capabilities,
-            notDeclaring: notDeclaring.capabilities,
+            topLabels: items.map((item) => item.label), entries, texts,
+            beforeAttach, dialogOpened,
+            attachmentKinds: attachments.map((value) => value.kind),
+            eventTypes: insertedEvents.map((event) => event.type),
+            eventTexts: insertedEvents.map((event) => event.text || ""),
+            insertKinds: insert.submenu.map((item) => item.kind),
+            restored,
         }}));
     """)
-    # Exact equality is the sparsity assertion: `capability_id` and `kind` and
-    # nothing else. A stored `channel_key`/`placement` would freeze this chip's
-    # routing against a later format change, and a stored `enabled` would turn
-    # the tri-state into an authored deviation from a default that may be off.
-    assert result["declaring"] == [
-        {"capability_id": "mentions", "kind": "mentions"}]
-    # Declaration-driven, so a format without `mentions` seeds nothing and
-    # keeps the compiler's format default — `generic@1` is exactly that case.
-    assert result["notDeclaring"] == []
+    assert result["topLabels"] == [
+        "Mention", "Attach", "Insert at cursor", "Writing aid"]
+    assert result["insertKinds"] == ["shot"]
+    assert result["texts"] == ["@HeroIdentity", "@WrongPhysical"]
+    assert result["beforeAttach"] == {"attachmentCount": 0, "dialogOpened": 0}
+    assert result["dialogOpened"] == 1
+    assert result["attachmentKinds"] == ["reference"]
+    assert result["eventTypes"] == ["mention", "mention", "attachment"]
+    assert result["eventTexts"][:2] == ["@HeroIdentity", "@WrongPhysical"]
+    wrong = next(row for row in result["entries"]
+                 if row["label"] == "@WrongPhysical")
+    assert wrong["disabled"] is False
+    handleless = next(row for row in result["entries"]
+                      if "Unnamed" in row["label"])
+    assert handleless["disabled"] is True
+    assert handleless["hint"] == "Set its handle in Reference Prompting"
+    assert len(result["restored"]) == 3
+
+
+def test_menu_mention_commits_each_surface_shape_before_blur():
+    """Insertion completes each host's durable callback in the same action."""
+    result = _run_chip_dom_script(f"""
+        const stores = {{}};
+        const contexts = {{
+            scene: {_ATTACH_SCENE},
+            references: [{{ reference_id: "e1", name: "Hero", members: [
+                {{ member_id: "m1", handle: "HeroPhysical" }}] }}],
+            semanticUnits: [{{ semantic_unit_id: "unit-hero", name: "Hero identity",
+                handle: "HeroIdentity", sources: [{{ entity_id: "e1", member_id: "m1" }}] }}],
+            profileId: "generic@1", scope: "section",
+            resolvedProfile: {{ physical_populations: [{{ key: "pictures" }}] }},
+        }};
+        const run = async (surface, onInserted) => {{
+            const editor = {{
+                value: "",
+                restorePromptSelection() {{ return true; }},
+                insertText(value) {{ this.value += value; }},
+            }};
+            const items = mod.createPromptContextMenuItems({{
+                editor, allowedKinds: ["reference"], referenceContext: contexts,
+                onInserted: (event) => onInserted(editor, event),
+            }});
+            await items.find((item) => item.label === "Mention").submenu
+                .find((item) => item.label === "@HeroIdentity").action();
+            return editor.value;
+        }};
+        // These are the four real persistence shapes: Writing snapshots then
+        // saves, timeline delegates to onEnter, and Global/Structured widen
+        // their immediate-commit gates for mention text.
+        const writing = await run("writing", async (editor) => {{
+            stores.writing = editor.value;
+        }});
+        const timeline = await run("timeline", async (editor) => {{
+            stores.timeline = editor.value;
+        }});
+        const global = await run("global", async (editor, event) => {{
+            if (["writing_aid", "mention"].includes(event.type)) stores.global = editor.value;
+        }});
+        const structured = await run("structured", async (editor, event) => {{
+            if (["writing_aid", "mention"].includes(event.type)) stores.structured = editor.value;
+        }});
+        console.log(JSON.stringify({{ stores, values: {{ writing, timeline, global, structured }} }}));
+    """)
+    expected = {name: "@HeroIdentity" for name in
+                ("writing", "timeline", "global", "structured")}
+    assert result["values"] == expected
+    assert result["stores"] == expected
+
+
+def test_typeahead_accepts_an_out_of_window_handle_as_plain_text():
+    """Attach eligibility must not gate text that the author could type."""
+    result = _run_chip_dom_script(f"""
+        const handlers = {{}};
+        const owned = [];
+        const inserted = [];
+        const accepted = [];
+        const editor = {{
+            value: "@WrongPhysical",
+            promptTextOffset: 14,
+            isConnected: true,
+            isPromptComposing: () => false,
+            addEventListener(name, handler) {{
+                (handlers[name] ||= []).push(handler);
+            }},
+            removeEventListener(name, handler) {{
+                handlers[name] = (handlers[name] || []).filter(
+                    (value) => value !== handler);
+            }},
+            addOwnedKeyHandler(handler) {{
+                owned.push(handler);
+                return () => {{}};
+            }},
+            getBoundingClientRect: () => ({{ left: 10, top: 10,
+                right: 210, bottom: 30, width: 200, height: 20 }}),
+            insertText(text, options) {{ inserted.push({{ text, options }}); }},
+        }};
+        const cleanup = mod.installPromptContextMenu({{
+            editor,
+            referenceContext: () => ({{
+                scene: {_ATTACH_SCENE},
+                references: [{{ reference_id: "e2", name: "Wrong",
+                    members: [{{ member_id: "m2", handle: "WrongPhysical" }}] }}],
+                semanticUnits: [], profileId: "generic@1", scope: "section",
+                resolvedProfile: {{ physical_populations: [{{ key: "pictures" }}] }},
+            }}),
+            onMentionAccepted: (spelling) => accepted.push(spelling),
+        }});
+        for (const handler of handlers.input || []) handler({{}});
+        const claimed = owned.map((handler) => handler({{
+            key: "Enter", isComposing: false, keyCode: 0,
+        }}));
+        cleanup();
+        console.log(JSON.stringify({{ inserted, accepted, claimed }}));
+    """)
+    assert result["inserted"] == [{
+        "text": "@WrongPhysical",
+        "options": {"replaceTextRange": {"start": 0, "end": 14}},
+    }]
+    assert result["accepted"] == ["@WrongPhysical"]
+    assert result["claimed"] == [False, True]
 
 
 def _mention_seed_compile(capabilities):
@@ -3602,7 +3676,7 @@ def test_reference_row_falls_back_to_the_dialog_without_a_context():
         const row = mod.createPromptContextMenuItems({
             editor, allowedKinds: ["reference"],
             onCreate: async (a) => a,
-        })[0].submenu[0];
+        }).find((item) => item.label === "Attach");
         console.log(JSON.stringify({
             hasSubmenu: Boolean(row.submenu),
             isAction: typeof row.action === "function",
@@ -3626,7 +3700,7 @@ def test_an_unresolvable_caret_appends_instead_of_inserting_at_position_zero():
         const row = mod.createPromptContextMenuItems({
             editor, writingAids: [{ id: "c", label: "Cutoff", text: "<cutoff>" }],
             selection: { bookmark: null, text: "" },
-        })[1].submenu[0];
+        }).find((item) => item.label === "Writing aid").submenu[0];
         await row.action();
         console.log(JSON.stringify({ calls }));
     """)
@@ -4232,9 +4306,8 @@ def test_a_channel_contribution_resolves_its_text_label_and_placement():
 def test_accepting_a_mention_replaces_the_query_it_completes():
     """The typed `@KWo` must go, or the completion lands beside it.
 
-    `insertAttachment` has taken `replaceTextRange` since the mention menu was
-    built; now that a mention is TEXT rather than a chip, `insertText` needs the
-    same option for the same caller. Without it the accepted spelling is
+    Now that a mention is TEXT rather than a chip, `insertText` owns the
+    completion replacement range. Without it the accepted spelling is
     inserted at the caret while the partial query stays put, and the prose reads
     `@KWo@KWoman` — which then resolves the second and leaves the first as
     literal text.
@@ -5032,7 +5105,7 @@ def test_a_focused_mention_control_reflows_instead_of_covering_the_prose():
     on layout, which is what makes this safe here and not there.
     """
     result = _run_chip_dom_script("""
-        const attachment = { attachment_id: "ref", kind: "reference",
+        const attachment = { attachment_id: "ref", kind: "vocal_event",
             source: {}, config: {} };
         const editor = mod.createPromptDocumentEditor({
             document: { nodes: [
@@ -5050,8 +5123,12 @@ def test_a_focused_mention_control_reflows_instead_of_covering_the_prose():
         const host = hostOf(chip)[0];
         const glyph = (host.children || []).find((c) =>
             c.dataset?.sonderChipEditAffordance === "1");
-        const snap = () => ({ position: host.style.position,
-                              opacity: glyph.style.opacity });
+        const snap = () => ({
+            position: host.style.position,
+            pointerEvents: host.style.pointerEvents,
+            opacity: glyph.style.opacity,
+            glyphPointerEvents: glyph.style.pointerEvents,
+        });
         const rest = snap();
         chip._handlers.focusin[0]();
         const focused = snap();
@@ -5060,10 +5137,14 @@ def test_a_focused_mention_control_reflows_instead_of_covering_the_prose():
     """)
     # At rest: out of flow and unpainted, so a hidden control costs no width.
     assert result["rest"]["position"] == "absolute", result
+    assert result["rest"]["pointerEvents"] == "none", result
     assert result["rest"]["opacity"] == "0", result
+    assert result["rest"]["glyphPointerEvents"] == "none", result
     # Focused: in flow, so the sentence moves aside rather than being covered.
     assert result["focused"]["position"] == "static", result
+    assert result["focused"]["pointerEvents"] != "none", result
     assert result["focused"]["opacity"] != "0", result
+    assert result["focused"]["glyphPointerEvents"] != "none", result
     # And blurring puts the gap back, or every visited handle would keep a hole.
     assert result["back"] == result["rest"], result
 

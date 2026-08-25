@@ -1447,7 +1447,7 @@ function handleCss() {
         white-space:normal;`;
 }
 
-/** Whether a rendered label is a handle mention rather than a described chip. */
+/** Whether an attachment's rendered label uses compact handle-shaped chrome. */
 export function isHandleLabel(label) {
     return /^@\S/.test(String(label || ""));
 }
@@ -1966,6 +1966,7 @@ export function createPromptDocumentEditor({
                 const affordances = [editGlyph, remove];
                 const reveal = (shown) => {
                     affordanceHost.style.position = shown ? "static" : "absolute";
+                    affordanceHost.style.pointerEvents = shown ? "" : "none";
                     for (const element of affordances) {
                         element.style.opacity = shown ? "" : "0";
                         element.style.pointerEvents = shown ? "" : "none";
@@ -2225,26 +2226,10 @@ export function createPromptDocumentEditor({
         event.stopPropagation();
     });
 
-    /** Insert a chip, optionally replacing a run of text in `value` coordinates.
-     *
-     *  `replaceTextRange` exists for the mention menu: it has to remove the
-     *  `@KWo` the author typed and put the chip in its place. Without it the
-     *  literal query survives beside the chip — the very thing that made a
-     *  typed mention compile as prose. Splicing the text out first is not an
-     *  option either: that re-renders, drops the selection, and the chip then
-     *  lands at the end of the document.
-     */
-    const insertAttachment = (rawAttachment, capabilityId = "", { replaceTextRange = null } = {}) => {
+    /** Insert a configured contribution chip at the active caret. */
+    const insertAttachment = (rawAttachment, capabilityId = "") => {
         if (disabled) return null;
         pushHistory();
-        let replaced = null;
-        if (replaceTextRange && Number.isFinite(replaceTextRange.start)
-                && Number.isFinite(replaceTextRange.end)
-                && replaceTextRange.end > replaceTextRange.start) {
-            const from = modelPositionForTextOffset(replaceTextRange.start);
-            const to = modelPositionForTextOffset(replaceTextRange.end);
-            if (from && to) replaced = deleteModelSpan(from, to);
-        }
         const attachment = normalizePromptAttachment(rawAttachment);
         attachments = [...attachments.filter((value) => value.attachment_id !== attachment.attachment_id), attachment];
         const node = { type: "attachment", node_id: uid(), attachment_id: attachment.attachment_id };
@@ -2256,9 +2241,7 @@ export function createPromptDocumentEditor({
         // on the editor element — the shape `focusFirst()` produces — so a
         // caret-menu attach after a programmatic focus placed the chip at the
         // bottom of the document instead of where the author was.
-        const target = replaced
-            ? { index: replaced.index, offset: replaced.offset }
-            : modelPositionFor(selectionBookmark()?.start);
+        const target = modelPositionFor(selectionBookmark()?.start);
         let index = target ? target.index : model.nodes.length;
         if (target && model.nodes[target.index]?.type === "text") {
             const current = model.nodes[target.index];
@@ -3102,24 +3085,6 @@ function writingAidMenuItem(editor, selection, aid, onInserted) {
     };
 }
 
-/**
- * `@KWoman.speaker` → `{handle: "KWoman", qualifier: "speaker"}`.
- *
- * The dotted suffix is the CAPABILITY QUALIFIER: the explicit way to say which
- * declared capability a handle seeds when the channel's own answer is not the
- * one wanted. Splitting on the first dot is unambiguous because a handle cannot
- * contain one (`PROMPT_HANDLE_RE` in `server/prompt_context.py` is
- * `[A-Za-z][A-Za-z0-9_]{0,63}`), so everything after it is the qualifier.
- *
- * Pure text → parts. Whether the qualifier names a real capability is
- * `handleAttachCapabilityKind`'s question, not this one's.
- */
-export function parseHandleMention(text) {
-    const raw = String(text || "").trim().replace(/^@/, "");
-    const dot = raw.indexOf(".");
-    if (dot < 0) return { handle: raw, qualifier: "" };
-    return { handle: raw.slice(0, dot), qualifier: raw.slice(dot + 1) };
-}
 
 /**
  * Mention rows for a typeahead: an attachable source that HAS a spelling.
@@ -3131,8 +3096,9 @@ export function parseHandleMention(text) {
  *
  * A source with no handle is DROPPED, not shown greyed: a typeahead completes
  * a spelling, and a source without one has nothing to type. Ineligible sources
- * are kept with their reason so the menu explains rather than omits, matching
- * the caret menu — but they cannot be accepted.
+ * retain the attach verdict as metadata but remain insertable: prose is not an
+ * attachment, and an unstaged or out-of-window spelling produces the compiler's
+ * deliberately non-blocking `unresolved_handle_mention` warning.
  */
 export function promptMentionCandidates({ options = null, references = [],
     semanticUnits = [] } = {}) {
@@ -3217,9 +3183,8 @@ export function handleMentionCandidates(query, options = []) {
         if (needle && position < 0) return;
         scored.push({
             // The WHOLE row is carried through. Returning only `{handle,label}`
-            // silently dropped `value` — the source id an accept needs to build
-            // the attachment — so a completed mention produced a chip whose
-            // source was empty and which therefore referenced nothing at all.
+            // would discard source and eligibility metadata used to describe
+            // the candidate, even though accept only inserts its handle text.
             row: typeof option === "string"
                 ? { handle: value, label: value }
                 : { ...option, handle: value, label: String(option?.label || value) },
@@ -3232,97 +3197,8 @@ export function handleMentionCandidates(query, options = []) {
         .map(({ row }) => row);
 }
 
-/**
- * The capability kind a handle attach seeds, or "" for the format default.
- *
- * A handle is an ATTACHMENT rendered as text, and which declared capability it
- * seeds decides where its output goes. Three authorities, most specific first:
- *
- * 1. **The dotted qualifier** — explicit, and only honoured when the format
- *    actually declares that kind. An undeclared qualifier falls through rather
- *    than seeding a kind nothing can compile.
- * 2. **The channel being written in** — the capability declaring this
- *    `channel_key`, lowest `order` winning a tie (`summary` beats
- *    `audio_relationship`, which share `summary` under H3 Full Reference).
- *    Attaching while writing in `subject_definitions` used to seed `mentions`,
- *    whose declared route is `detailed_description`, so the chip emitted into a
- *    channel other than the one it was placed in.
- * 3. **`mentions`** — the prose default, for a channel no capability claims.
- *
- * Declaration-driven throughout: `generic@1` declares only `derived_prompt`, so
- * a `visual` attach resolves to it by channel and every other channel answers
- * "" and takes the format default.
- */
-const MENTION_CAPABILITY_KIND = "mentions";
-export function handleAttachCapabilityKind(profile,
-    { channelKey = "", qualifier = "" } = {}) {
-    const declared = orderedReferenceDerived(profile);
-    const kinds = new Set(declared.map(([kind]) => kind));
-    if (qualifier && kinds.has(qualifier)) return qualifier;
-    const key = String(channelKey || "");
-    if (key) {
-        // `declared` is already ordered by (order, kind), so the first match IS
-        // the lowest-order claimant.
-        const claimed = declared.find(([, declaration]) =>
-            String(declaration?.channel_key || "") === key);
-        if (claimed) return claimed[0];
-    }
-    return kinds.has(MENTION_CAPABILITY_KIND) ? MENTION_CAPABILITY_KIND : "";
-}
-
-/**
- * The `capabilities` array a handle attach stores — usually empty.
- *
- * Records stay SPARSE: the compiler already falls back to the lowest-`order`
- * declared capability (`_default_capability`), so storing that same kind writes
- * an authored deviation where the author deviated from nothing. Only a kind
- * that differs from the format default is worth a record. `capability_id` and
- * `kind` only — no `channel_key`/`placement`, which would freeze this chip's
- * routing at attach time, and no `enabled`, which would resolve the tri-state
- * out of inheriting its Reference or identity default.
- */
-export function handleAttachCapabilityRecord(profile, options = {}) {
-    const kind = handleAttachCapabilityKind(profile, options);
-    if (!kind) return [];
-    // Deliberately NOT `orderedReferenceDerived(profile)[0]`. That helper reads
-    // a missing `order` as 0, putting such a capability FIRST, while the server's
-    // `_default_capability` reads it as MAX_CAPABILITIES and puts it LAST. For
-    // display ordering the difference is cosmetic; here it decides whether a
-    // record is written at all, and guessing wrong means the chip silently
-    // compiles as a capability the author never chose. So mirror the server's
-    // rule exactly — `(order ?? last, kind)` — and omit a record only when the
-    // two genuinely agree. Storing one is always semantically correct; it is
-    // only less sparse, which is the safe direction to err in.
-    const MAX_ORDER = Number.MAX_SAFE_INTEGER;
-    let defaultKind = "";
-    let best = null;
-    for (const [candidate, declaration] of orderedReferenceDerived(profile)) {
-        const order = Number.isFinite(Number(declaration?.order))
-            ? Number(declaration.order) : MAX_ORDER;
-        if (best === null || order < best
-                || (order === best && candidate < defaultKind)) {
-            best = order; defaultKind = candidate;
-        }
-    }
-    if (kind === defaultKind) return [];
-    return [{ capability_id: kind, kind }];
-}
-
-/**
- * The `Reference` row: attach a handle directly, or open the full dialog.
- *
- * Physical References now carry the same prompt defaults an identity does, so a
- * chip inserted with no overrides resolves to real text — which is what makes a
- * one-click attach worth offering at all. The dialog stays one row away, and
- * remains reachable from the chip itself afterwards, so this demotes it from a
- * toll gate to an edit step rather than removing it.
- *
- * Ineligible sources stay visible and dimmed with the reason the Attach dialog
- * would have given, because "my Reference is missing" is a worse question than
- * "why is it greyed out".
- */
-function referenceAttachItem(editor, bookmark, referenceContext, onCreate,
-    onInserted, channelKey = "") {
+/** The one caret-anchored path that creates a contributing Reference chip. */
+function referenceAttachItem(editor, bookmark, onCreate, onInserted) {
     const openDialog = async () => {
         const attachment = normalizePromptAttachment({ kind: "reference" });
         const result = onCreate ? await onCreate(attachment) : { attachment };
@@ -3335,48 +3211,53 @@ function referenceAttachItem(editor, bookmark, referenceContext, onCreate,
                 identityCreateIntent: configured.identityCreateIntent });
         }
     };
+    return { label: "Attach", kind: "reference", action: openDialog };
+}
+
+/** A discovery menu for the same plain-text handles an author can type. */
+function referenceMentionItem(editor, bookmark, referenceContext, onInserted) {
     if (!referenceContext) {
-        return { label: LABELS.reference, kind: "reference", action: openDialog };
+        return { label: "Mention", disabled: true,
+            hint: "Reference sources are unavailable" };
     }
-    const { options, usesDeclaredSources, unitOptions, physicalOptions } =
+    const { unitOptions, physicalOptions } =
         promptReferenceSourceOptions(referenceContext);
-    // Inferred from the channel this menu was opened in. No dotted qualifier is
-    // reachable from a menu row — a typed `@handle.capability` is what supplies
-    // one — so this is the channel-inferred half of the same resolution.
-    const seededCapabilities = handleAttachCapabilityRecord(
-        referenceContext.resolvedProfile, { channelKey });
-    const attach = (value) => async () => {
-        const attachment = applyPromptReferenceSource(
-            normalizePromptAttachment({ kind: "reference" }), value);
-        // No overrides either, so the chip follows its Reference or identity
-        // defaults instead of freezing a copy of them.
-        if (seededCapabilities.length) {
-            attachment.capabilities = structuredClone(seededCapabilities);
-        }
-        if (!restorePromptInsertion(editor, bookmark)) return;
-        editor?.insertAttachment?.(attachment);
-        await onInserted?.({ type: "attachment", attachment });
-    };
-    const row = ([value, label, eligible]) => ({
-        label: String(label),
-        disabled: !eligible,
-        action: eligible ? attach(value) : undefined,
+    const candidates = promptMentionCandidates({
+        options: { unitOptions, physicalOptions },
+        references: referenceContext.references || [],
+        semanticUnits: referenceContext.semanticUnits || [],
     });
-    // Identities and physical sources stay visibly separate, as they are
-    // everywhere else in the tool.
-    const grouped = usesDeclaredSources
-        ? [...unitOptions.map(row),
-            ...(unitOptions.length && physicalOptions.length
-                ? [{ type: "separator" }] : []),
-            ...physicalOptions.map(row)]
-        : options.map(row);
+    const candidateByValue = new Map(candidates.map((candidate) =>
+        [String(candidate.value || ""), candidate]));
+    const insert = (candidate) => async () => {
+        const spelling = `@${candidate.handle}`;
+        if (!restorePromptInsertion(editor, bookmark)) return;
+        editor?.insertText?.(spelling);
+        await onInserted?.({ type: "mention", text: spelling });
+    };
+    const row = ([value, label]) => {
+        const candidate = candidateByValue.get(String(value || ""));
+        return candidate ? {
+            label: `@${candidate.handle}`,
+            hint: String(label || candidate.label || candidate.handle),
+            action: insert(candidate),
+        } : {
+            label: String(label || value || "Reference"),
+            disabled: true,
+            hint: "Set its handle in Reference Prompting",
+        };
+    };
+    const grouped = [
+        ...unitOptions.map(row),
+        ...(unitOptions.length && physicalOptions.length
+            ? [{ type: "separator" }] : []),
+        ...physicalOptions.map(row),
+    ];
     return {
-        label: LABELS.reference,
-        kind: "reference",
-        submenu: [
-            { label: "Configure…", action: openDialog },
-            ...(grouped.length ? [{ type: "separator" }, ...grouped] : []),
-        ],
+        label: "Mention",
+        disabled: !grouped.length,
+        hint: grouped.length ? "" : "No Reference sources",
+        submenu: grouped,
     };
 }
 
@@ -3385,17 +3266,22 @@ export function createPromptContextMenuItems({ editor, bookmark = null,
     writingAids = [], channelKey = "", profile = null,
     referenceContext = null, onInserted = null } = {}) {
     const kinds = promptContextAuthoringKinds(allowedKinds, profile);
+    const insertionKinds = kinds.filter((kind) => kind !== "reference");
+    const hasReference = insertionKinds.length !== kinds.length;
     const declared = promptWritingAids(writingAids);
     const aids = promptWritingAids(writingAids, channelKey);
     // An attachment always lands at a collapsed caret so a chip cannot swallow
     // authored prose; only a writing aid consults the live range.
     const aidSelection = selection || { bookmark, text: "" };
-    return [{
+    const items = [];
+    if (hasReference) {
+        items.push(
+            referenceMentionItem(editor, bookmark, referenceContext, onInserted),
+            referenceAttachItem(editor, bookmark, onCreate, onInserted));
+    }
+    if (insertionKinds.length) items.push({
         label: "Insert at cursor",
-        submenu: kinds.map((kind) => kind === "reference"
-            ? referenceAttachItem(editor, bookmark, referenceContext, onCreate,
-                onInserted, channelKey)
-            : {
+        submenu: insertionKinds.map((kind) => ({
                 label: LABELS[kind] || kind,
                 kind,
                 action: async () => {
@@ -3410,8 +3296,9 @@ export function createPromptContextMenuItems({ editor, bookmark = null,
                             identityCreateIntent: configured.identityCreateIntent });
                     }
                 },
-            }),
-    }, {
+            })),
+    });
+    items.push({
         label: "Writing aid",
         disabled: !aids.length,
         // A row that is empty because this channel declares no aids is a
@@ -3421,18 +3308,16 @@ export function createPromptContextMenuItems({ editor, bookmark = null,
             : `None for ${channelKey}`,
         submenu: aids.map((aid) =>
             writingAidMenuItem(editor, aidSelection, aid, onInserted)),
-    }];
+    });
+    return items;
 }
 
 /** Install right-click and keyboard Context authoring on one prompt box. */
 /** Typeahead for `@handle` while writing prose, on ANY channel editor.
  *
- *  Accepting ATTACHES a Reference. It used to insert text, on the reasoning
- *  that attaching per keystroke would make an undo step per character — which
- *  confused a keystroke with an accept. The text version was worse than
- *  incomplete: the compiler's grammar is `@kind(source_id)`, so a bare
- *  `@KWoman` in prose compiles literally and never becomes `<Subject 1>`. Only
- *  an attachment resolves.
+ *  Accepting inserts the same bare `@handle` text an author can type. The
+ *  compiler resolves that spelling when its source is staged and in-window;
+ *  no Reference attachment or contribution configuration is created.
  *
  *  `sources()` is called once per menu OPEN, not per keystroke: the only
  *  builder of the shape it needs also reconciles block metadata and can clone
@@ -3496,16 +3381,12 @@ export function installPromptMentionMenu(area, { sources, onAccepted } = {}) {
     const accept = (index) => {
         const chosen = rows[index];
         if (!chosen || !query) return close();
-        // An ineligible source is listed so the menu can explain itself, but it
-        // cannot be attached — accepting one would create a chip the compiler
-        // will refuse.
-        if (chosen.eligible === false) return;
         const attached = onAccepted?.({
             handle: chosen.handle,
             value: chosen.value,
             // In `value` coordinates, so the editor can delete the typed query
-            // and put the chip in its place. Leaving the text behind is what
-            // made a mention compile literally.
+            // and put the accepted spelling in its place. Leaving the query
+            // behind would produce two adjacent mention runs.
             replaceTextRange: { start: query.start, end: query.end },
         });
         close();

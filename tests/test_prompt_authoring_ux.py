@@ -1057,6 +1057,8 @@ def test_prompt_tool_rebuilds_scope_rows_after_attachment_transactions():
 
 def test_context_actions_are_named_by_inline_vs_scope_semantics():
     chips = _source("web/js/prompt_context_chips.js")
+    assert 'label: "Mention"' in chips
+    assert 'label: "Attach"' in chips
     assert 'label: "Insert at cursor"' in chips
     assert 'label: "Writing aid"' in chips
     assert "export function installPromptContextMenu" in chips
@@ -4066,121 +4068,6 @@ def _run_chips_script(body):
         f"{body}\n")
 
 
-def test_handle_mention_splits_its_capability_qualifier_at_the_first_dot():
-    result = _run_chips_script("""
-console.log(JSON.stringify({
-  bare: mod.parseHandleMention("@KWoman"),
-  dotted: mod.parseHandleMention("@KWoman.speaker"),
-  noSigil: mod.parseHandleMention("KWoman.speaker"),
-  // A handle cannot contain a dot (PROMPT_HANDLE_RE), so everything after the
-  // first one is qualifier — never a second handle segment.
-  extraDots: mod.parseHandleMention("@KWoman.a.b"),
-  empty: mod.parseHandleMention(""),
-}));
-""")
-    assert result["bare"] == {"handle": "KWoman", "qualifier": ""}
-    assert result["dotted"] == {"handle": "KWoman", "qualifier": "speaker"}
-    assert result["noSigil"] == {"handle": "KWoman", "qualifier": "speaker"}
-    assert result["extraDots"] == {"handle": "KWoman", "qualifier": "a.b"}
-    assert result["empty"] == {"handle": "", "qualifier": ""}
-
-
-def test_handle_capability_is_inferred_from_its_channel_with_a_dotted_override():
-    result = _run_chips_script("""
-const kind = (profile, channelKey, qualifier) =>
-  mod.handleAttachCapabilityKind(profile, { channelKey, qualifier });
-console.log(JSON.stringify({
-  definitions: kind(h3, "subject_definitions", ""),
-  retention: kind(h3, "retention_analysis", ""),
-  body: kind(h3, "detailed_description", ""),
-  tie: kind(h3, "summary", ""),
-  unclaimed: kind(h3, "overall_soundscape", ""),
-  noChannel: kind(h3, "", ""),
-  override: kind(h3, "subject_definitions", "mentions"),
-  undeclaredOverride: kind(h3, "subject_definitions", "not_a_capability"),
-  genericVisual: kind(generic, "visual", ""),
-  genericOther: kind(generic, "speech", ""),
-}));
-""")
-    # Placing a chip while writing in a channel seeds the capability that
-    # channel routes to, so the chip emits where it was placed. Attaching in
-    # `subject_definitions` used to seed `mentions`, whose declared route is
-    # `detailed_description` — the chip emitted into a different channel.
-    assert result["definitions"] == "definitions"
-    assert result["retention"] == "retention"
-    assert result["body"] == "mentions"
-    # Two capabilities declare `summary`; the lower `order` wins the tie.
-    assert result["tie"] == "summary"
-    # A channel no capability claims falls back to the prose default, as does
-    # one box projecting every channel — the Writing draft has no single channel.
-    assert result["unclaimed"] == "mentions"
-    assert result["noChannel"] == "mentions"
-    # The dotted qualifier is the explicit override; an undeclared one falls
-    # through rather than seeding a kind nothing can compile.
-    assert result["override"] == "mentions"
-    assert result["undeclaredOverride"] == "definitions"
-    assert result["genericVisual"] == "derived_prompt"
-    # `generic@1` declares no `mentions`, and "" is the correct answer: it means
-    # seed nothing and take the format default.
-    assert result["genericOther"] == ""
-
-
-def test_handle_attach_stores_a_capability_only_when_it_deviates_from_the_default():
-    result = _run_chips_script("""
-const record = (profile, channelKey, qualifier) =>
-  mod.handleAttachCapabilityRecord(profile, { channelKey, qualifier });
-console.log(JSON.stringify({
-  deviating: record(h3, "detailed_description", ""),
-  matchesDefault: record(h3, "subject_definitions", ""),
-  genericVisual: record(generic, "visual", ""),
-  genericOther: record(generic, "speech", ""),
-}));
-""")
-    # Sparse like the routing beside it: the compiler already falls back to the
-    # lowest-`order` capability, so storing that same kind writes an authored
-    # deviation where the author deviated from nothing. `capability_id`/`kind`
-    # only — a stored `channel_key`/`placement` would freeze this chip's routing
-    # at attach time, and a stored `enabled` would resolve the tri-state out of
-    # inheriting its Reference or identity default.
-    assert result["deviating"] == [
-        {"capability_id": "mentions", "kind": "mentions"}]
-    assert result["matchesDefault"] == []
-    assert result["genericVisual"] == []
-    assert result["genericOther"] == []
-
-
-def test_handle_attach_default_matches_the_servers_undeclared_order_rule():
-    from server import prompt_context
-
-    # A capability with no `order` is LAST to the server
-    # (`_default_capability` reads it as MAX_CAPABILITIES) and FIRST to the
-    # browser's display ordering (`orderedReferenceDerived` reads it as 0).
-    # Sparsity has to follow the server, or a chip omits a record the compiler
-    # then resolves to a capability the author never chose.
-    profile = {"capabilities": {"reference": {"derived": {
-        "ordered": {"order": 2, "channel_key": "body", "placement": "inline",
-                    "label": "Ordered"},
-        "unordered": {"channel_key": "aside", "placement": "inline",
-                      "label": "Unordered"},
-    }}}}
-    server_default = prompt_context._default_capability(
-        {"kind": "reference"}, profile)["kind"]
-    assert server_default == "ordered"
-    result = _run_node(
-        f"const mod = await import("
-        f"{json.dumps((ROOT / 'web/js/prompt_context_chips.js').as_uri())});\n"
-        f"const p = {json.dumps(profile)};\n"
-        "const record = (channelKey) =>"
-        " mod.handleAttachCapabilityRecord(p, { channelKey });\n"
-        "console.log(JSON.stringify({"
-        " displayFirst: mod.handleAttachCapabilityKind(p, {}),"
-        " serverDefault: record('body'),"
-        " deviating: record('aside') }));\n")
-    # The server's default kind gets no record; the other one does — the reverse
-    # of what the display ordering alone would have produced.
-    assert result["serverDefault"] == []
-    assert result["deviating"] == [
-        {"capability_id": "unordered", "kind": "unordered"}]
 
 
 def test_unheadered_draft_text_lands_in_the_declared_default_draft_channel():
@@ -4359,22 +4246,20 @@ console.log(JSON.stringify({
     assert result["silentWhenUnheaded"] == f"{nl}---{nl}"
 
 
-def test_a_handle_renders_without_pill_chrome():
-    """Writing mode shows a sentence, so a handle must not be a capsule.
+def test_a_handle_labelled_attachment_renders_without_pill_chrome():
+    """An inline attachment handle stays compact beside authored prose.
 
-    Only the chrome goes: the element stays atomic and keyboard-reachable.
+    It remains an atomic, keyboard-reachable chip—not a plain-text mention.
     """
     result = _run_chips_script("""
 console.log(JSON.stringify({
   handle: mod.isHandleLabel("@KWoman"),
-  qualified: mod.isHandleLabel("@KWoman.speaker"),
   described: mod.isHandleLabel("Reference — Korean Woman"),
   bareSigil: mod.isHandleLabel("@"),
   empty: mod.isHandleLabel(""),
 }));
 """)
     assert result["handle"] is True
-    assert result["qualified"] is True
     assert result["described"] is False
     # A lone sigil is not a handle; it is someone mid-keystroke.
     assert result["bareSigil"] is False
@@ -4613,15 +4498,14 @@ def test_the_two_document_normalizers_agree_on_carriage_returns():
     assert server_text == browser_text == "a" + lf + "b" + lf + "c"
 
 
-def test_mention_ranking_preserves_the_source_a_row_needs_to_attach():
+def test_mention_ranking_preserves_source_metadata_without_gating_text():
     """Ranking must not narrow the row to `{handle, label}`.
 
-    Accepting a mention builds a Reference attachment from the row's `value`
-    — the semantic unit id, or `physical:<population>:<member_id>`. When the
-    ranker returned only the handle and the label, that id was silently lost
-    and the accept produced a chip whose source was empty, referencing
-    nothing. `eligible` matters for the same reason: an ineligible row is
-    listed to explain itself but must not be attachable.
+    `value` is the semantic unit id or `physical:<population>:<member_id>` used
+    to join a ranked handle back to its discovery row. `eligible` is still
+    carried as attachment metadata, but it deliberately does not gate mention
+    insertion: an unstaged or out-of-window handle is valid prose and produces
+    the compiler's non-blocking `unresolved_handle_mention` warning.
     """
     result = _run_chips_script('const opts = [\n  { handle: "KWoman", label: "Subject: KoreanWoman", value: "unit-1", eligible: true },\n  { handle: "Street", label: "Picture source: Locations", value: "physical:pictures:m-9", eligible: false },\n];\nconsole.log(JSON.stringify({\n  ranked: mod.handleMentionCandidates("", opts),\n  filtered: mod.handleMentionCandidates("Str", opts),\n}));\n')
     assert [r["handle"] for r in result["ranked"]] == ["KWoman", "Street"]

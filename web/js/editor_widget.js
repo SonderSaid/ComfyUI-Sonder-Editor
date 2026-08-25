@@ -242,6 +242,10 @@ import {
     templateLabelsOn,
 } from "./prompt_channel_templates.js";
 import { mountSharedRenderQueue, queueBatchIds, formatQueueTime } from "./shared_render_queue.js";
+import {
+    dockQueueInFullscreen,
+    restoreQueueFromFullscreen,
+} from "./fullscreen_queue_lifecycle.js";
 import { mountEditorSettingsPanel } from "./editor_settings_panel.js";
 import {
     cancelBulkThumbnailRepair,
@@ -1275,6 +1279,7 @@ export class EditorWidget {
         });
 
         queueSection.append(queueHeader, this._queueContainer);
+        this._queueSection = queueSection;
 
         gallery.append(this.assetGrid, queueSection);
         this.container.appendChild(gallery);
@@ -1985,6 +1990,7 @@ export class EditorWidget {
 
     _referenceLibraryData() {
         return {
+            projectKey: this._projectDirName(),
             references: this._references,
             catalog: this._referenceTagPresets,
             recipePresets: this._referenceRecipePresets,
@@ -2487,6 +2493,9 @@ export class EditorWidget {
         this._ensureReferenceLibraryMounted();
         if (this.galleryEl) this.galleryEl.style.display = mode === "assets" ? "flex" : "none";
         if (this._referenceLibraryEl) this._referenceLibraryEl.style.display = mode === "references" ? "flex" : "none";
+        if (mode === "references") {
+            this._referenceLibraryHandle?.restoreScroll?.();
+        }
         if (this._fsAssetsTab) this._fsAssetsTab.dataset.active = mode === "assets" ? "true" : "false";
         if (this._fsReferencesTab) this._fsReferencesTab.dataset.active = mode === "references" ? "true" : "false";
         for (const button of [this._fsAssetsTab, this._fsReferencesTab]) {
@@ -15758,7 +15767,7 @@ export class EditorWidget {
         this._savedNodeSize = this.widgetHost?.getSize?.() || null;
 
         // Reparent: gallery goes to sidebar, rest of container goes to bottom row
-        // Save gallery's position in container for restoration
+        // Save the gallery and queue positions for symmetric restoration.
         this._galleryNextSibling = this.galleryEl.nextSibling;
 
         // Move gallery to sidebar (keep gallery zoom for scale)
@@ -15776,6 +15785,8 @@ export class EditorWidget {
         this.assetGrid.style.minHeight = "0";
         this.assetGrid.style.gridTemplateColumns = "";
         this._showFullscreenSidebarContent(this._settings?.layout?.fullscreenSidebarContent, { persist: false });
+        this._queuePlacement = dockQueueInFullscreen(
+            this._queueSection, this._fsSidebar);
 
         // Move timeline container (without gallery) to bottom row
         this._fsBottomRow.appendChild(this.container);
@@ -15860,6 +15871,11 @@ export class EditorWidget {
             this._fullscreenPlaceholder.remove();
             this._fullscreenPlaceholder = null;
         }
+
+        // The queue is independent of the fullscreen Assets/References switch,
+        // but belongs inside the gallery everywhere else.
+        restoreQueueFromFullscreen(this._queueSection, this._queuePlacement);
+        this._queuePlacement = null;
 
         // Move gallery back into container (before its original next sibling)
         if (this.galleryEl) {

@@ -149,6 +149,7 @@ def test_reference_sidebar_refresh_and_settings_contracts_are_wired():
 
     assert 'coalesce: false' in widget
     assert 'this._referenceLibraryHandle?.render?.();' in widget
+    assert 'this._referenceLibraryHandle?.restoreScroll?.();' in widget
     assert 'wanted.has("references")' in widget
     assert '["project", "assets", "scenes", "queue", "references"]' in controller
     assert '["project", "assets", "scenes", "queue", "references"]' in tab
@@ -158,6 +159,289 @@ def test_reference_sidebar_refresh_and_settings_contracts_are_wired():
     assert 'referenceMediaViewMode: "source"' in settings
     assert settings.index("VALID_REFERENCE_MEDIA_VIEW_MODES") < settings.index("let currentSettings")
     assert 'VALID_REFERENCE_MEDIA_VIEW_MODES.has(stored?.inspector?.referenceMediaViewMode)' in settings
+
+
+def test_fullscreen_queue_lifecycle_is_wired_to_enter_and_exit():
+    widget = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
+    assert "this._queueSection = queueSection;" in widget
+
+    enter = widget.split("    _enterFullscreen() {", 1)[1].split(
+        "    async _requestExitFullscreen", 1)[0]
+    assert enter.index("this._fsSidebar.appendChild(this.galleryEl);") < enter.index(
+        "this._showFullscreenSidebarContent") < enter.index("dockQueueInFullscreen(")
+
+    exit_block = widget.split("    _exitFullscreen() {", 1)[1].split(
+        "    _toggleFullscreen()", 1)[0]
+    restore = "restoreQueueFromFullscreen(this._queueSection, this._queuePlacement);"
+    assert restore in exit_block
+    assert exit_block.index(restore) < exit_block.index(
+        "this.container.insertBefore(this.galleryEl, this._galleryNextSibling || null);")
+
+
+def test_fullscreen_queue_lifecycle_executes_twice_and_preserves_state():
+    lifecycle = (ROOT / "web" / "js" / "fullscreen_queue_lifecycle.js").as_uri()
+    _run_node(f"""
+        import assert from 'node:assert/strict';
+        import {{ dockQueueInFullscreen, restoreQueueFromFullscreen }} from {lifecycle!r};
+
+        class Element {{
+            constructor(name) {{
+                this.name = name;
+                this.style = {{}};
+                this.children = [];
+                this.parentElement = null;
+            }}
+            get nextSibling() {{
+                if (!this.parentElement) return null;
+                const siblings = this.parentElement.children;
+                return siblings[siblings.indexOf(this) + 1] || null;
+            }}
+            appendChild(child) {{
+                if (child.parentElement) {{
+                    const old = child.parentElement.children;
+                    old.splice(old.indexOf(child), 1);
+                }}
+                this.children.push(child);
+                child.parentElement = this;
+                return child;
+            }}
+            insertBefore(child, sibling) {{
+                if (sibling && sibling.parentElement !== this) throw new Error('wrong parent');
+                if (child.parentElement) {{
+                    const old = child.parentElement.children;
+                    old.splice(old.indexOf(child), 1);
+                }}
+                const index = sibling ? this.children.indexOf(sibling) : this.children.length;
+                this.children.splice(index, 0, child);
+                child.parentElement = this;
+                return child;
+            }}
+        }}
+
+        const gallery = new Element('gallery');
+        const assetGrid = new Element('assets');
+        const queue = new Element('queue');
+        const queueBody = new Element('queue-body');
+        queueBody.style.maxHeight = '180px';
+        queue.appendChild(queueBody);
+        gallery.appendChild(assetGrid);
+        gallery.appendChild(queue);
+        const sidebar = new Element('sidebar');
+        const references = new Element('references');
+        sidebar.appendChild(references);
+
+        for (let cycle = 0; cycle < 2; cycle += 1) {{
+            const placement = dockQueueInFullscreen(queue, sidebar);
+            assert.equal(queue.parentElement, sidebar);
+            assert.equal(queue.style.flex, '0 0 auto');
+            assert.equal(queueBody.style.maxHeight, '180px');
+            // References hides the gallery wholesale; the queue remains a
+            // visible sibling and retains the expansion state on its child.
+            gallery.style.display = 'none';
+            references.style.display = 'flex';
+            assert.notEqual(queue.parentElement.style.display, 'none');
+            assert.equal(queueBody.style.maxHeight, '180px');
+            // Exercise the stale-sibling recovery on the second cycle.
+            if (cycle === 1) placement.nextSibling = new Element('stale');
+            assert.equal(restoreQueueFromFullscreen(queue, placement), true);
+            assert.equal(queue.parentElement, gallery);
+            assert.equal(queue.style.flex, '');
+            assert.deepEqual(gallery.children.map((child) => child.name), ['assets', 'queue']);
+            gallery.style.display = '';
+        }}
+    """)
+
+
+def test_reference_library_scroll_preserves_only_comparable_visible_lists():
+    library = (ROOT / "web" / "js" / "editor_reference_library.js").as_uri()
+    _run_node(f"""
+        import assert from 'node:assert/strict';
+
+        class Element {{
+            constructor(tag) {{
+                this.tag = tag;
+                this.style = {{}};
+                this.dataset = {{}};
+                this.attributes = {{}};
+                this.children = [];
+                this.parentElement = null;
+                this.listeners = new Map();
+                this.scrollTop = 0;
+                this.value = '';
+                this.textContent = '';
+                this._visible = true;
+            }}
+            set innerHTML(value) {{
+                for (const child of this.children) child.parentElement = null;
+                this.children = [];
+            }}
+            get innerHTML() {{ return ''; }}
+            append(...items) {{ for (const item of items) this.appendChild(item); }}
+            appendChild(child) {{
+                this.children.push(child);
+                child.parentElement = this;
+                return child;
+            }}
+            setAttribute(key, value) {{ this.attributes[key] = String(value); }}
+            addEventListener(key, fn) {{
+                if (!this.listeners.has(key)) this.listeners.set(key, []);
+                this.listeners.get(key).push(fn);
+            }}
+            emit(key, event = {{}}) {{
+                for (const fn of this.listeners.get(key) || []) fn({{
+                    preventDefault() {{}}, stopPropagation() {{}}, ...event,
+                }});
+            }}
+            getClientRects() {{ return this._visible ? [{{ width: 300 }}] : []; }}
+            focus() {{}}
+            setSelectionRange() {{}}
+            remove() {{
+                if (!this.parentElement) return;
+                const siblings = this.parentElement.children;
+                siblings.splice(siblings.indexOf(this), 1);
+                this.parentElement = null;
+            }}
+            querySelector(selector) {{ return this.querySelectorAll(selector)[0] || null; }}
+            querySelectorAll(selector) {{
+                const match = (node) => {{
+                    if (selector === '[data-reference-library-body="true"]')
+                        return node.dataset.referenceLibraryBody === 'true';
+                    if (selector === '[data-reference-search="true"]')
+                        return node.dataset.referenceSearch === 'true';
+                    return node.tag === selector;
+                }};
+                const found = [];
+                const visit = (node) => {{
+                    for (const child of node.children || []) {{
+                        if (match(child)) found.push(child);
+                        visit(child);
+                    }}
+                }};
+                visit(this);
+                return found;
+            }}
+        }}
+
+        globalThis.document = {{
+            createElement: (tag) => new Element(tag),
+            body: new Element('body'),
+            querySelector: () => null,
+            addEventListener() {{}},
+        }};
+        const {{ mountReferenceLibrary }} = await import({library!r});
+        const container = new Element('container');
+        const reference = (id, name) => ({{
+            reference_id: id, name, kind: 'character', reference_class: 'subject',
+            description: '', members: [],
+        }});
+        const data = {{
+            projectKey: 'project-a', references: [reference('a', 'Alpha'),
+                reference('b', 'Beta')], assets: [], scenes: [], semanticUnits: [],
+            catalog: [], loading: false, error: '',
+        }};
+        const host = {{
+            getData: () => data,
+            mutate: async (operations) => {{
+                for (const operation of operations) {{
+                    if (operation.type !== 'update_member') continue;
+                    const target = data.references.find((entry) =>
+                        entry.reference_id === operation.reference_id)?.members.find(
+                            (entry) => entry.member_id === operation.member_id);
+                    if (target) Object.assign(target, operation.fields);
+                }}
+            }},
+            confirm: () => true,
+            pickAsset() {{}},
+            assetPreviewUrl: () => null,
+        }};
+        const mounted = mountReferenceLibrary(container, host);
+        const body = () => container.querySelector('[data-reference-library-body="true"]');
+        const toolbar = () => container.children[0];
+
+        body().scrollTop = 73;
+        data.references.push(reference('c', 'Gamma'));
+        mounted.render();
+        assert.equal(body().scrollTop, 73, 'same project/list keeps scroll');
+
+        const search = toolbar().children[0];
+        search.value = 'Beta';
+        search.selectionStart = 4;
+        search.emit('input');
+        assert.equal(body().scrollTop, 0, 'query change rejects stale offset');
+
+        body().scrollTop = 41;
+        body().emit('scroll');
+        container._visible = false;
+        mounted.render();
+        assert.equal(body().scrollTop, 0, 'hidden render does not restore');
+        container._visible = true;
+        assert.equal(mounted.restoreScroll(), true);
+        assert.equal(body().scrollTop, 41, 'reveal restores without requiring a render');
+
+        body().scrollTop = 47;
+        body().emit('scroll');
+        data.loading = true;
+        mounted.render();
+        assert.equal(body().dataset.referenceListView, undefined);
+        data.loading = false;
+        mounted.render();
+        assert.equal(body().scrollTop, 47, 'loading did not discard outgoing scroll');
+
+        body().scrollTop = 29;
+        toolbar().children[1].emit('click');
+        assert.equal(body().scrollTop, 0, 'Manage mode change rejects stale offset');
+
+        body().scrollTop = 55;
+        mounted.render();
+        assert.equal(body().scrollTop, 55);
+        data.projectKey = 'project-b';
+        mounted.reset();
+        assert.equal(body().scrollTop, 0, 'project change rejects stale offset');
+        data.projectKey = 'project-a';
+        mounted.reset();
+        assert.equal(body().scrollTop, 0, 'returning to a project does not revive its old offset');
+
+        body().scrollTop = 64;
+        toolbar().children[2].emit('click');
+        const cancel = container.querySelectorAll('button').find(
+            (button) => button.textContent === 'Cancel');
+        cancel.emit('click');
+        assert.equal(body().scrollTop, 0, 'draft tree invalidates list offset');
+
+        // A member editor is embedded in the list rather than replacing it.
+        // Its own key must not overwrite the list key needed after Save.
+        const resetSearch = toolbar().children[0];
+        resetSearch.value = '';
+        resetSearch.selectionStart = 0;
+        resetSearch.emit('input');
+        if (toolbar().children[1].attributes['aria-pressed'] === 'true') {{
+            toolbar().children[1].emit('click');
+        }}
+        const member = {{ member_id: 'm1', asset_id: 'image-1', name: 'Front',
+            tags: [], prompt: '', crop: null, source_start_sec: 0,
+            source_end_sec: null, order: 0 }};
+        data.references = [{{ ...reference('member-ref', 'Member Ref'), members: [member] }}];
+        data.assets = [{{ asset_id: 'image-1', asset_type: 'image', name: 'front.png' }}];
+        data.projectKey = 'project-member';
+        mounted.render();
+        const section = container.querySelector('section');
+        section.children[0].emit('click');
+        body().scrollTop = 88;
+        body().emit('scroll');
+        const edit = container.querySelectorAll('button').find(
+            (button) => button.textContent === 'Edit');
+        edit.emit('click');
+        const memberName = container.querySelectorAll('input').find(
+            (input) => input.attributes['aria-label'] === 'Member name');
+        memberName.value = 'Portrait';
+        memberName.emit('input');
+        const save = container.querySelectorAll('button').find(
+            (button) => button.textContent === 'Save');
+        save.emit('click');
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(body().scrollTop, 88, 'member save returns to list offset');
+        mounted.destroy();
+    """)
 
 
 def test_shared_gallery_renders_reference_usage_and_delete_semantics():

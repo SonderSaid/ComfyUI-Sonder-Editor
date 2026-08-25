@@ -213,6 +213,10 @@ MINIMAX_H3_ROLE_CATALOGS = {
         {"value": "first_frame", "label": "First frame"},
         {"value": "last_frame", "label": "Last frame"},
         {"value": "keyframe", "label": "Keyframe"},
+        # `_minimax_task_types` already maps this to `keyframe completion`; only
+        # the catalog entry was missing, so an edited-keyframe relationship had
+        # to survive as prose inside a plain `keyframe` definition.
+        {"value": "edited_keyframe", "label": "Edited keyframe"},
         {"value": "storyboard", "label": "Storyboard"},
         {"value": "composition_anchor", "label": "Composition anchor"},
         {"value": "identity", "label": "Identity"},

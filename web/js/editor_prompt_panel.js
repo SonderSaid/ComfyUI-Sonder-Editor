@@ -3671,7 +3671,7 @@ export function mountPromptManagementPanel(host) {
                     if (identityCreateIntent) acceptDurableConfiguration({
                         attachment, identityCreateIntent,
                     });
-                    return type === "writing_aid" ? commitGlobal() : null;
+                    return ["writing_aid", "mention"].includes(type) ? commitGlobal() : null;
                 },
                 onCreate: configureGlobalAttachment,
                 profile: host._resolvedPromptContextProfile?.(),
@@ -3979,7 +3979,7 @@ export function mountPromptManagementPanel(host) {
                         if (identityCreateIntent) acceptDurableConfiguration({
                             attachment, identityCreateIntent,
                         });
-                        return type === "writing_aid" ? commitChannels() : null;
+                        return ["writing_aid", "mention"].includes(type) ? commitChannels() : null;
                     },
                     onCreate: configureChannelAttachment,
                     profile: host._resolvedPromptContextProfile?.(),

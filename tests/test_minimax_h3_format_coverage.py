@@ -15,7 +15,7 @@ Two disciplines keep this file alive:
   without provider knowledge is a UX property; it lives in the coverage matrix
   and the practice-run findings, not in an assertion.
 
-Three rows are `xfail(strict=True)`: they assert the guide's shape for a
+One row is `xfail(strict=True)`: it asserts the guide's shape for a
 relationship Sonder currently emits differently. They fail loudly the day the
 gap is closed, which is the signal to promote them to ordinary rows.
 """
@@ -803,6 +803,7 @@ PICTURE_ROLE_VALUES = {value["value"] for value in
 @pytest.mark.parametrize("item,role", [
     ("B1", "first_frame"),
     ("B2", "keyframe"),
+    ("B3", "edited_keyframe"),
     ("B4", "last_frame"),
     ("B5", "composition_anchor"),
     ("B6", "storyboard"),
@@ -811,15 +812,38 @@ def test_picture_roles_exist_in_the_authoring_catalog(item, role):
     assert role in PICTURE_ROLE_VALUES, f"{item}: no authorable {role} role"
 
 
-def test_b3_edited_keyframe_has_no_role_value():
-    """B3 — deliberately recorded: the relationship is prose-only today."""
-    assert "edited_keyframe" not in PICTURE_ROLE_VALUES
-    # The task-type deriver still understands the value, so adding it to the
-    # catalog is the only change a fix needs.
+def test_b3_edited_keyframe_derives_keyframe_completion():
+    """B3 — the authorable role and the task-type deriver agree.
+
+    This test used to assert the role's ABSENCE, recording that the
+    relationship was prose-only. The deriver always understood the value, so
+    the catalog entry was the whole fix; the pairing is what must not drift.
+    """
+    assert "edited_keyframe" in PICTURE_ROLE_VALUES
     assert prompt_context._minimax_task_types(
         {"setup_manifest": {"pictures": [{"role": "edited_keyframe"}]}},
         profile=H3_PROFILE) == [
             "keyframe completion"]
+
+
+def test_b3_edited_keyframe_passes_builtin_role_validation():
+    """B3 — the built-in catalog is the compiler's validation authority.
+
+    An already-forked custom format still owns its stored ``role_catalogs``
+    and may reject this role until its author adds it. No migration is owed:
+    the missing built-in catalog entry meant nobody could author it before.
+    """
+    compiled = prompt_context.compile_prompt_context(
+        sections=[], window_start=0, window_end=10,
+        template="minimax_h3_ref", profile="minimax_h3_ref@1",
+        context={"setup_manifest": {
+            "setup": {"mode": "reference"},
+            "pictures": [{"member_id": "edited", "role": "edited_keyframe",
+                          "member_prompt": "the revised composition"}],
+        }})
+    assert not any(
+        error["code"] == "unsupported_reference_role"
+        for error in compiled["errors"])
 
 
 def test_standalone_picture_lines_use_their_own_ordinals(compiled):
