@@ -18,6 +18,8 @@ const SESSION_DIAG_RING_MAX = 2048;
 // are marked immediately for correctness; only their dimmed repaint waits, so
 // normal typing never flashes through an intermediate visual state.
 const PROMPT_STALE_VISUAL_DELAY_MS = 300;
+const PROMPT_TIMELINE_COMPILE_DELAY_MS = 180;
+const PROMPT_BAR_LABEL_MEMO = new WeakMap();
 
 if (typeof window !== "undefined" && !window.SONDER_DEBUG_SESSION) {
     try {
@@ -228,6 +230,8 @@ import {
     normalizeChannelExceptions,
     globalChannelLines,
     normalizeChannels,
+    promptPreviewAuthoredFirstChannels,
+    promptPreviewFullChannelLines,
 } from "./prompt_composition.js";
 import {
     DEFAULT_CHANNEL_TEMPLATE_ID,
@@ -1043,7 +1047,7 @@ export class EditorWidget {
         this._renderTimeline();
         this._renderQueuePanel();
         if (this._promptContextConsumersMounted()) {
-            this._previewPromptContextCandidate({}, 0);
+            this._previewPromptContextCandidate({}, this._promptContextPreviewDelay(0));
         }
         this.onWidgetStateApplied?.(Object.fromEntries(orderedEntries));
     }
@@ -1572,7 +1576,7 @@ export class EditorWidget {
         this._updateToolbar();
         this._assetGallery?.refreshCurrentScene?.();
         if (this._promptContextConsumersMounted()) {
-            this._previewPromptContextCandidate({}, 0);
+            this._previewPromptContextCandidate({}, this._promptContextPreviewDelay(0));
         }
     }
 
@@ -2210,9 +2214,34 @@ export class EditorWidget {
         return true;
     }
 
-    _promptContextConsumersMounted() {
+    _promptContextEditingConsumersMounted() {
         return !!(this._promptPanelHandle?.isMounted?.()
             || this._promptEditorEl || this._refreshInlinePromptProjections);
+    }
+
+    _promptContextTimelineConsumerMounted() {
+        const expanded = (index) => index >= 0
+            && this._trackLayout?.[index]?.collapsed !== true;
+        // Hidden lanes still draw their dimmed labels. Only collapse removes
+        // the display consumer and therefore its reason to compile.
+        return expanded(this._promptLayoutIdx())
+            || expanded(this._globalPromptLayoutIdx());
+    }
+
+    _promptContextConsumersMounted() {
+        return this._promptContextEditingConsumersMounted()
+            || this._promptContextTimelineConsumerMounted();
+    }
+
+    _promptContextPreviewDelay(immediateDelay = 0) {
+        return this._promptContextEditingConsumersMounted()
+            ? immediateDelay : PROMPT_TIMELINE_COMPILE_DELAY_MS;
+    }
+
+    _previewPromptContextForNewConsumer(wasMounted) {
+        if (wasMounted || !this._promptContextConsumersMounted()) return false;
+        this._previewPromptContextCandidate({}, this._promptContextPreviewDelay(0));
+        return true;
     }
 
     _refreshPromptContextDependencyConsumers({ ignoreGates = false } = {}) {
@@ -2226,7 +2255,7 @@ export class EditorWidget {
         this._refreshInlinePromptProjections?.();
         this._renderTimeline();
         if (this._promptContextConsumersMounted()) {
-            this._previewPromptContextCandidate({}, 0);
+            this._previewPromptContextCandidate({}, this._promptContextPreviewDelay(0));
         }
     }
 
@@ -4803,7 +4832,7 @@ export class EditorWidget {
         // Context frames widen the highlight window (selection + context).
         this._refreshPromptUsageHighlight();
         if (this._promptContextConsumersMounted()) {
-            this._previewPromptContextCandidate({}, 0);
+            this._previewPromptContextCandidate({}, this._promptContextPreviewDelay(0));
         }
         this._renderTimeline();
         this._updateGenReadout();
@@ -5001,7 +5030,7 @@ export class EditorWidget {
         this._refreshSelectionInputs();
         this._refreshPromptUsageHighlight();
         if (this._promptContextConsumersMounted()) {
-            this._previewPromptContextCandidate({}, 0);
+            this._previewPromptContextCandidate({}, this._promptContextPreviewDelay(0));
         }
         if (render) {
             this._renderTimeline();
@@ -6002,7 +6031,9 @@ export class EditorWidget {
             this._updateProjectTemplateId("free");
         }
         if (this.activeScene && prevTrackCollapseSignature !== nextTrackCollapseSignature) {
+            const hadPromptConsumer = this._promptContextConsumersMounted();
             this._buildTrackLayout();
+            this._previewPromptContextForNewConsumer(hadPromptConsumer);
             if (this.timelineCanvas) {
                 this._renderTimeline();
             }
@@ -7143,9 +7174,11 @@ export class EditorWidget {
                     : [entry];
                 switch (headerHit.zone) {
                     case "collapse": {
+                        const hadPromptConsumer = this._promptContextConsumersMounted();
                         const nextCollapsed = !entry.collapsed;
                         for (const target of bulkEntries) target.collapsed = nextCollapsed;
                         this._persistTrackCollapseState();
+                        this._previewPromptContextForNewConsumer(hadPromptConsumer);
                         break;
                     }
                     case "lock": {
@@ -9970,14 +10003,42 @@ export class EditorWidget {
         return templateChannelKeys(this._channelTemplate());
     }
 
+    _promptCompiledBarLabel(payload, promptId, keys, template, globalScope = false) {
+        if (!payload || typeof payload !== "object") return null;
+        const preview = globalScope
+            ? payload.section_channel_previews?.global
+            : payload.section_channel_previews?.sections?.[promptId];
+        if (!preview || typeof preview !== "object") return null;
+        let labels = PROMPT_BAR_LABEL_MEMO.get(payload);
+        if (!labels) {
+            labels = new Map();
+            PROMPT_BAR_LABEL_MEMO.set(payload, labels);
+        }
+        const memoKey = globalScope ? "global" : `section:${String(promptId || "")}`;
+        if (labels.has(memoKey)) return labels.get(memoKey);
+        const channels = promptPreviewAuthoredFirstChannels(preview, keys);
+        // The compiler wraps prefix contributions before authored prose. That is
+        // correct for generation and deliberately wrong for a clipped one-line
+        // identifier: authored prose leads here, then contributions follow.
+        const label = composeSectionText(channels, false, template)
+            .replace(/\s+/g, " ").trim();
+        labels.set(memoKey, label);
+        return label;
+    }
+
     /** Label-free composed text for one section's timeline bar, over the
      *  ACTIVE template rather than the legacy three-channel `prompt` mirror.
      *  Without this a MiniMax section draws a blank bar. */
     _promptSectionBarLabel(section) {
         if (!section) return "";
         const template = this._channelTemplate();
+        const keys = templateChannelKeys(template);
+        const compiled = this._promptCompiledBarLabel(
+            this._windowedPromptCandidate(), String(section.prompt_id || ""),
+            keys, template);
+        if (compiled !== null) return compiled;
         const channels = normalizeChannels(section.channels, section.prompt,
-                                           templateChannelKeys(template));
+                                           keys);
         return composeSectionText(channels, false, template) || (section.prompt || "");
     }
 
@@ -9989,7 +10050,12 @@ export class EditorWidget {
     _promptGlobalBarLabel() {
         const scene = this.activeScene;
         if (!scene) return "";
-        return globalChannelLines(scene.global_channels, this._channelTemplate(), false).join(" ")
+        const template = this._channelTemplate();
+        const compiled = this._promptCompiledBarLabel(
+            this._windowedPromptCandidate(), "global",
+            this._globalChannelKeys(), template, true);
+        if (compiled !== null) return compiled;
+        return globalChannelLines(scene.global_channels, template, false).join(" ")
             || (scene.prompt || "");
     }
 
@@ -11437,7 +11503,8 @@ export class EditorWidget {
     _promptProjectionSubset(payload) {
         const keep = ["attachment_capability_projections",
             "attachment_channel_previews", "attachment_channel_routes",
-            "emissions", "attachment_previews", "section_window_states"];
+            "emissions", "attachment_previews", "section_channel_previews",
+            "section_window_states"];
         const out = {};
         for (const key of keep) {
             if (payload && key in payload) out[key] = payload[key];
@@ -11588,6 +11655,7 @@ export class EditorWidget {
                     this._clearPromptStaleVisualTimerIfSettled(sceneId);
                     this._refreshInlinePromptProjections?.();
                     this._promptPanelHandle?.refreshProjections?.();
+                    this._renderTimeline();
                     return;
                 }
                 const payload = await response.json().catch(() => null);
@@ -11597,6 +11665,7 @@ export class EditorWidget {
                     this._clearPromptStaleVisualTimerIfSettled(sceneId);
                     this._refreshInlinePromptProjections?.();
                     this._promptPanelHandle?.refreshProjections?.();
+                    this._renderTimeline();
                     return;
                 }
                 this._promptContextScenePayloadCache = {
@@ -11618,6 +11687,7 @@ export class EditorWidget {
             // derives from a `setup_manifest` this payload does not carry.
             this._refreshInlinePromptProjections?.();
             this._promptPanelHandle?.refreshProjections?.();
+            this._renderTimeline();
         })();
     }
 
@@ -11693,6 +11763,7 @@ export class EditorWidget {
                     this._promptPanelHandle?.refreshProjections?.();
                 }
                 this._refreshInlinePromptProjections?.();
+                this._renderTimeline();
             }, PROMPT_STALE_VISUAL_DELAY_MS);
         }
         this._promptContextPreviewTimer = setTimeout(async () => {
@@ -11734,6 +11805,7 @@ export class EditorWidget {
                 this._promptPanelHandle?.refreshDiagnostics?.(
                     this._promptContextCandidateCache);
                 this._refreshInlinePromptProjections?.();
+                this._renderTimeline();
                 // Reference Prompting reads the setup manifest out of THIS
                 // payload, so diagnostics and inline projections alone left it
                 // showing every population at (0) until an unrelated full
@@ -11754,6 +11826,7 @@ export class EditorWidget {
                     this._promptPanelHandle?.refreshDiagnostics?.(
                         this._promptContextCandidateCache);
                     this._refreshInlinePromptProjections?.();
+                    this._renderTimeline();
                     this._promptPanelHandle?.applyCandidate?.(
                         this._promptContextCandidateCache);
                 }
@@ -13471,8 +13544,14 @@ export class EditorWidget {
             // with per-channel globals off shows the one channel it actually
             // serves. The legacy mirror stays as the fallback for scenes whose
             // channels were never populated.
-            lines = globalChannelLines(this.activeScene?.global_channels,
-                                       this._channelTemplate(), false);
+            const template = this._channelTemplate();
+            const preview = this._windowedPromptCandidate()
+                ?.section_channel_previews?.global;
+            lines = preview
+                ? promptPreviewFullChannelLines(
+                    preview, template, this._globalChannelKeys(), false)
+                : globalChannelLines(this.activeScene?.global_channels,
+                                     template, false);
             if (!lines.length) {
                 const text = (this.activeScene?.prompt || "").trim();
                 lines = text ? [text] : ["(empty global prompt)"];
@@ -13489,14 +13568,21 @@ export class EditorWidget {
                 ? `${this._frameToTimecode(start)}–${this._frameToTimecode(lastFrame)}`
                 : `f${start}–f${lastFrame}`;
             const template = this._channelTemplate();
-            const channels = normalizeChannels(section.channels, section.prompt,
-                                               templateChannelKeys(template));
-            const showLabels = templateLabelsOn(template, false);
-            lines = [];
-            for (const entry of template.channels || []) {
-                const text = (channels[entry.key] || "").trim();
-                if (!text) continue;
-                lines.push(showLabels && entry.label ? `${entry.label} ${text}` : text);
+            const preview = this._windowedPromptCandidate()
+                ?.section_channel_previews?.sections?.[String(section.prompt_id || "")];
+            if (preview) {
+                lines = promptPreviewFullChannelLines(
+                    preview, template, templateChannelKeys(template), false);
+            } else {
+                const channels = normalizeChannels(section.channels, section.prompt,
+                                                   templateChannelKeys(template));
+                const showLabels = templateLabelsOn(template, false);
+                lines = [];
+                for (const entry of template.channels || []) {
+                    const text = (channels[entry.key] || "").trim();
+                    if (!text) continue;
+                    lines.push(showLabels && entry.label ? `${entry.label} ${text}` : text);
+                }
             }
             if (!lines.length) lines = ["(empty section)"];
         }
@@ -16894,6 +16980,10 @@ export class EditorWidget {
         const promptHidden = !!this.activeScene.prompt_track_config?.hidden;
         const globalHidden = !!this.activeScene.global_prompt_track_config?.hidden;
         const scenePrompt = globalHidden ? "" : (this.activeScene.prompt || "");
+        const displayScenePrompt = globalHidden ? "" : (
+            globalChannelLines(this.activeScene.global_channels,
+                               this._channelTemplate(), false).join(" ")
+            || scenePrompt);
         const sections = promptHidden ? [] : (this.activeScene.prompt_sections || []);
         // Freeze ALL window-overlapping sections (channel-bearing) — the relay
         // bridge consumes them; the single `prompt` string is the composed
@@ -16928,7 +17018,8 @@ export class EditorWidget {
         const displaySectionText = composeSectionsDisplayText(
             promptSections, false, this._promptSectionDelimiter ?? ".",
             this._channelTemplate());
-        const prompt = [scenePrompt.trim(), displaySectionText].filter(Boolean).join(" ");
+        const prompt = [displayScenePrompt.trim(), displaySectionText]
+            .filter(Boolean).join(" ");
 
         const guideFrameSnapshots = [];
         const guideTrackHidden = !!this.activeScene.guide_track_config?.hidden;

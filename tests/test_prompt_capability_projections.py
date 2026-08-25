@@ -30,13 +30,14 @@ def _attachment(text="value", *, attachment_id="a", group_id=None,
     })
 
 
-def _section(prompt_id, attachment, *, document=None, start=0, end=10):
+def _section(prompt_id, attachment, *, document=None, document_channel="visual",
+             start=0, end=10):
     return {
         "prompt_id": prompt_id,
         "start_frame": start,
         "end_frame": end,
         "channels": {"visual": "body"},
-        "channel_docs": ({"visual": document} if document else {}),
+        "channel_docs": ({document_channel: document} if document else {}),
         "attachments": [attachment],
     }
 
@@ -261,7 +262,9 @@ def test_minimax_reference_accounts_for_all_five_capabilities_and_resolved_route
     })
     compiled = prompt_context.compile_prompt_context(
         global_channels={},
-        sections=[_section("one", attachment)],
+        sections=[_section("one", attachment, document_channel="detailed_description",
+                           document={"nodes": [{"type": "text", "node_id": "text",
+                                                "text": "@KWoman walks forward."}]})],
         window_start=0,
         window_end=10,
         fps=24.0,
@@ -273,8 +276,9 @@ def test_minimax_reference_accounts_for_all_five_capabilities_and_resolved_route
             "semantic_units": [{
                 "semantic_unit_id": "subject",
                 "name": "Korean Woman",
+                "handle": "KWoman",
                 "definition": "a woman in a black coat",
-                "sources": [],
+                "sources": [{"entity_id": "reference", "member_id": "member"}],
             }],
         },
     )
@@ -292,7 +296,37 @@ def test_minimax_reference_accounts_for_all_five_capabilities_and_resolved_route
     }
     mention = next(row for row in rows if row["capability_id"] == "mentions")
     assert (mention["declared_placement"], mention["effective_phase"],
-            mention["region"]) == ("inline", "inline", "before")
+             mention["region"]) == ("inline", "inline", "before")
+
+    preview = compiled["section_channel_previews"]["sections"]["one"]
+    assert preview["index"] == 0
+    assert preview["authored"]["detailed_description"] == (
+        "<Subject 1> walks forward.")
+    assert "@KWoman" not in preview["authored"]["detailed_description"]
+    assert "a woman in a black coat" in preview["full"]["subject_definitions"]
+
+
+def test_channel_previews_use_original_ids_and_skip_synthetic_ids():
+    named = _section("global", _attachment("prefix", attachment_id="named-chip"),
+                     document={"nodes": [{"type": "text", "node_id": "named-text",
+                                          "text": "authored body"}]}, start=0, end=10)
+    unnamed = _section("", _attachment("other", attachment_id="unnamed-chip"),
+                       start=10, end=20)
+    result = _compile([named, unnamed])
+    previews = result["section_channel_previews"]
+    assert previews["sections"]["global"] == {
+        "index": 0,
+        "authored": {"visual": "authored body"},
+        "bar": {"visual": "authored body prefix"},
+        "full": {"visual": "prefix authored body"},
+    }
+    assert previews["global"] == {
+        "authored": {"visual": ""},
+        "bar": {"visual": ""},
+        "full": {"visual": ""},
+    }
+    assert not any(key.startswith("__compile_section_")
+                   for key in previews["sections"])
 
 
 def _enabled_probe(body):

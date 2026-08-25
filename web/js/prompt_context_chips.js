@@ -1501,22 +1501,69 @@ function selectionPoint(root) {
 
 function setCaretAfter(node) {
     const selection = globalThis.getSelection?.();
-    if (!selection) return;
+    if (!selection) return false;
     const range = document.createRange();
     range.setStartAfter(node);
     range.collapse(true);
     selection.removeAllRanges();
     selection.addRange(range);
+    return true;
 }
 
 function setCaretBefore(node) {
     const selection = globalThis.getSelection?.();
-    if (!selection) return;
+    if (!selection) return false;
     const range = document.createRange();
     range.setStartBefore(node);
     range.collapse(true);
     selection.removeAllRanges();
     selection.addRange(range);
+    return true;
+}
+
+function promptCaretRangeFromPoint(x, y) {
+    let range = document.caretRangeFromPoint?.(x, y) || null;
+    if (!range && document.caretPositionFromPoint) {
+        const position = document.caretPositionFromPoint(x, y);
+        if (position) {
+            range = document.createRange();
+            range.setStart(position.offsetNode, position.offset);
+            range.collapse(true);
+        }
+    }
+    return range;
+}
+
+/**
+ * Correct native point placement only at contenteditable's atomic boundaries.
+ * Chromium can report a caret inside a `contenteditable=false` attachment when
+ * the editor background beside or below that chip is clicked. Text positions
+ * remain entirely native; this helper only snaps an atomic hit before/after the
+ * direct model chip, with the below-terminal case taking precedence.
+ */
+function snapPromptCaretAtAtomicBoundary(editor, x, y, range = null) {
+    // Editing may leave a bare text node in the live DOM until the next render.
+    // `children` would skip it and falsely call the preceding chip terminal.
+    const lastContentChild = [...(editor?.childNodes || [])].reverse().find((child) => {
+        if (child?.nodeType === Node.TEXT_NODE) {
+            return String(child.nodeValue || "").replaceAll("\u200b", "") !== "";
+        }
+        return child instanceof HTMLElement
+            && child.dataset.sonderDecoration !== "1";
+    });
+    if (lastContentChild?.dataset?.nodeType === "attachment") {
+        const rect = lastContentChild.getBoundingClientRect();
+        if (y > rect.bottom) return setCaretAfter(lastContentChild);
+    }
+
+    let container = range?.startContainer || null;
+    if (container?.nodeType === Node.TEXT_NODE) container = container.parentElement;
+    if (!(container instanceof HTMLElement)) container = container?.parentElement || null;
+    const chip = container?.closest?.('[data-node-type="attachment"]') || null;
+    if (!chip || chip.parentElement !== editor) return false;
+    const rect = chip.getBoundingClientRect();
+    return x < (rect.left + rect.right) / 2
+        ? setCaretBefore(chip) : setCaretAfter(chip);
 }
 
 /**
@@ -2091,6 +2138,17 @@ export function createPromptDocumentEditor({
     editor.addEventListener("compositionend", () => {
         composing = false;
         readDom();
+    });
+    editor.addEventListener("click", (event) => {
+        if (editor.disabled || event.target !== editor || event.button !== 0
+                || event.detail !== 1 || composing || event.isComposing === true) return;
+        const selection = globalThis.getSelection?.();
+        if (selection?.isCollapsed !== true) return;
+        // `click` runs after the browser has made its native selection. Preserve
+        // every ordinary text hit and repair only a native atomic-chip result.
+        const range = promptCaretRangeFromPoint(event.clientX, event.clientY);
+        snapPromptCaretAtAtomicBoundary(
+            editor, event.clientX, event.clientY, range);
     });
     editor.addEventListener("beforeinput", (event) => {
         if (!composing && !String(event.inputType || "").startsWith("history")) pushHistory();
@@ -2963,14 +3021,10 @@ function promptPointInSelection(editor, x, y) {
 }
 
 function setPromptCaretFromPoint(editor, x, y) {
-    let range = document.caretRangeFromPoint?.(x, y) || null;
-    if (!range && document.caretPositionFromPoint) {
-        const position = document.caretPositionFromPoint(x, y);
-        if (position) {
-            range = document.createRange();
-            range.setStart(position.offsetNode, position.offset);
-            range.collapse(true);
-        }
+    const range = promptCaretRangeFromPoint(x, y);
+    if (snapPromptCaretAtAtomicBoundary(editor, x, y, range)) {
+        editor.focus({ preventScroll: true });
+        return true;
     }
     if (!range || !editor.contains(range.startContainer)) return false;
     const selection = globalThis.getSelection?.();

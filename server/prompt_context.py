@@ -3742,6 +3742,7 @@ def profile_error_result(exc, *, window_start=0, window_end=1, fps=24.0) -> dict
         "attachment_channel_previews": {},
         "attachment_channel_routes": {},
         "attachment_capability_projections": [],
+        "section_channel_previews": {"sections": {}, "global": None},
         # Empty, not absent. A surface reading this key must not have to know
         # which of the compile's exits produced the payload; an empty list means
         # "nothing known", which every consumer already treats as `selected`.
@@ -5056,6 +5057,11 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         return value
 
     expanded_sections = []
+    section_channel_previews = {}
+    raw_section_indexes = {
+        str(section.get("prompt_id") or ""): index
+        for index, section in enumerate(raw_sections)
+    }
     attachment_channel_routes = defaultdict(dict)
     attachment_capability_projections = []
     projection_rows = {}
@@ -5174,6 +5180,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                     attachment, capability_id, key, anchor_node_id,
                     adjacent_raw_text),
             context)
+    global_authored_mirror = dict(global_mirror)
+    global_bar_mirror = dict(global_authored_mirror)
     for attachment in global_by_id.values():
         if not attachment["enabled"] or attachment["attachment_id"] in global_anchored:
             continue
@@ -5234,6 +5242,15 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 for a, c, projection in phases.get(phase, []))
         global_mirror[route] = _join_declared_emissions(
             prefixes + [(global_mirror[route], global_attachment_separator)] + suffixes,
+            global_attachment_separator)
+        # Timeline bars deliberately keep the authored document first, while
+        # retaining the compiler's declared contribution order on either side.
+        # Publishing this exact mirror avoids trying to subtract authored text
+        # from the wrapped result in the browser, which is ambiguous whenever
+        # the same text also appears in an attachment contribution.
+        global_bar_mirror[route] = _join_declared_emissions(
+            [(global_authored_mirror[route], global_attachment_separator)]
+            + prefixes + suffixes,
             global_attachment_separator)
 
     for section in selected_sections:
@@ -5376,6 +5393,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                     attachment, capability_id, key, anchor_node_id,
                     adjacent_raw_text),
                 context)
+        authored_mirrors = dict(mirrors)
+        bar_mirrors = dict(authored_mirrors)
 
         # Scope attachments are emitted by placement. Inline attachment nodes
         # already emitted above and are not emitted again here.
@@ -5484,7 +5503,20 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             mirrors[key] = _join_declared_emissions(
                 prefixes + [(mirrors[key], attachment_separator)] + suffixes,
                 attachment_separator)
+            bar_mirrors[key] = _join_declared_emissions(
+                [(authored_mirrors[key], attachment_separator)] + prefixes + suffixes,
+                attachment_separator)
         prompt_id = str(section.get("prompt_id") or "")
+        raw_index = raw_section_indexes.get(prompt_id, -1)
+        original_prompt_id = (original_prompt_ids[raw_index]
+                              if 0 <= raw_index < len(original_prompt_ids) else "")
+        if original_prompt_id:
+            section_channel_previews[original_prompt_id] = {
+                "index": raw_index,
+                "authored": authored_mirrors,
+                "bar": bar_mirrors,
+                "full": dict(mirrors),
+            }
         for key, value in mirrors.items():
             if str(value or "").strip():
                 present_origins.add((prompt_id, str(key)))
@@ -5779,7 +5811,19 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         },
         "attachment_capability_projections": copy.deepcopy(
             attachment_capability_projections),
-        # Response-only, like the two above it: presentation state describing
+        # Response-only display mirrors. Namespaces keep arbitrary durable prompt
+        # ids from colliding with the global row. `bar` is the compiler-authored
+        # authored-first display order; `full` is the exact wrapped compile order
+        # used by the unclipped hover. None is durable or render-authoritative.
+        "section_channel_previews": {
+            "sections": section_channel_previews,
+            "global": {
+                "authored": global_authored_mirror,
+                "bar": global_bar_mirror,
+                "full": dict(global_mirror),
+            },
+        },
+        # Response-only, like the display mirrors above: presentation state describing
         # this window, not part of what a job renders. It must therefore be
         # named in the freeze DENYLIST in `routes.py`, which excludes rather
         # than allows -- silence there puts a key in every frozen envelope.

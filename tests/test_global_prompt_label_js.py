@@ -23,6 +23,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_URL = (ROOT / "web" / "js" / "prompt_composition.js").as_uri()
+TEMPLATE_MODULE_URL = (ROOT / "web" / "js" / "prompt_channel_templates.js").as_uri()
 
 # Two global channels, so "all keys" and "first key only" are distinguishable.
 TEMPLATE = {
@@ -51,6 +52,58 @@ def _lines(channels, template, labels_on=False):
         [node, "--input-type=module", "-e", script],
         capture_output=True, text=True, encoding="utf-8", check=True,
     ).stdout)
+
+
+def _method_source(source, name):
+    marker = f"    {name}("
+    start = source.index(marker)
+    opening = source.index("{", start)
+    depth = 0
+    for index in range(opening, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start:index + 1].strip()
+    raise AssertionError(f"Unclosed method {name}")
+
+
+def _bar_probe(payload, section, template):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for the prompt bar label test")
+    widget = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
+    methods = "\n".join(_method_source(widget, name) for name in (
+        "_promptCompiledBarLabel", "_promptSectionBarLabel", "_promptGlobalBarLabel"))
+    script = f"""
+const composition = await import({json.dumps(MODULE_URL)});
+const templates = await import({json.dumps(TEMPLATE_MODULE_URL)});
+const {{ composeSectionText, globalChannelLines, normalizeChannels,
+  promptPreviewAuthoredFirstChannels }} = composition;
+const {{ globalChannelKeys, templateChannelKeys }} = templates;
+const PROMPT_BAR_LABEL_MEMO = new WeakMap();
+class Subject {{
+  constructor() {{
+    this.payload = {json.dumps(payload)};
+    this.activeScene = {{ prompt: "legacy global", global_channels: {{
+      alpha: "fallback global", beta: "hidden global" }} }};
+    this.template = {json.dumps(template)};
+  }}
+  _channelTemplate() {{ return this.template; }}
+  _windowedPromptCandidate() {{ return this.payload; }}
+  _globalChannelKeys() {{ return globalChannelKeys(this.template); }}
+  {methods}
+}}
+const subject = new Subject();
+console.log(JSON.stringify({{
+  section: subject._promptSectionBarLabel({json.dumps(section)}),
+  global: subject._promptGlobalBarLabel(),
+}}));
+"""
+    return json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
 
 
 def test_every_global_channel_shows_when_per_channel_globals_are_on():
@@ -98,7 +151,8 @@ def test_surfaces_consume_the_shared_helper_rather_than_the_legacy_mirror():
     # The lane bar is label-free and joins with a space, mirroring the backend
     # derivation in prompt_payload.compose_range_prompt.
     assert "_promptGlobalBarLabel()" in widget
-    assert 'globalChannelLines(scene.global_channels, this._channelTemplate(), false).join(" ")' in widget
+    assert "section_channel_previews" in widget
+    assert "this._globalChannelKeys()" in widget
     assert "host._promptGlobalBarLabel" in canvas
 
     # The hover panel is multi-line and labelled, matching its section branch —
@@ -106,6 +160,68 @@ def test_surfaces_consume_the_shared_helper_rather_than_the_legacy_mirror():
     # content rather than the same content scoped scene-wide.
     hover = widget.split("_showPromptHoverPreview(hit, clientX, clientY) {", 1)[1]
     hover = hover.split("\n    _hidePromptHoverPreview", 1)[0]
-    assert "globalChannelLines(this.activeScene?.global_channels," in hover
-    assert "this._channelTemplate(), false)" in hover
+    assert "promptPreviewFullChannelLines(" in hover
+    assert "this._globalChannelKeys()" in hover
     assert '"(empty global prompt)"' in hover
+
+
+def test_bar_preview_is_authored_first_collapsed_and_falls_back_without_a_row():
+    template = {**TEMPLATE, "labels": "never", "global_channels_enabled": False}
+    payload = {"_stale": True, "section_channel_previews": {
+        "sections": {"section": {
+            "authored": {"alpha": "Authored\n  sentence", "beta": "other authored"},
+            "bar": {"alpha": "Authored\n  sentence\nPrefix line\nSuffix line",
+                    "beta": "other authored\nBeta prefix"},
+            "full": {"alpha": "Prefix line\nAuthored\n  sentence\nSuffix line",
+                     "beta": "Beta prefix\nother authored"},
+        }},
+        "global": {
+            "authored": {"alpha": "Global authored", "beta": "must not show"},
+            "bar": {"alpha": "Global authored\nGlobal prefix",
+                    "beta": "must not show\nHidden prefix"},
+            "full": {"alpha": "Global prefix\nGlobal authored",
+                     "beta": "Hidden prefix\nmust not show"},
+        },
+    }}
+    result = _bar_probe(payload, {
+        "prompt_id": "section", "channels": {"alpha": "fallback section"},
+        "prompt": "legacy section",
+    }, template)
+    assert result == {
+        "section": ("Authored sentence Prefix line Suffix line "
+                    "other authored Beta prefix"),
+        "global": "Global authored Global prefix",
+    }
+    assert "must not show" not in result["global"]
+
+    # The browser must consume the exact server-published bar mirror. Subtracting
+    # authored prose from `full` cannot distinguish the prefix's "cat" from the
+    # authored "cat" and used to corrupt this label.
+    collision = _bar_probe({"section_channel_previews": {
+        "sections": {"section": {
+            "authored": {"alpha": "cat"},
+            "bar": {"alpha": "cat a cat person"},
+            "full": {"alpha": "a cat person cat"},
+        }},
+        "global": None,
+    }}, {"prompt_id": "section", "channels": {}}, template)
+    assert collision["section"] == "cat a cat person"
+
+    fallback = _bar_probe({}, {
+        "prompt_id": "missing", "channels": {"alpha": "fallback section"},
+        "prompt": "legacy section",
+    }, template)
+    assert fallback == {
+        "section": "fallback section",
+        "global": "fallback global",
+    }
+
+
+def test_queue_display_uses_global_channels_without_changing_scene_prompt_contract():
+    widget = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
+    queue = _method_source(widget, "_buildQueueSnapshot")
+    assert "const displayScenePrompt" in queue
+    assert "globalChannelLines(this.activeScene.global_channels" in queue
+    assert "prompt = [displayScenePrompt.trim()" in queue
+    assert "scene_prompt: scenePrompt" in queue
+    assert "scene_prompt: displayScenePrompt" not in queue

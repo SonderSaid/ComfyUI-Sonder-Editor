@@ -103,6 +103,8 @@ a fresh `[Unreleased]` block.
   format's own label.
 
 ### Fixed
+- Timeline prompt bars and optimistic queue rows now show the active format's resolved prompt content, while clipped bars keep authored prose first and full hover previews retain compiler order.
+- Clicking or right-clicking blank editor space beside or below a terminal Context chip now lands the caret at the chip boundary without disrupting native text selection, IME, or chip activation.
 - MiniMax H3 population slot limits now appear as non-blocking Prompt-tool advice after the resolver bounds the ordinal presentation to the node's available inputs.
 - The render queue now remains visible and expanded across Assets/References tab switches and returns to the mounted gallery after fullscreen; hidden Vocal Event controls no longer intercept prose clicks; and Reference Library scroll is preserved across same-scope mutations and loading/tab reveal while resetting across query, mode, draft, and project changes.
 - A field your References feed that the prompt format lists first now shows its contributions inside the section you wrote them in, rather than stacked at the top of the Writing draft — and it stays there while you type, instead of dropping to the bottom each time the preview catches up.

@@ -1267,7 +1267,7 @@ def test_prompt_panel_consumes_only_windowed_candidate_diagnostics():
     assert keep == {
         "attachment_capability_projections", "attachment_channel_previews",
         "attachment_channel_routes", "emissions", "attachment_previews",
-        "section_window_states"}, keep
+        "section_channel_previews", "section_window_states"}, keep
 
     # And nothing on the scene payload's arrival path can reach diagnostics,
     # the queue gate, or Reference Prompting -- which derives from a
@@ -1298,6 +1298,67 @@ def test_the_scene_wide_compile_asks_for_the_whole_scene():
     assert "windowStart: 0, windowEnd: duration" in arrival
     # ...and it does not fire at all when the window already is the scene.
     assert "if (windowStart <= 0 && windowEnd >= duration)" in arrival
+
+
+def test_timeline_prompt_labels_gate_compiles_by_collapse_and_debounce_hot_refreshes():
+    widget = _source("web/js/editor_widget.js")
+    timeline = _method_body(widget, "_promptContextTimelineConsumerMounted")
+    assert "_promptLayoutIdx()" in timeline
+    assert "_globalPromptLayoutIdx()" in timeline
+    assert "collapsed !== true" in timeline
+    code = " ".join(line.split("//")[0] for line in timeline.splitlines())
+    assert "hidden" not in code
+
+    delay = _method_body(widget, "    _promptContextPreviewDelay")
+    assert "_promptContextEditingConsumersMounted()" in delay
+    assert "PROMPT_TIMELINE_COMPILE_DELAY_MS" in delay
+    # Widget-state, scene-switch, context, selection, and dependency gates all
+    # pass through the timeline-only debounce instead of hard-coding zero.
+    assert widget.count("this._promptContextPreviewDelay(0)") >= 5
+
+    scene = _method_body(widget, "_previewPromptContextScenePayload",
+                         marker="this._renderTimeline();")
+    windowed = _method_body(widget, "    _previewPromptContextCandidate",
+                            marker="this._renderTimeline();")
+    assert scene.count("this._renderTimeline();") >= 3
+    assert windowed.count("this._renderTimeline();") >= 3
+
+
+def test_expanding_the_first_prompt_lane_schedules_its_initial_compile():
+    widget = _source("web/js/editor_widget.js")
+    transition = _method(
+        widget, "_previewPromptContextForNewConsumer",
+        "_refreshPromptContextDependencyConsumers")
+    result = _run_node(f"""
+const PROMPT_TIMELINE_COMPILE_DELAY_MS = 180;
+class Subject {{
+{transition}
+  constructor(mounted) {{ this.mounted = mounted; this.calls = []; }}
+  _promptContextConsumersMounted() {{ return this.mounted; }}
+  _promptContextEditingConsumersMounted() {{ return false; }}
+  _promptContextPreviewDelay(immediateDelay = 0) {{
+    return this._promptContextEditingConsumersMounted()
+      ? immediateDelay : PROMPT_TIMELINE_COMPILE_DELAY_MS;
+  }}
+  _previewPromptContextCandidate(options, delay) {{ this.calls.push([options, delay]); }}
+}}
+const dormant = new Subject(false);
+const expanded = new Subject(true);
+console.log(JSON.stringify({{
+  dormant: [dormant._previewPromptContextForNewConsumer(false), dormant.calls],
+  expanded: [expanded._previewPromptContextForNewConsumer(false), expanded.calls],
+  alreadyMounted: [expanded._previewPromptContextForNewConsumer(true), expanded.calls],
+}}));
+""")
+    assert result["dormant"] == [False, []]
+    assert result["expanded"] == [True, [[{}, 180]]]
+    assert result["alreadyMounted"] == [False, [[{}, 180]]]
+
+    settings = _method(widget, "_handleSettingsChange", "_syncSettingsPanelControls")
+    timeline_events = _method(widget, "_setupTimelineEvents", "_resolveDropHoverTarget")
+    for path in (settings, timeline_events):
+        assert "const hadPromptConsumer = this._promptContextConsumersMounted();" in path
+        assert "this._previewPromptContextForNewConsumer(hadPromptConsumer);" in path
 
 
 def test_prompt_projection_repaints_are_signature_gated_at_every_consumer():
@@ -1430,7 +1491,7 @@ class Subject {
       _candidate_scene_id: "scene", _stale: false };
     this._promptContextScenePayloadCache = {
       _candidate_scene_id: "scene", _stale: false };
-    this.counts = { diagnostics: 0, projections: 0, inline: 0 };
+    this.counts = { diagnostics: 0, projections: 0, inline: 0, timeline: 0 };
     this._promptPanelHandle = {
       // Production `renderDiagnostics` owns the panel projection fan-out.
       refreshDiagnostics: () => {
@@ -1440,6 +1501,7 @@ class Subject {
     };
     this._refreshInlinePromptProjections = () => this.counts.inline++;
   }
+  _renderTimeline() { this.counts.timeline++; }
   _projectDirName() { return "project"; }
   _selectionContextRange() { return { contextStart: 0, contextEnd: 100 }; }
   _promptScenePayload() { return this._promptContextScenePayloadCache; }
@@ -1474,11 +1536,13 @@ console.log(JSON.stringify({ immediate, painted,
             "windowStale": True, "windowVisual": False,
             "sceneStale": True, "sceneVisual": False,
             "sceneToken": 8,
-            "counts": {"diagnostics": 0, "projections": 0, "inline": 0},
+            "counts": {"diagnostics": 0, "projections": 0, "inline": 0,
+                       "timeline": 0},
         },
         "painted": {
             "windowVisual": True, "sceneVisual": True,
-            "counts": {"diagnostics": 1, "projections": 1, "inline": 1},
+            "counts": {"diagnostics": 1, "projections": 1, "inline": 1,
+                       "timeline": 1},
         },
         "secondSceneToken": 9,
     }
@@ -1557,7 +1621,7 @@ class Subject {
     this._promptContextCandidateCache = {
       _candidate_scene_id: "scene", _stale: false };
     this._promptContextScenePayloadCache = null;
-    this.counts = { diagnostics: 0, inline: 0, apply: 0 };
+    this.counts = { diagnostics: 0, inline: 0, apply: 0, timeline: 0 };
     this._promptPanelHandle = {
       refreshDiagnostics: () => this.counts.diagnostics++,
       applyCandidate: () => this.counts.apply++,
@@ -1569,6 +1633,7 @@ class Subject {
   _promptScenePayload() { return null; }
   _previewPromptContextScenePayload() {}
   _promptCompileRequestBody() { return {}; }
+  _renderTimeline() { this.counts.timeline++; }
 }
 const subject = new Subject();
 subject._previewPromptContextCandidate({}, 0);
@@ -1588,7 +1653,7 @@ console.log(JSON.stringify({
     assert result == {
         "code": "preview_invalid_response", "stale": False,
         "staleTimerCancelled": True,
-        "counts": {"diagnostics": 1, "inline": 1, "apply": 1},
+        "counts": {"diagnostics": 1, "inline": 1, "apply": 1, "timeline": 1},
     }
 
 
@@ -1621,7 +1686,7 @@ class Subject {
     this._promptContextScenePayloadCache = {
       _candidate_scene_id: "scene", _stale: true, _stale_visual: false };
     this._promptContextStaleVisualTimer = setTimeout(() => {}, 10000);
-    this.counts = { inline: 0, projections: 0 };
+    this.counts = { inline: 0, projections: 0, timeline: 0 };
     this._refreshInlinePromptProjections = () => this.counts.inline++;
     this._promptPanelHandle = {
       refreshProjections: () => this.counts.projections++,
@@ -1629,6 +1694,7 @@ class Subject {
   }
   _promptCompileRequestBody() { return {}; }
   _promptProjectionSubset(value) { return value; }
+  _renderTimeline() { this.counts.timeline++; }
 }
 const subject = new Subject();
 subject._previewPromptContextScenePayload({ dirName: "project", sceneId: "scene",
@@ -1642,7 +1708,7 @@ console.log(JSON.stringify({ cache: subject._promptContextScenePayloadCache,
         text=True, encoding="utf-8", check=True).stdout)
     assert result == {
         "cache": None, "timer": None,
-        "counts": {"inline": 1, "projections": 1},
+        "counts": {"inline": 1, "projections": 1, "timeline": 1},
     }
 
 

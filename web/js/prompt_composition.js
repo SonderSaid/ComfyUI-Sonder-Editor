@@ -87,6 +87,43 @@ export function globalChannelLines(globalChannels, template = null, labelsOn = f
     return lines;
 }
 
+/** Display-only channel values with authored prose leading and the compiler's
+ *  surrounding contributions following. The server publishes this exact order:
+ *  deriving it from `full` is ambiguous when authored prose also occurs inside
+ *  a contribution. */
+export function promptPreviewAuthoredFirstChannels(preview, keys = []) {
+    const bar = preview?.bar && typeof preview.bar === "object"
+        ? preview.bar
+        : (preview?.authored && typeof preview.authored === "object"
+            ? preview.authored : {});
+    const channels = {};
+    for (const key of keys || []) {
+        channels[key] = String(bar[key] ?? "")
+            .replace(/\s+/g, " ")
+            .trim();
+    }
+    return channels;
+}
+
+/** Multi-line full mirrors, labelled exactly like the existing hover surface. */
+export function promptPreviewFullChannelLines(preview, template = null, keys = null,
+                                              labelsOn = false) {
+    const resolved = getChannelTemplate(template);
+    const activeKeys = keys || templateChannelKeys(resolved);
+    const full = preview?.full && typeof preview.full === "object" ? preview.full : {};
+    const showLabels = templateLabelsOn(resolved, labelsOn);
+    const separator = resolved.label_separator ?? " ";
+    const labels = new Map((resolved.channels || []).map((entry) => [entry.key, entry.label]));
+    const lines = [];
+    for (const key of activeKeys) {
+        const text = String(full[key] ?? "").trim();
+        if (!text) continue;
+        const label = labels.get(key);
+        lines.push(showLabels && label ? `${label}${separator}${text}` : text);
+    }
+    return lines;
+}
+
 // Display twin of the backend's compose_range_prompt section part: labels ON
 // groups by channel (one label per channel, segment texts joined in temporal
 // order); labels OFF is plain temporal concatenation. Sections must already

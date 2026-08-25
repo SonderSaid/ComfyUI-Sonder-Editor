@@ -3855,6 +3855,7 @@ def _compose_frozen_job_prompt(project: TimelineProject, job: GenerationJob) -> 
         key: value for key, value in compiled.items()
                     if key not in {"attachment_channel_routes",
                                    "attachment_capability_projections",
+                                   "section_channel_previews",
                                    "section_window_states", "copy_plan"}
     }
     job.minimax_h3_setup_snapshot = copy.deepcopy(

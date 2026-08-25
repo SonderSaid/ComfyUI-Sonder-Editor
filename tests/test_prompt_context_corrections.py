@@ -3910,6 +3910,150 @@ def test_reset_heals_separator_padding_a_project_already_accumulated():
     assert result["caretSlot"] == "<one>|[]|<two>|[tailNL]"
 
 
+def test_background_clicks_snap_only_around_atomic_prompt_chips():
+    result = _run_chip_dom_script(r"""
+        const attachment = { attachment_id: "ref", kind: "reference",
+            source: {}, config: {} };
+        let activations = 0;
+        const editor = mod.createPromptDocumentEditor({
+            document: { nodes: [
+                { type: "attachment", node_id: "a1", attachment_id: "ref" },
+            ] },
+            attachments: [attachment],
+            onActivateAttachment: () => { activations += 1; },
+        });
+        const chip = editor.children.find((child) =>
+            child.dataset.nodeType === "attachment");
+        chip.getBoundingClientRect = () => ({ left: 10, right: 30,
+            top: 5, bottom: 20, width: 20, height: 15 });
+        const chipInner = chip.children[0] || chip;
+        const nativeRange = { startContainer: chipInner, startOffset: 0,
+            endContainer: chipInner, endOffset: 0, collapsed: true };
+        document.caretRangeFromPoint = () => nativeRange;
+        document.createRange = () => ({
+            mode: "",
+            startContainer: editor,
+            startOffset: 0,
+            collapsed: true,
+            setStartAfter(node) { this.mode = "after"; this.startContainer = node.parentElement; },
+            setStartBefore(node) { this.mode = "before"; this.startContainer = node.parentElement; },
+            setStart(node, offset) { this.mode = "native"; this.startContainer = node;
+                this.startOffset = offset; },
+            collapse() { this.collapsed = true; },
+        });
+        let collapsed = true;
+        let selected = "native";
+        let activeRange = nativeRange;
+        const selection = {
+            rangeCount: 1,
+            get isCollapsed() { return collapsed; },
+            getRangeAt: () => activeRange,
+            removeAllRanges() {},
+            addRange(range) { activeRange = range; selected = range.mode || "native"; },
+        };
+        globalThis.getSelection = () => selection;
+        const click = ({ x = 0, y = 10, detail = 1, button = 0,
+                         target = editor, isComposing = false } = {}) => {
+            selected = "native";
+            activeRange = nativeRange;
+            editor._handlers.click[0]({ target, button, detail,
+                clientX: x, clientY: y, isComposing });
+            return selected;
+        };
+
+        const left = click({ x: 12 });
+        const rightGap = click({ x: 28 });
+        const below = click({ x: 0, y: 30 });
+        const doubleClick = click({ x: 28, detail: 2 });
+        collapsed = false;
+        const dragSelection = click({ x: 28 });
+        collapsed = true;
+        const composing = click({ x: 28, isComposing: true });
+        editor.disabled = true;
+        const disabledAfterConstruction = click({ x: 28 });
+        editor.disabled = false;
+        selected = "native";
+        chip._handlers.click[0]({ preventDefault() {}, stopPropagation() {} });
+        const chipActivation = { selected, activations };
+
+        const unlockedEditor = mod.createPromptDocumentEditor({
+            document: { nodes: [
+                { type: "attachment", node_id: "a2", attachment_id: "ref" },
+            ] },
+            attachments: [attachment],
+            disabled: true,
+        });
+        const unlockedChip = unlockedEditor.children.find((child) =>
+            child.dataset.nodeType === "attachment");
+        unlockedChip.getBoundingClientRect = chip.getBoundingClientRect;
+        const unlockedRange = { startContainer: unlockedChip.children[0] || unlockedChip,
+            startOffset: 0, collapsed: true };
+        unlockedEditor.disabled = false;
+        document.caretRangeFromPoint = () => unlockedRange;
+        activeRange = unlockedRange;
+        selected = "native";
+        unlockedEditor._handlers.click[0]({ target: unlockedEditor, button: 0,
+            detail: 1, clientX: 28, clientY: 10, isComposing: false });
+        const enabledAfterConstruction = selected;
+
+        const textEditor = mod.createPromptDocumentEditor({ text: "ordinary text" });
+        const textSpan = textEditor.children[0];
+        document.caretRangeFromPoint = () => ({ startContainer: textSpan,
+            startOffset: 2, collapsed: true });
+        selected = "native";
+        textEditor._handlers.click[0]({ target: textEditor, button: 0, detail: 1,
+            clientX: 90, clientY: 90, isComposing: false });
+        const textOnly = selected;
+
+        const mixedEditor = mod.createPromptDocumentEditor({
+            document: { nodes: [
+                { type: "attachment", node_id: "a3", attachment_id: "ref" },
+            ] },
+            attachments: [attachment],
+        });
+        const mixedChip = mixedEditor.children.find((child) =>
+            child.dataset.nodeType === "attachment");
+        mixedChip.getBoundingClientRect = chip.getBoundingClientRect;
+        const liveTail = document.createTextNode(" live trailing prose");
+        mixedEditor.appendChild(liveTail);
+        const mixedRange = { startContainer: liveTail, startOffset: 19,
+            collapsed: true };
+        document.caretRangeFromPoint = () => mixedRange;
+        activeRange = mixedRange;
+        selected = "native";
+        mixedEditor._handlers.click[0]({ target: mixedEditor, button: 0, detail: 1,
+            clientX: 0, clientY: 30, isComposing: false });
+        const liveTrailingText = selected;
+
+        document.caretRangeFromPoint = () => nativeRange;
+        selected = "native";
+        activeRange = nativeRange;
+        mod.installPromptContextMenu({ editor, allowedKinds: [] });
+        editor._handlers.contextmenu[0]({ clientX: 0, clientY: 30,
+            preventDefault() {}, stopPropagation() {} });
+        const rightClickBelow = selected;
+
+        console.log(JSON.stringify({ left, rightGap, below, doubleClick,
+            dragSelection, composing, disabledAfterConstruction,
+            enabledAfterConstruction, chipActivation, textOnly,
+            liveTrailingText, rightClickBelow }));
+    """)
+    assert result == {
+        "left": "before",
+        "rightGap": "after",
+        "below": "after",
+        "doubleClick": "native",
+        "dragSelection": "native",
+        "composing": "native",
+        "disabledAfterConstruction": "native",
+        "enabledAfterConstruction": "after",
+        "chipActivation": {"selected": "native", "activations": 1},
+        "textOnly": "native",
+        "liveTrailingText": "native",
+        "rightClickBelow": "after",
+    }
+
+
 def test_a_decoration_never_enters_the_document_and_never_eats_a_keystroke():
     """The four ways host chrome inside a contenteditable can destroy authoring.
 
@@ -4815,7 +4959,7 @@ def test_section_window_states_carry_the_id_the_client_knows():
     assert rows[1]["prompt_id"] == "p-named", rows
 
 
-def test_section_window_states_are_response_only():
+def test_window_display_indexes_are_response_only():
     """Presentation state about one window, never part of what a job renders.
 
     Two things make that true and neither is automatic. `content_hash` is
@@ -4826,13 +4970,11 @@ def test_section_window_states_are_response_only():
     sections = [_section(0, 10, "one", prompt_id="p-1")]
     compiled = prompt_context.compile_prompt_context(
         sections=sections, window_start=0, window_end=10, fps=24.0)
-    stripped = {key: value for key, value in compiled.items()
-                if key != "section_window_states"}
     assert prompt_context.content_hash({
-        "prompt": stripped["prompt"], "channels": stripped["channels"],
-        "segments": stripped["segments"], "window": stripped["window"],
-        "profile_hash": stripped["profile_hash"],
-        "setup_manifest": stripped["setup_manifest"],
+        "prompt": compiled["prompt"], "channels": compiled["channels"],
+        "segments": compiled["segments"], "window": compiled["window"],
+        "profile_hash": compiled["profile_hash"],
+        "setup_manifest": compiled["setup_manifest"],
     }) == compiled["content_hash"]
     # And the freeze excludes it beside the two projection keys it belongs with.
     source = (ROOT / "server" / "routes.py").read_text(encoding="utf-8")
@@ -4851,7 +4993,7 @@ def test_section_window_states_are_response_only():
                 break
     assert freeze and "if key not in" in freeze, freeze
     for key in ("attachment_channel_routes", "attachment_capability_projections",
-                "section_window_states", "copy_plan"):
+                "section_channel_previews", "section_window_states", "copy_plan"):
         assert key in freeze, freeze
 
 
@@ -4866,6 +5008,7 @@ def test_an_unusable_profile_still_answers_the_window_state_question():
     result = prompt_context.profile_error_result(
         prompt_context.ProfileResolutionError("nope"))
     assert result["section_window_states"] == []
+    assert result["section_channel_previews"] == {"sections": {}, "global": None}
 
 
 def test_a_leading_anchor_is_the_blocks_own_not_the_documents():
