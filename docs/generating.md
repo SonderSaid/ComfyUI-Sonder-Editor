@@ -97,51 +97,10 @@ Already-queued jobs are never affected.
 
 ## Prompts
 
-### How the output prompt is composed
-
-The **Global** document plus every prompt section in the render window compile
-into one provider-ready prompt. The project's Channel Template defines the
-fields—Standard, Visual/Speech/Sound, MiniMax H3, or a custom set—and its
-**prompt format** (technical: Prompt Context Profile) owns labels, separators,
-dynamic syntax, writing aids, and validation.
-
-Text stays yours. Dynamic **Context chips** store stable intent and source ids,
-then resolve for the selected window: Shot numbering and its optional relative
-time, Reference context, Custom text with an optional H3 physical Guide binding,
-managed Vocal Events, and links to earlier prompt sections. Fixed syntax such as
-dialogue wrappers and camera phrases is inserted as a profile-provided **Writing
-aid**. Hover previews use the latest live
-compiler result; blocking diagnostics must be repaired before queueing.
-
-Timeline prompt bars show **All channels** by default. You can focus one channel,
-and that presentation choice is remembered per Channel Template. Hidden
-channels stay mounted with their caret/undo state and show non-empty counts
-beside the Channel selector. Switching is presentation only; it never moves or
-flattens authored text or chips.
-
-- **Boundary Prompt Threshold** (project-wide) drops a section from a window
-  when the selection clips only a tiny edge sliver of it — so frame snapping
-  can't bleed a neighbor's text into your generation. The timeline shows
-  affected slivers with a dim "Ignored" hatch, and sections that *will*
-  compose get a strong accent.
-- Lane hiding is part of composition: Prompt lane hidden → global-only
-  output; Global hidden → sections only; both hidden → empty prompt.
-
-### The Prompt Management panel
-
-Open it with **☰** on the Prompt or Global header. Two modes:
-
-- **Structured mode** — global and per-section document editors with the same
-  inline/scope Context chips as the timeline bars, range/channel controls,
-  per-row **Select** / **Queue**, reusable
-  prompt **templates**, and an enqueue-captured **history** with one-click
-  Apply.
-- **Writing mode** — one continuous chip-aware draft split into sections with
-  `---` break lines and channel headers, plus an allocation strip to distribute frames per block.
-  **Apply** replaces the lane's sections in one undoable step and can extend
-  the scene if the draft runs past it. Muted state, per-channel global opt-outs,
-  stable empty sections, and internal Prompt Link identities survive an
-  unchanged Apply and deliberate split/merge reconciliation.
+The Global document and every prompt section in the render window compile
+into the one prompt a job carries. Composition, Channel Templates, prompt
+formats, Context chips, and the Prompt Management panel are covered in
+[Prompts](prompts.md).
 
 ## Guides
 
@@ -175,8 +134,9 @@ frames for the render window.
 The editor's output socket feeds your generation workflow; optional bridge
 nodes carry each conditioning stream to where your graph needs it — guides
 (**Guides Bridge Start/End**), masks (**Masks Bridge**), prompts
-(**Prompt Relay Bridge**), and Drivers (**Driver Selector/Bridge**). Results
-come back through **Sonder Save Video** or **Sonder Save Bridge**, which
+(**Prompt Relay Bridge**), Drivers (**Driver Selector/Bridge**), and
+References (**Reference Selector** plus the Image, Audio, and Prompt Bridges —
+see [References](references.md)). Results come back through **Sonder Save Video** or **Sonder Save Bridge**, which
 register outputs as project assets. The full node list is in the
 [README](../README.md#nodes).
 

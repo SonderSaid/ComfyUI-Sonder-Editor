@@ -186,3 +186,31 @@ def test_prompt_tool_colour_comes_from_theme_tokens():
         "raw colour in the Prompt tool; use editor_theme.js tokens:\n"
         + "\n".join(findings)
     )
+
+
+def _builtin_reference_recipe_names() -> set[str]:
+    """Every recipe name a user can pick, from the one declaration that owns them."""
+    text = (ROOT / "server" / "timeline_state.py").read_text(encoding="utf-8")
+    start = text.index("REFERENCE_RECIPE_PRESETS = (")
+    end = text.index("ALL_REFERENCE_RECIPE_PRESETS")
+    return set(re.findall(r'"name":\s*"([^"]+)"', text[start:end]))
+
+
+def test_reference_recipe_table_lists_every_builtin_preset():
+    """The recipe table in docs/references.md duplicates a code declaration.
+
+    It shipped incomplete the first time it was written — `Wan VACE Reference
+    Sheet` was silently absent — because the table is hand-maintained and a
+    missing row looks exactly like a recipe that does not exist. Choosing a
+    recipe is the hard part of Reference setup, so the table earns its keep;
+    this makes the drift enforced rather than remembered.
+
+    Adding a preset means adding its row. Removing this table is also a valid
+    way to satisfy the test, in which case delete the test with it.
+    """
+    doc = (ROOT / "docs" / "references.md").read_text(encoding="utf-8")
+    missing = sorted(name for name in _builtin_reference_recipe_names() if name not in doc)
+    assert not missing, (
+        "docs/references.md recipe table is missing built-in preset(s):\n"
+        + "\n".join(f"  - {name}" for name in missing)
+    )

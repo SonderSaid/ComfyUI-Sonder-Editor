@@ -48,7 +48,7 @@ For a first text-to-video run, the scene can stay empty — no media needed.
 
 That's a complete T2V setup. Sections hold until the next section starts,
 so one section covers the whole scene — add more later to
-[direct different moments](generating.md#prompts).
+[direct different moments](prompts.md).
 
 ![The Global lane holding a scene-wide description, with per-moment prompt sections beneath it](images/prompt-lanes.webp)
 
@@ -74,7 +74,10 @@ project.
 editor → sampler → Sonder Save Video, and grow bridges as you need
 them.</em></p>
 
-<!-- TODO: link the example workflow .json here once published -->
+Prefer to start from a finished graph? Download the
+**[Sonder LTX 2.3 Playground](../example_workflows/sonder_ltx_2_3_playground.json)**
+and drop it onto the ComfyUI canvas — it wires prompt relay, multi-pass
+upscaling, image guides, and driver-controlled generation already.
 
 ## 7. Run it
 
@@ -109,10 +112,22 @@ combine on the same timeline — that's where the editor starts paying off.
 
 ## 9. Where to go next
 
+- **Write in more fields** — the default is one plain prompt box. A
+  [Channel Template](prompts.md#channel-templates) splits it into Visual /
+  Speech / Sound, or into a model's own fields.
+- **Draft a whole scene at once** —
+  [Writing mode](prompts.md#the-prompt-management-panel) turns one continuous
+  draft into timed sections.
 - **Generate longer sequences** — chain windows with context frames, or
   stage many jobs at once with the [render queue](generating.md#the-render-queue).
+- **Regenerate part of a clip** —
+  [mask a window](generating.md#masking-an-audio-video-latent) so the frames
+  around it are kept exactly.
 - **Condition harder** — [guide frames](generating.md#guides),
   [Drivers](generating.md#drivers), and time-aligned
-  [prompt sections](generating.md#prompts).
-- **Finish** — [export the timeline](assets-and-gallery.md#export-timeline)
-  to a file when the edit is done.
+  [prompt sections](prompts.md).
+- **Reuse characters and places** — build a
+  [Reference Library](references.md) and stage its members over a range.
+- **Review and finish** — [compare takes](assets-and-gallery.md#compare-mode)
+  side by side, then
+  [export the timeline](assets-and-gallery.md#export-timeline).

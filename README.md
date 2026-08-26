@@ -68,7 +68,7 @@ https://github.com/user-attachments/assets/7c8459fb-6d10-4b84-9bc6-a1e98308c3f1
   lock/hide, lane management, multi-layer compositing, and per-item fit modes.
 - **Scenes** — each with its own duration, resolution, and FPS.
 - **Prompt sections** — channel-template fields, history, and reusable **Context
-  chips** in timeline bars plus the Prompt tool's Structured and Writing modes.
+  chips** in timeline bars plus Prompt Management's Structured and Writing modes.
   Shot (with an optional relative time), Reference, Vocal Event, Prompt Link,
   and Custom chips resolve against the selected render window; Custom text can
   carry an H3 physical Guide binding, and fixed provider syntax stays available
@@ -82,7 +82,9 @@ https://github.com/user-attachments/assets/7c8459fb-6d10-4b84-9bc6-a1e98308c3f1
   collisions. The editor CSV outputs and Sonder Guides Bridge are alternative
   injection paths; do not inject the same project guides through both.
 - **Selections & context** — saved in/out ranges with pre/post context frames
-  and mask offsets for generation overlap.
+  and mask offsets for generation overlap. The Sonder Masks Bridge compiles
+  that window into hard video and audio latent noise masks, so a section
+  regenerates in place while the frames around it are kept exactly.
 - **Render queue + batch render** — stage and queue render jobs, including
   contiguous chunked batches.
 - **Asset gallery** — project-scoped assets and artifacts, folders, inspector,
@@ -99,7 +101,7 @@ https://github.com/user-attachments/assets/7c8459fb-6d10-4b84-9bc6-a1e98308c3f1
   Prompt Link intent without writing provider ordinals by hand. Shot owns its
   optional relative time, and H3 Custom text can bind to a physical Guide.
   Timeline bars show one remembered channel at a time while keeping every
-  channel editor and undo history mounted; the Prompt tool exposes the same chip
+  channel editor and undo history mounted; Prompt Management exposes the same chip
   documents in Structured and Writing modes.
 - **Progressive Reference setup** — staged thumbnails, ranges, applicability,
   recipe lifecycle, and errors stay visible; assembly internals and per-member
@@ -227,10 +229,14 @@ sample project below.
 - **[Editor Basics](docs/editor-basics.md)** — layout, timeline, item
   types, gestures, and shortcuts.
 - **[Generating](docs/generating.md)** — the generation window, model
-  templates, prompts, guides, Drivers, the render queue, and what's frozen
+  templates, guides, Drivers, the render queue, and what's frozen
   vs. live in queued jobs.
+- **[Prompts](docs/prompts.md)** — how a prompt is composed, Channel
+  Templates, prompt formats, Context chips, and the Prompt Management panel.
 - **[Assets & Gallery](docs/assets-and-gallery.md)** — asset lifecycle,
   tracked metadata, inspect/compare, and timeline export.
+- **[References](docs/references.md)** — the Reference Library, Reference
+  lanes and recipes, derived prompts, and the Reference nodes.
 
 ## Sample project
 

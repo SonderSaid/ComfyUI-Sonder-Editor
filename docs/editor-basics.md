@@ -41,9 +41,10 @@ between sessions (**Settings ▸ Layout & UI Scale ▸ Reset Editor Layout**
 clears them).
 
 **References** is the project-level authoring Library for reusable character,
-location, prop, outfit, voice, and video media. It stays beside the viewport but does
-not place anything on the timeline in this phase. See
-[Assets & Gallery › Reference Library](assets-and-gallery.md#reference-library).
+location, prop, outfit, voice, and video media. The Library holds the media
+itself; **Reference lanes** on the timeline are what scope its members over a
+range of frames. See
+[References](references.md).
 
 ## The timeline
 
@@ -53,9 +54,11 @@ not place anything on the timeline in this phase. See
    lane renders in front.
 2. **Audio lanes** (A1, A2, …) — independent rows.
 3. **Driver lanes** — one Driver clip per lane (conditioning, not output).
-4. **Guides** — a fixed track of guide-frame markers.
-5. **Global** — the always-on scene-wide prompt.
-6. **Prompt** — the segment prompt-section lane.
+4. **Reference lanes** (R1, R2, …) — scope Library members over a range
+   (conditioning, not output).
+5. **Guides** — a fixed track of guide-frame markers.
+6. **Global** — the always-on scene-wide prompt.
+7. **Prompt** — the segment prompt-section lane.
 
 ### Lane headers
 
@@ -128,14 +131,33 @@ one clip each, and Driver clips never appear in normal preview or renders
 separate Driver lanes for separate conditioning sources. Convert a video clip
 to a Driver (and back) from its right-click menu.
 
+### Reference items
+
+A range on a Reference lane saying **which Library members apply over which
+frames** — say, this character's face plus this outfit, from frame 0 to 120.
+The lane points at the [Reference Library](references.md); trimming an item
+changes when those references apply, never the media itself.
+
+Create one by dragging a Reference from the **References** sidebar onto the
+timeline. Dropping on the **ruler** always makes a new lane; dropping on an
+existing lane stages into it, and is refused with a message if that lane is
+locked, already occupied at that frame, or holds the other media kind. Stage
+image/video references separately from voice-reference audio — a mixed
+selection is refused before the drag starts.
+
+Lane rules, recipes, and what a lane resolves to for a render window are in
+[References](references.md).
+
 ### Prompt sections
 
 A text range on the Prompt lane. A section holds until the next section
-starts, and each carries three channels — **Visual / Speech / Sounds**.
-Double-click empty lane space to create one; double-click a section to edit
-its text inline. The lane is no-overlap: drags abut neighbors or swap with
-the hovered section. How sections compose into the generation prompt is
-covered in [Generating](generating.md).
+starts, and its fields come from the project's **Channel Template** — a new
+project starts on **Standard**, one plain text field, while other templates
+split it into labelled channels or a model's own field set. Double-click
+empty lane space to create one; double-click a section to edit its text
+inline. The lane is no-overlap: drags abut neighbors or swap with the hovered
+section. How sections compose into the generation prompt, and which templates
+exist, is covered in [Prompts](prompts.md).
 
 ### The Global prompt
 
