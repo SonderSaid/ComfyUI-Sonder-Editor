@@ -20,6 +20,8 @@ timeline gestures in [Editor Basics](editor-basics.md), and generation in
 Switch the fullscreen or mounted left sidebar from **Assets** to
 **References**.
 
+![The References sidebar with one character expanded to its three members — two image sheets and a voice reference — each with its tags and prompt text](images/reference-library.webp)
+
 - Create a named **character**, **location**, **prop**, or **outfit**, choose
   whether it is a **subject** or **context**, and give it a one-line
   description. Locations begin as context; the other kinds begin as subjects,
@@ -44,8 +46,8 @@ Switch the fullscreen or mounted left sidebar from **Assets** to
   take Arrow-key nudges — the full list is in the editor's **?** shortcut
   atlas. **Apply to Draft** returns your edit to the member; nothing reaches
   the project until you Save.
-- **Edit**, **Replace**, **Remove**, and **Up/Down** act on individual members,
-  with explicit Save and Cancel.
+- **Edit**, **Remove**, and **Up/Down** act on individual members, with explicit
+  Save and Cancel. Swapping a member's source asset happens inside its editor.
 - Search matches reference names, kinds, descriptions, member tags, and current
   asset names. Missing, Trashed, and unresolved members stay visible.
 
@@ -85,11 +87,12 @@ carries at least one member, and a blank end runs to scene end.
 
 Each lane holds one media kind, so items can't move between an image lane and
 an audio lane. Items on a lane can't overlap. Each item can be muted and
-carries its own conditioning strength. The lane header shows the lane's recipe
-name; item bars show their member names, then tags.
+carries its own conditioning strength. The lane header carries the lane name,
+with the recipe name beside it when the header is wide enough; item bars show
+their member names, then tags.
 
-Create items by dragging from the **References** sidebar onto the timeline; the
-drop rules are in
+Create items by dragging from the **References** sidebar onto the timeline, or
+with **Add to timeline** on an expanded Library card; the rules are in
 [Editor Basics › Reference items](editor-basics.md#reference-items).
 
 A Reference lane header's **☰** (also on its right-click menu) opens the lane
@@ -130,10 +133,17 @@ Recipes that ship built in:
 A built-in recipe is read-only, so a lane naming one always matches what that
 node expects. **Edit as custom** forks it into a project recipe you can change.
 
-The overlay shows only the controls your Assembly actually uses, grouped as
-Assembly, Members, Geometry, Frame grid, Frame rate, Bridge outputs, Prompt,
-Prompt Context, and Advisories. Staged members, ranges, state, and the advisory
-count stay visible; the rest expands when you want it.
+The **Reference Lanes** overlay opens on the lane's staged items: each item's
+frame range, strength and Active state, its members as `Reference · Member`
+thumbnails, and its advisory count. Tabs along the top switch between Reference
+lanes without closing it.
+
+Expanding an item reaches its derived prompt and its per-member controls, where
+each member carries a **role** and a **preservation** choice drawn from the
+recipe's own catalogs. The recipe itself sits below, showing only the fields
+your Assembly actually uses.
+
+![The Reference Lanes overlay: lane tabs across the top, one staged item with its frame range, strength and Active state, its two members as thumbnails, and the recipe template below](images/reference-lane-setup.webp)
 
 Some values are **pegged** rather than typed — the frame grid and snap multiple
 follow the scene's model template, a sheet's loop length follows the render
@@ -153,6 +163,9 @@ panel alike:
 | **Below threshold** | The window covers too little of this item's own span, so nothing is sent. |
 | **Outside window** | The item doesn't overlap the window. |
 | **Excluded** | Muted, or on a hidden lane, so it never participates. |
+
+![Four Reference lanes across a render window: solid bars are in window, while a Superseded item and a Below threshold item are dimmed and hatched](images/reference-verdicts.webp)
+<p align="center"><em>Only the solid bars reach the model. <strong>Superseded</strong> lost to an item covering the window more tightly; <strong>Below threshold</strong> was dropped because the window clips too little of its own span.</em></p>
 
 **Reference Threshold %** (Settings, project-wide) is what drops an item whose
 own span the window barely touches. Unlike prompts, this can leave a lane with

@@ -43,6 +43,10 @@ flattens authored text or chips.
   compose get a strong accent.
 - Lane hiding is part of composition: Prompt lane hidden → global-only
   output; Global hidden → sections only; both hidden → empty prompt.
+- **Takes global** on a section decides, per channel, whether that field picks
+  up the scene's Global text. Only channels whose Global actually carries text
+  are offered. Untick one and the global text is dropped from any render that
+  covers only sections which opted out.
 
 ## Channel Templates
 
@@ -118,7 +122,16 @@ render.
 
 **+ Attach** adds one, and the same dialog configures it before it exists rather
 than sending you hunting for it afterwards. A chip carries a small `✎` because
-it is an editor, not a static token.
+it is an editor, not a static token. Chips sit either inline in a field or in the
+section's own context row, depending on where the format places them.
+
+A chip can also be switched off for a single field without being removed. That
+field then says the capability is disabled and contributes no text, so a chip
+you have silenced stays visible rather than vanishing from the section.
+
+Because a chip resolves against a window, editing a section that falls **outside
+the current render window** shows scene-wide numbering instead — the panel says
+so, and warns that those numbers can differ from what the section will render.
 
 | Chip | What it contributes |
 |---|---|
@@ -128,6 +141,8 @@ it is an editor, not a static token.
 | **Vocal Event** | A managed piece of speech or song. |
 | **Prompt Link** | A link to an earlier prompt section. |
 | **Custom** | Your own text, optionally bound to an H3 physical Guide. |
+
+![A prompt section in Structured mode: chips inline inside a channel and in the section's own context row, with @mentions written directly into the prose](images/prompt-structured-chips.webp)
 
 Overrides on a chip disclose by **state, not category**: fields still following
 their source collapse into one line naming the most specific source in play,
@@ -188,6 +203,13 @@ splits sections, a line like `visual:` starts that channel, and unlabelled text
 goes to the template's default draft channel. An allocation strip distributes
 frames per block.
 
+Two views share one draft. **Source** is where you write — channel headings,
+break lines and chip contributions all editable, with each chip's contribution
+shown as prose beneath the text it attaches to. **Compiled** is read-only output
+from the same compiler the render uses, for checking what the draft becomes.
+
+![Writing mode in Source view: channel heading lines, a --- break between blocks, and each chip's contribution shown as prose beneath the text it attaches to](images/writing-mode-source.webp)
+
 **Nothing here reaches your prompts until you Apply** — and nothing your prompts
 do reaches the draft on its own either. Traffic moves only when you ask, in
 whichever direction you ask for:
@@ -200,6 +222,12 @@ whichever direction you ask for:
 - **Reset from sections** pulls the other way, rebuilding the draft and its
   lengths from the lane's current sections. The draft you had is kept, and
   **Restore draft** brings it back.
+
+Alongside those, **Split here** breaks the draft at the caret and **Equalize**
+resets every block to an equal share of the scene.
+
+![The Writing mode tool row above the allocation strip, with seven blocks showing their frame lengths, timecodes and per-block context rows](images/writing-mode-allocation.webp)
+<p align="center"><em><strong>Restore draft</strong> appears only while a draft is stashed, which is what makes <strong>Reset from sections</strong> safe to press.</em></p>
 
 Applying an unchanged draft is safe: muted state, per-channel global opt-outs,
 stable empty sections, and internal Prompt Link identities all survive it, as

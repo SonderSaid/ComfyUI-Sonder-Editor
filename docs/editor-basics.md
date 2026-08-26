@@ -145,6 +145,9 @@ locked, already occupied at that frame, or holds the other media kind. Stage
 image/video references separately from voice-reference audio — a mixed
 selection is refused before the drag starts.
 
+An expanded Library card also offers **Add to timeline**, which stages at the
+playhead on the first compatible lane, making a new one only if none fits.
+
 Lane rules, recipes, and what a lane resolves to for a render window are in
 [References](references.md).
 

@@ -109,10 +109,13 @@ Double-click (or Space) a gallery asset for fullscreen inspection.
 built for take review.
 
 - **Layouts** — a screen-fixed **divider** over one shared stage (pan/zoom
-  moves both together), or explicit **side-by-side** with linked zoom.
-- **Pickers** — each side gets its own search box and keeps its own scroll
-  position; a sticky toggle chooses which side the arrow keys cycle, so you
-  can hold one take fixed and flip the other through candidates.
+  moves both together), or explicit **side-by-side**, where a further toggle
+  switches between **Linked Zoom** and **Independent Zoom**.
+- **Pickers** — left-click assigns A, right-click assigns B, and the current
+  pair stays pinned at the top of both lists. Each side gets its own search box
+  and keeps its own scroll position; a sticky toggle chooses which side the
+  arrow keys cycle, so you can hold one take fixed and flip the other through
+  candidates.
 - **Video** — linked transport with drift recovery; an **A | B | None**
   control picks which side's audio plays.
 - **Audio** — stacked waveforms; monitor **A / B / Both / Mute** on keys
@@ -120,6 +123,10 @@ built for take review.
 - **Metadata** — panels flank the media (A left, B right). Left-click a
   tracked field to filter the **A** picker, right-click to filter **B** —
   compare takes against their own generation parameters.
+
+![Compare mode in Divider layout: one shared stage split by a vertical divider, with the Gallery A and Gallery B pickers either side](images/compare-divider.webp)
+
+![The same pair in Side by Side layout, where a Linked Zoom toggle appears beside the layout buttons](images/compare-side-by-side.webp)
 
 ## Export timeline
 
