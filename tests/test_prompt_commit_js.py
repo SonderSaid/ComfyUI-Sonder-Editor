@@ -100,3 +100,42 @@ def test_discarding_close_paths_do_not_write_stale_edits():
     flush_at = exit_fullscreen.index("this._hidePromptEditor();")
     drain_at = exit_fullscreen.index("await this._drainProjectMutations(")
     assert flush_at < drain_at
+
+
+def test_timeline_acknowledgements_enrol_live_edits_before_repainting():
+    widget = _source("web/js/editor_widget.js")
+    section = _method(widget, "_showPromptEditor", "_showGlobalPromptEditor")
+    global_bar = _method(widget, "_showGlobalPromptEditor", "_updateScenePrompt")
+
+    for editor, docs_key, attachments_key in (
+        (section, "channel_docs", "attachments"),
+        (global_bar, "global_channel_docs", "global_attachments"),
+    ):
+        assert "onAcknowledge: ({ submitted," in editor
+        assert "channelInputs.readDocuments()" in editor
+        assert "channelInputs.readAttachments()" in editor
+        assert f"{docs_key}: submitted.{docs_key} || {{}}" in editor
+        assert f"{attachments_key}: submitted.{attachments_key} || []" in editor
+        assert "const liveChanged = JSON.stringify(live) !== JSON.stringify(submittedContext);" in editor
+        update_at = editor.index("const row = updatePromptDraft(")
+        retry_at = editor.index("row.saveAgain = true;")
+        repaint_at = editor.index("channelInputs.syncAcknowledged(")
+        assert update_at < retry_at < repaint_at
+        assert "if (liveChanged)" in editor[update_at - 200:update_at]
+        assert "} else {" in editor[retry_at:repaint_at]
+
+
+def test_server_settlement_sync_is_history_free_and_reseeds_panel_documents():
+    chips = _source("web/js/prompt_context_chips.js")
+    sync_start = chips.index("editor.syncPromptState =")
+    sync_end = chips.index("editor.transactPromptAttachments", sync_start)
+    sync = chips[sync_start:sync_end]
+    assert "pushHistory()" not in sync
+    assert "JSON.stringify(nextModel) === JSON.stringify(model)" in sync
+    assert "const bookmark = selectionBookmark();" in sync
+    assert "restoreSelection(bookmark)" in sync
+
+    panel = _source("web/js/editor_prompt_panel.js")
+    assert "document: globalDocuments[channelKey]" in panel
+    assert "document: channelDocuments[channelKey]" in panel
+    assert panel.count("sibling.syncPromptState?.({") >= 2

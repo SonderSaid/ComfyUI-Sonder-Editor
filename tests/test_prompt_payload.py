@@ -256,6 +256,45 @@ def test_threshold_compose_range_prompt_drops_sliver_text():
                                    template=LEGACY_PROJECT_LABELS_TEMPLATE) == "A"
 
 
+def test_resolve_template_is_idempotent_for_resolved_builtin_and_custom():
+    custom = {
+        **pct.get_channel_template("minimax_h3_ref"),
+        "id": "custom:test", "name": "Custom", "builtin": False,
+    }
+    for source in ("sonder", "minimax_h3_ref", custom):
+        once = pp.resolve_template(source)
+        assert pp.resolve_template(once) == once
+
+
+def test_compose_range_prompt_with_pre_resolved_segments_is_byte_identical():
+    template = pp.resolve_template("minimax_h3_ref")
+    sections = [
+        {"prompt_id": "a", "start_frame": 0, "end_frame": 120,
+         "channels": {"summary": "first", "detailed_description": "walks"},
+         "_opens_shot": True, "_shot_timestamp": True,
+         "global_channel_exceptions": []},
+        {"prompt_id": "b", "start_frame": 120, "end_frame": 240,
+         "channels": {"summary": "second", "detailed_description": "runs"},
+         "_opens_shot": True, "_shot_timestamp": False,
+         "global_channel_exceptions": ["summary"]},
+    ]
+    args = dict(
+        global_text="global", sections=sections, window_start=0, window_end=125,
+        labels_on=True, delimiter=" + ", boundary_threshold_pct=10.0,
+        template=template, fps=24.0,
+        global_channels={"summary": "global", "detailed_description": "style"},
+    )
+    effective_labels = pct.template_labels_on(template, True)
+    segments = pp.resolve_segments(
+        sections, 0, 125, effective_labels, 10.0, template)
+    expected = pp.compose_range_prompt(**args)
+    actual = pp.compose_range_prompt(**args, resolved_segments=segments)
+    assert actual == expected
+    # The composer promises to treat the supplied list as read-only.
+    assert segments == pp.resolve_segments(
+        sections, 0, 125, effective_labels, 10.0, template)
+
+
 # --- join + compose_range_prompt -------------------------------------------------
 
 def test_join_segment_texts():

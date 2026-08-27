@@ -1046,7 +1046,8 @@ def test_linked_edits_use_exact_identity_snapshots_in_one_noncoalesced_batch():
 
 def test_prompt_diagnostics_use_stable_scrollable_geometry():
     panel = _source("web/js/editor_prompt_panel.js")
-    assert "height:72px;overflow-y:auto;box-sizing:border-box" in panel
+    assert 'height:72px;flex:0 0 72px' in panel
+    assert "height:100%;overflow-y:auto;box-sizing:border-box" in panel
 
 
 def test_prompt_tool_rebuilds_scope_rows_after_attachment_transactions():
@@ -1179,6 +1180,21 @@ def test_copy_plan_discloses_fallbacks_and_is_offered_only_when_supported():
     assert "{ sceneWide: Boolean(dormancy) }" in panel
 
 
+def _prompt_compile_test_support(widget):
+    """Run the actual shared request/cache helpers in isolated host harnesses."""
+    methods = _method(widget, "_requestPromptContextCompile", "_promptCompileRequestBody")
+    api_url = (ROOT / "web/js/api_client.js").as_uri()
+    return f"""
+const {{ getProjectVersion, rememberProjectVersion, resetProjectVersion,
+    rememberProjectVersionFromPayload, rememberProjectVersionFromResponse }} =
+    await import({json.dumps(api_url)});
+class CompileSupport {{
+  _projectDirName() {{ return "project"; }}
+  {methods}
+}}
+"""
+
+
 def test_copy_plan_executes_the_scope_used_by_its_projection_row():
     """Dormant Copy behavior, not merely its source spelling, stays scene-wide."""
     node = shutil.which("node")
@@ -1187,16 +1203,17 @@ def test_copy_plan_executes_the_scope_used_by_its_projection_row():
     widget = _source("web/js/editor_widget.js")
     method = _method_body(
         widget, "_promptCopyPlan", marker="return payload?.copy_plan || null")
-    script = """
+    script = _prompt_compile_test_support(widget) + """
 const api = { apiURL: (value) => value };
 const requests = [];
 globalThis.fetch = async (_url, options) => {
   requests.push(JSON.parse(options.body));
   return { ok: true, json: async () => ({ copy_plan: { lines: [] } }) };
 };
-class Subject {
+class Subject extends CompileSupport {
   async """ + method + """
   constructor() {
+    super();
     this.activeSceneId = "scene";
     this.activeScene = { duration_frames: 100 };
     this.totalFrames = 100;
@@ -1320,7 +1337,8 @@ def test_timeline_prompt_labels_gate_compiles_by_collapse_and_debounce_hot_refre
                          marker="this._renderTimeline();")
     windowed = _method_body(widget, "    _previewPromptContextCandidate",
                             marker="this._renderTimeline();")
-    assert scene.count("this._renderTimeline();") >= 3
+    # HTTP failure and invalid JSON now share one repaint branch.
+    assert scene.count("this._renderTimeline();") >= 2
     assert windowed.count("this._renderTimeline();") >= 3
 
 
@@ -1439,7 +1457,7 @@ console.log(JSON.stringify({{
     }
 
 
-def test_stale_cache_marking_is_immediate_but_its_visual_repaint_waits():
+def test_stale_cache_marking_is_immediate_and_grace_starts_with_request():
     widget = _source("web/js/editor_widget.js")
     definition = widget[widget.index("\n    _previewPromptContextCandidate("):]
     preview = _method_body(definition, "_previewPromptContextCandidate",
@@ -1447,17 +1465,18 @@ def test_stale_cache_marking_is_immediate_but_its_visual_repaint_waits():
     assert "PROMPT_STALE_VISUAL_DELAY_MS = 300" in widget
     assert "_promptContextCandidateCache = {" in preview
     assert "_promptContextScenePayloadCache = {" in preview
-    stale_timer = preview.index("_promptContextStaleVisualTimer = setTimeout")
     compile_timer = preview.index("_promptContextPreviewTimer = setTimeout")
-    assert stale_timer < compile_timer
-    immediate = preview[preview.index("if (this._promptScenePayload())"):stale_timer]
+    stale_timer = preview.index("_promptContextStaleVisualTimer = setTimeout")
+    assert compile_timer < stale_timer
+    immediate = preview[preview.index("if (this._promptScenePayload())"):compile_timer]
+    assert "_promptContextStaleVisualTimer = setTimeout" not in immediate
     assert "refreshDiagnostics" not in immediate
     assert "_refreshInlinePromptProjections" not in immediate
     # Every terminal window branch settles against both parallel caches.
     assert preview.count("_clearPromptStaleVisualTimerIfSettled(sceneId)") >= 2
 
 
-def test_stale_visual_timer_and_scene_invalidation_execute_at_edit_time():
+def test_stale_visual_timer_arms_only_when_debounced_request_starts():
     node = shutil.which("node")
     if not node:
         pytest.skip("node is required for stale-paint lifecycle coverage")
@@ -1467,7 +1486,6 @@ def test_stale_visual_timer_and_scene_invalidation_execute_at_edit_time():
                           marker="Math.max(0, Number(delay) || 0)")
     script = """
 const PROMPT_STALE_VISUAL_DELAY_MS = 300;
-const api = { apiURL: (value) => value };
 const resolvePromptCandidateSelection = (start, end, duration) =>
   ({ selectionStart: start || 0, selectionEnd: end || duration });
 const timers = [];
@@ -1505,6 +1523,9 @@ class Subject {
   _projectDirName() { return "project"; }
   _selectionContextRange() { return { contextStart: 0, contextEnd: 100 }; }
   _promptScenePayload() { return this._promptContextScenePayloadCache; }
+  _previewPromptContextScenePayload() {}
+  _promptCompileRequestBody() { return {}; }
+  _requestPromptContextCompile() { return new Promise(() => {}); }
 }
 const subject = new Subject();
 subject._previewPromptContextCandidate({}, 1000);
@@ -1516,17 +1537,27 @@ const immediate = {
   sceneToken: subject._promptContextScenePayloadToken,
   counts: { ...subject.counts },
 };
+const beforeRequest = {
+  activeCompileTimers: timers.filter((timer) => timer.ms === 1000 && !timer.cancelled).length,
+  activeStaleTimers: timers.filter((timer) =>
+    timer.ms === PROMPT_STALE_VISUAL_DELAY_MS && !timer.cancelled).length,
+};
+const compileTimer = timers.find((timer) => timer.ms === 1000 && !timer.cancelled);
+compileTimer.fn();
+await Promise.resolve();
 const staleTimer = timers.find((timer) =>
   timer.ms === PROMPT_STALE_VISUAL_DELAY_MS && !timer.cancelled);
-await staleTimer.fn();
+const afterRequest = {
+  activeStaleTimers: timers.filter((timer) =>
+    timer.ms === PROMPT_STALE_VISUAL_DELAY_MS && !timer.cancelled).length,
+};
+staleTimer.fn();
 const painted = {
   windowVisual: subject._promptContextCandidateCache._stale_visual,
   sceneVisual: subject._promptContextScenePayloadCache._stale_visual,
   counts: { ...subject.counts },
 };
-subject._previewPromptContextCandidate({}, 1000);
-console.log(JSON.stringify({ immediate, painted,
-  secondSceneToken: subject._promptContextScenePayloadToken }));
+console.log(JSON.stringify({ immediate, beforeRequest, afterRequest, painted }));
 """
     result = json.loads(subprocess.run(
         [node, "--input-type=module", "-e", script], capture_output=True,
@@ -1539,12 +1570,422 @@ console.log(JSON.stringify({ immediate, painted,
             "counts": {"diagnostics": 0, "projections": 0, "inline": 0,
                        "timeline": 0},
         },
+        "beforeRequest": {"activeCompileTimers": 1, "activeStaleTimers": 0},
+        "afterRequest": {"activeStaleTimers": 1},
         "painted": {
             "windowVisual": True, "sceneVisual": True,
             "counts": {"diagnostics": 1, "projections": 1, "inline": 1,
                        "timeline": 1},
         },
-        "secondSceneToken": 9,
+    }
+
+
+def test_continuous_burst_arms_no_grace_and_token_bump_cancels_one_in_flight():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for stale-paint cancellation coverage")
+    widget = _source("web/js/editor_widget.js")
+    definition = widget[widget.index("\n    _previewPromptContextCandidate("):]
+    method = _method_body(definition, "_previewPromptContextCandidate",
+                          marker="Math.max(0, Number(delay) || 0)")
+    script = """
+const PROMPT_STALE_VISUAL_DELAY_MS = 300;
+const resolvePromptCandidateSelection = () => ({selectionStart: 0, selectionEnd: 100});
+const timers = [];
+globalThis.setTimeout = (fn, ms) => {
+  const timer = {fn, ms, cancelled: false}; timers.push(timer); return timer;
+};
+globalThis.clearTimeout = (timer) => { if (timer) timer.cancelled = true; };
+class Subject {
+""" + method + """
+  constructor() {
+    this.activeSceneId = "scene"; this.activeScene = {duration_frames: 100};
+    this.totalFrames = 100; this._promptContextPreviewToken = 0;
+    this._promptContextScenePayloadToken = 0;
+    this._promptContextCandidateCache = {
+      _candidate_scene_id: "scene", _stale: false};
+    this._promptContextScenePayloadCache = null;
+    this.paints = 0;
+    this._promptPanelHandle = {refreshDiagnostics: () => this.paints++};
+  }
+  _projectDirName() { return "project"; }
+  _selectionContextRange() { return {contextStart: 0, contextEnd: 100}; }
+  _promptScenePayload() { return null; }
+  _previewPromptContextScenePayload() {}
+  _promptCompileRequestBody() { return {}; }
+  _requestPromptContextCompile() { return new Promise(() => {}); }
+  _renderTimeline() {}
+}
+const subject = new Subject();
+subject._previewPromptContextCandidate({}, 180);
+subject._previewPromptContextCandidate({}, 180);
+const burst = {
+  activeCompile: timers.filter((timer) => timer.ms === 180 && !timer.cancelled).length,
+  activeGrace: timers.filter((timer) => timer.ms === 300 && !timer.cancelled).length,
+  paints: subject.paints,
+};
+const compile = timers.find((timer) => timer.ms === 180 && !timer.cancelled);
+compile.fn();
+await Promise.resolve();
+const grace = timers.find((timer) => timer.ms === 300 && !timer.cancelled);
+subject.activeSceneId = "other";
+subject._previewPromptContextCandidate({}, 180);
+grace.fn();
+const destroyed = new Subject();
+const destroyStart = timers.length;
+destroyed._previewPromptContextCandidate({}, 180);
+const destroyCompile = timers.slice(destroyStart).find(
+  (timer) => timer.ms === 180 && !timer.cancelled);
+destroyCompile.fn();
+await Promise.resolve();
+const destroyGrace = timers.slice(destroyStart).find(
+  (timer) => timer.ms === 300 && !timer.cancelled);
+destroyed._destroyed = true;
+destroyGrace.fn();
+console.log(JSON.stringify({burst, graceCancelled: grace.cancelled,
+  token: subject._promptContextPreviewToken, paints: subject.paints,
+  destroyedPaints: destroyed.paints}));
+"""
+    result = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+    assert result == {
+        "burst": {"activeCompile": 1, "activeGrace": 0, "paints": 0},
+        "graceCancelled": True, "token": 3, "paints": 0,
+        "destroyedPaints": 0,
+    }
+
+
+def test_destroy_cancels_prompt_preview_grace_and_ownership_tokens():
+    widget = _source("web/js/editor_widget.js")
+    start = widget.index("\n    destroy() {")
+    setup = widget[start:widget.index("        this._stopPlayback();", start)]
+    assert setup.count("_promptContextPreviewToken") == 2
+    assert setup.count("_promptContextScenePayloadToken") == 2
+    assert "clearTimeout(this._promptContextPreviewTimer)" in setup
+    assert "clearTimeout(this._promptContextStaleVisualTimer)" in setup
+    assert "this._promptContextPreviewTimer = null" in setup
+    assert "this._promptContextStaleVisualTimer = null" in setup
+
+
+def test_compile_settling_inside_request_grace_never_paints_stale():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for request-grace lifecycle coverage")
+    widget = _source("web/js/editor_widget.js")
+    definition = widget[widget.index("\n    _previewPromptContextCandidate("):]
+    method = _method_body(definition, "_previewPromptContextCandidate",
+                          marker="Math.max(0, Number(delay) || 0)")
+    settle_start = widget.index("\n    _clearPromptStaleVisualTimerIfSettled(")
+    settle = _method_body(widget[settle_start:],
+                          "_clearPromptStaleVisualTimerIfSettled",
+                          marker="return true;")
+    script = """
+const PROMPT_STALE_VISUAL_DELAY_MS = 300;
+const resolvePromptCandidateSelection = (_start, _end, duration) =>
+  ({ selectionStart: 0, selectionEnd: duration });
+const timers = [];
+globalThis.setTimeout = (fn, ms) => {
+  const timer = { fn, ms, cancelled: false };
+  timers.push(timer); return timer;
+};
+globalThis.clearTimeout = (timer) => { if (timer) timer.cancelled = true; };
+class Subject {
+""" + settle + """
+""" + method + """
+  constructor() {
+    this.activeSceneId = "scene";
+    this.activeScene = { duration_frames: 100 };
+    this.totalFrames = 100;
+    this._promptContextPreviewToken = 0;
+    this._promptContextCandidateCache = {
+      _candidate_scene_id: "scene", prompt: "old", _stale: false };
+    this._promptContextScenePayloadCache = null;
+    this.counts = { diagnostics: 0, inline: 0, apply: 0, timeline: 0 };
+    this._promptPanelHandle = {
+      refreshDiagnostics: () => this.counts.diagnostics++,
+      applyCandidate: () => this.counts.apply++,
+    };
+    this._refreshInlinePromptProjections = () => this.counts.inline++;
+  }
+  _projectDirName() { return "project"; }
+  _selectionContextRange() { return { contextStart: 0, contextEnd: 100 }; }
+  _promptScenePayload() { return null; }
+  _previewPromptContextScenePayload() {}
+  _promptCompileRequestBody() { return {}; }
+  async _requestPromptContextCompile() {
+    return {response: {ok: true}, payload: {prompt: "new"}};
+  }
+  _renderTimeline() { this.counts.timeline++; }
+}
+const subject = new Subject();
+subject._previewPromptContextCandidate({}, 180);
+const beforeRequest = timers.filter((timer) => timer.ms === 300 && !timer.cancelled).length;
+const compileTimer = timers.find((timer) => timer.ms === 180 && !timer.cancelled);
+await compileTimer.fn();
+const staleTimers = timers.filter((timer) => timer.ms === 300);
+console.log(JSON.stringify({
+  beforeRequest,
+  staleTimerCount: staleTimers.length,
+  staleTimerCancelled: staleTimers[0]?.cancelled,
+  cache: subject._promptContextCandidateCache,
+  counts: subject.counts,
+}));
+"""
+    result = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+    assert result == {
+        "beforeRequest": 0,
+        "staleTimerCount": 1,
+        "staleTimerCancelled": True,
+        "cache": {"prompt": "new", "_candidate_scene_id": "scene",
+                  "_stale": False, "_stale_visual": False, "_failed": False},
+        "counts": {"diagnostics": 1, "inline": 1, "apply": 1,
+                   "timeline": 1},
+    }
+
+
+def test_failed_candidate_latch_survives_edit_and_success_clears_it():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for failed-candidate lifecycle coverage")
+    widget = _source("web/js/editor_widget.js")
+    preview_start = widget.index("\n    _previewPromptContextCandidate(")
+    preview = _method_body(widget[preview_start:], "_previewPromptContextCandidate",
+                           marker="Math.max(0, Number(delay) || 0)")
+    failed_start = widget.index("\n    _failedPromptContextCandidate(")
+    failed = _method_body(widget[failed_start:], "_failedPromptContextCandidate")
+    settle_start = widget.index("\n    _clearPromptStaleVisualTimerIfSettled(")
+    settle = _method_body(widget[settle_start:],
+                          "_clearPromptStaleVisualTimerIfSettled",
+                          marker="return true;")
+    script = """
+const PROMPT_STALE_VISUAL_DELAY_MS = 300;
+const resolvePromptCandidateSelection = () => ({selectionStart: 0, selectionEnd: 100});
+const timers = [];
+globalThis.setTimeout = (fn, ms) => {
+  const timer = {fn, ms, cancelled: false}; timers.push(timer); return timer;
+};
+globalThis.clearTimeout = (timer) => { if (timer) timer.cancelled = true; };
+class Subject {
+""" + failed + """
+""" + settle + """
+""" + preview + """
+  constructor() {
+    this.activeSceneId = "scene"; this.activeScene = {duration_frames: 100};
+    this.totalFrames = 100; this._promptContextPreviewToken = 0;
+    this._promptContextScenePayloadToken = 0;
+    this._promptContextCandidateCache = {_candidate_scene_id: "scene",
+      prompt: "last good", setup_manifest: {slots: [1]},
+      attachment_capability_projections: {a: [{state: "emitted"}]},
+      _stale: false, _stale_visual: false};
+    this._promptContextScenePayloadCache = null;
+    this.results = [
+      {response: {ok: false, status: 409},
+       payload: {code: "project_version_conflict", error: "project_version_conflict"}},
+      {response: {ok: true, status: 200}, payload: {prompt: "fresh"}},
+    ];
+  }
+  _projectDirName() { return "project"; }
+  _selectionContextRange() { return {contextStart: 0, contextEnd: 100}; }
+  _promptScenePayload() { return null; }
+  _previewPromptContextScenePayload() {}
+  _promptCompileRequestBody() { return {}; }
+  async _requestPromptContextCompile() { return this.results.shift(); }
+  _renderTimeline() {}
+}
+const subject = new Subject();
+subject._previewPromptContextCandidate({}, 0);
+await timers.find((timer) => timer.ms === 0 && !timer.cancelled).fn();
+const failedState = structuredClone(subject._promptContextCandidateCache);
+subject._previewPromptContextCandidate({}, 1000);
+const superseded = structuredClone(subject._promptContextCandidateCache);
+await timers.find((timer) => timer.ms === 1000 && !timer.cancelled).fn();
+const success = structuredClone(subject._promptContextCandidateCache);
+console.log(JSON.stringify({failedState, superseded, success}));
+"""
+    result = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+    for state in (result["failedState"], result["superseded"]):
+        assert state["_failed"] is True
+        assert state["_stale"] is True
+        assert state["_stale_visual"] is True
+        assert state["prompt"] == "last good"
+        assert state["setup_manifest"] == {"slots": [1]}
+        assert state["attachment_capability_projections"] == {
+            "a": [{"state": "emitted"}]}
+        assert state["errors"][0]["code"] == "project_version_conflict"
+        assert "project changed while it was compiling" in state["errors"][0]["message"]
+        assert "Any previous preview remains visible" in state["errors"][0]["message"]
+        assert state["errors"][0]["message"] != "project_version_conflict"
+    assert result["success"] == {
+        "prompt": "fresh", "_candidate_scene_id": "scene",
+        "_stale": False, "_stale_visual": False, "_failed": False,
+    }
+
+
+def test_first_load_preview_conflict_does_not_claim_retained_compile():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for first-load preview-conflict coverage")
+    widget = _source("web/js/editor_widget.js")
+    preview = _method_body(
+        widget[widget.index("\n    _previewPromptContextCandidate("):],
+        "_previewPromptContextCandidate", marker="Math.max(0, Number(delay) || 0)")
+    failed = _method_body(
+        widget[widget.index("\n    _failedPromptContextCandidate("):],
+        "_failedPromptContextCandidate")
+    settle = _method_body(
+        widget[widget.index("\n    _clearPromptStaleVisualTimerIfSettled("):],
+        "_clearPromptStaleVisualTimerIfSettled", marker="return true;")
+    script = """
+const PROMPT_STALE_VISUAL_DELAY_MS = 300;
+const resolvePromptCandidateSelection = () => ({selectionStart: 0, selectionEnd: 100});
+const timers = [];
+globalThis.setTimeout = (fn, ms) => {
+  const timer = {fn, ms, cancelled: false}; timers.push(timer); return timer;
+};
+globalThis.clearTimeout = (timer) => { if (timer) timer.cancelled = true; };
+class Subject {
+""" + failed + """
+""" + settle + """
+""" + preview + """
+  constructor() {
+    this.activeSceneId = "scene"; this.activeScene = {duration_frames: 100};
+    this.totalFrames = 100; this._promptContextPreviewToken = 0;
+    this._promptContextCandidateCache = null;
+    this._promptContextScenePayloadCache = null;
+  }
+  _projectDirName() { return "project"; }
+  _selectionContextRange() { return {contextStart: 0, contextEnd: 100}; }
+  _promptScenePayload() { return null; }
+  _previewPromptContextScenePayload() {}
+  _promptCompileRequestBody() { return {}; }
+  async _requestPromptContextCompile() {
+    return {response: {ok: false, status: 409},
+      payload: {code: "project_version_conflict", error: "project_version_conflict"}};
+  }
+  _renderTimeline() {}
+}
+const subject = new Subject();
+subject._previewPromptContextCandidate({}, 0);
+await timers.find((timer) => timer.ms === 0 && !timer.cancelled).fn();
+const first = structuredClone(subject._promptContextCandidateCache);
+subject._previewPromptContextCandidate({}, 0);
+await timers.filter((timer) => timer.ms === 0 && !timer.cancelled).at(-1).fn();
+const second = structuredClone(subject._promptContextCandidateCache);
+console.log(JSON.stringify({first, second}));
+"""
+    result = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+    for state in (result["first"], result["second"]):
+        assert state["_failed"] is True
+        message = state["errors"][0]["message"]
+        assert "preview could not refresh" in message
+        assert "project changed while it was compiling" in message
+        assert "Any previous preview remains visible" in message
+        assert "showing the last successful compile" not in message
+
+
+def test_stale_grace_refreshes_only_consumers_of_flags_it_flips():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for stale-paint fan-out coverage")
+    widget = _source("web/js/editor_widget.js")
+    preview = _method_body(
+        widget[widget.index("\n    _previewPromptContextCandidate("):],
+        "_previewPromptContextCandidate", marker="Math.max(0, Number(delay) || 0)")
+    script = """
+const PROMPT_STALE_VISUAL_DELAY_MS = 300;
+const resolvePromptCandidateSelection = () => ({selectionStart: 0, selectionEnd: 100});
+const timers = [];
+globalThis.setTimeout = (fn, ms) => {
+  const timer = {fn, ms, cancelled: false}; timers.push(timer); return timer;
+};
+globalThis.clearTimeout = (timer) => { if (timer) timer.cancelled = true; };
+class Subject {
+""" + preview + """
+  constructor(windowed, scene) {
+    this.activeSceneId = "scene"; this.activeScene = {duration_frames: 100};
+    this.totalFrames = 100; this._promptContextPreviewToken = 0;
+    this._promptContextScenePayloadToken = 0;
+    this._promptContextCandidateCache = windowed;
+    this._promptContextScenePayloadCache = scene;
+    this.counts = {diagnostics: 0, projections: 0, inline: 0, timeline: 0};
+    this._promptPanelHandle = {
+      // Production renderDiagnostics performs the panel-wide projection sweep.
+      refreshDiagnostics: () => {
+        this.counts.diagnostics++; this.counts.projections++;
+      },
+      refreshProjections: () => this.counts.projections++,
+    };
+    this._refreshInlinePromptProjections = () => this.counts.inline++;
+  }
+  _projectDirName() { return "project"; }
+  _selectionContextRange() { return {contextStart: 0, contextEnd: 100}; }
+  _promptScenePayload() { return this._promptContextScenePayloadCache; }
+  _previewPromptContextScenePayload() {}
+  _promptCompileRequestBody() { return {}; }
+  _requestPromptContextCompile() { return new Promise(() => {}); }
+  _renderTimeline() { this.counts.timeline++; }
+}
+const fresh = () => ({_candidate_scene_id: "scene", _stale: false,
+  _stale_visual: false});
+const failed = () => ({_candidate_scene_id: "scene", _stale: true,
+  _stale_visual: true, _failed: true});
+const rows = {};
+for (const [name, windowed, scene] of [
+  ["windowOnly", fresh(), null],
+  ["sceneOnly", null, fresh()],
+  ["both", fresh(), fresh()],
+  ["sceneWithFailedWindow", failed(), fresh()],
+  ["alreadyVisual", failed(), null],
+]) {
+  const start = timers.length;
+  const subject = new Subject(windowed, scene);
+  subject._previewPromptContextCandidate({}, 0);
+  timers.slice(start).find((timer) => timer.ms === 0 && !timer.cancelled).fn();
+  await Promise.resolve();
+  const grace = timers.slice(start).find((timer) => timer.ms === 300 && !timer.cancelled);
+  grace.fn();
+  rows[name] = {counts: subject.counts,
+    windowVisual: subject._promptContextCandidateCache?._stale_visual,
+    sceneVisual: subject._promptContextScenePayloadCache?._stale_visual};
+}
+console.log(JSON.stringify(rows));
+"""
+    result = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+    assert result == {
+        "windowOnly": {
+            "counts": {"diagnostics": 1, "projections": 1,
+                       "inline": 1, "timeline": 1},
+            "windowVisual": True,
+        },
+        "sceneOnly": {
+            "counts": {"diagnostics": 0, "projections": 1,
+                       "inline": 1, "timeline": 1},
+            "sceneVisual": True,
+        },
+        "both": {
+            "counts": {"diagnostics": 1, "projections": 1,
+                       "inline": 1, "timeline": 1},
+            "windowVisual": True, "sceneVisual": True,
+        },
+        "sceneWithFailedWindow": {
+            "counts": {"diagnostics": 0, "projections": 1,
+                       "inline": 1, "timeline": 1},
+            "windowVisual": True, "sceneVisual": True,
+        },
+        "alreadyVisual": {
+            "counts": {"diagnostics": 0, "projections": 0,
+                       "inline": 0, "timeline": 0},
+            "windowVisual": True,
+        },
     }
 
 
@@ -1598,7 +2039,7 @@ def test_invalid_window_payload_publishes_failure_and_settles_timer():
     settle = _method_body(widget[settle_start:],
                           "_clearPromptStaleVisualTimerIfSettled",
                           marker="return true;")
-    script = """
+    script = _prompt_compile_test_support(widget) + """
 const PROMPT_STALE_VISUAL_DELAY_MS = 300;
 const api = { apiURL: (value) => value };
 const resolvePromptCandidateSelection = (_start, _end, duration) =>
@@ -1611,10 +2052,11 @@ globalThis.setTimeout = (fn, ms) => {
 globalThis.clearTimeout = (timer) => { if (timer) timer.cancelled = true; };
 globalThis.fetch = async () => ({ ok: true, status: 200,
   json: async () => null });
-class Subject {
+class Subject extends CompileSupport {
 """ + settle + """
 """ + preview + """
   constructor() {
+    super();
     this.activeSceneId = "scene";
     this.activeScene = { duration_frames: 100 };
     this.totalFrames = 100;
@@ -1643,6 +2085,7 @@ const staleTimer = timers.find((timer) => timer.ms === 300);
 console.log(JSON.stringify({
   code: subject._promptContextCandidateCache.errors[0].code,
   stale: subject._promptContextCandidateCache._stale,
+  failed: subject._promptContextCandidateCache._failed,
   staleTimerCancelled: staleTimer.cancelled,
   counts: subject.counts,
 }));
@@ -1651,7 +2094,7 @@ console.log(JSON.stringify({
         [node, "--input-type=module", "-e", script], capture_output=True,
         text=True, encoding="utf-8", check=True).stdout)
     assert result == {
-        "code": "preview_invalid_response", "stale": False,
+        "code": "preview_invalid_response", "stale": True, "failed": True,
         "staleTimerCancelled": True,
         "counts": {"diagnostics": 1, "inline": 1, "apply": 1, "timeline": 1},
     }
@@ -1670,14 +2113,15 @@ def test_invalid_scene_payload_clears_obsolete_dormant_projections():
     settle = _method_body(widget[settle_start:],
                           "_clearPromptStaleVisualTimerIfSettled",
                           marker="return true;")
-    script = """
+    script = _prompt_compile_test_support(widget) + """
 const api = { apiURL: (value) => value };
 globalThis.fetch = async () => ({ ok: true, status: 200,
   json: async () => null });
-class Subject {
+class Subject extends CompileSupport {
 """ + settle + """
 """ + scene_method + """
   constructor() {
+    super();
     this.activeSceneId = "scene";
     this.totalFrames = 100;
     this._promptContextScenePayloadToken = 0;
@@ -1939,6 +2383,24 @@ def test_prompt_panel_writing_and_global_views_use_bound_shared_overlays():
     assert "const snapshot = draftGlobalSceneSnapshot();" in panel
 
 
+def test_prompt_panel_reuses_one_draft_overlay_per_global_and_section_change():
+    panel = _source("web/js/editor_prompt_panel.js")
+    global_start = panel.index("onChange: ({ document: nextDocument, attachments, reason }) => {",
+                               panel.index("const draftGlobalSceneSnapshot"))
+    global_change = panel[global_start:panel.index("onActivateAttachment:", global_start)]
+    assert global_change.count("draftGlobalSceneSnapshot()") == 1
+    assert "const snapshot = draftGlobalSceneSnapshot();" in global_change
+    assert "keepGlobalDraft(snapshot);" in global_change
+
+    section_start = panel.index("onChange: ({ document: nextDocument, attachments, reason }) => {",
+                                panel.index("const draftSceneSnapshot"))
+    section_change = panel[section_start:panel.index("onActivateAttachment:", section_start)]
+    assert section_change.count("draftSceneSnapshot()") == 1
+    assert "const snapshot = draftSceneSnapshot();" in section_change
+    assert "keepSectionDraft(snapshot);" in section_change
+    assert "prompt_sections: snapshot.prompt_sections" in section_change
+
+
 def test_candidate_diagnostic_projection_keys_chip_errors_and_labels_window():
     node = shutil.which("node")
     if not node:
@@ -2075,6 +2537,70 @@ def test_live_prompt_draft_overlays_preserve_section_identity_and_global_scope()
     assert result["identityOnly"]["prompt_sections"][0]["end_frame"] == 20
     assert len(result["global"]["prompt_sections"]) == 1
     assert result["global"]["global_attachments"][0]["attachment_id"] == "global-new"
+
+
+def test_draft_overlays_clone_only_overwritten_keys_and_keep_inputs_isolated():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for prompt draft overlay clone coverage")
+    module_url = (ROOT / "web" / "js" / "prompt_context_chips.js").as_uri()
+    result = _run_node(f"""
+const mod = await import({json.dumps(module_url)});
+const scene = {{metadata: {{owner: "scene"}},
+  global_attachments: [{{attachment_id: "global-old"}}],
+  global_channel_docs: {{visual: {{nodes: []}}}},
+  global_channels: {{visual: "old"}},
+  prompt_sections: [
+    {{prompt_id: "one", start_frame: 0, end_frame: 20,
+      untouched: {{owner: "section"}}, attachments: [{{attachment_id: "old"}}],
+      channel_docs: {{visual: {{nodes: []}}}}, channels: {{visual: "old"}}}},
+    {{prompt_id: "two", start_frame: 20, end_frame: 40,
+      untouched: {{owner: "other"}}}},
+  ]}};
+const sectionAttachments = [{{attachment_id: "new"}}];
+const sectionDocs = {{visual: {{nodes: [{{type: "text", text: "draft"}}]}}}};
+const sectionChannels = {{visual: "draft"}};
+const section = mod.sceneWithDraftSection(scene, {{index: 0, promptId: "one",
+  attachments: sectionAttachments, channelDocs: sectionDocs, channels: sectionChannels}});
+const globalAttachments = [{{attachment_id: "global-new"}}];
+const globalDocs = {{visual: {{nodes: [{{type: "text", text: "global"}}]}}}};
+const globalChannels = {{visual: "global"}};
+const global = mod.sceneWithDraftGlobal(scene, {{attachments: globalAttachments,
+  channelDocs: globalDocs, channels: globalChannels}});
+const identity = {{
+  sectionMetadataShared: section.metadata === scene.metadata,
+  sectionArrayCloned: section.prompt_sections !== scene.prompt_sections,
+  selectedSectionCloned: section.prompt_sections[0] !== scene.prompt_sections[0],
+  untouchedSectionShared: section.prompt_sections[1] === scene.prompt_sections[1],
+  untouchedSelectedKeyShared:
+    section.prompt_sections[0].untouched === scene.prompt_sections[0].untouched,
+  sectionAttachmentsCloned: section.prompt_sections[0].attachments !== sectionAttachments,
+  sectionDocsCloned: section.prompt_sections[0].channel_docs !== sectionDocs,
+  sectionChannelsCloned: section.prompt_sections[0].channels !== sectionChannels,
+  globalMetadataShared: global.metadata === scene.metadata,
+  globalSectionsShared: global.prompt_sections === scene.prompt_sections,
+  globalAttachmentsCloned: global.global_attachments !== globalAttachments,
+  globalDocsCloned: global.global_channel_docs !== globalDocs,
+  globalChannelsCloned: global.global_channels !== globalChannels,
+}};
+section.prompt_sections[0].attachments[0].attachment_id = "mutated";
+section.prompt_sections[0].channel_docs.visual.nodes[0].text = "mutated";
+section.prompt_sections[0].channels.visual = "mutated";
+global.global_attachments[0].attachment_id = "mutated";
+global.global_channel_docs.visual.nodes[0].text = "mutated";
+global.global_channels.visual = "mutated";
+console.log(JSON.stringify({{identity, inputs: {{sectionAttachments, sectionDocs,
+  sectionChannels, globalAttachments, globalDocs, globalChannels}}, scene}}));
+""")
+    assert all(result["identity"].values())
+    assert result["inputs"]["sectionAttachments"][0]["attachment_id"] == "new"
+    assert result["inputs"]["sectionDocs"]["visual"]["nodes"][0]["text"] == "draft"
+    assert result["inputs"]["sectionChannels"]["visual"] == "draft"
+    assert result["inputs"]["globalAttachments"][0]["attachment_id"] == "global-new"
+    assert result["inputs"]["globalDocs"]["visual"]["nodes"][0]["text"] == "global"
+    assert result["inputs"]["globalChannels"]["visual"] == "global"
+    assert result["scene"]["prompt_sections"][0]["attachments"][0]["attachment_id"] == "old"
+    assert result["scene"]["global_attachments"][0]["attachment_id"] == "global-old"
 
 
 def test_new_section_creator_defers_chip_transactions_until_explicit_commit():
@@ -4934,3 +5460,586 @@ const h=new Harness(); h._savePromptTemplate("Vocal");
 console.log(JSON.stringify(h.saved.prompt_semantic_units.map((value)=>value.semantic_unit_id)));
 """)
     assert result == ["speaker"]
+
+
+def test_candidate_compile_retries_fixed_snapshot_and_keeps_version_policy():
+    widget = _source("web/js/editor_widget.js")
+    result = _run_node(_prompt_compile_test_support(widget) + """
+const api = { apiURL: value => value };
+const results = [];
+for (const [sent, actual, during] of [["v1", "v2", ""], ["v9", "v2", ""],
+                                     ["v1", "v2", "v3"]]) {
+  resetProjectVersion("project", sent);
+  const host = new CompileSupport(); host.activeSceneId = "scene";
+  const body = {base_modified_at: sent, scene: {text: "draft"}, selection_start: 4,
+    window_end: 12, frame_constraint: {step: 4}, copy_plan_for: {attachment_id: "a"}};
+  const requests = [];
+  globalThis.fetch = async (_url, init) => {
+    requests.push(JSON.parse(init.body));
+    if (requests.length === 1) {
+      body.scene.text = "newer typing";
+      body.window_end = 99;
+      if (during) rememberProjectVersion("project", during);
+      return new Response(JSON.stringify({code: "project_version_conflict",
+        actual_modified_at: actual, project: {project_id:"project",modified_at:actual}}),
+        {status:409});
+    }
+    return new Response(JSON.stringify({copy_plan:{lines:["ok"]}}));
+  };
+  const value = await host._requestPromptContextCompile("project","scene",body);
+  results.push({requests, version:getProjectVersion("project"), ok:value.response.ok});
+}
+console.log(JSON.stringify(results));
+""")
+    for row, expected in zip(result, ("v2", "v2", "v3")):
+        first, retry = row["requests"]
+        assert retry == {**first, "base_modified_at": expected}
+        assert retry["scene"]["text"] == "draft"
+        assert row["version"] == expected
+        assert row["ok"]
+
+
+def test_candidate_compile_bounds_retry_and_cancels_superseded_work():
+    widget = _source("web/js/editor_widget.js")
+    result = _run_node(_prompt_compile_test_support(widget) + """
+const api = { apiURL: value => value };
+const rows = [];
+for (const cancel of ["none", "edit", "scene", "project", "destroy"]) {
+  resetProjectVersion("project", "v1");
+  const host = new CompileSupport(); host.activeSceneId = "scene";
+  let current = true, calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    if (cancel === "edit") current = false;
+    if (cancel === "scene") host.activeSceneId = "other";
+    if (cancel === "project") host._projectDirName = () => "other";
+    if (cancel === "destroy") host._destroyed = true;
+    return new Response(JSON.stringify({code:"project_version_conflict",
+      actual_modified_at:"v2",project:{project_id:"project",modified_at:"v2"}}),{status:409});
+  };
+  const value = await host._requestPromptContextCompile("project","scene",
+    {base_modified_at:"v1"}, () => current);
+  rows.push({cancel,calls,discarded:value===null,version:getProjectVersion("project")});
+}
+console.log(JSON.stringify(rows));
+""")
+    assert result[0] == {"cancel": "none", "calls": 2, "discarded": False, "version": "v2"}
+    for row in result[1:]:
+        assert row["calls"] == 1
+        assert row["discarded"] is True
+        assert row["version"] == "v1"
+
+
+def test_exhausted_preview_conflict_fails_window_and_settles_scene_sibling():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for exhausted preview-conflict coverage")
+    widget = _source("web/js/editor_widget.js")
+    preview = _method_body(
+        widget[widget.index("\n    _previewPromptContextCandidate("):],
+        "_previewPromptContextCandidate", marker="Math.max(0, Number(delay) || 0)")
+    scene = _method_body(
+        widget[widget.index("\n    _previewPromptContextScenePayload("):],
+        "_previewPromptContextScenePayload", marker="refreshProjections?.();")
+    settle = _method_body(
+        widget[widget.index("\n    _clearPromptStaleVisualTimerIfSettled("):],
+        "_clearPromptStaleVisualTimerIfSettled", marker="return true;")
+    result = _run_node(_prompt_compile_test_support(widget) + """
+const api = {apiURL: value => value};
+const PROMPT_STALE_VISUAL_DELAY_MS = 300;
+const resolvePromptCandidateSelection = () => ({selectionStart: 10, selectionEnd: 20});
+const timers = [];
+globalThis.setTimeout = (fn, ms) => {
+  const timer = {fn, ms, cancelled: false}; timers.push(timer); return timer;
+};
+globalThis.clearTimeout = (timer) => { if (timer) timer.cancelled = true; };
+resetProjectVersion("project", "v1");
+let calls = 0;
+globalThis.fetch = async () => {
+  calls++;
+  return new Response(JSON.stringify({code: "project_version_conflict",
+    error: "project_version_conflict", actual_modified_at: "v2",
+    project: {project_id: "project", modified_at: "v2"}}), {status: 409});
+};
+class Subject extends CompileSupport {
+""" + settle + """
+""" + scene + """
+""" + preview + """
+  constructor() {
+    super(); this.activeSceneId = "scene";
+    this.activeScene = {duration_frames: 100}; this.totalFrames = 100;
+    this.selectionStart = 10; this.selectionEnd = 20;
+    this._promptContextPreviewToken = 0; this._promptContextScenePayloadToken = 0;
+    this._promptContextCandidateCache = {_candidate_scene_id: "scene",
+      prompt: "last good", attachment_previews: {a: "kept"},
+      setup_manifest: {slots: [1]}, _stale: false};
+    this._promptContextScenePayloadCache = {_candidate_scene_id: "scene",
+      attachment_previews: {dormant: "old"}, _stale: false};
+  }
+  _projectDirName() { return "project"; }
+  _selectionContextRange() { return {contextStart: 10, contextEnd: 20}; }
+  _promptScenePayload() { return this._promptContextScenePayloadCache; }
+  _promptCompileRequestBody() { return {base_modified_at: getProjectVersion("project")}; }
+  _promptProjectionSubset(payload) { return payload; }
+  _renderTimeline() {}
+}
+const subject = new Subject();
+subject._previewPromptContextCandidate({}, 0);
+await timers.find((timer) => timer.ms === 0 && !timer.cancelled).fn();
+for (let index = 0; index < 40; index++) await Promise.resolve();
+const grace = timers.find((timer) => timer.ms === 300);
+console.log(JSON.stringify({calls, candidate: subject._promptContextCandidateCache,
+  scene: subject._promptContextScenePayloadCache, graceCancelled: grace.cancelled}));
+""")
+    assert result["calls"] == 4
+    assert result["scene"] is None
+    assert result["graceCancelled"] is True
+    assert result["candidate"]["_failed"] is True
+    assert result["candidate"]["_stale"] is True
+    assert result["candidate"]["attachment_previews"] == {"a": "kept"}
+    assert result["candidate"]["setup_manifest"] == {"slots": [1]}
+    error = result["candidate"]["errors"][0]
+    assert error["code"] == "project_version_conflict"
+    assert "project changed while it was compiling" in error["message"]
+    assert error["message"] != "project_version_conflict"
+
+
+def test_failed_candidate_retains_whole_same_scene_payload_only():
+    widget = _source("web/js/editor_widget.js")
+    result = _run_node(_prompt_compile_test_support(widget) + """
+const host = new CompileSupport();
+const previous = {_candidate_scene_id:"scene", prompt:"last good",
+  attachment_capability_projections:{a:[{state:"emitted"}]},
+  setup_manifest:{slots:[1]}, managed_speaker_subject_ids:["s"],
+  execution_window:{render_start:0}, future_projection_field:{kept:true},
+  errors:[],warnings:[]};
+host._promptContextCandidateCache = previous;
+const diagnostic = {code:"project_version_conflict"};
+console.log(JSON.stringify({same:host._failedPromptContextCandidate("scene",diagnostic),
+  other:host._failedPromptContextCandidate("other",diagnostic),previous}));
+""")
+    same = result["same"]
+    assert same == {**result["previous"], "errors": [{"code": "project_version_conflict"}],
+                    "warnings": [], "_stale": True, "_stale_visual": True, "_failed": True}
+    assert result["previous"]["errors"] == []
+    assert result["other"] == {
+        "_candidate_scene_id": "other", "errors": [{"code": "project_version_conflict"}],
+        "warnings": [], "_stale": True, "_stale_visual": True, "_failed": True}
+
+
+def test_compile_callers_recheck_ownership_after_helper_return():
+    widget = _source("web/js/editor_widget.js")
+    methods = "\n".join([
+        "async " + _method_body(widget[widget.index("\n    async _promptCopyPlan("):],
+            "_promptCopyPlan"),
+        _method_body(widget[widget.index("\n    _previewPromptContextScenePayload("):],
+            "_previewPromptContextScenePayload"),
+        _method_body(widget[widget.index("\n    _previewPromptContextCandidate("):],
+            "_previewPromptContextCandidate"),
+    ])
+    result = _run_node(_prompt_compile_test_support(widget) + """
+const api = {apiURL: value => value};
+const PROMPT_STALE_VISUAL_DELAY_MS = 300;
+const resolvePromptCandidateSelection = () => ({selectionStart:0,selectionEnd:100});
+const timers = [];
+globalThis.setTimeout = fn => {timers.push(fn);return timers.length;};
+globalThis.clearTimeout = () => {};
+globalThis.fetch = async () => new Response(JSON.stringify({
+  prompt:"OLD",copy_plan:{lines:["OLD"]},attachment_capability_projections:[]}));
+class Subject extends CompileSupport {
+""" + methods + """
+  constructor() {
+    super(); this.activeSceneId="scene";this.activeScene={duration_frames:100};
+    this._promptContextPreviewToken=0; this._promptContextScenePayloadToken=0;
+  }
+  _selectionContextRange() {return null;}
+  _promptScenePayload() {return null;}
+  _promptCompileRequestBody() {return {};}
+  _clearPromptStaleVisualTimerIfSettled() {}
+  _renderTimeline() {}
+  _promptProjectionSubset(payload) {return payload;}
+  async _requestPromptContextCompile(...args) {
+    const result = await super._requestPromptContextCompile(...args);
+    // An external microtask can run after the helper's final ownership check.
+    queueMicrotask(() => {
+      this._promptContextPreviewToken++;
+      this._promptContextScenePayloadToken++;
+      this._promptContextCandidateCache={prompt:"NEW",_stale:true};
+      this._promptContextScenePayloadCache={prompt:"NEW",_stale:true};
+    });
+    return result;
+  }
+}
+const rows=[];
+for(const caller of ["copy","window","scene"]) {
+  const host=new Subject();
+  if(caller==="copy") {
+    const value=await host._promptCopyPlan("a","c");
+    rows.push({caller,discarded:value===null});
+  } else if(caller==="window") {
+    host._previewPromptContextScenePayload=()=>{};
+    host._previewPromptContextCandidate({},0);
+    await timers.pop()();
+    rows.push({caller,cache:host._promptContextCandidateCache});
+  } else {
+    host._previewPromptContextScenePayload({dirName:"project",sceneId:"scene",
+      candidate:{duration_frames:100},windowStart:10,windowEnd:20});
+    for(let i=0;i<30;i++) await Promise.resolve();
+    rows.push({caller,cache:host._promptContextScenePayloadCache});
+  }
+}
+console.log(JSON.stringify(rows));
+""")
+    assert result == [
+        {"caller": "copy", "discarded": True},
+        {"caller": "window", "cache": {"prompt": "NEW", "_stale": True}},
+        {"caller": "scene", "cache": {"prompt": "NEW", "_stale": True}},
+    ]
+
+
+def test_prompt_draft_revisions_and_targeted_intents_survive_rapid_edits():
+    url = (ROOT / "web/js/prompt_edit_intent.js").as_uri()
+    result = _run_node(f"""
+const {{promptEditFields, promptDraftKey, updatePromptDraft, savePromptDraft, rebasePromptDraft}} = await import({json.dumps(url)});
+const base = {{prompt_id:"section", channel_docs:{{visual:{{text:"old"}},speech:{{text:"old speech"}}}}, attachments:[]}};
+const first = structuredClone(base); first.channel_docs.visual.text="A";
+const second = structuredClone(first); second.channel_docs.visual.text="B";
+const drafts=new Map(), key=promptDraftKey("p","s","section"), calls=[];
+updatePromptDraft(drafts,key,base,first);
+let finish;
+const save = async (value,before) => {{ calls.push([value,before]); if(calls.length===1) return await new Promise(r=>finish=r); return true; }};
+const pending=savePromptDraft(drafts,key,save);
+updatePromptDraft(drafts,key,base,second);
+const later=savePromptDraft(drafts,key,save);
+finish(true); await pending; await later;
+const clean=!drafts.has(key);
+updatePromptDraft(drafts,key,second,first);
+await savePromptDraft(drafts,key,async()=>false);
+const current=structuredClone(second); current.channel_docs.speech.text="external";
+const restored=rebasePromptDraft(drafts.get(key),current);
+const intent=promptEditFields(drafts.get(key).base,{{channel_docs:restored.channel_docs,attachments:restored.attachments}});
+console.log(JSON.stringify({{clean,calls,refused:drafts.get(key).error,restored,intent,
+ distinct:key!==promptDraftKey("p2","s","section") && key!==promptDraftKey("p","s2","section")}}));
+""")
+    assert result["clean"] and result["distinct"]
+    assert len(result["calls"]) == 2
+    assert result["calls"][1][1]["channel_docs"]["visual"]["text"] == "A"
+    assert result["calls"][1][0]["channel_docs"]["visual"]["text"] == "B"
+    assert result["refused"]
+    assert result["restored"]["channel_docs"]["visual"]["text"] == "A"
+    assert result["restored"]["channel_docs"]["speech"]["text"] == "external"
+    assert list(result["intent"]["prompt_edit"]["documents"]) == ["visual"]
+
+
+def test_newer_prompt_draft_retries_even_when_the_pending_save_is_refused():
+    url = (ROOT / "web/js/prompt_edit_intent.js").as_uri()
+    result = _run_node(f"""
+const {{updatePromptDraft,savePromptDraft}}=await import({json.dumps(url)});
+const drafts=new Map(), key="draft", calls=[];
+updatePromptDraft(drafts,key,{{text:"base"}},{{text:"A"}});
+let finish;
+const save=async(value,base)=>{{calls.push([value.text,base.text]);
+  if(calls.length===1)return await new Promise(resolve=>finish=resolve);return true;}};
+const first=savePromptDraft(drafts,key,save);
+updatePromptDraft(drafts,key,{{text:"base"}},{{text:"B"}});
+const second=savePromptDraft(drafts,key,save);
+finish(false);
+const outcomes=await Promise.all([first,second]);
+console.log(JSON.stringify({{calls,outcomes,clean:!drafts.has(key)}}));
+""")
+    assert result == {"calls": [["A", "base"], ["B", "base"]],
+                      "outcomes": [True, True], "clean": True}
+
+
+
+def test_prompt_draft_adopts_authoritative_ack_without_losing_newer_text():
+    url = (ROOT / "web/js/prompt_edit_intent.js").as_uri()
+    result = _run_node(f"""
+const {{updatePromptDraft,savePromptDraft}}=await import({json.dumps(url)});
+const drafts=new Map(), key="draft";
+const base={{channel_docs:{{visual:{{text:"old"}}}},attachments:[]}};
+const submitted={{channel_docs:{{visual:{{text:"A"}}}},attachments:[{{attachment_id:"chip",capabilities:[{{capability_id:"summary",kind:"summary",enabled:false}}]}}]}};
+const acknowledged={{channel_docs:{{visual:{{text:"A",nodes:[]}}}},attachments:[{{attachment_id:"chip",capabilities:[{{capability_id:"summary",kind:"summary",channel_key:"",placement:"",config:{{}},enabled:false}}]}}]}};
+const newer=structuredClone(submitted); newer.channel_docs.visual.text="B";
+updatePromptDraft(drafts,key,base,submitted);
+let finish;
+const pending=savePromptDraft(drafts,key,async()=>await new Promise(resolve=>finish=resolve));
+updatePromptDraft(drafts,key,base,newer);
+finish({{status:"acknowledged",value:acknowledged}});
+await pending;
+const row=drafts.get(key);
+console.log(JSON.stringify({{base:row.base,value:row.value,error:row.error}}));
+""")
+    assert result["base"] == {
+        "channel_docs": {"visual": {"text": "A", "nodes": []}},
+        "attachments": [{"attachment_id": "chip", "capabilities": [{
+            "capability_id": "summary", "kind": "summary", "channel_key": "",
+            "placement": "", "config": {}, "enabled": False,
+        }]}],
+    }
+    assert result["value"]["channel_docs"]["visual"]["text"] == "B"
+    assert result["value"]["attachments"] == result["base"]["attachments"]
+    assert result["error"] == ""
+
+
+
+def test_prompt_ack_callback_identifies_the_submitted_snapshot_for_live_settlement():
+    url = (ROOT / "web/js/prompt_edit_intent.js").as_uri()
+    result = _run_node(f"""
+const {{updatePromptDraft,savePromptDraft}}=await import({json.dumps(url)});
+const drafts=new Map(),key="draft";
+const base={{channel_docs:{{visual:{{text:"old"}}}},attachments:[]}};
+const submitted={{channel_docs:{{visual:{{text:"A"}}}},attachments:[]}};
+const acknowledged={{channel_docs:{{visual:{{text:"A",nodes:[]}}}},attachments:[]}};
+updatePromptDraft(drafts,key,base,submitted);
+let callback;
+await savePromptDraft(drafts,key,async()=>({{status:"acknowledged",value:acknowledged}}),{{
+  onAcknowledge:(value)=>callback=value,
+}});
+console.log(JSON.stringify(callback));
+""")
+    assert result["submitted"] == {
+        "channel_docs": {"visual": {"text": "A"}}, "attachments": [],
+    }
+    assert result["baseline"] == result["value"] == {
+        "channel_docs": {"visual": {"text": "A", "nodes": []}},
+        "attachments": [],
+    }
+
+def test_prompt_draft_no_op_settles_an_a_to_b_to_a_revision():
+    url = (ROOT / "web/js/prompt_edit_intent.js").as_uri()
+    result = _run_node(f"""
+const {{updatePromptDraft,savePromptDraft}}=await import({json.dumps(url)});
+const drafts=new Map(),key="draft",base={{channel_docs:{{visual:{{text:"A"}}}},attachments:[]}};
+updatePromptDraft(drafts,key,base,{{channel_docs:{{visual:{{text:"B"}}}},attachments:[]}});
+updatePromptDraft(drafts,key,base,structuredClone(base));
+const ok=await savePromptDraft(drafts,key,async()=>({{status:"no-op"}}));
+console.log(JSON.stringify({{ok,clean:!drafts.has(key)}}));
+""")
+    assert result == {"ok": True, "clean": True}
+
+
+
+def test_prompt_recovery_resolves_only_the_contested_record_and_can_dismiss():
+    url = (ROOT / "web/js/prompt_edit_intent.js").as_uri()
+    result = _run_node(f"""
+const {{dismissPromptDraftError,resolvePromptDraftRecord,updatePromptDraft}}=await import({json.dumps(url)});
+const drafts=new Map(),key="draft";
+const base={{channel_docs:{{visual:{{text:"old"}},speech:{{text:"old speech"}}}},attachments:[{{attachment_id:"a",config:{{text:"old"}}}}]}};
+const local={{channel_docs:{{visual:{{text:"mine"}},speech:{{text:"local speech"}}}},attachments:[{{attachment_id:"a",config:{{text:"mine"}}}},{{attachment_id:"b",config:{{text:"local chip"}}}}]}};
+const row=updatePromptDraft(drafts,key,base,local);
+row.error="conflict"; row.conflict={{record_kind:"attachment",record_key:"a",current:{{attachment_id:"a",config:{{text:"server"}}}}}};
+const resolved=resolvePromptDraftRecord(drafts,key);
+const afterResolve=structuredClone(drafts.get(key));
+row.error="network"; row.conflict={{record_kind:"document",record_key:"visual",current:{{text:"server visual"}}}};
+const dismissed=dismissPromptDraftError(drafts,key);
+console.log(JSON.stringify({{resolved,dismissed,afterResolve,afterDismiss:row}}));
+""")
+    resolved = result["afterResolve"]
+    assert result["resolved"] and result["dismissed"]
+    assert resolved["base"]["attachments"][0]["config"]["text"] == "server"
+    assert resolved["value"]["attachments"] == [
+        {"attachment_id": "a", "config": {"text": "server"}},
+        {"attachment_id": "b", "config": {"text": "local chip"}},
+    ]
+    assert resolved["value"]["channel_docs"]["visual"]["text"] == "mine"
+    assert resolved["value"]["channel_docs"]["speech"]["text"] == "local speech"
+    assert result["afterDismiss"]["error"] == ""
+    assert result["afterDismiss"]["conflict"] is None
+
+
+def test_prompt_recovery_retry_does_not_choose_a_conflict_winner():
+    url = (ROOT / "web/js/prompt_edit_intent.js").as_uri()
+    result = _run_node(f"""
+const {{retryPromptDraft,savePromptDraft,updatePromptDraft}}=await import({json.dumps(url)});
+const drafts=new Map(),key="draft",calls=[];
+updatePromptDraft(drafts,key,{{channel_docs:{{visual:{{text:"old"}}}},attachments:[]}},
+  {{channel_docs:{{visual:{{text:"mine"}}}},attachments:[]}});
+const save=async()=>{{calls.push("save");return {{status:"refused",message:"conflict",conflict:{{record_kind:"document",record_key:"visual",current:{{text:"server"}}}}}};}};
+await savePromptDraft(drafts,key,save);
+const retried=await retryPromptDraft(drafts,key);
+console.log(JSON.stringify({{retried,calls,row:drafts.get(key)}}));
+""")
+    assert result["retried"] is False
+    assert result["calls"] == ["save", "save"]
+    assert result["row"]["value"]["channel_docs"]["visual"]["text"] == "mine"
+    assert result["row"]["conflict"]["current"]["text"] == "server"
+
+
+
+def test_prompt_retry_keeps_failure_visible_until_the_attempt_settles():
+    url = (ROOT / "web/js/prompt_edit_intent.js").as_uri()
+    result = _run_node(f"""
+const {{retryPromptDraft,savePromptDraft,updatePromptDraft}}=await import({json.dumps(url)});
+const drafts=new Map(),key="draft";
+updatePromptDraft(drafts,key,{{channel_docs:{{visual:{{text:"old"}}}},attachments:[]}},
+  {{channel_docs:{{visual:{{text:"mine"}}}},attachments:[]}});
+let attempt=0,finish;
+const save=async()=>{{attempt+=1;if(attempt===1)return {{status:"refused",message:"conflict",conflict:{{record_kind:"document",record_key:"visual",current:{{text:"server"}}}}}};return await new Promise(resolve=>finish=resolve);}};
+await savePromptDraft(drafts,key,save);
+const pending=retryPromptDraft(drafts,key);
+await Promise.resolve();
+const during={{error:drafts.get(key).error,conflict:drafts.get(key).conflict}};
+finish({{status:"acknowledged",value:{{channel_docs:{{visual:{{text:"mine"}}}},attachments:[]}}}});
+const ok=await pending;
+console.log(JSON.stringify({{during,ok,clean:!drafts.has(key)}}));
+""")
+    assert result["during"]["error"] == "conflict"
+    assert result["during"]["conflict"]["record_key"] == "visual"
+    assert result["ok"] and result["clean"]
+
+def test_prompt_panel_uses_zero_height_recovery_chrome_and_commits_user_close():
+    panel = _source("web/js/editor_prompt_panel.js")
+    assert "draftStatus" not in panel
+    assert "refreshDraftStatus" not in panel
+    header_at = panel.index("panel.appendChild(header);")
+    region_at = panel.index("panel.appendChild(diagnosticsRegion);")
+    body_at = panel.index("panel.appendChild(body);")
+    assert header_at < region_at < body_at
+    assert 'height:72px;flex:0 0 72px' in panel
+    assert 'draftRecovery.style.cssText = `display:none;position:absolute;' in panel
+    assert 'diagnosticsRegion.appendChild(draftRecovery);' in panel
+    assert 'diagnosticsRegion.appendChild(diagnostics);' in panel
+    assert 'draftRecovery.style.display = "none";' in panel
+    assert 'draftRecovery.style.display = "flex";' in panel
+    assert 'diagnostics.style.paddingTop = "40px";' in panel
+    assert "let recoverySignature" in panel
+    assert "renderDraftRecovery = () =>" in panel
+    assert 'closeBtn.addEventListener("click", requestClose)' in panel
+    assert "if (e.target === backdrop) requestClose();" in panel
+    assert "guard.focusedBox.el.blur();" in panel
+    assert "cleanup: () => close({ commitFocused: false })" in panel
+    assert "focused.el.promptState = focused.revert" in panel
+    assert "guard.suppressBlurCommit = true;\n                focused.el.blur();" in panel
+    assert panel.count("guard.focusedBox.revert = sibling.promptState") == 2
+
+
+def test_prompt_recovery_actions_preserve_focus_and_discard_one_key():
+    panel = _source("web/js/editor_prompt_panel.js")
+    recovery = panel[panel.index("const draftRecovery"):
+                     panel.index("const diagnostics", panel.index("const draftRecovery"))]
+    assert 'control.addEventListener("pointerdown", (event) => event.preventDefault())' in recovery
+    assert 'control.addEventListener("mousedown", (event) => event.preventDefault())' in recovery
+    for label in ("Retry", "Use server's version", "Dismiss", "Discard"):
+        assert f'makeBtn("{label}"' in recovery
+    assert "drafts.delete(key);" in recovery
+    assert "for (const [key] of rows) drafts.delete(key)" not in recovery
+    assert "row.error" not in panel[panel.index("const keepGlobalDraft"):]
+
+
+def test_h3_summary_owner_notice_matches_compiler_identity_across_capability_ids():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for H3 Summary warning parity coverage")
+    chips_url = (ROOT / "web/js/prompt_context_chips.js").as_uri()
+    result = _run_node(f"""
+const {{referenceSummaryEmissionSignatures}} = await import({json.dumps(chips_url)});
+const first = {{attachment_id: "first", emission_group_id: "shared",
+  source: {{semantic_unit_ids: ["u"]}}, config: {{overrides: {{summary: "First."}}}},
+  capabilities: [{{capability_id: "summary-a", kind: "summary",
+    channel_key: "summary", enabled: true}}]}};
+const second = {{attachment_id: "second", emission_group_id: "shared",
+  source: {{semantic_unit_ids: ["u"]}}, config: {{overrides: {{summary: "Second."}}}},
+  capabilities: [{{capability_id: "summary-b", kind: "summary",
+    channel_key: "summary", enabled: true}}]}};
+const h3 = {{validators: ["minimax_reference_setup"], capabilities: {{}}}};
+const generic = {{validators: [], capabilities: {{}}}};
+const signatures = (value, profile) => referenceSummaryEmissionSignatures(value, {{
+  resolvedProfile: profile, channelKey: "summary", scene: {{_context_channel_keys: ["summary"]}},
+}});
+const intersects = (left, right) => [...left].some((value) => right.has(value));
+console.log(JSON.stringify({{
+  h3: {{first: [...signatures(first, h3)], second: [...signatures(second, h3)],
+    warning: intersects(signatures(first, h3), signatures(second, h3))}},
+  generic: {{first: [...signatures(first, generic)], second: [...signatures(second, generic)],
+    warning: intersects(signatures(first, generic), signatures(second, generic))}},
+  disabled: [...signatures({{...second, enabled: false}}, h3)],
+}}));
+""")
+    assert result == {
+        "h3": {"first": ["summary:summary"], "second": ["summary:summary"],
+               "warning": True},
+        "generic": {"first": ["summary-a:summary"],
+                    "second": ["summary-b:summary"], "warning": False},
+        "disabled": [],
+    }
+
+    chips = _source("web/js/prompt_context_chips.js")
+    notice = chips[chips.index("const summaryGroupId ="):
+                   chips.index("for (const field of", chips.index("const summaryGroupId ="))]
+    assert "referenceSummaryEmissionSignatures(value" in notice
+    assert 'String(value?.emission_group_id || "") === summaryGroupId' in notice
+    assert "Linked chips share one Summary." in notice
+
+    profile = _source("server/prompt_context.py")
+    assert "Prose from each chip accumulates. Two unlinked chips with different summaries both reach the prompt." in profile
+    assert "Task types are scene-wide. Every chip's selections combine, duplicates are removed, and the result prints once in MiniMax order as [a + b]." in profile
+
+
+def test_capability_diagnostic_decoration_does_not_poison_siblings():
+    source = _source("web/js/editor_prompt_panel.js")
+    start = source.index('        for (const chip of panel.querySelectorAll("[data-attachment-id]"))')
+    loop = source[start:source.index('        refreshWritingCompiled(payload);', start)]
+    url = (ROOT / "web/js/prompt_context_diagnostics.js").as_uri()
+    result = _run_node(f"""
+const {{buildPromptContextDiagnostics,promptContextDiagnosticTitle,promptCapabilityDiagnostics}} = await import({json.dumps(url)});
+const state=buildPromptContextDiagnostics({{errors:[{{attachment_id:"a",channel_key:"visual",capability_id:"bad",code:"conflicting_emission"}}]}});
+const chips=[{{capabilityId:"bad",channelKey:"visual"}},{{capabilityId:"good",channelKey:"visual"}},{{capabilityId:"bad",channelKey:"speech"}},{{}}].map(scope=>({{
+ dataset:{{attachmentId:"a",...scope}},style:{{}},title:"State: linked_elsewhere",invalid:false,
+ closest:()=>null,removeAttribute(){{this.invalid=false;}},setAttribute(){{this.invalid=true;}}
+}}));
+const panel={{querySelectorAll:()=>chips}},COLORS={{dangerText:"red",warningText:"yellow"}};
+{loop}
+console.log(JSON.stringify(chips.map(chip=>({{invalid:chip.invalid,title:chip.title}}))));
+""")
+    assert [row["invalid"] for row in result] == [True, False, False, True]
+    assert "conflicting_emission" not in result[1]["title"]
+
+
+@pytest.mark.parametrize("global_scope", [False, True])
+def test_real_prompt_save_preserves_remote_sibling_and_revision_owned_undo(global_scope):
+    widget = _source("web/js/editor_widget.js")
+    method = _method(widget, "_updateSceneGlobalContext", "_setSectionGlobalInherit") if global_scope else _method(widget, "_updatePromptSection", "_updateLinkedPromptAttachment")
+    take = _method(widget, "_takePromptIdentityCreateIntents", "_adoptPromptIdentitiesFromMutation")
+    intent_url = (ROOT / "web/js/prompt_edit_intent.js").as_uri()
+    composition_url = (ROOT / "web/js/prompt_composition.js").as_uri()
+    template_url = (ROOT / "web/js/prompt_channel_templates.js").as_uri()
+    result = _run_node(f"""
+const {{promptEditFields}}=await import({json.dumps(intent_url)});
+const {{normalizeChannels,composeSectionText}}=await import({json.dumps(composition_url)});
+const {{projectTemplateValue,getChannelTemplate}}=await import({json.dumps(template_url)});
+const globalScope={json.dumps(global_scope)};
+const docsKey=globalScope?"global_channel_docs":"channel_docs", channelsKey=globalScope?"global_channels":"channels", chipsKey=globalScope?"global_attachments":"attachments";
+const baseline={{prompt_id:"stable",start_frame:0,end_frame:24,[docsKey]:{{visual:{{text:"old"}},speech:{{text:"S"}}}},[channelsKey]:{{visual:"old",speech:"S"}},[chipsKey]:[]}};
+class Host {{
+ {method}
+ {take}
+ constructor() {{this.projectDir="p";this.activeSceneId="s";this.row=structuredClone(baseline);this.row[docsKey].speech.text="REMOTE";this.row[channelsKey].speech="REMOTE";this.activeScene=globalScope?this.row:{{prompt_sections:[this.row]}};this.history=[];this.calls=[];}}
+ _projectDirName(){{return "p";}} _channelTemplate(){{return getChannelTemplate("sonder");}}
+ _isGlobalPromptTrackLocked(){{return false;}} _isPromptTrackLocked(){{return false;}}
+ _pushUndo(label){{const row={{label}};this.history.push(row);return row;}}
+ _discardUndoEntry(row){{this.history=this.history.filter(value=>value!==row);}}
+ _renderSceneAfterLocalMutation(){{}} _refreshPromptContextDependencyConsumers(){{}}
+ _adoptPromptIdentitiesFromMutation(){{}} _finalizePromptIdentityCreationHistory(){{}}
+ _applyLocalPromptUpdate(index,fields){{Object.assign(this.row,fields);}}
+ _fetchReferences(){{return Promise.resolve();}}
+ _runSceneMutation(operations){{return new Promise((resolve,reject)=>this.calls.push({{operations,resolve,reject}}));}}
+}}
+const host=new Host();
+const value=structuredClone(baseline);value[docsKey].visual.text="A";value[channelsKey].visual="A";
+const submit=(row,base)=>globalScope?host._updateSceneGlobalContext(row[channelsKey],row[docsKey],row[chipsKey],{{baseline:base}}):host._updatePromptSection(0,{{channels:row.channels,channel_docs:row.channel_docs,attachments:row.attachments}},{{baseline:base}});
+const one=submit(value,baseline), firstUndo=host.history[0];
+const value2=structuredClone(value);value2[docsKey].visual.text="B";value2[channelsKey].visual="B";
+const two=submit(value2,value), secondUndo=host.history[1];
+host.calls[0].reject(new Error("refused")); await one;
+const afterOldFailure=host.row[docsKey].visual.text, ownUndo=host.history.includes(secondUndo)&&!host.history.includes(firstUndo);
+host.calls[1].resolve({{payload:{{}}}});await two;
+const identity={{unit:{{semantic_unit_id:"u"}}}}, chip={{attachment_id:"chip"}};
+host._pendingPromptIdentityCreateIntents=new Map([["u",{{attachmentId:"chip",intent:identity}}]]);
+const third=structuredClone(value2);third[docsKey].visual.text="C";third[chipsKey]=[chip];
+const fail=submit(third,value2);host.calls[2].reject(new Error("refused identity"));await fail;
+const retry=submit(third,value2);host.calls[3].resolve({{payload:{{}}}});await retry;
+console.log(JSON.stringify({{changed:Object.keys(host.calls[0].operations.at(-1).fields.prompt_edit.documents),afterOldFailure,ownUndo,
+ creates:host.calls.slice(2).map(call=>call.operations.filter(op=>op.unit).length)}}));
+""")
+    assert result == {"changed": ["visual"], "afterOldFailure": "B", "ownUndo": True, "creates": [1, 1]}

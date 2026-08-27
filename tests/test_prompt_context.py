@@ -911,8 +911,11 @@ def test_prompt_panel_escape_restores_structured_state_without_flattening_chips(
         encoding="utf-8")
     assert "promptState:" in editor
     assert "attachments: structuredClone(attachments)" in editor
-    assert "if (focused.structured) focused.el.promptState = focused.revert" in panel
-    assert "focused.el.value = focused.revert" in panel
+    escape_start = panel.index("if (focused.structured)")
+    escape_restore = panel[escape_start:panel.index("focused.el.blur()", escape_start)]
+    assert "focused.el.promptState = focused.revert" in escape_restore
+    assert "focused.el._sonderSyncDraft?.()" in escape_restore
+    assert "focused.el.value = focused.revert" in escape_restore
 
 
 def test_prompt_editors_claim_keyboard_and_compact_channels_without_flattening():

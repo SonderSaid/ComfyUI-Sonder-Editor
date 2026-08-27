@@ -1845,13 +1845,13 @@ BUILTIN_PROFILES = {
                         "placement": "section_prefix", "label": "Summary",
                         "description": "States the MiniMax H3 Full Reference task and optional summary prose.",
                         "example": "[reference generation] The subject crosses the corridor.",
-                        "help": "Task types are MiniMax H3 Full Reference syntax owned by this Prompt Format.",
+                        "help": "Prose from each chip accumulates. Two unlinked chips with different summaries both reach the prompt.",
                         "fields": {
                             "task_types": {
                                 "type": "enum_multi",
                                 "values": copy.deepcopy(MINIMAX_TASK_TYPE_CHOICES),
                                 "label": "Summary task types",
-                                "help": "Choose the H3 reference operations represented by staged roles.",
+                                "help": "Task types are scene-wide. Every chip's selections combine, duplicates are removed, and the result prints once in MiniMax order as [a + b].",
                                 "example": "reference generation + audio reference",
                                 "default_source": "roles",
                             },
@@ -4140,8 +4140,10 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     # Compiler-owned scratch state must never leak across a reused/injected
     # context, including when the next compile resolves a non-H3 profile.
     context.pop("h3_summary_task_types", None)
+    h3_summary_prefixes = defaultdict(list)  # Derived markers, never authored text.
     if is_h3_reference_profile:
-        # Summary is a scene singleton. Collect explicit selections across the
+        # Only the summary prefix is a singleton; prose belongs to each group.
+        # Collect explicit selections across the
         # effective window before any chip renders, so each chip sees the same
         # canonical prefix instead of whichever chip happened to compile first.
         # The window scope deliberately matches role-derived task types.
@@ -4798,8 +4800,6 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 "source", {}).get("reference_item_id"):
             identity_owner = ("reference_item", str(
                 attachment["source"]["reference_item_id"]))
-        elif is_h3_reference_profile and capability_kind == "summary":
-            identity_owner = "minimax_h3_summary"
         else:
             identity_owner = attachment["emission_group_id"]
         render_context = {**context, "origin": origin, "channel_key": channel,
@@ -4834,6 +4834,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                         errors.append({
                             "code": "conflicting_emission",
                             "attachment_id": attachment["attachment_id"],
+                            "channel_key": channel,
+                            "capability_id": capability["capability_id"],
                             "message": ("The same semantic emission resolved to "
                                         "conflicting text."),
                         })
@@ -4844,6 +4846,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                     warnings.append({
                         "code": "duplicate_reference_emission",
                         "attachment_id": attachment["attachment_id"],
+                        "channel_key": channel,
+                        "capability_id": capability["capability_id"],
                         "message": ("The same Reference text already emitted "
                                     "for a different subject or slot in this "
                                     "channel; blank one chip's field to stop it "
@@ -4857,6 +4861,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             if len(value.encode("utf-8")) > MAX_ATTACHMENT_OUTPUT:
                 errors.append({"code": "attachment_output_limit",
                                "attachment_id": attachment["attachment_id"],
+                               "channel_key": channel,
+                               "capability_id": capability["capability_id"],
                                "message": "An attachment emitted more than 16 KiB."})
                 set_projection_state(
                     projection, "output_limit", reason=
@@ -4880,8 +4886,12 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 set_projection_state(projection, "empty", reason=
                                      "This capability resolved to no text.")
             return value
+        # Linked H3 Summary copies share one semantic emission even if a
+        # custom declaration gives their capabilities different authored ids.
+        # Independent emission groups still accumulate in final composition.
         capability_identity = (
             "summary" if is_h3_reference_profile
+            and attachment["kind"] == "reference"
             and capability_kind == "summary"
             else capability["capability_id"])
         identity = (identity_owner, capability_identity,
@@ -4898,6 +4908,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         if len(value.encode("utf-8")) > MAX_ATTACHMENT_OUTPUT:
             errors.append({"code": "attachment_output_limit",
                            "attachment_id": attachment["attachment_id"],
+                           "channel_key": channel,
+                           "capability_id": capability["capability_id"],
                            "message": "An attachment emitted more than 16 KiB."})
             set_projection_state(
                 projection, "output_limit", reason=
@@ -4908,20 +4920,58 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             if prior != value:
                 errors.append({"code": "conflicting_emission",
                                "attachment_id": attachment["attachment_id"],
+                               "channel_key": channel,
+                               "capability_id": capability["capability_id"],
                                "message": "The same semantic emission resolved to conflicting text."})
             set_projection_state(
                 projection, "deduplicated", value,
                 "Equivalent output already emitted for this channel.")
             return ""
+        # Compare/store complete semantic output BEFORE stripping the prefix:
+        # linked copies must still agree, including their authored prose.
         emitted_groups[identity] = value
+        summary_candidate = None
+        if (value and is_h3_reference_profile and attachment["kind"] == "reference"
+                and capability_kind == "summary"):
+            # Defer the derived marker until final scope composition. Inline
+            # anchors render before scope prefixes, and empty scopes can vanish;
+            # render-call order cannot determine the first final channel text.
+            parts = reference_capability_segments(attachment, capability, render_context)
+            prefix = next((str(segment["text"]).rstrip()
+                           for _owner, segments in parts for segment in segments
+                           if segment.get("kind") == SEGMENT_MARKER
+                           and "task_types" in segment), "")
+            if prefix and (value == prefix or value.startswith(prefix + " ")):
+                value = value[len(prefix):].lstrip()
+                summary_candidate = {
+                    "prefix": prefix, "projection": projection,
+                    "attachment_id": attachment["attachment_id"],
+                    "emission_group_id": attachment["emission_group_id"],
+                    "capability_id": capability["capability_id"],
+                    "kind": attachment["kind"], "channel_key": channel,
+                    "origin": origin,
+                    "placement": capability.get("placement") or "inline",
+                    "anchor_node_id": projection.get("_anchor_node_id", "scope"),
+                    "discovery": projection.get("_discovery", 0),
+                    "text": value,
+                }
+                h3_summary_prefixes[channel].append(summary_candidate)
+                if not value:
+                    set_projection_state(
+                        projection, "deduplicated", reason=
+                        "The summary task prefix already emitted for this channel.")
+                    return ""
         if value:
-            emissions.append({"attachment_id": attachment["attachment_id"],
-                              "emission_group_id": attachment["emission_group_id"],
-                              "capability_id": capability["capability_id"],
-                              "kind": attachment["kind"], "channel_key": channel,
-                              "origin": origin,
-                              "placement": capability.get("placement") or "inline",
-                              "text": value})
+            emission = {"attachment_id": attachment["attachment_id"],
+                        "emission_group_id": attachment["emission_group_id"],
+                        "capability_id": capability["capability_id"],
+                        "kind": attachment["kind"], "channel_key": channel,
+                        "origin": origin,
+                        "placement": capability.get("placement") or "inline",
+                        "text": value}
+            emissions.append(emission)
+            if summary_candidate is not None:
+                summary_candidate["emission"] = emission
             set_projection_state(projection, "emitted", value,
                                  "This capability emitted resolved text.")
         else:
@@ -5531,15 +5581,99 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             "global_channel_exceptions": section.get("global_channel_exceptions", []),
         })
 
-    final_prompt = prompt_payload.compose_range_prompt(
-        prompt_payload.compose_section_text(global_mirror, labels_on=False),
-        expanded_sections, window_start, window_end, labels_on=labels_on,
-        delimiter=delimiter, boundary_threshold_pct=boundary_threshold_pct,
-        template=resolved_template, fps=fps, global_channels=global_mirror)
+    # Prefix ownership is channel-wide, independent of prose placement. Resolve
+    # prose-only scopes first so an empty former inheritor cannot suppress the
+    # marker in the scopes that actually survive. This changes no authored order.
+    summary_segments = prompt_payload.resolve_segments(
+        expanded_sections, window_start, window_end,
+        prompt_channel_templates.template_labels_on(resolved_template, labels_on),
+        boundary_threshold_pct, resolved_template) if h3_summary_prefixes else []
+    section_summary_order = {
+        str(section.get("prompt_id") or ""): index
+        for index, section in enumerate(expanded_sections)
+    }
+
+    def summary_final_order(row):
+        phase = (row["placement"] if row["placement"] in PLACEMENT_PHASES
+                 else "section_prefix")
+        # Scope-inline contributions are composed before the authored document;
+        # anchored inline contributions render earlier only because the document
+        # has to be walked before the scope bag can be assembled.
+        inline_rank = (0 if phase == "inline"
+                       and row.get("anchor_node_id") == "scope" else 1)
+        origin_rank = (-1 if row["origin"] == "global"
+                       else section_summary_order.get(row["origin"], len(expanded_sections)))
+        return (origin_rank, PLACEMENT_PHASES.index(phase), inline_rank,
+                int(row.get("discovery", 0)))
+
+    for channel, candidates in h3_summary_prefixes.items():
+        global_inherited = not summary_segments or any(
+            prompt_payload.section_inherits_global(segment, channel)
+            for segment in summary_segments)
+        global_candidates = [row for row in candidates if row["origin"] == "global"]
+        surviving_ids = {row["prompt_id"] for row in summary_segments}
+        eligible = [row for row in candidates if (
+            row["origin"] == "global" and global_inherited
+            or row["origin"] in surviving_ids)]
+        # With no remaining prose, a prefix-only chip still authors a channel.
+        if not eligible:
+            eligible = [row for row in candidates if row["origin"] != "global"]
+        if not eligible:
+            continue
+        owner = min(eligible, key=summary_final_order)
+        prefix = owner["prefix"]
+        if global_inherited and (global_mirror.get(channel) or global_candidates):
+            target = global_mirror
+            displays = [global_bar_mirror]
+        else:
+            target_section = next((row for row in expanded_sections
+                                   if row["prompt_id"] in surviving_ids
+                                   and row["channels"].get(channel)), None)
+            if target_section is None:
+                target_section = next((row for row in expanded_sections
+                                       if row["prompt_id"] == owner["origin"]), None)
+            if target_section is None:
+                continue
+            target = target_section["channels"]
+            preview = section_channel_previews.get(target_section["prompt_id"], {})
+            displays = [preview[key] for key in ("bar", "full") if key in preview]
+        target[channel] = " ".join(part for part in (prefix, target.get(channel, "")) if part)
+        for display in displays:
+            display[channel] = " ".join(part for part in (prefix, display.get(channel, "")) if part)
+        emission = owner.get("emission")
+        if emission is None:
+            emission = {key: value for key, value in owner.items()
+                        if key not in {"prefix", "projection", "anchor_node_id",
+                                       "discovery", "emission"}}
+            emissions.append(emission)
+            owner["emission"] = emission
+        emission["text"] = " ".join(part for part in (prefix, owner["text"]) if part)
+        set_projection_state(owner["projection"], "emitted", emission["text"],
+                             "This capability supplied the channel task prefix.")
+
+        # Keep the response's summary emissions in the same order as the text.
+        # Reassign only their existing slots, so unrelated emission ordering is
+        # untouched; a prefix-only owner contributes one new slot at the tail
+        # and is moved into the earliest summary position here.
+        ordered_summary_emissions = [row["emission"]
+                                     for row in sorted(candidates, key=summary_final_order)
+                                     if row.get("emission") is not None]
+        summary_emission_ids = {id(row) for row in ordered_summary_emissions}
+        slots = [index for index, row in enumerate(emissions)
+                 if id(row) in summary_emission_ids]
+        for index, row in zip(slots, ordered_summary_emissions):
+            emissions[index] = row
+
     segments = prompt_payload.resolve_segments(
         expanded_sections, window_start, window_end,
         prompt_channel_templates.template_labels_on(resolved_template, labels_on),
         boundary_threshold_pct, resolved_template)
+    final_prompt = prompt_payload.compose_range_prompt(
+        prompt_payload.compose_section_text(global_mirror, labels_on=False),
+        expanded_sections, window_start, window_end, labels_on=labels_on,
+        delimiter=delimiter, boundary_threshold_pct=boundary_threshold_pct,
+        template=resolved_template, fps=fps, global_channels=global_mirror,
+        resolved_segments=segments)
     shot_markers = prompt_payload.resolve_shot_markers(segments, fps)
     channel_outputs = {
         key: prompt_payload.join_segment_texts(
@@ -5739,13 +5873,26 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             (str(emission.get("emission_group_id") or ""),
              str(emission.get("channel_key") or ""))
         ].add(str(emission.get("attachment_id") or ""))
-    error_attachment_ids = {
-        str(error.get("attachment_id") or "") for error in errors
-        if str(error.get("attachment_id") or "")
+    # A missing channel intentionally means attachment-wide. In particular,
+    # unresolved_prompt_token is deduped by attachment/source, and
+    # broken_prompt_link is a whole-link failure. Giving either a channel would
+    # hide the failure everywhere except the first channel that discovered it.
+    error_projection_keys = {
+        (str(error.get("attachment_id") or ""),
+         str(error.get("channel_key") or ""),
+         str(error.get("capability_id") or "") if error.get("channel_key") else "")
+        for error in errors if error.get("attachment_id")
     }
     for projection in attachment_capability_projections:
-        if (projection["state"] in {"empty", "deduplicated"}
-                and projection["attachment_id"] in error_attachment_ids):
+        attachment_id = projection["attachment_id"]
+        channel = projection["channel_key"]
+        capability_id = projection["capability_id"]
+        blocked = any(key in error_projection_keys for key in (
+            (attachment_id, channel, capability_id),
+            (attachment_id, channel, ""),
+            (attachment_id, "", ""),
+        ))
+        if projection["state"] in {"empty", "deduplicated"} and blocked:
             set_projection_state(
                 projection, "unresolved", projection.get("text", ""),
                 "A blocking diagnostic prevented this capability from resolving.")
@@ -5759,13 +5906,22 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 projection, "linked_elsewhere", projection.get("text", ""),
                 "Equivalent output was emitted by a linked chip elsewhere.")
 
-    projection_orders = defaultdict(int)
+    projection_groups = {}
     for projection in sorted(
             attachment_capability_projections,
             key=lambda value: value.get("_discovery", 0)):
         order_key = (projection["origin"], projection["channel_key"])
-        projection["order"] = projection_orders[order_key]
-        projection_orders[order_key] += 1
+        projection_groups.setdefault(order_key, []).append(projection)
+    for projections in projection_groups.values():
+        def projection_final_order(row):
+            phase = row.get("effective_phase") or "section_prefix"
+            inline_rank = 0 if row.get("_scope_inline") else 1
+            return (PLACEMENT_PHASES.index(phase), inline_rank,
+                    row.get("_discovery", 0))
+        for order, projection in enumerate(sorted(
+                projections, key=projection_final_order)):
+            projection["order"] = order
+    for projection in attachment_capability_projections:
         projection.pop("_anchor_node_id", None)
         projection.pop("_discovery", None)
         projection.pop("_scope_inline", None)

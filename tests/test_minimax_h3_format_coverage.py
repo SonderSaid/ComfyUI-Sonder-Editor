@@ -26,7 +26,8 @@ import time
 
 import pytest
 
-from server import minimax_h3, prompt_context
+from server import (minimax_h3, prompt_channel_templates, prompt_context,
+                    prompt_payload)
 from server.timeline_state import (
     Asset,
     PromptSection,
@@ -155,8 +156,8 @@ def scene_single_member_subject():
     return _compile(resolved, units, sections)
 
 
-def test_global_h3_summary_owns_the_scene_wide_summary_key():
-    """H3 summaries dedupe scene-wide even when their reuse groups differ."""
+def test_global_and_section_h3_summaries_accumulate_with_one_prefix():
+    """Distinct groups contribute prose across the normal section seam."""
     entity = ReferenceEntity(reference_id="e", name="Woman", members=[
         ReferenceMember(member_id="mp", asset_id="img_a",
                         prompt="the young woman with long dark hair")])
@@ -198,11 +199,14 @@ def test_global_h3_summary_owns_the_scene_wide_summary_key():
         context=context, labels_on=True)
 
     assert "GLOBAL SUMMARY" in compiled["prompt"]
-    assert "SECTION SUMMARY" not in compiled["prompt"]
+    assert "SECTION SUMMARY" in compiled["prompt"]
     assert [row["attachment_id"] for row in compiled["emissions"]
-            if row["capability_id"] == "summary"] == ["global-summary"]
-    assert [row["attachment_id"] for row in compiled["errors"]
-            if row["code"] == "conflicting_emission"] == ["section-summary"]
+            if row["capability_id"] == "summary"] == ["global-summary", "section-summary"]
+    assert not [row for row in compiled["errors"] if row["code"] == "conflicting_emission"]
+    # channels is section-only; the composed prompt includes the global.
+    summary = compiled["prompt"]
+    assert summary.count("[reference generation]") == 1
+    assert "GLOBAL AUTHORED. SECTION SUMMARY" in summary
 
 
 def _summary_union_fixture():
@@ -251,6 +255,60 @@ def test_two_chips_declaring_task_types_union_instead_of_conflicting():
     assert not any(value["code"] == "conflicting_emission"
                    for value in compiled["errors"])
 
+
+
+def _compile_cross_scope_summary(global_task_types, section_task_types, *, section_source=None):
+    _entity, _resolved, _units, context = _summary_union_fixture()
+    global_chip = _reference_chip(
+        "global-summary", {"semantic_unit_ids": ["u"]},
+        {"task_types": global_task_types}, capabilities=("summary",))
+    section_chip = _reference_chip(
+        "section-summary", section_source or {"semantic_unit_ids": ["u"]},
+        {"task_types": section_task_types} if section_task_types is not None else {},
+        capabilities=("summary",))
+    return prompt_context.compile_prompt_context(
+        global_attachments=[global_chip],
+        sections=[PromptSection(0, WINDOW_END,
+            channels={"detailed_description": "scene"}, attachments=[section_chip])],
+        window_start=0, window_end=WINDOW_END, fps=24.0,
+        template="minimax_h3_ref", profile="minimax_h3_ref@1",
+        context=context, labels_on=True)
+
+
+def test_h3_task_types_union_across_global_and_section_scopes():
+    # Encounter order is deliberately reversed from MiniMax order: the
+    # global chip is visited before the section chip, but keyframe still leads.
+    compiled = _compile_cross_scope_summary(
+        ["video editing"], ["keyframe completion"])
+    prefix = "[keyframe completion + video editing]"
+    assert compiled["prompt"].count(prefix) == 1
+
+    without_section = _compile_cross_scope_summary(
+        ["video editing"], [])
+    assert "[video editing]" in without_section["prompt"]
+    assert "keyframe completion" not in without_section["prompt"]
+
+
+def test_h3_task_types_overlap_across_scopes_deduplicates_in_canonical_order():
+    compiled = _compile_cross_scope_summary(
+        ["reference generation", "video editing"],
+        ["video editing", "audio reuse"])
+    prefix = "[reference generation + video editing + audio reuse]"
+    assert compiled["prompt"].count(prefix) == 1
+    assert compiled["prompt"].count("video editing") == 1
+
+
+def test_h3_exact_task_type_sets_across_scopes_print_once():
+    compiled = _compile_cross_scope_summary(
+        ["audio reference"], ["audio reference"])
+    assert compiled["prompt"].count("[audio reference]") == 1
+
+
+def test_h3_explicit_global_task_type_suppresses_section_role_derivation():
+    compiled = _compile_cross_scope_summary(
+        ["keyframe completion"], None, section_source={"audio_ids": ["ma"]})
+    assert compiled["prompt"].count("[keyframe completion]") == 1
+    assert "audio reference" not in compiled["prompt"]
 
 def test_explicit_summary_task_type_still_suppresses_role_derivation():
     _entity, resolved, units, _context = _summary_union_fixture()
@@ -304,25 +362,59 @@ def test_stale_h3_summary_union_cannot_override_non_h3_profile_config():
     assert compiled["channels"]["summary"] == "[reference generation]"
 
 
-def test_h3_summary_singleton_ignores_arbitrary_capability_ids():
+def test_h3_summary_distinct_capability_ids_keep_prose_and_share_prefix():
     _entity, resolved, units, _context = _summary_union_fixture()
     subject = _reference_chip(
         "subject-summary", {"semantic_unit_ids": ["u"]},
-        {"task_types": ["reference generation"]}, capabilities=("summary",))
+        {"task_types": ["reference generation"], "summary": "First."}, capabilities=("summary",))
     audio = _reference_chip(
         "audio-summary", {"audio_ids": ["ma"]},
-        {"task_types": ["audio reference"]}, capabilities=("summary",))
+        {"task_types": ["audio reference"], "summary": "Second."}, capabilities=("summary",))
     subject["capabilities"][0]["capability_id"] = "summary-a"
     audio["capabilities"][0]["capability_id"] = "summary-b"
     compiled = _compile(resolved, units, [PromptSection(
         0, WINDOW_END, channels={"detailed_description": "scene"},
         attachments=[subject, audio])])
     assert compiled["channels"]["summary"] == (
-        "[reference generation + audio reference]")
+        "[reference generation + audio reference] First. Second.")
     assert len([value for value in compiled["emissions"]
-                if value["channel_key"] == "summary"]) == 1
+                if value["channel_key"] == "summary"]) == 2
     assert not any(value["code"] == "conflicting_emission"
                    for value in compiled["errors"])
+
+
+def test_summary_survivors_need_post_expansion_resolve_after_common_edge_cases():
+    template = prompt_channel_templates.get_channel_template("minimax_h3_ref")
+    labels = prompt_channel_templates.template_labels_on(template, True)
+
+    def ids(sections, start=0, end=100, threshold=0.0):
+        return {row["prompt_id"] for row in prompt_payload.resolve_segments(
+            sections, start, end, labels, threshold, template)}
+
+    shared = [
+        {"prompt_id": "muted", "start_frame": 0, "end_frame": 30,
+         "muted": True, "channels": {"summary": "muted"}},
+        {"prompt_id": "kept", "start_frame": 30, "end_frame": 100,
+         "channels": {"summary": "kept"}, "_opens_shot": True},
+        {"prompt_id": "sliver", "start_frame": 100, "end_frame": 200,
+         "channels": {"summary": "sliver"}, "_opens_shot": True},
+    ]
+    # Muting, boundary dropping and shot metadata agree when channel prose is
+    # otherwise unchanged; these are the tempting cases for reusing the early set.
+    assert ids(shared, 0, 105, 10.0) == ids([dict(row) for row in shared], 0, 105, 10.0)
+    assert ids(shared, 0, 105, 10.0) == {"kept"}
+
+    # The compiler's preliminary pass gives an attachment-only section a private
+    # sentinel so it participates in selection. Expansion can legitimately leave
+    # that channel empty until the H3 task prefix is assigned. The post-expansion
+    # resolve therefore answers a different question and cannot be replaced by
+    # `selected_prompt_ids`.
+    preliminary = [{"prompt_id": "task-only", "start_frame": 0,
+                    "end_frame": 100, "channels": {"summary": "\ue000"}}]
+    expanded = [{"prompt_id": "task-only", "start_frame": 0,
+                 "end_frame": 100, "channels": {"summary": ""}}]
+    assert ids(preliminary) == {"task-only"}
+    assert ids(expanded) == set()
 
 
 def test_summary_prefix_matches_render_and_segments_under_union():
@@ -2624,3 +2716,146 @@ def test_a_compile_without_a_copy_request_carries_no_plan():
         window_start=0, window_end=WINDOW_END, fps=24.0,
         template="minimax_h3_ref", profile="minimax_h3_ref@1")
     assert "copy_plan" not in compiled
+
+
+@pytest.mark.parametrize("first,second", [("", ""), ("First.", "Second."),
+                                          ("Same.", "Same.")])
+def test_role_derived_h3_prefix_is_singleton_but_authored_prose_accumulates(first, second):
+    _entity, resolved, units, _context = _summary_union_fixture()
+    chips = [_reference_chip(
+        name, {"semantic_unit_ids": ["u"]}, {"summary": text},
+        capabilities=("summary",)) for name, text in [("first", first), ("second", second)]]
+    compiled = _compile(resolved, units, [PromptSection(
+        0, WINDOW_END, channels={"detailed_description": "scene"}, attachments=chips)])
+    prefix = "[reference generation + audio reference]"
+    assert compiled["channels"]["summary"] == " ".join(
+        part for part in (prefix, first, second) if part)
+    assert not [error for error in compiled["errors"]
+                if error["code"] == "conflicting_emission"]
+    projection = next(row for row in compiled["attachment_capability_projections"]
+                      if row["attachment_id"] == "second")
+    assert projection["state"] == ("emitted" if second else "deduplicated")
+    if not second:
+        assert "prefix already emitted" in projection["state_reason"]
+
+
+@pytest.mark.parametrize("same_prose", [False, True])
+def test_linked_h3_summary_keeps_full_output_conflict_checks(same_prose):
+    _entity, resolved, units, _context = _summary_union_fixture()
+    first = _reference_chip("first", {"semantic_unit_ids": ["u"]},
+        {"summary": "First."}, capabilities=("summary",), group="shared")
+    second = _reference_chip("second", {"semantic_unit_ids": ["u"]},
+        {"summary": "First." if same_prose else "Second."},
+        capabilities=("summary",), group="shared")
+    # Authored capability ids may differ across linked copies, but H3 Summary
+    # ownership remains the emission group's one semantic output.
+    first["capabilities"][0]["capability_id"] = "summary-a"
+    second["capabilities"][0]["capability_id"] = "summary-b"
+    compiled = _compile(resolved, units, [PromptSection(
+        0, WINDOW_END, channels={"detailed_description": "scene"},
+        attachments=[first, second])])
+    conflicts = [error for error in compiled["errors"]
+                 if error["code"] == "conflicting_emission"]
+    assert len(conflicts) == (0 if same_prose else 1)
+    assert compiled["channels"]["summary"].count("First.") == 1
+    assert "Second." not in compiled["channels"]["summary"]
+
+
+def test_summary_prefix_is_per_channel_and_resets_each_compile():
+    _entity, resolved, units, _context = _summary_union_fixture()
+    first = _reference_chip("first", {"semantic_unit_ids": ["u"]},
+        {"summary": "First."}, capabilities=("summary",))
+    second = _reference_chip("second", {"semantic_unit_ids": ["u"]},
+        {"summary": "Second."}, capabilities=("summary",))
+    second["capabilities"][0]["channel_key"] = "detailed_description"
+    sections = [PromptSection(0, WINDOW_END,
+        channels={"detailed_description": "scene"}, attachments=[first, second])]
+    one = _compile(resolved, units, sections)
+    two = _compile(resolved, units, sections)
+    for channel in ("summary", "detailed_description"):
+        assert one["channels"][channel].count("[reference generation + audio reference]") == 1
+        assert one["channels"][channel] == two["channels"][channel]
+
+
+def test_excluded_global_summary_cannot_consume_section_prefix():
+    _entity, _resolved, _units, context = _summary_union_fixture()
+    global_chip = _reference_chip("global", {"semantic_unit_ids": ["u"]},
+        {"summary": "GLOBAL"}, capabilities=("summary",))
+    section_chip = _reference_chip("section", {"semantic_unit_ids": ["u"]},
+        {"summary": "SECTION"}, capabilities=("summary",))
+    compiled = prompt_context.compile_prompt_context(
+        global_attachments=[global_chip],
+        sections=[PromptSection(0, WINDOW_END,
+            channels={"detailed_description": "scene"}, attachments=[section_chip],
+            global_channel_exceptions=["summary"])],
+        window_start=0, window_end=WINDOW_END, fps=24,
+        template="minimax_h3_ref", profile="minimax_h3_ref@1", context=context)
+    assert "GLOBAL" not in compiled["prompt"]
+    assert "[reference generation + audio reference] SECTION" in compiled["prompt"]
+
+
+@pytest.mark.parametrize("global_scope", [False, True])
+def test_h3_summary_prefix_follows_final_order_not_inline_render_order(global_scope):
+    _entity, _resolved, _units, context = _summary_union_fixture()
+    inline = _reference_chip("inline", {"semantic_unit_ids": ["u"]},
+        {"summary": "INLINE"}, capabilities=("summary",), placement="inline")
+    prefix = _reference_chip("prefix", {"semantic_unit_ids": ["u"]},
+        {"summary": "PREFIX"}, capabilities=("summary",))
+    document = {"nodes": [{"type": "attachment", "attachment_id": "inline",
+                            "capability_id": "summary"}]}
+    kwargs = ({"global_documents": {"summary": document},
+               "global_attachments": [inline, prefix], "sections": []}
+              if global_scope else {"sections": [PromptSection(0, WINDOW_END,
+                  channel_docs={"summary": document}, attachments=[inline, prefix])]})
+    compiled = prompt_context.compile_prompt_context(**kwargs,
+        window_start=0, window_end=WINDOW_END, fps=24,
+        template="minimax_h3_ref", profile="minimax_h3_ref@1", context=context)
+    assert "[reference generation + audio reference] PREFIX INLINE" in compiled["prompt"]
+    assert compiled["prompt"].count("[reference generation + audio reference]") == 1
+    assert not any(row["code"] == "invalid_h3_task_prefix" for row in compiled["warnings"])
+
+
+@pytest.mark.parametrize("global_scope", [False, True])
+@pytest.mark.parametrize("scope_prose", ["SCOPE", ""])
+def test_h3_scope_inline_owns_prefix_before_document_inline(global_scope, scope_prose):
+    _entity, _resolved, _units, context = _summary_union_fixture()
+    inline = _reference_chip("inline", {"semantic_unit_ids": ["u"]},
+        {"summary": "INLINE"}, capabilities=("summary",), placement="inline")
+    scope = _reference_chip("scope", {"semantic_unit_ids": ["u"]},
+        {"summary": scope_prose}, capabilities=("summary",), placement="inline")
+    document = {"nodes": [{"type": "attachment", "attachment_id": "inline",
+                            "capability_id": "summary"}]}
+    kwargs = ({"global_documents": {"summary": document},
+               "global_attachments": [inline, scope], "sections": []}
+              if global_scope else {"sections": [PromptSection(0, WINDOW_END,
+                  channel_docs={"summary": document}, attachments=[inline, scope])]})
+    compiled = prompt_context.compile_prompt_context(**kwargs,
+        window_start=0, window_end=WINDOW_END, fps=24,
+        template="minimax_h3_ref", profile="minimax_h3_ref@1", context=context)
+    prefix = "[reference generation + audio reference]"
+    expected = " ".join(part for part in (prefix, scope_prose, "INLINE") if part)
+    assert expected in compiled["prompt"]
+    assert [row["attachment_id"] for row in compiled["emissions"]
+            if row["capability_id"] == "summary"] == ["scope", "inline"]
+    projections = {row["attachment_id"]: row
+                   for row in compiled["attachment_capability_projections"]
+                   if row["capability_id"] == "summary"}
+    assert projections["scope"]["state"] == "emitted"
+    assert projections["scope"]["text"].startswith(prefix)
+    assert projections["scope"]["order"] < projections["inline"]["order"]
+
+
+def test_empty_former_global_inheritor_cannot_remove_h3_prefix():
+    _entity, _resolved, _units, context = _summary_union_fixture()
+    def chip(name, prose):
+        return _reference_chip(name, {"semantic_unit_ids": ["u"]},
+            {"summary": prose}, capabilities=("summary",))
+    compiled = prompt_context.compile_prompt_context(
+        global_attachments=[chip("global", "GLOBAL")],
+        sections=[PromptSection(0, 50, attachments=[chip("empty", "")]),
+                  PromptSection(50, 100, attachments=[chip("second", "SECOND")],
+                                global_channel_exceptions=["summary"])],
+        window_start=0, window_end=100, fps=24,
+        template="minimax_h3_ref", profile="minimax_h3_ref@1", context=context)
+    assert "GLOBAL" not in compiled["prompt"]
+    assert "[reference generation + audio reference] SECOND" in compiled["prompt"]

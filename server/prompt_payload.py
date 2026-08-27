@@ -37,7 +37,18 @@ def resolve_template(template=None) -> dict:
     if template is None:
         return channel_templates.get_channel_template(
             channel_templates.DEFAULT_CHANNEL_TEMPLATE_ID)
-    return channel_templates.get_channel_template(template)
+    resolved = channel_templates.get_channel_template(template)
+    # A materialized built-in is already a valid resolved template. Generic
+    # dict normalization deliberately marks project-owned templates custom, so
+    # preserve `builtin` only when every normalized field matches the named
+    # shipped preset; authored dicts cannot promote themselves by setting a bit.
+    if isinstance(template, dict) and template.get("builtin") is True:
+        key = str(template.get("id") or "")
+        if key in channel_templates.PROMPT_CHANNEL_TEMPLATE_PRESETS:
+            preset = channel_templates.get_channel_template(key)
+            if {**resolved, "builtin": True} == preset:
+                return preset
+    return resolved
 
 # Matches PromptRelay's numeric weight tags exactly (parser.py _INLINE_TAG_RE):
 # [12], [1.5], [0-50], [0:50]. Non-numeric brackets like [VISUAL] do NOT match.
@@ -474,7 +485,8 @@ def _shot_marked_texts(segments, key, fps) -> list:
 def compose_range_prompt(global_text, sections, window_start, window_end,
                          labels_on=True, delimiter=DEFAULT_SECTION_DELIMITER,
                          boundary_threshold_pct=0.0, template=None,
-                         fps=0.0, global_channels=None) -> str:
+                         fps=0.0, global_channels=None,
+                         resolved_segments=None) -> str:
     """THE single-string composer: global + ALL window segments, joined by the
     section-seam delimiter. Used by the Scene selectors, the queue handlers'
     frozen-prompt compose, and the dormant summary.
@@ -493,12 +505,15 @@ def compose_range_prompt(global_text, sections, window_start, window_end,
     templates/jobs whose frozen policy is `project`; current presets never use it.
 
     `fps` is consumed by shot-marker timestamps and is inert for a template
-    that declares no shot-marker channel.
+    that declares no shot-marker channel. `resolved_segments`, when supplied,
+    is a read-only result from `resolve_segments` for these exact arguments.
     """
     resolved = resolve_template(template)
     effective_labels = channel_templates.template_labels_on(resolved, labels_on)
-    segments = resolve_segments(sections, window_start, window_end,
-                                effective_labels, boundary_threshold_pct, resolved)
+    segments = (resolve_segments(
+        sections, window_start, window_end, effective_labels,
+        boundary_threshold_pct, resolved)
+        if resolved_segments is None else list(resolved_segments))
     global_part = str(global_text or "").strip()
     # A template with global channels OFF has one global box, so there is no
     # channel to merge into and the text leads the whole payload.

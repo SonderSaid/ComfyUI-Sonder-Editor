@@ -248,9 +248,10 @@ export function sceneWithDraftSection(scene, {
     channels = undefined,
     section = null,
 } = {}) {
-    const snapshot = structuredClone(scene || {});
-    const sections = Array.isArray(snapshot.prompt_sections)
-        ? snapshot.prompt_sections : [];
+    const source = scene || {};
+    const snapshot = { ...source };
+    const sections = Array.isArray(source.prompt_sections)
+        ? [...source.prompt_sections] : [];
     const hasStart = startFrame !== null && startFrame !== undefined
         && Number.isFinite(Number(startFrame));
     const hasEnd = endFrame !== null && endFrame !== undefined
@@ -266,7 +267,7 @@ export function sceneWithDraftSection(scene, {
             Number(value?.start_frame) === Number(startFrame)
             && Number(value?.end_frame) === Number(endFrame));
     }
-    const base = resolved >= 0 ? sections[resolved] : structuredClone(section || {});
+    const base = resolved >= 0 ? sections[resolved] : (section || {});
     const overlay = { ...base };
     if (promptId) overlay.prompt_id = String(promptId);
     if (hasStart) overlay.start_frame = Number(startFrame);
@@ -286,7 +287,7 @@ export function sceneWithDraftGlobal(scene, {
     channelDocs = undefined,
     channels = undefined,
 } = {}) {
-    const snapshot = structuredClone(scene || {});
+    const snapshot = { ...(scene || {}) };
     if (attachments !== undefined) {
         snapshot.global_attachments = structuredClone(attachments || []);
     }
@@ -2580,13 +2581,27 @@ export function createPromptDocumentEditor({
         render();
         emit("attachment");
     };
-    // A channel editor owns its document/history, while its host owns the one
-    // scene attachment registry shared by every mounted channel.  Synchronize
-    // registry changes without replacing the document or creating an undo step.
-    editor.syncPromptAttachments = (raw) => {
-        attachments = normalizePromptAttachments(raw);
+    // Server acknowledgement is settlement, not an authoring action: adopt
+    // its canonical record without adding an undo step. Preserve a live caret
+    // across the uncommon case where canonicalization changes rendered nodes.
+    editor.syncPromptState = ({ document = model, attachments: raw = attachments } = {}) => {
+        const nextModel = normalizePromptDocument(document);
+        const nextAttachments = normalizePromptAttachments(raw);
+        if (JSON.stringify(nextModel) === JSON.stringify(model)
+                && JSON.stringify(nextAttachments) === JSON.stringify(attachments)) return false;
+        const bookmark = selectionBookmark();
+        model = nextModel;
+        attachments = nextAttachments;
         render();
+        if (bookmark) restoreSelection(bookmark);
+        return true;
     };
+    // A channel editor owns its document/history, while its host owns the one
+    // scene attachment registry shared by every mounted channel. Synchronize
+    // registry changes without replacing the document or creating an undo step.
+    editor.syncPromptAttachments = (raw) => editor.syncPromptState({
+        document: model, attachments: raw,
+    });
     editor.transactPromptAttachments = (raw, mutateHostState = null) => {
         pushHistory();
         if (typeof mutateHostState === "function") mutateHostState();
@@ -4187,6 +4202,50 @@ export function applyPromptReferenceSource(attachment, value) {
     return attachment;
 }
 
+/** Compiler-parity identity for the linked H3 Summary owner warning. */
+export function referenceSummaryEmissionSignatures(value, {
+    references = [], semanticUnits = [], resolvedProfile = {},
+    channelKey = "", scene = null,
+} = {}) {
+    if (value?.enabled === false) return new Set();
+    const source = value?.source || {};
+    let selected = "";
+    if (source.semantic_unit_ids?.[0]) selected = String(source.semantic_unit_ids[0]);
+    if (!selected) {
+        for (const kind of ["picture", "video", "audio"]) {
+            if (source[`${kind}_ids`]?.[0]) {
+                selected = `physical:${kind}:${source[`${kind}_ids`][0]}`;
+                break;
+            }
+        }
+    }
+    const referenceDerived = referenceDerivedDeclarations(resolvedProfile);
+    const stored = (value?.capabilities || []).filter((capability) =>
+        String(capability?.kind || capability?.capability_id || "") === "summary");
+    const capabilities = stored.length ? stored : [{
+        capability_id: "summary", kind: "summary",
+    }];
+    const h3Reference = (resolvedProfile?.validators || []).some((validator) =>
+        String(typeof validator === "object"
+            ? validator?.validator_id || validator?.id || ""
+            : validator) === "minimax_reference_setup");
+    return new Set(capabilities.filter((capability) => {
+        if (Object.hasOwn(capability, "enabled")) return capability.enabled !== false;
+        return resolveInheritedCapabilityEnabled(
+            capability.capability_id || "summary", {
+                selected, references, semanticUnits,
+            });
+    }).map((capability) => {
+        const capabilityId = h3Reference ? "summary" : String(
+            capability.capability_id || capability.kind || "summary");
+        const route = String(capability.channel_key
+            || referenceDerived.summary?.channel_key
+            || resolvedProfile?.capabilities?.reference?.channel_key
+            || channelKey || scene?._context_channel_keys?.[0] || "");
+        return `${capabilityId}:${route}`;
+    }));
+}
+
 /** Bounded, deterministic attachment configuration. No provider prose is generated. */
 export function configurePromptAttachment(rawAttachment, {
     scene = null, references = [], semanticUnits = [], channelKey = "", profileId = "generic@1",
@@ -4608,12 +4667,21 @@ export function configurePromptAttachment(rawAttachment, {
             referenceFieldset.pushRow(referenceRows, "audio_definition");
             if (referenceFieldset.pushRow(referenceRows, "summary")) {
                 referenceRows.push(tokenStrip);
-                const otherSummaryOwners = [
+                const summaryGroupId = String(attachment.emission_group_id || "");
+                const summaryEmissionSignatures = (value) =>
+                    referenceSummaryEmissionSignatures(value, {
+                        references, semanticUnits, resolvedProfile, channelKey, scene,
+                    });
+                const ownSummaryEmissions = summaryEmissionSignatures(attachment);
+                const otherSummaryOwners = summaryGroupId ? [
                     ...(scene?.global_attachments || []),
                     ...(scene?.prompt_sections || []).flatMap((value) => value?.attachments || []),
                 ].filter((value) => value?.kind === "reference"
                     && String(value?.attachment_id || "") !== String(attachment.attachment_id || "")
-                    && String(value?.config?.overrides?.summary || "").trim());
+                    && String(value?.emission_group_id || "") === summaryGroupId
+                    && String(value?.config?.overrides?.summary || "").trim()
+                    && [...summaryEmissionSignatures(value)].some((signature) =>
+                        ownSummaryEmissions.has(signature))) : [];
                 if (String(referenceFieldset.draftValue("summary") || "").trim()
                         && otherSummaryOwners.length) {
                     const summaryOwnerNotice = document.createElement("div");
@@ -4621,7 +4689,7 @@ export function configurePromptAttachment(rawAttachment, {
                     // a conflicting Summary owner is a transient compile state,
                     // which is exactly what status colour is for.
                     summaryOwnerNotice.style.cssText = `grid-column:2;font:9px/1.35 system-ui;color:${COLORS.warningText};margin-top:-4px;`;
-                    summaryOwnerNotice.textContent = "Only one Summary owner can emit per compile. Another Reference chip also carries Summary text.";
+                    summaryOwnerNotice.textContent = "Linked chips share one Summary. Another chip in this link group also carries Summary text, so only one will emit.";
                     referenceRows.push(summaryOwnerNotice);
                 }
             }
@@ -5310,6 +5378,7 @@ export function createAttachmentChannelProjections({ channelKey = "", attachment
             projection.tabIndex = -1;
             projection.dataset.attachmentId = attachment.attachment_id;
             projection.dataset.capabilityId = String(projectionRow.capability_id || "");
+            projection.dataset.channelKey = String(projectionRow.channel_key || channelKey);
             projection.dataset.sonderPromptProjection = "1";
             const sourceLabel = contribution.label;
             const reason = contribution.reason;

@@ -19,6 +19,7 @@ export function buildPromptContextDiagnostics(payload) {
                 message: String(raw?.message || raw?.detail || "Prompt Context diagnostic."),
                 attachment_id: String(raw?.attachment_id || ""),
                 channel_key: String(raw?.channel_key || ""),
+                capability_id: String(raw?.capability_id || ""),
             };
             if (diagnostic.attachment_id) {
                 (byAttachment[diagnostic.attachment_id] ||= []).push(diagnostic);
@@ -55,6 +56,14 @@ export function buildPromptContextDiagnostics(payload) {
             .reduce((sum, rows) => sum + rows.length, 0),
         stale: promptCandidateVisuallyStale(value),
     };
+}
+
+// A whole-attachment chip shows all failures; individual capability pills only
+// show failures in their own scope. Missing diagnostic scope remains broad.
+export function promptCapabilityDiagnostics(rows, channelKey = "", capabilityId = "") {
+    if (!capabilityId) return rows;
+    return rows.filter((row) => (!row.channel_key || !channelKey || row.channel_key === channelKey)
+        && (!row.capability_id || row.capability_id === capabilityId));
 }
 
 export function promptContextDiagnosticTitle(rows) {

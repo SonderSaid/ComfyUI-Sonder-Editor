@@ -103,6 +103,13 @@ a fresh `[Unreleased]` block.
   format's own label.
 
 ### Fixed
+- Structured and Global Prompt previews now measure their stale grace from the compile request instead of the preceding typing debounce, keep failed previews steadily explained until recovery, and avoid rebuilding unchanged projection chrome.
+- Prompt candidate previews now heal one project-version race from a fixed snapshot, retain same-scene stale projections on failure, and no longer blank the Context strip after a contribution write.
+- Prompt saves now accept browser-sparse records that normalize to the stored value, acknowledge the server's canonical row without overwriting newer typing, and keep real same-record conflicts recoverable per record.
+- Ordinary Prompt drafts no longer add a moving save advisory; failed saves use the fixed diagnostics region with Retry, server-version resolution, Dismiss, and row-specific Discard while editing remains live.
+- MiniMax H3 Summary guidance now states the scene-wide canonical task union and accumulated prose, and warns only for active linked peers that compete on the same Summary route.
+- MiniMax H3 Summary now emits one derived task prefix per channel while accumulating independent chip prose in final placement order; scoped diagnostics no longer mark healthy sibling projections invalid.
+- Global, Structured, and timeline Prompt edits now retain focused or refused drafts, merge only expected channel/chip records, serialize Prompt project settings, and stop template transforms while drafts remain pending.
 - Timeline prompt bars and optimistic queue rows now show the active format's resolved prompt content, while clipped bars keep authored prose first and full hover previews retain compiler order.
 - Clicking or right-clicking blank editor space beside or below a terminal Context chip now lands the caret at the chip boundary without disrupting native text selection, IME, or chip activation.
 - MiniMax H3 population slot limits now appear as non-blocking Prompt-tool advice after the resolver bounds the ordinal presentation to the node's available inputs.

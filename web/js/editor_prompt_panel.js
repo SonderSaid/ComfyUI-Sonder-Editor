@@ -1,3 +1,4 @@
+import { dismissPromptDraftError, promptEditFields, promptDraftKey, resolvePromptDraftRecord, retryPromptDraft, updatePromptDraft, savePromptDraft, rebasePromptDraft } from "./prompt_edit_intent.js";
 // Prompt Management panel — centered overlay for editing the scene-global
 // prompt, the segment lane's sections (ranges + channels), the project-durable
 // channel-template-aware prompt state and a PromptRelay payload preview.
@@ -43,6 +44,7 @@ import {
 } from "./prompt_composition.js";
 import {
     defaultDraftChannel,
+    projectTemplateValue,
     globalChannelKeys,
     templateChannelKeys,
 } from "./prompt_channel_templates.js";
@@ -92,6 +94,7 @@ import {
     buildPromptContextDiagnostics,
     promptCandidateVisuallyStale,
     promptContextDiagnosticTitle,
+    promptCapabilityDiagnostics,
 } from "./prompt_context_diagnostics.js";
 
 const WRITING_BREAK = "---";
@@ -948,7 +951,15 @@ export function mountPromptManagementPanel(host) {
         width: "min(1320px, 96vw)", maxWidth: "1320px", maxHeight: "86vh", padding: "0",
     }) + "display:flex; flex-direction:column; overflow:hidden;";
     backdrop.appendChild(panel);
+    panel.addEventListener("beforeinput", (event) => {
+        if (host._promptTemplateChanging) event.preventDefault();
+    }, true);
 
+    const drafts = host._promptToolDrafts ||= new Map();
+    const draftSceneIdentity = () => JSON.stringify([host._projectDirName(), host.activeSceneId]);
+    let renderedDraftScene = "";
+    let deferredDraftRender = false;
+    let renderDraftRecovery = () => {};
     let mounted = true;
     let identityPanelCleanup = () => {};
     let renderNow = () => {};
@@ -989,11 +1000,16 @@ export function mountPromptManagementPanel(host) {
         });
     };
 
-    const close = () => {
+    const close = ({ commitFocused = false } = {}) => {
         if (!mounted) return;
+        if (commitFocused && guard.focusedBox?.el === document.activeElement) {
+            // Blur while mounted so the box's normal commit path captures its
+            // current document. Removal-triggered blur remains suppressed for
+            // programmatic teardown and after this explicit flush.
+            guard.focusedBox.el.blur();
+        }
         mounted = false;
         identityRefreshGate.clear();
-        // Closing mid-edit must never commit via the removal-triggered blur
         guard.suppressBlurCommit = true;
         identityPanelCleanup();
         for (const editor of backdrop.querySelectorAll("[data-sonder-prompt-box='1']")) {
@@ -1004,6 +1020,7 @@ export function mountPromptManagementPanel(host) {
         guard.suppressBlurCommit = false;
         if (host._promptPanelHandle === handle) host._promptPanelHandle = null;
     };
+    const requestClose = () => close({ commitFocused: true });
 
     const unregisterKeyboard = registerKeyboardConsumer({
         id: `sonder-prompt-panel-${Date.now().toString(36)}`,
@@ -1015,7 +1032,10 @@ export function mountPromptManagementPanel(host) {
             if (focused && document.activeElement === focused.el) {
                 // First Esc: revert the box and drop focus WITHOUT committing;
                 // panel stays open. A second Esc (no focused box) closes.
-                if (focused.structured) focused.el.promptState = focused.revert;
+                if (focused.structured) {
+                    focused.el.promptState = focused.revert;
+                    focused.el._sonderSyncDraft?.();
+                }
                 else focused.el.value = focused.revert;
                 guard.suppressBlurCommit = true;
                 focused.el.blur();
@@ -1023,13 +1043,13 @@ export function mountPromptManagementPanel(host) {
                 guard.focusedBox = null;
                 return true;
             }
-            close();
+            requestClose();
             return true;
         },
     });
 
     backdrop.addEventListener("mousedown", (e) => {
-        if (e.target === backdrop) close();
+        if (e.target === backdrop) requestClose();
     });
 
     // ── Writing-mode state (per project+scene; persisted browser-local) ──
@@ -1366,16 +1386,141 @@ export function mountPromptManagementPanel(host) {
     title.style.cssText = `font-size:13px; font-weight:600; color:${COLORS.text};`;
     title.textContent = "Prompt Management";
     const closeBtn = makeBtn("Close", "Close (Esc)", "subtle");
-    closeBtn.addEventListener("click", close);
+    closeBtn.addEventListener("click", requestClose);
     header.append(title, closeBtn);
     panel.appendChild(header);
+
+    const diagnosticsRegion = document.createElement("div");
+    diagnosticsRegion.style.cssText = "position:relative;height:72px;flex:0 0 72px;min-height:0;";
+    const draftRecovery = document.createElement("div");
+    draftRecovery.dataset.sonderPromptDraftRecovery = "1";
+    draftRecovery.style.cssText = `display:none;position:absolute;inset:0 0 auto 0;z-index:1;`
+        + `height:36px;overflow:hidden;padding:5px 18px;`
+        + `border-bottom:1px solid ${COLORS.trackBorder};background:${COLORS.panelMuted};`
+        + `font:10px/1.35 ${FONT.sans};color:${COLORS.warningText};box-sizing:border-box;`
+        + "align-items:center;gap:6px;";
+    diagnosticsRegion.appendChild(draftRecovery);
+    let recoverySignature = "", selectedRecoveryKey = "";
+    const failedDraftRows = () => {
+        const projectId = host._projectDirName(), sceneId = host.activeSceneId;
+        return [...drafts].filter(([key, row]) => {
+            let identity = [];
+            try { identity = JSON.parse(key); } catch (_error) { return false; }
+            return identity[0] === projectId && identity[1] === sceneId && row.error;
+        });
+    };
+    const keepRecoveryFocus = (control) => {
+        control.addEventListener("pointerdown", (event) => event.preventDefault());
+        control.addEventListener("mousedown", (event) => event.preventDefault());
+        return control;
+    };
+    const syncResolvedRecord = (key, conflict) => {
+        const boxes = [...body.querySelectorAll("[data-sonder-prompt-box='1']")]
+            .filter((box) => box.dataset.sonderPromptDraftKey === key);
+        for (const box of boxes) {
+            const state = box.promptState;
+            if (!state) continue;
+            if (conflict.record_kind === "document"
+                    && box.dataset.sonderPromptChannel === conflict.record_key) {
+                box.syncPromptState?.({ document: conflict.current,
+                    attachments: state.attachments });
+                box._sonderSyncDraft?.();
+            } else if (conflict.record_kind === "attachment") {
+                const records = new Map((state.attachments || [])
+                    .map((value) => [value.attachment_id, value]));
+                if (conflict.current == null) records.delete(conflict.record_key);
+                else records.set(conflict.record_key, conflict.current);
+                box.syncPromptState?.({ document: state.document,
+                    attachments: [...records.values()] });
+                box._sonderSyncDraft?.();
+            }
+        }
+    };
+    renderDraftRecovery = () => {
+        const rows = failedDraftRows();
+        if (!rows.length) {
+            recoverySignature = "";
+            draftRecovery.replaceChildren();
+            draftRecovery.style.display = "none";
+            diagnostics.style.paddingTop = "7px";
+            return;
+        }
+        if (!rows.some(([key]) => key === selectedRecoveryKey)) selectedRecoveryKey = rows[0][0];
+        const signature = JSON.stringify(rows.map(([key, row]) => [key, row.error,
+            row.conflict?.record_kind, row.conflict?.record_key, row.conflict?.current,
+            key === selectedRecoveryKey]));
+        if (signature === recoverySignature) return;
+        recoverySignature = signature;
+        draftRecovery.replaceChildren();
+        draftRecovery.style.display = "flex";
+        diagnostics.style.paddingTop = "40px";
+        if (rows.length > 1) {
+            const picker = document.createElement("select");
+            picker.style.cssText = chromeInputCss({ compact: true });
+            for (const [key] of rows) {
+                const identity = JSON.parse(key);
+                const option = document.createElement("option");
+                option.value = key;
+                option.textContent = identity[2] === "global" ? "Global" : `Section ${identity[2]}`;
+                option.selected = key === selectedRecoveryKey;
+                picker.appendChild(option);
+            }
+            picker.addEventListener("change", () => {
+                selectedRecoveryKey = picker.value; recoverySignature = ""; renderDraftRecovery();
+            });
+            draftRecovery.appendChild(picker);
+        }
+        const [key, row] = rows.find(([candidate]) => candidate === selectedRecoveryKey) || rows[0];
+        const conflict = row.conflict;
+        const message = document.createElement("span");
+        message.style.cssText = "min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+        const target = conflict ? `${conflict.record_kind} ${conflict.record_key}` : "draft";
+        const serverValue = conflict ? JSON.stringify(conflict.current) : "";
+        message.textContent = `${rows.length} Prompt draft save${rows.length === 1 ? "" : "s"} failed — ${target}.`
+            + (serverValue ? ` Server has: ${serverValue}` : "");
+        message.title = `${row.error}${serverValue ? `
+Server value: ${serverValue}` : ""}`;
+        draftRecovery.appendChild(message);
+        const retry = keepRecoveryFocus(makeBtn("Retry", "Retry this draft"));
+        retry.addEventListener("click", async () => {
+            await retryPromptDraft(drafts, key); recoverySignature = ""; renderDraftRecovery();
+        });
+        const useServer = keepRecoveryFocus(makeBtn("Use server's version",
+            "Resolve only the contested record with the server's value"));
+        useServer.disabled = !conflict;
+        useServer.addEventListener("click", async () => {
+            if (!conflict || !resolvePromptDraftRecord(drafts, key)) return;
+            syncResolvedRecord(key, conflict);
+            await retryPromptDraft(drafts, key);
+            recoverySignature = ""; renderDraftRecovery();
+        });
+        const dismiss = keepRecoveryFocus(makeBtn("Dismiss", "Hide this recovery notice"));
+        dismiss.addEventListener("click", () => {
+            dismissPromptDraftError(drafts, key); recoverySignature = ""; renderDraftRecovery();
+        });
+        const discard = keepRecoveryFocus(makeBtn("Discard", "Discard only this draft"));
+        discard.disabled = Boolean(row.pending);
+        discard.addEventListener("click", async () => {
+            if (row.pending || !globalThis.confirm?.("Discard this unsaved Prompt draft and reload server text?")) return;
+            guard.suppressBlurCommit = true;
+            try {
+                document.activeElement?.blur?.();
+                drafts.delete(key);
+                await host._fetchScenes?.({ ignoreMutationGate: true,
+                    reason: "prompt_draft_discard" });
+                recoverySignature = ""; render(); renderDraftRecovery();
+            } finally { guard.suppressBlurCommit = false; }
+        });
+        draftRecovery.append(retry, useServer, dismiss, discard);
+    };
 
     const diagnostics = document.createElement("div");
     diagnostics.dataset.sonderPromptDiagnostics = "1";
     diagnostics.style.cssText = `padding:7px 18px;border-bottom:1px solid ${COLORS.trackBorder};`
         + `background:${COLORS.panelMuted};font:10px/1.35 ${FONT.sans};color:${COLORS.textDim};`
-        + "display:flex;flex-direction:column;gap:3px;height:72px;overflow-y:auto;box-sizing:border-box;flex:0 0 auto;";
-    panel.appendChild(diagnostics);
+        + "display:flex;flex-direction:column;gap:3px;height:100%;overflow-y:auto;box-sizing:border-box;";
+    diagnosticsRegion.appendChild(diagnostics);
+    panel.appendChild(diagnosticsRegion);
 
     const body = document.createElement("div");
     body.style.cssText = `
@@ -1570,7 +1715,11 @@ export function mountPromptManagementPanel(host) {
             chip.style.boxShadow = "";
             chip.removeAttribute("aria-invalid");
             delete chip.dataset.sonderDiagnosticTier;
-            const rows = state.byAttachment[chip.dataset.attachmentId] || [];
+            const rows = promptCapabilityDiagnostics(
+                state.byAttachment[chip.dataset.attachmentId] || [],
+                chip.dataset.channelKey || chip.closest("[data-sonder-prompt-channel]")
+                    ?.dataset.sonderPromptChannel || "",
+                chip.dataset.capabilityId || "");
             if (!rows.length) continue;
             const hasError = rows.some((row) => row.tier === "error");
             chip.dataset.sonderDiagnosticTier = hasError ? "error" : "warning";
@@ -3121,9 +3270,12 @@ export function mountPromptManagementPanel(host) {
                         profile_id: profileId, version: versionId,
                         name: name.value.trim() || profileId, definition,
                     });
-                    await commit([{ type: "update_scene_fields", fields: {
+                    const selected = await commit([{ type: "update_scene_fields", fields: {
                         prompt_context_profile_id: collisionKey,
                     } }], "select custom prompt profile");
+                    if (!selected) notifyWarning(
+                        "The custom format was saved, but could not be selected. Select the saved format from the Format menu.",
+                        { source: "prompt-profile-selection-refused" });
                     close();
                 } catch (error) {
                     save.disabled = false;
@@ -3479,10 +3631,14 @@ export function mountPromptManagementPanel(host) {
             const next = [...current, attachment];
             const operations = section ? [{
                 type: "update_prompt_section", index: sectionIndex,
-                expected: { start_frame: section.start_frame, end_frame: section.end_frame },
-                fields: { attachments: next },
+                expected: { prompt_id: section.prompt_id,
+                    start_frame: section.start_frame, end_frame: section.end_frame },
+                fields: promptEditFields(
+                    { attachments: current }, { attachments: next }),
             }] : [{
-                type: "update_scene_fields", fields: { global_attachments: next },
+                type: "update_scene_fields", fields: promptEditFields(
+                    { global_attachments: current }, { global_attachments: next },
+                    { global: true }),
             }];
             const label = "attach prompt Reference";
             const committed = await commit(operations, label, history, lifecycleToken);
@@ -3529,6 +3685,15 @@ export function mountPromptManagementPanel(host) {
     renderNow = () => {
         dormancyRefreshers = [];
         if (!mounted) return;
+        renderDraftRecovery();
+        if (renderedDraftScene === draftSceneIdentity()
+                && body.contains(document.activeElement)
+                && document.activeElement?.closest?.("[data-sonder-prompt-box='1']")) {
+            deferredDraftRender = true;
+            return;
+        }
+        deferredDraftRender = false;
+        renderedDraftScene = draftSceneIdentity();
         identityPanelCleanup();
         identityPanelCleanup = () => {};
         for (const editor of body.querySelectorAll("[data-sonder-prompt-box='1']")) {
@@ -3536,6 +3701,8 @@ export function mountPromptManagementPanel(host) {
         }
         body.textContent = "";
         const scene = host.activeScene;
+        const draftProjectId = host._projectDirName(), draftSceneId = host.activeSceneId;
+        const draftTemplate = projectTemplateValue(host._channelTemplate());
         if (!scene) {
             body.appendChild(sectionTitle("No active scene"));
             renderDiagnostics(null);
@@ -3557,10 +3724,20 @@ export function mountPromptManagementPanel(host) {
         // One box per channel, or a single box when the template turns
         // per-channel globals off.
         const globalKeys = globalChannelKeys(globalTemplate);
-        const globalChannels = normalizeChannels(
-            scene.global_channels, scene.prompt, globalKeys);
-        const globalDocuments = { ...(scene.global_channel_docs || {}) };
-        let globalAttachments = normalizePromptAttachments(scene.global_attachments);
+        const globalDraftKey = promptDraftKey(draftProjectId, draftSceneId);
+        let globalBase = structuredClone(scene);
+        const globalView = rebasePromptDraft(drafts.get(globalDraftKey), scene, { global: true });
+        const globalChannels = normalizeChannels(globalView.global_channels, globalView.prompt, globalKeys);
+        let globalDocuments = { ...(globalView.global_channel_docs || {}) };
+        let globalAttachments = normalizePromptAttachments(globalView.global_attachments);
+        const keepGlobalDraft = (snapshot = draftGlobalSceneSnapshot()) => {
+            updatePromptDraft(drafts, globalDraftKey, globalBase, {
+                global_channels: snapshot.global_channels,
+                global_channel_docs: snapshot.global_channel_docs,
+                global_attachments: snapshot.global_attachments,
+            });
+            renderDraftRecovery();
+        };
         const draftGlobalSceneSnapshot = () => sceneWithDraftGlobal(scene, {
             attachments: globalAttachments,
             channelDocs: globalDocuments,
@@ -3615,6 +3792,8 @@ export function mountPromptManagementPanel(host) {
                 onChange: ({ document: nextDocument, attachments, reason }) => {
                     globalDocuments[key] = nextDocument;
                     globalAttachments = attachments;
+                    const snapshot = draftGlobalSceneSnapshot();
+                    keepGlobalDraft(snapshot);
                     for (const sibling of Object.values(globalInputs)) {
                         if (sibling === input) continue;
                         if (reason === "attachment") {
@@ -3623,7 +3802,6 @@ export function mountPromptManagementPanel(host) {
                             sibling.syncPromptAttachments?.(globalAttachments);
                         }
                     }
-                    const snapshot = draftGlobalSceneSnapshot();
                     host._previewPromptContextCandidate?.({
                         global_channels: snapshot.global_channels,
                         global_channel_docs: snapshot.global_channel_docs,
@@ -3643,14 +3821,43 @@ export function mountPromptManagementPanel(host) {
                 },
             });
             globalInputs[key] = input;
+            input._sonderSyncDraft = () => {
+                globalDocuments[key] = input.promptDocument;
+                globalAttachments = input.promptState.attachments;
+                for (const sibling of Object.values(globalInputs)) sibling.syncPromptAttachments?.(globalAttachments);
+                keepGlobalDraft();
+            };
             input.dataset.sonderPromptGlobalChannel = key;
+            input.dataset.sonderPromptChannel = key;
+            input.dataset.sonderPromptDraftKey = globalDraftKey;
             applyBoxHeight(host, input, "panelGlobalBoxHeight", 72);
             registerPromptBoxGuard(input, () => globalChannels[key] || "");
             const commitGlobal = async () => {
                 if (globalLocked || guard.suppressBlurCommit) return;
                 globalChannels[key] = input.value;
-                await host._updateSceneGlobalContext(
-                    globalChannels, globalDocuments, globalAttachments);
+                keepGlobalDraft();
+                await savePromptDraft(drafts, globalDraftKey, async (value, baseline) =>
+                    await host._updateSceneGlobalContext(value.global_channels, value.global_channel_docs,
+                        value.global_attachments, { baseline, projectId: draftProjectId,
+                            sceneId: draftSceneId, template: draftTemplate }), {
+                    global: true,
+                    onAcknowledge: ({ baseline: nextBaseline, value: nextValue }) => {
+                        globalBase = structuredClone(nextBaseline);
+                        globalDocuments = structuredClone(nextValue.global_channel_docs || {});
+                        globalAttachments = normalizePromptAttachments(
+                            nextValue.global_attachments || []);
+                        for (const [channelKey, sibling] of Object.entries(globalInputs)) {
+                            sibling.syncPromptState?.({
+                                document: globalDocuments[channelKey],
+                                attachments: globalAttachments,
+                            });
+                            if (guard.focusedBox?.el === sibling)
+                                guard.focusedBox.revert = sibling.promptState;
+                        }
+                    },
+                });
+                renderDraftRecovery();
+                if (deferredDraftRender) render();
             };
             input.addOwnedKeyHandler?.((e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
@@ -3874,10 +4081,18 @@ export function mountPromptManagementPanel(host) {
             const endInput = smallInput({ value: String(section.end_frame ?? 0), numeric: true, width: "100%" });
             startInput.title = "Start frame";
             endInput.title = "End frame (exclusive)";
-            const channels = normalizeChannels(section.channels, section.prompt, channelKeys);
+            const sectionDraftKey = promptDraftKey(draftProjectId, draftSceneId, section.prompt_id);
+            let sectionBase = structuredClone(section);
+            const sectionView = rebasePromptDraft(drafts.get(sectionDraftKey), section);
+            const channels = normalizeChannels(sectionView.channels, sectionView.prompt, channelKeys);
             const channelInputs = {};
-            const channelDocuments = { ...(section.channel_docs || {}) };
-            let sectionAttachments = normalizePromptAttachments(section.attachments);
+            let channelDocuments = { ...(sectionView.channel_docs || {}) };
+            let sectionAttachments = normalizePromptAttachments(sectionView.attachments);
+            const keepSectionDraft = (sceneSnapshot = draftSceneSnapshot()) => {
+                const snapshot = sceneSnapshot.prompt_sections[idx];
+                updatePromptDraft(drafts, sectionDraftKey, sectionBase, snapshot);
+                renderDraftRecovery();
+            };
             const draftSceneSnapshot = () => sceneWithDraftSection(scene, {
                 index: idx,
                 promptId: section.prompt_id || "",
@@ -3938,6 +4153,8 @@ export function mountPromptManagementPanel(host) {
                     onChange: ({ document: nextDocument, attachments, reason }) => {
                         channelDocuments[key] = nextDocument;
                         sectionAttachments = attachments;
+                        const snapshot = draftSceneSnapshot();
+                        keepSectionDraft(snapshot);
                         for (const sibling of Object.values(channelInputs)) {
                             if (sibling === input) continue;
                             if (reason === "attachment") {
@@ -3946,9 +4163,8 @@ export function mountPromptManagementPanel(host) {
                                 sibling.syncPromptAttachments?.(sectionAttachments);
                             }
                         }
-                        const candidateSections = draftSceneSnapshot().prompt_sections;
                         host._previewPromptContextCandidate?.({
-                            prompt_sections: candidateSections,
+                            prompt_sections: snapshot.prompt_sections,
                         });
                         if (["attachment", "history"].includes(reason)) {
                             queueMicrotask(() => {
@@ -3973,6 +4189,14 @@ export function mountPromptManagementPanel(host) {
                 applyBoxHeight(host, input, "panelChannelBoxHeight", 72);
                 registerPromptBoxGuard(input, () => channels[key] || "");
                 channelInputs[key] = input;
+                input._sonderSyncDraft = () => {
+                    channelDocuments[key] = input.promptDocument;
+                    sectionAttachments = input.promptState.attachments;
+                    for (const sibling of Object.values(channelInputs)) sibling.syncPromptAttachments?.(sectionAttachments);
+                    keepSectionDraft();
+                };
+                input.dataset.sonderPromptChannel = key;
+                input.dataset.sonderPromptDraftKey = sectionDraftKey;
                 installPromptContextMenu({
                     editor: input,
                     onInserted: ({ type, attachment, identityCreateIntent }) => {
@@ -4072,11 +4296,28 @@ export function mountPromptManagementPanel(host) {
                 }
                 const nextDocuments = Object.fromEntries(
                     channelKeys.map((key) => [key, channelInputs[key].promptDocument]));
-                await host._updatePromptSection(idx, {
-                    channels: next,
-                    channel_docs: nextDocuments,
-                    attachments: sectionAttachments,
+                Object.assign(channelDocuments, nextDocuments);
+                keepSectionDraft();
+                await savePromptDraft(drafts, sectionDraftKey, async (value, baseline) =>
+                    await host._updatePromptSection(idx, { channels: value.channels,
+                        channel_docs: value.channel_docs, attachments: value.attachments },
+                        { baseline, projectId: draftProjectId, sceneId: draftSceneId, template: draftTemplate }), {
+                    onAcknowledge: ({ baseline: nextBaseline, value: nextValue }) => {
+                        sectionBase = structuredClone(nextBaseline);
+                        channelDocuments = structuredClone(nextValue.channel_docs || {});
+                        sectionAttachments = normalizePromptAttachments(nextValue.attachments || []);
+                        for (const [channelKey, sibling] of Object.entries(channelInputs)) {
+                            sibling.syncPromptState?.({
+                                document: channelDocuments[channelKey],
+                                attachments: sectionAttachments,
+                            });
+                            if (guard.focusedBox?.el === sibling)
+                                guard.focusedBox.revert = sibling.promptState;
+                        }
+                    },
                 });
+                renderDraftRecovery();
+                if (deferredDraftRender) render();
                 // A channel-only save cannot reorder rows. Keep these mounted
                 // editors alive so their shared attachment/caret/undo histories
                 // remain authoritative across the completed backend write.
@@ -4513,7 +4754,7 @@ export function mountPromptManagementPanel(host) {
             render();
             return true;
         },
-        cleanup: close,
+        cleanup: () => close({ commitFocused: false }),
         isMounted: () => mounted,
     };
     return handle;

@@ -972,7 +972,8 @@ def test_scene_mutation_prompt_overlap_rejected(monkeypatch, tmp_path):
             "type": "update_prompt_section",
             "index": 1,
             "fields": {"channels": {"visual": "updated", "speech": "say", "sounds": ""}},
-            "expected": {"start_frame": 20, "end_frame": 30},
+            "expected": {"start_frame": 20, "end_frame": 30,
+                         "channels": copy.deepcopy(scene.prompt_sections[1].channels)},
         }]},
     )))
     assert response.status == 200
@@ -2217,8 +2218,9 @@ def test_ad_hoc_prompt_identity_is_created_atomically_with_server_handle_and_ord
         {"type": "create_prompt_semantic_unit", "handle_suggestion": "Narrator",
          "unit": {"semantic_unit_id": "other-1", "name": "Narrator",
                   "kind": "subject", "definition": "Off screen"}},
-        {"type": "update_scene_fields", "fields": {
-            "global_attachments": [attachment]}},
+        {"type": "update_scene_fields", "fields": {"prompt_edit": {
+            "documents": {}, "attachments": {"vocal-1": {
+                "expected": None, "value": attachment}}}}},
     ], saves)
 
     assert response.status == 200
@@ -2424,3 +2426,268 @@ def test_guarded_prompt_identity_cleanup_rejects_partial_snapshot(monkeypatch):
             "semantic_unit_id": "other-1",
         })
     assert raised.value.code == "invalid_prompt_semantic_unit_cleanup"
+
+
+@pytest.mark.parametrize("body_stale", [False, True])
+def test_candidate_body_is_the_only_version_gate_and_conflicts_heal(
+        monkeypatch, tmp_path, body_stale):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    scene = Scene(scene_id="scene", duration_frames=20,
+                  prompt_sections=[PromptSection(0, 20, channels={"visual": "body"})])
+    project = TimelineProject(project_id="proj", project_dir=str(project_dir), scenes=[scene])
+    route_module.save_project(project)
+    before = copy.deepcopy(project.to_dict())
+    monkeypatch.setattr(route_module, "_get_base_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(route_module, "load_project", lambda _directory: project)
+    saves = []
+    monkeypatch.setattr(route_module, "save_project", lambda *args, **kwargs: saves.append(args))
+    handler = _route_handler(route_module, "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/prompt-context/compile")
+    request = DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene"},
+        headers={"If-Match": "stale-header"},
+        body={"base_modified_at": "stale-body" if body_stale else project.modified_at,
+              "scene": scene.to_dict()})
+    response = asyncio.run(route_module._project_conflict_middleware(request, handler))
+    payload = _response_json(response)
+    assert response.status == (409 if body_stale else 200)
+    if body_stale:
+        assert payload["code"] == "project_version_conflict"
+        assert payload["project"] == before
+        assert response.headers["X-Sonder-Project-Modified-At"] == project.modified_at
+        assert response.headers["X-Sonder-Project-Id"] == "proj"
+    assert project.to_dict() == before
+    assert saves == []
+    # Other project mutations retain their header check.
+    with pytest.raises(route_module.ProjectVersionConflict):
+        route_module._load_project_from_request(request, repair_missing_frames=False)
+    with pytest.raises(ValueError, match="cannot repair"):
+        route_module._load_project_from_request(request, version_checked=False)
+
+
+@pytest.mark.parametrize("global_scope", [False, True])
+def test_prompt_edit_merges_unrelated_changes_and_refuses_same_field(global_scope):
+    section = PromptSection(0, 24, channels={"visual": "before", "speech": "old speech"})
+    scene = Scene(scene_id="s", duration_frames=24, prompt_sections=[section])
+    scene.set_global_channels({"visual": "before", "speech": "old speech"})
+    project = TimelineProject(project_dir="", scenes=[scene])
+    target = scene if global_scope else section
+    docs_key = "global_channel_docs" if global_scope else "channel_docs"
+    channels_key = "global_channels" if global_scope else "channels"
+    original = copy.deepcopy(getattr(target, docs_key))
+    fields = {"prompt_edit": {"documents": {"visual": {
+        "expected": original["visual"], "value": prompt_context.text_document("mine")}}}}
+    setter = target.set_global_channels if global_scope else target.set_channels
+    setter({**getattr(target, channels_key), "speech": "someone else"})
+    def apply():
+        if global_scope:
+            routes._apply_scene_fields(project, scene, fields)
+        else:
+            routes._apply_update_prompt_section(scene, 0, fields,
+                {"prompt_id": section.prompt_id, "start_frame": 0, "end_frame": 24})
+    apply()
+    assert getattr(target, channels_key)["visual"] == "mine"
+    assert getattr(target, channels_key)["speech"] == "someone else"
+    before_refusal = target.to_dict()
+    with pytest.raises(routes.ProjectMutationRequestError) as raised:
+        apply()
+    assert raised.value.code == "prompt_edit_conflict"
+    assert target.to_dict() == before_refusal
+
+
+def test_prompt_edit_keeps_unrelated_chips_and_checks_template_and_stable_id():
+    first = prompt_context.normalize_attachment({"attachment_id": "first", "kind": "custom"})
+    other = prompt_context.normalize_attachment({"attachment_id": "other", "kind": "custom"})
+    section = PromptSection(0, 24, channels={"visual": "scene"}, attachments=[first, other])
+    scene = Scene(scene_id="s", duration_frames=24, prompt_sections=[section])
+    project = TimelineProject(project_dir="", scenes=[scene])
+    revised = copy.deepcopy(first); revised["config"]["text"] = "new"
+    fields = {"prompt_edit": {"attachments": {"first": {"expected": first, "value": revised}}}}
+    section.attachments[1]["config"]["text"] = "external"
+    operation = {"type": "update_prompt_section", "index": 0, "fields": fields,
+                 "expected": {"prompt_id": section.prompt_id},
+                 "expected_prompt_template": routes.prompt_channel_templates.project_template_value(
+                     routes.prompt_channel_templates.resolve_channel_template(project.metadata))}
+    routes._apply_scene_mutation_operation(project, scene, operation)
+    assert section.attachments[0]["config"]["text"] == "new"
+    assert section.attachments[1]["config"]["text"] == "external"
+    operation["expected"]["prompt_id"] = "replacement"
+    with pytest.raises(routes.ProjectMutationRequestError) as raised:
+        routes._apply_scene_mutation_operation(project, scene, operation)
+    assert raised.value.code == "identity_mismatch"
+    operation["expected_prompt_template"] = "minimax_h3_ref"
+    with pytest.raises(routes.ProjectMutationRequestError) as raised:
+        routes._apply_scene_mutation_operation(project, scene, operation)
+    assert raised.value.code == "prompt_template_conflict"
+
+
+
+def test_prompt_edit_accepts_sparse_expected_capability_after_server_normalization():
+    """A second toggle owns the same chip even when the first save expanded it."""
+    stored = prompt_context.normalize_attachment({
+        "attachment_id": "chip", "kind": "reference",
+        "capabilities": [{
+            "capability_id": "summary", "kind": "summary", "enabled": False,
+        }],
+    })
+    sparse_expected = copy.deepcopy(stored)
+    sparse_expected["capabilities"] = [{
+        "capability_id": "summary", "kind": "summary", "enabled": False,
+    }]
+    sparse_value = copy.deepcopy(sparse_expected)
+    sparse_value["capabilities"][0]["enabled"] = True
+    scene = Scene(scene_id="s", duration_frames=24,
+                  global_attachments=[stored])
+    project = TimelineProject(project_dir="", scenes=[scene])
+
+    routes._apply_scene_fields(project, scene, {"prompt_edit": {
+        "documents": {}, "attachments": {"chip": {
+            "expected": sparse_expected, "value": sparse_value,
+        }},
+    }})
+
+    assert scene.global_attachments[0]["capabilities"][0]["enabled"] is True
+    assert set(scene.global_attachments[0]["capabilities"][0]) == {
+        "capability_id", "kind", "channel_key", "placement", "config", "enabled",
+    }
+
+
+
+def test_prompt_edit_raw_equal_fast_path_does_not_invoke_normalizers(monkeypatch):
+    """Equal durable records cannot acquire random ids during comparison."""
+    document = prompt_context.normalize_prompt_document({
+        "nodes": [{"type": "text", "node_id": "text", "text": "old"}],
+    })
+    attachment = prompt_context.normalize_attachment({
+        "attachment_id": "chip", "kind": "custom", "config": {"text": "old"},
+    })
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("raw-equal prompt records must bypass normalization")
+
+    monkeypatch.setattr(routes.prompt_context, "normalize_prompt_document", unexpected)
+    monkeypatch.setattr(routes.prompt_context, "normalize_attachment", unexpected)
+    fields = routes._merge_prompt_edit_fields({"prompt_edit": {
+        "documents": {"visual": {"expected": document, "value": document}},
+        "attachments": {"chip": {"expected": attachment, "value": attachment}},
+    }}, {"visual": document}, [attachment])
+
+    assert fields == {"channel_docs": {"visual": document},
+                      "attachments": [attachment]}
+
+
+def test_prompt_edit_conflict_response_names_only_the_contested_record():
+    stored = prompt_context.normalize_attachment({
+        "attachment_id": "chip", "kind": "custom", "config": {"text": "server"},
+    })
+    stale = copy.deepcopy(stored)
+    stale["config"]["text"] = "stale"
+    with pytest.raises(routes.ProjectMutationRequestError) as raised:
+        routes._merge_prompt_edit_fields({"prompt_edit": {
+            "documents": {}, "attachments": {"chip": {
+                "expected": stale, "value": stale,
+            }},
+        }}, {}, [stored])
+
+    response = routes._mutation_json_error(raised.value)
+    payload = json.loads(response.body)
+    assert response.status == 409
+    assert payload == {
+        "error": "This prompt field changed elsewhere. Your draft was not saved.",
+        "code": "prompt_edit_conflict",
+        "conflict": {"record_kind": "attachment", "record_key": "chip",
+                     "current": stored},
+    }
+    assert "project" not in payload
+    assert "modified_at" not in payload
+
+def test_prompt_edit_normalized_comparison_still_refuses_real_capability_change():
+    stored = prompt_context.normalize_attachment({
+        "attachment_id": "chip", "kind": "reference",
+        "capabilities": [{
+            "capability_id": "summary", "kind": "summary", "enabled": False,
+        }],
+    })
+    stale = copy.deepcopy(stored)
+    stale["capabilities"] = [{
+        "capability_id": "summary", "kind": "summary", "enabled": True,
+    }]
+    scene = Scene(scene_id="s", duration_frames=24,
+                  global_attachments=[stored])
+    project = TimelineProject(project_dir="", scenes=[scene])
+
+    with pytest.raises(routes.ProjectMutationRequestError) as raised:
+        routes._apply_scene_fields(project, scene, {"prompt_edit": {
+            "documents": {}, "attachments": {"chip": {
+                "expected": stale, "value": stale,
+            }},
+        }})
+
+    assert raised.value.code == "prompt_edit_conflict"
+    assert scene.global_attachments == [stored]
+
+
+def test_generic_prompt_mutations_require_compare_state_and_reject_mixed_intents():
+    section = PromptSection(0, 24, channels={"visual": "before"})
+    scene = Scene(scene_id="s", duration_frames=24, prompt_sections=[section])
+    scene.set_global_channels({"visual": "before"})
+    project = TimelineProject(project_dir="", scenes=[scene])
+
+    for operation in ({
+        "type": "update_scene_fields",
+        "fields": {"global_channels": {"visual": "mine"}},
+    }, {
+        "type": "update_prompt_section", "index": 0,
+        "fields": {"channels": {"visual": "mine"}},
+        "expected": {"prompt_id": section.prompt_id},
+    }):
+        with pytest.raises(routes.ProjectMutationRequestError) as raised:
+            routes._apply_scene_mutation_operation(project, scene, operation)
+        assert raised.value.code == "prompt_edit_expectation_required"
+
+    with pytest.raises(routes.ProjectMutationRequestError) as raised:
+        routes._apply_scene_mutation_operation(project, scene, {
+            "type": "update_scene_fields",
+            "fields": {"global_channels": {"visual": "mine"},
+                       "prompt_edit": {"documents": {}, "attachments": {}}},
+            "expected": {"global_channels": {"visual": "before"}},
+        })
+    assert raised.value.code == "invalid_prompt_edit_intent"
+
+    operation = {
+        "type": "update_scene_fields",
+        "fields": {"global_channels": {"visual": "mine"}},
+        "expected": {"global_channels": {"visual": "before"}},
+    }
+    routes._apply_scene_mutation_operation(project, scene, operation)
+    assert scene.global_channels["visual"] == "mine"
+    scene.set_global_channels({"visual": "external"})
+    with pytest.raises(routes.ProjectMutationRequestError) as raised:
+        routes._apply_scene_mutation_operation(project, scene, operation)
+    assert raised.value.code == "prompt_edit_conflict"
+    assert scene.global_channels["visual"] == "external"
+
+
+def test_profile_uncertain_create_verification_uses_exact_server_normalization(monkeypatch):
+    module = _load_route_module(monkeypatch)
+    project = TimelineProject(project_dir="")
+    attempted = {"profile_id": "uncertain", "version": "1", "name": "Uncertain",
+        "definition": {"compatible_templates": ["*"], "capabilities": {
+            "custom": {"channel_key": "visual", "placement": "inline", "formatter": "{text}"}}}}
+    project.prompt_context_profiles = module._create_prompt_context_profile(project, attempted)
+    before = project.to_dict()
+    def load(request, **kwargs):
+        assert kwargs == {"repair_missing_frames": False,
+                          "version_checked": False}
+        return project
+    monkeypatch.setattr(module, "_load_project_from_request", load)
+    monkeypatch.setattr(module, "save_project", lambda *args, **kwargs: pytest.fail("verification wrote"))
+    handler = _route_handler(module, "POST", "/sonder-editor/project/{project_id}/prompt-context/profiles/verify")
+    response = asyncio.run(handler(DummyRequest(body=attempted)))
+    assert _response_json(response)["matches"] is True
+    changed = copy.deepcopy(attempted); changed["definition"]["capabilities"]["custom"]["formatter"] = "Other {text}"
+    response = asyncio.run(handler(DummyRequest(body=changed)))
+    assert _response_json(response)["matches"] is False
+    assert project.to_dict() == before

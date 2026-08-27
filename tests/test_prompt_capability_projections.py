@@ -42,10 +42,10 @@ def _section(prompt_id, attachment, *, document=None, document_channel="visual",
     }
 
 
-def _compile(sections, *, profile="generic@1"):
+def _compile(sections, *, profile="generic@1", template="standard"):
     return prompt_context.compile_prompt_context(
         global_channels={}, sections=sections, window_start=0, window_end=100,
-        fps=24.0, template="standard", profile=profile)
+        fps=24.0, template=template, profile=profile)
 
 
 def test_projection_contract_shape_scope_inline_and_region():
@@ -436,3 +436,42 @@ def test_linked_propagation_never_carries_enabled_to_an_inheriting_target():
     assert "enabled" not in result["inheritingMentions"]
     # A target that stated its own value keeps it.
     assert result["statingSummary"]["enabled"] is True
+
+
+@pytest.mark.parametrize("sibling_channel", ["speech", "visual"])
+def test_emission_conflict_does_not_block_an_unrelated_capability(sibling_channel):
+    first = _attachment("ignored", attachment_id="first", group_id="shared")
+    second = _attachment("ignored", attachment_id="second", group_id="shared")
+    for attachment, bad_text in ((first, "original"), (second, "conflicting")):
+        attachment["capabilities"] = [
+            {"capability_id": "bad", "kind": "custom", "placement": "section_prefix",
+             "channel_key": "visual", "config": {"text": bad_text}},
+            {"capability_id": "good", "kind": "custom", "placement": "section_prefix",
+             "channel_key": sibling_channel, "config": {"text": "same"}},
+        ]
+    result = _compile([_section("one", first, start=0, end=10),
+                       _section("two", second, start=10, end=20)], template="sonder")
+    errors = [row for row in result["errors"] if row["code"] == "conflicting_emission"]
+    assert [(row["attachment_id"], row["channel_key"], row["capability_id"])
+            for row in errors] == [("second", "visual", "bad")]
+    rows = {row["capability_id"]: row for row in result["attachment_capability_projections"]
+            if row["attachment_id"] == "second"}
+    assert rows["bad"]["state"] == "unresolved"
+    # Same-group output elsewhere still owns the good row; it is not blocked.
+    assert rows["good"]["state"] == "linked_elsewhere"
+
+
+def test_output_limit_diagnostic_does_not_relabel_empty_sibling():
+    attachment = _attachment(attachment_id="a")
+    attachment["capabilities"] = [
+        {"capability_id": "big", "kind": "custom", "placement": "section_prefix",
+         "channel_key": "visual", "config": {"text": "x" * (16 * 1024 + 1)}},
+        {"capability_id": "empty", "kind": "custom", "placement": "section_prefix",
+         "channel_key": "speech", "config": {"text": ""}},
+    ]
+    result = _compile([_section("one", attachment)], template="sonder")
+    errors = [row for row in result["errors"] if row["code"] == "attachment_output_limit"]
+    assert [(row["channel_key"], row["capability_id"]) for row in errors] == [("visual", "big")]
+    states = {row["capability_id"]: row["state"]
+              for row in result["attachment_capability_projections"]}
+    assert states == {"big": "output_limit", "empty": "empty"}

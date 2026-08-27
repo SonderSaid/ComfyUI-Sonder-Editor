@@ -643,19 +643,25 @@ def _compact_empty_media_lane(scene: Scene, lane_type: str, lane_index: int) -> 
 
 
 class ProjectMutationRequestError(Exception):
-    def __init__(self, message: str, status: int = 400, code: str = "invalid_project_mutation"):
+    def __init__(self, message: str, status: int = 400,
+                 code: str = "invalid_project_mutation", details=None):
         super().__init__(message)
         self.message = message
         self.status = status
         self.code = code
+        self.details = copy.deepcopy(details) if details is not None else None
 
 
-def _mutation_error(message: str, status: int = 400, code: str = "invalid_project_mutation") -> None:
-    raise ProjectMutationRequestError(message, status, code)
+def _mutation_error(message: str, status: int = 400,
+                    code: str = "invalid_project_mutation", details=None) -> None:
+    raise ProjectMutationRequestError(message, status, code, details)
 
 
 def _mutation_json_error(exc: ProjectMutationRequestError) -> web.Response:
-    return web.json_response({"error": exc.message, "code": exc.code}, status=exc.status)
+    payload = {"error": exc.message, "code": exc.code}
+    if exc.details is not None:
+        payload["conflict"] = copy.deepcopy(exc.details)
+    return web.json_response(payload, status=exc.status)
 
 
 def _scene_attachment_total(scene, *, exclude_section=None, exclude_global=False) -> int:
@@ -1540,9 +1546,141 @@ def _apply_split_linked(scene: Scene, anchor_ref: dict, split_frame: int, apply_
     }
 
 
+def _merge_prompt_edit_fields(fields, documents, attachments, *, global_scope=False):
+    """Compare touched records, then merge into current state under the write lock.
+
+    Project-version healing may retry this intent, never stale row snapshots.
+    An attachment remains atomic: edits to the same chip require user resolution.
+    """
+    edit = fields.get("prompt_edit")
+    if edit is None:
+        return fields
+    if not isinstance(edit, dict) or set(edit) - {"documents", "attachments"}:
+        _mutation_error("Invalid prompt edit intent", 400)
+    docs = copy.deepcopy(documents or {})
+    chips = {row["attachment_id"]: copy.deepcopy(row) for row in attachments or []}
+    for part, target in (("documents", docs), ("attachments", chips)):
+        changes = edit.get(part, {})
+        if not isinstance(changes, dict):
+            _mutation_error("Invalid prompt edit records", 400)
+        for key, change in changes.items():
+            if not isinstance(change, dict) or set(change) != {"expected", "value"}:
+                _mutation_error("Prompt edits require expected and value", 400)
+            if change["value"] is not None and not isinstance(change["value"], dict):
+                _mutation_error("Prompt edit values must be objects or null", 400)
+            current = target.get(key)
+            expected = change["expected"]
+            matches = (prompt_context.content_hash(current)
+                       == prompt_context.content_hash(expected))
+            if not matches and current is not None and expected is not None:
+                # Browser authoring deliberately stores sparse capability records;
+                # the durable write normalizes them. Compare the normalized shapes
+                # only after a raw miss: the document normalizer may mint node ids,
+                # so normalizing two already-equal raw values could manufacture a
+                # conflict instead of healing one.
+                normalizer = (prompt_context.normalize_prompt_document
+                              if part == "documents"
+                              else prompt_context.normalize_attachment)
+                matches = (prompt_context.content_hash(normalizer(current))
+                           == prompt_context.content_hash(normalizer(expected)))
+            if not matches:
+                _mutation_error(
+                    "This prompt field changed elsewhere. Your draft was not saved.",
+                    409, "prompt_edit_conflict", {
+                        "record_kind": "document" if part == "documents" else "attachment",
+                        "record_key": str(key),
+                        "current": copy.deepcopy(current),
+                    })
+            value = change["value"]
+            if part == "attachments" and value is not None and value.get("attachment_id") != key:
+                _mutation_error("Prompt attachment identity mismatch", 400)
+            if value is None:
+                target.pop(key, None)
+            else:
+                target[key] = copy.deepcopy(value)
+    prefix = "global_" if global_scope else ""
+    result = {key: value for key, value in fields.items() if key != "prompt_edit"}
+    if edit.get("documents"):
+        result[prefix + "channel_docs"] = docs
+    if edit.get("attachments"):
+        result[prefix + "attachments"] = list(chips.values())
+    return result
+
+
+_DIRECT_GLOBAL_PROMPT_FIELDS = frozenset({
+    "prompt", "global_channels", "global_channel_docs", "global_attachments",
+})
+_DIRECT_SECTION_PROMPT_FIELDS = frozenset({
+    "prompt", "channels", "channel_docs", "attachments",
+})
+
+
+def _require_prompt_mutation_contract(fields, expected, *, global_scope=False):
+    """Refuse retryable prompt row writes that carry no compare state."""
+    if not isinstance(fields, dict):
+        _mutation_error("Prompt mutation fields must be an object", 400)
+    direct_fields = (_DIRECT_GLOBAL_PROMPT_FIELDS if global_scope
+                     else _DIRECT_SECTION_PROMPT_FIELDS) & fields.keys()
+    if fields.get("prompt_edit") is not None:
+        if direct_fields:
+            _mutation_error(
+                "Prompt edit intents cannot include direct prompt row fields",
+                400, "invalid_prompt_edit_intent")
+        return
+    if not direct_fields:
+        return
+    if not isinstance(expected, dict):
+        _mutation_error(
+            "Direct prompt writes require exact expected state",
+            400, "prompt_edit_expectation_required")
+    required = set(direct_fields)
+    # Replacing the flat mirror rebuilds the canonical document bag, so the
+    # mirror alone is not enough compare state for a safe replay.
+    if global_scope and "prompt" in direct_fields:
+        required.add("global_channel_docs")
+    missing = required - expected.keys()
+    if missing:
+        _mutation_error(
+            "Direct prompt writes require exact expected state",
+            400, "prompt_edit_expectation_required")
+
+
+def _validate_global_prompt_expectations(scene, expected):
+    if not isinstance(expected, dict):
+        return
+    if ("prompt" in expected
+            and not _expected_matches(scene.prompt, expected["prompt"])):
+        _mutation_error("Global prompt changed elsewhere. Your draft was not saved.",
+                        409, "prompt_edit_conflict")
+    if "global_channels" in expected:
+        wanted = prompt_payload.normalize_channels(expected["global_channels"])
+        current = prompt_payload.normalize_channels(scene.global_channels)
+        if prompt_context.content_hash(wanted) != prompt_context.content_hash(current):
+            _mutation_error("Global prompt changed elsewhere. Your draft was not saved.",
+                            409, "prompt_edit_conflict")
+    if "global_channel_docs" in expected:
+        wanted = prompt_context.normalize_channel_documents(
+            expected["global_channel_docs"], expected.get("global_channels") or {},
+            (expected.get("global_channel_docs") or {}).keys())
+        current = prompt_context.normalize_channel_documents(
+            scene.global_channel_docs, scene.global_channels,
+            scene.global_channel_docs.keys())
+        if prompt_context.content_hash(wanted) != prompt_context.content_hash(current):
+            _mutation_error("Global prompt changed elsewhere. Your draft was not saved.",
+                            409, "prompt_edit_conflict")
+    if "global_attachments" in expected:
+        wanted = prompt_context.normalize_attachments(expected["global_attachments"])
+        current = prompt_context.normalize_attachments(scene.global_attachments)
+        if prompt_context.content_hash(wanted) != prompt_context.content_hash(current):
+            _mutation_error("Global prompt changed elsewhere. Your draft was not saved.",
+                            409, "prompt_edit_conflict")
+
+
 def _apply_scene_fields(project: TimelineProject, scene: Scene, fields: dict) -> None:
     if not isinstance(fields, dict):
         _mutation_error("update_scene_fields requires fields", 400)
+    fields = _merge_prompt_edit_fields(fields, scene.global_channel_docs,
+                                       scene.global_attachments, global_scope=True)
     if "name" in fields:
         scene.name = str(fields["name"])
     if "duration_frames" in fields:
@@ -2409,6 +2547,7 @@ def _apply_update_prompt_section(scene: Scene, index: int, fields: dict, expecte
     _require_lane_unlocked(scene, "prompt")
     section = _find_prompt_section(scene, index)
     _validate_prompt_identity(section, expected)
+    fields = _merge_prompt_edit_fields(fields, section.channel_docs, section.attachments)
     range_changed = "start_frame" in fields or "end_frame" in fields
     new_start = int(fields["start_frame"]) if "start_frame" in fields else section.start_frame
     new_end = int(fields["end_frame"]) if "end_frame" in fields else section.end_frame
@@ -3062,7 +3201,7 @@ def _normalize_prompt_context_profile_update(project: TimelineProject, raw_profi
     return normalized_profiles
 
 
-def _create_prompt_context_profile(project: TimelineProject, raw_create) -> list[dict]:
+def _normalize_prompt_context_profile_create(project: TimelineProject, raw_create) -> dict:
     """Append one immutable custom profile from separated identity/definition.
 
     The server owns normalization and the content hash.  Keeping identity out of
@@ -3117,6 +3256,11 @@ def _create_prompt_context_profile(project: TimelineProject, raw_create) -> list
     except ValueError as exc:
         _mutation_error(f"Invalid prompt context profile: {exc}", 400,
                         "invalid_prompt_context_profile")
+    return value
+
+
+def _create_prompt_context_profile(project: TimelineProject, raw_create) -> list[dict]:
+    value = _normalize_prompt_context_profile_create(project, raw_create)
     key = prompt_context.profile_key(value)
     if key in prompt_context.BUILTIN_PROFILES or any(
             prompt_context.profile_key(candidate) == key
@@ -3256,7 +3400,20 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
     if not isinstance(op, dict):
         _mutation_error("Mutation operation must be an object", 400)
     op_type = str(op.get("type", ""))
+    if "expected_prompt_template" in op:
+        current_template = prompt_channel_templates.project_template_value(
+            prompt_channel_templates.resolve_channel_template(project.metadata))
+        if prompt_context.content_hash(current_template) != prompt_context.content_hash(op["expected_prompt_template"]):
+            _mutation_error("Prompt channels changed. Keep the draft and review the new template.",
+                            409, "prompt_template_conflict")
     if op_type == "update_scene_fields":
+        operation_fields = op.get("fields", {})
+        if (isinstance(operation_fields, dict)
+                and _DIRECT_GLOBAL_PROMPT_FIELDS & operation_fields.keys()):
+            _require_lane_unlocked(scene, "prompt_global")
+        _require_prompt_mutation_contract(
+            op.get("fields", {}), op.get("expected"), global_scope=True)
+        _validate_global_prompt_expectations(scene, op.get("expected"))
         _apply_scene_fields(project, scene, op.get("fields", {}))
         return {"type": op_type}
     if op_type == "update_lane_configs":
@@ -3433,6 +3590,12 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
         return {"type": op_type, "frame_index": guide.frame_index}
     if op_type == "update_prompt_section":
         index = _mutation_int(op.get("index"), "index")
+        operation_fields = op.get("fields", {})
+        if (isinstance(operation_fields, dict)
+                and _DIRECT_SECTION_PROMPT_FIELDS & operation_fields.keys()):
+            _require_lane_unlocked(scene, "prompt")
+        _require_prompt_mutation_contract(
+            op.get("fields", {}), op.get("expected"), global_scope=False)
         if op.get("apply_linked"):
             section = _find_prompt_section(scene, index)
             _validate_prompt_identity(section, op.get("expected"))
@@ -6452,8 +6615,16 @@ def _validate_request_project_version(request: web.Request, project: TimelinePro
     )
 
 
-def _load_project_from_request(request: web.Request, *, repair_missing_frames: bool = True) -> TimelineProject:
-    """Load project from project_id path parameter."""
+def _load_project_from_request(request: web.Request, *, repair_missing_frames: bool = True,
+                               version_checked: bool = True) -> TimelineProject:
+    """Load project from project_id path parameter.
+
+    Read-only POST routes may disable the mutating header gate when they own
+    an explicit body gate or exact readback contract; they must also disable
+    opportunistic repair writes.
+    """
+    if not version_checked and repair_missing_frames:
+        raise ValueError("Read-only candidate loads cannot repair project data")
     if "path" in request.query:
         raise _bad_project_request("?path is no longer supported for project routes")
     try:
@@ -6470,7 +6641,8 @@ def _load_project_from_request(request: web.Request, *, repair_missing_frames: b
     _validate_loaded_project_request(project, project_id, project_dir, base_dir)
     loaded_modified_at = str(getattr(project, "modified_at", "") or "")
     if not repair_missing_frames:
-        _validate_request_project_version(request, project)
+        if version_checked:
+            _validate_request_project_version(request, project)
         _remember_request_project(request, project)
         return project
 
@@ -8197,6 +8369,25 @@ if routes is not None:
             return _json_error(str(e), 404)
         return web.json_response(_references_payload(project))
 
+    @routes.post("/sonder-editor/project/{project_id}/prompt-context/profiles/verify")
+    async def api_verify_prompt_context_profile_create(request: web.Request) -> web.Response:
+        """Read-only exact-definition recovery after an uncertain immutable create."""
+        try:
+            project = _load_project_from_request(
+                request, repair_missing_frames=False, version_checked=False)
+            attempted = _normalize_prompt_context_profile_create(project, await request.json())
+        except FileNotFoundError as exc:
+            return _json_error(str(exc), 404)
+        except ProjectMutationRequestError as exc:
+            return _mutation_json_error(exc)
+        except (json.JSONDecodeError, ValueError):
+            return _json_error("Invalid profile verification request", 400)
+        matches = any(value.get("content_hash") == attempted["content_hash"]
+                      and prompt_context.profile_key(value) == prompt_context.profile_key(attempted)
+                      for value in project.prompt_context_profiles)
+        return web.json_response({"matches": matches,
+                                  "prompt_context_profiles": project.prompt_context_profiles})
+
     @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/prompt-context/compile")
     async def api_compile_prompt_context_candidate(request: web.Request) -> web.Response:
         """Compile versioned candidate authoring state without mutating disk.
@@ -8207,7 +8398,8 @@ if routes is not None:
         """
         try:
             project = await asyncio.to_thread(
-                _load_project_from_request, request, repair_missing_frames=False)
+                _load_project_from_request, request,
+                repair_missing_frames=False, version_checked=False)
         except FileNotFoundError as exc:
             return _json_error(str(exc), 404)
         try:
@@ -8223,12 +8415,13 @@ if routes is not None:
                        body.get("project_version") or "")
         actual = str(getattr(project, "modified_at", "") or "")
         if expected and expected != actual:
-            return web.json_response({
-                "error": "Prompt Context candidate is stale.",
-                "code": "project_version_conflict",
-                "expected_modified_at": expected,
-                "actual_modified_at": actual,
-            }, status=409)
+            # The shared conflict response carries healing data and headers.
+            raise ProjectVersionConflict(
+                project_dir=getattr(project, "project_dir", ""),
+                expected_modified_at=expected,
+                actual_modified_at=actual,
+                current_data=project.to_dict(),
+            )
 
         candidate_data = copy.deepcopy(scene.to_dict())
         source = body.get("scene") if isinstance(body.get("scene"), dict) else body

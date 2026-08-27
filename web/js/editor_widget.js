@@ -1,3 +1,4 @@
+import { promptEditFields, promptDraftKey, updatePromptDraft, savePromptDraft, rebasePromptDraft } from "./prompt_edit_intent.js";
 /**
  * Sonder Editor Widget — Timeline + Asset Gallery embedded in a ComfyUI node.
  * Uses addDOMWidget pattern (same as VHS/KJNodes).
@@ -369,6 +370,9 @@ import {
     fetchProjectJson,
     getProjectVersion,
     postProjectJsonWithReconcile,
+    rememberProjectVersion,
+    rememberProjectVersionFromPayload,
+    rememberProjectVersionFromResponse,
     resetProjectVersion,
 } from "./api_client.js";
 import {
@@ -2007,19 +2011,62 @@ export class EditorWidget {
         };
     }
 
+    _queuePromptProjectWrite(body, { projectId = this._projectDirName(),
+        label = "prompt settings", beforeRun = null, retryOnConflict = true } = {}) {
+        const snapshot = structuredClone(body);
+        return this._queueProjectMutation({ key: `prompt-project:${projectId}`, label,
+            coalesce: false, refreshScenes: false, refreshKeysOnError: ["project"],
+            intent: { projectId, body: snapshot },
+            run: async (intent) => {
+                if (this._destroyed || this._projectDirName() !== intent.projectId)
+                    throw new Error("The active project changed before the prompt save.");
+                await beforeRun?.();
+                return this._runVersionedProjectMutation(
+                    `/sonder-editor/project/${encodeURIComponent(intent.projectId)}`,
+                    { method: "PUT", headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(intent.body) },
+                    { projectId: intent.projectId, retryOnConflict, maxAttempts: retryOnConflict ? 2 : 1 });
+            },
+        });
+    }
+
+    _hasPromptToolDrafts(projectId = this._projectDirName()) {
+        return [...(this._promptToolDrafts?.keys?.() || [])]
+            .some((key) => JSON.parse(key)[0] === projectId);
+    }
+
     async _createPromptContextProfile(profile) {
         if (!this.projectDir) return null;
-        const before = this._captureProjectDependencies();
+        let before;
         const dirName = this._projectDirName();
-        const { payload } = await fetchProjectJson(
-            api.apiURL(`/sonder-editor/project/${encodeURIComponent(dirName)}`),
-            { method: "PUT", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ create_prompt_context_profile: profile }) },
-            { projectId: dirName },
-        );
+        let payload, recovered = false;
+        const attempted = structuredClone(profile);
+        try {
+            ({ payload } = await this._queuePromptProjectWrite(
+                { create_prompt_context_profile: attempted }, { projectId: dirName,
+                    label: "create prompt format", retryOnConflict: false,
+                    beforeRun: () => { before = this._captureProjectDependencies(); } }));
+        } catch (error) {
+            // Read back with the SERVER's normalizer; a matching id alone is
+            // not proof this definition was saved. Verification never writes.
+            if (this._destroyed || this._projectDirName() !== dirName) throw error;
+            const verified = await this._runVersionedProjectMutation(
+                `/sonder-editor/project/${encodeURIComponent(dirName)}/prompt-context/profiles/verify`,
+                { method: "POST", headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(attempted) }, { projectId: dirName });
+            payload = verified?.payload;
+            if (this._projectDirName() !== dirName || this._destroyed) throw error;
+            if (Array.isArray(payload?.prompt_context_profiles))
+                this._promptContextProfiles = payload.prompt_context_profiles;
+            if (payload?.matches !== true) throw error;
+            recovered = true;
+        }
+        if (this._projectDirName() !== dirName || this._destroyed) return null;
         this._promptContextProfiles = Array.isArray(payload?.prompt_context_profiles)
             ? payload.prompt_context_profiles : [];
-        this._pushProjectDependencyUndo("create prompt format", before);
+        // An uncertain acknowledgment must not enroll another writer's
+        // identical immutable definition into this client's deletion undo.
+        if (!recovered) this._pushProjectDependencyUndo("create prompt format", before);
         await this._fetchReferences({ ignoreMutationGate: true,
             reason: "prompt_context_profile_create", force: true });
         return this._promptContextProfiles;
@@ -3122,7 +3169,13 @@ export class EditorWidget {
                 const tier = typeof failureTier === "function" ? failureTier(error) : failureTier;
                 const detail = typeof failureDetail === "function" ? failureDetail(error) : failureDetail;
                 const notify = tier === "warning" ? notifyWarning : notifyError;
-                notify(message, { source: "project-mutation-failed", detail: detail || null });
+                // While the Prompt panel is open, its persistent recovery row
+                // owns same-record conflicts. Keep the toast when it is closed,
+                // because then it is the only visible failure signal.
+                const panelOwnsPromptConflict = error?.payload?.code === "prompt_edit_conflict"
+                    && this._promptPanelHandle?.isMounted?.();
+                if (!panelOwnsPromptConflict)
+                    notify(message, { source: "project-mutation-failed", detail: detail || null });
                 if (Array.isArray(refreshKeysOnError) && refreshKeysOnError.length) {
                     this._deferProjectBackedRefresh(refreshKeysOnError, `${label || key}_error`);
                 } else if (refreshScenes) {
@@ -10551,6 +10604,27 @@ export class EditorWidget {
         const readDocuments = () => Object.fromEntries(
             keys.map((key) => [key, inputs[key].promptDocument]));
         const readAttachments = () => normalizePromptAttachments(sharedAttachments);
+        const syncAcknowledged = ({ channels = null, documents = null,
+            attachments = null } = {}) => {
+            if (attachments) sharedAttachments = normalizePromptAttachments(attachments);
+            for (const key of keys) {
+                const hasDocument = documents && Object.hasOwn(documents, key);
+                if (hasDocument) {
+                    inputs[key].syncPromptState?.({
+                        document: documents[key], attachments: sharedAttachments,
+                    });
+                } else {
+                    inputs[key].syncPromptAttachments?.(sharedAttachments);
+                    if (channels && Object.hasOwn(channels, key)
+                            && inputs[key].value !== String(channels[key] ?? "")) {
+                        inputs[key].value = String(channels[key] ?? "");
+                    }
+                }
+            }
+            updateHiddenSummary();
+            renderScope();
+            renderChannelProjections();
+        };
         scheduleCandidatePreview = () => {
             const snapshot = draftSceneSnapshot();
             if (globalScope) {
@@ -10567,7 +10641,7 @@ export class EditorWidget {
         };
         scheduleCandidatePreview();
         return { wrap, inputs, read, readDocuments, readAttachments,
-            keys, template, focusFirst };
+            keys, template, focusFirst, syncAcknowledged };
     }
 
     _showPromptCreator(startFrame, endFrame) {
@@ -10698,6 +10772,12 @@ export class EditorWidget {
     _showPromptEditor(section, idx) {
         if (this._isPromptTrackLocked()) return;
         this._hidePromptEditor();
+        const draftProjectId = this._projectDirName(), draftSceneId = this.activeSceneId;
+        const draftTemplate = projectTemplateValue(this._channelTemplate());
+        const drafts = this._promptToolDrafts ||= new Map();
+        const draftKey = promptDraftKey(draftProjectId, draftSceneId, section.prompt_id);
+        let baseline = structuredClone(section);
+        section = rebasePromptDraft(drafts.get(draftKey), section);
 
         const editor = document.createElement("div");
         editor.style.cssText = `
@@ -10726,14 +10806,46 @@ export class EditorWidget {
             const nextAttachments = channelInputs.readAttachments();
             const documentsChanged = JSON.stringify(nextDocuments) !== committedDocuments;
             const attachmentsChanged = JSON.stringify(nextAttachments) !== committedAttachments;
-            if (documentsChanged || attachmentsChanged
+            if (drafts.get(draftKey)?.error || documentsChanged || attachmentsChanged
                 || Object.keys(next).some((key) => next[key] !== (committed[key] ?? ""))) {
                 committed = next;
                 committedDocuments = JSON.stringify(nextDocuments);
                 committedAttachments = JSON.stringify(nextAttachments);
-                this._updatePromptSection(idx, {
-                    channels: next, channel_docs: nextDocuments,
-                    attachments: nextAttachments,
+                updatePromptDraft(drafts, draftKey, baseline, { ...baseline,
+                    channels: next, channel_docs: nextDocuments, attachments: nextAttachments });
+                savePromptDraft(drafts, draftKey, async (value, expected) =>
+                    await this._updatePromptSection(idx, {
+                        channels: value.channels, channel_docs: value.channel_docs,
+                        attachments: value.attachments,
+                    }, { baseline: expected, projectId: draftProjectId,
+                        sceneId: draftSceneId, template: draftTemplate }), {
+                    onAcknowledge: ({ submitted, baseline: nextBaseline, value: nextValue }) => {
+                        baseline = structuredClone(nextBaseline);
+                        const live = { channels: channelInputs.read(),
+                            channel_docs: channelInputs.readDocuments(),
+                            attachments: channelInputs.readAttachments() };
+                        const submittedContext = { channels: submitted.channels || {},
+                            channel_docs: submitted.channel_docs || {},
+                            attachments: submitted.attachments || [] };
+                        const liveChanged = JSON.stringify(live) !== JSON.stringify(submittedContext);
+                        committed = normalizeChannels(
+                            nextBaseline.channels, nextBaseline.prompt, this._channelKeys());
+                        committedDocuments = JSON.stringify(nextBaseline.channel_docs || {});
+                        committedAttachments = JSON.stringify(nextBaseline.attachments || []);
+                        if (liveChanged) {
+                            const row = updatePromptDraft(drafts, draftKey, nextBaseline,
+                                { ...nextBaseline, ...live });
+                            row.saveAgain = true;
+                        } else {
+                            committed = normalizeChannels(
+                                nextValue.channels, nextValue.prompt, this._channelKeys());
+                            committedDocuments = JSON.stringify(nextValue.channel_docs || {});
+                            committedAttachments = JSON.stringify(nextValue.attachments || []);
+                            channelInputs.syncAcknowledged({ channels: committed,
+                                documents: nextValue.channel_docs,
+                                attachments: nextValue.attachments });
+                        }
+                    },
                 });
                 // The mutation clears the lane highlight; an open bar should
                 // keep pointing at the section its Save/Delete still target.
@@ -10817,6 +10929,12 @@ export class EditorWidget {
         if (!this.activeScene) return;
         if (this._isGlobalPromptTrackLocked()) return;
         this._hidePromptEditor();
+        const draftProjectId = this._projectDirName(), draftSceneId = this.activeSceneId;
+        const draftTemplate = projectTemplateValue(this._channelTemplate());
+        const drafts = this._promptToolDrafts ||= new Map();
+        const draftKey = promptDraftKey(draftProjectId, draftSceneId);
+        let baseline = structuredClone(this.activeScene);
+        const view = rebasePromptDraft(drafts.get(draftKey), this.activeScene, { global: true });
 
         const editor = document.createElement("div");
         editor.style.cssText = `
@@ -10831,9 +10949,9 @@ export class EditorWidget {
 
         const keys = this._globalChannelKeys();
         let committed = normalizeChannels(
-            this.activeScene.global_channels, this.activeScene.prompt, keys);
-        let committedDocuments = JSON.stringify(this.activeScene.global_channel_docs || {});
-        let committedAttachments = JSON.stringify(this.activeScene.global_attachments || []);
+            view.global_channels, view.prompt, keys);
+        let committedDocuments = JSON.stringify(view.global_channel_docs || {});
+        let committedAttachments = JSON.stringify(view.global_attachments || []);
         let suppressBlurCommit = false;
         const commit = () => {
             if (suppressBlurCommit) return;
@@ -10841,13 +10959,47 @@ export class EditorWidget {
             const next = channelInputs.read();
             const nextDocuments = channelInputs.readDocuments();
             const nextAttachments = channelInputs.readAttachments();
-            if (Object.keys(next).every((key) => next[key] === (committed[key] ?? ""))
+            if (!drafts.get(draftKey)?.error && Object.keys(next).every((key) => next[key] === (committed[key] ?? ""))
                 && JSON.stringify(nextDocuments) === committedDocuments
                 && JSON.stringify(nextAttachments) === committedAttachments) return;
             committed = next;
             committedDocuments = JSON.stringify(nextDocuments);
             committedAttachments = JSON.stringify(nextAttachments);
-            this._updateSceneGlobalContext(next, nextDocuments, nextAttachments);
+            updatePromptDraft(drafts, draftKey, baseline, { global_channels: next,
+                global_channel_docs: nextDocuments, global_attachments: nextAttachments });
+            savePromptDraft(drafts, draftKey, async (value, expected) =>
+                await this._updateSceneGlobalContext(value.global_channels,
+                    value.global_channel_docs, value.global_attachments, { baseline: expected,
+                        projectId: draftProjectId, sceneId: draftSceneId, template: draftTemplate }), {
+                global: true,
+                onAcknowledge: ({ submitted, baseline: nextBaseline, value: nextValue }) => {
+                    baseline = structuredClone(nextBaseline);
+                    const live = { global_channels: channelInputs.read(),
+                        global_channel_docs: channelInputs.readDocuments(),
+                        global_attachments: channelInputs.readAttachments() };
+                    const submittedContext = {
+                        global_channels: submitted.global_channels || {},
+                        global_channel_docs: submitted.global_channel_docs || {},
+                        global_attachments: submitted.global_attachments || [],
+                    };
+                    const liveChanged = JSON.stringify(live) !== JSON.stringify(submittedContext);
+                    committed = normalizeChannels(nextBaseline.global_channels, "", keys);
+                    committedDocuments = JSON.stringify(nextBaseline.global_channel_docs || {});
+                    committedAttachments = JSON.stringify(nextBaseline.global_attachments || []);
+                    if (liveChanged) {
+                        const row = updatePromptDraft(drafts, draftKey, nextBaseline,
+                            { ...nextBaseline, ...live });
+                        row.saveAgain = true;
+                    } else {
+                        committed = normalizeChannels(nextValue.global_channels, "", keys);
+                        committedDocuments = JSON.stringify(nextValue.global_channel_docs || {});
+                        committedAttachments = JSON.stringify(nextValue.global_attachments || []);
+                        channelInputs.syncAcknowledged({ channels: committed,
+                            documents: nextValue.global_channel_docs,
+                            attachments: nextValue.global_attachments });
+                    }
+                },
+            });
         };
         const channelInputs = this._buildChannelInputs(committed, ({ close = true } = {}) => {
             commit();
@@ -10857,8 +11009,8 @@ export class EditorWidget {
             this._hidePromptEditor({ commit: false });
         }, {
             keys,
-            documents: this.activeScene.global_channel_docs || {},
-            attachments: this.activeScene.global_attachments || [],
+            documents: view.global_channel_docs || {},
+            attachments: view.global_attachments || [],
             previews: this._promptContextCandidateCache?._candidate_scene_id === this.activeSceneId
                 ? this._promptContextCandidateCache.attachment_previews || {} : {},
             globalScope: true,
@@ -10904,7 +11056,8 @@ export class EditorWidget {
         this._renderSceneAfterLocalMutation({ viewport: false });
         try {
             await this._runSceneMutation(
-                [{ type: "update_scene_fields", fields: { global_channels: patch } }],
+                [{ type: "update_scene_fields", fields: { global_channels: patch },
+                    expected: { global_channels: structuredClone(previous) } }],
                 {
                     key: `scene:${sceneId}:global_channels`,
                     label: "global prompt",
@@ -10923,54 +11076,83 @@ export class EditorWidget {
         }
     }
 
-    async _updateSceneGlobalContext(channels, channelDocs, attachments) {
-        if (!this.activeScene || !this.projectDir || this._isGlobalPromptTrackLocked()) return;
+    async _updateSceneGlobalContext(channels, channelDocs, attachments, {
+        baseline = null, projectId = this._projectDirName(), sceneId = this.activeSceneId,
+        template = projectTemplateValue(this._channelTemplate()),
+    } = {}) {
+        if (!this.activeScene || !this.projectDir || this._isGlobalPromptTrackLocked()
+                || projectId !== this._projectDirName() || sceneId !== this.activeSceneId) return false;
         const sceneRef = this.activeScene;
         const previous = {
             global_channels: structuredClone(sceneRef.global_channels || {}),
             global_channel_docs: structuredClone(sceneRef.global_channel_docs || {}),
             global_attachments: structuredClone(sceneRef.global_attachments || []),
         };
-        const next = normalizeChannels(channels);
+        const next = { global_channels: normalizeChannels(channels),
+            global_channel_docs: structuredClone(channelDocs || {}),
+            global_attachments: structuredClone(attachments || []) };
+        const fields = promptEditFields(baseline || previous, next, { global: true });
+        if (!Object.keys(fields).length) return { status: "no-op" };
         const undoLabel = "edit global prompt context";
+        const key = JSON.stringify([projectId, sceneId, "global"]);
+        const draft = this._promptToolDrafts?.get(key);
+        const pendingStore = this._pendingPromptIdentityCreateIntents ||= new Map();
+        for (const [id, pending] of draft?.identityCreates || []) {
+            if (!pendingStore.has(id)) pendingStore.set(id, structuredClone(pending));
+        }
+        const pendingCreates = new Map(pendingStore);
         const identityCreateIntents = this._takePromptIdentityCreateIntents(attachments);
+        if (draft) draft.identityCreates = identityCreateIntents.map((intent) => {
+            const id = String(intent?.unit?.semantic_unit_id || "");
+            return [id, pendingCreates.get(id)];
+        }).filter(([, pending]) => pending);
         const undoEntry = this._pushUndo(undoLabel,
             { promptIdentityCreateIntents: identityCreateIntents });
-        sceneRef.global_channels = next;
-        sceneRef.global_channel_docs = structuredClone(channelDocs || {});
-        sceneRef.global_attachments = structuredClone(attachments || []);
-        sceneRef.prompt = composeSectionText(next, false);
+        const revision = {};
+        this._promptEditRevisions ||= new Map();
+        this._promptEditRevisions.set(key, revision);
+        Object.assign(sceneRef, next);
+        sceneRef.prompt = composeSectionText(next.global_channels, false);
         this._renderSceneAfterLocalMutation({ viewport: false });
         try {
             const result = await this._runSceneMutation(
-                [...identityCreateIntents, { type: "update_scene_fields", fields: {
-                    global_channels: next,
-                    global_channel_docs: channelDocs,
-                    global_attachments: attachments,
-                } }],
-                { key: `scene:${this.activeSceneId}:global_prompt_context`,
-                    label: "global prompt context",
-                    refreshScenes: false,
-                    coalesce: identityCreateIntents.length === 0 });
-            this._adoptPromptIdentitiesFromMutation(result);
-            this._finalizePromptIdentityCreationHistory(undoEntry, result);
-        } catch (error) {
-            this._discardLastUndo(undoLabel);
-            Object.assign(sceneRef, previous);
-            notifyWarning(error?.message || "Global Context edit was refused.",
-                { source: "prompt-global-context-refused" });
-            // Reconcile every mounted consumer, not just the timeline. The
-            // Prompt panel owns its own channel editors, so `_renderTimeline`
-            // alone left it displaying text the server had just rejected.
-            // Route through the GATED seam rather than the panel handle
-            // directly: this write coalesces, so a refusal can land after the
-            // user has started typing in another box, and the gate defers
-            // instead of discarding that edit.
-            this._refreshPromptContextDependencyConsumers();
-            if (identityCreateIntents.length) {
-                await this._fetchReferences({ ignoreMutationGate: true,
-                    reason: "global_prompt_identity_error", force: true });
+                [...identityCreateIntents, { type: "update_scene_fields", fields,
+                    expected_prompt_template: template }],
+                { key: `scene:${sceneId}:global_prompt_context`, sceneId,
+                    label: "global prompt context", coalesce: false,
+                    failureMessage: "Global prompt save failed. The Prompt tool keeps your draft." });
+            if (this._promptEditRevisions.get(key) === revision && result?.payload?.scene) {
+                for (const field of Object.keys(next)) sceneRef[field] = structuredClone(result.payload.scene[field]);
+                sceneRef.prompt = result.payload.scene.prompt;
             }
+            if (this._projectDirName() === projectId && this.activeSceneId === sceneId) {
+                this._adoptPromptIdentitiesFromMutation(result);
+                this._finalizePromptIdentityCreationHistory(undoEntry, result);
+            }
+            const acknowledged = result?.payload?.scene ? {
+                global_channels: structuredClone(result.payload.scene.global_channels || {}),
+                global_channel_docs: structuredClone(result.payload.scene.global_channel_docs || {}),
+                global_attachments: structuredClone(result.payload.scene.global_attachments || []),
+            } : null;
+            return { status: "acknowledged",
+                ...(acknowledged ? { value: acknowledged } : {}) };
+        } catch (error) {
+            this._discardUndoEntry(undoEntry);
+            for (const intent of identityCreateIntents) {
+                const id = String(intent?.unit?.semantic_unit_id || "");
+                const pending = pendingCreates.get(id);
+                if (pending && !pendingStore.has(id))
+                    pendingStore.set(id, pending);
+            }
+            if (this._promptEditRevisions.get(key) === revision) {
+                Object.assign(sceneRef, previous);
+                sceneRef.prompt = composeSectionText(previous.global_channels, false);
+            }
+            this._refreshPromptContextDependencyConsumers();
+            if (identityCreateIntents.length && this._projectDirName() === projectId) await this._fetchReferences({ ignoreMutationGate: true,
+                reason: "global_prompt_identity_error", force: true });
+            return { status: "refused", message: error?.message || "",
+                conflict: error?.payload?.conflict || null };
         }
     }
 
@@ -11012,7 +11194,10 @@ export class EditorWidget {
         this._renderSceneAfterLocalMutation({ viewport: false });
         try {
             await this._runSceneMutation(
-                [{ type: "update_scene_fields", fields: { prompt: next } }],
+                [{ type: "update_scene_fields", fields: { prompt: next }, expected: {
+                    prompt: prev,
+                    global_channel_docs: structuredClone(sceneRef.global_channel_docs || {}),
+                } }],
                 {
                     key: `scene:${sceneId}:prompt`,
                     label: "global prompt",
@@ -11106,20 +11291,23 @@ export class EditorWidget {
             }
         }
 
+        await this._drainProjectMutations("prompt_template_boundary");
+        if (this._hasPromptToolDrafts(dirName)) {
+            notifyWarning("Save or discard Prompt drafts before switching channels.", { source: "prompt-template-draft" });
+            return false;
+        }
         const previous = this._promptChannelTemplateRaw;
         // Built-ins travel as an id; a project-owned fork travels as its whole
         // dict, so the project does not depend on a preset that may not exist.
         const frozen = projectTemplateValue(next);
+        this._promptTemplateChanging = true;
         try {
-            await this._runVersionedProjectMutation(
-                `/sonder-editor/project/${encodeURIComponent(dirName)}`,
-                {
-                    method: "PUT",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ metadata: { [PROJECT_TEMPLATE_KEY]: frozen } }),
-                },
-                { projectId: dirName }
-            );
+            await this._queuePromptProjectWrite({ metadata: { [PROJECT_TEMPLATE_KEY]: frozen } }, {
+                projectId: dirName, label: "switch prompt channels", retryOnConflict: false, beforeRun: () => {
+                        if (this._hasPromptToolDrafts(dirName)) throw new Error("Save or discard Prompt drafts before switching channels.");
+                    },
+            });
+            if (this._destroyed || this._projectDirName() !== dirName) return false;
             this._promptChannelTemplateRaw = frozen;
             // The backend rewrote every section in the same save, so the
             // client's scene copies are stale by definition — re-read before
@@ -11130,10 +11318,12 @@ export class EditorWidget {
             notifySuccess(`Prompt channels switched to "${next.name}".`);
             return true;
         } catch (e) {
-            this._promptChannelTemplateRaw = previous;
+            if (this._projectDirName() === dirName) this._promptChannelTemplateRaw = previous;
             notifyWarning(e?.message || "Failed to switch the prompt channel template.",
                           { source: "prompt-template-refused" });
             return false;
+        } finally {
+            this._promptTemplateChanging = false;
         }
     }
 
@@ -11232,15 +11422,10 @@ export class EditorWidget {
         if (!dirName) return;
         const delimiter = String(value ?? "").trim().slice(0, 8);
         try {
-            await this._runVersionedProjectMutation(
-                `/sonder-editor/project/${encodeURIComponent(dirName)}`,
-                {
-                    method: "PUT",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ metadata: { prompt_section_delimiter: delimiter } }),
-                },
-                { projectId: dirName }
-            );
+            await this._queuePromptProjectWrite({ metadata: { prompt_section_delimiter: delimiter } }, {
+                projectId: dirName, label: "prompt delimiter",
+            });
+            if (this._destroyed || this._projectDirName() !== dirName) return false;
             this._promptSectionDelimiter = delimiter;
         } catch (e) {
             notifyWarning(e?.message || "Failed to update section delimiter.", { source: "prompt-delimiter-refused" });
@@ -11259,15 +11444,10 @@ export class EditorWidget {
         if (!Number.isFinite(pct)) pct = 0;
         pct = Math.max(0, Math.min(100, pct));
         try {
-            await this._runVersionedProjectMutation(
-                `/sonder-editor/project/${encodeURIComponent(dirName)}`,
-                {
-                    method: "PUT",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ metadata: { prompt_frame_threshold: pct } }),
-                },
-                { projectId: dirName }
-            );
+            await this._queuePromptProjectWrite({ metadata: { prompt_frame_threshold: pct } }, {
+                projectId: dirName, label: "prompt threshold",
+            });
+            if (this._destroyed || this._projectDirName() !== dirName) return false;
             this._promptFrameThreshold = pct;
             // The threshold changes which sections survive the live selection
             // window — refresh the timeline "used/ignored" highlight.
@@ -11437,22 +11617,71 @@ export class EditorWidget {
                 range?.contextEnd ?? duration));
         const selection = sceneWide
             ? { selectionStart: 0, selectionEnd: duration } : null;
-        const response = await fetch(api.apiURL(
-            `/sonder-editor/project/${encodeURIComponent(dirName)}/scenes/${encodeURIComponent(sceneId)}/prompt-context/compile`
-        ), {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                ...this._promptCompileRequestBody({
-                    dirName, candidate, windowStart, windowEnd, selection,
-                    labelsOn: true }),
-                copy_plan_for: { attachment_id: attachmentId,
-                    capability_id: capabilityId },
-            }),
-        });
-        if (!response.ok) return null;
-        const payload = await response.json();
+        const previewToken = this._promptContextPreviewToken;
+        const result = await this._requestPromptContextCompile(dirName, sceneId, {
+            ...this._promptCompileRequestBody({
+                dirName, candidate, windowStart, windowEnd, selection,
+                labelsOn: true }),
+            copy_plan_for: { attachment_id: attachmentId,
+                capability_id: capabilityId },
+        }, () => previewToken === this._promptContextPreviewToken);
+        // The helper's return is another await boundary: ownership may change
+        // after its last check but before this continuation runs.
+        if (!result?.response.ok || this._destroyed
+                || dirName !== this._projectDirName() || sceneId !== this.activeSceneId
+                || previewToken !== this._promptContextPreviewToken) return null;
+        const { payload } = result;
         return payload?.copy_plan || null;
+    }
+
+    /**
+     * Read-only candidate POST: one bounded heal/retry with a fixed authoring
+     * and window snapshot. The generic write helper replays init.body verbatim;
+     * this endpoint's surviving gate is base_modified_at inside that body.
+     */
+    async _requestPromptContextCompile(dirName, sceneId, body, isCurrent = () => true) {
+        const current = () => !this._destroyed
+            && dirName === this._projectDirName()
+            && sceneId === this.activeSceneId && isCurrent();
+        const requestBody = structuredClone(body);
+        for (let attempt = 0; attempt < 2; attempt++) {
+            if (!current()) return null;
+            const sentVersion = String(requestBody.base_modified_at || "");
+            const response = await fetch(api.apiURL(
+                `/sonder-editor/project/${encodeURIComponent(dirName)}/scenes/${encodeURIComponent(sceneId)}/prompt-context/compile`
+            ), {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(requestBody),
+            });
+            const value = await response.json().catch(() => null);
+            if (!current()) return null;
+            const payload = value && typeof value === "object" && !Array.isArray(value)
+                ? value : null;
+            rememberProjectVersionFromResponse(response, dirName);
+            rememberProjectVersionFromPayload(payload, dirName);
+            if (response.status !== 409 || payload?.code !== "project_version_conflict"
+                    || attempt === 1) return { response, payload };
+            const actual = String(payload.actual_modified_at || "");
+            if (actual && sentVersion && actual < sentVersion) {
+                resetProjectVersion(dirName, actual);
+            } else if (actual) {
+                rememberProjectVersion(dirName, actual);
+            }
+            // Never rebuild selection/context or authoring between attempts.
+            requestBody.base_modified_at = getProjectVersion(dirName);
+        }
+        return null;
+    }
+
+    _failedPromptContextCandidate(sceneId, diagnostic) {
+        const previous = this._promptContextCandidateCache;
+        return {
+            ...(previous?._candidate_scene_id === sceneId ? previous : {}),
+            errors: [diagnostic], warnings: [],
+            _candidate_scene_id: sceneId, _stale: true, _stale_visual: true,
+            _failed: true,
+        };
     }
 
     /**
@@ -11595,7 +11824,8 @@ export class EditorWidget {
     _clearPromptStaleVisualTimerIfSettled(sceneId = this.activeSceneId) {
         const pending = [this._promptContextCandidateCache,
             this._promptContextScenePayloadCache].some((value) =>
-            value?._candidate_scene_id === sceneId && value?._stale === true);
+            value?._candidate_scene_id === sceneId && value?._stale === true
+                && value?._failed !== true);
         if (pending) return false;
         if (this._promptContextStaleVisualTimer) {
             clearTimeout(this._promptContextStaleVisualTimer);
@@ -11638,29 +11868,17 @@ export class EditorWidget {
         }
         (async () => {
             try {
-                const response = await fetch(api.apiURL(
-                    `/sonder-editor/project/${encodeURIComponent(dirName)}/scenes/${encodeURIComponent(sceneId)}/prompt-context/compile`
-                ), {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(this._promptCompileRequestBody({
+                const result = await this._requestPromptContextCompile(
+                    dirName, sceneId, this._promptCompileRequestBody({
                         dirName, candidate, windowStart: 0, windowEnd: duration,
                         selection: { selectionStart: 0, selectionEnd: duration },
                         promptSemanticUnitCreates,
-                    })),
-                });
-                if (token !== this._promptContextScenePayloadToken) return;
-                if (!response.ok) {
-                    this._promptContextScenePayloadCache = null;
-                    this._clearPromptStaleVisualTimerIfSettled(sceneId);
-                    this._refreshInlinePromptProjections?.();
-                    this._promptPanelHandle?.refreshProjections?.();
-                    this._renderTimeline();
-                    return;
-                }
-                const payload = await response.json().catch(() => null);
-                if (token !== this._promptContextScenePayloadToken) return;
-                if (!payload) {
+                    }), () => token === this._promptContextScenePayloadToken);
+                if (!result || this._destroyed || dirName !== this._projectDirName()
+                        || sceneId !== this.activeSceneId
+                        || token !== this._promptContextScenePayloadToken) return;
+                const { response, payload } = result;
+                if (!response.ok || !payload) {
                     this._promptContextScenePayloadCache = null;
                     this._clearPromptStaleVisualTimerIfSettled(sceneId);
                     this._refreshInlinePromptProjections?.();
@@ -11678,7 +11896,9 @@ export class EditorWidget {
                 // A dormant projection is an aid, not a result. Leaving the
                 // cache null degrades to the empty box this feature replaces
                 // rather than to a wrong one, so a failure is not reported.
-                if (token !== this._promptContextScenePayloadToken) return;
+                if (this._destroyed || dirName !== this._projectDirName()
+                        || sceneId !== this.activeSceneId
+                        || token !== this._promptContextScenePayloadToken) return;
                 this._promptContextScenePayloadCache = null;
                 this._clearPromptStaleVisualTimerIfSettled(sceneId);
             }
@@ -11731,76 +11951,84 @@ export class EditorWidget {
             this._promptContextCandidateCache = {
                 ...this._promptContextCandidateCache,
                 _stale: true,
-                _stale_visual: false,
+                _stale_visual: this._promptContextCandidateCache?._failed === true,
             };
         }
-        if (this._promptScenePayload()
-                || this._promptContextCandidateCache?._candidate_scene_id === sceneId) {
-            this._promptContextStaleVisualTimer = setTimeout(() => {
-                this._promptContextStaleVisualTimer = null;
-                if (token !== this._promptContextPreviewToken
-                        || sceneId !== this.activeSceneId) return;
-                if (this._promptContextScenePayloadCache?._stale === true) {
-                    this._promptContextScenePayloadCache = {
-                        ...this._promptContextScenePayloadCache,
-                        _stale_visual: true,
-                    };
-                }
-                if (this._promptContextCandidateCache?._stale === true) {
-                    this._promptContextCandidateCache = {
-                        ...this._promptContextCandidateCache,
-                        _stale_visual: true,
-                    };
-                }
-                const hasWindowed =
-                    this._promptContextCandidateCache?._candidate_scene_id === sceneId;
-                if (hasWindowed) {
-                    this._promptPanelHandle?.refreshDiagnostics?.(
-                        this._promptContextCandidateCache);
-                } else {
-                    // With no windowed payload there is no diagnostics fan-out
-                    // to sweep the panel's projection hosts.
-                    this._promptPanelHandle?.refreshProjections?.();
-                }
-                this._refreshInlinePromptProjections?.();
-                this._renderTimeline();
-            }, PROMPT_STALE_VISUAL_DELAY_MS);
-        }
         this._promptContextPreviewTimer = setTimeout(async () => {
+            if (this._destroyed || dirName !== this._projectDirName()
+                    || sceneId !== this.activeSceneId
+                    || token !== this._promptContextPreviewToken) return;
+            // The grace belongs to work in flight. Starting it at edit time
+            // silently spent the debounce interval out of the compile's budget.
+            if (this._promptScenePayload()
+                    || this._promptContextCandidateCache?._candidate_scene_id === sceneId) {
+                this._promptContextStaleVisualTimer = setTimeout(() => {
+                    this._promptContextStaleVisualTimer = null;
+                    if (this._destroyed || dirName !== this._projectDirName()
+                            || token !== this._promptContextPreviewToken
+                            || sceneId !== this.activeSceneId) return;
+                    let sceneChanged = false;
+                    let windowedChanged = false;
+                    if (this._promptContextScenePayloadCache?._stale === true
+                            && this._promptContextScenePayloadCache?._stale_visual !== true) {
+                        this._promptContextScenePayloadCache = {
+                            ...this._promptContextScenePayloadCache,
+                            _stale_visual: true,
+                        };
+                        sceneChanged = true;
+                    }
+                    if (this._promptContextCandidateCache?._stale === true
+                            && this._promptContextCandidateCache?._stale_visual !== true) {
+                        this._promptContextCandidateCache = {
+                            ...this._promptContextCandidateCache,
+                            _stale_visual: true,
+                        };
+                        windowedChanged = true;
+                    }
+                    if (windowedChanged) {
+                        // Diagnostics owns the panel-wide projection sweep.
+                        this._promptPanelHandle?.refreshDiagnostics?.(
+                            this._promptContextCandidateCache);
+                    } else if (sceneChanged) {
+                        // Dormant section rows read the scene-wide payload even
+                        // when a failed windowed candidate is already dim.
+                        this._promptPanelHandle?.refreshProjections?.();
+                    }
+                    if (sceneChanged || windowedChanged) {
+                        this._refreshInlinePromptProjections?.();
+                        this._renderTimeline();
+                    }
+                }, PROMPT_STALE_VISUAL_DELAY_MS);
+            }
             this._previewPromptContextScenePayload({
                 dirName, sceneId, candidate, windowStart, windowEnd,
                 promptSemanticUnitCreates });
             try {
-                const response = await fetch(api.apiURL(
-                    `/sonder-editor/project/${encodeURIComponent(dirName)}/scenes/${encodeURIComponent(sceneId)}/prompt-context/compile`
-                ), {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(this._promptCompileRequestBody({
+                const result = await this._requestPromptContextCompile(
+                    dirName, sceneId, this._promptCompileRequestBody({
                         dirName, candidate, windowStart, windowEnd,
                         selection: candidateSelection,
                         promptSemanticUnitCreates,
-                    })),
-                });
-                const payload = await response.json().catch(() => null);
-                if (token !== this._promptContextPreviewToken) return;
-                const candidatePayload = response.ok && payload ? payload : {
-                    errors: [{
-                        code: payload?.code || (response.ok
-                            ? "preview_invalid_response"
-                            : `preview_http_${response.status}`),
-                        message: payload?.error || (response.ok
+                    }), () => token === this._promptContextPreviewToken);
+                if (!result || this._destroyed || dirName !== this._projectDirName()
+                        || sceneId !== this.activeSceneId
+                        || token !== this._promptContextPreviewToken) return;
+                const { response, payload } = result;
+                const failed = !response.ok || !payload;
+                const diagnostic = failed ? {
+                    code: payload?.code || (response.ok
+                        ? "preview_invalid_response"
+                        : `preview_http_${response.status}`),
+                    message: payload?.code === "project_version_conflict"
+                        ? "The preview could not refresh because the project changed while it was compiling. Any previous preview remains visible; your next edit will try again."
+                        : payload?.error || (response.ok
                             ? "Prompt Context candidate preview returned no usable payload."
                             : "Prompt Context candidate preview failed."),
-                    }],
-                    warnings: [],
-                    attachment_previews: {},
-                };
-                this._promptContextCandidateCache = {
-                    ...candidatePayload,
-                    _candidate_scene_id: sceneId,
-                    _stale: false,
-                };
+                } : null;
+                this._promptContextCandidateCache = !failed ? {
+                    ...payload, _candidate_scene_id: sceneId,
+                    _stale: false, _stale_visual: false, _failed: false,
+                } : this._failedPromptContextCandidate(sceneId, diagnostic);
                 this._clearPromptStaleVisualTimerIfSettled(sceneId);
                 this._promptPanelHandle?.refreshDiagnostics?.(
                     this._promptContextCandidateCache);
@@ -11813,15 +12041,13 @@ export class EditorWidget {
                 this._promptPanelHandle?.applyCandidate?.(
                     this._promptContextCandidateCache);
             } catch (error) {
-                if (token === this._promptContextPreviewToken) {
+                if (!this._destroyed && dirName === this._projectDirName()
+                        && sceneId === this.activeSceneId
+                        && token === this._promptContextPreviewToken) {
                     console.warn("[Sonder] Prompt Context candidate preview failed:", error);
-                    this._promptContextCandidateCache = {
-                        errors: [{ code: "preview_request_failed",
-                            message: error?.message || "Prompt Context candidate preview failed." }],
-                        warnings: [], attachment_previews: {},
-                        _candidate_scene_id: sceneId,
-                        _stale: false,
-                    };
+                    this._promptContextCandidateCache = this._failedPromptContextCandidate(
+                        sceneId, { code: "preview_request_failed",
+                            message: error?.message || "Prompt Context candidate preview failed." });
                     this._clearPromptStaleVisualTimerIfSettled(sceneId);
                     this._promptPanelHandle?.refreshDiagnostics?.(
                         this._promptContextCandidateCache);
@@ -12290,7 +12516,20 @@ export class EditorWidget {
             sceneFields.active_minimax_h3_setup_id = String(activeMinimaxSetupId || "");
         }
         if (willExtend) sceneFields.duration_frames = nextDuration;
-        operations.push({ type: "update_scene_fields", fields: sceneFields });
+        const expectedSceneFields = {};
+        for (const field of ["global_channels", "global_channel_docs", "global_attachments"]) {
+            if (Object.hasOwn(sceneFields, field)) {
+                expectedSceneFields[field] = structuredClone(sceneRef[field]);
+            }
+        }
+        if (Object.hasOwn(sceneFields, "prompt")) {
+            expectedSceneFields.prompt = String(sceneRef.prompt || "");
+            expectedSceneFields.global_channel_docs = structuredClone(
+                sceneRef.global_channel_docs || {});
+        }
+        operations.push({ type: "update_scene_fields", fields: sceneFields,
+            ...(Object.keys(expectedSceneFields).length
+                ? { expected: expectedSceneFields } : {}) });
 
         // A lost response may have left the prior Apply outcome unknown. Never
         // take a second baseline until both authoritative refreshes can prove
@@ -12541,66 +12780,76 @@ export class EditorWidget {
         this._promptEditorResizeObserver = null;
     }
 
-    async _updatePromptSection(idx, updates) {
-        if (!this.activeScene || !this.projectDir) return;
-        if (this._isPromptTrackLocked()) return;
+    async _updatePromptSection(idx, updates, {
+        baseline = null, projectId = this._projectDirName(), sceneId = this.activeSceneId,
+        template = projectTemplateValue(this._channelTemplate()),
+    } = {}) {
+        if (!this.activeScene || !this.projectDir || this._isPromptTrackLocked()
+                || projectId !== this._projectDirName() || sceneId !== this.activeSceneId) return false;
+        if (baseline?.prompt_id) idx = (this.activeScene.prompt_sections || [])
+            .findIndex((row) => row.prompt_id === baseline.prompt_id);
+        const section = (this.activeScene.prompt_sections || [])[idx];
+        if (!section) return false;
+        const previous = structuredClone(section);
+        const before = baseline || previous;
+        const fields = promptEditFields(before, updates);
+        if (!Object.keys(fields).length) return { status: "no-op" };
+        const expected = { prompt_id: before.prompt_id,
+            start_frame: before.start_frame, end_frame: before.end_frame };
+        for (const field of Object.keys(fields)) {
+            if (field !== "prompt_edit") expected[field] = structuredClone(before[field] ?? null);
+        }
         const undoLabel = "edit prompt";
-        const identityCreateIntents = this._takePromptIdentityCreateIntents(
-            Array.isArray(updates?.attachments) ? updates.attachments : []);
+        const key = JSON.stringify([projectId, sceneId, before.prompt_id]);
+        const draft = this._promptToolDrafts?.get(key);
+        const pendingStore = this._pendingPromptIdentityCreateIntents ||= new Map();
+        for (const [id, pending] of draft?.identityCreates || []) {
+            if (!pendingStore.has(id)) pendingStore.set(id, structuredClone(pending));
+        }
+        const pendingCreates = new Map(pendingStore);
+        const identityCreateIntents = this._takePromptIdentityCreateIntents(updates.attachments || []);
+        if (draft) draft.identityCreates = identityCreateIntents.map((intent) => {
+            const id = String(intent?.unit?.semantic_unit_id || "");
+            return [id, pendingCreates.get(id)];
+        }).filter(([, pending]) => pending);
         const undoEntry = this._pushUndo(undoLabel,
             { promptIdentityCreateIntents: identityCreateIntents });
-        const section = (this.activeScene.prompt_sections || [])[idx];
-        const expected = section ? {
-            start_frame: section.start_frame,
-            end_frame: section.end_frame,
-        } : undefined;
+        const revision = {};
+        this._promptEditRevisions ||= new Map();
+        this._promptEditRevisions.set(key, revision);
         this._applyLocalPromptUpdate(idx, { ...updates });
         this._selectedPromptIdx = null;
         this._renderSceneAfterLocalMutation({ viewport: false });
-
         try {
             const result = await this._runSceneMutation(
-                [...identityCreateIntents, {
-                    type: "update_prompt_section",
-                    index: idx,
-                    expected,
-                    fields: { ...updates },
-                }],
-                {
-                    key: `prompt:${this.activeSceneId}:${idx}:fields:${Object.keys(updates || {}).sort().join("-")}`,
-                    label: "edit prompt",
-                    coalesce: identityCreateIntents.length === 0,
-                    merge: (oldIntent, nextIntent) => {
-                        if (identityCreateIntents.length
-                                || !oldIntent?.operations?.[0]
-                                || !nextIntent?.operations?.[0]) return nextIntent;
-                        return {
-                            ...nextIntent,
-                            operations: [{
-                                ...nextIntent.operations[0],
-                                fields: {
-                                    ...(oldIntent.operations[0].fields || {}),
-                                    ...(nextIntent.operations[0].fields || {}),
-                                },
-                            }],
-                        };
-                    },
-                }
-            );
-            this._adoptPromptIdentitiesFromMutation(result);
-            this._finalizePromptIdentityCreationHistory(undoEntry, result);
-        } catch (e) {
-            this._discardLastUndo(undoLabel);
-            notifyWarning(e?.message || "Prompt edit was refused.", { source: "prompt-edit-refused" });
-            await this._fetchScenes({ ignoreMutationGate: true, reason: "edit_prompt_error" });
-            // `_fetchScenes` restores the scene but reaches the Prompt panel
-            // through no seam, so an open panel keeps showing the refused edit.
-            this._refreshPromptContextDependencyConsumers();
-            if (identityCreateIntents.length) {
-                await this._fetchReferences({ ignoreMutationGate: true,
-                    reason: "edit_prompt_identity_error", force: true });
+                [...identityCreateIntents, { type: "update_prompt_section", index: idx,
+                    expected, fields, expected_prompt_template: template }],
+                { key: `prompt:${sceneId}:${before.prompt_id}:fields`, sceneId,
+                    label: "edit prompt", coalesce: false,
+                    failureMessage: "Prompt save failed. The Prompt tool keeps your draft." });
+            const saved = result?.payload?.scene?.prompt_sections?.find((row) => row.prompt_id === before.prompt_id);
+            if (saved && this._promptEditRevisions.get(key) === revision) Object.assign(section, structuredClone(saved));
+            if (this._projectDirName() === projectId && this.activeSceneId === sceneId) {
+                this._adoptPromptIdentitiesFromMutation(result);
+                this._finalizePromptIdentityCreationHistory(undoEntry, result);
             }
-            console.warn("[Sonder] Failed to update prompt section:", e);
+            return { status: "acknowledged", ...(saved ? {
+                value: structuredClone(saved),
+            } : {}) };
+        } catch (error) {
+            this._discardUndoEntry(undoEntry);
+            for (const intent of identityCreateIntents) {
+                const id = String(intent?.unit?.semantic_unit_id || "");
+                const pending = pendingCreates.get(id);
+                if (pending && !pendingStore.has(id))
+                    pendingStore.set(id, pending);
+            }
+            if (this._promptEditRevisions.get(key) === revision) Object.assign(section, previous);
+            this._refreshPromptContextDependencyConsumers();
+            if (identityCreateIntents.length && this._projectDirName() === projectId) await this._fetchReferences({ ignoreMutationGate: true,
+                reason: "edit_prompt_identity_error", force: true });
+            return { status: "refused", message: error?.message || "",
+                conflict: error?.payload?.conflict || null };
         }
     }
 
@@ -19692,6 +19941,17 @@ export class EditorWidget {
         if (this._destroyed) return;
         this._destroyed = true;
         this._clearStaleReplayState();
+        this._promptContextPreviewToken = (this._promptContextPreviewToken || 0) + 1;
+        this._promptContextScenePayloadToken =
+            (this._promptContextScenePayloadToken || 0) + 1;
+        if (this._promptContextPreviewTimer) {
+            clearTimeout(this._promptContextPreviewTimer);
+            this._promptContextPreviewTimer = null;
+        }
+        if (this._promptContextStaleVisualTimer) {
+            clearTimeout(this._promptContextStaleVisualTimer);
+            this._promptContextStaleVisualTimer = null;
+        }
 
         this._stopPlayback();
         if (this._seekAbort) {
