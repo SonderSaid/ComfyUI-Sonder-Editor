@@ -3758,3 +3758,289 @@ def test_execute_applies_guide_driver_collision_manifest(tmp_path, monkeypatch):
     assert manifest["entries"][0]["original_local_idx"] == 0
     assert manifest["entries"][0]["effective_local_idx"] == 2
     assert manifest["predicted_unresolved"] is False
+
+
+# --- Grid padding fill (frame_count_padding) ---
+# A SonderMasksBridge Freeze collapses a channel's mask, so the fabricated pad is
+# KEPT rather than regenerated. These lock the remedy - an in-distribution fill on
+# both channels. They cannot reach the failure condition itself (Freeze + padding +
+# a real sampler); that is a manual test.
+
+
+def _ramp_audio(torch, samples, *, channels=2, batch=1, sample_rate=44100):
+    """Non-zero, strictly varying waveform - a level check alone cannot tell a
+    mirror from a DC hold, so the tests assert sample identity against this."""
+    ramp = torch.arange(1, samples + 1, dtype=torch.float32) / float(max(1, samples))
+    return {
+        "waveform": ramp.reshape(1, 1, samples).repeat(batch, channels, 1),
+        "sample_rate": sample_rate,
+    }
+
+
+def test_pad_audio_tail_mirrors_instead_of_appending_silence(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+
+    audio = _ramp_audio(torch, 1000, sample_rate=1000)
+    padded = editor_node.SonderEditor._pad_audio_to_frame_count(audio, 1100, 1000.0)
+
+    waveform = padded["waveform"]
+    assert tuple(waveform.shape) == (1, 2, 1100)
+    original = audio["waveform"][0, 0]
+    tail = waveform[0, 0, 1000:]
+
+    assert float(tail.abs().max()) > 0.0
+    # Reflect excludes the boundary sample: the fill starts at x[N-2], not x[N-1].
+    expected = torch.stack([original[998 - k] for k in range(100)])
+    assert torch.equal(tail, expected)
+
+    def rms(chunk):
+        return float((chunk.double() ** 2).mean().sqrt())
+
+    assert rms(tail) == pytest.approx(rms(waveform[0, 0, 900:1000]), rel=0.05)
+
+
+def test_pad_audio_mirror_tiles_when_padding_exceeds_signal_length(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+
+    # The real reachable case: MiniMax H3 (step 17, offset 5) rounds a 6-frame source
+    # up to 22, so 16 pad frames stand against 6 real ones. This is why the fill is a
+    # hand-rolled gather - F.pad(mode="reflect") raises once pad >= current.
+    audio = _ramp_audio(torch, 6, channels=1, sample_rate=6)
+    padded = editor_node.SonderEditor._pad_audio_to_frame_count(audio, 22, 6.0)
+
+    got = padded["waveform"][0, 0]
+    assert tuple(padded["waveform"].shape) == (1, 1, 22)
+    original = audio["waveform"][0, 0]
+    assert set(got.tolist()) <= set(original.tolist())
+    # Triangle wave carried past a full period (10 samples), never out of range.
+    order = [0, 1, 2, 3, 4, 5, 4, 3, 2, 1, 0, 1, 2, 3, 4, 5, 4, 3, 2, 1, 0, 1]
+    assert torch.equal(got, torch.stack([original[i] for i in order]))
+
+
+def test_pad_audio_single_sample_signal_pads_with_zeros_not_dc(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+
+    audio = {"waveform": torch.full((1, 2, 1), 0.75), "sample_rate": 10}
+    padded = editor_node.SonderEditor._pad_audio_to_frame_count(audio, 6, 10.0)
+
+    tail = padded["waveform"][0, 0, 1:]
+    assert tuple(padded["waveform"].shape) == (1, 2, 6)
+    assert torch.equal(tail, torch.zeros(5))
+    # A constant hold would be DC, which is the other out-of-distribution fill.
+    assert not bool((tail == 0.75).any())
+
+
+def test_pad_audio_zero_length_signal_pads_to_target(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+
+    audio = {"waveform": torch.zeros(1, 2, 0), "sample_rate": 10}
+    padded = editor_node.SonderEditor._pad_audio_to_frame_count(audio, 4, 10.0)
+
+    assert tuple(padded["waveform"].shape) == (1, 2, 4)
+    assert float(padded["waveform"].abs().max()) == 0.0
+
+
+def test_pad_audio_preserves_batch_channels_and_silence(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+
+    # Mirroring silence yields silence: a timeline with no audio under the window
+    # must not gain invented sound.
+    silent = {"waveform": torch.zeros(1, 2, 100, dtype=torch.float32), "sample_rate": 100}
+    padded_silent = editor_node.SonderEditor._pad_audio_to_frame_count(silent, 150, 100.0)
+    assert tuple(padded_silent["waveform"].shape) == (1, 2, 150)
+    assert float(padded_silent["waveform"].abs().max()) == 0.0
+
+    left = torch.arange(1, 11, dtype=torch.float32)
+    right = torch.arange(101, 111, dtype=torch.float32)
+    stacked = torch.stack([left, right]).reshape(1, 2, 10)
+    padded = editor_node.SonderEditor._pad_audio_to_frame_count(
+        {"waveform": stacked, "sample_rate": 10}, 14, 10.0)
+
+    result = padded["waveform"]
+    assert tuple(result.shape) == (1, 2, 14)
+    assert result.dtype is torch.float32
+    # Each channel mirrors its own tail; index_select touches only the last axis.
+    assert torch.equal(result[0, 0, 10:], torch.tensor([9.0, 8.0, 7.0, 6.0]))
+    assert torch.equal(result[0, 1, 10:], torch.tensor([109.0, 108.0, 107.0, 106.0]))
+
+
+def test_pad_audio_early_returns_leave_input_unchanged(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+
+    ok = _ramp_audio(torch, 50, sample_rate=10)
+    cases = [
+        (["not-a-dict"], 100, 10.0),
+        ({"waveform": None, "sample_rate": 10}, 100, 10.0),
+        ({"waveform": torch.tensor(1.0), "sample_rate": 10}, 100, 10.0),
+        (ok, 100, 0.0),
+        (ok, 100, -24.0),
+        ({"waveform": ok["waveform"], "sample_rate": 0}, 100, 10.0),
+        (ok, 1, 10.0),
+    ]
+    for audio, target, fps in cases:
+        assert editor_node.SonderEditor._pad_audio_to_frame_count(audio, target, fps) is audio
+
+
+def test_pad_audio_never_raises_across_degenerate_shapes(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+
+    for ndim in (1, 2, 3):
+        for samples in (0, 1, 2, 3):
+            for target in (1, 5, 50):
+                shape = [1] * (ndim - 1) + [samples]
+                audio = {"waveform": torch.zeros(*shape), "sample_rate": 10}
+                padded = editor_node.SonderEditor._pad_audio_to_frame_count(audio, target, 10.0)
+                assert isinstance(padded, dict)
+                # Exact length, not just ">= samples": a function that returned its input
+                # unchanged would satisfy the weaker bound and this sweep would never fail.
+                # sample_rate == fps here, so target_samples == target.
+                assert int(padded["waveform"].shape[-1]) == max(samples, target)
+
+
+def test_execute_padded_audio_tail_is_not_fabricated_silence(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+
+    project = _FrameConstraintProject(
+        tmp_path,
+        template_id="ltx-2.3",
+        frame_constraint={"step": 8, "offset": 1, "min": 1},
+    )
+    monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_render_scene_frames",
+        lambda self, proj, scene, start, end, use_cache=False, **_kwargs:
+            torch.ones(end - start, 4, 4, 3, dtype=torch.float32),
+    )
+    # `_load_scene_audio` floors where the padder ceils, so a full-length real return is
+    # still short of the target - if it were not, the padder would no-op and this would
+    # pass vacuously. The length assertion below is what keeps that honest.
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_load_scene_audio",
+        lambda self, proj, scene, start, end:
+            _ramp_audio(torch, int(((end - start) / 24.0) * 44100)),
+    )
+
+    result = editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=768,
+        height=512,
+        scene_id="scene-1",
+        selection_start=482,
+        selection_end=601,
+        pre_context_frames=48,
+        post_context_frames=0,
+    )
+
+    assert project._execution_context["frame_count_padding"] == 1
+    audio = result[10]
+    waveform = audio["waveform"][0, 0]
+    source_samples = int((168 / 24.0) * 44100)
+    assert int(waveform.shape[-1]) > source_samples
+
+    tail = waveform[source_samples:]
+
+    def rms(chunk):
+        return float((chunk.double() ** 2).mean().sqrt())
+
+    assert float(tail.abs().max()) > 0.0
+    # The defect measured the pad 340x quieter than the audio before it.
+    assert rms(tail) == pytest.approx(
+        rms(waveform[source_samples - tail.numel():source_samples]), rel=0.05)
+
+
+def test_pad_image_batch_tail_repeats_last_real_frame(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+
+    # Parity lock for the video channel: it is already in-distribution because it holds
+    # real content at full level. A "simplification" to torch.zeros would be the pixel
+    # equivalent of the silence defect.
+    frames = torch.stack([torch.full((2, 2, 3), float(i)) for i in range(1, 5)])
+    padded = editor_node.SonderEditor._pad_image_batch_to_frame_count(frames, 7)
+
+    assert tuple(padded.shape) == (7, 2, 2, 3)
+    assert torch.equal(padded[:4], frames)
+    for i in range(4, 7):
+        assert torch.equal(padded[i], frames[-1])
+        assert float(padded[i].abs().max()) > 0.0
+
+    # Documented asymmetry: at zero frames video returns short rather than emitting
+    # black, where audio returns zeros at full length. Do not "fix" this into parity.
+    empty = torch.zeros(0, 2, 2, 3)
+    short = editor_node.SonderEditor._pad_image_batch_to_frame_count(empty, 5)
+    assert tuple(short.shape) == (0, 2, 2, 3)
+
+
+def test_padding_sits_outside_the_mask_once_post_context_is_present(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+
+    # Characterises the geometry logged in sonder_editor_bugs.md as "Grid padding lands
+    # outside the generation mask whenever post-context is present". The pad occupies the
+    # tail of the tensor, AFTER post-context, but mask_end_pixel adds frame_count_padding
+    # before it - so the mask overruns generation_end into real post-context frames while
+    # never reaching the pad. Every other padding test in this file uses post_context=0,
+    # which is the one case where the two coincide; that gap is why this went unnoticed.
+    # Update this test deliberately when the geometry is fixed - do not delete it.
+    project = _FrameConstraintProject(
+        tmp_path,
+        template_id="minimax-h3",
+        frame_constraint={"step": 17, "offset": 5, "min": 1},
+    )
+    monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
+    _patch_render_and_audio(editor_node, monkeypatch)
+    editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=768,
+        height=512,
+        scene_id="scene-1",
+        selection_start=300,
+        selection_end=400,
+        pre_context_frames=34,
+        post_context_frames=34,
+    )
+
+    ctx = project._execution_context
+    assert ctx["frame_count_padding"] > 0
+    generation_end_pixel = ctx["actual_pre_context_frames"] + (400 - 300)
+
+    # The pad is never reached: the mask ends well short of the padded tensor.
+    assert ctx["mask_end_frame"] < ctx["frame_count"]
+    # And it overruns into real post-context by exactly the padding it meant to cover.
+    assert ctx["mask_end_frame"] == generation_end_pixel + ctx["frame_count_padding"]
+
+    # The zero-post case is the coincidence: there the two are the same frames.
+    zero_post = _FrameConstraintProject(
+        tmp_path,
+        template_id="minimax-h3",
+        frame_constraint={"step": 17, "offset": 5, "min": 1},
+    )
+    monkeypatch.setattr(editor_node, "load_project", lambda project_dir: zero_post)
+    editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=768,
+        height=512,
+        scene_id="scene-1",
+        selection_start=300,
+        selection_end=400,
+        pre_context_frames=34,
+        post_context_frames=0,
+    )
+    zero_ctx = zero_post._execution_context
+    assert zero_ctx["frame_count_padding"] > 0
+    assert zero_ctx["mask_end_frame"] == zero_ctx["frame_count"]

@@ -164,11 +164,27 @@ def resolve_mask_times(project, edit_video: bool = True, edit_audio: bool = True
         "video_mask_frames": video_frames,
         "audio_mask_frames": audio_frames,
         "frame_count": _coerce_int(ctx.get("frame_count"), 0),
+        # Read tolerantly: an older execution context predates the key and must yield 0
+        # rather than raising. This fabricated tail is often kept rather than regenerated,
+        # so recording it here is what makes a take self-describing.
+        "frame_count_padding": max(0, _coerce_int(ctx.get("frame_count_padding"), 0)),
         "fps": fps,
     }
 
 
 # ── Latent geometry, read from the wired VAEs ────────────────────────────────
+
+
+def _pins_padding(result: dict, mask_frames) -> bool:
+    """True when this channel keeps the fabricated grid padding instead of regenerating it.
+
+    The pad occupies the tail of the tensor, so it is regenerated only by a mask that
+    reaches `frame_count`. A Freeze (zero-width window) never does; neither does an Edit
+    whose window ends before the tail, which is every render carrying post-context.
+    """
+    if _coerce_int(result.get("frame_count_padding"), 0) <= 0:
+        return False
+    return _coerce_int(mask_frames[1], 0) < _coerce_int(result.get("frame_count"), 0)
 
 
 def video_downscale_fn(vae):
@@ -570,6 +586,14 @@ class SonderMasksBridge:
             "audio_mask": [result["audio_mask_start_time"], result["audio_mask_end_time"]],
             "video_latent_mask": video_prov,
             "audio_latent_mask": audio_prov,
+            # Provenance only - pinned padding is a correct, common configuration, so this
+            # is never a warning. Derive it from the emitted window rather than the Edit/Freeze
+            # switch: the pad sits at the tensor tail, AFTER post-context, while mask_end_pixel
+            # adds the padding before it, so an Edit channel with any post-context also leaves
+            # the pad outside its mask. Freeze is only the zero-width special case.
+            "frame_count_padding": result["frame_count_padding"],
+            "video_pins_padding": _pins_padding(result, result["video_mask_frames"]),
+            "audio_pins_padding": _pins_padding(result, result["audio_mask_frames"]),
         }
         ctx = getattr(project, "_execution_context", None)
         if isinstance(ctx, dict):
@@ -585,13 +609,15 @@ class SonderMasksBridge:
             ctx["masks_bridge_by_node"] = by_node
 
         logger.info(
-            "masks bridge: edit_video=%s edit_audio=%s video=[%.4f,%.4f] audio=[%.4f,%.4f]",
+            "masks bridge: edit_video=%s edit_audio=%s video=[%.4f,%.4f] audio=[%.4f,%.4f] "
+            "padding=%d",
             result["edit_video"],
             result["edit_audio"],
             result["video_mask_start_time"],
             result["video_mask_end_time"],
             result["audio_mask_start_time"],
             result["audio_mask_end_time"],
+            result["frame_count_padding"],
         )
         if video_prov or audio_prov:
             logger.info("masks bridge latent masks: video=%s audio=%s", video_prov, audio_prov)

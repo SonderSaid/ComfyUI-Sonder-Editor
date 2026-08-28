@@ -8,6 +8,7 @@ coverage and must still run in a bare environment.
 """
 
 import importlib
+import json
 import math
 import os
 import sys
@@ -404,6 +405,23 @@ def test_node_contract():
     assert spec["hidden"]["unique_id"] == "UNIQUE_ID"
 
 
+def test_resolve_mask_times_reports_frame_count_padding():
+    mb = _import_masks_bridge()
+    project, _ = _project()
+
+    # An execution context written before the key existed must yield 0, not raise.
+    assert mb.resolve_mask_times(project, True, True)["frame_count_padding"] == 0
+
+    project._execution_context["frame_count_padding"] = 9
+    assert mb.resolve_mask_times(project, True, True)["frame_count_padding"] == 9
+
+    # Negative or unparseable values floor at 0 rather than propagating.
+    project._execution_context["frame_count_padding"] = -4
+    assert mb.resolve_mask_times(project, True, True)["frame_count_padding"] == 0
+    project._execution_context["frame_count_padding"] = "not-a-number"
+    assert mb.resolve_mask_times(project, True, True)["frame_count_padding"] == 0
+
+
 # ── Tensor emission (needs torch) ────────────────────────────────────────────
 
 
@@ -668,3 +686,67 @@ def test_pixel_count_video_mask_does_not_survive_core_reshape():
     assert not torch.equal(got, want)
     # the pre-context latent the resample wrongly turns on
     assert float(got[9]) == 1.0 and float(want[9]) == 0.0
+
+
+def test_frozen_channel_provenance_records_pinned_padding():
+    pytest.importorskip("torch")
+    mb = _import_masks_bridge()
+    # A window that reaches the padded tail, so the editing channel genuinely regenerates
+    # the pad and Freeze is the only thing pinning it. See
+    # test_edit_channel_still_pins_padding_without_any_freeze for the ordinary case where
+    # post-context leaves the pad outside an editing channel's mask too.
+    project, _ = _project(mask_start=12, mask_end=241, frame_count=241)
+    project._execution_context["frame_count_padding"] = 9
+    node = mb.SonderMasksBridge()
+
+    node.execute(project, edit_video=True, edit_audio=False)
+    prov = project._execution_context["masks_bridge"]
+
+    assert prov["frame_count_padding"] == 9
+    # Freeze collapses the window to zero width, so it can never reach the tail.
+    assert prov["audio_pins_padding"] is True
+    assert prov["video_pins_padding"] is False
+    # The real guarantee: this payload flows into every take's generation_params via
+    # _public_execution_context, so it must stay JSON-safe - never a tensor.
+    assert json.loads(json.dumps(prov))["frame_count_padding"] == 9
+
+    # No padding means nothing is pinned, however the channels are set.
+    project._execution_context["frame_count_padding"] = 0
+    node.execute(project, edit_video=False, edit_audio=False)
+    prov = project._execution_context["masks_bridge"]
+    assert prov["frame_count_padding"] == 0
+    assert prov["video_pins_padding"] is False
+    assert prov["audio_pins_padding"] is False
+    json.dumps(prov)
+
+
+def test_edit_channel_still_pins_padding_without_any_freeze():
+    pytest.importorskip("torch")
+    mb = _import_masks_bridge()
+    # Both channels editing, but the window ends before the padded tensor - the ordinary
+    # shape of any render carrying post-context. Nothing is frozen, and both channels
+    # still keep the fabricated tail, so provenance must not read the Edit/Freeze switch.
+    project, _ = _project(mask_start=39, mask_end=141, frame_count=175)
+    project._execution_context["frame_count_padding"] = 2
+    node = mb.SonderMasksBridge()
+
+    node.execute(project, edit_video=True, edit_audio=True)
+    prov = project._execution_context["masks_bridge"]
+
+    assert prov["edit_video"] is True and prov["edit_audio"] is True
+    assert prov["video_pins_padding"] is True
+    assert prov["audio_pins_padding"] is True
+
+    # A window that does reach the tail regenerates the pad on both channels.
+    reaching, _ = _project(mask_start=39, mask_end=141, frame_count=141)
+    reaching._execution_context["frame_count_padding"] = 2
+    node.execute(reaching, edit_video=True, edit_audio=True)
+    prov = reaching._execution_context["masks_bridge"]
+    assert prov["video_pins_padding"] is False
+    assert prov["audio_pins_padding"] is False
+
+    # Freeze remains the zero-width special case, pinning regardless of where the mask ends.
+    node.execute(reaching, edit_video=False, edit_audio=True)
+    prov = reaching._execution_context["masks_bridge"]
+    assert prov["video_pins_padding"] is True
+    assert prov["audio_pins_padding"] is False

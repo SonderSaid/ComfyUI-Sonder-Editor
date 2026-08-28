@@ -405,17 +405,51 @@ class SonderEditor:
             return audio
         waveform = audio.get("waveform")
         sample_rate = _coerce_int(audio.get("sample_rate"), 0)
-        if not torch.is_tensor(waveform) or sample_rate <= 0:
+        # ndim guard mirrors _pad_image_batch_to_frame_count; shape[-1] raises on a 0-dim tensor.
+        if not torch.is_tensor(waveform) or waveform.ndim < 1 or sample_rate <= 0:
             return audio
-        target_samples = math.ceil((max(0, target_frame_count) / fps) * sample_rate)
+        target_samples = math.ceil((max(0, _coerce_int(target_frame_count, 0)) / fps) * sample_rate)
         current_samples = int(waveform.shape[-1])
         if current_samples >= target_samples:
             return audio
-        pad_shape = list(waveform.shape)
-        pad_shape[-1] = target_samples - current_samples
-        padded = torch.cat([waveform, waveform.new_zeros(pad_shape)], dim=-1)
+
+        # Grid padding is fabricated, and it is frequently KEPT rather than regenerated -
+        # pinned as ground truth at every sampling step. Two ways in: a SonderMasksBridge
+        # Freeze collapses that channel's mask to zero width, and, more commonly, the pad
+        # sits at the tensor tail AFTER post-context while mask_end_pixel adds the padding
+        # before it, so any render carrying post-context leaves the pad outside the mask
+        # with no Freeze involved. The fill must stay inside this channel's natural
+        # statistics: mirror the tail, never append digital silence (a spectral cliff no
+        # recording contains) and never hold one sample (constant DC). Confirmed by manual
+        # test 2026-08-28: silence here really did corrupt the generated video's head.
+        # Reflect excludes the boundary sample, so
+        # amplitude is continuous at the seam; do not add a taper, which would reintroduce the
+        # level notch this removes. Peak is unchanged, so nothing can clip.
+        #
+        # A hand-rolled gather, not F.pad(mode="reflect"): reflect raises once pad >= current,
+        # which is reachable (H3 step 17 / offset 5 rounds a 6-frame source to 22, so 16 pad
+        # frames against 6 real). The triangle-wave index is periodic and therefore total for
+        # every N >= 2 - the never-block guarantee is the arithmetic, not a swallowed
+        # exception. Under two samples there is nothing to reflect and no signal to be
+        # discontinuous with, so zeros are correct; that branch is defensive only, since the
+        # padder runs solely inside the `audio_needed` branch where N is a full render window.
+        # The pad is bounded by `step - 1` frames only because getFrameConstraint emits just
+        # {step, offset}; round_up_frame_count also honours a `min` key, which would make it
+        # unbounded. The gather is length-agnostic, so a custom template carrying `min`
+        # degrades to a longer mirror rather than breaking.
+        if current_samples >= 2:
+            period = 2 * (current_samples - 1)
+            positions = torch.arange(current_samples, target_samples,
+                                     device=waveform.device) % period
+            index = torch.where(positions < current_samples, positions, period - positions)
+            tail = waveform.index_select(-1, index)
+        else:
+            pad_shape = list(waveform.shape)
+            pad_shape[-1] = target_samples - current_samples
+            tail = waveform.new_zeros(pad_shape)
+
         next_audio = dict(audio)
-        next_audio["waveform"] = padded
+        next_audio["waveform"] = torch.cat([waveform, tail], dim=-1)
         return next_audio
 
     @staticmethod

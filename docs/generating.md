@@ -95,6 +95,12 @@ Switching to a template with a *different* frame rule clears the In/Out
 selection (the old endpoints would be off-grid); same-rule switches keep it.
 Already-queued jobs are never affected.
 
+When your render window does not land on the frame rule, the editor rounds
+**up** rather than trimming your selection, and fills the extra frames itself:
+video holds the last frame, audio mirrors the end of its own window. Those
+frames are trimmed from where the Take is placed on your timeline, so you do
+not have to think about them - but they are inside the generated file.
+
 ## Prompts
 
 The Global document and every prompt section in the render window compile
@@ -163,7 +169,12 @@ notes below.
 Notes worth knowing:
 
 - **Freeze** emits an all-zero mask, so that channel is kept from source. This
-  is how you regenerate audio over locked picture, or the reverse.
+  is how you regenerate audio over locked picture, or the reverse. A frozen
+  channel keeps the rounded-up filler too, so if the window had to be rounded
+  to the frame rule, its last fraction of a second is editor-generated rather
+  than timeline content. Freeze is not the only way that happens - a window
+  with post-context keeps the filler on both channels - so treat the filler as
+  something the model sees, not something it replaces.
 - Wire only half a pair and that channel emits a keep-everything mask and logs
   a warning. A latent that was not encoded from this render window is refused
   outright rather than masked at the wrong scale.
