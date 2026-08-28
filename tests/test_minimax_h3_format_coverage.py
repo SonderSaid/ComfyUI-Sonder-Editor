@@ -112,7 +112,7 @@ def _resolve(*, setup, entities, items, recipes, units=()):
 
 
 def _compile(resolved, units, sections, *, global_attachments=(),
-             global_documents=None, references=None):
+             global_documents=None, references=None, copy_plan_for=None):
     context = {
         "setup_manifest": resolved["setup_manifest"],
         "ordinal_manifest": resolved["ordinal_manifest"],
@@ -130,7 +130,7 @@ def _compile(resolved, units, sections, *, global_attachments=(),
         global_attachments=list(global_attachments),
         sections=list(sections), window_start=0, window_end=WINDOW_END,
         fps=24.0, template="minimax_h3_ref", profile="minimax_h3_ref@1",
-        context=context, labels_on=True)
+        context=context, labels_on=True, copy_plan_for=copy_plan_for)
 
 
 def test_reference_dormancy_predicates_are_derived_from_winning_sources():
@@ -195,7 +195,9 @@ def _identity_dormancy_fixture(*, global_chip=None, global_chips=None,
                                 section_chip=None,
                                 global_documents=None, units=None,
                                 catalog_members=None,
-                                duplicate_member_slots=None):
+                                duplicate_member_slots=None,
+                                section_global_exceptions=(),
+                                copy_plan_for=None):
     members = catalog_members if catalog_members is not None else [
         ReferenceMember(member_id="staged-member", asset_id="img_a"),
         ReferenceMember(member_id="dormant-member", asset_id="img_b"),
@@ -227,7 +229,8 @@ def _identity_dormancy_fixture(*, global_chip=None, global_chips=None,
         section_attachments.append(section_chip)
     section = PromptSection(
         0, WINDOW_END, channels={"detailed_description": "The shot moves."},
-        attachments=section_attachments)
+        attachments=section_attachments,
+        global_channel_exceptions=list(section_global_exceptions))
     section.prompt_id = "section"
     sections = [section]
     chosen_global_chips = (list(global_chips) if global_chips is not None
@@ -236,7 +239,7 @@ def _identity_dormancy_fixture(*, global_chip=None, global_chips=None,
         resolved, units, sections,
         global_attachments=chosen_global_chips,
         global_documents=global_documents,
-        references=[entity])
+        references=[entity], copy_plan_for=copy_plan_for)
 
 
 def test_global_dormant_identity_warns_while_same_id_section_still_blocks():
@@ -267,7 +270,7 @@ def test_global_dormant_identity_warns_while_same_id_section_still_blocks():
         if row["attachment_id"] == "shared"
         and row["capability_id"] == "definitions"]
     assert next(row for row in projections
-                if row["origin"] == "global")["state"] == "empty"
+                if row["origin"] == "global")["state"] == "dormant"
     assert next(row for row in projections
                 if row["origin"] == "section")["state"] == "unresolved"
 
@@ -433,21 +436,29 @@ def test_dormant_identities_with_equal_names_keep_distinct_warnings():
     assert [row["semantic_unit_id"] for row in dormant] == ["twin-a", "twin-b"]
 
 
-def test_fully_dormant_global_chip_suppresses_only_authored_chip_prose():
+def test_fully_dormant_global_chip_suppresses_every_capability():
     chip = _reference_chip(
         "dormant-prose", {"semantic_unit_ids": ["dormant"]},
-        {"text": "DORMANT MENTION TEXT",
+        {"definition": "DORMANT DEFINITION",
+         "retention_details": "DORMANT RETENTION",
+         "text": "DORMANT MENTION TEXT",
+         "task_types": ["video editing"],
+         "summary": "DORMANT SUMMARY",
          "audio_relationship": "DORMANT AUDIO RELATIONSHIP"},
-        capabilities=("mentions", "audio_relationship"))
+        capabilities=("definitions", "retention", "mentions", "summary",
+                      "audio_relationship"))
 
     compiled = _identity_dormancy_fixture(global_chip=chip)
 
-    assert "DORMANT MENTION TEXT" not in compiled["prompt"]
-    assert "DORMANT AUDIO RELATIONSHIP" not in compiled["prompt"]
+    for text in ("DORMANT DEFINITION", "DORMANT RETENTION",
+                 "DORMANT MENTION TEXT", "DORMANT SUMMARY",
+                 "DORMANT AUDIO RELATIONSHIP", "video editing"):
+        assert text not in compiled["prompt"]
     rows = [row for row in compiled["attachment_capability_projections"]
             if row["attachment_id"] == "dormant-prose"]
     assert {row["capability_id"] for row in rows} == {
-        "mentions", "audio_relationship"}
+        "definitions", "retention", "mentions", "summary",
+        "audio_relationship"}
     assert all(row["state"] == "dormant" for row in rows)
     assert all(row["state_reason"] == prompt_context.DORMANT_REFERENCE_REASON
                for row in rows)
@@ -455,21 +466,21 @@ def test_fully_dormant_global_chip_suppresses_only_authored_chip_prose():
                 if row["attachment_id"] == "dormant-prose"]
 
 
-def test_late_render_blockers_prevent_dormant_suppression():
+def test_dormant_output_and_conflict_preflight_do_not_block():
     oversized = _reference_chip(
         "oversized", {"semantic_unit_ids": ["dormant"]},
         {"text": "OVERSIZED CHIP MENTION",
          "summary": "x" * (prompt_context.MAX_ATTACHMENT_OUTPUT + 1)},
         capabilities=("mentions", "summary"))
     compiled = _identity_dormancy_fixture(global_chip=oversized)
-    assert any(row["code"] == "attachment_output_limit"
-               for row in compiled["errors"])
-    assert not any(row["code"] == "reference_source_dormant"
-                   for row in compiled["warnings"])
-    assert "OVERSIZED CHIP MENTION" in compiled["prompt"]
-    assert not any(row["state"] == "dormant"
-                   for row in compiled["attachment_capability_projections"]
-                   if row["attachment_id"] == "oversized")
+    assert not any(row["code"] == "attachment_output_limit"
+                   for row in compiled["errors"])
+    assert any(row["code"] == "reference_source_dormant"
+               for row in compiled["warnings"])
+    assert "OVERSIZED CHIP MENTION" not in compiled["prompt"]
+    assert all(row["state"] == "dormant"
+               for row in compiled["attachment_capability_projections"]
+               if row["attachment_id"] == "oversized")
 
     first = _reference_chip(
         "first", {"semantic_unit_ids": ["staged"]},
@@ -480,16 +491,16 @@ def test_late_render_blockers_prevent_dormant_suppression():
         {"text": "CONFLICTING CHIP MENTION", "summary": "SECOND SUMMARY"},
         capabilities=("mentions", "summary"), group="shared-summary")
     compiled = _identity_dormancy_fixture(global_chips=[first, conflicting])
-    assert any(row["code"] == "conflicting_emission"
-               and row["attachment_id"] == "conflicting"
-               for row in compiled["errors"])
-    assert not any(row["code"] == "reference_source_dormant"
+    assert not any(row["code"] == "conflicting_emission"
                    and row["attachment_id"] == "conflicting"
-                   for row in compiled["warnings"])
-    assert "CONFLICTING CHIP MENTION" in compiled["prompt"]
-    assert not any(row["state"] == "dormant"
-                   for row in compiled["attachment_capability_projections"]
-                   if row["attachment_id"] == "conflicting")
+                   for row in compiled["errors"])
+    assert any(row["code"] == "reference_source_dormant"
+               and row["attachment_id"] == "conflicting"
+               for row in compiled["warnings"])
+    assert "CONFLICTING CHIP MENTION" not in compiled["prompt"]
+    assert all(row["state"] == "dormant"
+               for row in compiled["attachment_capability_projections"]
+               if row["attachment_id"] == "conflicting")
 
 
 def test_preflight_does_not_invent_blockers_from_suppressed_prose():
@@ -589,8 +600,7 @@ def test_dormant_global_chip_claims_no_shots_but_live_chip_still_does(
         {"summary": "Section claim"}, capabilities=("summary",),
         group="shared-group")
     compile_three_shots(dormant, middle_chip=section_claim)
-    assert captured["dormant-shots"]["groups"]["shared-group"] == [2]
-    assert captured["dormant-shots"]["units"]["dormant"] == [2]
+    assert "dormant-shots" not in captured
 
     live = _reference_chip(
         "live-shots", {"semantic_unit_ids": ["staged"]},
@@ -668,17 +678,19 @@ def test_duplicate_global_ids_keep_blockers_attached_to_rendered_chip():
                    if row["attachment_id"] == rendered_id)
 
 
-def test_partial_and_physical_output_and_dormant_summary_survive():
+def test_partial_and_physical_output_survive_while_dormant_summary_disappears():
     partial = _reference_chip(
         "partial", {"semantic_unit_ids": ["staged", "dormant"]},
         {"definition": "the authored subject",
-         "text": "PARTIAL MENTION SURVIVES"},
-        capabilities=("definitions", "mentions"))
+         "text": "PARTIAL MENTION SURVIVES",
+         "summary": "PARTIAL SUMMARY SURVIVES"},
+        capabilities=("definitions", "mentions", "summary"))
     physical = _reference_chip(
         "physical", {"semantic_unit_ids": ["dormant"],
                      "picture_ids": ["staged-member"]},
-        {"definition": "the staged physical picture"},
-        capabilities=("definitions",))
+        {"definition": "the staged physical picture",
+         "summary": "PHYSICAL SUMMARY SURVIVES"},
+        capabilities=("definitions", "summary"))
     summary = _reference_chip(
         "summary", {"semantic_unit_ids": ["dormant"]},
         {"task_types": ["reference generation"],
@@ -719,11 +731,77 @@ def test_partial_and_physical_output_and_dormant_summary_survive():
     assert "<Subject 1> is the authored subject" in compiled["prompt"]
     assert "PARTIAL MENTION SURVIVES" in compiled["prompt"]
     assert "<Picture 1> is the staged physical picture" in compiled["prompt"]
+    assert "PARTIAL SUMMARY SURVIVES" in compiled["prompt"]
+    assert "PHYSICAL SUMMARY SURVIVES" in compiled["prompt"]
     assert "[reference generation]" in compiled["prompt"]
-    assert "DORMANT SUMMARY SURVIVES" in compiled["prompt"]
-    assert not any(row["state"] == "dormant"
-                   for row in compiled["attachment_capability_projections"]
-                   if row["attachment_id"] in {"partial", "physical", "summary"})
+    assert "DORMANT SUMMARY SURVIVES" not in compiled["prompt"]
+    states = {row["attachment_id"]: row["state"] for row in
+              compiled["attachment_capability_projections"]}
+    assert states["partial"] == "emitted"
+    assert states["physical"] == "emitted"
+    assert states["summary"] == "dormant"
+
+
+def test_dormant_explicit_task_set_cannot_suppress_live_role_derivation():
+    dormant = _reference_chip(
+        "dormant-task", {"semantic_unit_ids": ["dormant"]},
+        {"task_types": ["video editing"], "summary": "DORMANT TASK"},
+        capabilities=("summary",))
+    live = _reference_chip(
+        "live-task", {"semantic_unit_ids": ["staged"]},
+        {"summary": "LIVE TASK"}, capabilities=("summary",))
+
+    compiled = _identity_dormancy_fixture(global_chips=[dormant, live])
+
+    assert "[reference generation] LIVE TASK" in compiled["prompt"]
+    assert "video editing" not in compiled["prompt"]
+    assert "DORMANT TASK" not in compiled["prompt"]
+    states = {row["attachment_id"]: row["state"] for row in
+              compiled["attachment_capability_projections"]}
+    assert states["dormant-task"] == "dormant"
+    assert states["live-task"] == "emitted"
+
+
+def test_copy_of_dormant_summary_keeps_its_own_authored_task_set():
+    dormant = _reference_chip(
+        "dormant-copy", {"semantic_unit_ids": ["dormant"]},
+        {"task_types": ["video editing"], "summary": "DORMANT COPY BODY"},
+        capabilities=("summary",))
+    live = _reference_chip(
+        "live-copy", {"semantic_unit_ids": ["staged"]},
+        {"task_types": ["audio reference"], "summary": "LIVE"},
+        capabilities=("summary",))
+
+    compiled = _identity_dormancy_fixture(
+        global_chips=[dormant, live],
+        copy_plan_for={"attachment_id": "dormant-copy",
+                       "capability_id": "summary"})
+
+    assert "[audio reference] LIVE" in compiled["prompt"]
+    copied = "\n".join(
+        part.get("text", "")
+        for row in compiled["copy_plan"]["lines"]
+        for part in row.get("parts") or [])
+    assert "video editing" in copied
+    assert "DORMANT COPY BODY" in copied
+    assert "audio reference" not in copied
+
+
+def test_fully_excluded_dormant_global_reports_only_not_inherited():
+    dormant = _reference_chip(
+        "excluded-dormant", {"semantic_unit_ids": ["dormant"]},
+        {"summary": "EXCLUDED DORMANT"}, capabilities=("summary",))
+
+    compiled = _identity_dormancy_fixture(
+        global_chip=dormant, section_global_exceptions=["summary"])
+
+    projection = next(row for row in compiled[
+        "attachment_capability_projections"]
+        if row["attachment_id"] == "excluded-dormant")
+    assert projection["state"] == "not_inherited"
+    assert not any(row["code"] == "reference_source_dormant"
+                   and row.get("attachment_id") == "excluded-dormant"
+                   for row in compiled["warnings"])
 
 
 # --------------------------------------------------------------------------
@@ -3395,6 +3473,162 @@ def test_excluded_global_summary_cannot_consume_section_prefix():
     assert "[reference generation + audio reference] SECTION" in compiled["prompt"]
 
 
+def test_excluded_global_summary_never_owns_output_or_diagnostics():
+    _entity, _resolved, _units, context = _summary_union_fixture()
+    global_chip = _reference_chip(
+        "global", {"semantic_unit_ids": ["u"]},
+        {"summary": "GLOBAL @Missing", "task_types": ["video editing"]},
+        capabilities=("summary",), group="shared")
+    section_chip = _reference_chip(
+        "section", {"semantic_unit_ids": ["u"]},
+        {"summary": "SECTION", "task_types": ["keyframe completion"]},
+        capabilities=("summary",), group="shared")
+    compiled = prompt_context.compile_prompt_context(
+        global_attachments=[global_chip],
+        sections=[PromptSection(
+            0, WINDOW_END, channels={"detailed_description": "scene"},
+            attachments=[section_chip], global_channel_exceptions=["summary"])],
+        window_start=0, window_end=WINDOW_END, fps=24,
+        template="minimax_h3_ref", profile="minimax_h3_ref@1", context=context)
+
+    assert "GLOBAL" not in compiled["prompt"]
+    assert "video editing" not in compiled["prompt"]
+    assert "[keyframe completion] SECTION" in compiled["prompt"]
+    assert not any(row["code"] in {
+        "conflicting_emission", "unresolved_handle_mention"}
+        and row.get("attachment_id") == "global"
+        for row in [*compiled["warnings"], *compiled["errors"]])
+    global_projection = next(
+        row for row in compiled["attachment_capability_projections"]
+        if row["attachment_id"] == "global")
+    assert global_projection["state"] == "not_inherited"
+    assert "inherits the global summary channel" in global_projection[
+        "state_reason"].lower()
+    assert not [row for row in compiled["emissions"]
+                if row["attachment_id"] == "global"]
+    assert "global" not in compiled["attachment_channel_routes"]
+    assert "global" not in compiled["attachment_previews"]
+    assert "GLOBAL" not in compiled["relay"]["global_prompt"]
+    section_projection = next(
+        row for row in compiled["attachment_capability_projections"]
+        if row["attachment_id"] == "section")
+    assert section_projection["state"] == "emitted"
+
+
+def test_global_summary_emits_once_when_any_effective_section_inherits():
+    _entity, _resolved, _units, context = _summary_union_fixture()
+    global_chip = _reference_chip(
+        "global", {"semantic_unit_ids": ["u"]},
+        {"summary": "GLOBAL"}, capabilities=("summary",))
+    compiled = prompt_context.compile_prompt_context(
+        global_attachments=[global_chip],
+        sections=[
+            PromptSection(0, 50, channels={"detailed_description": "first"},
+                          global_channel_exceptions=["summary"]),
+            PromptSection(50, 100, channels={"detailed_description": "second"}),
+        ],
+        window_start=0, window_end=100, fps=24,
+        template="minimax_h3_ref", profile="minimax_h3_ref@1", context=context)
+
+    assert compiled["prompt"].count("GLOBAL") == 1
+    projection = next(row for row in compiled[
+        "attachment_capability_projections"] if row["attachment_id"] == "global")
+    assert projection["state"] == "emitted"
+    assert "GLOBAL" in compiled["relay"]["global_prompt"]
+
+
+def test_boundary_dropped_inheritor_cannot_keep_global_capability_active():
+    _entity, _resolved, _units, context = _summary_union_fixture()
+    global_chip = _reference_chip(
+        "global", {"semantic_unit_ids": ["u"]},
+        {"summary": "GLOBAL"}, capabilities=("summary",))
+    compiled = prompt_context.compile_prompt_context(
+        global_attachments=[global_chip],
+        sections=[
+            PromptSection(0, 90, channels={"detailed_description": "first"},
+                          global_channel_exceptions=["summary"]),
+            PromptSection(90, 190, channels={"detailed_description": "spill"}),
+        ],
+        window_start=0, window_end=100, fps=24, boundary_threshold_pct=20,
+        template="minimax_h3_ref", profile="minimax_h3_ref@1", context=context)
+
+    assert "GLOBAL" not in compiled["prompt"]
+    projection = next(row for row in compiled[
+        "attachment_capability_projections"] if row["attachment_id"] == "global")
+    assert projection["state"] == "not_inherited"
+
+
+def test_inert_attachment_only_section_does_not_vote_on_global_inheritance():
+    _entity, _resolved, _units, context = _summary_union_fixture()
+    global_chip = _reference_chip(
+        "global", {"semantic_unit_ids": ["u"]},
+        {"summary": "GLOBAL"}, capabilities=("summary",))
+    inert = _reference_chip(
+        "inert", {"semantic_unit_ids": ["u"]},
+        {"summary": "INERT"}, capabilities=("summary",))
+    inert["capabilities"][0]["enabled"] = False
+    compiled = prompt_context.compile_prompt_context(
+        global_attachments=[global_chip],
+        sections=[PromptSection(
+            0, WINDOW_END, attachments=[inert],
+            global_channel_exceptions=["summary"])],
+        window_start=0, window_end=WINDOW_END, fps=24,
+        template="minimax_h3_ref", profile="minimax_h3_ref@1", context=context)
+
+    assert "GLOBAL" in compiled["prompt"]
+    projection = next(row for row in compiled[
+        "attachment_capability_projections"] if row["attachment_id"] == "global")
+    assert projection["state"] == "emitted"
+
+
+def test_sparse_inherited_disabled_attachment_does_not_vote_on_global_inheritance():
+    _entity, _resolved, _units, context = _summary_union_fixture()
+    context["semantic_units"][0]["disabled_capabilities"] = ["summary"]
+    global_chip = _reference_chip(
+        "global", {"semantic_unit_ids": ["u"]},
+        {"summary": "GLOBAL"}, capabilities=("summary",))
+    global_chip["capabilities"][0]["enabled"] = True
+    inherited_disabled = _reference_chip(
+        "inherited-disabled", {"semantic_unit_ids": ["u"]},
+        {"summary": "INERT"}, capabilities=("summary",))
+    inherited_disabled["capabilities"][0].pop("enabled", None)
+    compiled = prompt_context.compile_prompt_context(
+        global_attachments=[global_chip],
+        sections=[PromptSection(
+            0, WINDOW_END, attachments=[inherited_disabled],
+            global_channel_exceptions=["summary"])],
+        window_start=0, window_end=WINDOW_END, fps=24,
+        template="minimax_h3_ref", profile="minimax_h3_ref@1", context=context)
+
+    assert "GLOBAL" in compiled["prompt"]
+    projections = {row["attachment_id"]: row for row in compiled[
+        "attachment_capability_projections"]}
+    assert projections["global"]["state"] == "emitted"
+    assert "inherited-disabled" not in projections
+    assert compiled["section_window_states"][0]["state"] == "empty"
+
+
+def test_attachment_wide_blocker_overrides_not_inherited_projection():
+    _entity, _resolved, _units, context = _summary_union_fixture()
+    global_chip = _reference_chip(
+        "global", {"semantic_unit_ids": ["u"]},
+        {"summary": "GLOBAL"}, capabilities=("summary",))
+    global_chip["provider_id"] = "unsupported"
+    compiled = prompt_context.compile_prompt_context(
+        global_attachments=[global_chip],
+        sections=[PromptSection(
+            0, WINDOW_END, channels={"detailed_description": "scene"},
+            global_channel_exceptions=["summary"])],
+        window_start=0, window_end=WINDOW_END, fps=24,
+        template="minimax_h3_ref", profile="minimax_h3_ref@1", context=context)
+
+    assert any(row["code"] == "unsupported_attachment_provider"
+               for row in compiled["errors"])
+    projection = next(row for row in compiled[
+        "attachment_capability_projections"] if row["attachment_id"] == "global")
+    assert projection["state"] == "unresolved"
+
+
 @pytest.mark.parametrize("global_scope", [False, True])
 def test_h3_summary_prefix_follows_final_order_not_inline_render_order(global_scope):
     _entity, _resolved, _units, context = _summary_union_fixture()
@@ -3446,7 +3680,7 @@ def test_h3_scope_inline_owns_prefix_before_document_inline(global_scope, scope_
     assert projections["scope"]["order"] < projections["inline"]["order"]
 
 
-def test_empty_former_global_inheritor_cannot_remove_h3_prefix():
+def test_live_prefix_only_inheritor_keeps_global_summary_applicable():
     _entity, _resolved, _units, context = _summary_union_fixture()
     def chip(name, prose):
         return _reference_chip(name, {"semantic_unit_ids": ["u"]},
@@ -3458,5 +3692,5 @@ def test_empty_former_global_inheritor_cannot_remove_h3_prefix():
                                 global_channel_exceptions=["summary"])],
         window_start=0, window_end=100, fps=24,
         template="minimax_h3_ref", profile="minimax_h3_ref@1", context=context)
-    assert "GLOBAL" not in compiled["prompt"]
-    assert "[reference generation + audio reference] SECOND" in compiled["prompt"]
+    assert "[reference generation + audio reference] GLOBAL. SECOND" in compiled["prompt"]
+    assert compiled["prompt"].count("GLOBAL") == 1

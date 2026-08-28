@@ -6059,6 +6059,39 @@ console.log(JSON.stringify({{
     assert 'String(consumerSection.prompt_id || "section") : "global"' in widget
 
 
+def test_not_inherited_projection_uses_generic_non_emitting_presentation():
+    chips_path = ROOT / "web/js/prompt_context_chips.js"
+    result = _run_node(f"""
+const {{channelContributionRows}} = await import({json.dumps(chips_path.as_uri())});
+const attachment = {{
+  attachment_id:"global",emission_group_id:"global",kind:"reference",enabled:true,
+  source:{{}},config:{{}},capabilities:[{{capability_id:"summary",kind:"summary",enabled:true}}],
+}};
+const reason = "No effective prompt section in this window inherits the global Summary channel.";
+const candidate = {{attachment_capability_projections:[{{
+  attachment_id:"global",emission_group_id:"global",capability_id:"summary",
+  channel_key:"summary",origin:"global",state:"not_inherited",
+  state_reason:reason,text:"",region:"before",order:0,
+}}]}};
+const row = channelContributionRows({{
+  channelKey:"summary",attachments:[attachment],candidate,origin:"global",
+}})[0];
+console.log(JSON.stringify({{
+  state:row.state,emitting:row.emitting,resolved:row.resolved,reason:row.reason,
+}}));
+""")
+    assert result == {
+        "state": "not_inherited",
+        "emitting": False,
+        "resolved": (
+            "No effective prompt section in this window inherits the global "
+            "Summary channel."),
+        "reason": (
+            "No effective prompt section in this window inherits the global "
+            "Summary channel."),
+    }
+
+
 @pytest.mark.parametrize("global_scope", [False, True])
 def test_real_prompt_save_preserves_remote_sibling_and_revision_owned_undo(global_scope):
     widget = _source("web/js/editor_widget.js")

@@ -117,6 +117,20 @@ def section_inherits_global(section, key) -> bool:
     return str(key) not in set(raw or ())
 
 
+def global_channel_inherited(segments, key) -> bool:
+    """Whether a window's effective segments admit one global channel.
+
+    No effective segments means the global prompt stands alone. Otherwise the
+    channel emits once when any surviving segment inherits it. Prompt Context
+    calls this before capability validation/rendering; the range composer calls
+    the same helper when merging authored global channels.
+    """
+    values = list(segments or [])
+    if not values:
+        return True
+    return any(section_inherits_global(segment, key) for segment in values)
+
+
 def merge_channels(existing, incoming) -> dict:
     """Apply an incoming channel patch over a section's stored channels.
 
@@ -486,7 +500,8 @@ def compose_range_prompt(global_text, sections, window_start, window_end,
                          labels_on=True, delimiter=DEFAULT_SECTION_DELIMITER,
                          boundary_threshold_pct=0.0, template=None,
                          fps=0.0, global_channels=None,
-                         resolved_segments=None) -> str:
+                         resolved_segments=None,
+                         global_channel_applicability=None) -> str:
     """THE single-string composer: global + ALL window segments, joined by the
     section-seam delimiter. Used by the Scene selectors, the queue handlers'
     frozen-prompt compose, and the dormant summary.
@@ -507,6 +522,10 @@ def compose_range_prompt(global_text, sections, window_start, window_end,
     `fps` is consumed by shot-marker timestamps and is inert for a template
     that declares no shot-marker channel. `resolved_segments`, when supplied,
     is a read-only result from `resolve_segments` for these exact arguments.
+    `global_channel_applicability`, when supplied, is the compiler's map from
+    the same preliminary effective-segment resolution used before attachment
+    validation. It keeps final composition from inventing a second answer after
+    ownership or empty rendering removes a section's eventual prose.
     """
     resolved = resolve_template(template)
     effective_labels = channel_templates.template_labels_on(resolved, labels_on)
@@ -515,6 +534,11 @@ def compose_range_prompt(global_text, sections, window_start, window_end,
         boundary_threshold_pct, resolved)
         if resolved_segments is None else list(resolved_segments))
     global_part = str(global_text or "").strip()
+
+    def _global_channel_inherited(key):
+        if isinstance(global_channel_applicability, dict):
+            return bool(global_channel_applicability.get(str(key or ""), True))
+        return global_channel_inherited(segments, key)
     # A template with global channels OFF has one global box, so there is no
     # channel to merge into and the text leads the whole payload.
     per_channel_global = (
@@ -538,21 +562,14 @@ def compose_range_prompt(global_text, sections, window_start, window_end,
             if text)
         if derived:
             global_part = derived
-
-    def _any_segment_inherits(key):
-        """Emit-once-if-any: a global channel appears at the head of its own
-        channel exactly once, provided at least one segment the window actually
-        reaches still inherits it.
-
-        Repeating it per inheriting section would print a style opening several
-        times over; emitting it regardless would make the per-section checkbox
-        do nothing on a full-scene render. This reading keeps it meaningful
-        exactly where it is used — rendering one section at a time, where
-        opting out drops the global text entirely.
-        """
-        if not segments:
-            return True
-        return any(section_inherits_global(segment, key) for segment in segments)
+    elif per_channel_global and global_channels:
+        # Labels-off composition and the no-section fallback both consume the
+        # flat mirror. Rebuild it from applicable channels so neither path can
+        # bypass the compiler-supplied applicability authority.
+        global_part = " ".join(
+            text for key in global_keys
+            for text in [str((global_channels or {}).get(key) or "").strip()]
+            if text and _global_channel_inherited(key))
 
     def _channel_texts(key):
         if key and key == shot_channel:
@@ -573,12 +590,12 @@ def compose_range_prompt(global_text, sections, window_start, window_end,
                 # ahead of [Shot 1] inside detailed_description, where its
                 # guide wants it, instead of before the first field name.
                 lead = str((global_channels or {}).get(key) or "").strip()
-                if lead and not _any_segment_inherits(key):
+                if lead and not _global_channel_inherited(key):
                     lead = ""
                 if lead:
                     texts = [lead] + texts
                 elif (global_part and not global_channels and not parts
-                        and _any_segment_inherits(key)):
+                        and _global_channel_inherited(key)):
                     # No per-channel global authored: fall back to the flat
                     # global text at the head of the first emitted field, which
                     # is still inside a field rather than ahead of one.
@@ -615,17 +632,21 @@ def compose_range_prompt(global_text, sections, window_start, window_end,
                     texts.append(text)
         else:
             texts = [s["text"] for s in segments]
-        if per_channel_global and global_part and _any_segment_inherits(lead_key):
+        if (per_channel_global and global_part
+                and (bool(global_channels)
+                     or _global_channel_inherited(lead_key))):
             texts = [global_part] + texts
         section_text = join_segment_texts(texts, delimiter)
 
     if per_channel_global:
         # Already merged above — unless nothing composed, in which case the
         # global text is the whole payload rather than being dropped.
-        return section_text or global_part
+        return section_text or (
+            global_part if (bool(global_channels)
+                            or _global_channel_inherited(lead_key)) else "")
     # Leading merge: ONE global text ahead of everything, so the opt-out that
     # matters is the one on the template's first (and only) global channel.
-    if global_part and not _any_segment_inherits(lead_key):
+    if global_part and not _global_channel_inherited(lead_key):
         global_part = ""
     return " ".join(part for part in (global_part, section_text) if part)
 

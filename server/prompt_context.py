@@ -4022,6 +4022,22 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     errors.extend(attachment_limit_errors(
         scene_attachments, origins=scene_attachment_origins))
 
+    context["semantic_units_by_id"] = {
+        unit["semantic_unit_id"]: unit
+        for unit in (normalize_semantic_unit(value)
+                     for value in context.get("semantic_units") or [])
+    }
+
+    # Resolve sparse capability enablement before the preliminary segment vote.
+    # Otherwise a capability disabled by its shared Reference/identity default
+    # can make an attachment-only section exclude a global channel even though
+    # that section is inert everywhere downstream. Storage remains untouched.
+    for attachment in scene_attachments:
+        for capability in attachment.get("capabilities") or []:
+            if "enabled" not in capability:
+                capability["enabled"] = _inherited_capability_enabled(
+                    attachment, capability, context)
+
     # Determine the effective segment origins before validating or rendering
     # section-owned Context.  Out-of-window chips are dormant for this job and
     # must not block it or claim a Prompt Link fallback.  A private sentinel
@@ -4038,7 +4054,16 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     section_states = []
     for section in raw_sections:
         mirrors = channel_document_mirrors(section["channel_docs"])
-        has_attachment = any(value["enabled"] for value in section["attachments"])
+        # A preserved chip whose every capability is disabled is inert and must
+        # not make an otherwise empty section an effective global-inheritance
+        # voter. Enabled capability records still keep attachment-only sections
+        # in the resolver, even when their eventual text is empty.
+        has_attachment = any(
+            value["enabled"] and any(
+                capability.get("enabled", True)
+                for capability in _resolved_capabilities(
+                    value, resolved_profile))
+            for value in section["attachments"])
         has_text = any(str(mirrors.get(key) or "").strip() for key in keys)
         # Same predicate the sentinel below fires on, deliberately: whatever
         # counts as "this section has authored text" must be one answer, or a
@@ -4062,6 +4087,25 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         preliminary, window_start, window_end,
         prompt_channel_templates.template_labels_on(resolved_template, labels_on),
         boundary_threshold_pct, resolved_template)
+    global_channel_inheritance = {
+        key: prompt_payload.global_channel_inherited(preliminary_segments, key)
+        for key in keys
+    }
+    global_channel_labels = {
+        str(row.get("key") or ""): str(row.get("label") or row.get("key") or "")
+        for row in resolved_template.get("channels") or []
+        if isinstance(row, dict) and str(row.get("key") or "")
+    }
+
+    def global_channel_is_inherited(channel_key) -> bool:
+        return bool(global_channel_inheritance.get(str(channel_key or ""), True))
+
+    def global_not_inherited_reason(channel_key) -> str:
+        key = str(channel_key or "")
+        label = global_channel_labels.get(key) or key or "selected"
+        return (f"No effective prompt section in this window inherits the global "
+                f"{label} channel, so this contribution stays out of the prompt.")
+
     selected_prompt_ids = {str(value.get("prompt_id") or "")
                            for value in preliminary_segments}
     selected_sections = [value for value in raw_sections
@@ -4108,20 +4152,64 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     all_attachments = [attachment for attachment, _origin
                        in all_attachment_origins]
     global_anchor_capability_ids = defaultdict(set)
-    for document in global_docs.values():
+    global_capability_routes = defaultdict(set)
+    global_by_id_for_routes = {
+        attachment["attachment_id"]: attachment
+        for attachment in global_attachment_values
+    }
+    for anchor_channel, document in global_docs.items():
         for node in document.get("nodes") or []:
             if node.get("type") != "attachment":
                 continue
             attachment_id = str(node.get("attachment_id") or "")
             if attachment_id:
+                selected_capability_id = str(node.get("capability_id") or "")
                 global_anchor_capability_ids[attachment_id].add(
-                    str(node.get("capability_id") or ""))
+                    selected_capability_id)
+                attachment = global_by_id_for_routes.get(attachment_id)
+                if attachment is None:
+                    continue
+                capabilities = _capabilities(attachment, resolved_profile)
+                if selected_capability_id:
+                    capabilities = [
+                        capability for capability in capabilities
+                        if str(capability.get("capability_id") or "")
+                        == selected_capability_id
+                    ]
+                if not capabilities and not attachment.get("capabilities"):
+                    capabilities = [_default_capability(
+                        attachment, resolved_profile)]
+                for capability in capabilities:
+                    capability_id = str(capability.get("capability_id") or "")
+                    global_capability_routes[
+                        (attachment_id, capability_id)].add(_route_for(
+                            attachment, capability, resolved_profile,
+                            anchor_channel))
+
+    for attachment in global_attachment_values:
+        if attachment["attachment_id"] in global_anchor_capability_ids:
+            continue
+        for capability in _capabilities(attachment, resolved_profile):
+            global_capability_routes[
+                (attachment["attachment_id"], str(
+                    capability.get("capability_id") or ""))].add(_route_for(
+                        attachment, capability, resolved_profile,
+                        keys[0] if keys else "visual"))
 
     def global_capability_selected(attachment, capability) -> bool:
         selected = global_anchor_capability_ids.get(
             attachment["attachment_id"])
         return (selected is None or "" in selected
                 or str(capability.get("capability_id") or "") in selected)
+
+    def global_capability_effective(attachment, capability) -> bool:
+        if not global_capability_selected(attachment, capability):
+            return False
+        routes = global_capability_routes.get((
+            attachment["attachment_id"],
+            str(capability.get("capability_id") or ""))) or set()
+        return any(route not in keys or global_channel_is_inherited(route)
+                   for route in routes)
 
     blocked_global_reference_attachment_ids = {
         attachment["attachment_id"]
@@ -4151,6 +4239,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
 
     def warn_authored_prompt_tokens(origin, documents):
         for channel_key, document in (documents or {}).items():
+            if origin == "global" and not global_channel_is_inherited(channel_key):
+                continue
             text = prompt_document_text(document)
             if not prompt_tokens.find(text):
                 continue
@@ -4165,6 +4255,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     def warn_authored_ordinal_literals(origin, documents):
         """Disclose provider ordinals pasted into durable authored prose."""
         for channel_key, document in (documents or {}).items():
+            if origin == "global" and not global_channel_is_inherited(channel_key):
+                continue
             text = prompt_document_text(document)
             found = authored_ordinal_literals(text, resolved_profile, context)
             if not found:
@@ -4188,11 +4280,6 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         warn_authored_prompt_tokens(
             section.get("prompt_id", ""), section.get("channel_docs") or {})
 
-    context["semantic_units_by_id"] = {
-        unit["semantic_unit_id"]: unit
-        for unit in (normalize_semantic_unit(value)
-                     for value in context.get("semantic_units") or [])
-    }
     for unit in context["semantic_units_by_id"].values():
         legacy_voice = (unit.get("voice")
                         if isinstance(unit.get("voice"), dict) else {})
@@ -4207,18 +4294,6 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 "as a physical source when the repair action is available."),
         })
 
-    # Resolve the tri-state capability `enabled` ONCE, into the in-memory
-    # compile only. Storage stays sparse — absent means inherit the shared
-    # Reference/identity default — while every downstream reader keeps its plain
-    # `capability["enabled"]` boolean. Resolving per read site instead would
-    # thread this context through a dozen render helpers that have no business
-    # knowing about Reference defaults. Must run after `semantic_units_by_id`
-    # and before the first capability read.
-    for attachment in [*global_attachment_values, *scene_attachments]:
-        for capability in attachment.get("capabilities") or []:
-            if "enabled" not in capability:
-                capability["enabled"] = _inherited_capability_enabled(
-                    attachment, capability, context)
     profile_validator_ids = {
         str(value) for value in resolved_profile.get("validators") or []
         if isinstance(value, str)
@@ -4257,37 +4332,6 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     # context, including when the next compile resolves a non-H3 profile.
     context.pop("h3_summary_task_types", None)
     h3_summary_prefixes = defaultdict(list)  # Derived markers, never authored text.
-    if is_h3_reference_profile:
-        # Only the summary prefix is a singleton; prose belongs to each group.
-        # Collect explicit selections across the
-        # effective window before any chip renders, so each chip sees the same
-        # canonical prefix instead of whichever chip happened to compile first.
-        # The window scope deliberately matches role-derived task types.
-        explicit_summary_task_types = []
-        has_explicit_summary_task_types = False
-        for attachment in all_attachments:
-            if (not attachment.get("enabled", True)
-                    or attachment.get("kind") != "reference"):
-                continue
-            for capability in _enabled_capabilities(
-                    attachment, resolved_profile):
-                kind = str(capability.get("kind")
-                           or capability.get("capability_id") or "")
-                if kind != "summary":
-                    continue
-                config = effective_reference_config(
-                    attachment, capability, context)
-                values = config.get("task_types")
-                if not isinstance(values, list):
-                    continue
-                normalized = [str(value or "").strip()
-                              for value in values if str(value or "").strip()]
-                if normalized:
-                    has_explicit_summary_task_types = True
-                    explicit_summary_task_types.extend(normalized)
-        if has_explicit_summary_task_types:
-            context["h3_summary_task_types"] = _minimax_task_types(
-                context, explicit_summary_task_types, resolved_profile)
     if is_h3_reference_profile:
         for event in vocal_events:
             source = event["attachment"].get("source") or {}
@@ -4436,12 +4480,17 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 attachment, raw_capability, resolved_profile)
             if not capability.get("enabled", True):
                 continue
+            route = _route_for(
+                attachment, capability, resolved_profile,
+                keys[0] if keys else "visual")
+            actual_global_routes = global_capability_routes.get((
+                attachment["attachment_id"],
+                str(capability.get("capability_id") or ""))) or {route}
             if (attachment_origin == "global"
                     and attachment["kind"] == "reference"
                     and global_capability_selected(attachment, capability)
-                    and _route_for(
-                        attachment, capability, resolved_profile,
-                        keys[0] if keys else "visual") not in keys):
+                    and any(value not in keys
+                            for value in actual_global_routes)):
                 # Rendering reports the route error with the projection that
                 # owns it. Record only precedence here, before dormancy
                 # warnings are finalized, so the later blocker cannot coexist
@@ -4458,11 +4507,19 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                                 "not declared by this build; choose a supported placement."),
                 })
                 continue
+            if (attachment_origin == "global"
+                    and not global_capability_effective(
+                        attachment, capability)):
+                continue
             if attachment["kind"] == "reference":
                 errors.extend(reference_capability_errors(
                     attachment, capability, context))
         if attachment["kind"] == "custom":
             for capability in _enabled_capabilities(attachment, resolved_profile):
+                if (attachment_origin == "global"
+                        and not global_capability_effective(
+                            attachment, capability)):
+                    continue
                 errors.extend(custom_capability_errors(
                     attachment, capability, resolved_profile))
         for diagnostic in errors[attachment_error_count:]:
@@ -4885,6 +4942,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                         or attachment["kind"] != "reference"
                         or not capability.get("enabled", True)
                         or channel not in keys
+                        or not global_channel_is_inherited(channel)
                         or reference_capability_errors(
                             attachment, capability,
                             {**context, "origin": "global",
@@ -4898,8 +4956,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                     **context, "origin": "global", "channel_key": channel,
                     "profile": resolved_profile, "adjacent_raw_text": "",
                 }
-                if (capability_kind in {"mentions", "audio_relationship"}
-                        and attachment["attachment_id"]
+                if (attachment["attachment_id"]
                         not in blocked_global_reference_attachment_ids
                         and reference_chip_dormant(
                             attachment, render_context)):
@@ -4962,6 +5019,46 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
 
     prevalidated_prompt_token_diagnostics = set()
     if is_h3_reference_profile:
+        # Only the Summary prefix is a singleton; prose belongs to each group.
+        # Collect explicit selections after genuine attachment/source/config
+        # blockers have established precedence, but before the render preflight
+        # needs the canonical task set. A fully dormant global chip has no
+        # capability contribution, so its explicit set cannot suppress role
+        # derivation or a live contributor's explicit selection.
+        explicit_summary_task_types = []
+        has_explicit_summary_task_types = False
+        for attachment, attachment_origin in all_attachment_origins:
+            if (not attachment.get("enabled", True)
+                    or attachment.get("kind") != "reference"):
+                continue
+            if (attachment_origin == "global"
+                    and attachment["attachment_id"]
+                    not in blocked_global_reference_attachment_ids
+                    and reference_chip_dormant(attachment, context)):
+                continue
+            for capability in _enabled_capabilities(
+                    attachment, resolved_profile):
+                if (attachment_origin == "global"
+                        and not global_capability_effective(
+                            attachment, capability)):
+                    continue
+                kind = str(capability.get("kind")
+                           or capability.get("capability_id") or "")
+                if kind != "summary":
+                    continue
+                config = effective_reference_config(
+                    attachment, capability, context)
+                values = config.get("task_types")
+                if not isinstance(values, list):
+                    continue
+                normalized = [str(value or "").strip()
+                              for value in values if str(value or "").strip()]
+                if normalized:
+                    has_explicit_summary_task_types = True
+                    explicit_summary_task_types.extend(normalized)
+        if has_explicit_summary_task_types:
+            context["h3_summary_task_types"] = _minimax_task_types(
+                context, explicit_summary_task_types, resolved_profile)
         preflight_global_reference_render_blockers()
         candidate_attachment_ids = {
             attachment_id for attachment_id, _unit_id, _identity_name
@@ -4976,7 +5073,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                               "profile": resolved_profile}
             for capability in _enabled_capabilities(
                     attachment, resolved_profile):
-                if not global_capability_selected(attachment, capability):
+                if not global_capability_effective(attachment, capability):
                     continue
                 value = _render_reference_capability(
                     attachment, capability, render_context)
@@ -4994,6 +5091,12 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         current_reference_origin = ""
         for attachment_id, unit_id, identity_name in dormant_identity_candidates:
             if attachment_id in blocked_global_reference_attachment_ids:
+                continue
+            attachment = global_by_id_for_routes.get(attachment_id)
+            if (attachment is None or not any(
+                    global_capability_effective(attachment, capability)
+                    for capability in _enabled_capabilities(
+                        attachment, resolved_profile))):
                 continue
             reference_warning(
                 "reference_source_dormant",
@@ -5023,6 +5126,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         """
         known = _handle_sources(context)
         for channel_key, document in (documents or {}).items():
+            if origin == "global" and not global_channel_is_inherited(channel_key):
+                continue
             unresolved = [f"@{row['handle']}" for row
                           in prompt_tokens.handle_mentions(
                               prompt_document_text(document))
@@ -5185,7 +5290,6 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 reason="This capability contains a value outside the Prompt Format vocabulary.")
             return ""
         if (attachment["kind"] == "reference" and origin == "global"
-                and capability_kind in {"mentions", "audio_relationship"}
                 and attachment["attachment_id"]
                 not in blocked_global_reference_attachment_ids
                 and reference_chip_dormant(attachment, render_context)):
@@ -5591,12 +5695,18 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             route = _route_for(attachment, capability, resolved_profile, channel_key)
             projection = record_capability_projection(
                 attachment, capability, route, "global", anchor_node_id)
+            if (not attachment.get("enabled", True)
+                    or not capability.get("enabled", True)):
+                continue
+            if route in keys and not global_channel_is_inherited(route):
+                set_projection_state(
+                    projection, "not_inherited",
+                    reason=global_not_inherited_reason(route))
+                continue
             if section_only:
                 # The validation pass already names the invalid global chip.
                 # Keep its projection discoverable, but never let it emit or
                 # claim a semantic owner before a valid section attachment.
-                continue
-            if not capability.get("enabled", True):
                 continue
             record_attachment_route(attachment, route, capability["placement"])
             if route == channel_key and capability["placement"] == "inline":
@@ -5637,6 +5747,11 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             projection = record_capability_projection(
                 attachment, capability, route, "global")
             if not capability.get("enabled", True):
+                continue
+            if route in keys and not global_channel_is_inherited(route):
+                set_projection_state(
+                    projection, "not_inherited",
+                    reason=global_not_inherited_reason(route))
                 continue
             record_attachment_route(attachment, route, capability["placement"])
             if route not in global_mirror:
@@ -6001,9 +6116,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 int(row.get("discovery", 0)))
 
     for channel, candidates in h3_summary_prefixes.items():
-        global_inherited = not summary_segments or any(
-            prompt_payload.section_inherits_global(segment, channel)
-            for segment in summary_segments)
+        global_inherited = global_channel_is_inherited(channel)
         global_candidates = [row for row in candidates if row["origin"] == "global"]
         surviving_ids = {row["prompt_id"] for row in summary_segments}
         eligible = [row for row in candidates if (
@@ -6062,12 +6175,19 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         expanded_sections, window_start, window_end,
         prompt_channel_templates.template_labels_on(resolved_template, labels_on),
         boundary_threshold_pct, resolved_template)
+    rendered_global_mirror = {
+        key: (value if global_channel_is_inherited(key) else "")
+        for key, value in global_mirror.items()
+    }
     final_prompt = prompt_payload.compose_range_prompt(
-        prompt_payload.compose_section_text(global_mirror, labels_on=False),
+        prompt_payload.compose_section_text(
+            rendered_global_mirror, labels_on=False),
         expanded_sections, window_start, window_end, labels_on=labels_on,
         delimiter=delimiter, boundary_threshold_pct=boundary_threshold_pct,
-        template=resolved_template, fps=fps, global_channels=global_mirror,
-        resolved_segments=segments)
+        template=resolved_template, fps=fps,
+        global_channels=rendered_global_mirror,
+        resolved_segments=segments,
+        global_channel_applicability=global_channel_inheritance)
     shot_markers = prompt_payload.resolve_shot_markers(segments, fps)
     channel_outputs = {
         key: prompt_payload.join_segment_texts(
@@ -6111,7 +6231,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     effective_values = {}
     for key in keys:
         values = []
-        global_value = str(global_mirror.get(key) or "").strip()
+        global_value = str(rendered_global_mirror.get(key) or "").strip()
         if global_value:
             values.append(global_value)
         values.extend(str(segment.get("channels", {}).get(key) or "").strip()
@@ -6169,7 +6289,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         target = warnings if severity == "warning" else errors
         channel_key = str(validator.get("channel_key") or "")
         channel_value = _join_emissions(
-            [global_mirror.get(channel_key, ""), channel_outputs.get(channel_key, "")],
+            [rendered_global_mirror.get(channel_key, ""),
+             channel_outputs.get(channel_key, "")],
             delimiter)
         failed = False
         default_message = "Prompt Context profile validation failed."
@@ -6199,7 +6320,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     # Prompt Relay's global input is a raw always-on prefix, historically
     # label-free even when local segments use labelled channels.
     relay_global = prompt_payload.compose_section_text(
-        global_mirror, labels_on=False, template=resolved_template)
+        rendered_global_mirror, labels_on=False, template=resolved_template)
     relay_manifest = prompt_payload.build_relay_payload(relay_global, segments)
     previews = defaultdict(list)
     channel_previews = defaultdict(lambda: defaultdict(list))
@@ -6291,7 +6412,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             ("", attachment_id, channel, ""),
             ("", attachment_id, "", ""),
         ))
-        if projection["state"] in {"empty", "deduplicated"} and blocked:
+        if projection["state"] in {
+                "empty", "deduplicated", "not_inherited"} and blocked:
             set_projection_state(
                 projection, "unresolved", projection.get("text", ""),
                 "A blocking diagnostic prevented this capability from resolving.")
@@ -6334,7 +6456,13 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     if copy_plan_for is not None:
         located = _locate_capability(
             copy_plan_for, global_attachments, sections, resolved_profile, keys)
-        copy_plan = (copy_capability_plan(located[0], located[1], context)
+        # Copy is an explicit author handoff for the selected capability, not a
+        # render. The scene-wide Summary task union is render scratch state and
+        # would replace this chip's own authored task selection with a peer's.
+        copy_context = dict(context)
+        copy_context.pop("h3_summary_task_types", None)
+        copy_plan = (copy_capability_plan(
+            located[0], located[1], copy_context)
                      if located else
                      {"lines": [], "frozen_static": [], "frozen_ordinal": [],
                       "refused": "That capability is not staged in this scene."})

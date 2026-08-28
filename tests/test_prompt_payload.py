@@ -295,6 +295,59 @@ def test_compose_range_prompt_with_pre_resolved_segments_is_byte_identical():
         sections, 0, 125, effective_labels, 10.0, template)
 
 
+def test_global_channel_inherited_is_emit_once_if_any_and_global_only_by_default():
+    assert pp.global_channel_inherited([], "summary") is True
+    excluded = [{"global_channel_exceptions": ["summary"]}]
+    assert pp.global_channel_inherited(excluded, "summary") is False
+    mixed = [*excluded, {"global_channel_exceptions": []}]
+    assert pp.global_channel_inherited(mixed, "summary") is True
+
+
+def test_composer_accepts_compiler_global_applicability_authority():
+    sections = [{
+        "start_frame": 0, "end_frame": 10,
+        "channels": {"visual": "local"},
+        "global_channel_exceptions": [],
+    }]
+    assert "GLOBAL" not in pp.compose_range_prompt(
+        "GLOBAL", sections, 0, 10, labels_on=False,
+        global_channels={"visual": "GLOBAL"},
+        global_channel_applicability={"visual": False})
+    assert pp.compose_range_prompt(
+        "GLOBAL", [], 0, 10, template="minimax_h3_ref",
+        global_channels={"summary": "GLOBAL"},
+        global_channel_applicability={"summary": False}) == ""
+    applicability = {
+        key: False for key in pct.global_channel_keys(
+            pct.get_channel_template("minimax_h3_ref"))
+    }
+    for global_channels in ({}, None):
+        assert pp.compose_range_prompt(
+            "GLOBAL", [], 0, 10, template="minimax_h3_ref",
+            global_channels=global_channels,
+            global_channel_applicability=applicability) == ""
+
+
+def test_labels_off_per_channel_keeps_later_applicable_global():
+    template = {
+        "id": "standard", "name": "Labels off per channel",
+        "channels": [{"key": "a", "label": "A:"},
+                     {"key": "b", "label": "B:"}],
+        "labels": "never", "global_merge": "per_channel",
+        "global_channels_enabled": True,
+    }
+    sections = [{
+        "prompt_id": "section", "start_frame": 0, "end_frame": 10,
+        "channels": {"a": "LOCAL", "b": ""},
+        "global_channel_exceptions": ["a"],
+    }]
+
+    assert pp.compose_range_prompt(
+        "A B", sections, 0, 10, template=template,
+        global_channels={"a": "A", "b": "B"},
+        global_channel_applicability={"a": False, "b": True}) == "B. LOCAL"
+
+
 # --- join + compose_range_prompt -------------------------------------------------
 
 def test_join_segment_texts():

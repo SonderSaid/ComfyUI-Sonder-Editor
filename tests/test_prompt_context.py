@@ -1793,3 +1793,26 @@ def test_per_channel_suppression_survives_a_transitive_link_chain():
     # the origin text must not arrive through the chain either.
     assert "origin text" not in compiled["prompt"]
     assert "middle text" in compiled["prompt"]
+
+
+def test_labels_off_later_global_matches_final_prompt_and_relay():
+    template = {
+        "id": "standard", "name": "Labels off per channel",
+        "channels": [{"key": "visual", "label": "Visual:"},
+                     {"key": "speech", "label": "Speech:"}],
+        "labels": "never", "global_merge": "per_channel",
+        "global_channels_enabled": True,
+        "default_context_profile": "generic@1",
+    }
+    compiled = prompt_context.compile_prompt_context(
+        global_channels={"visual": "A", "speech": "B"},
+        sections=[{
+            "prompt_id": "section", "start_frame": 0, "end_frame": 10,
+            "channels": {"visual": "LOCAL", "speech": ""},
+            "global_channel_exceptions": ["visual"],
+        }],
+        window_start=0, window_end=10, fps=24,
+        template=template, profile="generic@1")
+
+    assert compiled["prompt"] == "B. LOCAL"
+    assert compiled["relay"]["global_prompt"] == "B"

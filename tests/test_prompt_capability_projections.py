@@ -88,6 +88,93 @@ def test_disabled_output_limit_and_invalid_route_are_closed_states():
     }
 
 
+_ANCHORED_ENUM_PROFILE = {
+    "profile_id": "anchored-enum", "version": "1", "template_id": "sonder",
+    "writing_aids": [],
+    "capabilities": {"custom": {
+        "placement": "inline", "formatter": "The camera {motion}.",
+        "fields": {"motion": {"type": "enum",
+                              "values": ["pushes in", "pulls out"]}},
+    }},
+}
+
+
+def _compile_anchored_global_custom(*, exceptions, anchor_channels):
+    attachment = prompt_context.normalize_attachment({
+        "attachment_id": "global-custom", "kind": "custom",
+        "config": {"motion": "invalid"},
+        "capabilities": [{"capability_id": "custom", "kind": "custom",
+                          "placement": "inline"}],
+    })
+    documents = {
+        channel: {"nodes": [{
+            "type": "attachment", "node_id": f"anchor-{channel}",
+            "attachment_id": "global-custom", "capability_id": "custom",
+        }]}
+        for channel in anchor_channels
+    }
+    return prompt_context.compile_prompt_context(
+        global_documents=documents, global_attachments=[attachment],
+        sections=[{
+            "prompt_id": "section", "start_frame": 0, "end_frame": 10,
+            "channels": {"visual": "body"},
+            "global_channel_exceptions": list(exceptions),
+        }],
+        window_start=0, window_end=10, fps=24, template="sonder",
+        profile=_ANCHORED_ENUM_PROFILE)
+
+
+def test_anchored_global_applicability_uses_actual_anchor_route():
+    excluded_anchor = _compile_anchored_global_custom(
+        exceptions=["speech"], anchor_channels=["speech"])
+    assert not any(row["code"] == "invalid_custom_capability_field"
+                   for row in excluded_anchor["errors"])
+    assert excluded_anchor["attachment_capability_projections"][0][
+        "state"] == "not_inherited"
+
+    inherited_anchor = _compile_anchored_global_custom(
+        exceptions=["visual"], anchor_channels=["speech"])
+    assert any(row["code"] == "invalid_custom_capability_field"
+               for row in inherited_anchor["errors"])
+    assert inherited_anchor["attachment_capability_projections"][0][
+        "state"] == "emitted"
+
+
+def test_multi_anchor_global_capability_is_effective_when_any_anchor_is_inherited():
+    compiled = _compile_anchored_global_custom(
+        exceptions=["speech"], anchor_channels=["visual", "speech"])
+    assert any(row["code"] == "invalid_custom_capability_field"
+               for row in compiled["errors"])
+    states = {row["channel_key"]: row["state"]
+              for row in compiled["attachment_capability_projections"]}
+    assert states == {"visual": "emitted", "speech": "unresolved"}
+
+
+def test_enabled_empty_section_vote_is_shared_by_projection_and_composition():
+    global_attachment = _attachment("CAP", attachment_id="global")
+    empty_section_attachment = _attachment("", attachment_id="empty")
+    compiled = prompt_context.compile_prompt_context(
+        global_documents={"visual": {"nodes": [
+            {"type": "text", "node_id": "authored", "text": "AUTHORED "},
+            {"type": "attachment", "node_id": "global-anchor",
+             "attachment_id": "global", "capability_id": "custom"},
+        ]}},
+        global_attachments=[global_attachment],
+        sections=[{
+            "prompt_id": "empty-section", "start_frame": 0, "end_frame": 10,
+            "attachments": [empty_section_attachment],
+            "global_channel_exceptions": ["visual"],
+        }],
+        window_start=0, window_end=10, fps=24,
+        template="sonder", profile="generic@1")
+
+    global_projection = next(row for row in compiled[
+        "attachment_capability_projections"] if row["attachment_id"] == "global")
+    assert global_projection["state"] == "not_inherited"
+    assert compiled["prompt"] == ""
+    assert compiled["relay"]["global_prompt"] == ""
+
+
 def test_multi_anchor_identity_preserves_deduplicated_row():
     attachment = _attachment(attachment_id="multi", placement="inline")
     document = {"nodes": [
