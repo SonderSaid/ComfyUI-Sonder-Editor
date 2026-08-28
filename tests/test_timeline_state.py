@@ -830,14 +830,23 @@ def test_scene_get_prompt_for_range():
 
 
 def test_live_prompt_path_returns_text_for_warnings_but_not_integrity_errors(monkeypatch):
-    scene = Scene(global_attachments=[{"kind": "custom"}])
+    scene = Scene(global_attachments=[{
+        "kind": "reference",
+        "source": {"semantic_unit_ids": ["dormant"]},
+    }])
+    calls = []
 
-    monkeypatch.setattr(Scene, "compile_prompt_context", lambda self, *args, **kwargs: {
-        "prompt": "resolved live prompt",
-        "warnings": [{"code": "empty_channel"}],
-        "errors": [],
-    })
+    def dormant_result(self, *args, **kwargs):
+        calls.append((args, kwargs))
+        return {
+            "prompt": "resolved live prompt",
+            "warnings": [{"code": "reference_source_dormant"}],
+            "errors": [],
+        }
+
+    monkeypatch.setattr(Scene, "compile_prompt_context", dormant_result)
     assert scene.get_prompt_for_range(0, 24) == "resolved live prompt"
+    assert len(calls) == 1
 
     monkeypatch.setattr(Scene, "compile_prompt_context", lambda self, *args, **kwargs: {
         "prompt": "must not escape",

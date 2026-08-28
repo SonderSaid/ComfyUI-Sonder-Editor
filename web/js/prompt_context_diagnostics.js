@@ -20,6 +20,8 @@ export function buildPromptContextDiagnostics(payload) {
                 attachment_id: String(raw?.attachment_id || ""),
                 channel_key: String(raw?.channel_key || ""),
                 capability_id: String(raw?.capability_id || ""),
+                origin: String(raw?.origin || ""),
+                semantic_unit_id: String(raw?.semantic_unit_id || ""),
             };
             if (diagnostic.attachment_id) {
                 (byAttachment[diagnostic.attachment_id] ||= []).push(diagnostic);
@@ -60,9 +62,13 @@ export function buildPromptContextDiagnostics(payload) {
 
 // A whole-attachment chip shows all failures; individual capability pills only
 // show failures in their own scope. Missing diagnostic scope remains broad.
-export function promptCapabilityDiagnostics(rows, channelKey = "", capabilityId = "") {
-    if (!capabilityId) return rows;
-    return rows.filter((row) => (!row.channel_key || !channelKey || row.channel_key === channelKey)
+export function promptCapabilityDiagnostics(
+    rows, channelKey = "", capabilityId = "", origin = "",
+) {
+    const scoped = rows.filter((row) => !row.origin || !origin || row.origin === origin);
+    if (!capabilityId) return scoped;
+    return scoped.filter((row) =>
+        (!row.channel_key || !channelKey || row.channel_key === channelKey)
         && (!row.capability_id || row.capability_id === capabilityId));
 }
 

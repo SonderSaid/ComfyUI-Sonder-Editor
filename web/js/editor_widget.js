@@ -10247,6 +10247,8 @@ export class EditorWidget {
                 profileId: this.activeScene?.prompt_context_profile_id
                     || template.default_context_profile || "generic@1",
                 scope: consumerSection ? "section" : "global",
+                origin: consumerSection
+                    ? String(consumerSection.prompt_id || "section") : "global",
                 anchoredChannels: [key],
                 profile: this._resolvedPromptContextProfile(),
                 placementPhases: this._promptContextCatalog?.placement_phases || [],
@@ -10400,6 +10402,8 @@ export class EditorWidget {
                 const signature = attachmentChannelProjectionSignature({
                     channelKey: key, attachments: sharedAttachments,
                     candidate, attachmentLabelFor,
+                    origin: consumerSection
+                        ? String(consumerSection.prompt_id || "section") : "global",
                 });
                 if (signature === projectionSignatures[key]) continue;
                 const next = createAttachmentChannelProjections({
@@ -10407,6 +10411,8 @@ export class EditorWidget {
                     attachments: sharedAttachments,
                     candidate,
                     attachmentLabelFor,
+                    origin: consumerSection
+                        ? String(consumerSection.prompt_id || "section") : "global",
                     onActivate: async (attachment) => {
                         const configured = this._acceptPromptAttachmentConfiguration(
                             await configurePromptAttachment(attachment, {
@@ -10420,6 +10426,8 @@ export class EditorWidget {
                             profileId: this.activeScene?.prompt_context_profile_id
                                 || template.default_context_profile || "generic@1",
                             scope: consumerSection ? "section" : "global",
+                            origin: consumerSection
+                                ? String(consumerSection.prompt_id || "section") : "global",
                             anchoredChannels: anchoredChannelsFor(
                                 attachment.attachment_id),
                             // The WINDOWED payload, never `candidate` --
@@ -10519,6 +10527,8 @@ export class EditorWidget {
             profileId: this.activeScene?.prompt_context_profile_id
                 || template.default_context_profile || "generic@1",
             scope: consumerSection ? "section" : "global",
+            origin: consumerSection
+                ? String(consumerSection.prompt_id || "section") : "global",
             anchoredChannels: [],
             profile: this._resolvedPromptContextProfile(),
             placementPhases: this._promptContextCatalog?.placement_phases || [],

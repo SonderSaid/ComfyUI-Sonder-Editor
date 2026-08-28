@@ -4249,7 +4249,7 @@ export function referenceSummaryEmissionSignatures(value, {
 /** Bounded, deterministic attachment configuration. No provider prose is generated. */
 export function configurePromptAttachment(rawAttachment, {
     scene = null, references = [], semanticUnits = [], channelKey = "", profileId = "generic@1",
-    scope = "", profile = null, placementPhases = [], managedSpeakerSubjectIds = [],
+    scope = "", origin = "", profile = null, placementPhases = [], managedSpeakerSubjectIds = [],
     ordinalManifest = {}, candidate = null, anchoredChannels = [],
 } = {}) {
     const attachment = normalizePromptAttachment(rawAttachment);
@@ -4892,9 +4892,13 @@ export function configurePromptAttachment(rawAttachment, {
                         option.title = placementHelpFor(option.value);
                     }
                     const state = document.createElement("span");
+                    const projectionOrigin = String(
+                        origin || (scope === "global" ? "global" : ""));
                     const projection = (candidate?.attachment_capability_projections || [])
                         .filter((value) => value?.attachment_id === attachment.attachment_id
-                            && value?.capability_id === capabilityId)
+                            && value?.capability_id === capabilityId
+                            && (!value?.origin || !projectionOrigin
+                                || value.origin === projectionOrigin))
                         .sort((a, b) => Number(a?.order || 0) - Number(b?.order || 0))[0];
                     const projectionState = projection?.state === "linked_elsewhere"
                         ? "linked" : String(projection?.state || "pending");
@@ -5240,12 +5244,13 @@ export function createPromptProjectionBox(editor, beforeHost, afterHost) {
  * the registry is what made section-scoped chips anonymous.
  */
 export function channelContributionRows({ channelKey = "", attachments = [],
-    candidate = null, attachmentLabelFor = null } = {}) {
+    candidate = null, attachmentLabelFor = null, origin = "" } = {}) {
     const byId = new Map(normalizePromptAttachments(attachments)
         .map((value) => [value.attachment_id, value]));
     const rows = (candidate?.attachment_capability_projections || [])
         .filter((value) => value?.channel_key === channelKey
-            && byId.has(value?.attachment_id));
+            && byId.has(value?.attachment_id)
+            && (!value?.origin || !origin || value.origin === origin));
     if (!rows.length) return [];
     const regions = splitCapabilityProjectionsByRegion(rows);
     const out = [];
@@ -5278,17 +5283,19 @@ export function channelContributionRows({ channelKey = "", attachments = [],
 /** Everything `createAttachmentChannelProjections` reads, as one render key. */
 export function attachmentChannelProjectionSignature({ channelKey = "",
     attachments = [], candidate = null, attachmentLabelFor = null,
-    disabled = false } = {}) {
+    disabled = false, origin = "" } = {}) {
     const normalized = normalizePromptAttachments(attachments);
     const ids = new Set(normalized.map((value) => value.attachment_id));
     const groups = new Set(normalized.map((value) => value.emission_group_id));
     const projections = (candidate?.attachment_capability_projections || [])
         .filter((value) => value?.channel_key === channelKey
-            && ids.has(value?.attachment_id))
+            && ids.has(value?.attachment_id)
+            && (!value?.origin || !origin || value.origin === origin))
         .map((value) => ({
             attachment_id: value?.attachment_id,
             capability_id: value?.capability_id,
             emission_group_id: value?.emission_group_id,
+            origin: value?.origin,
             state: value?.state,
             text: value?.text,
             rendered_at_anchor: value?.rendered_at_anchor === true,
@@ -5342,7 +5349,8 @@ export function attachmentChannelProjectionSignature({ channelKey = "",
 
 export function createAttachmentChannelProjections({ channelKey = "", attachments = [],
     candidate = null, attachmentLabelFor = null, onActivate = null,
-    onSetCapabilityEnabled = null, onLinkedSuppressionWarning = null } = {}) {
+    onSetCapabilityEnabled = null, onLinkedSuppressionWarning = null,
+    origin = "" } = {}) {
     const makeHost = (region) => {
         const host = document.createElement("div");
         host.dataset.sonderPromptChannelProjections = String(channelKey || "");
@@ -5358,7 +5366,7 @@ export function createAttachmentChannelProjections({ channelKey = "", attachment
     const attachmentById = new Map(normalized.map((value) =>
         [value.attachment_id, value]));
     const contributions = channelContributionRows({
-        channelKey, attachments, candidate, attachmentLabelFor });
+        channelKey, attachments, candidate, attachmentLabelFor, origin });
     if (contributions.length) {
         for (const contribution of contributions) {
             if (contribution.atAnchor) continue;

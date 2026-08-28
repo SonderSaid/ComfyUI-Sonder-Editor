@@ -111,18 +111,619 @@ def _resolve(*, setup, entities, items, recipes, units=()):
         semantic_units=list(units))
 
 
-def _compile(resolved, units, sections):
+def _compile(resolved, units, sections, *, global_attachments=(),
+             global_documents=None, references=None):
+    context = {
+        "setup_manifest": resolved["setup_manifest"],
+        "ordinal_manifest": resolved["ordinal_manifest"],
+        "unit_picture_ordinals": resolved.get("unit_picture_ordinals", {}),
+        "unit_source_labels": resolved.get("unit_source_labels", {}),
+        "unit_source_members": resolved.get("unit_source_members", {}),
+        "semantic_units": list(units),
+    }
+    if references is not None:
+        context["references"] = [
+            value.to_dict() if hasattr(value, "to_dict") else copy.deepcopy(value)
+            for value in references]
     return prompt_context.compile_prompt_context(
+        global_documents=global_documents,
+        global_attachments=list(global_attachments),
         sections=list(sections), window_start=0, window_end=WINDOW_END,
         fps=24.0, template="minimax_h3_ref", profile="minimax_h3_ref@1",
-        context={
-            "setup_manifest": resolved["setup_manifest"],
-            "ordinal_manifest": resolved["ordinal_manifest"],
-            "unit_picture_ordinals": resolved.get("unit_picture_ordinals", {}),
-            "unit_source_labels": resolved.get("unit_source_labels", {}),
-            "unit_source_members": resolved.get("unit_source_members", {}),
-            "semantic_units": list(units),
-        }, labels_on=True)
+        context=context, labels_on=True)
+
+
+def test_reference_dormancy_predicates_are_derived_from_winning_sources():
+    attachment = _reference_chip(
+        "global", {"semantic_unit_ids": [
+            "dormant", "staged", "assetless", "missing"]}, {})
+    context = {
+        "profile": H3_PROFILE,
+        "ordinal_manifest": {
+            "subjects": {"staged": 1},
+            "pictures": {"winning-picture": 1},
+        },
+        "semantic_units_by_id": {
+            "dormant": {"semantic_unit_id": "dormant", "kind": "subject",
+                        "sources": [{"member_id": "dormant-member"}]},
+            "staged": {"semantic_unit_id": "staged", "kind": "subject",
+                       "sources": [{"member_id": "staged-member"}]},
+            "assetless": {"semantic_unit_id": "assetless", "kind": "subject",
+                          "sources": []},
+        },
+    }
+
+    assert prompt_context.dormant_reference_identities(
+        attachment, context) == ["dormant"]
+    assert not prompt_context.reference_chip_dormant(attachment, context)
+
+    attachment["source"]["semantic_unit_ids"] = ["dormant"]
+    assert prompt_context.reference_chip_dormant(attachment, context)
+
+    attachment["source"]["semantic_unit_ids"] = ["assetless"]
+    assert not prompt_context.reference_chip_dormant(attachment, context)
+    attachment["source"]["semantic_unit_ids"] = ["missing"]
+    assert not prompt_context.reference_chip_dormant(attachment, context)
+
+    attachment["source"] = {
+        "semantic_unit_ids": ["dormant"],
+        "picture_ids": ["winning-picture"],
+    }
+    assert not prompt_context.reference_chip_dormant(attachment, context)
+
+    attachment["source"] = {"picture_ids": ["unwon-picture"]}
+    assert prompt_context.reference_chip_dormant(attachment, context)
+
+    # Classification is attachment-local even when two scopes carry the same
+    # UI id; no cross-scope id set is an authority over dormancy.
+    same_id_staged = _reference_chip(
+        "shared", {"semantic_unit_ids": ["staged"]}, {})
+    same_id_dormant = _reference_chip(
+        "shared", {"semantic_unit_ids": ["dormant"]}, {})
+    assert not prompt_context.reference_chip_dormant(same_id_staged, context)
+    assert prompt_context.reference_chip_dormant(same_id_dormant, context)
+
+    attachment["source"] = {
+        "semantic_unit_ids": 1,
+        "picture_ids": "winning-picture",
+    }
+    assert prompt_context.dormant_reference_identities(attachment, context) == []
+    assert not prompt_context.reference_chip_dormant(attachment, context)
+
+
+def _identity_dormancy_fixture(*, global_chip=None, global_chips=None,
+                                section_chip=None,
+                                global_documents=None, units=None,
+                                catalog_members=None,
+                                duplicate_member_slots=None):
+    members = catalog_members if catalog_members is not None else [
+        ReferenceMember(member_id="staged-member", asset_id="img_a"),
+        ReferenceMember(member_id="dormant-member", asset_id="img_b"),
+    ]
+    entity = ReferenceEntity(reference_id="entity", name="Cast", members=members)
+    recipes = [ReferenceLaneRecipe(
+        lane_id="picture-lane", media_kind="image", recipe=PICTURE_RECIPE)]
+    items = [ReferenceItem(
+        reference_item_id="picture-item", lane_index=0,
+        start_frame=0, end_frame=WINDOW_END,
+        members=[{"entity_id": "entity", "member_id": "staged-member",
+                  "role": "identity", "visual_intent": "preserve"}])]
+    units = units if units is not None else [
+        {"semantic_unit_id": "staged", "name": "Staged", "kind": "subject",
+         "definition": "the staged subject",
+         "sources": [{"entity_id": "entity", "member_id": "staged-member"}]},
+        {"semantic_unit_id": "dormant", "name": "Dormant", "kind": "subject",
+         "definition": "the dormant subject",
+         "sources": [{"entity_id": "entity", "member_id": "dormant-member"}]},
+    ]
+    resolved = _resolve(
+        setup={"mode": "reference", "picture_lane_ids": ["picture-lane"]},
+        entities=[entity], items=items, recipes=recipes, units=units)
+    if duplicate_member_slots is not None:
+        resolved["setup_manifest"]["duplicate_member_slots"] = copy.deepcopy(
+            duplicate_member_slots)
+    section_attachments = [prompt_context.shot_attachment()]
+    if section_chip is not None:
+        section_attachments.append(section_chip)
+    section = PromptSection(
+        0, WINDOW_END, channels={"detailed_description": "The shot moves."},
+        attachments=section_attachments)
+    section.prompt_id = "section"
+    sections = [section]
+    chosen_global_chips = (list(global_chips) if global_chips is not None
+                           else ([global_chip] if global_chip is not None else []))
+    return _compile(
+        resolved, units, sections,
+        global_attachments=chosen_global_chips,
+        global_documents=global_documents,
+        references=[entity])
+
+
+def test_global_dormant_identity_warns_while_same_id_section_still_blocks():
+    global_chip = _reference_chip(
+        "shared", {"semantic_unit_ids": ["dormant"]}, {},
+        capabilities=("definitions",))
+    section_chip = _reference_chip(
+        "shared", {"semantic_unit_ids": ["dormant"]}, {},
+        capabilities=("definitions",))
+
+    compiled = _identity_dormancy_fixture(
+        global_chip=global_chip, section_chip=section_chip)
+
+    dormant = [row for row in compiled["warnings"]
+               if row["code"] == "reference_source_dormant"]
+    blocked = [row for row in compiled["errors"]
+               if row["code"] == "reference_source_not_applicable"]
+    assert len(dormant) == 1
+    assert dormant[0]["message"] == (
+        "No Reference staged in this window supplies Prompt identity "
+        "'Dormant', so it is not described here.")
+    assert dormant[0]["origin"] == "global"
+    assert dormant[0]["semantic_unit_id"] == "dormant"
+    assert len(blocked) == 1
+    assert blocked[0]["origin"] == "section"
+    projections = [
+        row for row in compiled["attachment_capability_projections"]
+        if row["attachment_id"] == "shared"
+        and row["capability_id"] == "definitions"]
+    assert next(row for row in projections
+                if row["origin"] == "global")["state"] == "empty"
+    assert next(row for row in projections
+                if row["origin"] == "section")["state"] == "unresolved"
+
+
+def test_same_id_section_capability_limit_does_not_poison_global_dormancy():
+    global_chip = _reference_chip(
+        "same", {"semantic_unit_ids": ["dormant"]},
+        {"text": "GLOBAL DORMANT TEXT"}, capabilities=("mentions",))
+    section_chip = _reference_chip(
+        "same", {"semantic_unit_ids": ["staged"]},
+        {"text": "SECTION LIVE TEXT"}, capabilities=("mentions",))
+    section_chip["capabilities"] = [
+        {"capability_id": f"mention-{index}", "kind": "mentions",
+         "placement": "section_prefix", "enabled": True}
+        for index in range(prompt_context.MAX_CAPABILITIES + 1)]
+
+    compiled = _identity_dormancy_fixture(
+        global_chip=global_chip, section_chip=section_chip)
+
+    capability_limit = [
+        row for row in compiled["errors"]
+        if row["code"] == "capability_limit"]
+    assert len(capability_limit) == 1
+    assert capability_limit[0]["origin"] == "section"
+    assert any(row["code"] == "reference_source_dormant"
+               and row["origin"] == "global"
+               for row in compiled["warnings"])
+    global_projection = next(
+        row for row in compiled["attachment_capability_projections"]
+        if row["attachment_id"] == "same"
+        and row["origin"] == "global")
+    assert global_projection["state"] == "dormant"
+
+
+def test_broken_global_identity_blocks_without_a_dormancy_warning():
+    broken_unit = {
+        "semantic_unit_id": "broken", "name": "Broken", "kind": "subject",
+        "definition": "a broken subject",
+        "sources": [{"entity_id": "entity", "member_id": "deleted-member"}],
+    }
+    chip = _reference_chip(
+        "broken-chip", {"semantic_unit_ids": ["broken"]},
+        {"text": "BROKEN AUTHORED TEXT"},
+        capabilities=("mentions",))
+
+    compiled = _identity_dormancy_fixture(
+        global_chip=chip, units=[broken_unit], catalog_members=[])
+
+    assert any(row["code"] == "broken_reference_source"
+               for row in compiled["errors"])
+    assert not any(row["code"] == "reference_source_dormant"
+                   for row in compiled["warnings"])
+    assert "BROKEN AUTHORED TEXT" in compiled["prompt"]
+
+    token_chip = _reference_chip(
+        "token-chip", {"semantic_unit_ids": ["dormant"]},
+        {"text": "@subject(missing)"}, capabilities=("mentions",))
+    compiled = _identity_dormancy_fixture(global_chip=token_chip)
+    token_errors = [row for row in compiled["errors"]
+                    if row["code"] == "unresolved_prompt_token"]
+    assert len(token_errors) == 1
+    assert token_errors[0]["origin"] == "global"
+    assert not any(row["code"] == "reference_source_dormant"
+                   for row in compiled["warnings"])
+
+    ambiguous_chip = _reference_chip(
+        "ambiguous-token-chip", {"semantic_unit_ids": ["dormant"]},
+        {"text": "Use @picture(staged-member)"}, capabilities=("mentions",))
+    compiled = _identity_dormancy_fixture(
+        global_chip=ambiguous_chip,
+        duplicate_member_slots={"staged-member": [
+            {"population": "pictures", "slot_id": "one", "label": "Picture 1",
+             "lane_id": "lane-one"},
+            {"population": "pictures", "slot_id": "two", "label": "Picture 2",
+             "lane_id": "lane-two"},
+        ]})
+    ambiguous_errors = [row for row in compiled["errors"]
+                        if row["code"] == "ambiguous_physical_handle"]
+    assert len(ambiguous_errors) == 1
+    assert ambiguous_errors[0]["origin"] == "global"
+    assert not any(row["code"] == "reference_source_dormant"
+                   for row in compiled["warnings"])
+
+    invalid_route = _reference_chip(
+        "invalid-route-chip", {"semantic_unit_ids": ["dormant"]}, {},
+        capabilities=("mentions",))
+    invalid_route["capabilities"][0]["channel_key"] = "not_a_channel"
+    compiled = _identity_dormancy_fixture(global_chip=invalid_route)
+    assert any(row["code"] == "invalid_attachment_route"
+               and row.get("origin") == "global"
+               for row in compiled["errors"])
+    assert not any(row["code"] == "reference_source_dormant"
+                   for row in compiled["warnings"])
+
+    anchored = _reference_chip(
+        "anchored-chip", {"semantic_unit_ids": ["dormant"]}, {},
+        capabilities=("definitions", "mentions"))
+    anchored["capabilities"][1]["channel_key"] = "not_a_channel"
+    compiled = _identity_dormancy_fixture(
+        global_chip=anchored,
+        global_documents={"subject_definitions": {"nodes": [{
+            "type": "attachment", "node_id": "definition-anchor",
+            "attachment_id": "anchored-chip", "capability_id": "definitions",
+        }]}})
+    assert not any(row["code"] == "invalid_attachment_route"
+                   for row in compiled["errors"])
+    assert any(row["code"] == "reference_source_dormant"
+               for row in compiled["warnings"])
+
+    unsupported = _reference_chip(
+        "unsupported-chip", {"semantic_unit_ids": ["dormant"]}, {},
+        capabilities=("mentions",))
+    unsupported["attachment_id"] = "unsupported-chip"
+    unsupported["provider_id"] = "unsupported"
+    compiled = _identity_dormancy_fixture(global_chip=unsupported)
+    assert any(row["code"] == "unsupported_attachment_provider"
+               for row in compiled["errors"])
+    assert not any(row["code"] == "reference_source_dormant"
+                   for row in compiled["warnings"])
+
+
+def test_assetless_identity_keeps_its_existing_warning_not_dormancy():
+    assetless_unit = {
+        "semantic_unit_id": "assetless", "name": "Assetless",
+        "kind": "subject", "definition": "an imagined subject", "sources": [],
+    }
+    chip = _reference_chip(
+        "assetless-chip", {"semantic_unit_ids": ["assetless"]}, {},
+        capabilities=("definitions",))
+
+    compiled = _identity_dormancy_fixture(
+        global_chip=chip, units=[assetless_unit], catalog_members=[])
+
+    assert any(row["code"] == "assetless_prompt_identity"
+               for row in compiled["warnings"])
+    assert not any(row["code"] == "reference_source_dormant"
+                   for row in compiled["warnings"])
+
+
+def test_dormant_identities_with_equal_names_keep_distinct_warnings():
+    units = [
+        {"semantic_unit_id": unit_id, "name": "Twin", "kind": "subject",
+         "definition": f"the {unit_id} twin",
+         "sources": [{"entity_id": "entity", "member_id": member_id}]}
+        for unit_id, member_id in [
+            ("twin-a", "dormant-member"),
+            ("twin-b", "other-dormant-member"),
+        ]
+    ]
+    chip = _reference_chip(
+        "twins", {"semantic_unit_ids": ["twin-a", "twin-b"]}, {},
+        capabilities=("definitions",))
+
+    compiled = _identity_dormancy_fixture(
+        global_chip=chip, units=units,
+        catalog_members=[
+            ReferenceMember(member_id="dormant-member", asset_id="img_b"),
+            ReferenceMember(member_id="other-dormant-member", asset_id="img_c"),
+        ])
+
+    dormant = [row for row in compiled["warnings"]
+               if row["code"] == "reference_source_dormant"]
+    assert [row["semantic_unit_id"] for row in dormant] == ["twin-a", "twin-b"]
+
+
+def test_fully_dormant_global_chip_suppresses_only_authored_chip_prose():
+    chip = _reference_chip(
+        "dormant-prose", {"semantic_unit_ids": ["dormant"]},
+        {"text": "DORMANT MENTION TEXT",
+         "audio_relationship": "DORMANT AUDIO RELATIONSHIP"},
+        capabilities=("mentions", "audio_relationship"))
+
+    compiled = _identity_dormancy_fixture(global_chip=chip)
+
+    assert "DORMANT MENTION TEXT" not in compiled["prompt"]
+    assert "DORMANT AUDIO RELATIONSHIP" not in compiled["prompt"]
+    rows = [row for row in compiled["attachment_capability_projections"]
+            if row["attachment_id"] == "dormant-prose"]
+    assert {row["capability_id"] for row in rows} == {
+        "mentions", "audio_relationship"}
+    assert all(row["state"] == "dormant" for row in rows)
+    assert all(row["state_reason"] == prompt_context.DORMANT_REFERENCE_REASON
+               for row in rows)
+    assert not [row for row in compiled["emissions"]
+                if row["attachment_id"] == "dormant-prose"]
+
+
+def test_late_render_blockers_prevent_dormant_suppression():
+    oversized = _reference_chip(
+        "oversized", {"semantic_unit_ids": ["dormant"]},
+        {"text": "OVERSIZED CHIP MENTION",
+         "summary": "x" * (prompt_context.MAX_ATTACHMENT_OUTPUT + 1)},
+        capabilities=("mentions", "summary"))
+    compiled = _identity_dormancy_fixture(global_chip=oversized)
+    assert any(row["code"] == "attachment_output_limit"
+               for row in compiled["errors"])
+    assert not any(row["code"] == "reference_source_dormant"
+                   for row in compiled["warnings"])
+    assert "OVERSIZED CHIP MENTION" in compiled["prompt"]
+    assert not any(row["state"] == "dormant"
+                   for row in compiled["attachment_capability_projections"]
+                   if row["attachment_id"] == "oversized")
+
+    first = _reference_chip(
+        "first", {"semantic_unit_ids": ["staged"]},
+        {"summary": "FIRST SUMMARY"}, capabilities=("summary",),
+        group="shared-summary")
+    conflicting = _reference_chip(
+        "conflicting", {"semantic_unit_ids": ["dormant"]},
+        {"text": "CONFLICTING CHIP MENTION", "summary": "SECOND SUMMARY"},
+        capabilities=("mentions", "summary"), group="shared-summary")
+    compiled = _identity_dormancy_fixture(global_chips=[first, conflicting])
+    assert any(row["code"] == "conflicting_emission"
+               and row["attachment_id"] == "conflicting"
+               for row in compiled["errors"])
+    assert not any(row["code"] == "reference_source_dormant"
+                   and row["attachment_id"] == "conflicting"
+                   for row in compiled["warnings"])
+    assert "CONFLICTING CHIP MENTION" in compiled["prompt"]
+    assert not any(row["state"] == "dormant"
+                   for row in compiled["attachment_capability_projections"]
+                   if row["attachment_id"] == "conflicting")
+
+
+def test_preflight_does_not_invent_blockers_from_suppressed_prose():
+    oversized_mention = _reference_chip(
+        "oversized-mention", {"semantic_unit_ids": ["dormant"]},
+        {"text": "m" * (prompt_context.MAX_ATTACHMENT_OUTPUT + 1)},
+        capabilities=("mentions",))
+    compiled = _identity_dormancy_fixture(global_chip=oversized_mention)
+    assert not compiled["errors"]
+    assert any(row["code"] == "reference_source_dormant"
+               for row in compiled["warnings"])
+    projection = next(
+        row for row in compiled["attachment_capability_projections"]
+        if row["attachment_id"] == "oversized-mention")
+    assert projection["state"] == "dormant"
+
+    first = _reference_chip(
+        "audio-first", {"semantic_unit_ids": ["dormant"]},
+        {"audio_relationship": "FIRST DORMANT AUDIO"},
+        capabilities=("audio_relationship",), group="dormant-audio")
+    second = _reference_chip(
+        "audio-second", {"semantic_unit_ids": ["dormant"]},
+        {"audio_relationship": "SECOND DORMANT AUDIO"},
+        capabilities=("audio_relationship",), group="dormant-audio")
+    compiled = _identity_dormancy_fixture(global_chips=[first, second])
+    assert not compiled["errors"]
+    assert "FIRST DORMANT AUDIO" not in compiled["prompt"]
+    assert "SECOND DORMANT AUDIO" not in compiled["prompt"]
+    states = [row["state"] for row in
+              compiled["attachment_capability_projections"]
+              if row["attachment_id"] in {"audio-first", "audio-second"}]
+    assert states == ["dormant", "dormant"]
+
+
+def test_dormant_global_chip_claims_no_shots_but_live_chip_still_does(
+        monkeypatch):
+    captured = {}
+    original = prompt_context._render_generic
+
+    def inspect(attachment, capability, context, speaker_numbers=None):
+        if str(attachment.get("attachment_id") or "").endswith("-shots"):
+            captured[attachment["attachment_id"]] = {
+                "groups": copy.deepcopy(context.get("reference_group_shots") or {}),
+                "units": copy.deepcopy(context.get("reference_unit_shots") or {}),
+            }
+        return original(attachment, capability, context, speaker_numbers)
+
+    monkeypatch.setattr(prompt_context, "_render_generic", inspect)
+
+    members = [
+        ReferenceMember(member_id="staged-member", asset_id="img_a"),
+        ReferenceMember(member_id="dormant-member", asset_id="img_b"),
+    ]
+    entity = ReferenceEntity(reference_id="entity", name="Cast", members=members)
+    recipes = [ReferenceLaneRecipe(
+        lane_id="picture-lane", media_kind="image", recipe=PICTURE_RECIPE)]
+    items = [ReferenceItem(
+        reference_item_id="picture-item", lane_index=0,
+        start_frame=0, end_frame=WINDOW_END,
+        members=[{"entity_id": "entity", "member_id": "staged-member",
+                  "role": "identity", "visual_intent": "preserve"}])]
+    default_units = [
+        {"semantic_unit_id": "staged", "name": "Staged", "kind": "subject",
+         "definition": "the staged subject",
+         "sources": [{"entity_id": "entity", "member_id": "staged-member"}]},
+        {"semantic_unit_id": "dormant", "name": "Dormant", "kind": "subject",
+         "definition": "the dormant subject",
+         "sources": [{"entity_id": "entity", "member_id": "dormant-member"}]},
+    ]
+
+    def compile_three_shots(global_chip, *, middle_chip=None, units=None):
+        active_units = list(units if units is not None else default_units)
+        resolved = _resolve(
+            setup={"mode": "reference", "picture_lane_ids": ["picture-lane"]},
+            entities=[entity], items=items, recipes=recipes, units=active_units)
+        sections = []
+        for index, (start, end) in enumerate(((0, 33), (33, 66), (66, 100))):
+            attachments = [prompt_context.shot_attachment()]
+            if index == 1 and middle_chip is not None:
+                attachments.append(middle_chip)
+            section = PromptSection(
+                start, end,
+                channels={"detailed_description": f"Shot {index + 1}."},
+                attachments=attachments)
+            section.prompt_id = f"section-{index + 1}"
+            sections.append(section)
+        return _compile(
+            resolved, active_units, sections,
+            global_attachments=[global_chip], references=[entity])
+
+    dormant = _reference_chip(
+        "dormant-shots", {"semantic_unit_ids": ["dormant"]},
+        {"summary": "Dormant summary"}, capabilities=("summary",),
+        group="shared-group")
+    section_claim = _reference_chip(
+        "section-claim", {"semantic_unit_ids": ["dormant"]},
+        {"summary": "Section claim"}, capabilities=("summary",),
+        group="shared-group")
+    compile_three_shots(dormant, middle_chip=section_claim)
+    assert captured["dormant-shots"]["groups"]["shared-group"] == [2]
+    assert captured["dormant-shots"]["units"]["dormant"] == [2]
+
+    live = _reference_chip(
+        "live-shots", {"semantic_unit_ids": ["staged"]},
+        {"summary": "Live summary"}, capabilities=("summary",),
+        group="live-group")
+    compile_three_shots(live)
+    assert captured["live-shots"]["groups"]["live-group"] == [1, 2, 3]
+    assert captured["live-shots"]["units"]["staged"] == [1, 2, 3]
+
+    partial = _reference_chip(
+        "partial-shots", {"semantic_unit_ids": ["staged", "dormant"]},
+        {"summary": "Partial summary"}, capabilities=("summary",),
+        group="partial-group")
+    compile_three_shots(partial)
+    assert captured["partial-shots"]["groups"]["partial-group"] == [1, 2, 3]
+    assert captured["partial-shots"]["units"]["staged"] == [1, 2, 3]
+    assert captured["partial-shots"]["units"]["dormant"] == [1, 2, 3]
+
+    physical = _reference_chip(
+        "physical-shots",
+        {"semantic_unit_ids": ["dormant"],
+         "picture_ids": ["staged-member"]},
+        {"summary": "Physical summary"}, capabilities=("summary",),
+        group="physical-group")
+    compile_three_shots(physical)
+    assert captured["physical-shots"]["groups"]["physical-group"] == [1, 2, 3]
+    assert captured["physical-shots"]["units"]["dormant"] == [1, 2, 3]
+
+    broken_unit = {
+        "semantic_unit_id": "broken", "name": "Broken", "kind": "subject",
+        "definition": "the broken subject",
+        "sources": [{"entity_id": "entity", "member_id": "deleted-member"}],
+    }
+    blocked = _reference_chip(
+        "blocked-shots", {"semantic_unit_ids": ["broken"]},
+        {"summary": "Blocked summary"}, capabilities=("summary",),
+        group="blocked-group")
+    compiled = compile_three_shots(blocked, units=[broken_unit])
+    assert any(row["code"] == "broken_reference_source"
+               for row in compiled["errors"])
+    assert captured["blocked-shots"]["groups"]["blocked-group"] == [1, 2, 3]
+    assert captured["blocked-shots"]["units"]["broken"] == [1, 2, 3]
+
+
+def test_duplicate_global_ids_keep_blockers_attached_to_rendered_chip():
+    valid = _reference_chip(
+        "same", {"semantic_unit_ids": ["staged"]},
+        {"text": "VALID"}, capabilities=("mentions",))
+    broken = _reference_chip(
+        "same", {"semantic_unit_ids": ["broken"]},
+        {"text": "BROKEN DUPLICATE TEXT"}, capabilities=("mentions",))
+    units = [
+        {"semantic_unit_id": "staged", "name": "Staged", "kind": "subject",
+         "definition": "staged",
+         "sources": [{"entity_id": "entity", "member_id": "staged-member"}]},
+        {"semantic_unit_id": "broken", "name": "Broken", "kind": "subject",
+         "definition": "broken",
+         "sources": [{"entity_id": "entity", "member_id": "deleted-member"}]},
+    ]
+    compiled = _identity_dormancy_fixture(
+        global_chips=[valid, broken], units=units,
+        catalog_members=[ReferenceMember(
+            member_id="staged-member", asset_id="img_a")])
+
+    broken_error = next(row for row in compiled["errors"]
+                        if row["code"] == "broken_reference_source")
+    rendered_id = broken_error["attachment_id"]
+    assert rendered_id != "same"
+    assert "BROKEN DUPLICATE TEXT" in compiled["prompt"]
+    assert not any(row["code"] == "reference_source_dormant"
+                   and row["attachment_id"] == rendered_id
+                   for row in compiled["warnings"])
+    assert not any(row["state"] == "dormant"
+                   for row in compiled["attachment_capability_projections"]
+                   if row["attachment_id"] == rendered_id)
+
+
+def test_partial_and_physical_output_and_dormant_summary_survive():
+    partial = _reference_chip(
+        "partial", {"semantic_unit_ids": ["staged", "dormant"]},
+        {"definition": "the authored subject",
+         "text": "PARTIAL MENTION SURVIVES"},
+        capabilities=("definitions", "mentions"))
+    physical = _reference_chip(
+        "physical", {"semantic_unit_ids": ["dormant"],
+                     "picture_ids": ["staged-member"]},
+        {"definition": "the staged physical picture"},
+        capabilities=("definitions",))
+    summary = _reference_chip(
+        "summary", {"semantic_unit_ids": ["dormant"]},
+        {"task_types": ["reference generation"],
+         "summary": "DORMANT SUMMARY SURVIVES"},
+        capabilities=("summary",))
+
+    # The fixture accepts one global chip; compile all three against the same
+    # real resolved/catalog context for the cross-capability discrimination.
+    entity = ReferenceEntity(reference_id="entity", name="Cast", members=[
+        ReferenceMember(member_id="staged-member", asset_id="img_a"),
+        ReferenceMember(member_id="dormant-member", asset_id="img_b"),
+    ])
+    recipes = [ReferenceLaneRecipe(
+        lane_id="picture-lane", media_kind="image", recipe=PICTURE_RECIPE)]
+    items = [ReferenceItem(
+        reference_item_id="picture-item", lane_index=0,
+        start_frame=0, end_frame=WINDOW_END,
+        members=[{"entity_id": "entity", "member_id": "staged-member",
+                  "role": "identity", "visual_intent": "preserve"}])]
+    units = [
+        {"semantic_unit_id": "staged", "name": "Staged", "kind": "subject",
+         "definition": "the staged subject",
+         "sources": [{"entity_id": "entity", "member_id": "staged-member"}]},
+        {"semantic_unit_id": "dormant", "name": "Dormant", "kind": "subject",
+         "definition": "the dormant subject",
+         "sources": [{"entity_id": "entity", "member_id": "dormant-member"}]},
+    ]
+    resolved = _resolve(
+        setup={"mode": "reference", "picture_lane_ids": ["picture-lane"]},
+        entities=[entity], items=items, recipes=recipes, units=units)
+    compiled = _compile(
+        resolved, units,
+        [PromptSection(0, WINDOW_END, channels={
+            "detailed_description": "The shot moves."},
+            attachments=[prompt_context.shot_attachment()])],
+        global_attachments=[partial, physical, summary], references=[entity])
+
+    assert "<Subject 1> is the authored subject" in compiled["prompt"]
+    assert "PARTIAL MENTION SURVIVES" in compiled["prompt"]
+    assert "<Picture 1> is the staged physical picture" in compiled["prompt"]
+    assert "[reference generation]" in compiled["prompt"]
+    assert "DORMANT SUMMARY SURVIVES" in compiled["prompt"]
+    assert not any(row["state"] == "dormant"
+                   for row in compiled["attachment_capability_projections"]
+                   if row["attachment_id"] in {"partial", "physical", "summary"})
 
 
 # --------------------------------------------------------------------------

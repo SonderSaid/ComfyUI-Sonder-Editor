@@ -103,6 +103,7 @@ a fresh `[Unreleased]` block.
   format's own label.
 
 ### Fixed
+- Global Reference chips no longer block windows where none of their selected References are staged; their mention, audio-relationship, and shot-claim output stays out, while genuine broken references still refuse the render.
 - Structured and Global Prompt previews now measure their stale grace from the compile request instead of the preceding typing debounce, keep failed previews steadily explained until recovery, and avoid rebuilding unchanged projection chrome.
 - Prompt candidate previews now heal one project-version race from a fixed snapshot, retain same-scene stale projections on failure, and no longer blank the Context strip after a contribution write.
 - Prompt saves now accept browser-sparse records that normalize to the stored value, acknowledge the server's canonical row without overwriting newer typing, and keep real same-record conflicts recoverable per record.

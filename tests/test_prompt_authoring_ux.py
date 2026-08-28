@@ -2421,7 +2421,9 @@ def test_candidate_diagnostic_projection_keys_chip_errors_and_labels_window():
             {"code": "profile_error", "message": "Profile is invalid."},
         ],
         "warnings": [
-            {"code": "quiet", "message": "Check this chip.", "attachment_id": "chip-a"},
+            {"code": "quiet", "message": "Check this chip.",
+             "attachment_id": "chip-a", "origin": "global",
+             "semantic_unit_id": "unit-a"},
         ],
     }
     script = (
@@ -2436,6 +2438,8 @@ def test_candidate_diagnostic_projection_keys_chip_errors_and_labels_window():
         "Effective render window: frames 8–56 (selection 16–48; pre 8f, post 8f).")
     assert [row["code"] for row in projected["byAttachment"]["chip-a"]] == [
         "unresolved_audio_speaker_binding", "quiet"]
+    assert projected["byAttachment"]["chip-a"][1]["origin"] == "global"
+    assert projected["byAttachment"]["chip-a"][1]["semantic_unit_id"] == "unit-a"
     assert [row["code"] for row in projected["general"]] == ["profile_error"]
     assert projected["errorCount"] == 2
     assert projected["warningCount"] == 1
@@ -5994,6 +5998,65 @@ console.log(JSON.stringify(chips.map(chip=>({{invalid:chip.invalid,title:chip.ti
 """)
     assert [row["invalid"] for row in result] == [True, False, False, True]
     assert "conflicting_emission" not in result[1]["title"]
+
+
+def test_capability_diagnostics_discriminate_attachment_origin():
+    url = (ROOT / "web/js/prompt_context_diagnostics.js").as_uri()
+    result = _run_node(f"""
+const {{promptCapabilityDiagnostics}} = await import({json.dumps(url)});
+const rows = [
+  {{code:"global",origin:"global",channel_key:"speech"}},
+  {{code:"section",origin:"section-a"}},
+  {{code:"legacy"}},
+];
+console.log(JSON.stringify({{
+  global: promptCapabilityDiagnostics(rows,"visual","","global").map(row=>row.code),
+  section: promptCapabilityDiagnostics(rows,"","","section-a").map(row=>row.code),
+}}));
+""")
+    assert result == {
+        "global": ["global", "legacy"],
+        "section": ["section", "legacy"],
+    }
+
+
+def test_capability_projections_discriminate_attachment_origin():
+    chips_path = ROOT / "web/js/prompt_context_chips.js"
+    result = _run_node(f"""
+const {{channelContributionRows,attachmentChannelProjectionSignature}} = await import({json.dumps(chips_path.as_uri())});
+const attachment = {{
+  attachment_id:"same",emission_group_id:"same",kind:"custom",enabled:true,
+  source:{{}},config:{{}},capabilities:[{{capability_id:"body",kind:"custom",placement:"section_prefix",enabled:true}}],
+}};
+const candidate = {{attachment_capability_projections:[
+  {{attachment_id:"same",emission_group_id:"same",capability_id:"body",channel_key:"visual",origin:"global",state:"dormant",state_reason:"global dormant",region:"before",order:0}},
+  {{attachment_id:"same",emission_group_id:"same",capability_id:"body",channel_key:"visual",origin:"section-a",state:"emitted",text:"section text",region:"before",order:0}},
+  {{attachment_id:"same",emission_group_id:"same",capability_id:"legacy",channel_key:"visual",state:"empty",state_reason:"legacy",region:"after",order:1}},
+]}};
+const rows = (origin) => channelContributionRows({{
+  channelKey:"visual",attachments:[attachment],candidate,origin,
+}}).map(value => [value.row.origin || "", value.state]);
+const signature = (origin) => JSON.parse(attachmentChannelProjectionSignature({{
+  channelKey:"visual",attachments:[attachment],candidate,origin,
+}})).projections.map(value => [value.origin || "", value.state]);
+console.log(JSON.stringify({{
+  globalRows:rows("global"),sectionRows:rows("section-a"),
+  globalSignature:signature("global"),sectionSignature:signature("section-a"),
+}}));
+""")
+    assert result == {
+        "globalRows": [["global", "dormant"], ["", "empty"]],
+        "sectionRows": [["section-a", "emitted"], ["", "empty"]],
+        "globalSignature": [["global", "dormant"], ["", "empty"]],
+        "sectionSignature": [["section-a", "emitted"], ["", "empty"]],
+    }
+
+    chips = _source("web/js/prompt_context_chips.js")
+    panel = _source("web/js/editor_prompt_panel.js")
+    widget = _source("web/js/editor_widget.js")
+    assert 'origin || (scope === "global" ? "global" : "")' in chips
+    assert 'origin: String(section.prompt_id || "section")' in panel
+    assert 'String(consumerSection.prompt_id || "section") : "global"' in widget
 
 
 @pytest.mark.parametrize("global_scope", [False, True])

@@ -1719,7 +1719,9 @@ Server value: ${serverValue}` : ""}`;
                 state.byAttachment[chip.dataset.attachmentId] || [],
                 chip.dataset.channelKey || chip.closest("[data-sonder-prompt-channel]")
                     ?.dataset.sonderPromptChannel || "",
-                chip.dataset.capabilityId || "");
+                chip.dataset.capabilityId || "",
+                chip.closest("[data-sonder-prompt-origin]")
+                    ?.dataset.sonderPromptOrigin || "");
             if (!rows.length) continue;
             const hasError = rows.some((row) => row.tier === "error");
             chip.dataset.sonderDiagnosticTier = hasError ? "error" : "warning";
@@ -1886,6 +1888,8 @@ Server value: ${serverValue}` : ""}`;
                 profileId: scene?.prompt_context_profile_id
                     || host._channelTemplate().default_context_profile || "generic@1",
                 scope: "section",
+                origin: context.scene?.prompt_sections?.[context.selectedIndex]
+                    ?.prompt_id || "",
                 anchoredChannels: [context.scene?._context_channel_keys?.[0]].filter(Boolean),
                 profile: currentPromptProfile(),
                 placementPhases: promptPlacementPhases(),
@@ -2097,9 +2101,9 @@ Server value: ${serverValue}` : ""}`;
                         writingState.blockMeta[blockIndex]?.attachments),
                 ];
             };
-            const rowsFor = (channelKey, pool, payload) => channelContributionRows({
+            const rowsFor = (channelKey, pool, payload, origin) => channelContributionRows({
                 channelKey, attachments: pool, candidate: payload,
-                attachmentLabelFor,
+                attachmentLabelFor, origin,
             })
                 // An inline capability compiles where its anchor sits, so it is
                 // already in the sentence the author wrote. Printing it again
@@ -2162,7 +2166,9 @@ Server value: ${serverValue}` : ""}`;
                 for (const channelKey of keys) {
                     const isWritten = written.has(channelKey);
                     if (isWritten) anchor = written.get(channelKey);
-                    const lines = rowsFor(channelKey, pool, payload);
+                    const lines = rowsFor(
+                        channelKey, pool, payload,
+                        writingBlockPromptId(range.block, ranges.length));
                     // A HEADER means this channel has content. A block whose
                     // rows all resolve to nothing would put a heading on a
                     // channel that contributes nothing — six of them under H3 —
@@ -2652,6 +2658,8 @@ Server value: ${serverValue}` : ""}`;
                     _context_consumer_end: blockEnd,
                     _context_reference_frame_threshold: host._referenceFrameThreshold || 0 };
                 const blockCard = document.createElement("div");
+                blockCard.dataset.sonderPromptOrigin = writingBlockPromptId(
+                    i, writingState.allocations.length);
                 blockCard.style.cssText = "display:flex;flex-direction:column;gap:3px;";
                 const chip = document.createElement("div");
                 chip.style.cssText = `display:flex; gap:8px; align-items:center; font-size:10px; color:${COLORS.text};`;
@@ -2735,6 +2743,8 @@ Server value: ${serverValue}` : ""}`;
                                 profileId: scene?.prompt_context_profile_id
                                     || host._channelTemplate().default_context_profile || "generic@1",
                                 scope: "section",
+                                origin: writingBlockPromptId(
+                                    i, writingState.allocations.length),
                                 anchoredChannels: [],
                                 profile: currentPromptProfile(),
                                 placementPhases: promptPlacementPhases(),
@@ -2760,6 +2770,8 @@ Server value: ${serverValue}` : ""}`;
                                 profileId: scene?.prompt_context_profile_id
                                     || host._channelTemplate().default_context_profile || "generic@1",
                                 scope: "section",
+                                origin: writingBlockPromptId(
+                                    i, writingState.allocations.length),
                                 anchoredChannels: [],
                                 profile: currentPromptProfile(),
                                 placementPhases: promptPlacementPhases(),
@@ -3749,6 +3761,7 @@ Server value: ${serverValue}` : ""}`;
         });
         const globalInputs = {};
         const globalRow = document.createElement("div");
+        globalRow.dataset.sonderPromptOrigin = "global";
         globalRow.style.cssText = `
             display:grid; gap:6px; align-items:start;
             grid-template-columns: ${globalKeys.map(() => "1fr").join(" ")};
@@ -3773,6 +3786,7 @@ Server value: ${serverValue}` : ""}`;
                 profileId: scene.prompt_context_profile_id
                     || globalTemplate.default_context_profile || "generic@1",
                 scope: "global",
+                origin: "global",
                 anchoredChannels,
                 profile: currentPromptProfile(),
                 placementPhases: promptPlacementPhases(),
@@ -3904,7 +3918,7 @@ Server value: ${serverValue}` : ""}`;
                 const signature = attachmentChannelProjectionSignature({
                     channelKey: key, attachments: globalAttachments,
                     candidate: payload, attachmentLabelFor,
-                    disabled: globalLocked,
+                    disabled: globalLocked, origin: "global",
                 });
                 if (projectionHosts && signature === projectionSignature) return;
                 const next = createAttachmentChannelProjections({
@@ -3912,6 +3926,7 @@ Server value: ${serverValue}` : ""}`;
                     attachments: globalAttachments,
                     candidate: payload,
                     attachmentLabelFor,
+                    origin: "global",
                     onActivate: async (attachment) => {
                         const configured = acceptDurableConfiguration(
                             await configureGlobalAttachment(
@@ -3943,6 +3958,7 @@ Server value: ${serverValue}` : ""}`;
         }
         body.appendChild(globalRow);
         const globalScopeHost = document.createElement("div");
+        globalScopeHost.dataset.sonderPromptOrigin = "global";
         const globalAnchorIds = () => new Set(Object.values(globalDocuments)
             .flatMap((value) => normalizePromptDocument(value).nodes)
             .filter((node) => node.type === "attachment")
@@ -3955,6 +3971,7 @@ Server value: ${serverValue}` : ""}`;
             profileId: scene.prompt_context_profile_id
                 || globalTemplate.default_context_profile || "generic@1",
             scope: "global",
+            origin: "global",
             anchoredChannels: [],
             profile: currentPromptProfile(),
             placementPhases: promptPlacementPhases(),
@@ -4065,6 +4082,7 @@ Server value: ${serverValue}` : ""}`;
             // ~40px each — one character per line. The channels now own a
             // full-width row of their own beneath the controls.
             const card = document.createElement("div");
+            card.dataset.sonderPromptOrigin = String(section.prompt_id || "section");
             card.style.cssText = `
                 display:flex; flex-direction:column; gap:6px; padding:6px 8px;
                 background:${COLORS.panel}; border:1px solid ${COLORS.promptBorder}; border-radius:4px;
@@ -4133,6 +4151,7 @@ Server value: ${serverValue}` : ""}`;
                     profileId: scene.prompt_context_profile_id
                         || template.default_context_profile || "generic@1",
                     scope: "section",
+                    origin: String(section.prompt_id || "section"),
                     anchoredChannels,
                     profile: currentPromptProfile(),
                     placementPhases: promptPlacementPhases(),
@@ -4233,6 +4252,7 @@ Server value: ${serverValue}` : ""}`;
                         channelKey: key, attachments: sectionAttachments,
                         candidate: payload, attachmentLabelFor,
                         disabled: sectionsLocked,
+                        origin: String(section.prompt_id || "section"),
                     });
                     if (projectionHosts && signature === projectionSignature) return;
                     const next = createAttachmentChannelProjections({
@@ -4240,6 +4260,7 @@ Server value: ${serverValue}` : ""}`;
                         attachments: sectionAttachments,
                         candidate: payload,
                         attachmentLabelFor,
+                        origin: String(section.prompt_id || "section"),
                         onActivate: async (attachment) => {
                             const configured = acceptDurableConfiguration(
                                 await configureChannelAttachment(
@@ -4333,6 +4354,7 @@ Server value: ${serverValue}` : ""}`;
                 profileId: scene.prompt_context_profile_id
                     || template.default_context_profile || "generic@1",
                 scope: "section",
+                origin: String(section.prompt_id || "section"),
                 anchoredChannels: [],
                 profile: currentPromptProfile(),
                 placementPhases: promptPlacementPhases(),
