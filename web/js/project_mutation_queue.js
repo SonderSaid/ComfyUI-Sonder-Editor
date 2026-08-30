@@ -3,6 +3,7 @@ export class ProjectMutationQueue {
         this._pending = [];
         this._active = null;
         this._drainWaiters = [];
+        this._drainFlushScheduled = false;
         this._pumpScheduled = false;
         this._onIdle = typeof onIdle === "function" ? onIdle : null;
     }
@@ -45,6 +46,10 @@ export class ProjectMutationQueue {
 
     hasPending() {
         return this._pending.length > 0;
+    }
+
+    hasPendingKey(key) {
+        return this._pending.some((mutation) => mutation.key === key);
     }
 
     isActive() {
@@ -94,11 +99,19 @@ export class ProjectMutationQueue {
     }
 
     _flushDrainWaiters() {
-        if (this.isBusy()) return;
-        const waiters = this._drainWaiters.splice(0);
-        for (const resolve of waiters) {
-            resolve();
-        }
-        this._onIdle?.();
+        if (this.isBusy() || this._drainFlushScheduled) return;
+        this._drainFlushScheduled = true;
+        // Mutation waiter continuations may enqueue dependent writes. Give
+        // those same-turn continuations one microtask to declare their work
+        // before drain waiters observe a stable idle boundary.
+        queueMicrotask(() => {
+            this._drainFlushScheduled = false;
+            if (this.isBusy()) return;
+            const waiters = this._drainWaiters.splice(0);
+            for (const resolve of waiters) {
+                resolve();
+            }
+            this._onIdle?.();
+        });
     }
 }

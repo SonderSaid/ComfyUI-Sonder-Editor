@@ -89,6 +89,32 @@ def test_project_mutation_queue_contract_and_version_headers():
         await drained;
         assert.equal(drainedDone, true);
 
+        const q6 = new ProjectMutationQueue();
+        let releaseFirst;
+        let releaseSecond;
+        const first = q6.enqueue({{
+            key: 'first',
+            run: async () => await new Promise((resolve) => {{ releaseFirst = resolve; }}),
+        }});
+        const second = first.then(() => q6.enqueue({{
+            key: 'second',
+            run: async () => await new Promise((resolve) => {{ releaseSecond = resolve; }}),
+        }}));
+        const stableDrain = q6.drain('chained');
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        releaseFirst('first');
+        await first;
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(q6.isBusy(), true);
+        let stableDrainDone = false;
+        stableDrain.then(() => {{ stableDrainDone = true; }});
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(stableDrainDone, false);
+        releaseSecond('second');
+        await second;
+        await stableDrain;
+        assert.equal(q6.isBusy(), false);
+
         const q5 = new ProjectMutationQueue();
         const failed = q5.enqueue({{ key: 'fail', run: async () => {{ throw new Error('boom'); }} }});
         const after = q5.enqueue({{ key: 'after', run: async () => 'after' }});

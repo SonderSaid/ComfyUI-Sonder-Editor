@@ -614,6 +614,73 @@ def test_timeline_project_roundtrip():
     assert restored.assets[0].asset_id == "img001"
 
 
+def test_project_roundtrip_preserves_unknown_scene_and_member_fields():
+    raw = TimelineProject(
+        project_id="project",
+        assets=[Asset(asset_id="asset", name="future.png", asset_type="image")],
+        generation_queue=[GenerationJob(job_id="job")],
+        scenes=[Scene(
+            scene_id="scene", duration_frames=24,
+            video_lane_configs=[LaneConfig()],
+            prompt_sections=[PromptSection(
+                0, 8, attachments=[{
+                    "attachment_id": "attachment", "kind": "custom",
+                    "config": {"text": "kept"},
+                }])],
+            clips=[
+                ClipReference(clip_id="a", timeline_start_frame=0,
+                              timeline_end_frame=8),
+                ClipReference(clip_id="b", timeline_start_frame=8,
+                              timeline_end_frame=16),
+            ],
+        )],
+    ).to_dict()
+    raw["future_project"] = {"keep": True}
+    raw["assets"][0]["future_asset"] = {"keep": True}
+    raw["generation_queue"][0]["future_job"] = {"keep": True}
+    raw["scenes"][0]["future_scene"] = {"keep": True}
+    raw["scenes"][0]["clips"][0]["future_clip"] = {"keep": True}
+    raw["scenes"][0]["prompt_sections"][0]["attachments"][0][
+        "future_attachment"] = {"keep": True}
+    raw["scenes"][0]["prompt_sections"][0]["attachments"][0][
+        "capabilities"] = [{
+            "capability_id": "future-capability", "kind": "text",
+            "future_capability": {"keep": True},
+        }]
+    raw["scenes"][0]["prompt_sections"][0]["channel_docs"]["visual"][
+        "nodes"][0]["future_node"] = {"keep": True}
+    raw["scenes"][0]["video_lane_configs"][0]["future_lane"] = "kept"
+    raw["scenes"][0]["linked_item_groups"] = [{
+        "group_id": "group", "future_group": 7,
+        "items": [
+            {"type": "clip", "id": "a", "future_ref": "a"},
+            {"type": "clip", "id": "b", "future_ref": "b"},
+        ],
+    }]
+
+    restored = TimelineProject.from_dict(raw)
+    restored.scenes[0].name = "Known field changed"
+    serialized = restored.to_dict()
+
+    assert serialized["future_project"] == {"keep": True}
+    assert serialized["assets"][0]["future_asset"] == {"keep": True}
+    assert serialized["generation_queue"][0]["future_job"] == {"keep": True}
+    scene = serialized["scenes"][0]
+    assert scene["name"] == "Known field changed"
+    assert scene["future_scene"] == {"keep": True}
+    assert scene["clips"][0]["future_clip"] == {"keep": True}
+    assert scene["prompt_sections"][0]["attachments"][0][
+        "future_attachment"] == {"keep": True}
+    assert scene["prompt_sections"][0]["attachments"][0]["capabilities"][0][
+        "future_capability"] == {"keep": True}
+    assert scene["prompt_sections"][0]["channel_docs"]["visual"]["nodes"][0][
+        "future_node"] == {"keep": True}
+    assert scene["video_lane_configs"][0]["future_lane"] == "kept"
+    assert scene["linked_item_groups"][0]["future_group"] == 7
+    assert [item["future_ref"] for item in scene["linked_item_groups"][0]["items"]] == [
+        "a", "b"]
+
+
 def test_project_total_frames():
     project = TimelineProject(fps=24.0)
     assert project.total_frames == 0

@@ -1736,7 +1736,6 @@ export class EditorWidget {
             this._updateTransportUI();
             return true;
         };
-        this._pushUndo("change fps");
         try {
             await this._runSceneMutation(
                 [{ type: "update_scene_fields", fields: { fps } }],
@@ -1755,7 +1754,6 @@ export class EditorWidget {
                 }
             );
         } catch (e) {
-            this._discardLastUndo("change fps");
             console.warn("[Sonder] Failed to update scene FPS:", e);
         } finally {
             this._fpsUpdatePending = false;
@@ -3130,6 +3128,7 @@ export class EditorWidget {
         failureTier = "error",
         retryOnConflict = true,
         invalidateQueueFetch = false,
+        historyEntry = null,
     }) {
         // Invalidate any in-flight scenes GET when a mutation is enqueued.
         // Mutation invalidation is deliberately separate from fetch dispatch
@@ -3139,14 +3138,48 @@ export class EditorWidget {
         if (invalidateQueueFetch) {
             this._queueFetchSeq += 1;
         }
+        const capturedHistoryEntry = historyEntry
+            || this._claimHistoryPostSnapshotCapture(intent?.sceneId);
+        if (capturedHistoryEntry) capturedHistoryEntry._postSnapshotCaptureClaimed = true;
+        this._pendingHistoryEntryByMutationKey ||= new Map();
+        const willCoalesce = coalesce !== false
+            && this._projectMutationQueue.hasPendingKey?.(key) === true;
+        if (willCoalesce) {
+            const supersededEntry = this._pendingHistoryEntryByMutationKey.get(key);
+            if (supersededEntry) this._discardUndoEntry(supersededEntry);
+            this._pendingHistoryEntryByMutationKey.delete(key);
+        }
+        if (capturedHistoryEntry) {
+            this._pendingHistoryEntryByMutationKey.set(key, capturedHistoryEntry);
+        }
+        const queuedIntent = { payload: intent, historyEntry: capturedHistoryEntry };
+        const wrappedMerge = typeof merge === "function"
+            ? (oldValue, nextValue) => ({
+                payload: merge(oldValue?.payload, nextValue?.payload),
+                // A coalesced request has only the latest mutation's durable
+                // result. Never stamp an older entry from that later state.
+                historyEntry: nextValue?.historyEntry || null,
+            })
+            : null;
         const promise = this._projectMutationQueue.enqueue({
             key,
             label,
             coalesce,
-            merge,
-            intent,
-            run: async (queuedIntent) => run(queuedIntent),
+            merge: wrappedMerge,
+            intent: queuedIntent,
+            run: async (queuedValue) => {
+                const result = await run(queuedValue?.payload);
+                this._stampHistoryPostSnapshot(
+                    queuedValue?.historyEntry, result?.payload?.scene);
+                return result;
+            },
         });
+        const clearPendingHistoryEntry = () => {
+            if (this._pendingHistoryEntryByMutationKey.get(key) === capturedHistoryEntry) {
+                this._pendingHistoryEntryByMutationKey.delete(key);
+            }
+        };
+        promise.then(clearPendingHistoryEntry, clearPendingHistoryEntry);
         promise.then(
             (result) => {
                 if (!refreshScenes) return;
@@ -3199,6 +3232,7 @@ export class EditorWidget {
         failureTier = "error",
         retryOnConflict = true,
         expectedModifiedAt = "",
+        historyEntry = null,
     } = {}) {
         const context = this._snapshotProjectMutationContext();
         if (!context) return Promise.resolve(null);
@@ -3222,6 +3256,7 @@ export class EditorWidget {
             failureMessage,
             failureDetail,
             failureTier,
+            historyEntry,
             run: async (queuedIntent) => {
                 return await this._runVersionedProjectMutation(
                     `/sonder-editor/project/${encodeURIComponent(queuedIntent.projectId)}/scenes/${encodeURIComponent(queuedIntent.sceneId)}/mutations`,
@@ -7288,7 +7323,7 @@ export class EditorWidget {
                         if (edgeHit.type === "audio" && this._isLaneLocked(TRACK_TYPE.AUDIO, edgeHit.data.lane_index || 0)) return;
                         if (edgeHit.type === "prompt" && this._isPromptTrackLocked()) return;
                         if (edgeHit.type === "reference" && this._isLaneLocked(TRACK_TYPE.REFERENCE, edgeHit.data.lane_index || 0)) return;
-                        this._pushUndo("trim");
+                        const historyEntry = this._pushUndo("trim");
                         const isSourceLess = edgeHit.type === "prompt" || edgeHit.type === "reference";
                         const trimOrigStart = isSourceLess ? edgeHit.data.start_frame : edgeHit.data.timeline_start_frame;
                         const trimStoredEnd = isSourceLess ? edgeHit.data.end_frame : edgeHit.data.timeline_end_frame;
@@ -7316,6 +7351,7 @@ export class EditorWidget {
                             origSourceIn: trimOrigSourceIn,
                             origSourceOut: trimOrigSourceOut,
                             origTotalSourceFrames: trimOrigTotalSource,
+                            historyEntry,
                             ...trimLimits,
                         };
                         this.isDragging = true;
@@ -7362,7 +7398,7 @@ export class EditorWidget {
                         // Block drag if any selected item is on a locked lane
                         const anyLocked = this.selectedItems.some(s => this._isItemLocked(s));
                         if (anyLocked) return;
-                        this._pushUndo("move items"); // Capture BEFORE drag modifies data
+                        this._dragHistoryEntry = this._pushUndo("move items"); // Capture BEFORE drag modifies data
                         this.isDragging = true;
                         this.dragType = "moveItem";
                         this._dragStartFrame = frame;
@@ -14216,6 +14252,8 @@ export class EditorWidget {
     async _commitItemMove(frameDelta) {
         if (this.selectedItems.length === 0 || !this.activeScene || !this.projectDir) return;
         const sceneId = this.activeSceneId;
+        const historyEntry = this._dragHistoryEntry;
+        this._dragHistoryEntry = null;
 
         return this._withTimelineMutationCommit("moveItem", async () => {
             try {
@@ -14380,6 +14418,7 @@ export class EditorWidget {
                         label: "move item commit",
                         coalesce: false,
                         refreshScenes: false,
+                        historyEntry,
                     });
                     this._reconcileActiveSceneFromMutation(result, { reason: "moveItem_commit", ignoreTimelineGate: true });
                 }
@@ -14467,6 +14506,7 @@ export class EditorWidget {
                         label: "trim commit",
                         coalesce: false,
                         refreshScenes: false,
+                        historyEntry: trimInfo.historyEntry,
                     });
                     this._reconcileActiveSceneFromMutation(result, { reason: "trim_commit", ignoreTimelineGate: true });
                 }
@@ -17941,11 +17981,48 @@ export class EditorWidget {
         };
         this._undoStack.push(entry);
         this._trimUndoStack();
+        // The next scene mutation started in this synchronous action owns the
+        // post-state capture. Expire at the microtask boundary so a later,
+        // unrelated write can never claim an entry left by a dedicated route
+        // or a refused local action.
+        this._historyPostSnapshotCaptureCandidate = entry;
+        queueMicrotask(() => {
+            if (this._historyPostSnapshotCaptureCandidate === entry) {
+                this._historyPostSnapshotCaptureCandidate = null;
+            }
+        });
         // A pending transaction has not changed durable scene state yet. Keep
         // prior Redo ownership until commit; a fully refused + compensated
         // action must be history-neutral.
         if (!entry.pending) this._redoStack = [];
         return entry;
+    }
+
+    _claimHistoryPostSnapshotCapture(sceneId) {
+        if (!sceneId) return null;
+        const entry = this._historyPostSnapshotCaptureCandidate;
+        this._historyPostSnapshotCaptureCandidate = null;
+        if (entry?.kind || entry?.postSnapshot || entry?._postSnapshotCaptureClaimed
+                || !this._undoStack.includes(entry)
+                || String(entry?.sceneId || "") !== String(sceneId)) {
+            return null;
+        }
+        entry._postSnapshotCaptureClaimed = true;
+        return entry;
+    }
+
+    _stampHistoryPostSnapshot(entry, scene) {
+        if (!entry || entry.kind || entry.postSnapshot || !scene?.scene_id
+                || !this._undoStack.includes(entry)
+                || String(entry.sceneId || "") !== String(scene.scene_id)) {
+            return false;
+        }
+        // The entry reference was claimed synchronously by the mutation that
+        // produced this complete server response. activeScene and unrelated
+        // GET payloads are intentionally never fallbacks: both may include
+        // concurrent work that this operation merely observed.
+        entry.postSnapshot = structuredClone(scene);
+        return true;
     }
 
     _commitUndoEntry(entry) {
@@ -18039,6 +18116,29 @@ export class EditorWidget {
     }
 
     async _undo() {
+        if (this._historyOperationInFlight) {
+            notifyInfo("Undo or Redo is still finishing. Try again in a moment.",
+                { source: "history-operation-pending" });
+            return;
+        }
+        if (this._hasPendingHistoryCommit?.()) {
+            notifyInfo("That change is still saving. Try Undo again when it finishes.",
+                { source: "undo-pending" });
+            return;
+        }
+        if (this._sceneHistoryLifecycleOwner) {
+            notifyInfo("Another scene change is still finishing. Try Undo again in a moment.",
+                { source: "undo-scene-lifecycle-pending" });
+            return;
+        }
+        await this._drainProjectMutations?.("history_undo");
+        // Draining yields to queued work and to other history requests. Re-check
+        // every ownership gate before claiming the non-reentrant history lock.
+        if (this._hasPendingProjectMutations?.()) {
+            notifyInfo("That change is still saving. Try Undo again when it finishes.",
+                { source: "undo-project-mutation-pending" });
+            return;
+        }
         if (this._historyOperationInFlight) {
             notifyInfo("Undo or Redo is still finishing. Try again in a moment.",
                 { source: "history-operation-pending" });
@@ -18160,11 +18260,18 @@ export class EditorWidget {
             return;
         }
 
-        const opposite = entry.retryOpposite
-            ? structuredClone(entry.retryOpposite)
-            : (this.activeScene && this.activeSceneId === entry.sceneId) ? {
-            sceneId: this.activeSceneId,
-            snapshot: JSON.parse(JSON.stringify(this.activeScene)),
+        if (!entry.postSnapshot) {
+            this._undoStack.push(entry);
+            sessionDiagRecord("undo_missing_post_snapshot", {
+                scene_id: entry.sceneId || "", label: entry.label || "",
+            });
+            notifyWarning("Undo cannot safely reverse this change because its saved result is unavailable. Refresh the editor and try again.",
+                { source: "undo-missing-post-snapshot" });
+            return;
+        }
+        const opposite = {
+            sceneId: entry.sceneId,
+            snapshot: structuredClone(entry.postSnapshot),
             label: entry.label,
             referenceOperations: structuredClone(entry.inverseReferenceOperations || []),
             inverseReferenceOperations: structuredClone(entry.referenceOperations || []),
@@ -18174,21 +18281,26 @@ export class EditorWidget {
                 ? structuredClone(entry.promptIdentityChange) : null,
             promptIdentityCreateIntents:
                 structuredClone(entry.promptIdentityCreateIntents || []),
-        } : null;
-        let referencesApplied = false;
-        let promptIdentityApplied = false;
+        };
+        const priorAuxiliaryState = entry._ambiguousAuxiliaryState || {};
+        let referencesApplied = priorAuxiliaryState.referencesApplied === true;
+        let promptIdentityApplied = priorAuxiliaryState.promptIdentityApplied === true;
         try {
-            if (entry.referenceOperations?.length) {
+            if (entry.referenceOperations?.length && !referencesApplied) {
                 await this._applyReferenceHistoryOperations(entry.referenceOperations,
                     `undo ${entry.label || "prompt attachment"}`);
                 referencesApplied = true;
             }
-            if (entry.promptIdentityChange) {
+            if (entry.promptIdentityChange && !promptIdentityApplied) {
                 await this._applyPromptIdentityChange(entry.promptIdentityChange,
                     `undo ${entry.label || "prompt attachment"}`, { recordUndo: false });
                 promptIdentityApplied = true;
             }
-            await this._restoreScene(entry.sceneId, entry.snapshot);
+            const restoredScene = await this._restoreScene(
+                entry.sceneId, entry.snapshot, entry.postSnapshot, entry.restoreToken);
+            delete entry.restoreToken;
+            delete entry._ambiguousAuxiliaryState;
+            opposite.postSnapshot = structuredClone(restoredScene);
             if (entry.promptIdentityCreateIntents?.length) {
                 const cleanupPlan = promptIdentityCleanupPlan(
                     entry.promptIdentityCreateIntents);
@@ -18228,14 +18340,24 @@ export class EditorWidget {
                         { source: "undo-prompt-identity-cleanup-unknown" });
                 }
             }
-            delete entry.retryOpposite;
-            if (opposite) this._redoStack.push(opposite);
+            this._redoStack.push(opposite);
         } catch (error) {
             // The source entry remains authoritative until every durable
             // participant has completed. Requeue it before attempting
             // best-effort compensation so a second failure cannot erase the
             // user's only retry path.
-            if (opposite) entry.retryOpposite = structuredClone(opposite);
+            if (error?.restoreAmbiguous && error?.restoreToken) {
+                entry.restoreToken = error.restoreToken;
+                entry._ambiguousAuxiliaryState = {
+                    referencesApplied,
+                    promptIdentityApplied,
+                };
+                this._undoStack.push(entry);
+                notifyWarning("Undo was sent and is still being confirmed. Try Undo again to reconcile it.",
+                    { source: "undo-restore-ambiguous" });
+                return;
+            }
+            delete entry.restoreToken;
             this._undoStack.push(entry);
             const compensationErrors = [];
             if (promptIdentityApplied && entry.inversePromptIdentityChange) {
@@ -18243,6 +18365,7 @@ export class EditorWidget {
                     await this._applyPromptIdentityChange(entry.inversePromptIdentityChange,
                         `restore failed undo ${entry.label || "prompt attachment"}`,
                         { recordUndo: false });
+                    promptIdentityApplied = false;
                 } catch (compensationError) {
                     compensationErrors.push(compensationError);
                 }
@@ -18252,6 +18375,7 @@ export class EditorWidget {
                     await this._applyReferenceHistoryOperations(
                         entry.inverseReferenceOperations,
                         `restore failed undo ${entry.label || "prompt attachment"}`);
+                    referencesApplied = false;
                 } catch (compensationError) {
                     compensationErrors.push(compensationError);
                 }
@@ -18261,6 +18385,14 @@ export class EditorWidget {
                     value?.message || String(value)).join("; ")}` : "";
             notifyWarning(`${error?.message || "Undo was refused."}${recoveryDetail}`,
                 { source: "undo-refused" });
+            if (referencesApplied || promptIdentityApplied) {
+                entry._ambiguousAuxiliaryState = {
+                    referencesApplied,
+                    promptIdentityApplied,
+                };
+            } else {
+                delete entry._ambiguousAuxiliaryState;
+            }
             return;
         }
         this._keyboardDebug("undo complete", {
@@ -18273,6 +18405,29 @@ export class EditorWidget {
     }
 
     async _redo() {
+        if (this._historyOperationInFlight) {
+            notifyInfo("Undo or Redo is still finishing. Try again in a moment.",
+                { source: "history-operation-pending" });
+            return;
+        }
+        if (this._hasPendingHistoryCommit?.()) {
+            notifyInfo("That change is still saving. Try Redo again when it finishes.",
+                { source: "redo-pending" });
+            return;
+        }
+        if (this._sceneHistoryLifecycleOwner) {
+            notifyInfo("Another scene change is still finishing. Try Redo again in a moment.",
+                { source: "redo-scene-lifecycle-pending" });
+            return;
+        }
+        await this._drainProjectMutations?.("history_redo");
+        // The await above opens the same ownership window as Undo. A mutation
+        // settlement may also have created a pending composite history entry.
+        if (this._hasPendingProjectMutations?.()) {
+            notifyInfo("That change is still saving. Try Redo again when it finishes.",
+                { source: "redo-project-mutation-pending" });
+            return;
+        }
         if (this._historyOperationInFlight) {
             notifyInfo("Undo or Redo is still finishing. Try again in a moment.",
                 { source: "history-operation-pending" });
@@ -18373,11 +18528,18 @@ export class EditorWidget {
             return;
         }
 
-        const opposite = entry.retryOpposite
-            ? structuredClone(entry.retryOpposite)
-            : (this.activeScene && this.activeSceneId === entry.sceneId) ? {
-            sceneId: this.activeSceneId,
-            snapshot: JSON.parse(JSON.stringify(this.activeScene)),
+        if (!entry.postSnapshot) {
+            this._redoStack.push(entry);
+            sessionDiagRecord("undo_missing_post_snapshot", {
+                scene_id: entry.sceneId || "", label: entry.label || "", redo: true,
+            });
+            notifyWarning("Redo cannot safely reapply this change because its saved result is unavailable. Refresh the editor and try again.",
+                { source: "redo-missing-post-snapshot" });
+            return;
+        }
+        const opposite = {
+            sceneId: entry.sceneId,
+            snapshot: structuredClone(entry.postSnapshot),
             label: entry.label,
             referenceOperations: structuredClone(entry.inverseReferenceOperations || []),
             inverseReferenceOperations: structuredClone(entry.referenceOperations || []),
@@ -18387,22 +18549,26 @@ export class EditorWidget {
                 ? structuredClone(entry.promptIdentityChange) : null,
             promptIdentityCreateIntents:
                 structuredClone(entry.promptIdentityCreateIntents || []),
-        } : null;
-        let referencesApplied = false;
-        let promptIdentityApplied = false;
-        let promptIdentityCreatesApplied = [];
+        };
+        const priorAuxiliaryState = entry._ambiguousAuxiliaryState || {};
+        let referencesApplied = priorAuxiliaryState.referencesApplied === true;
+        let promptIdentityApplied = priorAuxiliaryState.promptIdentityApplied === true;
+        let promptIdentityCreatesApplied = structuredClone(
+            priorAuxiliaryState.promptIdentityCreatesApplied || []);
+        let promptIdentityCreatesResolved =
+            priorAuxiliaryState.promptIdentityCreatesResolved === true;
         try {
-            if (entry.referenceOperations?.length) {
+            if (entry.referenceOperations?.length && !referencesApplied) {
                 await this._applyReferenceHistoryOperations(entry.referenceOperations,
                     `redo ${entry.label || "prompt attachment"}`);
                 referencesApplied = true;
             }
-            if (entry.promptIdentityChange) {
+            if (entry.promptIdentityChange && !promptIdentityApplied) {
                 await this._applyPromptIdentityChange(entry.promptIdentityChange,
                     `redo ${entry.label || "prompt attachment"}`, { recordUndo: false });
                 promptIdentityApplied = true;
             }
-            if (entry.promptIdentityCreateIntents?.length) {
+            if (entry.promptIdentityCreateIntents?.length && !promptIdentityCreatesResolved) {
                 const refreshed = await this._fetchReferences({
                     ignoreMutationGate: true,
                     reason: "redo_prompt_identity_plan", force: true,
@@ -18440,12 +18606,30 @@ export class EditorWidget {
                     opposite.promptIdentityCreateIntents = structuredClone(
                         entry.promptIdentityCreateIntents || []);
                 }
+                promptIdentityCreatesResolved = true;
             }
-            await this._restoreScene(entry.sceneId, entry.snapshot);
-            delete entry.retryOpposite;
-            if (opposite) this._undoStack.push(opposite);
+            const restoredScene = await this._restoreScene(
+                entry.sceneId, entry.snapshot, entry.postSnapshot, entry.restoreToken);
+            delete entry.restoreToken;
+            delete entry._ambiguousAuxiliaryState;
+            opposite.postSnapshot = structuredClone(restoredScene);
+            this._undoStack.push(opposite);
         } catch (error) {
-            if (opposite) entry.retryOpposite = structuredClone(opposite);
+            if (error?.restoreAmbiguous && error?.restoreToken) {
+                entry.restoreToken = error.restoreToken;
+                entry._ambiguousAuxiliaryState = {
+                    referencesApplied,
+                    promptIdentityApplied,
+                    promptIdentityCreatesApplied:
+                        structuredClone(promptIdentityCreatesApplied),
+                    promptIdentityCreatesResolved,
+                };
+                this._redoStack.push(entry);
+                notifyWarning("Redo was sent and is still being confirmed. Try Redo again to reconcile it.",
+                    { source: "redo-restore-ambiguous" });
+                return;
+            }
+            delete entry.restoreToken;
             this._redoStack.push(entry);
             const compensationErrors = [];
             if (promptIdentityApplied && entry.inversePromptIdentityChange) {
@@ -18453,6 +18637,7 @@ export class EditorWidget {
                     await this._applyPromptIdentityChange(entry.inversePromptIdentityChange,
                         `restore failed redo ${entry.label || "prompt attachment"}`,
                         { recordUndo: false });
+                    promptIdentityApplied = false;
                 } catch (compensationError) {
                     compensationErrors.push(compensationError);
                 }
@@ -18468,6 +18653,8 @@ export class EditorWidget {
                             sceneId: entry.sceneId,
                         });
                     this._adoptPromptIdentitiesFromMutation(cleanupResult);
+                    promptIdentityCreatesApplied = [];
+                    promptIdentityCreatesResolved = false;
                 } catch (compensationError) {
                     compensationErrors.push(compensationError);
                 }
@@ -18477,6 +18664,7 @@ export class EditorWidget {
                     await this._applyReferenceHistoryOperations(
                         entry.inverseReferenceOperations,
                         `restore failed redo ${entry.label || "prompt attachment"}`);
+                    referencesApplied = false;
                 } catch (compensationError) {
                     compensationErrors.push(compensationError);
                 }
@@ -18486,6 +18674,19 @@ export class EditorWidget {
                     value?.message || String(value)).join("; ")}` : "";
             notifyWarning(`${error?.message || "Redo was refused."}${recoveryDetail}`,
                 { source: "redo-refused" });
+            if (referencesApplied || promptIdentityApplied
+                    || promptIdentityCreatesApplied.length
+                    || promptIdentityCreatesResolved) {
+                entry._ambiguousAuxiliaryState = {
+                    referencesApplied,
+                    promptIdentityApplied,
+                    promptIdentityCreatesApplied:
+                        structuredClone(promptIdentityCreatesApplied),
+                    promptIdentityCreatesResolved,
+                };
+            } else {
+                delete entry._ambiguousAuxiliaryState;
+            }
             return;
         }
         this._keyboardDebug("redo complete", {
@@ -18497,41 +18698,41 @@ export class EditorWidget {
         });
     }
 
-    async _restoreScene(sceneId, snapshot) {
+    async _restoreScene(sceneId, targetSnapshot, baseSnapshot, existingRestoreToken = "") {
         if (!this.projectDir) throw new Error("No project is open for scene restore.");
+        if (!baseSnapshot) throw new Error(
+            "Scene history is missing its authoritative result; refresh the editor.");
         const dirName = this.projectDir.split(/[/\\]/).pop();
+        const encodedProject = encodeURIComponent(dirName);
+        const encodedScene = encodeURIComponent(sceneId);
+        const tokenUrl = `/sonder-editor/project/${encodedProject}/scenes/${encodedScene}/restore-token`;
         this._keyboardDebug("restore start", {
             sceneId,
             activeSceneId: this.activeSceneId || "",
             projectDir: dirName || "",
-            snapshotKeys: snapshot ? Object.keys(snapshot) : [],
+            targetKeys: targetSnapshot ? Object.keys(targetSnapshot) : [],
+            baseKeys: baseSnapshot ? Object.keys(baseSnapshot) : [],
         });
 
-        try {
-            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/restore`), {
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(snapshot),
-            });
-            this._keyboardDebug("restore response", {
-                sceneId,
-                status: resp.status,
-                ok: resp.ok,
-            });
-            if (!resp.ok) {
-                throw new Error(`Scene restore failed (${resp.status}).`);
+        const responseError = async (response, fallback) => {
+            let payload = null;
+            try { payload = await response.json(); } catch (_error) {}
+            const error = new Error(payload?.error || fallback);
+            error.status = response.status;
+            error.code = payload?.code || "";
+            error.payload = payload;
+            if (error.code === "project_version_conflict") {
+                error.message = "The project kept changing while scene history was applied. Try again.";
             }
-            // If we're restoring a different scene, switch to it
-            if (this.activeSceneId !== sceneId) {
-                this.activeSceneId = sceneId;
+            return error;
+        };
+        const adopt = (scene) => {
+            if (!scene || String(scene.scene_id || "") !== String(sceneId || "")) {
+                throw new Error("Scene restore returned an invalid scene.");
             }
-            await this._fetchScenes();
-            this._keyboardDebug("restore fetched scenes", {
-                sceneId,
-                activeSceneId: this.activeSceneId || "",
-                sceneCount: this.scenes.length,
-                activeElement: describeKeyboardDebugElement(document.activeElement),
-            });
+            if (this.activeSceneId !== sceneId) this.activeSceneId = sceneId;
+            this._replaceSceneInList?.(scene);
+            this._setActiveScene(scene);
             this._renderTimeline();
             this._renderViewportFrame();
             this._keyboardDebug("restore render complete", {
@@ -18540,42 +18741,127 @@ export class EditorWidget {
                 editorFocused: !!this._editorFocused,
                 activeElement: describeKeyboardDebugElement(document.activeElement),
             });
-        } catch (e) {
-            this._keyboardDebug("restore failed", {
-                sceneId,
-                error: e?.message || String(e),
-            });
-            console.warn("[Sonder] Undo/redo restore failed:", e);
-            // The restore PUT may have committed before its response or the
-            // following refresh failed. Re-read and treat an exact target
-            // snapshot as success so history cannot strand an already-applied
-            // scene transition.
-            try {
-                const reconcileResponse = await fetch(api.apiURL(
-                    `/sonder-editor/project/${dirName}/scenes`));
-                if (!reconcileResponse.ok) throw new Error(
-                    `Scene history reconciliation failed (${reconcileResponse.status}).`);
-                const reconcilePayload = await reconcileResponse.json();
-                const reconciledScenes = Array.isArray(reconcilePayload?.scenes)
-                    ? reconcilePayload.scenes : [];
-                const restored = reconciledScenes.find((scene) =>
-                    String(scene?.scene_id || "") === String(sceneId || ""));
-                if (restored && JSON.stringify(restored) === JSON.stringify(snapshot)) {
-                    this.scenes = reconciledScenes;
-                    this._setActiveScene(restored);
-                    try {
-                        this._renderTimeline();
-                        this._renderViewportFrame();
-                    } catch (renderError) {
-                        console.warn("[Sonder] Restored scene, but history repaint failed:",
-                            renderError);
-                    }
-                    return;
-                }
-            } catch (reconcileError) {
-                console.warn("[Sonder] Failed to reconcile scene restore:", reconcileError);
+            return scene;
+        };
+
+        let restoreToken = String(existingRestoreToken || "");
+        if (!restoreToken) {
+            const tokenResponse = await fetch(api.apiURL(tokenUrl), { method: "POST" });
+            if (!tokenResponse.ok) {
+                throw await responseError(tokenResponse,
+                    `Scene history token failed (${tokenResponse.status}).`);
             }
-            throw e;
+            const tokenPayload = await tokenResponse.json();
+            restoreToken = String(tokenPayload?.restore_token || "");
+            if (!restoreToken) throw new Error("Scene history token was not returned.");
+        }
+        const reconcileReceipt = async () => {
+            const receiptUrl = `${tokenUrl}/${encodeURIComponent(restoreToken)}`;
+            for (const delayMs of [0, 80, 200, 500, 1000]) {
+                if (delayMs > 0) {
+                    await new Promise((resolve) => setTimeout(resolve, delayMs));
+                }
+                try {
+                    const receiptResponse = await fetch(api.apiURL(receiptUrl));
+                    if (!receiptResponse.ok) continue;
+                    const receipt = await receiptResponse.json();
+                    if (receipt?.status === "committed" && receipt?.scene) {
+                        return receipt.scene;
+                    }
+                    if (receipt?.status === "refused") {
+                        const error = new Error(
+                            receipt?.error || "Scene history was refused.");
+                        error.status = 409;
+                        error.code = receipt?.code || "";
+                        error.payload = receipt;
+                        throw error;
+                    }
+                } catch (receiptError) {
+                    if (receiptError?.status != null) throw receiptError;
+                    console.warn("[Sonder] Failed to query scene restore receipt:", receiptError);
+                }
+            }
+            return null;
+        };
+        const markRestoreAmbiguous = (error) => {
+            const ambiguousError = error instanceof Error
+                ? error
+                : new Error(String(error || "Scene restore response was lost."));
+            ambiguousError.restoreToken = restoreToken;
+            ambiguousError.restoreAmbiguous = true;
+            return ambiguousError;
+        };
+        const adoptReconciledScene = (scene) => {
+            try {
+                return adopt(scene);
+            } catch (adoptError) {
+                throw markRestoreAmbiguous(adoptError);
+            }
+        };
+
+        let restoreResponse;
+        try {
+            // Do not use postProjectJsonWithReconcile here. Re-sending the same
+            // body with a healed If-Match would repeat a stale write; only the
+            // backend may retry after reloading and re-merging against stored.
+            restoreResponse = await fetch(api.apiURL(
+                `/sonder-editor/project/${encodedProject}/scenes/${encodedScene}/restore`), {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    base_scene: baseSnapshot,
+                    target_scene: targetSnapshot,
+                    restore_token: restoreToken,
+                }),
+            });
+        } catch (networkError) {
+            this._keyboardDebug("restore response lost", {
+                sceneId, error: networkError?.message || String(networkError),
+            });
+            const receiptScene = await reconcileReceipt();
+            if (receiptScene) return adoptReconciledScene(receiptScene);
+            // Pending or unreachable receipt state is ambiguous. Preserve the
+            // server-issued token on the history entry so a later user retry
+            // addresses this exact operation instead of creating a conflicting
+            // second restore after the first one commits.
+            throw markRestoreAmbiguous(networkError);
+        }
+
+        this._keyboardDebug("restore response", {
+            sceneId,
+            status: restoreResponse.status,
+            ok: restoreResponse.ok,
+        });
+        if (!restoreResponse.ok) {
+            const error = await responseError(
+                restoreResponse, `Scene restore failed (${restoreResponse.status}).`);
+            if (error.code === "scene_restore_token_expired" && existingRestoreToken) {
+                return this._restoreScene(sceneId, targetSnapshot, baseSnapshot, "");
+            }
+            if (restoreResponse.status >= 500) {
+                const receiptScene = await reconcileReceipt();
+                if (receiptScene) return adoptReconciledScene(receiptScene);
+                throw markRestoreAmbiguous(error);
+            }
+            if (restoreResponse.status === 409) {
+                await this._fetchScenes({
+                    ignoreMutationGate: true,
+                    reason: `scene_history_${error.code || "conflict"}`,
+                });
+            }
+            throw error;
+        }
+        try {
+            const payload = await restoreResponse.json();
+            return adopt(payload?.scene);
+        } catch (responseBodyOrAdoptError) {
+            this._keyboardDebug("restore success body/adoption lost", {
+                sceneId,
+                error: responseBodyOrAdoptError?.message || String(responseBodyOrAdoptError),
+            });
+            const receiptScene = await reconcileReceipt();
+            if (receiptScene) return adoptReconciledScene(receiptScene);
+            throw markRestoreAmbiguous(responseBodyOrAdoptError);
         }
     }
 

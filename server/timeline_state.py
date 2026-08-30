@@ -66,6 +66,239 @@ REFERENCE_TAG_PRESETS = (
     {"id": "sonder:h3_sound_texture", "label": "Sound Texture", "asset_types": ["audio", "video"], "suggested_kinds": ["location"]},
 )
 
+
+def _overlay_unknown_record(raw: Any, canonical: dict) -> dict:
+    """Overlay known canonical fields while retaining unknown persisted keys."""
+    result = copy.deepcopy(raw) if isinstance(raw, dict) else {}
+    result.update(copy.deepcopy(canonical))
+    return result
+
+
+def _overlay_unknown_keyed_records(raw: Any, canonical: list, key: str) -> list:
+    """Preserve unknown member fields without resurrecting deleted members."""
+    raw_by_id = {}
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get(key) or "")
+            if item_id and item_id not in raw_by_id:
+                raw_by_id[item_id] = item
+    return [
+        _overlay_unknown_record(raw_by_id.get(str(item.get(key) or "")), item)
+        if isinstance(item, dict) else copy.deepcopy(item)
+        for item in canonical
+    ]
+
+
+def _overlay_unknown_positional_records(raw: Any, canonical: list) -> list:
+    """Retain future keys in schema records whose identity is their list slot."""
+    raw_items = raw if isinstance(raw, list) else []
+    return [
+        _overlay_unknown_record(
+            raw_items[index] if index < len(raw_items) else None, item)
+        if isinstance(item, dict) else copy.deepcopy(item)
+        for index, item in enumerate(canonical)
+    ]
+
+
+def _overlay_unknown_attachment(raw: Any, canonical: dict) -> dict:
+    result = _overlay_unknown_record(raw, canonical)
+    raw_attachment = raw if isinstance(raw, dict) else {}
+    result["capabilities"] = _overlay_unknown_keyed_records(
+        raw_attachment.get("capabilities"), canonical.get("capabilities", []),
+        "capability_id")
+    return result
+
+
+def _overlay_unknown_attachments(raw: Any, canonical: list) -> list:
+    raw_by_id = {
+        str(item.get("attachment_id") or ""): item
+        for item in raw if isinstance(item, dict) and item.get("attachment_id")
+    } if isinstance(raw, list) else {}
+    return [
+        _overlay_unknown_attachment(
+            raw_by_id.get(str(item.get("attachment_id") or "")), item)
+        for item in canonical if isinstance(item, dict)
+    ]
+
+
+def _overlay_unknown_prompt_document(raw: Any, canonical: dict) -> dict:
+    result = _overlay_unknown_record(raw, canonical)
+    raw_document = raw if isinstance(raw, dict) else {}
+    result["nodes"] = _overlay_unknown_keyed_records(
+        raw_document.get("nodes"), canonical.get("nodes", []), "node_id")
+    return result
+
+
+def _preserve_scene_unknown_fields(raw: Any, canonical: dict) -> dict:
+    """Round-trip future scene/member fields at the project boundary."""
+    result = _overlay_unknown_record(raw, canonical)
+    raw_scene = raw if isinstance(raw, dict) else {}
+    for field_name, member_key in (
+        ("prompt_sections", "prompt_id"),
+        ("guide_frames", "guide_id"),
+        ("clips", "clip_id"),
+        ("audio_tracks", "track_id"),
+        ("reference_items", "reference_item_id"),
+        ("linked_item_groups", "group_id"),
+        ("minimax_h3_conditioning_setups", "setup_id"),
+        ("reference_lane_recipes", "lane_id"),
+    ):
+        result[field_name] = _overlay_unknown_keyed_records(
+            raw_scene.get(field_name), canonical.get(field_name, []), member_key)
+    result["global_attachments"] = _overlay_unknown_attachments(
+        raw_scene.get("global_attachments"), canonical.get("global_attachments", []))
+
+    # These records have no durable id; their list position is their identity.
+    for field_name in (
+        "video_lane_configs",
+        "motion_driver_lane_configs",
+        "audio_lane_configs",
+        "reference_lane_configs",
+        "saved_selections",
+    ):
+        result[field_name] = _overlay_unknown_positional_records(
+            raw_scene.get(field_name), canonical.get(field_name, []))
+
+    for field_name in (
+        "batch_config",
+        "guide_track_config",
+        "prompt_track_config",
+        "global_prompt_track_config",
+    ):
+        result[field_name] = _overlay_unknown_record(
+            raw_scene.get(field_name), canonical.get(field_name, {}))
+
+    # Linked refs and staged Reference members are typed nested records too.
+    raw_groups = {
+        str(item.get("group_id") or ""): item
+        for item in raw_scene.get("linked_item_groups", [])
+        if isinstance(item, dict) and item.get("group_id")
+    }
+    for group in result.get("linked_item_groups", []):
+        raw_group = raw_groups.get(str(group.get("group_id") or ""), {})
+        raw_refs = {
+            (str(item.get("type") or ""), str(item.get("id") or "")): item
+            for item in raw_group.get("items", [])
+            if isinstance(item, dict)
+        }
+        group["items"] = [
+            _overlay_unknown_record(
+                raw_refs.get((str(item.get("type") or ""), str(item.get("id") or ""))),
+                item,
+            )
+            for item in group.get("items", []) if isinstance(item, dict)
+        ]
+
+    raw_reference_items = {
+        str(item.get("reference_item_id") or ""): item
+        for item in raw_scene.get("reference_items", [])
+        if isinstance(item, dict) and item.get("reference_item_id")
+    }
+    for item in result.get("reference_items", []):
+        raw_item = raw_reference_items.get(str(item.get("reference_item_id") or ""), {})
+        item["members"] = _overlay_unknown_keyed_records(
+            raw_item.get("members"), item.get("members", []), "member_id")
+
+    raw_sections = {
+        str(item.get("prompt_id") or ""): item
+        for item in raw_scene.get("prompt_sections", [])
+        if isinstance(item, dict) and item.get("prompt_id")
+    }
+    for section in result.get("prompt_sections", []):
+        raw_section = raw_sections.get(str(section.get("prompt_id") or ""), {})
+        section["attachments"] = _overlay_unknown_attachments(
+            raw_section.get("attachments"), section.get("attachments", []))
+        raw_docs = raw_section.get("channel_docs", {})
+        section["channel_docs"] = {
+            key: _overlay_unknown_prompt_document(
+                raw_docs.get(key) if isinstance(raw_docs, dict) else None, document)
+            for key, document in section.get("channel_docs", {}).items()
+        }
+
+    raw_global_docs = raw_scene.get("global_channel_docs", {})
+    result["global_channel_docs"] = {
+        key: _overlay_unknown_prompt_document(
+            raw_global_docs.get(key) if isinstance(raw_global_docs, dict) else None,
+            document)
+        for key, document in result.get("global_channel_docs", {}).items()
+    }
+    return result
+
+
+def _preserve_project_unknown_fields(raw: Any, canonical: dict) -> dict:
+    """Round-trip future typed project members during any project save."""
+    result = _overlay_unknown_record(raw, canonical)
+    raw_project = raw if isinstance(raw, dict) else {}
+    for field_name, member_key in (
+        ("assets", "asset_id"),
+        ("generation_queue", "job_id"),
+        ("references", "reference_id"),
+        ("prompt_semantic_units", "semantic_unit_id"),
+    ):
+        result[field_name] = _overlay_unknown_keyed_records(
+            raw_project.get(field_name), canonical.get(field_name, []), member_key)
+
+    raw_references = {
+        str(item.get("reference_id") or ""): item
+        for item in raw_project.get("references", [])
+        if isinstance(item, dict) and item.get("reference_id")
+    }
+    for reference in result.get("references", []):
+        raw_reference = raw_references.get(
+            str(reference.get("reference_id") or ""), {})
+        reference["members"] = _overlay_unknown_keyed_records(
+            raw_reference.get("members"), reference.get("members", []),
+            "member_id")
+        raw_members = {
+            str(item.get("member_id") or ""): item
+            for item in raw_reference.get("members", [])
+            if isinstance(item, dict) and item.get("member_id")
+        }
+        for member in reference["members"]:
+            raw_member = raw_members.get(str(member.get("member_id") or ""), {})
+            if isinstance(member.get("crop"), dict):
+                member["crop"] = _overlay_unknown_record(
+                    raw_member.get("crop"), member["crop"])
+        # This known pre-release field was deliberately retired, not unknown.
+        reference.pop("notes", None)
+
+    raw_units = {
+        str(item.get("semantic_unit_id") or ""): item
+        for item in raw_project.get("prompt_semantic_units", [])
+        if isinstance(item, dict) and item.get("semantic_unit_id")
+    }
+    for unit in result.get("prompt_semantic_units", []):
+        raw_unit = raw_units.get(str(unit.get("semantic_unit_id") or ""), {})
+        raw_sources = {
+            (str(item.get("entity_id") or ""), str(item.get("member_id") or "")): item
+            for item in raw_unit.get("sources", [])
+            if isinstance(item, dict)
+        }
+        unit["sources"] = [
+            _overlay_unknown_record(
+                raw_sources.get((str(item.get("entity_id") or ""),
+                                 str(item.get("member_id") or ""))), item)
+            for item in unit.get("sources", []) if isinstance(item, dict)
+        ]
+        # One-time migration authority; never resurrect the retired alias.
+        unit.pop("source_members", None)
+
+    raw_profiles = {
+        (str(item.get("profile_id") or ""), str(item.get("version") or "1")): item
+        for item in raw_project.get("prompt_context_profiles", [])
+        if isinstance(item, dict) and item.get("profile_id")
+    }
+    result["prompt_context_profiles"] = [
+        _overlay_unknown_record(
+            raw_profiles.get((str(item.get("profile_id") or ""),
+                              str(item.get("version") or "1"))), item)
+        for item in canonical.get("prompt_context_profiles", [])
+        if isinstance(item, dict)
+    ]
+    return result
+
 # Backend-owned recipe catalog. Lane state stores a materialized copy of the
 # selected recipe so projects remain reproducible if this catalog evolves.
 #
@@ -1438,6 +1671,9 @@ class Scene:
     height: int = 0                             # 0 = inherit from project
     fps: float = 0.0                            # 0 = inherit from project
     saved_selections: list = field(default_factory=list)  # list[dict] {name, start, end, pre/post context, mask pre/post offsets}
+    # Raw persisted shape is a compatibility shadow only. Known fields always
+    # come from the model; unknown future keys are overlaid back on save.
+    _raw_data: dict = field(default_factory=dict, repr=False, compare=False)
 
     def __post_init__(self):
         # A legacy scene carries only the flat `prompt`; seed the channels from
@@ -1653,7 +1889,7 @@ class Scene:
             if isinstance(entry, dict)
         ]
 
-        return {
+        data = {
             "scene_id": self.scene_id,
             "name": self.name,
             "order": self.order,
@@ -1700,6 +1936,7 @@ class Scene:
             "fps": self.fps,
             "saved_selections": saved_selections,
         }
+        return _preserve_scene_unknown_fields(self._raw_data, data)
 
     @classmethod
     def from_dict(cls, data: dict) -> "Scene":
@@ -1805,6 +2042,7 @@ class Scene:
             scene.global_prompt_track_config = LaneConfig(
                 hidden=scene.prompt_track_config.hidden
             )
+        scene._raw_data = copy.deepcopy(data)
         return scene
 
     def _ensure_stable_link_item_ids(self) -> None:
@@ -2287,6 +2525,10 @@ class TimelineProject:
     metadata: dict = field(default_factory=dict)
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     modified_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    # Persistence-only compatibility and restore-commit state. Neither is part
+    # of the public project API returned by ``to_dict()``.
+    _raw_data: dict = field(default_factory=dict, repr=False, compare=False)
+    _scene_restore_receipts: list = field(default_factory=list, repr=False, compare=False)
 
     # --- Scene helpers ---
 
@@ -2408,8 +2650,8 @@ class TimelineProject:
 
     # --- Serialization ---
 
-    def to_dict(self) -> dict:
-        return {
+    def to_dict(self, *, include_internal: bool = False) -> dict:
+        canonical = {
             "project_id": self.project_id,
             "name": self.name,
             "fps": self.fps,
@@ -2428,6 +2670,16 @@ class TimelineProject:
             "created_at": self.created_at,
             "modified_at": self.modified_at,
         }
+        data = _preserve_project_unknown_fields(self._raw_data, canonical)
+        # These legacy authorities are intentionally retired on the next save.
+        data.pop("clips", None)
+        data.pop("audio_tracks", None)
+        if include_internal:
+            data["_scene_restore_receipts"] = copy.deepcopy(
+                self._scene_restore_receipts)
+        else:
+            data.pop("_scene_restore_receipts", None)
+        return data
 
     @classmethod
     def from_dict(cls, data: dict, project_dir: str = "") -> "TimelineProject":
@@ -2500,6 +2752,11 @@ class TimelineProject:
         project.generation_queue = [
             GenerationJob.from_dict(j) for j in data.get("generation_queue", [])
         ]
+        raw_receipts = data.get("_scene_restore_receipts", [])
+        project._scene_restore_receipts = [
+            copy.deepcopy(item) for item in raw_receipts
+            if isinstance(item, dict)
+        ] if isinstance(raw_receipts, list) else []
         # Backward compat: migrate old flat clips/audio_tracks into a default scene
         old_clips = data.get("clips", [])
         old_audio = data.get("audio_tracks", [])
@@ -2508,4 +2765,5 @@ class TimelineProject:
             scene.clips = [ClipReference.from_dict(c) for c in old_clips]
             scene.audio_tracks = [AudioTrack.from_dict(a) for a in old_audio]
             project.scenes.append(scene)
+        project._raw_data = copy.deepcopy(data)
         return project

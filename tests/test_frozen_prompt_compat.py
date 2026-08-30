@@ -172,7 +172,7 @@ def test_representative_v022_project_and_job_semantically_round_trip():
     assert len(saved["scenes"][0]["video_lane_configs"]) == 18
     assert saved["scenes"][0]["prompt_sections"][0]["channels"][
         "vendor_channel"] == "preserve authored unknown channel"
-    assert "future_top_level_blob" not in saved
+    assert saved["future_top_level_blob"] == [1, 2, 3]
 
     job_raw = json.loads(
         (FIXTURES / "fixture_v022_job.json").read_text(encoding="utf-8"))

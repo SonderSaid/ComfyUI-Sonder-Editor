@@ -103,6 +103,7 @@ a fresh `[Unreleased]` block.
   format's own label.
 
 ### Fixed
+- Scene Undo and Redo now reverse only their own acknowledged edit through a conflict-checked three-way merge, preserving concurrent generated takes and other unrelated work while refusing unverifiable or genuinely conflicting history.
 - Generated video no longer starts on wrong content when the render window has to be rounded up to the model's frame rule. The rounded-up tail was filled with digital silence, and generation frequently keeps those filler frames rather than regenerating them - always when a channel is frozen, and also whenever the window carries post-context - so the silence reached the model as if it were real recording. The tail now mirrors the end of the window's own audio instead.
 - Global Reference chips now stay completely dormant when none of their selected References are staged: every capability, Summary task type, and shot claim stays out. Globals excluded by all effective sections report **not inherited** and cannot validate, warn, own, deduplicate, or render through that channel, while genuine integrity failures still refuse the render.
 - Structured and Global Prompt previews now measure their stale grace from the compile request instead of the preceding typing debounce, keep failed previews steadily explained until recovery, and avoid rebuilding unchanged projection chrome.

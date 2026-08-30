@@ -181,11 +181,15 @@ def save_project(
 
         if bump_modified_at:
             project.modified_at = datetime.now().isoformat()
-        data = project.to_dict()
+        data = project.to_dict(include_internal=True)
         tmp_file = f"{project_file}.{uuid.uuid4().hex}.tmp"
         with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
         atomic_replace(tmp_file, project_file)
+        # Advance the compatibility shadow only after the atomic replace. A
+        # failed CAS/write must not make unsaved state look durable in memory.
+        if hasattr(project, "_raw_data"):
+            project._raw_data = json.loads(json.dumps(data))
         if hasattr(project, "_expected_modified_at"):
             setattr(project, "_expected_modified_at", getattr(project, "modified_at", ""))
     # #36 diagnostic: every save with the caller's immediate stack frame so the diag ring

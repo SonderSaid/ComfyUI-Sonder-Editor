@@ -24,7 +24,7 @@ def _run_node(script: str):
     if not node:
         pytest.skip("node is required for this test")
     return json.loads(subprocess.run(
-        [node, "--input-type=module", "-e", script], capture_output=True,
+        [node, "--input-type=module"], input=script, capture_output=True,
         text=True, encoding="utf-8", check=True).stdout)
 
 
@@ -3226,17 +3226,19 @@ class Harness {{
   async _restoreScene(_sceneId,value) {{
     this.events.push(["scene",value.attachments.length]);
     this.activeScene=structuredClone(value);
+    return structuredClone(this.activeScene);
   }}
   async _mutateReferences() {{}}
 }}
 const h=new Harness();
 const before={{semantic_unit_id:"u"}};
 const after={{semantic_unit_id:"u",handle:"KoreanWoman"}};
-h._pushUndo("attach prompt Reference",{{
+const entry=h._pushUndo("attach prompt Reference",{{
   promptIdentityChange:{{type:"upsert",value:before,expected:after}},
   inversePromptIdentityChange:{{type:"upsert",value:after,expected:before}},
 }});
 h.activeScene={{attachments:[{{attachment_id:"chip"}}]}};
+entry.postSnapshot=structuredClone(h.activeScene);
 h.currentDependencies={{prompt_semantic_units:[structuredClone(after)]}};
 const depthAfterAttach=h._undoStack.length;
 await h._undo();
@@ -3264,6 +3266,164 @@ console.log(JSON.stringify({{depthAfterAttach,afterUndo,afterRedo:{{
     assert result["afterRedo"]["redo"] == 0
     assert result["afterRedo"]["events"] == [
         ["identity", "KoreanWoman"], ["scene", 1]]
+
+
+def test_scene_history_post_snapshot_is_stamped_only_by_claimed_mutation_payload():
+    widget = _source("web/js/editor_widget.js")
+    push = _method(widget, "_pushUndo", "_commitUndoEntry")
+    result = _run_node(f"""
+class Harness {{
+{push}
+  constructor() {{
+    this.activeSceneId="scene";
+    this.activeScene={{scene_id:"scene",value:"before"}};
+    this._undoStack=[];this._redoStack=[];this._maxUndoSteps=20;
+  }}
+  _trimUndoStack(){{}}
+}}
+const h=new Harness();
+const entry=h._pushUndo("edit");
+h.activeScene.value="optimistic-local";
+const beforeStamp={{hasPost:Object.hasOwn(entry,"postSnapshot"),
+  snapshot:entry.snapshot.value}};
+const claimed=h._claimHistoryPostSnapshotCapture("scene");
+h._stampHistoryPostSnapshot(claimed,{{scene_id:"scene",value:"server-after"}});
+const afterStamp={{post:entry.postSnapshot.value,active:h.activeScene.value}};
+h._stampHistoryPostSnapshot(entry,{{scene_id:"scene",value:"later-server"}});
+console.log(JSON.stringify({{beforeStamp,afterStamp,stable:entry.postSnapshot.value}}));
+""")
+    assert result == {
+        "beforeStamp": {"hasPost": False, "snapshot": "before"},
+        "afterStamp": {"post": "server-after", "active": "optimistic-local"},
+        "stable": "server-after",
+    }
+    fetch_scenes = _method(widget, "_fetchScenes", "_createScene")
+    reconcile = _method(widget, "_reconcileActiveSceneFromMutation", "_discardLastUndo")
+    assert "_stampHistoryPostSnapshot" not in fetch_scenes
+    assert "_stampHistoryPostSnapshot" not in reconcile
+
+
+def test_fps_change_is_not_recorded_until_scene_history_is_timebase_aware():
+    widget = _source("web/js/editor_widget.js")
+    update_fps = _method(widget, "_updateSceneFps", "_cycleScene")
+    assert "_pushUndo" not in update_fps
+    assert "_discardLastUndo" not in update_fps
+
+
+def test_coalesced_scene_mutation_stamps_only_its_latest_correlated_undo_entry():
+    widget = _source("web/js/editor_widget.js")
+    queue_method = _method(widget, "_queueProjectMutation", "_runSceneMutation")
+    history_methods = _method(widget, "_pushUndo", "_commitUndoEntry")
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+globalThis.notifyError=()=>{{}};globalThis.notifyWarning=()=>{{}};
+class Harness {{
+{queue_method}
+{history_methods}
+  constructor(){{this.activeSceneId="scene";
+    this.activeScene={{scene_id:"scene",value:0}};
+    this._undoStack=[];this._redoStack=[];this._maxUndoSteps=20;
+    this._sceneMutationInvalidationSeq=0;
+    this._projectMutationQueue=new ProjectMutationQueue();}}
+  _trimUndoStack(){{}}
+  _discardUndoEntry(entry){{const index=this._undoStack.indexOf(entry);
+    if(index<0)return false;this._undoStack.splice(index,1);return true;}}
+}}
+const h=new Harness();
+const first=h._pushUndo("first");
+const firstPromise=h._queueProjectMutation({{key:"scene:value",label:"first",
+  refreshScenes:false,intent:{{sceneId:"scene",value:1}},
+  run:async(intent)=>({{payload:{{scene:{{scene_id:"scene",value:intent.value}}}}}})}});
+h.activeScene.value=1;
+const second=h._pushUndo("second");
+const secondPromise=h._queueProjectMutation({{key:"scene:value",label:"second",
+  refreshScenes:false,intent:{{sceneId:"scene",value:2}},
+  run:async(intent)=>({{payload:{{scene:{{scene_id:"scene",value:intent.value}}}}}})}});
+await Promise.all([firstPromise,secondPromise]);
+const orphan=h._pushUndo("dedicated route");
+await Promise.resolve();
+await h._queueProjectMutation({{key:"scene:later",label:"later",
+  refreshScenes:false,intent:{{sceneId:"scene",value:3}},coalesce:false,
+  run:async(intent)=>({{payload:{{scene:{{scene_id:"scene",value:intent.value}}}}}})}});
+console.log(JSON.stringify({{
+  firstClaimed:first._postSnapshotCaptureClaimed===true,
+  firstStamped:Object.hasOwn(first,"postSnapshot"),
+  firstPresent:h._undoStack.includes(first),
+  secondPost:second.postSnapshot,
+  orphanStamped:Object.hasOwn(orphan,"postSnapshot"),
+}}));
+""")
+    assert result == {
+        "firstClaimed": True,
+        "firstStamped": False,
+        "firstPresent": False,
+        "secondPost": {"scene_id": "scene", "value": 2},
+        "orphanStamped": False,
+    }
+
+
+def test_unstamped_scene_history_refuses_before_network_access():
+    widget = _source("web/js/editor_widget.js")
+    undo = _method(widget, "_undo", "_redo")
+    result = _run_node(f"""
+globalThis.document={{activeElement:null}};
+globalThis.describeKeyboardDebugElement=()=>({{}});
+globalThis.sessionDiagRecord=()=>{{}};
+let fetches=0;globalThis.fetch=async()=>{{fetches+=1;}};
+const warnings=[];globalThis.notifyWarning=(message)=>warnings.push(message);
+globalThis.notifyInfo=()=>{{}};
+class Harness {{
+{undo}
+  constructor() {{this.activeSceneId="scene";this.activeScene={{value:"after"}};
+    this._undoStack=[{{sceneId:"scene",snapshot:{{value:"before"}},label:"edit"}}];
+    this._redoStack=[];this._editorFocused=false;}}
+  _keyboardDebug(){{}}
+}}
+const h=new Harness();await h._undo();
+console.log(JSON.stringify({{fetches,warnings,undo:h._undoStack.length,
+  redo:h._redoStack.length}}));
+""")
+    assert result["fetches"] == 0
+    assert result["undo"] == 1
+    assert result["redo"] == 0
+    assert "cannot safely reverse" in result["warnings"][0]
+
+
+def test_redo_builds_inverse_from_restore_response_not_active_scene():
+    widget = _source("web/js/editor_widget.js")
+    redo = _method(widget, "_redo", "_restoreScene")
+    result = _run_node(f"""
+globalThis.document={{activeElement:null}};
+globalThis.describeKeyboardDebugElement=()=>({{}});
+globalThis.notifyWarning=()=>{{}};globalThis.notifyInfo=()=>{{}};
+class Harness {{
+{redo}
+  constructor() {{
+    this.activeSceneId="scene";this.activeScene={{scene_id:"scene",items:["stale"]}};
+    this._undoStack=[];this._redoStack=[{{sceneId:"scene",label:"edit",
+      snapshot:{{scene_id:"scene",items:["owned"]}},
+      postSnapshot:{{scene_id:"scene",items:["concurrent"]}}}}];
+    this._editorFocused=false;this._historyOperationInFlight=false;this.calls=[];
+  }}
+  _keyboardDebug(){{}}
+  _finishHistoryOperation(){{this._historyOperationInFlight=false;}}
+  async _restoreScene(sceneId,target,base){{
+    this.calls.push({{sceneId,target,base}});
+    this.activeScene={{scene_id:"scene",items:["owned","concurrent"]}};
+    return structuredClone(this.activeScene);
+  }}
+  async _applyReferenceHistoryOperations(){{}}
+  async _applyPromptIdentityChange(){{}}
+}}
+const h=new Harness();await h._redo();
+console.log(JSON.stringify({{calls:h.calls,undo:h._undoStack,active:h.activeScene}}));
+""")
+    assert result["calls"][0]["target"]["items"] == ["owned"]
+    assert result["calls"][0]["base"]["items"] == ["concurrent"]
+    assert result["undo"][0]["snapshot"]["items"] == ["concurrent"]
+    assert result["undo"][0]["postSnapshot"]["items"] == [
+        "owned", "concurrent"]
 
 
 def test_semantic_unit_save_can_defer_undo_to_composite_scene_history():
@@ -3409,12 +3569,14 @@ class Harness {{
     this._undoStack=[]; this._redoStack=[{{label:"older redo"}}]; this._maxUndoSteps=20;
     this._editorFocused=false; this.restores=0; }}
   _keyboardDebug() {{}}
-  async _restoreScene(_id,snapshot) {{ this.restores += 1; this.activeScene=snapshot; }}
+  async _restoreScene(_id,snapshot) {{ this.restores += 1;
+    this.activeScene=snapshot; return structuredClone(snapshot); }}
   async _mutateReferences() {{}}
   async _applyPromptIdentityChange() {{}}
 }}
 const h=new Harness();
 const entry=h._pushUndo("attach",{{pending:true}});
+entry.postSnapshot=structuredClone(h.activeScene);
 await h._undo();
 await h._redo();
 const whilePending={{undo:h._undoStack.length,redo:h._redoStack.length,
@@ -3502,6 +3664,7 @@ class Harness {{
     this._promptSemanticUnits=[{{semantic_unit_id:"one",handle:"One",name:"One",
       kind:"subject",definition:"",sources:[],voice:{{member_id:null}}}}];
     this._undoStack=[{{sceneId:"scene",snapshot:{{scene_id:"scene",value:"old"}},
+      postSnapshot:{{scene_id:"scene",value:"applied"}},
       label:"apply prompt setup",promptIdentityCreateIntents:[{{
         type:"create_prompt_semantic_unit",handle_suggestion:"One",
         unit:{{semantic_unit_id:"one",name:"One",kind:"subject",definition:""}},
@@ -3517,6 +3680,7 @@ class Harness {{
   async _applyPromptIdentityChange() {{}}
   async _restoreScene(_id,snapshot) {{
     this.restores.push(snapshot.value); this.activeScene=structuredClone(snapshot);
+    return structuredClone(snapshot);
   }}
   async _runSceneMutation(operations) {{
     if(operations[0]?.type==="delete_prompt_semantic_unit_if_unreferenced") {{
@@ -3536,7 +3700,7 @@ const afterUndo={{undo:h._undoStack.length,redo:h._redoStack.length,
   refreshRequired:h._redoStack[0].promptIdentityRefreshRequired===true}};
 await h._redo();
 const afterFailedRedo={{undo:h._undoStack.length,redo:h._redoStack.length,
-  retrySnapshot:h._redoStack[0].retryOpposite.snapshot.value,
+  postSnapshot:h._redoStack[0].postSnapshot.value,
   restores:[...h.restores],creates:h.createAttempts}};
 h.refreshWorks=true;
 await h._redo();
@@ -3548,7 +3712,7 @@ console.log(JSON.stringify({{afterUndo,afterFailedRedo,afterSuccess:{{
     assert result["afterUndo"] == {
         "undo": 0, "redo": 1, "redoSnapshot": "applied", "refreshRequired": True}
     assert result["afterFailedRedo"] == {
-        "undo": 0, "redo": 1, "retrySnapshot": "old",
+        "undo": 0, "redo": 1, "postSnapshot": "old",
         "restores": ["old"], "creates": 0}
     assert result["afterSuccess"] == {
         "undo": 1, "redo": 0, "undoSnapshot": "old",
@@ -3689,12 +3853,12 @@ class Harness {{
 {redo}
   constructor() {{ this.activeSceneId="scene"; this.activeScene={{value:2}};
     this._undoStack=[
-      {{sceneId:"scene",snapshot:{{value:0}},label:"first"}},
-      {{sceneId:"scene",snapshot:{{value:1}},label:"second"}},
+      {{sceneId:"scene",snapshot:{{value:0}},postSnapshot:{{value:1}},label:"first"}},
+      {{sceneId:"scene",snapshot:{{value:1}},postSnapshot:{{value:2}},label:"second"}},
     ]; this._redoStack=[]; this._editorFocused=false; this.restores=0; }}
   _keyboardDebug() {{}}
   async _restoreScene() {{ this.restores += 1;
-    await new Promise((resolve)=>{{this.release=resolve;}}); }}
+    await new Promise((resolve)=>{{this.release=resolve;}}); return {{value:1}}; }}
   async _applyPromptIdentityChange() {{}}
   async _applyReferenceHistoryOperations() {{}}
 }}
@@ -3717,6 +3881,69 @@ console.log(JSON.stringify({{whileRunning,after:{{undo:h._undoStack.length,
         "Undo or Redo is still finishing. Try again in a moment.",
         "Undo or Redo is still finishing. Try again in a moment.",
     ]
+
+
+def test_undo_and_redo_drain_mutations_then_recheck_history_gates():
+    widget = _source("web/js/editor_widget.js")
+    undo = _method(widget, "_undo", "_redo")
+    redo = _method(widget, "_redo", "_restoreScene")
+    result = _run_node(f"""
+globalThis.document={{activeElement:null}};
+globalThis.describeKeyboardDebugElement=()=>({{}});
+const notices=[]; globalThis.notifyInfo=(message)=>notices.push(message);
+globalThis.notifyWarning=()=>{{}};
+class Harness {{
+{undo}
+{redo}
+  constructor() {{ this.activeSceneId="scene"; this.activeScene={{value:2}};
+    this._undoStack=[{{sceneId:"scene",snapshot:{{value:1}},label:"edit"}}];
+    this._redoStack=[{{sceneId:"scene",snapshot:{{value:3}},label:"edit"}}];
+    this._editorFocused=false; this._historyOperationInFlight=false;
+    this.pending=false; this.projectBusy=false; this.restores=0; this.drains=[]; }}
+  _keyboardDebug() {{}}
+  _hasPendingHistoryCommit() {{ return this.pending; }}
+  _hasPendingProjectMutations() {{ return this.projectBusy; }}
+  async _drainProjectMutations(reason) {{
+    this.drains.push(reason);
+    await new Promise((resolve)=>{{this.releaseDrain=resolve;}});
+  }}
+  async _restoreScene() {{ this.restores += 1; }}
+  async _applyPromptIdentityChange() {{}}
+  async _applyReferenceHistoryOperations() {{}}
+}}
+const results=[];
+for (const operation of ["undo","redo"]) {{
+  for (const gate of ["project","in_flight","pending","lifecycle"]) {{
+    const h=new Harness();
+    const call=operation === "undo" ? h._undo() : h._redo();
+    await Promise.resolve();
+    if (gate === "project") h.projectBusy=true;
+    if (gate === "in_flight") h._historyOperationInFlight=true;
+    if (gate === "pending") h.pending=true;
+    if (gate === "lifecycle") h._sceneHistoryLifecycleOwner={{label:"settled mutation"}};
+    h.releaseDrain(); await call;
+    results.push({{operation,gate,drains:h.drains,restores:h.restores,
+      depth:operation === "undo" ? h._undoStack.length : h._redoStack.length}});
+  }}
+}}
+console.log(JSON.stringify({{results,notices}}));
+""")
+    assert result["results"] == [
+        {"operation": operation, "gate": gate,
+         "drains": [f"history_{operation}"], "restores": 0, "depth": 1}
+        for operation in ("undo", "redo")
+        for gate in ("project", "in_flight", "pending", "lifecycle")
+    ]
+    assert result["notices"] == [
+            "That change is still saving. Try Undo again when it finishes.",
+            "Undo or Redo is still finishing. Try again in a moment.",
+            "That change is still saving. Try Undo again when it finishes.",
+            "Another scene change is still finishing. Try Undo again in a moment.",
+            "That change is still saving. Try Redo again when it finishes.",
+            "Undo or Redo is still finishing. Try again in a moment.",
+            "That change is still saving. Try Redo again when it finishes.",
+            "Another scene change is still finishing. Try Redo again in a moment.",
+        ]
 
 
 def test_scene_navigation_cannot_clear_history_while_undo_or_redo_is_in_flight():
@@ -3855,6 +4082,7 @@ class Harness {{
   _clearProjectNotFound(){{}}
   _markStaleReplayApplied(){{}}
   _getWidgetValue(){{return "";}}
+  _stampLatestHistoryPostSnapshot(){{return false;}}
   _setActiveScene(scene){{this.activeSceneId=scene.scene_id;}}
   _governStaleVersionReplay(){{return true;}}
 }}
@@ -3905,6 +4133,7 @@ class Harness {{
   _showProjectNotFound(){{}}
   _markStaleReplayApplied(){{}}
   _getWidgetValue(){{return "";}}
+  _stampLatestHistoryPostSnapshot(){{return false;}}
   _setActiveScene(scene){{this.activeSceneId=scene.scene_id;}}
   _governStaleVersionReplay(){{return true;}}
 }}
@@ -4258,7 +4487,8 @@ class Harness {{
   async _restoreScene() {{ throw new Error(`${{this.mode}} scene refused`); }}
   async _mutateReferences() {{}}
 }}
-const entry={{sceneId:"scene",snapshot:{{value:"other"}},label:"attach",
+const entry={{sceneId:"scene",snapshot:{{value:"other"}},
+  postSnapshot:{{value:"current"}},label:"attach",
   promptIdentityChange:{{type:"upsert",value:{{handle:""}}}},
   inversePromptIdentityChange:{{type:"upsert",value:{{handle:"Stored"}}}}}};
 const undoHarness=new Harness("undo"); undoHarness._undoStack.push(structuredClone(entry));
@@ -4273,6 +4503,125 @@ console.log(JSON.stringify({{undoState,redoState:{{undo:redoHarness._undoStack.l
     assert result["redoState"] == {"undo": 0, "redo": 1}
     assert "undo scene refused Recovery also failed: undo compensation refused" in result["warnings"]
     assert "redo scene refused Recovery also failed: redo compensation refused" in result["warnings"]
+
+
+def test_ambiguous_composite_restore_keeps_auxiliary_state_and_reconciles_once():
+    widget = _source("web/js/editor_widget.js")
+    undo = _method(widget, "_undo", "_redo")
+    redo = _method(widget, "_redo", "_restoreScene")
+    result = _run_node(f"""
+globalThis.document={{activeElement:null}};
+globalThis.describeKeyboardDebugElement=()=>({{}});
+const warnings=[];globalThis.notifyWarning=(message)=>warnings.push(message);
+globalThis.notifyInfo=()=>{{}};
+class Harness {{
+{undo}
+{redo}
+  constructor(mode){{this.mode=mode;this.activeSceneId="scene";
+    this.activeScene={{scene_id:"scene",value:"current"}};this._editorFocused=false;
+    this._undoStack=[];this._redoStack=[];this.referenceCalls=0;
+    this.identityCalls=0;this.restoreCalls=[];}}
+  _keyboardDebug(){{}}
+  async _applyReferenceHistoryOperations(){{this.referenceCalls+=1;}}
+  async _applyPromptIdentityChange(){{this.identityCalls+=1;}}
+  async _restoreScene(_id,target,_base,token){{this.restoreCalls.push(token||"");
+    if(this.restoreCalls.length===1){{const error=new Error("response unknown");
+      error.restoreAmbiguous=true;error.restoreToken=`${{this.mode}}-token`;throw error;}}
+    this.activeScene=structuredClone(target);return structuredClone(target);
+  }}
+}}
+const entry={{sceneId:"scene",snapshot:{{scene_id:"scene",value:"target"}},
+  postSnapshot:{{scene_id:"scene",value:"base"}},label:"composite",
+  referenceOperations:[{{type:"ref"}}],inverseReferenceOperations:[{{type:"ref-back"}}],
+  promptIdentityChange:{{type:"identity"}},
+  inversePromptIdentityChange:{{type:"identity-back"}}}};
+const undoHarness=new Harness("undo");undoHarness._undoStack.push(structuredClone(entry));
+await undoHarness._undo();const undoPending={{refs:undoHarness.referenceCalls,
+  ids:undoHarness.identityCalls,token:undoHarness._undoStack[0].restoreToken}};
+await undoHarness._undo();
+const redoHarness=new Harness("redo");redoHarness._redoStack.push(structuredClone(entry));
+await redoHarness._redo();const redoPending={{refs:redoHarness.referenceCalls,
+  ids:redoHarness.identityCalls,token:redoHarness._redoStack[0].restoreToken}};
+await redoHarness._redo();
+console.log(JSON.stringify({{undoPending,undoDone:{{refs:undoHarness.referenceCalls,
+  ids:undoHarness.identityCalls,calls:undoHarness.restoreCalls,
+  undo:undoHarness._undoStack.length,redo:undoHarness._redoStack.length}},
+  redoPending,redoDone:{{refs:redoHarness.referenceCalls,ids:redoHarness.identityCalls,
+  calls:redoHarness.restoreCalls,undo:redoHarness._undoStack.length,
+  redo:redoHarness._redoStack.length}},warnings}}));
+""")
+    assert result["undoPending"] == {
+        "refs": 1, "ids": 1, "token": "undo-token"}
+    assert result["undoDone"] == {
+        "refs": 1, "ids": 1, "calls": ["", "undo-token"],
+        "undo": 0, "redo": 1,
+    }
+    assert result["redoPending"] == {
+        "refs": 1, "ids": 1, "token": "redo-token"}
+    assert result["redoDone"] == {
+        "refs": 1, "ids": 1, "calls": ["", "redo-token"],
+        "undo": 1, "redo": 0,
+    }
+    assert any("still being confirmed" in message for message in result["warnings"])
+
+
+def test_ambiguous_composite_partial_compensation_tracks_each_applied_leg():
+    widget = _source("web/js/editor_widget.js")
+    undo = _method(widget, "_undo", "_redo")
+    redo = _method(widget, "_redo", "_restoreScene")
+    result = _run_node(f"""
+globalThis.document={{activeElement:null}};
+globalThis.describeKeyboardDebugElement=()=>({{}});
+globalThis.notifyWarning=()=>{{}};globalThis.notifyInfo=()=>{{}};
+class Harness {{
+{undo}
+{redo}
+  constructor(mode){{this.mode=mode;this.activeSceneId="scene";
+    this.activeScene={{scene_id:"scene",value:"current"}};this._editorFocused=false;
+    this._undoStack=[];this._redoStack=[];this.referenceCalls=[];
+    this.identityCalls=[];this.restoreCalls=[];this.failedReferenceCompensation=false;}}
+  _keyboardDebug(){{}}
+  async _applyReferenceHistoryOperations(operations){{
+    const type=operations[0]?.type||"";this.referenceCalls.push(type);
+    if(type==="ref-back"&&!this.failedReferenceCompensation){{
+      this.failedReferenceCompensation=true;throw new Error("reference compensation refused");
+    }}
+  }}
+  async _applyPromptIdentityChange(change){{this.identityCalls.push(change?.type||"");}}
+  async _restoreScene(_id,target,_base,token){{this.restoreCalls.push(token||"");
+    if(this.restoreCalls.length===1){{const error=new Error("response unknown");
+      error.restoreAmbiguous=true;error.restoreToken=`${{this.mode}}-token`;throw error;}}
+    if(this.restoreCalls.length===2)throw new Error("restore refused");
+    this.activeScene=structuredClone(target);return structuredClone(target);
+  }}
+}}
+const entry={{sceneId:"scene",snapshot:{{scene_id:"scene",value:"target"}},
+  postSnapshot:{{scene_id:"scene",value:"base"}},label:"composite",
+  referenceOperations:[{{type:"ref"}}],inverseReferenceOperations:[{{type:"ref-back"}}],
+  promptIdentityChange:{{type:"identity"}},
+  inversePromptIdentityChange:{{type:"identity-back"}}}};
+const run=async(mode)=>{{const h=new Harness(mode);
+  (mode==="undo"?h._undoStack:h._redoStack).push(structuredClone(entry));
+  if(mode==="undo"){{await h._undo();await h._undo();}}
+  else{{await h._redo();await h._redo();}}
+  const pending=(mode==="undo"?h._undoStack:h._redoStack)[0];
+  const afterRefusal=structuredClone(pending._ambiguousAuxiliaryState);
+  if(mode==="undo")await h._undo();else await h._redo();
+  return {{afterRefusal,referenceCalls:h.referenceCalls,identityCalls:h.identityCalls,
+    restoreCalls:h.restoreCalls,undo:h._undoStack.length,redo:h._redoStack.length}};
+}};
+console.log(JSON.stringify({{undo:await run("undo"),redo:await run("redo")}}));
+""")
+    for mode, expected_stacks in (
+            ("undo", {"undo": 0, "redo": 1}),
+            ("redo", {"undo": 1, "redo": 0})):
+        row = result[mode]
+        assert row["afterRefusal"]["referencesApplied"] is True
+        assert row["afterRefusal"]["promptIdentityApplied"] is False
+        assert row["referenceCalls"] == ["ref", "ref-back"]
+        assert row["identityCalls"] == ["identity", "identity-back", "identity"]
+        assert row["restoreCalls"] == ["", f"{mode}-token", ""]
+        assert {"undo": row["undo"], "redo": row["redo"]} == expected_stacks
 
 
 def test_prompt_identity_history_rebases_without_erasing_unrelated_units():
@@ -4450,29 +4799,115 @@ class Harness {{
   _renderTimeline() {{}}
   _renderViewportFrame() {{}}
 }}
-const h=new Harness();
-globalThis.fetch=async()=>({{ok:false,status:500}});
-let http=""; try {{ await h._restoreScene("scene",{{}}); }}
+const h=new Harness(); let httpCalls=0;
+globalThis.fetch=async()=>{{httpCalls += 1;
+  if(httpCalls===1)return {{ok:true,status:200,json:async()=>({{restore_token:"http"}})}};
+  return {{ok:false,status:500,json:async()=>{{throw new Error("no body");}}}};
+}};
+const base={{scene_id:"scene",attachments:[{{id:"chip"}}]}};
+let http=""; try {{ await h._restoreScene("scene",{{scene_id:"scene"}},base); }}
 catch(error) {{ http=error.message; }}
-globalThis.fetch=async()=>{{throw new Error("offline")}};
-let network=""; try {{ await h._restoreScene("scene",{{}}); }}
-catch(error) {{ network=error.message; }}
+let networkCalls=0;
+globalThis.fetch=async()=>{{networkCalls += 1;
+  if(networkCalls===1)return {{ok:true,status:200,json:async()=>({{restore_token:"network"}})}};
+  if(networkCalls===2)throw new Error("offline");
+  return {{ok:true,status:200,json:async()=>({{status:"pending"}})}};
+}};
+  let network=""; let networkToken="";
+  try {{ await h._restoreScene("scene",{{scene_id:"scene"}},base); }}
+  catch(error) {{ network=error.message; networkToken=error.restoreToken||""; }}
+  const retryCalls=[];
+  globalThis.fetch=async(url,init={{}})=>{{retryCalls.push({{url,init}});
+    return {{ok:true,status:200,json:async()=>({{scene:{{scene_id:"scene",value:"retried"}}}})}};
+  }};
+  await h._restoreScene("scene",{{scene_id:"scene"}},base,networkToken);
+  const expiredCalls=[];
+  globalThis.fetch=async(url,init={{}})=>{{expiredCalls.push({{url,init}});
+    if(expiredCalls.length===1)return {{ok:false,status:400,json:async()=>({{
+      error:"expired",code:"scene_restore_token_expired"}})}};
+    if(expiredCalls.length===2)return {{ok:true,status:200,
+      json:async()=>({{restore_token:"fresh"}})}};
+    return {{ok:true,status:200,
+      json:async()=>({{scene:{{scene_id:"scene",value:"restart-reconciled"}}}})}};
+  }};
+  await h._restoreScene("scene",{{scene_id:"scene"}},base,"expired");
 const target={{scene_id:"scene",attachments:[]}}; let lostCalls=0;
 globalThis.fetch=async()=>{{ lostCalls += 1;
-  if (lostCalls===1) throw new Error("lost response");
-  return {{ok:true,status:200,json:async()=>({{scenes:[target]}})}};
+  if(lostCalls===1)return {{ok:true,status:200,json:async()=>({{restore_token:"lost"}})}};
+  if(lostCalls===2)throw new Error("lost response");
+  return {{ok:true,status:200,json:async()=>({{status:"committed",scene:target}})}};
 }};
-let lost=""; try {{ await h._restoreScene("scene",target); }}
+let lost=""; try {{ await h._restoreScene("scene",target,base); }}
 catch(error) {{ lost=error.message; }}
-console.log(JSON.stringify({{http,network,lost,lostCalls,active:h.activeScene}}));
+let bodyCalls=0;
+globalThis.fetch=async()=>{{ bodyCalls += 1;
+  if(bodyCalls===1)return {{ok:true,status:200,json:async()=>({{restore_token:"body"}})}};
+  if(bodyCalls===2)return {{ok:true,status:200,json:async()=>{{throw new Error("body lost");}}}};
+  return {{ok:true,status:200,json:async()=>({{status:"committed",scene:target}})}};
+}};
+let body=""; try {{ await h._restoreScene("scene",target,base); }}
+catch(error) {{ body=error.message; }}
+  console.log(JSON.stringify({{http,httpCalls,network,networkToken,networkCalls,
+    retryCalls:retryCalls.map((call)=>({{method:call.init.method,
+      token:JSON.parse(call.init.body).restore_token}})),
+    expiredCalls:expiredCalls.map((call)=>call.init.method||"GET"),
+    lost,lostCalls,body,bodyCalls,active:h.activeScene}}));
 """)
     assert result == {
         "http": "Scene restore failed (500).",
+        "httpCalls": 7,
         "network": "offline",
+        "networkToken": "network",
+        "networkCalls": 7,
+        "retryCalls": [{"method": "PUT", "token": "network"}],
+        "expiredCalls": ["PUT", "POST", "PUT"],
         "lost": "",
-        "lostCalls": 2,
+        "lostCalls": 3,
+        "body": "",
+        "bodyCalls": 3,
         "active": {"scene_id": "scene", "attachments": []},
     }
+
+
+def test_scene_restore_conflict_refreshes_without_receipt_reconciliation_get():
+    widget = _source("web/js/editor_widget.js")
+    restore = _method(widget, "_restoreScene", "_setWidgetValue")
+    result = _run_node(f"""
+globalThis.document={{activeElement:null}};
+globalThis.describeKeyboardDebugElement=()=>({{}});
+globalThis.api={{apiURL:(value)=>value}};
+const calls=[];
+globalThis.fetch=async(url,init={{}})=>{{
+  calls.push({{url,method:init.method||"GET"}});
+  if(calls.length===1)return {{ok:true,status:200,json:async()=>({{restore_token:"token"}})}};
+  return {{ok:false,status:409,json:async()=>({{
+    error:"Scene changed elsewhere at clips[c].muted.",
+    code:"scene_merge_conflict",conflicts:[{{path:"clips[c].muted"}}]
+  }})}};
+}};
+class Harness {{
+{restore}
+  constructor(){{this.projectDir="project";this.activeSceneId="scene";
+    this.activeScene={{scene_id:"scene"}};this.scenes=[];this.refreshes=[];}}
+  _keyboardDebug(){{}}
+  async _fetchScenes(options){{this.refreshes.push(options);return true;}}
+  _setActiveScene(scene){{this.activeScene=scene;}}
+  _renderTimeline(){{}} _renderViewportFrame(){{}}
+}}
+const h=new Harness();let error=null;
+try{{await h._restoreScene("scene",{{scene_id:"scene",value:0}},
+  {{scene_id:"scene",value:1}});}}catch(value){{error={{message:value.message,
+  code:value.code,status:value.status}};}}
+console.log(JSON.stringify({{calls,refreshes:h.refreshes,error}}));
+""")
+    assert len(result["calls"]) == 2
+    assert result["calls"][1]["method"] == "PUT"
+    assert result["error"] == {
+        "message": "Scene changed elsewhere at clips[c].muted.",
+        "code": "scene_merge_conflict", "status": 409,
+    }
+    assert result["refreshes"][0]["reason"] == (
+        "scene_history_scene_merge_conflict")
 
 
 def test_chrome_placeholder_style_is_theme_owned_and_idempotent():

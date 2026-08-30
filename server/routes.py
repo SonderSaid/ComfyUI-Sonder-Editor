@@ -79,6 +79,13 @@ from .project_manager import (
     list_projects,
     register_project_saved_hook,
 )
+from .scene_history_merge import (
+    SceneMergeConflict,
+    SceneRestoreReceiptStore,
+    has_durable_scene_restore_receipt,
+    merge_scene_history,
+    remember_durable_scene_restore_receipt,
+)
 from .session_registry import (
     claim_session,
     create_handoff,
@@ -137,6 +144,7 @@ from .guide_collision import resolve_execution_window, resolve_guide_collisions
 
 logger = logging.getLogger("sonder_editor")
 _TIMELINE_EXPORTS = TimelineExportManager()
+_SCENE_RESTORE_RECEIPTS = SceneRestoreReceiptStore()
 _ASSET_DERIVED_CACHE_HEADERS = {
     "Cache-Control": "public, max-age=0, must-revalidate",
 }
@@ -307,6 +315,13 @@ def _project_saved_event(project: TimelineProject) -> None:
 register_project_saved_hook(_project_saved_event)
 
 
+def _public_project_data(data: dict | None) -> dict:
+    """Strip persistence-only authorities from project-shaped API payloads."""
+    public = copy.deepcopy(data) if isinstance(data, dict) else {}
+    public.pop("_scene_restore_receipts", None)
+    return public
+
+
 @web.middleware
 async def _project_conflict_middleware(request: web.Request, handler):
     try:
@@ -331,15 +346,15 @@ async def _project_conflict_middleware(request: web.Request, handler):
             )
         except Exception:
             logger.debug("project_conflict_middleware failed to emit diag event", exc_info=True)
+        current = _public_project_data(exc.current_data)
         payload = {
             "error": "project_version_conflict",
             "code": "project_version_conflict",
             "expected_modified_at": exc.expected_modified_at,
             "actual_modified_at": exc.actual_modified_at,
-            "project": exc.current_data,
+            "project": current,
         }
         response = web.json_response(payload, status=409)
-        current = exc.current_data or {}
         _attach_project_version_headers(
             response,
             current.get("project_id", "") or project_id,
@@ -1914,6 +1929,171 @@ def _require_media_target_bounds_fit(scene: Scene, targets: list[tuple[object, i
             other_start, other_end = _media_item_bounds(other)
             if _media_bounds_overlap(start, end, other_start, other_end):
                 _mutation_error("Timeline item overlaps another item on the lane", 409, "lane_collision")
+
+
+def _validate_scene_history_merge(scene: Scene) -> None:
+    """Reject a merged scene that ordinary mutation routes cannot construct."""
+    for raw_setup in getattr(scene, "minimax_h3_conditioning_setups", []) or []:
+        if not isinstance(raw_setup, dict):
+            _mutation_error("A merged H3 setup is invalid", 409,
+                            "scene_merge_invalid")
+        normalized_setup = minimax_h3.normalize_setup(raw_setup)
+        invalid_setup = minimax_h3.setup_validation_errors(normalized_setup)
+        if invalid_setup:
+            _mutation_error(str(invalid_setup[0]["message"]), 409,
+                            "scene_merge_invalid")
+    raw_duration = int(getattr(scene, "duration_frames", 0) or 0)
+    if raw_duration < 0:
+        _mutation_error("Scene duration cannot be negative", 409,
+                        "scene_merge_invalid")
+    duration = raw_duration
+    for descriptor in VARIABLE_LANE_DESCRIPTORS:
+        try:
+            raw_lane_count = int(getattr(scene, descriptor.count_attr))
+        except (TypeError, ValueError):
+            _mutation_error("A merged lane family has an invalid lane count", 409,
+                            "scene_merge_invalid")
+        if raw_lane_count < 1:
+            _mutation_error("A merged lane family has no lanes", 409,
+                            "scene_merge_invalid")
+    media_targets = []
+    for clip in getattr(scene, "clips", []) or []:
+        lane_type = _clip_lane_type(clip)
+        lane_index = int(getattr(clip, "track_index", 0) or 0)
+        lane_count = _scene_lane_count(scene, lane_type)
+        if lane_index < 0 or lane_index >= lane_count:
+            _mutation_error(
+                f"Clip {getattr(clip, 'clip_id', '')} is on missing {lane_type} lane {lane_index}",
+                409, "scene_merge_invalid")
+        start, end = _media_item_bounds(clip)
+        if start < 0 or end <= start or (duration > 0 and end > duration):
+            _mutation_error("A clip range is outside the merged scene", 409,
+                            "scene_merge_invalid")
+        media_targets.append((clip, start, end, lane_type, lane_index))
+
+    for track in getattr(scene, "audio_tracks", []) or []:
+        lane_index = int(getattr(track, "lane_index", 0) or 0)
+        lane_count = _scene_lane_count(scene, "audio")
+        if lane_index < 0 or lane_index >= lane_count:
+            _mutation_error(
+                f"Audio track {getattr(track, 'track_id', '')} is on missing audio lane {lane_index}",
+                409, "scene_merge_invalid")
+        start, end = _media_item_bounds(track)
+        if start < 0 or end <= start or (duration > 0 and end > duration):
+            _mutation_error("An audio range is outside the merged scene", 409,
+                            "scene_merge_invalid")
+        media_targets.append((track, start, end, "audio", lane_index))
+
+    _validate_single_driver_per_lane(scene)
+    _require_media_target_bounds_fit(scene, media_targets)
+
+    for item in getattr(scene, "reference_items", []) or []:
+        lane_index = int(getattr(item, "lane_index", 0) or 0)
+        lane_count = _scene_lane_count(scene, "reference")
+        if lane_index < 0 or lane_index >= lane_count:
+            _mutation_error(
+                f"Reference item {getattr(item, 'reference_item_id', '')} is on missing Reference lane {lane_index}",
+                409, "scene_merge_invalid")
+        start = int(getattr(item, "start_frame", 0) or 0)
+        end = int(getattr(item, "end_frame", -1))
+        if (start < 0 or (duration > 0 and start >= duration)
+                or (end >= 0 and (end <= start or (duration > 0 and end > duration)))):
+            _mutation_error("A Reference range is outside the merged scene", 409,
+                            "scene_merge_invalid")
+        _require_no_reference_overlap(scene, lane_index, start, end, ignore=item)
+
+    prompt_targets = {
+        str(getattr(section, "prompt_id", "") or index): (
+            section,
+            int(getattr(section, "start_frame", 0) or 0),
+            int(getattr(section, "end_frame", 0) or 0),
+        )
+        for index, section in enumerate(getattr(scene, "prompt_sections", []) or [])
+    }
+    _validate_prompt_target_ranges(scene, prompt_targets)
+    scene.prompt_sections.sort(
+        key=lambda section: int(getattr(section, "start_frame", 0) or 0))
+
+    seen_guide_frames = set()
+    for guide in getattr(scene, "guide_frames", []) or []:
+        frame_index = int(getattr(guide, "frame_index", 0) or 0)
+        if frame_index < -1 or (duration > 0 and frame_index >= duration):
+            _mutation_error("A guide is outside the merged scene", 409,
+                            "scene_merge_invalid")
+        if frame_index in seen_guide_frames:
+            _mutation_error("Guide frames must be unique", 409,
+                            "scene_merge_invalid")
+        seen_guide_frames.add(frame_index)
+    scene.guide_frames.sort(key=lambda guide: int(getattr(guide, "frame_index", 0) or 0))
+
+    # Deliberately not enforced here: source-media bounds (legacy split fields
+    # are ambiguous), lane locks, asset existence, model recipe semantics, or
+    # queue-idle geometry rules. Geometry is conflict-only and never written by
+    # history; the remaining checks are not structural merge invariants.
+
+
+def _validate_scene_history_link_groups(raw_scene: dict) -> None:
+    """Refuse link dependencies that deserialization would otherwise prune."""
+    groups = raw_scene.get("linked_item_groups", [])
+    if not isinstance(groups, list):
+        _mutation_error("Merged linked groups are invalid", 409,
+                        "scene_merge_invalid")
+    if not groups:
+        return
+    collection_ids = {}
+    for field_name, item_type, id_field in (
+        ("clips", "clip", "clip_id"),
+        ("audio_tracks", "audio", "track_id"),
+        ("guide_frames", "guide", "guide_id"),
+        ("prompt_sections", "prompt", "prompt_id"),
+    ):
+        raw_members = raw_scene.get(field_name, [])
+        if not isinstance(raw_members, list):
+            _mutation_error("A merged scene collection is invalid", 409,
+                            "scene_merge_invalid")
+        member_ids = set()
+        for member in raw_members:
+            if not isinstance(member, dict):
+                _mutation_error("A merged scene member is invalid", 409,
+                                "scene_merge_invalid")
+            member_id = str(member.get(id_field) or "")
+            if not member_id or member_id in member_ids:
+                _mutation_error("Merged scene member ids must be stable and unique", 409,
+                                "scene_merge_invalid")
+            member_ids.add(member_id)
+        collection_ids[item_type] = member_ids
+
+    seen_group_ids = set()
+    globally_linked = set()
+    for group in groups:
+        if not isinstance(group, dict):
+            _mutation_error("A merged linked group is invalid", 409,
+                            "scene_merge_invalid")
+        group_id = str(group.get("group_id") or "")
+        if not group_id or group_id in seen_group_ids:
+            _mutation_error("Merged linked group ids must be stable and unique", 409,
+                            "scene_merge_invalid")
+        seen_group_ids.add(group_id)
+        items = group.get("items", [])
+        if not isinstance(items, list) or len(items) < 2:
+            _mutation_error("A merged linked group requires two existing items", 409,
+                            "scene_merge_invalid")
+        group_refs = set()
+        for item in items:
+            if not isinstance(item, dict):
+                _mutation_error("A merged linked item is invalid", 409,
+                                "scene_merge_invalid")
+            item_type, item_id = _link_ref_key(item)
+            ref = (item_type, item_id)
+            if (item_type not in LINK_ITEM_TYPES
+                    or not item_id
+                    or item_id not in collection_ids.get(item_type, set())
+                    or ref in group_refs
+                    or ref in globally_linked):
+                _mutation_error("A merged linked group references invalid or duplicate items", 409,
+                                "scene_merge_invalid")
+            group_refs.add(ref)
+            globally_linked.add(ref)
 
 
 def _require_media_items_fit_lane(moving_items: list, destination_items: list) -> None:
@@ -10353,109 +10533,211 @@ if routes is not None:
     # Scene restore (undo/redo support)
     # -----------------------------------------------------------------------
 
+    @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/restore-token")
+    async def api_issue_scene_restore_token(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(
+                request, repair_missing_frames=False, version_checked=False)
+        except FileNotFoundError as exc:
+            return _json_error(str(exc), 404)
+        scene_id = request.match_info["scene_id"]
+        if project.get_scene(scene_id) is None:
+            return _json_error(f"Scene not found: {scene_id}", 404)
+        project_id = str(request.match_info.get("project_id", "") or "")
+        token = _SCENE_RESTORE_RECEIPTS.issue(project_id, scene_id)
+        return web.json_response({"restore_token": token})
+
+    @routes.get("/sonder-editor/project/{project_id}/scenes/{scene_id}/restore-token/{token}")
+    async def api_get_scene_restore_token(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(
+                request, repair_missing_frames=False, version_checked=False)
+        except FileNotFoundError as exc:
+            return _json_error(str(exc), 404)
+        project_id = str(request.match_info.get("project_id", "") or "")
+        scene_id = str(request.match_info.get("scene_id", "") or "")
+        token = str(request.match_info.get("token", "") or "")
+        receipt = _SCENE_RESTORE_RECEIPTS.get(token, project_id, scene_id)
+        if has_durable_scene_restore_receipt(
+                project, token, project_id, scene_id):
+            current_scene = project.get_scene(scene_id)
+            return web.json_response({
+                "status": "committed",
+                "restore_token": token,
+                "scene": current_scene.to_dict() if current_scene is not None else None,
+            })
+        if receipt is None:
+            return _json_error("Scene restore receipt not found", 404)
+        payload = {"status": receipt.status, "restore_token": token}
+        if receipt.payload is not None:
+            payload.update(copy.deepcopy(receipt.payload))
+        if receipt.status == "committed":
+            current_scene = project.get_scene(scene_id)
+            payload["scene"] = current_scene.to_dict() if current_scene is not None else None
+        return web.json_response(payload)
+
     @routes.put("/sonder-editor/project/{project_id}/scenes/{scene_id}/restore")
     async def api_restore_scene(request: web.Request) -> web.Response:
-        """Replace a scene entirely from a snapshot (for undo/redo)."""
+        """Three-way merge a scene history reversal onto current durable state."""
         try:
-            project = _load_project_from_request(request)
+            project = _load_project_from_request(
+                request, repair_missing_frames=False, version_checked=False)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
+        project_id = str(request.match_info.get("project_id", "") or "")
         scene_id = request.match_info["scene_id"]
-        scene = project.get_scene(scene_id)
-        if not scene:
-            return _json_error(f"Scene not found: {scene_id}", 404)
-
         try:
             body = await request.json()
         except json.JSONDecodeError:
             return _json_error("Invalid JSON body", 400)
+        if not isinstance(body, dict):
+            return _json_error("Scene restore body must be an object", 400)
+        base_scene = body.get("base_scene")
+        target_scene = body.get("target_scene")
+        token = str(body.get("restore_token") or "")
+        if not isinstance(base_scene, dict):
+            record_diag_event(
+                "undo_missing_post_snapshot",
+                project_id=project_id,
+                scene_id=scene_id,
+            )
+            return _json_error(
+                "Scene restore requires base_scene; reload the editor after updating Sonder Editor.",
+                400)
+        if not isinstance(target_scene, dict):
+            return _json_error("Scene restore requires target_scene; reload the editor.", 400)
+        receipt = _SCENE_RESTORE_RECEIPTS.get(token, project_id, scene_id)
+        if has_durable_scene_restore_receipt(
+                project, token, project_id, scene_id):
+            current_scene = project.get_scene(scene_id)
+            if current_scene is None:
+                return _json_error(f"Scene not found: {scene_id}", 404)
+            return web.json_response({
+                "scene": current_scene.to_dict(), "restore_token": token})
+        if receipt is None:
+            return web.json_response({
+                "error": "Scene restore token is missing or expired; try Undo again.",
+                "code": "scene_restore_token_expired",
+            }, status=400)
+        if receipt.status == "committed" and receipt.payload is not None:
+            current_scene = project.get_scene(scene_id)
+            if current_scene is None:
+                return _json_error(f"Scene not found: {scene_id}", 404)
+            return web.json_response({
+                "scene": current_scene.to_dict(), "restore_token": token})
+        if receipt.status == "refused" and receipt.payload is not None:
+            return web.json_response(copy.deepcopy(receipt.payload), status=409)
 
-        # Restore all mutable scene fields from the snapshot
-        scene.name = body.get("name", scene.name)
-        scene.duration_frames = body.get("duration_frames", scene.duration_frames)
-        # The scene-global prompt restores from its CHANNELS, never from the
-        # flat `prompt` mirror. `set_global_prompt` is destructive by contract —
-        # the text lands in channel 1 and every other channel is cleared — and
-        # the mirror it would be fed covers only the legacy three channels, so
-        # it reads empty under any other template. Undoing an edit on a MiniMax
-        # scene therefore used to blank the whole global bag. The client posts
-        # the entire `to_dict()` snapshot, so the channel state is already on
-        # the wire; the route simply ignored it.
-        if "global_channel_docs" in body or "global_channels" in body:
-            scene.global_channels = prompt_payload.normalize_channels(
-                body.get("global_channels"))
-            scene.global_channel_docs = prompt_context.normalize_channel_documents(
-                body.get("global_channel_docs"), scene.global_channels,
-                scene.global_channels.keys())
-        elif "prompt" in body:
-            # Only a snapshot with no channel state at all falls back to the
-            # lossy mirror, which is the pre-channels shape.
-            scene.set_global_prompt(body["prompt"])
-        if "global_attachments" in body:
-            scene.global_attachments = prompt_context.normalize_attachments(
-                body["global_attachments"])
-
-        if "prompt_sections" in body:
-            scene.prompt_sections = [
-                PromptSection.from_dict(p) for p in body["prompt_sections"]
-            ]
-        if "guide_frames" in body:
-            scene.guide_frames = [
-                GuideFrame.from_dict(g) for g in body["guide_frames"]
-            ]
-        if "clips" in body:
-            scene.clips = [
-                ClipReference.from_dict(c) for c in body["clips"]
-            ]
-        if "audio_tracks" in body:
-            scene.audio_tracks = [
-                AudioTrack.from_dict(a) for a in body["audio_tracks"]
-            ]
-        if "reference_items" in body:
-            scene.reference_items = [
-                ReferenceItem.from_dict(item) for item in body["reference_items"]
-            ]
-        for descriptor in VARIABLE_LANE_DESCRIPTORS:
-            if descriptor.count_attr in body:
-                _set_scene_lane_count(
-                    scene,
-                    descriptor.lane_type,
-                    max(1, int(body[descriptor.count_attr])),
-                )
-            if descriptor.configs_attr in body:
-                setattr(
-                    scene,
-                    descriptor.configs_attr,
-                    [LaneConfig.from_dict(config) for config in body[descriptor.configs_attr]],
-                )
-            if descriptor.recipe_attr and descriptor.recipe_attr in body:
-                _replace_reference_lane_recipes(scene, body[descriptor.recipe_attr])
-        setup_fields = {
-            key: body[key] for key in (
-                "minimax_h3_conditioning_setups",
-                "active_minimax_h3_setup_id",
-            ) if key in body
-        }
-        if setup_fields:
+        for attempt in range(3):
+            if has_durable_scene_restore_receipt(
+                    project, token, project_id, scene_id):
+                current_scene = project.get_scene(scene_id)
+                if current_scene is None:
+                    return _json_error(f"Scene not found: {scene_id}", 404)
+                return web.json_response({
+                    "scene": current_scene.to_dict(), "restore_token": token})
+            scene = project.get_scene(scene_id)
+            if scene is None:
+                return _json_error(f"Scene not found: {scene_id}", 404)
+            stored_scene = scene.to_dict()
             try:
-                _apply_scene_fields(project, scene, setup_fields)
+                merged_dict = merge_scene_history(
+                    base_scene, target_scene, stored_scene)
+            except SceneMergeConflict as exc:
+                payload = {
+                    "error": str(exc),
+                    "code": "scene_merge_conflict",
+                    "conflicts": exc.conflicts,
+                }
+                _SCENE_RESTORE_RECEIPTS.finish(
+                    token, project_id, scene_id, status="refused", payload=payload)
+                record_diag_event(
+                    "scene_merge_conflict",
+                    project_id=project_id,
+                    scene_id=scene_id,
+                    conflicts=[item.get("path") for item in exc.conflicts],
+                )
+                return web.json_response(payload, status=409)
+
+            # Out-of-scope fields began in stored and remain there because the
+            # pure merge edits only its declared write set. Rebuilding through
+            # Scene re-derives prompt/channel mirrors and preserves absent-field
+            # defaults without ever injecting explicit nulls.
+            merged_dict["scene_id"] = scene_id
+            try:
+                _validate_scene_history_link_groups(merged_dict)
+                merged_scene = Scene.from_dict(merged_dict)
+                _validate_scene_history_merge(merged_scene)
+            except (TypeError, ValueError) as exc:
+                exc = ProjectMutationRequestError(
+                    f"Merged scene data is invalid: {exc}", 409,
+                    "scene_merge_invalid")
+                payload = {
+                    "error": exc.message,
+                    "code": "scene_merge_invalid",
+                    "invariant": exc.code,
+                }
+                _SCENE_RESTORE_RECEIPTS.finish(
+                    token, project_id, scene_id, status="refused", payload=payload)
+                record_diag_event(
+                    "scene_merge_invalid",
+                    project_id=project_id,
+                    scene_id=scene_id,
+                    invariant=exc.code,
+                )
+                return web.json_response(payload, status=409)
             except ProjectMutationRequestError as exc:
-                return _mutation_json_error(exc)
-        if "guide_track_config" in body:
-            scene.guide_track_config = LaneConfig.from_dict(body["guide_track_config"])
-        if "prompt_track_config" in body:
-            scene.prompt_track_config = LaneConfig.from_dict(body["prompt_track_config"])
-        pad_lane_configs(scene, LaneConfig)
-        pad_lane_recipes(scene, ReferenceLaneRecipe)
+                payload = {
+                    "error": exc.message,
+                    "code": "scene_merge_invalid",
+                    "invariant": exc.code,
+                }
+                _SCENE_RESTORE_RECEIPTS.finish(
+                    token, project_id, scene_id, status="refused", payload=payload)
+                record_diag_event(
+                    "scene_merge_invalid",
+                    project_id=project_id,
+                    scene_id=scene_id,
+                    invariant=exc.code,
+                )
+                return web.json_response(payload, status=409)
 
-        try:
-            _validate_single_driver_per_lane(scene)
-        except ProjectMutationRequestError as e:
-            return _mutation_json_error(e)
+            scene_index = project.scenes.index(scene)
+            project.scenes[scene_index] = merged_scene
+            # The hashed marker and scene must cross the atomic persistence
+            # boundary together. It proves a lost response committed even
+            # after process restart and later same-field edits.
+            remember_durable_scene_restore_receipt(
+                project, token, project_id, scene_id)
+            base_modified_at = str(getattr(project, "modified_at", "") or "")
+            try:
+                save_project(project, expected_modified_at=base_modified_at)
+            except ProjectVersionConflict as exc:
+                if attempt >= 2:
+                    payload = {
+                        "error": "Project kept changing while scene history was applied.",
+                        "code": "project_version_conflict",
+                        "expected_modified_at": exc.expected_modified_at,
+                        "actual_modified_at": exc.actual_modified_at,
+                        "project": _public_project_data(exc.current_data),
+                    }
+                    _SCENE_RESTORE_RECEIPTS.finish(
+                        token, project_id, scene_id, status="refused", payload=payload)
+                    raise
+                project = load_project(str(getattr(project, "project_dir", "") or ""))
+                continue
 
-        save_project(project)
-        return web.json_response(scene.to_dict())
+            payload = {"scene": merged_scene.to_dict(), "restore_token": token}
+            _SCENE_RESTORE_RECEIPTS.finish(
+                token, project_id, scene_id, status="committed", payload=payload)
+            # A CAS retry may replace the request's initially remembered project.
+            # The version-header middleware must stamp the object that actually
+            # committed, or the client immediately regresses to a stale version.
+            _remember_request_project(request, project)
+            return web.json_response(payload)
+
+        raise RuntimeError("Scene history merge retry loop exhausted")
 
     # -----------------------------------------------------------------------
     # Guide frames

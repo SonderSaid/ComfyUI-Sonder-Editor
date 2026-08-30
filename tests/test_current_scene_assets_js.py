@@ -487,7 +487,10 @@ def test_timeline_fps_frontend_semantics_are_wired_at_all_boundaries():
     fps_start = widget_source.index("async _updateSceneFps(fps)")
     fps_end = widget_source.index("_cycleScene(dir)", fps_start)
     fps_source = widget_source[fps_start:fps_end]
-    assert '_pushUndo("change fps")' in fps_source
+    # FPS retimes existing scene geometry and cannot be represented by the
+    # ordinary field-delta history merge. Keep it outside scene Undo until a
+    # dedicated timebase transaction can record the complete transformation.
+    assert '_pushUndo("change fps")' not in fps_source
     assert "reconcileFromResult: reconcileRetimedScene" in fps_source
     assert "queue_jobs_pending" in fps_source
     assert "Scene FPS change refused." in fps_source

@@ -1,6 +1,7 @@
 """Route-level coverage for Phase 4.3 clip role fields."""
 
 import asyncio
+import copy
 import importlib
 import json
 import os
@@ -9,6 +10,7 @@ import sys
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from aiohttp import web
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -33,10 +35,14 @@ from server.timeline_state import (
 
 
 class DummyRequest:
-    def __init__(self, *, match_info=None, query=None, body=None):
+    def __init__(self, *, match_info=None, query=None, body=None, headers=None,
+                 method="GET", path=""):
         self.match_info = match_info or {}
         self.query = query or {}
         self._body = body
+        self.headers = headers or {}
+        self.method = method
+        self.path = path
 
     async def json(self):
         return self._body
@@ -317,8 +323,9 @@ def test_post_guide_to_scene_with_empty_guide_frames(tmp_path, monkeypatch):
         Asset(asset_id="img-1", asset_type="image", path="media/ref.png"),
     ]
 
-    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+    monkeypatch.setattr(route_module, "_load_project_from_request",
+                        lambda request, **kwargs: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project, **kwargs: None)
 
     add_guide = _route_handler(
         route_module,
@@ -356,8 +363,9 @@ def test_clip_put_accepts_same_lane_move_when_no_other_clip_overlaps(tmp_path, m
     scene.clips = [clip]
     project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
 
-    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+    monkeypatch.setattr(route_module, "_load_project_from_request",
+                        lambda request, **kwargs: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project, **kwargs: None)
 
     update_clip = _route_handler(
         route_module,
@@ -900,23 +908,29 @@ def test_scene_restore_accepts_guide_and_prompt_track_config(tmp_path, monkeypat
     scene = Scene(scene_id="scene-1", name="Scene")
     project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
 
-    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+    monkeypatch.setattr(route_module, "_load_project_from_request",
+                        lambda request, **kwargs: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project, **kwargs: None)
 
     restore_scene = _route_handler(
         route_module,
         "PUT",
         "/sonder-editor/project/{project_id}/scenes/{scene_id}/restore",
     )
-    response = asyncio.run(restore_scene(DummyRequest(
-        match_info={"scene_id": "scene-1"},
-        body={
+    base = scene.to_dict()
+    target = copy.deepcopy(base)
+    target.update({
             "name": "Restored",
             "guide_track_config": {"locked": True, "hidden": False},
             "prompt_track_config": {"locked": False, "hidden": True},
-        },
+        })
+    token = route_module._SCENE_RESTORE_RECEIPTS.issue("project", "scene-1")
+    response = asyncio.run(restore_scene(DummyRequest(
+        match_info={"project_id": "project", "scene_id": "scene-1"},
+        body={"base_scene": base, "target_scene": target,
+              "restore_token": token},
     )))
-    payload = _response_json(response)
+    payload = _response_json(response)["scene"]
 
     assert response.status == 200
     assert payload["name"] == "Restored"
@@ -924,6 +938,74 @@ def test_scene_restore_accepts_guide_and_prompt_track_config(tmp_path, monkeypat
     assert payload["guide_track_config"]["hidden"] is False
     assert payload["prompt_track_config"]["locked"] is False
     assert payload["prompt_track_config"]["hidden"] is True
+
+
+def test_scene_restore_accepts_last_frame_guide_sentinel(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(
+        scene_id="scene-1", name="After", duration_frames=24,
+        guide_frames=[GuideFrame(guide_id="last", frame_index=-1)],
+    )
+    project = TimelineProject(
+        project_id="project", project_dir=str(tmp_path), scenes=[scene])
+    monkeypatch.setattr(route_module, "_load_project_from_request",
+                        lambda request, **kwargs: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project, **kwargs: None)
+    base = scene.to_dict()
+    target = copy.deepcopy(base)
+    target["name"] = "Before"
+    token = route_module._SCENE_RESTORE_RECEIPTS.issue("project", "scene-1")
+    restore = _route_handler(
+        route_module, "PUT",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/restore")
+
+    response = asyncio.run(restore(DummyRequest(
+        match_info={"project_id": "project", "scene_id": "scene-1"},
+        body={"base_scene": base, "target_scene": target,
+              "restore_token": token})))
+
+    assert response.status == 200
+    assert _response_json(response)["scene"]["guide_frames"] == [{
+        "guide_id": "last", "frame_index": -1, "asset_id": "",
+        "source": "", "strength": 1.0, "muted": False,
+        "fit_mode": "pad_edge", "crop_position": "center",
+    }]
+
+
+def test_scene_restore_duration_change_conflicts_with_concurrent_last_frame_guide(
+        tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    target = Scene(scene_id="scene-1", duration_frames=24).to_dict()
+    base = copy.deepcopy(target)
+    base["duration_frames"] = 48
+    stored = copy.deepcopy(base)
+    stored["guide_frames"] = [GuideFrame(
+        guide_id="concurrent-last", frame_index=-1).to_dict()]
+    project = TimelineProject(
+        project_id="project", project_dir=str(tmp_path),
+        scenes=[Scene.from_dict(stored)])
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request",
+                        lambda request, **kwargs: project)
+    monkeypatch.setattr(route_module, "save_project",
+                        lambda project, **kwargs: saves.append(project))
+    token = route_module._SCENE_RESTORE_RECEIPTS.issue("project", "scene-1")
+    restore = _route_handler(
+        route_module, "PUT",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/restore")
+
+    response = asyncio.run(restore(DummyRequest(
+        match_info={"project_id": "project", "scene_id": "scene-1"},
+        body={"base_scene": base, "target_scene": target,
+              "restore_token": token})))
+
+    payload = _response_json(response)
+    assert response.status == 409
+    assert payload["code"] == "scene_merge_conflict"
+    assert payload["conflicts"][0]["path"] == (
+        "guide_frames[concurrent-last].effective_frame_index")
+    assert saves == []
+    assert project.scenes[0].duration_frames == 48
 
 
 def test_scene_restore_atomically_restores_reference_lane_ids_and_h3_setup(tmp_path, monkeypatch):
@@ -944,15 +1026,16 @@ def test_scene_restore_atomically_restores_reference_lane_ids_and_h3_setup(tmp_p
         active_minimax_h3_setup_id="setup",
     )
     project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
-    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+    monkeypatch.setattr(route_module, "_load_project_from_request",
+                        lambda request, **kwargs: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project, **kwargs: None)
     restore_scene = _route_handler(
         route_module, "PUT",
         "/sonder-editor/project/{project_id}/scenes/{scene_id}/restore")
 
-    response = asyncio.run(restore_scene(DummyRequest(
-        match_info={"scene_id": "scene-1"},
-        body={
+    base = scene.to_dict()
+    target = copy.deepcopy(base)
+    target.update({
             "reference_lane_count": 2,
             "reference_lane_configs": [{}, {}],
             "reference_lane_recipes": [
@@ -968,14 +1051,96 @@ def test_scene_restore_atomically_restores_reference_lane_ids_and_h3_setup(tmp_p
                 "video_lane_ids": [], "audio_lane_ids": [],
             }],
             "active_minimax_h3_setup_id": "setup",
-        },
+        })
+    token = route_module._SCENE_RESTORE_RECEIPTS.issue("project", "scene-1")
+    response = asyncio.run(restore_scene(DummyRequest(
+        match_info={"project_id": "project", "scene_id": "scene-1"},
+        body={"base_scene": base, "target_scene": target,
+              "restore_token": token},
     )))
-    payload = _response_json(response)
+    payload = _response_json(response)["scene"]
     assert response.status == 200
     assert [value["lane_id"] for value in payload["reference_lane_recipes"]] == [
         "old-a", "old-b"]
     assert payload["minimax_h3_conditioning_setups"][0]["picture_lane_ids"] == [
         "old-a", "old-b"]
+
+
+def test_scene_restore_does_not_normalize_untouched_h3_setup_data(
+        tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    setup = {
+        "schema": "minimax_h3_setup_v1", "setup_id": "setup",
+        "name": "Setup", "mode": "reference", "task_mode": "T2VA",
+        "picture_lane_ids": [], "video_lane_ids": [], "audio_lane_ids": [],
+        "future_field": {"preserve": True},
+    }
+    scene = Scene(scene_id="scene-1", name="After",
+                  minimax_h3_conditioning_setups=[copy.deepcopy(setup)],
+                  active_minimax_h3_setup_id="setup")
+    project = TimelineProject(project_id="project", project_dir=str(tmp_path),
+                              scenes=[scene])
+    monkeypatch.setattr(route_module, "_load_project_from_request",
+                        lambda request, **kwargs: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project, **kwargs: None)
+    base = scene.to_dict()
+    target = copy.deepcopy(base)
+    target["name"] = "Before"
+    token = route_module._SCENE_RESTORE_RECEIPTS.issue("project", "scene-1")
+    restore = _route_handler(
+        route_module, "PUT",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/restore")
+
+    response = asyncio.run(restore(DummyRequest(
+        match_info={"project_id": "project", "scene_id": "scene-1"},
+        body={"base_scene": base, "target_scene": target,
+              "restore_token": token})))
+
+    assert response.status == 200
+    assert _response_json(response)["scene"][
+        "minimax_h3_conditioning_setups"][0]["future_field"] == {
+            "preserve": True}
+
+
+def test_scene_restore_preserves_unknown_scene_and_typed_member_fields(
+        tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    stored = Scene(
+        scene_id="scene-1", name="After", duration_frames=24,
+        clips=[ClipReference(
+            clip_id="clip", timeline_start_frame=0,
+            timeline_end_frame=8)],
+    ).to_dict()
+    stored["future_scene"] = {"owner": "future"}
+    stored["clips"][0]["future_clip"] = {"owner": "future"}
+    scene = Scene.from_dict(stored)
+    project = TimelineProject(
+        project_id="project", project_dir=str(tmp_path), scenes=[scene])
+    saved = []
+    monkeypatch.setattr(route_module, "_load_project_from_request",
+                        lambda request, **kwargs: project)
+    monkeypatch.setattr(route_module, "save_project",
+                        lambda project, **kwargs: saved.append(project.to_dict()))
+    base = scene.to_dict()
+    target = copy.deepcopy(base)
+    target["name"] = "Before"
+    token = route_module._SCENE_RESTORE_RECEIPTS.issue("project", "scene-1")
+    restore = _route_handler(
+        route_module, "PUT",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/restore")
+
+    response = asyncio.run(restore(DummyRequest(
+        match_info={"project_id": "project", "scene_id": "scene-1"},
+        body={"base_scene": base, "target_scene": target,
+              "restore_token": token})))
+    payload = _response_json(response)["scene"]
+
+    assert response.status == 200
+    assert payload["future_scene"] == {"owner": "future"}
+    assert payload["clips"][0]["future_clip"] == {"owner": "future"}
+    assert saved[0]["scenes"][0]["future_scene"] == {"owner": "future"}
+    assert saved[0]["scenes"][0]["clips"][0]["future_clip"] == {
+        "owner": "future"}
 
 
 def test_scene_put_preserves_omitted_reference_lane_id_and_setup_binding(tmp_path, monkeypatch):
@@ -1064,29 +1229,606 @@ def test_scene_restore_rejects_duplicate_driver_clip_snapshot(tmp_path, monkeypa
     project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
     save_calls = []
 
-    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda project: save_calls.append(project))
+    monkeypatch.setattr(route_module, "_load_project_from_request",
+                        lambda request, **kwargs: project)
+    monkeypatch.setattr(route_module, "save_project",
+                        lambda project, **kwargs: save_calls.append(project))
 
     restore_scene = _route_handler(
         route_module,
         "PUT",
         "/sonder-editor/project/{project_id}/scenes/{scene_id}/restore",
     )
-    response = asyncio.run(restore_scene(DummyRequest(
-        match_info={"scene_id": "scene-1"},
-        body={
+    base = scene.to_dict()
+    target = copy.deepcopy(base)
+    target.update({
             "clips": [
                 {"clip_id": "driver-a", "source_path": "media/a.mp4", "timeline_end_frame": 10, "role": "motion_driver"},
                 {"clip_id": "driver-b", "source_path": "media/b.mp4", "timeline_end_frame": 10, "role": "motion_driver"},
             ],
             "motion_driver_lane_count": 1,
-        },
+        })
+    token = route_module._SCENE_RESTORE_RECEIPTS.issue("project", "scene-1")
+    response = asyncio.run(restore_scene(DummyRequest(
+        match_info={"project_id": "project", "scene_id": "scene-1"},
+        body={"base_scene": base, "target_scene": target,
+              "restore_token": token},
     )))
     payload = _response_json(response)
 
     assert response.status == 409
-    assert payload["code"] == "driver_lane_occupied"
+    assert payload["code"] == "scene_merge_invalid"
+    assert payload["invariant"] == "driver_lane_occupied"
     assert save_calls == []
+
+
+@pytest.mark.parametrize("concurrent_kind", ["new_clip", "observed_take"])
+def test_scene_restore_preserves_concurrent_generated_work(
+        concurrent_kind, tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    target_scene = Scene(scene_id="scene-1", duration_frames=24, clips=[
+        ClipReference(clip_id="edited", source_path="media/a.mp4",
+                      timeline_start_frame=0, timeline_end_frame=8),
+    ])
+    target = target_scene.to_dict()
+    base = copy.deepcopy(target)
+    base["clips"][0].update({"timeline_start_frame": 4,
+                              "timeline_end_frame": 12})
+    stored = copy.deepcopy(base)
+    if concurrent_kind == "new_clip":
+        stored["clips"].append(ClipReference(
+            clip_id="generated", source_path="media/take.mp4",
+            timeline_start_frame=12, timeline_end_frame=20,
+            is_generated=True).to_dict())
+    else:
+        stored["clips"][0]["takes"].append({"asset_id": "generated-take"})
+    scene = Scene.from_dict(stored)
+    project = TimelineProject(project_id="project", project_dir=str(tmp_path),
+                              scenes=[scene])
+    monkeypatch.setattr(route_module, "_load_project_from_request",
+                        lambda request, **kwargs: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project, **kwargs: None)
+    handler = _route_handler(
+        route_module, "PUT",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/restore")
+    token = route_module._SCENE_RESTORE_RECEIPTS.issue("project", "scene-1")
+
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "project", "scene_id": "scene-1"},
+        body={"base_scene": base, "target_scene": target,
+              "restore_token": token})))
+    payload = _response_json(response)["scene"]
+
+    assert response.status == 200
+    assert payload["clips"][0]["timeline_start_frame"] == 0
+    if concurrent_kind == "new_clip":
+        assert [clip["clip_id"] for clip in payload["clips"]] == [
+            "edited", "generated"]
+    else:
+        assert payload["clips"][0]["takes"] == [{"asset_id": "generated-take"}]
+
+
+def test_scene_restore_same_field_conflict_saves_nothing(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    target_scene = Scene(scene_id="scene-1", duration_frames=24, clips=[
+        ClipReference(clip_id="clip", timeline_start_frame=0,
+                      timeline_end_frame=8),
+    ])
+    target = target_scene.to_dict()
+    base = copy.deepcopy(target)
+    base["clips"][0]["timeline_start_frame"] = 4
+    stored = copy.deepcopy(base)
+    stored["clips"][0]["timeline_start_frame"] = 7
+    project = TimelineProject(project_id="project", project_dir=str(tmp_path),
+                              scenes=[Scene.from_dict(stored)])
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request",
+                        lambda request, **kwargs: project)
+    monkeypatch.setattr(route_module, "save_project",
+                        lambda project, **kwargs: saves.append(project))
+    handler = _route_handler(
+        route_module, "PUT",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/restore")
+    token = route_module._SCENE_RESTORE_RECEIPTS.issue("project", "scene-1")
+
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "project", "scene_id": "scene-1"},
+        body={"base_scene": base, "target_scene": target,
+              "restore_token": token})))
+    payload = _response_json(response)
+
+    assert response.status == 409
+    assert payload["code"] == "scene_merge_conflict"
+    assert payload["conflicts"][0]["path"] == "clips[clip].timeline_start_frame"
+    assert saves == []
+
+
+def test_scene_restore_refuses_dangling_concurrent_link_group(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    target_scene = Scene(scene_id="scene-1", duration_frames=24, clips=[
+        ClipReference(clip_id="d", timeline_start_frame=0,
+                      timeline_end_frame=8),
+    ])
+    target = target_scene.to_dict()
+    base = copy.deepcopy(target)
+    base["clips"].append(ClipReference(
+        clip_id="c", timeline_start_frame=8,
+        timeline_end_frame=16).to_dict())
+    stored = copy.deepcopy(base)
+    stored["linked_item_groups"] = [{
+        "group_id": "concurrent", "items": [
+            {"type": "clip", "id": "c"},
+            {"type": "clip", "id": "d"},
+        ],
+    }]
+    project = TimelineProject(
+        project_id="project", project_dir=str(tmp_path),
+        scenes=[Scene.from_dict(stored)])
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request",
+                        lambda request, **kwargs: project)
+    monkeypatch.setattr(route_module, "save_project",
+                        lambda project, **kwargs: saves.append(project))
+    handler = _route_handler(
+        route_module, "PUT",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/restore")
+    token = route_module._SCENE_RESTORE_RECEIPTS.issue("project", "scene-1")
+
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "project", "scene_id": "scene-1"},
+        body={"base_scene": base, "target_scene": target,
+              "restore_token": token})))
+
+    assert response.status == 409
+    assert _response_json(response)["code"] == "scene_merge_invalid"
+    assert saves == []
+    assert project.scenes[0].linked_item_groups == stored["linked_item_groups"]
+
+
+def test_scene_restore_reorders_prompt_sections_after_merged_range_change(
+        tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    first = PromptSection(0, 8)
+    first.prompt_id = "first"
+    second = PromptSection(8, 16)
+    second.prompt_id = "second"
+    base_scene = Scene(scene_id="scene-1", duration_frames=24,
+                       prompt_sections=[first, second])
+    base = base_scene.to_dict()
+    target = copy.deepcopy(base)
+    target["prompt_sections"][0].update({"start_frame": 8, "end_frame": 16})
+    target["prompt_sections"][1].update({"start_frame": 0, "end_frame": 8})
+    project = TimelineProject(
+        project_id="project", project_dir=str(tmp_path),
+        scenes=[Scene.from_dict(base)])
+    monkeypatch.setattr(route_module, "_load_project_from_request",
+                        lambda request, **kwargs: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project, **kwargs: None)
+    handler = _route_handler(
+        route_module, "PUT",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/restore")
+    token = route_module._SCENE_RESTORE_RECEIPTS.issue("project", "scene-1")
+
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "project", "scene_id": "scene-1"},
+        body={"base_scene": base, "target_scene": target,
+              "restore_token": token})))
+    sections = _response_json(response)["scene"]["prompt_sections"]
+
+    assert response.status == 200
+    assert [section["prompt_id"] for section in sections] == ["second", "first"]
+
+
+def test_scene_restore_remerges_after_save_conflict(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    target_scene = Scene(scene_id="scene-1", duration_frames=24, name="Before")
+    target = target_scene.to_dict()
+    base = copy.deepcopy(target)
+    base["name"] = "After"
+    initial = TimelineProject(
+        project_id="project", project_dir=str(tmp_path),
+        modified_at="v1", scenes=[Scene.from_dict(base)])
+    latest_scene = Scene.from_dict(base)
+    latest_scene.clips.append(ClipReference(
+        clip_id="generated", timeline_start_frame=0, timeline_end_frame=8))
+    latest = TimelineProject(
+        project_id="project", project_dir=str(tmp_path),
+        modified_at="v2", scenes=[latest_scene])
+    calls = []
+
+    monkeypatch.setattr(route_module, "_load_project_from_request",
+                        lambda request, **kwargs: initial)
+    monkeypatch.setattr(route_module, "load_project", lambda directory: latest)
+
+    def save_with_conflict(project, **kwargs):
+        calls.append((project, kwargs.get("expected_modified_at")))
+        if len(calls) == 1:
+            raise route_module.ProjectVersionConflict(
+                project_dir=str(tmp_path), expected_modified_at="v1",
+                actual_modified_at="v2", current_data=latest.to_dict())
+
+    monkeypatch.setattr(route_module, "save_project", save_with_conflict)
+    handler = _route_handler(
+        route_module, "PUT",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/restore")
+    token = route_module._SCENE_RESTORE_RECEIPTS.issue("project", "scene-1")
+
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "project", "scene_id": "scene-1"},
+        body={"base_scene": base, "target_scene": target,
+              "restore_token": token})))
+    payload = _response_json(response)["scene"]
+
+    assert response.status == 200
+    assert len(calls) == 2
+    assert calls[0][1] == "v1"
+    assert calls[1][1] == "v2"
+    assert payload["name"] == "Before"
+    assert [clip["clip_id"] for clip in payload["clips"]] == ["generated"]
+
+
+def test_scene_restore_save_conflict_retry_is_bounded_and_receipted(
+        tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="After")
+    base = scene.to_dict()
+    target = copy.deepcopy(base)
+    target["name"] = "Before"
+    versions = iter(["v2", "v3"])
+    initial = TimelineProject(
+        project_id="project", project_dir=str(tmp_path),
+        modified_at="v1", scenes=[Scene.from_dict(base)])
+    monkeypatch.setattr(route_module, "_load_project_from_request",
+                        lambda request, **kwargs: initial)
+
+    def load_latest(_directory):
+        return TimelineProject(
+            project_id="project", project_dir=str(tmp_path),
+            modified_at=next(versions), scenes=[Scene.from_dict(base)])
+
+    monkeypatch.setattr(route_module, "load_project", load_latest)
+    saves = []
+
+    def always_conflict(project, **kwargs):
+        expected = kwargs.get("expected_modified_at")
+        saves.append(expected)
+        actual = f"v{len(saves) + 1}"
+        raise route_module.ProjectVersionConflict(
+            project_dir=str(tmp_path), expected_modified_at=expected,
+            actual_modified_at=actual,
+            current_data=project.to_dict(include_internal=True))
+
+    monkeypatch.setattr(route_module, "save_project", always_conflict)
+    handler = _route_handler(
+        route_module, "PUT",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/restore")
+    token = route_module._SCENE_RESTORE_RECEIPTS.issue("project", "scene-1")
+    request = DummyRequest(
+        match_info={"project_id": "project", "scene_id": "scene-1"},
+        method="PUT", path="/sonder-editor/project/project/scenes/scene-1/restore",
+        body={"base_scene": base, "target_scene": target,
+              "restore_token": token})
+
+    response = asyncio.run(route_module._project_conflict_middleware(request, handler))
+    receipt = route_module._SCENE_RESTORE_RECEIPTS.get(token, "project", "scene-1")
+
+    assert response.status == 409
+    response_payload = _response_json(response)
+    assert response_payload["code"] == "project_version_conflict"
+    assert "_scene_restore_receipts" not in response_payload["project"]
+    assert saves == ["v1", "v2", "v3"]
+    assert receipt.status == "refused"
+    assert receipt.payload["code"] == "project_version_conflict"
+    assert "_scene_restore_receipts" not in receipt.payload["project"]
+
+
+def _scene_restore_invariant_case(case):
+    if case == "empty_lane":
+        base = Scene.from_dict(
+            Scene(scene_id="scene-1", duration_frames=24).to_dict()).to_dict()
+        target = copy.deepcopy(base)
+        target["video_lane_count"] = 0
+        target["video_lane_configs"] = []
+        return base, target, copy.deepcopy(base)
+    if case == "lane":
+        base_scene = Scene(scene_id="scene-1", duration_frames=24,
+                           video_lane_count=2,
+                           video_lane_configs=[LaneConfig(), LaneConfig()])
+        base = base_scene.to_dict()
+        target = copy.deepcopy(base)
+        target["video_lane_count"] = 1
+        target["video_lane_configs"] = target["video_lane_configs"][:1]
+        stored = copy.deepcopy(base)
+        stored["clips"].append(ClipReference(
+            clip_id="concurrent", timeline_start_frame=0,
+            timeline_end_frame=8, track_index=1).to_dict())
+        return base, target, stored
+    if case == "prompt":
+        base_scene = Scene(scene_id="scene-1", duration_frames=24,
+                           prompt_sections=[PromptSection(0, 4)])
+        base_scene.prompt_sections[0].prompt_id = "edited"
+        base = base_scene.to_dict()
+        target = copy.deepcopy(base)
+        target["prompt_sections"][0]["end_frame"] = 8
+        stored = copy.deepcopy(base)
+        concurrent = PromptSection(4, 8).to_dict()
+        concurrent["prompt_id"] = "concurrent"
+        stored["prompt_sections"].append(concurrent)
+        return base, target, stored
+    if case == "guide":
+        base_scene = Scene(scene_id="scene-1", duration_frames=24,
+                           guide_frames=[GuideFrame(guide_id="edited", frame_index=3)])
+        base = base_scene.to_dict()
+        target = copy.deepcopy(base)
+        target["guide_frames"][0]["frame_index"] = 5
+        stored = copy.deepcopy(base)
+        stored["guide_frames"].append(GuideFrame(
+            guide_id="concurrent", frame_index=5).to_dict())
+        return base, target, stored
+    base_scene = Scene(scene_id="scene-1", duration_frames=24)
+    base = base_scene.to_dict()
+    target = copy.deepcopy(base)
+    target["duration_frames"] = 12
+    stored = copy.deepcopy(base)
+    stored["clips"].append(ClipReference(
+        clip_id="concurrent", timeline_start_frame=16,
+        timeline_end_frame=20).to_dict())
+    return base, target, stored
+
+
+@pytest.mark.parametrize("case", ["empty_lane", "lane", "prompt", "guide", "duration"])
+def test_scene_restore_rejects_invalid_merged_scene(case, tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    base, target, stored = _scene_restore_invariant_case(case)
+    project = TimelineProject(project_id="project", project_dir=str(tmp_path),
+                              scenes=[Scene.from_dict(stored)])
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request",
+                        lambda request, **kwargs: project)
+    monkeypatch.setattr(route_module, "save_project",
+                        lambda project, **kwargs: saves.append(project))
+    handler = _route_handler(
+        route_module, "PUT",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/restore")
+    token = route_module._SCENE_RESTORE_RECEIPTS.issue("project", "scene-1")
+
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "project", "scene_id": "scene-1"},
+        body={"base_scene": base, "target_scene": target,
+              "restore_token": token})))
+    payload = _response_json(response)
+
+    assert response.status == 409
+    assert payload["code"] == "scene_merge_invalid"
+    assert saves == []
+
+
+def test_scene_restore_missing_base_requires_reload(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project = TimelineProject(project_id="project", project_dir=str(tmp_path),
+                              scenes=[Scene(scene_id="scene-1")])
+    monkeypatch.setattr(route_module, "_load_project_from_request",
+                        lambda request, **kwargs: project)
+    handler = _route_handler(
+        route_module, "PUT",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/restore")
+
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "project", "scene_id": "scene-1"},
+        body={"target_scene": project.scenes[0].to_dict()})))
+    payload = _response_json(response)
+
+    assert response.status == 400
+    assert "base_scene" in payload["error"]
+    assert "reload" in payload["error"].lower()
+
+
+def test_scene_restore_absent_field_round_trips_without_null(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", duration_frames=24, clips=[
+        ClipReference(clip_id="clip", timeline_start_frame=0,
+                      timeline_end_frame=8, takes=[{"asset_id": "take"}]),
+    ])
+    base = scene.to_dict()
+    target = copy.deepcopy(base)
+    target["clips"][0].pop("takes")
+    project = TimelineProject(project_id="project", project_dir=str(tmp_path),
+                              scenes=[Scene.from_dict(base)])
+    monkeypatch.setattr(route_module, "_load_project_from_request",
+                        lambda request, **kwargs: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project, **kwargs: None)
+    handler = _route_handler(
+        route_module, "PUT",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/restore")
+    token = route_module._SCENE_RESTORE_RECEIPTS.issue("project", "scene-1")
+
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "project", "scene_id": "scene-1"},
+        body={"base_scene": base, "target_scene": target,
+              "restore_token": token})))
+    payload = _response_json(response)["scene"]
+
+    assert response.status == 200
+    assert payload["clips"][0]["takes"] == []
+
+
+def test_scene_restore_token_is_idempotent_and_queryable(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="After")
+    project = TimelineProject(project_id="project", project_dir=str(tmp_path),
+                              scenes=[scene])
+    base = scene.to_dict()
+    target = copy.deepcopy(base)
+    target["name"] = "Before"
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request",
+                        lambda request, **kwargs: project)
+    monkeypatch.setattr(route_module, "save_project",
+                        lambda project, **kwargs: saves.append(project.to_dict()))
+    restore = _route_handler(
+        route_module, "PUT",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/restore")
+    receipt_handler = _route_handler(
+        route_module, "GET",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/restore-token/{token}")
+    token = route_module._SCENE_RESTORE_RECEIPTS.issue("project", "scene-1")
+    request = DummyRequest(
+        match_info={"project_id": "project", "scene_id": "scene-1"},
+        body={"base_scene": base, "target_scene": target,
+              "restore_token": token})
+
+    first = asyncio.run(restore(request))
+    second = asyncio.run(restore(request))
+    route_module._SCENE_RESTORE_RECEIPTS = route_module.SceneRestoreReceiptStore()
+    restart_token = route_module._SCENE_RESTORE_RECEIPTS.issue("project", "scene-1")
+    after_restart = asyncio.run(restore(DummyRequest(
+        match_info={"project_id": "project", "scene_id": "scene-1"},
+        body={"base_scene": base, "target_scene": target,
+              "restore_token": restart_token})))
+    route_module._SCENE_RESTORE_RECEIPTS = route_module.SceneRestoreReceiptStore()
+    project.scenes[0].name = "Concurrent after restore"
+    receipt = asyncio.run(receipt_handler(DummyRequest(match_info={
+        "project_id": "project", "scene_id": "scene-1", "token": restart_token})))
+
+    assert first.status == second.status == after_restart.status == receipt.status == 200
+    assert _response_json(first) == _response_json(second)
+    assert _response_json(after_restart)["scene"]["name"] == "Before"
+    assert _response_json(receipt)["status"] == "committed"
+    assert _response_json(receipt)["scene"]["name"] == "Concurrent after restore"
+    # The fresh no-op token is also persisted so a later response loss remains
+    # provable after restart and a same-field concurrent edit.
+    assert len(saves) == 2
+
+
+def test_scene_restore_durable_receipt_survives_restart_then_same_field_edit(
+        tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    project = TimelineProject(
+        project_id="project", project_dir=str(project_dir),
+        scenes=[Scene(scene_id="scene-1", name="After")])
+    route_module.save_project(project)
+    project_box = [route_module.load_project(str(project_dir))]
+    monkeypatch.setattr(
+        route_module, "_load_project_from_request",
+        lambda request, **kwargs: project_box[0])
+    restore = _route_handler(
+        route_module, "PUT",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/restore")
+    receipt_handler = _route_handler(
+        route_module, "GET",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/restore-token/{token}")
+    base = project_box[0].scenes[0].to_dict()
+    target = copy.deepcopy(base)
+    target["name"] = "Before"
+    token = route_module._SCENE_RESTORE_RECEIPTS.issue("project", "scene-1")
+    request = DummyRequest(
+        match_info={"project_id": "project", "scene_id": "scene-1"},
+        body={"base_scene": base, "target_scene": target,
+              "restore_token": token})
+
+    assert asyncio.run(restore(request)).status == 200
+    route_module._SCENE_RESTORE_RECEIPTS = route_module.SceneRestoreReceiptStore()
+    concurrent = route_module.load_project(str(project_dir))
+    concurrent.scenes[0].name = "Concurrent"
+    route_module.save_project(concurrent)
+    project_box[0] = route_module.load_project(str(project_dir))
+    version_before_retry = project_box[0].modified_at
+
+    receipt = asyncio.run(receipt_handler(DummyRequest(match_info={
+        "project_id": "project", "scene_id": "scene-1", "token": token})))
+    retry = asyncio.run(restore(request))
+    public_project = project_box[0].to_dict()
+    persisted = json.loads((project_dir / "project.json").read_text(encoding="utf-8"))
+
+    assert receipt.status == retry.status == 200
+    assert _response_json(receipt)["status"] == "committed"
+    assert _response_json(receipt)["scene"]["name"] == "Concurrent"
+    assert _response_json(retry)["scene"]["name"] == "Concurrent"
+    assert project_box[0].modified_at == version_before_retry
+    assert "_scene_restore_receipts" not in public_project
+    assert token not in json.dumps(persisted)
+    assert persisted["_scene_restore_receipts"]
+
+
+def test_scene_restore_token_endpoint_issues_scene_scoped_receipt(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project = TimelineProject(project_id="project", project_dir=str(tmp_path),
+                              scenes=[Scene(scene_id="scene-1")])
+    monkeypatch.setattr(route_module, "_load_project_from_request",
+                        lambda request, **kwargs: project)
+    issue = _route_handler(
+        route_module, "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/restore-token")
+    query = _route_handler(
+        route_module, "GET",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/restore-token/{token}")
+
+    issue_response = asyncio.run(issue(DummyRequest(match_info={
+        "project_id": "project", "scene_id": "scene-1"})))
+    token = _response_json(issue_response)["restore_token"]
+    query_response = asyncio.run(query(DummyRequest(match_info={
+        "project_id": "project", "scene_id": "scene-1", "token": token})))
+    wrong_scene = asyncio.run(query(DummyRequest(match_info={
+        "project_id": "project", "scene_id": "other", "token": token})))
+
+    assert issue_response.status == query_response.status == 200
+    assert _response_json(query_response)["status"] == "pending"
+    assert wrong_scene.status == 404
+
+
+def test_scene_restore_real_disk_merge_is_durable_through_conflict_middleware(
+        tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    scene = Scene(scene_id="scene-1", duration_frames=24, clips=[
+        ClipReference(clip_id="edited", timeline_start_frame=0,
+                      timeline_end_frame=8),
+    ])
+    project = TimelineProject(project_id="project", project_dir=str(project_dir),
+                              scenes=[scene])
+    route_module.save_project(project)
+    target = copy.deepcopy(scene.to_dict())
+
+    after = route_module.load_project(str(project_dir))
+    after.scenes[0].clips[0].timeline_start_frame = 4
+    after.scenes[0].clips[0].timeline_end_frame = 12
+    route_module.save_project(after)
+    base = copy.deepcopy(after.scenes[0].to_dict())
+    stale_version = after.modified_at
+
+    latest = route_module.load_project(str(project_dir))
+    latest.scenes[0].clips.append(ClipReference(
+        clip_id="generated", timeline_start_frame=12,
+        timeline_end_frame=20, is_generated=True))
+    route_module.save_project(latest)
+    monkeypatch.setattr(route_module, "_get_base_dir", lambda: str(tmp_path))
+    token = route_module._SCENE_RESTORE_RECEIPTS.issue("project", "scene-1")
+    handler = _route_handler(
+        route_module, "PUT",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/restore")
+    request = DummyRequest(
+        match_info={"project_id": "project", "scene_id": "scene-1"},
+        headers={"If-Match": stale_version}, method="PUT",
+        path="/sonder-editor/project/project/scenes/scene-1/restore",
+        body={"base_scene": base, "target_scene": target,
+              "restore_token": token})
+
+    async def through_conflict_middleware(inner_request):
+        return await route_module._project_conflict_middleware(inner_request, handler)
+
+    response = asyncio.run(route_module._project_version_header_middleware(
+        request, through_conflict_middleware))
+    restored = route_module.load_project(str(project_dir))
+
+    assert response.status == 200
+    assert response.headers["X-Sonder-Project-Modified-At"] == restored.modified_at
+    assert response.headers["X-Sonder-Project-Modified-At"] != stale_version
+    assert restored.scenes[0].clips[0].timeline_start_frame == 0
+    assert [clip.clip_id for clip in restored.scenes[0].clips] == [
+        "edited", "generated"]
 
 
 def test_duplicate_scene_route_deep_copies_scene_and_regenerates_child_ids(tmp_path, monkeypatch):
