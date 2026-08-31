@@ -20,6 +20,10 @@ a fresh `[Unreleased]` block.
 - MiniMax H3 Picture roles now include **Edited keyframe**, matching the task type the compiler already understands.
 
 ### Changed
+- Large projects now share one generation-aware Reference fetch across matching Bridge and Selector
+  nodes, while Prompt previews keep independent bounded lanes for windowed and scene-wide work.
+  Newer authoring replaces queued preview intent, obsolete conflicts cannot retry, and Copy Plan
+  remains an explicit fresh one-click action.
 - Prompt identities now declare voice through their physical audio sources: appearance and audio prose/retention stay on their own rows, mentions name only the identity, speaker suffixes derive from speaking identities, explicit H3 Summary choices union scene-wide, and `@handles` resolve across supported chip configuration prose (including inherited Library text) without rewriting authored Copy text. Legacy voice bindings remain intact until explicitly repaired from the identity editor.
 - Vocal Events now derive managed H3 speaker identity from their selected subjects, keep provider Voice IDs separate, add bounded delivery prose and identifiable inline chips, sort group speaker tokens, and can atomically create an assetless **Other speaker** from Writing with recoverable Apply, Reset, Undo, and Redo behavior.
 - Prompt sections outside the current render window no longer look empty. Select one section on the timeline and the others still show what their References contribute, marked once as outside the window and numbered across the whole scene — which can differ from what that section will actually render. A section that contributes nothing for another reason now says which: muted, or clipped at the window edge and dropped by the boundary threshold.
@@ -103,6 +107,10 @@ a fresh `[Unreleased]` block.
   format's own label.
 
 ### Fixed
+- Large-project prompt compilation now moves its CPU-heavy compiler work off the server event loop,
+  project-version conflicts return only the fields needed to heal instead of serializing scenes and
+  assets, and project saves reuse one exact pretty-JSON serialization for both disk and compatibility
+  state while cleaning failed temporary writes.
 - Scene Undo and Redo now reverse only their own acknowledged edit through a conflict-checked three-way merge, preserving concurrent generated takes and other unrelated work while refusing unverifiable or genuinely conflicting history.
 - Generated video no longer starts on wrong content when the render window has to be rounded up to the model's frame rule. The rounded-up tail was filled with digital silence, and generation frequently keeps those filler frames rather than regenerating them - always when a channel is frozen, and also whenever the window carries post-context - so the silence reached the model as if it were real recording. The tail now mirrors the end of the window's own audio instead.
 - Global Reference chips now stay completely dormant when none of their selected References are staged: every capability, Summary task type, and shot claim stays out. Globals excluded by all effective sections report **not inherited** and cannot validate, warn, own, deduplicate, or render through that channel, while genuine integrity failures still refuse the render.

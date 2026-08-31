@@ -1122,6 +1122,7 @@ def test_reference_bridge_extension_wires_definitions_graphs_and_policy_callback
 
     bridge_source = (ROOT / "web" / "js" / "reference_bridge.js").read_text(encoding="utf-8")
     shape_url = (ROOT / "web" / "js" / "reference_bridge_shape.js").as_uri()
+    coordinator_url = (ROOT / "web" / "js" / "bridge_reference_coordinator.js").as_uri()
     modules = {
         "app.mjs": """
 export const app = {
@@ -1153,6 +1154,7 @@ export const resolveProjectSource = () => ({ status: 'unresolved' });
         "./editor_render_window_events.js": (tmp_path / "events.mjs").as_uri(),
         "./keyboard_ownership.js": (tmp_path / "keyboard.mjs").as_uri(),
         "./reference_bridge_shape.js": shape_url,
+        "./bridge_reference_coordinator.js": coordinator_url,
     }
     for old, new in replacements.items():
         bridge_source = bridge_source.replace(f'"{old}"', json.dumps(new))
@@ -1254,9 +1256,10 @@ bridgeModule.applyReferenceBridgeShape(requiredBridge.node, sharedShape);
 bridgeModule.applyReferenceBridgeShape(optionalBridge.node, sharedShape);
 const sharedKeys = Object.keys(sharedShape).sort();
 
-// Install the real callback wrapper, discard only its initial refresh, then
-// execute the refresh scheduled by changing the policy widget.
+// Install the real callback wrapper, execute its initial scheduler wave,
+// then execute the distinct wave scheduled by changing the policy widget.
 extension.nodeCreated(requiredBridge.node);
+scheduled.shift()?.();
 scheduled.length = 0;
 requiredBridge.widget.value = 'placeholder';
 requiredBridge.widget.callback('placeholder');
@@ -1300,6 +1303,7 @@ def test_multi_lane_selector_panel_add_remove_menu_and_growth(tmp_path):
 
     bridge_source = (ROOT / "web" / "js" / "reference_bridge.js").read_text(encoding="utf-8")
     shape_url = (ROOT / "web" / "js" / "reference_bridge_shape.js").as_uri()
+    coordinator_url = (ROOT / "web" / "js" / "bridge_reference_coordinator.js").as_uri()
     modules = {
         "app.mjs": """
 export const app = {
@@ -1342,6 +1346,7 @@ export const resolveProjectSource = () => ({
         "./editor_render_window_events.js": (tmp_path / "events.mjs").as_uri(),
         "./keyboard_ownership.js": (tmp_path / "keyboard.mjs").as_uri(),
         "./reference_bridge_shape.js": shape_url,
+        "./bridge_reference_coordinator.js": coordinator_url,
     }
     for old, new in replacements.items():
         bridge_source = bridge_source.replace(f'"{old}"', json.dumps(new))
@@ -1407,7 +1412,7 @@ const node = {
   setSize(value) { this.size = value; },
 };
 extension.nodeCreated(node);
-for (let index = 0; index < 8; index += 1) await Promise.resolve();
+for (let index = 0; index < 20; index += 1) await Promise.resolve();
 const walk = (root, out = []) => { out.push(root); root.children.forEach((child) => walk(child, out)); return out; };
 const findButton = (text) => walk(domWidget.element).find((entry) => entry.tagName === 'BUTTON' && entry.textContent === text);
 const add = findButton('+');
@@ -1433,21 +1438,21 @@ add.click();
 const addLaneZero = findButton('Reference 1 — Slots');
 const incompatible = findButton('Reference 2 — Slots');
 addLaneZero.click();
-for (let index = 0; index < 8; index += 1) await Promise.resolve();
+for (let index = 0; index < 20; index += 1) await Promise.resolve();
 const afterAdd = widget.value;
 const removeLaneTwo = walk(domWidget.element).find((entry) => entry.title === 'Remove lane 2');
 removeLaneTwo.click();
-for (let index = 0; index < 8; index += 1) await Promise.resolve();
+for (let index = 0; index < 20; index += 1) await Promise.resolve();
 const afterRemove = widget.value;
 
 widget.value = '0,1,2,3';
 widget.callback(widget.value);
-for (let index = 0; index < 8; index += 1) await Promise.resolve();
+for (let index = 0; index < 20; index += 1) await Promise.resolve();
 const beforeMaxHeight = domWidget.options.getHeight();
 const beforeMaxOverflow = domWidget.element.children[1].style.overflowY;
 widget.value = '0,1,2,3,4,5,6,7';
 widget.callback(widget.value);
-for (let index = 0; index < 8; index += 1) await Promise.resolve();
+for (let index = 0; index < 20; index += 1) await Promise.resolve();
 const grownHeight = domWidget.options.getHeight();
 const rows = domWidget.element.children[1];
 add.click();

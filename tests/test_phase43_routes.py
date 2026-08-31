@@ -1493,10 +1493,12 @@ def test_scene_restore_save_conflict_retry_is_bounded_and_receipted(
         expected = kwargs.get("expected_modified_at")
         saves.append(expected)
         actual = f"v{len(saves) + 1}"
+        current_data = project.to_dict(include_internal=True)
+        current_data["modified_at"] = actual
         raise route_module.ProjectVersionConflict(
             project_dir=str(tmp_path), expected_modified_at=expected,
             actual_modified_at=actual,
-            current_data=project.to_dict(include_internal=True))
+            current_data=current_data)
 
     monkeypatch.setattr(route_module, "save_project", always_conflict)
     handler = _route_handler(
@@ -1515,11 +1517,24 @@ def test_scene_restore_save_conflict_retry_is_bounded_and_receipted(
     assert response.status == 409
     response_payload = _response_json(response)
     assert response_payload["code"] == "project_version_conflict"
-    assert "_scene_restore_receipts" not in response_payload["project"]
+    expected_keys = {
+        "project_id", "modified_at",
+        "prompt_semantic_units", "prompt_context_profiles",
+    }
+    assert set(response_payload["project"]) == expected_keys
+    assert response_payload["project"] == {
+        "project_id": "project",
+        "modified_at": "v4",
+        "prompt_semantic_units": [],
+        "prompt_context_profiles": [],
+    }
+    assert response.headers["X-Sonder-Project-Id"] == "project"
+    assert response.headers["X-Sonder-Project-Modified-At"] == "v4"
     assert saves == ["v1", "v2", "v3"]
     assert receipt.status == "refused"
     assert receipt.payload["code"] == "project_version_conflict"
-    assert "_scene_restore_receipts" not in receipt.payload["project"]
+    assert set(receipt.payload["project"]) == expected_keys
+    assert receipt.payload["project"] == response_payload["project"]
 
 
 def _scene_restore_invariant_case(case):

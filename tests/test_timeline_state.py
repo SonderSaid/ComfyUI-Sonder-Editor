@@ -635,7 +635,10 @@ def test_project_roundtrip_preserves_unknown_scene_and_member_fields():
             ],
         )],
     ).to_dict()
-    raw["future_project"] = {"keep": True}
+    raw["future_project"] = {
+        "keep": True,
+        7: ("tuple", {"nested": (1, 2)}),
+    }
     raw["assets"][0]["future_asset"] = {"keep": True}
     raw["generation_queue"][0]["future_job"] = {"keep": True}
     raw["scenes"][0]["future_scene"] = {"keep": True}
@@ -662,7 +665,10 @@ def test_project_roundtrip_preserves_unknown_scene_and_member_fields():
     restored.scenes[0].name = "Known field changed"
     serialized = restored.to_dict()
 
-    assert serialized["future_project"] == {"keep": True}
+    assert serialized["future_project"] == {
+        "keep": True,
+        7: ("tuple", {"nested": (1, 2)}),
+    }
     assert serialized["assets"][0]["future_asset"] == {"keep": True}
     assert serialized["generation_queue"][0]["future_job"] == {"keep": True}
     scene = serialized["scenes"][0]

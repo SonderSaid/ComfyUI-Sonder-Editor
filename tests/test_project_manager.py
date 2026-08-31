@@ -4,6 +4,7 @@ import sys
 import os
 import tempfile
 import builtins
+import copy
 import json
 import pytest
 
@@ -92,6 +93,135 @@ def test_load_project_does_not_retry_malformed_json(monkeypatch):
         with pytest.raises(json.JSONDecodeError):
             load_project(project.project_dir)
         assert calls["count"] == 1
+
+
+@pytest.mark.parametrize("corrupt", [
+    '{{"modified_at": {version}, "name": "truncated"',
+    '{{"modified_at": {version}, invalid-json}}',
+])
+def test_save_cas_rejects_malformed_matching_version_without_changing_bytes_or_shadow(
+        corrupt, tmp_path):
+    project = create_project("Fail Closed CAS", base_dir=str(tmp_path))
+    project_file = os.path.join(project.project_dir, "project.json")
+    expected = project.modified_at
+    poisoned = corrupt.format(version=json.dumps(expected))
+    with open(project_file, "w", encoding="utf-8") as handle:
+        handle.write(poisoned)
+    before_shadow = copy.deepcopy(project._raw_data)
+
+    with pytest.raises(json.JSONDecodeError):
+        save_project(project, expected_modified_at=expected, notify=False)
+
+    assert open(project_file, encoding="utf-8").read() == poisoned
+    assert project._raw_data == before_shadow
+
+
+def test_save_cas_read_retries_transient_permission_errors(monkeypatch, tmp_path):
+    project = create_project("CAS Read Retry", base_dir=str(tmp_path))
+    project_file = os.path.abspath(os.path.join(project.project_dir, "project.json"))
+    expected = project.modified_at
+    original_open = builtins.open
+    attempts = {"count": 0}
+
+    def flaky_open(file, mode="r", *args, **kwargs):
+        if os.path.abspath(str(file)) == project_file and "r" in str(mode):
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                raise PermissionError(13, "sharing violation", str(file))
+        return original_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", flaky_open)
+    save_project(project, expected_modified_at=expected, notify=False)
+
+    assert attempts["count"] == 3
+    assert load_project(project.project_dir).modified_at == project.modified_at
+
+
+def test_save_uses_one_exact_serialized_string_for_disk_and_shadow(
+        monkeypatch, tmp_path):
+    from server import project_manager
+
+    project = create_project("Single Encode", base_dir=str(tmp_path))
+    project._raw_data["future_project"] = {
+        7: ("tuple", {"nested": (1, 2)}),
+    }
+    data = project.to_dict(include_internal=True)
+    expected = json.dumps(data, indent=2, ensure_ascii=False)
+    original_dumps = json.dumps
+    original_replace = project_manager.atomic_replace
+    calls = []
+    replaced_text = []
+
+    def counted_dumps(*args, **kwargs):
+        calls.append((args, kwargs))
+        return original_dumps(*args, **kwargs)
+
+    def capture_replace(source, destination):
+        replaced_text.append(open(source, "rb").read())
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(project_manager.json, "dumps", counted_dumps)
+    monkeypatch.setattr(project_manager, "atomic_replace", capture_replace)
+    save_project(project, bump_modified_at=False, notify=False)
+
+    project_file = os.path.join(project.project_dir, "project.json")
+    persisted = open(project_file, "rb").read()
+    assert len(calls) == 1
+    assert replaced_text == [expected.encode("utf-8")]
+    assert persisted == expected.encode("utf-8")
+    assert not persisted.endswith(b"\n")
+    assert project._raw_data == json.loads(expected)
+    assert project._raw_data["future_project"]["7"] == [
+        "tuple", {"nested": [1, 2]}]
+
+
+@pytest.mark.parametrize("failure", ["encode", "write", "replace"])
+def test_save_failure_does_not_advance_shadow_or_replace_durable_bytes(
+        monkeypatch, tmp_path, failure):
+    from server import project_manager
+
+    project = create_project("Shadow Failure", base_dir=str(tmp_path))
+    project_file = os.path.join(project.project_dir, "project.json")
+    durable_before = open(project_file, "rb").read()
+    shadow_before = copy.deepcopy(project._raw_data)
+    original_open = builtins.open
+
+    if failure == "encode":
+        project.metadata["not_json"] = object()
+    elif failure == "write":
+        class PartialWriter:
+            def __init__(self, handle):
+                self.handle = handle
+
+            def __enter__(self):
+                self.handle.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.handle.__exit__(*args)
+
+            def write(self, value):
+                self.handle.write(value[:64])
+                self.handle.flush()
+                raise OSError("partial temp write refused")
+
+        def reject_temp_write(file, mode="r", *args, **kwargs):
+            if str(file).endswith(".tmp") and "w" in str(mode):
+                return PartialWriter(original_open(file, mode, *args, **kwargs))
+            return original_open(file, mode, *args, **kwargs)
+        monkeypatch.setattr(builtins, "open", reject_temp_write)
+    else:
+        monkeypatch.setattr(
+            project_manager, "atomic_replace",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("replace refused")))
+
+    with pytest.raises((TypeError, OSError)):
+        save_project(project, bump_modified_at=False, notify=False)
+
+    assert project._raw_data == shadow_before
+    assert open(project_file, "rb").read() == durable_before
+    assert not [name for name in os.listdir(project.project_dir)
+                if name.startswith("project.json.") and name.endswith(".tmp")]
 
 
 def test_legacy_template_id_roundtrips_unchanged():

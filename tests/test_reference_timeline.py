@@ -720,7 +720,7 @@ def test_reference_bridge_shape_tracks_project_writes_and_recipe_liveness():
     window_events = (ROOT / "web" / "js" / "editor_render_window_events.js").read_text(encoding="utf-8")
     assert 'import { onProjectVersionChanged } from "./api_client.js";' in bridge
     assert "onProjectVersionChanged(refreshAllBridges);" in bridge
-    assert "onEditorRenderWindowChanged(refreshAllBridges);" in bridge
+    assert "onEditorRenderWindowChanged(refreshAllBridgesForWindow);" in bridge
     assert "emitEditorRenderWindowChanged({" in controller
     for field in ("scene_id", "selection_start", "selection_end",
                   "pre_context_frames", "post_context_frames"):
@@ -730,7 +730,7 @@ def test_reference_bridge_shape_tracks_project_writes_and_recipe_liveness():
     assert "lane?.audio_slot_count" in shape
     assert "lane?.prompt_slot_count" in shape
     assert "BRIDGES.has(nodeType(target))" in bridge
-    assert "controller.whenProjectReady(() => refreshShape(node));" in bridge
+    assert 'origin: "project_ready"' in bridge
     assert "Refresh reference slots" in bridge
     assert "beforeRegisterNodeDef(_nodeType, nodeData)" in bridge
     assert "INPUT_DEFINITIONS.set(name, distillInputDefinition(nodeData))" in bridge
@@ -741,7 +741,7 @@ def test_reference_bridge_shape_tracks_project_writes_and_recipe_liveness():
         'const unusedSlotsWidget = findWidget(node, "unused_slots");', 1)[1]
     policy_callback = policy_callback.split("const originalMenu", 1)[0]
     assert "unusedSlotsWidget.callback = function" in policy_callback
-    assert "window.setTimeout(() => refreshShape(node), 0);" in policy_callback
+    assert 'origin: "bridge_widget"' in policy_callback
     # Every transport/source "we don't know" path resolves to the full shape,
     # never a subset: an unwired selector, an unresolved project, or failed
     # project readiness. Orphan-only selections reach the same fail-open result
@@ -915,6 +915,68 @@ def _bridge_reference_rows(monkeypatch, preset_id, member_count=2):
     response = asyncio.run(handler(request))
     assert response.status == 200
     return json.loads(response.text)["references"][0]
+
+
+def test_bridge_reference_route_entry_diagnostic_records_fast_physical_dispatch(monkeypatch):
+    import importlib
+    from types import SimpleNamespace
+
+    from aiohttp import web
+    from aiohttp.test_utils import make_mocked_request
+
+    import server
+    import server.routes as routes_module
+
+    monkeypatch.setattr(
+        server, "PromptServer",
+        SimpleNamespace(instance=SimpleNamespace(routes=web.RouteTableDef())),
+        raising=False,
+    )
+    module = importlib.reload(routes_module)
+    project = TimelineProject(
+        project_id="project-1",
+        scenes=[Scene(scene_id="scene-1", duration_frames=100)],
+    )
+    monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
+    events = []
+    monkeypatch.setattr(
+        module,
+        "record_diag_event",
+        lambda kind, **details: events.append((kind, details)),
+    )
+
+    handler = next(
+        route.handler for route in module.routes
+        if route.method == "GET" and route.path.endswith("/bridge-references")
+    )
+    request = make_mocked_request(
+        "GET",
+        "/sonder-editor/project/project-1/scenes/scene-1/bridge-references"
+        "?selection_start=5&selection_end=20",
+        headers={
+            "X-Sonder-Reference-Request-Id": "reference-test-1",
+            "X-Sonder-Reference-Generation": "project:project-1:v2",
+            "X-Sonder-Reference-Origin": "project_version",
+        },
+    )
+    request.match_info.update({"project_id": "project-1", "scene_id": "scene-1"})
+
+    response = asyncio.run(handler(request))
+
+    assert response.status == 200
+    assert events == [(
+        "bridge_references_route_entry",
+        {
+            "project_id": "project-1",
+            "rel_url": (
+                "/sonder-editor/project/project-1/scenes/scene-1/bridge-references"
+                "?selection_start=5&selection_end=20"
+            ),
+            "request_id": "reference-test-1",
+            "generation": "project:project-1:v2",
+            "origin": "project_version",
+        },
+    )]
 
 
 def test_bridge_references_gates_the_prompt_block_apart_from_the_r_block(monkeypatch):

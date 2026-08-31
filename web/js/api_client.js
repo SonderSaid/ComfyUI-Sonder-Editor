@@ -218,8 +218,8 @@ export async function fetchProjectJson(input, init = {}, { projectId: fallbackPr
 // Versioned project write with immediate heal-and-retry from the 409 body.
 // Unlike the scenes/queue governor (blind timed backoff for GETs that only learn
 // staleness from a header), a versioned POST receives a 409 whose body already
-// carries `actual_modified_at` + the full project, so it can adopt the correct
-// version and retry at once. Returns fetchProjectJson's `{ response, payload }`
+// carries `actual_modified_at` plus the four-key project healing projection,
+// so it can adopt the correct version and retry at once. Returns fetchProjectJson's `{ response, payload }`
 // plus an `attempts` count so callers can emit reconcile diagnostics.
 export async function postProjectJsonWithReconcile(
     url,

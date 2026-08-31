@@ -75,6 +75,7 @@ from .project_manager import (
     ProjectVersionConflict,
     create_project,
     load_project,
+    project_conflict_projection,
     save_project,
     list_projects,
     register_project_saved_hook,
@@ -316,10 +317,20 @@ register_project_saved_hook(_project_saved_event)
 
 
 def _public_project_data(data: dict | None) -> dict:
-    """Strip persistence-only authorities from project-shaped API payloads."""
-    public = copy.deepcopy(data) if isinstance(data, dict) else {}
-    public.pop("_scene_restore_receipts", None)
-    return public
+    """Defensively enforce the four-key public conflict-healing contract."""
+    source = data if isinstance(data, dict) else {}
+    return {
+        "project_id": str(source.get("project_id", "") or ""),
+        "modified_at": str(source.get("modified_at", "") or ""),
+        "prompt_semantic_units": (
+            source.get("prompt_semantic_units")
+            if isinstance(source.get("prompt_semantic_units"), list) else []
+        ),
+        "prompt_context_profiles": (
+            source.get("prompt_context_profiles")
+            if isinstance(source.get("prompt_context_profiles"), list) else []
+        ),
+    }
 
 
 @web.middleware
@@ -6791,7 +6802,7 @@ def _validate_request_project_version(request: web.Request, project: TimelinePro
         project_dir=getattr(project, "project_dir", ""),
         expected_modified_at=expected,
         actual_modified_at=actual,
-        current_data=project.to_dict(),
+        current_data=project_conflict_projection(project),
     )
 
 
@@ -8254,6 +8265,124 @@ def _timeline_job_matches_project(job, project: TimelineProject) -> bool:
     return bool(job_project_id and project_id and job_project_id == project_id)
 
 
+def _compile_prompt_context_candidate_sync(
+        project: TimelineProject, scene_id: str, body: dict) -> tuple[int, dict]:
+    """Compile one candidate entirely off the aiohttp event loop.
+
+    The loaded project is request-local. This worker owns every CPU-heavy copy,
+    overlay, window-resolution and compiler step, and returns plain response
+    data so aiohttp objects remain loop-owned.
+    """
+    scene = project.get_scene(scene_id)
+    if scene is None:
+        return 404, {"error": "Scene not found"}
+
+    candidate_data = copy.deepcopy(scene.to_dict())
+    source = body.get("scene") if isinstance(body.get("scene"), dict) else body
+    aliases = {"sections": "prompt_sections",
+               "global_documents": "global_channel_docs",
+               "global_attachments": "global_attachments"}
+    allowed = {
+        "prompt_sections", "global_channels", "global_channel_docs",
+        "global_attachments", "prompt_context_profile_id",
+        "prompt_context_profile_config", "minimax_h3_conditioning_setups",
+        "active_minimax_h3_setup_id", "guide_frames", "reference_items",
+        "reference_lane_recipes", "reference_lane_configs",
+        "reference_lane_count", "duration_frames", "fps",
+    }
+    for raw_key, value in source.items():
+        key = aliases.get(raw_key, raw_key)
+        if key in allowed:
+            candidate_data[key] = copy.deepcopy(value)
+    candidate = Scene.from_dict(candidate_data)
+
+    raw_template = body.get("channel_template")
+    if raw_template is None:
+        raw_template = body.get(prompt_channel_templates.PROJECT_TEMPLATE_KEY)
+    template = (prompt_channel_templates.get_channel_template(raw_template)
+                if raw_template is not None else
+                prompt_channel_templates.resolve_channel_template(project.metadata))
+
+    raw_creates = body.get("prompt_semantic_unit_creates", [])
+    if not isinstance(raw_creates, list):
+        return 400, {
+            "error": "prompt_semantic_unit_creates must be a list",
+            "code": "invalid_prompt_semantic_unit_overlay",
+        }
+    if len(raw_creates) > 64:
+        return 400, {
+            "error": "Prompt Identity preview overlay exceeds 64 creates",
+            "code": "prompt_semantic_unit_overlay_too_large",
+        }
+    compile_project = project
+    if raw_creates:
+        compile_project = copy.deepcopy(project)
+        try:
+            for raw_create in raw_creates:
+                if (not isinstance(raw_create, dict)
+                        or raw_create.get("type") != "create_prompt_semantic_unit"):
+                    _mutation_error(
+                        "Invalid Prompt Identity preview create", 400,
+                        "invalid_prompt_semantic_unit_overlay")
+                _apply_create_prompt_semantic_unit(
+                    compile_project, candidate, raw_create, template=template)
+        except ProjectMutationRequestError as exc:
+            payload = {"error": exc.message, "code": exc.code}
+            if exc.details is not None:
+                payload["conflict"] = copy.deepcopy(exc.details)
+            return exc.status, payload
+
+    try:
+        raw_window_start = max(0, int(body.get("window_start", 0) or 0))
+        raw_window_end = int(body.get(
+            "window_end", candidate.duration_frames) or candidate.duration_frames)
+        execution_window = resolve_execution_window(
+            scene_duration=candidate.duration_frames,
+            selection_start=int(body.get(
+                "selection_start", raw_window_start) or 0),
+            selection_end=int(body.get(
+                "selection_end", raw_window_end) or raw_window_end),
+            pre_context_frames=int(body.get("pre_context_frames", 0) or 0),
+            post_context_frames=int(body.get("post_context_frames", 0) or 0),
+            mask_pre_offset=int(body.get("mask_pre_offset", 0) or 0),
+            mask_post_offset=int(body.get("mask_post_offset", 0) or 0),
+            frame_constraint=(body.get("frame_constraint")
+                              if isinstance(body.get("frame_constraint"), dict)
+                              else None),
+        )
+    except (TypeError, ValueError):
+        return 400, {"error": "Invalid Prompt Context preview window"}
+
+    try:
+        fps = float(body.get("fps") or effective_scene_fps(project, candidate))
+        prompt_threshold = float(body.get(
+            "prompt_frame_threshold",
+            (project.metadata or {}).get("prompt_frame_threshold", 10.0)) or 0.0)
+        reference_threshold = float(body.get(
+            "reference_frame_threshold",
+            (project.metadata or {}).get("reference_frame_threshold", 0.0)) or 0.0)
+    except (TypeError, ValueError):
+        return 400, {"error": "Invalid Prompt Context preview parameters"}
+    delimiter = str(body.get(
+        "delimiter", (project.metadata or {}).get(
+            "prompt_section_delimiter",
+            prompt_payload.DEFAULT_SECTION_DELIMITER)) or "")
+    compiled = compile_live_scene_prompt_context(
+        compile_project, candidate, template=template,
+        window_start=execution_window["render_start"],
+        window_end=execution_window["render_end"], fps=fps,
+        labels_on=body.get("labels_on", False) is True,
+        delimiter=delimiter, prompt_threshold=prompt_threshold,
+        reference_threshold=reference_threshold,
+        copy_plan_for=(body.get("copy_plan_for")
+                       if isinstance(body.get("copy_plan_for"), dict)
+                       else None))
+    compiled["execution_window"] = execution_window
+    compiled["candidate_base_modified_at"] = str(
+        getattr(project, "modified_at", "") or "")
+    return 200, compiled
+
+
 if routes is not None:
 
     # -----------------------------------------------------------------------
@@ -8572,139 +8701,52 @@ if routes is not None:
     async def api_compile_prompt_context_candidate(request: web.Request) -> web.Response:
         """Compile versioned candidate authoring state without mutating disk.
 
-        All prompt surfaces use this endpoint for authoritative previews. The
-        same pure compiler is called again at enqueue, where its result is
-        frozen for Relay, queued preview and execution.
+        JSON parsing and aiohttp response construction stay on the event loop;
+        all candidate copying, overlays, window resolution and compilation run
+        in a worker against this request's private project instance.
         """
-        try:
-            project = await asyncio.to_thread(
-                _load_project_from_request, request,
-                repair_missing_frames=False, version_checked=False)
-        except FileNotFoundError as exc:
-            return _json_error(str(exc), 404)
+        def _diagnostic_header(name: str) -> str:
+            return str(request.headers.get(name, "") or "")[:256]
+
+        record_diag_event(
+            "prompt_context_compile_route_entry",
+            project_id=str(request.match_info.get("project_id", "") or ""),
+            scene_id=str(request.match_info.get("scene_id", "") or ""),
+            purpose=_diagnostic_header("X-Sonder-Prompt-Purpose"),
+            request_id=_diagnostic_header("X-Sonder-Prompt-Request-Id"),
+            attempt=_diagnostic_header("X-Sonder-Prompt-Attempt"),
+        )
         try:
             body = await request.json()
         except json.JSONDecodeError:
             return _json_error("Invalid JSON body", 400)
         if not isinstance(body, dict):
             return _json_error("Prompt Context candidate must be an object", 400)
-        scene = project.get_scene(request.match_info["scene_id"])
-        if scene is None:
-            return _json_error("Scene not found", 404)
+        try:
+            project = await asyncio.to_thread(
+                _load_project_from_request, request,
+                repair_missing_frames=False, version_checked=False)
+        except FileNotFoundError as exc:
+            return _json_error(str(exc), 404)
+
         expected = str(body.get("base_modified_at") or
                        body.get("project_version") or "")
         actual = str(getattr(project, "modified_at", "") or "")
         if expected and expected != actual:
-            # The shared conflict response carries healing data and headers.
             raise ProjectVersionConflict(
                 project_dir=getattr(project, "project_dir", ""),
                 expected_modified_at=expected,
                 actual_modified_at=actual,
-                current_data=project.to_dict(),
+                current_data=project_conflict_projection(project),
             )
 
-        candidate_data = copy.deepcopy(scene.to_dict())
-        source = body.get("scene") if isinstance(body.get("scene"), dict) else body
-        aliases = {"sections": "prompt_sections",
-                   "global_documents": "global_channel_docs",
-                   "global_attachments": "global_attachments"}
-        allowed = {
-            "prompt_sections", "global_channels", "global_channel_docs",
-            "global_attachments", "prompt_context_profile_id",
-            "prompt_context_profile_config", "minimax_h3_conditioning_setups",
-            "active_minimax_h3_setup_id", "guide_frames", "reference_items",
-            "reference_lane_recipes", "reference_lane_configs",
-            "reference_lane_count", "duration_frames", "fps",
-        }
-        for raw_key, value in source.items():
-            key = aliases.get(raw_key, raw_key)
-            if key in allowed:
-                candidate_data[key] = copy.deepcopy(value)
-        candidate = Scene.from_dict(candidate_data)
-
-        raw_template = body.get("channel_template")
-        if raw_template is None:
-            raw_template = body.get(prompt_channel_templates.PROJECT_TEMPLATE_KEY)
-        template = (prompt_channel_templates.get_channel_template(raw_template)
-                    if raw_template is not None else
-                    prompt_channel_templates.resolve_channel_template(project.metadata))
-
-        raw_creates = body.get("prompt_semantic_unit_creates", [])
-        if not isinstance(raw_creates, list):
-            return web.json_response({
-                "error": "prompt_semantic_unit_creates must be a list",
-                "code": "invalid_prompt_semantic_unit_overlay",
-            }, status=400)
-        if len(raw_creates) > 64:
-            return web.json_response({
-                "error": "Prompt Identity preview overlay exceeds 64 creates",
-                "code": "prompt_semantic_unit_overlay_too_large",
-            }, status=400)
-        compile_project = project
-        if raw_creates:
-            # Preview overlays are transient by contract. Materialize through
-            # the same collision, speaking-kind, handle and normalization
-            # authority as Apply, but only on a deep copy of project state.
-            compile_project = copy.deepcopy(project)
-            try:
-                for raw_create in raw_creates:
-                    if (not isinstance(raw_create, dict)
-                            or raw_create.get("type") != "create_prompt_semantic_unit"):
-                        _mutation_error(
-                            "Invalid Prompt Identity preview create", 400,
-                            "invalid_prompt_semantic_unit_overlay")
-                    _apply_create_prompt_semantic_unit(
-                        compile_project, candidate, raw_create, template=template)
-            except ProjectMutationRequestError as exc:
-                return _mutation_json_error(exc)
-        try:
-            raw_window_start = max(0, int(body.get("window_start", 0) or 0))
-            raw_window_end = int(body.get(
-                "window_end", candidate.duration_frames) or candidate.duration_frames)
-            execution_window = resolve_execution_window(
-                scene_duration=candidate.duration_frames,
-                selection_start=int(body.get(
-                    "selection_start", raw_window_start) or 0),
-                selection_end=int(body.get(
-                    "selection_end", raw_window_end) or raw_window_end),
-                pre_context_frames=int(body.get("pre_context_frames", 0) or 0),
-                post_context_frames=int(body.get("post_context_frames", 0) or 0),
-                mask_pre_offset=int(body.get("mask_pre_offset", 0) or 0),
-                mask_post_offset=int(body.get("mask_post_offset", 0) or 0),
-                frame_constraint=(body.get("frame_constraint")
-                                  if isinstance(body.get("frame_constraint"), dict)
-                                  else None),
-            )
-            window_start = execution_window["render_start"]
-            window_end = execution_window["render_end"]
-        except (TypeError, ValueError):
-            return _json_error("Invalid Prompt Context preview window", 400)
-        try:
-            fps = float(body.get("fps") or effective_scene_fps(project, candidate))
-            prompt_threshold = float(body.get(
-                "prompt_frame_threshold",
-                (project.metadata or {}).get("prompt_frame_threshold", 10.0)) or 0.0)
-            reference_threshold = float(body.get(
-                "reference_frame_threshold",
-                (project.metadata or {}).get("reference_frame_threshold", 0.0)) or 0.0)
-        except (TypeError, ValueError):
-            return _json_error("Invalid Prompt Context preview parameters", 400)
-        delimiter = str(body.get(
-            "delimiter", (project.metadata or {}).get(
-                "prompt_section_delimiter",
-                prompt_payload.DEFAULT_SECTION_DELIMITER)) or "")
-        compiled = compile_live_scene_prompt_context(
-            compile_project, candidate, template=template,
-            window_start=window_start, window_end=window_end, fps=fps,
-            labels_on=body.get("labels_on", False) is True,
-            delimiter=delimiter, prompt_threshold=prompt_threshold,
-            reference_threshold=reference_threshold,
-            copy_plan_for=(body.get("copy_plan_for")
-                           if isinstance(body.get("copy_plan_for"), dict)
-                           else None))
-        compiled["execution_window"] = execution_window
-        compiled["candidate_base_modified_at"] = actual
-        return web.json_response(compiled)
+        status, payload = await asyncio.to_thread(
+            _compile_prompt_context_candidate_sync,
+            project,
+            request.match_info["scene_id"],
+            body,
+        )
+        return web.json_response(payload, status=status)
 
     @routes.post("/sonder-editor/project/{project_id}/references/mutations")
     async def api_apply_reference_mutations(request: web.Request) -> web.Response:
@@ -10977,6 +11019,20 @@ if routes is not None:
         uses its frozen compiled window and Reference rows, so socket shape and
         labels cannot drift while a job is executing.
         """
+        def _diagnostic_header(name: str) -> str:
+            return str(request.headers.get(name, "") or "")[:256]
+
+        # Unlike route_blocking, this event is emitted at entry and is therefore
+        # present even for fast responses. It proves physical request count; the
+        # client-provided ids are diagnostic correlation only, never authority.
+        record_diag_event(
+            "bridge_references_route_entry",
+            project_id=str(request.match_info.get("project_id", "") or ""),
+            rel_url=str(request.rel_url),
+            request_id=_diagnostic_header("X-Sonder-Reference-Request-Id"),
+            generation=_diagnostic_header("X-Sonder-Reference-Generation"),
+            origin=_diagnostic_header("X-Sonder-Reference-Origin"),
+        )
         try:
             project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:

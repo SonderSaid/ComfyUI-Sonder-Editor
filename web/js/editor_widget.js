@@ -383,6 +383,7 @@ import {
     requestProjectAssetRefresh,
 } from "./asset_refresh_coordinator.js";
 import { ProjectMutationQueue } from "./project_mutation_queue.js";
+import { createPromptCompileCoordinator } from "./prompt_compile_coordinator.js";
 import { applyPromptIdentityChange, sameIdentitySnapshot } from "./prompt_identity_panel.js";
 import {
     promptIdentityCleanupPlan,
@@ -676,6 +677,10 @@ export class EditorWidget {
             onIdle: () => this._replayDeferredProjectBackedRefresh(),
         });
         this._projectMutationCloseInProgress = null;
+        this._promptCompileCoordinator = createPromptCompileCoordinator(
+            ({ purpose, projectId, sceneId, body, requestId, isCurrent }) =>
+                this._requestPromptContextCompile(
+                    projectId, sceneId, body, isCurrent, { purpose, requestId }));
 
         // Asset state
         this.assets = { video: [], image: [], audio: [], artifact: [] };
@@ -11648,36 +11653,60 @@ export class EditorWidget {
      */
     async _promptCopyPlan(attachmentId, capabilityId, scenePatch = null,
         { sceneWide = false } = {}) {
+        if (this._promptCopyPlanInFlight) {
+            return { refused: "A Copy Plan request is already running." };
+        }
         const dirName = this._projectDirName?.();
         const sceneId = this.activeSceneId;
         if (!dirName || !sceneId) return null;
-        const candidate = { ...structuredClone(this.activeScene),
-            ...structuredClone(scenePatch || {}) };
-        const range = this._selectionContextRange?.();
-        const duration = Math.max(1, Math.round(
-            candidate.duration_frames ?? this.totalFrames ?? 1));
-        const windowStart = sceneWide
-            ? 0 : Math.max(0, Math.round(range?.contextStart ?? 0));
-        const windowEnd = sceneWide
-            ? duration : Math.max(windowStart + 1, Math.round(
-                range?.contextEnd ?? duration));
-        const selection = sceneWide
-            ? { selectionStart: 0, selectionEnd: duration } : null;
-        const previewToken = this._promptContextPreviewToken;
-        const result = await this._requestPromptContextCompile(dirName, sceneId, {
-            ...this._promptCompileRequestBody({
-                dirName, candidate, windowStart, windowEnd, selection,
-                labelsOn: true }),
-            copy_plan_for: { attachment_id: attachmentId,
-                capability_id: capabilityId },
-        }, () => previewToken === this._promptContextPreviewToken);
-        // The helper's return is another await boundary: ownership may change
-        // after its last check but before this continuation runs.
-        if (!result?.response.ok || this._destroyed
-                || dirName !== this._projectDirName() || sceneId !== this.activeSceneId
-                || previewToken !== this._promptContextPreviewToken) return null;
-        const { payload } = result;
-        return payload?.copy_plan || null;
+        const owner = {
+            requestId: `copy-plan-${(this._promptCopyPlanRequestSeq || 0) + 1}`,
+        };
+        this._promptCopyPlanRequestSeq = (this._promptCopyPlanRequestSeq || 0) + 1;
+        this._promptCopyPlanInFlight = owner;
+        try {
+            const candidate = { ...structuredClone(this.activeScene),
+                ...structuredClone(scenePatch || {}) };
+            const range = this._selectionContextRange?.();
+            const duration = Math.max(1, Math.round(
+                candidate.duration_frames ?? this.totalFrames ?? 1));
+            const windowStart = sceneWide
+                ? 0 : Math.max(0, Math.round(range?.contextStart ?? 0));
+            const windowEnd = sceneWide
+                ? duration : Math.max(windowStart + 1, Math.round(
+                    range?.contextEnd ?? duration));
+            const selection = sceneWide
+                ? { selectionStart: 0, selectionEnd: duration } : null;
+            const previewToken = this._promptContextPreviewToken;
+            const result = await this._requestPromptContextCompile(dirName, sceneId, {
+                ...this._promptCompileRequestBody({
+                    dirName, candidate, windowStart, windowEnd, selection,
+                    labelsOn: true }),
+                copy_plan_for: { attachment_id: attachmentId,
+                    capability_id: capabilityId },
+            }, () => previewToken === this._promptContextPreviewToken,
+            { purpose: "copy-plan", requestId: owner.requestId });
+            // The helper's return is another await boundary: ownership may change
+            // after its last check but before this continuation runs.
+            const authoringChanged = previewToken !== this._promptContextPreviewToken;
+            if (authoringChanged && !this._destroyed
+                    && dirName === this._projectDirName() && sceneId === this.activeSceneId) {
+                return { refused: "Project changed; request Copy Plan again.", stale: true };
+            }
+            if (!result?.response.ok || this._destroyed
+                    || dirName !== this._projectDirName()
+                    || sceneId !== this.activeSceneId) return null;
+            const { payload } = result;
+            return payload?.copy_plan || null;
+        } finally {
+            if (this._promptCopyPlanInFlight === owner) {
+                this._promptCopyPlanInFlight = null;
+            }
+        }
+    }
+
+    _isPromptCopyPlanBusy() {
+        return !!this._promptCopyPlanInFlight;
     }
 
     /**
@@ -11685,7 +11714,8 @@ export class EditorWidget {
      * and window snapshot. The generic write helper replays init.body verbatim;
      * this endpoint's surviving gate is base_modified_at inside that body.
      */
-    async _requestPromptContextCompile(dirName, sceneId, body, isCurrent = () => true) {
+    async _requestPromptContextCompile(dirName, sceneId, body, isCurrent = () => true,
+        { purpose = "unspecified", requestId = "" } = {}) {
         const current = () => !this._destroyed
             && dirName === this._projectDirName()
             && sceneId === this.activeSceneId && isCurrent();
@@ -11697,27 +11727,50 @@ export class EditorWidget {
                 `/sonder-editor/project/${encodeURIComponent(dirName)}/scenes/${encodeURIComponent(sceneId)}/prompt-context/compile`
             ), {
                 method: "POST",
-                headers: { "Content-Type": "application/json" },
+                headers: {
+                    "Content-Type": "application/json",
+                    "X-Sonder-Prompt-Purpose": String(purpose || "unspecified"),
+                    "X-Sonder-Prompt-Request-Id": String(requestId || ""),
+                    "X-Sonder-Prompt-Attempt": String(attempt + 1),
+                },
                 body: JSON.stringify(requestBody),
             });
             const value = await response.json().catch(() => null);
-            if (!current()) return null;
             const payload = value && typeof value === "object" && !Array.isArray(value)
                 ? value : null;
             rememberProjectVersionFromResponse(response, dirName);
             rememberProjectVersionFromPayload(payload, dirName);
-            if (response.status !== 409 || payload?.code !== "project_version_conflict"
-                    || attempt === 1) return { response, payload };
-            const actual = String(payload.actual_modified_at || "");
-            if (actual && sentVersion && actual < sentVersion) {
-                resetProjectVersion(dirName, actual);
-            } else if (actual) {
-                rememberProjectVersion(dirName, actual);
+            const conflict = response.status === 409
+                && payload?.code === "project_version_conflict";
+            if (conflict) {
+                const actual = String(payload.actual_modified_at || "");
+                if (actual && sentVersion && actual < sentVersion) {
+                    resetProjectVersion(dirName, actual);
+                } else if (actual) {
+                    rememberProjectVersion(dirName, actual);
+                }
             }
+            // Even an obsolete 409 heals the shared version map, but ownership
+            // is required before any retry or result leaves this helper.
+            if (!current()) return null;
+            if (!conflict || attempt === 1) return { response, payload };
             // Never rebuild selection/context or authoring between attempts.
             requestBody.base_modified_at = getProjectVersion(dirName);
         }
         return null;
+    }
+
+    _queuePromptContextCompile(purpose, dirName, sceneId, body, isCurrent) {
+        // Extracted-method test harnesses intentionally omit constructor state.
+        // Production always owns the coordinator; the fallback preserves that
+        // narrow harness seam without creating a second runtime authority.
+        if (!this._promptCompileCoordinator?.schedule) {
+            return this._requestPromptContextCompile(
+                dirName, sceneId, body, isCurrent, { purpose });
+        }
+        return this._promptCompileCoordinator.schedule({
+            purpose, projectId: dirName, sceneId, body, isCurrent,
+        });
     }
 
     _failedPromptContextCandidate(sceneId, diagnostic) {
@@ -11914,12 +11967,18 @@ export class EditorWidget {
         }
         (async () => {
             try {
-                const result = await this._requestPromptContextCompile(
-                    dirName, sceneId, this._promptCompileRequestBody({
-                        dirName, candidate, windowStart: 0, windowEnd: duration,
-                        selection: { selectionStart: 0, selectionEnd: duration },
-                        promptSemanticUnitCreates,
-                    }), () => token === this._promptContextScenePayloadToken);
+                const body = this._promptCompileRequestBody({
+                    dirName, candidate, windowStart: 0, windowEnd: duration,
+                    selection: { selectionStart: 0, selectionEnd: duration },
+                    promptSemanticUnitCreates,
+                });
+                const result = await (this._queuePromptContextCompile
+                    ? this._queuePromptContextCompile(
+                        "scene-projection", dirName, sceneId, body,
+                        () => token === this._promptContextScenePayloadToken)
+                    : this._requestPromptContextCompile(
+                        dirName, sceneId, body,
+                        () => token === this._promptContextScenePayloadToken));
                 if (!result || this._destroyed || dirName !== this._projectDirName()
                         || sceneId !== this.activeSceneId
                         || token !== this._promptContextScenePayloadToken) return;
@@ -12050,12 +12109,18 @@ export class EditorWidget {
                 dirName, sceneId, candidate, windowStart, windowEnd,
                 promptSemanticUnitCreates });
             try {
-                const result = await this._requestPromptContextCompile(
-                    dirName, sceneId, this._promptCompileRequestBody({
-                        dirName, candidate, windowStart, windowEnd,
-                        selection: candidateSelection,
-                        promptSemanticUnitCreates,
-                    }), () => token === this._promptContextPreviewToken);
+                const body = this._promptCompileRequestBody({
+                    dirName, candidate, windowStart, windowEnd,
+                    selection: candidateSelection,
+                    promptSemanticUnitCreates,
+                });
+                const result = await (this._queuePromptContextCompile
+                    ? this._queuePromptContextCompile(
+                        "windowed-preview", dirName, sceneId, body,
+                        () => token === this._promptContextPreviewToken)
+                    : this._requestPromptContextCompile(
+                        dirName, sceneId, body,
+                        () => token === this._promptContextPreviewToken));
                 if (!result || this._destroyed || dirName !== this._projectDirName()
                         || sceneId !== this.activeSceneId
                         || token !== this._promptContextPreviewToken) return;
@@ -20240,6 +20305,7 @@ export class EditorWidget {
         this._promptContextPreviewToken = (this._promptContextPreviewToken || 0) + 1;
         this._promptContextScenePayloadToken =
             (this._promptContextScenePayloadToken || 0) + 1;
+        this._promptCompileCoordinator?.dispose?.();
         if (this._promptContextPreviewTimer) {
             clearTimeout(this._promptContextPreviewTimer);
             this._promptContextPreviewTimer = null;

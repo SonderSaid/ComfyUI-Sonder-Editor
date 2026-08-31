@@ -5966,7 +5966,9 @@ console.log(JSON.stringify(rows));
     for row in result[1:]:
         assert row["calls"] == 1
         assert row["discarded"] is True
-        assert row["version"] == "v1"
+        # Obsolete work has no retry/application authority, but its conflict
+        # still heals the shared version map for the trailing owner.
+        assert row["version"] == "v2"
 
 
 def test_exhausted_preview_conflict_fails_window_and_settles_scene_sibling():
@@ -6112,9 +6114,9 @@ class Subject extends CompileSupport {
 const rows=[];
 for(const caller of ["copy","window","scene"]) {
   const host=new Subject();
-  if(caller==="copy") {
-    const value=await host._promptCopyPlan("a","c");
-    rows.push({caller,discarded:value===null});
+    if(caller==="copy") {
+      const value=await host._promptCopyPlan("a","c");
+      rows.push({caller,refused:value?.refused||null});
   } else if(caller==="window") {
     host._previewPromptContextScenePayload=()=>{};
     host._previewPromptContextCandidate({},0);
@@ -6130,10 +6132,114 @@ for(const caller of ["copy","window","scene"]) {
 console.log(JSON.stringify(rows));
 """)
     assert result == [
-        {"caller": "copy", "discarded": True},
+        {"caller": "copy",
+         "refused": "Project changed; request Copy Plan again."},
         {"caller": "window", "cache": {"prompt": "NEW", "_stale": True}},
         {"caller": "scene", "cache": {"prompt": "NEW", "_stale": True}},
     ]
+
+
+def test_copy_plan_action_is_host_owned_across_panel_remount_and_has_request_ids():
+    panel = _source("web/js/editor_prompt_panel.js")
+    widget = _source("web/js/editor_widget.js")
+    method = _method_body(
+        widget, "_promptCopyPlan", marker="this._promptCopyPlanInFlight = null")
+    busy_method = _method_body(
+        widget, "_isPromptCopyPlanBusy",
+        marker="return !!this._promptCopyPlanInFlight;")
+    result = _run_node("""
+class Subject {
+  async """ + method + """
+  """ + busy_method + """
+  constructor() {
+    this.activeSceneId="scene"; this.activeScene={duration_frames:24};
+    this.totalFrames=24; this._promptContextPreviewToken=1; this.pending=[];
+    this.requests=[];
+  }
+  _projectDirName() { return "project"; }
+  _selectionContextRange() { return {contextStart:0,contextEnd:24}; }
+  _promptCompileRequestBody() { return {base_modified_at:"v1"}; }
+  _requestPromptContextCompile(_project,_scene,body,_current,meta) {
+    this.requests.push({body:structuredClone(body),meta});
+    return new Promise(resolve=>this.pending.push(resolve));
+  }
+}
+const host=new Subject();
+const first=host._promptCopyPlan("a","c");
+const second=await host._promptCopyPlan("a","c");
+const busyWhileMounted=host._isPromptCopyPlanBusy();
+// A remounted panel calls the same host method; it cannot reset host ownership.
+const remountAttempt=await host._promptCopyPlan("a","c");
+host.pending.shift()({response:{ok:true},payload:{copy_plan:{lines:[]}}});
+await first;
+const busyAfter=host._isPromptCopyPlanBusy();
+const third=host._promptCopyPlan("a","c");
+host.pending.shift()({response:{ok:true},payload:{copy_plan:{lines:[]}}});
+await third;
+console.log(JSON.stringify({requests:host.requests,second,remountAttempt,
+  busyWhileMounted,busyAfter}));
+""")
+    assert [row["meta"]["requestId"] for row in result["requests"]] == [
+        "copy-plan-1", "copy-plan-2"]
+    assert all(row["meta"]["purpose"] == "copy-plan"
+               for row in result["requests"])
+    assert result["second"] == {
+        "refused": "A Copy Plan request is already running."}
+    assert result["remountAttempt"] == result["second"]
+    assert result["busyWhileMounted"] is True
+    assert result["busyAfter"] is False
+    menu = panel[panel.index('label: "Copy with handles"'):]
+    assert "disabled: host._isPromptCopyPlanBusy?.() === true" in menu
+    assert "a Copy Plan request is already running" in menu
+
+
+def test_coordinator_obsolete_409_heals_without_retry_then_trailing_owns_retry():
+    widget = _source("web/js/editor_widget.js")
+    coordinator_url = (ROOT / "web/js/prompt_compile_coordinator.js").as_uri()
+    result = _run_node(_prompt_compile_test_support(widget) + f"""
+const {{createPromptCompileCoordinator}}=await import({json.dumps(coordinator_url)});
+const api={{apiURL:value=>value}}; resetProjectVersion("project","v1");
+let releaseA; const requests=[];
+globalThis.fetch=async (_url,init)=>{{
+  const row={{body:JSON.parse(init.body),headers:init.headers}}; requests.push(row);
+  if(requests.length===1) return await new Promise(resolve=>{{releaseA=resolve;}});
+  if(requests.length===2) return new Response(JSON.stringify({{
+    code:"project_version_conflict",actual_modified_at:"v3",
+    project:{{project_id:"project",modified_at:"v3"}}}}),{{status:409}});
+  return new Response(JSON.stringify({{prompt:"B"}}));
+}};
+class Subject extends CompileSupport {{
+  constructor() {{
+    super(); this.activeSceneId="scene";
+    this._promptCompileCoordinator=createPromptCompileCoordinator(
+      (request)=>this._requestPromptContextCompile(request.projectId,request.sceneId,
+        request.body,request.isCurrent,{{purpose:request.purpose,
+          requestId:request.requestId}}));
+  }}
+}}
+const host=new Subject();
+const a=host._queuePromptContextCompile("windowed-preview","project","scene",
+  {{base_modified_at:"v1",scene:{{text:"A"}}}},()=>true);
+await Promise.resolve(); await Promise.resolve();
+const b=host._queuePromptContextCompile("windowed-preview","project","scene",
+  {{base_modified_at:"v1",scene:{{text:"B"}}}},()=>true);
+releaseA(new Response(JSON.stringify({{
+  code:"project_version_conflict",actual_modified_at:"v2",
+  project:{{project_id:"project",modified_at:"v2"}}}}),{{status:409}}));
+const values=await Promise.all([a,b]);
+console.log(JSON.stringify({{requests,version:getProjectVersion("project"),
+  aDiscarded:values[0]===null,bPrompt:values[1]?.payload?.prompt}}));
+""")
+    assert result["aDiscarded"] is True
+    assert result["bPrompt"] == "B"
+    assert result["version"] == "v3"
+    assert [row["body"]["scene"]["text"] for row in result["requests"]] == [
+        "A", "B", "B"]
+    assert [row["headers"]["X-Sonder-Prompt-Request-Id"]
+            for row in result["requests"]] == ["prompt-1", "prompt-2", "prompt-2"]
+    assert [row["headers"]["X-Sonder-Prompt-Attempt"]
+            for row in result["requests"]] == ["1", "1", "2"]
+    assert result["requests"][2]["body"]["base_modified_at"] == "v3"
 
 
 def test_prompt_draft_revisions_and_targeted_intents_survive_rapid_edits():

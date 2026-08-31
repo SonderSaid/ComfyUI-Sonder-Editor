@@ -1937,7 +1937,7 @@ Server value: ${serverValue}` : ""}`;
          * authored prose. The plan stays inside compile because the context it
          * needs is injected there.
          */
-        const copyContribution = async (attachmentId, capabilityId,
+        const runCopyContribution = async (attachmentId, capabilityId,
             { sceneWide = false } = {}) => {
             const plan = await host._promptCopyPlan?.(
                 attachmentId, capabilityId, buildWritingCandidatePatch(
@@ -2041,6 +2041,11 @@ Server value: ${serverValue}` : ""}`;
                     { source: "prompt-copy" });
             }
             return true;
+        };
+        const copyContribution = async (attachmentId, capabilityId,
+            options = {}) => {
+            if (host._isPromptCopyPlanBusy?.()) return false;
+            return await runCopyContribution(attachmentId, capabilityId, options);
         };
         /** Turn one capability on or off, wherever this draft holds the chip. */
         const setContributionEnabled = (attachmentId, capabilityId, enabled) => {
@@ -2272,7 +2277,10 @@ Server value: ${serverValue}` : ""}`;
                                 // `hint`, not `title` — `openContextMenu` reads
                                 // `hint`, so anything under another key renders
                                 // as a bare label and the explanation is lost.
-                                hint: "uses live @handles and discloses any frozen text",
+                                hint: host._isPromptCopyPlanBusy?.()
+                                    ? "a Copy Plan request is already running"
+                                    : "uses live @handles and discloses any frozen text",
+                                disabled: host._isPromptCopyPlanBusy?.() === true,
                                 action: () => copyContribution(
                                     line.attachmentId, line.capabilityId,
                                     { sceneWide: Boolean(dormancy) }) });

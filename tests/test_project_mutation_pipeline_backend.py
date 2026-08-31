@@ -4,6 +4,7 @@ import importlib
 import json
 import os
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -128,6 +129,66 @@ def test_prompt_context_candidate_uses_constraint_aware_execution_window(monkeyp
     assert payload["execution_window"] == expected
     assert payload["window"]["start_frame"] == expected["render_start"]
     assert payload["window"]["end_frame"] == expected["render_end"]
+
+
+def test_prompt_context_candidate_cpu_helper_is_off_loop_and_route_entry_is_countable(
+        monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene", duration_frames=24)
+    project = TimelineProject(project_id="proj", scenes=[scene], fps=24.0)
+    monkeypatch.setattr(
+        route_module, "_load_project_from_request",
+        lambda request, **_kwargs: project)
+    events = []
+    monkeypatch.setattr(
+        route_module, "record_diag_event",
+        lambda event, **payload: events.append((event, payload)))
+    release = threading.Event()
+    worker_threads = []
+
+    def blocked_compile(value, scene_id, body):
+        worker_threads.append(threading.get_ident())
+        assert value is project
+        assert scene_id == "scene"
+        assert body == {"labels_on": True}
+        assert release.wait(1.0)
+        return 200, {"ok": True}
+
+    monkeypatch.setattr(
+        route_module, "_compile_prompt_context_candidate_sync", blocked_compile)
+    handler = _route_handler(
+        route_module, "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/prompt-context/compile")
+    request = DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene"},
+        body={"labels_on": True},
+        headers={
+            "X-Sonder-Prompt-Purpose": "windowed-preview",
+            "X-Sonder-Prompt-Request-Id": "prompt-7",
+            "X-Sonder-Prompt-Attempt": "1",
+        })
+
+    async def exercise():
+        loop = asyncio.get_running_loop()
+        main_thread = threading.get_ident()
+        loop.call_later(0.02, release.set)
+        started = loop.time()
+        response = await handler(request)
+        return response, loop.time() - started, main_thread
+
+    response, elapsed, main_thread = asyncio.run(exercise())
+
+    assert response.status == 200
+    assert _response_json(response) == {"ok": True}
+    assert elapsed < 0.5
+    assert worker_threads and worker_threads[0] != main_thread
+    assert events == [("prompt_context_compile_route_entry", {
+        "project_id": "proj",
+        "scene_id": "scene",
+        "purpose": "windowed-preview",
+        "request_id": "prompt-7",
+        "attempt": "1",
+    })]
 
 
 def test_prompt_context_candidate_compiles_transient_pending_identity_without_mutation(monkeypatch):
@@ -1493,6 +1554,50 @@ def test_asset_sync_stale_version_returns_409_conflict(monkeypatch, tmp_path):
     assert payload["project"]["project_id"] == "proj"
 
 
+def test_save_path_version_mismatch_returns_projection_and_healing_headers(
+        monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    stale = TimelineProject(project_dir=str(project_dir), name="Project")
+    stale.project_id = "proj"
+    stale.prompt_semantic_units = [{
+        "semantic_unit_id": "unit", "name": "Hero", "future": {"kept": True}}]
+    route_module.save_project(stale)
+    expected = stale.modified_at
+
+    current = route_module.load_project(str(project_dir))
+    current.prompt_context_profiles = [{
+        "profile_id": "profile", "name": "Profile", "future": [1, 2]}]
+    route_module.save_project(current)
+    assert current.modified_at != expected
+
+    async def stale_save(_request):
+        route_module.save_project(stale, expected_modified_at=expected)
+        return web.json_response({"unexpected": True})
+
+    request = DummyRequest(
+        match_info={"project_id": "proj"},
+        method="POST", path="/sonder-editor/project/proj/test-save")
+    response = asyncio.run(
+        route_module._project_conflict_middleware(request, stale_save))
+    payload = _response_json(response)
+
+    assert response.status == 409
+    assert payload["code"] == "project_version_conflict"
+    assert payload["expected_modified_at"] == expected
+    assert payload["actual_modified_at"] == current.modified_at
+    assert set(payload["project"]) == {
+        "project_id", "modified_at",
+        "prompt_semantic_units", "prompt_context_profiles",
+    }
+    assert payload["project"]["prompt_semantic_units"][0]["future"] == {
+        "kept": True}
+    assert payload["project"]["prompt_context_profiles"][0]["future"] == [1, 2]
+    assert response.headers["X-Sonder-Project-Id"] == "proj"
+    assert response.headers["X-Sonder-Project-Modified-At"] == current.modified_at
+
+
 def test_scene_mutation_consolidates_video_and_removes_only_vacated_lanes(monkeypatch, tmp_path):
     route_module = _load_route_module(monkeypatch)
     scene = Scene(scene_id="scene-1", name="Scene")
@@ -2437,8 +2542,24 @@ def test_candidate_body_is_the_only_version_gate_and_conflicts_heal(
     scene = Scene(scene_id="scene", duration_frames=20,
                   prompt_sections=[PromptSection(0, 20, channels={"visual": "body"})])
     project = TimelineProject(project_id="proj", project_dir=str(project_dir), scenes=[scene])
+    project.prompt_semantic_units = [{
+        "semantic_unit_id": "unit-1",
+        "name": "Hero",
+        "future_unit": {"nested": ["preserved"]},
+    }]
+    project.prompt_context_profiles = [{
+        "profile_id": "profile-1",
+        "name": "Custom",
+        "future_profile": {"nested": {"preserved": True}},
+    }]
     route_module.save_project(project)
     before = copy.deepcopy(project.to_dict())
+    expected_projection = {
+        "project_id": before["project_id"],
+        "modified_at": before["modified_at"],
+        "prompt_semantic_units": before["prompt_semantic_units"],
+        "prompt_context_profiles": before["prompt_context_profiles"],
+    }
     monkeypatch.setattr(route_module, "_get_base_dir", lambda: str(tmp_path))
     monkeypatch.setattr(route_module, "load_project", lambda _directory: project)
     saves = []
@@ -2455,7 +2576,17 @@ def test_candidate_body_is_the_only_version_gate_and_conflicts_heal(
     assert response.status == (409 if body_stale else 200)
     if body_stale:
         assert payload["code"] == "project_version_conflict"
-        assert payload["project"] == before
+        assert set(payload["project"]) == {
+            "project_id", "modified_at",
+            "prompt_semantic_units", "prompt_context_profiles",
+        }
+        assert payload["project"] == expected_projection
+        assert payload["project"]["prompt_semantic_units"][0]["future_unit"] == {
+            "nested": ["preserved"]}
+        assert payload["project"]["prompt_context_profiles"][0]["future_profile"] == {
+            "nested": {"preserved": True}}
+        assert "assets" not in payload["project"]
+        assert "scenes" not in payload["project"]
         assert response.headers["X-Sonder-Project-Modified-At"] == project.modified_at
         assert response.headers["X-Sonder-Project-Id"] == "proj"
     assert project.to_dict() == before
@@ -2465,6 +2596,74 @@ def test_candidate_body_is_the_only_version_gate_and_conflicts_heal(
         route_module._load_project_from_request(request, repair_missing_frames=False)
     with pytest.raises(ValueError, match="cannot repair"):
         route_module._load_project_from_request(request, version_checked=False)
+
+
+def test_compile_conflict_projection_does_not_serialize_full_project(
+        monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    scene = Scene(scene_id="scene", duration_frames=20)
+    raw_project = TimelineProject(
+        project_id="proj", project_dir=str(project_dir), scenes=[scene]).to_dict()
+    raw_project["prompt_semantic_units"] = [{
+        "semantic_unit_id": "unit-1",
+        "name": "Hero",
+        "sources": [{
+            "entity_id": "reference-1",
+            "member_id": "member-1",
+            "contribution": "",
+            "future_source": {"nested": ["preserved"]},
+        }],
+        "future_unit": {"nested": {"preserved": True}},
+    }]
+    raw_project["prompt_context_profiles"] = [{
+        "profile_id": "profile-1",
+        "version": "1",
+        "name": "Custom",
+        "capabilities": {},
+        "future_profile": {"nested": [1, 2]},
+    }]
+    project = TimelineProject.from_dict(raw_project, project_dir=str(project_dir))
+    serialized = project.to_dict()
+    expected = {
+        "project_id": serialized["project_id"],
+        "modified_at": serialized["modified_at"],
+        "prompt_semantic_units": serialized["prompt_semantic_units"],
+        "prompt_context_profiles": serialized["prompt_context_profiles"],
+    }
+    monkeypatch.setattr(
+        route_module, "_load_project_from_request",
+        lambda _request, **_kwargs: project)
+
+    def reject_full_serialization(*_args, **_kwargs):
+        raise AssertionError("stale conflict must not serialize the full project")
+
+    monkeypatch.setattr(project, "to_dict", reject_full_serialization)
+    handler = _route_handler(
+        route_module, "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/prompt-context/compile")
+    request = DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene"},
+        body={"base_modified_at": "stale", "scene": scene.to_dict()})
+
+    response = asyncio.run(route_module._project_conflict_middleware(request, handler))
+    payload = _response_json(response)
+
+    assert response.status == 409
+    assert payload["project"] == expected
+    assert set(payload["project"]) == {
+        "project_id", "modified_at",
+        "prompt_semantic_units", "prompt_context_profiles",
+    }
+    assert response.headers["X-Sonder-Project-Modified-At"] == project.modified_at
+    assert response.headers["X-Sonder-Project-Id"] == "proj"
+    assert payload["project"]["prompt_semantic_units"][0]["future_unit"] == {
+        "nested": {"preserved": True}}
+    assert payload["project"]["prompt_semantic_units"][0]["sources"][0][
+        "future_source"] == {"nested": ["preserved"]}
+    assert payload["project"]["prompt_context_profiles"][0]["future_profile"] == {
+        "nested": [1, 2]}
 
 
 @pytest.mark.parametrize("global_scope", [False, True])

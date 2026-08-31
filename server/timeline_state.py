@@ -102,6 +102,77 @@ def _overlay_unknown_positional_records(raw: Any, canonical: list) -> list:
     ]
 
 
+def project_prompt_fields_with_unknowns(
+    raw: Any,
+    semantic_units: list,
+    context_profiles: list,
+    *,
+    deep_copy: bool = True,
+) -> tuple[list, list]:
+    """Overlay the two project-level prompt collections without other fields."""
+    raw_project = raw if isinstance(raw, dict) else {}
+
+    def overlay_record(raw_record: Any, canonical: dict) -> dict:
+        if deep_copy:
+            return _overlay_unknown_record(raw_record, canonical)
+        result = dict(raw_record) if isinstance(raw_record, dict) else {}
+        result.update(canonical)
+        return result
+
+    def overlay_keyed(raw_values: Any, canonical_values: list, key: str) -> list:
+        raw_by_id = {
+            str(item.get(key) or ""): item
+            for item in (raw_values if isinstance(raw_values, list) else [])
+            if isinstance(item, dict) and item.get(key)
+        }
+        return [
+            overlay_record(raw_by_id.get(str(item.get(key) or "")), item)
+            if isinstance(item, dict)
+            else (copy.deepcopy(item) if deep_copy else item)
+            for item in canonical_values
+        ]
+
+    units = overlay_keyed(
+        raw_project.get("prompt_semantic_units"),
+        semantic_units if isinstance(semantic_units, list) else [],
+        "semantic_unit_id",
+    )
+    raw_units = {
+        str(item.get("semantic_unit_id") or ""): item
+        for item in raw_project.get("prompt_semantic_units", [])
+        if isinstance(item, dict) and item.get("semantic_unit_id")
+    }
+    for unit in units:
+        raw_unit = raw_units.get(str(unit.get("semantic_unit_id") or ""), {})
+        raw_sources = {
+            (str(item.get("entity_id") or ""), str(item.get("member_id") or "")): item
+            for item in raw_unit.get("sources", [])
+            if isinstance(item, dict)
+        }
+        unit["sources"] = [
+            overlay_record(
+                raw_sources.get((str(item.get("entity_id") or ""),
+                                 str(item.get("member_id") or ""))), item)
+            for item in unit.get("sources", []) if isinstance(item, dict)
+        ]
+        # One-time migration authority; never resurrect the retired alias.
+        unit.pop("source_members", None)
+
+    raw_profiles = {
+        (str(item.get("profile_id") or ""), str(item.get("version") or "1")): item
+        for item in raw_project.get("prompt_context_profiles", [])
+        if isinstance(item, dict) and item.get("profile_id")
+    }
+    profiles = [
+        overlay_record(
+            raw_profiles.get((str(item.get("profile_id") or ""),
+                              str(item.get("version") or "1"))), item)
+        for item in (context_profiles if isinstance(context_profiles, list) else [])
+        if isinstance(item, dict)
+    ]
+    return units, profiles
+
+
 def _overlay_unknown_attachment(raw: Any, canonical: dict) -> dict:
     result = _overlay_unknown_record(raw, canonical)
     raw_attachment = raw if isinstance(raw, dict) else {}
@@ -235,7 +306,6 @@ def _preserve_project_unknown_fields(raw: Any, canonical: dict) -> dict:
         ("assets", "asset_id"),
         ("generation_queue", "job_id"),
         ("references", "reference_id"),
-        ("prompt_semantic_units", "semantic_unit_id"),
     ):
         result[field_name] = _overlay_unknown_keyed_records(
             raw_project.get(field_name), canonical.get(field_name, []), member_key)
@@ -264,39 +334,14 @@ def _preserve_project_unknown_fields(raw: Any, canonical: dict) -> dict:
         # This known pre-release field was deliberately retired, not unknown.
         reference.pop("notes", None)
 
-    raw_units = {
-        str(item.get("semantic_unit_id") or ""): item
-        for item in raw_project.get("prompt_semantic_units", [])
-        if isinstance(item, dict) and item.get("semantic_unit_id")
-    }
-    for unit in result.get("prompt_semantic_units", []):
-        raw_unit = raw_units.get(str(unit.get("semantic_unit_id") or ""), {})
-        raw_sources = {
-            (str(item.get("entity_id") or ""), str(item.get("member_id") or "")): item
-            for item in raw_unit.get("sources", [])
-            if isinstance(item, dict)
-        }
-        unit["sources"] = [
-            _overlay_unknown_record(
-                raw_sources.get((str(item.get("entity_id") or ""),
-                                 str(item.get("member_id") or ""))), item)
-            for item in unit.get("sources", []) if isinstance(item, dict)
-        ]
-        # One-time migration authority; never resurrect the retired alias.
-        unit.pop("source_members", None)
-
-    raw_profiles = {
-        (str(item.get("profile_id") or ""), str(item.get("version") or "1")): item
-        for item in raw_project.get("prompt_context_profiles", [])
-        if isinstance(item, dict) and item.get("profile_id")
-    }
-    result["prompt_context_profiles"] = [
-        _overlay_unknown_record(
-            raw_profiles.get((str(item.get("profile_id") or ""),
-                              str(item.get("version") or "1"))), item)
-        for item in canonical.get("prompt_context_profiles", [])
-        if isinstance(item, dict)
-    ]
+    (
+        result["prompt_semantic_units"],
+        result["prompt_context_profiles"],
+    ) = project_prompt_fields_with_unknowns(
+        raw_project,
+        canonical.get("prompt_semantic_units", []),
+        canonical.get("prompt_context_profiles", []),
+    )
     return result
 
 # Backend-owned recipe catalog. Lane state stores a materialized copy of the

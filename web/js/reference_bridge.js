@@ -17,6 +17,10 @@ import { onProjectVersionChanged } from "./api_client.js";
 import { onEditorRenderWindowChanged } from "./editor_render_window_events.js";
 import { PRIORITY as KEY_PRIORITY, register as registerKeyboardConsumer } from "./keyboard_ownership.js";
 import {
+    allocateBridgeReferenceGeneration,
+    requestBridgeReferencePayload,
+} from "./bridge_reference_coordinator.js";
+import {
     MAX_REFERENCE_SLOTS,
     SLOT_NAME_RE,
     canonicalOutputOrder,
@@ -146,7 +150,7 @@ const FULL_SHAPE = {
     imageSlotLabels: [],
 };
 
-async function referenceShapeForBridge(node) {
+async function referenceShapeForBridge(node, wave) {
     const selector = upstreamSelector(node);
     if (!selector) return FULL_SHAPE;
     const resolution = resolveProjectSource(selector);
@@ -161,15 +165,18 @@ async function referenceShapeForBridge(node) {
         // has not resolved a project yet. Retry once when it does, mirroring the
         // guide/driver bridge panels.
         if (controller && !projectDir && typeof controller.whenProjectReady === "function") {
-            controller.whenProjectReady(() => refreshShape(node));
+            controller.whenProjectReady(() => scheduleReferenceRefresh({
+                origin: "project_ready",
+                targets: [node],
+            }));
         }
         return FULL_SHAPE;
     }
-    const response = await fetch(api.apiURL(
-        referenceBridgeUrl(projectId, sceneId, controllerState)
-    ));
-    if (!response.ok) throw new Error(`Reference bridge shape fetch failed: ${response.status}`);
-    const payload = await response.json();
+    const payload = await requestBridgeReferencePayload({
+        url: api.apiURL(referenceBridgeUrl(projectId, sceneId, controllerState)),
+        generation: wave.generation,
+        origin: wave.origin,
+    });
     const selection = parseLaneSelection(findWidget(selector, "reference_lanes")?.value);
     return mergedBridgeShape({
         lanes: Array.isArray(payload?.references) ? payload.references : [],
@@ -177,11 +184,11 @@ async function referenceShapeForBridge(node) {
     });
 }
 
-function refreshShape(node) {
+function refreshShape(node, wave) {
     if (!BRIDGES.has(nodeType(node))) return;
     const state = ensureState(node);
     const token = ++state.refreshToken;
-    referenceShapeForBridge(node)
+    referenceShapeForBridge(node, wave)
         .then((shape) => {
             if (token === state.refreshToken) applyReferenceBridgeShape(node, shape);
         })
@@ -193,21 +200,91 @@ function refreshShape(node) {
         });
 }
 
-// Library and timeline mutations change the staged member count without ever
-// touching this node, so connection/widget hooks alone leave the slot block
-// stale. Every project write moves the durable version, so one page-level
-// subscription keeps every placed bridge current. Coalesced because a single
-// mutation batch can record the version more than once.
-let versionRefreshTimer = null;
-function refreshAllBridges() {
-    clearTimeout(versionRefreshTimer);
-    versionRefreshTimer = setTimeout(() => {
-        versionRefreshTimer = null;
-        for (const node of app.graph?._nodes || []) {
-            if (BRIDGES.has(nodeType(node))) refreshShape(node);
-            else if (nodeType(node) === SELECTOR) refreshSelectorPanel(node);
+// Every refresh origin enters this scheduler. It owns logical generations;
+// node-local consumers own only application tokens. Automatic calls landing in
+// one scheduled turn share a wave, while project versions retain a stable
+// identity across duplicate notifications. Explicit refreshes always allocate
+// post-click work.
+const pendingRefreshWaves = new Map();
+
+function scheduleReferenceRefresh({
+    origin = "refresh",
+    projectId = "",
+    modifiedAt = "",
+    force = false,
+    targets = null,
+    delayMs = 0,
+} = {}) {
+    const normalizedOrigin = String(origin || "refresh");
+    // Version healing emits once for the canonical UUID and once for the
+    // folder alias. Both signals refresh every Reference node, and the
+    // coordinator already keys physical work by the complete resource URL, so
+    // generation identity must not embed the alias spelling. Otherwise one
+    // response creates an active request plus an identical trailing request.
+    const stableGeneration = !force && modifiedAt
+        ? `project-version:${String(modifiedAt)}`
+        : "";
+    const generation = force
+        ? allocateBridgeReferenceGeneration(normalizedOrigin)
+        : (stableGeneration || pendingRefreshWaves.get("automatic")?.generation
+            || allocateBridgeReferenceGeneration(normalizedOrigin));
+    const waveKey = force ? generation : (stableGeneration || "automatic");
+    let wave = pendingRefreshWaves.get(waveKey);
+    let created = false;
+    if (!wave) {
+        created = true;
+        wave = {
+            generation,
+            origins: new Set(),
+            targets: new Set(),
+            all: false,
+            timer: null,
+        };
+        pendingRefreshWaves.set(waveKey, wave);
+    }
+    wave.origins.add(normalizedOrigin);
+    if (targets == null) {
+        wave.all = true;
+        wave.targets.clear();
+    } else if (!wave.all) {
+        for (const node of targets) {
+            if (node) wave.targets.add(node);
         }
-    }, 250);
+    }
+    if (created) {
+        wave.timer = window.setTimeout(() => {
+            if (pendingRefreshWaves.get(waveKey) !== wave) return;
+            pendingRefreshWaves.delete(waveKey);
+            const dispatch = {
+                generation: wave.generation,
+                origin: [...wave.origins].sort().join("+") || "refresh",
+            };
+            const nodes = wave.all ? [...(app.graph?._nodes || [])] : [...wave.targets];
+            for (const node of nodes) {
+                if (BRIDGES.has(nodeType(node))) refreshShape(node, dispatch);
+                else if (nodeType(node) === SELECTOR) refreshSelectorPanel(node, dispatch);
+            }
+        }, Math.max(0, Number(delayMs) || 0));
+    }
+    return wave.generation;
+}
+
+function refreshAllBridges(projectId, modifiedAt) {
+    scheduleReferenceRefresh({
+        origin: "project_version",
+        projectId,
+        modifiedAt,
+        targets: null,
+        delayMs: 250,
+    });
+}
+
+function refreshAllBridgesForWindow() {
+    scheduleReferenceRefresh({
+        origin: "render_window",
+        targets: null,
+        delayMs: 250,
+    });
 }
 
 function downstreamBridges(selector) {
@@ -223,8 +300,8 @@ function downstreamBridges(selector) {
     return bridges;
 }
 
-function refreshDownstreamBridges(selector) {
-    for (const bridge of downstreamBridges(selector)) refreshShape(bridge);
+function selectorRefreshTargets(selector) {
+    return [selector, ...downstreamBridges(selector)];
 }
 
 // ── Selector lane panel ───────────────────────────────────────────────
@@ -314,7 +391,7 @@ function selectorPanelHeight(view) {
     );
 }
 
-async function selectorLanePayload(node) {
+async function selectorLanePayload(node, wave) {
     const resolution = resolveProjectSource(node);
     if (resolution.status !== "resolved") {
         return { status: "Connect a Sonder Editor project.", lanes: [], linked: false };
@@ -326,15 +403,18 @@ async function selectorLanePayload(node) {
     const sceneId = controllerState?.sceneId || controllerState?.dormantSummary?.active_scene?.scene_id || "";
     if (!projectId || !sceneId) {
         if (controller && !projectDir && typeof controller.whenProjectReady === "function") {
-            controller.whenProjectReady(() => refreshSelectorPanel(node));
+            controller.whenProjectReady(() => scheduleReferenceRefresh({
+                origin: "project_ready",
+                targets: [node],
+            }));
         }
         return { status: projectId ? "No active scene." : "Loading project...", lanes: [], linked: false };
     }
-    const response = await fetch(api.apiURL(
-        referenceBridgeUrl(projectId, sceneId, controllerState)
-    ));
-    if (!response.ok) throw new Error(`Reference lane fetch failed: ${response.status}`);
-    const payload = await response.json();
+    const payload = await requestBridgeReferencePayload({
+        url: api.apiURL(referenceBridgeUrl(projectId, sceneId, controllerState)),
+        generation: wave.generation,
+        origin: wave.origin,
+    });
     return {
         status: "",
         lanes: Array.isArray(payload?.references) ? payload.references : [],
@@ -387,7 +467,6 @@ function renderSelectorPanel(node, payload) {
         remove.addEventListener("click", () => {
             closeSelectorMenu(node);
             setSelectorLanes(node, view.laneIndices.filter((value) => value !== row.laneIndex));
-            refreshSelectorPanel(node);
         });
         line.append(copy, remove);
         state.rows.appendChild(line);
@@ -440,7 +519,6 @@ function renderSelectorPanel(node, payload) {
             option.addEventListener("click", () => {
                 closeSelectorMenu(node);
                 setSelectorLanes(node, [...view.laneIndices, entry.laneIndex]);
-                refreshSelectorPanel(node);
             });
         }
         state.menu.appendChild(option);
@@ -457,13 +535,13 @@ function renderSelectorPanel(node, payload) {
     app.graph?.setDirtyCanvas?.(true, true);
 }
 
-function refreshSelectorPanel(node) {
+function refreshSelectorPanel(node, wave) {
     if (nodeType(node) !== SELECTOR) return;
     const state = selectorState(node);
     if (!state.panel) return;
     const token = ++state.refreshToken;
     state.status.textContent = "Loading Reference lanes...";
-    selectorLanePayload(node)
+    selectorLanePayload(node, wave)
         .then((payload) => {
             if (token === state.refreshToken) renderSelectorPanel(node, payload);
         })
@@ -497,7 +575,11 @@ function installSelectorPanel(node) {
         color:#dbe4ed; font-size:10px; padding:2px 6px; cursor:pointer;
     `);
     refreshBtn.textContent = "Refresh";
-    refreshBtn.addEventListener("click", () => refreshSelectorPanel(node));
+    refreshBtn.addEventListener("click", () => scheduleReferenceRefresh({
+        origin: "selector_manual_refresh",
+        force: true,
+        targets: [node],
+    }));
     actions.append(addButton, refreshBtn);
     header.append(title, actions);
 
@@ -529,7 +611,10 @@ function installSelectorPanel(node) {
     state.disclosures = disclosures;
     state.chips = chips;
     state.menu = menu;
-    refreshSelectorPanel(node);
+    scheduleReferenceRefresh({
+        origin: "selector_install",
+        targets: [node],
+    });
 }
 
 function installSelector(node) {
@@ -543,21 +628,21 @@ function installSelector(node) {
         const originalCallback = laneWidget.callback;
         laneWidget.callback = function (...args) {
             const result = originalCallback?.apply(this, args);
-            window.setTimeout(() => {
-                refreshDownstreamBridges(node);
-                refreshSelectorPanel(node);
-            }, 0);
+            scheduleReferenceRefresh({
+                origin: "selector_widget",
+                targets: selectorRefreshTargets(node),
+            });
             return result;
         };
     }
     const originalConnections = node.onConnectionsChange;
     node.onConnectionsChange = function (...args) {
         const result = originalConnections?.apply(this, args);
-        window.setTimeout(() => {
-            refreshDownstreamBridges(this);
-            // Wiring the project input is what makes the lane list resolvable.
-            refreshSelectorPanel(this);
-        }, 0);
+        // Wiring the project input is what makes the lane list resolvable.
+        scheduleReferenceRefresh({
+            origin: "selector_connection",
+            targets: selectorRefreshTargets(this),
+        });
         return result;
     };
     const originalRemoved = node.onRemoved;
@@ -575,7 +660,10 @@ function install(node) {
     const originalConnections = node.onConnectionsChange;
     node.onConnectionsChange = function (...args) {
         const result = originalConnections?.apply(this, args);
-        window.setTimeout(() => refreshShape(this), 0);
+        scheduleReferenceRefresh({
+            origin: "bridge_connection",
+            targets: [this],
+        });
         return result;
     };
     const unusedSlotsWidget = findWidget(node, "unused_slots");
@@ -583,7 +671,10 @@ function install(node) {
         const originalCallback = unusedSlotsWidget.callback;
         unusedSlotsWidget.callback = function (...args) {
             const result = originalCallback?.apply(this, args);
-            window.setTimeout(() => refreshShape(node), 0);
+            scheduleReferenceRefresh({
+                origin: "bridge_widget",
+                targets: [node],
+            });
             return result;
         };
     }
@@ -592,11 +683,18 @@ function install(node) {
         const result = originalMenu?.apply(this, arguments);
         options?.push({
             content: "Refresh reference slots",
-            callback: () => refreshShape(this),
+            callback: () => scheduleReferenceRefresh({
+                origin: "bridge_manual_refresh",
+                force: true,
+                targets: [this],
+            }),
         });
         return result;
     };
-    window.setTimeout(() => refreshShape(node), 0);
+    scheduleReferenceRefresh({
+        origin: "bridge_install",
+        targets: [node],
+    });
 }
 
 app.registerExtension({
@@ -607,7 +705,7 @@ app.registerExtension({
     },
     setup() {
         onProjectVersionChanged(refreshAllBridges);
-        onEditorRenderWindowChanged(refreshAllBridges);
+        onEditorRenderWindowChanged(refreshAllBridgesForWindow);
     },
     nodeCreated(node) {
         installSelector(node);

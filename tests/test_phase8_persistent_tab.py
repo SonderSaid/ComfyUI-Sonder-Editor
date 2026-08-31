@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import json
 import os
 import re
 import tempfile
@@ -18,6 +19,7 @@ from server.project_manager import (
     ProjectVersionConflict,
     create_project,
     load_project,
+    project_conflict_projection,
     save_project,
 )
 from server.session_registry import (
@@ -58,12 +60,36 @@ def test_versioned_save_rejects_stale_writer():
 
         current = load_project(project.project_dir)
         current.name = "Current"
+        current.prompt_semantic_units = [{
+            "semantic_unit_id": "unit-1",
+            "future_unit": {"nested": ["preserved"]},
+        }]
+        current.prompt_context_profiles = [{
+            "profile_id": "profile-1",
+            "future_profile": {"nested": {"preserved": True}},
+        }]
         save_project(current, expected_modified_at=base_version)
 
         stale = load_project(project.project_dir)
         stale.name = "Stale"
-        with pytest.raises(ProjectVersionConflict):
+        with open(os.path.join(project.project_dir, "project.json"),
+                  "r", encoding="utf-8") as handle:
+            expected_projection = project_conflict_projection(json.load(handle))
+        with pytest.raises(ProjectVersionConflict) as raised:
             save_project(stale, expected_modified_at=base_version)
+
+        conflict = raised.value
+        assert set(conflict.current_data) == {
+            "project_id", "modified_at",
+            "prompt_semantic_units", "prompt_context_profiles",
+        }
+        assert conflict.current_data == expected_projection
+        assert conflict.current_data["prompt_semantic_units"][0]["future_unit"] == {
+            "nested": ["preserved"]}
+        assert conflict.current_data["prompt_context_profiles"][0]["future_profile"] == {
+            "nested": {"preserved": True}}
+        assert "assets" not in conflict.current_data
+        assert "scenes" not in conflict.current_data
 
         restored = load_project(project.project_dir)
         assert restored.name == "Current"

@@ -10,7 +10,7 @@ from typing import Callable
 from .atomic_io import atomic_replace
 from . import external_links
 from .path_security import path_within
-from .timeline_state import TimelineProject
+from .timeline_state import TimelineProject, project_prompt_fields_with_unknowns
 
 logger = logging.getLogger("sonder_editor")
 
@@ -105,6 +105,50 @@ class ProjectVersionConflict(RuntimeError):
         self.current_data = current_data or {}
 
 
+def project_conflict_projection(source: TimelineProject | dict | None) -> dict:
+    """Return the complete public healing contract for a version conflict.
+
+    Conflict responses intentionally carry no scenes, assets, queue, metadata,
+    or persistence-only fields. These four fields are the version-map and
+    prompt-identity/profile data consumed by current clients.
+    """
+    if isinstance(source, TimelineProject):
+        project_id = getattr(source, "project_id", "")
+        modified_at = getattr(source, "modified_at", "")
+        semantic_units, profiles = project_prompt_fields_with_unknowns(
+            getattr(source, "_raw_data", {}),
+            getattr(source, "prompt_semantic_units", []),
+            getattr(source, "prompt_context_profiles", []),
+            deep_copy=False,
+        )
+    elif isinstance(source, dict):
+        project_id = source.get("project_id", "")
+        modified_at = source.get("modified_at", "")
+        semantic_units = [
+            dict(item) if isinstance(item, dict) else item
+            for item in (source.get("prompt_semantic_units", [])
+                         if isinstance(source.get("prompt_semantic_units"), list)
+                         else [])
+        ]
+        profiles = [
+            dict(item) if isinstance(item, dict) else item
+            for item in (source.get("prompt_context_profiles", [])
+                         if isinstance(source.get("prompt_context_profiles"), list)
+                         else [])
+        ]
+    else:
+        project_id = ""
+        modified_at = ""
+        semantic_units = []
+        profiles = []
+    return {
+        "project_id": str(project_id or ""),
+        "modified_at": str(modified_at or ""),
+        "prompt_semantic_units": semantic_units if isinstance(semantic_units, list) else [],
+        "prompt_context_profiles": profiles if isinstance(profiles, list) else [],
+    }
+
+
 def register_project_saved_hook(hook: Callable[[TimelineProject], None]) -> None:
     if hook not in _PROJECT_SAVED_HOOKS:
         _PROJECT_SAVED_HOOKS.append(hook)
@@ -176,20 +220,40 @@ def save_project(
                     project_dir=project.project_dir,
                     expected_modified_at=expected_modified_at,
                     actual_modified_at=actual_modified_at,
-                    current_data=current_data,
+                    current_data=project_conflict_projection(current_data),
                 )
 
         if bump_modified_at:
             project.modified_at = datetime.now().isoformat()
         data = project.to_dict(include_internal=True)
+        # One authoritative encode owns both persistence and compatibility
+        # shadow normalization. Pretty printing is deliberately retained; the
+        # incidents this path protects were diagnosed from readable files.
+        serialized = json.dumps(data, indent=2, ensure_ascii=False)
         tmp_file = f"{project_file}.{uuid.uuid4().hex}.tmp"
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        atomic_replace(tmp_file, project_file)
+        try:
+            # `newline=""` is load-bearing on Windows: default text-mode
+            # translation would persist CRLF bytes that are not the serialized
+            # string subsequently parsed into the compatibility shadow.
+            with open(tmp_file, "w", encoding="utf-8", newline="") as f:
+                f.write(serialized)
+            atomic_replace(tmp_file, project_file)
+        finally:
+            # atomic_replace removes its temp after exhausted PermissionError,
+            # but a partial write or unrelated OSError used to leak a full-size
+            # UUID file. Cleanup is best effort and never hides the first error.
+            if os.path.exists(tmp_file):
+                try:
+                    os.remove(tmp_file)
+                except OSError:
+                    logger.warning(
+                        "Could not clean failed project temp file: %s", tmp_file,
+                        exc_info=True,
+                    )
         # Advance the compatibility shadow only after the atomic replace. A
         # failed CAS/write must not make unsaved state look durable in memory.
         if hasattr(project, "_raw_data"):
-            project._raw_data = json.loads(json.dumps(data))
+            project._raw_data = json.loads(serialized)
         if hasattr(project, "_expected_modified_at"):
             setattr(project, "_expected_modified_at", getattr(project, "modified_at", ""))
     # #36 diagnostic: every save with the caller's immediate stack frame so the diag ring
