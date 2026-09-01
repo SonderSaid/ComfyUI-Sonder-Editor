@@ -12,6 +12,7 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Added
+- Reference lane setup now warns when VACE strip padding grows crowded, Bernini task selection depends on connected sockets, ID-LoRA Voice reads only one input, or SCAIL moves its primary member downstream.
 - Reference Selector can now combine several compatible lanes into one stable, lane-ordered Reference set; its panel adds and removes lanes, discloses inactive reservations and compatibility reasons, and the Image, Audio, and Prompt Bridges preserve later slot positions when an earlier lane is hidden, muted, or outside the render window.
 - Reference Image and Audio Bridges can now emit nothing from unstaged slots, with a persistent canvas advisory when that would feed a required input.
 - A Reference contribution can now be copied out of Writing mode as text you own. Copy uses live `@handles` wherever possible; when a staged marker or ordinal has no live spelling, it copies the rendered text and says whether it merely stopped following intent or froze a number staging can change. Pasting a provider ordinal into authored prompt text raises a non-blocking warning that says whether the number currently resolves. Each supported contribution row opens a small menu with Copy and a way to stop that chip contributing there; unsupported Custom and Vocal Event rows no longer offer a Copy that cannot work. The block itself lost its buttons: every field your References feed now shows its own heading in the order the format lists them, with its contributions underneath, and you can type in any of them.
@@ -20,6 +21,7 @@ a fresh `[Unreleased]` block.
 - MiniMax H3 Picture roles now include **Edited keyframe**, matching the task type the compiler already understands.
 
 ### Changed
+- Built-in Reference recipes now preserve authored SCAIL batch order, match MiniMax H3's picture/video canvases and Bernini's native-reference snapping, floor Phantom dimensions to `/16`, and choose sheet grids by fitted member area so four-panel sheets no longer reserve dead cells.
 - Large projects now share one generation-aware Reference fetch across matching Bridge and Selector
   nodes, while Prompt previews keep independent bounded lanes for windowed and scene-wide work.
   Newer authoring replaces queued preview intent, obsolete conflicts cannot retry, and Copy Plan

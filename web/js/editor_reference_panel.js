@@ -18,9 +18,9 @@
 //   _renderTimeline(), _pushUndo(label), _discardLastUndo(label)
 //
 // Two invariants this module must not break:
-//   1. A built-in recipe is never edited in place. It renders read-only and
-//      forks through "Edit as custom", so a lane claiming a named template
-//      always matches what the real node expects.
+//   1. A built-in recipe is never edited in place. Its materialized lane values
+//      render read-only and fork through "Edit as custom"; selecting a template
+//      deliberately rematerializes the catalog's current values.
 //   2. Every reference-item write carries exact prior values in `expected` and
 //      runs non-coalesced — the backend requires the snapshot and treats a
 //      mismatch as a terminal conflict, never a replay signal.

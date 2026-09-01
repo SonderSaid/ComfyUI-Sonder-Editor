@@ -547,11 +547,12 @@ def resolve_pegged_hard(hard: dict, pegs: dict) -> dict:
     return resolved
 
 
-def _snap_dimension(value: int, multiple: int, *, ceiling=None, floor=False) -> int:
+def _snap_dimension(value: float, multiple: int, *, ceiling=None, floor=False) -> int:
     multiple = max(1, int(multiple))
-    value = max(multiple, int(value))
-    raw = (value // multiple) * multiple if floor else round(value / multiple) * multiple
-    result = max(multiple, raw)
+    value = max(float(multiple), float(value))
+    raw = (math.floor(value / multiple) * multiple
+           if floor else round(value / multiple) * multiple)
+    result = max(multiple, int(raw))
     if ceiling:
         result = min(result, max(multiple, (int(ceiling) // multiple) * multiple))
     return result
@@ -568,15 +569,48 @@ def _member_geometry(
         width_value = max(1.0, float(width_value))
         height_value = max(1.0, float(height_value))
         short_edge_max = max(0, _int(hard.get("short_edge_max"), 0))
+        max_pixels = max(0, _int(hard.get("max_pixels"), 0))
+        snap_floor = floor or str(hard.get("size_rounding") or "nearest") == "floor"
+        if short_edge_max and max_pixels:
+            # A combined short-edge/area envelope matches H3 Video's
+            # `adapt_canvas`: derive the aspect-preserving target, apply the area
+            # cap, round the target, then avoid upscaling when the source area is
+            # smaller than that rounded canvas.
+            # Preserve the node's ratio-first operation order exactly. The
+            # algebraically equivalent min-edge scale lands on the opposite side
+            # of some /32 half-step boundaries due to floating-point rounding.
+            ratio = width_value / height_value
+            if ratio >= 1.0:
+                target_width = short_edge_max * ratio
+                target_height = float(short_edge_max)
+            else:
+                target_width = float(short_edge_max)
+                target_height = short_edge_max / ratio
+            if target_width * target_height > max_pixels:
+                target_scale = math.sqrt(max_pixels / (target_width * target_height))
+                target_width *= target_scale
+                target_height *= target_scale
+            target = (
+                _snap_dimension(target_width, multiple, floor=snap_floor, ceiling=ceiling),
+                _snap_dimension(target_height, multiple, floor=snap_floor, ceiling=ceiling),
+            )
+            if width_value * height_value < target[0] * target[1]:
+                return (
+                    _snap_dimension(width_value, multiple, floor=snap_floor, ceiling=ceiling),
+                    _snap_dimension(height_value, multiple, floor=snap_floor, ceiling=ceiling),
+                )
+            return target
         if short_edge_max and min(width_value, height_value) > short_edge_max:
             scale = short_edge_max / min(width_value, height_value)
             width_value *= scale
             height_value *= scale
-            floor = True
-        floor = floor or str(hard.get("size_rounding") or "nearest") == "floor"
+        if max_pixels and width_value * height_value > max_pixels:
+            scale = math.sqrt(max_pixels / (width_value * height_value))
+            width_value *= scale
+            height_value *= scale
         return (
-            _snap_dimension(width_value, multiple, floor=floor, ceiling=ceiling),
-            _snap_dimension(height_value, multiple, floor=floor, ceiling=ceiling),
+            _snap_dimension(width_value, multiple, floor=snap_floor, ceiling=ceiling),
+            _snap_dimension(height_value, multiple, floor=snap_floor, ceiling=ceiling),
         )
 
     mode = str(hard.get("output_size", "scene") or "scene")
@@ -587,9 +621,13 @@ def _member_geometry(
         # exclusive. Only apply the 848 fallback when no explicit short-edge
         # model contract exists.
         if max(0, _int(hard.get("short_edge_max"), 0)) <= 0:
-            long_edge = min(max(width, height), max(16, _int(hard.get("long_edge_max"), 848)))
+            long_edge_limit = max(16, _int(hard.get("long_edge_max"), 848))
+            long_edge = min(max(width, height), long_edge_limit)
             scale = long_edge / max(1, max(width, height))
-            return bounded(width * scale, height * scale, ceiling=long_edge)
+            # The configured limit is the ceiling, not the unsnapped source
+            # edge. Bernini rounds a small native reference to nearest /16 and
+            # may therefore add a few pixels without exceeding ref_max_size.
+            return bounded(width * scale, height * scale, ceiling=long_edge_limit)
         return bounded(width, height)
     # A lone member may have its own canonical size (Best Face ID's bust crop is
     # ~460x406 where its 4-panel sheet is exactly 1536x1024).
@@ -610,9 +648,33 @@ def _to_tensor(frame: np.ndarray, width: int, height: int) -> torch.Tensor:
     return torch.from_numpy(np.ascontiguousarray(fitted, dtype=np.float32) / 255.0)
 
 
+def _sheet_columns(images: list[np.ndarray], width: int, height: int) -> int:
+    count = max(1, len(images))
+    best_columns = 1
+    best_score = None
+    for columns in range(1, count + 1):
+        rows = max(1, math.ceil(count / columns))
+        cell_width = width / columns
+        cell_height = height / rows
+        fitted_areas = []
+        for image in images:
+            image_height, image_width = image.shape[:2]
+            scale = min(
+                cell_width / max(1, image_width),
+                cell_height / max(1, image_height),
+            )
+            fitted_areas.append(image_width * scale * image_height * scale)
+        empty_cells = rows * columns - len(images)
+        score = (math.fsum(fitted_areas), -empty_cells, -columns)
+        if best_score is None or score > best_score:
+            best_columns = columns
+            best_score = score
+    return best_columns
+
+
 def _sheet(images: list[np.ndarray], width: int, height: int, background: str) -> torch.Tensor:
     count = max(1, len(images))
-    columns = max(1, min(count, math.ceil(math.sqrt(count * width / max(1, height)))))
+    columns = _sheet_columns(images, width, height)
     rows = max(1, math.ceil(count / columns))
     value = 255 if background == "white" else 0
     canvas = np.full((height, width, 3), value, dtype=np.uint8)
@@ -933,12 +995,9 @@ def _decode_lane_images(context) -> list[torch.Tensor]:
     elif assembly == "slots":
         values = member_tensors
     else:
-        ordered = list(member_tensors)
-        if hard.get("primary_model_position") == "last" and len(ordered) > 1:
-            ordered = [*ordered[1:], ordered[0]]
         # A custom batch+native recipe may still raise here for mixed geometry;
         # that is the pre-existing schema gap recorded by the plan.
-        values = [torch.cat(ordered, dim=0)]
+        values = [torch.cat(member_tensors, dim=0)]
 
     return values
 

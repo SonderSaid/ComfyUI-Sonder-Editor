@@ -11,7 +11,7 @@ import pytest
 
 from server import routes
 from server.reference_resolution import REFERENCE_OUTPUT_NAMES
-from server.timeline_state import REFERENCE_RECIPE_FIELDS, REFERENCE_RECIPE_PRESETS
+from server.timeline_state import ALL_REFERENCE_RECIPE_PRESETS, REFERENCE_RECIPE_FIELDS
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +41,43 @@ console.log(JSON.stringify(cases));
         "stable", "stable", "minted"]
 
 
+def test_recipe_advisories_follow_materialized_configuration_executably():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for Reference advisory coverage")
+    module_url = (ROOT / "web" / "js" / "reference_lane_identity.js").as_uri()
+    script = f"""
+const {{ referenceConfigurationAdvisories }} = await import({json.dumps(module_url)});
+const text = (hard, soft, count) => referenceConfigurationAdvisories(hard, soft, count).map((row) => row.text);
+const cases = {{
+  vaceStrip: text({{assembly: "sheet", layout: "strip"}}, {{crowded_sheet_padding: true}}, 3),
+  vaceGrid: text({{assembly: "sheet", layout: "grid"}}, {{crowded_sheet_padding: true}}, 3),
+  vaceChangedAssembly: text({{assembly: "slots", layout: "strip"}}, {{crowded_sheet_padding: true}}, 3),
+  bernini: text({{assembly: "slots"}}, {{task_from_connectivity: true}}, 0),
+  berniniChangedAssembly: text({{assembly: "batch"}}, {{task_from_connectivity: true}}, 0),
+  scail: text({{assembly: "batch"}}, {{primary_model_position: "last"}}, 1),
+  scailChangedAssembly: text({{assembly: "sheet"}}, {{primary_model_position: "last"}}, 1),
+  voiceOne: text({{assembly: "audio"}}, {{silent_single_input: true}}, 1),
+  voiceTwo: text({{assembly: "audio"}}, {{silent_single_input: true}}, 2),
+}};
+console.log(JSON.stringify(cases));
+"""
+    cases = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        capture_output=True, text=True, encoding="utf-8", check=True,
+    ).stdout)
+
+    assert len(cases["vaceStrip"]) == 1 and "Edit as custom" in cases["vaceStrip"][0]
+    assert cases["vaceGrid"] == []
+    assert cases["vaceChangedAssembly"] == []
+    assert len(cases["bernini"]) == 1 and "unused_slots: nothing" in cases["bernini"][0]
+    assert cases["berniniChangedAssembly"] == []
+    assert len(cases["scail"]) == 1 and "member 1 arrives last" in cases["scail"][0]
+    assert cases["scailChangedAssembly"] == []
+    assert cases["voiceOne"] == []
+    assert len(cases["voiceTwo"]) == 1 and "one input" in cases["voiceTwo"][0]
+
+
 def _import_reference_core(monkeypatch):
     """`nodes/reference_core.py` uses package-relative imports, so it only loads
     under a synthetic package rooted at the repo (same shim as
@@ -62,7 +99,7 @@ def test_recipe_schema_declares_every_key_the_presets_and_assembler_use():
     silently does nothing. Both are caught here.
     """
     preset_keys = set()
-    for preset in REFERENCE_RECIPE_PRESETS:
+    for preset in ALL_REFERENCE_RECIPE_PRESETS:
         preset_keys.update(preset["hard"])
         preset_keys.update(preset["soft"])
     assert preset_keys <= SCHEMA_KEYS, f"presets use undeclared keys: {sorted(preset_keys - SCHEMA_KEYS)}"
@@ -115,7 +152,7 @@ def test_recipe_schema_entries_are_well_formed():
 
 
 def test_custom_recipes_round_trip_every_built_in_and_refuse_bad_authoring():
-    for preset in REFERENCE_RECIPE_PRESETS:
+    for preset in ALL_REFERENCE_RECIPE_PRESETS:
         forked = routes._normalize_custom_reference_recipe({
             "name": f"{preset['name']} (custom)",
             "media_kind": preset["media_kind"],

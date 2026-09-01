@@ -8,6 +8,30 @@ export function preserveLaneRecipeIdentity(currentRecipe, nextRecipe, fallbackLa
     };
 }
 
+/** Advisories whose truth depends only on the materialized recipe shape. */
+export function referenceConfigurationAdvisories(hard, soft, stagedCount = 0) {
+    const hardValues = hard && typeof hard === "object" ? hard : {};
+    const softValues = soft && typeof soft === "object" ? soft : {};
+    const assembly = String(hardValues.assembly || "batch");
+    const layout = String(hardValues.layout || "grid");
+    const count = Math.max(0, Number(stagedCount) || 0);
+    const advisories = [];
+
+    if (softValues.silent_single_input && count > 1) {
+        advisories.push({ voice: "suggestion", text: "This mechanism reads one input. Confirm the staged members are intentionally combined or that only the intended Bridge output is connected." });
+    }
+    if (softValues.crowded_sheet_padding && assembly === "sheet" && layout === "strip" && count > 2) {
+        advisories.push({ voice: "suggestion", text: "A vertical strip pads heavily as members are added. Use Edit as custom to choose a different sheet layout." });
+    }
+    if (softValues.task_from_connectivity && assembly === "slots") {
+        advisories.push({ voice: "suggestion", text: "This model infers its task from connected inputs. Set the Bridge to unused_slots: nothing so placeholder black images do not select a task." });
+    }
+    if (softValues.primary_model_position === "last" && assembly === "batch") {
+        advisories.push({ voice: "suggestion", text: "The model moves the first staged member to the end of the batch, so member 1 arrives last." });
+    }
+    return advisories;
+}
+
 const RECIPE_ID_POPULATIONS = {
     "sonder:minimax_h3_picture": "pictures",
     "sonder:minimax_h3_video": "videos",

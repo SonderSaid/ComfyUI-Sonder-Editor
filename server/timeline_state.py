@@ -395,7 +395,8 @@ REFERENCE_RECIPE_PRESETS = (
         "media_kind": "audio",
         "hard": {"assembly": "audio", "max_members": 16,
                  "live_outputs": ["audio_slots", "reference_prompt", "reference_names"]},
-        "soft": {"suggested_tags": ["sonder:voice_identity"], "recommended_duration_sec": 5.0},
+        "soft": {"suggested_tags": ["sonder:voice_identity"], "recommended_duration_sec": 5.0,
+                 "silent_single_input": True},
     },
     {
         "id": "sonder:wan_vace",
@@ -408,13 +409,16 @@ REFERENCE_RECIPE_PRESETS = (
         "hard": {"assembly": "sheet", "layout": "strip", "max_members": 16,
                  "output_size": "scene", "size_multiple": 16, "background": "white",
                  "live_outputs": ["image_slots", "reference_prompt", "reference_names"]},
-        "soft": {"silent_single_input": True},
+        "soft": {"silent_single_input": True, "crowded_sheet_padding": True},
     },
     {
         "id": "sonder:wan_phantom",
+        # Match the node's /16 widget granularity when its independently authored
+        # target has the same geometry. This avoids an extra quantization sliver;
+        # it cannot prevent the node's intentional crop to a different aspect.
         "name": "Wan Phantom Identities",
         "media_kind": "image",
-        "hard": {"assembly": "batch", "max_members": 4, "output_size": "scene",
+        "hard": {"assembly": "batch", "max_members": 4, "output_size": "scene", "size_multiple": 16,
                  "live_outputs": ["image_slots", "reference_prompt", "reference_names"]},
         "soft": {"suggested_tags": ["sonder:subject_still"]},
     },
@@ -423,9 +427,8 @@ REFERENCE_RECIPE_PRESETS = (
         "name": "Wan SCAIL Identities",
         "media_kind": "image",
         "hard": {"assembly": "batch", "max_members": 6, "output_size": "custom", "width": 512, "height": 896,
-                 "primary_model_position": "last",
                  "live_outputs": ["image_slots", "reference_prompt", "reference_names"]},
-        "soft": {"requires_identity_masks": True},
+        "soft": {"requires_identity_masks": True, "primary_model_position": "last"},
     },
     {
         "id": "sonder:wan_bernini",
@@ -434,7 +437,7 @@ REFERENCE_RECIPE_PRESETS = (
         "hard": {"assembly": "slots", "max_members": 8, "output_size": "native",
                  "long_edge_max": 848, "size_multiple": 16,
                  "live_outputs": ["image_slots", "reference_prompt", "reference_names"]},
-        "soft": {"prompt_tokens": "image{index}"},
+        "soft": {"prompt_tokens": "image{index}", "task_from_connectivity": True},
     },
 )
 
@@ -448,7 +451,7 @@ MINIMAX_H3_REFERENCE_RECIPE_PRESETS = (
         "media_kind": "image",
         "hard": {"assembly": "slots", "max_members": 9, "output_size": "native",
                  "short_edge_max": 2048, "size_multiple": 32,
-                 "size_rounding": "floor",
+                 "size_rounding": "nearest",
                  "live_outputs": ["image_slots", "reference_prompt", "reference_names"]},
         "soft": {"suggested_tags": ["sonder:h3_identity", "sonder:h3_environment",
                                      "sonder:h3_style", "sonder:h3_motion"],
@@ -464,8 +467,8 @@ MINIMAX_H3_REFERENCE_RECIPE_PRESETS = (
         # authoring video-only without inventing a fourth bridge media type.
         "media_kind": "image",
         "hard": {"assembly": "slots", "max_members": 3, "output_size": "native",
-                 "short_edge_max": 2048, "size_multiple": 32,
-                 "size_rounding": "floor",
+                 "short_edge_max": 768, "max_pixels": 768 * 1344,
+                 "size_multiple": 32, "size_rounding": "nearest",
                  "frame_rate": 24.0, "frame_rate_source": "custom",
                  "frame_count_snap": "floor_grid", "minimum_frames": 5,
                  "frame_step": 17, "frame_offset": 5,
@@ -561,7 +564,11 @@ REFERENCE_RECIPE_FIELDS = (
     {"key": "short_edge_max", "section": "hard", "group": "Geometry", "label": "Short-edge maximum",
      "type": "int", "min": 0, "max": 8192, "default": 0,
      "applies_to": list(IMAGE_ASSEMBLIES), "requires": "", "requires_value": "",
-     "help": "Upper bound on the shorter side. 0 disables it; MiniMax H3 uses 2048."},
+     "help": "Upper bound on the shorter side. 0 disables it; different model inputs may use different bounds."},
+    {"key": "max_pixels", "section": "hard", "group": "Geometry", "label": "Maximum pixels",
+     "type": "int", "min": 0, "max": 8192 * 8192, "default": 0,
+     "applies_to": list(IMAGE_ASSEMBLIES), "requires": "", "requires_value": "",
+     "help": "Upper bound on total width x height after edge limits. 0 disables it."},
     {"key": "single_member_size", "section": "hard", "group": "Geometry", "label": "Lone-member size",
      "type": "int_pair", "min": 1, "max": 8192, "default": [],
      "applies_to": ["sheet"], "requires": "", "requires_value": "",
@@ -648,7 +655,7 @@ REFERENCE_RECIPE_FIELDS = (
      "type": "int", "min": 1, "max": 16, "default": 16,
      "applies_to": [], "requires": "", "requires_value": "",
      "help": "Staging more than this refuses the render rather than dropping members silently."},
-    {"key": "primary_model_position", "section": "hard", "group": "Members", "label": "Primary arrives",
+    {"key": "primary_model_position", "section": "soft", "group": "Advisories", "label": "Primary arrives",
      "type": "enum", "values": ["first", "last"], "default": "first",
      "applies_to": ["batch"], "requires": "", "requires_value": "",
      "help": "Some models silently move the primary reference to the end of the batch.",
@@ -719,10 +726,18 @@ REFERENCE_RECIPE_FIELDS = (
      "type": "string_list", "default": [],
      "applies_to": [], "requires": "", "requires_value": "",
      "help": "Provider-neutral staged-member options this recipe lets the user author. Allowed roles come from the prompt-format/model-input catalog."},
-    {"key": "silent_single_input", "section": "soft", "group": "Advisories", "label": "Model reads one image",
+    {"key": "silent_single_input", "section": "soft", "group": "Advisories", "label": "Model reads one input",
      "type": "bool", "default": False,
      "applies_to": [], "requires": "", "requires_value": "",
-     "help": "Warns that the model consumes a single image, which is why members are composited."},
+     "help": "Warns that the model consumes one input even when the lane can stage several members."},
+    {"key": "crowded_sheet_padding", "section": "soft", "group": "Advisories", "label": "Strip padding grows",
+     "type": "bool", "default": False,
+     "applies_to": ["sheet"], "requires": "", "requires_value": "",
+     "help": "Warns that a vertical strip can spend more of the output on padding as members are added."},
+    {"key": "task_from_connectivity", "section": "soft", "group": "Advisories", "label": "Task follows connections",
+     "type": "bool", "default": False,
+     "applies_to": ["slots"], "requires": "", "requires_value": "",
+     "help": "Warns that connected placeholder inputs can change which task the consuming model selects."},
     {"key": "requires_identity_masks", "section": "soft", "group": "Advisories", "label": "Needs identity masks",
      "type": "bool", "default": False,
      "applies_to": [], "requires": "", "requires_value": "",
@@ -737,11 +752,22 @@ def reference_recipe_field(key: str) -> dict | None:
 def normalize_reference_recipe_data(recipe) -> dict:
     """Return one materialized/custom recipe without rewriting its vocabulary."""
     result = dict(recipe) if isinstance(recipe, dict) else {}
-    if "hard" in result:
-        result["hard"] = (dict(result.get("hard"))
-                          if isinstance(result.get("hard"), dict) else {})
+    if isinstance(result.get("hard"), dict):
+        result["hard"] = dict(result["hard"])
     if isinstance(result.get("soft"), dict):
         result["soft"] = dict(result["soft"])
+    hard = result.get("hard")
+    if isinstance(hard, dict) and "primary_model_position" in hard:
+        # Pre-correction custom recipes stored this model-owned reorder hint as
+        # hard assembly behavior. Keep those durable recipes editable by moving
+        # it to the advisory section. Remove once no project predating the
+        # Reference Recipe Correction Pass remains in circulation.
+        # A malformed `soft` value already survived tolerant loading before this
+        # migration; preserve it rather than turning repair into project loss.
+        if "soft" not in result or isinstance(result.get("soft"), dict):
+            soft = dict(result.get("soft") or {})
+            soft.setdefault("primary_model_position", hard.pop("primary_model_position"))
+            result["soft"] = soft
     return result
 
 
@@ -1131,22 +1157,34 @@ class ReferenceLaneRecipe:
             media_kind = "image"
         recipe = normalize_reference_recipe_data(data.get("recipe", {}))
         if recipe_id in {"sonder:minimax_h3_picture", "sonder:minimax_h3_video"}:
+            # Repair the structural shape materialized by projects predating the
+            # Reference Recipe Correction Pass. Remove once none remain in
+            # circulation; tuning constants outside this shape are not healed.
             recipe = dict(recipe)
-            hard = dict(recipe.get("hard") or {})
-            hard.update({"short_edge_max": 2048, "size_multiple": 32,
-                         "size_rounding": "floor"})
+            can_heal_hard = "hard" not in recipe or isinstance(recipe.get("hard"), dict)
+            hard = dict(recipe.get("hard") or {}) if can_heal_hard else None
             if recipe_id == "sonder:minimax_h3_video":
                 media_kind = "image"
-                hard.update({"assembly": "slots", "max_members": 3,
-                             "output_size": "native", "frame_rate": 24.0,
-                             "frame_rate_source": "custom",
-                             "frame_count_snap": "floor_grid",
-                             "minimum_frames": 5, "frame_step": 17,
-                             "frame_offset": 5})
-                soft = dict(recipe.get("soft") or {})
-                soft["physical_population"] = "videos"
-                recipe["soft"] = soft
-            recipe["hard"] = hard
+                if hard is not None:
+                    hard.update({"assembly": "slots", "max_members": 3,
+                                  "output_size": "native", "frame_rate": 24.0,
+                                  "frame_rate_source": "custom",
+                                  "frame_count_snap": "floor_grid",
+                                  "minimum_frames": 5, "frame_step": 17,
+                                  "frame_offset": 5, "short_edge_max": 768,
+                                  "max_pixels": 768 * 1344, "size_multiple": 32,
+                                  # `adapt_canvas` rounds each axis to nearest /32.
+                                  "size_rounding": "nearest"})
+                if "soft" not in recipe or isinstance(recipe.get("soft"), dict):
+                    soft = dict(recipe.get("soft") or {})
+                    soft["physical_population"] = "videos"
+                    recipe["soft"] = soft
+            elif hard is not None:
+                hard.update({"short_edge_max": 2048, "size_multiple": 32,
+                             # H3 rounds each image axis to nearest /32.
+                             "size_rounding": "nearest"})
+            if hard is not None:
+                recipe["hard"] = hard
         return cls(
             lane_id=str(data.get("lane_id") or "").strip() or uuid.uuid4().hex,
             media_kind=media_kind,

@@ -130,8 +130,24 @@ Recipes that ship built in:
 | MiniMax H3 Videos (IMAGE sequences) | image | slots | 3 |
 | MiniMax H3 Standalone Audio | audio | audio | 3 |
 
-A built-in recipe is read-only, so a lane naming one always matches what that
-node expects. **Edit as custom** forks it into a project recipe you can change.
+Selecting a built-in recipe materializes its current values onto the lane; an
+existing lane does not generally live-follow later catalog corrections.
+**Edit as custom** forks those values into a project recipe you can change. To
+return to the current built-in, pick it again from the lane's template dropdown.
+That re-materializes the built-in and discards the fork's edits.
+
+Several model contracts need one extra setup detail outside the recipe:
+
+- **LTX Best Face ID** uses a canonical lone-reference frame of `460×406`
+  (`1.133:1`). A portrait face crop is therefore pillarboxed to roughly 59–66%
+  frame fill unless the Library member's crop box matches that aspect.
+- **LTX IC-LoRA Ingredients** needs both `Reference sheet: [...]` and
+  `Generated video: [...]`. The recipe supplies the Reference-sheet prefix;
+  author the Generated-video description on the prompt track.
+- **MiniMax H3 Pictures** assumes the consuming node's `ref_image_size` is
+  `max`. The node defaults to `match`, which rescales to the generation's pixel
+  area and discards the recipe's 2048-short-edge preparation. The recipe mirrors
+  the node's nearest-`/32` image rounding; set the node to `max` when using it.
 
 The **Reference Lanes** overlay opens on the lane's staged items: each item's
 frame range, strength and Active state, its members as `Reference · Member`
@@ -149,6 +165,10 @@ Some values are **pegged** rather than typed — the frame grid and snap multipl
 follow the scene's model template, a sheet's loop length follows the render
 window. A pegged value names the source it follows, and falls back to its
 authored number when that source is unset.
+
+Grid sheets choose the column count that gives their actual members the most
+fitted image area. Four square members form a `2×2`; four portrait members form
+the accepted `4×1` layout rather than reserving empty cells.
 
 ## What a render window resolves to
 

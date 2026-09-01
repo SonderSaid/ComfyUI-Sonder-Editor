@@ -220,6 +220,7 @@ import { getActiveReferenceDrag, mountReferenceLibrary, referenceMemberMediaKind
 import { openReferenceMediaEditor, REFERENCE_MEDIA_EDITOR_SHORTCUTS } from "./reference_media_editor.js";
 import { shouldApplyReferenceResponse } from "./reference_library_model.js";
 import { mountReferenceLanePanel } from "./editor_reference_panel.js";
+import { referenceConfigurationAdvisories } from "./reference_lane_identity.js";
 import { REFERENCE_LANE_CAUSE, classifyReferenceChunks } from "./reference_resolution.js";
 import { deriveCurrentSceneAssetIds } from "./current_scene_assets.js";
 import { notifyInfo, notifySuccess, notifyWarning, notifyError, notifyProgress } from "./editor_notifications.js";
@@ -19096,9 +19097,7 @@ export class EditorWidget {
                 advisories.push({ voice: "suggestion", text: `This recipe works best with about ${recommendedSeconds}s of reference; the shortest staged member is ${shortest.toFixed(1)}s.` });
             }
         }
-        if (soft.silent_single_input && staged.length > 1) {
-            advisories.push({ voice: "suggestion", text: "The model reads a single image, which is why these members are composited into one sheet." });
-        }
+        advisories.push(...referenceConfigurationAdvisories(hard, soft, staged.length));
         if (soft.requires_identity_masks && staged.length) {
             advisories.push({ voice: "suggestion", text: "This mechanism also needs colour-matched identity masks, supplied outside the Bridge." });
         }

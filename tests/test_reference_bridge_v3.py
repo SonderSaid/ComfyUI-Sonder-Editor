@@ -21,6 +21,7 @@ from server.timeline_state import (
     Scene,
     PromptSection,
     TimelineProject,
+    normalize_reference_recipe_data,
 )
 
 
@@ -304,6 +305,68 @@ def test_vace_composites_an_equal_width_strip_on_floored_divisible_16_geometry(m
     assert core._member_geometry(wide, hard, 1920, 1080, 2) == (1920, 1072)
 
 
+def test_scail_emits_authored_order_because_the_model_performs_its_own_reorder(monkeypatch, tmp_path):
+    core = _import_module(monkeypatch, "reference_core")
+    monkeypatch.setattr(
+        core, "resolve_existing_project_path",
+        lambda project, path, **_kwargs: str(Path(project.project_dir) / path),
+    )
+    project = _multi_member_project(
+        tmp_path, _preset("sonder:wan_scail"),
+        [(255, 0, 0), (0, 255, 0), (0, 0, 255)],
+    )
+
+    batch = core.decode_reference_images(core.resolve_reference_set(project, 0))[0]
+
+    assert tuple(batch.shape[:1]) == (3,)
+    assert [int(frame[0, 0].argmax()) for frame in batch] == [0, 1, 2]
+
+
+def test_scail_prompt_names_agree_with_emitted_image_batch_order(monkeypatch, tmp_path):
+    core = _import_module(monkeypatch, "reference_core")
+    monkeypatch.setattr(
+        core, "resolve_existing_project_path",
+        lambda project, path, **_kwargs: str(Path(project.project_dir) / path),
+    )
+    project = _multi_member_project(
+        tmp_path, _preset("sonder:wan_scail"),
+        [(255, 0, 0), (0, 255, 0), (0, 0, 255)],
+    )
+    resolved = core.resolve_reference_set(project, 0)
+
+    batch = core.decode_reference_images(resolved)[0]
+    names = core.decode_reference_prompts(resolved)[1].split(", ")
+
+    assert [int(frame[0, 0].argmax()) for frame in batch] == [0, 1, 2]
+    assert names == ["Hero_0", "Hero_1", "Hero_2"]
+
+
+def test_recipe_normalization_relocates_legacy_primary_position_to_soft():
+    normalized = normalize_reference_recipe_data({
+        "hard": {"assembly": "batch", "primary_model_position": "last"},
+        "soft": {"requires_identity_masks": True},
+    })
+
+    assert "primary_model_position" not in normalized["hard"]
+    assert normalized["soft"]["primary_model_position"] == "last"
+    assert normalized["soft"]["requires_identity_masks"] is True
+
+
+def test_recipe_normalization_preserves_malformed_soft_data_during_primary_repair():
+    malformed = {
+        "hard": {"assembly": "batch", "primary_model_position": "last"},
+        "soft": "oops",
+    }
+
+    assert normalize_reference_recipe_data(malformed) == malformed
+
+
+def test_recipe_normalization_preserves_malformed_hard_data():
+    malformed = {"hard": "oops", "soft": {"suggested_tags": []}}
+
+    assert normalize_reference_recipe_data(malformed) == malformed
+
+
 def test_best_face_id_uses_the_bust_size_for_a_lone_member(monkeypatch):
     core = _import_module(monkeypatch, "reference_core")
     hard = dict(next(row for row in REFERENCE_RECIPE_PRESETS if row["id"] == "sonder:ltx_best_face_id")["hard"])
@@ -317,13 +380,96 @@ def test_h3_generic_recipe_geometry_and_frame_grid_match_model_contract(monkeypa
     picture = _h3_preset("sonder:minimax_h3_picture").recipe["hard"]
     assert core._member_geometry(
         np.zeros((1080, 1920, 3), dtype=np.uint8), picture, 64, 48,
-    ) == (1920, 1056)
+    ) == (1920, 1088)
+    assert core._member_geometry(
+        np.zeros((1008, 1008, 3), dtype=np.uint8), picture, 64, 48,
+    ) == (1024, 1024)
     assert core._member_geometry(
         np.zeros((4000, 3000, 3), dtype=np.uint8), picture, 64, 48,
     ) == (2048, 2720)
 
     video = _h3_preset("sonder:minimax_h3_video").recipe["hard"]
     assert [core._snap_span_frame_count(count, video) for count in (5, 24, 120)] == [5, 22, 107]
+
+
+def test_h3_video_geometry_matches_adapt_canvas_across_wide_and_tall_aspects(monkeypatch):
+    core = _import_module(monkeypatch, "reference_core")
+    hard = _h3_preset("sonder:minimax_h3_video").recipe["hard"]
+
+    def node_video_canvas(width, height):
+        ratio = width / height
+        if ratio >= 1.0:
+            nominal_width, nominal_height = 768 * ratio, 768
+        else:
+            nominal_width, nominal_height = 768, 768 / ratio
+        if nominal_width * nominal_height > 768 * 1344:
+            scale = ((768 * 1344) / (nominal_width * nominal_height)) ** 0.5
+            nominal_width *= scale
+            nominal_height *= scale
+        canvas = (
+            max(32, round(nominal_width / 32) * 32),
+            max(32, round(nominal_height / 32) * 32),
+        )
+        if width * height < canvas[0] * canvas[1]:
+            return (
+                max(32, round(width / 32) * 32),
+                max(32, round(height / 32) * 32),
+            )
+        return canvas
+
+    source_sizes = [
+        (1000, 1000), (1500, 1000), (1778, 1000),
+        (1850, 1000), (2000, 1000), (2390, 1000),
+        (1560, 1025), (768, 944), (896, 2178),
+        (320, 180), (800, 200), (487, 2058),
+    ]
+    source_sizes += [(height, width) for width, height in source_sizes[1:]]
+    for width, height in source_sizes:
+        frame = types.SimpleNamespace(shape=(height, width, 3))
+        assert core._member_geometry(frame, hard, 64, 48) == node_video_canvas(width, height)
+
+
+def test_h3_recipe_heal_splits_picture_and_video_geometry_without_touching_custom_forks():
+    stale_video = ReferenceLaneRecipe.from_dict({
+        "recipe_id": "sonder:minimax_h3_video",
+        "media_kind": "video",
+        "recipe": {"hard": {"short_edge_max": 2048}, "soft": {"physical_population": "videos"}},
+    })
+    stale_picture = ReferenceLaneRecipe.from_dict({
+        "recipe_id": "sonder:minimax_h3_picture",
+        "media_kind": "image",
+        "recipe": {"hard": {"short_edge_max": 768}},
+    })
+    custom = ReferenceLaneRecipe.from_dict({
+        "recipe_id": "custom:h3-video-fork",
+        "media_kind": "image",
+        "recipe": {"hard": {"short_edge_max": 2048, "size_rounding": "floor"}},
+    })
+
+    assert stale_video.media_kind == "image"
+    assert stale_video.recipe["hard"]["short_edge_max"] == 768
+    assert stale_video.recipe["hard"]["max_pixels"] == 768 * 1344
+    assert stale_video.recipe["hard"]["size_rounding"] == "nearest"
+    assert stale_picture.recipe["hard"]["short_edge_max"] == 2048
+    assert stale_picture.recipe["hard"]["size_rounding"] == "nearest"
+    assert "max_pixels" not in stale_picture.recipe["hard"]
+    assert custom.recipe["hard"] == {"short_edge_max": 2048, "size_rounding": "floor"}
+
+
+def test_h3_recipe_heal_preserves_malformed_sections_instead_of_crashing_or_erasing():
+    malformed_hard = ReferenceLaneRecipe.from_dict({
+        "recipe_id": "sonder:minimax_h3_video",
+        "recipe": {"hard": "oops", "soft": {}},
+    })
+    malformed_soft = ReferenceLaneRecipe.from_dict({
+        "recipe_id": "sonder:minimax_h3_video",
+        "recipe": {"hard": {"short_edge_max": 2048}, "soft": "oops"},
+    })
+
+    assert malformed_hard.recipe["hard"] == "oops"
+    assert malformed_hard.recipe["soft"]["physical_population"] == "videos"
+    assert malformed_soft.recipe["hard"]["short_edge_max"] == 768
+    assert malformed_soft.recipe["soft"] == "oops"
 
 
 def test_h3_video_recipe_is_served_by_generic_image_bridge(monkeypatch, tmp_path):
@@ -865,6 +1011,53 @@ def test_sheet_assembly_preserves_recipe_background_padding(monkeypatch):
     assert not np.allclose(sheet[0, 16, 32].numpy(), 1.0)
 
 
+def test_sheet_packing_uses_every_cell_for_four_members(monkeypatch):
+    core = _import_module(monkeypatch, "reference_core")
+    square_images = [np.full((64, 64, 3), value, dtype=np.uint8) for value in (40, 80, 120, 160)]
+
+    square_sheet = core._sheet(square_images, 1536, 1024, "black")
+
+    assert core._sheet_columns(square_images, 1536, 1024) == 2
+    assert tuple(square_sheet.shape) == (1, 1024, 1536, 3)
+    assert all(
+        float(square_sheet[0, y, x].mean()) > 0
+        for y in (256, 768) for x in (384, 1152)
+    )
+
+    # A 2x2 cell on this canvas is 3:2. Matching sources prove that the new
+    # layout leaves neither dead cells nor fit padding.
+    panel_images = [np.full((64, 96, 3), value, dtype=np.uint8) for value in (40, 80, 120, 160)]
+    panel_sheet = core._sheet(panel_images, 1536, 1024, "black")
+    assert not bool(np.any(np.all(panel_sheet.numpy() == 0, axis=-1)))
+
+
+def test_sheet_packing_chooses_four_by_one_for_four_portrait_members(monkeypatch):
+    core = _import_module(monkeypatch, "reference_core")
+    images = [np.full((96, 64, 3), value, dtype=np.uint8) for value in (40, 80, 120, 160)]
+
+    sheet = core._sheet(images, 1536, 1024, "black")
+
+    assert core._sheet_columns(images, 1536, 1024) == 4
+    assert [float(sheet[0, 512, x].mean()) for x in (192, 576, 960, 1344)] == pytest.approx(
+        [40 / 255, 80 / 255, 120 / 255, 160 / 255]
+    )
+
+
+def test_sheet_column_choice_is_stable_under_member_reordering(monkeypatch):
+    core = _import_module(monkeypatch, "reference_core")
+    images = [
+        np.ones((120, 60, 3), dtype=np.uint8),
+        np.ones((90, 160, 3), dtype=np.uint8),
+        np.ones((64, 64, 3), dtype=np.uint8),
+        np.ones((200, 80, 3), dtype=np.uint8),
+        np.ones((70, 140, 3), dtype=np.uint8),
+    ]
+
+    assert core._sheet_columns(images, 1536, 1024) == core._sheet_columns(
+        list(reversed(images)), 1536, 1024
+    )
+
+
 def test_bridge_refuses_silent_member_loss_and_missing_media(monkeypatch, tmp_path):
     core = _import_module(monkeypatch, "reference_core")
     recipe = ReferenceLaneRecipe(recipe={"hard": {"assembly": "batch", "max_members": 1}})
@@ -1006,7 +1199,9 @@ def test_video_member_span_decodes_and_resamples_to_recipe_rate(monkeypatch, tmp
 # The pre-redesign `hard` geometry blocks, kept verbatim. The Output size
 # rework collapsed three overlapping keys (size_mode / native_aspect /
 # dimension_multiple) into two orthogonal ones, and it is only a safe
-# re-expression if every preset still resolves the same pixels.
+# re-expression if every unchanged preset still resolves the same pixels.
+# Phantom's /16 correction and Bernini's native nearest-/16 correction are the
+# two intentional deltas among these pre-H3 presets.
 _LEGACY_GEOMETRY = {
     "sonder:ltx_msr": {},
     "sonder:ltx_ingredients": {"size_mode": "output"},
@@ -1042,23 +1237,64 @@ def _legacy_member_geometry(core, frame, hard, output_width, output_height, memb
     return output_width, output_height
 
 
-def test_output_size_redesign_resolves_identical_geometry_for_every_preset(monkeypatch):
+def test_output_size_redesign_preserves_geometry_except_explicit_corrections(monkeypatch):
     core = _import_module(monkeypatch, "reference_core")
-    frames = [np.zeros((h, w, 3), dtype=np.uint8) for h, w in ((512, 512), (1080, 1920), (900, 600), (3000, 4000))]
+    frames = [np.zeros((h, w, 3), dtype=np.uint8) for h, w in (
+        (100, 105), (512, 512), (1080, 1920), (900, 600), (3000, 4000),
+    )]
     outputs = ((960, 576), (1024, 1024), (853, 480))
     checked = 0
     for preset in REFERENCE_RECIPE_PRESETS:
-        legacy = _LEGACY_GEOMETRY[preset["id"]]
+        legacy_hard = _LEGACY_GEOMETRY[preset["id"]]
         for frame in frames:
             for output_width, output_height in outputs:
                 for member_count in (1, 3):
-                    assert core._member_geometry(
+                    current = core._member_geometry(
                         frame, preset["hard"], output_width, output_height, member_count,
-                    ) == _legacy_member_geometry(
-                        core, frame, legacy, output_width, output_height, member_count,
-                    ), (preset["id"], frame.shape[:2], (output_width, output_height), member_count)
+                    )
+                    legacy_geometry = _legacy_member_geometry(
+                        core, frame, legacy_hard, output_width, output_height, member_count,
+                    )
+                    if preset["id"] == "sonder:wan_phantom":
+                        assert current == (
+                            core._snap_dimension(output_width, 16, floor=True),
+                            core._snap_dimension(output_height, 16, floor=True),
+                        )
+                        if output_width % 16 or output_height % 16:
+                            assert current != legacy_geometry
+                    elif preset["id"] == "sonder:wan_bernini":
+                        height, width = frame.shape[:2]
+                        scale = min(848 / max(width, height), 1.0)
+                        assert current == (
+                            core._snap_dimension(width * scale, 16),
+                            core._snap_dimension(height * scale, 16),
+                        )
+                        if (height, width) == (100, 105):
+                            assert current == (112, 96)
+                            assert current != legacy_geometry
+                    else:
+                        assert current == legacy_geometry, (
+                            preset["id"], frame.shape[:2],
+                            (output_width, output_height), member_count,
+                        )
                     checked += 1
     assert checked == len(REFERENCE_RECIPE_PRESETS) * len(frames) * len(outputs) * 2
+
+
+def test_phantom_geometry_floors_scene_dimensions_to_sixteen(monkeypatch):
+    core = _import_module(monkeypatch, "reference_core")
+    hard = _preset("sonder:wan_phantom").recipe["hard"]
+    frame = np.zeros((480, 853, 3), dtype=np.uint8)
+
+    assert core._member_geometry(frame, hard, 853, 480) == (848, 480)
+
+
+def test_bernini_small_native_reference_rounds_nearest_without_source_edge_cap(monkeypatch):
+    core = _import_module(monkeypatch, "reference_core")
+    hard = _preset("sonder:wan_bernini").recipe["hard"]
+    frame = np.zeros((100, 105, 3), dtype=np.uint8)
+
+    assert core._member_geometry(frame, hard, 64, 48) == (112, 96)
 
 
 def test_output_size_modes_are_mutually_exclusive_in_the_assembler(monkeypatch):
