@@ -2171,7 +2171,10 @@ export function mountSharedAssetGallery(container, options = {}) {
             return `${usage.status || "pending"} | ${usage.job_id || "job"}`;
         }
         if (usage.type === "reference_member") {
-            const tags = Array.isArray(usage.tags) && usage.tags.length ? ` | ${usage.tags.join(", ")}` : "";
+            const labels = (Array.isArray(usage.tags) ? usage.tags : []).map((tag) => (
+                options.formatReferenceTag?.(tag) || String(tag)
+            ));
+            const tags = labels.length ? ` | ${labels.join(", ")}` : "";
             return `${usage.reference_name || "Untitled Reference"}${tags}`;
         }
         return "";

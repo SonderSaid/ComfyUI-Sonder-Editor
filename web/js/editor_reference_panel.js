@@ -40,7 +40,12 @@ import {
 } from "./keyboard_ownership.js";
 import { TRACK_TYPE } from "./editor_timeline_constants.js";
 import { preserveLaneRecipeIdentity } from "./reference_lane_identity.js";
-import { createMemberDraft, moveMember } from "./reference_library_model.js";
+import {
+    createMemberDraft,
+    formatReferenceTag,
+    moveMember,
+    referenceTagSearchText,
+} from "./reference_library_model.js";
 import { createDisclosureMemory } from "./disclosure_memory.js";
 import {
     REFERENCE_VERDICT,
@@ -393,6 +398,17 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         .map((preset) => String(preset?.tag || preset?.id || preset?.name || ""))
         .filter(Boolean);
 
+    const tagLabel = (tag, density = "long") => formatReferenceTag(tag, {
+        catalog: host._referenceTagPresets,
+        families: host._referenceTagFamilies,
+        density,
+    });
+
+    const tagWithId = (tag) => {
+        const label = tagLabel(tag);
+        return label && label !== tag ? `${tag} · ${label}` : String(tag);
+    };
+
     const tagChipEditor = (field, tags, locked) => {
         const wrap = el("div", "", "display:flex;flex-wrap:wrap;align-items:center;gap:4px;flex:1;");
         for (const tag of tags) {
@@ -400,7 +416,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                 display:inline-flex;align-items:center;gap:4px;font-size:10px;padding:2px 4px 2px 6px;
                 border:1px solid ${COLORS.border};border-radius:10px;color:${COLORS.text};
             `);
-            chip.appendChild(el("span", tag));
+            chip.appendChild(el("span", tagWithId(tag)));
             if (!locked) {
                 const drop = el("button", "×", chromeButtonCss({ variant: "tertiary", padding: "0 3px", fontSize: "10px", radius: "8px" }));
                 drop.title = `Remove ${tag}`;
@@ -444,7 +460,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         const hint = el("span", "", `font-size:10px;color:${COLORS.textMuted};`);
         input.addEventListener("input", () => {
             const completion = completionFor(input.value);
-            hint.textContent = completion && completion !== input.value ? `Tab → ${completion}` : "";
+            hint.textContent = completion && completion !== input.value ? `Tab → ${tagWithId(completion)}` : "";
         });
         wrap.appendChild(hint);
         return wrap;
@@ -925,7 +941,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         const resolved = host._referenceMemberForRef?.(memberRef);
         if (!resolved) return { title: "Missing member", detail: memberRef?.member_id || "", asset: null };
         const asset = host._findAssetById?.(resolved.member.asset_id) || null;
-        const tags = (resolved.member.tags || []).join(", ");
+        const tags = (resolved.member.tags || []).map((tag) => tagLabel(tag)).join(", ");
         return {
             title: resolved.member.name
                 ? `${resolved.reference.name || "Reference"} · ${resolved.member.name}`
@@ -1126,7 +1142,11 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                             : (asset?.asset_type === "audio"
                                 || (asset?.asset_type === "video" && asset?.has_audio)));
                     if (!asset || !compatible) continue;
-                    const haystack = `${reference.name} ${member.prompt || ""} ${asset.name || ""} ${(member.tags || []).join(" ")}`.toLowerCase();
+                    const tagSearch = (member.tags || []).map((tag) => referenceTagSearchText(tag, {
+                        catalog: host._referenceTagPresets,
+                        families: host._referenceTagFamilies,
+                    })).join(" ");
+                    const haystack = `${reference.name} ${member.prompt || ""} ${asset.name || ""} ${tagSearch}`.toLowerCase();
                     if (query && !haystack.includes(query)) continue;
                     offered += 1;
                     const memberName = member.name || asset.name || member.member_id;

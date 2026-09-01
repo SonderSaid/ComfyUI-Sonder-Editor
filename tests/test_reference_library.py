@@ -13,7 +13,9 @@ import server
 from server import prompt_context
 from server.project_manager import load_project, save_project
 from server.timeline_state import (
-    Asset, ReferenceEntity, ReferenceMember, TimelineProject,
+    ALL_REFERENCE_RECIPE_PRESETS, REFERENCE_TAG_FAMILIES,
+    REFERENCE_TAG_PRESETS, Asset, ReferenceEntity, ReferenceMember,
+    TimelineProject,
 )
 import server.routes as routes
 
@@ -685,16 +687,33 @@ def test_reference_get_is_read_only_and_returns_catalog(monkeypatch, tmp_path):
     payload = json.loads(response.body.decode("utf-8"))
     assert response.status == 200
     assert payload["references"] == []
-    assert {entry["id"] for entry in payload["tag_presets"]} >= {
-        "sonder:portrait", "sonder:voice_identity", "sonder:subject_clip",
-        "sonder:context_clip", "sonder:motion_reference",
-    }
+    assert payload["tag_presets"] == routes._reference_catalog_payload()
+    assert payload["tag_families"] == REFERENCE_TAG_FAMILIES
+    assert len(payload["tag_presets"]) == 26
+    assert not any(entry["id"].startswith("sonder:h3_")
+                   for entry in payload["tag_presets"])
+    assert all("family" in entry for entry in payload["tag_presets"])
+    assert all(entry["family"] is None or entry["family"] in payload["tag_families"]
+               for entry in payload["tag_presets"])
     assert all("suggested_kinds" in entry for entry in payload["tag_presets"])
     assert all(isinstance(entry["requires_audio"], bool) for entry in payload["tag_presets"])
     voice = next(entry for entry in payload["tag_presets"] if entry["id"] == "sonder:voice_identity")
     assert voice["requires_audio"] is True
     assert voice["asset_types"] == ["audio", "video"]
     assert path.stat().st_mtime_ns == before
+
+
+def test_builtin_recipe_tag_advisories_resolve_to_live_catalog():
+    tag_ids = {str(entry["id"]) for entry in REFERENCE_TAG_PRESETS}
+    for recipe in ALL_REFERENCE_RECIPE_PRESETS:
+        soft = recipe.get("soft", {})
+        for key in ("suggested_tags",):
+            for tag in soft.get(key, []) or []:
+                assert tag in tag_ids, f"{recipe['id']} has unknown {key} entry {tag}"
+        context_tag = soft.get("context_tag")
+        if context_tag:
+            assert context_tag in tag_ids, (
+                f"{recipe['id']} has unknown context_tag {context_tag}")
 
 
 def test_reference_mutation_rejects_stale_if_match(monkeypatch, tmp_path):

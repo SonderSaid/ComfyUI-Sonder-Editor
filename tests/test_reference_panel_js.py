@@ -648,13 +648,17 @@ def test_selector_panel_view_parses_and_explains_multi_lane_selection(monkeypatc
     script = f"""
 const {{ parseLaneSelection, selectorPanelView }} = await import({json.dumps(module_url)});
 const lanes = {json.dumps(lanes)};
+const tagPresets = [
+  {{ id: 'sonder:face_closeup', label: 'Face Close-up', family: null }},
+  {{ id: 'sonder:location', label: 'Location', family: null }},
+];
 const huge = '9'.repeat(5000);
 const parsed = parseLaneSelection(`2, 0 2 garbage -1 1_0 +3 ١ 9007199254740992 ${{huge}}`);
 const separators = parseLaneSelection(`0\u001c1, 2\ufeff3 4\t5`);
 console.log(JSON.stringify({{
   parsed,
   separators,
-  selected: selectorPanelView({{ lanes, ...parsed, laneIndices: [2, 0, 7], sceneName: 'Act One' }}),
+  selected: selectorPanelView({{ lanes, ...parsed, laneIndices: [2, 0, 7], sceneName: 'Act One', tagPresets }}),
   anchoredAfterOrphan: selectorPanelView({{ lanes, laneIndices: [7, 2], sceneName: 'Act One' }}),
   inert: selectorPanelView({{ lanes, laneIndices: [0, 4] }}),
   overrideConflict: selectorPanelView({{ lanes, laneIndices: [0] }}),
@@ -686,7 +690,7 @@ console.log(JSON.stringify({{
         "Prompt Bridge aggregate + p01..p16",
         "Prompt Bridge reference_names",
     ]
-    assert selected["tags"] == ["face_closeup", "location", "villain"]
+    assert selected["tags"] == ["Face Close-up", "Location", "sonder:villain"]
     assert any("different strengths" in value for value in selected["disclosures"])
     assert any("unparseable" in value for value in selected["disclosures"])
     assert all(entry["disabled"] for entry in selected["addable"])
@@ -771,7 +775,8 @@ def test_lane_bar_gives_names_priority_over_tags():
     assert name_at < tags_at, "the member name must be drawn before tags claim space"
     assert "const room = (x2 - x1 - 6) - nameW" in block
     assert "if (room > Math.round(30 * scale))" in block
-    assert 'tag.replace(/^sonder:/, "")' in block
+    assert "formatReferenceTag(tag" in block
+    assert 'density: "short"' in block
 
     # The recipe rides the lane HEADER, not each bar: it is per-lane and
     # invariant across items, so repeating it would cost the bar its space.
@@ -779,6 +784,12 @@ def test_lane_bar_gives_names_priority_over_tags():
     assert "_referenceLaneRecipeLabel" in header and "_referenceLaneRecipeLabel" not in block
     assert "const room = maxLabelW - nameW" in header
 
+
+def test_staging_member_search_uses_the_shared_tag_search_rule():
+    panel = (ROOT / "web" / "js" / "editor_reference_panel.js").read_text(encoding="utf-8")
+    assert "referenceTagSearchText(tag" in panel
+    assert "catalog: host._referenceTagPresets" in panel
+    assert "families: host._referenceTagFamilies" in panel
 
 def test_reference_item_editor_defers_the_prompt_to_the_lane_panel():
     widget = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")

@@ -21,6 +21,7 @@ Switch the fullscreen or mounted left sidebar from **Assets** to
 **References**.
 
 ![The References sidebar with one character expanded to its three members — two image sheets and a voice reference — each with its tags and prompt text](images/reference-library.webp)
+<!-- The tag picker in this image predates the verified family-grouped UI and remains flagged for later regeneration. -->
 
 - Create a named **character**, **location**, **prop**, or **outfit**, choose
   whether it is a **subject** or **context**, and give it a one-line
@@ -48,8 +49,9 @@ Switch the fullscreen or mounted left sidebar from **Assets** to
   the project until you Save.
 - **Edit**, **Remove**, and **Up/Down** act on individual members, with explicit
   Save and Cancel. Swapping a member's source asset happens inside its editor.
-- Search matches reference names, kinds, descriptions, member tags, and current
-  asset names. Missing, Trashed, and unresolved members stay visible.
+- Search matches reference names, kinds, descriptions, current asset names, and
+  both the stored id and displayed label of member tags. Missing, Trashed, and
+  unresolved members stay visible.
 
 ## Tags
 
@@ -63,9 +65,18 @@ kinds, and descriptions.
 **They let a recipe ask for what it needs.** Each recipe carries the tags it
 works best with, and a lane whose staged members don't include one raises a
 suggestion to stage it. LTX Best Face ID asks for a face close-up; MiniMax H3
-Pictures asks for identity, environment, style, or motion references. These are
-suggestions, not requirements — nothing is blocked, and the only hard limit is
-the recipe's member cap.
+Pictures asks for identity, environment, style, motion, storyboard, or
+composition-anchor inputs. These are suggestions, not requirements — nothing
+is blocked, and the only hard limit is the recipe's member cap.
+
+A tag describing content is universal. A tag naming a provider input slot
+carries its family: for example **Motion Reference** is universal, while
+**MiniMax H3 · Motion** names an H3 slot. The picker groups those families, and
+the Library, timeline, lane setup, live graph Selector, advisories, and asset
+usage rows all resolve them from the same declared label. Compact canvas labels
+use the same data in a shorter form, such as **H3·Motion**. A running frozen
+Selector deliberately keeps its frozen raw ids instead of relabelling them from
+live metadata. Custom and unknown tags also keep their authored text.
 
 Built-in tags are media-aware, so once you pick an asset only the tags that fit
 it are offered: Voice Identity takes standalone audio, and video only when the
@@ -89,7 +100,7 @@ Each lane holds one media kind, so items can't move between an image lane and
 an audio lane. Items on a lane can't overlap. Each item can be muted and
 carries its own conditioning strength. The lane header carries the lane name,
 with the recipe name beside it when the header is wide enough; item bars show
-their member names, then tags.
+their member names, then the same tags in compact form.
 
 Create items by dragging from the **References** sidebar onto the timeline, or
 with **Add to timeline** on an expanded Library card; the rules are in

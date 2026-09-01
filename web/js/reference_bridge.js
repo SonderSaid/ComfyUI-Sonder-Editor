@@ -418,6 +418,9 @@ async function selectorLanePayload(node, wave) {
     return {
         status: "",
         lanes: Array.isArray(payload?.references) ? payload.references : [],
+        tagPresets: Array.isArray(payload?.tag_presets) ? payload.tag_presets : [],
+        tagFamilies: payload?.tag_families && typeof payload.tag_families === "object"
+            ? payload.tag_families : {},
         sceneName: String(payload?.scene_name || ""),
         source: String(payload?.source || "live"),
         linked: true,
@@ -435,6 +438,8 @@ function renderSelectorPanel(node, payload) {
         status: payload.status,
         sceneName: payload.sceneName,
         source: payload.source,
+        tagPresets: payload.tagPresets,
+        tagFamilies: payload.tagFamilies,
     });
     state.view = view;
 

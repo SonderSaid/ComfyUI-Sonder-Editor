@@ -8,6 +8,7 @@ import {
     TRACK_TYPE,
 } from "./editor_timeline_constants.js";
 import { descriptorFor } from "./lane_registry.js";
+import { formatReferenceTag } from "./reference_library_model.js";
 import {
     REFERENCE_VERDICT,
     REFERENCE_VERDICT_LABEL,
@@ -1333,7 +1334,11 @@ export function _drawClips(host, ctx, width) {
                         if (room > Math.round(30 * scale)) {
                             ctx.fillStyle = COLORS.itemSubText;
                             ctx.font = host._canvasSansFont(Math.round(8 * scale), 500);
-                            const shortened = tags.map((tag) => tag.replace(/^sonder:/, ""));
+                            const shortened = tags.map((tag) => formatReferenceTag(tag, {
+                                catalog: host._referenceTagPresets,
+                                families: host._referenceTagFamilies,
+                                density: "short",
+                            }));
                             ctx.fillText(shortened.join(", "), textX + nameW + Math.round(8 * scale), baseline);
                         }
                     }

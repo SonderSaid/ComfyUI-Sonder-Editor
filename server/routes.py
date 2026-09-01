@@ -112,7 +112,8 @@ from .timeline_state import (
     TimelineProject, Asset, Scene, GuideFrame, PromptSection, AudioTrack,
     ClipReference, LaneConfig, GenerationJob, ReferenceEntity, ReferenceMember,
     ReferenceItem, ReferenceLaneRecipe,
-    REFERENCE_CLASSES, REFERENCE_KINDS, REFERENCE_TAG_NAMESPACE, REFERENCE_TAG_PRESETS,
+    REFERENCE_CLASSES, REFERENCE_KINDS, REFERENCE_TAG_NAMESPACE,
+    REFERENCE_TAG_FAMILIES, REFERENCE_TAG_PRESETS,
     REFERENCE_RECIPE_FIELDS,
     REFERENCE_RECIPE_PRESETS, ALL_REFERENCE_RECIPE_PRESETS,
     apply_color_metadata, classify_asset_path, default_reference_class,
@@ -4624,6 +4625,7 @@ def _reference_catalog_payload() -> list[dict]:
         {
             "id": str(preset["id"]),
             "label": str(preset["label"]),
+            "family": preset.get("family"),
             "asset_types": list(preset.get("asset_types", [])),
             "suggested_kinds": list(preset.get("suggested_kinds", [])),
             "requires_audio": bool(preset.get("requires_audio", False)),
@@ -4652,6 +4654,7 @@ def _references_payload(project: TimelineProject) -> dict:
         "modified_at": project.modified_at,
         "references": [reference.to_dict() for reference in project.references],
         "tag_presets": _reference_catalog_payload(),
+        "tag_families": copy.deepcopy(REFERENCE_TAG_FAMILIES),
         "recipe_presets": _reference_recipe_catalog_payload(),
         "recipe_field_schema": [dict(field) for field in REFERENCE_RECIPE_FIELDS],
         "reference_recipes": [dict(recipe) for recipe in project.reference_recipes if isinstance(recipe, dict)],
@@ -11278,6 +11281,13 @@ if routes is not None:
             "source": source_label,
             "reference_lane_count": lane_count,
             "references": rows,
+            # Snapshot rows carry frozen durable ids but no frozen display
+            # catalog. Keep them raw rather than resolving them against live
+            # labels that could drift while the job remains authoritative.
+            "tag_presets": _reference_catalog_payload()
+                if active_job is None else [],
+            "tag_families": copy.deepcopy(REFERENCE_TAG_FAMILIES)
+                if active_job is None else {},
         })
 
     @routes.get("/sonder-editor/project/{project_id}/scenes/{scene_id}/prompt-payload")

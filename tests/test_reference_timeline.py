@@ -1149,6 +1149,9 @@ def test_bridge_references_uses_effective_window_and_h3_video_image_labels(monke
 
     early = payload(5, 20)
     early_lane = early["references"][0]
+    assert len(early["tag_presets"]) == 26
+    assert early["tag_families"] == {
+        "minimax_h3": {"label": "MiniMax H3", "short": "H3"}}
     assert (early["window_start"], early["window_end"]) == (5, 20)
     assert early_lane["media_kind"] == "image"
     assert early_lane["image_slot_count"] == 1
@@ -1188,6 +1191,8 @@ def test_bridge_references_uses_effective_window_and_h3_video_image_labels(monke
     assert (frozen["window_start"], frozen["window_end"]) == (0, 20)
     assert frozen["references"][0]["slot_labels"] == [
         "Video 1 · Early (subject)"]
+    assert frozen["tag_presets"] == []
+    assert frozen["tag_families"] == {}
 
 
 # `lane_population` is the single authority for which lanes serve a MiniMax H3

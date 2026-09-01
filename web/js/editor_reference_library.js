@@ -4,6 +4,7 @@ import {
     createReferenceDraft,
     defaultReferenceClass,
     filterReferences,
+    formatReferenceTag,
     incompatibleReferencePresetTags,
     moveMember,
     normalizeReferenceTags,
@@ -367,48 +368,67 @@ export function mountReferenceLibrary(container, host) {
         }
 
         const catalog = data.catalog || [];
+        const families = data.tagFamilies || {};
         const tagLabel = el("div", "Preset tags · suggestions first", css.label);
         editor.appendChild(tagLabel);
         if (!asset) {
             editor.appendChild(el("div", "Choose an asset to see compatible preset tags.", "color:#7f8d99;font-size:10px;line-height:1.4;"));
         }
-        const chips = el("div", "", "display:flex;gap:4px;flex-wrap:wrap;");
         const orderedCatalog = compatibleReferencePresets(catalog, asset).sort((left, right) => {
             const leftSuggested = left.suggested_kinds?.includes(reference.kind) ? 0 : 1;
             const rightSuggested = right.suggested_kinds?.includes(reference.kind) ? 0 : 1;
             return leftSuggested - rightSuggested;
         });
+        const groupedCatalog = new Map();
         for (const preset of orderedCatalog) {
-            const active = draft.tags.includes(preset.id);
-            const chip = el("button", preset.label || preset.id, `${css.button}padding:3px 6px;${active ? "background:#476d88;border-color:#668ca7;" : ""}`);
-            chip.title = preset.suggested_kinds?.includes(reference.kind)
-                ? `Suggested for ${reference.kind}`
-                : "Available for any compatible Reference kind";
-            chip.addEventListener("click", () => {
-                draft.tags = active ? draft.tags.filter((tag) => tag !== preset.id) : [...draft.tags, preset.id];
-                render();
-            });
-            chips.appendChild(chip);
+            const family = String(preset.family || "");
+            if (!groupedCatalog.has(family)) groupedCatalog.set(family, []);
+            groupedCatalog.get(family).push(preset);
         }
+        const chipGroups = el("div", "", "display:flex;flex-direction:column;gap:5px;");
+        for (const [familyId, presets] of groupedCatalog) {
+            const group = el("div", "", "display:flex;flex-direction:column;gap:3px;");
+            if (familyId) {
+                const familyLabel = families?.[familyId]?.label || familyId;
+                group.appendChild(el("div", familyLabel, "color:#91a5b5;font-size:9px;font-weight:600;"));
+            }
+            const chips = el("div", "", "display:flex;gap:4px;flex-wrap:wrap;");
+            for (const preset of presets) {
+                const active = draft.tags.includes(preset.id);
+                const chip = el("button", preset.label || preset.id, `${css.button}padding:3px 6px;${active ? "background:#476d88;border-color:#668ca7;" : ""}`);
+                chip.title = preset.suggested_kinds?.includes(reference.kind)
+                    ? `Suggested for ${reference.kind}`
+                    : "Available for any compatible Reference kind";
+                chip.addEventListener("click", () => {
+                    draft.tags = active ? draft.tags.filter((tag) => tag !== preset.id) : [...draft.tags, preset.id];
+                    render();
+                });
+                chips.appendChild(chip);
+            }
+            group.appendChild(chips);
+            chipGroups.appendChild(group);
+        }
+        const statusChips = el("div", "", "display:flex;gap:4px;flex-wrap:wrap;");
         const incompatible = incompatibleReferencePresetTags(draft.tags, catalog, asset);
         for (const tag of incompatible) {
             const preset = catalog.find((entry) => entry.id === tag);
-            const chip = el("button", `${preset?.label || tag} · incompatible`, `${css.button}padding:3px 6px;background:#5a3030;border-color:#a25d5d;color:#ffd8d8;`);
+            const chip = el("button", `${formatReferenceTag(tag, { catalog, families })} · incompatible`, `${css.button}padding:3px 6px;background:#5a3030;border-color:#a25d5d;color:#ffd8d8;`);
             chip.title = "This preset is incompatible with the selected asset. Remove it before saving.";
             chip.addEventListener("click", () => { draft.tags = draft.tags.filter((entry) => entry !== tag); render(); });
-            chips.appendChild(chip);
+            statusChips.appendChild(chip);
         }
         if (!asset) {
             for (const tag of draft.tags) {
                 const preset = catalog.find((entry) => entry.id === tag);
                 if (!preset) continue;
-                const chip = el("button", `${preset.label || tag} · awaiting asset`, `${css.button}padding:3px 6px;background:#394857;border-color:#60788b;`);
+                const chip = el("button", `${formatReferenceTag(tag, { catalog, families })} · awaiting asset`, `${css.button}padding:3px 6px;background:#394857;border-color:#60788b;`);
                 chip.title = "Choose an asset to validate this saved preset, or click to remove it.";
                 chip.addEventListener("click", () => { draft.tags = draft.tags.filter((entry) => entry !== tag); render(); });
-                chips.appendChild(chip);
+                statusChips.appendChild(chip);
             }
         }
-        if (asset || incompatible.length || chips.childNodes.length) editor.appendChild(chips);
+        if (asset || chipGroups.childNodes.length) editor.appendChild(chipGroups);
+        if (statusChips.children.length) editor.appendChild(statusChips);
         const presetIds = new Set(catalog.map((preset) => preset.id));
         const custom = inputField("Custom tags (comma separated)", draft.tags.filter((tag) => !presetIds.has(tag)).join(", "), (value) => {
             const presets = draft.tags.filter((tag) => presetIds.has(tag));
@@ -450,7 +470,7 @@ export function mountReferenceLibrary(container, host) {
         const save = el("button", "Save", `${css.button}background:#476d88;border-color:#668ca7;`);
         const cancel = el("button", "Cancel", css.button);
         save.addEventListener("click", () => {
-            const errors = validateMemberDraft(draft, catalog, asset);
+            const errors = validateMemberDraft(draft, catalog, asset, families);
             if (errors.length) { state.error = errors[0]; render(); return; }
             const values = serializeMemberDraft(draft, catalog);
             if (member) {
@@ -529,7 +549,7 @@ export function mountReferenceLibrary(container, host) {
         body.addEventListener("scroll", () => {
             if (containerIsVisible()) rememberScroll(scrollKey, body.scrollTop);
         });
-        const references = filterReferences(data.references, state.query, allAssets);
+        const references = filterReferences(data.references, state.query, allAssets, data.catalog, data.tagFamilies);
         if (!references.length) body.appendChild(el("div", data.references.length ? "No references match." : "No references yet.", "color:#788692;padding:18px;text-align:center;font-size:11px;"));
         for (const reference of references) {
             const card = el("section", "", "border:1px solid #303841;border-radius:8px;background:#171d23;margin-bottom:8px;overflow:hidden;");
@@ -639,7 +659,7 @@ export function mountReferenceLibrary(container, host) {
                         preview.addEventListener("click", inspectMember);
                         nameLine.addEventListener("click", inspectMember);
                         info.appendChild(nameLine);
-                        if (member.tags?.length) info.appendChild(el("div", member.tags.join(" · "), "font-size:9px;color:#829fba;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:2px;"));
+                        if (member.tags?.length) info.appendChild(el("div", member.tags.map((tag) => formatReferenceTag(tag, { catalog: data.catalog, families: data.tagFamilies })).join(" · "), "font-size:9px;color:#829fba;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:2px;"));
                         if (member.prompt) info.appendChild(el("div", member.prompt, "font-size:9px;color:#b8c2ca;line-height:1.4;white-space:pre-wrap;overflow-wrap:anywhere;margin-top:3px;"));
                         const controls = el("div", "", "display:flex;gap:3px;margin-top:4px;");
                         for (const [label, handler] of [

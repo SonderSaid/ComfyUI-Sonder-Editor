@@ -18,6 +18,8 @@
 // workflow-embedded emission policy decides whether a dead slot carries its
 // type-correct placeholder or no value.
 
+import { formatReferenceTag } from "./reference_library_model.js";
+
 export const MAX_REFERENCE_SLOTS = 16;
 export const SLOT_NAME_RE = /^[rap](0[1-9]|1[0-6])$/;
 
@@ -187,6 +189,7 @@ const selectedLaneRows = (lanes, laneIndices) => {
  */
 export function selectorPanelView({
     lanes = [], laneIndices = [], invalidTokens = [], status = "", sceneName = "", source = "live",
+    tagPresets = [], tagFamilies = {},
 } = {}) {
     const available = Array.isArray(lanes) ? lanes : [];
     const selected = [...new Set((Array.isArray(laneIndices) ? laneIndices : [])
@@ -281,7 +284,11 @@ export function selectorPanelView({
             reference_names: "Prompt Bridge reference_names",
         }[name] || name)),
         tags: [...new Set(selectedLanes.flatMap((lane) => lane?.member_tags || []))]
-            .map((tag) => String(tag).replace(/^sonder:/, "")),
+            .map((tag) => formatReferenceTag(tag, {
+                catalog: tagPresets,
+                families: tagFamilies,
+                density: "short",
+            })),
     };
 }
 

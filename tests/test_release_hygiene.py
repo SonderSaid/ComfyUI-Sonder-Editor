@@ -188,6 +188,53 @@ def test_prompt_tool_colour_comes_from_theme_tokens():
     )
 
 
+def test_reference_tags_do_not_bypass_the_shared_formatter():
+    """Reference tag ids must not grow another ad-hoc display spelling."""
+    findings = []
+    prefix_strip = re.compile(r"replace\(\s*/\^sonder:/")
+    direct_join = re.compile(
+        r"(?:member|usage)(?:\?\.|\.)tags\s*(?:\?\.)?\.join\("
+        r"|(?:member|usage)(?:\?\.|\.)tags\s*\|\|\s*\[\]\s*\)\s*\.join\("
+        r"|\btags\s*(?:\?\.)?\.join\(")
+    for path in sorted((ROOT / "web" / "js").glob("*.js")):
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if prefix_strip.search(line):
+                findings.append(f"{path.relative_to(ROOT)}:{number}: strips the tag namespace")
+            if direct_join.search(line):
+                findings.append(f"{path.relative_to(ROOT)}:{number}: joins raw member/usage tags")
+    assert not findings, (
+        "Reference tags must render through formatReferenceTag:\n"
+        + "\n".join(findings)
+    )
+
+
+def test_reference_tag_formatter_is_wired_to_every_display_boundary():
+    required = {
+        "web/js/editor_reference_library.js": (
+            "member.tags.map((tag) => formatReferenceTag",
+            "filterReferences(data.references, state.query, allAssets, data.catalog, data.tagFamilies)",
+        ),
+        "web/js/editor_widget.js": (
+            "formatReferenceTag: (tag) => this._formatReferenceTag(tag)",
+            "tagged ${this._formatReferenceTag(tag)}",
+        ),
+        "web/js/editor_timeline_canvas.js": ("formatReferenceTag(tag", 'density: "short"'),
+        "web/js/editor_reference_panel.js": (
+            "tagWithId(tag)", "tagLabel(tag)", "referenceTagSearchText(tag",
+        ),
+        "web/js/reference_bridge_shape.js": ("formatReferenceTag(tag", 'density: "short"'),
+        "web/js/shared_asset_gallery.js": ("options.formatReferenceTag?.(tag)",),
+        "web/js/editor_node_controller.js": ("formatReferenceTag: () => null",),
+    }
+    findings = []
+    for relative, needles in required.items():
+        source = (ROOT / relative).read_text(encoding="utf-8")
+        for needle in needles:
+            if needle not in source:
+                findings.append(f"{relative}: missing {needle!r}")
+    assert not findings, "shared Reference tag formatter wiring drift:\n" + "\n".join(findings)
+
+
 def _builtin_reference_recipe_names() -> set[str]:
     """Every recipe name a user can pick, from the one declaration that owns them."""
     text = (ROOT / "server" / "timeline_state.py").read_text(encoding="utf-8")

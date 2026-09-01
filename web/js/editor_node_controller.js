@@ -3660,6 +3660,7 @@ export class EditorNodeController {
             ownerId: `sonder-editor-${this.node?.id ?? "anon"}:dormant-gallery`,
             getProjectDir: () => this.state.projectDir,
             initialData: data || { assets: [], folders: [] },
+            formatReferenceTag: () => null,
             onImportFiles: async (files, folder) => await this.importFiles(files, folder),
             onUpdateAsset: async (assetId, updates) => await this._updateAssetMetadata(assetId, updates),
             onGetAssetUsages: async (assetId) => await this._getAssetUsages(assetId),

@@ -218,7 +218,7 @@ function sessionDiagEndLoad(kind, markerId, payload) {
 import { INSPECT_OVERLAY_SHORTCUTS, mountSharedAssetGallery, getActiveDragAsset } from "./shared_asset_gallery.js";
 import { getActiveReferenceDrag, mountReferenceLibrary, referenceMemberMediaKind, SONDER_REFERENCE_MIME } from "./editor_reference_library.js";
 import { openReferenceMediaEditor, REFERENCE_MEDIA_EDITOR_SHORTCUTS } from "./reference_media_editor.js";
-import { shouldApplyReferenceResponse } from "./reference_library_model.js";
+import { formatReferenceTag, shouldApplyReferenceResponse } from "./reference_library_model.js";
 import { mountReferenceLanePanel } from "./editor_reference_panel.js";
 import { referenceConfigurationAdvisories } from "./reference_lane_identity.js";
 import { REFERENCE_LANE_CAUSE, classifyReferenceChunks } from "./reference_resolution.js";
@@ -689,6 +689,7 @@ export class EditorWidget {
         this._promptContextProfiles = [];
         this._promptSemanticUnits = [];
         this._referenceTagPresets = [];
+        this._referenceTagFamilies = {};
         this._referenceRecipePresets = [];
         this._customReferenceRecipes = [];
         this._referenceRecipeFieldSchema = [];
@@ -1228,6 +1229,7 @@ export class EditorWidget {
             getProjectDir: () => this.projectDir,
             initialData: { assets: [], folders: [] },
             getCurrentSceneAssetIds: () => this._currentSceneAssetIdsForGallery(),
+            formatReferenceTag: (tag) => this._formatReferenceTag(tag),
             onImportFiles: async (files, folder) => {
                 await this._importFilesWithProgress(Array.from(files || []), folder);
             },
@@ -2000,11 +2002,20 @@ export class EditorWidget {
         }
     }
 
+    _formatReferenceTag(tag, density = "long") {
+        return formatReferenceTag(tag, {
+            catalog: this._referenceTagPresets,
+            families: this._referenceTagFamilies,
+            density,
+        });
+    }
+
     _referenceLibraryData() {
         return {
             projectKey: this._projectDirName(),
             references: this._references,
             catalog: this._referenceTagPresets,
+            tagFamilies: this._referenceTagFamilies,
             recipePresets: this._referenceRecipePresets,
             customRecipes: this._customReferenceRecipes,
             assets: this._allProjectAssetsForGallery(),
@@ -2245,6 +2256,8 @@ export class EditorWidget {
         })) return false;
         this._references = Array.isArray(payload?.references) ? payload.references : [];
         this._referenceTagPresets = Array.isArray(payload?.tag_presets) ? payload.tag_presets : [];
+        this._referenceTagFamilies = payload?.tag_families && typeof payload.tag_families === "object"
+            ? payload.tag_families : {};
         this._referenceRecipePresets = Array.isArray(payload?.recipe_presets) ? payload.recipe_presets : [];
         this._customReferenceRecipes = Array.isArray(payload?.reference_recipes) ? payload.reference_recipes : [];
         this._promptContextProfiles = Array.isArray(payload?.prompt_context_profiles)
@@ -18968,6 +18981,7 @@ export class EditorWidget {
         this.scenes = [];
         this._references = [];
         this._referenceTagPresets = [];
+        this._referenceTagFamilies = {};
         this._referenceRecipePresets = [];
         this._customReferenceRecipes = [];
         this._promptContextProfiles = [];
@@ -19074,7 +19088,7 @@ export class EditorWidget {
         }
         for (const tag of soft.suggested_tags || []) {
             if (!staged.some(({ member }) => (member.tags || []).includes(tag))) {
-                advisories.push({ voice: "suggestion", text: `Consider staging a member tagged ${tag}.` });
+                advisories.push({ voice: "suggestion", text: `Consider staging a member tagged ${this._formatReferenceTag(tag)}.` });
             }
         }
         if (soft.context_tag && !staged.some(({ reference, member }) =>

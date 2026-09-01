@@ -1,8 +1,12 @@
+import json
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
+
+from server.prompt_context import MINIMAX_H3_ROLE_CATALOGS
+from server.timeline_state import REFERENCE_TAG_FAMILIES, REFERENCE_TAG_PRESETS
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,7 +35,15 @@ def test_reference_model_tags_drafts_search_and_ordering():
             {{ id: 'sonder:portrait', label: 'Portrait', asset_types: ['image', 'video'], requires_audio: false }},
             {{ id: 'sonder:motion_reference', label: 'Motion', asset_types: ['video'], requires_audio: false }},
             {{ id: 'sonder:voice_identity', label: 'Voice', asset_types: ['audio', 'video'], requires_audio: true }},
+            {{ id: 'sonder:minimax_h3_identity', label: 'Identity', family: 'minimax_h3', asset_types: ['image', 'video'], requires_audio: false }},
         ];
+        const families = {{ minimax_h3: {{ label: 'MiniMax H3', short: 'H3' }} }};
+
+        assert.equal(model.formatReferenceTag('sonder:minimax_h3_identity', {{ catalog, families }}), 'MiniMax H3 · Identity');
+        assert.equal(model.formatReferenceTag('sonder:minimax_h3_identity', {{ catalog, families, density: 'short' }}), 'H3·Identity');
+        assert.equal(model.formatReferenceTag('sonder:portrait', {{ catalog, families }}), 'Portrait');
+        assert.equal(model.formatReferenceTag('custom:handmade', {{ catalog, families }}), 'custom:handmade');
+        assert.equal(model.referenceTagSearchText('sonder:minimax_h3_identity', {{ catalog, families }}), 'sonder:minimax_h3_identity MiniMax H3 · Identity');
 
         assert.deepEqual(
             model.normalizeReferenceTags(['  Blue   Coat ', 'blue coat', 'sonder:portrait'], catalog, {{ strict: true }}),
@@ -60,9 +72,12 @@ def test_reference_model_tags_drafts_search_and_ordering():
         const videoDraft = model.createMemberDraft(null, silentVideo);
         videoDraft.tags = ['sonder:portrait', 'sonder:voice_identity'];
         videoDraft.has_audio = false;
-        assert.deepEqual(model.compatibleReferencePresets(catalog, silentVideo).map((item) => item.id), ['sonder:portrait', 'sonder:motion_reference']);
+        assert.deepEqual(model.compatibleReferencePresets(catalog, silentVideo).map((item) => item.id), ['sonder:portrait', 'sonder:motion_reference', 'sonder:minimax_h3_identity']);
         assert.deepEqual(model.incompatibleReferencePresetTags(videoDraft.tags, catalog, silentVideo), ['sonder:voice_identity']);
-        assert.match(model.validateMemberDraft(videoDraft, catalog, silentVideo)[0], /does not accept video/);
+        assert.match(model.validateMemberDraft(videoDraft, catalog, silentVideo, families)[0], /does not accept video/);
+        const h3AudioDraft = model.createMemberDraft(null, {{ asset_id: 'audio-h3', asset_type: 'audio' }});
+        h3AudioDraft.tags = ['sonder:minimax_h3_identity'];
+        assert.equal(model.validateMemberDraft(h3AudioDraft, catalog, {{ asset_type: 'audio' }}, families)[0], 'MiniMax H3 · Identity does not accept audio assets.');
         const audioVideo = {{ ...silentVideo, asset_id: 'video-2', has_audio: true }};
         assert.equal(model.compatibleReferencePresets(catalog, audioVideo).some((item) => item.id === 'sonder:voice_identity'), true);
 
@@ -104,11 +119,12 @@ def test_reference_model_tags_drafts_search_and_ordering():
         ];
         assert.deepEqual(model.moveMember(members, 'b', -1).map((item) => [item.member_id, item.order]), [['b', 0], ['a', 1], ['c', 2]]);
         const references = [
-            {{ name: 'Chloe', kind: 'character', description: '', members: [{{ asset_id: 'image-1', tags: ['Blue Coat'] }}] }},
+            {{ name: 'Chloe', kind: 'character', description: '', members: [{{ asset_id: 'image-1', tags: ['Blue Coat', 'sonder:minimax_h3_identity'] }}] }},
             {{ name: 'Cafe', kind: 'location', description: 'night', members: [] }},
         ];
         const assets = [{{ asset_id: 'image-1', name: 'portrait.png' }}];
         assert.equal(model.filterReferences(references, 'portrait.png', assets)[0].name, 'Chloe');
+        assert.equal(model.filterReferences(references, 'MiniMax H3 · Identity', assets, catalog, families)[0].name, 'Chloe');
         assert.equal(model.filterReferences(references, 'night', assets)[0].name, 'Cafe');
 
         assert.equal(model.shouldApplyReferenceResponse({{
@@ -120,6 +136,27 @@ def test_reference_model_tags_drafts_search_and_ordering():
         assert.equal(model.shouldApplyReferenceResponse({{
             requestedProject: 'p1', currentProject: 'p1', requestGeneration: 3, currentGeneration: 4,
         }}), false);
+    """)
+
+
+def test_rendered_reference_tag_labels_are_unique_and_do_not_collide_with_roles():
+    model = (ROOT / "web" / "js" / "reference_library_model.js").as_uri()
+    catalog = json.dumps(list(REFERENCE_TAG_PRESETS))
+    families = json.dumps(REFERENCE_TAG_FAMILIES)
+    role_labels = json.dumps([
+        str(role["label"])
+        for roles in MINIMAX_H3_ROLE_CATALOGS.values()
+        for role in roles
+    ])
+    _run_node(f"""
+        import assert from 'node:assert/strict';
+        import {{ formatReferenceTag }} from {model!r};
+        const catalog = {catalog};
+        const families = {families};
+        const roleLabels = {role_labels};
+        const labels = catalog.map((entry) => formatReferenceTag(entry.id, {{ catalog, families }}));
+        assert.equal(new Set(labels).size, labels.length);
+        for (const label of labels) assert.equal(roleLabels.includes(label), false, label);
     """)
 
 

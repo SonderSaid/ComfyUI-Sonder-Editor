@@ -217,6 +217,31 @@ export function catalogById(catalog = []) {
     return new Map((Array.isArray(catalog) ? catalog : []).map((entry) => [entry.id, entry]));
 }
 
+/** Resolve one durable tag id for display without deriving meaning from its id. */
+export function formatReferenceTag(tag, {
+    catalog = [], families = {}, density = "long",
+} = {}) {
+    const raw = String(tag ?? "");
+    const preset = catalogById(catalog).get(raw);
+    if (!preset) return raw;
+    const label = String(preset.label || raw);
+    const familyId = preset.family;
+    if (!familyId) return label;
+    const family = families && typeof families === "object" ? families[familyId] : null;
+    if (!family || typeof family !== "object") return raw;
+    const familyLabel = String(density === "short"
+        ? (family.short || family.label || "")
+        : (family.label || family.short || ""));
+    if (!familyLabel) return raw;
+    return density === "short" ? `${familyLabel}·${label}` : `${familyLabel} · ${label}`;
+}
+
+export function referenceTagSearchText(tag, options = {}) {
+    const raw = String(tag ?? "");
+    const label = formatReferenceTag(raw, options);
+    return label && label !== raw ? `${raw} ${label}` : raw;
+}
+
 export function assetHasReferenceAudio(asset) {
     return asset?.asset_type === "audio"
         || (asset?.asset_type === "video" && asset?.has_audio === true);
@@ -332,7 +357,7 @@ export function validateReferenceDraft(draft) {
     return errors;
 }
 
-export function validateMemberDraft(draft, catalog = [], asset = null) {
+export function validateMemberDraft(draft, catalog = [], asset = null, families = {}) {
     const errors = [];
     if (!text(draft?.asset_id)) errors.push("Choose an image or audio asset.");
     const media = draft?.asset_type;
@@ -344,7 +369,7 @@ export function validateMemberDraft(draft, catalog = [], asset = null) {
         const preset = presets.get(tag);
         const selectedAsset = asset || (media ? { asset_type: media, has_audio: draft?.has_audio === true } : null);
         if (preset && selectedAsset && !referencePresetAcceptsAsset(preset, selectedAsset)) {
-            errors.push(`${preset.label || tag} does not accept ${media} assets.`);
+            errors.push(`${formatReferenceTag(tag, { catalog, families })} does not accept ${media} assets.`);
         }
     }
     const start = Number(draft?.source_start_sec);
@@ -407,14 +432,17 @@ export function moveMember(members, memberId, direction) {
     return denseMemberOrder(result);
 }
 
-export function filterReferences(references = [], query = "", assets = []) {
+export function filterReferences(references = [], query = "", assets = [], catalog = [], families = {}) {
     const needle = text(query).toLocaleLowerCase();
     if (!needle) return Array.isArray(references) ? references : [];
     const names = new Map((Array.isArray(assets) ? assets : []).map((asset) => [asset.asset_id, asset.name || asset.path || ""]));
     return (Array.isArray(references) ? references : []).filter((reference) => {
         const values = [reference.name, reference.kind, reference.description];
         for (const member of reference.members || []) {
-            values.push(...(member.tags || []), names.get(member.asset_id) || "");
+            for (const tag of member.tags || []) {
+                values.push(referenceTagSearchText(tag, { catalog, families }));
+            }
+            values.push(names.get(member.asset_id) || "");
         }
         return values.some((value) => String(value || "").toLocaleLowerCase().includes(needle));
     });
