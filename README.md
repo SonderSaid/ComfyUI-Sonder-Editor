@@ -34,7 +34,7 @@ project card and viewport preview.</em></p>
 Three techniques from the same project, run through the same workflow. Each clip
 shows the timeline alongside the result it produced — and both halves are yours
 to open: the scenes are in the [sample project](#sample-project), and the
-[example workflow](#example-workflow) is the one that generated them.
+[LTX 2.3 Playground](#example-workflows) below is the workflow that generated them.
 
 ### Prompt Relay
 
@@ -215,12 +215,19 @@ automatically.
 7. **Run the prompt.** The editor renders the selected window (or queued
    snapshots) into your workflow, and outputs return as project assets.
 
-## Example workflow
+## Example workflows
 
-Download the **[Sonder LTX 2.3 Playground](example_workflows/sonder_ltx_2_3_playground.json)**
-workflow for a ready-wired generation graph covering prompt relay, multi-pass
-upscaling, image guides, and driver-controlled generation. It pairs with the
-sample project below.
+Two ready-wired generation graphs. Drop either onto the ComfyUI canvas.
+
+**[Sonder LTX 2.3 Playground](example_workflows/sonder_ltx_2_3_playground.json)** —
+prompt relay, multi-pass upscaling, image guides, and driver-controlled
+generation. It pairs with the sample project below.
+
+**[Sonder MiniMax H3 References](example_workflows/sonder_minimax_h3_references.json)** —
+References driving MiniMax H3: Reference lanes reaching the model through the
+Reference Selector and the Image and Audio bridges, first- and last-frame guides
+through the Guides Bridge, separated AV latents, and the Masks Bridge writing
+latent noise masks so a window can be regenerated in place.
 
 ## Documentation
 

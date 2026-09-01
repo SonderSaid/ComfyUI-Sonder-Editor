@@ -291,6 +291,11 @@ Sonder Editor ──project──> Reference Selector ──reference_set──>
                                     └── has_reference ── gate ──> Prompt Bridge
 ```
 
+Prefer to start from a finished graph? The
+**[Sonder MiniMax H3 References](../example_workflows/sonder_minimax_h3_references.json)**
+example workflow has all four wired against MiniMax H3, alongside first- and
+last-frame guides and latent noise masks.
+
 **Sonder Reference Selector** takes the editor's `project` output, and its own
 panel is where you choose **one or more Reference lanes** to send on. `+` lists
 the lanes available, each chosen lane becomes a removable row, and several

@@ -169,6 +169,12 @@ a fresh `[Unreleased]` block.
   `LTXVAudioVideoMask` from the four time outputs instead. Note that a mask
   replaces rather than composes, so it overwrites any pin a start-image or
   continuation node set upstream.
+- Added a second example workflow, **Sonder MiniMax H3 References**: a
+  ready-wired graph in which Reference lanes reach MiniMax H3 through the
+  Reference Selector and the Image and Audio bridges, keyframes arrive as first-
+  and last-frame guides through the Guides Bridge, and the Masks Bridge writes
+  latent noise masks so part of a window can be regenerated in place. Both
+  example workflows are linked from the README.
 
 ### Changed
 - **Visual + Speech + Sound now always emits `[VISUAL]:`, `[SPEECH]:`, and
