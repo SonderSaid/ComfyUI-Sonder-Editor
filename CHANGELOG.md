@@ -12,522 +12,227 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Added
-- Reference lane setup now warns when VACE strip padding grows crowded, Bernini task selection depends on connected sockets, ID-LoRA Voice reads only one input, or SCAIL moves its primary member downstream.
-- Reference Selector can now combine several compatible lanes into one stable, lane-ordered Reference set; its panel adds and removes lanes, discloses inactive reservations and compatibility reasons, and the Image, Audio, and Prompt Bridges preserve later slot positions when an earlier lane is hidden, muted, or outside the render window.
-- Reference Image and Audio Bridges can now emit nothing from unstaged slots, with a persistent canvas advisory when that would feed a required input.
-- A Reference contribution can now be copied out of Writing mode as text you own. Copy uses live `@handles` wherever possible; when a staged marker or ordinal has no live spelling, it copies the rendered text and says whether it merely stopped following intent or froze a number staging can change. Pasting a provider ordinal into authored prompt text raises a non-blocking warning that says whether the number currently resolves. Each supported contribution row opens a small menu with Copy and a way to stop that chip contributing there; unsupported Custom and Vocal Event rows no longer offer a Copy that cannot work. The block itself lost its buttons: every field your References feed now shows its own heading in the order the format lists them, with its contributions underneath, and you can type in any of them.
-- Reference mentions are now ordinary text. Typing `@KWoman` in any prompt field compiles to that format's label, and the editor marks it so you can see it is live. Because it is text it survives copy, cut and paste — previously a copied mention came back as dead words with its Reference silently dropped — and prose can name handles that do not exist yet, wiring itself up when you create them. `@` completion is now offered in every prompt field rather than only the Writing draft. An `@` that is not one of your handles, an email address included, is left exactly as you wrote it.
-- The Masks Bridge can now compile the generation window straight into hard video and audio latent noise masks. Wire each half of a separated AV latent together with its VAE, and feed the two new mask outputs to **Set Latent Noise Mask** — no retyped frame rate, no seconds round-trip, and the context frames outside the window are kept exactly. Geometry is read from the VAE, so it is correct on LTX, MiniMax H3 and Wan with no per-model setting. On LTX, a graph that also uses guides or a start image should drive kjnodes' `LTXVAudioVideoMask` from the four time outputs instead of feeding the masks to **Set Latent Noise Mask** — the generating guide has the wiring. Note also that a mask replaces rather than composes, so it overwrites any pin a start-image or continuation node set upstream.
-- MiniMax H3 Picture roles now include **Edited keyframe**, matching the task type the compiler already understands.
-
-### Changed
-- Built-in Reference recipes now preserve authored SCAIL batch order, match MiniMax H3's picture/video canvases and Bernini's native-reference snapping, floor Phantom dimensions to `/16`, and choose sheet grids by fitted member area so four-panel sheets no longer reserve dead cells.
-- Large projects now share one generation-aware Reference fetch across matching Bridge and Selector
-  nodes, while Prompt previews keep independent bounded lanes for windowed and scene-wide work.
-  Newer authoring replaces queued preview intent, obsolete conflicts cannot retry, and Copy Plan
-  remains an explicit fresh one-click action.
-- Prompt identities now declare voice through their physical audio sources: appearance and audio prose/retention stay on their own rows, mentions name only the identity, speaker suffixes derive from speaking identities, explicit H3 Summary choices union scene-wide, and `@handles` resolve across supported chip configuration prose (including inherited Library text) without rewriting authored Copy text. Legacy voice bindings remain intact until explicitly repaired from the identity editor.
-- Vocal Events now derive managed H3 speaker identity from their selected subjects, keep provider Voice IDs separate, add bounded delivery prose and identifiable inline chips, sort group speaker tokens, and can atomically create an assetless **Other speaker** from Writing with recoverable Apply, Reset, Undo, and Redo behavior.
-- Prompt sections outside the current render window no longer look empty. Select one section on the timeline and the others still show what their References contribute, marked once as outside the window and numbered across the whole scene — which can differ from what that section will actually render. A section that contributes nothing for another reason now says which: muted, or clipped at the window edge and dropped by the boundary threshold.
-- The Context strip under every prompt section reads as one thing again. It names what it belongs to, keeps one **+ Attach** in a fixed position before its chips, and shows compact handles while the full identity and preview remain on hover. Its menu offers the chip kinds and lets you reuse one you already have. Everything you could do to a chip — configure it, unlink it, remove it, or see how many sections use it — now lives in a menu on the chip itself, reachable by mouse or keyboard, and a seventh chip is no longer hidden behind a count you could not open.
-- Prompt previews no longer blink or disturb the caret while you type: ordinary prose edits leave diagnostics, inline projections, and Writing contribution blocks in place, while the Compiled tab still follows each landed compile.
-- Scene-wide Context now claims shared Reference output before section Context, so its position and winning text no longer change with the timeline selection; a disagreeing section override is reported on the section chip the author can change.
-- Unstored handle suggestions no longer masquerade as live `@handles`. Physical rows use a placeholder and identities say **no handle** until the author saves one; handleless Mention rows stay disabled and direct the author to **Reference Prompting**. Mentioning never creates or materializes a handle.
-- Writing aids now ask for their choices in the menu itself instead of a browser popup: an aid with nothing left to decide inserts straight away, one with a single choice opens a submenu, and one needing several opens a small panel. Select a line first and an aid wraps it — highlight a spoken line, pick Dialogue, and it comes back in the format's own syntax.
-- Writing aids are offered only in the channels their prompt format declares them for, so a soundscape or retention field no longer lists dialogue and camera aids, and each menu row previews the text it inserts.
-- MiniMax H3 camera motion now follows H3's own documented grammar — motion type plus optional amplitude and speed, across all twenty documented moves — instead of inheriting the shorter generic list. Shot distance, composition, depth of field and field of view are available to every format.
-- The right-click menu now separates **Mention** from **Attach**. Mention inserts ordinary `@handle` text exactly like typing it, leaves ineligible or out-of-window sources available for late compile-time resolution, and creates no attachment or chip; Attach opens the full Reference contribution dialog and inserts its configured chip at the bookmarked caret.
-- Prompt Link channels and Vocal Event subjects are now checkboxes with All/None rather than a list needing ctrl-click, and a section-scope Prompt Link can have individual channels switched off instead of only the whole chip.
-- Custom prompt formats can now edit an existing writing aid's choices and channels, not only set them when it is first created, and an aid whose placeholder has no choices says so instead of silently producing a format that cannot be saved.
-- The Context chip is now offered only by prompt formats that declare one, so it no longer appears under formats that have no use for it while staying available to any format that does.
-- Physical References now carry the same prompt defaults an Identity does, so a Reference attached anywhere follows its own prompt text, preservation detail, summary and handling instead of needing every field retyped on every chip. Whether a Reference contributes a prompt part at all is now set once on the Reference, while where that part lands stays per-attachment.
-- Attaching a Reference now configures it in the same dialog rather than only asking where to put it, and the chip editor shows the fields you have actually overridden with the rest collapsed behind a line naming what they follow. Both surfaces say which level of defaults they edit.
-- Reference field labels, help and availability now come from the prompt format's own declarations, so a format that declares no preservation or summary no longer shows those fields, and no MiniMax wording appears under an unrelated format.
-- Staged Reference rows read their declared role names and say when nothing in the prompt refers to a staged Reference yet. Handle suggestions are short enough to type, follow the Name field while you write it, and are corrected as you type instead of only on refusal.
-- A staged Reference row now reads `Role: <name> · <slot> · 1 prompt identity`, so a role that happens to be called "Identity" no longer contradicts the identity count beside it, and the row no longer stays permanently tinted when a Style Reference legitimately has no identity. Creating one is a labelled **+ Identity** button that fits on one line.
-- The collapsed override summary now names the most specific default a chip is following instead of counting how many sources disagree.
-- Prompt tool colour, spacing and buttons now come from the shared editor theme, so its panels match the rest of the editor and disabled controls in it look disabled instead of silently doing nothing.
-- A prompt format now declares what a Reference contributes — its name, destination, placement, guidance, and bounded choices — and the editor reads those declarations instead of carrying its own copy of the provider's vocabulary. Switching formats changes the labels, help, and choices you see.
-- Custom prompt formats can now be authored in full: Reference prompt parts, physical populations, identity kinds, roles, contributions, and speaker policy, each behind its own disclosure. Forking a format keeps its readable role names instead of replacing them with their machine values.
-- Reference and Identity rows now share one layout, prompt section `+` and `×` stay together as one control, glyph buttons have accessible names, and the identity editor opens with only Core identity expanded, adds searchable physical sources, reports missing required fields visibly, and shows a read-only panel of the format's routing defaults.
-- Prompt authoring now compiles, labels, links, and counts reuse from the same live draft; opening one prompt surface no longer initializes another, and late Reference data refreshes every mounted consumer behind mutation guards.
-- Declared inline capability placement is now available without a caret anchor, with truthful effective-phase reporting, resolved-text-first projections, caret-render deduplication, readable Prompt Link targets, responsive routing help, and fixed diagnostics geometry.
-- Prompt Context placement now accounts for every capability independently, shows compiler-resolved in-box projections and non-emitting reasons, and supports per-section capability suppression without deleting the chip.
-- Prompt formats now declare their physical populations, identity kinds, contribution vocabulary, speaker policy, and token grammar; MiniMax behavior no longer depends on duplicated channel-template checks.
-- Unqueued dormant prompt preview now uses the same project-aware compilation path as live candidate/execution/Relay, while queued dormant previews remain frozen snapshots.
-- Live Editor execution and Prompt Relay now share the project-aware Prompt Context compiler used by preview/enqueue, with demand-gated blocking diagnostics instead of silent blank prompts.
-- Prompt diagnostics retain a visibly stale scene-keyed result while recompiling, avoiding per-keystroke placeholder reflow and cross-scene preview leakage.
-- Context projections now follow every compiler placement above/below channel text, including multiple placements in one channel, and keep routed silent or linked-deduped chips visible with an explanation.
-- Shot and standalone section Time chips now have real editors and are the only authored marker state; Time remains window-local and template-gated.
-- Scope rows can reuse configured chips as linked emission groups with atomic propagated edits and Unlink, while the Prompt tool now separates compact Prompt Format, physical Reference Prompting, and explicit Identity Prompting.
-- Prompt authoring now defaults inline bars to an all-channel view, uses a shared caret-aware context menu, shows per-channel Reference-chip projections, supports format-declared stable-id tokens, treats resolvable empty content as advisory, and restores persisted box heights. Semantic identities can now be description-only or combine attributed physical sources and voice.
-- Timestamp is now an option on the Shot Context chip. Guide authoring is folded
-  into Custom text; ComfyUI's own Add Guide for MiniMax H3 node takes the first-
-  and last-frame images straight from the Guides Bridge, so no prompt-side
-  binding is involved. Unsupported raw Guide/unknown kinds remain visible for
-  repair and block while enabled.
-- A MiniMax H3 Full Reference lane now feeds the model as soon as you stage it.
-  Set a Reference lane to Pictures, Videos, or Audio and drop a Reference in —
-  there is no separate step that registers the lane, and a brand-new scene works
-  the same as one you copied. Lane order decides which is Picture 1. To leave a
-  lane out, hide it or mute the item. Existing projects gain any H3 lane they had
-  staged but never registered, which can renumber slots in a scene that has more
-  than one. Reference lane Members and Advisories start collapsed, remember
-  browser-local disclosure choices, and use larger thumbnails that open the
-  existing read-only media inspector.
-- MiniMax H3 Picture, Video, and standalone Audio populations now flow through
-  the generic Reference Selector and media-typed bridges. Video remains a
-  video-only authored population but is served as a 24 fps IMAGE sequence on
-  the `17n+5` frame grid; bridge shape and labels follow the effective render
-  window or the running job's frozen window.
-- New queue jobs use an explicit `prompt_context_v1` envelope with complete
-  Prompt Context, template, and Reference freezes; released unmarked v0.2.2
-  jobs replay through an isolated frozen-only composer.
-- Prompt profile, role, recipe, and validator authoring now consumes one
-  schema-versioned server catalog, including sanitized built-in fork seeds.
-- Reference chips now inherit identity defaults and store only sparse per-chip
-  deviations; reset and explicit empty values remain distinct, with
-  capability-owned config retaining final precedence.
-- MiniMax H3 Picture, Video, and Audio population creation is one atomic,
-  version-checked server mutation that reuses only safe unowned lanes.
-
-### Removed
-- Removed unpublished Shot/Time marker mirrors and migrations, Guide Context
-  compilation, role aliases, paired-Audio semantics, retired Reference output
-  vocabulary, implicit ordinal/audio text fallbacks, and frozen-to-live
-  Reference/template fallbacks.
-- Removed the six provider-shaped MiniMax H3 setup/bridge workflow nodes and
-  setup-owned paired Audio. Paired Audio remains unavailable pending its own
-  replacement design; Base physical keyframes use the existing Guides Bridge
-  with upstream `MiniMaxH3AddGuide`, without a Sonder-specific replacement.
-
-### Added
-- Writing mode now shows what each attached Reference actually contributes, as prose, under the channel it is staged in — so you can read the sentence your References will produce beside the sentence you are writing, without leaving the draft. That includes channels you have not written in yet, which is where most of a Reference's output usually goes. A capability that routes to a channel but resolves to nothing says so, and says which one it is.
-- Writing mode now completes `@` mentions. Typing `@` and the start of a
-  handle offers this project's References — both prompt identities and
-  physical sources — and Enter writes the handle, which compiles to the
-  format's own label.
-
-### Fixed
-- Large-project prompt compilation now moves its CPU-heavy compiler work off the server event loop,
-  project-version conflicts return only the fields needed to heal instead of serializing scenes and
-  assets, and project saves reuse one exact pretty-JSON serialization for both disk and compatibility
-  state while cleaning failed temporary writes.
-- Scene Undo and Redo now reverse only their own acknowledged edit through a conflict-checked three-way merge, preserving concurrent generated takes and other unrelated work while refusing unverifiable or genuinely conflicting history.
-- Generated video no longer starts on wrong content when the render window has to be rounded up to the model's frame rule. The rounded-up tail was filled with digital silence, and generation frequently keeps those filler frames rather than regenerating them - always when a channel is frozen, and also whenever the window carries post-context - so the silence reached the model as if it were real recording. The tail now mirrors the end of the window's own audio instead.
-- Global Reference chips now stay completely dormant when none of their selected References are staged: every capability, Summary task type, and shot claim stays out. Globals excluded by all effective sections report **not inherited** and cannot validate, warn, own, deduplicate, or render through that channel, while genuine integrity failures still refuse the render.
-- Structured and Global Prompt previews now measure their stale grace from the compile request instead of the preceding typing debounce, keep failed previews steadily explained until recovery, and avoid rebuilding unchanged projection chrome.
-- Prompt candidate previews now heal one project-version race from a fixed snapshot, retain same-scene stale projections on failure, and no longer blank the Context strip after a contribution write.
-- Prompt saves now accept browser-sparse records that normalize to the stored value, acknowledge the server's canonical row without overwriting newer typing, and keep real same-record conflicts recoverable per record.
-- Ordinary Prompt drafts no longer add a moving save advisory; failed saves use the fixed diagnostics region with Retry, server-version resolution, Dismiss, and row-specific Discard while editing remains live.
-- MiniMax H3 Summary guidance now states the scene-wide canonical task union and accumulated prose, and warns only for active linked peers that compete on the same Summary route.
-- MiniMax H3 Summary now emits one derived task prefix per channel while accumulating independent chip prose in final placement order; scoped diagnostics no longer mark healthy sibling projections invalid.
-- Global, Structured, and timeline Prompt edits now retain focused or refused drafts, merge only expected channel/chip records, serialize Prompt project settings, and stop template transforms while drafts remain pending.
-- Timeline prompt bars and optimistic queue rows now show the active format's resolved prompt content, while clipped bars keep authored prose first and full hover previews retain compiler order.
-- Clicking or right-clicking blank editor space beside or below a terminal Context chip now lands the caret at the chip boundary without disrupting native text selection, IME, or chip activation.
-- MiniMax H3 population slot limits now appear as non-blocking Prompt-tool advice after the resolver bounds the ordinal presentation to the node's available inputs.
-- The render queue now remains visible and expanded across Assets/References tab switches and returns to the mounted gallery after fullscreen; hidden Vocal Event controls no longer intercept prose clicks; and Reference Library scroll is preserved across same-scope mutations and loading/tab reveal while resetting across query, mode, draft, and project changes.
-- A field your References feed that the prompt format lists first now shows its contributions inside the section you wrote them in, rather than stacked at the top of the Writing draft — and it stays there while you type, instead of dropping to the bottom each time the preview catches up.
-- Writing mode no longer opens blank on a scene that has prompt sections, and Reset from sections no longer asks permission to discard a draft that is not there. An emptied draft was being treated as real work, which also meant a blank panel plus one Apply could clear every section in the scene.
-- Shot and Time markers in Writing mode now show what they contribute — `[Shot 1] At 00:00.000,` — instead of an internal note about the section composer, and are named as Shots rather than as References. Chips attached to a section were mislabelled the same way.
-- Splitting a section no longer stacks both halves' Reference contributions under the second one.
-- The Writing draft's compiled preview now shows the same sections Apply will write. Preview and Apply each built that projection separately, and after merging two sections the preview could still show a Prompt Link pointing at the section that was absorbed.
-- A Reference handle typed into a sentence now reads as ordinary inline text rather than as a bordered token. It previously broke the paragraph and repeated the Reference description after `@KWoman`; the editor now only paints the live spelling while keeping ordinary text selection, editing, copy, and paste behavior.
-- Applying a Writing draft no longer adds a blank line between every section each time. Repeated Applies had accumulated more than a dozen, and Reset from sections now also clears padding a project already built up.
-- Applying a Writing draft is no longer refused because the project changed. Any save anywhere in the project — moving a clip, importing an asset, editing another scene — used to mark every open draft stale, and the only offered recovery rebuilt the draft from the lane instead of applying what you wrote, so authored text had no way in at all. Apply now replaces the lane with your draft, as it says it does, and reports when it changes the number of sections.
-- A Writing draft is no longer discarded when Apply is refused. The refusal could arrive after the editor had already cleared the draft and reported success, taking the draft, its chips and the restore copy with it. Applying now also keeps a restorable copy of what it applied.
-- Undo no longer wipes the scene-wide prompt. Restoring any scene edit fed back a text-only mirror that is empty under MiniMax H3, clearing every global field with it. Undo now restores the global fields themselves.
-- Text pasted from Windows apps now keeps its field headers. Carriage returns stopped `detailed_description:` and the rest from being recognized, so headers were left as literal text and everything landed in one field. Existing drafts carrying them are repaired on load.
-- **Split here** now keeps you in the field you were writing in. Splitting
-  mid-paragraph under a heading used to send everything after the break to the
-  default field; the new section now carries that heading. It also tells you
-  when other fields in the section you are leaving will not come with it.
-- In Writing mode, text written above the first field header no longer becomes a
-  subject definition under MiniMax H3 (full reference). It now goes to the
-  body field — `detailed_description` — because that template leads with
-  `subject_definitions`, so "the first field" was the wrong place for narrative
-  prose. The panel names the field it will use, and a channel template can point
-  this anywhere; drafts written before this change keep landing where they always
-  did, so nothing already unapplied moves.
-- An unapplied Writing draft could be discarded without warning. Applying a
-  draft left behind an emptied record stamped with the current time, and those
-  records competed for the same forty slots as real ones — so enough applied
-  scenes would silently evict the one draft still holding unwritten work. The
-  emptied records are now dropped instead of hoarding a slot.
-- Prompt text can now cite a shot instead of hard-coding its number. Writing
-  `@shot(...)` against a Shot marker compiles to `[Shot 1]`, `[Shot 2]` and so
-  on, and the number follows the marker — adding a shot earlier in the scene
-  renumbers the citation instead of leaving it pointing at the wrong shot.
-  Citing a shot outside the render window is refused rather than compiling as
-  if it were there.
-- MiniMax H3 reference definitions and retention lines now get one line each
-  when they come from separate Reference chips, instead of being run together
-  into a single paragraph. Three Subjects described on three chips compiled as
-  one long line; MiniMax's own guide asks for a line per reference label. Prompts
-  using more than one Reference chip in these channels will compile differently
-  — and closer to the format — than they did before.
-- **Reset from sections** in Writing mode no longer throws your draft away. It
-  keeps a copy first and offers **Restore draft**, so the one control available
-  when Apply is locked is no longer the one that destroys unapplied work. The
-  copy survives a browser reload and is dropped once you Apply.
-- Writing drafts no longer overwrite each other between editor windows. Saving
-  or applying a draft rewrote the whole set of drafts from whatever snapshot
-  that window last read, reverting any draft another window had changed since;
-  each draft is now written on its own.
-- Escape now closes the dialog you are actually in. Pressing it over the
-  Reference attachment dialog, the writing-aid panel, the prompt format editor
-  or the format actions menu closed the Prompt tool behind them instead, leaving
-  the dialog stranded over a shut editor. Escape in the channel template editor
-  did nothing at all for the same reason, and now closes it.
-- A Reference chip now follows its Prompt Format when the format's declared
-  destination or placement changes, instead of staying where it was first
-  attached; per-part routing is stored only when it genuinely differs, so
-  **Provider default** and Reset work on it like every other field.
-- A refused prompt edit no longer leaves the Prompt tool showing text the server
-  rejected.
-- The identity and prompt format editors now confirm before a stray click or
-  Escape discards an unsaved draft; Cancel still discards immediately.
-- Dragging a Reference onto the timeline ruler creates a lane, matching how
-  clips and audio already behave, and lane highlighting during the drag now
-  matches what the drop will accept. A Reference mixing images and voice audio
-  is refused when the drag starts, with an explanation, rather than after it
-  lands.
-- Subject definitions no longer read `…combat boots. from <Picture 1>`; the
-  source citation is woven into the sentence.
-- The prompt format actions menu now closes from its own button, from an outside
-  click, and with Escape; unavailable actions are visibly dimmed and explain why
-  instead of appearing to do nothing.
-- Custom prompt formats can now actually be deleted. The actions menu lists every
-  custom format in the project instead of only the one currently selected — which
-  was always the one in use, and so always refused — and a format that cannot be
-  deleted is dimmed and names the scenes, channel template, or Reference recipe
-  still using it. Deleting now names the single format rather than rewriting the
-  whole list, so a format created in another window is no longer destroyed
-  alongside it.
-- Reference Prompting now fills in as soon as the scene compiles, instead of
-  showing every population as empty until the Prompt tool was closed and
-  reopened.
-- A Reference chip opened before its prompt format finishes loading now says that
-  format-declared fields are still loading, and that saved values are untouched,
-  instead of silently showing no task-type or handling rows at all.
-- Disabled editor buttons no longer highlight on hover, and the prompt section
-  `+` and `×` controls are the same size.
-- Prompt Context chips now wrap to two container-bounded lines, scope placement reads **After section prefixes**, routing rows use title-case capability labels and stack cleanly at constrained widths, and fullscreen background paste is ignored without an intrusive warning.
-- Fullscreen now owns background paste through the shared keyboard registry, refusing hidden graph paste while preserving native prompt-field paste; linked suppression uses a warning toast, and composer-owned Shot/Time markers no longer expose inert capability suppression.
-- Prompt editor paste now stays inside the active contenteditable, authored token-like prose gets a literal-text advisory, and deletion is pinned through canonical document, save/reload, candidate, and newly frozen queue state.
-- Reference/member deletion now prunes prompt-identity source and voice bindings,
-  and identities are explicitly authored/deletable instead of auto-minted by
-  the Reference Library.
-- Reference Context chips now derive their visible name from the bound prompt
-  identity or Library item and show the candidate compile emission. MiniMax
-  identity definitions inherit through the effective sparse attachment config,
-  then the authored identity and contributing Library member prompts; the
-  attachment menu identifies that source, disables speaker targets without a
-  Vocal Event in the render window, and exposes explicit Summary task-type
-  overrides while staged Roles remain the default.
-- Queue refusals now show the server diagnostic code and message. The Prompt
-  tool reports compile errors for the effective render window, marks the exact
-  affected Context chips, and treats no selection as the full-scene queue
-  window. Context insertion no longer closes inline bars, scope rows refresh
-  immediately, the Writing grip reaches its advertised height, and the Prompt
-  tool has more room for six-channel templates.
-- Reference lane identities now survive recipe edits, lane-count changes, and
-  undo/restore; MiniMax setup bindings are repointed or pruned atomically, and
-  stale unambiguous project bindings self-repair on load.
-
-### Added
+- Added a project-durable **Reference Library**: named Reference entities, each
+  holding one or more image, video, or audio members, with a one-line
+  Description, media-aware built-in tags alongside free-text custom ones,
+  per-member image and video crops, audio and video source trims, and a focused
+  editor that previews the full source beside the applied result. A tag
+  describing content is universal — **Motion Reference** — while one naming a
+  provider input slot carries its family, as **MiniMax H3 · Motion** does; every
+  surface from the Library to the live graph Selector resolves both from the same
+  declared label. An **Assets | References** switch opens the Library in both the
+  fullscreen and mounted editors. Asset **Where Used**, Trash warnings, and
+  permanent-deletion results now name Library memberships and identify which
+  edges a deletion removes.
+- Added scene-durable **Reference lanes**. Drop a Reference onto the timeline —
+  including onto the ruler, which creates a lane the way clips and audio already
+  do — and it occupies a range you can move, trim, hide, mute, or lock. A lane's
+  ☰ icon opens a setup overlay that leads with the staged items, marks which one
+  actually reaches the model for the current window, and shows the derived
+  prompt so it can be read and copied before you override it. Lane headers name
+  the recipe in use.
+- Reference lanes assemble their members through **recipes**: segmented subject
+  sequences, looped panel sheets, and equal-width strips, with built-in
+  templates that fork into editable project recipes. A recipe owns output size
+  (scene, native, or custom) plus a snap-to multiple, its frame grid, member cap,
+  and prompt convention — and its grid, snap multiple, and sheet loop length can
+  be pegged to the scene's model template or the render window instead of typed
+  once. Reference items also author conditioning strength and temporal sequence
+  length; video members serve their trimmed spans with streaming decode and
+  resampling.
+- Reference prompts take a per-member pattern with `{n}`, `{index}`, `{prompt}`
+  and `{name}` placeholders, usable more than once, so a recipe can compose
+  `<Subject 1> is a redhead woman, from <Picture 1>`. `{subject_n}`,
+  `{picture_n}`, `{audio_n}` and `{speaker_n}` number the same entity
+  identically on every lane, so an image lane and an audio lane staging one
+  character agree.
+- Added a project-wide **Reference Threshold**: a staged Reference is ignored
+  for a render window that covers too little of its own span. Reference items
+  show what a render will do with them — the item the current window sends to
+  the model takes an accent bar, while one another item supersedes, or one the
+  Threshold drops, is hatched with the reason. Queueing a batch warns when this
+  changes whether a lane resolves between chunks, naming the lane, the number of
+  chunks affected, and the remedy that applies.
+- Added guarded Nodes 2.0 **Sonder Reference Selector**, **Sonder Reference
+  Image Bridge**, **Sonder Reference Audio Bridge**, and **Sonder Reference
+  Prompt Bridge** nodes. The Selector combines several compatible lanes into one
+  stable, lane-ordered Reference set, with a lane dropdown, a status line, the
+  staged tags, and hover descriptions on every socket. The bridges are
+  type-homogeneous and their numbered blocks grow only to the staged or
+  connected-slot ceiling; outputs a recipe does not drive are marked unused on
+  both renderers, unstaged slots emit nothing, and a persistent canvas advisory
+  appears when that would starve a required input.
 - Added project-durable **Context chips** and canonical prompt documents across
-  timeline prompt bars and the Prompt tool's Structured and Writing modes.
-  Shot, Reference, Vocal Event, Prompt Link, and declarative Custom capabilities
-  now resolve from stable ids and the effective render
-  window; profile-owned Writing aids insert fixed syntax without an LLM.
-- Added immutable Prompt Context profiles (`generic@1`, MiniMax H3 Base, and
-  MiniMax H3 Full Reference), project-scoped semantic identities, exact live
-  compile diagnostics, collision-safe browser-template dependency closures,
-  and enqueue-frozen prompts/Relay/setup manifests.
-- Added project-unique physical/semantic handles, a section-scope live Prompt
-  Link with explicit copy/unlink actions, and a reload-safe Writing Source view
-  paired with read-only compiler output.
-- Added one scene-authoritative MiniMax H3 conditioning setup with typed Picture,
-  Video, and standalone Audio recipes and roles. The generic Reference bridges
-  follow the same frozen physical slot plan and late-bound ordinals as prompt
-  compilation.
-- Replaced the mixed 39-output Reference Bridge with separate, type-homogeneous
-  Image, Audio, and Prompt bridges. Their numbered blocks grow only to the
-  staged or connected-slot ceiling, keeping links index-safe while removing the
-  unusable wall of empty sockets.
-- Reference items now author conditioning strength and temporal sequence length.
-  Recipes can bound the short image edge and choose native, scene, or custom
-  reference frame rate; video members serve their trimmed spans with streaming
-  decode and resampling, and audio recipes can expose multiple members.
-- Prompt channels are now a project-wide template rather than a fixed three.
+  timeline prompt bars and the Prompt tool's Structured and Writing modes. Shot,
+  Reference, Vocal Event, Prompt Link, and declarative Custom capabilities
+  resolve from stable ids and the effective render window. A prompt section can
+  open a new Shot and optionally stamp its cut time, relative to the render
+  window, so the same Shot reads correctly whether you render the whole scene or
+  one slice of it. Prompt text can cite a shot rather than hard-code its
+  number — `@shot(...)` compiles to `[Shot 1]` and follows the marker when an
+  earlier shot is added.
+- Added immutable **Prompt Context profiles** (`generic@1`, MiniMax H3 Base, and
+  MiniMax H3 Full Reference) with project-scoped semantic identities, exact live
+  compile diagnostics, and enqueue-frozen prompts, Relay payloads, and setup
+  manifests. A prompt format declares what a Reference contributes — its name,
+  destination, placement, guidance, and bounded choices — and the editor reads
+  those declarations rather than carrying its own copy of a provider's
+  vocabulary, so switching formats changes the labels, help, and choices you
+  see.
+- Custom prompt formats can be authored in full: Reference prompt parts,
+  physical populations, identity kinds, roles, contributions, and speaker
+  policy, each behind its own disclosure. Formats can be forked, edited, and
+  deleted; a format that cannot be deleted is dimmed and names the scenes,
+  channel template, or Reference recipe still using it. A format can only be
+  chosen alongside a channel template it targets, so pairing MiniMax H3 (full
+  reference) with Standard channels is shown disabled rather than silently
+  claiming a format whose requirements the channels cannot carry.
+- Prompt formats declare **writing aids** — fixed syntax the editor inserts for
+  you, with no model call involved. An aid with nothing left to decide inserts
+  straight away, one with a single choice opens a submenu, and one needing
+  several opens a small panel; each menu row previews the text it will insert.
+  Select a line first and the aid wraps it: highlight a spoken line, pick
+  Dialogue, and it comes back in the format's own syntax. Aids are offered only
+  in the channels their format declares them for, so a soundscape or retention
+  field does not list dialogue and camera aids, and custom formats can edit an
+  existing aid's choices and channels rather than only setting them at creation.
+  MiniMax H3's camera aid follows H3's own documented grammar — motion type plus
+  optional amplitude and speed, across all twenty documented moves — while shot
+  distance, composition, depth of field, and field of view are available to
+  every format.
+- Physical References carry the same prompt defaults an Identity does, so a
+  Reference attached anywhere follows its own prompt text, preservation detail,
+  summary, and handling instead of needing every field retyped on every chip.
+  Whether a Reference contributes a prompt part at all is set once on the
+  Reference; where that part lands stays per-attachment, and a chip stores only
+  the fields you actually overrode.
+- Added project-unique **`@handles`**. Typing `@KWoman` in any prompt field
+  compiles to the active format's label and is marked live so you can see it
+  resolve. Because it is ordinary text it survives copy, cut, and paste, and
+  prose can name a handle that does not exist yet, wiring itself up when you
+  create it. `@` completion is offered in every prompt field. An `@` that is not
+  one of your handles — an email address included — is left exactly as written.
+- **Writing mode** now shows what each attached Reference contributes, as prose,
+  under the channel it is staged in, so you can read the sentence your
+  References will produce beside the sentence you are writing. That includes
+  channels you have not written in yet, which is where most of a Reference's
+  output usually goes; a capability that routes to a channel but resolves to
+  nothing says so, and says which one. A contribution can be copied out as text
+  you own, using live `@handles` wherever possible.
+- Writing mode now speaks channels. A line like `summary:` starts that channel
+  and `---` still splits sections, so a whole model output can be pasted in and
+  arranges itself. Previously every word in a draft landed in the Visual
+  channel.
+- Prompt channels are now a project-wide **template** rather than a fixed three.
   Pick one in Settings > Prompts: **Standard** (one plain channel and the
-  new-project default), **Visual + Speech + Sound** (the previous three), or **MiniMax H3** in
-  base and full-reference form. Each channel carries its own authoring guidance,
-  and each template owns whether its field names are written. Switching asks
-  first and says what it is about to rewrite, across every scene.
-- Channel templates now have their own Settings catalog. Built-ins are read-only
-  and offer **Save as Custom**; custom templates persist independently of the
-  project using them and support explicit new, copy, edit, delete, and default-
-  for-new-project actions. The editor covers channel keys and headers, guidance,
-  shot-marker placement, field-name policy, separators, and scene-global mode.
-  Channel-key changes rewrite text through the same guarded project transaction
-  as a template switch.
-- Prompt sections can open a new Shot and optionally stamp that Shot's cut time.
-  Times are relative to the render window, so the same Shot reads correctly
-  whether you render the whole scene or one slice of it.
+  new-project default), **Visual + Speech + Sound** (the previous three), or
+  **MiniMax H3** in base and full-reference form. Each channel carries its own
+  authoring guidance, and each template owns whether its field names are
+  written. Switching asks first and says what it is about to rewrite, across
+  every scene — text in channels the new template does not use is collapsed into
+  the first channel under its old channel name, visible and movable, and
+  switching back puts it where it was.
+- Channel templates have their own Settings catalog. Built-ins are read-only and
+  offer **Save as Custom**; custom templates persist independently of the project
+  using them and support new, copy, edit, delete, and default-for-new-project
+  actions, covering channel keys and headers, guidance, shot-marker placement,
+  field-name policy, separators, and scene-global mode.
 - The scene-global prompt is per channel too, so a style opening can sit at the
   head of the description rather than ahead of the whole prompt. Each prompt
   section chooses which global channels it takes; a global channel is written
   once, and only if some section in the render actually takes it. Templates that
-  turn per-channel globals off get a single global box instead, written ahead of
-  everything — and switching either way keeps the text.
-- The writing tool speaks channels. A line like `summary:` starts that channel
-  and `---` still splits sections, so a whole MiniMax-format model output can be
-  pasted in and arranges itself.
-- Switching channel templates now rewrites your text instead of hiding it. Text
-  in channels the new template does not use is collapsed into the first channel
-  under its old channel name, visible and movable; switching back puts it where
-  it was. The same applies when a saved prompt template was written under a
-  different channel set.
-- Library entries gained a one-line **Description** so a crowded Reference
-  Library stays readable when the name alone is not enough. It is project-only
-  and never enters a prompt — per-member prompt text is what reaches the model.
-- Reference prompt patterns gained `{subject_n}`, `{picture_n}`, `{audio_n}`
-  and `{speaker_n}`, which number the same entity identically on every lane —
-  an image lane and an audio lane staging one character agree. `{n}` keeps its
-  existing per-lane meaning.
-- Added scene-durable Reference lanes and scoped Reference items with drag/drop,
-  range editing, hide/mute/lock, undoable exact mutations, hard media-kind
-  enforcement, built-in and project-custom assembly recipes, and queue freezes.
-- Added guarded Nodes 2.0 **Sonder Reference Selector** and **Sonder Reference
-  Bridge** nodes with lazy effective-window presence, per-recipe image/audio
-  assembly (segmented subject sequences, looped panel sheets, equal-width
-  strips), a per-recipe output liveness map, fixed `r01`–`r16` workflow sockets
-  that follow the staged member count, and loud staged-media failures.
-- Added a project-durable Reference Library with conflict-safe atomic editing,
-  hybrid built-in/custom member tags, image/video crops, audio/video source trims, and an
-  **Assets | References** authoring switch in fullscreen and mounted editors.
-- Reference authoring now includes media-aware preset filtering, video members,
-  non-committing picker inspection, richer cards and Manage mode, plus a focused
-  visual crop/trim editor with full-source and applied-result preview.
-- Asset **Where Used**, Trash warnings, and permanent-deletion results now
-  include Reference Library memberships and identify which edges are removed.
-- Reference lanes now open a full setup overlay from the ☰ icon: the recipe's
-  assembly, geometry, frame grid, member cap, prompt convention and live Bridge
-  outputs are all shown and explained, built-in templates fork into editable
-  project recipes, and each staged item lists its Library members with a
-  searchable picker and reorder controls.
-- The Reference lane overlay leads with the staged items, marks which one
-  actually reaches the model for the current window, shows the derived prompt so
-  it can be read and copied before overriding it, and completes suggested member
-  tags on Tab.
-- Reference recipe geometry is now Output size (scene, native or custom) plus a
-  snap-to multiple that can be copied from the scene's model template.
-- Sonder Reference Selector gained a lane dropdown with a status line in place
-  of a bare index, every Reference socket gained a hover description, and Sonder
-  Reference Bridge marks every output a recipe does not drive — and every
-  numbered slot past the staged member count — as unused.
-- Reference lane headers show the recipe in use, and item bars show member tags
-  when there is room for them.
-- Reference recipe options now explain themselves: choosing an Assembly or a
-  Bridge output says what that choice does and what an unchecked output emits.
-- Reference recipe frame grid, snap multiple and sheet loop length can be pegged
-  to the scene's model template or to the render window instead of being typed
-  once, so they follow whatever model the scene uses.
-- Reference prompts take a per-member pattern with `{n}`, `{index}`, `{prompt}`
-  and `{name}` placeholders, usable more than once, so a recipe can compose
-  `<Subject 1> is a redhead woman, from <Picture 1>`. Each member's expansion is
-  also emitted on its own `p01`–`p16` Bridge output.
-- Added a project-wide Reference Threshold: a staged Reference is ignored for a
-  render window that covers too little of its own span. Queueing a batch warns
-  when this changes whether a lane resolves between chunks.
-- Sonder Reference Selector lists the tags of the references staged on the
-  selected lane.
-- Reference items now show what a render will do with them: the item the current
-  window sends to the model takes an accent bar, while one another item
-  supersedes, or one the Reference Threshold drops, is hatched with the reason.
-  The lane panel uses the same wording, and nothing is marked without a
-  selection.
-
-### Removed
-- Reference Library entries no longer carry **Notes**. Description replaced it —
-  the two overlapped, and neither had shipped. Existing note text is dropped.
-
-### Fixed
-
-- Reference entity visual/audio defaults and staged role/preservation overrides
-  now survive exact mutations, reload, undo, queue freezing, and compilation.
-  Image-only References may retain a dormant audio default without blocking
-  edits, and unsupported enum values are controlled validation errors.
-- Structured scene-global documents now outrank their flat mirrors in combined
-  mutations, and anchored flat replacement returns a controlled structured-edit
-  conflict. Internal project reads share the canonical project lock and retry
-  only short-lived Windows `PermissionError` races.
-- Prompt editors now claim keyboard events above the timeline/graph while
-  preserving native browser input. Space, arrows, deletion, and undo no longer
-  leak into the timeline or LiteGraph, and every inline chip has an accessible
-  remove action. The graph-load guard also covers ComfyUI builds whose undo
-  capture runs before extension listeners, while document history restores the
-  stable node/offset caret before continued typing.
-- Prompt Context compilation now chooses effective segment origins before
-  validation/emission, so dormant out-of-window chips cannot block a job or
-  steal Prompt Link fallback text from the earliest selected consumer. Live
-  candidate preview uses the same constraint-aware execution-window resolver
-  as enqueue.
-- Writing mode now round-trips muted state, global-channel exclusions, and
-  stable empty sections. Range deletion removes both an inline chip anchor and
-  its attachment record, and IME composition receives a real undo snapshot.
-- MiniMax H3 Reference setup creation now installs complete typed recipe
-  declarations. Physical Picture/Video/Audio definitions are authorable,
-  setup overflow is diagnosed instead of truncated, and managed
-  group/voiceover syntax follows the H3 guide.
-- Prompt section split now preserves global-channel exclusions; transitive
-  Prompt Links export their dependency edge by default; custom formatters are
-  bounded to 4 KiB and resolve both `{text}` and legacy `{value}`.
-- Legacy Timestamp-only prompt sections migrate to a timed Shot instead of
-  losing authored timing intent; new projects persist one Shot attachment with
-  a timestamp option.
-- Browser prompt templates now retain structured documents, inline/scope chips,
-  stable prompt ids, profile/setup state, semantic-unit dependencies, and muted
-  state instead of silently flattening or dropping them during settings reload.
-
-- **Apply in the prompt writing tool no longer erases the scene-global prompt.**
-  It rewrote sections correctly but handed the global text back through the flat
-  legacy field, which clears every channel past the first — so on a MiniMax or
-  custom channel set the whole global prompt vanished, and on the default set
-  the three channels were flattened into the first. Globals authored before this
-  fix and lost to it cannot be recovered.
-- The scene-global lane on the timeline shows its text again. The lane bar and
-  the hover preview read a legacy three-channel mirror, so any other channel set
-  drew "Global prompt (empty)" over text plainly visible in the inline editor.
-  The hover preview now lists the global text per channel, the way it already
-  did for prompt sections.
-- Reference Bridge outputs a recipe does not drive now read `(unused)` even when
-  something is plugged into them. `reference_frames` is wired in almost every
-  workflow, so it was the one output that could never show the mark — while
-  quietly feeding a black-frame fallback down that link.
-- Batching a scene with a Reference staged over part of the range no longer
-  reports it as a problem. The warning could not tell "this chunk is outside the
-  range you scoped" from "the Reference Threshold dropped a chunk this item does
-  cover", and blamed the threshold for both. Both are still announced, because
-  either one changes which sockets are wired mid-batch, but they now say which
-  happened and what to do about it — including when the item is simply muted or
-  its lane hidden.
-- A saved prompt template now comes back with all its text. A template saved
-  under a six-field MiniMax project used to reload with its section ranges
-  intact and every channel blank, because the browser-local settings normalizer
-  only knew the three original channel names. Templates saved before this fix
-  were emptied at rest and need re-saving.
-- Custom channel templates remain available after switching to a preset. Their
-  definitions now live in a browser catalog instead of only in the active
-  project's metadata, while projects keep an independent copy so catalog edits
-  never propagate silently.
-- Prompt history and browser prompt templates retain the full source channel
-  template and compare channel-key sets when applied. Custom ids no longer fall
-  through to the default, and same-structure MiniMax text is not needlessly
-  collapsed and reparsed.
-- Prompt boxes in the Prompt panel obey their drag-resize again, and the inline
-  prompt bar on the timeline no longer clips its lower half when a template with
-  many channels wraps it onto a second row.
-- Opening the inline prompt bar under a MiniMax template no longer throws while
-  trying to focus a channel that template does not have.
-- A queued job now freezes the complete resolved channel template, including
-  label policy. Later preset or custom-catalog edits cannot rewrite pending work,
-  while legacy jobs carrying a bare preset id plus the old label toggle retain
-  their original behavior.
-- A Reference member with a prompt pattern but no prompt text no longer renders
-  a dangling clause like `<Subject 2> is the  from <Picture 2>`; it falls back
-  to the Reference's name rather than vanishing while its image still reaches
-  the model.
-- Deleting a Reference now also clears it from any prompt section that named it,
-  across every scene.
-- Reference item-bar tags are legible again.
-- A pegged Reference recipe value now displays what the render will use instead
-  of the number it replaced, read-only, with its source beside it.
-- Reference batch warnings now name the lane, how many chunks were affected, and
-  the remedy that actually applies.
-- Sonder Reference Bridge `p01`-`p16` deliver their prompt text instead of image
-  data. Trimming the `r01`-`r16` block shifted the prompt sockets into image
-  positions; no Reference Bridge socket is removed any more, only marked.
-- Reference Bridge outputs a recipe does not drive now read as unused on Nodes
-  2.0 as well as legacy LiteGraph.
-- Prompt Links and Vocal Events are inserted into the prompt text, not attached
-  to the section as a whole. A section-level Prompt Link resolved to nothing and
-  a section-level Vocal Event was pushed to the end of the spoken order, both
-  silently. The scope row no longer offers either; any chip already sitting
-  there stays visible, is marked, and blocks the job until it is re-inserted or
-  removed.
-- A prompt format can only be chosen alongside a channel template it targets.
-  Pairing MiniMax H3 Full Reference with Standard channels previously skipped
-  every MiniMax requirement while still claiming the format; incompatible
-  choices are now shown disabled and refused on compile.
-- MiniMax H3 Base no longer re-invents its implicit conditioning setup on every
-  compile, so repeated previews agree with each other and with the live H3
-  Bridge selector.
-- A Vocal Event must name at least one Subject or a stable voice. Without one
-  the speaker number was minted from the chip's own id and referred to nobody.
-- MiniMax H3 Audio slots refuse a video that carries no audio track, in both
-  standalone and paired positions.
-- Malformed custom prompt formats are refused when saved instead of failing
-  during compilation, and an unusable format now blocks with a readable message
-  rather than a server error.
-- Over-cap Context attachments and capabilities are refused on save instead of
-  being silently trimmed, so authored work cannot disappear after a successful
-  save. Existing over-cap projects still load intact.
-- Context chips carrying a provider this build does not understand block instead
-  of rendering under guessed semantics, and custom-capability fields are held to
-  their declared names and values.
-- Overlapping Reference Context chips no longer print the same Subject twice,
-  and two chips that disagree about one Subject now report the conflict.
-- Prompt history keeps runs with identical text but different task modes or
-  conditioning setups as separate entries.
-- Enter, Escape, and Backspace pressed while an IME candidate window is open now
-  reach the IME instead of committing or discarding the prompt.
-- Reference deletion confirms conditioning intents whenever they have been
-  changed from their defaults, so a stale tab cannot delete work it never saw.
-- The MiniMax singing writing aid emits the bounded-language `<d>[…] …</d>`
-  envelope instead of the plain Generic form.
-- Disabled Reference capabilities no longer take part in validation, so a
-  capability that emits nothing cannot block a job.
+  turn per-channel globals off get a single global box written ahead of
+  everything, and switching either way keeps the text.
+- **MiniMax H3 (full reference)** carries H3's six reference-bearing sections and
+  is driven by Reference lanes. Set a Reference lane to Pictures, Videos, or
+  Audio and drop a Reference in, and it feeds the model — there is no separate
+  step that registers the lane. Lane order decides which is Picture 1; to leave
+  one out, hide the lane or mute the item. Picture, Video, and standalone Audio
+  populations flow through the generic Reference Selector and media-typed
+  bridges, and video is served as a 24 fps IMAGE sequence on the `17n+5` frame
+  grid.
+- **MiniMax H3** (base) carries the three core fields for text- and
+  keyframe-driven generation, with a setup authored in the Prompt tool: pick the
+  task mode — T2VA, I2VA, FL2VA, L2VA — and bind first- and last-frame Guide
+  anchors. **Treat this setup as provisional: it is superseded and will change.**
+  Placing a Guide on the timeline and driving ComfyUI's own Add Guide for MiniMax
+  H3 node from the Guides Bridge reaches the same first- and last-frame result
+  far more directly, and is the route to prefer. Do not build on the anchor
+  binding.
+- The **Masks Bridge** can now compile the generation window straight into hard
+  video and audio latent noise masks. Wire each half of a separated AV latent
+  together with its VAE, and feed the two new mask outputs to **Set Latent Noise
+  Mask** — no retyped frame rate, no seconds round-trip, and the context frames
+  outside the window are kept exactly. Geometry is read from the VAE, so it is
+  correct on LTX, MiniMax H3, and Wan with no per-model setting. On LTX, a graph
+  that also uses guides or a start image should drive kjnodes'
+  `LTXVAudioVideoMask` from the four time outputs instead. Note that a mask
+  replaces rather than composes, so it overwrites any pin a start-image or
+  continuation node set upstream.
 
 ### Changed
-- Timeline prompt bars now show one remembered active channel with hidden
-  non-empty indicators while retaining all channel editors, carets, undo state,
-  and one host-owned attachment registry. IME composition must finish before a
-  channel switch.
-- Reference setup uses progressive disclosure and friendlier terms: prompt
-  format, model input, prompt part, per-member options, Subject, and what to
-  preserve. Reference Context pickers list staged sources only and distinguish
-  section applicability from global authoring.
-- Reference members may carry an optional suffix. Displays use
-  `Reference · Member`; prompt patterns and `reference_names` use the normalized
-  composite token while `{entity_name}` and `{member_name}` offer explicit
-  custom-recipe control.
-- New projects start with **Standard** channels and **No Model Template**, a
-  model-agnostic one-field baseline. Existing projects and stored browser
-  defaults are unchanged.
 - **Visual + Speech + Sound now always emits `[VISUAL]:`, `[SPEECH]:`, and
-  `[SOUNDS]:` field names, including for released projects whose old Channel
-  Labels toggle was off.** The project-level toggle has been removed; Standard
-  remains unlabelled, both MiniMax templates remain labelled, and legacy queued
-  jobs replay their frozen setting.
-- Reference crop/trim preview now remembers Full Source versus Applied Result,
-  uses the shared gallery seek bar for audio and video, and makes audio
-  waveform-first with movable trim ranges and visible playback lines.
-- Reference image/video cropping now supports the timeline aspect presets plus
-  Free and user-entered Custom ratio locking.
+  `[SOUNDS]:` field names, including for existing projects whose Channel Labels
+  toggle was off.** The project-level toggle has been removed. Standard remains
+  unlabelled, both MiniMax templates remain labelled, and queued jobs replay
+  their frozen setting. Prompts from affected projects will compile differently
+  than they did in 0.2.2.
+- New projects start with **Standard** channels — one plain field — rather than
+  the three Visual/Speech/Sound channels. Existing projects are unchanged.
+- Timeline prompt bars now show one remembered active channel with indicators
+  for the non-empty channels that are hidden, rather than every channel's
+  textarea at once, while retaining all channel editors, carets, undo state, and
+  one host-owned attachment registry.
+- **Prompt Relay** and live Editor execution now compile through the same
+  project-aware Prompt Context compiler used by preview and enqueue, with
+  demand-gated blocking diagnostics instead of silent blank prompts.
+- New queue jobs carry an explicit `prompt_context_v1` envelope with complete
+  Prompt Context, template, and Reference freezes, including the resolved
+  channel template and its label policy, so later preset or catalog edits cannot
+  rewrite pending work. Jobs queued by 0.2.2 replay through an isolated
+  frozen-only composer and keep their original behavior.
 
 ### Fixed
-- Reference source inspection now resolves the requested image, audio, or video
-  independently of the Asset Gallery's active filters and last media type.
-- Focused Reference overlays now own Space, Escape, and geometry shortcuts
-  through the editor keyboard registry, open on a neutral focus target, restore
-  crop/trim focus on pointer interaction, suppress the neutral shell's visual
-  focus ring, and suppress the browser context menu.
-- Reference field help no longer displays a duplicate browser-native tooltip.
-- The external-links setting no longer shows a garbled ellipsis while its
-  server value loads.
+- Generated video no longer starts on wrong content when the render window has
+  to be rounded up to the model's frame rule. The rounded-up tail was filled
+  with digital silence, and generation frequently keeps those filler frames
+  rather than regenerating them — always when a channel is frozen, and whenever
+  the window carries post-context — so the silence reached the model as if it
+  were real recording. The tail now mirrors the end of the window's own audio.
+- An unapplied writing draft could be discarded without warning. Applying a
+  draft left behind an emptied record stamped with the current time, and those
+  records competed for the same forty slots as real ones — so enough applied
+  scenes would silently evict the one draft still holding unwritten work. The
+  emptied records are now dropped instead of hoarding a slot.
+- Writing drafts no longer overwrite each other between editor windows. Saving
+  or applying a draft rewrote the whole set of drafts from whatever snapshot
+  that window last read, reverting any draft another window had changed since;
+  each draft is now written on its own.
+- **Reset from sections** in Writing mode no longer throws your draft away. It
+  keeps a copy first and offers **Restore draft**, so the one control available
+  when Apply is locked is no longer the one that destroys unapplied work. The
+  copy survives a browser reload and is dropped once you Apply.
+- Scene Undo and Redo now reverse only their own acknowledged edit through a
+  conflict-checked three-way merge, preserving concurrent generated takes and
+  other unrelated work while refusing unverifiable or genuinely conflicting
+  history.
+- Large projects no longer stall on save and conflict handling. Project-version
+  conflicts return only the fields needed to heal instead of serializing every
+  scene and asset, and project saves reuse one exact pretty-JSON serialization
+  for both disk and compatibility state while cleaning up failed temporary
+  writes.
+- Prompt fields no longer leak keystrokes into the timeline or the graph. Space,
+  arrows, deletion, and undo were stopped only after LiteGraph's own
+  document-level handlers had already seen them, so typing in a prompt could
+  scrub playback or undo a graph edit. The guard also covers ComfyUI builds
+  whose undo capture runs before extension listeners.
+- Enter, Escape, and Backspace pressed while an IME candidate window is open now
+  reach the IME instead of committing or discarding the prompt.
+- Pasting into the fullscreen editor background no longer reaches the hidden
+  graph behind it. Fullscreen now owns background paste through the shared
+  keyboard registry while preserving native paste inside prompt fields.
+- The external-links setting no longer shows a garbled ellipsis while its server
+  value loads.
 
 ## [0.2.2] - 2026-08-13
 
