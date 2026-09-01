@@ -11,6 +11,8 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-01
+
 ### Added
 - Added a project-durable **Reference Library**: named Reference entities, each
   holding one or more image, video, or audio members, with a one-line
