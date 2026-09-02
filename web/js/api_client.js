@@ -2,6 +2,15 @@ const projectVersions = new Map();
 const projectAliases = new Map();
 const projectVersionListeners = new Set();
 let fetchPatchInstalled = false;
+let mutationRequestSequence = 0;
+const mutationRequestNamespace = (() => {
+    try {
+        if (typeof globalThis.crypto?.randomUUID === "function") {
+            return globalThis.crypto.randomUUID();
+        }
+    } catch (_) {}
+    return `${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
+})();
 
 const STALE_REPLAY_DELAYS_MS = [250, 1000, 4000];
 
@@ -11,6 +20,27 @@ function normalizeProjectId(projectId) {
 
 function methodIsMutating(method) {
     return !["GET", "HEAD", "OPTIONS"].includes(String(method || "GET").toUpperCase());
+}
+
+function nextMutationRequestId() {
+    mutationRequestSequence += 1;
+    return `mutation-${mutationRequestNamespace}-${mutationRequestSequence.toString(36)}`;
+}
+
+export function withMutationRequestDiagnostics(init = {}, attempt = 1) {
+    const headers = new Headers(init?.headers || {});
+    if (!headers.has("X-Sonder-Gesture-Id")) {
+        headers.set("X-Sonder-Gesture-Id", "");
+    }
+    if (!headers.has("X-Sonder-Gesture-Kind")) {
+        headers.set("X-Sonder-Gesture-Kind", "unscoped");
+    }
+    if (!headers.has("X-Sonder-Mutation-Coalesced-Count")) {
+        headers.set("X-Sonder-Mutation-Coalesced-Count", "1");
+    }
+    headers.set("X-Sonder-Request-Id", nextMutationRequestId());
+    headers.set("X-Sonder-Gesture-Attempt", String(Math.max(1, Number(attempt) || 1)));
+    return { ...init, headers };
 }
 
 function associateProjectIds(firstProjectId, secondProjectId) {
@@ -229,12 +259,16 @@ export async function postProjectJsonWithReconcile(
     let attempt = 0;
     while (true) {
         attempt += 1;
-        const explicitIfMatch = new Headers(init?.headers || {}).get("If-Match") || "";
+        // A retry is another physical request, not another user gesture. Keep
+        // the gesture headers supplied by the enqueue site, but mint request
+        // identity and attempt ordinal here for every actual send.
+        const attemptInit = withMutationRequestDiagnostics(init, attempt);
+        const explicitIfMatch = new Headers(attemptInit.headers || {}).get("If-Match") || "";
         const sentVersion = String(explicitIfMatch || getProjectVersion(projectId) || "")
             .replace(/^W\//, "")
             .replace(/^"|"$/g, "");
         try {
-            const result = await fetchProjectJson(url, init, { projectId });
+            const result = await fetchProjectJson(url, attemptInit, { projectId });
             return { ...result, attempts: attempt };
         } catch (error) {
             if (

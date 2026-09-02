@@ -4691,7 +4691,11 @@ console.log(JSON.stringify({{safe:safe.saved[0],options:safe.options,
         {"semantic_unit_id": "u", "name": "Person"},
         {"semantic_unit_id": "other", "name": "Concurrent"},
     ]
-    assert result["options"] == {"recordUndo": False}
+    assert result["options"] == {
+        "recordUndo": False,
+        "diagnostics": None,
+        "attempt": 1,
+    }
     assert result["refreshes"] == 1
     assert result["changedSaves"] == 0
     assert "changed elsewhere" in result["changedError"]

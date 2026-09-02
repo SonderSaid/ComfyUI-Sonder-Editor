@@ -131,6 +131,99 @@ def test_prompt_context_candidate_uses_constraint_aware_execution_window(monkeyp
     assert payload["window"]["end_frame"] == expected["render_end"]
 
 
+def test_mutation_route_entry_is_preparse_gated_and_bounded(monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    events = []
+    monkeypatch.setattr(
+        route_module, "record_diag_event",
+        lambda event, **payload: events.append((event, payload)))
+
+    class MalformedRequest(DummyRequest):
+        async def json(self):
+            raise json.JSONDecodeError("malformed", "{", 1)
+
+    async def malformed_handler(request):
+        assert len(events) == 1
+        try:
+            await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON body"}, status=400)
+        raise AssertionError("Malformed JSON unexpectedly parsed")
+
+    long_gesture_id = "g" * 300
+    request = MalformedRequest(
+        match_info={"project_id": "folder-project"},
+        method="POST",
+        path="/api/sonder-editor/project/folder-project/scenes/scene/mutations",
+        headers={
+            "X-Sonder-Gesture-Id": long_gesture_id,
+            "X-Sonder-Gesture-Kind": "moveItem",
+            "X-Sonder-Request-Id": "mutation-7",
+            "X-Sonder-Gesture-Attempt": "2",
+            "X-Sonder-Mutation-Coalesced-Count": "3",
+        },
+    )
+    response = asyncio.run(route_module._route_timing_middleware(
+        request, malformed_handler))
+
+    assert response.status == 400
+    assert events == [("mutation_route_entry", {
+        "project_id": "folder-project",
+        "path": "/api/sonder-editor/project/folder-project/scenes/scene/mutations",
+        "method": "POST",
+        "gesture_id": "g" * 256,
+        "gesture_kind": "moveItem",
+        "request_id": "mutation-7",
+        "attempt": "2",
+        "coalesced_count": "3",
+    })]
+
+    events.clear()
+    unscoped_request = DummyRequest(
+        match_info={"project_id": "folder-project"},
+        method="POST",
+        path="/api/sonder-editor/project/folder-project/scenes/scene/mutations")
+    asyncio.run(route_module._route_timing_middleware(
+        unscoped_request, lambda _request: asyncio.sleep(
+            0, result=web.json_response({"ok": True}))))
+    assert events == [("mutation_route_entry", {
+        "project_id": "folder-project",
+        "path": "/api/sonder-editor/project/folder-project/scenes/scene/mutations",
+        "method": "POST",
+        "gesture_id": "",
+        "gesture_kind": "unscoped",
+        "request_id": "",
+        "attempt": "",
+        "coalesced_count": "",
+    })]
+
+    events.clear()
+    for read_shaped_path in (
+        "/api/sonder-editor/session/folder-project/heartbeat",
+        "/api/sonder-editor/project/folder-project/scenes/scene/prompt-context/compile",
+        "/api/sonder-editor/project/folder-project/reveal",
+        "/api/sonder-editor/project/folder-project/assets/bulk-usages",
+    ):
+        read_shaped_request = DummyRequest(
+            match_info={"project_id": "folder-project"},
+            method="POST",
+            path=read_shaped_path)
+        asyncio.run(route_module._route_timing_middleware(
+            read_shaped_request, lambda _request: asyncio.sleep(
+                0, result=web.json_response({"ok": True}))))
+    assert events == []
+
+    events.clear()
+    get_request = DummyRequest(
+        match_info={"project_id": "folder-project"},
+        method="GET",
+        path="/api/sonder-editor/project/folder-project/scenes")
+    asyncio.run(route_module._route_timing_middleware(
+        get_request, lambda _request: asyncio.sleep(
+            0, result=web.json_response({"ok": True}))))
+    assert events == []
+
+
 def test_prompt_context_candidate_cpu_helper_is_off_loop_and_route_entry_is_countable(
         monkeypatch):
     route_module = _load_route_module(monkeypatch)

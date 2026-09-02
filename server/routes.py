@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import threading
 import time
@@ -427,8 +428,60 @@ except Exception:
 _ROUTE_TIMING_THRESHOLD_S = 0.5
 
 
+def _diagnostic_header(request: web.Request, name: str) -> str:
+    """Bound client correlation text before it reaches the diagnostic ring."""
+    return str(request.headers.get(name, "") or "")[:256]
+
+
+_READ_SHAPED_POST_ROUTES = (
+    re.compile(r"^/sonder-editor/project/[^/]+/prompt-context/profiles/verify$"),
+    re.compile(r"^/sonder-editor/project/[^/]+/scenes/[^/]+/prompt-context/compile$"),
+    re.compile(r"^/sonder-editor/project/[^/]+/reveal$"),
+    re.compile(r"^/sonder-editor/project/[^/]+/assets/bulk-usages$"),
+)
+
+
+def _is_mutation_diagnostic_request(method: str, path: str) -> bool:
+    if method in {"GET", "HEAD", "OPTIONS"}:
+        return False
+    sonder_path = _sonder_route_path(path)
+    if not sonder_path.startswith("/sonder-editor/"):
+        return False
+    # Session ownership already has dedicated diagnostic events and its 5/10 s
+    # presence traffic would evict the bounded physical-write evidence ring.
+    if sonder_path.startswith("/sonder-editor/session/"):
+        return False
+    if method == "POST" and any(
+            pattern.fullmatch(sonder_path) for pattern in _READ_SHAPED_POST_ROUTES):
+        return False
+    return True
+
+
 @web.middleware
 async def _route_timing_middleware(request: web.Request, handler):
+    path = request.path or ""
+    method = str(request.method or "").upper()
+    if _is_mutation_diagnostic_request(method, path):
+        try:
+            # Diagnostic correlation only, never request authority. Retain while
+            # roadmap work still cites physical write-request counts.
+            record_diag_event(
+                "mutation_route_entry",
+                project_id=str(request.match_info.get("project_id", "") or ""),
+                path=path,
+                method=method,
+                gesture_id=_diagnostic_header(request, "X-Sonder-Gesture-Id"),
+                gesture_kind=(
+                    _diagnostic_header(request, "X-Sonder-Gesture-Kind")
+                    or "unscoped"
+                ),
+                request_id=_diagnostic_header(request, "X-Sonder-Request-Id"),
+                attempt=_diagnostic_header(request, "X-Sonder-Gesture-Attempt"),
+                coalesced_count=_diagnostic_header(
+                    request, "X-Sonder-Mutation-Coalesced-Count"),
+            )
+        except Exception:
+            logger.debug("route timing middleware failed to emit mutation entry", exc_info=True)
     started = time.monotonic()
     response = None
     try:
@@ -438,7 +491,6 @@ async def _route_timing_middleware(request: web.Request, handler):
         elapsed = time.monotonic() - started
         if elapsed >= _ROUTE_TIMING_THRESHOLD_S:
             try:
-                path = request.path or ""
                 if _sonder_route_path(path).startswith("/sonder-editor/"):
                     project_id = ""
                     try:
@@ -8708,16 +8760,13 @@ if routes is not None:
         all candidate copying, overlays, window resolution and compilation run
         in a worker against this request's private project instance.
         """
-        def _diagnostic_header(name: str) -> str:
-            return str(request.headers.get(name, "") or "")[:256]
-
         record_diag_event(
             "prompt_context_compile_route_entry",
             project_id=str(request.match_info.get("project_id", "") or ""),
             scene_id=str(request.match_info.get("scene_id", "") or ""),
-            purpose=_diagnostic_header("X-Sonder-Prompt-Purpose"),
-            request_id=_diagnostic_header("X-Sonder-Prompt-Request-Id"),
-            attempt=_diagnostic_header("X-Sonder-Prompt-Attempt"),
+            purpose=_diagnostic_header(request, "X-Sonder-Prompt-Purpose"),
+            request_id=_diagnostic_header(request, "X-Sonder-Prompt-Request-Id"),
+            attempt=_diagnostic_header(request, "X-Sonder-Prompt-Attempt"),
         )
         try:
             body = await request.json()
@@ -11022,9 +11071,6 @@ if routes is not None:
         uses its frozen compiled window and Reference rows, so socket shape and
         labels cannot drift while a job is executing.
         """
-        def _diagnostic_header(name: str) -> str:
-            return str(request.headers.get(name, "") or "")[:256]
-
         # Unlike route_blocking, this event is emitted at entry and is therefore
         # present even for fast responses. It proves physical request count; the
         # client-provided ids are diagnostic correlation only, never authority.
@@ -11032,9 +11078,9 @@ if routes is not None:
             "bridge_references_route_entry",
             project_id=str(request.match_info.get("project_id", "") or ""),
             rel_url=str(request.rel_url),
-            request_id=_diagnostic_header("X-Sonder-Reference-Request-Id"),
-            generation=_diagnostic_header("X-Sonder-Reference-Generation"),
-            origin=_diagnostic_header("X-Sonder-Reference-Origin"),
+            request_id=_diagnostic_header(request, "X-Sonder-Reference-Request-Id"),
+            generation=_diagnostic_header(request, "X-Sonder-Reference-Generation"),
+            origin=_diagnostic_header(request, "X-Sonder-Reference-Origin"),
         )
         try:
             project = await asyncio.to_thread(_load_project_from_request, request)

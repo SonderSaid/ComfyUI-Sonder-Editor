@@ -46,6 +46,14 @@ let _sessionDiagRafGapHandle = 0;
 let _sessionDiagLastRafTs = 0;
 let _sessionDiagLongTaskObserver = null;
 let _sessionDiagCaptureSeq = 0;
+const _sessionDiagMarkerNamespace = (() => {
+    try {
+        if (typeof globalThis.crypto?.randomUUID === "function") {
+            return globalThis.crypto.randomUUID();
+        }
+    } catch (_) {}
+    return `${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
+})();
 
 function rotateSessionDiagCaptureId() {
     if (typeof window === "undefined") return "";
@@ -195,11 +203,14 @@ function sessionDiagRecord(kind, payload) {
     surface.record(kind, payload || {});
 }
 
-function sessionDiagBeginLoad(kind, payload) {
+function sessionDiagBeginLoad(kind, payload, preferredMarkerId = "") {
     if (!isSessionDiagEnabled()) return "";
     _sessionDiagInit();
-    _sessionDiagLoadMarkerSeq += 1;
-    const markerId = `${kind}-${_sessionDiagLoadMarkerSeq}`;
+    let markerId = String(preferredMarkerId || "");
+    if (!markerId) {
+        _sessionDiagLoadMarkerSeq += 1;
+        markerId = `${kind}-${_sessionDiagMarkerNamespace}-${_sessionDiagLoadMarkerSeq}`;
+    }
     _sessionDiagInFlightMarkerId = markerId;
     _sessionDiagInFlightKind = kind;
     sessionDiagRecord(`${kind}_start`, { marker_id: markerId, ...(payload || {}) });
@@ -375,6 +386,7 @@ import {
     rememberProjectVersionFromPayload,
     rememberProjectVersionFromResponse,
     resetProjectVersion,
+    withMutationRequestDiagnostics,
 } from "./api_client.js";
 import {
     allocateAssetRefreshWave,
@@ -669,6 +681,7 @@ export class EditorWidget {
         this._pendingProjectRefreshKeys = null;
         this._pendingProjectRefreshDrain = false;
         this._timelineMutationDepth = 0;
+        this._activeMutationGesture = null;
         this._sceneFetchSeq = 0;
         this._sceneMutationInvalidationSeq = 0;
         this._queueFetchSeq = 0;
@@ -1108,18 +1121,86 @@ export class EditorWidget {
             });
     }
 
+    _withMutationGesture(kind, callback, preferredMarkerId = "") {
+        // Ambient state exists only while the callback is invoked synchronously.
+        // That preserves true call-stack nesting without merging an independent
+        // gesture that starts while the first gesture's network promise drains.
+        if (this._activeMutationGesture) return callback(this._activeMutationGesture);
+        const gestureKind = String(kind || "unscoped");
+        const gestureId = sessionDiagBeginLoad(
+            "gesture", { gesture_kind: gestureKind }, preferredMarkerId);
+        const gesture = { gestureId: String(gestureId || ""), gestureKind,
+            coalescedCount: 1 };
+        const previousGesture = this._activeMutationGesture;
+        this._activeMutationGesture = gesture;
+        let result;
+        try {
+            result = callback(gesture);
+        } catch (error) {
+            sessionDiagEndLoad("gesture", gestureId, { gesture_kind: gestureKind });
+            throw error;
+        } finally {
+            if (this._activeMutationGesture === gesture) {
+                this._activeMutationGesture = previousGesture;
+            }
+        }
+        if (result && typeof result.then === "function") {
+            return Promise.resolve(result).finally(() => {
+                sessionDiagEndLoad("gesture", gestureId, { gesture_kind: gestureKind });
+            });
+        }
+        sessionDiagEndLoad("gesture", gestureId, { gesture_kind: gestureKind });
+        return result;
+    }
+
+    _snapshotMutationDiagnostics() {
+        return {
+            gestureId: String(this._activeMutationGesture?.gestureId || ""),
+            gestureKind: String(this._activeMutationGesture?.gestureKind || "unscoped"),
+            coalescedCount: 1,
+        };
+    }
+
+    _mutationDiagnosticHeaders(diagnostics = {}) {
+        const gestureId = String(diagnostics?.gestureId || "");
+        return {
+            "X-Sonder-Gesture-Id": gestureId,
+            "X-Sonder-Gesture-Kind": gestureId
+                ? String(diagnostics?.gestureKind || "unscoped")
+                : "unscoped",
+            "X-Sonder-Mutation-Coalesced-Count": String(
+                Math.max(1, Number(diagnostics?.coalescedCount) || 1)),
+        };
+    }
+
+    _withMutationDiagnosticHeaders(init = {}, diagnostics = {}) {
+        const headers = new Headers(init?.headers || {});
+        for (const [name, value] of Object.entries(
+                this._mutationDiagnosticHeaders(diagnostics))) {
+            headers.set(name, value);
+        }
+        return { ...init, headers };
+    }
+
+    _withMutationRequestDiagnostics(init = {}, attempt = 1) {
+        return withMutationRequestDiagnostics(init, attempt);
+    }
+
     async _withTimelineMutationCommit(kind, callback) {
         this._timelineMutationDepth += 1;
         sessionDiagRecord("timeline_mutation_commit_start", {
-            kind,
+            mutation_kind: kind,
             mutation_depth: this._timelineMutationDepth,
         });
         try {
-            return await callback();
+            // Synchronous call-stack nesting reuses the active gesture inside
+            // _withMutationGesture. Async overlap after a prior callback yields
+            // is a distinct user action even while timeline depth remains > 1.
+            return await this._withMutationGesture(kind, callback);
         } finally {
             this._timelineMutationDepth = Math.max(0, this._timelineMutationDepth - 1);
             sessionDiagRecord("timeline_mutation_commit_end", {
-                kind,
+                mutation_kind: kind,
                 mutation_depth: this._timelineMutationDepth,
             });
             if (this._timelineMutationDepth === 0) {
@@ -2112,14 +2193,23 @@ export class EditorWidget {
 
     async _savePromptSemanticUnits(units, label = "edit prompt identities", {
         recordUndo = true,
+        diagnostics = null,
+        attempt = 1,
     } = {}) {
         if (!this.projectDir) return null;
         const before = this._captureProjectDependencies();
         const dirName = this._projectDirName();
+        const init = { method: "PUT", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ prompt_semantic_units: units }) };
+        const gestureInit = typeof this._withMutationDiagnosticHeaders === "function"
+            ? this._withMutationDiagnosticHeaders(init, diagnostics)
+            : init;
+        const requestInit = typeof this._withMutationRequestDiagnostics === "function"
+            ? this._withMutationRequestDiagnostics(gestureInit, attempt)
+            : gestureInit;
         const { payload } = await fetchProjectJson(
             api.apiURL(`/sonder-editor/project/${encodeURIComponent(dirName)}`),
-            { method: "PUT", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ prompt_semantic_units: units }) },
+            requestInit,
             { projectId: dirName },
         );
         this._promptSemanticUnits = Array.isArray(payload?.prompt_semantic_units)
@@ -2140,6 +2230,7 @@ export class EditorWidget {
      */
     async _applyPromptIdentityChange(change, label = "edit prompt identity", {
         recordUndo = true,
+        diagnostics = null,
     } = {}) {
         if (!this.projectDir) return null;
         const refreshed = await this._fetchReferences({
@@ -2160,8 +2251,9 @@ export class EditorWidget {
         if (alreadyApplied(this._promptSemanticUnits)) {
             return this._promptSemanticUnits;
         }
-        const saveAgainst = async (units) => this._savePromptSemanticUnits(
-            applyPromptIdentityChange(units || [], change), label, { recordUndo });
+        const saveAgainst = async (units, attempt = 1) => this._savePromptSemanticUnits(
+            applyPromptIdentityChange(units || [], change), label,
+            { recordUndo, diagnostics, attempt });
         const reconcileUnknownOutcome = async (error) => {
             const reconciled = await this._fetchReferences({
                 ignoreMutationGate: true,
@@ -2179,7 +2271,7 @@ export class EditorWidget {
             throw error;
         };
         try {
-            return await saveAgainst(this._promptSemanticUnits || []);
+            return await saveAgainst(this._promptSemanticUnits || [], 1);
         } catch (error) {
             if (error?.code === "project_version_conflict"
                     && Array.isArray(error?.project?.prompt_semantic_units)) {
@@ -2196,7 +2288,7 @@ export class EditorWidget {
                     return this._promptSemanticUnits;
                 }
                 try {
-                    return await saveAgainst(this._promptSemanticUnits);
+                    return await saveAgainst(this._promptSemanticUnits, 2);
                 } catch (retryError) {
                     return reconcileUnknownOutcome(retryError);
                 }
@@ -2207,7 +2299,7 @@ export class EditorWidget {
         }
     }
 
-    async _applyReferenceHistoryOperations(operations, label) {
+    async _applyReferenceHistoryOperations(operations, label, diagnostics = null) {
         const requested = Array.isArray(operations) ? operations : [];
         const stateFor = (operation) => {
             const memberId = String(operation?.member_id || "");
@@ -2229,7 +2321,7 @@ export class EditorWidget {
         }
         if (alreadyApplied()) return true;
         try {
-            await this._mutateReferences(requested, label);
+            await this._mutateReferences(requested, label, diagnostics);
             return true;
         } catch (error) {
             const reconciled = await this._fetchReferences({
@@ -2365,7 +2457,7 @@ export class EditorWidget {
         }
     }
 
-    _mutateReferences(operations, label = "Reference Library change") {
+    _mutateReferences(operations, label = "Reference Library change", diagnostics = null) {
         if (!this.projectDir || !Array.isArray(operations) || !operations.length) return Promise.resolve(null);
         const projectDir = this.projectDir;
         const dirName = this._projectDirName();
@@ -2375,17 +2467,19 @@ export class EditorWidget {
             label,
             coalesce: false,
             intent: operations,
+            diagnostics,
             refreshScenes: false,
             refreshKeysOnError: ["references"],
             failureMessage: (error) => error?.code === "identity_mismatch"
                 ? "Reference changed elsewhere — Library refreshed."
                 : "Reference Library change failed.",
-            run: async (queuedOperations) => {
+            run: async (queuedOperations, diagnostics) => {
                 const result = await this._runVersionedProjectMutation(
                     `/sonder-editor/project/${encodeURIComponent(dirName)}/references/mutations`,
                     {
                         method: "POST",
-                        headers: { "Content-Type": "application/json" },
+                        headers: { "Content-Type": "application/json",
+                            ...this._mutationDiagnosticHeaders(diagnostics) },
                         body: JSON.stringify({ operations: queuedOperations }),
                     },
                     { projectId: dirName, retryOnConflict: true, maxAttempts: 2 },
@@ -3148,6 +3242,7 @@ export class EditorWidget {
         retryOnConflict = true,
         invalidateQueueFetch = false,
         historyEntry = null,
+        diagnostics = null,
     }) {
         // Invalidate any in-flight scenes GET when a mutation is enqueued.
         // Mutation invalidation is deliberately separate from fetch dispatch
@@ -3171,6 +3266,20 @@ export class EditorWidget {
         if (capturedHistoryEntry) {
             this._pendingHistoryEntryByMutationKey.set(key, capturedHistoryEntry);
         }
+        // Capture at enqueue. The queue may not send this request until a much
+        // later gesture is active, and coalescing deliberately replaces this
+        // object with the last surviving gesture's closure.
+        const sourceDiagnostics = diagnostics
+            ?? (typeof this._snapshotMutationDiagnostics === "function"
+                ? this._snapshotMutationDiagnostics()
+                : null);
+        // The coalesced count belongs to this physical queue entry. A composite
+        // gesture may enqueue several writes under one gesture object, so never
+        // let one entry mutate the shared gesture's count.
+        const mutationDiagnostics = sourceDiagnostics
+                && typeof sourceDiagnostics === "object"
+            ? { ...sourceDiagnostics, coalescedCount: 1 }
+            : sourceDiagnostics;
         const queuedIntent = { payload: intent, historyEntry: capturedHistoryEntry };
         const wrappedMerge = typeof merge === "function"
             ? (oldValue, nextValue) => ({
@@ -3186,8 +3295,9 @@ export class EditorWidget {
             coalesce,
             merge: wrappedMerge,
             intent: queuedIntent,
-            run: async (queuedValue) => {
-                const result = await run(queuedValue?.payload);
+            diagnostics: mutationDiagnostics,
+            run: async (queuedValue, queuedDiagnostics) => {
+                const result = await run(queuedValue?.payload, queuedDiagnostics);
                 this._stampHistoryPostSnapshot(
                     queuedValue?.historyEntry, result?.payload?.scene);
                 return result;
@@ -3252,6 +3362,7 @@ export class EditorWidget {
         retryOnConflict = true,
         expectedModifiedAt = "",
         historyEntry = null,
+        diagnostics = null,
     } = {}) {
         const context = this._snapshotProjectMutationContext();
         if (!context) return Promise.resolve(null);
@@ -3276,12 +3387,14 @@ export class EditorWidget {
             failureDetail,
             failureTier,
             historyEntry,
-            run: async (queuedIntent) => {
+            diagnostics,
+            run: async (queuedIntent, diagnostics) => {
                 return await this._runVersionedProjectMutation(
                     `/sonder-editor/project/${encodeURIComponent(queuedIntent.projectId)}/scenes/${encodeURIComponent(queuedIntent.sceneId)}/mutations`,
                     {
                         method: "POST",
                         headers: { "Content-Type": "application/json",
+                            ...this._mutationDiagnosticHeaders(diagnostics),
                             ...(expectedModifiedAt
                                 ? { "If-Match": expectedModifiedAt } : {}) },
                         body: JSON.stringify({ operations: queuedIntent.operations }),
@@ -3415,12 +3528,13 @@ export class EditorWidget {
             refreshKeysOnError: ["queue"],
             failureMessage: "Render queue change failed — queue restored.",
             invalidateQueueFetch: true,
-            run: async (queuedIntent) => {
+            run: async (queuedIntent, diagnostics) => {
                 const result = await this._runVersionedProjectMutation(
                     `/sonder-editor/project/${encodeURIComponent(queuedIntent.projectId)}/queue/mutations`,
                     {
                         method: "POST",
-                        headers: { "Content-Type": "application/json" },
+                        headers: { "Content-Type": "application/json",
+                            ...this._mutationDiagnosticHeaders(diagnostics) },
                         body: JSON.stringify({ operations: queuedIntent.operations }),
                     },
                     { projectId: queuedIntent.projectId }
@@ -8647,6 +8761,16 @@ export class EditorWidget {
     }
 
     async _handleAssetDrop(asset, frame, trackRawY) {
+        const dropSeq = `${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
+        return this._withMutationGesture(
+            "assetDrop",
+            (diagnostics) => this._handleAssetDropWithinGesture(
+                asset, frame, trackRawY, dropSeq, diagnostics),
+            dropSeq,
+        );
+    }
+
+    async _handleAssetDropWithinGesture(asset, frame, trackRawY, dropSeq, diagnostics) {
         if (!this.activeScene || !this.projectDir) return;
         if (asset?.asset_type === "artifact") {
             this._showToast("Artifact assets cannot be added to the timeline.");
@@ -8740,20 +8864,25 @@ export class EditorWidget {
             });
             this._renderSceneAfterLocalMutation();
             try {
-                const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/clips`), {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        asset_id: asset.asset_id,
-                        timeline_start_frame: frame,
-                        track_index: targetMotionDriverLane,
-                        role: "motion_driver",
-                        strength: this._defaultMotionDriverStrength(),
-                        dual_drop: false,
-                        fit_mode: this._defaultFitMode(),
-                        crop_position: this._defaultCropPosition(),
-                    }),
-                });
+                const resp = await fetch(
+                    api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/clips`),
+                    this._withMutationRequestDiagnostics(
+                        this._withMutationDiagnosticHeaders({
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({
+                                asset_id: asset.asset_id,
+                                timeline_start_frame: frame,
+                                track_index: targetMotionDriverLane,
+                                role: "motion_driver",
+                                strength: this._defaultMotionDriverStrength(),
+                                dual_drop: false,
+                                fit_mode: this._defaultFitMode(),
+                                crop_position: this._defaultCropPosition(),
+                            }),
+                        }, diagnostics),
+                    ),
+                );
                 if (!resp.ok) {
                     const message = await readResponseError(resp, `Driver clip creation failed: ${resp.status}`);
                     console.warn("[Sonder] Driver clip creation failed:", resp.status, message);
@@ -8883,15 +9012,18 @@ export class EditorWidget {
         // (incl. the lane PUT's deliberate silent revert) — do not "fix" the
         // sentinel into a rejection or failures will double-toast.
         // Per-drop key token + coalesce:false so rapid drops never coalesce.
-        const dropSeq = `${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
         const queueDropMutation = (keySuffix, label, path, init) => this._queueProjectMutation({
             key: `scene:${this.activeSceneId}:drop:${dropSeq}:${keySuffix}`,
             label,
             coalesce: false,
             refreshScenes: false,
-            run: async () => {
+            diagnostics,
+            run: async (_intent, diagnostics) => {
                 try {
-                    const result = await this._runVersionedProjectMutation(path, init, { projectId: dirName });
+                    const result = await this._runVersionedProjectMutation(
+                        path,
+                        this._withMutationDiagnosticHeaders(init, diagnostics),
+                        { projectId: dirName });
                     return { ok: true, payload: result?.payload };
                 } catch (error) {
                     return { ok: false, error };
@@ -8948,11 +9080,16 @@ export class EditorWidget {
                 });
                 this._applyLocalCreateGuide(guideFields);
                 this._renderSceneAfterLocalMutation();
-                resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/guides`), {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(guideFields),
-                });
+                resp = await fetch(
+                    api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/guides`),
+                    this._withMutationRequestDiagnostics(
+                        this._withMutationDiagnosticHeaders({
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify(guideFields),
+                        }, diagnostics),
+                    ),
+                );
                 if (!resp.ok) {
                     const message = await readResponseError(resp, `Guide creation failed: ${resp.status}`);
                     console.warn("[Sonder] Guide creation failed:", resp.status, message);
@@ -18173,16 +18310,26 @@ export class EditorWidget {
         this._redoStack = [];
     }
 
-    async _restoreProjectDependencies(snapshot) {
+    async _restoreProjectDependencies(snapshot, diagnostics = null) {
         if (!this.projectDir) return;
         const dirName = this._projectDirName();
+        const init = {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                prompt_context_profiles: snapshot?.prompt_context_profiles || [],
+                prompt_semantic_units: snapshot?.prompt_semantic_units || [],
+            }),
+        };
+        const gestureInit = typeof this._withMutationDiagnosticHeaders === "function"
+            ? this._withMutationDiagnosticHeaders(init, diagnostics)
+            : init;
+        const requestInit = typeof this._withMutationRequestDiagnostics === "function"
+            ? this._withMutationRequestDiagnostics(gestureInit)
+            : gestureInit;
         const { payload } = await fetchProjectJson(
             api.apiURL(`/sonder-editor/project/${encodeURIComponent(dirName)}`),
-            { method: "PUT", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    prompt_context_profiles: snapshot?.prompt_context_profiles || [],
-                    prompt_semantic_units: snapshot?.prompt_semantic_units || [],
-                }) },
+            requestInit,
             { projectId: dirName },
         );
         this._promptContextProfiles = Array.isArray(payload?.prompt_context_profiles)
@@ -18262,6 +18409,14 @@ export class EditorWidget {
     }
 
     async _runUndo() {
+        if (typeof this._withMutationGesture === "function") {
+            return this._withMutationGesture(
+                "undo", (diagnostics) => this._runUndoWithinGesture(diagnostics));
+        }
+        return this._runUndoWithinGesture(null);
+    }
+
+    async _runUndoWithinGesture(diagnostics = null) {
         if (this._undoStack.length === 0) {
             this._keyboardDebug("undo skipped: empty stack", {
                 activeSceneId: this.activeSceneId || "",
@@ -18293,7 +18448,7 @@ export class EditorWidget {
                 snapshot: this._captureProjectDependencies(), label: entry.label,
             };
             try {
-                await this._restoreProjectDependencies(entry.snapshot);
+                await this._restoreProjectDependencies(entry.snapshot, diagnostics);
             } catch (error) {
                 this._undoStack.push(entry);
                 notifyWarning(error?.message || "Undo was refused.", { source: "undo-refused" });
@@ -18311,7 +18466,8 @@ export class EditorWidget {
             };
             try {
                 await this._applyPromptIdentityChange(entry.change,
-                    `undo ${entry.label || "prompt identity"}`, { recordUndo: false });
+                    `undo ${entry.label || "prompt identity"}`,
+                    { recordUndo: false, diagnostics });
             } catch (error) {
                 this._undoStack.push(entry);
                 notifyWarning(error?.message || "Undo was refused.", { source: "undo-refused" });
@@ -18329,7 +18485,7 @@ export class EditorWidget {
             };
             try {
                 await this._applyReferenceHistoryOperations(entry.operations,
-                    `undo ${entry.label || "Reference change"}`);
+                    `undo ${entry.label || "Reference change"}`, diagnostics);
             } catch (error) {
                 this._undoStack.push(entry);
                 notifyWarning(error?.message || "Undo was refused.", { source: "undo-refused" });
@@ -18367,16 +18523,18 @@ export class EditorWidget {
         try {
             if (entry.referenceOperations?.length && !referencesApplied) {
                 await this._applyReferenceHistoryOperations(entry.referenceOperations,
-                    `undo ${entry.label || "prompt attachment"}`);
+                    `undo ${entry.label || "prompt attachment"}`, diagnostics);
                 referencesApplied = true;
             }
             if (entry.promptIdentityChange && !promptIdentityApplied) {
                 await this._applyPromptIdentityChange(entry.promptIdentityChange,
-                    `undo ${entry.label || "prompt attachment"}`, { recordUndo: false });
+                    `undo ${entry.label || "prompt attachment"}`,
+                    { recordUndo: false, diagnostics });
                 promptIdentityApplied = true;
             }
             const restoredScene = await this._restoreScene(
-                entry.sceneId, entry.snapshot, entry.postSnapshot, entry.restoreToken);
+                entry.sceneId, entry.snapshot, entry.postSnapshot,
+                entry.restoreToken, diagnostics);
             delete entry.restoreToken;
             delete entry._ambiguousAuxiliaryState;
             opposite.postSnapshot = structuredClone(restoredScene);
@@ -18396,6 +18554,7 @@ export class EditorWidget {
                         coalesce: false,
                         refreshScenes: false,
                         sceneId: entry.sceneId,
+                        diagnostics,
                     }) : null;
                     if (cleanupResult) this._adoptPromptIdentitiesFromMutation(cleanupResult);
                     const retained = (cleanupResult?.payload?.results || []).filter(
@@ -18443,7 +18602,7 @@ export class EditorWidget {
                 try {
                     await this._applyPromptIdentityChange(entry.inversePromptIdentityChange,
                         `restore failed undo ${entry.label || "prompt attachment"}`,
-                        { recordUndo: false });
+                        { recordUndo: false, diagnostics });
                     promptIdentityApplied = false;
                 } catch (compensationError) {
                     compensationErrors.push(compensationError);
@@ -18453,7 +18612,8 @@ export class EditorWidget {
                 try {
                     await this._applyReferenceHistoryOperations(
                         entry.inverseReferenceOperations,
-                        `restore failed undo ${entry.label || "prompt attachment"}`);
+                        `restore failed undo ${entry.label || "prompt attachment"}`,
+                        diagnostics);
                     referencesApplied = false;
                 } catch (compensationError) {
                     compensationErrors.push(compensationError);
@@ -18531,6 +18691,14 @@ export class EditorWidget {
     }
 
     async _runRedo() {
+        if (typeof this._withMutationGesture === "function") {
+            return this._withMutationGesture(
+                "redo", (diagnostics) => this._runRedoWithinGesture(diagnostics));
+        }
+        return this._runRedoWithinGesture(null);
+    }
+
+    async _runRedoWithinGesture(diagnostics = null) {
         if (this._undoStack[this._undoStack.length - 1]?.pending) {
             notifyInfo("That change is still saving. Try Redo again when it finishes.",
                 { source: "redo-pending" });
@@ -18561,7 +18729,7 @@ export class EditorWidget {
                 snapshot: this._captureProjectDependencies(), label: entry.label,
             };
             try {
-                await this._restoreProjectDependencies(entry.snapshot);
+                await this._restoreProjectDependencies(entry.snapshot, diagnostics);
             } catch (error) {
                 this._redoStack.push(entry);
                 notifyWarning(error?.message || "Redo was refused.", { source: "redo-refused" });
@@ -18579,7 +18747,8 @@ export class EditorWidget {
             };
             try {
                 await this._applyPromptIdentityChange(entry.change,
-                    `redo ${entry.label || "prompt identity"}`, { recordUndo: false });
+                    `redo ${entry.label || "prompt identity"}`,
+                    { recordUndo: false, diagnostics });
             } catch (error) {
                 this._redoStack.push(entry);
                 notifyWarning(error?.message || "Redo was refused.", { source: "redo-refused" });
@@ -18597,7 +18766,7 @@ export class EditorWidget {
             };
             try {
                 await this._applyReferenceHistoryOperations(entry.operations,
-                    `redo ${entry.label || "Reference change"}`);
+                    `redo ${entry.label || "Reference change"}`, diagnostics);
             } catch (error) {
                 this._redoStack.push(entry);
                 notifyWarning(error?.message || "Redo was refused.", { source: "redo-refused" });
@@ -18639,12 +18808,13 @@ export class EditorWidget {
         try {
             if (entry.referenceOperations?.length && !referencesApplied) {
                 await this._applyReferenceHistoryOperations(entry.referenceOperations,
-                    `redo ${entry.label || "prompt attachment"}`);
+                    `redo ${entry.label || "prompt attachment"}`, diagnostics);
                 referencesApplied = true;
             }
             if (entry.promptIdentityChange && !promptIdentityApplied) {
                 await this._applyPromptIdentityChange(entry.promptIdentityChange,
-                    `redo ${entry.label || "prompt attachment"}`, { recordUndo: false });
+                    `redo ${entry.label || "prompt attachment"}`,
+                    { recordUndo: false, diagnostics });
                 promptIdentityApplied = true;
             }
             if (entry.promptIdentityCreateIntents?.length && !promptIdentityCreatesResolved) {
@@ -18673,6 +18843,7 @@ export class EditorWidget {
                         coalesce: false,
                         refreshScenes: false,
                         sceneId: entry.sceneId,
+                        diagnostics,
                     }) : null;
                 if (createResult) {
                     this._adoptPromptIdentitiesFromMutation(createResult);
@@ -18688,7 +18859,8 @@ export class EditorWidget {
                 promptIdentityCreatesResolved = true;
             }
             const restoredScene = await this._restoreScene(
-                entry.sceneId, entry.snapshot, entry.postSnapshot, entry.restoreToken);
+                entry.sceneId, entry.snapshot, entry.postSnapshot,
+                entry.restoreToken, diagnostics);
             delete entry.restoreToken;
             delete entry._ambiguousAuxiliaryState;
             opposite.postSnapshot = structuredClone(restoredScene);
@@ -18715,7 +18887,7 @@ export class EditorWidget {
                 try {
                     await this._applyPromptIdentityChange(entry.inversePromptIdentityChange,
                         `restore failed redo ${entry.label || "prompt attachment"}`,
-                        { recordUndo: false });
+                        { recordUndo: false, diagnostics });
                     promptIdentityApplied = false;
                 } catch (compensationError) {
                     compensationErrors.push(compensationError);
@@ -18730,6 +18902,7 @@ export class EditorWidget {
                             coalesce: false,
                             refreshScenes: false,
                             sceneId: entry.sceneId,
+                            diagnostics,
                         });
                     this._adoptPromptIdentitiesFromMutation(cleanupResult);
                     promptIdentityCreatesApplied = [];
@@ -18742,7 +18915,8 @@ export class EditorWidget {
                 try {
                     await this._applyReferenceHistoryOperations(
                         entry.inverseReferenceOperations,
-                        `restore failed redo ${entry.label || "prompt attachment"}`);
+                        `restore failed redo ${entry.label || "prompt attachment"}`,
+                        diagnostics);
                     referencesApplied = false;
                 } catch (compensationError) {
                     compensationErrors.push(compensationError);
@@ -18777,7 +18951,8 @@ export class EditorWidget {
         });
     }
 
-    async _restoreScene(sceneId, targetSnapshot, baseSnapshot, existingRestoreToken = "") {
+    async _restoreScene(sceneId, targetSnapshot, baseSnapshot, existingRestoreToken = "",
+        diagnostics = null) {
         if (!this.projectDir) throw new Error("No project is open for scene restore.");
         if (!baseSnapshot) throw new Error(
             "Scene history is missing its authoritative result; refresh the editor.");
@@ -18785,6 +18960,18 @@ export class EditorWidget {
         const encodedProject = encodeURIComponent(dirName);
         const encodedScene = encodeURIComponent(sceneId);
         const tokenUrl = `/sonder-editor/project/${encodedProject}/scenes/${encodedScene}/restore-token`;
+        const restoreDiagnostics = diagnostics
+            ?? (typeof this._snapshotMutationDiagnostics === "function"
+                ? this._snapshotMutationDiagnostics()
+                : null);
+        const diagnosticInit = (init) => {
+            const gestureInit = typeof this._withMutationDiagnosticHeaders === "function"
+                ? this._withMutationDiagnosticHeaders(init, restoreDiagnostics)
+                : init;
+            return typeof this._withMutationRequestDiagnostics === "function"
+                ? this._withMutationRequestDiagnostics(gestureInit)
+                : gestureInit;
+        };
         this._keyboardDebug("restore start", {
             sceneId,
             activeSceneId: this.activeSceneId || "",
@@ -18825,7 +19012,8 @@ export class EditorWidget {
 
         let restoreToken = String(existingRestoreToken || "");
         if (!restoreToken) {
-            const tokenResponse = await fetch(api.apiURL(tokenUrl), { method: "POST" });
+            const tokenResponse = await fetch(
+                api.apiURL(tokenUrl), diagnosticInit({ method: "POST" }));
             if (!tokenResponse.ok) {
                 throw await responseError(tokenResponse,
                     `Scene history token failed (${tokenResponse.status}).`);
@@ -18884,7 +19072,8 @@ export class EditorWidget {
             // body with a healed If-Match would repeat a stale write; only the
             // backend may retry after reloading and re-merging against stored.
             restoreResponse = await fetch(api.apiURL(
-                `/sonder-editor/project/${encodedProject}/scenes/${encodedScene}/restore`), {
+                `/sonder-editor/project/${encodedProject}/scenes/${encodedScene}/restore`),
+                diagnosticInit({
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -18892,7 +19081,7 @@ export class EditorWidget {
                     target_scene: targetSnapshot,
                     restore_token: restoreToken,
                 }),
-            });
+            }));
         } catch (networkError) {
             this._keyboardDebug("restore response lost", {
                 sceneId, error: networkError?.message || String(networkError),
@@ -18915,7 +19104,8 @@ export class EditorWidget {
             const error = await responseError(
                 restoreResponse, `Scene restore failed (${restoreResponse.status}).`);
             if (error.code === "scene_restore_token_expired" && existingRestoreToken) {
-                return this._restoreScene(sceneId, targetSnapshot, baseSnapshot, "");
+                return this._restoreScene(
+                    sceneId, targetSnapshot, baseSnapshot, "", restoreDiagnostics);
             }
             if (restoreResponse.status >= 500) {
                 const receiptScene = await reconcileReceipt();

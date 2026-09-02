@@ -8,7 +8,8 @@ export class ProjectMutationQueue {
         this._onIdle = typeof onIdle === "function" ? onIdle : null;
     }
 
-    enqueue({ key, label = "", coalesce = true, merge = null, intent = null, run }) {
+    enqueue({ key, label = "", coalesce = true, merge = null, intent = null,
+        diagnostics = null, run }) {
         if (!key) {
             return Promise.reject(new Error("Project mutation key is required"));
         }
@@ -29,13 +30,23 @@ export class ProjectMutationQueue {
                     existing.intent = intent;
                 }
                 existing.label = label || existing.label;
+                existing.coalescedCount += 1;
+                existing.diagnostics = diagnostics;
+                if (diagnostics && typeof diagnostics === "object") {
+                    diagnostics.coalescedCount = existing.coalescedCount;
+                }
                 existing.run = run;
                 existing.waiters.push(waiter);
             } else {
+                if (diagnostics && typeof diagnostics === "object") {
+                    diagnostics.coalescedCount = 1;
+                }
                 this._pending.push({
                     key,
                     label,
                     intent,
+                    diagnostics,
+                    coalescedCount: 1,
                     run,
                     waiters: [waiter],
                 });
@@ -83,7 +94,7 @@ export class ProjectMutationQueue {
             const mutation = this._pending.shift();
             this._active = mutation;
             try {
-                const result = await mutation.run(mutation.intent);
+                const result = await mutation.run(mutation.intent, mutation.diagnostics);
                 for (const waiter of mutation.waiters) {
                     waiter.resolve(result);
                 }
