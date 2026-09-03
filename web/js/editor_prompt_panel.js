@@ -3685,6 +3685,9 @@ Server value: ${serverValue}` : ""}`;
             assets: host._allProjectAssetsForGallery?.() || [],
             semanticUnits: host._promptSemanticUnits || [],
             projectKey: host._projectDirName?.() || host.projectId || "project",
+            // Without it a derived-prompt row would claim an item is in window
+            // that the threshold actually drops at render time.
+            frameThresholdPct: host._referenceFrameThreshold || 0,
             scenes: (host.scenes || []).length
                 ? host.scenes : [host.activeScene].filter(Boolean),
             saveSemanticUnitChange,

@@ -19,6 +19,13 @@ import {
     referenceFieldDeclaration,
     referenceRoleChoices,
 } from "./prompt_profile_declarations.js";
+import {
+    REFERENCE_VERDICT,
+    REFERENCE_VERDICT_LABEL,
+    countAttachedReferenceChips,
+    deriveReferencePrompt,
+    resolveReferenceVerdicts,
+} from "./reference_resolution.js";
 
 const uid = () => globalThis.crypto?.randomUUID?.().replaceAll("-", "")
     || `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
@@ -445,6 +452,67 @@ export function referencePromptingProjection({ candidate = {}, profile = {},
             diagnostic?.lane_id && !(manifest?.[population] || []).some((row) =>
                 row?.lane_id === diagnostic.lane_id));
         return { declaration, population, rows, unresolved };
+    });
+}
+
+/**
+ * What each staged Reference contributes as prompt TEXT, for this window.
+ *
+ * `referencePromptingProjection` above answers a different question — which
+ * physical media a format's declared populations resolve to — and it is driven
+ * entirely by `profile.physical_populations`. A recipe-derived prompt is not
+ * physical and needs no declaration, so on a profile declaring no populations
+ * (`generic@1`, the default) that projection is empty and the section said
+ * nothing at all, while a staged item was contributing
+ * `Reference sheet: … Generated video:` to the very prompt being compiled.
+ *
+ * The derived string comes from `deriveReferencePrompt`, the same mirror the
+ * lane panel and the Python formatter share, so this is disclosure and never a
+ * second authority. The override is applied because this screen reports what an
+ * item CONTRIBUTES; the lane panel is where the two states are edited apart.
+ */
+export function recipeDerivedPromptProjection({ scene = null, references = [],
+    windowStart = 0, windowEnd = 0, frameThresholdPct = 0 } = {}) {
+    const items = scene?.reference_items || [];
+    if (!items.length) return [];
+    const members = memberIndex(references);
+    const recipes = scene?.reference_lane_recipes || [];
+    const { verdicts } = resolveReferenceVerdicts({
+        referenceItems: items,
+        laneCount: Math.max(1, parseInt(scene?.reference_lane_count, 10) || 1),
+        sceneDuration: Math.max(0, parseInt(scene?.duration_frames, 10) || 0),
+        windowStart, windowEnd,
+        laneConfigs: scene?.reference_lane_configs || [],
+        frameThresholdPct,
+    });
+    return items.map((item, itemIndex) => {
+        const laneIndex = Math.max(0, parseInt(item?.lane_index, 10) || 0);
+        const wrapper = recipes[laneIndex] || {};
+        const soft = wrapper?.recipe?.soft || {};
+        const resolved = (item?.members || []).map((memberRef) => {
+            const owner = members.get(String(memberRef?.member_id || "")) || {};
+            return {
+                entity_name: owner.reference?.name || "",
+                member_name: owner.member?.name || "",
+                prompt: owner.member?.prompt || "",
+            };
+        });
+        const override = String(item?.prompt_override || "");
+        return {
+            itemId: String(item?.reference_item_id || ""),
+            laneIndex,
+            laneLabel: String(wrapper?.recipe?.name || "").trim()
+                || `Lane ${laneIndex + 1}`,
+            memberCount: resolved.length,
+            overridden: !!override.trim(),
+            prefix: String(soft?.prompt_prefix || "").trim(),
+            suffix: String(soft?.prompt_suffix || "").trim(),
+            derived: deriveReferencePrompt({
+                promptOverride: override, members: resolved, soft }),
+            verdict: verdicts.get(itemIndex) || "",
+            attachedChips: countAttachedReferenceChips({
+                scene, referenceItemId: String(item?.reference_item_id || "") }),
+        };
     });
 }
 
@@ -1113,15 +1181,27 @@ export function mountPromptIdentityPanel(container, options = {}) {
         candidate, profile, references, semanticUnits, assets,
     });
 
+    const derivedRows = recipeDerivedPromptProjection({
+        scene: options.scene, references,
+        windowStart: Number(candidate?.window?.start_frame || 0),
+        windowEnd: Number(candidate?.window?.end_frame || 0),
+        frameThresholdPct: Number(options.frameThresholdPct || 0),
+    });
+
     container.appendChild(sectionHeading("Reference Prompting",
-        "Physical media resolved from the active setup and effective window. Staging remains in Reference lanes."));
+        "Physical media resolved from the active setup and effective window, and the prompt text each staged Reference derives from its recipe. Staging remains in Reference lanes."));
     const referenceBody = document.createElement("div");
     referenceBody.dataset.referencePrompting = "1";
     referenceBody.style.cssText = "display:flex;flex-direction:column;gap:5px;";
     container.appendChild(referenceBody);
     if (!projection.length) {
         const empty = document.createElement("div");
-        empty.textContent = "This prompt format declares no physical Reference populations.";
+        // Stays true and stops being the whole story. On `generic@1` this line
+        // was the only thing the section said, which read as "no Reference
+        // reaches the prompt" while a staged item was contributing text to it.
+        empty.textContent = derivedRows.length
+            ? "This prompt format declares no physical Reference populations; staged References still contribute the derived text below."
+            : "This prompt format declares no physical Reference populations.";
         empty.style.cssText = `font:10px system-ui;color:${COLORS.textDim};`;
         referenceBody.appendChild(empty);
     }
@@ -1394,6 +1474,71 @@ export function mountPromptIdentityPanel(container, options = {}) {
             groupEl.appendChild(empty);
         }
         referenceBody.appendChild(groupEl);
+    }
+
+    if (derivedRows.length) {
+        const derivedGroup = document.createElement("div");
+        derivedGroup.dataset.sonderRecipeDerivedPrompts = "1";
+        derivedGroup.style.cssText = "display:flex;flex-direction:column;gap:4px;";
+        const label = document.createElement("strong");
+        label.textContent = `Recipe-derived prompt (${derivedRows.length})`;
+        label.style.cssText = `font:9px system-ui;color:${COLORS.textDim};text-transform:uppercase;`;
+        derivedGroup.appendChild(label);
+        const intro = document.createElement("span");
+        // Read-only on purpose. The lane panel owns editing this, and saying so
+        // is what stops the row reading as a second, disagreeing authority.
+        intro.textContent = "Read-only. Edit the text in Reference Lane Setup; both exits render the same string.";
+        intro.style.cssText = `font:9px/1.35 system-ui;color:${COLORS.textDim};`;
+        derivedGroup.appendChild(intro);
+        for (const row of derivedRows) {
+            const rowEl = document.createElement("div");
+            rowEl.dataset.sonderDerivedPromptItem = row.itemId;
+            rowEl.style.cssText = `display:flex;flex-direction:column;gap:3px;padding:5px 6px;border:1px solid ${COLORS.border};border-radius:5px;`;
+            const head = document.createElement("div");
+            head.style.cssText = `display:flex;gap:6px;align-items:baseline;font:9px system-ui;color:${COLORS.textDim};`;
+            const name = document.createElement("span");
+            name.textContent = row.laneLabel;
+            name.style.cssText = `font-weight:600;color:${COLORS.text};`;
+            const state = document.createElement("span");
+            const verdictLabel = REFERENCE_VERDICT_LABEL[row.verdict] || "";
+            const chips = row.attachedChips
+                ? `Attached to ${row.attachedChips} prompt chip${row.attachedChips === 1 ? "" : "s"}`
+                : "Not attached to any prompt chip";
+            state.textContent = [
+                verdictLabel,
+                `${row.memberCount} member${row.memberCount === 1 ? "" : "s"}`,
+                row.overridden ? "overridden" : "",
+                chips,
+            ].filter(Boolean).join(" · ");
+            head.append(name, state);
+            rowEl.appendChild(head);
+            const text = document.createElement("div");
+            text.textContent = row.derived || "No prompt text.";
+            text.style.cssText = `font:10px/1.4 system-ui;color:${
+                row.derived ? COLORS.text : COLORS.textDim};white-space:pre-wrap;word-break:break-word;`;
+            rowEl.appendChild(text);
+            // The suffix in particular is invisible in the members it wraps, so
+            // an author reading only the assembled line cannot tell which part
+            // the recipe contributed and which part they wrote.
+            const parts = [
+                row.prefix ? `prefix “${row.prefix}”` : "",
+                row.suffix ? `suffix “${row.suffix}”` : "",
+            ].filter(Boolean);
+            if (parts.length && !row.overridden) {
+                const recipeNote = document.createElement("span");
+                recipeNote.textContent = `Recipe adds ${parts.join(" and ")}.`;
+                recipeNote.style.cssText = `font:9px system-ui;color:${COLORS.textDim};`;
+                rowEl.appendChild(recipeNote);
+            }
+            if (row.overridden && parts.length) {
+                const overrideNote = document.createElement("span");
+                overrideNote.textContent = "An override replaces the whole derivation, so the recipe's prefix and suffix are not added.";
+                overrideNote.style.cssText = `font:9px system-ui;color:${COLORS.textDim};`;
+                rowEl.appendChild(overrideNote);
+            }
+            derivedGroup.appendChild(rowEl);
+        }
+        referenceBody.appendChild(derivedGroup);
     }
 
     container.appendChild(sectionHeading("Identity Prompting",

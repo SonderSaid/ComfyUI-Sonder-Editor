@@ -568,6 +568,17 @@ _PROMPT_FIXTURES = [
     {"promptOverride": "", "members": [{"name": "Chloe", "prompt": ""}], "soft": {"prompt_tokens": "<{name} {n}>"}},
     {"promptOverride": "", "members": [{"name": "", "prompt": ""}], "soft": {"prompt_tokens": "<Subject {n}> is {prompt}"}},
     {"promptOverride": "", "members": [{"name": "Hero", "prompt": "  padded  "}], "soft": {"prompt_prefix": "  spaced  ", "prompt_tokens": ""}},
+    # prefix . body . suffix - the Ingredients shape, and the three degenerate
+    # forms of it. An override must suppress the suffix as it suppresses the
+    # prefix, or "Edit as override" (which seeds from this string) doubles the
+    # closing label.
+    {"promptOverride": "", "members": [{"name": "Hero", "prompt": "face"}, {"name": "Room", "prompt": "room"}],
+     "soft": {"prompt_prefix": "Reference sheet:", "prompt_suffix": "Generated video:"}},
+    {"promptOverride": "", "members": [{"name": "Hero", "prompt": "face"}], "soft": {"prompt_suffix": "Generated video:"}},
+    {"promptOverride": "", "members": [], "soft": {"prompt_prefix": "Reference sheet:", "prompt_suffix": "Generated video:"}},
+    {"promptOverride": "an override", "members": [{"name": "Hero", "prompt": "face"}],
+     "soft": {"prompt_prefix": "Reference sheet:", "prompt_suffix": "Generated video:"}},
+    {"promptOverride": "", "members": [{"name": "Hero", "prompt": "face"}], "soft": {"prompt_suffix": "  padded suffix  "}},
 ]
 
 
@@ -601,7 +612,14 @@ console.log(JSON.stringify({json.dumps(_PROMPT_FIXTURES)}.map((f) => mod.deriveR
     ).stdout)
     assert actual == expected
     # Guard the fixtures themselves: an all-empty result would pass vacuously.
-    assert len([value for value in expected if value]) >= 7
+    assert len([value for value in expected if value]) >= 12
+    # Parity alone cannot prove the suffix exists: if NEITHER half implemented
+    # it every fixture above would still agree. Pin the shape both sides owe.
+    assert expected[-5] == "Reference sheet: face, room Generated video:"
+    assert expected[-4] == "face Generated video:"
+    assert expected[-3] == "Reference sheet: Generated video:"
+    assert expected[-2] == "an override"
+    assert expected[-1] == "face padded suffix"
 
 
 FIXED_OUTPUT_NAMES = [name for name in REFERENCE_OUTPUT_NAMES if name != "slots"]
@@ -1860,3 +1878,118 @@ console.log(JSON.stringify(out));
     # lane reads unresolved and warns about nothing.
     assert [lane["staged"] for lane in out["lanes"]] == [True, True, True]
     assert [lane["resolved"] for lane in out["lanes"]] == [3, 3, 3]
+
+
+def _derived_prompt_projection(cases):
+    """Run `recipeDerivedPromptProjection` in node for a list of argument objects."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for the derived-prompt projection test")
+    module_url = (ROOT / "web" / "js" / "prompt_identity_panel.js").as_uri()
+    script = f"""
+const {{ recipeDerivedPromptProjection }} = await import({json.dumps(module_url)});
+console.log(JSON.stringify({json.dumps(cases)}.map(recipeDerivedPromptProjection)));
+"""
+    return json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        capture_output=True, text=True, encoding="utf-8", check=True,
+    ).stdout)
+
+
+_INGREDIENTS_SCENE = {
+    "duration_frames": 241,
+    "reference_lane_count": 1,
+    "reference_lane_configs": [{}],
+    "reference_lane_recipes": [{
+        "recipe_id": "sonder:ltx_ingredients",
+        "recipe": {"name": "LTX IC-LoRA Ingredients", "soft": {
+            "prompt_prefix": "Reference sheet:", "prompt_suffix": "Generated video:"}},
+    }],
+    "reference_items": [{
+        "reference_item_id": "item-1", "lane_index": 0,
+        "start_frame": 0, "end_frame": -1,
+        "members": [{"member_id": "m1"}],
+    }],
+    "global_attachments": [],
+    "prompt_sections": [],
+}
+_INGREDIENTS_REFERENCES = [{
+    "reference_id": "e1", "name": "Image Subject",
+    "members": [{"member_id": "m1", "name": "node", "prompt": "a lit face"}],
+}]
+
+
+def test_reference_prompting_projects_the_recipe_derived_prompt():
+    """`generic@1` declares no physical populations, so the Reference Prompting
+    section was empty while a staged item was contributing text to the very
+    prompt being compiled. The derived row is what makes the recipe's prefix and
+    suffix visible on that screen.
+    """
+    [rows] = _derived_prompt_projection([{
+        "scene": _INGREDIENTS_SCENE, "references": _INGREDIENTS_REFERENCES,
+        "windowStart": 8, "windowEnd": 27,
+    }])
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["derived"] == "Reference sheet: a lit face Generated video:"
+    assert row["prefix"] == "Reference sheet:"
+    assert row["suffix"] == "Generated video:"
+    assert row["laneLabel"] == "LTX IC-LoRA Ingredients"
+    assert row["verdict"] == "winner"
+    assert row["overridden"] is False
+
+
+def test_reference_prompting_derived_row_counts_only_enabled_reference_chips():
+    """The same predicate the lane panel states, from the one shared helper.
+
+    An unfiltered scan would count a disabled chip and a non-Reference chip, and
+    the compiler dedupes `derived_prompt` per item anyway — so a raw number
+    would claim use where there is only attachment.
+    """
+    scene = json.loads(json.dumps(_INGREDIENTS_SCENE))
+    scene["global_attachments"] = [
+        {"kind": "reference", "enabled": True, "source": {"reference_item_id": "item-1"}},
+        {"kind": "reference", "enabled": False, "source": {"reference_item_id": "item-1"}},
+        {"kind": "shot", "enabled": True, "source": {"reference_item_id": "item-1"}},
+        {"kind": "reference", "enabled": True, "source": {"reference_item_id": "other"}},
+    ]
+    scene["prompt_sections"] = [{"attachments": [
+        {"kind": "reference", "source": {"reference_item_id": "item-1"}},
+    ]}]
+    [rows] = _derived_prompt_projection([{
+        "scene": scene, "references": _INGREDIENTS_REFERENCES,
+        "windowStart": 8, "windowEnd": 27,
+    }])
+    # One enabled global chip + one section chip whose `enabled` is absent,
+    # which means inherit-on rather than off.
+    assert rows[0]["attachedChips"] == 2
+
+
+def test_reference_prompting_derived_row_reports_override_and_window():
+    """An override replaces the whole grammar, and an out-of-window item says so
+    rather than reading as text that reaches this render."""
+    overridden = json.loads(json.dumps(_INGREDIENTS_SCENE))
+    overridden["reference_items"][0]["prompt_override"] = "a hand-written prompt"
+    outside = json.loads(json.dumps(_INGREDIENTS_SCENE))
+    outside["reference_items"][0].update({"start_frame": 100, "end_frame": 140})
+    [with_override, out_of_window] = _derived_prompt_projection([
+        {"scene": overridden, "references": _INGREDIENTS_REFERENCES,
+         "windowStart": 8, "windowEnd": 27},
+        {"scene": outside, "references": _INGREDIENTS_REFERENCES,
+         "windowStart": 8, "windowEnd": 27},
+    ])
+    assert with_override[0]["derived"] == "a hand-written prompt"
+    assert with_override[0]["overridden"] is True
+    assert out_of_window[0]["verdict"] == "outside"
+
+
+def test_reference_prompting_projection_is_empty_without_staged_items():
+    """No staged items means the section keeps its original bare empty state;
+    the derived block must not appear as an empty heading."""
+    scene = json.loads(json.dumps(_INGREDIENTS_SCENE))
+    scene["reference_items"] = []
+    [rows] = _derived_prompt_projection([{
+        "scene": scene, "references": _INGREDIENTS_REFERENCES,
+        "windowStart": 8, "windowEnd": 27,
+    }])
+    assert rows == []

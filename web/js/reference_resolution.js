@@ -18,7 +18,9 @@ export function referenceLiveOutputs(hard) {
 /**
  * The prompt a staged item contributes, mirroring `_assemble_prompt` in
  * `nodes/reference_core.py`. The panel shows this so the user can read and copy
- * what actually reaches the model before deciding to override it.
+ * the text before deciding to override it. It is what the item CONTRIBUTES, not
+ * what reaches the model: both exits carrying it - the Prompt Bridge socket and
+ * a Reference Context chip - are opt-in, and by default neither is live.
  *
  * `members` are pre-resolved `{name, prompt}` pairs in staged slot order.
  */
@@ -89,6 +91,28 @@ export function memberPromptFragment(pattern, index, prompt, name, registryNumbe
     return label ? `${expand(memberPrompt)}: ${label}` : expand(memberPrompt);
 }
 
+/**
+ * How many enabled Reference Context chips in one scene point at one staged
+ * item — the count two surfaces need and neither may compute its own way.
+ *
+ * The filters are the whole point. The unfiltered scan this replaces (the
+ * Library's delete confirmation) counts every attachment kind and every
+ * disabled chip, and the compiler dedupes `derived_prompt` per reference item,
+ * so an unfiltered number would claim *use* where there is only attachment.
+ * Callers say "attached", never "used by".
+ */
+export function countAttachedReferenceChips({ scene = null, referenceItemId = "" } = {}) {
+    const itemId = String(referenceItemId || "");
+    if (!scene || !itemId) return 0;
+    const attachments = [
+        ...(scene.global_attachments || []),
+        ...(scene.prompt_sections || []).flatMap((section) => section.attachments || []),
+    ];
+    return attachments.filter((attachment) => attachment?.kind === "reference"
+        && attachment?.enabled !== false
+        && String(attachment?.source?.reference_item_id || "") === itemId).length;
+}
+
 export function deriveReferencePrompt({ promptOverride = "", members = [], soft = {} } = {}) {
     const override = String(promptOverride || "").trim();
     if (override) return override;
@@ -106,9 +130,11 @@ export function deriveReferencePrompt({ promptOverride = "", members = [], soft 
         );
         if (fragment) values.push(fragment);
     });
+    // Mirror of `format_reference_prompt`; the parity test guards the pair.
     const prefix = String(soft?.prompt_prefix || "").trim();
+    const suffix = String(soft?.prompt_suffix || "").trim();
     const joined = values.join(", ");
-    return [prefix, joined].filter(Boolean).join(" ");
+    return [prefix, joined, suffix].filter(Boolean).join(" ");
 }
 
 function integer(value, fallback = 0) {

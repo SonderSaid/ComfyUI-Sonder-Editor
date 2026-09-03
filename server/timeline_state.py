@@ -379,7 +379,7 @@ REFERENCE_RECIPE_PRESETS = (
                  "loop_frames": 121, "frame_step": 8, "frame_offset": 1,
                  "live_outputs": ["image_slots", "reference_prompt", "reference_names"]},
         "soft": {"suggested_tags": ["sonder:face_closeup", "sonder:full_body", "sonder:turnaround"],
-                 "prompt_prefix": "Reference sheet:"},
+                 "prompt_prefix": "Reference sheet:", "prompt_suffix": "Generated video:"},
     },
     {
         "id": "sonder:ltx_best_face_id",
@@ -689,6 +689,12 @@ REFERENCE_RECIPE_FIELDS = (
              "{entity_name} and {member_name} the explicit normalized pieces. Use as many as you like, e.g. "
              "'<Subject {n}> is {prompt}, from <Picture {n}>'. With no {prompt}/{name} the member text is "
              "appended after the pattern. Each expansion is also emitted on its own p01-p16 output."},
+    {"key": "prompt_suffix", "section": "soft", "group": "Prompt", "label": "Prompt suffix",
+     "type": "string", "default": "",
+     "applies_to": [], "requires": "", "requires_value": "",
+     "help": "Static text placed once after the whole derived prompt. Use it for a format whose "
+             "reference block is closed by a second label, such as Ingredients' 'Generated video:', "
+             "which leads the prompt the author writes next."},
     {"key": "suggested_tags", "section": "soft", "group": "Advisories", "label": "Suggested member tags",
      "type": "string_list", "default": [],
      "applies_to": [], "requires": "", "requires_value": "",
@@ -1188,6 +1194,19 @@ class ReferenceLaneRecipe:
                              "size_rounding": "nearest"})
             if hard is not None:
                 recipe["hard"] = hard
+        elif recipe_id == "sonder:ltx_ingredients":
+            # Ingredients' `Generated video:` lead was added after these lanes
+            # materialized their recipe, and a built-in lane cannot be edited in
+            # place to acquire it. Only fills an ABSENT key - a fork that
+            # authored an empty suffix keeps it, and a `custom:` fork carries a
+            # different recipe_id so this branch cannot reach it. Remove once no
+            # project predating the `prompt_suffix` field remains in circulation.
+            if "soft" not in recipe or isinstance(recipe.get("soft"), dict):
+                soft = dict(recipe.get("soft") or {})
+                if "prompt_suffix" not in soft:
+                    soft["prompt_suffix"] = "Generated video:"
+                    recipe = dict(recipe)
+                    recipe["soft"] = soft
         return cls(
             lane_id=str(data.get("lane_id") or "").strip() or uuid.uuid4().hex,
             media_kind=media_kind,

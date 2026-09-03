@@ -226,7 +226,7 @@ hands you the same text as an editable draft. Once overridden the header reads
 **Prompt — overridden**, the derived version stays visible beside it, and
 **Clear** goes back to following the members.
 
-Two recipe fields shape the derived text:
+Three recipe fields shape the derived text:
 
 - **Prompt prefix** — static text placed once at the front, not repeated per
   member.
@@ -237,9 +237,25 @@ Two recipe fields shape the derived text:
   `<Subject {n}> is {prompt}, from <Picture {n}>` composes a sentence rather
   than prefixing a token. With no `{prompt}` or `{name}`, the member text is
   appended after the pattern.
+- **Prompt suffix** — static text placed once after the whole thing, for a
+  format whose reference block is closed by a second label. LTX IC-LoRA
+  Ingredients uses it for `Generated video:`, which leads the prompt you write
+  next, so the two halves of that grammar stay one definition.
 
-Each expansion also goes out on its own numbered Prompt Bridge output, so a
-graph can wire one member's text separately from the aggregate.
+Each per-member expansion also goes out on its own numbered Prompt Bridge
+output, so a graph can wire one member's text separately from the aggregate.
+The prefix and suffix are not repeated there — they open and close the whole
+block, not each member.
+
+The derived text has two exits and neither is automatic: wire the Prompt
+Bridge's `reference_prompt` output in the graph, or attach the staged item as a
+Reference Context chip. The lane panel says which of the two are available and
+whether a chip is attached.
+
+Prompt Management's **Reference Prompting** section lists the same text for
+every staged Reference, read-only, with whether it falls in the current render
+window and which parts the recipe added. It is the one place to read what all
+your staged References contribute without opening each lane.
 
 ### Attaching a Context chip
 

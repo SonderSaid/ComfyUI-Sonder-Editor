@@ -86,8 +86,19 @@ def format_reference_prompt(*, item=None, members=None, recipe=None) -> tuple[st
         for index, record in enumerate(records) if isinstance(record, dict)]
     override = str(item.get("prompt_override") or "").strip()
     prefix = str(soft.get("prompt_prefix") or "").strip()
+    suffix = str(soft.get("prompt_suffix") or "").strip()
+    # `prefix . body . suffix` is one recipe-owned grammar, not two independent
+    # leads: Ingredients' `Generated video:` exists only to close
+    # `Reference sheet:`. Three consequences are deliberate, not oversights.
+    # An override suppresses the suffix exactly as it already suppresses the
+    # prefix - "Edit as override" seeds the override from this aggregate, so
+    # re-appending would emit the closing label twice. `p01..p16` carry
+    # `fragments`, never the aggregate, because the suffix closes the whole
+    # block rather than each member. And multi-lane decoding sources the suffix
+    # from lane 0 only, as `reference_core.decode_reference_prompts` already does
+    # for the prefix.
     aggregate = override or " ".join(value for value in (
-        prefix, ", ".join(value for value in fragments if value)) if value)
+        prefix, ", ".join(value for value in fragments if value), suffix) if value)
     return aggregate, fragments
 
 

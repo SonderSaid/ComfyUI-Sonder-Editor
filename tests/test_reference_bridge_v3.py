@@ -456,6 +456,46 @@ def test_h3_recipe_heal_splits_picture_and_video_geometry_without_touching_custo
     assert custom.recipe["hard"] == {"short_edge_max": 2048, "size_rounding": "floor"}
 
 
+def test_ingredients_recipe_heal_fills_only_an_absent_prompt_suffix():
+    """A preset edit reaches no lane that already materialized its recipe.
+
+    Picking a template deep-copies the preset onto the lane, and a built-in lane
+    is read-only, so without this heal an existing Ingredients lane can never
+    acquire `Generated video:` - the user's own project data, which the
+    workflow's compatibility budget ranks first.
+    """
+    stale = ReferenceLaneRecipe.from_dict({
+        "recipe_id": "sonder:ltx_ingredients",
+        "media_kind": "image",
+        "recipe": {"soft": {"prompt_prefix": "Reference sheet:"}},
+    })
+    cleared = ReferenceLaneRecipe.from_dict({
+        "recipe_id": "sonder:ltx_ingredients",
+        "recipe": {"soft": {"prompt_prefix": "Reference sheet:", "prompt_suffix": ""}},
+    })
+    authored = ReferenceLaneRecipe.from_dict({
+        "recipe_id": "sonder:ltx_ingredients",
+        "recipe": {"soft": {"prompt_suffix": "Rendered clip:"}},
+    })
+    fork = ReferenceLaneRecipe.from_dict({
+        "recipe_id": "custom:ingredients-fork",
+        "recipe": {"soft": {"prompt_prefix": "Reference sheet:"}},
+    })
+    malformed = ReferenceLaneRecipe.from_dict({
+        "recipe_id": "sonder:ltx_ingredients",
+        "recipe": {"soft": "oops"},
+    })
+
+    assert stale.recipe["soft"]["prompt_suffix"] == "Generated video:"
+    assert stale.recipe["soft"]["prompt_prefix"] == "Reference sheet:"
+    # An absent key cannot mean "deliberately cleared" on a read-only built-in
+    # lane, but a present one always can.
+    assert cleared.recipe["soft"]["prompt_suffix"] == ""
+    assert authored.recipe["soft"]["prompt_suffix"] == "Rendered clip:"
+    assert "prompt_suffix" not in fork.recipe.get("soft", {})
+    assert malformed.recipe["soft"] == "oops"
+
+
 def test_h3_recipe_heal_preserves_malformed_sections_instead_of_crashing_or_erasing():
     malformed_hard = ReferenceLaneRecipe.from_dict({
         "recipe_id": "sonder:minimax_h3_video",
@@ -663,6 +703,39 @@ def test_two_slot_lanes_concatenate_in_lane_order_not_authored_order(monkeypatch
     prompts = core.decode_reference_prompts(selected)
     assert prompts[2].startswith("reference 1")
     assert prompts[3].startswith("reference 2")
+
+
+def test_ingredients_bridge_prompt_carries_prefix_body_and_suffix(monkeypatch, tmp_path):
+    """The Bridge exit renders the whole `prefix . body . suffix` grammar.
+
+    Golden rather than structural: the recipe presets are the only place the
+    two halves of Ingredients' two-part format are defined, and a parity test
+    between the Python formatter and its JS mirror cannot notice if BOTH sides
+    stop emitting the suffix.
+    """
+    core = _import_module(monkeypatch, "reference_core")
+    project = _project(tmp_path, _preset("sonder:ltx_ingredients"))
+    selected = core.resolve_reference_set(project, 0)
+    prompts = core.decode_reference_prompts(selected)
+    assert prompts[0] == "Reference sheet: red subject Generated video:"
+    # The suffix closes the whole block, so `p01..p16` carry the member
+    # fragments alone - never the aggregate, and never a repeated label.
+    assert prompts[2] == "red subject"
+    assert not any("Generated video:" in value for value in prompts[2:])
+
+
+def test_reference_prompt_override_suppresses_prefix_and_suffix(monkeypatch, tmp_path):
+    """An override replaces the derived grammar whole, both ends included.
+
+    "Edit as override" seeds the override from the derived string, which now
+    already contains the suffix; re-appending would emit the closing label
+    twice on the very next render.
+    """
+    core = _import_module(monkeypatch, "reference_core")
+    project = _project(tmp_path, _preset("sonder:ltx_ingredients"))
+    project.scenes[0].reference_items[0].prompt_override = "a hand-written prompt"
+    prompts = core.decode_reference_prompts(core.resolve_reference_set(project, 0))
+    assert prompts[0] == "a hand-written prompt"
 
 
 @pytest.mark.parametrize("inert_cause", ["hidden", "muted", "out_of_window", "threshold"])

@@ -11,6 +11,26 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Added
+- Reference recipes carry a **Prompt suffix** beside the existing prefix and
+  per-member token, so a model format whose reference block is closed by a
+  second label stays one recipe-owned definition. **LTX IC-LoRA Ingredients**
+  now derives `Reference sheet: … Generated video:`, rendered identically by the
+  Prompt Bridge `reference_prompt` output and a Reference Context chip, and
+  lanes created before this change pick the suffix up on open.
+
+### Changed
+- The Reference lane panel's derived-prompt row names the two exits that can
+  carry the text — a Reference Context chip and the Prompt Bridge output — and
+  says whether a chip is attached, rather than claiming the text reaches the
+  model when by default neither exit is live.
+- **Reference Prompting** in Prompt Management now lists the recipe-derived
+  prompt of every staged Reference, with its window verdict, attached-chip
+  count, and the prefix and suffix the recipe contributes. It previously showed
+  only formats' declared physical populations, so on the default Generic format
+  it reported that nothing existed while a staged Reference was contributing
+  text to the prompt being compiled.
+
 ## [0.3.0] - 2026-09-01
 
 ### Added

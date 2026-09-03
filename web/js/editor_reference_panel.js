@@ -50,7 +50,9 @@ import { createDisclosureMemory } from "./disclosure_memory.js";
 import {
     REFERENCE_VERDICT,
     REFERENCE_VERDICT_LABEL,
+    countAttachedReferenceChips,
     deriveReferencePrompt,
+    referenceLiveOutputs,
     resolveReferenceVerdicts,
 } from "./reference_resolution.js";
 import { notifySuccess, notifyWarning } from "./editor_notifications.js";
@@ -1207,6 +1209,28 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         return byId;
     };
 
+    // Names the two exits without claiming either is live. The Bridge half
+    // reads the recipe's own output declaration, which the panel does know;
+    // whether a graph WIRED that socket it cannot know, so it never says wired.
+    const promptExitNote = (item) => {
+        const attached = countAttachedReferenceChips({
+            scene: host.activeScene, referenceItemId: item.reference_item_id });
+        const bridgeLive = referenceLiveOutputs(laneRecipe().recipe?.hard).has("reference_prompt");
+        const parts = [
+            attached
+                ? `Attached to ${attached} prompt chip${attached === 1 ? "" : "s"}`
+                : "Not attached to any prompt chip",
+            bridgeLive
+                ? "available on the Prompt Bridge reference_prompt output"
+                : "the Prompt Bridge reference_prompt output is off for this recipe",
+        ];
+        const note = el("div", parts.join(" · "),
+            `font-size:9px;color:${COLORS.textMuted};line-height:1.35;`);
+        note.title = "Attach this item as a Reference Context chip in the Prompt tool, "
+            + "or wire the Prompt Bridge output in the graph. Both exits are opt-in.";
+        return note;
+    };
+
     const renderPromptRow = (item, locked) => {
         const soft = laneRecipe().recipe?.soft || {};
         const members = (item.members || []).map((memberRef) => {
@@ -1228,7 +1252,9 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             const box = el("textarea", "", chromeInputCss({ padding: "4px 6px", fontSize: "11px" }) + "width:100%;box-sizing:border-box;resize:vertical;min-height:34px;");
             box.value = derived;
             box.readOnly = true;
-            box.title = "This is what reaches the model. Copy it, or take it over as an override.";
+            box.title = "The text this item derives from its staged members. Two exits can "
+                + "carry it - a Reference Context chip and the Prompt Bridge output - and "
+                + "neither is on by default. Copy it, or take it over as an override.";
             wrap.appendChild(box);
             const copy = button("Copy", "Copy the derived prompt");
             copy.addEventListener("click", async () => {
@@ -1248,6 +1274,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                 void writeItem(item, { prompt_override: derived }, "override reference prompt");
             });
             header.append(copy, takeOver);
+            wrap.appendChild(promptExitNote(item));
             return wrap;
         }
 
@@ -1267,6 +1294,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         const derivedNote = el("span", derived ? `derived: ${derived}` : "", `flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
         derivedNote.title = derived;
         header.append(derivedNote, revert);
+        wrap.appendChild(promptExitNote(item));
         return wrap;
     };
 

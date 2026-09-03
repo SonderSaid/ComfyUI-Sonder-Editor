@@ -182,6 +182,14 @@ relationship but leaves the identity visible for repair.
 Identities live under **Identity Prompting**, beside **Reference Prompting** in
 Prompt Management. Which identity kinds exist is declared by your prompt format.
 
+**Reference Prompting** shows the physical media your prompt format asks for —
+editable handles and per-member defaults — and, below that, the prompt text each
+staged Reference derives from its lane recipe, read-only, with whether it falls
+in the current render window and which parts the recipe added. The derived list
+does not depend on the format declaring anything, so it is there on the default
+Generic format too. Edit that text in Reference Lane Setup; this screen reports
+it.
+
 ## The Prompt Management panel
 
 Open it with **☰** on the Prompt or Global header. Two modes, and the difference
