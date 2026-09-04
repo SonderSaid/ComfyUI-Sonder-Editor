@@ -31,6 +31,27 @@ a fresh `[Unreleased]` block.
   it reported that nothing existed while a staged Reference was contributing
   text to the prompt being compiled.
 
+### Fixed
+- Undo and Redo now queue behind in-flight project writes in request order instead of discarding the action, with durable waiting feedback and execution-time graph-undo suppression.
+- Redo no longer reverts work done elsewhere while an Undo was in flight. The
+  reverse action is now measured against the state the Undo asked for rather
+  than the scene the server happened to return, so a take committed by a render,
+  or an edit made in another window, survives instead of being quietly undone.
+- An edit made straight after an Undo now lands on the lane it was aimed at.
+  Video, audio, Driver, and Reference destinations keep their selected index
+  when only contents moved; actual lane additions/removals retarget uniquely
+  identifiable lanes and refuse ambiguous targets with a lane-specific message.
+- Failed changes no longer wedge Undo or Redo: unusable history is removed by
+  exact entry, and a shortcut that encounters one skips only that action and
+  explains that the next press reaches the next available change. Skipping
+  removes only the history entry; it leaves the scene content unchanged.
+- Dropping an image onto the timeline during a queued Undo now creates its guide
+  in queue order rather than racing ahead of the restore.
+- An Undo whose outcome the server can no longer confirm — a lost response for a
+  change that never committed, followed by a restart — no longer blocks every
+  later edit to that scene. The editor refreshes from the server, explains that
+  the earlier action could not be confirmed, and carries on.
+
 ## [0.3.0] - 2026-09-01
 
 ### Added

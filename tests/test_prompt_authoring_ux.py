@@ -3363,7 +3363,7 @@ console.log(JSON.stringify({{
     }
 
 
-def test_unstamped_scene_history_refuses_before_network_access():
+def test_unstamped_scene_history_is_removed_before_network_access():
     widget = _source("web/js/editor_widget.js")
     undo = _method(widget, "_undo", "_redo")
     result = _run_node(f"""
@@ -3385,9 +3385,9 @@ console.log(JSON.stringify({{fetches,warnings,undo:h._undoStack.length,
   redo:h._redoStack.length}}));
 """)
     assert result["fetches"] == 0
-    assert result["undo"] == 1
+    assert result["undo"] == 0
     assert result["redo"] == 0
-    assert "cannot safely reverse" in result["warnings"][0]
+    assert "unusable entry was removed" in result["warnings"][0]
 
 
 def test_redo_builds_inverse_from_restore_response_not_active_scene():
@@ -3558,14 +3558,15 @@ def test_pending_scene_history_cannot_be_consumed_by_undo():
 globalThis.document={{activeElement:null}};
 globalThis.describeKeyboardDebugElement=()=>({{}});
 const notices=[]; globalThis.notifyInfo=(message)=>notices.push(message);
-globalThis.notifyWarning=()=>{{}};
+globalThis.notifyWarning=(message)=>notices.push(message);
+globalThis.sessionDiagRecord=()=>{{}};
 class Harness {{
 {pending_helper}
 {push}
 {commit_entry}
 {undo}
 {redo}
-  constructor() {{ this.activeSceneId="scene"; this.activeScene={{value:"after"}};
+  constructor() {{ this.activeSceneId="scene"; this.activeScene={{scene_id:"scene",value:"after"}};
     this._undoStack=[]; this._redoStack=[{{label:"older redo"}}]; this._maxUndoSteps=20;
     this._editorFocused=false; this.restores=0; }}
   _keyboardDebug() {{}}
@@ -3608,10 +3609,9 @@ console.log(JSON.stringify({{whilePending,whileBuried,afterCommit:{{undo:h._undo
     assert result["afterCommit"] == {
         "undo": 0, "redo": 1, "restores": 1, "pending": False}
     assert result["notices"] == [
-        "That change is still saving. Try Undo again when it finishes.",
-        "That change is still saving. Try Redo again when it finishes.",
-        "That change is still saving. Try Undo again when it finishes.",
-        "That change is still saving. Try Redo again when it finishes.",
+        f"{operation} is waiting on an unresolved Prompt Apply. "
+        "Reopen Apply and save or discard that draft first."
+        for operation in ("Undo", "Redo", "Undo", "Redo")
     ]
     assert result["orphan"] == {
         "committed": False, "undo": 0, "pending": True}
@@ -3726,13 +3726,21 @@ def test_unknown_prompt_apply_keeps_pending_history_until_authoritative_reconcil
     methods_end = widget.index("    async _applyPromptSetup(", methods_start)
     methods = widget[methods_start:methods_end]
     transactions_url = (ROOT / "web/js/prompt_identity_transactions.js").as_uri()
+    queue_mutation = _method(widget, "_queueProjectMutation", "_runSceneMutation")
+    discard = _method(widget, "_discardUndoEntry", "_trimLocalLaneConfigs")
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
     result = _run_node(f"""
 const {{promptIdentityCleanupPlan,reconcilePromptIdentityCreateOutcome}}=
   await import({json.dumps(transactions_url)});
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+globalThis.notifyError=()=>{{}};globalThis.notifyWarning=()=>{{}};
 class Harness {{
 {methods}
+{queue_mutation}
+{discard}
   constructor() {{
     this.refreshWorks=false; this.commits=0;
+    this._projectMutationQueue=new ProjectMutationQueue();
     this._promptSemanticUnits=[{{semantic_unit_id:"one",handle:"One",name:"One",
       kind:"subject",definition:"",order:0,sources:[],voice:{{member_id:null}},
       attachment_defaults:{{}},disabled_capabilities:[]}}];
@@ -3743,7 +3751,9 @@ class Harness {{
   }}
   async _fetchScenes() {{ return this.refreshWorks; }}
   async _fetchReferences() {{ return this.refreshWorks ? {{ok:true}} : null; }}
-  _commitUndoEntry(entry) {{ entry.pending=false; this.commits += 1; return true; }}
+  _deferProjectBackedRefresh(){{}}
+  _commitUndoEntry(entry) {{ if(!this._undoStack.includes(entry))return false;
+    entry.pending=false; this.commits += 1; return true; }}
 }}
 const h=new Harness();
 const intent={{type:"create_prompt_semantic_unit",handle_suggestion:"One",
@@ -3751,6 +3761,9 @@ const intent={{type:"create_prompt_semantic_unit",handle_suggestion:"One",
 const expected=structuredClone(h.activeScene.prompt_sections);
 const entry={{pending:true,promptIdentityCreateIntents:[intent],
   promptIdentityExpectedSections:expected}};
+h._undoStack=[entry];
+try{{await h._queueProjectMutation({{key:"apply",historyEntry:entry,
+  historyFailureOwnedByCaller:true,run:async()=>{{throw new Error("lost response");}}}});}}catch{{}}
 const unknown=await h._refreshAndReconcilePromptSetupIdentityCreates(
   entry,[intent],expected);
 h.refreshWorks=true;
@@ -3772,6 +3785,8 @@ console.log(JSON.stringify({{unknown,applied,pending:entry.pending,commits:h.com
     assert result["applied"]["applied"] is True
     assert result["pending"] is False
     assert result["commits"] == 1
+    apply_setup = _method(widget, "_applyPromptSetup", "_getPromptTemplates")
+    assert "historyFailureOwnedByCaller: identityCreateIntents.length > 0" in apply_setup
     assert result["cleanupExpected"] is False
     assert result["cleanupUnproven"] is True
     assert result["reconciledExpected"]["semantic_unit_id"] == "one"
@@ -3839,111 +3854,2492 @@ console.log(JSON.stringify({{afterReplay,afterCreated:{{
     assert result["afterCreated"]["created"] == ["one"]
 
 
-def test_undo_and_redo_share_a_non_reentrant_history_gate():
+def test_three_rapid_undos_reserve_distinct_entries_and_run_serially():
     widget = _source("web/js/editor_widget.js")
     undo = _method(widget, "_undo", "_redo")
     redo = _method(widget, "_redo", "_restoreScene")
+    helpers = _method(widget, "_recordHistoryRefusal", "_setWidgetValue")
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
     result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
 globalThis.document={{activeElement:null}};
 globalThis.describeKeyboardDebugElement=()=>({{}});
 const notices=[]; globalThis.notifyInfo=(message)=>notices.push(message);
-globalThis.notifyWarning=()=>{{}};
+globalThis.notifyWarning=(message)=>notices.push(message);
+globalThis.notifyProgress=()=>({{update:()=>{{}},dismiss:()=>{{}}}});
+globalThis.sessionDiagRecord=()=>{{}};
 class Harness {{
 {undo}
 {redo}
+{helpers}
   constructor() {{ this.activeSceneId="scene"; this.activeScene={{value:2}};
     this._undoStack=[
       {{sceneId:"scene",snapshot:{{value:0}},postSnapshot:{{value:1}},label:"first"}},
       {{sceneId:"scene",snapshot:{{value:1}},postSnapshot:{{value:2}},label:"second"}},
-    ]; this._redoStack=[]; this._editorFocused=false; this.restores=0; }}
+      {{sceneId:"scene",snapshot:{{value:2}},postSnapshot:{{value:3}},label:"third"}},
+    ]; this._redoStack=[]; this._editorFocused=false; this.restores=[];this.releases=[];
+    this._historyStackRevision=0;this._historyOperationSeq=0;
+    this._queuedHistoryOperationCount=0;this._queuedHistoryNotification=null;
+    this._sceneMutationInvalidationSeq=0;this._projectMutationQueue=new ProjectMutationQueue(); }}
   _keyboardDebug() {{}}
-  async _restoreScene() {{ this.restores += 1;
-    await new Promise((resolve)=>{{this.release=resolve;}}); return {{value:1}}; }}
+  async _restoreScene(_sceneId,target) {{ this.restores.push(target.value);
+    await new Promise((resolve)=>this.releases.push(resolve)); return target; }}
   async _applyPromptIdentityChange() {{}}
   async _applyReferenceHistoryOperations() {{}}
+  _schedulePostMutationSceneRefresh(){{}}
 }}
 const h=new Harness();
-const first=h._undo(); await Promise.resolve();
-await h._undo();
-await h._redo();
-const whileRunning={{undo:h._undoStack.length,redo:h._redoStack.length,
-  restores:h.restores,inFlight:h._historyOperationInFlight}};
-h.release(); await first;
-console.log(JSON.stringify({{whileRunning,after:{{undo:h._undoStack.length,
-  redo:h._redoStack.length,restores:h.restores,inFlight:h._historyOperationInFlight}},
-  notices}}));
+const promises=[h._undo(),h._undo(),h._undo()];await Promise.resolve();await Promise.resolve();
+const reserved=h._undoStack.map((entry)=>({{label:entry.label,claimed:Boolean(entry.claimedBy)}}));
+const starts=[];for(let index=0;index<3;index+=1){{
+  while(h.releases.length===0)await new Promise((resolve)=>setImmediate(resolve));
+  starts.push([...h.restores]);h.releases.shift()();
+}}
+await Promise.all(promises);
+console.log(JSON.stringify({{reserved,starts,after:{{undo:h._undoStack.length,
+  redo:h._redoStack.length,restores:h.restores,inFlight:h._historyOperationInFlight}},notices}}));
 """)
-    assert result["whileRunning"] == {
-        "undo": 1, "redo": 0, "restores": 1, "inFlight": True}
-    assert result["after"] == {
-        "undo": 1, "redo": 1, "restores": 1, "inFlight": False}
-    assert result["notices"] == [
-        "Undo or Redo is still finishing. Try again in a moment.",
-        "Undo or Redo is still finishing. Try again in a moment.",
+    assert result["reserved"] == [
+        {"label": "first", "claimed": True},
+        {"label": "second", "claimed": True},
+        {"label": "third", "claimed": True},
     ]
+    assert result["starts"] == [[2], [2, 1], [2, 1, 0]]
+    assert result["after"] == {
+        "undo": 0, "redo": 3, "restores": [2, 1, 0], "inFlight": False}
+    assert result["notices"] == []
 
 
-def test_undo_and_redo_drain_mutations_then_recheck_history_gates():
+def test_queued_history_alternates_directions_without_dropping_or_misrouting_actions():
+    widget = _source("web/js/editor_widget.js")
+    reservations = _method(widget, "_trimUndoStack", "_captureProjectDependencies")
+    undo = _method(widget, "_undo", "_redo")
+    redo = _method(widget, "_redo", "_restoreScene")
+    helpers = _method(widget, "_recordHistoryRefusal", "_setWidgetValue")
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+globalThis.document={{activeElement:null}};globalThis.describeKeyboardDebugElement=()=>({{}});
+const notices=[];globalThis.notifyInfo=(message)=>notices.push(message);
+globalThis.notifyWarning=(message)=>notices.push(message);
+globalThis.notifyProgress=()=>({{update:()=>{{}},dismiss:()=>{{}}}});
+globalThis.sessionDiagRecord=()=>{{}};
+class Harness {{
+{reservations}
+{undo}
+{redo}
+{helpers}
+  constructor(){{this.activeSceneId="scene";this.activeScene={{scene_id:"scene",value:2}};
+    this._undoStack=[{{sceneId:"scene",snapshot:{{scene_id:"scene",value:1}},
+      postSnapshot:{{scene_id:"scene",value:2}},label:"edit"}}];this._redoStack=[];
+    this._maxUndoSteps=50;this._editorFocused=false;this._historyStackRevision=0;
+    this._historyOperationSeq=0;this._queuedHistoryOperationCount=0;
+    this._queuedHistoryNotification=null;this._sceneMutationInvalidationSeq=0;
+    this._projectMutationQueue=new ProjectMutationQueue();this.restores=[];}}
+  _keyboardDebug(){{}}
+  async _restoreScene(_sceneId,target){{this.restores.push(target.value);
+    this.activeScene=structuredClone(target);return structuredClone(target);}}
+  async _applyPromptIdentityChange(){{}}
+  async _applyReferenceHistoryOperations(){{}}
+  _schedulePostMutationSceneRefresh(){{}}
+}}
+const h=new Harness();let release;
+const blocker=h._projectMutationQueue.enqueue({{key:"busy",coalesce:false,
+  run:async()=>await new Promise((resolve)=>release=resolve)}});
+while(!release)await new Promise((resolve)=>setImmediate(resolve));
+const actions=[h._undo(),h._redo(),h._undo()];await Promise.resolve();
+const during={{undo:h._undoStack.map((entry)=>({{future:!!entry._historyFuture,
+  claimed:!!entry.claimedBy}})),redo:h._redoStack.map((entry)=>({{
+  future:!!entry._historyFuture,claimed:!!entry.claimedBy}})),
+  queued:h._queuedHistoryOperationCount}};
+release();await blocker;await Promise.all(actions);
+const all=[...h._undoStack,...h._redoStack];
+console.log(JSON.stringify({{during,restores:h.restores,undo:h._undoStack.length,
+  redo:h._redoStack.length,futures:all.filter((entry)=>entry._historyFuture).length,
+  claims:all.filter((entry)=>entry.claimedBy).length,notices}}));
+""")
+    assert result["during"] == {
+        "undo": [{"future": False, "claimed": True},
+                 {"future": True, "claimed": True}],
+        "redo": [{"future": True, "claimed": True},
+                 {"future": True, "claimed": False}],
+        "queued": 3,
+    }
+    assert result["restores"] == [1, 2, 1]
+    assert result["undo"] == 0
+    assert result["redo"] == 1
+    assert result["futures"] == 0
+    assert result["claims"] == 0
+    assert result["notices"] == []
+
+
+def test_new_edit_during_undo_restore_prevents_invalid_redo_materialization():
+    widget = _source("web/js/editor_widget.js")
+    reservations = _method(widget, "_trimUndoStack", "_captureProjectDependencies")
+    undo = _method(widget, "_undo", "_redo")
+    clear_redo = _method(widget, "_clearRedoForNewEdit", "_recordHistoryRefusal")
+    helpers = _method(widget, "_recordHistoryRefusal", "_setWidgetValue")
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+globalThis.document={{activeElement:null}};globalThis.describeKeyboardDebugElement=()=>({{}});
+globalThis.notifyInfo=()=>{{}};globalThis.notifyWarning=()=>{{}};
+globalThis.notifyProgress=()=>({{update:()=>{{}},dismiss:()=>{{}}}});
+globalThis.sessionDiagRecord=()=>{{}};
+class Harness {{
+{reservations}
+{undo}
+{clear_redo}
+{helpers}
+  constructor(){{this.activeSceneId="scene";this.activeScene={{scene_id:"scene",value:2}};
+    this._undoStack=[{{sceneId:"scene",snapshot:{{scene_id:"scene",value:1}},
+      postSnapshot:{{scene_id:"scene",value:2}},label:"edit"}}];this._redoStack=[];
+    this._maxUndoSteps=50;this._editorFocused=false;this._historyStackRevision=0;
+    this._historyOperationSeq=0;this._queuedHistoryOperationCount=0;
+    this._queuedHistoryNotification=null;this._sceneMutationInvalidationSeq=0;
+    this._projectMutationQueue=new ProjectMutationQueue();}}
+  _keyboardDebug(){{}}
+  async _restoreScene(_sceneId,target){{this.restoreStarted=true;
+    await new Promise((resolve)=>this.releaseRestore=resolve);return target;}}
+  async _applyPromptIdentityChange(){{}}
+  async _applyReferenceHistoryOperations(){{}}
+  _schedulePostMutationSceneRefresh(){{}}
+}}
+const h=new Harness();const call=h._undo();
+while(!h.restoreStarted)await new Promise((resolve)=>setImmediate(resolve));
+const reservedRedo=h._redoStack[0];h._historyStackRevision+=1;h._clearRedoForNewEdit();
+const afterEdit={{redo:h._redoStack.length,reservationStillPresent:h._redoStack.includes(reservedRedo)}};
+h.releaseRestore();await call;
+console.log(JSON.stringify({{afterEdit,undo:h._undoStack.length,redo:h._redoStack.length,
+  reservationFuture:!!reservedRedo._historyFuture}}));
+""")
+    assert result == {
+        "afterEdit": {"redo": 0, "reservationStillPresent": False},
+        "undo": 0,
+        "redo": 0,
+        "reservationFuture": True,
+    }
+
+
+def test_alternating_history_queue_does_not_discard_viable_actions_at_undo_depth_limit():
+    widget = _source("web/js/editor_widget.js")
+    reservations = _method(widget, "_trimUndoStack", "_captureProjectDependencies")
+    undo = _method(widget, "_undo", "_redo")
+    redo = _method(widget, "_redo", "_restoreScene")
+    helpers = _method(widget, "_recordHistoryRefusal", "_setWidgetValue")
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+globalThis.document={{activeElement:null}};globalThis.describeKeyboardDebugElement=()=>({{}});
+const warnings=[];globalThis.notifyInfo=()=>{{}};
+globalThis.notifyWarning=(message)=>warnings.push(message);
+globalThis.notifyProgress=()=>({{update:()=>{{}},dismiss:()=>{{}}}});
+globalThis.sessionDiagRecord=()=>{{}};
+class Harness {{
+{reservations}
+{undo}
+{redo}
+{helpers}
+  constructor(){{this.activeSceneId="scene";this.activeScene={{scene_id:"scene",value:2}};
+    this._undoStack=[{{sceneId:"scene",snapshot:{{scene_id:"scene",value:1}},
+      postSnapshot:{{scene_id:"scene",value:2}},label:"edit"}}];this._redoStack=[];
+    this._maxUndoSteps=4;this._editorFocused=false;this._historyStackRevision=0;
+    this._historyOperationSeq=0;this._queuedHistoryOperationCount=0;
+    this._queuedHistoryNotification=null;this._sceneMutationInvalidationSeq=0;
+    this._projectMutationQueue=new ProjectMutationQueue();}}
+  _keyboardDebug(){{}}
+  _finishHistoryOperation(){{}}
+  async _restoreScene(_sceneId,target){{return target;}}
+  async _applyPromptIdentityChange(){{}}
+  async _applyReferenceHistoryOperations(){{}}
+  _schedulePostMutationSceneRefresh(){{}}
+}}
+const h=new Harness();let release;
+const blocker=h._projectMutationQueue.enqueue({{key:"busy",coalesce:false,
+  run:async()=>await new Promise((resolve)=>release=resolve)}});
+while(!release)await new Promise((resolve)=>setImmediate(resolve));
+    const actions=[];for(let index=0;index<55;index+=1){{
+      actions.push(index%2===0?h._undo():h._redo());
+}}
+await Promise.resolve();const during={{count:h._queuedHistoryOperationCount,
+  pending:h._projectMutationQueue._pending.length}};
+release();await blocker;const outcomes=await Promise.all(actions);
+console.log(JSON.stringify({{during,outcomes,warnings,undo:h._undoStack.length,
+  redo:h._redoStack.length}}));
+""")
+    assert result["during"] == {"count": 55, "pending": 55}
+    assert result["outcomes"] == [None] * 55
+    assert result["warnings"] == []
+    assert result["undo"] == 0
+    assert result["redo"] == 1
+
+
+def test_trim_preserves_claimed_history_entry_at_depth_limit():
+    widget = _source("web/js/editor_widget.js")
+    trim = _method(widget, "_trimUndoStack", "_captureProjectDependencies")
+    result = _run_node(f"""
+class Harness {{
+{trim}
+  constructor(){{this._maxUndoSteps=49;
+    this._undoStack=Array.from({{length:51}},(_,id)=>({{id}}));
+    this._undoStack[0].claimedBy={{operation:"undo",id:1}};}}
+}}
+const h=new Harness();const claimed=h._undoStack[0];h._trimUndoStack();
+console.log(JSON.stringify({{depth:h._undoStack.length,claimedRetained:h._undoStack[0]===claimed,
+  ids:h._undoStack.map((entry)=>entry.id)}}));
+""")
+    assert result["depth"] == 50
+    assert result["claimedRetained"] is True
+    assert result["ids"][0] == 0
+    assert 1 not in result["ids"]
+
+
+def test_redo_materialization_reapplies_undo_depth_limit_after_future_reservations():
+    widget = _source("web/js/editor_widget.js")
+    reservations = _method(widget, "_trimUndoStack", "_captureProjectDependencies")
+    redo = _method(widget, "_redo", "_restoreScene")
+    helpers = _method(widget, "_recordHistoryRefusal", "_setWidgetValue")
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+globalThis.document={{activeElement:null}};globalThis.describeKeyboardDebugElement=()=>({{}});
+globalThis.notifyInfo=()=>{{}};globalThis.notifyWarning=()=>{{}};
+globalThis.notifyProgress=()=>({{update:()=>{{}},dismiss:()=>{{}}}});
+globalThis.sessionDiagRecord=()=>{{}};
+class Harness {{
+{reservations}
+{redo}
+{helpers}
+  constructor(){{this.activeSceneId="scene";this.activeScene={{scene_id:"scene",value:0}};
+    this._undoStack=[];this._redoStack=[
+      {{sceneId:"scene",snapshot:{{scene_id:"scene",value:1}},
+        postSnapshot:{{scene_id:"scene",value:0}},label:"one"}},
+      {{sceneId:"scene",snapshot:{{scene_id:"scene",value:2}},
+        postSnapshot:{{scene_id:"scene",value:1}},label:"two"}}];
+    this._maxUndoSteps=2;this._editorFocused=false;this._historyStackRevision=0;
+    this._historyOperationSeq=0;this._queuedHistoryOperationCount=0;
+    this._queuedHistoryNotification=null;this._sceneMutationInvalidationSeq=0;
+    this._projectMutationQueue=new ProjectMutationQueue();}}
+  _keyboardDebug(){{}}
+  _finishHistoryOperation(){{}}
+  async _restoreScene(_sceneId,target){{return target;}}
+  async _applyPromptIdentityChange(){{}}
+  async _applyReferenceHistoryOperations(){{}}
+  _schedulePostMutationSceneRefresh(){{}}
+}}
+const h=new Harness();let release;
+const blocker=h._projectMutationQueue.enqueue({{key:"busy",coalesce:false,
+  run:async()=>await new Promise((resolve)=>release=resolve)}});
+while(!release)await new Promise((resolve)=>setImmediate(resolve));
+const actions=[h._redo(),h._redo()];await Promise.resolve();
+h._undoStack.push({{label:"later-a"}},{{label:"later-b"}});h._trimUndoStack();
+const during={{depth:h._undoStack.length,futures:h._undoStack.filter(
+  (entry)=>entry._historyFuture).length}};
+release();await blocker;await Promise.all(actions);
+console.log(JSON.stringify({{during,depth:h._undoStack.length,
+  futures:h._undoStack.filter((entry)=>entry._historyFuture).length,
+  labels:h._undoStack.map((entry)=>entry.label)}}));
+""")
+    assert result["during"] == {"depth": 4, "futures": 2}
+    assert result["depth"] == 2
+    assert result["futures"] == 0
+    assert result["labels"] == ["later-a", "later-b"]
+
+
+def test_failed_downstream_undo_retrims_materialized_future_entry():
+    widget = _source("web/js/editor_widget.js")
+    reservations = _method(widget, "_trimUndoStack", "_captureProjectDependencies")
+    undo = _method(widget, "_undo", "_redo")
+    redo = _method(widget, "_redo", "_restoreScene")
+    helpers = _method(widget, "_recordHistoryRefusal", "_setWidgetValue")
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+globalThis.document={{activeElement:null}};globalThis.describeKeyboardDebugElement=()=>({{}});
+globalThis.notifyInfo=()=>{{}};globalThis.notifyWarning=()=>{{}};
+globalThis.notifyProgress=()=>({{update:()=>{{}},dismiss:()=>{{}}}});
+globalThis.sessionDiagRecord=()=>{{}};
+class Harness {{
+{reservations}
+{undo}
+{redo}
+{helpers}
+  constructor(){{this.activeSceneId="scene";this.activeScene={{scene_id:"scene",value:0}};
+    this._undoStack=[];this._redoStack=[{{sceneId:"scene",
+      snapshot:{{scene_id:"scene",value:1}},postSnapshot:{{scene_id:"scene",value:0}},
+      label:"redo-source"}}];this._maxUndoSteps=2;this._editorFocused=false;
+    this._historyStackRevision=0;this._historyOperationSeq=0;
+    this._queuedHistoryOperationCount=0;this._queuedHistoryNotification=null;
+    this._sceneMutationInvalidationSeq=0;this._projectMutationQueue=new ProjectMutationQueue();
+    this.restoreCalls=0;}}
+  _keyboardDebug(){{}}
+  async _restoreScene(_sceneId,target){{this.restoreCalls+=1;
+    if(this.restoreCalls===2)throw new Error("downstream restore refused");return target;}}
+  async _applyPromptIdentityChange(){{}}
+  async _applyReferenceHistoryOperations(){{}}
+  _schedulePostMutationSceneRefresh(){{}}
+}}
+const h=new Harness();let release;
+const blocker=h._projectMutationQueue.enqueue({{key:"busy",coalesce:false,
+  run:async()=>await new Promise((resolve)=>release=resolve)}});
+while(!release)await new Promise((resolve)=>setImmediate(resolve));
+const redoCall=h._redo();const undoCall=h._undo();await Promise.resolve();
+h._undoStack.push({{label:"later-a"}},{{label:"later-b"}});h._trimUndoStack();
+const during={{depth:h._undoStack.length,claimed:!!h._undoStack[0].claimedBy}};
+release();await blocker;await Promise.all([redoCall,undoCall]);
+console.log(JSON.stringify({{during,depth:h._undoStack.length,
+  labels:h._undoStack.map((entry)=>entry.label),futures:[...h._undoStack,...h._redoStack]
+    .filter((entry)=>entry._historyFuture).length,restoreCalls:h.restoreCalls}}));
+""")
+    assert result["during"] == {"depth": 3, "claimed": True}
+    assert result["depth"] == 2
+    assert result["labels"] == ["later-a", "later-b"]
+    assert result["futures"] == 0
+    assert result["restoreCalls"] == 2
+
+
+def test_failed_queued_history_clears_claim_and_preserves_stack_bytes():
+    widget = _source("web/js/editor_widget.js")
+    undo = _method(widget, "_undo", "_redo")
+    helpers = _method(widget, "_recordHistoryRefusal", "_setWidgetValue")
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+globalThis.document={{activeElement:null}};globalThis.describeKeyboardDebugElement=()=>({{}});
+globalThis.notifyInfo=()=>{{}};globalThis.notifyWarning=()=>{{}};
+globalThis.notifyProgress=()=>({{update:()=>{{}},dismiss:()=>{{}}}});
+globalThis.sessionDiagRecord=()=>{{}};
+class Harness {{
+{undo}
+{helpers}
+  constructor(){{this.activeSceneId="scene";this.activeScene={{scene_id:"scene",value:"after"}};
+    this._undoStack=[{{sceneId:"scene",snapshot:{{scene_id:"scene",value:"before"}},
+      postSnapshot:{{scene_id:"scene",value:"after"}},label:"failing edit",
+      metadata:{{nested:[1,2,3]}}}}];this._redoStack=[];this._editorFocused=false;
+    this._historyStackRevision=0;this._historyOperationSeq=0;
+    this._queuedHistoryOperationCount=0;this._queuedHistoryNotification=null;
+    this._sceneMutationInvalidationSeq=0;this._projectMutationQueue=new ProjectMutationQueue();}}
+  _keyboardDebug(){{}}
+  async _restoreScene(){{throw new Error("restore refused");}}
+  async _applyPromptIdentityChange(){{}}
+  async _applyReferenceHistoryOperations(){{}}
+  _schedulePostMutationSceneRefresh(){{}}
+}}
+const h=new Harness();const before=JSON.stringify(h._undoStack);await h._undo();
+console.log(JSON.stringify({{before,after:JSON.stringify(h._undoStack),
+  claim:Object.hasOwn(h._undoStack[0],"claimedBy"),redo:h._redoStack.length,
+  idle:!h._projectMutationQueue.isBusy()}}));
+""")
+    assert result["after"] == result["before"]
+    assert result["claim"] is False
+    assert result["redo"] == 0
+    assert result["idle"] is True
+
+
+def test_history_catch_compensation_uses_owner_token_without_deadlock():
+    widget = _source("web/js/editor_widget.js")
+    undo = _method(widget, "_undo", "_redo")
+    helpers = _method(widget, "_recordHistoryRefusal", "_setWidgetValue")
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+globalThis.document={{activeElement:null}};globalThis.describeKeyboardDebugElement=()=>({{}});
+globalThis.notifyInfo=()=>{{}};globalThis.notifyWarning=()=>{{}};
+globalThis.notifyProgress=()=>({{update:()=>{{}},dismiss:()=>{{}}}});
+globalThis.sessionDiagRecord=()=>{{}};
+class Harness {{
+{undo}
+{helpers}
+  constructor(){{this.activeSceneId="scene";this.activeScene={{scene_id:"scene"}};
+    this._undoStack=[{{sceneId:"scene",snapshot:{{scene_id:"scene",value:"before"}},
+      postSnapshot:{{scene_id:"scene",value:"after"}},label:"composite",
+      referenceOperations:[{{type:"forward"}}],
+      inverseReferenceOperations:[{{type:"inverse"}}]}}];this._redoStack=[];
+    this._editorFocused=false;this._historyStackRevision=0;this._historyOperationSeq=0;
+    this._queuedHistoryOperationCount=0;this._queuedHistoryNotification=null;
+    this._sceneMutationInvalidationSeq=0;this._projectMutationQueue=new ProjectMutationQueue();
+    this.calls=[];this.nestedId=0;}}
+  _keyboardDebug(){{}}
+  async _applyReferenceHistoryOperations(operations,_label,_diagnostics,ownerToken){{
+    const type=operations[0].type;
+    return this._projectMutationQueue.enqueue({{key:`nested:${{++this.nestedId}}`,
+      coalesce:false,ownerToken,run:async()=>this.calls.push(type)}});
+  }}
+  async _applyPromptIdentityChange(){{}}
+  async _restoreScene(){{throw new Error("force compensation");}}
+  _schedulePostMutationSceneRefresh(){{}}
+}}
+const h=new Harness();const completed=await Promise.race([
+  h._undo().then(()=>true),
+  new Promise((resolve)=>setTimeout(()=>resolve(false),150)),
+]);
+console.log(JSON.stringify({{completed,calls:h.calls,idle:!h._projectMutationQueue.isBusy(),
+  undo:h._undoStack.length,claim:Object.hasOwn(h._undoStack[0],"claimedBy")}}));
+""")
+    assert result == {"completed": True, "calls": ["forward", "inverse"],
+                      "idle": True, "undo": 1, "claim": False}
+
+
+def test_undo_and_redo_wait_behind_busy_mutation_queue_and_then_apply():
     widget = _source("web/js/editor_widget.js")
     undo = _method(widget, "_undo", "_redo")
     redo = _method(widget, "_redo", "_restoreScene")
+    helpers = _method(widget, "_recordHistoryRefusal", "_setWidgetValue")
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
     result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
 globalThis.document={{activeElement:null}};
 globalThis.describeKeyboardDebugElement=()=>({{}});
 const notices=[]; globalThis.notifyInfo=(message)=>notices.push(message);
-globalThis.notifyWarning=()=>{{}};
+globalThis.notifyWarning=(message)=>notices.push(message);
+globalThis.notifyProgress=()=>({{update:()=>{{}},dismiss:()=>{{}}}});
+globalThis.sessionDiagRecord=()=>{{}};
 class Harness {{
 {undo}
 {redo}
-  constructor() {{ this.activeSceneId="scene"; this.activeScene={{value:2}};
-    this._undoStack=[{{sceneId:"scene",snapshot:{{value:1}},label:"edit"}}];
-    this._redoStack=[{{sceneId:"scene",snapshot:{{value:3}},label:"edit"}}];
-    this._editorFocused=false; this._historyOperationInFlight=false;
-    this.pending=false; this.projectBusy=false; this.restores=0; this.drains=[]; }}
+{helpers}
+  constructor(operation) {{ this.activeSceneId="scene"; this.activeScene={{scene_id:"scene",value:2}};
+    this._undoStack=operation==="undo"
+      ?[{{sceneId:"scene",snapshot:{{scene_id:"scene",value:1}},postSnapshot:{{scene_id:"scene",value:2}},label:"edit"}}]:[];
+    this._redoStack=operation==="redo"
+      ?[{{sceneId:"scene",snapshot:{{scene_id:"scene",value:3}},postSnapshot:{{scene_id:"scene",value:2}},label:"edit"}}]:[];
+    this._editorFocused=false;this.restores=[];this._historyStackRevision=0;
+    this._historyOperationSeq=0;this._queuedHistoryOperationCount=0;
+    this._queuedHistoryNotification=null;this._sceneMutationInvalidationSeq=0;
+    this._projectMutationQueue=new ProjectMutationQueue();this.suppressions=[]; }}
   _keyboardDebug() {{}}
-  _hasPendingHistoryCommit() {{ return this.pending; }}
-  _hasPendingProjectMutations() {{ return this.projectBusy; }}
-  async _drainProjectMutations(reason) {{
-    this.drains.push(reason);
-    await new Promise((resolve)=>{{this.releaseDrain=resolve;}});
-  }}
-  async _restoreScene() {{ this.restores += 1; }}
+  _hasPendingProjectMutations() {{return this._projectMutationQueue.isBusy();}}
+  async _restoreScene(_sceneId,target) {{this.restores.push(target.value);return target;}}
   async _applyPromptIdentityChange() {{}}
   async _applyReferenceHistoryOperations() {{}}
+  _activateGraphUndoSuppression(reason){{this.suppressions.push(reason);}}
+  _schedulePostMutationSceneRefresh(){{}}
 }}
 const results=[];
 for (const operation of ["undo","redo"]) {{
-  for (const gate of ["project","in_flight","pending","lifecycle"]) {{
-    const h=new Harness();
-    const call=operation === "undo" ? h._undo() : h._redo();
-    await Promise.resolve();
-    if (gate === "project") h.projectBusy=true;
-    if (gate === "in_flight") h._historyOperationInFlight=true;
-    if (gate === "pending") h.pending=true;
-    if (gate === "lifecycle") h._sceneHistoryLifecycleOwner={{label:"settled mutation"}};
-    h.releaseDrain(); await call;
-    results.push({{operation,gate,drains:h.drains,restores:h.restores,
-      depth:operation === "undo" ? h._undoStack.length : h._redoStack.length}});
-  }}
+  const h=new Harness(operation);let release;
+  const blocker=h._projectMutationQueue.enqueue({{key:"scene:scene:busy",coalesce:false,
+    run:async()=>{{await new Promise((resolve)=>release=resolve);return "write";}}}});
+  while(!release)await new Promise((resolve)=>setImmediate(resolve));
+  const call=operation === "undo" ? h._undo() : h._redo();await Promise.resolve();
+  const source=operation === "undo" ? h._undoStack : h._redoStack;
+  const during={{claimed:Boolean(source[0]?.claimedBy),restores:[...h.restores],
+    suppressions:[...h.suppressions],
+    queued:h._projectMutationQueue.hasPending()}};
+  release();await blocker;await call;
+  results.push({{operation,during,restores:h.restores,suppressions:h.suppressions,
+    undo:h._undoStack.length,redo:h._redoStack.length}});
 }}
 console.log(JSON.stringify({{results,notices}}));
 """)
     assert result["results"] == [
-        {"operation": operation, "gate": gate,
-         "drains": [f"history_{operation}"], "restores": 0, "depth": 1}
-        for operation in ("undo", "redo")
-        for gate in ("project", "in_flight", "pending", "lifecycle")
+        {"operation": "undo", "during": {"claimed": True, "restores": [],
+         "suppressions": [], "queued": True}, "restores": [1],
+         "suppressions": ["editor-undo-apply"], "undo": 0, "redo": 1},
+        {"operation": "redo", "during": {"claimed": True, "restores": [],
+         "suppressions": [], "queued": True}, "restores": [3],
+         "suppressions": ["editor-redo-apply"], "undo": 1, "redo": 0},
     ]
-    assert result["notices"] == [
-            "That change is still saving. Try Undo again when it finishes.",
-            "Undo or Redo is still finishing. Try again in a moment.",
-            "That change is still saving. Try Undo again when it finishes.",
-            "Another scene change is still finishing. Try Undo again in a moment.",
-            "That change is still saving. Try Redo again when it finishes.",
-            "Undo or Redo is still finishing. Try again in a moment.",
-            "That change is still saving. Try Redo again when it finishes.",
-            "Another scene change is still finishing. Try Redo again in a moment.",
-        ]
+    assert result["notices"] == []
+
+
+def test_history_claim_and_apply_refusals_have_parity_and_runtime_diagnostics():
+    widget = _source("web/js/editor_widget.js")
+    reservations = _method(widget, "_trimUndoStack", "_captureProjectDependencies")
+    undo = _method(widget, "_undo", "_redo")
+    redo = _method(widget, "_redo", "_restoreScene")
+    clear_redo = _method(widget, "_clearRedoForNewEdit", "_recordHistoryRefusal")
+    refusal = _method(widget, "_recordHistoryRefusal", "_setWidgetValue")
+    result = _run_node(f"""
+globalThis.document={{activeElement:null}};
+globalThis.describeKeyboardDebugElement=()=>({{}});
+globalThis.notifyInfo=()=>{{}};globalThis.notifyWarning=()=>{{}};
+globalThis.notifyProgress=()=>({{update:()=>{{}},dismiss:()=>{{}}}});
+const records=[];globalThis.sessionDiagRecord=(kind,payload)=>{{
+  if(kind==="history_operation_refused")records.push(payload);
+}};
+class Harness {{
+{reservations}
+{undo}
+{redo}
+{clear_redo}
+{refusal}
+  constructor(operation,gate) {{this.activeSceneId="scene-a";this.gate=gate;
+    this.activeScene={{scene_id:"scene-a"}};this._project="project-a";
+    const entry={{sceneId:"scene-a",snapshot:{{scene_id:"scene-a"}},
+      postSnapshot:{{scene_id:"scene-a"}},label:`${{operation}}-${{gate}}`}};
+    this._undoStack=operation==="undo"?[entry]:[];
+    this._redoStack=operation==="redo"?[entry]:[];
+    this._editorFocused=false;this._historyStackRevision=0;
+    this._historyCommitRevisionByEntry=new WeakMap();this._historyOperationSeq=0;
+    this._queuedHistoryOperationCount=0;this._queuedHistoryNotification=null;
+    this._sceneMutationInvalidationSeq=0;
+    this._projectMutationQueue=gate==="queue_failed"
+      ?{{enqueue:()=>Promise.reject(new Error("queue refused"))}}
+      :{{enqueue:(spec)=>new Promise((resolve)=>{{this.release=async()=>resolve(
+          await spec.run(spec.intent,spec.diagnostics,{{owner:true}}));}})}};}}
+  _keyboardDebug(){{}}
+  _projectDirName(){{return this._project;}}
+  _hasPendingProjectMutations(){{return ["stalled_pending_entry",
+    "redo_invalidated_by_edit"].includes(this.gate);}}
+  async _restoreScene(_sceneId,target){{return target;}}
+  async _applyPromptIdentityChange(){{}}
+  async _applyReferenceHistoryOperations(){{}}
+  _schedulePostMutationSceneRefresh(){{}}
+}}
+const shared=["editor_destroyed","project_changed","claim_lost",
+  "history_dependency_unresolved","stalled_pending_entry",
+  "scene_history_lifecycle","target_scene_unavailable"];
+let invalidatedRedoDepth=null;
+for(const operation of ["undo","redo"]){{
+  for(const gate of [...shared,...(operation==="redo"?["redo_invalidated_by_edit"]:[]),
+      "queue_failed"]){{
+    const h=new Harness(operation,gate);const entry=(operation==="undo"
+      ?h._undoStack:h._redoStack)[0];
+    if(gate==="stalled_pending_entry"){{
+      h._priorPending={{sceneId:"scene-a",pending:true}};
+      h._undoStack.unshift(h._priorPending);
+    }}
+    if(gate==="redo_invalidated_by_edit"){{
+      h._priorPending={{sceneId:"scene-a",pending:true}};
+      h._undoStack.push(h._priorPending);
+    }}
+    const call=operation==="undo"?h._undo():h._redo();
+    if(gate==="queue_failed"){{await call;continue;}}
+    if(gate==="editor_destroyed")h._destroyed=true;
+    if(gate==="project_changed")h._project="project-b";
+    if(gate==="claim_lost")delete entry.claimedBy;
+    if(gate==="history_dependency_unresolved")entry._historyFuture=true;
+    if(gate==="scene_history_lifecycle")h._sceneHistoryLifecycleOwner={{}};
+    if(gate==="target_scene_unavailable"){{h.activeSceneId="scene-b";
+      h.activeScene={{scene_id:"scene-b"}};}}
+    if(gate==="redo_invalidated_by_edit"){{h._priorPending.pending=false;
+      h._historyStackRevision=1;
+      h._historyCommitRevisionByEntry.set(h._priorPending,1);
+      h._clearRedoForNewEdit({{preserveFutureReservations:true}});}}
+    await h.release();await call;
+    if(gate==="redo_invalidated_by_edit")invalidatedRedoDepth=h._redoStack.length;
+  }}
+}}
+for(const operation of ["undo","redo"]){{
+  const empty=new Harness(operation,"empty");
+  if(operation==="undo")empty._undoStack=[];else empty._redoStack=[];
+  await (operation==="undo"?empty._undo():empty._redo());
+  const stalled=new Harness(operation,"stalled");
+  if(operation==="undo")stalled._undoStack.unshift({{sceneId:"scene-a",pending:true}});
+  else stalled._undoStack=[{{sceneId:"scene-a",pending:true}},
+    {{sceneId:"scene-a",pending:false}}];
+  await (operation==="undo"?stalled._undo():stalled._redo());
+}}
+console.log(JSON.stringify({{records,invalidatedRedoDepth,sourceOrder:{{
+  undoEmpty:{json.dumps(undo)}.indexOf('"empty_stack"'),
+  undoPending:{json.dumps(undo)}.indexOf('"stalled_pending_entry"'),
+  redoEmpty:{json.dumps(redo)}.indexOf('"empty_stack"'),
+  redoPending:{json.dumps(redo)}.indexOf('"stalled_pending_entry"'),
+}}}}));
+""")
+    shared = ["editor_destroyed", "project_changed", "claim_lost",
+              "history_dependency_unresolved",
+              "stalled_pending_entry", "scene_history_lifecycle",
+              "target_scene_unavailable"]
+    expected = ([*(('undo', gate) for gate in shared), ('undo', 'queue_failed'),
+                 *(('redo', gate) for gate in shared),
+                 ('redo', 'redo_invalidated_by_edit'), ('redo', 'queue_failed'),
+                 ('undo', 'empty_stack'), ('undo', 'stalled_pending_entry'),
+                 ('redo', 'empty_stack'), ('redo', 'stalled_pending_entry')])
+    assert [(row["operation"], row["gate"]) for row in result["records"]] == expected
+    assert all("scene_id" in row and "gesture_id" in row
+               for row in result["records"])
+    assert result["invalidatedRedoDepth"] == 0
+    # Undo discovers an empty source stack before it can inspect an entry;
+    # Redo deliberately checks a pending Undo transaction first.
+    assert result["sourceOrder"]["undoEmpty"] < result["sourceOrder"]["undoPending"]
+    assert result["sourceOrder"]["redoPending"] < result["sourceOrder"]["redoEmpty"]
+
+
+def test_history_apply_refusals_emit_entry_and_gesture_diagnostics_at_runtime():
+    widget = _source("web/js/editor_widget.js")
+    undo = _method(widget, "_undo", "_redo")
+    redo = _method(widget, "_redo", "_restoreScene")
+    refusal = _method(widget, "_recordHistoryRefusal", "_setWidgetValue")
+    result = _run_node(f"""
+globalThis.document={{activeElement:null}};globalThis.describeKeyboardDebugElement=()=>({{}});
+globalThis.notifyInfo=()=>{{}};globalThis.notifyWarning=()=>{{}};
+const records=[];globalThis.sessionDiagRecord=(kind,payload)=>{{
+  if(kind==="history_operation_refused")records.push(payload);
+}};
+class Harness {{
+{undo}
+{redo}
+{refusal}
+  constructor(mode,operation){{this.mode=mode;this.operation=operation;
+    this.activeSceneId="active-scene";this.activeScene={{scene_id:"active-scene"}};
+    this._undoStack=[];this._redoStack=[];this._editorFocused=false;}}
+  _keyboardDebug(){{}}
+  _captureProjectDependencies(){{return {{}};}}
+  async _restoreProjectDependencies(){{throw new Error("project dependencies refused");}}
+  async _applyPromptIdentityChange(){{throw new Error("prompt identity refused");}}
+  async _applyReferenceHistoryOperations(){{throw new Error("reference refused");}}
+  async _restoreScene(){{const error=new Error("scene refused");
+    if(this.mode==="restore_ambiguous"){{error.restoreAmbiguous=true;error.restoreToken="token";}}
+    throw error;}}
+}}
+const entryFor=(mode)=>{{
+  const base={{sceneId:"entry-scene",label:mode,snapshot:{{scene_id:"entry-scene"}}}};
+  if(mode==="project_dependencies_restore_failed")return{{...base,kind:"project_dependencies"}};
+  if(mode==="prompt_identity_restore_failed")return{{...base,kind:"prompt_identity",
+    change:{{}},inverseChange:{{}}}};
+  if(mode==="reference_restore_failed")return{{...base,kind:"reference_change",
+    operations:[{{type:"x"}}],inverseOperations:[]}};
+  if(mode==="missing_post_snapshot")return base;
+  return{{...base,postSnapshot:{{scene_id:"entry-scene"}}}};
+}};
+for(const operation of ["undo","redo"]){{
+  for(const mode of ["project_dependencies_restore_failed","prompt_identity_restore_failed",
+    "reference_restore_failed","missing_post_snapshot","restore_ambiguous","restore_failed"]){{
+    const h=new Harness(mode,operation);const entry=entryFor(mode);
+    (operation==="undo"?h._undoStack:h._redoStack).push(entry);
+    await (operation==="undo"
+      ?h._runUndoWithinGesture({{gestureId:`g-${{operation}}-${{mode}}`}})
+      :h._runRedoWithinGesture({{gestureId:`g-${{operation}}-${{mode}}`}}));
+  }}
+}}
+console.log(JSON.stringify(records));
+""")
+    gates = [
+        "project_dependencies_restore_failed",
+        "prompt_identity_restore_failed",
+        "reference_restore_failed",
+        "missing_post_snapshot",
+        "restore_ambiguous",
+        "restore_failed",
+    ]
+    assert len(result) == 12
+    for operation_index, operation in enumerate(("undo", "redo")):
+        rows = result[operation_index * 6:(operation_index + 1) * 6]
+        assert [row["gate"] for row in rows] == gates
+        assert all(row["operation"] == operation for row in rows)
+        assert all(row["scene_id"] == "entry-scene" for row in rows)
+        assert [row["gesture_id"] for row in rows] == [
+            f"g-{operation}-{gate}" for gate in gates]
+
+
+def test_missing_post_snapshot_is_consumed_once_for_direct_and_reserved_history():
+    widget = _source("web/js/editor_widget.js")
+    undo = _method(widget, "_runUndoWithinGesture", "_redo")
+    redo = _method(widget, "_runRedoWithinGesture", "_restoreScene")
+    result = _run_node(f"""
+globalThis.document={{activeElement:null}};globalThis.describeKeyboardDebugElement=()=>({{}});
+const warnings=[];const diagnostics=[];
+globalThis.notifyInfo=()=>{{}};globalThis.notifyWarning=(message)=>warnings.push(message);
+globalThis.sessionDiagRecord=(kind,payload)=>diagnostics.push({{kind,payload}});
+class Harness {{
+{undo}
+{redo}
+  constructor(mode){{this.activeSceneId="scene";this.activeScene={{scene_id:"scene",value:"after"}};
+    this.scenes=[this.activeScene];this._undoStack=[];this._redoStack=[];
+    this.restores=[];this.refusals=[];this.mode=mode;}}
+  _keyboardDebug(){{}}
+  _recordHistoryRefusal(operation,gate,_diagnostics,detail){{
+    this.refusals.push({{operation,gate,...detail}});}}
+  _recordHistoryOrderedScene(){{}}
+  _historyBaseForRestoredScene(scene){{return scene;}}
+  async _restoreScene(_id,target){{this.restores.push(target.value);return structuredClone(target);}}
+  _materializeHistoryOpposite(stack,reservation,opposite){{
+    const index=stack.indexOf(reservation);if(index<0)return false;
+    stack.splice(index,1,opposite);return true;}}
+  async _restoreProjectDependencies(){{}}
+  _captureProjectDependencies(){{return {{}};}}
+  async _applyPromptIdentityChange(){{}}
+  async _applyReferenceHistoryOperations(){{}}
+}}
+async function direct(mode){{
+  const h=new Harness(mode);
+  const valid={{sceneId:"scene",label:"valid",
+    snapshot:{{scene_id:"scene",value:mode==="undo"?"before":"after"}},
+    postSnapshot:{{scene_id:"scene",value:mode==="undo"?"after":"before"}}}};
+  const poison={{sceneId:"scene",label:"failed",snapshot:{{scene_id:"scene",value:"bad"}}}};
+  const source=mode==="undo"?h._undoStack:h._redoStack;
+  source.push(valid,poison);
+  await (mode==="undo"?h._runUndoWithinGesture():h._runRedoWithinGesture());
+  const afterPoison={{source:source.map((entry)=>entry.label),
+    opposite:(mode==="undo"?h._redoStack:h._undoStack).map((entry)=>entry.label),
+    restores:[...h.restores]}};
+  await (mode==="undo"?h._runUndoWithinGesture():h._runRedoWithinGesture());
+  return {{afterPoison,afterValid:{{source:source.map((entry)=>entry.label),
+    opposite:(mode==="undo"?h._redoStack:h._undoStack).map((entry)=>entry.label),
+    restores:[...h.restores]}},refusals:h.refusals}};
+}}
+async function reserved(mode){{
+  const h=new Harness(mode);const claim={{id:"claim"}};
+  const poison={{sceneId:"scene",label:"failed",snapshot:{{scene_id:"scene"}},claimedBy:claim}};
+  const source=mode==="undo"?h._undoStack:h._redoStack;
+  const opposite=mode==="undo"?h._redoStack:h._undoStack;
+  const future={{_historyFuture:true}};source.push(poison);opposite.push(future);
+  await (mode==="undo"
+    ? h._runUndoWithinGesture(null,poison,claim,null,future,null)
+    : h._runRedoWithinGesture(null,poison,claim,null,future,null));
+  return {{source:source.length,opposite:opposite.length,futureStill:opposite.includes(future),
+    restores:h.restores,refusals:h.refusals}};
+}}
+const output={{undo:await direct("undo"),redo:await direct("redo"),
+  reservedUndo:await reserved("undo"),reservedRedo:await reserved("redo"),
+  warnings,diagnostics}};
+console.log(JSON.stringify(output));
+""")
+    for operation in ("undo", "redo"):
+        direct = result[operation]
+        assert direct["afterPoison"] == {
+            "source": ["valid"], "opposite": [], "restores": []}
+        assert direct["afterValid"]["source"] == []
+        assert direct["afterValid"]["opposite"] == ["valid"]
+        assert direct["afterValid"]["restores"] == ["before" if operation == "undo" else "after"]
+        assert direct["refusals"][0]["gate"] == "missing_post_snapshot"
+        assert direct["refusals"][0]["entry_discarded"] is True
+    for key in ("reservedUndo", "reservedRedo"):
+        reserved = result[key]
+        assert reserved["source"] == 0
+        assert reserved["opposite"] == 1  # outer queued finalizer releases this reservation
+        assert reserved["futureStill"] is True
+        assert reserved["restores"] == []
+        assert reserved["refusals"][0]["entry_discarded"] is True
+    assert len(result["warnings"]) == 4
+    assert all("Press Undo again" in message or "Press Redo again" in message
+               for message in result["warnings"])
+    recovered = [row for row in result["diagnostics"]
+                 if row["kind"] == "undo_missing_post_snapshot"]
+    assert len(recovered) == 4
+    assert all(row["payload"]["entry_discarded"] is True for row in recovered)
+
+
+def test_queued_missing_post_snapshot_releases_its_opposite_reservation():
+    widget = _source("web/js/editor_widget.js")
+    undo = _method(widget, "_undo", "_redo")
+    redo = _method(widget, "_redo", "_restoreScene")
+    helpers = _method(widget, "_recordHistoryRefusal", "_setWidgetValue")
+    reservations = _method(widget, "_reserveHistoryOpposite", "_beginHistoryOrderContext")
+    contexts = _method(widget, "_beginHistoryOrderContext", "_captureProjectDependencies")
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+globalThis.document={{activeElement:null}};globalThis.describeKeyboardDebugElement=()=>({{}});
+globalThis.notifyInfo=()=>{{}};globalThis.notifyWarning=()=>{{}};
+globalThis.notifyProgress=()=>({{update:()=>{{}},dismiss:()=>{{}}}});
+globalThis.sessionDiagRecord=()=>{{}};globalThis.performance={{now:()=>0}};
+globalThis.api={{apiURL:value=>value}};
+let reads=0;globalThis.fetchProjectJson=async()=>{{reads++;throw new Error("offline");}};
+class Harness {{
+{undo}
+{redo}
+{helpers}
+{reservations}
+{contexts}
+  constructor(mode){{this.activeSceneId="scene";this.activeScene={{scene_id:"scene"}};
+    this.scenes=[this.activeScene];this._undoStack=[];this._redoStack=[];
+    this._historyStackRevision=0;this._historyOperationSeq=0;
+    this._sceneMutationInvalidationSeq=0;this._queuedHistoryOperationCount=0;
+    this._queuedHistoryNotification=null;this._projectMutationQueue=new ProjectMutationQueue();
+    this._latestHistoryOrderContext={{scenes:new Map([["scene",null]])}};
+    (mode==="undo"?this._undoStack:this._redoStack).push({{
+      sceneId:"scene",label:"failed",snapshot:{{scene_id:"scene"}}}});}}
+  _projectDirName(){{return "project";}}
+  _keyboardDebug(){{}}
+  _activateGraphUndoSuppression(){{}}
+  _schedulePostMutationSceneRefresh(){{}}
+  _deferProjectBackedRefresh(){{}}
+  _trimUndoStack(){{}}
+  _hasPendingProjectMutations(){{return this._projectMutationQueue.isBusy();}}
+}}
+async function run(mode){{const h=new Harness(mode);
+  let release;const gate=new Promise(resolve=>{{release=resolve;}});
+  const blocker=h._projectMutationQueue.enqueue({{key:"blocker",run:()=>gate}});
+  const pending=mode==="undo"?h._undo():h._redo();
+  const futureCount=(mode==="undo"?h._redoStack:h._undoStack).length;
+  release();await blocker;await pending;
+  return {{undo:h._undoStack.length,redo:h._redoStack.length,
+    inFlight:Boolean(h._historyOperationInFlight),futureCount,reads}};}}
+console.log(JSON.stringify({{undo:await run("undo"),redo:await run("redo")}}));
+""")
+    assert result == {
+        "undo": {"undo": 0, "redo": 0, "inFlight": False, "futureCount": 1, "reads": 0},
+        "redo": {"undo": 0, "redo": 0, "inFlight": False, "futureCount": 1, "reads": 0},
+    }
+
+
+def test_failure_recovery_preserves_stamped_and_restore_token_entries():
+    widget = _source("web/js/editor_widget.js")
+    queue_mutation = _method(widget, "_queueProjectMutation", "_runSceneMutation")
+    undo = _method(widget, "_runUndoWithinGesture", "_redo")
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+globalThis.notifyError=()=>{{}};globalThis.notifyWarning=()=>{{}};
+globalThis.sessionDiagRecord=()=>{{}};globalThis.document={{activeElement:null}};
+globalThis.describeKeyboardDebugElement=()=>({{}});
+const stamped={{sceneId:"scene",label:"stamped",snapshot:{{scene_id:"scene"}},
+  postSnapshot:{{scene_id:"scene"}}}};
+class QueueHarness {{
+{queue_mutation}
+  constructor(){{this._sceneMutationInvalidationSeq=0;this._queueFetchSeq=0;
+    this._projectMutationQueue=new ProjectMutationQueue();
+    this._pendingHistoryEntryByMutationKey=new Map();this._undoStack=[stamped];}}
+  _claimHistoryPostSnapshotCapture(){{return null;}}
+  _historyOrderedSceneForContext(){{return null;}}
+  _recordHistoryOrderedScene(){{}} _stampHistoryPostSnapshot(){{}}
+  _schedulePostMutationSceneRefresh(){{}} _deferProjectBackedRefresh(){{}}
+  _discardUndoEntry(entry){{const index=this._undoStack.indexOf(entry);
+    if(index<0)return false;this._undoStack.splice(index,1);return true;}}
+}}
+const q=new QueueHarness();
+try {{await q._queueProjectMutation({{key:"failed",coalesce:false,refreshScenes:false,
+  historyEntry:stamped,intent:{{sceneId:"scene",operations:[]}},
+  run:async()=>{{throw new Error("lost");}}}});}} catch(_error){{}}
+const tokenEntry={{sceneId:"scene",label:"token",snapshot:{{scene_id:"scene"}},
+  restoreToken:"receipt"}};
+class UndoHarness {{
+{undo}
+  constructor(){{this._undoStack=[tokenEntry];this._redoStack=[];
+    this.activeSceneId="scene";this.activeScene={{scene_id:"scene"}};}}
+  _keyboardDebug(){{}} _recordHistoryRefusal(){{}}
+}}
+const u=new UndoHarness();await u._runUndoWithinGesture();
+console.log(JSON.stringify({{stampedKept:q._undoStack.includes(stamped),
+  tokenKept:u._undoStack.includes(tokenEntry),token:tokenEntry.restoreToken}}));
+""")
+    assert result == {
+        "stampedKept": True,
+        "tokenKept": True,
+        "token": "receipt",
+    }
+
+
+def test_queued_history_notification_is_single_and_tracks_depth():
+    widget = _source("web/js/editor_widget.js")
+    helpers = _method(widget, "_recordHistoryRefusal", "_setWidgetValue")
+    result = _run_node(f"""
+const events=[];
+globalThis.notifyProgress=(options)=>{{events.push(["create",options]);return{{
+  update:(patch)=>events.push(["update",patch]),
+  dismiss:()=>events.push(["dismiss"]),
+}};}};
+class Harness {{
+{helpers}
+  constructor(){{this._queuedHistoryOperationCount=0;this._queuedHistoryNotification=null;}}
+}}
+const h=new Harness();const first=h._beginQueuedHistoryWait("undo");
+const second=h._beginQueuedHistoryWait("redo");
+h._endQueuedHistoryWait(first);h._endQueuedHistoryWait(second);
+h._endQueuedHistoryWait(second);
+console.log(JSON.stringify({{events,count:h._queuedHistoryOperationCount,
+  handle:h._queuedHistoryNotification}}));
+""")
+    assert result["count"] == 0
+    assert result["handle"] is None
+    assert [event[0] for event in result["events"]] == [
+        "create", "update", "update", "dismiss"]
+    assert result["events"][0][1]["source"] == "history-operation-queued"
+    assert "1 history action" in result["events"][0][1]["message"]
+    assert "2 history actions" in result["events"][1][1]["message"]
+    assert "1 history action" in result["events"][2][1]["message"]
+
+
+def test_busy_undo_keeps_reserved_entry_stampable_until_queued_apply():
+    widget = _source("web/js/editor_widget.js")
+    push_and_stamp = _method(widget, "_pushUndo", "_commitUndoEntry")
+    commit_and_trim = _method(
+        widget, "_commitUndoEntry", "_captureProjectDependencies")
+    queue_mutation = _method(widget, "_queueProjectMutation", "_runSceneMutation")
+    undo = _method(widget, "_undo", "_redo")
+    helpers = _method(widget, "_recordHistoryRefusal", "_setWidgetValue")
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+globalThis.document={{activeElement:null}};globalThis.describeKeyboardDebugElement=()=>({{}});
+const warnings=[];globalThis.notifyInfo=()=>{{}};
+globalThis.notifyWarning=(message)=>warnings.push(message);globalThis.notifyError=()=>{{}};
+const events=[];globalThis.notifyProgress=(options)=>{{events.push(["create",options]);return{{
+  update:(patch)=>events.push(["update",patch]),dismiss:()=>events.push(["dismiss"]),
+}};}};globalThis.sessionDiagRecord=()=>{{}};
+class Harness {{
+{push_and_stamp}
+{commit_and_trim}
+{queue_mutation}
+{undo}
+{helpers}
+  constructor(){{this.activeSceneId="scene";this.activeScene={{scene_id:"scene",value:"before"}};
+    this._undoStack=[];this._redoStack=[];this._maxUndoSteps=50;this._editorFocused=false;
+    this._historyStackRevision=0;this._historyOperationSeq=0;
+    this._queuedHistoryOperationCount=0;this._queuedHistoryNotification=null;
+    this._sceneMutationInvalidationSeq=0;this._queueFetchSeq=0;
+    this._projectMutationQueue=new ProjectMutationQueue();this.restores=[];}}
+  _keyboardDebug(){{}}
+  _hasPendingProjectMutations(){{return this._projectMutationQueue.isBusy();}}
+  async _restoreScene(_sceneId,target,expectedPost){{
+    this.restores.push({{target:target.value,expectedPost:expectedPost?.value || null}});return target;}}
+  async _applyPromptIdentityChange(){{}}
+  async _applyReferenceHistoryOperations(){{}}
+  _schedulePostMutationSceneRefresh(){{}}
+}}
+const h=new Harness();const entry=h._pushUndo("edit",{{pending:true}});let release;
+const write=h._queueProjectMutation({{key:"scene:scene:edit",label:"edit",coalesce:false,
+  refreshScenes:false,intent:{{sceneId:"scene"}},run:async()=>{{
+    await new Promise((resolve)=>release=resolve);
+    return {{payload:{{scene:{{scene_id:"scene",value:"after"}}}}}};
+  }}}});
+const committed=write.then(()=>h._commitUndoEntry(entry));
+while(!release)await new Promise((resolve)=>setImmediate(resolve));
+const pending=h._undo();await Promise.resolve();
+const during={{claimed:Boolean(entry.claimedBy),stamped:Boolean(entry.postSnapshot),
+  retained:h._undoStack.includes(entry),entryPending:entry.pending,
+  revision:h._historyStackRevision,count:h._queuedHistoryOperationCount,events:[...events]}};
+release();await write;const committedResult=await committed;await pending;
+console.log(JSON.stringify({{during,after:{{count:h._queuedHistoryOperationCount,
+  events,handle:h._queuedHistoryNotification,restores:h.restores,
+  undo:h._undoStack.length,redo:h._redoStack.length,committedResult,
+  revision:h._historyStackRevision,warnings}}}}));
+""")
+    assert result["during"]["claimed"] is True
+    assert result["during"]["stamped"] is False
+    assert result["during"]["retained"] is True
+    assert result["during"]["entryPending"] is True
+    assert result["during"]["revision"] == 0
+    assert result["during"]["count"] == 1
+    assert [event[0] for event in result["during"]["events"]] == ["create"]
+    assert result["after"]["count"] == 0
+    assert result["after"]["handle"] is None
+    assert [event[0] for event in result["after"]["events"]] == ["create", "dismiss"]
+    assert result["after"]["restores"] == [
+        {"target": "before", "expectedPost": "after"}]
+    assert result["after"]["undo"] == 0
+    assert result["after"]["redo"] == 1
+    assert result["after"]["committedResult"] is True
+    assert result["after"]["revision"] == 1
+    assert result["after"]["warnings"] == []
+
+
+def test_edits_after_queued_history_use_physical_order_for_snapshots_and_validity():
+    widget = _source("web/js/editor_widget.js")
+    push_and_stamp = _method(widget, "_pushUndo", "_commitUndoEntry")
+    commit_and_helpers = _method(
+        widget, "_commitUndoEntry", "_captureProjectDependencies")
+    queue_mutation = _method(widget, "_queueProjectMutation", "_runSceneMutation")
+    undo = _method(widget, "_undo", "_redo")
+    redo = _method(widget, "_redo", "_restoreScene")
+    clear_redo = _method(widget, "_clearRedoForNewEdit", "_recordHistoryRefusal")
+    helpers = _method(widget, "_recordHistoryRefusal", "_setWidgetValue")
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+globalThis.document={{activeElement:null}};globalThis.describeKeyboardDebugElement=()=>({{}});
+const warnings=[];globalThis.notifyInfo=()=>{{}};
+globalThis.notifyWarning=(message)=>warnings.push(message);globalThis.notifyError=()=>{{}};
+globalThis.notifyProgress=()=>({{update:()=>{{}},dismiss:()=>{{}}}});
+globalThis.sessionDiagRecord=()=>{{}};
+let receiptScene=null;globalThis.api={{apiURL:(path)=>path}};
+globalThis.fetch=async()=>({{ok:true,json:async()=>({{
+  status:"committed",scene:structuredClone(receiptScene)}})}});
+globalThis.fetchProjectJson=async()=>({{payload:structuredClone(receiptScene)}});
+class Harness {{
+{push_and_stamp}
+{commit_and_helpers}
+{queue_mutation}
+{undo}
+{redo}
+{clear_redo}
+{helpers}
+  constructor(mode){{this.mode=mode;this.activeSceneId="scene";
+    this.activeScene={{scene_id:"scene",a:mode==="redo"?1:2,b:0}};
+    const history={{sceneId:"scene",snapshot:{{scene_id:"scene",a:mode==="redo"?2:1,b:0}},
+      postSnapshot:{{scene_id:"scene",a:mode==="redo"?1:2,b:0}},label:"first"}};
+    this._undoStack=mode==="redo"?[]:[history];this._redoStack=mode==="redo"?[history]:[];
+    this._maxUndoSteps=50;this._editorFocused=false;this._historyStackRevision=0;
+    this._historyCommitRevisionByEntry=new WeakMap();this._historyOperationSeq=0;
+    this._latestHistoryOrderContext=null;this._queuedHistoryOperationCount=0;
+    this._queuedHistoryNotification=null;this._sceneMutationInvalidationSeq=0;
+    this._queueFetchSeq=0;this._projectMutationQueue=new ProjectMutationQueue();this.restores=[];}}
+  _keyboardDebug(){{}}
+  _projectDirName(){{return "project";}}
+  _hasPendingProjectMutations(){{return this._projectMutationQueue.isBusy();}}
+  async _restoreScene(_sceneId,target){{this.restores.push(structuredClone(target));
+    if(this.ambiguousRestore){{receiptScene=structuredClone(target);
+      const error=new Error("lost response");error.restoreAmbiguous=true;
+      error.restoreToken="restore-token";throw error;}}
+    this.activeScene=structuredClone(target);return structuredClone(target);}}
+  async _applyPromptIdentityChange(){{}}
+  async _applyReferenceHistoryOperations(){{}}
+  _schedulePostMutationSceneRefresh(){{}}
+}}
+async function runLaterEdit(mode,pending){{
+  const h=new Harness(mode);let release;
+  const blocker=h._projectMutationQueue.enqueue({{key:"busy",coalesce:false,
+    run:async()=>await new Promise((resolve)=>release=resolve)}});
+  while(!release)await new Promise((resolve)=>setImmediate(resolve));
+  const historyCall=mode==="redo"?h._redo():h._undo();
+  const later=h._pushUndo("later",{{pending}});h.activeScene.b=1;
+  const write=h._queueProjectMutation({{key:`later-${{mode}}-${{pending}}`,label:"later",
+    coalesce:false,refreshScenes:false,historyEntry:later,intent:{{sceneId:"scene"}},
+    run:async()=>({{payload:{{scene:{{scene_id:"scene",a:mode==="redo"?2:1,b:1}}}}}})}});
+  const committed=pending?write.then(()=>h._commitUndoEntry(later)):write;
+  release();await blocker;await Promise.all([historyCall,committed]);
+  return {{restores:h.restores.map((scene)=>scene.a),before:later.snapshot,
+    post:later.postSnapshot,undo:h._undoStack.length,redo:h._redoStack.length}};
+}}
+async function runEarlierPendingRedo(){{
+  const h=new Harness("redo");let release;
+  const blocker=h._projectMutationQueue.enqueue({{key:"busy",coalesce:false,
+    run:async()=>await new Promise((resolve)=>release=resolve)}});
+  while(!release)await new Promise((resolve)=>setImmediate(resolve));
+  const earlier=h._pushUndo("earlier",{{pending:true}});h.activeScene.b=1;
+  const write=h._queueProjectMutation({{key:"earlier",label:"earlier",coalesce:false,
+    refreshScenes:false,historyEntry:earlier,intent:{{sceneId:"scene"}},
+    run:async()=>({{payload:{{scene:{{scene_id:"scene",a:1,b:1}}}}}})}});
+  const committed=write.then(()=>h._commitUndoEntry(earlier));
+  const redoCall=h._redo();release();await blocker;await Promise.all([committed,redoCall]);
+  return {{restores:h.restores.length,undo:h._undoStack.length,redo:h._redoStack.length}};
+}}
+async function runTrailingWave(){{
+  const h=new Harness("undo");h.activeScene.c=0;
+  h._undoStack[0].snapshot.c=0;h._undoStack[0].postSnapshot.c=0;
+  let releaseBlocker;const blocker=h._projectMutationQueue.enqueue({{key:"busy-wave",
+    coalesce:false,run:async()=>await new Promise((resolve)=>releaseBlocker=resolve)}});
+  while(!releaseBlocker)await new Promise((resolve)=>setImmediate(resolve));
+  const historyCall=h._undo();const editB=h._pushUndo("B");h.activeScene.b=1;
+  let releaseB;const writeB=h._queueProjectMutation({{key:"B",label:"B",coalesce:false,
+    refreshScenes:false,historyEntry:editB,intent:{{sceneId:"scene"}},run:async()=>{{
+      await new Promise((resolve)=>releaseB=resolve);
+      return {{payload:{{scene:{{scene_id:"scene",a:1,b:1,c:0}}}}}};
+    }}}});
+  releaseBlocker();await blocker;
+  while(!releaseB)await new Promise((resolve)=>setImmediate(resolve));
+  const editC=h._pushUndo("C");h.activeScene.c=1;
+  const writeC=h._queueProjectMutation({{key:"C",label:"C",coalesce:false,
+    refreshScenes:false,historyEntry:editC,intent:{{sceneId:"scene"}},
+    run:async()=>({{payload:{{scene:{{scene_id:"scene",a:1,b:1,c:1}}}}}})}});
+  releaseB();await Promise.all([historyCall,writeB,writeC]);
+  return {{bBefore:editB.snapshot,bPost:editB.postSnapshot,
+    cBefore:editC.snapshot,cPost:editC.postSnapshot}};
+}}
+async function runAmbiguousHistory(){{
+  const h=new Harness("undo");h.ambiguousRestore=true;let releaseBlocker;
+  const blocker=h._projectMutationQueue.enqueue({{key:"busy-ambiguous",coalesce:false,
+    run:async()=>await new Promise((resolve)=>releaseBlocker=resolve)}});
+  while(!releaseBlocker)await new Promise((resolve)=>setImmediate(resolve));
+  const historyCall=h._undo();const later=h._pushUndo("after ambiguous");h.activeScene.b=1;
+  const write=h._queueProjectMutation({{key:"after-ambiguous",label:"after ambiguous",
+    coalesce:false,refreshScenes:false,historyEntry:later,intent:{{sceneId:"scene"}},
+    run:async()=>({{payload:{{scene:{{scene_id:"scene",a:1,b:1}}}}}})}});
+  releaseBlocker();await blocker;await Promise.all([historyCall,write]);
+  return {{before:later.snapshot,post:later.postSnapshot}};
+}}
+const laterPendingUndo=await runLaterEdit("undo",true);
+const laterOrdinaryRedo=await runLaterEdit("redo",false);
+const earlierPendingRedo=await runEarlierPendingRedo();
+const trailingWave=await runTrailingWave();
+const ambiguousHistory=await runAmbiguousHistory();
+console.log(JSON.stringify({{laterPendingUndo,laterOrdinaryRedo,earlierPendingRedo,
+  trailingWave,ambiguousHistory,warnings}}));
+""")
+    assert result["laterPendingUndo"] == {
+        "restores": [1],
+        "before": {"scene_id": "scene", "a": 1, "b": 0},
+        "post": {"scene_id": "scene", "a": 1, "b": 1},
+        "undo": 1,
+        "redo": 0,
+    }
+    assert result["laterOrdinaryRedo"] == {
+        "restores": [2],
+        "before": {"scene_id": "scene", "a": 2, "b": 0},
+        "post": {"scene_id": "scene", "a": 2, "b": 1},
+        "undo": 2,
+        "redo": 0,
+    }
+    assert result["earlierPendingRedo"] == {
+        "restores": 0, "undo": 1, "redo": 0}
+    assert result["trailingWave"] == {
+        "bBefore": {"scene_id": "scene", "a": 1, "b": 0, "c": 0},
+        "bPost": {"scene_id": "scene", "a": 1, "b": 1, "c": 0},
+        "cBefore": {"scene_id": "scene", "a": 1, "b": 1, "c": 0},
+        "cPost": {"scene_id": "scene", "a": 1, "b": 1, "c": 1},
+    }
+    assert result["ambiguousHistory"] == {
+        "before": {"scene_id": "scene", "a": 1, "b": 0},
+        "post": {"scene_id": "scene", "a": 1, "b": 1},
+    }
+    assert len(result["warnings"]) == 2
+    assert any("newer edit changed its history" in warning
+               for warning in result["warnings"])
+    assert any("still being confirmed" in warning
+               for warning in result["warnings"])
+
+
+def test_later_scene_mutation_rebases_compare_state_and_stable_targets_after_history():
+    widget = _source("web/js/editor_widget.js")
+    rebase = _method(widget, "_historyExpectedProjection", "_queueProjectMutation")
+    queue_mutation = _method(widget, "_queueProjectMutation", "_runSceneMutation")
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+globalThis.notifyError=()=>{{}};globalThis.notifyWarning=()=>{{}};
+class Harness {{
+{rebase}
+{queue_mutation}
+  constructor(){{this._sceneMutationInvalidationSeq=0;this._queueFetchSeq=0;
+    this._projectMutationQueue=new ProjectMutationQueue();this._pendingHistoryEntryByMutationKey=new Map();}}
+  _claimHistoryPostSnapshotCapture(){{return null;}}
+  _stampHistoryPostSnapshot(){{}}
+  _historyOrderedSceneForContext(context,sceneId){{return context?.scenes?.get(sceneId)||null;}}
+  _recordHistoryOrderedScene(){{}}
+  _schedulePostMutationSceneRefresh(){{}}
+}}
+const ordered={{scene_id:"scene",prompt:"after undo",global_channel_docs:{{visual:{{text:"u"}}}},
+  prompt_sections:[{{prompt_id:"p",start_frame:4,end_frame:8,channel_docs:{{visual:{{text:"u"}}}},
+    attachments:[{{attachment_id:"a",value:"u"}}]}}],
+  guide_frames:[{{guide_id:"g",frame_index:7,asset_id:"new"}}],
+  reference_items:[{{reference_item_id:"r",start_frame:3,end_frame:9,muted:false}}]}};
+const context={{scenes:new Map([["scene",ordered]])}};
+const intent={{sceneId:"scene",operations:[
+  {{type:"update_scene_fields",fields:{{prompt:"later"}},expected:{{prompt:"before undo",global_channel_docs:{{}}}}}},
+  {{type:"update_prompt_section",index:1,expected:{{prompt_id:"p",start_frame:20}},
+    fields:{{prompt_edit:{{documents:{{visual:{{expected:{{text:"old"}},value:{{text:"later"}}}}}},
+      attachments:{{a:{{expected:{{attachment_id:"a",value:"old"}},value:null}}}}}}}}}},
+  {{type:"move_guide",from_frame_index:20,to_frame_index:21,
+    expected:{{guide_id:"g",frame_index:20,asset_id:"old"}}}},
+  {{type:"update_reference_item",reference_item_id:"r",fields:{{muted:true}},expected:{{muted:true}}}},
+  {{type:"delete_prompt_section",index:1,expected:{{start_frame:20,end_frame:30}}}}
+]}};
+let sent=null;
+const h=new Harness();h._latestHistoryOrderContext=context;
+await h._queueProjectMutation({{key:"later",label:"later",coalesce:false,
+  refreshScenes:false,intent,run:async(value)=>{{sent=value;
+    if(value.operations[0].expected.prompt!==ordered.prompt)throw new Error("stale prompt compare");
+    return {{payload:{{scene:ordered}}}};}}}});
+console.log(JSON.stringify({{sent,original:intent}}));
+""")
+    sent = result["sent"]["operations"]
+    assert sent[0]["expected"] == {
+        "prompt": "after undo", "global_channel_docs": {"visual": {"text": "u"}}}
+    assert sent[1]["index"] == 0
+    assert sent[1]["expected"] == {"prompt_id": "p", "start_frame": 4}
+    assert sent[1]["fields"]["prompt_edit"]["documents"]["visual"]["expected"] == {
+        "text": "u"}
+    assert sent[1]["fields"]["prompt_edit"]["attachments"]["a"]["expected"] == {
+        "attachment_id": "a", "value": "u"}
+    assert sent[2]["from_frame_index"] == 7
+    assert sent[2]["expected"] == {
+        "guide_id": "g", "frame_index": 7, "asset_id": "new"}
+    assert sent[3]["expected"] == {"muted": False}
+    assert sent[4] == {
+        "type": "delete_prompt_section", "index": 1,
+        "expected": {"start_frame": 20, "end_frame": 30},
+    }
+    assert result["original"]["operations"][0]["expected"]["prompt"] == "before undo"
+    delete_method = _method(widget, "_deletePromptSection", "_showItemEditor")
+    assert 'prompt_id: section.prompt_id || ""' in delete_method
+
+
+def test_later_lane_mutation_rebases_identity_and_count_through_the_queue():
+    """Drive the production wiring, not the helper in isolation.
+
+    `_queueProjectMutation` overwrites `historyEntry.snapshot` with the ordered
+    scene before the rebase reads it, so a test that calls
+    `_rebaseSceneMutationIntentForHistory` directly with a distinct authored
+    scene passes against wiring that can never supply one. Assert on what was
+    actually sent.
+    """
+    widget = _source("web/js/editor_widget.js")
+    rebase = _method(widget, "_historyExpectedProjection", "_queueProjectMutation")
+    queue_mutation = _method(widget, "_queueProjectMutation", "_runSceneMutation")
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+globalThis.notifyError=()=>{{}};globalThis.notifyWarning=()=>{{}};
+class Harness {{
+{rebase}
+{queue_mutation}
+  constructor(){{this._sceneMutationInvalidationSeq=0;this._queueFetchSeq=0;
+    this._projectMutationQueue=new ProjectMutationQueue();
+    this._pendingHistoryEntryByMutationKey=new Map();}}
+  _claimHistoryPostSnapshotCapture(){{return null;}}
+  _stampHistoryPostSnapshot(){{}}
+  _historyOrderedSceneForContext(context,sceneId){{return context?.scenes?.get(sceneId)||null;}}
+  _recordHistoryOrderedScene(){{}}
+  _schedulePostMutationSceneRefresh(){{}}
+}}
+const authored={{scene_id:"scene",video_lane_count:1,
+  video_lane_configs:[{{name:"B",locked:false}}],clips:[]}};
+const ordered={{scene_id:"scene",video_lane_count:2,
+  video_lane_configs:[{{name:"A",locked:false}},{{name:"B",locked:false}}],clips:[]}};
+const historyEntry={{sceneId:"scene",label:"undo",snapshot:authored}};
+const context={{scenes:new Map([["scene",ordered]])}};
+const intent={{sceneId:"scene",operations:[
+  {{type:"update_lane_config",lane_type:"video",lane_index:0,fields:{{locked:true}}}},
+  {{type:"set_lane_count",lane_type:"video",count:2}}
+]}};
+let sent=null;
+const h=new Harness();h._latestHistoryOrderContext=context;
+await h._queueProjectMutation({{key:"lane",label:"lane",coalesce:false,
+  refreshScenes:false,intent,historyEntry,
+  run:async(value)=>{{sent=value;return {{payload:{{scene:ordered}}}};}}}});
+console.log(JSON.stringify({{sent,
+  entrySnapshotLaneCount:historyEntry.snapshot?.video_lane_count}}));
+""")
+    operations = result["sent"]["operations"]
+    # Lane B sat at index 0 when the edit was authored; the queued undo restored
+    # lane A ahead of it, so the write must land on index 1.
+    assert operations[0]["lane_index"] == 1
+    # Authored delta was +1 onto a 1-lane scene; the ordered scene has 2.
+    assert operations[1]["count"] == 3
+    # The snapshot is still rebased to the queue position - that invariant feeds
+    # the restore target at the undo/redo apply sites and must not regress.
+    assert result["entrySnapshotLaneCount"] == 2
+
+
+def test_equal_count_lane_content_move_never_retargets_later_destination():
+    """Lane membership is content, not topology or destination identity.
+
+    This is the manual failure from the queued-Undo run driven through the
+    production queue wrapper: FirstScene occupied Target when the later drop
+    was authored, then Undo moved it back to C before that drop executed.  The
+    three lane slots still mean B/C/Target, so the destination must remain 2.
+    """
+    widget = _source("web/js/editor_widget.js")
+    rebase = _method(widget, "_historyExpectedProjection", "_queueProjectMutation")
+    queue_mutation = _method(widget, "_queueProjectMutation", "_runSceneMutation")
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+globalThis.notifyError=()=>{{}};globalThis.notifyWarning=()=>{{}};
+class Harness {{
+{rebase}
+{queue_mutation}
+  constructor(){{this._sceneMutationInvalidationSeq=0;this._queueFetchSeq=0;
+    this._projectMutationQueue=new ProjectMutationQueue();
+    this._pendingHistoryEntryByMutationKey=new Map();}}
+  _claimHistoryPostSnapshotCapture(){{return null;}}
+  _stampHistoryPostSnapshot(){{}}
+  _historyOrderedSceneForContext(context,sceneId){{return context?.scenes?.get(sceneId)||null;}}
+  _recordHistoryOrderedScene(){{}}
+  _schedulePostMutationSceneRefresh(){{}}
+}}
+const laneConfigs=[{{name:"B"}},{{name:"C"}},{{name:"Target"}}];
+const authored={{scene_id:"scene",video_lane_count:3,video_lane_configs:laneConfigs,
+  clips:[{{clip_id:"FirstScene",track_index:2}}]}};
+const ordered={{scene_id:"scene",video_lane_count:3,video_lane_configs:laneConfigs,
+  clips:[{{clip_id:"FirstScene",track_index:1}}]}};
+const historyEntry={{sceneId:"scene",label:"drop",snapshot:authored}};
+const context={{scenes:new Map([["scene",ordered]])}};
+const intent={{sceneId:"scene",operations:[
+  {{type:"drop_clip",fields:{{asset_id:"waking",track_index:2,dual_drop:false}}}},
+  {{type:"update_clip",clip_id:"waking",fields:{{track_index:2}}}}
+]}};
+let sent=null;
+const h=new Harness();h._latestHistoryOrderContext=context;
+await h._queueProjectMutation({{key:"drop",label:"drop",coalesce:false,
+  refreshScenes:false,intent,historyEntry,
+  run:async(value)=>{{sent=value;return {{payload:{{scene:ordered}}}};}}}});
+console.log(JSON.stringify({{sent}}));
+""")
+    assert result["sent"]["operations"][0]["fields"]["track_index"] == 2
+    assert result["sent"]["operations"][1]["fields"]["track_index"] == 2
+
+
+def test_production_media_drop_routes_rebase_behind_history_and_refresh_next_baseline():
+    widget = _source("web/js/editor_widget.js")
+    queue_setup = widget[widget.index("this._projectMutationQueue = new ProjectMutationQueue({"):
+                         widget.index("        this._projectMutationCloseInProgress = null;")]
+    methods = "\n".join([
+        _method(widget, "_handleAssetDropWithinGesture", "_firstAvailableLane"),
+        _method(widget, "_historyExpectedProjection", "_queueProjectMutation"),
+        _method(widget, "_queueProjectMutation", "_runSceneMutation"),
+        _method(widget, "_beginHistoryOrderContext", "_captureProjectDependencies"),
+        _method(widget, "_discardUndoEntry", "_trimLocalLaneConfigs"),
+    ])
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    lanes_url = (ROOT / "web/js/lane_registry.js").as_uri()
+    result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+const {{TRACK_TYPE,descriptorFor,laneCountFor,laneAcceptsAssetType}}=await import({json.dumps(lanes_url)});
+globalThis.notifyError=()=>{{}};globalThis.notifyWarning=()=>{{}};globalThis.notifyInfo=()=>{{}};
+globalThis.api={{apiURL:value=>value}};
+const configs=[{{name:"B"}},{{name:"C"}},{{name:"Target"}}];
+const base={{scene_id:"scene",video_lane_count:3,audio_lane_count:3,motion_driver_lane_count:3,
+  video_lane_configs:configs,audio_lane_configs:configs,motion_driver_lane_configs:configs,
+  clips:[{{clip_id:"FirstScene",track_index:2,timeline_start_frame:0,timeline_end_frame:24}}],audio_tracks:[]}};
+class Harness {{
+{methods}
+  constructor(mode,structural,fail){{this.mode=mode;this.fail=fail;this.events=[];this.sent=[];
+    this.projectDir="project";this.activeSceneId="scene";this._effectiveFps=24;
+    this.activeScene=structuredClone(base);this.server=structuredClone(base);
+    this.server.clips[0].track_index=1;
+    if(structural)for(const type of ["video","audio","motion_driver"]){{
+      this.server[type+"_lane_count"]=2;this.server[type+"_lane_configs"]=configs.slice(1);}}
+    this.asset={{asset_id:"asset",asset_type:mode==="audio"?"audio":"video",has_audio:true}};
+    this.assets={{[this.asset.asset_type]:[this.asset]}};
+    this._trackLayout=[{{type:mode==="driver"?TRACK_TYPE.MOTION_DRIVER:
+      ["audio","extracted"].includes(mode)?TRACK_TYPE.AUDIO:TRACK_TYPE.VIDEO,laneIndex:2}}];
+    this._undoStack=[];
+    {queue_setup}
+    this._latestHistoryOrderContext={{scenes:new Map()}};
+  }}
+  _snapshotProjectMutationContext(){{return {{sceneId:"scene",projectId:"project"}};}}
+  _claimHistoryPostSnapshotCapture(){{return null;}}
+  _pushUndo(label){{const entry={{sceneId:"scene",label,snapshot:structuredClone(this.activeScene)}};
+    this._undoStack.push(entry);this.dropEntry=entry;return entry;}}
+  _stampHistoryPostSnapshot(entry,scene){{if(entry&&scene)entry.postSnapshot=structuredClone(scene);}}
+  _withMutationDiagnosticHeaders(init){{return init;}}
+  _timelineRulerHeight(){{return 10;}} _layoutIndexFromRawY(){{return 0;}}
+  _isLaneLocked(){{return false;}} _driverClipInLane(){{return false;}}
+  _isRenderClip(clip){{return clip.role!=="motion_driver";}}
+  _findAssetById(){{return this.asset;}} _mediaTimelineFrames(){{return 24;}}
+  _defaultMotionDriverStrength(){{return 1;}} _defaultFitMode(){{return "contain";}}
+  _defaultCropPosition(){{return "center";}}
+  _renderSceneAfterLocalMutation(){{}} _buildTrackLayout(){{}} _renderTimeline(){{}}
+  _deferProjectBackedRefresh(){{}} _schedulePostMutationSceneRefresh(){{}}
+  _replayDeferredProjectBackedRefresh(){{}} // Model the refresh not yet completed.
+  _showToast(message){{throw new Error(message);}}
+  async _fetchScenes(){{this.activeScene=structuredClone(this.server);return true;}}
+  async _runVersionedProjectMutation(path,init){{const body=JSON.parse(init.body);
+    if(path.endsWith("/mutations")){{this.events.push("lanes");
+      for(const op of body.operations){{this.server[op.lane_type+"_lane_count"]=op.count;}}
+      return {{payload:{{scene:structuredClone(this.server)}}}};}}
+    this.events.push("create");this.sent.push(body);
+    if(this.fail)throw new Error("dedicated failure");
+    const payload=path.endsWith("/audio_tracks")?{{track_id:"created",...body}}:{{clip_id:"created",...body}};
+    if(payload.clip_id)this.server.clips.push(payload);else this.server.audio_tracks.push(payload);
+    if(body.dual_drop){{payload.audio_track={{track_id:"paired",lane_index:body.audio_lane_index}};
+      this.server.audio_tracks.push(payload.audio_track);}}
+    return {{payload}};
+  }}
+}}
+const outcomes=[];
+for(const structural of [false,true])for(const mode of ["video","dual","audio","extracted","driver"]){{
+  const h=new Harness(mode,structural,false);let release;
+  const gate=new Promise(resolve=>{{release=resolve;}});
+  const history=h._projectMutationQueue.enqueue({{key:"history",coalesce:false,run:async()=>{{
+    await gate;h.events.push("undo");h.activeScene=structuredClone(h.server);
+    h._recordHistoryOrderedScene(h._latestHistoryOrderContext,h.server);}}}});
+  const drop=h._handleAssetDropWithinGesture(h.asset,100,mode==="dual"?0:20,1,null);
+  const beforeRelease=h.sent.length;release();await history;await drop;
+  let reads=0;
+  globalThis.fetchProjectJson=async()=>{{reads++;return {{payload:structuredClone(h.server)}};}};
+  const next={{sceneId:"scene",snapshot:structuredClone(h.activeScene)}};
+  await h._queueProjectMutation({{key:"next",historyEntry:next,refreshScenes:false,
+    intent:{{sceneId:"scene",projectId:"project",operations:[]}},
+    run:async()=>({{payload:{{scene:structuredClone(h.server)}}}})}});
+  outcomes.push({{mode,structural,beforeRelease,events:h.events,body:h.sent[0],reads,
+    stamped:!!h.dropEntry.postSnapshot,
+    baselineHasCreated:[...next.snapshot.clips,...next.snapshot.audio_tracks]
+      .some(item=>(item.clip_id||item.track_id)==="created")}});
+}}
+// Internally caught failures run the complete production route cleanup twice;
+// neither pass may consume a same-labelled neighbor.
+for(const mode of ["video","dual","audio","extracted","driver"]){{
+  const h=new Harness(mode,false,true);const prior={{label:mode==="driver"?"add driver":"add asset",postSnapshot:{{}}}};
+  h._undoStack.push(prior);
+  await h._handleAssetDropWithinGesture(h.asset,100,mode==="dual"?0:20,1,null);
+  outcomes.push({{mode,failure:true,prior:h._undoStack.includes(prior),failed:h._undoStack.includes(h.dropEntry)}});
+}}
+console.log(JSON.stringify(outcomes));
+""")
+    for row in result[:10]:
+        assert row["beforeRelease"] == 0
+        assert row["events"] == (["undo", "lanes", "create"] if row["mode"] == "dual" else ["undo", "create"])
+        index = (2 if row["structural"] else 3) if row["mode"] == "dual" else (1 if row["structural"] else 2)
+        field = "lane_index" if row["mode"] in ("audio", "extracted") else "track_index"
+        assert row["body"][field] == index
+        if row["mode"] == "dual":
+            assert row["body"]["audio_lane_index"] == index
+        assert row["reads"] == 1
+        assert row["baselineHasCreated"] is True
+        assert row["stamped"] is False
+    for row in result[10:]:
+        assert row["prior"] is True
+        assert row["failed"] is False
+
+
+def test_dedicated_drop_body_is_built_from_execution_time_lane_intent():
+    """The queued semantic target, not an enqueue-time body closure, is sent."""
+    widget = _source("web/js/editor_widget.js")
+    drop = _method(widget, "_handleAssetDropWithinGesture", "_firstAvailableLane")
+    helper = drop[drop.index("const queueDropMutation ="):
+                  drop.index("// Zone-model drop targeting")]
+    result = _run_node(f"""
+let sentBody=null;let queuedIntent=null;
+class Harness {{
+  constructor(fail=false){{this.fail=fail;this.discarded=false;}}
+  _snapshotProjectMutationContext(){{return {{projectId:"project",sceneId:"scene"}};}}
+  _withMutationDiagnosticHeaders(init){{return init;}}
+  async _runVersionedProjectMutation(_path,init){{if(this.fail)throw new Error("404");
+    sentBody=JSON.parse(init.body);
+    return {{payload:{{clip_id:"created"}}}};}}
+  _discardUnstampableUndoEntry(entry){{this.discarded=entry?.label==="drop";}}
+  _queueProjectMutation(options){{queuedIntent=options.intent;
+    const ordered=structuredClone(options.intent);
+    ordered.operations[0].fields.track_index=7;
+    ordered.operations[0].fields.audio_lane_index=5;
+    return options.run(ordered,null);}}
+  async run(){{
+    const dropSeq=3;const diagnostics=null;
+    const dropContext=this._snapshotProjectMutationContext();
+{helper}
+    return queueDropMutation({{
+      keySuffix:"clip",label:"drop clip",path:"/clips",
+      historyEntry:{{label:"drop"}},
+      operation:{{type:"drop_clip",fields:{{track_index:2,audio_lane_index:1,
+        dual_drop:true,asset_id:"asset"}}}},
+      buildInit:(orderedOperation)=>({{method:"POST",headers:{{}},
+        body:JSON.stringify(orderedOperation.fields)}}),
+    }});
+  }}
+}}
+const h=new Harness();const outcome=await h.run();
+const failing=new Harness(true);const failedOutcome=await failing.run();
+console.log(JSON.stringify({{sentBody,queuedIntent,outcome,
+  failed:failedOutcome.ok===false,discarded:failing.discarded}}));
+""")
+    assert result["queuedIntent"]["operations"][0]["type"] == "drop_clip"
+    assert result["sentBody"]["track_index"] == 7
+    assert result["sentBody"]["audio_lane_index"] == 5
+    assert result["outcome"]["ok"] is True
+    assert result["failed"] is True
+    assert result["discarded"] is True
+    driver_branch = drop[drop.index("if (targetMotionDriverLane >= 0)"):
+                         drop.index("const _findAsset")]
+    assert "queueDropMutation({" in driver_branch
+    assert "await fetch(" not in driver_branch
+    assert 'type: "drop_audio_track"' in drop
+    assert 'type: "set_lane_count"' in drop
+
+
+def test_ruler_drop_does_not_double_rebase_or_stamp_its_intermediate_lane_scene():
+    """Both physical writes stay in one slot and consume the tail index once."""
+    widget = _source("web/js/editor_widget.js")
+    rebase = _method(widget, "_historyExpectedProjection", "_queueProjectMutation")
+    queue_mutation = _method(widget, "_queueProjectMutation", "_runSceneMutation")
+    drop = _method(widget, "_handleAssetDropWithinGesture", "_firstAvailableLane")
+    helper = drop[drop.index("const queueDropMutation ="):
+                  drop.index("// Zone-model drop targeting")]
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+globalThis.notifyError=()=>{{}};globalThis.notifyWarning=()=>{{}};
+const TRACK_TYPE={{VIDEO:"video",AUDIO:"audio"}};
+const laneCountFor=(scene,type)=>type==="video"
+  ? scene.video_lane_count : scene.audio_lane_count;
+let releaseLane;const laneGate=new Promise((resolve)=>{{releaseLane=resolve;}});
+const events=[];let sentBody=null;
+class Harness {{
+{rebase}
+{queue_mutation}
+  constructor(){{this._sceneMutationInvalidationSeq=0;this._queueFetchSeq=0;
+    this._projectMutationQueue=new ProjectMutationQueue();
+    this._pendingHistoryEntryByMutationKey=new Map();this.stamps=[];
+    this._latestHistoryOrderContext={{scenes:new Map([["scene",before]])}};}}
+  _snapshotProjectMutationContext(){{return {{projectId:"project",sceneId:"scene"}};}}
+  _claimHistoryPostSnapshotCapture(){{return null;}}
+  _stampHistoryPostSnapshot(entry,scene){{if(scene)this.stamps.push(scene.video_lane_count);}}
+  _historyOrderedSceneForContext(context,sceneId){{return context?.scenes?.get(sceneId)||null;}}
+  _recordHistoryOrderedScene(context,scene){{if(scene)context?.scenes?.set(scene.scene_id,scene);}}
+  _schedulePostMutationSceneRefresh(){{}}
+  _withMutationDiagnosticHeaders(init){{return init;}}
+  async _runVersionedProjectMutation(path,init){{
+    if(path.endsWith("/mutations")){{events.push("lane");await laneGate;
+      return {{payload:{{scene:afterLane}}}};}}
+    events.push("create");sentBody=JSON.parse(init.body);
+    return {{payload:{{clip_id:"created"}}}};
+  }}
+  runDrop(){{
+    const dropSeq=1;const diagnostics=null;
+    const dropContext=this._snapshotProjectMutationContext();
+{helper}
+    return queueDropMutation({{keySuffix:"clip",label:"drop clip",path:"/clips",
+      historyEntry:entry,
+      laneCountOperations:[{{type:"set_lane_count",lane_type:"video",count:2}}],
+      operation:{{type:"drop_clip",fields:{{asset_id:"asset",track_index:1}}}},
+      buildInit:(orderedOperation)=>({{method:"POST",headers:{{}},
+        body:JSON.stringify(orderedOperation.fields)}}),
+    }});
+  }}
+}}
+const before={{scene_id:"scene",video_lane_count:1,
+  video_lane_configs:[{{name:"B"}}],clips:[]}};
+const afterLane={{scene_id:"scene",video_lane_count:2,
+  video_lane_configs:[{{name:"B"}},{{name:"New"}}],clips:[]}};
+const entry={{sceneId:"scene",label:"drop",snapshot:before}};
+const h=new Harness();const dropPromise=h.runDrop();
+await new Promise((resolve)=>setTimeout(resolve,0));
+const interloper=h._projectMutationQueue.enqueue({{key:"other",coalesce:false,
+  run:async()=>{{events.push("interloper");}}}});
+releaseLane();await dropPromise;await interloper;
+console.log(JSON.stringify({{sentBody,stamps:h.stamps,events}}));
+""")
+    assert result["sentBody"]["track_index"] == 1
+    assert result["stamps"] == [], "neither a lane-only nor entity-only response is exact"
+    assert result["events"] == ["lane", "create", "interloper"]
+    assert "stampHistory: false" in drop
+    assert "laneCountOperations" in drop
+
+
+def test_lane_rebase_covers_all_drop_lane_fields_without_membership_identity():
+    widget = _source("web/js/editor_widget.js")
+    rebase = _method(widget, "_historyExpectedProjection", "_queueProjectMutation")
+    result = _run_node(f"""
+class Harness {{
+{rebase}
+}}
+const configs=[{{name:"B"}},{{name:"C"}},{{name:"Target"}}];
+const counts={{video_lane_count:3,motion_driver_lane_count:3,
+  audio_lane_count:3,reference_lane_count:3}};
+const configLists={{video_lane_configs:configs,motion_driver_lane_configs:configs,
+  audio_lane_configs:configs,reference_lane_configs:configs}};
+const recipes=[{{lane_id:"B"}},{{lane_id:"C"}},{{lane_id:"Target"}}];
+const authored={{scene_id:"scene",...counts,...configLists,
+  reference_lane_recipes:recipes,
+  clips:[{{clip_id:"video-member",track_index:2}},
+    {{clip_id:"driver-member",track_index:2,role:"motion_driver"}}],
+  audio_tracks:[{{track_id:"audio-member",lane_index:2}}],
+  reference_items:[{{reference_item_id:"reference-member",lane_index:2}}]}};
+const ordered={{scene_id:"scene",...counts,...configLists,
+  reference_lane_recipes:recipes,
+  clips:[{{clip_id:"video-member",track_index:1}},
+    {{clip_id:"driver-member",track_index:1,role:"motion_driver"}}],
+  audio_tracks:[{{track_id:"audio-member",lane_index:1}}],
+  reference_items:[{{reference_item_id:"reference-member",lane_index:1}}]}};
+const operations=[
+  {{type:"drop_clip",fields:{{track_index:2,dual_drop:true,audio_lane_index:2}}}},
+  {{type:"drop_clip",fields:{{track_index:2,role:"motion_driver",dual_drop:false}}}},
+  {{type:"drop_audio_track",fields:{{lane_index:2}}}},
+  {{type:"create_reference_item",fields:{{lane_index:2}}}},
+];
+const equal=new Harness()._rebaseSceneMutationIntentForHistory(
+  {{sceneId:"scene",operations}},ordered,authored).operations;
+const structuralAuthored={{scene_id:"scene",video_lane_count:1,
+  video_lane_configs:[{{name:"B",locked:false}}],clips:[]}};
+const structuralOrdered={{scene_id:"scene",video_lane_count:2,
+  video_lane_configs:[{{name:"A",locked:false}},{{locked:false,name:"B"}}],clips:[]}};
+const structural=new Harness()._rebaseSceneMutationIntentForHistory(
+  {{sceneId:"scene",operations:[{{type:"drop_clip",fields:{{track_index:0}}}}]}},
+  structuralOrdered,structuralAuthored).operations[0];
+console.log(JSON.stringify({{equal,structural}}));
+""")
+    equal = result["equal"]
+    assert equal[0]["fields"]["track_index"] == 2
+    assert equal[0]["fields"]["audio_lane_index"] == 2
+    assert equal[1]["fields"]["track_index"] == 2
+    assert equal[2]["fields"]["lane_index"] == 2
+    assert equal[3]["fields"]["lane_index"] == 2
+    assert result["structural"]["fields"]["track_index"] == 1
+
+
+def test_history_order_context_keeps_live_publishers_and_receipt_owners():
+    widget = _source("web/js/editor_widget.js")
+    contexts = _method(widget, "_beginHistoryOrderContext", "_captureProjectDependencies")
+    cleanup = _method(widget, "_discardAmbiguousHistoryReservation", "_materializeHistoryOpposite")
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+class Harness {{
+{contexts}
+{cleanup}
+}}
+const h=new Harness();h._projectMutationQueue=new ProjectMutationQueue();
+let release;const gate=new Promise(resolve=>{{release=resolve;}});
+const producer=h._beginHistoryOrderContext("undo",0);
+const blocked=h._projectMutationQueue.enqueue({{key:"history",run:async()=>{{
+  await gate;h._recordHistoryOrderedScene(producer,{{scene_id:"scene",value:"late"}});}}}});
+const receiptEntry={{}};
+h._markHistoryOrderContextAmbiguous(producer,"ambiguous","token",{{entry:receiptEntry}});
+for(let i=1;i<20;i++)h._beginHistoryOrderContext("undo",i);
+const head=h._latestHistoryOrderContext;
+const reachable=()=>{{for(let current=head;current;current=current.parent)if(current===producer)return true;return false;}};
+const liveReachable=reachable();release();await blocked;
+const late=h._historyOrderedSceneForContext(head,"scene");
+h._compactHistoryOrderContextChain(head);
+const idleReachable=reachable();
+h._discardAmbiguousHistoryReservation(receiptEntry);
+const stillAmbiguous=h._historyOrderContextNeedsResolution(head,"ambiguous");
+let depth=0;for(let current=head;current;current=current.parent)depth++;
+console.log(JSON.stringify({{liveReachable,idleReachable,late,stillAmbiguous,depth}}));
+""")
+    assert result == {
+        "liveReachable": True, "idleReachable": True,
+        "late": {"scene_id": "scene", "value": "late"},
+        "stillAmbiguous": False, "depth": 2,
+    }
+
+
+def test_history_order_context_chain_prunes_empty_settled_links_without_losing_lookups():
+    """Sustained ambiguity must not grow one full scene clone per action.
+
+    Queue idle normally truncates the chain, but an unresolved receipt
+    deliberately preserves it. Pruning settled links stays lookup-preserving:
+    a scene recorded deep in the chain is still found, and an ambiguity marked
+    deeper still blocks resolution.
+    """
+    widget = _source("web/js/editor_widget.js")
+    contexts = _method(widget, "_beginHistoryOrderContext", "_captureProjectDependencies")
+    result = _run_node(f"""
+class Harness {{
+{contexts}
+  constructor(){{this._latestHistoryOrderContext=null;}}
+  _keyboardDebug(){{}}
+}}
+const h=new Harness();
+for(let i=0;i<40;i+=1){{
+  const context=h._beginHistoryOrderContext("undo",i);
+  if(i===0)h._markHistoryOrderContextAmbiguous(context,"blocked","token");
+  if(i===1)h._recordHistoryOrderedScene(context,{{scene_id:"deep",value:"kept"}});
+}}
+let depth=0;
+for(let node=h._latestHistoryOrderContext;node;node=node.parent)depth+=1;
+const head=h._latestHistoryOrderContext;
+console.log(JSON.stringify({{depth,
+  deepScene:h._historyOrderedSceneForContext(head,"deep"),
+  blocked:h._historyOrderContextNeedsResolution(head,"blocked"),
+  hasAmbiguity:h._historyOrderContextHasAmbiguity(head)}}));
+""")
+    assert result["depth"] <= 3, "empty settled links must not grow per action"
+    # Pruning retains the original scene and receipt owners.
+    assert result["deepScene"] == {"scene_id": "deep", "value": "kept"}
+    assert result["blocked"] is True
+    assert result["hasAmbiguity"] is True
+
+
+def test_permanently_missing_receipt_clears_the_ambiguity_instead_of_wedging():
+    """A token the server has never heard of must not block the scene forever.
+
+    If the restore PUT is lost *and* never committed, and the server then
+    restarts, the receipt lookup 404s for good. The poll exhausts, the mutation
+    is refused, and because nothing clears an unresolvable ambiguity the same
+    ~24s block repeats for every later edit on that scene. Only pressing Ctrl+Z
+    again escapes it, which the failure message never suggests.
+
+    A 404 is only treated as terminal after the whole budget is spent - an early
+    404 can simply mean the server has not registered the pending receipt yet.
+    """
+    widget = _source("web/js/editor_widget.js")
+    resolve = _method(
+        widget, "_resolveHistoryOrderContextScene", "_captureProjectDependencies")
+    result = _run_node(f"""
+globalThis.api={{apiURL:(value)=>value}};
+globalThis.rememberProjectVersionFromResponse=()=>{{}};
+globalThis.fetchProjectJson=async()=>({{payload:{{}}}});
+// Collapse the retry backoff; the schedule itself is not under test.
+const realTimeout=globalThis.setTimeout;
+globalThis.setTimeout=(fn)=>realTimeout(fn,0);
+let polls=0;
+globalThis.fetch=async()=>{{polls+=1;
+  return {{ok:false,status:404,json:async()=>null}};}};
+let refreshed=null;
+class Harness {{
+{resolve}
+  _recordHistoryOrderedScene(){{}}
+  _discardHistoryFutureReservation(){{return true;}}
+  _finalizeCommittedHistoryAmbiguity(){{return true;}}
+  _projectDirName(){{return "project";}}
+  async _fetchScenes(options){{refreshed=options?.reason||"";}}
+}}
+const entry={{sceneId:"scene",restoreToken:"gone",label:"undo"}};
+const context={{ambiguousScenes:new Map([["scene",
+  {{entry,projectId:"project",restoreToken:"gone",operation:"undo"}}]]),
+  scenes:new Map()}};
+const h=new Harness();
+let code="";let message="";
+try {{ await h._resolveHistoryOrderContextScene(context,"scene"); }}
+catch(error) {{ code=error.code||"";message=error.message||""; }}
+console.log(JSON.stringify({{code,message,polls,refreshed,
+  stillAmbiguous:context.ambiguousScenes.has("scene"),
+  tokenRetained:Object.hasOwn(entry,"restoreToken")}}));
+""")
+    assert result["polls"] > 1, "the budget must still be spent before giving up"
+    assert result["stillAmbiguous"] is False, "an unresolvable ambiguity must be cleared"
+    assert result["code"] == "scene_history_receipt_unrecoverable"
+    assert result["refreshed"], "authoritative state must be re-read, not assumed"
+    assert result["tokenRetained"] is False
+
+
+def test_unresolvable_lane_refusal_surfaces_its_message_and_frees_the_undo_stack():
+    """A genuine ambiguity must refuse loudly and leave history usable.
+
+    Two failure-path defects meet here: the queue's rejection handler builds a
+    generic message and discards `error.message`, and the entry never reaches
+    `_stampHistoryPostSnapshot`, so an unstamped entry is left at the top of the
+    undo stack where it refuses every later Ctrl+Z.
+    """
+    widget = _source("web/js/editor_widget.js")
+    rebase = _method(widget, "_historyExpectedProjection", "_queueProjectMutation")
+    queue_mutation = _method(widget, "_queueProjectMutation", "_runSceneMutation")
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+const notified=[];
+globalThis.notifyError=(m)=>notified.push(m);
+globalThis.notifyWarning=(m)=>notified.push(m);
+const authored={{scene_id:"scene",video_lane_count:1,
+  video_lane_configs:[{{}}],clips:[]}};
+const ordered={{scene_id:"scene",video_lane_count:2,
+  video_lane_configs:[{{}},{{}}],clips:[]}};
+const historyEntry={{sceneId:"scene",label:"lane",snapshot:authored}};
+let discarded=false;
+class Harness {{
+{rebase}
+{queue_mutation}
+  constructor(){{this._sceneMutationInvalidationSeq=0;this._queueFetchSeq=0;
+    this._projectMutationQueue=new ProjectMutationQueue();
+    this._pendingHistoryEntryByMutationKey=new Map();}}
+  _claimHistoryPostSnapshotCapture(){{return null;}}
+  _stampHistoryPostSnapshot(){{}}
+  _historyOrderedSceneForContext(context,sceneId){{return context?.scenes?.get(sceneId)||null;}}
+  _recordHistoryOrderedScene(){{}}
+  _schedulePostMutationSceneRefresh(){{}}
+  _deferProjectBackedRefresh(){{}}
+  _discardUndoEntry(entry){{discarded=entry===historyEntry;return true;}}
+}}
+const context={{scenes:new Map([["scene",ordered]])}};
+const intent={{sceneId:"scene",operations:[
+  {{type:"update_lane_config",lane_type:"video",lane_index:0,fields:{{locked:true}}}}
+]}};
+let ran=false;let failure="";
+const h=new Harness();h._latestHistoryOrderContext=context;
+try {{
+  await h._queueProjectMutation({{key:"lane",label:"lane",coalesce:false,
+    refreshScenes:false,intent,historyEntry,
+    run:async()=>{{ran=true;return {{payload:{{scene:ordered}}}};}}}});
+}} catch(error) {{ failure=error.message; }}
+await new Promise((resolve)=>setTimeout(resolve,0));
+console.log(JSON.stringify({{failure,ran,discarded,notified}}));
+""")
+    assert result["ran"] is False, "the ambiguous edit must never reach the server"
+    assert "could no longer be identified" in result["failure"]
+    # The specific wording must survive the queue's generic fallback.
+    assert result["notified"] == [result["failure"]]
+    assert result["discarded"] is True, "unstampable entry must leave the undo stack"
+
+
+def test_any_terminal_queue_failure_discards_its_exact_unstampable_entry():
+    widget = _source("web/js/editor_widget.js")
+    queue_mutation = _method(widget, "_queueProjectMutation", "_runSceneMutation")
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+globalThis.notifyError=()=>{{}};globalThis.notifyWarning=()=>{{}};
+const failed={{sceneId:"scene",label:"same",snapshot:{{scene_id:"scene"}}}};
+const newer={{sceneId:"scene",label:"same",snapshot:{{scene_id:"scene"}}}};
+class Harness {{
+{queue_mutation}
+  constructor(){{this._sceneMutationInvalidationSeq=0;this._queueFetchSeq=0;
+    this._projectMutationQueue=new ProjectMutationQueue();
+    this._pendingHistoryEntryByMutationKey=new Map();this._undoStack=[failed,newer];}}
+  _claimHistoryPostSnapshotCapture(){{return null;}}
+  _historyOrderedSceneForContext(){{return null;}}
+  _recordHistoryOrderedScene(){{}}
+  _stampHistoryPostSnapshot(){{}}
+  _schedulePostMutationSceneRefresh(){{}}
+  _deferProjectBackedRefresh(){{}}
+  _discardUndoEntry(entry){{const index=this._undoStack.indexOf(entry);
+    if(index<0)return false;this._undoStack.splice(index,1);return true;}}
+}}
+const h=new Harness();let failure="";
+try {{await h._queueProjectMutation({{key:"failed",label:"failed",coalesce:false,
+  refreshScenes:false,historyEntry:failed,intent:{{sceneId:"scene",operations:[]}},
+  run:async()=>{{throw new Error("ordinary 404");}}}});}}
+catch(error){{failure=error.message;}}
+await new Promise((resolve)=>setTimeout(resolve,0));
+console.log(JSON.stringify({{failure,failedStill:h._undoStack.includes(failed),
+  newerStill:h._undoStack.includes(newer),depth:h._undoStack.length}}));
+""")
+    assert result == {
+        "failure": "ordinary 404",
+        "failedStill": False,
+        "newerStill": True,
+        "depth": 1,
+    }
+
+
+def test_failed_consolidation_preserves_same_label_neighbors():
+    widget = _source("web/js/editor_widget.js")
+    methods = "\n".join([
+        _method(widget, "_consolidateSelectedItemsToLane", "_removeLaneDeletingItems"),
+        _method(widget, "_queueProjectMutation", "_runSceneMutation"),
+        _method(widget, "_discardLastUndo", "_trimLocalLaneConfigs"),
+    ])
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+globalThis.notifyError=()=>{{}};globalThis.notifyWarning=()=>{{}};
+class Harness {{
+{methods}
+  constructor(){{this.activeScene={{scene_id:"scene"}};this.activeSceneId="scene";
+    this.projectDir="project";this._undoStack=[];this.selectedItems=[];
+    this._projectMutationQueue=new ProjectMutationQueue();}}
+  _selectedConsolidationItems(){{return [];}}
+  _consolidationRefusal(){{return "";}}
+  _pushUndo(label){{const entry={{label,sceneId:"scene",snapshot:this.activeScene}};
+    this._undoStack.push(entry);this.candidate=entry;return entry;}}
+  _claimHistoryPostSnapshotCapture(){{return this.candidate;}}
+  _deferProjectBackedRefresh(){{}}
+  _runSceneMutation(operations,options){{return this._queueProjectMutation({{...options,
+    intent:{{sceneId:"scene",operations}},run:async()=>{{
+      if(this.newer)this._undoStack.push(this.newer);
+      throw new Error("ordinary 404");}}}});}}
+}}
+const outcomes=[];
+for(const withNewer of [false,true]){{
+  const h=new Harness();const valid={{label:"consolidate items",postSnapshot:{{}}}};
+  h._undoStack.push(valid);
+  if(withNewer)h.newer={{label:"consolidate items"}};
+  await h._consolidateSelectedItemsToLane({{type:"clip",data:{{track_index:2}}}});
+  outcomes.push({{valid:h._undoStack.includes(valid),failed:h._undoStack.includes(h.candidate),
+    newer:!withNewer||h._undoStack.includes(h.newer)}});
+}}
+console.log(JSON.stringify(outcomes));
+""")
+    assert result == [{"valid": True, "failed": False, "newer": True}] * 2
+
+
+def test_history_context_resolution_failure_cleans_exact_entry_and_context():
+    widget = _source("web/js/editor_widget.js")
+    queue_mutation = _method(widget, "_queueProjectMutation", "_runSceneMutation")
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+globalThis.notifyError=()=>{{}};globalThis.notifyWarning=()=>{{}};
+const outcomes=[];
+for(const code of ["scene_history_outcome_pending","scene_history_receipt_unrecoverable"]){{
+  const entry={{sceneId:"scene",snapshot:{{scene_id:"scene"}}}};
+  let discarded=false,sent=false;
+  class Harness {{
+{queue_mutation}
+    constructor(){{this._projectMutationQueue=new ProjectMutationQueue();}}
+    _historyOrderContextNeedsResolution(){{return true;}}
+    _resolveHistoryOrderContextScene(){{throw Object.assign(new Error(code),{{code}});}}
+    _discardUndoEntry(target){{discarded=target===entry;}}
+    _deferProjectBackedRefresh(){{}}
+  }}
+  const h=new Harness();
+  try{{await h._queueProjectMutation({{key:code,label:code,historyEntry:entry,
+    historyOrderContext:{{}},intent:{{sceneId:"scene"}},
+    run:async()=>{{sent=true;}}}});}}catch{{}}
+  outcomes.push({{discarded,sent,contextRetained:!!entry._historyOrderContext}});
+}}
+console.log(JSON.stringify(outcomes));
+""")
+    assert result == [{"discarded": True, "sent": False, "contextRetained": False}] * 2
+
+
+def test_response_lost_write_cannot_be_absorbed_into_next_history_entry():
+    widget = _source("web/js/editor_widget.js")
+    methods = "\n".join([
+        _method(widget, "_queueProjectMutation", "_runSceneMutation"),
+        _method(widget, "_beginHistoryOrderContext", "_captureProjectDependencies"),
+        _method(widget, "_discardUndoEntry", "_trimLocalLaneConfigs"),
+    ])
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+globalThis.notifyError=()=>{{}};globalThis.notifyWarning=()=>{{}};
+globalThis.api={{apiURL:value=>value}};
+let server={{scene_id:"scene",x:0,y:0}},reads=0,failRead=true;
+globalThis.fetchProjectJson=async()=>{{reads++;if(failRead)throw new Error("GET lost");
+  return {{payload:structuredClone(server)}};}};
+class Harness {{
+{methods}
+  constructor(){{this._projectMutationQueue=new ProjectMutationQueue();this._undoStack=[];
+    this._latestHistoryOrderContext={{scenes:new Map([["scene",structuredClone(server)]])}};}}
+  _stampHistoryPostSnapshot(entry,scene){{if(scene)entry.postSnapshot=structuredClone(scene);}}
+  _deferProjectBackedRefresh(){{}}
+}}
+const h=new Harness();const failed={{sceneId:"scene",snapshot:structuredClone(server)}};
+h._undoStack.push(failed);
+const intent={{sceneId:"scene",projectId:"captured-project",operations:[]}};
+try{{await h._queueProjectMutation({{key:"X",historyEntry:failed,intent,refreshScenes:false,
+  run:async()=>{{server.x=1;throw new Error("response lost");}}}});}}catch{{}}
+let sent=false;const refused={{sceneId:"scene",snapshot:{{...server}}}};h._undoStack.push(refused);
+try{{await h._queueProjectMutation({{key:"read-fails",historyEntry:refused,intent,refreshScenes:false,
+  run:async()=>{{sent=true;}}}});}}catch{{}}
+const stillNeedsRead=h._historyOrderContextNeedsResolution(h._latestHistoryOrderContext,"scene");
+failRead=false;
+const next={{sceneId:"scene",snapshot:{{scene_id:"scene",x:0,y:0}}}};h._undoStack.push(next);
+await h._queueProjectMutation({{key:"Y",historyEntry:next,intent,refreshScenes:false,
+  run:async()=>{{server.y=1;return {{payload:{{scene:structuredClone(server)}}}};}}}});
+console.log(JSON.stringify({{sent,stillNeedsRead,reads,failedKept:h._undoStack.includes(failed),
+  refusedKept:h._undoStack.includes(refused),before:next.snapshot,after:next.postSnapshot,
+  failedStamped:!!failed.postSnapshot}}));
+""")
+    assert result == {
+        "sent": False, "stillNeedsRead": True, "reads": 2,
+        "failedKept": False, "refusedKept": False, "failedStamped": False,
+        "before": {"scene_id": "scene", "x": 1, "y": 0},
+        "after": {"scene_id": "scene", "x": 1, "y": 1},
+    }
+
+
+def test_lane_rebase_matches_a_lane_an_earlier_history_action_emptied():
+    """Dragging an item back into the lane a queued undo just emptied.
+
+    The authored anchor carries the item ids the lane held; the ordered lane is
+    now empty. Matching item ids and config in parallel makes this structurally
+    unmatchable - no clause can fire - so the most likely post-undo gesture
+    refuses. The config is the lane's only surviving handle and must be reached
+    as a fallback.
+    """
+    widget = _source("web/js/editor_widget.js")
+    rebase = _method(widget, "_historyExpectedProjection", "_queueProjectMutation")
+    result = _run_node(f"""
+class Harness {{
+{rebase}
+}}
+const h=new Harness();
+const authored={{scene_id:"scene",video_lane_count:1,
+  video_lane_configs:[{{name:"L"}}],clips:[{{clip_id:"c1",track_index:0}}]}};
+const ordered={{scene_id:"scene",video_lane_count:2,
+  video_lane_configs:[{{name:"A"}},{{name:"L"}}],clips:[]}};
+const intent={{sceneId:"scene",operations:[
+  {{type:"update_lane_config",lane_type:"video",lane_index:0,fields:{{locked:true}}}}
+]}};
+const rebased=h._rebaseSceneMutationIntentForHistory(intent,ordered,authored);
+console.log(JSON.stringify({{rebased}}));
+""")
+    assert result["rebased"]["operations"][0]["lane_index"] == 1
+
+
+def test_lane_rebase_prefers_durable_reference_lane_id_over_moved_items():
+    """A structural rebase uses durable `lane_id`, even with duplicate configs."""
+    widget = _source("web/js/editor_widget.js")
+    rebase = _method(widget, "_historyExpectedProjection", "_queueProjectMutation")
+    result = _run_node(f"""
+class Harness {{
+{rebase}
+}}
+const h=new Harness();
+const authored={{scene_id:"scene",reference_lane_count:1,
+  reference_lane_configs:[{{}}],reference_lane_recipes:[{{lane_id:"R"}}],
+  reference_items:[]}};
+const ordered={{scene_id:"scene",reference_lane_count:2,
+  reference_lane_configs:[{{}},{{}}],
+  reference_lane_recipes:[{{lane_id:"S"}},{{lane_id:"R"}}],reference_items:[]}};
+const intent={{sceneId:"scene",operations:[
+  {{type:"update_lane_config",lane_type:"reference",lane_index:0,fields:{{locked:true}}}}
+]}};
+const rebased=h._rebaseSceneMutationIntentForHistory(intent,ordered,authored);
+console.log(JSON.stringify({{rebased}}));
+""")
+    assert result["rebased"]["operations"][0]["lane_index"] == 1
+
+
+def test_lane_rebase_helper_retargets_and_refuses_ambiguous_lanes():
+    """Unit-level cover for the helper itself.
+
+    Kept alongside the wired test above: this one pins the helper's contract,
+    that one proves production actually reaches it.
+    """
+    widget = _source("web/js/editor_widget.js")
+    rebase = _method(widget, "_historyExpectedProjection", "_queueProjectMutation")
+    result = _run_node(f"""
+class Harness {{
+{rebase}
+}}
+const h=new Harness();
+const authored={{scene_id:"scene",video_lane_count:1,
+  video_lane_configs:[{{name:"B",locked:false}}],clips:[]}};
+const ordered={{scene_id:"scene",video_lane_count:2,
+  video_lane_configs:[{{name:"A",locked:false}},{{name:"B",locked:false}}],clips:[]}};
+const intent={{sceneId:"scene",operations:[
+  {{type:"update_lane_config",lane_type:"video",lane_index:0,fields:{{locked:true}}}},
+  {{type:"remove_lane",lane_type:"video",lane_index:0,item_policy:"require_empty"}},
+  {{type:"set_lane_count",lane_type:"video",count:2}}
+]}};
+const rebased=h._rebaseSceneMutationIntentForHistory(intent,ordered,authored);
+let ambiguity="";
+try {{
+  h._rebaseSceneMutationIntentForHistory(intent,
+    {{...ordered,video_lane_configs:[{{}},{{}}]}},
+    {{...authored,video_lane_configs:[{{}}]}});
+}} catch(error) {{ ambiguity=error.message; }}
+console.log(JSON.stringify({{rebased,original:intent,ambiguity}}));
+""")
+    operations = result["rebased"]["operations"]
+    assert operations[0]["lane_index"] == 1
+    assert operations[1]["lane_index"] == 1
+    assert operations[2]["count"] == 3
+    assert result["original"]["operations"][0]["lane_index"] == 0
+    assert "could no longer be identified" in result["ambiguity"]
+
+
+def test_parent_history_ambiguity_dominates_descendant_scene_and_history_apply_waits():
+    widget = _source("web/js/editor_widget.js")
+    contexts = _method(widget, "_beginHistoryOrderContext", "_captureProjectDependencies")
+    queue_undo = _method(widget, "_runUndo", "_runUndoWithinGesture")
+    queue_redo = _method(widget, "_runRedo", "_runRedoWithinGesture")
+    helpers = _method(widget, "_recordHistoryRefusal", "_setWidgetValue")
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+globalThis.performance={{now:()=>0}};globalThis.sessionDiagRecord=()=>{{}};
+globalThis.notifyWarning=()=>{{}};globalThis.notifyProgress=()=>({{dismiss:()=>{{}}}});
+class ContextHarness {{
+{contexts}
+}}
+const parent={{scenes:new Map(),ambiguousScenes:new Map([["scene",{{}}]])}};
+const child={{parent,scenes:new Map([["scene",{{scene_id:"scene",value:"too-new"}}]])}};
+const c=new ContextHarness();
+const dominance={{scene:c._historyOrderedSceneForContext(child,"scene"),
+  needs:c._historyOrderContextNeedsResolution(child,"scene")}};
+let activeParent=parent;
+class Harness {{
+{contexts}
+{queue_undo}
+{queue_redo}
+{helpers}
+  constructor(mode){{this.activeSceneId="scene";this.activeScene={{scene_id:"scene"}};
+    this.scenes=[this.activeScene];this._undoStack=[];this._redoStack=[];
+    const entry={{sceneId:"scene",snapshot:{{scene_id:"scene"}},
+      postSnapshot:{{scene_id:"scene"}},label:"A"}};
+    (mode==="undo"?this._undoStack:this._redoStack).push(entry);
+    this._projectMutationQueue=new ProjectMutationQueue();this._historyOperationSeq=0;
+    this._historyStackRevision=0;this._sceneMutationInvalidationSeq=0;
+    this._queuedHistoryOperationCount=0;this.events=[];this.mode=mode;}}
+  _projectDirName(){{return "project";}} _keyboardDebug(){{}}
+  _beginHistoryOrderContext(){{return {{parent:activeParent,scenes:new Map()}};}}
+  _reserveHistoryOpposite(){{return {{_historyFuture:true}};}}
+  _discardAmbiguousHistoryReservation(){{}} _trimUndoStack(){{}}
+  _hasPendingProjectMutations(){{return this._projectMutationQueue.isBusy();}}
+  async _resolveHistoryOrderContextScene(){{this.events.push("resolve");return {{scene_id:"scene"}};}}
+  _activateGraphUndoSuppression(){{this.events.push("suppress");}}
+  async _runUndoWithinGesture(){{this.events.push("run");}}
+  async _runRedoWithinGesture(){{this.events.push("run");}}
+  _schedulePostMutationSceneRefresh(){{}} _finishHistoryOperation(){{}}
+}}
+async function run(mode){{const h=new Harness(mode);
+  await (mode==="undo"?h._queueUndoWithinGesture():h._queueRedoWithinGesture());
+  return h.events;}}
+const undo=await run("undo");const redo=await run("redo");
+// Same wiring, unambiguous ancestor: the real gate must now decline to resolve.
+activeParent={{scenes:new Map([["scene",{{scene_id:"scene"}}]]),
+  ambiguousScenes:new Map()}};
+const undoClean=await run("undo");
+console.log(JSON.stringify({{dominance,undo,redo,undoClean}}));
+""")
+    assert result == {
+        "dominance": {"scene": None, "needs": True},
+        "undo": ["resolve", "suppress", "run"],
+        "redo": ["resolve", "suppress", "run"],
+        # The gate is the production one now, so a clean ancestor skips the wait
+        # instead of the test asserting that a stub it forced to true was called.
+        "undoClean": ["suppress", "run"],
+    }
+
+
+def test_image_asset_drop_uses_the_project_mutation_queue():
+    """Run the image drop branch, do not grep it.
+
+    Three source substrings cannot tell whether the queued operation carries the
+    right fields, whether the guide the server returns is found again by id, or
+    whether a failure propagates so the caller can roll back. `assert "await
+    fetch(" not in image_branch` in particular is satisfied by any rewrite at
+    all.
+    """
+    widget = _source("web/js/editor_widget.js")
+    drop = _method(widget, "_handleAssetDropWithinGesture", "_firstAvailableLane")
+    image_branch = drop[drop.index('if (asset.asset_type === "image")'):
+                        drop.index('} else if (asset.asset_type === "video"')] + "}"
+    result = _run_node(f"""
+const emit=console.log;console.log=()=>{{}};
+class Harness {{
+  constructor(){{this.activeSceneId="scene";this.applied=[];this.sent=[];
+    this.response={{payload:{{scene:{{guide_frames:[
+      {{guide_id:"guide-1",frame_index:20,asset_id:"a1"}}]}}}}}};}}
+  _seedFitDefaults(fields){{return {{...fields,fit_mode:"contain"}};}}
+  _newLocalItemId(kind){{return `${{kind}}-1`;}}
+  _defaultGuideStrength(){{return 0.5;}}
+  _applyLocalCreateGuide(fields){{this.applied.push(fields);}}
+  _renderSceneAfterLocalMutation(){{}}
+  async _runSceneMutation(operations,options){{
+    this.sent.push({{operations,options}});
+    if(this.fail)throw new Error("mutation refused");
+    return this.response;
+  }}
+  async runDrop(asset,frame,dropSeq,diagnostics){{
+{image_branch}
+  }}
+}}
+const h=new Harness();
+await h.runDrop({{asset_type:"image",asset_id:"a1"}},12,7,null);
+let propagated=false;
+const failing=new Harness();failing.fail=true;
+try {{ await failing.runDrop({{asset_type:"image",asset_id:"a1"}},12,7,null); }}
+catch(error) {{ propagated=error.message==="mutation refused"; }}
+emit(JSON.stringify({{sent:h.sent,applied:h.applied,propagated}}));
+""")
+    assert len(result["sent"]) == 1, "the drop must issue exactly one scene mutation"
+    call = result["sent"][0]
+    assert call["operations"] == [{
+        "type": "create_guide",
+        "fields": {
+            "guide_id": "guide-1", "frame_index": 12, "asset_id": "a1",
+            "source": "asset", "strength": 0.5, "fit_mode": "contain",
+        },
+    }]
+    # The drop defers its own scenes refresh, and history ordering depends on it
+    # not coalescing with a neighbouring drop.
+    assert call["options"]["coalesce"] is False
+    assert call["options"]["refreshScenes"] is False
+    assert "drop:7:guide" in call["options"]["key"]
+    # The server's authoritative frame_index must be re-applied, which only works
+    # if the returned scene is searched by the locally minted guide_id.
+    assert [entry["frame_index"] for entry in result["applied"]] == [12, 20]
+    # A refusal has to reach the caller's catch, which owns the rollback.
+    assert result["propagated"] is True
+
+
+def test_nested_owner_write_records_only_its_executing_history_context():
+    widget = _source("web/js/editor_widget.js")
+    queue_mutation = _method(widget, "_queueProjectMutation", "_runSceneMutation")
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+globalThis.notifyError=()=>{{}};globalThis.notifyWarning=()=>{{}};
+class Harness {{
+{queue_mutation}
+  constructor(){{this._sceneMutationInvalidationSeq=0;this._queueFetchSeq=0;
+    this._projectMutationQueue=new ProjectMutationQueue();this._pendingHistoryEntryByMutationKey=new Map();}}
+  _claimHistoryPostSnapshotCapture(){{return null;}}
+  _stampHistoryPostSnapshot(){{}}
+  _historyOrderedSceneForContext(){{return null;}}
+  _recordHistoryOrderedScene(context,scene){{context.scenes.set(scene.scene_id,structuredClone(scene));}}
+  _schedulePostMutationSceneRefresh(){{}}
+}}
+const h=new Harness();const parent={{scenes:new Map()}},child={{parent,scenes:new Map()}};
+await h._projectMutationQueue.enqueue({{key:"history",coalesce:false,run:async(_i,_d,ownerToken)=>{{
+  h._latestHistoryOrderContext=child;
+  return await h._queueProjectMutation({{key:"nested",label:"nested",coalesce:false,
+    refreshScenes:false,ownerToken,historyOrderContext:parent,intent:{{sceneId:"scene"}},
+    run:async()=>({{payload:{{scene:{{scene_id:"scene",value:"parent"}}}}}})}});
+}}}});
+console.log(JSON.stringify({{parent:parent.scenes.get("scene")||null,
+  child:child.scenes.get("scene")||null}}));
+""")
+    assert result == {
+        "parent": {"scene_id": "scene", "value": "parent"},
+        "child": None,
+    }
+
+
+def test_committed_ambiguous_history_receipt_consumes_exact_source_entry():
+    widget = _source("web/js/editor_widget.js")
+    history_context = _method(widget, "_beginHistoryOrderContext", "_captureProjectDependencies")
+    result = _run_node(f"""
+globalThis.api={{apiURL:(value)=>value}};globalThis.notifyInfo=()=>{{}};
+globalThis.rememberProjectVersionFromResponse=()=>{{}};
+globalThis.fetch=async()=>({{ok:true,json:async()=>({{status:"committed",
+  scene:{{scene_id:"scene",value:"restored"}}}})}});
+class Harness {{
+{history_context}
+  constructor(){{this._undoStack=[];this._redoStack=[];}}
+  _projectDirName(){{return "project";}}
+  _trimUndoStack(){{}}
+}}
+const h=new Harness();const entry={{sceneId:"scene",label:"edit",restoreToken:"token"}};
+const later={{sceneId:"scene",label:"later"}};h._undoStack.push(entry,later);
+const context={{scenes:new Map()}};
+h._markHistoryOrderContextAmbiguous(context,"scene","token",{{
+  operation:"undo",entry,sourceStack:h._undoStack}});
+const scene=await h._resolveHistoryOrderContextScene(context,"scene",{{}});
+console.log(JSON.stringify({{scene,labels:h._undoStack.map((value)=>value.label),
+  token:Object.hasOwn(entry,"restoreToken"),ambiguous:context.ambiguousScenes.has("scene")}}));
+""")
+    assert result == {
+        "scene": {"scene_id": "scene", "value": "restored"},
+        "labels": ["later"],
+        "token": False,
+        "ambiguous": False,
+    }
+
+
+def _on_idle_closure(widget: str) -> str:
+    """Lift the real `onIdle` callback body out of the widget constructor.
+
+    The callback is the behavior under test and cannot be reached through
+    `_method`, which only extracts class-body methods.
+    """
+    start = widget.index("onIdle: () => {")
+    body_start = widget.index("{", start)
+    depth = 0
+    for index in range(body_start, len(widget)):
+        if widget[index] == "{":
+            depth += 1
+        elif widget[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return widget[body_start:index + 1]
+    raise AssertionError("unbalanced onIdle callback")
+
+
+def test_unresolved_history_context_survives_queue_idle_until_receipt_resolution():
+    """Drive the real queue-idle callback, not the file's text.
+
+    The previous form asserted two substrings against the whole 21k-line source.
+    One of them, `this._latestHistoryOrderContext = null;`, also matches the
+    constructor's own initialiser, so it could not fail. Splice the actual
+    callback into a harness constructor and let a real `ProjectMutationQueue`
+    reach idle.
+    """
+    widget = _source("web/js/editor_widget.js")
+    history_context = _method(widget, "_beginHistoryOrderContext", "_captureProjectDependencies")
+    on_idle = _on_idle_closure(widget)
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+class Harness {{
+{history_context}
+  constructor(){{
+    this._latestHistoryOrderContext=null;
+    this._projectMutationQueue=new ProjectMutationQueue({{onIdle: () => {on_idle}}});
+  }}
+  _replayDeferredProjectBackedRefresh(){{}}
+  async drain(){{
+    await this._projectMutationQueue.enqueue(
+      {{key:"edit",coalesce:false,run:async()=>({{ok:true}})}});
+    await new Promise((resolve)=>setTimeout(resolve,0));
+  }}
+}}
+const ambiguous={{scenes:new Map(),
+  ambiguousScenes:new Map([["scene",{{restoreToken:"token"}}]])}};
+const resolved={{scenes:new Map(),ambiguousScenes:new Map()}};
+const h=new Harness();
+h._latestHistoryOrderContext=ambiguous;
+await h.drain();
+const survivedWhileAmbiguous=h._latestHistoryOrderContext===ambiguous;
+h._latestHistoryOrderContext=resolved;
+await h.drain();
+const clearedWhenResolved=h._latestHistoryOrderContext===null;
+console.log(JSON.stringify({{survivedWhileAmbiguous,clearedWhenResolved}}));
+""")
+    assert result == {
+        "survivedWhileAmbiguous": True, "clearedWhenResolved": True}
+
+
+def test_committed_ambiguous_redo_materializes_undo_before_later_edit():
+    widget = _source("web/js/editor_widget.js")
+    history_context = _method(widget, "_beginHistoryOrderContext", "_captureProjectDependencies")
+    push = _method(widget, "_pushUndo", "_claimHistoryPostSnapshotCapture")
+    clear_redo = _method(widget, "_clearRedoForNewEdit", "_recordHistoryRefusal")
+    result = _run_node(f"""
+globalThis.api={{apiURL:(value)=>value}};globalThis.notifyInfo=()=>{{}};
+globalThis.rememberProjectVersionFromResponse=()=>{{}};
+globalThis.fetch=async()=>({{ok:true,json:async()=>({{status:"committed",
+  scene:{{scene_id:"scene",value:"redone"}}}})}});
+class Harness {{
+{history_context}
+{push}
+{clear_redo}
+  constructor(){{this.activeSceneId="scene";this.activeScene={{scene_id:"scene"}};
+    this._undoStack=[];this._redoStack=[];this._maxUndoSteps=50;this._historyStackRevision=0;}}
+  _projectDirName(){{return "project";}}
+  _trimUndoStack(){{}}
+  _materializeHistoryOpposite(stack,reservation,opposite){{
+    const index=stack.indexOf(reservation);if(index<0)return false;
+    stack.splice(index,1,opposite);return true;
+  }}
+}}
+const h=new Harness();
+const source={{sceneId:"scene",label:"A",restoreToken:"token",
+  snapshot:{{scene_id:"scene",value:"redone-base"}}}};
+const reservation={{_historyFuture:true,label:"A"}};
+const opposite={{sceneId:"scene",label:"A",snapshot:{{scene_id:"scene",value:"before"}}}};
+h._redoStack.push(source);h._undoStack.push(reservation);
+const context={{scenes:new Map()}};
+h._markHistoryOrderContextAmbiguous(context,"scene","token",{{operation:"redo",
+  entry:source,sourceStack:h._redoStack,opposite,oppositeReservation:reservation,
+  oppositeStack:h._undoStack}});
+h._pushUndo("B");
+await h._resolveHistoryOrderContextScene(context,"scene",{{}});
+console.log(JSON.stringify({{undo:h._undoStack,redo:h._redoStack}}));
+""")
+    assert [entry["label"] for entry in result["undo"]] == ["A", "B"]
+    assert result["undo"][0]["postSnapshot"] == {
+        "scene_id": "scene", "value": "redone-base"}
+    assert result["redo"] == []
+
+
+def test_receipt_reconciliation_uses_restore_target_as_reverse_merge_base():
+    widget = _source("web/js/editor_widget.js")
+    history_base = _method(
+        widget, "_rememberReconciledHistoryBase", "_resolveHistoryOrderContextScene")
+    restore = _method(widget, "_restoreScene", "_setWidgetValue")
+    result = _run_node(f"""
+globalThis.api={{apiURL:(value)=>value}};
+globalThis.document={{activeElement:null}};globalThis.describeKeyboardDebugElement=()=>({{}});
+class Harness {{
+{history_base}
+{restore}
+  constructor(){{this.projectDir="project";this.activeSceneId="scene";
+    this.activeScene={{scene_id:"scene",value:"after"}};this.scenes=[];}}
+  _keyboardDebug(){{}} _renderTimeline(){{}} _renderViewportFrame(){{}}
+  _setActiveScene(scene){{this.activeScene=scene;}}
+}}
+let calls=0;globalThis.fetch=async()=>{{calls+=1;
+  if(calls===1)return{{ok:true,status:200,json:async()=>({{restore_token:"token"}})}};
+  if(calls===2)throw new Error("response lost");
+  return{{ok:true,status:200,json:async()=>({{status:"committed",
+    scene:{{scene_id:"scene",value:"concurrent"}}}})}};
+}};
+const h=new Harness();const target={{scene_id:"scene",value:"before"}};
+const restored=await h._restoreScene("scene",target,{{scene_id:"scene",value:"after"}});
+console.log(JSON.stringify({{restored,base:h._historyBaseForRestoredScene(restored)}}));
+""")
+    assert result == {
+        "restored": {"scene_id": "scene", "value": "concurrent"},
+        "base": {"scene_id": "scene", "value": "before"},
+    }
+
+
+def test_plain_restore_response_still_uses_restore_target_as_reverse_merge_base():
+    """A 200 restore body is not proof of the exact committed bytes either.
+
+    The server answers an already-receipted token with the *current* scene
+    (`routes.py` durable and in-memory short-circuits), and a transparent
+    transport retry reaches that branch with no client-visible token. The
+    reverse entry must therefore pin the authored restore target on the
+    ordinary success path too, not just on the reconciliation paths.
+    """
+    widget = _source("web/js/editor_widget.js")
+    history_base = _method(
+        widget, "_rememberReconciledHistoryBase", "_resolveHistoryOrderContextScene")
+    restore = _method(widget, "_restoreScene", "_setWidgetValue")
+    result = _run_node(f"""
+globalThis.api={{apiURL:(value)=>value}};
+globalThis.document={{activeElement:null}};globalThis.describeKeyboardDebugElement=()=>({{}});
+class Harness {{
+{history_base}
+{restore}
+  constructor(){{this.projectDir="project";this.activeSceneId="scene";
+    this.activeScene={{scene_id:"scene",value:"after"}};this.scenes=[];}}
+  _keyboardDebug(){{}} _renderTimeline(){{}} _renderViewportFrame(){{}}
+  _setActiveScene(scene){{this.activeScene=scene;}}
+}}
+let calls=0;globalThis.fetch=async()=>{{calls+=1;
+  if(calls===1)return{{ok:true,status:200,json:async()=>({{restore_token:"token"}})}};
+  return{{ok:true,status:200,json:async()=>({{
+    scene:{{scene_id:"scene",value:"current-with-later-work"}}}})}};
+}};
+const h=new Harness();const target={{scene_id:"scene",value:"before"}};
+const restored=await h._restoreScene("scene",target,{{scene_id:"scene",value:"after"}});
+console.log(JSON.stringify({{calls,restored,base:h._historyBaseForRestoredScene(restored)}}));
+""")
+    assert result["calls"] == 2, "expected the token POST then a single restore PUT"
+    assert result["restored"] == {
+        "scene_id": "scene", "value": "current-with-later-work"}
+    assert result["base"] == {"scene_id": "scene", "value": "before"}
+
+
+def test_refused_ambiguous_receipt_compensates_auxiliary_state_before_later_edit():
+    widget = _source("web/js/editor_widget.js")
+    history_context = _method(widget, "_beginHistoryOrderContext", "_captureProjectDependencies")
+    push = _method(widget, "_pushUndo", "_claimHistoryPostSnapshotCapture")
+    clear_redo = _method(widget, "_clearRedoForNewEdit", "_recordHistoryRefusal")
+    result = _run_node(f"""
+globalThis.api={{apiURL:(value)=>value}};globalThis.notifyInfo=()=>{{}};
+globalThis.rememberProjectVersionFromResponse=()=>{{}};
+globalThis.fetch=async()=>({{ok:true,json:async()=>({{status:"refused"}})}});
+globalThis.fetchProjectJson=async()=>({{payload:{{scene_id:"scene",value:"unchanged"}}}});
+class Harness {{
+{history_context}
+{push}
+{clear_redo}
+  constructor(){{this.activeSceneId="scene";this.activeScene={{scene_id:"scene"}};
+    this._undoStack=[];this._redoStack=[];this.calls=[];this._maxUndoSteps=50;
+    this._historyStackRevision=0;}}
+  _projectDirName(){{return "project";}}
+  _trimUndoStack(){{}}
+  async _applyPromptIdentityChange(change){{this.calls.push(["prompt",change.type]);}}
+  async _applyReferenceHistoryOperations(operations){{this.calls.push(["references",operations[0].type]);}}
+  _discardHistoryFutureReservation(stack,reservation){{
+    const index=stack.indexOf(reservation);if(index>=0)stack.splice(index,1);
+  }}
+}}
+const h=new Harness();const reservation={{_historyFuture:true}};
+const entry={{sceneId:"scene",label:"A",restoreToken:"token",
+  inversePromptIdentityChange:{{type:"prompt-inverse"}},
+  inverseReferenceOperations:[{{type:"reference-inverse"}}],
+  _ambiguousAuxiliaryState:{{promptIdentityApplied:true,referencesApplied:true}}}};
+h._redoStack.push(entry);h._undoStack.push(reservation);
+const context={{scenes:new Map()}};
+h._markHistoryOrderContextAmbiguous(context,"scene","token",{{operation:"redo",
+  entry,sourceStack:h._redoStack,oppositeReservation:reservation,
+  oppositeStack:h._undoStack}});
+h._pushUndo("B");
+const scene=await h._resolveHistoryOrderContextScene(context,"scene",{{}});
+console.log(JSON.stringify({{scene,calls:h.calls,undo:h._undoStack.length,
+  redo:h._redoStack.length,token:Object.hasOwn(entry,"restoreToken"),
+  auxiliary:Object.hasOwn(entry,"_ambiguousAuxiliaryState")}}));
+""")
+    assert result == {
+        "scene": {"scene_id": "scene", "value": "unchanged"},
+        "calls": [["prompt", "prompt-inverse"],
+                  ["references", "reference-inverse"]],
+        "undo": 1,
+        "redo": 0,
+        "token": False,
+        "auxiliary": False,
+    }
+
+
+def test_direct_retry_replaces_retained_ambiguous_future_reservation():
+    widget = _source("web/js/editor_widget.js")
+    reservations = _method(widget, "_trimUndoStack", "_captureProjectDependencies")
+    undo = _method(widget, "_undo", "_redo")
+    redo = _method(widget, "_redo", "_restoreScene")
+    helpers = _method(widget, "_recordHistoryRefusal", "_setWidgetValue")
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    result = _run_node(f"""
+const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+globalThis.document={{activeElement:null}};globalThis.describeKeyboardDebugElement=()=>({{}});
+globalThis.notifyInfo=()=>{{}};globalThis.notifyWarning=()=>{{}};
+globalThis.notifyProgress=()=>({{update:()=>{{}},dismiss:()=>{{}}}});
+globalThis.sessionDiagRecord=()=>{{}};
+class Harness {{
+{reservations}
+{undo}
+{redo}
+{helpers}
+  constructor(mode){{this.mode=mode;this.activeSceneId="scene";
+    this.activeScene={{scene_id:"scene",value:"base"}};
+    const entry={{sceneId:"scene",snapshot:{{scene_id:"scene",value:"target"}},
+      postSnapshot:{{scene_id:"scene",value:"base"}},label:"A"}};
+    this._undoStack=mode==="undo"?[entry]:[];this._redoStack=mode==="redo"?[entry]:[];
+    this._maxUndoSteps=50;this._editorFocused=false;this._historyStackRevision=0;
+    this._historyOperationSeq=0;this._queuedHistoryOperationCount=0;
+    this._queuedHistoryNotification=null;this._sceneMutationInvalidationSeq=0;
+    this._projectMutationQueue=new ProjectMutationQueue();this.calls=0;}}
+  _keyboardDebug(){{}} _projectDirName(){{return "project";}}
+  _hasPendingProjectMutations(){{return this._projectMutationQueue.isBusy();}}
+  async _restoreScene(_id,target){{this.calls+=1;if(this.calls===1){{
+    const error=new Error("unknown");error.restoreAmbiguous=true;error.restoreToken="token";
+    throw error;}}return structuredClone(target);}}
+  async _applyPromptIdentityChange(){{}} async _applyReferenceHistoryOperations(){{}}
+  _schedulePostMutationSceneRefresh(){{}}
+}}
+async function run(mode){{const h=new Harness(mode);
+  await (mode==="undo"?h._undo():h._redo());
+  const pending={{undo:h._undoStack.length,redo:h._redoStack.length,
+    futures:[...h._undoStack,...h._redoStack].filter((value)=>value._historyFuture).length}};
+  await (mode==="undo"?h._undo():h._redo());
+  return {{pending,done:{{undo:h._undoStack.length,redo:h._redoStack.length,
+    futures:[...h._undoStack,...h._redoStack].filter((value)=>value._historyFuture).length}}}};
+}}
+console.log(JSON.stringify({{undo:await run("undo"),redo:await run("redo")}}));
+""")
+    assert result == {
+        "undo": {
+            "pending": {"undo": 1, "redo": 1, "futures": 1},
+            "done": {"undo": 0, "redo": 1, "futures": 0},
+        },
+        "redo": {
+            "pending": {"undo": 1, "redo": 1, "futures": 1},
+            "done": {"undo": 1, "redo": 0, "futures": 0},
+        },
+    }
 
 
 def test_scene_navigation_cannot_clear_history_while_undo_or_redo_is_in_flight():
@@ -4871,6 +7267,83 @@ catch(error) {{ body=error.message; }}
         "bodyCalls": 3,
         "active": {"scene_id": "scene", "attachments": []},
     }
+
+
+def test_scene_restore_rearms_graph_suppression_at_direct_and_reconciled_adoption():
+    widget = _source("web/js/editor_widget.js")
+    restore = _method(widget, "_restoreScene", "_setWidgetValue")
+    result = _run_node(f"""
+globalThis.api={{apiURL:(value)=>value}};
+globalThis.document={{activeElement:null}};globalThis.describeKeyboardDebugElement=()=>({{}});
+class Harness {{
+{restore}
+  constructor(){{this.projectDir="project";this.activeSceneId="scene";
+    this.activeScene={{scene_id:"scene"}};this.scenes=[];this.events=[];}}
+  _keyboardDebug(){{}}
+  _activateGraphUndoSuppression(reason){{this.events.push(["suppress",reason]);}}
+  _setActiveScene(scene){{this.events.push(["set",scene.value]);this.activeScene=scene;}}
+  _renderTimeline(){{}} _renderViewportFrame(){{}}
+}}
+const h=new Harness();let calls=0;
+globalThis.fetch=async()=>{{calls+=1;
+  if(calls===1)return{{ok:true,status:200,json:async()=>({{restore_token:"direct"}})}};
+  return{{ok:true,status:200,json:async()=>({{scene:{{scene_id:"scene",value:"direct"}}}})}};
+}};
+await h._restoreScene("scene",{{scene_id:"scene",value:"direct"}},{{scene_id:"scene"}});
+calls=0;globalThis.fetch=async()=>{{calls+=1;
+  if(calls===1)return{{ok:true,status:200,json:async()=>({{restore_token:"receipt"}})}};
+  if(calls===2)throw new Error("response lost");
+  return{{ok:true,status:200,json:async()=>({{status:"committed",
+    scene:{{scene_id:"scene",value:"reconciled"}}}})}};
+}};
+await h._restoreScene("scene",{{scene_id:"scene",value:"reconciled"}},
+  {{scene_id:"scene",value:"direct"}});
+console.log(JSON.stringify(h.events));
+""")
+    assert result == [
+        ["suppress", "editor-history-adopt"], ["set", "direct"],
+        ["suppress", "editor-history-adopt"], ["set", "reconciled"],
+    ]
+
+
+def test_scene_restore_adopts_project_versions_from_direct_and_receipt_responses():
+    widget = _source("web/js/editor_widget.js")
+    restore = _method(widget, "_restoreScene", "_setWidgetValue")
+    result = _run_node(f"""
+globalThis.api={{apiURL:(value)=>value}};
+globalThis.document={{activeElement:null}};globalThis.describeKeyboardDebugElement=()=>({{}});
+const versions=[];globalThis.rememberProjectVersionFromResponse=(response,projectId)=>
+  versions.push([response.version||"",projectId]);
+class Harness {{
+{restore}
+  constructor(){{this.projectDir="project";this.activeSceneId="scene";
+    this.activeScene={{scene_id:"scene"}};this.scenes=[];}}
+  _keyboardDebug(){{}} _setActiveScene(scene){{this.activeScene=scene;}}
+  _renderTimeline(){{}} _renderViewportFrame(){{}}
+}}
+const h=new Harness();let calls=0;
+globalThis.fetch=async()=>{{calls+=1;
+  if(calls===1)return{{ok:true,status:200,version:"token-direct",
+    json:async()=>({{restore_token:"direct"}})}};
+  return{{ok:true,status:200,version:"restore-direct",
+    json:async()=>({{scene:{{scene_id:"scene",value:"direct"}}}})}};
+}};
+await h._restoreScene("scene",{{scene_id:"scene",value:"direct"}},{{scene_id:"scene"}});
+calls=0;globalThis.fetch=async()=>{{calls+=1;
+  if(calls===1)return{{ok:true,status:200,version:"token-receipt",
+    json:async()=>({{restore_token:"receipt"}})}};
+  if(calls===2)throw new Error("response lost");
+  return{{ok:true,status:200,version:"receipt-committed",
+    json:async()=>({{status:"committed",scene:{{scene_id:"scene",value:"receipt"}}}})}};
+}};
+await h._restoreScene("scene",{{scene_id:"scene",value:"receipt"}},
+  {{scene_id:"scene",value:"direct"}});
+console.log(JSON.stringify(versions));
+""")
+    assert result == [
+        ["token-direct", "project"], ["restore-direct", "project"],
+        ["token-receipt", "project"], ["receipt-committed", "project"],
+    ]
 
 
 def test_scene_restore_conflict_refreshes_without_receipt_reconciliation_get():

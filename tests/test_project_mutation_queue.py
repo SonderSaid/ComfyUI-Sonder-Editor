@@ -142,6 +142,112 @@ def test_project_mutation_queue_contract_and_version_headers():
     """)
 
 
+def test_history_barrier_seals_same_key_coalescing_order():
+    queue_url = (ROOT / "web" / "js" / "project_mutation_queue.js").as_uri()
+    _run_node(f"""
+        import assert from 'node:assert/strict';
+        import {{ ProjectMutationQueue }} from {queue_url!r};
+
+        const queue = new ProjectMutationQueue();
+        const calls = [];
+        let releaseActive;
+        const active = queue.enqueue({{
+            key: 'active',
+            run: async () => {{
+                calls.push('active');
+                await new Promise((resolve) => {{ releaseActive = resolve; }});
+            }},
+        }});
+        await Promise.resolve();
+        const before = queue.enqueue({{
+            key: 'scene:X:prompt', intent: 'before',
+            run: async (intent) => calls.push(intent),
+        }});
+        const history = queue.enqueue({{
+            key: 'history:undo:1', coalesce: false, sealCoalescing: true,
+            run: async () => calls.push('undo'),
+        }});
+        const after = queue.enqueue({{
+            key: 'scene:X:prompt', intent: 'after',
+            run: async (intent) => calls.push(intent),
+        }});
+        assert.equal(queue.hasPendingKey('scene:X:prompt'), true);
+        assert.equal(queue.hasPendingKey(
+            'scene:X:prompt', {{ currentEpochOnly: true }}), true);
+        releaseActive();
+        await Promise.all([active, before, history, after]);
+        assert.deepEqual(calls, ['active', 'before', 'undo', 'after']);
+    """)
+
+
+def test_owner_token_reentrancy_is_identity_scoped_and_missing_token_deadlocks():
+    queue_url = (ROOT / "web" / "js" / "project_mutation_queue.js").as_uri()
+    _run_node(f"""
+        import assert from 'node:assert/strict';
+        import {{ ProjectMutationQueue }} from {queue_url!r};
+
+        const queue = new ProjectMutationQueue();
+        const calls = [];
+        let capturedToken;
+        let foreignPromise;
+        const active = queue.enqueue({{
+            key: 'outer',
+            run: async (_intent, _diagnostics, ownerToken) => {{
+                capturedToken = ownerToken;
+                await queue.enqueue({{
+                    key: 'inline', ownerToken,
+                    run: async () => {{
+                        calls.push(['inline', queue.isActive(),
+                            queue.hasPendingKey('inline')]);
+                    }},
+                }});
+                foreignPromise = queue.enqueue({{
+                    key: 'foreign', ownerToken: {{}},
+                    run: async () => calls.push(['foreign']),
+                }});
+                await Promise.resolve();
+                assert.deepEqual(calls, [['inline', true, false]]);
+            }},
+        }});
+        await active;
+        await foreignPromise;
+        assert.deepEqual(calls, [['inline', true, false], ['foreign']]);
+
+        let releaseSecond;
+        let staleRan = false;
+        const second = queue.enqueue({{
+            key: 'second',
+            run: async () => new Promise((resolve) => {{ releaseSecond = resolve; }}),
+        }});
+        await Promise.resolve();
+        const stale = queue.enqueue({{
+            key: 'stale', ownerToken: capturedToken,
+            run: async () => {{ staleRan = true; }},
+        }});
+        await Promise.resolve();
+        assert.equal(staleRan, false);
+        assert.equal(queue.hasPendingKey('stale'), true);
+        releaseSecond();
+        await Promise.all([second, stale]);
+        assert.equal(staleRan, true);
+
+        const deadlockQueue = new ProjectMutationQueue();
+        let nestedWithoutToken;
+        void deadlockQueue.enqueue({{
+            key: 'deadlock-outer',
+            run: async () => {{
+                nestedWithoutToken = deadlockQueue.enqueue({{
+                    key: 'deadlock-inner', run: async () => undefined,
+                }});
+                await nestedWithoutToken;
+            }},
+        }});
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(deadlockQueue.isActive(), true);
+        assert.equal(deadlockQueue.hasPendingKey('deadlock-inner'), true);
+    """)
+
+
 def test_reconcile_retry_has_one_gesture_and_distinct_physical_request_ids():
     api_url = (ROOT / "web" / "js" / "api_client.js").as_uri()
     _run_node(f"""
@@ -407,6 +513,24 @@ def test_widget_gesture_scope_coalescing_unscoped_and_nested_contracts():
         releaseTrim();
         releaseMove();
         await Promise.all([movePromise, trimPromise]);
+
+        const spanWidget = makeWidget();
+        const eventOffset = window.__SONDER_CANVAS_DIAG.events.length;
+        let releaseQueuedHistory;
+        const historySpan = spanWidget._withMutationGesture('undo', async (diagnostics) => {{
+            diagnostics.queueWaitMs = 42;
+            await new Promise((resolve) => {{ releaseQueuedHistory = resolve; }});
+        }});
+        assert.equal(window.__SONDER_CANVAS_DIAG.events.slice(eventOffset)
+            .some((event) => event.kind === 'gesture_end'), false);
+        releaseQueuedHistory();
+        await historySpan;
+        const historyEvents = window.__SONDER_CANVAS_DIAG.events.slice(eventOffset)
+            .filter((event) => event.kind === 'gesture_start'
+                || event.kind === 'gesture_end');
+        assert.deepEqual(historyEvents.map((event) => event.gesture_kind),
+            ['undo', 'undo']);
+        assert.equal(historyEvents[1].queue_wait_ms, 42);
     """)
 
 

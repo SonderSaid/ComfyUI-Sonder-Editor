@@ -2,6 +2,8 @@ export class ProjectMutationQueue {
     constructor({ onIdle = null } = {}) {
         this._pending = [];
         this._active = null;
+        this._activeOwnerToken = null;
+        this._coalescingEpoch = 0;
         this._drainWaiters = [];
         this._drainFlushScheduled = false;
         this._pumpScheduled = false;
@@ -9,7 +11,7 @@ export class ProjectMutationQueue {
     }
 
     enqueue({ key, label = "", coalesce = true, merge = null, intent = null,
-        diagnostics = null, run }) {
+        diagnostics = null, ownerToken = null, sealCoalescing = false, run }) {
         if (!key) {
             return Promise.reject(new Error("Project mutation key is required"));
         }
@@ -17,10 +19,26 @@ export class ProjectMutationQueue {
             return Promise.reject(new Error("Project mutation run function is required"));
         }
 
+        // A nested write owned by the currently running item executes inline.
+        // Inline work deliberately does not replace `_active` or appear in
+        // `_pending`; isActive() stays true and hasPendingKey() sees only real
+        // queue slots. Missing, foreign, and stale tokens fail closed by taking
+        // the ordinary queue path.
+        if (ownerToken && this._active && ownerToken === this._activeOwnerToken) {
+            if (diagnostics && typeof diagnostics === "object") {
+                diagnostics.coalescedCount = 1;
+            }
+            return Promise.resolve().then(() => run(intent, diagnostics, ownerToken));
+        }
+
+        if (sealCoalescing) this._coalescingEpoch += 1;
+        const coalescingEpoch = this._coalescingEpoch;
+
         return new Promise((resolve, reject) => {
             const waiter = { resolve, reject };
             const existing = coalesce !== false
-                ? this._pending.find((mutation) => mutation.key === key)
+                ? this._pending.find((mutation) => mutation.key === key
+                    && mutation.coalescingEpoch === coalescingEpoch)
                 : null;
 
             if (existing) {
@@ -46,6 +64,7 @@ export class ProjectMutationQueue {
                     label,
                     intent,
                     diagnostics,
+                    coalescingEpoch,
                     coalescedCount: 1,
                     run,
                     waiters: [waiter],
@@ -59,8 +78,10 @@ export class ProjectMutationQueue {
         return this._pending.length > 0;
     }
 
-    hasPendingKey(key) {
-        return this._pending.some((mutation) => mutation.key === key);
+    hasPendingKey(key, { currentEpochOnly = false } = {}) {
+        return this._pending.some((mutation) => mutation.key === key
+            && (!currentEpochOnly
+                || mutation.coalescingEpoch === this._coalescingEpoch));
     }
 
     isActive() {
@@ -93,8 +114,11 @@ export class ProjectMutationQueue {
         while (this._pending.length > 0) {
             const mutation = this._pending.shift();
             this._active = mutation;
+            const ownerToken = {};
+            this._activeOwnerToken = ownerToken;
             try {
-                const result = await mutation.run(mutation.intent, mutation.diagnostics);
+                const result = await mutation.run(
+                    mutation.intent, mutation.diagnostics, ownerToken);
                 for (const waiter of mutation.waiters) {
                     waiter.resolve(result);
                 }
@@ -103,6 +127,9 @@ export class ProjectMutationQueue {
                     waiter.reject(error);
                 }
             } finally {
+                if (this._activeOwnerToken === ownerToken) {
+                    this._activeOwnerToken = null;
+                }
                 this._active = null;
             }
         }

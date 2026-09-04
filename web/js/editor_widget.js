@@ -688,7 +688,20 @@ export class EditorWidget {
         this._staleReplayGovernors = new Map();
         this._staleReplayTimers = new Map();
         this._projectMutationQueue = new ProjectMutationQueue({
-            onIdle: () => this._replayDeferredProjectBackedRefresh(),
+            onIdle: () => {
+                // History-order state remains authoritative through every
+                // mutation queued behind the history item, including edits
+                // authored while one of those trailing requests is active.
+                // Idle alone does not make the live scene authoritative: an
+                // entity-only/lost response may still await its refresh. Keep
+                // effective tombstones and receipts until an ordered read or
+                // exact response resolves them.
+                if (!this._historyOrderContextNeedsRetention?.(
+                        this._latestHistoryOrderContext)) {
+                    this._latestHistoryOrderContext = null;
+                }
+                this._replayDeferredProjectBackedRefresh();
+            },
         });
         this._projectMutationCloseInProgress = null;
         this._promptCompileCoordinator = createPromptCompileCoordinator(
@@ -823,6 +836,12 @@ export class EditorWidget {
         this._redoStack = [];
         this._maxUndoSteps = 50;
         this._sceneHistoryLifecycleOwner = null;
+        this._historyStackRevision = 0;
+        this._historyCommitRevisionByEntry = new WeakMap();
+        this._historyOperationSeq = 0;
+        this._latestHistoryOrderContext = null;
+        this._queuedHistoryOperationCount = 0;
+        this._queuedHistoryNotification = null;
 
         // Thumbnail strip cache: { assetId: { img: Image, frameWidth, numFrames, loaded } }
         this._thumbStripCache = {};
@@ -1131,13 +1150,18 @@ export class EditorWidget {
             "gesture", { gesture_kind: gestureKind }, preferredMarkerId);
         const gesture = { gestureId: String(gestureId || ""), gestureKind,
             coalescedCount: 1 };
+        const endPayload = () => ({
+            gesture_kind: gestureKind,
+            ...(Number.isFinite(gesture.queueWaitMs)
+                ? { queue_wait_ms: gesture.queueWaitMs } : {}),
+        });
         const previousGesture = this._activeMutationGesture;
         this._activeMutationGesture = gesture;
         let result;
         try {
             result = callback(gesture);
         } catch (error) {
-            sessionDiagEndLoad("gesture", gestureId, { gesture_kind: gestureKind });
+            sessionDiagEndLoad("gesture", gestureId, endPayload());
             throw error;
         } finally {
             if (this._activeMutationGesture === gesture) {
@@ -1146,10 +1170,10 @@ export class EditorWidget {
         }
         if (result && typeof result.then === "function") {
             return Promise.resolve(result).finally(() => {
-                sessionDiagEndLoad("gesture", gestureId, { gesture_kind: gestureKind });
+                sessionDiagEndLoad("gesture", gestureId, endPayload());
             });
         }
-        sessionDiagEndLoad("gesture", gestureId, { gesture_kind: gestureKind });
+        sessionDiagEndLoad("gesture", gestureId, endPayload());
         return result;
     }
 
@@ -1544,7 +1568,6 @@ export class EditorWidget {
             "create scene", { allowSceneSwitch: true });
         if (!lifecycleToken) return;
         const dirName = this.projectDir.split(/[/\\]/).pop();
-
         try {
             const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes`), {
                 method: "POST",
@@ -2299,7 +2322,9 @@ export class EditorWidget {
         }
     }
 
-    async _applyReferenceHistoryOperations(operations, label, diagnostics = null) {
+    async _applyReferenceHistoryOperations(
+        operations, label, diagnostics = null, ownerToken = null,
+        historyOrderContext = undefined) {
         const requested = Array.isArray(operations) ? operations : [];
         const stateFor = (operation) => {
             const memberId = String(operation?.member_id || "");
@@ -2321,7 +2346,8 @@ export class EditorWidget {
         }
         if (alreadyApplied()) return true;
         try {
-            await this._mutateReferences(requested, label, diagnostics);
+            await this._mutateReferences(
+                requested, label, diagnostics, ownerToken, historyOrderContext);
             return true;
         } catch (error) {
             const reconciled = await this._fetchReferences({
@@ -2457,7 +2483,9 @@ export class EditorWidget {
         }
     }
 
-    _mutateReferences(operations, label = "Reference Library change", diagnostics = null) {
+    _mutateReferences(
+        operations, label = "Reference Library change", diagnostics = null,
+        ownerToken = null, historyOrderContext = undefined) {
         if (!this.projectDir || !Array.isArray(operations) || !operations.length) return Promise.resolve(null);
         const projectDir = this.projectDir;
         const dirName = this._projectDirName();
@@ -2468,6 +2496,8 @@ export class EditorWidget {
             coalesce: false,
             intent: operations,
             diagnostics,
+            ownerToken,
+            historyOrderContext,
             refreshScenes: false,
             refreshKeysOnError: ["references"],
             failureMessage: (error) => error?.code === "identity_mismatch"
@@ -3226,6 +3256,364 @@ export class EditorWidget {
         return postProjectJsonWithReconcile(api.apiURL(path), init, { projectId, retryOnConflict, maxAttempts });
     }
 
+    _historyExpectedProjection(expected, current) {
+        if (!expected || typeof expected !== "object" || Array.isArray(expected)
+                || !current || typeof current !== "object") {
+            return expected;
+        }
+        const rebased = structuredClone(expected);
+        for (const key of Object.keys(expected)) {
+            if (Object.hasOwn(current, key)) rebased[key] = structuredClone(current[key]);
+        }
+        return rebased;
+    }
+
+    _rebasePromptEditExpectations(fields, current, { global = false } = {}) {
+        const edit = fields?.prompt_edit;
+        if (!edit || typeof edit !== "object" || !current) return;
+        const docsKey = global ? "global_channel_docs" : "channel_docs";
+        const attachmentsKey = global ? "global_attachments" : "attachments";
+        const documents = current[docsKey] || {};
+        const attachments = new Map((current[attachmentsKey] || []).map((value) => [
+            String(value?.attachment_id || ""), value,
+        ]));
+        for (const [key, change] of Object.entries(edit.documents || {})) {
+            if (!change || typeof change !== "object") continue;
+            change.expected = Object.hasOwn(documents, key)
+                ? structuredClone(documents[key]) : null;
+        }
+        for (const [key, change] of Object.entries(edit.attachments || {})) {
+            if (!change || typeof change !== "object") continue;
+            change.expected = attachments.has(String(key))
+                ? structuredClone(attachments.get(String(key))) : null;
+        }
+    }
+
+    _rebaseSceneMutationIntentForHistory(intent, orderedScene, authoredScene = null) {
+        if (!intent || !Array.isArray(intent.operations) || !orderedScene) return intent;
+        const rebased = structuredClone(intent);
+        const prompts = Array.isArray(orderedScene.prompt_sections)
+            ? orderedScene.prompt_sections : [];
+        const guides = Array.isArray(orderedScene.guide_frames)
+            ? orderedScene.guide_frames : [];
+        const references = Array.isArray(orderedScene.reference_items)
+            ? orderedScene.reference_items : [];
+        const clips = Array.isArray(orderedScene.clips) ? orderedScene.clips : [];
+        const audio = Array.isArray(orderedScene.audio_tracks)
+            ? orderedScene.audio_tracks : [];
+        const laneSpecs = {
+            video: {
+                count: "video_lane_count", configs: "video_lane_configs",
+            },
+            motion_driver: {
+                count: "motion_driver_lane_count", configs: "motion_driver_lane_configs",
+            },
+            audio: {
+                count: "audio_lane_count", configs: "audio_lane_configs",
+            },
+            reference: {
+                count: "reference_lane_count", configs: "reference_lane_configs",
+                recipes: "reference_lane_recipes",
+            },
+        };
+        const laneCount = (scene, laneType) => {
+            const spec = laneSpecs[laneType];
+            return spec ? Math.max(1, Number(scene?.[spec.count]) || 1) : 1;
+        };
+        const stableConfigString = (value) => {
+            if (Array.isArray(value)) {
+                return `[${value.map((item) => stableConfigString(item)).join(",")}]`;
+            }
+            if (value && typeof value === "object") {
+                return `{${Object.keys(value).sort().map((key) =>
+                    `${JSON.stringify(key)}:${stableConfigString(value[key])}`).join(",")}}`;
+            }
+            return JSON.stringify(value);
+        };
+        const normalizedLaneConfig = (value) => ({
+            ...(value && typeof value === "object" ? value : {}),
+            name: String(value?.name || ""),
+            color: String(value?.color || ""),
+            locked: value?.locked === true,
+            hidden: value?.hidden === true,
+        });
+        const laneAnchor = (scene, laneType, laneIndex) => {
+            const spec = laneSpecs[laneType];
+            const index = Number(laneIndex);
+            if (!spec || !Number.isInteger(index) || index < 0
+                    || index >= laneCount(scene, laneType)) return null;
+            const recipe = spec.recipes && Array.isArray(scene?.[spec.recipes])
+                ? scene[spec.recipes][index] : null;
+            const recipeId = String(recipe?.lane_id || "");
+            const config = Array.isArray(scene?.[spec.configs])
+                ? (scene[spec.configs][index] || {}) : {};
+            return {
+                recipeId,
+                config: stableConfigString(normalizedLaneConfig(config)),
+            };
+        };
+        // Membership is lane content, not lane identity. In particular a queued
+        // Undo may move an item out of the destination selected by a later drag;
+        // following that item would silently redirect the drag. Reference lanes
+        // have durable recipe lane ids. Other variable lanes have only their
+        // normalized config, which is accepted only when it is unique.
+        const findLaneByAnchor = (scene, laneType, anchor) => {
+            if (!anchor) return -1;
+            const total = laneCount(scene, laneType);
+            const candidates = [];
+            for (let index = 0; index < total; index += 1) {
+                candidates.push(laneAnchor(scene, laneType, index));
+            }
+            const matches = anchor.recipeId
+                ? (candidate) => candidate?.recipeId === anchor.recipeId
+                : (candidate) => candidate?.config === anchor.config;
+            const found = [];
+            for (let index = 0; index < total; index += 1) {
+                if (matches(candidates[index])) found.push(index);
+            }
+            return found.length === 1 ? found[0] : -1;
+        };
+        const rebaseLaneIndex = (laneType, laneIndex) => {
+            const index = Number(laneIndex);
+            const spec = laneSpecs[laneType];
+            if (!spec || !authoredScene || !Number.isInteger(index) || index < 0) return index;
+            const authoredCount = laneCount(authoredScene, laneType);
+            const orderedCount = laneCount(orderedScene, laneType);
+            // New lanes are append-only. Preserve their offset from the authored
+            // tail when an earlier history action restored or removed lanes.
+            if (index >= authoredCount) return orderedCount + (index - authoredCount);
+            // Lane topology changes only through add/remove operations today.
+            // With equal counts every numeric slot is stable even when history
+            // moved all of its contents or changed its presentation config.
+            if (authoredCount === orderedCount) return index;
+            const matched = findLaneByAnchor(
+                orderedScene, laneType, laneAnchor(authoredScene, laneType, index));
+            if (matched >= 0) return matched;
+            const unresolvable = new Error(
+                `The queued ${laneType.replaceAll("_", " ")} lane edit was not sent because its lane could no longer be identified after Undo/Redo.`);
+            // The queue's rejection handler builds its own generic message and
+            // discards error.message. This code is what lets it keep the
+            // specific one, which names the actual problem.
+            unresolvable.code = "history_lane_unresolvable";
+            throw unresolvable;
+        };
+        const promptTarget = (operation, expectedKey = "expected", indexKey = "index") => {
+            const expected = operation?.[expectedKey];
+            const promptId = String(expected?.prompt_id || operation?.prompt_id || "");
+            let index = promptId
+                ? prompts.findIndex((value) => String(value?.prompt_id || "") === promptId)
+                : -1;
+            // A numeric prompt index is not identity: history can insert,
+            // remove, or reorder rows before this queued edit runs. For older
+            // intents without prompt_id, accept only one exact expected-state
+            // match; ambiguity must remain a server refusal, never become
+            // authorization to mutate the row that inherited the index.
+            if (!promptId && expected && typeof expected === "object") {
+                const matches = prompts.map((value, candidateIndex) => ({
+                    candidateIndex,
+                    matches: Object.entries(expected).every(([key, wanted]) =>
+                        JSON.stringify(value?.[key]) === JSON.stringify(wanted)),
+                })).filter((candidate) => candidate.matches);
+                if (matches.length === 1) index = matches[0].candidateIndex;
+            }
+            if (!Number.isInteger(index) || index < 0 || index >= prompts.length) return null;
+            return { index, value: prompts[index] };
+        };
+        const guideTarget = (operation, frameKey = "frame_index") => {
+            const guideId = String(operation?.expected?.guide_id || operation?.guide_id || "");
+            const frame = Number(operation?.[frameKey]);
+            return (guideId
+                ? guides.find((value) => String(value?.guide_id || "") === guideId)
+                : guides.find((value) => Number(value?.frame_index) === frame)) || null;
+        };
+        const referenceTarget = (operation) => references.find((value) =>
+            String(value?.reference_item_id || "")
+                === String(operation?.reference_item_id || operation?.id || "")) || null;
+        const rebasePromptOperation = (operation, expectedKey = "expected", indexKey = "index") => {
+            const target = promptTarget(operation, expectedKey, indexKey);
+            if (!target) return;
+            operation[indexKey] = target.index;
+            if (operation[expectedKey]) {
+                operation[expectedKey] = this._historyExpectedProjection(
+                    operation[expectedKey], target.value);
+            }
+            this._rebasePromptEditExpectations(operation.fields, target.value);
+        };
+        const rebaseGuideOperation = (operation, frameKey = "frame_index") => {
+            const target = guideTarget(operation, frameKey);
+            if (!target) return;
+            operation[frameKey] = Number(target.frame_index);
+            if (operation.expected) {
+                operation.expected = this._historyExpectedProjection(
+                    operation.expected, target);
+            }
+        };
+        const rebaseBulkItem = (item) => {
+            if (!item || typeof item !== "object") return;
+            if (item.type === "prompt") {
+                const target = promptTarget(item, "expected", "id");
+                if (!target) return;
+                item.id = target.index;
+                item.expected = this._historyExpectedProjection(item.expected, target.value);
+            } else if (item.type === "guide") {
+                const target = guideTarget(item, "id");
+                if (!target) return;
+                item.id = Number(target.frame_index);
+                item.expected = this._historyExpectedProjection(item.expected, target);
+            } else if (item.type === "reference") {
+                const target = references.find((value) => String(value?.reference_item_id || "")
+                    === String(item.id || ""));
+                if (target) item.expected = this._historyExpectedProjection(item.expected, target);
+            } else if (item.type === "clip") {
+                const target = clips.find((value) => String(value?.clip_id || "")
+                    === String(item.id || ""));
+                if (target) item.expected = this._historyExpectedProjection(item.expected, target);
+            } else if (item.type === "audio") {
+                const target = audio.find((value) => String(value?.track_id || "")
+                    === String(item.id || ""));
+                if (target) item.expected = this._historyExpectedProjection(item.expected, target);
+            }
+        };
+
+        for (const operation of rebased.operations) {
+            if (!operation || typeof operation !== "object") continue;
+            switch (operation.type) {
+            case "update_scene_fields":
+                if (operation.expected) {
+                    operation.expected = this._historyExpectedProjection(
+                        operation.expected, orderedScene);
+                }
+                this._rebasePromptEditExpectations(
+                    operation.fields, orderedScene, { global: true });
+                break;
+            case "update_prompt_section":
+            case "delete_prompt_section":
+            case "split_prompt_section":
+                rebasePromptOperation(operation);
+                break;
+            case "swap_prompt_sections":
+                rebasePromptOperation(operation, "expected_a", "index_a");
+                rebasePromptOperation(operation, "expected_b", "index_b");
+                break;
+            case "move_guide":
+                rebaseGuideOperation(operation, "from_frame_index");
+                break;
+            case "update_guide":
+            case "delete_guide":
+                rebaseGuideOperation(operation);
+                break;
+            case "update_reference_item":
+            case "delete_reference_item": {
+                const target = referenceTarget(operation);
+                if (target && operation.expected) {
+                    operation.expected = this._historyExpectedProjection(
+                        operation.expected, target);
+                }
+                if (operation.type === "update_reference_item"
+                        && Object.hasOwn(operation.fields || {}, "lane_index")) {
+                    operation.fields.lane_index = rebaseLaneIndex(
+                        "reference", operation.fields.lane_index);
+                }
+                break;
+            }
+            case "create_reference_item":
+                if (Object.hasOwn(operation.fields || {}, "lane_index")) {
+                    operation.fields.lane_index = rebaseLaneIndex(
+                        "reference", operation.fields.lane_index);
+                }
+                break;
+            case "update_audio_track":
+                if (Object.hasOwn(operation.fields || {}, "lane_index")) {
+                    operation.fields.lane_index = rebaseLaneIndex(
+                        "audio", operation.fields.lane_index);
+                }
+                break;
+            case "update_clip":
+                if (Object.hasOwn(operation.fields || {}, "track_index")) {
+                    const authoredClip = (Array.isArray(authoredScene?.clips)
+                        ? authoredScene.clips : []).find((value) =>
+                        String(value?.clip_id || "") === String(operation.clip_id || ""));
+                    const role = String(operation.fields?.role
+                        || authoredClip?.role || "render");
+                    operation.fields.track_index = rebaseLaneIndex(
+                        role === "motion_driver" ? "motion_driver" : "video",
+                        operation.fields.track_index);
+                }
+                break;
+            case "drop_clip": {
+                const role = String(operation.fields?.role || "render");
+                if (Object.hasOwn(operation.fields || {}, "track_index")) {
+                    operation.fields.track_index = rebaseLaneIndex(
+                        role === "motion_driver" ? "motion_driver" : "video",
+                        operation.fields.track_index);
+                }
+                if (operation.fields?.dual_drop
+                        && Object.hasOwn(operation.fields, "audio_lane_index")) {
+                    operation.fields.audio_lane_index = rebaseLaneIndex(
+                        "audio", operation.fields.audio_lane_index);
+                }
+                break;
+            }
+            case "drop_audio_track":
+                if (Object.hasOwn(operation.fields || {}, "lane_index")) {
+                    operation.fields.lane_index = rebaseLaneIndex(
+                        "audio", operation.fields.lane_index);
+                }
+                break;
+            case "set_lane_count": {
+                const laneType = String(operation.lane_type || "");
+                if (authoredScene && laneSpecs[laneType]) {
+                    // An absolute count is reinterpreted as an authored delta.
+                    // Valid only while both of these hold - both are verified
+                    // facts today, not assumptions. Every emitter sends
+                    // `current + n` (`_addLane`, `_convertClipRole`,
+                    // `_moveItemToNewLane`, the reference-stage drop), and every
+                    // one is `coalesce: false`. A genuinely absolute emitter
+                    // would be silently retargeted. A coalescing one would merge
+                    // two clicks into one payload while keeping only the newer
+                    // entry's snapshot, computing +1 for an intended +2 and
+                    // losing a lane. Re-verify both before adding an emitter.
+                    const delta = Number(operation.count) - laneCount(authoredScene, laneType);
+                    // Unlike its sibling lane operations this clamps instead of
+                    // refusing: a lane count carries no identity to be ambiguous
+                    // about, and the floor stops a scene reaching zero lanes when
+                    // history removed more lanes than the delta adds back.
+                    operation.count = Math.max(1, laneCount(orderedScene, laneType) + delta);
+                }
+                break;
+            }
+            case "update_lane_config":
+                if (laneSpecs[operation.lane_type]) {
+                    operation.lane_index = rebaseLaneIndex(
+                        operation.lane_type, operation.lane_index);
+                }
+                break;
+            case "remove_lane":
+                if (laneSpecs[operation.lane_type]) {
+                    operation.lane_index = rebaseLaneIndex(
+                        operation.lane_type, operation.lane_index);
+                    if (operation.item_policy === "move_items") {
+                        operation.target_lane = rebaseLaneIndex(
+                            operation.lane_type, operation.target_lane);
+                    }
+                }
+                break;
+            case "consolidate_items":
+                if (laneSpecs[operation.lane_type]) {
+                    operation.target_lane = rebaseLaneIndex(
+                        operation.lane_type, operation.target_lane);
+                }
+                break;
+            case "bulk_delete_items":
+                for (const item of operation.items || []) rebaseBulkItem(item);
+                break;
+            default:
+                break;
+            }
+        }
+        return rebased;
+    }
+
     _queueProjectMutation({
         key,
         label,
@@ -3243,6 +3631,10 @@ export class EditorWidget {
         invalidateQueueFetch = false,
         historyEntry = null,
         diagnostics = null,
+        ownerToken = null,
+        historyOrderContext = undefined,
+        stampHistory = true,
+        historyFailureOwnedByCaller = false,
     }) {
         // Invalidate any in-flight scenes GET when a mutation is enqueued.
         // Mutation invalidation is deliberately separate from fetch dispatch
@@ -3257,7 +3649,8 @@ export class EditorWidget {
         if (capturedHistoryEntry) capturedHistoryEntry._postSnapshotCaptureClaimed = true;
         this._pendingHistoryEntryByMutationKey ||= new Map();
         const willCoalesce = coalesce !== false
-            && this._projectMutationQueue.hasPendingKey?.(key) === true;
+            && this._projectMutationQueue.hasPendingKey?.(
+                key, { currentEpochOnly: true }) === true;
         if (willCoalesce) {
             const supersededEntry = this._pendingHistoryEntryByMutationKey.get(key);
             if (supersededEntry) this._discardUndoEntry(supersededEntry);
@@ -3280,13 +3673,33 @@ export class EditorWidget {
                 && typeof sourceDiagnostics === "object"
             ? { ...sourceDiagnostics, coalescedCount: 1 }
             : sourceDiagnostics;
-        const queuedIntent = { payload: intent, historyEntry: capturedHistoryEntry };
+        // A mutation authored after a queued history action must derive its
+        // before-snapshot from the state produced at its physical queue
+        // position, not from the optimistic UI state visible before that
+        // history action applies. Keep the exact history-order context with the
+        // queue slot; later coalescing adopts the latest surviving gesture's
+        // context along with its entry.
+        const capturedHistoryOrderContext = historyOrderContext === undefined
+            ? (this._latestHistoryOrderContext || null) : historyOrderContext;
+        if (capturedHistoryEntry && capturedHistoryOrderContext) {
+            capturedHistoryEntry._historyOrderContext = capturedHistoryOrderContext;
+        }
+        const queuedIntent = {
+            payload: intent,
+            historyEntry: capturedHistoryEntry,
+            historyOrderContext: capturedHistoryOrderContext,
+            stampHistory,
+            historyFailureOwnedByCaller,
+        };
         const wrappedMerge = typeof merge === "function"
             ? (oldValue, nextValue) => ({
                 payload: merge(oldValue?.payload, nextValue?.payload),
                 // A coalesced request has only the latest mutation's durable
                 // result. Never stamp an older entry from that later state.
                 historyEntry: nextValue?.historyEntry || null,
+                historyOrderContext: nextValue?.historyOrderContext || null,
+                stampHistory: nextValue?.stampHistory !== false,
+                historyFailureOwnedByCaller: nextValue?.historyFailureOwnedByCaller === true,
             })
             : null;
         const promise = this._projectMutationQueue.enqueue({
@@ -3296,11 +3709,74 @@ export class EditorWidget {
             merge: wrappedMerge,
             intent: queuedIntent,
             diagnostics: mutationDiagnostics,
-            run: async (queuedValue, queuedDiagnostics) => {
-                const result = await run(queuedValue?.payload, queuedDiagnostics);
-                this._stampHistoryPostSnapshot(
-                    queuedValue?.historyEntry, result?.payload?.scene);
-                return result;
+            ownerToken,
+            run: async (queuedValue, queuedDiagnostics, queuedOwnerToken) => {
+                const queuedHistoryEntry = queuedValue?.historyEntry;
+                const orderedSceneId = String(
+                    queuedHistoryEntry?.sceneId || queuedValue?.payload?.sceneId || "");
+                try {
+                    let orderedBefore = this._historyOrderedSceneForContext?.(
+                        queuedValue?.historyOrderContext, orderedSceneId) || null;
+                    if (!orderedBefore && this._historyOrderContextNeedsResolution?.(
+                            queuedValue?.historyOrderContext, orderedSceneId)) {
+                        orderedBefore = await this._resolveHistoryOrderContextScene(
+                            queuedValue.historyOrderContext, orderedSceneId,
+                            queuedOwnerToken, queuedValue?.payload?.projectId);
+                    }
+                    // Read the authored scene before the snapshot is rebased to this
+                    // queue position. Reading it after compares the ordered scene
+                    // against itself, so every lane index passes through unchanged
+                    // and lane retargeting silently does nothing. Validate by scene
+                    // identity rather than by `kind`: an explicitly passed history
+                    // entry bypasses _claimHistoryPostSnapshotCapture's kind
+                    // rejection, and a project-dependencies entry's snapshot is not
+                    // a scene at all.
+                    const authoredSceneId = String(
+                        queuedHistoryEntry?.snapshot?.scene_id || "");
+                    const authoredScene = authoredSceneId && authoredSceneId === orderedSceneId
+                        ? queuedHistoryEntry.snapshot
+                        : null;
+                    if (orderedBefore && queuedHistoryEntry && !queuedHistoryEntry.kind) {
+                        queuedHistoryEntry.snapshot = structuredClone(orderedBefore);
+                    }
+                    const orderedIntent = orderedBefore
+                        ? (this._rebaseSceneMutationIntentForHistory?.(
+                            queuedValue?.payload, orderedBefore,
+                            authoredScene) || queuedValue?.payload)
+                        : queuedValue?.payload;
+                    if (orderedSceneId) {
+                        // A dispatched write invalidates the ordering baseline
+                        // until its exact scene response replaces it. Entity-
+                        // only and lost responses leave a tombstone: the next
+                        // slot reads its own baseline without stamping this
+                        // entry from a later GET.
+                        queuedValue?.historyOrderContext?.scenes?.set(orderedSceneId, null);
+                    }
+                    const result = await run(
+                        orderedIntent, queuedDiagnostics, queuedOwnerToken);
+                    if (queuedValue?.stampHistory !== false) {
+                        this._recordHistoryOrderedScene?.(
+                            queuedValue?.historyOrderContext, result?.payload?.scene);
+                        this._stampHistoryPostSnapshot(
+                            queuedHistoryEntry, result?.payload?.scene);
+                    }
+                    return result;
+                } catch (mutationError) {
+                    if (!queuedValue?.historyFailureOwnedByCaller
+                            && queuedHistoryEntry && !queuedHistoryEntry.postSnapshot
+                            && !queuedHistoryEntry.restoreToken) {
+                        // Any terminal mutation failure leaves an unstamped
+                        // entry unusable, regardless of its error code. Remove
+                        // the exact claimed object; a label/top-of-stack cleanup
+                        // can delete a newer gesture after queue interleaving.
+                        this._discardUndoEntry?.(queuedHistoryEntry);
+                    }
+                    throw mutationError;
+                } finally {
+                    if (queuedHistoryEntry && !queuedHistoryEntry.pending) {
+                        delete queuedHistoryEntry._historyOrderContext;
+                    }
+                }
             },
         });
         const clearPendingHistoryEntry = () => {
@@ -3308,7 +3784,17 @@ export class EditorWidget {
                 this._pendingHistoryEntryByMutationKey.delete(key);
             }
         };
-        promise.then(clearPendingHistoryEntry, clearPendingHistoryEntry);
+        promise.then(clearPendingHistoryEntry, () => {
+            clearPendingHistoryEntry();
+            // Enqueue itself can reject without entering run (for example an
+            // invalid nested owner). Apply the same exact-entry rule there.
+            if (!historyFailureOwnedByCaller
+                    && capturedHistoryEntry && !capturedHistoryEntry.postSnapshot
+                    && !capturedHistoryEntry.restoreToken) {
+                this._discardUndoEntry?.(capturedHistoryEntry);
+                delete capturedHistoryEntry._historyOrderContext;
+            }
+        });
         promise.then(
             (result) => {
                 if (!refreshScenes) return;
@@ -3325,9 +3811,16 @@ export class EditorWidget {
                 // omission of onRetry — failure paths auto-resync to authoritative
                 // state, so a retry would re-issue stale intent; source-coalesced
                 // so a burst of failures yields one counted toast.
-                const message = typeof failureMessage === "function"
-                    ? failureMessage(error)
-                    : (failureMessage || `${label || "Project change"} failed — timeline restored.`);
+                // A lane-rebase refusal already names the exact problem. The
+                // generic fallback would replace it with "… failed — timeline
+                // restored." and discard the only actionable detail the user
+                // gets. Resolved once here rather than at each lane call site so
+                // any future caller inherits it.
+                const message = error?.code === "history_lane_unresolvable"
+                    ? error.message
+                    : (typeof failureMessage === "function"
+                        ? failureMessage(error)
+                        : (failureMessage || `${label || "Project change"} failed — timeline restored.`));
                 const tier = typeof failureTier === "function" ? failureTier(error) : failureTier;
                 const detail = typeof failureDetail === "function" ? failureDetail(error) : failureDetail;
                 const notify = tier === "warning" ? notifyWarning : notifyError;
@@ -3363,6 +3856,10 @@ export class EditorWidget {
         expectedModifiedAt = "",
         historyEntry = null,
         diagnostics = null,
+        ownerToken = null,
+        historyOrderContext = undefined,
+        stampHistory = true,
+        historyFailureOwnedByCaller = false,
     } = {}) {
         const context = this._snapshotProjectMutationContext();
         if (!context) return Promise.resolve(null);
@@ -3388,6 +3885,10 @@ export class EditorWidget {
             failureTier,
             historyEntry,
             diagnostics,
+            ownerToken,
+            historyOrderContext,
+            stampHistory,
+            historyFailureOwnedByCaller,
             run: async (queuedIntent, diagnostics) => {
                 return await this._runVersionedProjectMutation(
                     `/sonder-editor/project/${encodeURIComponent(queuedIntent.projectId)}/scenes/${encodeURIComponent(queuedIntent.sceneId)}/mutations`,
@@ -3594,6 +4095,14 @@ export class EditorWidget {
         this._undoStack.splice(index, 1);
         this._replayDeferredHistoryWidgetStateIfIdle?.();
         return true;
+    }
+
+    _discardUnstampableUndoEntry(target) {
+        if (!target || target.postSnapshot || target.restoreToken) return false;
+        if (this._historyPostSnapshotCaptureCandidate === target) {
+            this._historyPostSnapshotCaptureCandidate = null;
+        }
+        return this._discardUndoEntry(target);
     }
 
     _trimLocalLaneConfigs(configs, removedIndex, targetCount) {
@@ -8751,7 +9260,6 @@ export class EditorWidget {
             this._buildTrackLayout();
             this._renderTimeline();
         } catch (error) {
-            this._discardLastUndo("add reference item");
             notifyWarning(error?.message || "Reference placement was refused.", { source: "reference-stage-refused" });
             await this._fetchScenes({ ignoreMutationGate: true, reason: "reference_stage_error" });
             // Staging changes what the Prompt tool resolves, so a refusal has
@@ -8796,7 +9304,89 @@ export class EditorWidget {
             return;
         }
 
-        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const dropContext = this._snapshotProjectMutationContext();
+        if (!dropContext) return;
+
+        // Dedicated media-create routes are not scene-mutation operations, but
+        // their lane targets still need the same history-order rebase. Keep a
+        // frontend-only semantic operation in the queue and serialize the HTTP
+        // body from the rebased value only when this slot actually executes.
+        const queueDropMutation = ({
+            keySuffix, label, path, operation, buildInit, historyEntry = null,
+            laneCountOperations = [],
+        }) => this._queueProjectMutation({
+            key: `scene:${dropContext.sceneId}:drop:${dropSeq}:${keySuffix}`,
+            label,
+            coalesce: false,
+            refreshScenes: false,
+            diagnostics,
+            historyEntry,
+            // Dedicated routes return only the created entity, never the exact
+            // canonical scene required for a history post-state. A ruler drop's
+            // lane-count response is intermediate and must not stamp the whole
+            // gesture either; Landing 2 makes that unverifiable entry terminal.
+            stampHistory: false,
+            intent: {
+                ...dropContext,
+                operations: [
+                    ...structuredClone(laneCountOperations),
+                    structuredClone(operation),
+                ],
+            },
+            run: async (orderedIntent, queuedDiagnostics) => {
+                let historyOrderedScene = null;
+                try {
+                    const orderedOperations = orderedIntent?.operations || [];
+                    const orderedLaneCounts = orderedOperations.filter(
+                        (candidate) => candidate?.type === "set_lane_count");
+                    const orderedOperation = orderedOperations.find(
+                        (candidate) => candidate?.type === operation.type) || operation;
+                    if (orderedLaneCounts.length) {
+                        const laneResult = await this._runVersionedProjectMutation(
+                            `/sonder-editor/project/${encodeURIComponent(dropContext.projectId)}/scenes/${encodeURIComponent(dropContext.sceneId)}/mutations`,
+                            this._withMutationDiagnosticHeaders({
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({ operations: orderedLaneCounts }),
+                            }, queuedDiagnostics),
+                            { projectId: dropContext.projectId });
+                        historyOrderedScene = laneResult?.payload?.scene || null;
+                        if (!historyOrderedScene) {
+                            throw new Error("Drop lane creation returned no canonical scene.");
+                        }
+                        for (const countOperation of orderedLaneCounts) {
+                            if (countOperation.lane_type === "video"
+                                    && Object.hasOwn(orderedOperation.fields || {}, "track_index")) {
+                                orderedOperation.fields.track_index =
+                                    laneCountFor(historyOrderedScene, TRACK_TYPE.VIDEO) - 1;
+                            }
+                            if (countOperation.lane_type === "audio"
+                                    && Object.hasOwn(orderedOperation.fields || {}, "audio_lane_index")) {
+                                orderedOperation.fields.audio_lane_index =
+                                    laneCountFor(historyOrderedScene, TRACK_TYPE.AUDIO) - 1;
+                            }
+                            if (countOperation.lane_type === "audio"
+                                    && Object.hasOwn(orderedOperation.fields || {}, "lane_index")) {
+                                orderedOperation.fields.lane_index =
+                                    laneCountFor(historyOrderedScene, TRACK_TYPE.AUDIO) - 1;
+                            }
+                        }
+                    }
+                    const result = await this._runVersionedProjectMutation(
+                        path,
+                        this._withMutationDiagnosticHeaders(
+                            buildInit(orderedOperation), queuedDiagnostics),
+                        { projectId: dropContext.projectId });
+                    return { ok: true, payload: result?.payload };
+                } catch (error) {
+                    // This handler owns dedicated-drop failure presentation and
+                    // rollback, so resolve a sentinel to avoid the queue's second
+                    // generic toast.
+                    this._discardUnstampableUndoEntry(historyEntry);
+                    return { ok: false, error };
+                }
+            },
+        });
 
         // Zone-model drop targeting (2026-06-11, user-decided rules):
         //   ruler strip  -> ALWAYS a new lane (the only auto-lane-creation path;
@@ -8841,7 +9431,7 @@ export class EditorWidget {
                 this._showToast("Only one driver clip is allowed per driver lane.");
                 return;
             }
-            this._pushUndo("add driver");
+            const driverUndoEntry = this._pushUndo("add driver");
             const assetObj = this._findAssetById(asset.asset_id);
             const dropDuration = assetObj ? this._mediaTimelineFrames(assetObj) : 30;
             const dropEnd = frame + dropDuration;
@@ -8864,40 +9454,47 @@ export class EditorWidget {
             });
             this._renderSceneAfterLocalMutation();
             try {
-                const resp = await fetch(
-                    api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/clips`),
-                    this._withMutationRequestDiagnostics(
-                        this._withMutationDiagnosticHeaders({
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({
-                                asset_id: asset.asset_id,
-                                timeline_start_frame: frame,
-                                track_index: targetMotionDriverLane,
-                                role: "motion_driver",
-                                strength: this._defaultMotionDriverStrength(),
-                                dual_drop: false,
-                                fit_mode: this._defaultFitMode(),
-                                crop_position: this._defaultCropPosition(),
-                            }),
-                        }, diagnostics),
-                    ),
-                );
-                if (!resp.ok) {
-                    const message = await readResponseError(resp, `Driver clip creation failed: ${resp.status}`);
-                    console.warn("[Sonder] Driver clip creation failed:", resp.status, message);
+                const driverOutcome = await queueDropMutation({
+                    keySuffix: "driver",
+                    label: "drop driver clip",
+                    path: `/sonder-editor/project/${encodeURIComponent(dropContext.projectId)}/scenes/${encodeURIComponent(dropContext.sceneId)}/clips`,
+                    historyEntry: driverUndoEntry,
+                    operation: {
+                        type: "drop_clip",
+                        fields: {
+                            asset_id: asset.asset_id,
+                            timeline_start_frame: frame,
+                            track_index: targetMotionDriverLane,
+                            role: "motion_driver",
+                            strength: this._defaultMotionDriverStrength(),
+                            dual_drop: false,
+                            fit_mode: this._defaultFitMode(),
+                            crop_position: this._defaultCropPosition(),
+                        },
+                    },
+                    buildInit: (orderedOperation) => ({
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(orderedOperation.fields),
+                    }),
+                });
+                if (!driverOutcome?.ok) {
+                    const error = driverOutcome?.error;
+                    const message = error?.message
+                        || `Driver clip creation failed: ${error?.status || ""}`;
+                    console.warn("[Sonder] Driver clip creation failed:", error?.status, message);
                     notifyError(message, { source: "timeline-drop" });
-                    this._discardLastUndo("add driver");
+                    this._discardUnstampableUndoEntry(driverUndoEntry);
                     await this._fetchScenes({ ignoreMutationGate: true, reason: "drop_motion_driver_error" });
                     return;
                 }
-                const createdClip = await resp.json();
+                const createdClip = driverOutcome.payload;
                 const clipIdx = (this.activeScene.clips || []).findIndex((clip) => clip.clip_id === tempClipId);
                 if (clipIdx >= 0) this.activeScene.clips[clipIdx] = createdClip;
                 this._renderSceneAfterLocalMutation();
                 this._deferProjectBackedRefresh(["scenes"], "motion_driver_drop_reconcile");
             } catch (e) {
-                this._discardLastUndo("add driver");
+                this._discardUnstampableUndoEntry(driverUndoEntry);
                 await this._fetchScenes({ ignoreMutationGate: true, reason: "drop_motion_driver_error" });
                 console.warn("[Sonder] Failed to drop driver:", e);
             }
@@ -9002,55 +9599,26 @@ export class EditorWidget {
             }
         }
 
-        this._pushUndo("add asset");
+        const assetUndoEntry = this._pushUndo("add asset");
+        const laneCountOperations = [];
+        const videoCountField = descriptorFor(TRACK_TYPE.VIDEO).countField;
+        const audioCountField = descriptorFor(TRACK_TYPE.AUDIO).countField;
+        if (Object.hasOwn(laneCountFields, videoCountField)) {
+            laneCountOperations.push({
+                type: "set_lane_count", lane_type: "video",
+                count: laneCountFields[videoCountField],
+            });
+        }
+        if (Object.hasOwn(laneCountFields, audioCountField)) {
+            laneCountOperations.push({
+                type: "set_lane_count", lane_type: "audio",
+                count: laneCountFields[audioCountField],
+            });
+        }
 
-        // Drop mutations go through the versioned mutation queue for
-        // serialization, fresh If-Match versions, and one-shot 409 retry.
-        // Each `run` resolves an {ok, payload|error} sentinel instead of
-        // rejecting: the queue's rejection handler would toast and defer its
-        // own scenes refresh, but this handler owns drop failure surfacing
-        // (incl. the lane PUT's deliberate silent revert) — do not "fix" the
-        // sentinel into a rejection or failures will double-toast.
-        // Per-drop key token + coalesce:false so rapid drops never coalesce.
-        const queueDropMutation = (keySuffix, label, path, init) => this._queueProjectMutation({
-            key: `scene:${this.activeSceneId}:drop:${dropSeq}:${keySuffix}`,
-            label,
-            coalesce: false,
-            refreshScenes: false,
-            diagnostics,
-            run: async (_intent, diagnostics) => {
-                try {
-                    const result = await this._runVersionedProjectMutation(
-                        path,
-                        this._withMutationDiagnosticHeaders(init, diagnostics),
-                        { projectId: dirName });
-                    return { ok: true, payload: result?.payload };
-                } catch (error) {
-                    return { ok: false, error };
-                }
-            },
-        });
-
-        const persistSceneLaneCounts = async (fields, reason) => {
-            const outcome = await queueDropMutation(
-                "lanes",
-                "drop lane counts",
-                `/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}`,
-                {
-                    method: "PUT",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(fields),
-                },
-            );
-            if (outcome?.ok) return true;
-            console.warn("[Sonder] Auto-add lane failed:", outcome?.error?.status, outcome?.error?.message || outcome?.error);
-            this._discardLastUndo("add asset");
-            await this._fetchScenes({ ignoreMutationGate: true, reason });
-            return false;
-        };
-
-        // Ruler-zone drops create their new lane(s) optimistically, then persist
-        // the counts before item creation (the only auto-lane-creation path).
+        // Ruler-zone drops create their new lane(s) optimistically. The count
+        // operation and dedicated media create execute inside one queue-owned
+        // slot below, so no unrelated mutation can interleave between them.
         if (Object.keys(laneCountFields).length > 0) {
             for (const trackType of [TRACK_TYPE.VIDEO, TRACK_TYPE.AUDIO]) {
                 const countField = descriptorFor(trackType).countField;
@@ -9060,11 +9628,8 @@ export class EditorWidget {
             }
             this._buildTrackLayout();
             this._renderTimeline();
-            const lanesPersisted = await persistSceneLaneCounts(laneCountFields, "drop_lane_count_error");
-            if (!lanesPersisted) return;
         }
 
-        let resp;
         let optimisticClipId = "";
         let optimisticAudioId = "";
         let droppedVideoHasAudio = false;
@@ -9080,25 +9645,18 @@ export class EditorWidget {
                 });
                 this._applyLocalCreateGuide(guideFields);
                 this._renderSceneAfterLocalMutation();
-                resp = await fetch(
-                    api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/guides`),
-                    this._withMutationRequestDiagnostics(
-                        this._withMutationDiagnosticHeaders({
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify(guideFields),
-                        }, diagnostics),
-                    ),
-                );
-                if (!resp.ok) {
-                    const message = await readResponseError(resp, `Guide creation failed: ${resp.status}`);
-                    console.warn("[Sonder] Guide creation failed:", resp.status, message);
-                    notifyError(message, { source: "timeline-drop" });
-                    this._discardLastUndo("add asset");
-                    await this._fetchScenes({ ignoreMutationGate: true, reason: "drop_guide_error" });
-                    return;
-                }
-                const guidePayload = await resp.json();
+                const guideResult = await this._runSceneMutation(
+                    [{ type: "create_guide", fields: guideFields }],
+                    {
+                        key: `scene:${this.activeSceneId}:drop:${dropSeq}:guide`,
+                        label: "drop guide",
+                        coalesce: false,
+                        refreshScenes: false,
+                        diagnostics,
+                    });
+                const guidePayload = (guideResult?.payload?.scene?.guide_frames || [])
+                    .find((value) => String(value?.guide_id || "")
+                        === String(guideFields.guide_id || ""));
                 if (guidePayload?.frame_index !== undefined) {
                     this._applyLocalCreateGuide(guidePayload);
                     this._renderSceneAfterLocalMutation();
@@ -9145,32 +9703,37 @@ export class EditorWidget {
                     this.activeScene.audio_tracks.push(optimisticAudio);
                 }
                 this._renderSceneAfterLocalMutation();
-                const clipBody = {
-                    asset_id: asset.asset_id,
-                    timeline_start_frame: frame,
-                    track_index: targetVideoLane,
-                    audio_lane_index: dualDrop ? targetAudioLane : 0,
-                    dual_drop: dualDrop,
-                    link_video_audio: this._settings?.timelineBehavior?.linkedVideoAudioDrop !== false,
-                    fit_mode: this._defaultFitMode(),
-                    crop_position: this._defaultCropPosition(),
-                };
-                const clipOutcome = await queueDropMutation(
-                    "clip",
-                    "drop clip",
-                    `/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/clips`,
-                    {
+                const clipOutcome = await queueDropMutation({
+                    keySuffix: "clip",
+                    label: "drop clip",
+                    path: `/sonder-editor/project/${encodeURIComponent(dropContext.projectId)}/scenes/${encodeURIComponent(dropContext.sceneId)}/clips`,
+                    historyEntry: assetUndoEntry,
+                    laneCountOperations,
+                    operation: {
+                        type: "drop_clip",
+                        fields: {
+                            asset_id: asset.asset_id,
+                            timeline_start_frame: frame,
+                            track_index: targetVideoLane,
+                            audio_lane_index: dualDrop ? targetAudioLane : 0,
+                            dual_drop: dualDrop,
+                            link_video_audio: this._settings?.timelineBehavior?.linkedVideoAudioDrop !== false,
+                            fit_mode: this._defaultFitMode(),
+                            crop_position: this._defaultCropPosition(),
+                        },
+                    },
+                    buildInit: (orderedOperation) => ({
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify(clipBody),
-                    },
-                );
+                        body: JSON.stringify(orderedOperation.fields),
+                    }),
+                });
                 if (!clipOutcome?.ok) {
                     const error = clipOutcome?.error;
                     const message = error?.message || `Clip creation failed: ${error?.status || ""}`;
                     console.warn("[Sonder] Clip creation failed:", error?.status, message);
                     notifyError(message, { source: "timeline-drop" });
-                    this._discardLastUndo("add asset");
+                    this._discardUnstampableUndoEntry(assetUndoEntry);
                     await this._fetchScenes({ ignoreMutationGate: true, reason: "drop_clip_error" });
                     return;
                 }
@@ -9225,26 +9788,32 @@ export class EditorWidget {
                 this.activeScene.audio_tracks = this.activeScene.audio_tracks || [];
                 this.activeScene.audio_tracks.push(optimisticAudio);
                 this._renderSceneAfterLocalMutation();
-                const audioOutcome = await queueDropMutation(
-                    "audio",
-                    "drop audio track",
-                    `/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/audio_tracks`,
-                    {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({
+                const audioOutcome = await queueDropMutation({
+                    keySuffix: "audio",
+                    label: "drop audio track",
+                    path: `/sonder-editor/project/${encodeURIComponent(dropContext.projectId)}/scenes/${encodeURIComponent(dropContext.sceneId)}/audio_tracks`,
+                    historyEntry: assetUndoEntry,
+                    laneCountOperations,
+                    operation: {
+                        type: "drop_audio_track",
+                        fields: {
                             asset_id: asset.asset_id,
                             timeline_start_frame: frame,
                             lane_index: targetAudioLane,
-                        }),
+                        },
                     },
-                );
+                    buildInit: (orderedOperation) => ({
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(orderedOperation.fields),
+                    }),
+                });
                 if (!audioOutcome?.ok) {
                     const error = audioOutcome?.error;
                     const message = error?.message || `Audio track creation failed: ${error?.status || ""}`;
                     console.warn("[Sonder] Audio track creation failed:", error?.status, message);
                     notifyError(message, { source: "timeline-drop" });
-                    this._discardLastUndo("add asset");
+                    this._discardUnstampableUndoEntry(assetUndoEntry);
                     await this._fetchScenes({ ignoreMutationGate: true, reason: "drop_audio_error" });
                     return;
                 }
@@ -9259,7 +9828,7 @@ export class EditorWidget {
             }
             this._deferProjectBackedRefresh(["scenes"], "asset_drop_reconcile");
         } catch (e) {
-            this._discardLastUndo("add asset");
+            this._discardUnstampableUndoEntry(assetUndoEntry);
             await this._fetchScenes({ ignoreMutationGate: true, reason: "asset_drop_error" });
             console.warn("[Sonder] Failed to drop asset:", e);
         }
@@ -9359,7 +9928,12 @@ export class EditorWidget {
             Object.assign(clip, oldState);
             await this._fetchScenes({ ignoreMutationGate: true, reason: "convert_clip_role_error" });
             console.warn("[Sonder] Failed to convert clip role:", e);
-            notifyError(e?.message || "Failed to convert clip role.");
+            // The mutation queue's rejection handler already raises a toast that
+            // carries this code's specific wording, so notifying here too would
+            // show the same failure twice.
+            if (e?.code !== "history_lane_unresolvable") {
+                notifyError(e?.message || "Failed to convert clip role.");
+            }
             this._renderTimeline();
         }
     }
@@ -9580,7 +10154,6 @@ export class EditorWidget {
             this._buildTrackLayout();
         } catch (error) {
             if (visibilitySeq === this._headerVisibilitySeq) {
-                this._discardLastUndo("toggle track visibility");
                 await this._fetchScenes({ ignoreMutationGate: true, reason: "header_visibility_error" });
                 this._buildTrackLayout();
             }
@@ -9747,7 +10320,6 @@ export class EditorWidget {
             this._buildTrackLayout();
             this._renderTimeline();
         } catch (e) {
-            this._discardLastUndo(undoLabel);
             await this._fetchScenes({ ignoreMutationGate: true, reason: "add_lane_error" });
             console.warn("[Sonder] Failed to add lane:", e);
         }
@@ -9893,7 +10465,7 @@ export class EditorWidget {
             this._renderTimeline();
             this._renderViewportFrame();
         } catch (error) {
-            this._discardLastUndo(undoLabel);
+            // The mutation queue owns exact-entry failure cleanup.
         }
     }
 
@@ -9939,7 +10511,6 @@ export class EditorWidget {
                 }
             );
         } catch (e) {
-            this._discardLastUndo(undoLabel);
             await this._fetchScenes({ ignoreMutationGate: true, reason: "delete_lane_and_items_error" });
             console.warn("[Sonder] Failed to delete lane and items:", e);
         }
@@ -10019,7 +10590,6 @@ export class EditorWidget {
                 }
             );
         } catch (e) {
-            this._discardLastUndo(undoLabel);
             await this._fetchScenes({ ignoreMutationGate: true, reason: "delete_selected_lanes_error" });
             console.warn("[Sonder] Failed to delete selected lanes:", e);
         }
@@ -10069,7 +10639,6 @@ export class EditorWidget {
                 }
             );
         } catch (e) {
-            this._discardLastUndo(undoLabel);
             await this._fetchScenes({ ignoreMutationGate: true, reason: "remove_lane_error" });
             console.warn("[Sonder] Failed to remove lane with items:", e);
         }
@@ -10113,7 +10682,6 @@ export class EditorWidget {
                 }
             );
         } catch (e) {
-            this._discardLastUndo(undoLabel);
             await this._fetchScenes({ ignoreMutationGate: true, reason: "delete_lane_items_error" });
             console.warn("[Sonder] Failed to delete lane items:", e);
         }
@@ -10147,7 +10715,6 @@ export class EditorWidget {
                 }
             );
         } catch (e) {
-            this._discardLastUndo(undoLabel);
             await this._fetchScenes({ ignoreMutationGate: true, reason: "remove_empty_lane_error" });
             console.warn("[Sonder] Failed to remove lane:", e);
         }
@@ -10960,7 +11527,6 @@ export class EditorWidget {
             this._adoptPromptIdentitiesFromMutation(result);
             this._finalizePromptIdentityCreationHistory(undoEntry, result);
         } catch (e) {
-            this._discardLastUndo(undoLabel);
             notifyWarning(e?.message || "Prompt section was refused.", { source: "prompt-create-refused" });
             await this._fetchScenes({ ignoreMutationGate: true, reason: "add_prompt_error" });
             if (identityCreateIntents.length) {
@@ -11268,7 +11834,6 @@ export class EditorWidget {
                 }
             );
         } catch (e) {
-            this._discardLastUndo(undoLabel);
             if (sceneRef === this.activeScene) {
                 sceneRef.global_channels = previous;
                 sceneRef.prompt = composeSectionText(previous, false);
@@ -11408,7 +11973,6 @@ export class EditorWidget {
                 }
             );
         } catch (e) {
-            this._discardLastUndo(undoLabel);
             if (sceneRef === this.activeScene) sceneRef.prompt = prev;
             notifyWarning(e?.message || "Global prompt edit was refused.", { source: "prompt-global-refused" });
             console.warn("[Sonder] Failed to update global prompt:", e);
@@ -12867,6 +13431,10 @@ export class EditorWidget {
                 label: "apply prompt setup",
                 coalesce: false,
                 retryOnConflict: false,
+                // Identity Apply owns a pending outcome-reconciliation
+                // lifecycle. A rejected transport is not terminal until that
+                // caller proves refusal or commitment; do not erase its gate.
+                historyFailureOwnedByCaller: identityCreateIntents.length > 0,
                 // Deliberately NOT the draft's base version. The queue is FIFO
                 // and every completed mutation bumps `modified_at`, so a version
                 // captured when the draft was built — or even at click time — is
@@ -13176,7 +13744,6 @@ export class EditorWidget {
             this._finalizePromptIdentityCreationHistory(undoEntry, result);
             return true;
         } catch (error) {
-            this._discardLastUndo(undoLabel);
             notifyWarning(error?.message || "Linked Context edit conflicted with newer state.", {
                 source: "prompt-linked-edit-refused",
             });
@@ -13210,6 +13777,7 @@ export class EditorWidget {
                     type: "delete_prompt_section",
                     index: idx,
                     expected: section ? {
+                        prompt_id: section.prompt_id || "",
                         start_frame: section.start_frame,
                         end_frame: section.end_frame,
                     } : undefined,
@@ -13221,7 +13789,6 @@ export class EditorWidget {
                 }
             );
         } catch (e) {
-            this._discardLastUndo(undoLabel);
             notifyWarning(e?.message || "Prompt delete was refused.", { source: "prompt-delete-refused" });
             await this._fetchScenes({ ignoreMutationGate: true, reason: "delete_prompt_error" });
             console.warn("[Sonder] Failed to delete prompt section:", e);
@@ -13821,7 +14388,6 @@ export class EditorWidget {
             this._reconcileSelection();
             this._renderTimeline();
         } catch (e) {
-            this._discardLastUndo("link items");
             notifyWarning(e?.message || "Link operation was refused.", { source: "timeline-link-refused" });
             await this._fetchScenes({ ignoreMutationGate: true, reason: "link_items_error" });
         }
@@ -13847,7 +14413,6 @@ export class EditorWidget {
             this._reconcileSelection();
             this._renderTimeline();
         } catch (e) {
-            this._discardLastUndo("unlink items");
             notifyWarning(e?.message || "Unlink operation was refused.", { source: "timeline-unlink-refused" });
             await this._fetchScenes({ ignoreMutationGate: true, reason: "unlink_items_error" });
         }
@@ -13907,7 +14472,6 @@ export class EditorWidget {
                 }
             );
         } catch (e) {
-            this._discardLastUndo(undoLabel);
             await this._fetchScenes({ ignoreMutationGate: true, reason: "move_guide_error" });
             console.warn("[Sonder] Failed to move guide:", e);
         }
@@ -14292,7 +14856,6 @@ export class EditorWidget {
                 }
             );
         } catch (e) {
-            this._discardLastUndo("add guide");
             await this._fetchScenes({ ignoreMutationGate: true, reason: "add_guide_error" });
             console.warn("[Sonder] Add frame to guides failed:", e);
         }
@@ -14326,7 +14889,6 @@ export class EditorWidget {
                 }
             );
         } catch (e) {
-            this._discardLastUndo(undoLabel);
             await this._fetchScenes({ ignoreMutationGate: true, reason: "delete_items_error" });
             console.warn("[Sonder] Failed to delete items:", e);
         }
@@ -14601,9 +15163,11 @@ export class EditorWidget {
                                     type: "swap_prompt_sections",
                                     index_a: indexA,
                                     index_b: indexB,
-                                    expected_a: { start_frame: orig.origStart, end_frame: orig.origEnd },
+                                    expected_a: { prompt_id: data.prompt_id || "",
+                                        start_frame: orig.origStart, end_frame: orig.origEnd },
                                     expected_b: targetSnap
-                                        ? { start_frame: targetSnap.start, end_frame: targetSnap.end }
+                                        ? { prompt_id: swap.target.prompt_id || "",
+                                            start_frame: targetSnap.start, end_frame: targetSnap.end }
                                         : undefined,
                                     fields_a: { start_frame: data.start_frame, end_frame: data.end_frame },
                                     fields_b: { start_frame: swap.target.start_frame, end_frame: swap.target.end_frame },
@@ -14640,7 +15204,6 @@ export class EditorWidget {
                 }
                 this._renderTimeline();
             } catch (e) {
-                this._discardLastUndo("move items");
                 console.warn("[Sonder] Failed to move items:", e);
                 notifyWarning(e?.message || "Move was refused — timeline restored.", { source: "timeline-move-refused" });
                 await this._fetchScenes({ ignoreMutationGate: true, reason: "moveItem_error" });
@@ -14728,7 +15291,6 @@ export class EditorWidget {
                 }
                 this._renderTimeline();
             } catch (e) {
-                this._discardLastUndo("trim");
                 console.warn("[Sonder] Failed to commit trim:", e);
                 notifyWarning(e?.message || "Trim was refused — timeline restored.", { source: "timeline-trim-refused" });
                 await this._fetchScenes({ ignoreMutationGate: true, reason: "trim_error" });
@@ -14785,7 +15347,6 @@ export class EditorWidget {
             });
             this._renderTimeline();
         } catch (e) {
-            this._discardLastUndo(`split ${hit.type}`);
             await this._fetchScenes({ ignoreMutationGate: true, reason: "split_item_error" });
             console.warn(`[Sonder] Failed to split ${hit.type}:`, e);
         }
@@ -14937,7 +15498,6 @@ export class EditorWidget {
                         }
                     );
                 } catch (e) {
-                    this._discardLastUndo(undoLabel);
                     await this._fetchScenes({ ignoreMutationGate: true, reason: "delete_guide_error" });
                     this._showGuideManagementPopup(x, y);
                     console.warn("[Sonder] Failed to delete guide:", e);
@@ -15226,7 +15786,6 @@ export class EditorWidget {
                         }
                     );
                 } catch (e) {
-                    this._discardLastUndo(undoLabel);
                     await refreshPanel();
                     console.warn("[Sonder] Failed to delete guide:", e);
                 }
@@ -15307,6 +15866,7 @@ export class EditorWidget {
                 ["Ctrl+Z", "Undo"],
                 ["Ctrl+Y", "Redo"],
                 ["Ctrl+Shift+Z", "Redo"],
+                ["Timeline Undo / Redo", "Waits for saves; warns and skips one unusable history entry per press"],
                 ["Ctrl+V", "Paste into the focused field; fullscreen background paste is ignored"],
             ]) +
             this._shortcutSection("Prompt", [
@@ -15549,7 +16109,6 @@ export class EditorWidget {
                     );
                     if (onDone) await onDone();
                 } catch (e) {
-                    this._discardLastUndo("replace guide");
                     console.warn("[Sonder] Failed to replace guide:", e);
                 }
             },
@@ -15585,7 +16144,6 @@ export class EditorWidget {
                     this._renderTimeline();
                     this._renderViewportFrame();
                 } catch (e) {
-                    this._discardLastUndo(undoLabel);
                     console.warn("[Sonder] Failed to replace clip source:", e);
                 }
             },
@@ -15621,7 +16179,6 @@ export class EditorWidget {
                     this._renderTimeline();
                     this._renderViewportFrame();
                 } catch (e) {
-                    this._discardLastUndo(undoLabel);
                     console.warn("[Sonder] Failed to replace audio source:", e);
                 }
             },
@@ -18210,7 +18767,14 @@ export class EditorWidget {
         // A pending transaction has not changed durable scene state yet. Keep
         // prior Redo ownership until commit; a fully refused + compensated
         // action must be history-neutral.
-        if (!entry.pending) this._redoStack = [];
+        if (!entry.pending) {
+            this._historyStackRevision += 1;
+            if (typeof this._clearRedoForNewEdit === "function") {
+                this._clearRedoForNewEdit();
+            } else {
+                this._redoStack.splice(0);
+            }
+        }
         return entry;
     }
 
@@ -18249,23 +18813,513 @@ export class EditorWidget {
             // current scene's stack.
             return false;
         }
+        const followsQueuedHistory = !!entry._historyOrderContext;
+        delete entry._historyOrderContext;
         entry.pending = false;
         this._trimUndoStack();
-        this._redoStack = [];
+        this._historyStackRevision += 1;
+        this._historyCommitRevisionByEntry ||= new WeakMap();
+        this._historyCommitRevisionByEntry.set(entry, this._historyStackRevision);
+        if (typeof this._clearRedoForNewEdit === "function") {
+            // Pending edits created before a history claim must preserve that
+            // later action's future reservation. A pending edit carrying a
+            // history-order context was authored after that action and must
+            // invalidate the Redo it produced, just like an ordinary edit.
+            this._clearRedoForNewEdit({
+                preserveFutureReservations: !followsQueuedHistory,
+            });
+        } else {
+            for (let index = this._redoStack.length - 1; index >= 0; index -= 1) {
+                if (!this._redoStack[index]?._historyFuture) {
+                    this._redoStack.splice(index, 1);
+                }
+            }
+        }
         this._replayDeferredHistoryWidgetStateIfIdle?.();
         return true;
     }
 
     _trimUndoStack() {
         // Pending entries have not committed durable state and therefore do
-        // not spend an Undo slot yet. If they later refuse, exact removal must
-        // recover the byte-for-byte history stack that preceded them.
-        while (this._undoStack.filter((entry) => !entry?.pending).length
+        // not spend an Undo slot yet. Claimed entries and future entries are
+        // reservations owned by queued operations and must retain identity
+        // until those operations apply.
+        while (this._undoStack.filter((entry) =>
+            !entry?.pending && !entry?.claimedBy && !entry?._historyFuture).length
                 > this._maxUndoSteps) {
-            const index = this._undoStack.findIndex((entry) => !entry?.pending);
+            const index = this._undoStack.findIndex(
+                (entry) => !entry?.pending && !entry?.claimedBy && !entry?._historyFuture);
             if (index < 0) break;
             this._undoStack.splice(index, 1);
         }
+    }
+
+    _reserveHistoryOpposite(operation, entry, claimId) {
+        const reservation = {
+            _historyFuture: true,
+            _historyFutureProducerEntry: entry,
+            _historyFutureProducerClaim: claimId,
+            sceneId: entry?.sceneId || "",
+            label: entry?.label || "change",
+        };
+        const targetStack = operation === "undo" ? this._redoStack : this._undoStack;
+        targetStack.push(reservation);
+        return reservation;
+    }
+
+    _discardHistoryFutureReservation(stack, reservation) {
+        if (!reservation?._historyFuture) return false;
+        const index = stack?.indexOf?.(reservation) ?? -1;
+        if (index >= 0) stack.splice(index, 1);
+        return index >= 0;
+    }
+
+    _discardAmbiguousHistoryReservation(entry) {
+        const retained = entry?._ambiguousOppositeReservation;
+        const discarded = retained ? this._discardHistoryFutureReservation?.(
+            retained.stack, retained.reservation) === true : false;
+        delete entry._ambiguousOppositeReservation;
+        const marker = entry?._ambiguousHistoryOrderContext;
+        const ambiguity = marker?.context?.ambiguousScenes?.get?.(marker.sceneId);
+        if (ambiguity?.entry === entry) {
+            marker.context.ambiguousScenes.delete(marker.sceneId);
+        }
+        delete entry._ambiguousHistoryOrderContext;
+        return discarded;
+    }
+
+    _materializeHistoryOpposite(stack, reservation, opposite) {
+        if (!reservation) {
+            stack.push(opposite);
+            return true;
+        }
+        if (!reservation._historyFuture || !stack.includes(reservation)) return false;
+        // A later opposite action may already have claimed this exact object.
+        // Preserve that claim while replacing the placeholder in place so its
+        // queued operation observes the durable entry produced ahead of it.
+        const downstreamClaim = reservation.claimedBy;
+        for (const key of Object.keys(reservation)) delete reservation[key];
+        Object.assign(reservation, opposite);
+        if (downstreamClaim) reservation.claimedBy = downstreamClaim;
+        if (stack === this._undoStack) this._trimUndoStack?.();
+        return true;
+    }
+
+    _historyRevisionMatchesClaim(claimedRevision, claimedPendingEntries = null) {
+        if (claimedRevision == null) return true;
+        // Only a pending edit that already existed ahead of Redo can invalidate
+        // it at apply time. Revisions created by actions authored after Redo
+        // are physically behind it in the project queue and must not cancel it.
+        for (const candidate of claimedPendingEntries || []) {
+            const commitRevision = Number(
+                this._historyCommitRevisionByEntry?.get(candidate)) || 0;
+            if (commitRevision > claimedRevision) return false;
+        }
+        return true;
+    }
+
+    _beginHistoryOrderContext(operation, operationId) {
+        const context = {
+            operation: String(operation || "history"),
+            operationId: Number(operationId) || 0,
+            parent: this._latestHistoryOrderContext || null,
+            scenes: new Map(),
+        };
+        this._compactHistoryOrderContextChain(context);
+        this._latestHistoryOrderContext = context;
+        return context;
+    }
+
+    // Queue idle normally drops the chain. A receipt can retain it across
+    // waves, so prune empty settled links then, never live producers. Keep
+    // original nonempty nodes/maps: queued writes and receipt cleanup hold
+    // those owners by identity, so copying their maps would split authority.
+    _compactHistoryOrderContextChain(context) {
+        if (this._projectMutationQueue?.isBusy?.()
+                || Number(this._queuedHistoryOperationCount) > 0) return false;
+        let changed = false;
+        for (let current = context; current?.parent;) {
+            const parent = current.parent;
+            if (!parent.scenes?.size && !parent.ambiguousScenes?.size) {
+                current.parent = parent.parent || null;
+                changed = true;
+            } else {
+                current = parent;
+            }
+        }
+        return changed;
+    }
+
+    _historyOrderedSceneForContext(context, sceneId) {
+        const targetSceneId = String(sceneId || "");
+        if (!context || !targetSceneId) return null;
+        for (let current = context; current; current = current.parent) {
+            if (current.ambiguousScenes?.has?.(targetSceneId)) return null;
+        }
+        for (let current = context; current; current = current.parent) {
+            const scene = current.scenes?.get?.(targetSceneId);
+            if (current.scenes?.has?.(targetSceneId) && !scene) return null;
+            if (scene) return structuredClone(scene);
+        }
+        return null;
+    }
+
+    _recordHistoryOrderedScene(context, scene) {
+        const sceneId = String(scene?.scene_id || "");
+        if (!context || !sceneId) return false;
+        context.scenes.set(sceneId, structuredClone(scene));
+        context.ambiguousScenes?.delete?.(sceneId);
+        return true;
+    }
+
+    _markHistoryOrderContextAmbiguous(context, sceneId, restoreToken = "", details = null) {
+        const targetSceneId = String(sceneId || "");
+        if (!context || !targetSceneId) return false;
+        context.ambiguousScenes ||= new Map();
+        const ambiguity = {
+            projectId: String(this._projectDirName?.() || ""),
+            restoreToken: String(restoreToken || ""),
+            ...(details && typeof details === "object" ? details : {}),
+        };
+        context.ambiguousScenes.set(targetSceneId, ambiguity);
+        if (ambiguity.entry) {
+            ambiguity.entry._ambiguousHistoryOrderContext = {
+                context, sceneId: targetSceneId,
+            };
+        }
+        if (ambiguity.entry && ambiguity.oppositeReservation && ambiguity.oppositeStack) {
+            ambiguity.entry._ambiguousOppositeReservation = {
+                stack: ambiguity.oppositeStack,
+                reservation: ambiguity.oppositeReservation,
+            };
+        }
+        return true;
+    }
+
+    async _finalizeCommittedHistoryAmbiguity(
+        ambiguity, restoredScene, ownerToken = null, historyOrderContext = null) {
+        const entry = ambiguity?.entry;
+        const sourceStack = ambiguity?.sourceStack;
+        const restoreToken = String(ambiguity?.restoreToken || "");
+        if (!entry || !Array.isArray(sourceStack)
+                || !sourceStack.includes(entry)
+                || String(entry.restoreToken || "") !== restoreToken) {
+            return false;
+        }
+        // Undo normally performs this best-effort cleanup after the restore.
+        // A lost response exits before that point, so finish it when the exact
+        // receipt later proves the restore committed.
+        if (ambiguity.operation === "undo" && entry.promptIdentityCreateIntents?.length) {
+            try {
+                const cleanupPlan = promptIdentityCleanupPlan(
+                    entry.promptIdentityCreateIntents);
+                const cleanupResult = cleanupPlan.operations.length
+                    ? await this._runSceneMutation(cleanupPlan.operations, {
+                        key: `prompt:${entry.sceneId}:identity-cleanup:${Date.now()}`,
+                        label: `finish undo ${entry.label || "Other speaker"}`,
+                        coalesce: false,
+                        refreshScenes: false,
+                        sceneId: entry.sceneId,
+                        ownerToken,
+                        historyOrderContext,
+                    }) : null;
+                if (cleanupResult) this._adoptPromptIdentitiesFromMutation(cleanupResult);
+            } catch (_cleanupError) {
+                notifyInfo("The scene was undone, but created Prompt Identity cleanup could not be confirmed. Retained identities remain safe to reuse.",
+                    { source: "undo-prompt-identity-cleanup-unknown" });
+            }
+        }
+        const index = sourceStack.indexOf(entry);
+        if (index < 0 || String(entry.restoreToken || "") !== restoreToken) return false;
+        const opposite = ambiguity?.opposite;
+        const oppositeStack = ambiguity?.oppositeStack;
+        const oppositeReservation = ambiguity?.oppositeReservation;
+        if (opposite && Array.isArray(oppositeStack)) {
+            // A durable receipt proves the restore committed, but its scene is
+            // the current scene at query time and may include later work. The
+            // restore target is the conservative three-way-merge base for the
+            // reverse action: unchanged fields preserve later work and changed
+            // fields conflict instead of overwriting it.
+            opposite.postSnapshot = structuredClone(entry.snapshot);
+            if (typeof this._materializeHistoryOpposite === "function") {
+                this._materializeHistoryOpposite(
+                    oppositeStack, oppositeReservation, opposite);
+            } else if (oppositeReservation?._historyFuture
+                    && oppositeStack.includes(oppositeReservation)) {
+                const reservationIndex = oppositeStack.indexOf(oppositeReservation);
+                oppositeStack.splice(reservationIndex, 1, opposite);
+            }
+        }
+        sourceStack.splice(index, 1);
+        delete entry.claimedBy;
+        delete entry.restoreToken;
+        delete entry._ambiguousAuxiliaryState;
+        delete entry._ambiguousOppositeReservation;
+        delete entry._ambiguousHistoryOrderContext;
+        if (sourceStack === this._undoStack) this._trimUndoStack?.();
+        return true;
+    }
+
+    async _finalizeRefusedHistoryAmbiguity(
+        ambiguity, ownerToken = null, historyOrderContext = null) {
+        const entry = ambiguity?.entry;
+        const sourceStack = ambiguity?.sourceStack;
+        const restoreToken = String(ambiguity?.restoreToken || "");
+        if (!entry || !Array.isArray(sourceStack)
+                || !sourceStack.includes(entry)
+                || String(entry.restoreToken || "") !== restoreToken) {
+            return false;
+        }
+        const state = entry._ambiguousAuxiliaryState || {};
+        const errors = [];
+        if (state.promptIdentityApplied && entry.inversePromptIdentityChange) {
+            try {
+                await this._applyPromptIdentityChange(entry.inversePromptIdentityChange,
+                    `refused ${ambiguity.operation} ${entry.label || "prompt attachment"}`,
+                    { recordUndo: false });
+                state.promptIdentityApplied = false;
+            } catch (error) {
+                errors.push(error);
+            }
+        }
+        if (ambiguity.operation === "redo"
+                && Array.isArray(state.promptIdentityCreatesApplied)
+                && state.promptIdentityCreatesApplied.length) {
+            try {
+                const cleanupPlan = promptIdentityCleanupPlan(
+                    state.promptIdentityCreatesApplied);
+                const cleanupResult = cleanupPlan.operations.length
+                    ? await this._runSceneMutation(cleanupPlan.operations, {
+                        key: `prompt:${entry.sceneId}:identity-redo-refused:${Date.now()}`,
+                        label: "refused redo identity cleanup",
+                        coalesce: false,
+                        refreshScenes: false,
+                        sceneId: entry.sceneId,
+                        ownerToken,
+                        historyOrderContext,
+                    }) : null;
+                if (cleanupResult) this._adoptPromptIdentitiesFromMutation(cleanupResult);
+                state.promptIdentityCreatesApplied = [];
+                state.promptIdentityCreatesResolved = false;
+            } catch (error) {
+                errors.push(error);
+            }
+        }
+        if (state.referencesApplied && entry.inverseReferenceOperations?.length) {
+            try {
+                await this._applyReferenceHistoryOperations(
+                    entry.inverseReferenceOperations,
+                    `refused ${ambiguity.operation} ${entry.label || "prompt attachment"}`,
+                    null, ownerToken, historyOrderContext);
+                state.referencesApplied = false;
+            } catch (error) {
+                errors.push(error);
+            }
+        }
+        if (errors.length) {
+            entry._ambiguousAuxiliaryState = state;
+            const error = new Error(`Scene history was refused, but its recovery is incomplete: ${
+                errors.map((value) => value?.message || String(value)).join("; ")}`);
+            error.code = "scene_history_reconciliation_failed";
+            throw error;
+        }
+        delete entry.restoreToken;
+        delete entry._ambiguousAuxiliaryState;
+        delete entry._ambiguousOppositeReservation;
+        delete entry._ambiguousHistoryOrderContext;
+        this._discardHistoryFutureReservation?.(
+            ambiguity?.oppositeStack, ambiguity?.oppositeReservation);
+        if (ambiguity.operation === "redo") {
+            const index = sourceStack.indexOf(entry);
+            if (index >= 0) sourceStack.splice(index, 1);
+        }
+        return true;
+    }
+
+    _historyOrderContextNeedsResolution(context, sceneId) {
+        const targetSceneId = String(sceneId || "");
+        if (!context || !targetSceneId) return false;
+        for (let current = context; current; current = current.parent) {
+            if (current.ambiguousScenes?.has?.(targetSceneId)) return true;
+        }
+        for (let current = context; current; current = current.parent) {
+            if (current.scenes?.has?.(targetSceneId)) {
+                return !current.scenes.get(targetSceneId);
+            }
+        }
+        return false;
+    }
+
+    _historyOrderContextHasAmbiguity(context) {
+        for (let current = context; current; current = current.parent) {
+            if ((Number(current.ambiguousScenes?.size) || 0) > 0) return true;
+        }
+        return false;
+    }
+
+    _historyOrderContextNeedsRetention(context) {
+        if (this._historyOrderContextHasAmbiguity(context)) return true;
+        const seen = new Set();
+        for (let current = context; current; current = current.parent) {
+            for (const [sceneId, scene] of current.scenes || []) {
+                if (seen.has(sceneId)) continue;
+                seen.add(sceneId);
+                if (!scene) return true;
+            }
+        }
+        return false;
+    }
+
+    _rememberReconciledHistoryBase(scene, targetSnapshot) {
+        if (!scene || typeof scene !== "object" || !targetSnapshot) return scene;
+        this._reconciledHistoryBaseByScene ||= new WeakMap();
+        this._reconciledHistoryBaseByScene.set(scene, structuredClone(targetSnapshot));
+        return scene;
+    }
+
+    _historyBaseForRestoredScene(scene) {
+        return this._reconciledHistoryBaseByScene?.get?.(scene) || scene;
+    }
+
+    async _resolveHistoryOrderContextScene(context, sceneId, ownerToken = null, orderedProjectId = "") {
+        const targetSceneId = String(sceneId || "");
+        let owner = null;
+        let ambiguity = null;
+        for (let current = context; current; current = current.parent) {
+            if (current.ambiguousScenes?.has?.(targetSceneId)) {
+                owner = current;
+                ambiguity = current.ambiguousScenes.get(targetSceneId);
+                break;
+            }
+        }
+        if (!owner || !ambiguity) {
+            for (let current = context; current; current = current.parent) {
+                const inherited = current.scenes?.get?.(targetSceneId);
+                if (inherited) return structuredClone(inherited);
+                if (current.scenes?.has?.(targetSceneId)) {
+                    const projectId = String(orderedProjectId || this._projectDirName?.() || "");
+                    if (!projectId) throw new Error("The queued scene's project could not be identified.");
+                    // Ordering baseline only: this GET must never stamp the
+                    // preceding entity-only history entry's postSnapshot.
+                    const { payload } = await fetchProjectJson(
+                        api.apiURL(`/sonder-editor/project/${encodeURIComponent(projectId)}`
+                            + `/scenes/${encodeURIComponent(targetSceneId)}`),
+                        {}, { projectId });
+                    if (!payload || String(payload.scene_id || "") !== targetSceneId) {
+                        throw new Error("The queued scene could not be read before the next edit.");
+                    }
+                    this._recordHistoryOrderedScene(current, payload);
+                    return structuredClone(payload);
+                }
+            }
+        }
+        if (!owner || !ambiguity) return null;
+        const projectId = String(ambiguity.projectId || this._projectDirName?.() || "");
+        const restoreToken = String(ambiguity.restoreToken || "");
+        if (!projectId || !restoreToken) {
+            throw new Error("Scene history outcome could not be identified before the next edit.");
+        }
+        const receiptUrl = `/sonder-editor/project/${encodeURIComponent(projectId)}`
+            + `/scenes/${encodeURIComponent(targetSceneId)}/restore-token/`
+            + encodeURIComponent(restoreToken);
+        const acceptResolvedScene = async (
+            scene, { committed = false, refused = false } = {}) => {
+            if (!scene || String(scene.scene_id || "") !== targetSceneId) {
+                throw new Error(
+                    "Scene history confirmation returned an invalid scene before the next edit.");
+            }
+            if (committed) {
+                this._recordHistoryOrderedScene(owner, scene);
+                await this._finalizeCommittedHistoryAmbiguity?.(
+                    ambiguity, scene, ownerToken, owner);
+            } else if (refused) {
+                await this._finalizeRefusedHistoryAmbiguity?.(
+                    ambiguity, ownerToken, owner);
+                this._recordHistoryOrderedScene(owner, scene);
+            } else {
+                this._recordHistoryOrderedScene(owner, scene);
+            }
+            return structuredClone(scene);
+        };
+        // A lost restore response can return control while the server is still
+        // applying the write. Keep the following queue slot behind that exact
+        // receipt instead of racing a GET or mutation against an unknown state.
+        // A 404 means the server holds neither a durable committed marker nor an
+        // in-memory receipt for this token. That is terminal - but only once the
+        // whole budget is spent, because an early 404 can simply mean the server
+        // has not registered the pending receipt yet. A network error proves
+        // nothing either way and must not count as evidence.
+        let receiptEverKnown = false;
+        for (const delayMs of [0, 80, 200, 500, 1000, 2000, 4000, 8000, 8000]) {
+            if (delayMs > 0) {
+                await new Promise((resolve) => setTimeout(resolve, delayMs));
+            }
+            let response;
+            try {
+                response = await fetch(api.apiURL(receiptUrl));
+            } catch (_error) {
+                receiptEverKnown = true;
+                continue;
+            }
+            if (typeof rememberProjectVersionFromResponse === "function") {
+                rememberProjectVersionFromResponse(response, projectId);
+            }
+            if (!response.ok) {
+                if (response.status !== 404) receiptEverKnown = true;
+                continue;
+            }
+            receiptEverKnown = true;
+            const receipt = await response.json().catch(() => null);
+            if (receipt?.status === "committed" && receipt.scene) {
+                return await acceptResolvedScene(receipt.scene, { committed: true });
+            }
+            if (receipt?.status === "refused") {
+                const { payload } = await fetchProjectJson(
+                    api.apiURL(`/sonder-editor/project/${encodeURIComponent(projectId)}`
+                        + `/scenes/${encodeURIComponent(targetSceneId)}`),
+                    {}, { projectId });
+                return await acceptResolvedScene(payload, { refused: true });
+            }
+        }
+        if (!receiptEverKnown) {
+            // Expiry condition: this branch exists only because a restore token
+            // can outlive the server's knowledge of it - the in-memory receipt
+            // dies on restart or its TTL, and the durable marker list is capped.
+            // Remove it once a committed restore is provably recoverable for as
+            // long as its history entry can be applied. Until then, leaving the
+            // ambiguity in place blocks every later edit on this scene for the
+            // full budget, forever, with no user-visible way out.
+            owner.ambiguousScenes?.delete?.(targetSceneId);
+            this._discardHistoryFutureReservation?.(
+                ambiguity?.oppositeStack, ambiguity?.oppositeReservation);
+            const strandedEntry = ambiguity?.entry;
+            if (strandedEntry) {
+                // The token names an operation the server cannot identify, so it
+                // can never address that exact restore again. The entry itself
+                // stays: a later Undo re-merges from current state, and a restore
+                // that did commit is a no-op second time because the merge finds
+                // stored state already equal to the target.
+                delete strandedEntry.restoreToken;
+                delete strandedEntry._ambiguousAuxiliaryState;
+                delete strandedEntry._ambiguousOppositeReservation;
+                delete strandedEntry._ambiguousHistoryOrderContext;
+            }
+            // Re-read rather than assume: a 404 does not strictly prove the
+            // restore never committed, because the durable marker list is capped
+            // and can roll.
+            await this._fetchScenes?.({
+                ignoreMutationGate: true,
+                reason: "scene_history_receipt_unrecoverable",
+            });
+            const unrecoverable = new Error(
+                "The result of the earlier Undo/Redo can no longer be confirmed, so this edit was not sent. The timeline has been refreshed from the server — please check it and redo the edit.");
+            unrecoverable.code = "scene_history_receipt_unrecoverable";
+            throw unrecoverable;
+        }
+        const error = new Error(
+            "Scene history is still being confirmed; the later edit was not sent.");
+        error.code = "scene_history_outcome_pending";
+        throw error;
     }
 
     _captureProjectDependencies() {
@@ -18283,7 +19337,12 @@ export class EditorWidget {
             label,
         });
         this._trimUndoStack();
-        this._redoStack = [];
+        this._historyStackRevision += 1;
+        if (typeof this._clearRedoForNewEdit === "function") {
+            this._clearRedoForNewEdit();
+        } else {
+            this._redoStack.splice(0);
+        }
     }
 
     _pushPromptIdentityUndo(label, change, inverseChange) {
@@ -18295,7 +19354,12 @@ export class EditorWidget {
             label,
         });
         this._trimUndoStack();
-        this._redoStack = [];
+        this._historyStackRevision += 1;
+        if (typeof this._clearRedoForNewEdit === "function") {
+            this._clearRedoForNewEdit();
+        } else {
+            this._redoStack.splice(0);
+        }
     }
 
     _pushReferenceUndo(label, operations, inverseOperations) {
@@ -18307,7 +19371,12 @@ export class EditorWidget {
             label,
         });
         this._trimUndoStack();
-        this._redoStack = [];
+        this._historyStackRevision += 1;
+        if (typeof this._clearRedoForNewEdit === "function") {
+            this._clearRedoForNewEdit();
+        } else {
+            this._redoStack.splice(0);
+        }
     }
 
     async _restoreProjectDependencies(snapshot, diagnostics = null) {
@@ -18342,55 +19411,18 @@ export class EditorWidget {
     }
 
     async _undo() {
-        if (this._historyOperationInFlight) {
-            notifyInfo("Undo or Redo is still finishing. Try again in a moment.",
-                { source: "history-operation-pending" });
-            return;
-        }
-        if (this._hasPendingHistoryCommit?.()) {
-            notifyInfo("That change is still saving. Try Undo again when it finishes.",
-                { source: "undo-pending" });
-            return;
-        }
-        if (this._sceneHistoryLifecycleOwner) {
-            notifyInfo("Another scene change is still finishing. Try Undo again in a moment.",
-                { source: "undo-scene-lifecycle-pending" });
-            return;
-        }
-        await this._drainProjectMutations?.("history_undo");
-        // Draining yields to queued work and to other history requests. Re-check
-        // every ownership gate before claiming the non-reentrant history lock.
-        if (this._hasPendingProjectMutations?.()) {
-            notifyInfo("That change is still saving. Try Undo again when it finishes.",
-                { source: "undo-project-mutation-pending" });
-            return;
-        }
-        if (this._historyOperationInFlight) {
-            notifyInfo("Undo or Redo is still finishing. Try again in a moment.",
-                { source: "history-operation-pending" });
-            return;
-        }
-        if (this._hasPendingHistoryCommit?.()) {
-            notifyInfo("That change is still saving. Try Undo again when it finishes.",
-                { source: "undo-pending" });
-            return;
-        }
-        if (this._sceneHistoryLifecycleOwner) {
-            notifyInfo("Another scene change is still finishing. Try Undo again in a moment.",
-                { source: "undo-scene-lifecycle-pending" });
-            return;
-        }
-        this._historyOperationInFlight = true;
-        try {
-            return await this._runUndo();
-        } finally {
-            this._finishHistoryOperation();
-        }
+        // Claim synchronously inside the gesture, then let the shared project
+        // queue serialize the apply behind every earlier user action.
+        return this._runUndo();
     }
 
-    _finishHistoryOperation() {
-        this._historyOperationInFlight = false;
-        this._replayDeferredHistoryWidgetStateIfIdle();
+    _finishHistoryOperation(waitToken = null) {
+        this._endQueuedHistoryWait?.(waitToken);
+        this._historyOperationInFlight =
+            (Number(this._queuedHistoryOperationCount) || 0) > 0;
+        if (!this._historyOperationInFlight && !this._destroyed) {
+            this._replayDeferredHistoryWidgetStateIfIdle();
+        }
     }
 
     _replayDeferredHistoryWidgetStateIfIdle() {
@@ -18411,13 +19443,187 @@ export class EditorWidget {
     async _runUndo() {
         if (typeof this._withMutationGesture === "function") {
             return this._withMutationGesture(
-                "undo", (diagnostics) => this._runUndoWithinGesture(diagnostics));
+                "undo", (diagnostics) => this._queueUndoWithinGesture(diagnostics));
         }
-        return this._runUndoWithinGesture(null);
+        return this._queueUndoWithinGesture(null);
     }
 
-    async _runUndoWithinGesture(diagnostics = null) {
-        if (this._undoStack.length === 0) {
+    _queueUndoWithinGesture(diagnostics = null) {
+        const stack = this._undoStack || [];
+        const hasPendingHistoryCommit = () => typeof this._hasPendingHistoryCommit === "function"
+            ? this._hasPendingHistoryCommit()
+            : stack.some((candidate) => candidate?.pending);
+        let entry = null;
+        for (let index = stack.length - 1; index >= 0; index -= 1) {
+            if (!stack[index]?.claimedBy) {
+                entry = stack[index];
+                break;
+            }
+        }
+        if (!entry) {
+            this._recordHistoryRefusal?.("undo", "empty_stack", diagnostics);
+            this._keyboardDebug("undo skipped: no unclaimed entry", {
+                activeSceneId: this.activeSceneId || "",
+                undoDepth: stack.length,
+                redoDepth: this._redoStack?.length || 0,
+            });
+            return Promise.resolve(false);
+        }
+        const queueBusy = this._hasPendingProjectMutations?.() === true;
+        if (hasPendingHistoryCommit() && !queueBusy) {
+            this._recordHistoryRefusal?.("undo", "stalled_pending_entry", diagnostics, {
+                sceneId: entry.sceneId || "", label: entry.label || "",
+            });
+            notifyWarning("Undo is waiting on an unresolved Prompt Apply. Reopen Apply and save or discard that draft first.",
+                { source: "undo-stalled-pending" });
+            return Promise.resolve(false);
+        }
+
+        const operationId = (Number(this._historyOperationSeq) || 0) + 1;
+        this._historyOperationSeq = operationId;
+        const claimId = {
+            operation: "undo",
+            id: operationId,
+            gestureId: String(diagnostics?.gestureId || ""),
+        };
+        const historyOrderContext = this._beginHistoryOrderContext?.(
+            "undo", operationId) || null;
+        const claimedPendingEntries = new Set(
+            (this._undoStack || []).filter((candidate) => candidate?.pending));
+        entry.claimedBy = claimId;
+        this._discardAmbiguousHistoryReservation?.(entry);
+        const oppositeReservation = this._reserveHistoryOpposite?.(
+            "undo", entry, claimId) || null;
+        const claimedProject = String(this._projectDirName?.() || "");
+        const queuedAt = typeof performance !== "undefined" && performance?.now
+            ? performance.now() : Date.now();
+        const waitToken = this._beginQueuedHistoryWait?.("undo") || null;
+        this._historyOperationInFlight = true;
+        this._sceneMutationInvalidationSeq =
+            (Number(this._sceneMutationInvalidationSeq) || 0) + 1;
+
+        const apply = async (queuedDiagnostics, ownerToken) => {
+            const now = typeof performance !== "undefined" && performance?.now
+                ? performance.now() : Date.now();
+            const queueWaitMs = Math.max(0, now - queuedAt);
+            if (queuedDiagnostics && typeof queuedDiagnostics === "object") {
+                queuedDiagnostics.queueWaitMs = queueWaitMs;
+            }
+            if (typeof sessionDiagRecord === "function") {
+                sessionDiagRecord("history_operation_apply_start", {
+                    operation: "undo", scene_id: entry.sceneId || "",
+                    gesture_id: String(queuedDiagnostics?.gestureId || ""),
+                    queue_wait_ms: queueWaitMs,
+                });
+            }
+            const refuse = (gate, message, source) => {
+                this._recordHistoryRefusal?.("undo", gate, queuedDiagnostics, {
+                    sceneId: entry.sceneId || "", label: entry.label || "",
+                });
+                notifyWarning(message, { source });
+                return false;
+            };
+            if (this._destroyed) {
+                return refuse("editor_destroyed", "Undo was cancelled because the editor closed.",
+                    "undo-editor-closed");
+            }
+            if (String(this._projectDirName?.() || "") !== claimedProject) {
+                return refuse("project_changed", "Undo was cancelled because the project changed.",
+                    "undo-project-changed");
+            }
+            if (!stack.includes(entry) || entry.claimedBy !== claimId) {
+                return refuse("claim_lost", "Undo could not find its reserved history entry.",
+                    "undo-claim-lost");
+            }
+            if (entry._historyFuture) {
+                return refuse("history_dependency_unresolved",
+                    "Undo could not resolve the earlier history action it depends on.",
+                    "undo-dependency-unresolved");
+            }
+            // The preceding queue item resolves its caller immediately before
+            // this item starts. Give that caller one microtask to commit its
+            // reserved pending history entry, then distinguish an ordinary
+            // in-flight save from the genuinely stalled Prompt Apply state.
+            const hasClaimedPendingCommit = () => [...claimedPendingEntries]
+                .some((candidate) => candidate?.pending);
+            if (hasClaimedPendingCommit()) await Promise.resolve();
+            if (hasClaimedPendingCommit()) {
+                return refuse("stalled_pending_entry",
+                    "Undo is waiting on an unresolved Prompt Apply. Reopen Apply and save or discard that draft first.",
+                    "undo-stalled-pending");
+            }
+            if (this._sceneHistoryLifecycleOwner) {
+                return refuse("scene_history_lifecycle",
+                    "Undo was cancelled because another scene change replaced its target.",
+                    "undo-scene-lifecycle");
+            }
+            const sceneId = String(entry.sceneId || "");
+            const sceneList = Array.isArray(this.scenes) ? this.scenes : [];
+            const sceneExists = sceneList.length > 0
+                ? sceneList.some((scene) => String(scene?.scene_id || "") === sceneId)
+                : String(this.activeScene?.scene_id || this.activeSceneId || "") === sceneId;
+            if (!sceneExists || String(this.activeSceneId || "") !== sceneId) {
+                return refuse("target_scene_unavailable",
+                    "Undo was cancelled because its scene is no longer active or no longer exists.",
+                    "undo-scene-unavailable");
+            }
+            // Removing plain poison is local history housekeeping, not a
+            // restore. It must remain possible even when an ordering GET is
+            // unavailable; typed history and restore receipts still reconcile.
+            if ((entry.kind || entry.postSnapshot || entry.restoreToken)
+                    && this._historyOrderContextNeedsResolution?.(historyOrderContext, sceneId)) {
+                await this._resolveHistoryOrderContextScene(
+                    historyOrderContext, sceneId, ownerToken);
+            }
+            this._activateGraphUndoSuppression?.("editor-undo-apply");
+            return this._runUndoWithinGesture(
+                queuedDiagnostics, entry, claimId, ownerToken,
+                oppositeReservation, historyOrderContext);
+        };
+
+        const queue = this._projectMutationQueue;
+        const promise = queue?.enqueue
+            ? queue.enqueue({
+                key: `history:undo:${claimId.id}`,
+                label: `undo ${entry.label || "change"}`,
+                coalesce: false,
+                sealCoalescing: true,
+                diagnostics,
+                run: (_intent, queuedDiagnostics, ownerToken) =>
+                    apply(queuedDiagnostics, ownerToken),
+            })
+            : Promise.resolve().then(() => apply(diagnostics, null));
+        return Promise.resolve(promise).then((result) => {
+            if (result !== false) {
+                this._schedulePostMutationSceneRefresh?.("history_undo");
+            }
+            return result;
+        }).catch((error) => {
+            this._recordHistoryRefusal?.("undo", "queue_failed", diagnostics, {
+                sceneId: entry.sceneId || "", label: entry.label || "",
+                error: error?.message || String(error),
+            });
+            notifyWarning(error?.message || "Undo could not be queued.",
+                { source: "undo-queue-failed" });
+            this._deferProjectBackedRefresh?.(["scenes"], "history_undo_error");
+            return false;
+        }).finally(() => {
+            if (entry.claimedBy === claimId) delete entry.claimedBy;
+            if (!entry.restoreToken) {
+                this._discardHistoryFutureReservation?.(
+                    this._redoStack, oppositeReservation);
+            }
+            this._trimUndoStack?.();
+            this._finishHistoryOperation(waitToken);
+        });
+    }
+
+    async _runUndoWithinGesture(
+        diagnostics = null, reservedEntry = null, claimId = null,
+        ownerToken = null, oppositeReservation = null,
+        historyOrderContext = null) {
+        if (!reservedEntry && this._undoStack.length === 0) {
+            this._recordHistoryRefusal?.("undo", "empty_stack", diagnostics);
             this._keyboardDebug("undo skipped: empty stack", {
                 activeSceneId: this.activeSceneId || "",
                 undoDepth: this._undoStack.length,
@@ -18425,13 +19631,39 @@ export class EditorWidget {
             });
             return;
         }
-        const pendingEntry = this._undoStack[this._undoStack.length - 1];
-        if (pendingEntry?.pending) {
+        const pendingEntry = (this._undoStack || []).find(
+            (candidate) => candidate?.pending);
+        if (!reservedEntry && pendingEntry) {
+            this._recordHistoryRefusal?.("undo", "pending_entry", diagnostics, {
+                sceneId: pendingEntry.sceneId || "",
+                label: pendingEntry.label || "",
+            });
             notifyInfo("That change is still saving. Try Undo again when it finishes.",
                 { source: "undo-pending" });
             return;
         }
-        const entry = this._undoStack.pop();
+        const entry = reservedEntry || this._undoStack.pop();
+        const queuedClaim = !!reservedEntry;
+        const restoreEntryAfterFailure = () => {
+            if (!queuedClaim) this._undoStack.push(entry);
+        };
+        const consumeEntry = () => {
+            if (!queuedClaim) return true;
+            const entryIndex = this._undoStack.indexOf(entry);
+            if (entryIndex < 0 || entry.claimedBy !== claimId) return false;
+            this._undoStack.splice(entryIndex, 1);
+            delete entry.claimedBy;
+            return true;
+        };
+        const materializeOpposite = (opposite) => {
+            if (oppositeReservation
+                    && typeof this._materializeHistoryOpposite === "function") {
+                return this._materializeHistoryOpposite(
+                    this._redoStack, oppositeReservation, opposite);
+            }
+            this._redoStack.push(opposite);
+            return true;
+        };
         this._keyboardDebug("undo start", {
             entrySceneId: entry.sceneId,
             label: entry.label,
@@ -18450,11 +19682,16 @@ export class EditorWidget {
             try {
                 await this._restoreProjectDependencies(entry.snapshot, diagnostics);
             } catch (error) {
-                this._undoStack.push(entry);
+                restoreEntryAfterFailure();
+                this._recordHistoryRefusal?.("undo", "project_dependencies_restore_failed",
+                    diagnostics, { sceneId: entry.sceneId || "", label: entry.label || "",
+                        error: error?.message || String(error) });
                 notifyWarning(error?.message || "Undo was refused.", { source: "undo-refused" });
                 return;
             }
-            this._redoStack.push(opposite);
+            if (consumeEntry()) {
+                materializeOpposite(opposite);
+            }
             return;
         }
 
@@ -18469,11 +19706,16 @@ export class EditorWidget {
                     `undo ${entry.label || "prompt identity"}`,
                     { recordUndo: false, diagnostics });
             } catch (error) {
-                this._undoStack.push(entry);
+                restoreEntryAfterFailure();
+                this._recordHistoryRefusal?.("undo", "prompt_identity_restore_failed",
+                    diagnostics, { sceneId: entry.sceneId || "", label: entry.label || "",
+                        error: error?.message || String(error) });
                 notifyWarning(error?.message || "Undo was refused.", { source: "undo-refused" });
                 return;
             }
-            this._redoStack.push(opposite);
+            if (consumeEntry()) {
+                materializeOpposite(opposite);
+            }
             return;
         }
 
@@ -18485,24 +19727,53 @@ export class EditorWidget {
             };
             try {
                 await this._applyReferenceHistoryOperations(entry.operations,
-                    `undo ${entry.label || "Reference change"}`, diagnostics);
+                    `undo ${entry.label || "Reference change"}`, diagnostics, ownerToken,
+                    historyOrderContext);
             } catch (error) {
-                this._undoStack.push(entry);
+                restoreEntryAfterFailure();
+                this._recordHistoryRefusal?.("undo", "reference_restore_failed",
+                    diagnostics, { sceneId: entry.sceneId || "", label: entry.label || "",
+                        error: error?.message || String(error) });
                 notifyWarning(error?.message || "Undo was refused.", { source: "undo-refused" });
                 return;
             }
-            this._redoStack.push(opposite);
+            if (consumeEntry()) {
+                materializeOpposite(opposite);
+            }
             return;
         }
 
         if (!entry.postSnapshot) {
-            this._undoStack.push(entry);
+            if (entry.restoreToken) {
+                restoreEntryAfterFailure();
+                this._recordHistoryRefusal?.("undo", "missing_post_snapshot", diagnostics, {
+                    sceneId: entry.sceneId || "", label: entry.label || "",
+                    entry_discarded: false, recovery: "restore_receipt_pending",
+                });
+                sessionDiagRecord("undo_missing_post_snapshot", {
+                    scene_id: entry.sceneId || "", label: entry.label || "",
+                    entry_discarded: false, recovery: "restore_receipt_pending",
+                });
+                notifyWarning("Undo is still confirming this change and kept its recovery token. Try Undo again to reconcile it.",
+                    { source: "undo-missing-post-snapshot" });
+                return false;
+            }
+            const entryDiscarded = consumeEntry();
+            this._recordHistoryRefusal?.("undo", "missing_post_snapshot", diagnostics, {
+                sceneId: entry.sceneId || "", label: entry.label || "",
+                entry_discarded: entryDiscarded,
+                recovery: entryDiscarded ? "discarded_unstampable_entry" : "discard_failed",
+            });
             sessionDiagRecord("undo_missing_post_snapshot", {
                 scene_id: entry.sceneId || "", label: entry.label || "",
+                entry_discarded: entryDiscarded,
+                recovery: entryDiscarded ? "discarded_unstampable_entry" : "discard_failed",
             });
-            notifyWarning("Undo cannot safely reverse this change because its saved result is unavailable. Refresh the editor and try again.",
+            notifyWarning(entryDiscarded
+                ? "Undo skipped one change because its saved result is unavailable. The unusable entry was removed. Press Undo again for the previous change."
+                : "Undo could not remove the unavailable change because history changed. Press Undo again to retry.",
                 { source: "undo-missing-post-snapshot" });
-            return;
+            return false;
         }
         const opposite = {
             sceneId: entry.sceneId,
@@ -18523,7 +19794,8 @@ export class EditorWidget {
         try {
             if (entry.referenceOperations?.length && !referencesApplied) {
                 await this._applyReferenceHistoryOperations(entry.referenceOperations,
-                    `undo ${entry.label || "prompt attachment"}`, diagnostics);
+                    `undo ${entry.label || "prompt attachment"}`, diagnostics, ownerToken,
+                    historyOrderContext);
                 referencesApplied = true;
             }
             if (entry.promptIdentityChange && !promptIdentityApplied) {
@@ -18535,9 +19807,18 @@ export class EditorWidget {
             const restoredScene = await this._restoreScene(
                 entry.sceneId, entry.snapshot, entry.postSnapshot,
                 entry.restoreToken, diagnostics);
+            // Deliberate asymmetry, not an inconsistency: the same object is
+            // authoritative for one use and untrusted for the other. As the
+            // ordered scene it answers "what is durable at this queue position"
+            // for the slots behind it, and current state is exactly right for
+            // that. As a merge base it would answer "what state was this action
+            // authored against", which it cannot, because a receipted token
+            // returns current state. The base comes from the memo below.
+            this._recordHistoryOrderedScene?.(historyOrderContext, restoredScene);
             delete entry.restoreToken;
             delete entry._ambiguousAuxiliaryState;
-            opposite.postSnapshot = structuredClone(restoredScene);
+            opposite.postSnapshot = structuredClone(
+                this._historyBaseForRestoredScene?.(restoredScene) || restoredScene);
             if (entry.promptIdentityCreateIntents?.length) {
                 const cleanupPlan = promptIdentityCleanupPlan(
                     entry.promptIdentityCreateIntents);
@@ -18555,6 +19836,8 @@ export class EditorWidget {
                         refreshScenes: false,
                         sceneId: entry.sceneId,
                         diagnostics,
+                        ownerToken,
+                        historyOrderContext,
                     }) : null;
                     if (cleanupResult) this._adoptPromptIdentitiesFromMutation(cleanupResult);
                     const retained = (cleanupResult?.payload?.results || []).filter(
@@ -18578,25 +19861,37 @@ export class EditorWidget {
                         { source: "undo-prompt-identity-cleanup-unknown" });
                 }
             }
-            this._redoStack.push(opposite);
+            if (consumeEntry()) {
+                materializeOpposite(opposite);
+            }
         } catch (error) {
-            // The source entry remains authoritative until every durable
-            // participant has completed. Requeue it before attempting
+            // The source entry remains reserved in place until every durable
+            // participant has completed. Keep it there while attempting
             // best-effort compensation so a second failure cannot erase the
             // user's only retry path.
             if (error?.restoreAmbiguous && error?.restoreToken) {
+                this._markHistoryOrderContextAmbiguous?.(
+                    historyOrderContext, entry.sceneId, error.restoreToken, {
+                        operation: "undo", entry, sourceStack: this._undoStack,
+                        opposite, oppositeReservation,
+                        oppositeStack: this._redoStack,
+                    });
                 entry.restoreToken = error.restoreToken;
                 entry._ambiguousAuxiliaryState = {
                     referencesApplied,
                     promptIdentityApplied,
                 };
-                this._undoStack.push(entry);
+                restoreEntryAfterFailure();
+                this._recordHistoryRefusal?.("undo", "restore_ambiguous", diagnostics, {
+                    sceneId: entry.sceneId || "", label: entry.label || "",
+                    error: error?.message || String(error),
+                });
                 notifyWarning("Undo was sent and is still being confirmed. Try Undo again to reconcile it.",
                     { source: "undo-restore-ambiguous" });
                 return;
             }
             delete entry.restoreToken;
-            this._undoStack.push(entry);
+            restoreEntryAfterFailure();
             const compensationErrors = [];
             if (promptIdentityApplied && entry.inversePromptIdentityChange) {
                 try {
@@ -18613,7 +19908,7 @@ export class EditorWidget {
                     await this._applyReferenceHistoryOperations(
                         entry.inverseReferenceOperations,
                         `restore failed undo ${entry.label || "prompt attachment"}`,
-                        diagnostics);
+                        diagnostics, ownerToken, historyOrderContext);
                     referencesApplied = false;
                 } catch (compensationError) {
                     compensationErrors.push(compensationError);
@@ -18622,6 +19917,12 @@ export class EditorWidget {
             const recoveryDetail = compensationErrors.length
                 ? ` Recovery also failed: ${compensationErrors.map((value) =>
                     value?.message || String(value)).join("; ")}` : "";
+            this._recordHistoryRefusal?.("undo", "restore_failed", diagnostics, {
+                sceneId: entry.sceneId || "", label: entry.label || "",
+                error: error?.message || String(error),
+                compensation_errors: compensationErrors.map((value) =>
+                    value?.message || String(value)),
+            });
             notifyWarning(`${error?.message || "Undo was refused."}${recoveryDetail}`,
                 { source: "undo-refused" });
             if (referencesApplied || promptIdentityApplied) {
@@ -18644,67 +19945,216 @@ export class EditorWidget {
     }
 
     async _redo() {
-        if (this._historyOperationInFlight) {
-            notifyInfo("Undo or Redo is still finishing. Try again in a moment.",
-                { source: "history-operation-pending" });
-            return;
-        }
-        if (this._hasPendingHistoryCommit?.()) {
-            notifyInfo("That change is still saving. Try Redo again when it finishes.",
-                { source: "redo-pending" });
-            return;
-        }
-        if (this._sceneHistoryLifecycleOwner) {
-            notifyInfo("Another scene change is still finishing. Try Redo again in a moment.",
-                { source: "redo-scene-lifecycle-pending" });
-            return;
-        }
-        await this._drainProjectMutations?.("history_redo");
-        // The await above opens the same ownership window as Undo. A mutation
-        // settlement may also have created a pending composite history entry.
-        if (this._hasPendingProjectMutations?.()) {
-            notifyInfo("That change is still saving. Try Redo again when it finishes.",
-                { source: "redo-project-mutation-pending" });
-            return;
-        }
-        if (this._historyOperationInFlight) {
-            notifyInfo("Undo or Redo is still finishing. Try again in a moment.",
-                { source: "history-operation-pending" });
-            return;
-        }
-        if (this._hasPendingHistoryCommit?.()) {
-            notifyInfo("That change is still saving. Try Redo again when it finishes.",
-                { source: "redo-pending" });
-            return;
-        }
-        if (this._sceneHistoryLifecycleOwner) {
-            notifyInfo("Another scene change is still finishing. Try Redo again in a moment.",
-                { source: "redo-scene-lifecycle-pending" });
-            return;
-        }
-        this._historyOperationInFlight = true;
-        try {
-            return await this._runRedo();
-        } finally {
-            this._finishHistoryOperation();
-        }
+        // Redo uses the same FIFO claim/apply split as Undo while preserving
+        // its pending Undo-side transaction check inside the queue item.
+        return this._runRedo();
     }
 
     async _runRedo() {
         if (typeof this._withMutationGesture === "function") {
             return this._withMutationGesture(
-                "redo", (diagnostics) => this._runRedoWithinGesture(diagnostics));
+                "redo", (diagnostics) => this._queueRedoWithinGesture(diagnostics));
         }
-        return this._runRedoWithinGesture(null);
+        return this._queueRedoWithinGesture(null);
     }
 
-    async _runRedoWithinGesture(diagnostics = null) {
-        if (this._undoStack[this._undoStack.length - 1]?.pending) {
+    _queueRedoWithinGesture(diagnostics = null) {
+        const queueBusy = this._hasPendingProjectMutations?.() === true;
+        const pendingUndoEntry = (this._undoStack || []).find(
+            (candidate) => candidate?.pending);
+        const hasPendingHistoryCommit = () => typeof this._hasPendingHistoryCommit === "function"
+            ? this._hasPendingHistoryCommit()
+            : (this._undoStack || []).some((candidate) => candidate?.pending);
+        if (hasPendingHistoryCommit() && !queueBusy) {
+            this._recordHistoryRefusal?.("redo", "stalled_pending_entry", diagnostics, {
+                sceneId: pendingUndoEntry.sceneId || "",
+                label: pendingUndoEntry.label || "",
+            });
+            notifyWarning("Redo is waiting on an unresolved Prompt Apply. Reopen Apply and save or discard that draft first.",
+                { source: "redo-stalled-pending" });
+            return Promise.resolve(false);
+        }
+        const stack = this._redoStack || [];
+        let entry = null;
+        for (let index = stack.length - 1; index >= 0; index -= 1) {
+            if (!stack[index]?.claimedBy) {
+                entry = stack[index];
+                break;
+            }
+        }
+        if (!entry) {
+            this._recordHistoryRefusal?.("redo", "empty_stack", diagnostics);
+            this._keyboardDebug("redo skipped: no unclaimed entry", {
+                activeSceneId: this.activeSceneId || "",
+                undoDepth: this._undoStack?.length || 0,
+                redoDepth: stack.length,
+            });
+            return Promise.resolve(false);
+        }
+
+        const operationId = (Number(this._historyOperationSeq) || 0) + 1;
+        this._historyOperationSeq = operationId;
+        const claimId = {
+            operation: "redo",
+            id: operationId,
+            gestureId: String(diagnostics?.gestureId || ""),
+        };
+        const historyOrderContext = this._beginHistoryOrderContext?.(
+            "redo", operationId) || null;
+        entry.claimedBy = claimId;
+        this._discardAmbiguousHistoryReservation?.(entry);
+        const oppositeReservation = this._reserveHistoryOpposite?.(
+            "redo", entry, claimId) || null;
+        const claimedRevision = Number(this._historyStackRevision) || 0;
+        const claimedPendingEntries = new Set(
+            (this._undoStack || []).filter((candidate) => candidate?.pending));
+        const claimedProject = String(this._projectDirName?.() || "");
+        const queuedAt = typeof performance !== "undefined" && performance?.now
+            ? performance.now() : Date.now();
+        const waitToken = this._beginQueuedHistoryWait?.("redo") || null;
+        this._historyOperationInFlight = true;
+        this._sceneMutationInvalidationSeq =
+            (Number(this._sceneMutationInvalidationSeq) || 0) + 1;
+
+        const apply = async (queuedDiagnostics, ownerToken) => {
+            const now = typeof performance !== "undefined" && performance?.now
+                ? performance.now() : Date.now();
+            const queueWaitMs = Math.max(0, now - queuedAt);
+            if (queuedDiagnostics && typeof queuedDiagnostics === "object") {
+                queuedDiagnostics.queueWaitMs = queueWaitMs;
+            }
+            if (typeof sessionDiagRecord === "function") {
+                sessionDiagRecord("history_operation_apply_start", {
+                    operation: "redo", scene_id: entry.sceneId || "",
+                    gesture_id: String(queuedDiagnostics?.gestureId || ""),
+                    queue_wait_ms: queueWaitMs,
+                });
+            }
+            const refuse = (gate, message, source) => {
+                this._recordHistoryRefusal?.("redo", gate, queuedDiagnostics, {
+                    sceneId: entry.sceneId || "", label: entry.label || "",
+                });
+                notifyWarning(message, { source });
+                return false;
+            };
+            if (this._destroyed) {
+                return refuse("editor_destroyed", "Redo was cancelled because the editor closed.",
+                    "redo-editor-closed");
+            }
+            if (String(this._projectDirName?.() || "") !== claimedProject) {
+                return refuse("project_changed", "Redo was cancelled because the project changed.",
+                    "redo-project-changed");
+            }
+            if (!stack.includes(entry) || entry.claimedBy !== claimId) {
+                return refuse("claim_lost", "Redo could not find its reserved history entry.",
+                    "redo-claim-lost");
+            }
+            if (entry._historyFuture) {
+                return refuse("history_dependency_unresolved",
+                    "Redo could not resolve the earlier history action it depends on.",
+                    "redo-dependency-unresolved");
+            }
+            const hasClaimedPendingCommit = () => [...claimedPendingEntries]
+                .some((candidate) => candidate?.pending);
+            if (hasClaimedPendingCommit()) {
+                await Promise.resolve();
+            }
+            if (hasClaimedPendingCommit()) {
+                return refuse("stalled_pending_entry",
+                    "Redo is waiting on an unresolved Prompt Apply. Reopen Apply and save or discard that draft first.",
+                    "redo-stalled-pending");
+            }
+            if (this._sceneHistoryLifecycleOwner) {
+                return refuse("scene_history_lifecycle",
+                    "Redo was cancelled because another scene change replaced its target.",
+                    "redo-scene-lifecycle");
+            }
+            const revisionMatches = typeof this._historyRevisionMatchesClaim === "function"
+                ? this._historyRevisionMatchesClaim(
+                    claimedRevision, claimedPendingEntries)
+                : (Number(this._historyStackRevision) || 0) === claimedRevision;
+            if (!revisionMatches) {
+                const entryIndex = stack.indexOf(entry);
+                if (entryIndex >= 0) stack.splice(entryIndex, 1);
+                delete entry.claimedBy;
+                return refuse("redo_invalidated_by_edit",
+                    "Redo was cancelled because a newer edit changed its history.",
+                    "redo-invalidated");
+            }
+            const sceneId = String(entry.sceneId || "");
+            const sceneList = Array.isArray(this.scenes) ? this.scenes : [];
+            const sceneExists = sceneList.length > 0
+                ? sceneList.some((scene) => String(scene?.scene_id || "") === sceneId)
+                : String(this.activeScene?.scene_id || this.activeSceneId || "") === sceneId;
+            if (!sceneExists || String(this.activeSceneId || "") !== sceneId) {
+                return refuse("target_scene_unavailable",
+                    "Redo was cancelled because its scene is no longer active or no longer exists.",
+                    "redo-scene-unavailable");
+            }
+            // Mirror Undo: poison cleanup never needs an ordering GET.
+            if ((entry.kind || entry.postSnapshot || entry.restoreToken)
+                    && this._historyOrderContextNeedsResolution?.(historyOrderContext, sceneId)) {
+                await this._resolveHistoryOrderContextScene(
+                    historyOrderContext, sceneId, ownerToken);
+            }
+            this._activateGraphUndoSuppression?.("editor-redo-apply");
+            return this._runRedoWithinGesture(
+                queuedDiagnostics, entry, claimId, ownerToken,
+                oppositeReservation, historyOrderContext);
+        };
+
+        const queue = this._projectMutationQueue;
+        const promise = queue?.enqueue
+            ? queue.enqueue({
+                key: `history:redo:${claimId.id}`,
+                label: `redo ${entry.label || "change"}`,
+                coalesce: false,
+                sealCoalescing: true,
+                diagnostics,
+                run: (_intent, queuedDiagnostics, ownerToken) =>
+                    apply(queuedDiagnostics, ownerToken),
+            })
+            : Promise.resolve().then(() => apply(diagnostics, null));
+        return Promise.resolve(promise).then((result) => {
+            if (result !== false) {
+                this._schedulePostMutationSceneRefresh?.("history_redo");
+            }
+            return result;
+        }).catch((error) => {
+            this._recordHistoryRefusal?.("redo", "queue_failed", diagnostics, {
+                sceneId: entry.sceneId || "", label: entry.label || "",
+                error: error?.message || String(error),
+            });
+            notifyWarning(error?.message || "Redo could not be queued.",
+                { source: "redo-queue-failed" });
+            this._deferProjectBackedRefresh?.(["scenes"], "history_redo_error");
+            return false;
+        }).finally(() => {
+            if (entry.claimedBy === claimId) delete entry.claimedBy;
+            if (!entry.restoreToken) {
+                this._discardHistoryFutureReservation?.(
+                    this._undoStack, oppositeReservation);
+            }
+            this._trimUndoStack?.();
+            this._finishHistoryOperation(waitToken);
+        });
+    }
+
+    async _runRedoWithinGesture(
+        diagnostics = null, reservedEntry = null, claimId = null,
+        ownerToken = null, oppositeReservation = null,
+        historyOrderContext = null) {
+        if (!reservedEntry && this._undoStack.some((candidate) => candidate?.pending)) {
+            const pendingEntry = this._undoStack.find((candidate) => candidate?.pending);
+            this._recordHistoryRefusal?.("redo", "pending_entry", diagnostics, {
+                sceneId: pendingEntry?.sceneId || "", label: pendingEntry?.label || "",
+            });
             notifyInfo("That change is still saving. Try Redo again when it finishes.",
                 { source: "redo-pending" });
             return;
         }
-        if (this._redoStack.length === 0) {
+        if (!reservedEntry && this._redoStack.length === 0) {
+            this._recordHistoryRefusal?.("redo", "empty_stack", diagnostics);
             this._keyboardDebug("redo skipped: empty stack", {
                 activeSceneId: this.activeSceneId || "",
                 undoDepth: this._undoStack.length,
@@ -18712,7 +20162,28 @@ export class EditorWidget {
             });
             return;
         }
-        const entry = this._redoStack.pop();
+        const entry = reservedEntry || this._redoStack.pop();
+        const queuedClaim = !!reservedEntry;
+        const restoreEntryAfterFailure = () => {
+            if (!queuedClaim) this._redoStack.push(entry);
+        };
+        const consumeEntry = () => {
+            if (!queuedClaim) return true;
+            const entryIndex = this._redoStack.indexOf(entry);
+            if (entryIndex < 0 || entry.claimedBy !== claimId) return false;
+            this._redoStack.splice(entryIndex, 1);
+            delete entry.claimedBy;
+            return true;
+        };
+        const materializeOpposite = (opposite) => {
+            if (oppositeReservation
+                    && typeof this._materializeHistoryOpposite === "function") {
+                return this._materializeHistoryOpposite(
+                    this._undoStack, oppositeReservation, opposite);
+            }
+            this._undoStack.push(opposite);
+            return true;
+        };
         this._keyboardDebug("redo start", {
             entrySceneId: entry.sceneId,
             label: entry.label,
@@ -18731,11 +20202,16 @@ export class EditorWidget {
             try {
                 await this._restoreProjectDependencies(entry.snapshot, diagnostics);
             } catch (error) {
-                this._redoStack.push(entry);
+                restoreEntryAfterFailure();
+                this._recordHistoryRefusal?.("redo", "project_dependencies_restore_failed",
+                    diagnostics, { sceneId: entry.sceneId || "", label: entry.label || "",
+                        error: error?.message || String(error) });
                 notifyWarning(error?.message || "Redo was refused.", { source: "redo-refused" });
                 return;
             }
-            this._undoStack.push(opposite);
+            if (consumeEntry()) {
+                materializeOpposite(opposite);
+            }
             return;
         }
 
@@ -18750,11 +20226,16 @@ export class EditorWidget {
                     `redo ${entry.label || "prompt identity"}`,
                     { recordUndo: false, diagnostics });
             } catch (error) {
-                this._redoStack.push(entry);
+                restoreEntryAfterFailure();
+                this._recordHistoryRefusal?.("redo", "prompt_identity_restore_failed",
+                    diagnostics, { sceneId: entry.sceneId || "", label: entry.label || "",
+                        error: error?.message || String(error) });
                 notifyWarning(error?.message || "Redo was refused.", { source: "redo-refused" });
                 return;
             }
-            this._undoStack.push(opposite);
+            if (consumeEntry()) {
+                materializeOpposite(opposite);
+            }
             return;
         }
 
@@ -18766,24 +20247,53 @@ export class EditorWidget {
             };
             try {
                 await this._applyReferenceHistoryOperations(entry.operations,
-                    `redo ${entry.label || "Reference change"}`, diagnostics);
+                    `redo ${entry.label || "Reference change"}`, diagnostics, ownerToken,
+                    historyOrderContext);
             } catch (error) {
-                this._redoStack.push(entry);
+                restoreEntryAfterFailure();
+                this._recordHistoryRefusal?.("redo", "reference_restore_failed",
+                    diagnostics, { sceneId: entry.sceneId || "", label: entry.label || "",
+                        error: error?.message || String(error) });
                 notifyWarning(error?.message || "Redo was refused.", { source: "redo-refused" });
                 return;
             }
-            this._undoStack.push(opposite);
+            if (consumeEntry()) {
+                materializeOpposite(opposite);
+            }
             return;
         }
 
         if (!entry.postSnapshot) {
-            this._redoStack.push(entry);
+            if (entry.restoreToken) {
+                restoreEntryAfterFailure();
+                this._recordHistoryRefusal?.("redo", "missing_post_snapshot", diagnostics, {
+                    sceneId: entry.sceneId || "", label: entry.label || "",
+                    entry_discarded: false, recovery: "restore_receipt_pending",
+                });
+                sessionDiagRecord("undo_missing_post_snapshot", {
+                    scene_id: entry.sceneId || "", label: entry.label || "", redo: true,
+                    entry_discarded: false, recovery: "restore_receipt_pending",
+                });
+                notifyWarning("Redo is still confirming this change and kept its recovery token. Try Redo again to reconcile it.",
+                    { source: "redo-missing-post-snapshot" });
+                return false;
+            }
+            const entryDiscarded = consumeEntry();
+            this._recordHistoryRefusal?.("redo", "missing_post_snapshot", diagnostics, {
+                sceneId: entry.sceneId || "", label: entry.label || "",
+                entry_discarded: entryDiscarded,
+                recovery: entryDiscarded ? "discarded_unstampable_entry" : "discard_failed",
+            });
             sessionDiagRecord("undo_missing_post_snapshot", {
                 scene_id: entry.sceneId || "", label: entry.label || "", redo: true,
+                entry_discarded: entryDiscarded,
+                recovery: entryDiscarded ? "discarded_unstampable_entry" : "discard_failed",
             });
-            notifyWarning("Redo cannot safely reapply this change because its saved result is unavailable. Refresh the editor and try again.",
+            notifyWarning(entryDiscarded
+                ? "Redo skipped one change because its saved result is unavailable. The unusable entry was removed. Press Redo again for the next change."
+                : "Redo could not remove the unavailable change because history changed. Press Redo again to retry.",
                 { source: "redo-missing-post-snapshot" });
-            return;
+            return false;
         }
         const opposite = {
             sceneId: entry.sceneId,
@@ -18808,7 +20318,8 @@ export class EditorWidget {
         try {
             if (entry.referenceOperations?.length && !referencesApplied) {
                 await this._applyReferenceHistoryOperations(entry.referenceOperations,
-                    `redo ${entry.label || "prompt attachment"}`, diagnostics);
+                    `redo ${entry.label || "prompt attachment"}`, diagnostics, ownerToken,
+                    historyOrderContext);
                 referencesApplied = true;
             }
             if (entry.promptIdentityChange && !promptIdentityApplied) {
@@ -18844,6 +20355,8 @@ export class EditorWidget {
                         refreshScenes: false,
                         sceneId: entry.sceneId,
                         diagnostics,
+                        ownerToken,
+                        historyOrderContext,
                     }) : null;
                 if (createResult) {
                     this._adoptPromptIdentitiesFromMutation(createResult);
@@ -18861,12 +20374,29 @@ export class EditorWidget {
             const restoredScene = await this._restoreScene(
                 entry.sceneId, entry.snapshot, entry.postSnapshot,
                 entry.restoreToken, diagnostics);
+            // Deliberate asymmetry, not an inconsistency: the same object is
+            // authoritative for one use and untrusted for the other. As the
+            // ordered scene it answers "what is durable at this queue position"
+            // for the slots behind it, and current state is exactly right for
+            // that. As a merge base it would answer "what state was this action
+            // authored against", which it cannot, because a receipted token
+            // returns current state. The base comes from the memo below.
+            this._recordHistoryOrderedScene?.(historyOrderContext, restoredScene);
             delete entry.restoreToken;
             delete entry._ambiguousAuxiliaryState;
-            opposite.postSnapshot = structuredClone(restoredScene);
-            this._undoStack.push(opposite);
+            opposite.postSnapshot = structuredClone(
+                this._historyBaseForRestoredScene?.(restoredScene) || restoredScene);
+            if (consumeEntry()) {
+                materializeOpposite(opposite);
+            }
         } catch (error) {
             if (error?.restoreAmbiguous && error?.restoreToken) {
+                this._markHistoryOrderContextAmbiguous?.(
+                    historyOrderContext, entry.sceneId, error.restoreToken, {
+                        operation: "redo", entry, sourceStack: this._redoStack,
+                        opposite, oppositeReservation,
+                        oppositeStack: this._undoStack,
+                    });
                 entry.restoreToken = error.restoreToken;
                 entry._ambiguousAuxiliaryState = {
                     referencesApplied,
@@ -18875,13 +20405,17 @@ export class EditorWidget {
                         structuredClone(promptIdentityCreatesApplied),
                     promptIdentityCreatesResolved,
                 };
-                this._redoStack.push(entry);
+                restoreEntryAfterFailure();
+                this._recordHistoryRefusal?.("redo", "restore_ambiguous", diagnostics, {
+                    sceneId: entry.sceneId || "", label: entry.label || "",
+                    error: error?.message || String(error),
+                });
                 notifyWarning("Redo was sent and is still being confirmed. Try Redo again to reconcile it.",
                     { source: "redo-restore-ambiguous" });
                 return;
             }
             delete entry.restoreToken;
-            this._redoStack.push(entry);
+            restoreEntryAfterFailure();
             const compensationErrors = [];
             if (promptIdentityApplied && entry.inversePromptIdentityChange) {
                 try {
@@ -18903,6 +20437,8 @@ export class EditorWidget {
                             refreshScenes: false,
                             sceneId: entry.sceneId,
                             diagnostics,
+                            ownerToken,
+                            historyOrderContext,
                         });
                     this._adoptPromptIdentitiesFromMutation(cleanupResult);
                     promptIdentityCreatesApplied = [];
@@ -18916,7 +20452,7 @@ export class EditorWidget {
                     await this._applyReferenceHistoryOperations(
                         entry.inverseReferenceOperations,
                         `restore failed redo ${entry.label || "prompt attachment"}`,
-                        diagnostics);
+                        diagnostics, ownerToken, historyOrderContext);
                     referencesApplied = false;
                 } catch (compensationError) {
                     compensationErrors.push(compensationError);
@@ -18925,6 +20461,12 @@ export class EditorWidget {
             const recoveryDetail = compensationErrors.length
                 ? ` Recovery also failed: ${compensationErrors.map((value) =>
                     value?.message || String(value)).join("; ")}` : "";
+            this._recordHistoryRefusal?.("redo", "restore_failed", diagnostics, {
+                sceneId: entry.sceneId || "", label: entry.label || "",
+                error: error?.message || String(error),
+                compensation_errors: compensationErrors.map((value) =>
+                    value?.message || String(value)),
+            });
             notifyWarning(`${error?.message || "Redo was refused."}${recoveryDetail}`,
                 { source: "redo-refused" });
             if (referencesApplied || promptIdentityApplied
@@ -18996,6 +20538,10 @@ export class EditorWidget {
             if (!scene || String(scene.scene_id || "") !== String(sceneId || "")) {
                 throw new Error("Scene restore returned an invalid scene.");
             }
+            // Restore requests can outlive the graph suppression lease by many
+            // seconds. Re-arm at the graph-affecting adoption point for both
+            // the direct response and receipt-reconciliation paths.
+            this._activateGraphUndoSuppression?.("editor-history-adopt");
             if (this.activeSceneId !== sceneId) this.activeSceneId = sceneId;
             this._replaceSceneInList?.(scene);
             this._setActiveScene(scene);
@@ -19014,6 +20560,9 @@ export class EditorWidget {
         if (!restoreToken) {
             const tokenResponse = await fetch(
                 api.apiURL(tokenUrl), diagnosticInit({ method: "POST" }));
+            if (typeof rememberProjectVersionFromResponse === "function") {
+                rememberProjectVersionFromResponse(tokenResponse, dirName);
+            }
             if (!tokenResponse.ok) {
                 throw await responseError(tokenResponse,
                     `Scene history token failed (${tokenResponse.status}).`);
@@ -19030,6 +20579,9 @@ export class EditorWidget {
                 }
                 try {
                     const receiptResponse = await fetch(api.apiURL(receiptUrl));
+                    if (typeof rememberProjectVersionFromResponse === "function") {
+                        rememberProjectVersionFromResponse(receiptResponse, dirName);
+                    }
                     if (!receiptResponse.ok) continue;
                     const receipt = await receiptResponse.json();
                     if (receipt?.status === "committed" && receipt?.scene) {
@@ -19060,7 +20612,9 @@ export class EditorWidget {
         };
         const adoptReconciledScene = (scene) => {
             try {
-                return adopt(scene);
+                const adopted = adopt(scene);
+                this._rememberReconciledHistoryBase?.(adopted, targetSnapshot);
+                return adopted;
             } catch (adoptError) {
                 throw markRestoreAmbiguous(adoptError);
             }
@@ -19100,6 +20654,9 @@ export class EditorWidget {
             status: restoreResponse.status,
             ok: restoreResponse.ok,
         });
+        if (typeof rememberProjectVersionFromResponse === "function") {
+            rememberProjectVersionFromResponse(restoreResponse, dirName);
+        }
         if (!restoreResponse.ok) {
             const error = await responseError(
                 restoreResponse, `Scene restore failed (${restoreResponse.status}).`);
@@ -19122,7 +20679,15 @@ export class EditorWidget {
         }
         try {
             const payload = await restoreResponse.json();
-            return adopt(payload?.scene);
+            // A 200 body is not proof of the exact committed bytes: the server
+            // answers an already-receipted token with the *current* scene, and a
+            // transparent transport retry reaches that branch with no
+            // client-visible token. The restore target is never a worse merge
+            // base than the true committed scene and is strictly better for
+            // fields this operation did not touch, so pin it on every path.
+            const scene = adopt(payload?.scene);
+            this._rememberReconciledHistoryBase?.(scene, targetSnapshot);
+            return scene;
         } catch (responseBodyOrAdoptError) {
             this._keyboardDebug("restore success body/adoption lost", {
                 sceneId,
@@ -19132,6 +20697,70 @@ export class EditorWidget {
             if (receiptScene) return adoptReconciledScene(receiptScene);
             throw markRestoreAmbiguous(responseBodyOrAdoptError);
         }
+    }
+
+    _clearRedoForNewEdit({ preserveFutureReservations = false } = {}) {
+        // A new edit invalidates ordinary Redo history. A queued Redo owns its
+        // reserved entry, so preserve it long enough to fail visibly at apply
+        // if this edit changed the history revision after its claim.
+        const stack = this._redoStack || [];
+        for (let index = stack.length - 1; index >= 0; index -= 1) {
+            const entry = stack[index];
+            if (!entry?.claimedBy && !entry?.restoreToken
+                    && !(preserveFutureReservations && entry?._historyFuture)) {
+                stack.splice(index, 1);
+            }
+        }
+    }
+
+    _recordHistoryRefusal(operation, gate, diagnostics = null, extra = {}) {
+        if (typeof sessionDiagRecord !== "function") return;
+        const { sceneId = this.activeSceneId, ...details } = extra || {};
+        sessionDiagRecord("history_operation_refused", {
+            operation: String(operation || "history"),
+            gate: String(gate || "unknown"),
+            scene_id: String(sceneId || ""),
+            gesture_id: String(diagnostics?.gestureId || ""),
+            ...details,
+        });
+    }
+
+    _beginQueuedHistoryWait(operation = "history") {
+        const token = { active: true };
+        this._queuedHistoryOperationCount = Math.max(
+            0, Number(this._queuedHistoryOperationCount) || 0) + 1;
+        const count = this._queuedHistoryOperationCount;
+        const message = `${count} history action${count === 1 ? "" : "s"} queued behind project writes…`;
+        const detail = `${String(operation || "history").replace(/^./, (value) => value.toUpperCase())} will run in request order.`;
+        if (this._queuedHistoryNotification) {
+            this._queuedHistoryNotification.update({ message, detail, progress: null });
+        } else {
+            this._queuedHistoryNotification = notifyProgress({
+                verb: "Waiting",
+                message,
+                detail,
+                progress: null,
+                source: "history-operation-queued",
+            });
+        }
+        return token;
+    }
+
+    _endQueuedHistoryWait(token) {
+        if (!token?.active) return;
+        token.active = false;
+        this._queuedHistoryOperationCount = Math.max(
+            0, (Number(this._queuedHistoryOperationCount) || 0) - 1);
+        if (this._queuedHistoryOperationCount > 0) {
+            const count = this._queuedHistoryOperationCount;
+            this._queuedHistoryNotification?.update({
+                message: `${count} history action${count === 1 ? "" : "s"} queued behind project writes…`,
+                progress: null,
+            });
+            return;
+        }
+        this._queuedHistoryNotification?.dismiss();
+        this._queuedHistoryNotification = null;
     }
 
     // ── Widget Value Helpers ───────────────────────────────────────────
@@ -20504,6 +22133,9 @@ export class EditorWidget {
     destroy() {
         if (this._destroyed) return;
         this._destroyed = true;
+        this._queuedHistoryNotification?.dismiss();
+        this._queuedHistoryNotification = null;
+        this._queuedHistoryOperationCount = 0;
         this._clearStaleReplayState();
         this._promptContextPreviewToken = (this._promptContextPreviewToken || 0) + 1;
         this._promptContextScenePayloadToken =
