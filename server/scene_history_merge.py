@@ -281,6 +281,76 @@ def _validate_duration_sentinels(base: dict, target: dict, stored: dict,
                       stored_member)
 
 
+def _validate_lane_shrink_members(result: dict, base: dict, target: dict,
+                                  stored: dict, conflicts: list[dict]) -> None:
+    """Refuse a history-owned shrink that would strand concurrent members."""
+    specs = (
+        ("video_lane_count", "clips", "clip_id", "track_index", "render"),
+        ("motion_driver_lane_count", "clips", "clip_id", "track_index",
+         "motion_driver"),
+        ("audio_lane_count", "audio_tracks", "track_id", "lane_index", None),
+        ("reference_lane_count", "reference_items", "reference_item_id",
+         "lane_index", None),
+    )
+    for count_field, collection, id_field, index_field, role in specs:
+        try:
+            base_count = int(base.get(count_field))
+            target_count = int(target.get(count_field))
+            stored_count = int(stored.get(count_field))
+            result_count = int(result.get(count_field))
+        except (TypeError, ValueError):
+            continue
+        # Only guard the shrink this merge is applying. Existing over-cap data
+        # remains tolerated when the operation does not own a lane reduction.
+        if (base_count <= target_count or stored_count != base_count
+                or result_count != target_count):
+            continue
+
+        base_items = {
+            str(member.get(id_field) or ""): member
+            for member in base.get(collection, [])
+            if isinstance(member, dict) and member.get(id_field)
+        }
+        target_items = {
+            str(member.get(id_field) or ""): member
+            for member in target.get(collection, [])
+            if isinstance(member, dict) and member.get(id_field)
+        }
+        stored_items = {
+            str(member.get(id_field) or ""): member
+            for member in stored.get(collection, [])
+            if isinstance(member, dict) and member.get(id_field)
+        }
+        for member in result.get(collection, []):
+            if not isinstance(member, dict):
+                continue
+            member_role = str(member.get("role") or "render")
+            if role is not None and member_role != role:
+                continue
+            member_id = str(member.get(id_field) or "")
+            try:
+                lane_index = int(member.get(index_field, 0))
+            except (TypeError, ValueError):
+                continue
+            if not member_id or lane_index < target_count:
+                continue
+            target_member = target_items.get(member_id)
+            try:
+                target_index = int(target_member.get(index_field, 0)) \
+                    if target_member is not None else -1
+            except (TypeError, ValueError):
+                target_index = -1
+            if target_member is not None and target_index >= target_count:
+                continue
+            _conflict(
+                conflicts,
+                f"{collection}[{member_id}].{index_field}",
+                base_items.get(member_id, _MISSING),
+                target_member if target_member is not None else _MISSING,
+                stored_items.get(member_id, member),
+            )
+
+
 def merge_scene_history(base: dict, target: dict, stored: dict) -> dict:
     """Apply the base→target reversal onto stored without touching unrelated work.
 
@@ -344,6 +414,7 @@ def merge_scene_history(base: dict, target: dict, stored: dict) -> dict:
     ):
         _merge_bundle(result, keys, base, target, stored, conflicts, path)
 
+    _validate_lane_shrink_members(result, base, target, stored, conflicts)
     _validate_duration_sentinels(base, target, stored, conflicts)
     if conflicts:
         raise SceneMergeConflict(conflicts)

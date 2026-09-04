@@ -32,6 +32,11 @@ a fresh `[Unreleased]` block.
   text to the prompt being compiled.
 
 ### Fixed
+- Media drops that add lanes now create those lanes, the clip or audio track,
+  extracted audio, and their link in one project write instead of two.
+- Undo now reverses successful video, audio, and Driver drops from their exact
+  canonical post-state; a concurrent edit that makes lane removal unsafe is
+  refused instead of silently stranding media.
 - Reduced render-cache maintenance delays when opening the editor or viewing cache usage, with reliable deferred cleanup after rendering finishes.
 - Undo and Redo now queue behind in-flight project writes in request order instead of discarding the action, with durable waiting feedback and execution-time graph-undo suppression.
 - Redo no longer reverts work done elsewhere while an Undo was in flight. The

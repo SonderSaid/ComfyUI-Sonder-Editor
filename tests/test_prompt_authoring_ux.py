@@ -5129,7 +5129,7 @@ const ordered={{scene_id:"scene",video_lane_count:3,video_lane_configs:laneConfi
 const historyEntry={{sceneId:"scene",label:"drop",snapshot:authored}};
 const context={{scenes:new Map([["scene",ordered]])}};
 const intent={{sceneId:"scene",operations:[
-  {{type:"drop_clip",fields:{{asset_id:"waking",track_index:2,dual_drop:false}}}},
+  {{type:"create_clip",fields:{{asset_id:"waking",track_index:2,dual_drop:false}}}},
   {{type:"update_clip",clip_id:"waking",fields:{{track_index:2}}}}
 ]}};
 let sent=null;
@@ -5143,7 +5143,7 @@ console.log(JSON.stringify({{sent}}));
     assert result["sent"]["operations"][1]["fields"]["track_index"] == 2
 
 
-def test_production_media_drop_routes_rebase_behind_history_and_refresh_next_baseline():
+def test_production_media_drops_rebase_behind_history_and_stamp_batch_scene():
     widget = _source("web/js/editor_widget.js")
     queue_setup = widget[widget.index("this._projectMutationQueue = new ProjectMutationQueue({"):
                          widget.index("        this._projectMutationCloseInProgress = null;")]
@@ -5195,20 +5195,32 @@ class Harness {{
   _defaultCropPosition(){{return "center";}}
   _renderSceneAfterLocalMutation(){{}} _buildTrackLayout(){{}} _renderTimeline(){{}}
   _deferProjectBackedRefresh(){{}} _schedulePostMutationSceneRefresh(){{}}
+  _reconcileActiveSceneFromMutation(result){{
+    this.activeScene=structuredClone(result.payload.scene);return true;}}
   _replayDeferredProjectBackedRefresh(){{}} // Model the refresh not yet completed.
   _showToast(message){{throw new Error(message);}}
   async _fetchScenes(){{this.activeScene=structuredClone(this.server);return true;}}
   async _runVersionedProjectMutation(path,init){{const body=JSON.parse(init.body);
-    if(path.endsWith("/mutations")){{this.events.push("lanes");
-      for(const op of body.operations){{this.server[op.lane_type+"_lane_count"]=op.count;}}
-      return {{payload:{{scene:structuredClone(this.server)}}}};}}
-    this.events.push("create");this.sent.push(body);
-    if(this.fail)throw new Error("dedicated failure");
-    const payload=path.endsWith("/audio_tracks")?{{track_id:"created",...body}}:{{clip_id:"created",...body}};
-    if(payload.clip_id)this.server.clips.push(payload);else this.server.audio_tracks.push(payload);
-    if(body.dual_drop){{payload.audio_track={{track_id:"paired",lane_index:body.audio_lane_index}};
-      this.server.audio_tracks.push(payload.audio_track);}}
-    return {{payload}};
+    this.events.push("batch");this.sent.push(body);
+    if(this.fail)throw new Error("batch failure");
+    const results=[];
+    for(const op of body.operations){{
+      if(op.type==="set_lane_count"){{
+        this.server[op.lane_type+"_lane_count"]=op.count;
+        results.push({{type:op.type}});continue;
+      }}
+      if(op.type==="create_clip"){{
+        const clip={{clip_id:"created",...op.fields}};this.server.clips.push(clip);
+        let audio_track=null;
+        if(op.fields.dual_drop){{audio_track={{track_id:"paired",lane_index:op.fields.audio_lane_index}};
+          this.server.audio_tracks.push(audio_track);}}
+        results.push({{type:op.type,clip,audio_track}});continue;
+      }}
+      const audio_track={{track_id:"created",...op.fields}};
+      this.server.audio_tracks.push(audio_track);
+      results.push({{type:op.type,audio_track}});
+    }}
+    return {{payload:{{results,scene:structuredClone(this.server)}}}};
   }}
 }}
 const outcomes=[];
@@ -5231,7 +5243,7 @@ for(const structural of [false,true])for(const mode of ["video","dual","audio","
     baselineHasCreated:[...next.snapshot.clips,...next.snapshot.audio_tracks]
       .some(item=>(item.clip_id||item.track_id)==="created")}});
 }}
-// Internally caught failures run the complete production route cleanup twice;
+// Internally caught failures run the complete production batch cleanup twice;
 // neither pass may consume a same-labelled neighbor.
 for(const mode of ["video","dual","audio","extracted","driver"]){{
   const h=new Harness(mode,false,true);const prior={{label:mode==="driver"?"add driver":"add asset",postSnapshot:{{}}}};
@@ -5243,21 +5255,27 @@ console.log(JSON.stringify(outcomes));
 """)
     for row in result[:10]:
         assert row["beforeRelease"] == 0
-        assert row["events"] == (["undo", "lanes", "create"] if row["mode"] == "dual" else ["undo", "create"])
+        assert row["events"] == ["undo", "batch"]
         index = (2 if row["structural"] else 3) if row["mode"] == "dual" else (1 if row["structural"] else 2)
         field = "lane_index" if row["mode"] in ("audio", "extracted") else "track_index"
-        assert row["body"][field] == index
+        create = next(op for op in row["body"]["operations"]
+                      if op["type"].startswith("create_"))
+        assert create["fields"][field] == index
         if row["mode"] == "dual":
-            assert row["body"]["audio_lane_index"] == index
-        assert row["reads"] == 1
+            assert create["fields"]["audio_lane_index"] == index
+            assert [op["type"] for op in row["body"]["operations"]] == [
+                "set_lane_count", "set_lane_count", "create_clip"]
+        else:
+            assert len(row["body"]["operations"]) == 1
+        assert row["reads"] == 0
         assert row["baselineHasCreated"] is True
-        assert row["stamped"] is False
+        assert row["stamped"] is True
     for row in result[10:]:
         assert row["prior"] is True
         assert row["failed"] is False
 
 
-def test_dedicated_drop_body_is_built_from_execution_time_lane_intent():
+def test_drop_batch_is_built_from_execution_time_lane_intent():
     """The queued semantic target, not an enqueue-time body closure, is sent."""
     widget = _source("web/js/editor_widget.js")
     drop = _method(widget, "_handleAssetDropWithinGesture", "_firstAvailableLane")
@@ -5269,9 +5287,10 @@ class Harness {{
   constructor(fail=false){{this.fail=fail;this.discarded=false;}}
   _snapshotProjectMutationContext(){{return {{projectId:"project",sceneId:"scene"}};}}
   _withMutationDiagnosticHeaders(init){{return init;}}
-  async _runVersionedProjectMutation(_path,init){{if(this.fail)throw new Error("404");
-    sentBody=JSON.parse(init.body);
-    return {{payload:{{clip_id:"created"}}}};}}
+      async _runVersionedProjectMutation(_path,init){{if(this.fail)throw new Error("404");
+        sentBody=JSON.parse(init.body);
+        return {{payload:{{results:[{{type:"create_clip",clip:{{clip_id:"created"}}}}],
+          scene:{{scene_id:"scene"}}}}}};}}
   _discardUnstampableUndoEntry(entry){{this.discarded=entry?.label==="drop";}}
   _queueProjectMutation(options){{queuedIntent=options.intent;
     const ordered=structuredClone(options.intent);
@@ -5282,14 +5301,12 @@ class Harness {{
     const dropSeq=3;const diagnostics=null;
     const dropContext=this._snapshotProjectMutationContext();
 {helper}
-    return queueDropMutation({{
-      keySuffix:"clip",label:"drop clip",path:"/clips",
-      historyEntry:{{label:"drop"}},
-      operation:{{type:"drop_clip",fields:{{track_index:2,audio_lane_index:1,
-        dual_drop:true,asset_id:"asset"}}}},
-      buildInit:(orderedOperation)=>({{method:"POST",headers:{{}},
-        body:JSON.stringify(orderedOperation.fields)}}),
-    }});
+        return queueDropMutation({{
+          keySuffix:"clip",label:"drop clip",
+          historyEntry:{{label:"drop"}},
+          operation:{{type:"create_clip",fields:{{track_index:2,audio_lane_index:1,
+            dual_drop:true,asset_id:"asset"}}}},
+        }});
   }}
 }}
 const h=new Harness();const outcome=await h.run();
@@ -5297,9 +5314,10 @@ const failing=new Harness(true);const failedOutcome=await failing.run();
 console.log(JSON.stringify({{sentBody,queuedIntent,outcome,
   failed:failedOutcome.ok===false,discarded:failing.discarded}}));
 """)
-    assert result["queuedIntent"]["operations"][0]["type"] == "drop_clip"
-    assert result["sentBody"]["track_index"] == 7
-    assert result["sentBody"]["audio_lane_index"] == 5
+    assert result["queuedIntent"]["operations"][0]["type"] == "create_clip"
+    fields = result["sentBody"]["operations"][0]["fields"]
+    assert fields["track_index"] == 7
+    assert fields["audio_lane_index"] == 5
     assert result["outcome"]["ok"] is True
     assert result["failed"] is True
     assert result["discarded"] is True
@@ -5307,12 +5325,12 @@ console.log(JSON.stringify({{sentBody,queuedIntent,outcome,
                          drop.index("const _findAsset")]
     assert "queueDropMutation({" in driver_branch
     assert "await fetch(" not in driver_branch
-    assert 'type: "drop_audio_track"' in drop
+    assert 'type: "create_audio_track"' in drop
     assert 'type: "set_lane_count"' in drop
 
 
-def test_ruler_drop_does_not_double_rebase_or_stamp_its_intermediate_lane_scene():
-    """Both physical writes stay in one slot and consume the tail index once."""
+def test_ruler_drop_sends_one_batch_and_stamps_its_composite_scene():
+    """Lane and entity creation stay in one slot and stamp one exact scene."""
     widget = _source("web/js/editor_widget.js")
     rebase = _method(widget, "_historyExpectedProjection", "_queueProjectMutation")
     queue_mutation = _method(widget, "_queueProjectMutation", "_runSceneMutation")
@@ -5326,7 +5344,7 @@ globalThis.notifyError=()=>{{}};globalThis.notifyWarning=()=>{{}};
 const TRACK_TYPE={{VIDEO:"video",AUDIO:"audio"}};
 const laneCountFor=(scene,type)=>type==="video"
   ? scene.video_lane_count : scene.audio_lane_count;
-let releaseLane;const laneGate=new Promise((resolve)=>{{releaseLane=resolve;}});
+let releaseBatch;const batchGate=new Promise((resolve)=>{{releaseBatch=resolve;}});
 const events=[];let sentBody=null;
 class Harness {{
 {rebase}
@@ -5343,40 +5361,41 @@ class Harness {{
   _schedulePostMutationSceneRefresh(){{}}
   _withMutationDiagnosticHeaders(init){{return init;}}
   async _runVersionedProjectMutation(path,init){{
-    if(path.endsWith("/mutations")){{events.push("lane");await laneGate;
-      return {{payload:{{scene:afterLane}}}};}}
-    events.push("create");sentBody=JSON.parse(init.body);
-    return {{payload:{{clip_id:"created"}}}};
+    events.push("batch");sentBody=JSON.parse(init.body);await batchGate;
+    return {{payload:{{scene:afterBatch,results:[
+      {{type:"set_lane_count",lane_type:"video"}},
+      {{type:"create_clip",clip:afterBatch.clips[0]}}
+    ]}}}};
   }}
   runDrop(){{
     const dropSeq=1;const diagnostics=null;
     const dropContext=this._snapshotProjectMutationContext();
 {helper}
-    return queueDropMutation({{keySuffix:"clip",label:"drop clip",path:"/clips",
+    return queueDropMutation({{keySuffix:"clip",label:"drop clip",
       historyEntry:entry,
       laneCountOperations:[{{type:"set_lane_count",lane_type:"video",count:2}}],
-      operation:{{type:"drop_clip",fields:{{asset_id:"asset",track_index:1}}}},
-      buildInit:(orderedOperation)=>({{method:"POST",headers:{{}},
-        body:JSON.stringify(orderedOperation.fields)}}),
+      operation:{{type:"create_clip",fields:{{asset_id:"asset",track_index:1}}}},
     }});
   }}
 }}
 const before={{scene_id:"scene",video_lane_count:1,
   video_lane_configs:[{{name:"B"}}],clips:[]}};
-const afterLane={{scene_id:"scene",video_lane_count:2,
-  video_lane_configs:[{{name:"B"}},{{name:"New"}}],clips:[]}};
+const afterBatch={{scene_id:"scene",video_lane_count:2,
+  video_lane_configs:[{{name:"B"}},{{name:"New"}}],
+  clips:[{{clip_id:"created",track_index:1}}]}};
 const entry={{sceneId:"scene",label:"drop",snapshot:before}};
 const h=new Harness();const dropPromise=h.runDrop();
 await new Promise((resolve)=>setTimeout(resolve,0));
 const interloper=h._projectMutationQueue.enqueue({{key:"other",coalesce:false,
   run:async()=>{{events.push("interloper");}}}});
-releaseLane();await dropPromise;await interloper;
+releaseBatch();await dropPromise;await interloper;
 console.log(JSON.stringify({{sentBody,stamps:h.stamps,events}}));
 """)
-    assert result["sentBody"]["track_index"] == 1
-    assert result["stamps"] == [], "neither a lane-only nor entity-only response is exact"
-    assert result["events"] == ["lane", "create", "interloper"]
-    assert "stampHistory: false" in drop
+    assert [op["type"] for op in result["sentBody"]["operations"]] == [
+        "set_lane_count", "create_clip"]
+    assert result["sentBody"]["operations"][1]["fields"]["track_index"] == 1
+    assert result["stamps"] == [2]
+    assert result["events"] == ["batch", "interloper"]
     assert "laneCountOperations" in drop
 
 
@@ -5406,9 +5425,9 @@ const ordered={{scene_id:"scene",...counts,...configLists,
   audio_tracks:[{{track_id:"audio-member",lane_index:1}}],
   reference_items:[{{reference_item_id:"reference-member",lane_index:1}}]}};
 const operations=[
-  {{type:"drop_clip",fields:{{track_index:2,dual_drop:true,audio_lane_index:2}}}},
-  {{type:"drop_clip",fields:{{track_index:2,role:"motion_driver",dual_drop:false}}}},
-  {{type:"drop_audio_track",fields:{{lane_index:2}}}},
+  {{type:"create_clip",fields:{{track_index:2,dual_drop:true,audio_lane_index:2}}}},
+  {{type:"create_clip",fields:{{track_index:2,role:"motion_driver",dual_drop:false}}}},
+  {{type:"create_audio_track",fields:{{lane_index:2}}}},
   {{type:"create_reference_item",fields:{{lane_index:2}}}},
 ];
 const equal=new Harness()._rebaseSceneMutationIntentForHistory(
@@ -5418,7 +5437,7 @@ const structuralAuthored={{scene_id:"scene",video_lane_count:1,
 const structuralOrdered={{scene_id:"scene",video_lane_count:2,
   video_lane_configs:[{{name:"A",locked:false}},{{locked:false,name:"B"}}],clips:[]}};
 const structural=new Harness()._rebaseSceneMutationIntentForHistory(
-  {{sceneId:"scene",operations:[{{type:"drop_clip",fields:{{track_index:0}}}}]}},
+  {{sceneId:"scene",operations:[{{type:"create_clip",fields:{{track_index:0}}}}]}},
   structuralOrdered,structuralAuthored).operations[0];
 console.log(JSON.stringify({{equal,structural}}));
 """)

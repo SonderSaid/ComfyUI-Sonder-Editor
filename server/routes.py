@@ -3640,6 +3640,188 @@ def _apply_swap_prompt_sections(scene: Scene, op: dict) -> tuple:
     return section_a, section_b
 
 
+def _clip_dual_drop_uses_media_io(asset: Asset, role: str, fields: dict) -> bool:
+    """Return whether a valid clip create can attempt embedded-audio extraction."""
+    return (
+        role == "render"
+        and bool(fields.get("dual_drop"))
+        and asset.asset_type == "video"
+        and asset.has_audio
+    )
+
+
+def _apply_create_clip(
+        project: TimelineProject, scene: Scene, fields: dict,
+) -> tuple[ClipReference, AudioTrack | None, Asset | None]:
+    if not isinstance(fields, dict):
+        _mutation_error("create_clip requires fields", 400)
+
+    asset_id = fields.get("asset_id", "")
+    asset = project.get_asset(asset_id)
+    if not asset:
+        _mutation_error(f"Asset not found: {asset_id}", 404, "asset_not_found")
+
+    role = fields.get("role", "render")
+    if role not in {"render", "motion_driver"}:
+        _mutation_error(f"Invalid clip role: {role}", 400, "invalid_clip_role")
+    if role == "motion_driver" and asset.asset_type != "video":
+        _mutation_error("Driver clips require video assets", 400, "invalid_clip_role")
+
+    start_frame = int(fields.get("timeline_start_frame", 0))
+    native_frame_count = _valid_source_frame_count(asset)
+    frame_count = media_timeline_frames(asset, effective_scene_fps(project, scene))
+    if (asset.asset_type == "video" and native_frame_count <= 0
+            and not _finite_positive_number(getattr(asset, "duration_sec", 0.0))):
+        _mutation_error(
+            "Video asset has invalid duration metadata. Refresh assets or re-import the file.",
+            400, "invalid_media_duration")
+    frame_count = frame_count or 1
+    track_index = int(fields.get("track_index", 0))
+    audio_lane_idx = int(fields.get("audio_lane_index", 0))
+    lane_type = "motion_driver" if role == "motion_driver" else "video"
+    if track_index < 0 or track_index >= _scene_lane_count(scene, lane_type):
+        _mutation_error(
+            f"{lane_type.replace('_', ' ').title()} lane index is out of range",
+            404, "item_not_found")
+
+    dual_drop = _clip_dual_drop_uses_media_io(asset, role, fields)
+    if dual_drop and (audio_lane_idx < 0
+                      or audio_lane_idx >= _scene_lane_count(scene, "audio")):
+        _mutation_error("Audio lane index is out of range", 404, "item_not_found")
+
+    clip_fit_mode = str(fields.get("fit_mode", DEFAULT_FIT_MODE)
+                        or DEFAULT_FIT_MODE).strip().lower()
+    if clip_fit_mode not in FIT_MODES:
+        _mutation_error(f"Invalid fit_mode: {clip_fit_mode}", 400, "invalid_fit_mode")
+    clip_crop_position = str(fields.get("crop_position", DEFAULT_CROP_POSITION)
+                             or DEFAULT_CROP_POSITION).strip().lower()
+    if clip_crop_position not in CROP_POSITIONS:
+        _mutation_error(f"Invalid crop_position: {clip_crop_position}", 400,
+                        "invalid_crop_position")
+
+    _require_lane_unlocked(scene, lane_type, track_index)
+    if dual_drop:
+        _require_lane_unlocked(scene, "audio", audio_lane_idx)
+
+    clip = ClipReference(
+        source_path=asset.path,
+        timeline_start_frame=start_frame,
+        timeline_end_frame=start_frame + frame_count,
+        source_in_frame=0,
+        source_out_frame=frame_count,
+        total_source_frames=frame_count,
+        track_index=track_index,
+        role=role,
+        strength=float(fields.get("strength", 1.0)),
+        muted=bool(fields.get("muted", False)),
+        fit_mode=clip_fit_mode,
+        crop_position=clip_crop_position,
+    )
+    scene.clips.append(clip)
+    try:
+        _validate_single_driver_per_lane(scene)
+    except ProjectMutationRequestError:
+        scene.clips = [existing for existing in scene.clips if existing is not clip]
+        raise
+
+    audio_track = None
+    audio_asset = None
+    if dual_drop:
+        # Extraction failure remains non-fatal: the video clip is still a valid
+        # drop and the returned canonical scene records that only it landed.
+        try:
+            audio_asset = _prepare_video_audio_asset(project, asset)
+            if audio_asset:
+                if (_valid_audio_duration_frames(
+                        audio_asset, effective_scene_fps(project, scene)) <= 0):
+                    raise ValueError("Extracted audio has invalid duration metadata")
+                audio_track = AudioTrack(
+                    source_path=audio_asset.path,
+                    timeline_start_frame=start_frame,
+                    timeline_end_frame=start_frame + frame_count,
+                    total_source_frames=frame_count,
+                    lane_index=audio_lane_idx,
+                )
+                scene.audio_tracks.append(audio_track)
+                if fields.get("linked") is not False and fields.get(
+                        "link_video_audio", True):
+                    _add_link_group(scene, [
+                        {"type": "clip", "id": clip.clip_id},
+                        {"type": "audio", "id": audio_track.track_id},
+                    ])
+        except Exception as exc:
+            logger.warning("Dual drop audio extraction failed: %s", exc)
+
+    return clip, audio_track, audio_asset
+
+
+def _apply_create_audio_track(
+        project: TimelineProject, scene: Scene, fields: dict,
+) -> tuple[AudioTrack, Asset | None]:
+    if not isinstance(fields, dict):
+        _mutation_error("create_audio_track requires fields", 400)
+
+    asset_id = fields.get("asset_id", "")
+    asset = project.get_asset(asset_id)
+    if not asset:
+        _mutation_error(f"Asset not found: {asset_id}", 404, "asset_not_found")
+
+    lane_index = int(fields.get("lane_index", 0))
+    if lane_index < 0 or lane_index >= _scene_lane_count(scene, "audio"):
+        _mutation_error("Audio lane index is out of range", 404, "item_not_found")
+    _require_lane_unlocked(scene, "audio", lane_index)
+
+    derived_audio_asset = None
+    if asset.asset_type == "video":
+        if not asset.has_audio:
+            _mutation_error("Video has no embedded audio", 400, "no_embedded_audio")
+        try:
+            derived_audio_asset = _prepare_video_audio_asset(project, asset)
+        except Exception as exc:
+            logger.warning("Audio-only drop extraction failed for %s: %s", asset_id, exc)
+        if not derived_audio_asset:
+            _mutation_error("Failed to extract audio from video", 500,
+                            "audio_extraction_failed")
+        asset = derived_audio_asset
+
+    start_frame = int(fields.get("timeline_start_frame", 0))
+    duration_frames = _valid_audio_duration_frames(
+        asset, effective_scene_fps(project, scene))
+    if asset.asset_type != "audio" or duration_frames <= 0:
+        _mutation_error(
+            "Audio asset has invalid duration metadata. Refresh assets or re-import the file.",
+            400, "invalid_media_duration")
+    track = AudioTrack(
+        source_path=asset.path,
+        timeline_start_frame=start_frame,
+        timeline_end_frame=start_frame + duration_frames,
+        total_source_frames=duration_frames,
+        lane_index=lane_index,
+    )
+    scene.audio_tracks.append(track)
+    return track, derived_audio_asset
+
+
+def _media_io_operation_count(project: TimelineProject, operations: list) -> int:
+    """Count operations that can invoke ffmpeg while one batch worker is held."""
+    count = 0
+    for operation in operations:
+        if not isinstance(operation, dict):
+            continue
+        op_type = str(operation.get("type") or "")
+        fields = operation.get("fields") if isinstance(
+            operation.get("fields"), dict) else {}
+        asset = project.get_asset(fields.get("asset_id", ""))
+        if (op_type == "create_audio_track" and asset is not None
+                and asset.asset_type == "video" and asset.has_audio):
+            count += 1
+        elif (op_type == "create_clip" and asset is not None
+              and _clip_dual_drop_uses_media_io(
+                  asset, fields.get("role", "render"), fields)):
+            count += 1
+    return count
+
+
 def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: dict) -> dict:
     if not isinstance(op, dict):
         _mutation_error("Mutation operation must be an object", 400)
@@ -3680,6 +3862,25 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
         return {"type": op_type}
     if op_type == "consolidate_items":
         return _consolidate_media_items(scene, op)
+    if op_type == "create_clip":
+        clip, audio_track, audio_asset = _apply_create_clip(
+            project, scene, op.get("fields", {}))
+        return {
+            "type": op_type,
+            "clip_id": clip.clip_id,
+            "clip": clip.to_dict(),
+            "audio_track": audio_track.to_dict() if audio_track else None,
+            "audio_asset": audio_asset.to_dict() if audio_asset else None,
+        }
+    if op_type == "create_audio_track":
+        track, audio_asset = _apply_create_audio_track(
+            project, scene, op.get("fields", {}))
+        return {
+            "type": op_type,
+            "track_id": track.track_id,
+            "audio_track": track.to_dict(),
+            "audio_asset": audio_asset.to_dict() if audio_asset else None,
+        }
     if op_type == "create_link_group":
         group = _add_link_group(scene, op.get("items", []), str(op.get("group_id", "") or ""))
         return {"type": op_type, "group_id": group["group_id"], "count": len(group["items"])}
@@ -3899,6 +4100,11 @@ def _apply_scene_mutations_sync(request: web.Request, scene_id: str, operations:
     scene = project.get_scene(scene_id)
     if not scene:
         _mutation_error(f"Scene not found: {scene_id}", 404, "item_not_found")
+
+    if _media_io_operation_count(project, operations) > 1:
+        _mutation_error(
+            "A scene mutation batch may contain at most one media-I/O create operation",
+            400, "too_many_media_io_operations")
 
     # Linked Context edits intentionally update several prompt sections in one
     # batch. Validate every prior identity before mutating the first member, so
@@ -11696,110 +11902,6 @@ if routes is not None:
     # Clips (video on timeline)
     # -----------------------------------------------------------------------
 
-    @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/clips")
-    async def api_add_clip(request: web.Request) -> web.Response:
-        try:
-            project = _load_project_from_request(request)
-        except FileNotFoundError as e:
-            return _json_error(str(e), 404)
-
-        scene_id = request.match_info["scene_id"]
-        scene = project.get_scene(scene_id)
-        if not scene:
-            return _json_error(f"Scene not found: {scene_id}", 404)
-
-        try:
-            body = await request.json()
-        except json.JSONDecodeError:
-            return _json_error("Invalid JSON body", 400)
-
-        asset_id = body.get("asset_id", "")
-        asset = project.get_asset(asset_id)
-        if not asset:
-            return _json_error(f"Asset not found: {asset_id}", 404)
-
-        role = body.get("role", "render")
-        if role not in {"render", "motion_driver"}:
-            return _json_error(f"Invalid clip role: {role}", 400)
-        if role == "motion_driver" and asset.asset_type != "video":
-            return _json_error("Driver clips require video assets", 400)
-        start_frame = int(body.get("timeline_start_frame", 0))
-        native_frame_count = _valid_source_frame_count(asset)
-        frame_count = media_timeline_frames(asset, effective_scene_fps(project, scene))
-        if asset.asset_type == "video" and native_frame_count <= 0 and not _finite_positive_number(getattr(asset, "duration_sec", 0.0)):
-            return _json_error("Video asset has invalid duration metadata. Refresh assets or re-import the file.", 400)
-        frame_count = frame_count or 1
-        end_frame = start_frame + frame_count
-        track_index = int(body.get("track_index", 0))
-        audio_lane_idx = int(body.get("audio_lane_index", 0))
-        clip_fit_mode = str(body.get("fit_mode", DEFAULT_FIT_MODE) or DEFAULT_FIT_MODE).strip().lower()
-        if clip_fit_mode not in FIT_MODES:
-            return _json_error(f"Invalid fit_mode: {clip_fit_mode}", 400)
-        clip_crop_position = str(body.get("crop_position", DEFAULT_CROP_POSITION) or DEFAULT_CROP_POSITION).strip().lower()
-        if clip_crop_position not in CROP_POSITIONS:
-            return _json_error(f"Invalid crop_position: {clip_crop_position}", 400)
-        try:
-            _require_lane_unlocked(scene, "motion_driver" if role == "motion_driver" else "video", track_index)
-            if role != "motion_driver" and body.get("dual_drop") and asset.asset_type == "video" and asset.has_audio:
-                _require_lane_unlocked(scene, "audio", audio_lane_idx)
-        except ProjectMutationRequestError as e:
-            return _mutation_json_error(e)
-
-        clip = ClipReference(
-            source_path=asset.path,
-            timeline_start_frame=start_frame,
-            timeline_end_frame=end_frame,
-            source_in_frame=0,
-            source_out_frame=frame_count,
-            total_source_frames=frame_count,
-            track_index=track_index,
-            role=role,
-            strength=float(body.get("strength", 1.0)),
-            muted=bool(body.get("muted", False)),
-            fit_mode=clip_fit_mode,
-            crop_position=clip_crop_position,
-        )
-        scene.clips.append(clip)
-        try:
-            _validate_single_driver_per_lane(scene)
-        except ProjectMutationRequestError as e:
-            scene.clips = [existing for existing in scene.clips if existing is not clip]
-            return _mutation_json_error(e)
-
-        # Dual drop: also create audio track if video has audio
-        # Wrapped in try/except so audio extraction failure doesn't prevent clip creation
-        audio_track_dict = None
-        if role != "motion_driver" and body.get("dual_drop") and asset.asset_type == "video" and asset.has_audio:
-            try:
-                audio_asset = await asyncio.to_thread(_prepare_video_audio_asset, project, asset)
-                if audio_asset:
-                    if _valid_audio_duration_frames(audio_asset, effective_scene_fps(project, scene)) <= 0:
-                        raise ValueError("Extracted audio has invalid duration metadata")
-                    audio_frames = frame_count
-                    audio_track = AudioTrack(
-                        source_path=audio_asset.path,
-                        timeline_start_frame=start_frame,
-                        timeline_end_frame=start_frame + audio_frames,
-                        total_source_frames=audio_frames,
-                        lane_index=audio_lane_idx,
-                    )
-                    scene.audio_tracks.append(audio_track)
-                    audio_track_dict = audio_track.to_dict()
-                    if body.get("linked") is not False and body.get("link_video_audio", True):
-                        _add_link_group(scene, [
-                            {"type": "clip", "id": clip.clip_id},
-                            {"type": "audio", "id": audio_track.track_id},
-                        ])
-            except Exception as e:
-                logger.warning("Dual drop audio extraction failed: %s", e)
-
-        save_project(project)
-
-        result = clip.to_dict()
-        if audio_track_dict:
-            result["audio_track"] = audio_track_dict
-        return web.json_response(result, status=201)
-
     @routes.delete("/sonder-editor/project/{project_id}/scenes/{scene_id}/clips/{clip_id}")
     async def api_delete_clip(request: web.Request) -> web.Response:
         try:
@@ -11908,68 +12010,6 @@ if routes is not None:
     # -----------------------------------------------------------------------
     # Audio tracks (audio on timeline)
     # -----------------------------------------------------------------------
-
-    @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/audio_tracks")
-    async def api_add_audio_track(request: web.Request) -> web.Response:
-        try:
-            project = _load_project_from_request(request)
-        except FileNotFoundError as e:
-            return _json_error(str(e), 404)
-
-        scene_id = request.match_info["scene_id"]
-        scene = project.get_scene(scene_id)
-        if not scene:
-            return _json_error(f"Scene not found: {scene_id}", 404)
-
-        try:
-            body = await request.json()
-        except json.JSONDecodeError:
-            return _json_error("Invalid JSON body", 400)
-
-        asset_id = body.get("asset_id", "")
-        asset = project.get_asset(asset_id)
-        if not asset:
-            return _json_error(f"Asset not found: {asset_id}", 404)
-
-        lane_index = int(body.get("lane_index", 0))
-        try:
-            _require_lane_unlocked(scene, "audio", lane_index)
-        except ProjectMutationRequestError as e:
-            return _mutation_json_error(e)
-
-        # Zone-model audio-only drop: a video asset on an audio lane places its
-        # extracted audio (derived audio asset, deduped by path).
-        if asset.asset_type == "video":
-            if not asset.has_audio:
-                return _json_error("Video has no embedded audio", 400)
-            try:
-                audio_asset = await asyncio.to_thread(_prepare_video_audio_asset, project, asset)
-            except Exception as e:
-                logger.warning("Audio-only drop extraction failed for %s: %s", asset_id, e)
-                audio_asset = None
-            if not audio_asset:
-                return _json_error("Failed to extract audio from video", 500)
-            asset = audio_asset
-
-        start_frame = int(body.get("timeline_start_frame", 0))
-        # Calculate duration in frames from asset duration
-        fps = effective_scene_fps(project, scene)
-        duration_frames = _valid_audio_duration_frames(asset, fps)
-        if asset.asset_type != "audio" or duration_frames <= 0:
-            return _json_error("Audio asset has invalid duration metadata. Refresh assets or re-import the file.", 400)
-        end_frame = start_frame + duration_frames
-
-        track = AudioTrack(
-            source_path=asset.path,
-            timeline_start_frame=start_frame,
-            timeline_end_frame=end_frame,
-            total_source_frames=duration_frames,
-            lane_index=lane_index,
-        )
-        scene.audio_tracks.append(track)
-        save_project(project)
-
-        return web.json_response(track.to_dict(), status=201)
 
     @routes.delete("/sonder-editor/project/{project_id}/scenes/{scene_id}/audio_tracks/{track_id}")
     async def api_delete_audio_track(request: web.Request) -> web.Response:

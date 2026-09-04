@@ -433,6 +433,301 @@ def _apply_scene_operations(route_module, monkeypatch, project, scene_id, operat
     )))
 
 
+def test_create_clip_batch_adds_tail_lane_audio_link_and_saves_once(
+        monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene", video_lane_count=1, audio_lane_count=1)
+    video = Asset(
+        asset_id="video", asset_type="video", path="media/video.mp4",
+        frame_count=24, duration_sec=1.0, has_audio=True)
+    audio = Asset(
+        asset_id="derived", asset_type="audio", path="media/video_audio.wav",
+        duration_sec=1.0, duration_checked=True)
+    project = TimelineProject(
+        project_dir=str(tmp_path), project_id="proj", scenes=[scene],
+        assets=[video])
+    saves = []
+    monkeypatch.setattr(
+        route_module, "_prepare_video_audio_asset", lambda *_args: audio)
+
+    response = _apply_scene_operations(route_module, monkeypatch, project, "scene", [
+        {"type": "set_lane_count", "lane_type": "video", "count": 2},
+        {"type": "set_lane_count", "lane_type": "audio", "count": 2},
+        {"type": "create_clip", "fields": {
+            "asset_id": "video", "timeline_start_frame": 5,
+            "track_index": 1, "audio_lane_index": 1, "dual_drop": True,
+            "link_video_audio": True,
+        }},
+    ], saves)
+    payload = _response_json(response)
+    result = payload["results"][2]
+
+    assert response.status == 200
+    assert len(saves) == 1
+    assert payload["operation_count"] == 3
+    assert result["type"] == "create_clip"
+    assert result["clip"]["track_index"] == 1
+    assert result["audio_track"]["lane_index"] == 1
+    assert result["audio_asset"]["asset_id"] == "derived"
+    assert payload["scene"]["video_lane_count"] == 2
+    assert payload["scene"]["audio_lane_count"] == 2
+    group = payload["scene"]["linked_item_groups"][0]
+    assert not group["group_id"].startswith("temp-drop-")
+    assert {item["type"] for item in group["items"]} == {"clip", "audio"}
+
+
+def test_create_clip_dual_drop_keeps_clip_when_extraction_fails(
+        monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene")
+    video = Asset(
+        asset_id="video", asset_type="video", path="media/video.mp4",
+        frame_count=24, duration_sec=1.0, has_audio=True)
+    project = TimelineProject(
+        project_dir=str(tmp_path), project_id="proj", scenes=[scene],
+        assets=[video])
+    saves = []
+    monkeypatch.setattr(
+        route_module, "_prepare_video_audio_asset",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("ffmpeg failed")))
+
+    response = _apply_scene_operations(route_module, monkeypatch, project, "scene", [{
+        "type": "create_clip", "fields": {
+            "asset_id": "video", "dual_drop": True,
+        },
+    }], saves)
+    result = _response_json(response)["results"][0]
+
+    assert response.status == 200
+    assert len(saves) == 1
+    assert result["clip"]["clip_id"]
+    assert result["audio_track"] is None
+    assert result["audio_asset"] is None
+    assert len(scene.clips) == 1
+    assert scene.audio_tracks == []
+
+
+@pytest.mark.parametrize(("fields", "status", "code"), [
+    ({"asset_id": "missing"}, 404, "asset_not_found"),
+    ({"asset_id": "video", "role": "invalid"}, 400, "invalid_clip_role"),
+    ({"asset_id": "video", "fit_mode": "invalid"}, 400, "invalid_fit_mode"),
+    ({"asset_id": "video", "crop_position": "invalid"}, 400,
+     "invalid_crop_position"),
+])
+def test_create_clip_reports_stable_refusal_codes(
+        monkeypatch, tmp_path, fields, status, code):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene")
+    project = TimelineProject(
+        project_dir=str(tmp_path), project_id="proj", scenes=[scene],
+        assets=[Asset(
+            asset_id="video", asset_type="video", path="media/video.mp4",
+            frame_count=24, duration_sec=1.0)])
+    saves = []
+
+    response = _apply_scene_operations(route_module, monkeypatch, project, "scene", [
+        {"type": "create_clip", "fields": fields},
+    ], saves)
+
+    assert response.status == status
+    assert _response_json(response)["code"] == code
+    assert scene.clips == []
+    assert saves == []
+
+
+def test_media_create_rejects_out_of_range_lane_without_padding_configs(
+        monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene", video_lane_count=1)
+    scene.video_lane_configs = [LaneConfig(name="Only")]
+    project = TimelineProject(
+        project_dir=str(tmp_path), project_id="proj", scenes=[scene],
+        assets=[Asset(
+            asset_id="video", asset_type="video", path="media/video.mp4",
+            frame_count=24, duration_sec=1.0)])
+    saves = []
+
+    response = _apply_scene_operations(route_module, monkeypatch, project, "scene", [
+        {"type": "create_clip", "fields": {
+            "asset_id": "video", "track_index": 99,
+        }},
+    ], saves)
+
+    assert response.status == 404
+    assert _response_json(response)["code"] == "item_not_found"
+    assert scene.video_lane_count == 1
+    assert len(scene.video_lane_configs) == 1
+    assert scene.clips == []
+    assert saves == []
+
+
+def test_audio_create_rejects_out_of_range_lane_without_padding_configs(
+        monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene", audio_lane_count=1)
+    scene.audio_lane_configs = [LaneConfig(name="Only")]
+    project = TimelineProject(
+        project_dir=str(tmp_path), project_id="proj", scenes=[scene],
+        assets=[Asset(
+            asset_id="audio", asset_type="audio", path="media/audio.wav",
+            duration_sec=1.0, duration_checked=True)])
+    saves = []
+
+    response = _apply_scene_operations(route_module, monkeypatch, project, "scene", [
+        {"type": "create_audio_track", "fields": {
+            "asset_id": "audio", "lane_index": 99,
+        }},
+    ], saves)
+
+    assert response.status == 404
+    assert _response_json(response)["code"] == "item_not_found"
+    assert scene.audio_lane_count == 1
+    assert len(scene.audio_lane_configs) == 1
+    assert scene.audio_tracks == []
+    assert saves == []
+
+
+@pytest.mark.parametrize(("has_audio", "prepared", "status", "code"), [
+    (False, None, 400, "no_embedded_audio"),
+    (True, None, 500, "audio_extraction_failed"),
+])
+def test_create_audio_track_from_video_reports_extraction_refusals(
+        monkeypatch, tmp_path, has_audio, prepared, status, code):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene")
+    video = Asset(
+        asset_id="video", asset_type="video", path="media/video.mp4",
+        frame_count=24, duration_sec=1.0, has_audio=has_audio)
+    project = TimelineProject(
+        project_dir=str(tmp_path), project_id="proj", scenes=[scene],
+        assets=[video])
+    saves = []
+    monkeypatch.setattr(
+        route_module, "_prepare_video_audio_asset", lambda *_args: prepared)
+
+    response = _apply_scene_operations(route_module, monkeypatch, project, "scene", [
+        {"type": "create_audio_track", "fields": {"asset_id": "video"}},
+    ], saves)
+
+    assert response.status == status
+    assert _response_json(response)["code"] == code
+    assert scene.audio_tracks == []
+    assert saves == []
+
+
+def test_create_driver_validation_refuses_in_operation_order(
+        monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene", motion_driver_lane_count=1)
+    video = Asset(
+        asset_id="video", asset_type="video", path="media/video.mp4",
+        frame_count=24, duration_sec=1.0)
+    project = TimelineProject(
+        project_dir=str(tmp_path), project_id="proj", scenes=[scene],
+        assets=[video])
+    saves = []
+
+    response = _apply_scene_operations(route_module, monkeypatch, project, "scene", [
+        {"type": "create_clip", "fields": {
+            "asset_id": "video", "role": "motion_driver"}},
+        {"type": "create_clip", "fields": {
+            "asset_id": "video", "role": "motion_driver"}},
+    ], saves)
+
+    assert response.status == 409
+    assert _response_json(response)["code"] == "driver_lane_occupied"
+    assert len(scene.clips) == 1
+    assert saves == []
+
+    scene.video_lane_count = 1
+    response = _apply_scene_operations(route_module, monkeypatch, project, "scene", [
+        {"type": "create_clip", "fields": {
+            "asset_id": "video", "role": "motion_driver"}},
+        {"type": "set_lane_count", "lane_type": "video", "count": 2},
+    ], saves)
+    assert response.status == 409
+    assert scene.video_lane_count == 1, "an operation after the invalid create must not run"
+    assert len(scene.clips) == 1
+    assert saves == []
+
+
+def test_scene_mutation_batch_caps_media_io_creates(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene")
+    video = Asset(
+        asset_id="video", asset_type="video", path="media/video.mp4",
+        frame_count=24, duration_sec=1.0, has_audio=True)
+    project = TimelineProject(
+        project_dir=str(tmp_path), project_id="proj", scenes=[scene],
+        assets=[video])
+    saves = []
+    monkeypatch.setattr(
+        route_module, "_prepare_video_audio_asset",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("batch cap must run before extraction")))
+
+    response = _apply_scene_operations(route_module, monkeypatch, project, "scene", [
+        {"type": "create_clip", "fields": {
+            "asset_id": "video", "dual_drop": True}},
+        {"type": "create_clip", "fields": {
+            "asset_id": "video", "dual_drop": True}},
+    ], saves)
+
+    assert response.status == 400
+    assert _response_json(response)["code"] == "too_many_media_io_operations"
+    assert scene.clips == []
+    assert saves == []
+
+
+def test_media_io_cap_ignores_non_extracting_media_creates(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(
+        scene_id="scene", video_lane_count=1, audio_lane_count=1,
+        motion_driver_lane_count=1)
+    video = Asset(
+        asset_id="video", asset_type="video", path="media/video.mp4",
+        frame_count=24, duration_sec=1.0, has_audio=True)
+    silent_video = Asset(
+        asset_id="silent", asset_type="video", path="media/silent.mp4",
+        frame_count=24, duration_sec=1.0, has_audio=False)
+    derived_audio = Asset(
+        asset_id="derived", asset_type="audio", path="media/video_audio.wav",
+        duration_sec=1.0, duration_checked=True)
+    project = TimelineProject(
+        project_dir=str(tmp_path), project_id="proj", scenes=[scene],
+        assets=[video, silent_video])
+    saves = []
+    extraction_calls = []
+
+    def prepare(*_args):
+        extraction_calls.append(True)
+        return derived_audio
+
+    monkeypatch.setattr(route_module, "_prepare_video_audio_asset", prepare)
+    response = _apply_scene_operations(route_module, monkeypatch, project, "scene", [
+        {"type": "create_clip", "fields": {
+            "asset_id": "video", "dual_drop": True,
+        }},
+        {"type": "create_clip", "fields": {
+            "asset_id": "video", "role": "motion_driver", "dual_drop": True,
+        }},
+    ], saves)
+
+    assert response.status == 200
+    assert len(extraction_calls) == 1
+    assert len(scene.clips) == 2
+    assert len(scene.audio_tracks) == 1
+    assert len(saves) == 1
+
+    refused = _apply_scene_operations(route_module, monkeypatch, project, "scene", [
+        {"type": "create_audio_track", "fields": {"asset_id": "silent"}},
+        {"type": "create_audio_track", "fields": {"asset_id": "silent"}},
+    ], saves)
+    assert refused.status == 400
+    assert _response_json(refused)["code"] == "no_embedded_audio"
+    assert len(extraction_calls) == 1
+
+
 def test_sonder_route_path_strips_single_api_segment(monkeypatch):
     route_module = _load_route_module(monkeypatch)
 

@@ -65,6 +65,14 @@ def _response_json(response):
     return json.loads(response.body.decode("utf-8"))
 
 
+def _mutation_body(op_type, fields):
+    return {"operations": [{"type": op_type, "fields": fields}]}
+
+
+def _first_mutation_result(response):
+    return _response_json(response)["results"][0]
+
+
 def test_workflow_endpoint_extracts_from_png_when_cache_empty(tmp_path, monkeypatch):
     route_module = _load_route_module(monkeypatch)
     project_dir = tmp_path / "project"
@@ -214,7 +222,7 @@ def test_clip_post_put_role_validation_and_defaults(tmp_path, monkeypatch):
     add_clip = _route_handler(
         route_module,
         "POST",
-        "/sonder-editor/project/{project_id}/scenes/{scene_id}/clips",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/mutations",
     )
     update_clip = _route_handler(
         route_module,
@@ -224,13 +232,14 @@ def test_clip_post_put_role_validation_and_defaults(tmp_path, monkeypatch):
 
     invalid = asyncio.run(add_clip(DummyRequest(
         match_info={"scene_id": "scene-1"},
-        body={"asset_id": "asset-1", "role": "bad"},
+        body=_mutation_body("create_clip", {"asset_id": "asset-1", "role": "bad"}),
     )))
     assert invalid.status == 400
 
     invalid_driver_asset = asyncio.run(add_clip(DummyRequest(
         match_info={"scene_id": "scene-1"},
-        body={"asset_id": "image-1", "role": "motion_driver"},
+        body=_mutation_body(
+            "create_clip", {"asset_id": "image-1", "role": "motion_driver"}),
     )))
     assert invalid_driver_asset.status == 400
 
@@ -241,24 +250,25 @@ def test_clip_post_put_role_validation_and_defaults(tmp_path, monkeypatch):
     )
     motion_driver = asyncio.run(add_clip(DummyRequest(
         match_info={"scene_id": "scene-1"},
-        body={
+        body=_mutation_body("create_clip", {
             "asset_id": "asset-1",
             "role": "motion_driver",
             "timeline_start_frame": 1,
             "dual_drop": True,
-        },
+        }),
     )))
-    motion_driver_json = _response_json(motion_driver)
-    assert motion_driver.status == 201
+    motion_driver_json = _first_mutation_result(motion_driver)["clip"]
+    assert motion_driver.status == 200
     assert motion_driver_json["role"] == "motion_driver"
     assert "audio_track" not in motion_driver_json
     assert scene.audio_tracks == []
 
     created = asyncio.run(add_clip(DummyRequest(
         match_info={"scene_id": "scene-1"},
-        body={"asset_id": "asset-1", "timeline_start_frame": 3},
+        body=_mutation_body(
+            "create_clip", {"asset_id": "asset-1", "timeline_start_frame": 3}),
     )))
-    created_json = _response_json(created)
+    created_json = _first_mutation_result(created)["clip"]
     assert created_json["role"] == "render"
     assert created_json["strength"] == 1.0
 
@@ -280,16 +290,18 @@ def test_clip_post_put_role_validation_and_defaults(tmp_path, monkeypatch):
 
     duplicate_driver = asyncio.run(add_clip(DummyRequest(
         match_info={"scene_id": "scene-1"},
-        body={"asset_id": "asset-1", "role": "motion_driver", "track_index": 1},
+        body=_mutation_body("create_clip", {
+            "asset_id": "asset-1", "role": "motion_driver", "track_index": 1}),
     )))
     assert duplicate_driver.status == 409
     assert _response_json(duplicate_driver)["code"] == "driver_lane_occupied"
 
     render_for_collision = asyncio.run(add_clip(DummyRequest(
         match_info={"scene_id": "scene-1"},
-        body={"asset_id": "asset-1", "timeline_start_frame": 6},
+        body=_mutation_body(
+            "create_clip", {"asset_id": "asset-1", "timeline_start_frame": 6}),
     )))
-    render_for_collision_json = _response_json(render_for_collision)
+    render_for_collision_json = _first_mutation_result(render_for_collision)["clip"]
     collision_id = render_for_collision_json["clip_id"]
     collision_update = asyncio.run(update_clip(DummyRequest(
         match_info={"scene_id": "scene-1", "clip_id": collision_id},
@@ -517,16 +529,17 @@ def test_dual_drop_skips_audio_when_video_asset_has_no_audio(tmp_path, monkeypat
     add_clip = _route_handler(
         route_module,
         "POST",
-        "/sonder-editor/project/{project_id}/scenes/{scene_id}/clips",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/mutations",
     )
     response = asyncio.run(add_clip(DummyRequest(
         match_info={"scene_id": "scene-1"},
-        body={"asset_id": "asset-1", "timeline_start_frame": 3, "dual_drop": True},
+        body=_mutation_body("create_clip", {
+            "asset_id": "asset-1", "timeline_start_frame": 3, "dual_drop": True}),
     )))
-    payload = _response_json(response)
+    payload = _first_mutation_result(response)
 
-    assert response.status == 201
-    assert "audio_track" not in payload
+    assert response.status == 200
+    assert payload["audio_track"] is None
     assert len(scene.clips) == 1
     assert scene.audio_tracks == []
     assert [asset.asset_id for asset in project.assets] == ["asset-1"]
@@ -556,15 +569,17 @@ def test_clip_post_rejects_video_asset_with_invalid_duration_metadata(tmp_path, 
     add_clip = _route_handler(
         route_module,
         "POST",
-        "/sonder-editor/project/{project_id}/scenes/{scene_id}/clips",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/mutations",
     )
     response = asyncio.run(add_clip(DummyRequest(
         match_info={"scene_id": "scene-1"},
-        body={"asset_id": "asset-1", "timeline_start_frame": 3},
+        body=_mutation_body(
+            "create_clip", {"asset_id": "asset-1", "timeline_start_frame": 3}),
     )))
     payload = _response_json(response)
 
     assert response.status == 400
+    assert payload["code"] == "invalid_media_duration"
     assert "invalid duration metadata" in payload["error"]
     assert scene.clips == []
     assert save_calls == []
@@ -594,15 +609,17 @@ def test_audio_track_post_rejects_audio_asset_with_invalid_duration(tmp_path, mo
     add_audio = _route_handler(
         route_module,
         "POST",
-        "/sonder-editor/project/{project_id}/scenes/{scene_id}/audio_tracks",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/mutations",
     )
     response = asyncio.run(add_audio(DummyRequest(
         match_info={"scene_id": "scene-1"},
-        body={"asset_id": "asset-1", "timeline_start_frame": 3},
+        body=_mutation_body("create_audio_track", {
+            "asset_id": "asset-1", "timeline_start_frame": 3}),
     )))
     payload = _response_json(response)
 
     assert response.status == 400
+    assert payload["code"] == "invalid_media_duration"
     assert "invalid duration metadata" in payload["error"]
     assert scene.audio_tracks == []
     assert save_calls == []
@@ -686,20 +703,20 @@ def test_dual_drop_uses_target_audio_lane_lock_only(tmp_path, monkeypatch):
     add_clip = _route_handler(
         route_module,
         "POST",
-        "/sonder-editor/project/{project_id}/scenes/{scene_id}/clips",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/mutations",
     )
     response = asyncio.run(add_clip(DummyRequest(
         match_info={"scene_id": "scene-1"},
-        body={
+        body=_mutation_body("create_clip", {
             "asset_id": "asset-1",
             "timeline_start_frame": 3,
             "dual_drop": True,
             "audio_lane_index": 1,
-        },
+        }),
     )))
-    payload = _response_json(response)
+    payload = _first_mutation_result(response)
 
-    assert response.status == 201
+    assert response.status == 200
     assert payload["audio_track"]["lane_index"] == 1
     assert len(scene.clips) == 1
     assert len(scene.audio_tracks) == 1
@@ -743,16 +760,16 @@ def test_dual_drop_rejects_locked_target_audio_lane_before_clip_creation(tmp_pat
     add_clip = _route_handler(
         route_module,
         "POST",
-        "/sonder-editor/project/{project_id}/scenes/{scene_id}/clips",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/mutations",
     )
     response = asyncio.run(add_clip(DummyRequest(
         match_info={"scene_id": "scene-1"},
-        body={
+        body=_mutation_body("create_clip", {
             "asset_id": "asset-1",
             "timeline_start_frame": 3,
             "dual_drop": True,
             "audio_lane_index": 0,
-        },
+        }),
     )))
     payload = _response_json(response)
 
@@ -797,17 +814,18 @@ def test_dual_drop_rejects_partial_audio_extraction(tmp_path, monkeypatch):
     add_clip = _route_handler(
         route_module,
         "POST",
-        "/sonder-editor/project/{project_id}/scenes/{scene_id}/clips",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/mutations",
     )
     response = asyncio.run(add_clip(DummyRequest(
         match_info={"scene_id": "scene-1"},
-        body={"asset_id": "asset-1", "timeline_start_frame": 3, "dual_drop": True},
+        body=_mutation_body("create_clip", {
+            "asset_id": "asset-1", "timeline_start_frame": 3, "dual_drop": True}),
     )))
-    payload = _response_json(response)
+    payload = _first_mutation_result(response)
     audio_path = project_dir / "media" / "asset-1_audio.wav"
 
-    assert response.status == 201
-    assert "audio_track" not in payload
+    assert response.status == 200
+    assert payload["audio_track"] is None
     assert len(scene.clips) == 1
     assert scene.audio_tracks == []
     assert [asset.asset_id for asset in project.assets] == ["asset-1"]
@@ -1614,7 +1632,8 @@ def test_scene_restore_rejects_invalid_merged_scene(case, tmp_path, monkeypatch)
     payload = _response_json(response)
 
     assert response.status == 409
-    assert payload["code"] == "scene_merge_invalid"
+    assert payload["code"] == (
+        "scene_merge_conflict" if case == "lane" else "scene_merge_invalid")
     assert saves == []
 
 

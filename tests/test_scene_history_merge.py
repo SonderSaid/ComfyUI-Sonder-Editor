@@ -217,6 +217,26 @@ def test_lane_family_merges_atomically_and_conflicts_as_one_unit():
     assert exc.value.conflicts[0]["path"] == "video_lane_family"
 
 
+def test_lane_shrink_refuses_to_strand_concurrently_added_clip():
+    target = _scene(video_lane_count=1,
+                    video_lane_configs=[{"name": "one"}])
+    base = _scene(
+        video_lane_count=2,
+        video_lane_configs=[{"name": "one"}, {"name": "drop lane"}],
+        clips=[{"clip_id": "dropped", "track_index": 1}],
+    )
+    stored = copy.deepcopy(base)
+    stored["clips"].append({
+        "clip_id": "concurrent", "track_index": 1,
+        "timeline_start_frame": 12, "timeline_end_frame": 20,
+    })
+
+    with pytest.raises(SceneMergeConflict) as exc:
+        merge_scene_history(base, target, stored)
+
+    assert exc.value.conflicts[0]["path"] == "clips[concurrent].track_index"
+
+
 def test_geometry_is_conflict_only_and_never_written():
     target = _scene(width=640)
     base = _scene(width=1280)

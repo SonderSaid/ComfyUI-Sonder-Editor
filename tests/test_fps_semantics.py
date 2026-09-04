@@ -175,19 +175,25 @@ def test_add_clip_dual_drop_and_audio_route_match_effective_scene_fps(tmp_path, 
     monkeypatch.setattr(route_module, "_prepare_video_audio_asset", lambda *_args: derived_audio)
     monkeypatch.setattr(route_module, "save_project", lambda _project: None)
 
-    handler = _route_handler(route_module, "POST", "/sonder-editor/project/{project_id}/scenes/{scene_id}/clips")
+    handler = _route_handler(
+        route_module, "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/mutations")
     response = asyncio.run(handler(DummyRequest(
         match_info={"scene_id": "scene-1"},
-        body={"asset_id": "video", "timeline_start_frame": 10, "dual_drop": True},
+        body={"operations": [{"type": "create_clip", "fields": {
+            "asset_id": "video", "timeline_start_frame": 10,
+            "dual_drop": True,
+        }}]},
     )))
-    payload = _payload(response)
+    result = _payload(response)["results"][0]
+    payload = result["clip"]
 
-    assert response.status == 201
+    assert response.status == 200
     assert payload["timeline_end_frame"] - payload["timeline_start_frame"] == expected
     assert payload["source_out_frame"] == expected
     assert payload["total_source_frames"] == expected
-    assert payload["audio_track"]["timeline_end_frame"] - payload["audio_track"]["timeline_start_frame"] == expected
-    assert payload["audio_track"]["total_source_frames"] == expected
+    assert result["audio_track"]["timeline_end_frame"] - result["audio_track"]["timeline_start_frame"] == expected
+    assert result["audio_track"]["total_source_frames"] == expected
 
 
 def test_add_audio_track_route_uses_scene_override(tmp_path, monkeypatch):
@@ -197,14 +203,18 @@ def test_add_audio_track_route_uses_scene_override(tmp_path, monkeypatch):
     project = TimelineProject(project_dir=str(tmp_path), fps=24.0, scenes=[scene], assets=[audio])
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda _request: project)
     monkeypatch.setattr(route_module, "save_project", lambda _project: None)
-    handler = _route_handler(route_module, "POST", "/sonder-editor/project/{project_id}/scenes/{scene_id}/audio_tracks")
+    handler = _route_handler(
+        route_module, "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/mutations")
 
     response = asyncio.run(handler(DummyRequest(
         match_info={"scene_id": "scene-1"},
-        body={"asset_id": "audio", "timeline_start_frame": 5, "lane_index": 0},
+        body={"operations": [{"type": "create_audio_track", "fields": {
+            "asset_id": "audio", "timeline_start_frame": 5, "lane_index": 0,
+        }}]},
     )))
-    payload = _payload(response)
-    assert response.status == 201
+    payload = _payload(response)["results"][0]["audio_track"]
+    assert response.status == 200
     assert payload["timeline_end_frame"] - payload["timeline_start_frame"] == 690
     assert payload["total_source_frames"] == 690
 

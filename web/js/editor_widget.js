@@ -3545,7 +3545,7 @@ export class EditorWidget {
                         operation.fields.track_index);
                 }
                 break;
-            case "drop_clip": {
+            case "create_clip": {
                 const role = String(operation.fields?.role || "render");
                 if (Object.hasOwn(operation.fields || {}, "track_index")) {
                     operation.fields.track_index = rebaseLaneIndex(
@@ -3559,7 +3559,7 @@ export class EditorWidget {
                 }
                 break;
             }
-            case "drop_audio_track":
+            case "create_audio_track":
                 if (Object.hasOwn(operation.fields || {}, "lane_index")) {
                     operation.fields.lane_index = rebaseLaneIndex(
                         "audio", operation.fields.lane_index);
@@ -9337,12 +9337,10 @@ export class EditorWidget {
         const dropContext = this._snapshotProjectMutationContext();
         if (!dropContext) return;
 
-        // Dedicated media-create routes are not scene-mutation operations, but
-        // their lane targets still need the same history-order rebase. Keep a
-        // frontend-only semantic operation in the queue and serialize the HTTP
-        // body from the rebased value only when this slot actually executes.
+        // Media creation and any ruler lane creation share one ordered mutation
+        // batch, so the exact canonical scene can stamp the composite gesture.
         const queueDropMutation = ({
-            keySuffix, label, path, operation, buildInit, historyEntry = null,
+            keySuffix, label, operation, historyEntry = null,
             laneCountOperations = [],
         }) => this._queueProjectMutation({
             key: `scene:${dropContext.sceneId}:drop:${dropSeq}:${keySuffix}`,
@@ -9351,11 +9349,6 @@ export class EditorWidget {
             refreshScenes: false,
             diagnostics,
             historyEntry,
-            // Dedicated routes return only the created entity, never the exact
-            // canonical scene required for a history post-state. A ruler drop's
-            // lane-count response is intermediate and must not stamp the whole
-            // gesture either; Landing 2 makes that unverifiable entry terminal.
-            stampHistory: false,
             intent: {
                 ...dropContext,
                 operations: [
@@ -9364,59 +9357,31 @@ export class EditorWidget {
                 ],
             },
             run: async (orderedIntent, queuedDiagnostics) => {
-                let historyOrderedScene = null;
                 try {
-                    const orderedOperations = orderedIntent?.operations || [];
-                    const orderedLaneCounts = orderedOperations.filter(
-                        (candidate) => candidate?.type === "set_lane_count");
-                    const orderedOperation = orderedOperations.find(
-                        (candidate) => candidate?.type === operation.type) || operation;
-                    if (orderedLaneCounts.length) {
-                        const laneResult = await this._runVersionedProjectMutation(
-                            `/sonder-editor/project/${encodeURIComponent(dropContext.projectId)}/scenes/${encodeURIComponent(dropContext.sceneId)}/mutations`,
-                            this._withMutationDiagnosticHeaders({
-                                method: "POST",
-                                headers: { "Content-Type": "application/json" },
-                                body: JSON.stringify({ operations: orderedLaneCounts }),
-                            }, queuedDiagnostics),
-                            { projectId: dropContext.projectId });
-                        historyOrderedScene = laneResult?.payload?.scene || null;
-                        if (!historyOrderedScene) {
-                            throw new Error("Drop lane creation returned no canonical scene.");
-                        }
-                        for (const countOperation of orderedLaneCounts) {
-                            if (countOperation.lane_type === "video"
-                                    && Object.hasOwn(orderedOperation.fields || {}, "track_index")) {
-                                orderedOperation.fields.track_index =
-                                    laneCountFor(historyOrderedScene, TRACK_TYPE.VIDEO) - 1;
-                            }
-                            if (countOperation.lane_type === "audio"
-                                    && Object.hasOwn(orderedOperation.fields || {}, "audio_lane_index")) {
-                                orderedOperation.fields.audio_lane_index =
-                                    laneCountFor(historyOrderedScene, TRACK_TYPE.AUDIO) - 1;
-                            }
-                            if (countOperation.lane_type === "audio"
-                                    && Object.hasOwn(orderedOperation.fields || {}, "lane_index")) {
-                                orderedOperation.fields.lane_index =
-                                    laneCountFor(historyOrderedScene, TRACK_TYPE.AUDIO) - 1;
-                            }
-                        }
-                    }
                     const result = await this._runVersionedProjectMutation(
-                        path,
-                        this._withMutationDiagnosticHeaders(
-                            buildInit(orderedOperation), queuedDiagnostics),
+                        `/sonder-editor/project/${encodeURIComponent(dropContext.projectId)}/scenes/${encodeURIComponent(dropContext.sceneId)}/mutations`,
+                        this._withMutationDiagnosticHeaders({
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({
+                                operations: orderedIntent?.operations || [],
+                            }),
+                        }, queuedDiagnostics),
                         { projectId: dropContext.projectId });
                     return { ok: true, payload: result?.payload };
                 } catch (error) {
-                    // This handler owns dedicated-drop failure presentation and
-                    // rollback, so resolve a sentinel to avoid the queue's second
-                    // generic toast.
+                    // This handler owns drop failure presentation and rollback,
+                    // so resolve a sentinel to avoid the queue's generic toast.
                     this._discardUnstampableUndoEntry(historyEntry);
                     return { ok: false, error };
                 }
             },
         });
+        const dropOperationResult = (payload, type) => (
+            Array.isArray(payload?.results)
+                ? payload.results.find((result) => result?.type === type)
+                : null
+        );
 
         // Zone-model drop targeting (2026-06-11, user-decided rules):
         //   ruler strip  -> ALWAYS a new lane (the only auto-lane-creation path;
@@ -9487,10 +9452,9 @@ export class EditorWidget {
                 const driverOutcome = await queueDropMutation({
                     keySuffix: "driver",
                     label: "drop driver clip",
-                    path: `/sonder-editor/project/${encodeURIComponent(dropContext.projectId)}/scenes/${encodeURIComponent(dropContext.sceneId)}/clips`,
                     historyEntry: driverUndoEntry,
                     operation: {
-                        type: "drop_clip",
+                        type: "create_clip",
                         fields: {
                             asset_id: asset.asset_id,
                             timeline_start_frame: frame,
@@ -9502,11 +9466,6 @@ export class EditorWidget {
                             crop_position: this._defaultCropPosition(),
                         },
                     },
-                    buildInit: (orderedOperation) => ({
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify(orderedOperation.fields),
-                    }),
                 });
                 if (!driverOutcome?.ok) {
                     const error = driverOutcome?.error;
@@ -9518,11 +9477,16 @@ export class EditorWidget {
                     await this._fetchScenes({ ignoreMutationGate: true, reason: "drop_motion_driver_error" });
                     return;
                 }
-                const createdClip = driverOutcome.payload;
+                const createdClip = dropOperationResult(
+                    driverOutcome.payload, "create_clip")?.clip;
+                if (!createdClip) {
+                    throw new Error("Driver creation returned no clip result.");
+                }
                 const clipIdx = (this.activeScene.clips || []).findIndex((clip) => clip.clip_id === tempClipId);
                 if (clipIdx >= 0) this.activeScene.clips[clipIdx] = createdClip;
                 this._renderSceneAfterLocalMutation();
-                this._deferProjectBackedRefresh(["scenes"], "motion_driver_drop_reconcile");
+                this._reconcileActiveSceneFromMutation(
+                    driverOutcome, { reason: "motion_driver_drop_reconcile" });
             } catch (e) {
                 this._discardUnstampableUndoEntry(driverUndoEntry);
                 await this._fetchScenes({ ignoreMutationGate: true, reason: "drop_motion_driver_error" });
@@ -9647,7 +9611,7 @@ export class EditorWidget {
         }
 
         // Ruler-zone drops create their new lane(s) optimistically. The count
-        // operation and dedicated media create execute inside one queue-owned
+        // operation and media-create operation execute inside one queue-owned
         // slot below, so no unrelated mutation can interleave between them.
         if (Object.keys(laneCountFields).length > 0) {
             for (const trackType of [TRACK_TYPE.VIDEO, TRACK_TYPE.AUDIO]) {
@@ -9736,11 +9700,10 @@ export class EditorWidget {
                 const clipOutcome = await queueDropMutation({
                     keySuffix: "clip",
                     label: "drop clip",
-                    path: `/sonder-editor/project/${encodeURIComponent(dropContext.projectId)}/scenes/${encodeURIComponent(dropContext.sceneId)}/clips`,
                     historyEntry: assetUndoEntry,
                     laneCountOperations,
                     operation: {
-                        type: "drop_clip",
+                        type: "create_clip",
                         fields: {
                             asset_id: asset.asset_id,
                             timeline_start_frame: frame,
@@ -9752,11 +9715,6 @@ export class EditorWidget {
                             crop_position: this._defaultCropPosition(),
                         },
                     },
-                    buildInit: (orderedOperation) => ({
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify(orderedOperation.fields),
-                    }),
                 });
                 if (!clipOutcome?.ok) {
                     const error = clipOutcome?.error;
@@ -9767,8 +9725,13 @@ export class EditorWidget {
                     await this._fetchScenes({ ignoreMutationGate: true, reason: "drop_clip_error" });
                     return;
                 }
-                const clipPayload = clipOutcome.payload;
-                const { audio_track: createdAudioTrack, ...createdClip } = clipPayload || {};
+                const clipResult = dropOperationResult(
+                    clipOutcome.payload, "create_clip");
+                const createdClip = clipResult?.clip;
+                const createdAudioTrack = clipResult?.audio_track;
+                if (!createdClip) {
+                    throw new Error("Clip creation returned no clip result.");
+                }
                 const clipIdx = (this.activeScene.clips || []).findIndex((clip) => clip.clip_id === optimisticClipId);
                 if (clipIdx >= 0) {
                     this.activeScene.clips[clipIdx] = createdClip;
@@ -9777,22 +9740,13 @@ export class EditorWidget {
                     if (createdAudioTrack) {
                         const audioIdx = (this.activeScene.audio_tracks || []).findIndex((track) => track.track_id === optimisticAudioId);
                         if (audioIdx >= 0) this.activeScene.audio_tracks[audioIdx] = createdAudioTrack;
-                        if (this._settings?.timelineBehavior?.linkedVideoAudioDrop !== false) {
-                            this.activeScene.linked_item_groups = (this.activeScene.linked_item_groups || [])
-                                .filter((group) => !(group?.group_id || "").startsWith("temp-drop-"));
-                            this.activeScene.linked_item_groups.push({
-                                group_id: `temp-drop-${Date.now().toString(36)}`,
-                                items: [
-                                    { type: "clip", id: createdClip.clip_id },
-                                    { type: "audio", id: createdAudioTrack.track_id },
-                                ],
-                            });
-                        }
                     } else {
                         this.activeScene.audio_tracks = (this.activeScene.audio_tracks || []).filter((track) => track.track_id !== optimisticAudioId);
                     }
                 }
                 this._renderSceneAfterLocalMutation();
+                this._reconcileActiveSceneFromMutation(
+                    clipOutcome, { reason: "asset_drop_reconcile" });
             } else if (asset.asset_type === "audio" || audioFromVideo) {
                 // Drop audio = create audio track on target audio lane.
                 // audioFromVideo: a video asset dropped on an audio lane places
@@ -9821,22 +9775,16 @@ export class EditorWidget {
                 const audioOutcome = await queueDropMutation({
                     keySuffix: "audio",
                     label: "drop audio track",
-                    path: `/sonder-editor/project/${encodeURIComponent(dropContext.projectId)}/scenes/${encodeURIComponent(dropContext.sceneId)}/audio_tracks`,
                     historyEntry: assetUndoEntry,
                     laneCountOperations,
                     operation: {
-                        type: "drop_audio_track",
+                        type: "create_audio_track",
                         fields: {
                             asset_id: asset.asset_id,
                             timeline_start_frame: frame,
                             lane_index: targetAudioLane,
                         },
                     },
-                    buildInit: (orderedOperation) => ({
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify(orderedOperation.fields),
-                    }),
                 });
                 if (!audioOutcome?.ok) {
                     const error = audioOutcome?.error;
@@ -9847,16 +9795,21 @@ export class EditorWidget {
                     await this._fetchScenes({ ignoreMutationGate: true, reason: "drop_audio_error" });
                     return;
                 }
-                const audioPayload = audioOutcome.payload;
+                const audioPayload = dropOperationResult(
+                    audioOutcome.payload, "create_audio_track")?.audio_track;
+                if (!audioPayload) {
+                    throw new Error("Audio track creation returned no track result.");
+                }
                 const audioIdx = (this.activeScene.audio_tracks || []).findIndex((track) => track.track_id === optimisticAudioId);
                 if (audioIdx >= 0) this.activeScene.audio_tracks[audioIdx] = audioPayload;
                 this._renderSceneAfterLocalMutation();
+                this._reconcileActiveSceneFromMutation(
+                    audioOutcome, { reason: "asset_drop_reconcile" });
             }
 
             if (droppedVideoHasAudio) {
                 this._deferProjectBackedRefresh(["assets"], "dual_drop_asset_refresh");
             }
-            this._deferProjectBackedRefresh(["scenes"], "asset_drop_reconcile");
         } catch (e) {
             this._discardUnstampableUndoEntry(assetUndoEntry);
             await this._fetchScenes({ ignoreMutationGate: true, reason: "asset_drop_error" });

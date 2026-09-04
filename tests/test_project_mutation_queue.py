@@ -22,6 +22,12 @@ def _run_node(script: str) -> None:
     assert result.returncode == 0, result.stderr or result.stdout
 
 
+def _method(source: str, start: str, end: str) -> str:
+    begin = source.index(f"    {start}(")
+    finish = source.index(f"    {end}(", begin)
+    return source[begin:finish]
+
+
 def test_project_mutation_queue_contract_and_version_headers():
     queue_url = (ROOT / "web" / "js" / "project_mutation_queue.js").as_uri()
     api_url = (ROOT / "web" / "js" / "api_client.js").as_uri()
@@ -248,7 +254,7 @@ def test_owner_token_reentrancy_is_identity_scoped_and_missing_token_deadlocks()
     """)
 
 
-def test_reconcile_retry_has_one_gesture_and_distinct_physical_request_ids():
+def test_folded_asset_drop_retry_replays_one_batch_without_duplicate_entities():
     api_url = (ROOT / "web" / "js" / "api_client.js").as_uri()
     _run_node(f"""
         import assert from 'node:assert/strict';
@@ -258,6 +264,7 @@ def test_reconcile_retry_has_one_gesture_and_distinct_physical_request_ids():
         }} from {api_url!r};
 
         const requests = [];
+        const server = {{ video_lane_count: 1, clips: [] }};
         rememberProjectVersion('retry-proj', '2026-09-02T10:00:00');
         globalThis.fetch = async (_url, init = {{}}) => {{
             const headers = new Headers(init.headers || {{}});
@@ -267,6 +274,7 @@ def test_reconcile_retry_has_one_gesture_and_distinct_physical_request_ids():
                 requestId: headers.get('X-Sonder-Request-Id'),
                 attempt: headers.get('X-Sonder-Gesture-Attempt'),
                 ifMatch: headers.get('If-Match'),
+                body: JSON.parse(init.body),
             }});
             if (requests.length === 1) {{
                 return new Response(JSON.stringify({{
@@ -285,7 +293,14 @@ def test_reconcile_retry_has_one_gesture_and_distinct_physical_request_ids():
                     }},
                 }});
             }}
-            return new Response(JSON.stringify({{ ok: true }}), {{ status: 200 }});
+            for (const operation of requests.at(-1).body.operations) {{
+                if (operation.type === 'set_lane_count') {{
+                    server.video_lane_count = operation.count;
+                }} else if (operation.type === 'create_clip') {{
+                    server.clips.push({{ clip_id: 'created', ...operation.fields }});
+                }}
+            }}
+            return new Response(JSON.stringify({{ scene: server }}), {{ status: 200 }});
         }};
 
         const result = await postProjectJsonWithReconcile(
@@ -295,9 +310,14 @@ def test_reconcile_retry_has_one_gesture_and_distinct_physical_request_ids():
                 headers: {{
                     'Content-Type': 'application/json',
                     'X-Sonder-Gesture-Id': 'gesture-9',
-                    'X-Sonder-Gesture-Kind': 'moveItem',
+                    'X-Sonder-Gesture-Kind': 'assetDrop',
                 }},
-                body: JSON.stringify({{ operations: [] }}),
+                body: JSON.stringify({{ operations: [
+                    {{ type: 'set_lane_count', lane_type: 'video', count: 2 }},
+                    {{ type: 'create_clip', fields: {{
+                        asset_id: 'video', track_index: 1,
+                    }} }},
+                ] }}),
             }},
             {{ projectId: 'retry-proj', maxAttempts: 2 }},
         );
@@ -306,11 +326,56 @@ def test_reconcile_retry_has_one_gesture_and_distinct_physical_request_ids():
         assert.deepEqual(requests.map((value) => value.gestureId),
             ['gesture-9', 'gesture-9']);
         assert.deepEqual(requests.map((value) => value.gestureKind),
-            ['moveItem', 'moveItem']);
+            ['assetDrop', 'assetDrop']);
         assert.notEqual(requests[0].requestId, requests[1].requestId);
         assert.deepEqual(requests.map((value) => value.attempt), ['1', '2']);
         assert.deepEqual(requests.map((value) => value.ifMatch),
             ['2026-09-02T10:00:00', '2026-09-02T10:00:01']);
+        assert.deepEqual(requests[0].body, requests[1].body);
+        assert.equal(server.video_lane_count, 2);
+        assert.equal(server.clips.length, 1);
+    """)
+
+
+def test_asset_drop_append_rebase_keeps_lane_count_and_create_target_aligned():
+    source = (ROOT / "web" / "js" / "editor_widget.js").read_text(
+        encoding="utf-8")
+    rebase = _method(source, "_historyExpectedProjection", "_queueProjectMutation")
+    _run_node(f"""
+        import assert from 'node:assert/strict';
+        class Harness {{
+        {rebase}
+        }}
+        const h = new Harness();
+        const scene = (video, audio = 1) => ({{
+            scene_id: 'scene', video_lane_count: video,
+            audio_lane_count: audio, clips: [], audio_tracks: [],
+        }});
+        for (const [authoredCount, orderedCount] of [[3, 5], [5, 3], [4, 4]]) {{
+            const operations = [
+                {{type: 'set_lane_count', lane_type: 'video', count: authoredCount + 1}},
+                {{type: 'create_clip', fields: {{track_index: authoredCount}}}},
+            ];
+            const rebased = h._rebaseSceneMutationIntentForHistory(
+                {{sceneId: 'scene', operations}}, scene(orderedCount),
+                scene(authoredCount)).operations;
+            assert.equal(rebased[0].count, orderedCount + 1);
+            assert.equal(rebased[1].fields.track_index, orderedCount);
+        }}
+
+        const dual = h._rebaseSceneMutationIntentForHistory({{
+            sceneId: 'scene', operations: [
+                {{type: 'set_lane_count', lane_type: 'video', count: 3}},
+                {{type: 'set_lane_count', lane_type: 'audio', count: 5}},
+                {{type: 'create_clip', fields: {{
+                    track_index: 2, audio_lane_index: 4, dual_drop: true,
+                }}}},
+            ],
+        }}, scene(5, 1), scene(2, 4)).operations;
+        assert.equal(dual[0].count, 6);
+        assert.equal(dual[2].fields.track_index, 5);
+        assert.equal(dual[1].count, 2);
+        assert.equal(dual[2].fields.audio_lane_index, 1);
     """)
 
 
