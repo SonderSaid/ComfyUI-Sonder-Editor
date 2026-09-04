@@ -149,8 +149,13 @@ def _validate_cache_root_path(root: str) -> None:
         raise RenderCacheError("Render cache root contains a reparse-point ancestor")
 
 
-def render_cache_root(project, *, create: bool = False) -> str:
-    root = resolve_project_path(project, os.path.join("cache", "renders"), purpose="render cache root")
+def render_cache_root(project_or_dir, *, create: bool = False) -> str:
+    """Contained cache root for a TimelineProject or a project directory string.
+
+    Cache helpers need only the directory; parsed project state is never read.
+    Both forms share the same root/store locks and active-store protection.
+    """
+    root = resolve_project_path(project_or_dir, os.path.join("cache", "renders"), purpose="render cache root")
     if not root:
         return root
     _validate_cache_root_path(root)
@@ -160,8 +165,8 @@ def render_cache_root(project, *, create: bool = False) -> str:
     return root
 
 
-def cache_store(project, scene_id: str, width: int, height: int, fps: float) -> RenderCacheStore | None:
-    root = render_cache_root(project)
+def cache_store(project_or_dir, scene_id: str, width: int, height: int, fps: float) -> RenderCacheStore | None:
+    root = render_cache_root(project_or_dir)
     if not root:
         return None
     frames = block_frame_count(width, height)
@@ -176,7 +181,7 @@ def cache_store(project, scene_id: str, width: int, height: int, fps: float) -> 
     }
     digest = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:32]
     token = f"rc3_{digest}.cache"
-    path = resolve_project_path(project, os.path.join("cache", "renders", token), purpose="render cache store")
+    path = resolve_project_path(project_or_dir, os.path.join("cache", "renders", token), purpose="render cache store")
     if not path:
         return None
     return RenderCacheStore(root=root, path=path, token=token, block_frames=frames)
@@ -402,8 +407,8 @@ def _legacy_path(root: str, token: str) -> str:
     return path
 
 
-def _store_from_token(project, token: str) -> RenderCacheStore:
-    root = render_cache_root(project)
+def _store_from_token(project_or_dir, token: str) -> RenderCacheStore:
+    root = render_cache_root(project_or_dir)
     if not root or not _STORE_RE.fullmatch(str(token or "")):
         raise RenderCacheError("Invalid render cache entry")
     path = os.path.abspath(os.path.join(root, token))
@@ -412,8 +417,8 @@ def _store_from_token(project, token: str) -> RenderCacheStore:
     return RenderCacheStore(root=root, path=path, token=token, block_frames=1)
 
 
-def _list_render_cache_entries_unlocked(project) -> list[dict]:
-    root = render_cache_root(project)
+def _list_render_cache_entries_unlocked(project_or_dir) -> list[dict]:
+    root = render_cache_root(project_or_dir)
     if not root or not os.path.isdir(root):
         return []
     entries = []
@@ -442,20 +447,20 @@ def _list_render_cache_entries_unlocked(project) -> list[dict]:
     return entries
 
 
-def list_render_cache_entries(project) -> list[dict]:
-    root = render_cache_root(project)
+def list_render_cache_entries(project_or_dir) -> list[dict]:
+    root = render_cache_root(project_or_dir)
     if not root or not os.path.isdir(root):
         return []
     with _root_lock(root):
-        return _list_render_cache_entries_unlocked(project)
+        return _list_render_cache_entries_unlocked(project_or_dir)
 
 
-def _delete_render_cache_entry_unlocked(project, root: str, token: str) -> dict:
+def _delete_render_cache_entry_unlocked(project_or_dir, root: str, token: str) -> dict:
     token = str(token or "").strip()
     if token in active_store_tokens(root):
         raise RenderCacheActiveError("Render cache entry is active")
     if _STORE_RE.fullmatch(token):
-        store = _store_from_token(project, token)
+        store = _store_from_token(project_or_dir, token)
         with _store_lock(store.path):
             if not os.path.isdir(store.path):
                 raise FileNotFoundError("Render cache entry not found")
@@ -472,15 +477,15 @@ def _delete_render_cache_entry_unlocked(project, root: str, token: str) -> dict:
     return {"deleted": True, "filename": token}
 
 
-def delete_render_cache_entry(project, token: str) -> dict:
-    root = render_cache_root(project)
+def delete_render_cache_entry(project_or_dir, token: str) -> dict:
+    root = render_cache_root(project_or_dir)
     if not root:
         raise FileNotFoundError("Render cache entry not found")
     with _root_lock(root):
-        return _delete_render_cache_entry_unlocked(project, root, token)
+        return _delete_render_cache_entry_unlocked(project_or_dir, root, token)
 
 
-def enforce_render_cache_budget(project, max_size_bytes: int | None, *,
+def enforce_render_cache_budget(project_or_dir, max_size_bytes: int | None, *,
                                 protected_tokens=()) -> dict:
     """Evict oldest whole entries until the project cache fits its soft budget."""
     if max_size_bytes is not None:
@@ -489,7 +494,7 @@ def enforce_render_cache_budget(project, max_size_bytes: int | None, *,
         if max_size_bytes < 0:
             raise RenderCacheError("Render cache budget must be a non-negative integer or null")
 
-    root = render_cache_root(project)
+    root = render_cache_root(project_or_dir)
     if not root or not os.path.isdir(root):
         return {
             "entry_count": 0,
@@ -503,7 +508,7 @@ def enforce_render_cache_budget(project, max_size_bytes: int | None, *,
         }
 
     with _root_lock(root):
-        entries = _list_render_cache_entries_unlocked(project)
+        entries = _list_render_cache_entries_unlocked(project_or_dir)
         protected = {
             str(token) for token in protected_tokens or ()
             if isinstance(token, str) and token
@@ -523,7 +528,7 @@ def enforce_render_cache_budget(project, max_size_bytes: int | None, *,
                     continue
                 entry_size = max(0, int(entry.get("size_bytes", 0) or 0))
                 try:
-                    _delete_render_cache_entry_unlocked(project, root, token)
+                    _delete_render_cache_entry_unlocked(project_or_dir, root, token)
                 except FileNotFoundError:
                     total_size = max(0, total_size - entry_size)
                 except (OSError, RenderCacheError) as exc:
@@ -534,7 +539,7 @@ def enforce_render_cache_budget(project, max_size_bytes: int | None, *,
                     deleted_bytes += entry_size
                     total_size = max(0, total_size - entry_size)
 
-        remaining = _list_render_cache_entries_unlocked(project)
+        remaining = _list_render_cache_entries_unlocked(project_or_dir)
         total_size = sum(max(0, int(entry.get("size_bytes", 0) or 0)) for entry in remaining)
         remaining_tokens = {str(entry.get("filename") or "") for entry in remaining}
         protected_remaining = sorted(protected & remaining_tokens)

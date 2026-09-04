@@ -19,3 +19,9 @@ export function applyRenderCacheSettingToNodes(nodes, settings) {
     }
     return changed;
 }
+
+// Only overlapping callers in the same lifecycle wave may share a sweep.
+// Explicit clear, budget-change, and queue-idle events use a new generation.
+export function shouldJoinSweep(inFlight, key, generation) {
+    return !!inFlight && inFlight.key === key && inFlight.generation === generation;
+}

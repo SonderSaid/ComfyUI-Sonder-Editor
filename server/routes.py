@@ -6716,6 +6716,26 @@ def _direct_project_dir_from_request(request: web.Request) -> str | None:
     return project_dir
 
 
+def _render_cache_project_dir(request: web.Request) -> str:
+    """Resolve derived cache storage without parsing the project for folder ids.
+
+    render_cache_root accepts a directory; cache maintenance neither reads nor
+    writes project document state, so its If-Match gate and repair saves do not
+    apply. Retain the repair-free, version-unchecked load for canonical ids that
+    differ from folder names until that alias lookup can resolve without a model.
+    """
+    project_dir = _direct_project_dir_from_request(request)
+    if not project_dir:
+        project = _load_project_from_request(
+            request, repair_missing_frames=False, version_checked=False,
+        )
+        project_dir = str(getattr(project, "project_dir", "") or "")
+    if not project_dir:
+        # An empty root resolves to CWD and would make its cache evictable.
+        raise _bad_project_request("Project directory could not be resolved")
+    return project_dir
+
+
 def _project_file_matches_request(data: dict, requested_id: str, folder_name: str) -> bool:
     canonical_id = str(data.get("project_id", "") or "")
     return requested_id == folder_name or requested_id == canonical_id
@@ -7710,8 +7730,8 @@ def _purge_expired_trashed_assets(
     return changed
 
 
-def _list_render_cache_entries(project: TimelineProject) -> list[dict]:
-    return list_render_cache_entries(project)
+def _list_render_cache_entries(project_or_dir: str) -> list[dict]:
+    return list_render_cache_entries(project_or_dir)
 
 
 def _trash_project_asset_folder(project: TimelineProject, folder: str) -> tuple[list[str], list[Asset]]:
@@ -9098,12 +9118,12 @@ if routes is not None:
     @routes.get("/sonder-editor/project/{project_id}/cache/renders")
     async def api_list_render_cache(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project_dir = await asyncio.to_thread(_render_cache_project_dir, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
         try:
-            entries = await asyncio.to_thread(_list_render_cache_entries, project)
+            entries = await asyncio.to_thread(_list_render_cache_entries, project_dir)
         except RenderCacheError as e:
             return _json_error(str(e), 400)
         except OSError as e:
@@ -9113,11 +9133,6 @@ if routes is not None:
 
     @routes.post("/sonder-editor/project/{project_id}/cache/renders/sweep")
     async def api_sweep_render_cache(request: web.Request) -> web.Response:
-        try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
-        except FileNotFoundError as e:
-            return _json_error(str(e), 404)
-
         try:
             body = await request.json()
         except (json.JSONDecodeError, TypeError):
@@ -9138,7 +9153,12 @@ if routes is not None:
             max_size_bytes = raw_budget
 
         try:
-            result = await asyncio.to_thread(enforce_render_cache_budget, project, max_size_bytes)
+            project_dir = await asyncio.to_thread(_render_cache_project_dir, request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        try:
+            result = await asyncio.to_thread(enforce_render_cache_budget, project_dir, max_size_bytes)
         except RenderCacheError as e:
             return _json_error(str(e), 400)
         except OSError as e:
@@ -9146,17 +9166,19 @@ if routes is not None:
             return _json_error("Failed to sweep render cache", 500)
         return web.json_response(result)
 
+    # Retained for external/manual clients; no frontend caller as of 0.3.0.
+    # Removable once a release ships with no non-frontend caller observed.
     @routes.delete("/sonder-editor/project/{project_id}/cache/renders/{filename}")
     async def api_delete_render_cache_entry(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project_dir = await asyncio.to_thread(_render_cache_project_dir, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
         try:
             payload = await asyncio.to_thread(
                 delete_render_cache_entry,
-                project,
+                project_dir,
                 request.match_info.get("filename", ""),
             )
         except FileNotFoundError:

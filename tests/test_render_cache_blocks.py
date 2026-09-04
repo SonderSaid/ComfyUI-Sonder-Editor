@@ -935,3 +935,45 @@ def test_cache_publication_failure_is_diagnostic_and_returns_output(tmp_path, mo
     assert "outcome=publication_failed" in caplog.text
     assert "published=partial_or_unknown" in caplog.text
     assert "reason=publish denied" in caplog.text
+
+
+def test_directory_string_cache_contract_and_eviction_parity(tmp_path):
+    project, scene, _ = _project_scene(tmp_path)
+    directory = project.project_dir
+    store = cache_store(project, scene.scene_id, 1, 1, 24.0)
+    assert cache_store(directory, scene.scene_id, 1, 1, 24.0) == store
+    os.makedirs(store.path)
+    block = os.path.join(store.path, 'block_00000000.pt')
+    old = os.path.join(store.root, 'old.pt')
+    new = os.path.join(store.root, 'new.pt')
+
+    def populate():
+        for path, content, mtime in [(old, b'old', 100), (new, b'newer', 200), (block, b'block', 300)]:
+            with open(path, 'wb') as handle:
+                handle.write(content)
+            os.utime(path, (mtime, mtime))
+        os.utime(store.path, (300, 300))
+
+    populate()
+    assert list_render_cache_entries(project) == list_render_cache_entries(directory)
+    assert enforce_render_cache_budget(project, None) == enforce_render_cache_budget(directory, None)
+    result = enforce_render_cache_budget(project, 10)
+    populate()
+    assert enforce_render_cache_budget(directory, 10) == result
+    assert result['deleted'] == ['old.pt']
+    assert result['size_bytes'] == 10
+    result = delete_render_cache_entry(project, 'new.pt')
+    populate()
+    assert delete_render_cache_entry(directory, 'new.pt') == result
+
+    # A renderer holding the model form protects a directory-addressed sweep.
+    with active_cache_store(store):
+        result = enforce_render_cache_budget(directory, 0)
+        assert result['pending'] is True
+        assert result['protected'] == [store.token]
+        with pytest.raises(RenderCacheActiveError):
+            delete_render_cache_entry(directory, store.token)
+    result = enforce_render_cache_budget(directory, 0)
+    assert result['pending'] is False
+    assert result['deleted'] == [store.token]
+    assert list_render_cache_entries(directory) == []

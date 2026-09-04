@@ -1286,7 +1286,9 @@ def test_render_cache_routes_list_and_delete_project_cache_files(tmp_path, monke
     os.utime(old_path, (100, 100))
     os.utime(new_path, (200, 200))
 
-    monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
+    # Folder requests must resolve storage without loading a project model.
+    _write_project_file(project, "project.json", b"{}")
+    monkeypatch.setattr(module, "_get_base_dir", lambda: str(tmp_path))
     threaded_calls = []
 
     async def tracked_to_thread(function, *args, **kwargs):
@@ -1295,7 +1297,7 @@ def test_render_cache_routes_list_and_delete_project_cache_files(tmp_path, monke
 
     monkeypatch.setattr(module.asyncio, "to_thread", tracked_to_thread)
 
-    response = asyncio.run(module.api_list_render_cache(DummyRequest(match_info={"project_id": "phase-2"})))
+    response = asyncio.run(module.api_list_render_cache(DummyRequest(match_info={"project_id": "project"})))
     payload = _response_json(response)
 
     assert response.status == 200
@@ -1303,29 +1305,29 @@ def test_render_cache_routes_list_and_delete_project_cache_files(tmp_path, monke
     assert payload[2]["filename"] == store_token
     assert payload[2]["size_bytes"] == 5
     assert payload[0]["size_bytes"] == 3
-    assert threaded_calls[-2:] == [module._load_project_from_request, module._list_render_cache_entries]
+    assert threaded_calls[-2:] == [module._render_cache_project_dir, module._list_render_cache_entries]
 
     delete_response = asyncio.run(module.api_delete_render_cache_entry(DummyRequest(
-        match_info={"project_id": "phase-2", "filename": "scene-old.pt"},
+        match_info={"project_id": "project", "filename": "scene-old.pt"},
     )))
     assert delete_response.status == 200
     assert not os.path.exists(old_path)
     assert os.path.exists(new_path)
-    assert threaded_calls[-2:] == [module._load_project_from_request, module.delete_render_cache_entry]
+    assert threaded_calls[-2:] == [module._render_cache_project_dir, module.delete_render_cache_entry]
 
     store_delete_response = asyncio.run(module.api_delete_render_cache_entry(DummyRequest(
-        match_info={"project_id": "phase-2", "filename": store_token},
+        match_info={"project_id": "project", "filename": store_token},
     )))
     assert store_delete_response.status == 200
     assert not os.path.exists(store_path)
 
     missing_response = asyncio.run(module.api_delete_render_cache_entry(DummyRequest(
-        match_info={"project_id": "phase-2", "filename": "missing.pt"},
+        match_info={"project_id": "project", "filename": "missing.pt"},
     )))
     assert missing_response.status == 404
 
     invalid_response = asyncio.run(module.api_delete_render_cache_entry(DummyRequest(
-        match_info={"project_id": "phase-2", "filename": "..\\escape.pt"},
+        match_info={"project_id": "project", "filename": "..\\escape.pt"},
     )))
     assert invalid_response.status == 400
 
@@ -1343,7 +1345,9 @@ def test_render_cache_sweep_route_validates_budget_and_runs_off_loop(tmp_path, m
         handle.write(b"newer")
     os.utime(old_path, (100, 100))
     os.utime(new_path, (200, 200))
-    monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
+    # Folder requests must resolve storage without loading a project model.
+    _write_project_file(project, "project.json", b"{}")
+    monkeypatch.setattr(module, "_get_base_dir", lambda: str(tmp_path))
     threaded_calls = []
 
     async def tracked_to_thread(function, *args, **kwargs):
@@ -1352,7 +1356,7 @@ def test_render_cache_sweep_route_validates_budget_and_runs_off_loop(tmp_path, m
 
     monkeypatch.setattr(module.asyncio, "to_thread", tracked_to_thread)
     response = asyncio.run(module.api_sweep_render_cache(DummyRequest(
-        match_info={"project_id": "phase-2"},
+        match_info={"project_id": "project"},
         body={"max_size_bytes": 5},
     )))
     payload = _response_json(response)
@@ -1363,16 +1367,16 @@ def test_render_cache_sweep_route_validates_budget_and_runs_off_loop(tmp_path, m
     assert payload["entry_count"] == 1
     assert payload["size_bytes"] == 5
     assert payload["over_budget_bytes"] == 0
-    assert threaded_calls[-2:] == [module._load_project_from_request, module.enforce_render_cache_budget]
+    assert threaded_calls[-2:] == [module._render_cache_project_dir, module.enforce_render_cache_budget]
 
     for invalid in [True, -1, 1.5, 9_007_199_254_740_992]:
         invalid_response = asyncio.run(module.api_sweep_render_cache(DummyRequest(
-            match_info={"project_id": "phase-2"},
+            match_info={"project_id": "project"},
             body={"max_size_bytes": invalid},
         )))
         assert invalid_response.status == 400
     missing_response = asyncio.run(module.api_sweep_render_cache(DummyRequest(
-        match_info={"project_id": "phase-2"},
+        match_info={"project_id": "project"},
         body={},
     )))
     assert missing_response.status == 400
@@ -1381,7 +1385,9 @@ def test_render_cache_sweep_route_validates_budget_and_runs_off_loop(tmp_path, m
 def test_render_cache_delete_route_reports_active_conflict(tmp_path, monkeypatch):
     module = _load_route_module(monkeypatch)
     project = _make_project(tmp_path)
-    monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
+    # Folder requests must resolve storage without loading a project model.
+    _write_project_file(project, "project.json", b"{}")
+    monkeypatch.setattr(module, "_get_base_dir", lambda: str(tmp_path))
     monkeypatch.setattr(
         module,
         "delete_render_cache_entry",
@@ -1389,7 +1395,7 @@ def test_render_cache_delete_route_reports_active_conflict(tmp_path, monkeypatch
     )
 
     response = asyncio.run(module.api_delete_render_cache_entry(DummyRequest(
-        match_info={"project_id": "phase-2", "filename": f"rc3_{'a' * 32}.cache"},
+        match_info={"project_id": "project", "filename": f"rc3_{'a' * 32}.cache"},
     )))
     assert response.status == 409
 

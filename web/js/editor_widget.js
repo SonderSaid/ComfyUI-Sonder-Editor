@@ -1,3 +1,4 @@
+import { shouldJoinSweep } from "./render_cache_activation.js";
 import { promptEditFields, promptDraftKey, updatePromptDraft, savePromptDraft, rebasePromptDraft } from "./prompt_edit_intent.js";
 /**
  * Sonder Editor Widget — Timeline + Asset Gallery embedded in a ComfyUI node.
@@ -648,6 +649,9 @@ export class EditorWidget {
         this._renderCacheUsage = null;
         this._renderCacheSweepPending = false;
         this._renderCacheSweepSeq = 0;
+        this._renderCacheSweepGeneration = 0;
+        this._renderCacheIdleEpoch = 0;
+        this._renderCacheSweepInFlight = null;
         this._renderCacheStatusHandler = null;
         this._thumbnailRepairOwnerId = this._keyboardConsumerId("thumbnail-bulk");
         this._thumbnailRepairPreflight = false;
@@ -883,6 +887,7 @@ export class EditorWidget {
             this._renderCacheStatusHandler = (event) => {
                 const remaining = Number(event?.detail?.exec_info?.queue_remaining);
                 if (remaining !== 0 || this._destroyed) return;
+                this._renderCacheIdleEpoch += 1;
                 if (this._renderCacheSweepPending) this._sweepRenderCache();
                 else if (this._settingsPanelHandle) this._refreshRenderCacheUsage();
             };
@@ -6478,6 +6483,7 @@ export class EditorWidget {
     }
 
     async _refreshRenderCacheUsage() {
+        if (this._destroyed) return null;
         const dirName = this._projectDirName();
         const sweepSeq = this._renderCacheSweepSeq;
         if (!dirName) {
@@ -6502,12 +6508,11 @@ export class EditorWidget {
                 deleted_bytes: 0,
                 protected: [],
                 over_budget_bytes: 0,
-                pending: false,
+                pending: this._renderCacheSweepPending,
                 failures: [],
             };
-            if (sweepSeq === this._renderCacheSweepSeq && dirName === this._projectDirName()) {
+            if (!this._destroyed && sweepSeq === this._renderCacheSweepSeq && dirName === this._projectDirName()) {
                 this._renderCacheUsage = usage;
-                this._renderCacheSweepPending = false;
                 this._syncSettingsPanelControls();
             }
             return usage;
@@ -6517,39 +6522,64 @@ export class EditorWidget {
         }
     }
 
-    async _sweepRenderCache(maxSizeBytes = this._renderCacheMaxBytes()) {
+    async _sweepRenderCache(maxSizeBytes = this._renderCacheMaxBytes(), {
+        generation = ++this._renderCacheSweepGeneration,
+    } = {}) {
+        if (this._destroyed) return null;
         const dirName = this._projectDirName();
+        const key = `${dirName}|${maxSizeBytes}`;
+        if (shouldJoinSweep(this._renderCacheSweepInFlight, key, generation)) {
+            return this._renderCacheSweepInFlight.promise;
+        }
         const seq = ++this._renderCacheSweepSeq;
+        const idleEpoch = this._renderCacheIdleEpoch;
         if (!dirName) {
+            this._renderCacheSweepInFlight = null;
             this._renderCacheUsage = null;
             this._renderCacheSweepPending = false;
             this._syncSettingsPanelControls();
             return null;
         }
-        try {
-            const response = await fetch(
-                api.apiURL(`/sonder-editor/project/${encodeURIComponent(dirName)}/cache/renders/sweep`),
-                {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ max_size_bytes: maxSizeBytes }),
-                },
-            );
-            if (!response.ok) {
-                console.warn("[Sonder] Render cache sweep skipped:", response.status);
+        const inFlight = { key, generation, promise: null };
+        this._renderCacheSweepInFlight = inFlight;
+        inFlight.promise = (async () => {
+            try {
+                const response = await fetch(
+                    api.apiURL(`/sonder-editor/project/${encodeURIComponent(dirName)}/cache/renders/sweep`),
+                    {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ max_size_bytes: maxSizeBytes }),
+                    },
+                );
+                if (!response.ok) {
+                    console.warn("[Sonder] Render cache sweep skipped:", response.status);
+                    return null;
+                }
+                const result = await response.json();
+                if (!this._destroyed && seq === this._renderCacheSweepSeq && dirName === this._projectDirName()) {
+                    this._renderCacheUsage = result;
+                    this._renderCacheSweepPending = result?.pending === true;
+                    this._syncSettingsPanelControls();
+                    // Idle may have arrived before this protected-store result.
+                    // Retry once across that boundary; a new dispatch captures
+                    // the current epoch, so a still-pending result cannot spin.
+                    if (this._renderCacheSweepPending && idleEpoch !== this._renderCacheIdleEpoch) {
+                        void this._sweepRenderCache(maxSizeBytes);
+                    }
+                }
+                return result;
+            } catch (error) {
+                console.warn("[Sonder] Failed to sweep render cache:", error);
                 return null;
+            } finally {
+                // A superseded request must never clear its successor's promise.
+                if (this._renderCacheSweepInFlight === inFlight) {
+                    this._renderCacheSweepInFlight = null;
+                }
             }
-            const result = await response.json();
-            if (seq === this._renderCacheSweepSeq && dirName === this._projectDirName()) {
-                this._renderCacheUsage = result;
-                this._renderCacheSweepPending = result?.pending === true;
-                this._syncSettingsPanelControls();
-            }
-            return result;
-        } catch (error) {
-            console.warn("[Sonder] Failed to sweep render cache:", error);
-            return null;
-        }
+        })();
+        return inFlight.promise;
     }
 
     async _clearRenderCache() {
@@ -16979,7 +17009,8 @@ export class EditorWidget {
         // Set fullscreen state + recalc
         this.isFullscreen = true;
         EditorWidget._activeFullscreen = this;
-        this._sweepRenderCache();
+        // Initial entry and project load share a wave; explicit events do not.
+        this._sweepRenderCache(undefined, { generation: this._renderCacheSweepGeneration });
 
         // ENTER must run _applyScales so saved/default panel height is clamped only after
         // the editor is mounted in the visible fullscreen bottom row.
@@ -17018,6 +17049,10 @@ export class EditorWidget {
     }
 
     _exitFullscreen() {
+        // Re-entry must ask again even if the previous open's request is pending.
+        this._renderCacheSweepGeneration += 1;
+        this._renderCacheSweepSeq += 1;
+        this._renderCacheSweepInFlight = null;
         if (!this.isFullscreen) return;
 
         // Stop playback before exiting
@@ -20793,6 +20828,9 @@ export class EditorWidget {
         cancelThumbnailRepairOwner(this._thumbnailRepairOwnerId);
         this._referenceFetchSeq += 1;
         this.projectDir = projectDir;
+        this._renderCacheSweepGeneration += 1;
+        this._renderCacheUsage = null;
+        this._renderCacheSweepPending = false;
         this._frameConstraintHealedFor = "";
         this._dimensionConstraintHealedFor = "";
         this.activeSceneId = "";
@@ -20822,7 +20860,7 @@ export class EditorWidget {
         // Stop playback and clear video cache on project change
         this._stopPlayback();
         this._clearVideoCache();
-        this._sweepRenderCache();
+        this._sweepRenderCache(undefined, { generation: this._renderCacheSweepGeneration });
 
         // Fetch project settings (fps, resolution)
         this._fetchProjectSettings();
@@ -22207,6 +22245,8 @@ export class EditorWidget {
             api.removeEventListener("status", this._renderCacheStatusHandler);
             this._renderCacheStatusHandler = null;
         }
+        this._renderCacheSweepSeq += 1;
+        this._renderCacheSweepInFlight = null;
 
         if (this._previewEl) {
             for (const media of this._previewEl.querySelectorAll("video, audio")) {
