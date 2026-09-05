@@ -11,6 +11,9 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Added
+- Added links to Project-Sample, the LTX 2.3 example project hosted on Hugging Face.
+
 ## [0.3.0] - 2026-09-01
 
 ### Added
