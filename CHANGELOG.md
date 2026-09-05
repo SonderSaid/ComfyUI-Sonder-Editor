@@ -296,7 +296,7 @@ a fresh `[Unreleased]` block.
 - Added shared frontend project-source resolution for direct wires, typed
   pass-through/reroute chains, and current KJNodes Set/Get scopes.
 - README now carries a 90-second overview video and three technique clips —
-  Prompt Relay, Guides, and IC-LoRA motion transfer — from the sample project.
+  Prompt Relay, Guides, and IC-LoRA motion transfer — from a showcase project.
 
 ### Changed
 - Rewrote the Registry and Manager listing description in plain language that
@@ -319,8 +319,7 @@ a fresh `[Unreleased]` block.
 
 ### Added
 - Initial public release of **Sonder Editor**.
-- Project documentation, an example LTX 2.3 workflow, and a downloadable
-  showcase project.
+- Project documentation and an example LTX 2.3 workflow.
 
 ### Notes
 - Requires ComfyUI and `ffmpeg` (see README). `torch`/`torchaudio` are provided
