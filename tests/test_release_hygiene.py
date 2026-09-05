@@ -1,11 +1,74 @@
 from __future__ import annotations
 
 import re
+import json
+import os
 from pathlib import Path
+from urllib.parse import unquote
 
 
 ROOT = Path(__file__).resolve().parents[1]
 COMFY_OWNED_PACKAGES = {"torch", "torchaudio"}
+
+
+def _documentation_zip_mentions(root: Path) -> list[str]:
+    """Local editorial guard; not a model of GitHub's undisclosed detector."""
+    findings = []
+    for directory, dirs, files in os.walk(root, followlinks=False):
+        dirs[:] = [d for d in dirs if d not in {
+            ".git", ".claude", ".codex", ".agents", "node_modules",
+            "__pycache__", ".pytest_cache", ".venv", "venv",
+        } and not (Path(directory) / d).is_symlink()]
+        for name in files:
+            path = Path(directory) / name
+            relative = path.relative_to(root)
+            markdown = path.suffix.lower() in {".md", ".markdown", ".mdx"}
+            workflow = relative.parts[0] == "example_workflows" and path.suffix.lower() == ".json"
+            if not (markdown or workflow):
+                continue
+            text = path.read_text(encoding="utf-8")
+            if workflow:
+                # Decode JSON escapes and inspect both positional and named note copies.
+                def strings(value):
+                    if isinstance(value, str):
+                        yield value
+                    elif isinstance(value, dict):
+                        for child in value.values():
+                            yield from strings(child)
+                    elif isinstance(value, list):
+                        for child in value:
+                            yield from strings(child)
+                text = "\n".join(strings(json.loads(text)))
+            for number, line in enumerate(text.splitlines(), 1):
+                if re.search(r"\bzip\b", unquote(line), re.IGNORECASE):
+                    label = "decoded text line" if workflow else "line"
+                    findings.append(f"{relative}:{label} {number}: {line[:180]}")
+    return findings
+
+
+def test_public_documentation_has_no_zip_mentions():
+    # Temporary project publishing constraint following support review. Keep
+    # private recovery records outside the repository. Remote release text and
+    # repository metadata require a separate review; this test cannot see them.
+    findings = _documentation_zip_mentions(ROOT)
+    assert not findings, "ZIP mention in public documentation; review distribution guidance:\n" + "\n".join(findings)
+
+
+def test_documentation_zip_guard_covers_markdown_and_encoded_workflow_notes(tmp_path):
+    (tmp_path / "README.md").write_text("Get Project-Sample.ZIP", encoding="utf-8")
+    (tmp_path / "guide.mdx").write_text("Download a zip", encoding="utf-8")
+    (tmp_path / "guide.markdown").write_text("https://example.org/sample%2Ezip", encoding="utf-8")
+    workflows = tmp_path / "example_workflows"
+    workflows.mkdir()
+    (workflows / "demo.json").write_text(
+        '{"nodes":[{"widgets_values":["sample.\\u007aip"],'
+        '"widgets_values_named":{"text":"Download ZIP"}}]}', encoding="utf-8")
+    (tmp_path / "implementation.py").write_text("zip(a, b)", encoding="utf-8")
+    assert len(_documentation_zip_mentions(tmp_path)) == 5
+    for path in [tmp_path / "README.md", tmp_path / "guide.mdx", tmp_path / "guide.markdown"]:
+        path.write_text("Install with ComfyUI Manager or git clone.", encoding="utf-8")
+    (workflows / "demo.json").write_text('{"nodes":[]}', encoding="utf-8")
+    assert _documentation_zip_mentions(tmp_path) == []
 
 
 def _normalized_requirement_name(requirement: str) -> str:
