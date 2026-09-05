@@ -23,9 +23,26 @@ def _run_node(script: str):
     node = shutil.which("node")
     if not node:
         pytest.skip("node is required for this test")
-    return json.loads(subprocess.run(
+    # These isolated behavior harnesses lift selected production methods rather
+    # than importing the DOM host. Include their real diagnostic dependency;
+    # debug-off marker hooks are the only stubs. Coverage tests import the full
+    # EditorWidget with diagnostics on in test_project_mutation_queue.py.
+    if "this._withMutationGesture(" in script:
+        widget = _source("web/js/editor_widget.js")
+        gesture = _method(widget, "_withMutationGesture", "_snapshotMutationDiagnostics")
+        headers = widget[widget.index("function mutationDiagnosticHeaders("):
+                         widget.index("export async function importFileIntoProject(")]
+        script = ("globalThis.sessionDiagBeginLoad = () => '';\n"
+                  "globalThis.sessionDiagEndLoad = () => {};\n"
+                  "globalThis.withMutationRequestDiagnostics = init => init;\n"
+                  + headers + script)
+        for host in ("Harness", "Host"):
+            script = script.replace("class " + host + " {", "class " + host + " {\n" + gesture)
+    result = subprocess.run(
         [node, "--input-type=module"], input=script, capture_output=True,
-        text=True, encoding="utf-8", check=True).stdout)
+        text=True, encoding="utf-8")
+    assert result.returncode == 0, result.stderr or result.stdout
+    return json.loads(result.stdout)
 
 
 def test_reference_override_fields_mirror_matches_the_server():
@@ -2371,7 +2388,8 @@ def test_fullscreen_background_paste_preserves_gallery_image_path():
     assert "notifyWarning" not in keyboard_registration
     assert 'source: "fullscreen-background-paste"' not in keyboard_registration
     assert "Paste needs a text field" not in keyboard_registration
-    assert "fullscreen background paste is ignored" in widget
+    assert '["Ctrl+V", "Paste"]' in widget
+    assert "Waits for saves; warns and skips" not in widget
 
 
 def test_prompt_panel_writing_and_global_views_use_bound_shared_overlays():
@@ -7108,7 +7126,7 @@ console.log(JSON.stringify({{safe:safe.saved[0],options:safe.options,
     ]
     assert result["options"] == {
         "recordUndo": False,
-        "diagnostics": None,
+        "diagnostics": {"gestureId": "", "gestureKind": "promptIdentityChange", "coalescedCount": 1},
         "attempt": 1,
     }
     assert result["refreshes"] == 1

@@ -655,3 +655,237 @@ def test_project_dependency_history_writes_keep_one_gesture_and_fresh_request_id
         assert.notEqual(requests[0].requestId, requests[1].requestId);
         assert.deepEqual(requests.map((value) => value.attempt), ['1', '1']);
     """)
+
+
+def _run_gesture_node(body: str, *, debug: bool = True) -> None:
+    widget_url = (ROOT / "web/js/editor_widget.js").as_uri()
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    _run_node(f"""
+        import assert from 'node:assert/strict';
+        globalThis.window = {{
+            comfyAPI: {{ api: {{ api: {{ apiURL: (path) => path }} }} }},
+            localStorage: {{ getItem: () => null }},
+            SONDER_DEBUG_SESSION: {str(debug).lower()},
+        }};
+        globalThis.location = {{ href: 'http://test/' }};
+        globalThis.requestAnimationFrame = () => 0;
+        const {{ EditorWidget }} = await import({widget_url!r});
+        const {{ ProjectMutationQueue }} = await import({queue_url!r});
+        function makeWidget() {{
+            const widget = Object.create(EditorWidget.prototype);
+            Object.assign(widget, {{
+                projectDir: 'project', activeSceneId: 'scene', activeScene: {{scene_id:'scene'}},
+                _activeMutationGesture: null, _timelineMutationDepth: 0,
+                _sceneMutationInvalidationSeq: 0,
+                _projectMutationQueue: new ProjectMutationQueue(),
+                _claimHistoryPostSnapshotCapture: () => null,
+                _stampHistoryPostSnapshot: () => {{}},
+                _reconcileActiveSceneFromMutation: () => true,
+                _schedulePostMutationSceneRefresh: () => {{}},
+                _deferProjectBackedRefresh: () => {{}},
+                _replayDeferredProjectBackedRefresh: () => {{}},
+                _fetchAssets: async () => {{}}, _fetchScenes: async () => {{}},
+                _fetchRenderQueue: async () => {{}},
+                _pushUndo: () => {{}}, _renderSceneAfterLocalMutation: () => {{}},
+                _renderTimeline: () => {{}}, _renderViewportFrame: () => {{}},
+            }});
+            return widget;
+        }}
+        const events = () => (window.__SONDER_CANVAS_DIAG?.events || [])
+            .filter(e => e.kind === 'gesture_start' || e.kind === 'gesture_end');
+        const starts = () => events().filter(e => e.kind === 'gesture_start');
+        {body}
+    """)
+
+
+def test_clean_mute_gesture_captures_at_enqueue_and_ends_after_settlement():
+    _run_gesture_node("""
+        const w = makeWidget(), sent = [];
+        w.selectedItems = [{type:'clip', id:'c', data:{muted:false}}];
+        w._expandItemsWithLinked = items => items;
+        w._isItemLocked = () => false;
+        w._linkedGroupIdForItem = () => '';
+        w._applyLocalItemProperty = () => {};
+        let release;
+        w._runSceneMutation = (operations, options) => w._queueProjectMutation({
+            ...options, refreshScenes:false, intent:{operations},
+            run: async (intent, diagnostics) => {
+                sent.push({intent, diagnostics});
+                await new Promise(resolve => { release = resolve; });
+            },
+        });
+        const pending = w._toggleSelectedMute();
+        assert.equal(starts().length, 1);
+        assert.equal(w._activeMutationGesture, null);
+        await new Promise(resolve => setTimeout(resolve, 0));
+        assert.equal(sent.length, 1);
+        assert.ok(sent[0].diagnostics.gestureId);
+        assert.equal(sent[0].diagnostics.gestureKind, 'toggleMute');
+        assert.equal(events().length, 1);
+        release(); await pending;
+        assert.deepEqual(events().map(e => e.kind), ['gesture_start','gesture_end']);
+    """)
+
+
+@pytest.mark.parametrize("directory", [False, True])
+def test_import_fanout_retains_one_gesture_and_unique_physical_request_ids(directory):
+    _run_gesture_node("""
+        const w = makeWidget(), requests = [];
+        const files = ['a.png','b.png','c.png'].map(name => new File(['x'],name));
+        w._readDroppedDirectoryFiles = async () => { await Promise.resolve(); return files; };
+        globalThis.fetch = async (url, init) => {
+            await Promise.resolve();
+            requests.push({url, headers:new Headers(init.headers)});
+            return new Response('{}', {status:200});
+        };
+        console.log = () => {};
+        """ + ("await w._importDroppedDirectory({name:'folder'});" if directory
+                else "await w._importFilesWithProgress(files, 'folder');") + """
+        assert.equal(requests.length, 3);
+        assert.equal(starts().length, 1);
+        assert.equal(events().length, 2);
+        const ids = requests.map(r => r.headers.get('X-Sonder-Gesture-Id'));
+        assert.ok(ids[0]); assert.equal(new Set(ids).size, 1);
+        assert.ok(requests.every(r => r.headers.get('X-Sonder-Gesture-Kind') === 'asset_import'));
+        assert.equal(new Set(requests.map(r => r.headers.get('X-Sonder-Request-Id'))).size, 3);
+    """)
+
+
+def test_asset_trash_has_diagnostics_without_altering_body_or_method():
+    _run_gesture_node("""
+        const w = makeWidget(); let request;
+        globalThis.fetch = async (url, init) => {
+            request = {url, ...init};
+            return new Response('{}', {status:200});
+        };
+        await w._deleteAsset('asset', true);
+        const h = new Headers(request.headers);
+        assert.ok(h.get('X-Sonder-Gesture-Id'));
+        assert.equal(h.get('X-Sonder-Gesture-Kind'), 'asset_trash');
+        assert.equal(h.get('X-Sonder-Mutation-Coalesced-Count'), '1');
+        assert.ok(h.get('X-Sonder-Request-Id'));
+        assert.equal(request.method, 'DELETE');
+        assert.deepEqual(JSON.parse(request.body), {force:true});
+    """)
+
+
+def test_source_picker_attributes_the_pick_not_the_deferred_builder():
+    _run_gesture_node("""
+        const w = makeWidget(); let picker; const sent = [];
+        w._findSceneItemBySelection = () => null;
+        w._isItemLocked = () => false;
+        w._getAssetForSourcePath = () => ({asset_id:'old'});
+        w._showImagePicker = options => { picker = options; };
+        w._runSceneMutation = async (operations) => {
+            sent.push({operations, diagnostics:w._snapshotMutationDiagnostics()});
+        };
+        w._replaceClipSource({clip_id:'clip',source_path:'old.mp4'});
+        assert.equal(events().length, 0);
+        await Promise.resolve();
+        await picker.onPick('new');
+        assert.equal(starts().length, 1);
+        assert.equal(sent.length, 1);
+        assert.equal(sent[0].diagnostics.gestureKind, 'replaceClipSource');
+        assert.ok(sent[0].diagnostics.gestureId);
+    """)
+
+
+def test_real_lane_config_coalescing_reports_last_gesture_and_three_intents():
+    _run_gesture_node("""
+        const w = makeWidget(), sent = [];
+        w._runVersionedProjectMutation = async (path, init) => {
+            sent.push({path, init}); return {payload:{}};
+        };
+        await Promise.all([false,true,false].map(hidden => w._saveLaneConfig({
+            type:'video',laneIndex:0,customName:'V1',hidden,
+        })));
+        assert.equal(starts().length, 3);
+        assert.equal(sent.length, 1);
+        const h = new Headers(sent[0].init.headers);
+        assert.equal(h.get('X-Sonder-Gesture-Kind'), 'laneConfig');
+        assert.equal(h.get('X-Sonder-Mutation-Coalesced-Count'), '3');
+        assert.equal(h.get('X-Sonder-Gesture-Id'), starts()[2].marker_id);
+        assert.equal(JSON.parse(sent[0].init.body).operations[0].fields.hidden, false);
+    """)
+
+
+def test_async_continuation_never_inherits_an_unrelated_ambient_gesture():
+    _run_gesture_node("""
+        const w = makeWidget(); let captured, ambient;
+        await w._withMutationGesture('threaded', async diagnostics => {
+            await Promise.resolve();
+            ambient = w._snapshotMutationDiagnostics();
+            captured = diagnostics;
+        });
+        assert.equal(ambient.gestureId, '');
+        assert.equal(ambient.gestureKind, 'unscoped');
+        assert.ok(captured.gestureId);
+        assert.equal(starts().length, 1);
+        // An auxiliary writer past its await consumes explicit diagnostics,
+        // without minting a new gesture or changing the history owner.
+        const owner = {}, order = {};
+        w._references = [{members:[{member_id:'m',handle:'old'}]}];
+        w._fetchReferences = async () => true;
+        let received;
+        w._mutateReferences = async (...args) => { received = args; };
+        await w._applyReferenceHistoryOperations([{member_id:'m',fields:{handle:'new'}}],
+            'undo', captured, owner, order);
+        assert.equal(starts().length, 1);
+        assert.equal(received[2], captured);
+        assert.equal(received[3], owner); assert.equal(received[4], order);
+    """)
+
+
+def test_debug_off_import_mints_no_gesture_but_preserves_request_correlation():
+    _run_gesture_node("""
+        const w = makeWidget(); let headers;
+        globalThis.fetch = async (_url, init) => {
+            headers = new Headers(init.headers); return new Response('{}');
+        };
+        await w._importFilesWithProgress([new File(['x'],'a.png')]);
+        assert.equal(events().length, 0);
+        assert.equal(headers.get('X-Sonder-Gesture-Id'), '');
+        assert.equal(headers.get('X-Sonder-Gesture-Kind'), 'unscoped');
+        assert.ok(headers.get('X-Sonder-Request-Id'));
+    """, debug=False)
+
+
+def test_prompt_project_queue_carries_diagnostics_past_before_run_await():
+    _run_gesture_node("""
+        const w = makeWidget(); let sent;
+        w._runVersionedProjectMutation = async (_path, init) => { sent = new Headers(init.headers); };
+        await w._withMutationGesture('promptSettings', diagnostics =>
+            w._queuePromptProjectWrite({metadata:{x:1}}, {
+                diagnostics, beforeRun: async () => { await Promise.resolve(); },
+            }));
+        assert.ok(sent.get('X-Sonder-Gesture-Id'));
+        assert.equal(sent.get('X-Sonder-Gesture-Kind'), 'promptSettings');
+    """)
+
+
+@pytest.mark.parametrize("close_panel", [False, True])
+def test_pending_export_cancel_retains_original_gesture(close_panel):
+    _run_gesture_node("""
+        const w = makeWidget(), requests = [];
+        w._exportPanelToken = 7;
+        w._resetExportControlsAfterCancel = () => {};
+        let release;
+        globalThis.fetch = async (url, init) => {
+            requests.push({url, headers:new Headers(init.headers)});
+            if (!url.endsWith('/cancel')) {
+                await new Promise(resolve => { release = resolve; });
+                return new Response(JSON.stringify({job_id:'job'}));
+            }
+            return new Response('{}');
+        };
+        const pending = w._startTimelineExport({}, {});
+        """ + ("w._hideExportPanel();" if close_panel else "await w._cancelTimelineExport(null);") + """
+        assert.equal(starts().length, 2);
+        const cancelId = starts()[1].marker_id;
+        release(); await pending;
+        assert.equal(requests.length, 2);
+        assert.equal(requests[1].headers.get('X-Sonder-Gesture-Id'), cancelId);
+        assert.equal(requests[1].headers.get('X-Sonder-Gesture-Kind'), 'cancelTimelineExport');
+        assert.equal(starts().length, 2);
+        assert.equal(w._exportStartDiagnostics, null);
+    """)

@@ -458,17 +458,43 @@ export function buildProjectAssetViewURL(projectDir, sourcePath) {
     return api.apiURL(`/view?filename=${encodeURIComponent(fileName)}&subfolder=${encodeURIComponent(subfolder)}&type=output`);
 }
 
-export async function importFileIntoProject(projectDir, file, folder = "") {
+function mutationDiagnosticHeaders(diagnostics = {}) {
+    const gestureId = String(diagnostics?.gestureId || "");
+    return {
+        "X-Sonder-Gesture-Id": gestureId,
+        "X-Sonder-Gesture-Kind": gestureId
+            ? String(diagnostics?.gestureKind || "unscoped") : "unscoped",
+        "X-Sonder-Mutation-Coalesced-Count": String(
+            Math.max(1, Number(diagnostics?.coalescedCount) || 1)),
+    };
+}
+
+function withMutationDiagnosticHeaders(init = {}, diagnostics = {}) {
+    const headers = new Headers(init?.headers || {});
+    for (const [name, value] of Object.entries(mutationDiagnosticHeaders(diagnostics))) {
+        headers.set(name, value);
+    }
+    return { ...init, headers };
+}
+
+// Compose at each physical fetch, so fan-out/retries share a gesture but never
+// a request id. Module upload helpers do not mint gestures; their host does.
+function withEditorMutationDiagnostics(init, diagnostics, attempt = 1) {
+    return withMutationRequestDiagnostics(
+        withMutationDiagnosticHeaders(init, diagnostics), attempt);
+}
+
+export async function importFileIntoProject(projectDir, file, folder = "", diagnostics = null) {
     if (!projectDir || !file) return false;
     const dirName = projectDir.split(/[/\\]/).pop();
     markProjectAssetMutation(dirName, "asset_import");
     const formData = new FormData();
     formData.append("file", file, file.name);
     if (folder) formData.append("folder", folder);
-    const importResp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/import`), {
+    const importResp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/import`), withEditorMutationDiagnostics({
         method: "POST",
         body: formData,
-    });
+    }, diagnostics));
 
     if (!importResp.ok) {
         const message = await readResponseError(importResp, `Import failed: ${importResp.status}`);
@@ -478,16 +504,16 @@ export async function importFileIntoProject(projectDir, file, folder = "") {
     return true;
 }
 
-export async function replaceAssetInProject(projectDir, assetId, file) {
+export async function replaceAssetInProject(projectDir, assetId, file, diagnostics = null) {
     if (!projectDir || !assetId || !file) return null;
     const dirName = projectDir.split(/[/\\]/).pop();
     markProjectAssetMutation(dirName, "asset_replace");
     const formData = new FormData();
     formData.append("file", file, file.name);
-    const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/${assetId}/replace`), {
+    const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/${assetId}/replace`), withEditorMutationDiagnostics({
         method: "POST",
         body: formData,
-    });
+    }, diagnostics));
     if (!resp.ok) {
         throw new Error(await readResponseError(resp, `Asset replace failed: ${resp.status}`));
     }
@@ -1191,24 +1217,11 @@ export class EditorWidget {
     }
 
     _mutationDiagnosticHeaders(diagnostics = {}) {
-        const gestureId = String(diagnostics?.gestureId || "");
-        return {
-            "X-Sonder-Gesture-Id": gestureId,
-            "X-Sonder-Gesture-Kind": gestureId
-                ? String(diagnostics?.gestureKind || "unscoped")
-                : "unscoped",
-            "X-Sonder-Mutation-Coalesced-Count": String(
-                Math.max(1, Number(diagnostics?.coalescedCount) || 1)),
-        };
+        return mutationDiagnosticHeaders(diagnostics);
     }
 
     _withMutationDiagnosticHeaders(init = {}, diagnostics = {}) {
-        const headers = new Headers(init?.headers || {});
-        for (const [name, value] of Object.entries(
-                this._mutationDiagnosticHeaders(diagnostics))) {
-            headers.set(name, value);
-        }
-        return { ...init, headers };
+        return withMutationDiagnosticHeaders(init, diagnostics);
     }
 
     _withMutationRequestDiagnostics(init = {}, attempt = 1) {
@@ -1346,9 +1359,10 @@ export class EditorWidget {
             onUpdateAsset: async (assetId, updates) => await this._updateAssetMetadata(assetId, updates),
             onGetAssetUsages: async (assetId) => await this._getAssetUsages(assetId),
             onGetBulkAssetUsages: async (assetIds) => await this._getBulkAssetUsages(assetIds),
-            onDeleteAsset: async (assetId, force) => await this._deleteAsset(assetId, force),
+            withMutationGesture: (kind, callback) => this._withMutationGesture(kind, callback),
+            onDeleteAsset: async (assetId, force, diagnostics) => await this._deleteAsset(assetId, force, diagnostics),
             onBulkMoveAssets: async (assetIds, folder) => await this._bulkMoveAssets(assetIds, folder),
-            onBulkDeleteAssets: async (assetIds, force) => await this._bulkDeleteAssets(assetIds, force),
+            onBulkDeleteAssets: async (assetIds, force, diagnostics) => await this._bulkDeleteAssets(assetIds, force, diagnostics),
             onRestoreAsset: async (assetId) => await this._restoreAsset(assetId),
             onBulkRestoreAssets: async (assetIds) => await this._bulkRestoreAssets(assetIds),
             onPermanentDeleteAsset: async (assetId, force) => await this._permanentDeleteAsset(assetId, force),
@@ -1356,7 +1370,7 @@ export class EditorWidget {
             onEmptyTrash: async () => await this._emptyTrash(),
             onCreateFolder: async (folderName) => await this._createAssetFolder(folderName),
             onRenameFolder: async (folderName, newFolderName) => await this._renameAssetFolder(folderName, newFolderName),
-            onDeleteFolder: async (folderName, force) => await this._deleteAssetFolder(folderName, force),
+            onDeleteFolder: async (folderName, force, diagnostics) => await this._deleteAssetFolder(folderName, force, diagnostics),
             onReplaceAsset: async (assetId, file) => await this._replaceAsset(assetId, file),
             onSetSceneAspectRatio: (width, height) => this._setSceneAspectRatioFromDimensions(width, height),
             onOpenSourceWorkflow: async (asset) => {
@@ -1376,7 +1390,7 @@ export class EditorWidget {
                         manual: true,
                         reason: "gallery_manual_refresh",
                     });
-                } finally {
+               } finally {
                     window.clearTimeout(timer);
                     if (handle) handle.resolve({ tier: "info", message: "Assets refreshed" });
                 }
@@ -1567,21 +1581,26 @@ export class EditorWidget {
         }
     }
 
-    async _createScene() {
+    async _createScene(...args) {
+        return this._withMutationGesture(
+            "createScene", (diagnostics) => this._createSceneWithinGesture(diagnostics, ...args));
+    }
+
+    async _createSceneWithinGesture(diagnostics) {
         if (!this.projectDir) return;
         const lifecycleToken = this._beginSceneHistoryLifecycle(
             "create scene", { allowSceneSwitch: true });
         if (!lifecycleToken) return;
         const dirName = this.projectDir.split(/[/\\]/).pop();
         try {
-            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes`), {
+            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes`), withEditorMutationDiagnostics({
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                     name: `Scene ${this.scenes.length + 1}`,
                     duration_frames: Math.max(1, this._defaultNewSceneDuration()),
                 }),
-            });
+            }, diagnostics));
             if (resp.ok) {
                 const scene = await resp.json();
                 this.scenes.push(scene);
@@ -1770,7 +1789,13 @@ export class EditorWidget {
         this._updateSceneResolution(width, height, { detectSelections: false });
     }
 
-    async _updateSceneResolution(w, h, { detectSelections = true } = {}) {
+    async _updateSceneResolution(w, h, options = {}) {
+        if (options.diagnostics) return this._updateSceneResolutionWithinGesture(w, h, options);
+        return this._withMutationGesture("updateSceneResolution", (diagnostics) =>
+            this._updateSceneResolutionWithinGesture(w, h, { ...options, diagnostics }));
+    }
+
+    async _updateSceneResolutionWithinGesture(w, h, { detectSelections = true, diagnostics = null } = {}) {
         if (!this.activeScene || !this.projectDir) return;
         w = Math.max(0, parseInt(w, 10) || 0);
         h = Math.max(0, parseInt(h, 10) || 0);
@@ -1790,6 +1815,7 @@ export class EditorWidget {
             await this._runSceneMutation(
                 [{ type: "update_scene_fields", fields: { width: w, height: h } }],
                 {
+                    diagnostics,
                     key: `scene:${sceneId}:width-height`,
                     label: "scene resolution",
                     coalesce: true,
@@ -1809,7 +1835,13 @@ export class EditorWidget {
         }
     }
 
-    async _updateSceneFps(fps) {
+    async _updateSceneFps(fps, diagnostics = null) {
+        if (diagnostics) return this._updateSceneFpsWithinGesture(fps, diagnostics);
+        return this._withMutationGesture("updateSceneFps", (gesture) =>
+            this._updateSceneFpsWithinGesture(fps, gesture));
+    }
+
+    async _updateSceneFpsWithinGesture(fps, diagnostics = null) {
         if (!this.activeScene || !this.projectDir) return;
         if (this._fpsUpdatePending) {
             this._syncSceneFpsControl();
@@ -1857,6 +1889,7 @@ export class EditorWidget {
             await this._runSceneMutation(
                 [{ type: "update_scene_fields", fields: { fps } }],
                 {
+                    diagnostics,
                     key: `scene:${sceneId}:fps`,
                     label: "scene fps",
                     coalesce: false,
@@ -1891,7 +1924,12 @@ export class EditorWidget {
         this._setActiveScene(this.scenes[newIdx]);
     }
 
-    async _renameScene(targetScene = null) {
+    async _renameScene(...args) {
+        return this._withMutationGesture(
+            "renameScene", () => this._renameSceneWithinGesture(...args));
+    }
+
+    async _renameSceneWithinGesture(targetScene = null) {
         const scene = targetScene || this.activeScene;
         if (!scene) return;
         const isActive = scene.scene_id === this.activeSceneId;
@@ -1919,7 +1957,12 @@ export class EditorWidget {
         }
     }
 
-    async _updateSceneDuration(frames) {
+    async _updateSceneDuration(...args) {
+        return this._withMutationGesture(
+            "updateSceneDuration", () => this._updateSceneDurationWithinGesture(...args));
+    }
+
+    async _updateSceneDurationWithinGesture(frames) {
         if (!this.activeScene || !this.projectDir) return;
         frames = Math.max(1, parseInt(frames, 10) || 1);
         this._pushUndo("change duration");
@@ -1961,7 +2004,12 @@ export class EditorWidget {
         }
     }
 
-    async _deleteScene(targetScene = null) {
+    async _deleteScene(...args) {
+        return this._withMutationGesture(
+            "deleteScene", (diagnostics) => this._deleteSceneWithinGesture(diagnostics, ...args));
+    }
+
+    async _deleteSceneWithinGesture(diagnostics, targetScene = null) {
         const scene = targetScene || this.activeScene;
         if (!scene || !this.projectDir) return;
         const deletesActive = scene.scene_id === this.activeSceneId;
@@ -1980,9 +2028,9 @@ export class EditorWidget {
 
         const dirName = this.projectDir.split(/[/\\]/).pop();
         try {
-            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${scene.scene_id}`), {
+            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${scene.scene_id}`), withEditorMutationDiagnostics({
                 method: "DELETE",
-            });
+            }, diagnostics));
             // _fetchScenes preserves the active scene when it still exists, so deleting a
             // non-active scene keeps the user in place; deleting the active one falls to scene 0.
             await this._fetchScenes({
@@ -1996,7 +2044,12 @@ export class EditorWidget {
         }
     }
 
-    async _duplicateScene(targetScene = null) {
+    async _duplicateScene(...args) {
+        return this._withMutationGesture(
+            "duplicateScene", (diagnostics) => this._duplicateSceneWithinGesture(diagnostics, ...args));
+    }
+
+    async _duplicateSceneWithinGesture(diagnostics, targetScene = null) {
         const scene = targetScene || this.activeScene;
         if (!scene || !this.projectDir) return;
         const isActive = scene.scene_id === this.activeSceneId;
@@ -2006,9 +2059,9 @@ export class EditorWidget {
         const dirName = this.projectDir.split(/[/\\]/).pop();
 
         try {
-            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${scene.scene_id}/duplicate`), {
+            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${scene.scene_id}/duplicate`), withEditorMutationDiagnostics({
                 method: "POST",
-            });
+            }, diagnostics));
 
             if (!resp.ok) return;
             const newScene = await resp.json();
@@ -2136,18 +2189,19 @@ export class EditorWidget {
     }
 
     _queuePromptProjectWrite(body, { projectId = this._projectDirName(),
-        label = "prompt settings", beforeRun = null, retryOnConflict = true } = {}) {
+        label = "prompt settings", beforeRun = null, retryOnConflict = true, diagnostics = null } = {}) {
         const snapshot = structuredClone(body);
         return this._queueProjectMutation({ key: `prompt-project:${projectId}`, label,
-            coalesce: false, refreshScenes: false, refreshKeysOnError: ["project"],
+            diagnostics, coalesce: false, refreshScenes: false, refreshKeysOnError: ["project"],
             intent: { projectId, body: snapshot },
-            run: async (intent) => {
+            run: async (intent, queuedDiagnostics) => {
                 if (this._destroyed || this._projectDirName() !== intent.projectId)
                     throw new Error("The active project changed before the prompt save.");
                 await beforeRun?.();
                 return this._runVersionedProjectMutation(
                     `/sonder-editor/project/${encodeURIComponent(intent.projectId)}`,
-                    { method: "PUT", headers: { "Content-Type": "application/json" },
+                    { method: "PUT", headers: { "Content-Type": "application/json",
+                        ...this._mutationDiagnosticHeaders(queuedDiagnostics) },
                         body: JSON.stringify(intent.body) },
                     { projectId: intent.projectId, retryOnConflict, maxAttempts: retryOnConflict ? 2 : 1 });
             },
@@ -2159,7 +2213,12 @@ export class EditorWidget {
             .some((key) => JSON.parse(key)[0] === projectId);
     }
 
-    async _createPromptContextProfile(profile) {
+    async _createPromptContextProfile(...args) {
+        return this._withMutationGesture(
+            "createPromptContextProfile", () => this._createPromptContextProfileWithinGesture(...args));
+    }
+
+    async _createPromptContextProfileWithinGesture(profile) {
         if (!this.projectDir) return null;
         let before;
         const dirName = this._projectDirName();
@@ -2219,9 +2278,15 @@ export class EditorWidget {
         });
     }
 
-    async _savePromptSemanticUnits(units, label = "edit prompt identities", {
+    async _savePromptSemanticUnits(units, label = "edit prompt identities", options = {}) {
+        if (options.diagnostics) return this._savePromptSemanticUnitsWithinGesture(
+            options.diagnostics, units, label, options);
+        return this._withMutationGesture("promptSemanticUnits", (diagnostics) =>
+            this._savePromptSemanticUnitsWithinGesture(diagnostics, units, label, options));
+    }
+
+    async _savePromptSemanticUnitsWithinGesture(diagnostics, units, label = "edit prompt identities", {
         recordUndo = true,
-        diagnostics = null,
         attempt = 1,
     } = {}) {
         if (!this.projectDir) return null;
@@ -2256,9 +2321,15 @@ export class EditorWidget {
      * the latest array before PUT. Otherwise an unrelated edit from another
      * window could be deleted by a stale rollback snapshot.
      */
-    async _applyPromptIdentityChange(change, label = "edit prompt identity", {
+    async _applyPromptIdentityChange(change, label = "edit prompt identity", options = {}) {
+        if (options.diagnostics) return this._applyPromptIdentityChangeWithinGesture(
+            options.diagnostics, change, label, options);
+        return this._withMutationGesture("promptIdentityChange", (diagnostics) =>
+            this._applyPromptIdentityChangeWithinGesture(diagnostics, change, label, options));
+    }
+
+    async _applyPromptIdentityChangeWithinGesture(diagnostics, change, label = "edit prompt identity", {
         recordUndo = true,
-        diagnostics = null,
     } = {}) {
         if (!this.projectDir) return null;
         const refreshed = await this._fetchReferences({
@@ -2527,7 +2598,12 @@ export class EditorWidget {
         });
     }
 
-    async _materializeReferenceMemberHandle({
+    async _materializeReferenceMemberHandle(...args) {
+        return this._withMutationGesture(
+            "materializeReferenceMemberHandle", () => this._materializeReferenceMemberHandleWithinGesture(...args));
+    }
+
+    async _materializeReferenceMemberHandleWithinGesture({
         referenceId, memberId, suggestion, expectedHandle = "",
     } = {}) {
         const targetReferenceId = String(referenceId || "");
@@ -2647,7 +2723,8 @@ export class EditorWidget {
         this._fsSidebar.appendChild(this._referenceLibraryEl);
         this._referenceLibraryHandle = mountReferenceLibrary(this._referenceLibraryEl, {
             getData: () => this._referenceLibraryData(),
-            mutate: (operations) => this._mutateReferences(operations),
+            mutate: (operations) => this._withMutationGesture(
+                "referenceLibrary", () => this._mutateReferences(operations)),
             confirm: (message) => window.confirm(message),
             pickAsset: ({ assetType, currentAssetId, onPick }) => this._showImagePicker({
                 title: `Choose ${assetType} reference`,
@@ -2737,15 +2814,20 @@ export class EditorWidget {
         }
     }
 
-    async _updateAssetMetadata(assetId, updates) {
+    async _updateAssetMetadata(...args) {
+        return this._withMutationGesture(
+            "asset_metadata", (diagnostics) => this._updateAssetMetadataWithinGesture(diagnostics, ...args));
+    }
+
+    async _updateAssetMetadataWithinGesture(diagnostics, assetId, updates) {
         if (!this.projectDir || !assetId) return null;
         const dirName = this.projectDir.split(/[/\\]/).pop();
         markProjectAssetMutation(dirName, "asset_metadata");
-        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/${assetId}`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/${assetId}`), withEditorMutationDiagnostics({
             method: "PUT",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(updates),
-        });
+        }, diagnostics));
         if (!resp.ok) {
             throw new Error(`Asset update failed: ${resp.status}`);
         }
@@ -2778,15 +2860,20 @@ export class EditorWidget {
         return await resp.json();
     }
 
-    async _bulkMoveAssets(assetIds, folder = "") {
+    async _bulkMoveAssets(...args) {
+        return this._withMutationGesture(
+            "asset_folder_move", (diagnostics) => this._bulkMoveAssetsWithinGesture(diagnostics, ...args));
+    }
+
+    async _bulkMoveAssetsWithinGesture(diagnostics, assetIds, folder = "") {
         if (!this.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { updated: 0 };
         const dirName = this.projectDir.split(/[/\\]/).pop();
         markProjectAssetMutation(dirName, "asset_folder_move");
-        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/bulk-move`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/bulk-move`), withEditorMutationDiagnostics({
             method: "PUT",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ asset_ids: assetIds, folder }),
-        });
+        }, diagnostics));
         if (!resp.ok) {
             throw new Error(`Bulk asset move failed: ${resp.status}`);
         }
@@ -2795,15 +2882,21 @@ export class EditorWidget {
         return payload;
     }
 
-    async _deleteAsset(assetId, force = false) {
+    async _deleteAsset(assetId, force = false, diagnostics = null) {
+        if (diagnostics) return this._deleteAssetWithinGesture(diagnostics, assetId, force);
+        return this._withMutationGesture("asset_trash", (gesture) =>
+            this._deleteAssetWithinGesture(gesture, assetId, force));
+    }
+
+    async _deleteAssetWithinGesture(diagnostics, assetId, force = false) {
         if (!this.projectDir || !assetId) return { status: "noop" };
         const dirName = this.projectDir.split(/[/\\]/).pop();
         markProjectAssetMutation(dirName, "asset_trash");
-        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/${assetId}`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/${assetId}`), withEditorMutationDiagnostics({
             method: "DELETE",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ force: !!force }),
-        });
+        }, diagnostics));
         if (resp.status === 409) {
             const payload = await resp.json();
             return { status: "conflict", ...(payload || {}) };
@@ -2819,15 +2912,21 @@ export class EditorWidget {
         return { status: "trashed", ...(payload || {}) };
     }
 
-    async _bulkDeleteAssets(assetIds, force = false) {
+    async _bulkDeleteAssets(assetIds, force = false, diagnostics = null) {
+        if (diagnostics) return this._bulkDeleteAssetsWithinGesture(diagnostics, assetIds, force);
+        return this._withMutationGesture("asset_bulk_trash", (gesture) =>
+            this._bulkDeleteAssetsWithinGesture(gesture, assetIds, force));
+    }
+
+    async _bulkDeleteAssetsWithinGesture(diagnostics, assetIds, force = false) {
         if (!this.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { status: "noop" };
         const dirName = this.projectDir.split(/[/\\]/).pop();
         markProjectAssetMutation(dirName, "asset_bulk_trash");
-        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/bulk-delete`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/bulk-delete`), withEditorMutationDiagnostics({
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ asset_ids: assetIds, force: !!force }),
-        });
+        }, diagnostics));
         if (resp.status === 409) {
             const payload = await resp.json();
             return { status: "conflict", ...(payload || {}) };
@@ -2843,15 +2942,20 @@ export class EditorWidget {
         return { status: "trashed", ...(payload || {}) };
     }
 
-    async _restoreAsset(assetId) {
+    async _restoreAsset(...args) {
+        return this._withMutationGesture(
+            "asset_restore", (diagnostics) => this._restoreAssetWithinGesture(diagnostics, ...args));
+    }
+
+    async _restoreAssetWithinGesture(diagnostics, assetId) {
         if (!this.projectDir || !assetId) return { status: "noop" };
         const dirName = this.projectDir.split(/[/\\]/).pop();
         markProjectAssetMutation(dirName, "asset_restore");
-        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/restore`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/restore`), withEditorMutationDiagnostics({
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ asset_id: assetId }),
-        });
+        }, diagnostics));
         if (!resp.ok) {
             throw new Error(`Asset restore failed: ${resp.status}`);
         }
@@ -2863,15 +2967,20 @@ export class EditorWidget {
         return { status: "restored", ...(payload || {}) };
     }
 
-    async _bulkRestoreAssets(assetIds) {
+    async _bulkRestoreAssets(...args) {
+        return this._withMutationGesture(
+            "asset_bulk_restore", (diagnostics) => this._bulkRestoreAssetsWithinGesture(diagnostics, ...args));
+    }
+
+    async _bulkRestoreAssetsWithinGesture(diagnostics, assetIds) {
         if (!this.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { status: "noop" };
         const dirName = this.projectDir.split(/[/\\]/).pop();
         markProjectAssetMutation(dirName, "asset_bulk_restore");
-        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/bulk-restore`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/bulk-restore`), withEditorMutationDiagnostics({
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ asset_ids: assetIds }),
-        });
+        }, diagnostics));
         if (!resp.ok) {
             throw new Error(`Bulk asset restore failed: ${resp.status}`);
         }
@@ -2883,15 +2992,20 @@ export class EditorWidget {
         return { status: "restored", ...(payload || {}) };
     }
 
-    async _permanentDeleteAsset(assetId, force = false) {
+    async _permanentDeleteAsset(...args) {
+        return this._withMutationGesture(
+            "asset_permanent_delete", (diagnostics) => this._permanentDeleteAssetWithinGesture(diagnostics, ...args));
+    }
+
+    async _permanentDeleteAssetWithinGesture(diagnostics, assetId, force = false) {
         if (!this.projectDir || !assetId) return { status: "noop" };
         const dirName = this.projectDir.split(/[/\\]/).pop();
         markProjectAssetMutation(dirName, "asset_permanent_delete");
-        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/permanent`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/permanent`), withEditorMutationDiagnostics({
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ asset_id: assetId, force: !!force }),
-        });
+        }, diagnostics));
         if (resp.status === 409) {
             const payload = await resp.json();
             return { status: "conflict", ...(payload || {}) };
@@ -2908,15 +3022,20 @@ export class EditorWidget {
         return { status: "deleted", ...(payload || {}) };
     }
 
-    async _bulkPermanentDeleteAssets(assetIds, force = false) {
+    async _bulkPermanentDeleteAssets(...args) {
+        return this._withMutationGesture(
+            "asset_bulk_permanent_delete", (diagnostics) => this._bulkPermanentDeleteAssetsWithinGesture(diagnostics, ...args));
+    }
+
+    async _bulkPermanentDeleteAssetsWithinGesture(diagnostics, assetIds, force = false) {
         if (!this.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { status: "noop" };
         const dirName = this.projectDir.split(/[/\\]/).pop();
         markProjectAssetMutation(dirName, "asset_bulk_permanent_delete");
-        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/bulk-permanent-delete`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/bulk-permanent-delete`), withEditorMutationDiagnostics({
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ asset_ids: assetIds, force: !!force }),
-        });
+        }, diagnostics));
         if (resp.status === 409) {
             const payload = await resp.json();
             return { status: "conflict", ...(payload || {}) };
@@ -2933,13 +3052,18 @@ export class EditorWidget {
         return { status: "deleted", ...(payload || {}) };
     }
 
-    async _emptyTrash() {
+    async _emptyTrash(...args) {
+        return this._withMutationGesture(
+            "asset_empty_trash", (diagnostics) => this._emptyTrashWithinGesture(diagnostics, ...args));
+    }
+
+    async _emptyTrashWithinGesture(diagnostics) {
         if (!this.projectDir) return { status: "noop" };
         const dirName = this.projectDir.split(/[/\\]/).pop();
         markProjectAssetMutation(dirName, "asset_empty_trash");
-        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/empty-trash`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/empty-trash`), withEditorMutationDiagnostics({
             method: "POST",
-        });
+        }, diagnostics));
         if (!resp.ok) {
             throw new Error(`Empty trash failed: ${resp.status}`);
         }
@@ -2952,15 +3076,20 @@ export class EditorWidget {
         return { status: "deleted", ...(payload || {}) };
     }
 
-    async _createAssetFolder(folderName) {
+    async _createAssetFolder(...args) {
+        return this._withMutationGesture(
+            "asset_folder_create", (diagnostics) => this._createAssetFolderWithinGesture(diagnostics, ...args));
+    }
+
+    async _createAssetFolderWithinGesture(diagnostics, folderName) {
         if (!this.projectDir || !folderName) return [];
         const dirName = this.projectDir.split(/[/\\]/).pop();
         markProjectAssetMutation(dirName, "asset_folder_create");
-        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/folders`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/folders`), withEditorMutationDiagnostics({
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ folder: folderName }),
-        });
+        }, diagnostics));
         if (!resp.ok) {
             throw new Error(`Folder create failed: ${resp.status}`);
         }
@@ -2969,15 +3098,20 @@ export class EditorWidget {
         return payload.folders || [];
     }
 
-    async _renameAssetFolder(folderName, newFolderName) {
+    async _renameAssetFolder(...args) {
+        return this._withMutationGesture(
+            "asset_folder_rename", (diagnostics) => this._renameAssetFolderWithinGesture(diagnostics, ...args));
+    }
+
+    async _renameAssetFolderWithinGesture(diagnostics, folderName, newFolderName) {
         if (!this.projectDir || !folderName || !newFolderName) return [];
         const dirName = this.projectDir.split(/[/\\]/).pop();
         markProjectAssetMutation(dirName, "asset_folder_rename");
-        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/folders`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/folders`), withEditorMutationDiagnostics({
             method: "PUT",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ old_folder: folderName, new_folder: newFolderName }),
-        });
+        }, diagnostics));
         if (!resp.ok) {
             throw new Error(`Folder rename failed: ${resp.status}`);
         }
@@ -2986,15 +3120,21 @@ export class EditorWidget {
         return payload || { folders: [] };
     }
 
-    async _deleteAssetFolder(folderName, force = false) {
+    async _deleteAssetFolder(folderName, force = false, diagnostics = null) {
+        if (diagnostics) return this._deleteAssetFolderWithinGesture(diagnostics, folderName, force);
+        return this._withMutationGesture("asset_folder_delete", (gesture) =>
+            this._deleteAssetFolderWithinGesture(gesture, folderName, force));
+    }
+
+    async _deleteAssetFolderWithinGesture(diagnostics, folderName, force = false) {
         if (!this.projectDir || !folderName) return { status: "noop" };
         const dirName = this.projectDir.split(/[/\\]/).pop();
         markProjectAssetMutation(dirName, "asset_folder_delete");
-        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/folders`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/folders`), withEditorMutationDiagnostics({
             method: "DELETE",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ folder: folderName, force: !!force }),
-        });
+        }, diagnostics));
         if (resp.status === 409) {
             const payload = await resp.json();
             return { status: "conflict", ...(payload || {}) };
@@ -3007,9 +3147,15 @@ export class EditorWidget {
         return { status: "deleted", ...(payload || {}) };
     }
 
-    async _replaceAsset(assetId, file) {
+    // Kind is shared with replaceAssetInProject's asset refresh reason.
+    async _replaceAsset(...args) {
+        return this._withMutationGesture(
+            "asset_replace", (diagnostics) => this._replaceAssetWithinGesture(diagnostics, ...args));
+    }
+
+    async _replaceAssetWithinGesture(diagnostics, assetId, file) {
         if (!this.projectDir || !assetId || !file) return null;
-        const payload = await replaceAssetInProject(this.projectDir, assetId, file);
+        const payload = await replaceAssetInProject(this.projectDir, assetId, file, diagnostics);
         await Promise.all([
             this._fetchAssets(),
             this._fetchScenes(),
@@ -3777,7 +3923,7 @@ export class EditorWidget {
                         this._discardUndoEntry?.(queuedHistoryEntry);
                     }
                     throw mutationError;
-                } finally {
+               } finally {
                     if (queuedHistoryEntry && !queuedHistoryEntry.pending) {
                         delete queuedHistoryEntry._historyOrderContext;
                     }
@@ -4676,14 +4822,19 @@ export class EditorWidget {
         });
     }
 
-    async _renameAsset(asset, newName) {
+    async _renameAsset(...args) {
+        return this._withMutationGesture(
+            "asset_rename", (diagnostics) => this._renameAssetWithinGesture(diagnostics, ...args));
+    }
+
+    async _renameAssetWithinGesture(diagnostics, asset, newName) {
         const dirName = this.projectDir.split(/[/\\]/).pop();
         try {
-            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/${asset.asset_id}`), {
+            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/${asset.asset_id}`), withEditorMutationDiagnostics({
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ name: newName }),
-            });
+            }, diagnostics));
             await this._fetchAssets();
         } catch (e) {
             console.warn("[Sonder] Failed to rename asset:", e);
@@ -4767,7 +4918,7 @@ export class EditorWidget {
         return Number(snapFpsToAllowed(numeric, values).toFixed(3));
     }
 
-    async _applyActiveTemplateFpsConstraint() {
+    async _applyActiveTemplateFpsConstraint(diagnostics = null) {
         if (!this.activeScene) return;
         const template = this._getActiveTemplate();
         const values = getTemplateFpsValues(template);
@@ -4784,7 +4935,7 @@ export class EditorWidget {
             this._syncSceneFpsControl();
             return;
         }
-        await this._updateSceneFps(nextFps);
+        await this._updateSceneFps(nextFps, diagnostics);
     }
 
     _snapSceneDurationToTemplate(frames) {
@@ -5323,7 +5474,13 @@ export class EditorWidget {
         return frameConstraintsEqual(a, b);
     }
 
-    async _updateProjectTemplateId(templateId) {
+    async _updateProjectTemplateId(templateId, diagnostics = null) {
+        if (diagnostics) return this._updateProjectTemplateIdWithinGesture(diagnostics, templateId);
+        return this._withMutationGesture("updateProjectTemplateId", (gesture) =>
+            this._updateProjectTemplateIdWithinGesture(gesture, templateId));
+    }
+
+    async _updateProjectTemplateIdWithinGesture(diagnostics, templateId) {
         if (!this.projectDir) return true;
         const dirName = this._projectDirName();
         const frameConstraint = this._resolveFrameConstraintForTemplate(templateId);
@@ -5335,7 +5492,8 @@ export class EditorWidget {
                 `/sonder-editor/project/${encodeURIComponent(dirName)}`,
                 {
                     method: "PUT",
-                    headers: { "Content-Type": "application/json" },
+                    headers: { "Content-Type": "application/json",
+                        ...this._mutationDiagnosticHeaders(diagnostics) },
                     body: JSON.stringify({
                         template_id: templateId,
                         frame_constraint: frameConstraint,
@@ -5351,13 +5509,18 @@ export class EditorWidget {
         }
     }
 
-    async _handleTemplateSelectionChange() {
+    async _handleTemplateSelectionChange(...args) {
+        return this._withMutationGesture("handleTemplateSelectionChange", (diagnostics) =>
+            this._handleTemplateSelectionChangeWithinGesture(diagnostics, ...args));
+    }
+
+    async _handleTemplateSelectionChangeWithinGesture(diagnostics) {
         const nextTemplateId = getTemplateById(this._templateSelect?.value, this._settings).id;
         if (!nextTemplateId || nextTemplateId === this._templateId) {
             this._rebuildTemplateOptions();
             return;
         }
-        if (!(await this._updateProjectTemplateId(nextTemplateId))) {
+        if (!(await this._updateProjectTemplateId(nextTemplateId, diagnostics))) {
             this._rebuildTemplateOptions();
             return;
         }
@@ -5370,7 +5533,7 @@ export class EditorWidget {
         this._rebuildResolutionTierOptions();
         this._applyTemplateConstraintMetadata();
         this._resetFreeAspectTierDraft();
-        this._syncSceneResolutionControls({ detectSelections: false });
+        this._syncSceneResolutionControls({ detectSelections: false, diagnostics });
         if (this._resolutionControlMode() === "free-custom") {
             const template = this._getActiveTemplate();
             const width = parseInt(this._resWInput?.value, 10) || this.activeScene?.width || 0;
@@ -5379,11 +5542,11 @@ export class EditorWidget {
                 ? { width, height }
                 : snapResolution(width, height, template);
             this._setResolutionInputs(nextResolution.width, nextResolution.height);
-            await this._updateSceneResolution(nextResolution.width, nextResolution.height, { detectSelections: false });
+            await this._updateSceneResolution(nextResolution.width, nextResolution.height, { detectSelections: false, diagnostics });
         } else {
-            await this._recalculateResolution();
+            await this._recalculateResolution(diagnostics);
         }
-        await this._applyActiveTemplateFpsConstraint();
+        await this._applyActiveTemplateFpsConstraint(diagnostics);
         // When the frame RULE actually changed (e.g. LTX 8n+1 → Cog 16n+1), the
         // existing selection sits on the old grid — clear it rather than silently
         // re-snapping endpoints the user placed. Same-rule switches (wan → hunyuan,
@@ -5399,7 +5562,7 @@ export class EditorWidget {
         this._updateViewportHeader();
     }
 
-    async _recalculateResolution() {
+    async _recalculateResolution(diagnostics = null) {
         this._resetFreeAspectTierDraft();
         this._updateResolutionInputMode();
         const mode = this._resolutionControlMode();
@@ -5418,7 +5581,7 @@ export class EditorWidget {
         }
         if (!resolution) return;
         this._setResolutionInputs(resolution.width, resolution.height);
-        await this._updateSceneResolution(resolution.width, resolution.height, { detectSelections: false });
+        await this._updateSceneResolution(resolution.width, resolution.height, { detectSelections: false, diagnostics });
     }
 
     _setSceneAspectRatioFromDimensions(width, height) {
@@ -6572,7 +6735,7 @@ export class EditorWidget {
             } catch (error) {
                 console.warn("[Sonder] Failed to sweep render cache:", error);
                 return null;
-            } finally {
+           } finally {
                 // A superseded request must never clear its successor's promise.
                 if (this._renderCacheSweepInFlight === inFlight) {
                     this._renderCacheSweepInFlight = null;
@@ -9207,7 +9370,12 @@ export class EditorWidget {
         return kinds.size === 1 ? [...kinds][0] : "";
     }
 
-    async _placeReferencePayload(payload, frame, trackRawY) {
+    async _placeReferencePayload(...args) {
+        return this._withMutationGesture(
+            "placeReferencePayload", () => this._placeReferencePayloadWithinGesture(...args));
+    }
+
+    async _placeReferencePayloadWithinGesture(payload, frame, trackRawY) {
         if (!this.activeScene || !this.projectDir || !Array.isArray(payload?.members) || !payload.members.length) return;
         const mediaKind = this._referencePayloadMediaKind(payload);
         if (!mediaKind) {
@@ -9858,7 +10026,12 @@ export class EditorWidget {
         return count;
     }
 
-    async _convertClipRole(clipId, targetRole) {
+    async _convertClipRole(...args) {
+        return this._withMutationGesture(
+            "convertClipRole", () => this._convertClipRoleWithinGesture(...args));
+    }
+
+    async _convertClipRoleWithinGesture(clipId, targetRole) {
         if (!this.activeScene || !this.projectDir || !clipId) return;
         const clip = (this.activeScene.clips || []).find(c => c.clip_id === clipId);
         if (!clip) return;
@@ -9921,7 +10094,12 @@ export class EditorWidget {
         }
     }
 
-    async _moveItemToNewLane(hit) {
+    async _moveItemToNewLane(...args) {
+        return this._withMutationGesture(
+            "moveItemToNewLane", () => this._moveItemToNewLaneWithinGesture(...args));
+    }
+
+    async _moveItemToNewLaneWithinGesture(hit) {
         if (!this.activeScene || !this.projectDir) return;
         const sceneId = this.activeSceneId;
         this._pushUndo("move to new lane");
@@ -10049,7 +10227,12 @@ export class EditorWidget {
 
     /** Apply one uniform header visibility command. Actual lane-hidden state is
      *  lane-local; an inferred muted/partial state performs linked-aware unmute. */
-    async _applyHeaderVisibilityBulk(entries, nextHidden) {
+    async _applyHeaderVisibilityBulk(...args) {
+        return this._withMutationGesture(
+            "applyHeaderVisibilityBulk", () => this._applyHeaderVisibilityBulkWithinGesture(...args));
+    }
+
+    async _applyHeaderVisibilityBulkWithinGesture(entries, nextHidden) {
         const targets = (entries || []).filter(
             (entry) => entry && !this._isLaneVisibilityControlDisabled(entry)
         );
@@ -10209,7 +10392,12 @@ export class EditorWidget {
      *  write the lanes it touched, so a transiently-reverted neighbor entry can
      *  never be persisted by an unrelated toggle (the full-snapshot writes were
      *  the rapid-toggle data-loss amplifier). */
-    async _saveLaneConfig(changedEntries) {
+    async _saveLaneConfig(...args) {
+        return this._withMutationGesture(
+            "laneConfig", () => this._saveLaneConfigWithinGesture(...args));
+    }
+
+    async _saveLaneConfigWithinGesture(changedEntries) {
         if (!this.activeScene || !this.projectDir) return;
         const entries = (Array.isArray(changedEntries) ? changedEntries : [changedEntries]).filter(Boolean);
         if (!entries.length) return;
@@ -10282,7 +10470,12 @@ export class EditorWidget {
         }
     }
 
-    async _addLane(trackType) {
+    async _addLane(...args) {
+        return this._withMutationGesture(
+            "addLane", () => this._addLaneWithinGesture(...args));
+    }
+
+    async _addLaneWithinGesture(trackType) {
         if (!this.activeScene || !this.projectDir) return;
         const laneType = variableLaneTypeFor(trackType);
         if (!laneType) return;
@@ -10410,7 +10603,12 @@ export class EditorWidget {
         return "";
     }
 
-    async _consolidateSelectedItemsToLane(hit) {
+    async _consolidateSelectedItemsToLane(...args) {
+        return this._withMutationGesture(
+            "consolidateSelectedItemsToLane", () => this._consolidateSelectedItemsToLaneWithinGesture(...args));
+    }
+
+    async _consolidateSelectedItemsToLaneWithinGesture(hit) {
         if (!this.activeScene || !this.projectDir) return;
         const items = this._selectedConsolidationItems(hit);
         const refusal = this._consolidationRefusal(items, hit);
@@ -10452,7 +10650,12 @@ export class EditorWidget {
         }
     }
 
-    async _removeLaneDeletingItems(trackType, laneIndex) {
+    async _removeLaneDeletingItems(...args) {
+        return this._withMutationGesture(
+            "removeLaneDeletingItems", () => this._removeLaneDeletingItemsWithinGesture(...args));
+    }
+
+    async _removeLaneDeletingItemsWithinGesture(trackType, laneIndex) {
         if (!this.activeScene || !this.projectDir) return;
         const laneType = this._laneTypeFromTrackType(trackType);
         if (!laneType) return;
@@ -10514,7 +10717,12 @@ export class EditorWidget {
         return entries;
     }
 
-    async _deleteSelectedLanesAndItems(clickedEntry) {
+    async _deleteSelectedLanesAndItems(...args) {
+        return this._withMutationGesture(
+            "deleteSelectedLanesAndItems", () => this._deleteSelectedLanesAndItemsWithinGesture(...args));
+    }
+
+    async _deleteSelectedLanesAndItemsWithinGesture(clickedEntry) {
         if (!this.activeScene || !this.projectDir) return;
         if (!clickedEntry || !this._isLaneSelected(clickedEntry) || (this._selectedLanes || []).length <= 1) return;
         const entries = this._selectedLaneDeleteEntries();
@@ -10578,7 +10786,12 @@ export class EditorWidget {
         }
     }
 
-    async _removeLaneWithItems(trackType, laneIndex) {
+    async _removeLaneWithItems(...args) {
+        return this._withMutationGesture(
+            "removeLaneWithItems", () => this._removeLaneWithItemsWithinGesture(...args));
+    }
+
+    async _removeLaneWithItemsWithinGesture(trackType, laneIndex) {
         const laneType = variableLaneTypeFor(trackType);
         const label = laneLogLabel(trackType);
         const items = laneItemsForType(this.activeScene, trackType, laneIndex);
@@ -10627,7 +10840,12 @@ export class EditorWidget {
         }
     }
 
-    async _deleteItemsInLane(trackType, laneIndex) {
+    async _deleteItemsInLane(...args) {
+        return this._withMutationGesture(
+            "deleteItemsInLane", () => this._deleteItemsInLaneWithinGesture(...args));
+    }
+
+    async _deleteItemsInLaneWithinGesture(trackType, laneIndex) {
         if (!this.activeScene || !this.projectDir) return;
         const descriptor = descriptorFor(trackType);
         const laneType = variableLaneTypeFor(trackType);
@@ -10670,7 +10888,12 @@ export class EditorWidget {
         }
     }
 
-    async _removeLane(trackType, laneIndex) {
+    async _removeLane(...args) {
+        return this._withMutationGesture(
+            "removeLane", () => this._removeLaneWithinGesture(...args));
+    }
+
+    async _removeLaneWithinGesture(trackType, laneIndex) {
         if (!this.activeScene || !this.projectDir) return;
         const laneType = variableLaneTypeFor(trackType);
         const currentCount = laneCountFor(this.activeScene, trackType);
@@ -11477,7 +11700,12 @@ export class EditorWidget {
         setTimeout(() => channelInputs.focusFirst(), 50);
     }
 
-    async _saveNewPromptSection(startFrame, endFrame, channels, channelDocs = {}, attachments = []) {
+    async _saveNewPromptSection(...args) {
+        return this._withMutationGesture(
+            "saveNewPromptSection", () => this._saveNewPromptSectionWithinGesture(...args));
+    }
+
+    async _saveNewPromptSectionWithinGesture(startFrame, endFrame, channels, channelDocs = {}, attachments = []) {
         if (!this.activeScene || !this.projectDir) return;
         if (this._isPromptTrackLocked()) return;
         const undoLabel = "add prompt";
@@ -11790,7 +12018,12 @@ export class EditorWidget {
 
     /** Per-channel scene-global text. Sends a channel PATCH — the backend
      *  merges, so channels not named here keep their value. */
-    async _updateSceneGlobalChannels(patch) {
+    async _updateSceneGlobalChannels(...args) {
+        return this._withMutationGesture(
+            "updateSceneGlobalChannels", () => this._updateSceneGlobalChannelsWithinGesture(...args));
+    }
+
+    async _updateSceneGlobalChannelsWithinGesture(patch) {
         if (!this.activeScene || !this.projectDir) return;
         if (this._isGlobalPromptTrackLocked()) return;
         const sceneRef = this.activeScene;
@@ -11826,7 +12059,12 @@ export class EditorWidget {
         }
     }
 
-    async _updateSceneGlobalContext(channels, channelDocs, attachments, {
+    async _updateSceneGlobalContext(...args) {
+        return this._withMutationGesture(
+            "updateSceneGlobalContext", () => this._updateSceneGlobalContextWithinGesture(...args));
+    }
+
+    async _updateSceneGlobalContextWithinGesture(channels, channelDocs, attachments, {
         baseline = null, projectId = this._projectDirName(), sceneId = this.activeSceneId,
         template = projectTemplateValue(this._channelTemplate()),
     } = {}) {
@@ -11930,7 +12168,12 @@ export class EditorWidget {
         return globalChannelKeys(this._channelTemplate());
     }
 
-    async _updateScenePrompt(value) {
+    async _updateScenePrompt(...args) {
+        return this._withMutationGesture(
+            "updateScenePrompt", () => this._updateScenePromptWithinGesture(...args));
+    }
+
+    async _updateScenePromptWithinGesture(value) {
         if (!this.activeScene || !this.projectDir) return;
         if (this._isGlobalPromptTrackLocked()) return;
         const sceneRef = this.activeScene;
@@ -12007,7 +12250,12 @@ export class EditorWidget {
      *  inside the same save that moves the pointer, so the two can never
      *  disagree. Text is never hidden, but it is moved, and scene-scoped undo
      *  will not switch the template back. Both facts go in the confirm. */
-    async _setPromptChannelTemplate(nextTemplateOrId, { confirm = true } = {}) {
+    async _setPromptChannelTemplate(...args) {
+        return this._withMutationGesture(
+            "setPromptChannelTemplate", (diagnostics) => this._setPromptChannelTemplateWithinGesture(diagnostics, ...args));
+    }
+
+    async _setPromptChannelTemplateWithinGesture(diagnostics, nextTemplateOrId, { confirm = true } = {}) {
         const dirName = this._projectDirName();
         if (!dirName) return false;
         const next = getChannelTemplate(
@@ -12052,7 +12300,7 @@ export class EditorWidget {
         this._promptTemplateChanging = true;
         try {
             await this._queuePromptProjectWrite({ metadata: { [PROJECT_TEMPLATE_KEY]: frozen } }, {
-                projectId: dirName, label: "switch prompt channels", retryOnConflict: false, beforeRun: () => {
+                diagnostics, projectId: dirName, label: "switch prompt channels", retryOnConflict: false, beforeRun: () => {
                         if (this._hasPromptToolDrafts(dirName)) throw new Error("Save or discard Prompt drafts before switching channels.");
                     },
             });
@@ -12166,7 +12414,12 @@ export class EditorWidget {
      *  Same documented ProjectMutationQueue exemption as the labels toggle:
      *  project-level metadata, infrequent single control, asset_folders
      *  precedent; not undo-enrolled. */
-    async _setPromptSectionDelimiter(value) {
+    async _setPromptSectionDelimiter(...args) {
+        return this._withMutationGesture(
+            "setPromptSectionDelimiter", () => this._setPromptSectionDelimiterWithinGesture(...args));
+    }
+
+    async _setPromptSectionDelimiterWithinGesture(value) {
         const dirName = this._projectDirName();
         if (!dirName) return;
         const delimiter = String(value ?? "").trim().slice(0, 8);
@@ -12186,7 +12439,12 @@ export class EditorWidget {
      *  from a render window when the selection only clips a small sliver of it
      *  at the window edge (under N% of that section's own length); 0 = off.
      *  Same project-metadata mutation exemption as the delimiter/labels. */
-    async _setPromptFrameThreshold(value) {
+    async _setPromptFrameThreshold(...args) {
+        return this._withMutationGesture(
+            "setPromptFrameThreshold", () => this._setPromptFrameThresholdWithinGesture(...args));
+    }
+
+    async _setPromptFrameThresholdWithinGesture(value) {
         const dirName = this._projectDirName();
         if (!dirName) return;
         let pct = parseFloat(value);
@@ -12293,7 +12551,12 @@ export class EditorWidget {
         }
     }
 
-    async _setReferenceFrameThreshold(value) {
+    async _setReferenceFrameThreshold(...args) {
+        return this._withMutationGesture("setReferenceFrameThreshold", (diagnostics) =>
+            this._setReferenceFrameThresholdWithinGesture(diagnostics, ...args));
+    }
+
+    async _setReferenceFrameThresholdWithinGesture(diagnostics, value) {
         const dirName = this._projectDirName();
         if (!dirName) return;
         let pct = parseFloat(value);
@@ -12304,7 +12567,8 @@ export class EditorWidget {
                 `/sonder-editor/project/${encodeURIComponent(dirName)}`,
                 {
                     method: "PUT",
-                    headers: { "Content-Type": "application/json" },
+                    headers: { "Content-Type": "application/json",
+                        ...this._mutationDiagnosticHeaders(diagnostics) },
                     body: JSON.stringify({ metadata: { reference_frame_threshold: pct } }),
                 },
                 { projectId: dirName }
@@ -12967,7 +13231,12 @@ export class EditorWidget {
         });
     }
 
-    async _queueSelectedPromptSections(items = this.selectedItems) {
+    async _queueSelectedPromptSections(...args) {
+        return this._withMutationGesture("queueSelectedPromptSections", () =>
+            this._queueSelectedPromptSectionsWithinGesture(...args));
+    }
+
+    async _queueSelectedPromptSectionsWithinGesture(items = this.selectedItems) {
         if (!this.activeScene) return;
         const promptItems = this._promptItemsForQueueBatch(items);
         const queueItems = promptItems.filter(({ section }) => {
@@ -13035,12 +13304,13 @@ export class EditorWidget {
                 refreshKeysOnError: ["queue"],
                 failureMessage: "Add prompt section batch failed - queue restored.",
                 invalidateQueueFetch: true,
-                run: async (queuedIntent) => {
+                run: async (queuedIntent, diagnostics) => {
                     return await this._runVersionedProjectMutation(
                         `/sonder-editor/project/${encodeURIComponent(queuedIntent.projectId)}/queue/batch`,
                         {
                             method: "POST",
-                            headers: { "Content-Type": "application/json" },
+                            headers: { "Content-Type": "application/json",
+                                ...this._mutationDiagnosticHeaders(diagnostics) },
                             body: JSON.stringify({ jobs: queuedIntent.snapshots }),
                         },
                         { projectId: queuedIntent.projectId }
@@ -13186,7 +13456,12 @@ export class EditorWidget {
     /** Replace the scene's prompt state with a history entry / template:
      *  ONE mutation request (deletes high-index-first, then creates, then the
      *  global text) so the apply is a single save and a single undo step. */
-    async _applyPromptSetup({ global: globalText, global_channels: globalChannels = null,
+    async _applyPromptSetup(...args) {
+        return this._withMutationGesture(
+            "applyPromptSetup", (diagnostics) => this._applyPromptSetupWithinGesture(diagnostics, ...args));
+    }
+
+    async _applyPromptSetupWithinGesture(diagnostics, { global: globalText, global_channels: globalChannels = null,
                               global_channel_docs: globalChannelDocs = null,
                               global_attachments: globalAttachments = null,
                               sections, extendDurationTo = 0, source_fps: sourceFps = 0,
@@ -13410,6 +13685,7 @@ export class EditorWidget {
                 this._updateTransportUI();
             }
             const result = await this._runSceneMutation(operations, {
+                diagnostics,
                 key: `prompt:${this.activeSceneId}:apply:${Date.now()}`,
                 label: "apply prompt setup",
                 coalesce: false,
@@ -13593,7 +13869,12 @@ export class EditorWidget {
         this._promptEditorResizeObserver = null;
     }
 
-    async _updatePromptSection(idx, updates, {
+    async _updatePromptSection(...args) {
+        return this._withMutationGesture(
+            "updatePromptSection", () => this._updatePromptSectionWithinGesture(...args));
+    }
+
+    async _updatePromptSectionWithinGesture(idx, updates, {
         baseline = null, projectId = this._projectDirName(), sceneId = this.activeSceneId,
         template = projectTemplateValue(this._channelTemplate()),
     } = {}) {
@@ -13666,7 +13947,12 @@ export class EditorWidget {
         }
     }
 
-    async _updateLinkedPromptAttachment(attachmentId, configured) {
+    async _updateLinkedPromptAttachment(...args) {
+        return this._withMutationGesture(
+            "updateLinkedPromptAttachment", () => this._updateLinkedPromptAttachmentWithinGesture(...args));
+    }
+
+    async _updateLinkedPromptAttachmentWithinGesture(attachmentId, configured) {
         if (!this.activeScene || !this.projectDir || this._isPromptTrackLocked()) return false;
         const sections = this.activeScene.prompt_sections || [];
         const source = sections.flatMap((section) => section.attachments || [])
@@ -13741,7 +14027,12 @@ export class EditorWidget {
         }
     }
 
-    async _deletePromptSection(idx) {
+    async _deletePromptSection(...args) {
+        return this._withMutationGesture(
+            "deletePromptSection", () => this._deletePromptSectionWithinGesture(...args));
+    }
+
+    async _deletePromptSectionWithinGesture(idx) {
         if (!this.activeScene || !this.projectDir) return;
         if (this._isPromptTrackLocked()) return;
         const undoLabel = "delete prompt";
@@ -14138,7 +14429,12 @@ export class EditorWidget {
         editor.append(fitLabel, fitSelect, cropLabel, cropSelect);
     }
 
-    async _moveItemToFrame(type, id, data, newStart) {
+    async _moveItemToFrame(...args) {
+        return this._withMutationGesture(
+            "moveItemToFrame", () => this._moveItemToFrameWithinGesture(...args));
+    }
+
+    async _moveItemToFrameWithinGesture(type, id, data, newStart) {
         if (!this.activeScene || !this.projectDir) return;
         const hit = { type, id, data };
         const applyLinked = this._isLinkedItem(hit);
@@ -14184,7 +14480,12 @@ export class EditorWidget {
         }
     }
 
-    async _updateItemProperty(type, id, props, { refresh = true, coalesce = true } = {}) {
+    async _updateItemProperty(...args) {
+        return this._withMutationGesture(
+            "updateItemProperty", () => this._updateItemPropertyWithinGesture(...args));
+    }
+
+    async _updateItemPropertyWithinGesture(type, id, props, { refresh = true, coalesce = true } = {}) {
         if (!this.activeScene || !this.projectDir) return;
         // Linked mute propagation (manual-test #7): muting one linked member mutes
         // the whole group atomically. Only `muted` propagates through links —
@@ -14276,7 +14577,12 @@ export class EditorWidget {
         }
     }
 
-    async _toggleSelectedMute() {
+    async _toggleSelectedMute(...args) {
+        return this._withMutationGesture(
+            "toggleMute", () => this._toggleSelectedMuteWithinGesture(...args));
+    }
+
+    async _toggleSelectedMuteWithinGesture() {
         const targets = this._expandItemsWithLinked(this.selectedItems)
             .filter((item) => item?.type === "clip" || item?.type === "audio" || item?.type === "guide" || item?.type === "prompt" || item?.type === "reference");
         if (!targets.length) return;
@@ -14349,7 +14655,12 @@ export class EditorWidget {
         this._updateToolbar();
     }
 
-    async _createLinkGroupFromSelection() {
+    async _createLinkGroupFromSelection(...args) {
+        return this._withMutationGesture(
+            "linkItems", () => this._createLinkGroupFromSelectionWithinGesture(...args));
+    }
+
+    async _createLinkGroupFromSelectionWithinGesture() {
         if (!this.activeScene || !this.projectDir) return;
         const items = this._selectedLinkableItems()
             .map((item) => this._mutationItemFromSelection(item))
@@ -14376,7 +14687,12 @@ export class EditorWidget {
         }
     }
 
-    async _unlinkSelectedItems() {
+    async _unlinkSelectedItems(...args) {
+        return this._withMutationGesture(
+            "unlinkItems", () => this._unlinkSelectedItemsWithinGesture(...args));
+    }
+
+    async _unlinkSelectedItemsWithinGesture() {
         if (!this.activeScene || !this.projectDir) return;
         const items = this._selectedLinkableItems()
             .filter((item) => this._isLinkedItem(item))
@@ -14412,7 +14728,12 @@ export class EditorWidget {
         this._updateToolbar();
     }
 
-    async _moveGuideToFrame(guideData, newIdx, strength = guideData?.strength ?? 1.0) {
+    async _moveGuideToFrame(...args) {
+        return this._withMutationGesture(
+            "moveGuideToFrame", () => this._moveGuideToFrameWithinGesture(...args));
+    }
+
+    async _moveGuideToFrameWithinGesture(guideData, newIdx, strength = guideData?.strength ?? 1.0) {
         if (!this.activeScene || !this.projectDir) return;
         if (this._isGuideTrackLocked()) return;
         const undoLabel = "move guide";
@@ -14738,7 +15059,12 @@ export class EditorWidget {
         return Math.max(1, targetLong);
     }
 
-    async _addClipFrameToGuides(clip) {
+    async _addClipFrameToGuides(...args) {
+        return this._withMutationGesture(
+            "addClipFrameToGuides", (diagnostics) => this._addClipFrameToGuidesWithinGesture(diagnostics, ...args));
+    }
+
+    async _addClipFrameToGuidesWithinGesture(diagnostics, clip) {
         if (!this.activeScene || !this.projectDir || !clip) return;
         if (this._isGuideTrackLocked()) {
             this._showToast("Guides track is locked");
@@ -14775,10 +15101,10 @@ export class EditorWidget {
                             snapshot_long_edge: snapshot.targetLongEdge || targetLongEdge,
                             snapshot_source_long_edge: snapshot.sourceLongEdge || Math.max(snapshot.sourceWidth || 0, snapshot.sourceHeight || 0),
                         }));
-                        const snapshotResp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/viewport_snapshot`), {
+                        const snapshotResp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/viewport_snapshot`), withEditorMutationDiagnostics({
                             method: "POST",
                             body: formData,
-                        });
+                        }, diagnostics));
                         if (snapshotResp.ok) {
                             asset = await snapshotResp.json();
                             console.debug?.("[Sonder] Guide captured via viewport snapshot", {
@@ -14796,7 +15122,7 @@ export class EditorWidget {
             }
 
             if (!asset) {
-                const extractResp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/extract_frame`), {
+                const extractResp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/extract_frame`), withEditorMutationDiagnostics({
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
@@ -14804,7 +15130,7 @@ export class EditorWidget {
                         frame_index: backendSourceFrame,
                         target_long_edge: targetLongEdge,
                     }),
-                });
+                }, diagnostics));
                 if (!extractResp.ok) {
                     console.warn("[Sonder] Extract frame failed:", await extractResp.text());
                     return;
@@ -14833,6 +15159,7 @@ export class EditorWidget {
             await this._runSceneMutation(
                 [{ type: "create_guide", fields }],
                 {
+                    diagnostics,
                     key: `guide:${this.activeSceneId}:${this.playhead}:create`,
                     label: "add guide",
                     coalesce: false,
@@ -14844,7 +15171,12 @@ export class EditorWidget {
         }
     }
 
-    async _deleteSelectedItems() {
+    async _deleteSelectedItems(...args) {
+        return this._withMutationGesture(
+            "deleteSelectedItems", () => this._deleteSelectedItemsWithinGesture(...args));
+    }
+
+    async _deleteSelectedItemsWithinGesture() {
         if (this.selectedItems.length === 0 || !this.activeScene || !this.projectDir) return;
         const expanded = this._expandItemsWithLinked(this.selectedItems);
         if (!expanded.length) return;
@@ -15191,7 +15523,7 @@ export class EditorWidget {
                 notifyWarning(e?.message || "Move was refused — timeline restored.", { source: "timeline-move-refused" });
                 await this._fetchScenes({ ignoreMutationGate: true, reason: "moveItem_error" });
                 this._renderTimeline();
-            } finally {
+           } finally {
                 this._dragPromptSwap = null;
                 this._dragPromptHold = null;
             }
@@ -15283,7 +15615,12 @@ export class EditorWidget {
     }
 
     /** Split a clip at the given frame (razor tool). */
-    async _splitClipAtFrame(hit, frame) {
+    async _splitClipAtFrame(...args) {
+        return this._withMutationGesture(
+            "splitItem", () => this._splitClipAtFrameWithinGesture(...args));
+    }
+
+    async _splitClipAtFrameWithinGesture(hit, frame) {
         if (!this.projectDir || !this.activeScene) return;
         if (hit.type !== "clip" && hit.type !== "audio" && hit.type !== "prompt") return;
         const start = hit.type === "prompt" ? hit.data.start_frame : hit.data.timeline_start_frame;
@@ -15447,7 +15784,7 @@ export class EditorWidget {
 
             const deleteBtn = this._makeBtn("✕", "Delete guide");
             deleteBtn.style.color = COLORS.dangerText;
-            deleteBtn.addEventListener("click", async (event) => {
+            deleteBtn.addEventListener("click", (event) => this._withMutationGesture("deleteGuide", async (diagnostics) => {
                 event.stopPropagation();
                 const undoLabel = "delete guide";
                 this._pushUndo(undoLabel);
@@ -15485,7 +15822,7 @@ export class EditorWidget {
                     this._showGuideManagementPopup(x, y);
                     console.warn("[Sonder] Failed to delete guide:", e);
                 }
-            });
+            }));
 
             row.append(thumb, frameInput, strengthInput, label, muteBtn, deleteBtn);
             popup.appendChild(row);
@@ -15709,32 +16046,32 @@ export class EditorWidget {
             }
             const swapBtn = this._makeBtn("Swap", "Swap guide frames");
             swapBtn.disabled = locked || guides.length < 2;
-            swapBtn.addEventListener("click", async (event) => {
+            swapBtn.addEventListener("click", (event) => this._withMutationGesture("swapGuides", async (diagnostics) => {
                 event.stopPropagation();
                 if (locked || !swapSelect.value) return;
                 this._pushUndo("swap guides");
                 const dirName = this._projectDirName();
                 const sceneId = this.activeSceneId;
                 try {
-                    await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/guides/swap`), {
+                    await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/guides/swap`), withEditorMutationDiagnostics({
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({
                             frame_a: guide.frame_index,
                             frame_b: Number(swapSelect.value),
                         }),
-                    });
+                    }, diagnostics));
                     await refreshPanel();
                 } catch (e) {
                     console.warn("[Sonder] Failed to swap guides:", e);
                 }
-            });
+            }));
             swapWrap.append(swapSelect, swapBtn);
 
             const deleteBtn = this._makeBtn("Del", "Delete guide");
             deleteBtn.disabled = locked;
             deleteBtn.style.color = COLORS.dangerText;
-            deleteBtn.addEventListener("click", async (event) => {
+            deleteBtn.addEventListener("click", (event) => this._withMutationGesture("deleteGuide", async (diagnostics) => {
                 event.stopPropagation();
                 if (locked) return;
                 const undoLabel = "delete guide";
@@ -15772,7 +16109,7 @@ export class EditorWidget {
                     await refreshPanel();
                     console.warn("[Sonder] Failed to delete guide:", e);
                 }
-            });
+            }));
 
             row.append(thumb, frameInput, strengthInput, label, muteBtn, replaceBtn, swapWrap, deleteBtn);
             body.appendChild(row);
@@ -15849,8 +16186,7 @@ export class EditorWidget {
                 ["Ctrl+Z", "Undo"],
                 ["Ctrl+Y", "Redo"],
                 ["Ctrl+Shift+Z", "Redo"],
-                ["Timeline Undo / Redo", "Waits for saves; warns and skips one unusable history entry per press"],
-                ["Ctrl+V", "Paste into the focused field; fullscreen background paste is ignored"],
+                ["Ctrl+V", "Paste"],
             ]) +
             this._shortcutSection("Prompt", [
                 ["Right-click prompt", "Open the insert menu where you clicked"],
@@ -16080,7 +16416,7 @@ export class EditorWidget {
         this._showImagePicker({
             title: "Replace guide with…",
             currentAssetId: guide.asset_id || "",
-            onPick: async (assetId) => {
+            onPick: (assetId) => this._withMutationGesture("replaceGuideImage", async () => {
                 if (!assetId || assetId === guide.asset_id) return;
                 this._pushUndo("replace guide");
                 try {
@@ -16094,7 +16430,7 @@ export class EditorWidget {
                 } catch (e) {
                     console.warn("[Sonder] Failed to replace guide:", e);
                 }
-            },
+            }),
         });
     }
 
@@ -16111,7 +16447,7 @@ export class EditorWidget {
             currentAssetId: currentAsset?.asset_id || "",
             assetType: "video",
             assetTypeLabel: "video",
-            onPick: async (assetId) => {
+            onPick: (assetId) => this._withMutationGesture("replaceClipSource", async () => {
                 if (!assetId || assetId === currentAsset?.asset_id) return;
                 const undoLabel = "replace clip";
                 this._pushUndo(undoLabel);
@@ -16129,7 +16465,7 @@ export class EditorWidget {
                 } catch (e) {
                     console.warn("[Sonder] Failed to replace clip source:", e);
                 }
-            },
+            }),
         });
     }
 
@@ -16146,7 +16482,7 @@ export class EditorWidget {
             currentAssetId: currentAsset?.asset_id || "",
             assetType: "audio",
             assetTypeLabel: "audio",
-            onPick: async (assetId) => {
+            onPick: (assetId) => this._withMutationGesture("replaceAudioSource", async () => {
                 if (!assetId || assetId === currentAsset?.asset_id) return;
                 const undoLabel = "replace audio";
                 this._pushUndo(undoLabel);
@@ -16164,7 +16500,7 @@ export class EditorWidget {
                 } catch (e) {
                     console.warn("[Sonder] Failed to replace audio source:", e);
                 }
-            },
+            }),
         });
     }
 
@@ -16313,7 +16649,12 @@ export class EditorWidget {
 
     /** Project-durable render-affecting guide collision policy. Snapshot jobs
      * freeze it at enqueue so queued execution stays reproducible. */
-    async _toggleGuideCollisionAutoOffset(on) {
+    async _toggleGuideCollisionAutoOffset(...args) {
+        return this._withMutationGesture("toggleGuideCollisionAutoOffset", (diagnostics) =>
+            this._toggleGuideCollisionAutoOffsetWithinGesture(diagnostics, ...args));
+    }
+
+    async _toggleGuideCollisionAutoOffsetWithinGesture(diagnostics, on) {
         const dirName = this._projectDirName();
         if (!dirName) return;
         try {
@@ -16321,7 +16662,8 @@ export class EditorWidget {
                 `/sonder-editor/project/${encodeURIComponent(dirName)}`,
                 {
                     method: "PUT",
-                    headers: { "Content-Type": "application/json" },
+                    headers: { "Content-Type": "application/json",
+                        ...this._mutationDiagnosticHeaders(diagnostics) },
                     body: JSON.stringify({ metadata: { guide_collision_auto_offset: !!on } }),
                 },
                 { projectId: dirName }
@@ -16416,14 +16758,19 @@ export class EditorWidget {
         }
     }
 
-    async _setAllowExternalProjectLinks(enabled) {
+    async _setAllowExternalProjectLinks(...args) {
+        return this._withMutationGesture(
+            "setAllowExternalProjectLinks", (diagnostics) => this._setAllowExternalProjectLinksWithinGesture(diagnostics, ...args));
+    }
+
+    async _setAllowExternalProjectLinksWithinGesture(diagnostics, enabled) {
         const requested = enabled === true;
         try {
-            const resp = await fetch(api.apiURL("/sonder-editor/server-settings"), {
+            const resp = await fetch(api.apiURL("/sonder-editor/server-settings"), withEditorMutationDiagnostics({
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ allow_external_project_links: requested }),
-            });
+            }, diagnostics));
             const data = await resp.json().catch(() => ({}));
             if (!resp.ok) throw new Error(data?.error || "Could not update server setting");
             this._serverSettings = data;
@@ -16437,15 +16784,20 @@ export class EditorWidget {
         }
     }
 
-    async _linkProjectFolder() {
+    async _linkProjectFolder(...args) {
+        return this._withMutationGesture(
+            "linkProjectFolder", (diagnostics) => this._linkProjectFolderWithinGesture(diagnostics, ...args));
+    }
+
+    async _linkProjectFolderWithinGesture(diagnostics) {
         const targetPath = prompt("Paste the path of an existing Sonder project folder:", "");
         if (!targetPath?.trim()) return;
         try {
-            const resp = await fetch(api.apiURL("/sonder-editor/projects/link"), {
+            const resp = await fetch(api.apiURL("/sonder-editor/projects/link"), withEditorMutationDiagnostics({
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ path: targetPath.trim() }),
-            });
+            }, diagnostics));
             const data = await resp.json().catch(() => ({}));
             if (!resp.ok) throw new Error(data?.error || "Could not link project folder");
             const folder = String(data?.project?.name || "");
@@ -16456,15 +16808,20 @@ export class EditorWidget {
         }
     }
 
-    async _unlinkActiveProject() {
+    async _unlinkActiveProject(...args) {
+        return this._withMutationGesture(
+            "unlinkActiveProject", (diagnostics) => this._unlinkActiveProjectWithinGesture(diagnostics, ...args));
+    }
+
+    async _unlinkActiveProjectWithinGesture(diagnostics) {
         const projectId = this._projectDirName();
         if (!projectId) return;
         try {
-            const resp = await fetch(api.apiURL("/sonder-editor/projects/unlink"), {
+            const resp = await fetch(api.apiURL("/sonder-editor/projects/unlink"), withEditorMutationDiagnostics({
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ project_id: projectId }),
-            });
+            }, diagnostics));
             const data = await resp.json().catch(() => ({}));
             if (!resp.ok) throw new Error(data?.error || "Could not unlink project folder");
             await this._refreshProjectChoicesAndSwitch();
@@ -17635,7 +17992,12 @@ export class EditorWidget {
         this._savedSelDropdown = dd;
     }
 
-    async _saveCurrentSelection() {
+    async _saveCurrentSelection(...args) {
+        return this._withMutationGesture(
+            "saveCurrentSelection", (diagnostics) => this._saveCurrentSelectionWithinGesture(diagnostics, ...args));
+    }
+
+    async _saveCurrentSelectionWithinGesture(diagnostics) {
         if (this._selectionDraftAnchor) {
             notifyWarning(
                 `Choose ${this._selectionDraftAnchor.edge === "start" ? "Out" : "In"} before saving the selection.`,
@@ -17650,7 +18012,7 @@ export class EditorWidget {
         try {
             const dirName = encodeURIComponent(this._projectDirName());
             const sceneId = this.activeScene.scene_id;
-            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/saved_selections`), {
+            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/saved_selections`), withEditorMutationDiagnostics({
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -17662,7 +18024,7 @@ export class EditorWidget {
                     mask_pre_offset: this._contextFrameValue("mask_pre_offset"),
                     mask_post_offset: this._contextFrameValue("mask_post_offset"),
                 }),
-            });
+            }, diagnostics));
             if (resp.ok) {
                 await this._fetchScenes();
                 notifySuccess(`Saved selection "${name.trim()}"`);
@@ -17686,26 +18048,36 @@ export class EditorWidget {
         this._updateToolbar();
     }
 
-    async _deleteSavedSelection(idx) {
+    async _deleteSavedSelection(...args) {
+        return this._withMutationGesture(
+            "deleteSavedSelection", (diagnostics) => this._deleteSavedSelectionWithinGesture(diagnostics, ...args));
+    }
+
+    async _deleteSavedSelectionWithinGesture(diagnostics, idx) {
         if (!this.activeScene) return;
         try {
             const dirName = encodeURIComponent(this._projectDirName());
             const sceneId = this.activeScene.scene_id;
-            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/saved_selections/${idx}`), { method: "DELETE" });
+            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/saved_selections/${idx}`), withEditorMutationDiagnostics({ method: "DELETE" }, diagnostics));
             await this._fetchScenes();
         } catch (e) { console.error("Delete saved selection failed:", e); }
     }
 
-    async _renameSavedSelection(idx, newName) {
+    async _renameSavedSelection(...args) {
+        return this._withMutationGesture(
+            "renameSavedSelection", (diagnostics) => this._renameSavedSelectionWithinGesture(diagnostics, ...args));
+    }
+
+    async _renameSavedSelectionWithinGesture(diagnostics, idx, newName) {
         if (!this.activeScene) return;
         try {
             const dirName = encodeURIComponent(this._projectDirName());
             const sceneId = this.activeScene.scene_id;
-            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/saved_selections/${idx}`), {
+            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/saved_selections/${idx}`), withEditorMutationDiagnostics({
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ name: newName }),
-            });
+            }, diagnostics));
             await this._fetchScenes();
         } catch (e) { console.error("Rename saved selection failed:", e); }
     }
@@ -17772,12 +18144,18 @@ export class EditorWidget {
         this._exportCancelRequested = false;
     }
 
-    _postExportCancel(jobId) {
+    _postExportCancel(jobId, diagnostics = null) {
+        if (diagnostics) return this._postExportCancelWithinGesture(diagnostics, jobId);
+        return this._withMutationGesture("cancelTimelineExport", (gesture) =>
+            this._postExportCancelWithinGesture(gesture, jobId));
+    }
+
+    _postExportCancelWithinGesture(diagnostics, jobId) {
         if (!jobId || !this._projectDirName()) return;
         const dirName = encodeURIComponent(this._projectDirName());
-        fetch(api.apiURL(`/sonder-editor/project/${dirName}/render_timeline/${jobId}/cancel`), {
+        fetch(api.apiURL(`/sonder-editor/project/${dirName}/render_timeline/${jobId}/cancel`), withEditorMutationDiagnostics({
             method: "POST",
-        }).catch((error) => console.warn("[Sonder] Export cancel failed:", error));
+        }, diagnostics)).catch((error) => console.warn("[Sonder] Export cancel failed:", error));
     }
 
     _restoreExportControls(ui) {
@@ -17800,6 +18178,14 @@ export class EditorWidget {
     }
 
     _hideExportPanel() {
+        // Ephemeral attribution only: the pending start owns this object, so a
+        // late response cannot borrow a newer panel's cancellation gesture.
+        if (this._exportStartPending && this._exportStartDiagnostics
+                && !this._exportStartDiagnostics.cancel) {
+            this._withMutationGesture("cancelTimelineExport", (diagnostics) => {
+                this._exportStartDiagnostics.cancel = diagnostics;
+            });
+        }
         // Closing the panel cancels any in-flight job below, so drop a lingering
         // progress notification (completion nulls it first, so this only fires on
         // genuine close/cancel).
@@ -17865,17 +18251,24 @@ export class EditorWidget {
         return null;
     }
 
-    async _startTimelineExport(payload, ui) {
+    async _startTimelineExport(...args) {
+        return this._withMutationGesture(
+            "startTimelineExport", (diagnostics) => this._startTimelineExportWithinGesture(diagnostics, ...args));
+    }
+
+    async _startTimelineExportWithinGesture(diagnostics, payload, ui) {
         const token = this._exportPanelToken;
+        const startDiagnostics = { cancel: null };
+        this._exportStartDiagnostics = startDiagnostics;
         this._exportStartPending = true;
         this._exportCancelRequested = false;
         try {
             const dirName = encodeURIComponent(this._projectDirName());
-            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/render_timeline`), {
+            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/render_timeline`), withEditorMutationDiagnostics({
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(payload),
-            });
+            }, diagnostics));
             if (!resp.ok) {
                 const message = await this._readExportError(resp, `Export failed: ${resp.status}`);
                 throw new Error(message);
@@ -17889,7 +18282,7 @@ export class EditorWidget {
             if (this._exportPanelToken !== token || this._exportCancelRequested) {
                 const cancelRequested = this._exportCancelRequested;
                 this._exportCancelRequested = false;
-                if (jobId) this._postExportCancel(jobId);
+                if (jobId) this._postExportCancel(jobId, startDiagnostics.cancel || diagnostics);
                 if (cancelRequested && this._exportPanelToken === token) {
                     this._exportJobId = "";
                     this._resetExportControlsAfterCancel(ui);
@@ -17930,6 +18323,10 @@ export class EditorWidget {
             }
             ui.errorEl.textContent = error?.message || "Export failed.";
             this._restoreExportControls(ui);
+        } finally {
+            if (this._exportStartDiagnostics === startDiagnostics) {
+                this._exportStartDiagnostics = null;
+            }
         }
     }
 
@@ -17980,10 +18377,16 @@ export class EditorWidget {
         }, 650);
     }
 
-    async _cancelTimelineExport(progressEl) {
+    async _cancelTimelineExport(...args) {
+        return this._withMutationGesture(
+            "cancelTimelineExport", (diagnostics) => this._cancelTimelineExportWithinGesture(diagnostics, ...args));
+    }
+
+    async _cancelTimelineExportWithinGesture(diagnostics, progressEl) {
         // Cancel pressed before the backend returned a job id: flag it so the
         // pending start cancels the late job and resets the panel.
         if (this._exportStartPending && !this._exportJobId) {
+            if (this._exportStartDiagnostics) this._exportStartDiagnostics.cancel = diagnostics;
             this._exportCancelRequested = true;
             if (progressEl) progressEl.textContent = "Cancelling...";
             return;
@@ -17994,9 +18397,9 @@ export class EditorWidget {
         }
         try {
             const dirName = encodeURIComponent(this._projectDirName());
-            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/render_timeline/${this._exportJobId}/cancel`), {
+            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/render_timeline/${this._exportJobId}/cancel`), withEditorMutationDiagnostics({
                 method: "POST",
-            });
+            }, diagnostics));
             if (progressEl) progressEl.textContent = "Cancelling...";
         } catch (error) {
             console.warn("[Sonder] Export cancel failed:", error);
@@ -18291,7 +18694,12 @@ export class EditorWidget {
         }, 500);
     }
 
-    async _addToRenderQueue() {
+    async _addToRenderQueue(...args) {
+        return this._withMutationGesture("addToRenderQueue", () =>
+            this._addToRenderQueueWithinGesture(...args));
+    }
+
+    async _addToRenderQueueWithinGesture() {
         if (this._selectionDraftAnchor) {
             notifyWarning(
                 `Choose ${this._selectionDraftAnchor.edge === "start" ? "Out" : "In"} before queueing.`,
@@ -18336,12 +18744,13 @@ export class EditorWidget {
                 failureDetail: (error) => [error?.payload?.code || error?.code, error?.message]
                     .filter(Boolean).join(": "),
                 invalidateQueueFetch: true,
-                run: async (queuedIntent) => {
+                run: async (queuedIntent, diagnostics) => {
                     return await this._runVersionedProjectMutation(
                         `/sonder-editor/project/${encodeURIComponent(queuedIntent.projectId)}/queue`,
                         {
                             method: "POST",
-                            headers: { "Content-Type": "application/json" },
+                            headers: { "Content-Type": "application/json",
+                                ...this._mutationDiagnosticHeaders(diagnostics) },
                             body: JSON.stringify(queuedIntent.snapshot),
                         },
                         { projectId: queuedIntent.projectId }
@@ -18367,7 +18776,12 @@ export class EditorWidget {
         }
     }
 
-    async _addBatchToRenderQueue() {
+    async _addBatchToRenderQueue(...args) {
+        return this._withMutationGesture("addBatchToRenderQueue", () =>
+            this._addBatchToRenderQueueWithinGesture(...args));
+    }
+
+    async _addBatchToRenderQueueWithinGesture() {
         if (this._selectionDraftAnchor) {
             notifyWarning(
                 `Choose ${this._selectionDraftAnchor.edge === "start" ? "Out" : "In"} before queueing a batch.`,
@@ -18441,12 +18855,13 @@ export class EditorWidget {
                 failureDetail: (error) => [error?.payload?.code || error?.code, error?.message]
                     .filter(Boolean).join(": "),
                 invalidateQueueFetch: true,
-                run: async (queuedIntent) => {
+                run: async (queuedIntent, diagnostics) => {
                     return await this._runVersionedProjectMutation(
                         `/sonder-editor/project/${encodeURIComponent(queuedIntent.projectId)}/queue/batch`,
                         {
                             method: "POST",
-                            headers: { "Content-Type": "application/json" },
+                            headers: { "Content-Type": "application/json",
+                                ...this._mutationDiagnosticHeaders(diagnostics) },
                             body: JSON.stringify({ jobs: queuedIntent.snapshots }),
                         },
                         { projectId: queuedIntent.projectId }
@@ -18535,7 +18950,12 @@ export class EditorWidget {
         } catch (e) { console.error("Fetch queue failed:", e); }
     }
 
-    async _clearCompletedRenderQueue() {
+    async _clearCompletedRenderQueue(...args) {
+        return this._withMutationGesture(
+            "clearCompletedRenderQueue", () => this._clearCompletedRenderQueueWithinGesture(...args));
+    }
+
+    async _clearCompletedRenderQueueWithinGesture() {
         if (!this._projectDirName()) return;
         this._renderQueue = (this._renderQueue || []).filter((job) => String(job.status || "").toLowerCase() !== "completed");
         this._renderQueuePanel();
@@ -18591,7 +19011,12 @@ export class EditorWidget {
         }
     }
 
-    async _deleteRenderQueueJob(job) {
+    async _deleteRenderQueueJob(...args) {
+        return this._withMutationGesture(
+            "deleteRenderQueueJob", () => this._deleteRenderQueueJobWithinGesture(...args));
+    }
+
+    async _deleteRenderQueueJobWithinGesture(job) {
         if (!this._projectDirName() || !job?.job_id) return;
         this._renderQueue = (this._renderQueue || []).filter((candidate) => candidate.job_id !== job.job_id);
         this._renderQueuePanel();
@@ -18984,7 +19409,12 @@ export class EditorWidget {
         return true;
     }
 
-    async _finalizeCommittedHistoryAmbiguity(
+    async _finalizeCommittedHistoryAmbiguity(...args) {
+        return this._withMutationGesture(
+            args[0]?.operation === "redo" ? "redoRecovery" : "undoRecovery", (diagnostics) => this._finalizeCommittedHistoryAmbiguityWithinGesture(diagnostics, ...args));
+    }
+
+    async _finalizeCommittedHistoryAmbiguityWithinGesture(diagnostics,
         ambiguity, restoredScene, ownerToken = null, historyOrderContext = null) {
         const entry = ambiguity?.entry;
         const sourceStack = ambiguity?.sourceStack;
@@ -19008,6 +19438,7 @@ export class EditorWidget {
                         coalesce: false,
                         refreshScenes: false,
                         sceneId: entry.sceneId,
+                        diagnostics,
                         ownerToken,
                         historyOrderContext,
                     }) : null;
@@ -19048,7 +19479,12 @@ export class EditorWidget {
         return true;
     }
 
-    async _finalizeRefusedHistoryAmbiguity(
+    async _finalizeRefusedHistoryAmbiguity(...args) {
+        return this._withMutationGesture(
+            args[0]?.operation === "redo" ? "redoRecovery" : "undoRecovery", (diagnostics) => this._finalizeRefusedHistoryAmbiguityWithinGesture(diagnostics, ...args));
+    }
+
+    async _finalizeRefusedHistoryAmbiguityWithinGesture(diagnostics,
         ambiguity, ownerToken = null, historyOrderContext = null) {
         const entry = ambiguity?.entry;
         const sourceStack = ambiguity?.sourceStack;
@@ -19064,7 +19500,7 @@ export class EditorWidget {
             try {
                 await this._applyPromptIdentityChange(entry.inversePromptIdentityChange,
                     `refused ${ambiguity.operation} ${entry.label || "prompt attachment"}`,
-                    { recordUndo: false });
+                    { recordUndo: false, diagnostics });
                 state.promptIdentityApplied = false;
             } catch (error) {
                 errors.push(error);
@@ -19083,6 +19519,7 @@ export class EditorWidget {
                         coalesce: false,
                         refreshScenes: false,
                         sceneId: entry.sceneId,
+                        diagnostics,
                         ownerToken,
                         historyOrderContext,
                     }) : null;
@@ -19098,7 +19535,7 @@ export class EditorWidget {
                 await this._applyReferenceHistoryOperations(
                     entry.inverseReferenceOperations,
                     `refused ${ambiguity.operation} ${entry.label || "prompt attachment"}`,
-                    null, ownerToken, historyOrderContext);
+                    diagnostics, ownerToken, historyOrderContext);
                 state.referencesApplied = false;
             } catch (error) {
                 errors.push(error);
@@ -22025,16 +22462,26 @@ export class EditorWidget {
         });
     }
 
-    async _importDroppedDirectory(dirEntry) {
+    async _importDroppedDirectory(...args) {
+        return this._withMutationGesture(
+            "asset_import", (diagnostics) => this._importDroppedDirectoryWithinGesture(diagnostics, ...args));
+    }
+
+    async _importDroppedDirectoryWithinGesture(diagnostics, dirEntry) {
         const files = await this._readDroppedDirectoryFiles(dirEntry);
         for (const file of files) {
-            await this._importFile(file, dirEntry.name || "");
+            await this._importFile(file, dirEntry.name || "", diagnostics);
         }
     }
 
     // Import N files with a foreground progress notification (count-based for
     // multi-file, indeterminate for a single file), resolving to success/error.
-    async _importFilesWithProgress(files, folder = "") {
+    async _importFilesWithProgress(...args) {
+        return this._withMutationGesture(
+            "asset_import", (diagnostics) => this._importFilesWithProgressWithinGesture(diagnostics, ...args));
+    }
+
+    async _importFilesWithProgressWithinGesture(diagnostics, files, folder = "") {
         const list = Array.isArray(files) ? files : Array.from(files || []);
         if (!list.length) return;
         const total = list.length;
@@ -22051,7 +22498,7 @@ export class EditorWidget {
             const failures = [];
             for (const file of list) {
                 try {
-                    if (await importFileIntoProject(this.projectDir, file, folder)) imported += 1;
+                    if (await importFileIntoProject(this.projectDir, file, folder, diagnostics)) imported += 1;
                 } catch (error) {
                     failures.push({ file, error });
                     console.warn("[Sonder] Import failed:", file?.name, error);
@@ -22078,10 +22525,16 @@ export class EditorWidget {
         }
     }
 
-    async _importFile(file, folder = "") {
+    async _importFile(file, folder = "", diagnostics = null) {
+        if (diagnostics) return this._importFileWithinGesture(diagnostics, file, folder);
+        return this._withMutationGesture("asset_import", (gesture) =>
+            this._importFileWithinGesture(gesture, file, folder));
+    }
+
+    async _importFileWithinGesture(diagnostics, file, folder = "") {
         if (!this.projectDir) return;
         try {
-            if (await importFileIntoProject(this.projectDir, file, folder)) {
+            if (await importFileIntoProject(this.projectDir, file, folder, diagnostics)) {
                 console.log("[Sonder] Imported:", file.name);
                 await this._fetchAssets();
             }

@@ -460,8 +460,8 @@ console.log(JSON.stringify(root.style));
     }
 
     widget_source = (root / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
-    snapshot_start = widget_source.index("async _addClipFrameToGuides(clip)")
-    snapshot_end = widget_source.index("async _deleteSelectedItems()", snapshot_start)
+    snapshot_start = widget_source.index("async _addClipFrameToGuides(")
+    snapshot_end = widget_source.index("async _deleteSelectedItems(", snapshot_start)
     snapshot_source = widget_source[snapshot_start:snapshot_end]
     assert "strength: this._defaultGuideStrength()" in snapshot_source
     assert "this._seedFitDefaults({" in snapshot_source
@@ -484,7 +484,7 @@ def test_timeline_fps_frontend_semantics_are_wired_at_all_boundaries():
     assert "Math.round(frameCount * fps / sourceFps)" in helper_source
     assert widget_source.count("this._mediaTimelineFrames(") >= 4
 
-    fps_start = widget_source.index("async _updateSceneFps(fps)")
+    fps_start = widget_source.index("async _updateSceneFps(")
     fps_end = widget_source.index("_cycleScene(dir)", fps_start)
     fps_source = widget_source[fps_start:fps_end]
     # FPS retimes existing scene geometry and cannot be represented by the
@@ -505,8 +505,8 @@ def test_timeline_fps_frontend_semantics_are_wired_at_all_boundaries():
     filmstrip_end = canvas_source.index("ctx.restore();", filmstrip_start)
     assert "clip.total_source_frames" not in canvas_source[filmstrip_start:filmstrip_end]
 
-    guide_start = widget_source.index("async _addClipFrameToGuides(clip)")
-    guide_end = widget_source.index("async _deleteSelectedItems()", guide_start)
+    guide_start = widget_source.index("async _addClipFrameToGuides(")
+    guide_end = widget_source.index("async _deleteSelectedItems(", guide_start)
     guide_source = widget_source[guide_start:guide_end]
     assert "Math.floor((sourceFrame + 0.5) * rateRatio)" in guide_source
     assert "frame_index: backendSourceFrame" in guide_source

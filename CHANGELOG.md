@@ -21,6 +21,7 @@ a fresh `[Unreleased]` block.
   lanes created before this change pick the suffix up on open.
 
 ### Changed
+- Simplified shortcut help: Undo and Redo show their actions, and Ctrl+V reads “Paste”.
 - The Reference lane panel's derived-prompt row names the two exits that can
   carry the text — a Reference Context chip and the Prompt Bridge output — and
   says whether a chip is attached, rather than claiming the text reaches the

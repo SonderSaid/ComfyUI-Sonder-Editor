@@ -2314,16 +2314,22 @@ export function mountSharedAssetGallery(container, options = {}) {
         }
         if (!options.onBulkDeleteAssets) return false;
 
+        const run = (diagnostics) => handleBulkDeleteWithinGesture(ids, diagnostics);
+        return options.withMutationGesture
+            ? options.withMutationGesture("asset_bulk_trash", run) : run(null);
+    }
+
+    async function handleBulkDeleteWithinGesture(ids, diagnostics) {
         const nextAssetId = successorAssetIdAfterRemoval(ids);
         try {
             const assets = ids.map((assetId) => data.assets.find((entry) => entry.asset_id === assetId)).filter(Boolean);
             let force = await resolveTrashForceDecision(assets);
             if (force === null) return false;
-            let result = await options.onBulkDeleteAssets(ids, force === true);
+            let result = await options.onBulkDeleteAssets(ids, force === true, diagnostics);
             if (result?.status === "conflict") {
                 force = confirmTrashProtection(assets, result);
                 if (force !== true) return false;
-                result = await options.onBulkDeleteAssets(ids, true);
+                result = await options.onBulkDeleteAssets(ids, true, diagnostics);
                 if (result?.status === "conflict") {
                     throw new Error(result?.error || "Bulk trash still reported a conflict.");
                 }
@@ -5625,16 +5631,23 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     async function handleAssetDelete(asset) {
+        // The fullscreen host owns diagnostics. Dormant hosts omit this hook.
+        const run = (diagnostics) => handleAssetDeleteWithinGesture(asset, diagnostics);
+        return options.withMutationGesture
+            ? options.withMutationGesture("asset_trash", run) : run(null);
+    }
+
+    async function handleAssetDeleteWithinGesture(asset, diagnostics) {
         if (!asset?.asset_id || !options.onDeleteAsset) return false;
         const nextAssetId = successorAssetIdAfterRemoval([asset.asset_id]);
         try {
             let force = await resolveTrashForceDecision([asset]);
             if (force === null) return false;
-            let result = await options.onDeleteAsset(asset.asset_id, force === true);
+            let result = await options.onDeleteAsset(asset.asset_id, force === true, diagnostics);
             if (result?.status === "conflict") {
                 force = confirmTrashProtection([asset], result);
                 if (force !== true) return false;
-                result = await options.onDeleteAsset(asset.asset_id, true);
+                result = await options.onDeleteAsset(asset.asset_id, true, diagnostics);
                 if (result?.status === "conflict") {
                     throw new Error(result?.error || "Asset trash still reported a conflict.");
                 }
@@ -5696,6 +5709,13 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     async function handleFolderDelete(folderName) {
+        // The fullscreen host owns diagnostics. Dormant hosts omit this hook.
+        const run = (diagnostics) => handleFolderDeleteWithinGesture(folderName, diagnostics);
+        return options.withMutationGesture
+            ? options.withMutationGesture("asset_folder_delete", run) : run(null);
+    }
+
+    async function handleFolderDeleteWithinGesture(folderName, diagnostics) {
         if (!folderName || !options.onDeleteFolder) return;
         try {
             const containedAssets = folderAssetsRecursive(folderName).filter((asset) => !isTrashed(asset));
@@ -5713,11 +5733,11 @@ export function mountSharedAssetGallery(container, options = {}) {
                 if (!confirm(message)) return;
             }
 
-            let result = await options.onDeleteFolder(folderName, force);
+            let result = await options.onDeleteFolder(folderName, force, diagnostics);
             if (result?.status === "conflict") {
                 force = confirmTrashProtection(containedAssets, result, { folderName });
                 if (force !== true) return;
-                result = await options.onDeleteFolder(folderName, true);
+                result = await options.onDeleteFolder(folderName, true, diagnostics);
                 if (result?.status === "conflict") {
                     throw new Error(result?.error || "Folder trash still reported a conflict.");
                 }
