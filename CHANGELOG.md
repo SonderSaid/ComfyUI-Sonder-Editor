@@ -12,6 +12,7 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Added
+- Added links to Project-Sample, the LTX 2.3 example project hosted on Hugging Face.
 - Reference recipes carry a **Prompt suffix** beside the existing prefix and
   per-member token, so a model format whose reference block is closed by a
   second label stays one recipe-owned definition. **LTX IC-LoRA Ingredients**

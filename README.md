@@ -32,8 +32,10 @@ project card and viewport preview.</em></p>
 ## See it work
 
 Three techniques from the same project, run through the same workflow. Each clip
-shows the timeline alongside the result it produced. The
-[LTX 2.3 Playground](#example-workflows) below is the workflow that generated them.
+shows the timeline alongside the result it produced. You can explore those scenes
+in **Project-Sample**, listed under **Project Sample — LTX 2.3** on
+[Hugging Face](https://huggingface.co/datasets/SonderSaid/Sonder-Editor-Projects),
+using the [LTX 2.3 Playground](#example-workflows) below.
 
 ### Prompt Relay
 
@@ -219,8 +221,9 @@ automatically.
 Two ready-wired generation graphs. Drop either onto the ComfyUI canvas.
 
 **[Sonder LTX 2.3 Playground](example_workflows/sonder_ltx_2_3_playground.json)** —
-prompt relay, multi-pass upscaling, image guides, and driver-controlled
-generation.
+prompt relay, multi-pass upscaling, image guides, and driver-controlled generation.
+Its matching project is **Project-Sample**, listed under **Project Sample — LTX 2.3**
+on [Hugging Face](https://huggingface.co/datasets/SonderSaid/Sonder-Editor-Projects).
 
 **[Sonder MiniMax H3 References](example_workflows/sonder_minimax_h3_references.json)** —
 References driving MiniMax H3: Reference lanes reaching the model through the
@@ -243,6 +246,16 @@ latent noise masks so a window can be regenerated in place.
   tracked metadata, inspect/compare, and timeline export.
 - **[References](docs/references.md)** — the Reference Library, Reference
   lanes and recipes, derived prompts, and the Reference nodes.
+
+## Example projects
+
+Explore complete Sonder Editor projects on
+[Hugging Face](https://huggingface.co/datasets/SonderSaid/Sonder-Editor-Projects).
+Each project entry includes its matching workflow, showcase video, tested editor
+version, and opening instructions.
+
+Start with **Project-Sample**, listed under **Project Sample — LTX 2.3**.
+It includes four scenes with their media, prompts, guides, and generated takes.
 
 ## Security & metadata
 
