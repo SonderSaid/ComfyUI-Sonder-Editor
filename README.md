@@ -32,8 +32,7 @@ project card and viewport preview.</em></p>
 ## See it work
 
 Three techniques from the same project, run through the same workflow. Each clip
-shows the timeline alongside the result it produced — and both halves are yours
-to open: the scenes are in the [sample project](#sample-project), and the
+shows the timeline alongside the result it produced. The
 [LTX 2.3 Playground](#example-workflows) below is the workflow that generated them.
 
 ### Prompt Relay
@@ -221,7 +220,7 @@ Two ready-wired generation graphs. Drop either onto the ComfyUI canvas.
 
 **[Sonder LTX 2.3 Playground](example_workflows/sonder_ltx_2_3_playground.json)** —
 prompt relay, multi-pass upscaling, image guides, and driver-controlled
-generation. It pairs with the sample project below.
+generation.
 
 **[Sonder MiniMax H3 References](example_workflows/sonder_minimax_h3_references.json)** —
 References driving MiniMax H3: Reference lanes reaching the model through the
@@ -244,17 +243,6 @@ latent noise masks so a window can be regenerated in place.
   tracked metadata, inspect/compare, and timeline export.
 - **[References](docs/references.md)** — the Reference Library, Reference
   lanes and recipes, derived prompts, and the Reference nodes.
-
-## Sample project
-
-A ready-made showcase project — media, scenes, guides, prompts, generated
-takes, and cached thumbnails — is available as a direct download.
-
-1. [Download `Project-Sample.zip`](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/releases/download/project_sample/Project-Sample.zip).
-2. Extract it into `ComfyUI/output/sonder-projects/` so the sample sits in
-   its own folder there.
-3. Open the **Sonder Editor** node and select the project from the project
-   selector.
 
 ## Security & metadata
 
