@@ -18377,6 +18377,9 @@ export class EditorWidget {
         }, 650);
     }
 
+    // A deliberate zero-write gesture: cancellation changes only an in-memory
+    // export job. Keep its attribution through start/close handoffs; the server
+    // excludes cancel from the physical project-write diagnostic ring.
     async _cancelTimelineExport(...args) {
         return this._withMutationGesture(
             "cancelTimelineExport", (diagnostics) => this._cancelTimelineExportWithinGesture(diagnostics, ...args));
@@ -18397,12 +18400,14 @@ export class EditorWidget {
         }
         try {
             const dirName = encodeURIComponent(this._projectDirName());
-            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/render_timeline/${this._exportJobId}/cancel`), withEditorMutationDiagnostics({
+            const response = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/render_timeline/${this._exportJobId}/cancel`), withEditorMutationDiagnostics({
                 method: "POST",
             }, diagnostics));
+            if (!response.ok) throw new Error(`Export cancel failed: ${response.status}`);
             if (progressEl) progressEl.textContent = "Cancelling...";
         } catch (error) {
             console.warn("[Sonder] Export cancel failed:", error);
+            if (progressEl) progressEl.textContent = error?.message || "Export cancel failed.";
         }
     }
 

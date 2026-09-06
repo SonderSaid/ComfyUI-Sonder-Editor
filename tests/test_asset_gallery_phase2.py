@@ -1305,7 +1305,7 @@ def test_render_cache_routes_list_and_delete_project_cache_files(tmp_path, monke
     assert payload[2]["filename"] == store_token
     assert payload[2]["size_bytes"] == 5
     assert payload[0]["size_bytes"] == 3
-    assert threaded_calls[-2:] == [module._render_cache_project_dir, module._list_render_cache_entries]
+    assert threaded_calls[-2:] == [module._project_dir_without_model, module._list_render_cache_entries]
 
     delete_response = asyncio.run(module.api_delete_render_cache_entry(DummyRequest(
         match_info={"project_id": "project", "filename": "scene-old.pt"},
@@ -1313,7 +1313,7 @@ def test_render_cache_routes_list_and_delete_project_cache_files(tmp_path, monke
     assert delete_response.status == 200
     assert not os.path.exists(old_path)
     assert os.path.exists(new_path)
-    assert threaded_calls[-2:] == [module._render_cache_project_dir, module.delete_render_cache_entry]
+    assert threaded_calls[-2:] == [module._project_dir_without_model, module.delete_render_cache_entry]
 
     store_delete_response = asyncio.run(module.api_delete_render_cache_entry(DummyRequest(
         match_info={"project_id": "project", "filename": store_token},
@@ -1367,7 +1367,7 @@ def test_render_cache_sweep_route_validates_budget_and_runs_off_loop(tmp_path, m
     assert payload["entry_count"] == 1
     assert payload["size_bytes"] == 5
     assert payload["over_budget_bytes"] == 0
-    assert threaded_calls[-2:] == [module._render_cache_project_dir, module.enforce_render_cache_budget]
+    assert threaded_calls[-2:] == [module._project_dir_without_model, module.enforce_render_cache_budget]
 
     for invalid in [True, -1, 1.5, 9_007_199_254_740_992]:
         invalid_response = asyncio.run(module.api_sweep_render_cache(DummyRequest(

@@ -17,9 +17,9 @@ import { onProjectVersionChanged } from "./api_client.js";
 import { onEditorRenderWindowChanged } from "./editor_render_window_events.js";
 import { PRIORITY as KEY_PRIORITY, register as registerKeyboardConsumer } from "./keyboard_ownership.js";
 import {
-    allocateBridgeReferenceGeneration,
+    createBridgeRefreshScheduler,
     requestBridgeReferencePayload,
-} from "./bridge_reference_coordinator.js";
+} from "./bridge_read_coordinator.js";
 import {
     MAX_REFERENCE_SLOTS,
     SLOT_NAME_RE,
@@ -200,74 +200,13 @@ function refreshShape(node, wave) {
         });
 }
 
-// Every refresh origin enters this scheduler. It owns logical generations;
-// node-local consumers own only application tokens. Automatic calls landing in
-// one scheduled turn share a wave, while project versions retain a stable
-// identity across duplicate notifications. Explicit refreshes always allocate
-// post-click work.
-const pendingRefreshWaves = new Map();
-
-function scheduleReferenceRefresh({
-    origin = "refresh",
-    projectId = "",
-    modifiedAt = "",
-    force = false,
-    targets = null,
-    delayMs = 0,
-} = {}) {
-    const normalizedOrigin = String(origin || "refresh");
-    // Version healing emits once for the canonical UUID and once for the
-    // folder alias. Both signals refresh every Reference node, and the
-    // coordinator already keys physical work by the complete resource URL, so
-    // generation identity must not embed the alias spelling. Otherwise one
-    // response creates an active request plus an identical trailing request.
-    const stableGeneration = !force && modifiedAt
-        ? `project-version:${String(modifiedAt)}`
-        : "";
-    const generation = force
-        ? allocateBridgeReferenceGeneration(normalizedOrigin)
-        : (stableGeneration || pendingRefreshWaves.get("automatic")?.generation
-            || allocateBridgeReferenceGeneration(normalizedOrigin));
-    const waveKey = force ? generation : (stableGeneration || "automatic");
-    let wave = pendingRefreshWaves.get(waveKey);
-    let created = false;
-    if (!wave) {
-        created = true;
-        wave = {
-            generation,
-            origins: new Set(),
-            targets: new Set(),
-            all: false,
-            timer: null,
-        };
-        pendingRefreshWaves.set(waveKey, wave);
-    }
-    wave.origins.add(normalizedOrigin);
-    if (targets == null) {
-        wave.all = true;
-        wave.targets.clear();
-    } else if (!wave.all) {
-        for (const node of targets) {
-            if (node) wave.targets.add(node);
-        }
-    }
-    if (created) {
-        wave.timer = window.setTimeout(() => {
-            if (pendingRefreshWaves.get(waveKey) !== wave) return;
-            pendingRefreshWaves.delete(waveKey);
-            const dispatch = {
-                generation: wave.generation,
-                origin: [...wave.origins].sort().join("+") || "refresh",
-            };
-            const nodes = wave.all ? [...(app.graph?._nodes || [])] : [...wave.targets];
-            for (const node of nodes) {
-                if (BRIDGES.has(nodeType(node))) refreshShape(node, dispatch);
-                else if (nodeType(node) === SELECTOR) refreshSelectorPanel(node, dispatch);
-            }
-        }, Math.max(0, Number(delayMs) || 0));
-    }
-    return wave.generation;
-}
+const scheduleReferenceRefresh = createBridgeRefreshScheduler({
+    getTargets: () => [...(app.graph?._nodes || [])],
+    dispatch(node, meta) {
+        if (BRIDGES.has(nodeType(node))) refreshShape(node, meta);
+        else if (nodeType(node) === SELECTOR) refreshSelectorPanel(node, meta);
+    },
+});
 
 function refreshAllBridges(projectId, modifiedAt) {
     scheduleReferenceRefresh({

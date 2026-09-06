@@ -423,7 +423,7 @@ def test_render_timeline_routes_return_job_payload(monkeypatch, tmp_path):
             return SimpleNamespace(public_status=lambda: {"job_id": "job-1", "status": "running", "phase": "cancelling"})
 
     monkeypatch.setattr(route_module, "_TIMELINE_EXPORTS", FakeManager())
-    monkeypatch.setattr(route_module, "_load_project_from_request", lambda _request: project)
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda _request, **kwargs: project)
 
     start = _route_handler(route_module, "POST", "/sonder-editor/project/{project_id}/render_timeline")
     status = _route_handler(route_module, "GET", "/sonder-editor/project/{project_id}/render_timeline/{job_id}")

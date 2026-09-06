@@ -34,6 +34,7 @@ a fresh `[Unreleased]` block.
   text to the prompt being compiled.
 
 ### Fixed
+- Improve editor responsiveness during timeline export polling and coalesce repeated Guides Bridge and Driver Selector refreshes.
 - Media drops that add lanes now create those lanes, the clip or audio track,
   extracted audio, and their link in one project write instead of two.
 - Undo now reverses successful video, audio, and Driver drops from their exact

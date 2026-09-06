@@ -43,6 +43,7 @@ class DummyRequest:
         self.headers = headers or {}
         self.method = method
         self.path = path
+        self.rel_url = path
 
     async def json(self):
         return self._body

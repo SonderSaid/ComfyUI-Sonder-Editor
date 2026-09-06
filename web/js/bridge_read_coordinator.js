@@ -1,4 +1,4 @@
-// Page-scoped coordinator for the read-only Reference shape projection.
+// Page-scoped coordinator for the read-only Reference, Guide, and Driver projections.
 // Resource identity is the complete request URL. Generation identity belongs
 // to the caller's logical refresh wave; this module never infers it from time.
 
@@ -22,16 +22,17 @@ function diagnosticHeaderValue(value, fallback) {
     return normalized || String(fallback || "unknown");
 }
 
-async function defaultRequest({ url, generation, origin, requestId }) {
+async function defaultRequest({ url, generation, origin, requestId, label, nodeId }) {
     const response = await fetch(url, {
         headers: {
-            "X-Sonder-Reference-Request-Id": diagnosticHeaderValue(requestId, "reference"),
-            "X-Sonder-Reference-Generation": diagnosticHeaderValue(generation, "unknown"),
-            "X-Sonder-Reference-Origin": diagnosticHeaderValue(origin, "refresh"),
+            [`X-Sonder-${label}-Node-Id`]: diagnosticHeaderValue(nodeId, "unknown"),
+            [`X-Sonder-${label}-Request-Id`]: diagnosticHeaderValue(requestId, label.toLowerCase()),
+            [`X-Sonder-${label}-Generation`]: diagnosticHeaderValue(generation, "unknown"),
+            [`X-Sonder-${label}-Origin`]: diagnosticHeaderValue(origin, "refresh"),
         },
     });
     if (!response.ok) {
-        const error = new Error(`Reference bridge fetch failed: ${response.status}`);
+        const error = new Error(`${label} bridge fetch failed: ${response.status}`);
         error.status = Number(response.status) || 0;
         throw error;
     }
@@ -53,7 +54,7 @@ function mergeTrailing(current, incoming) {
     return incoming;
 }
 
-export function createBridgeReferenceCoordinator({ request = defaultRequest } = {}) {
+export function createBridgeReadCoordinator({ request = defaultRequest, label = "Reference" } = {}) {
     const entries = new Map();
 
     const evictIfIdle = (url, entry) => {
@@ -65,9 +66,11 @@ export function createBridgeReferenceCoordinator({ request = defaultRequest } = 
     const drain = (url, entry, demand) => {
         entry.active = demand;
         requestSequence += 1;
-        demand.requestId = `reference-${Date.now().toString(36)}-${requestSequence.toString(36)}`;
+        demand.requestId = `${label.toLowerCase()}-${Date.now().toString(36)}-${requestSequence.toString(36)}`;
         Promise.resolve().then(() => request({
             url,
+            label,
+            nodeId: demand.nodeId,
             generation: demand.generation,
             origin: demand.origin,
             requestId: demand.requestId,
@@ -96,12 +99,12 @@ export function createBridgeReferenceCoordinator({ request = defaultRequest } = 
         });
     };
 
-    const requestPayload = ({ url, generation, origin = "refresh" } = {}) => {
+    const requestPayload = ({ url, generation, origin = "refresh", nodeId = "" } = {}) => {
         const resourceUrl = String(url || "");
         const refreshGeneration = String(generation || "");
-        if (!resourceUrl) return Promise.reject(new Error("Reference bridge URL is required"));
+        if (!resourceUrl) return Promise.reject(new Error(`${label} bridge URL is required`));
         if (!refreshGeneration) {
-            return Promise.reject(new Error("Reference refresh generation is required"));
+            return Promise.reject(new Error(`${label} refresh generation is required`));
         }
 
         const waiter = deferred();
@@ -115,6 +118,7 @@ export function createBridgeReferenceCoordinator({ request = defaultRequest } = 
             drain(resourceUrl, entry, {
                 generation: refreshGeneration,
                 origin: String(origin || "refresh"),
+                nodeId: String(nodeId ?? ""),
                 requestId: "",
                 waiters: [waiter],
             });
@@ -132,6 +136,7 @@ export function createBridgeReferenceCoordinator({ request = defaultRequest } = 
         entry.trailing = mergeTrailing(entry.trailing, {
             generation: refreshGeneration,
             origin: String(origin || "refresh"),
+            nodeId: String(nodeId ?? ""),
             requestId: "",
             waiters: [waiter],
         });
@@ -149,14 +154,56 @@ export function createBridgeReferenceCoordinator({ request = defaultRequest } = 
     };
 }
 
-export function allocateBridgeReferenceGeneration(origin = "refresh") {
+export function allocateBridgeReadGeneration(origin = "refresh") {
     generationSequence += 1;
     const label = String(origin || "refresh").replace(/[^a-zA-Z0-9_-]+/g, "-").slice(0, 48);
     return `${label || "refresh"}:${Date.now().toString(36)}:${generationSequence.toString(36)}`;
 }
 
-const pageCoordinator = createBridgeReferenceCoordinator();
+export const allocateBridgeReferenceGeneration = allocateBridgeReadGeneration;
+export const allocateBridgeGuideGeneration = allocateBridgeReadGeneration;
+export const allocateBridgeDriverGeneration = allocateBridgeReadGeneration;
 
-export function requestBridgeReferencePayload(options) {
-    return pageCoordinator.request(options);
+const referenceCoordinator = createBridgeReadCoordinator({ label: "Reference" });
+const guideCoordinator = createBridgeReadCoordinator({ label: "Guide" });
+const driverCoordinator = createBridgeReadCoordinator({ label: "Driver" });
+export const requestBridgeReferencePayload = (options) => referenceCoordinator.request(options);
+export const requestBridgeGuidePayload = (options) => guideCoordinator.request(options);
+export const requestBridgeDriverPayload = (options) => driverCoordinator.request(options);
+
+// One scheduling policy for all bridge families. Hosts retain their node
+// lifecycles and projection; only ephemeral refresh waves live here.
+export function createBridgeRefreshScheduler({ dispatch, getTargets = () => [] }) {
+    const pendingWaves = new Map();
+    return ({ origin = "refresh", modifiedAt = "", force = false,
+        targets = null, delayMs = 0 } = {}) => {
+        const normalizedOrigin = String(origin || "refresh");
+        // Canonical-id and folder-alias version notifications name one wave.
+        const stableGeneration = !force && modifiedAt ? `project-version:${String(modifiedAt)}` : "";
+        const generation = force ? allocateBridgeReadGeneration(normalizedOrigin)
+            : (stableGeneration || pendingWaves.get("automatic")?.generation
+                || allocateBridgeReadGeneration(normalizedOrigin));
+        const waveKey = force ? generation : (stableGeneration || "automatic");
+        let wave = pendingWaves.get(waveKey);
+        const created = !wave;
+        if (!wave) {
+            wave = { generation, origins: new Set(), targets: new Set(), all: false };
+            pendingWaves.set(waveKey, wave);
+        }
+        wave.origins.add(normalizedOrigin);
+        if (targets == null) {
+            wave.all = true;
+            wave.targets.clear();
+        } else if (!wave.all) {
+            for (const node of targets) if (node) wave.targets.add(node);
+        }
+        if (created) window.setTimeout(() => {
+            if (pendingWaves.get(waveKey) !== wave) return;
+            pendingWaves.delete(waveKey);
+            const meta = { generation: wave.generation,
+                origin: [...wave.origins].sort().join("+") || "refresh" };
+            for (const node of wave.all ? getTargets() : wave.targets) dispatch(node, meta);
+        }, Math.max(0, Number(delayMs) || 0));
+        return wave.generation;
+    };
 }

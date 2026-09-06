@@ -1188,7 +1188,7 @@ def test_reference_bridge_extension_wires_definitions_graphs_and_policy_callback
 
     bridge_source = (ROOT / "web" / "js" / "reference_bridge.js").read_text(encoding="utf-8")
     shape_url = (ROOT / "web" / "js" / "reference_bridge_shape.js").as_uri()
-    coordinator_url = (ROOT / "web" / "js" / "bridge_reference_coordinator.js").as_uri()
+    coordinator_url = (ROOT / "web" / "js" / "bridge_read_coordinator.js").as_uri()
     modules = {
         "app.mjs": """
 export const app = {
@@ -1220,7 +1220,7 @@ export const resolveProjectSource = () => ({ status: 'unresolved' });
         "./editor_render_window_events.js": (tmp_path / "events.mjs").as_uri(),
         "./keyboard_ownership.js": (tmp_path / "keyboard.mjs").as_uri(),
         "./reference_bridge_shape.js": shape_url,
-        "./bridge_reference_coordinator.js": coordinator_url,
+        "./bridge_read_coordinator.js": coordinator_url,
     }
     for old, new in replacements.items():
         bridge_source = bridge_source.replace(f'"{old}"', json.dumps(new))
@@ -1369,7 +1369,7 @@ def test_multi_lane_selector_panel_add_remove_menu_and_growth(tmp_path):
 
     bridge_source = (ROOT / "web" / "js" / "reference_bridge.js").read_text(encoding="utf-8")
     shape_url = (ROOT / "web" / "js" / "reference_bridge_shape.js").as_uri()
-    coordinator_url = (ROOT / "web" / "js" / "bridge_reference_coordinator.js").as_uri()
+    coordinator_url = (ROOT / "web" / "js" / "bridge_read_coordinator.js").as_uri()
     modules = {
         "app.mjs": """
 export const app = {
@@ -1412,7 +1412,7 @@ export const resolveProjectSource = () => ({
         "./editor_render_window_events.js": (tmp_path / "events.mjs").as_uri(),
         "./keyboard_ownership.js": (tmp_path / "keyboard.mjs").as_uri(),
         "./reference_bridge_shape.js": shape_url,
-        "./bridge_reference_coordinator.js": coordinator_url,
+        "./bridge_read_coordinator.js": coordinator_url,
     }
     for old, new in replacements.items():
         bridge_source = bridge_source.replace(f'"{old}"', json.dumps(new))

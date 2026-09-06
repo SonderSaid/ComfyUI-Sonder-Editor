@@ -18,7 +18,19 @@ import {
     commitWidgetVisibility,
     setWidgetHidden,
 } from "./widget_visibility.js";
+import {
+    createBridgeRefreshScheduler,
+    requestBridgeGuidePayload,
+    requestBridgeDriverPayload,
+} from "./bridge_read_coordinator.js";
 const { api } = window.comfyAPI.api;
+
+const scheduleBridgeGuideRefresh = createBridgeRefreshScheduler({
+    dispatch: (node, meta) => refreshBridgeGuidePanel(node, meta),
+});
+const scheduleBridgeDriverRefresh = createBridgeRefreshScheduler({
+    dispatch: (node, meta) => refreshBridgeDriverPanel(node, meta),
+});
 
 const EXT_NAME = "sonder.bridge";
 const TARGET_START = "SonderGuidesBridgeStart";
@@ -438,7 +450,7 @@ const mirrorProjectWire = (start) => {
     }
 };
 
-async function loadLinkedEditorGuides(node) {
+async function loadLinkedEditorGuides(node, dispatch) {
     const resolution = resolveProjectSource(node);
     if (resolution.status !== "resolved") {
         return {
@@ -461,11 +473,9 @@ async function loadLinkedEditorGuides(node) {
     }
 
     const url = `/sonder-editor/project/${encodeURIComponent(projectId)}/scenes/${encodeURIComponent(sceneId)}/bridge-guides`;
-    const resp = await fetch(api.apiURL(url));
-    if (!resp.ok) {
-        throw new Error(`Bridge guide fetch failed: ${resp.status}`);
-    }
-    const payload = await resp.json();
+    const payload = await requestBridgeGuidePayload({
+        url: api.apiURL(url), ...dispatch, nodeId: node.id,
+    });
     const rows = Array.isArray(payload?.guides) ? payload.guides : [];
     const guides = rows.map((row) => ({
         ...row,
@@ -577,7 +587,7 @@ function renderGuidePanel(node, payload = { status: "", guides: [] }) {
     }
 }
 
-function refreshBridgeGuidePanel(node) {
+function refreshBridgeGuidePanel(node, dispatch) {
     if (!isStart(node)) return;
     const state = ensureNodeState(node);
     if (!state.guidePanel) return;
@@ -590,12 +600,12 @@ function refreshBridgeGuidePanel(node) {
     const editorNode = resolution.status === "resolved" ? resolution.editor : null;
     const controller = editorNode?._sonderController || null;
     if (controller && !controller.state?.projectDir && typeof controller.whenProjectReady === "function") {
-        controller.whenProjectReady(() => refreshBridgeGuidePanel(node));
+        controller.whenProjectReady(() => scheduleBridgeGuideRefresh({ origin: "project_ready", targets: [node] }));
     }
 
     const token = ++state.guideRefreshToken;
     state.guideStatus.textContent = "Loading guides...";
-    loadLinkedEditorGuides(node)
+    loadLinkedEditorGuides(node, dispatch)
         .then((payload) => {
             if (token !== state.guideRefreshToken) return;
             renderGuidePanel(node, payload);
@@ -643,7 +653,7 @@ function installGuidePanel(node) {
         cursor:pointer;
     `);
     refreshBtn.textContent = "Refresh";
-    refreshBtn.addEventListener("click", () => refreshBridgeGuidePanel(node));
+    refreshBtn.addEventListener("click", () => scheduleBridgeGuideRefresh({ origin: "manual", force: true, targets: [node] }));
     header.append(title, refreshBtn);
     const status = style(document.createElement("div"), "color:#7f8d9b;font-size:10px;line-height:1.25;");
     const list = style(document.createElement("div"), "display:flex;flex-direction:column;max-height:138px;overflow:auto;");
@@ -659,7 +669,7 @@ function installGuidePanel(node) {
     state.guidePanel = wrapper;
     state.guideStatus = status;
     state.guideList = list;
-    refreshBridgeGuidePanel(node);
+    scheduleBridgeGuideRefresh({ origin: "lifecycle", targets: [node] });
 }
 
 const readDriverOverrides = (node) => {
@@ -704,7 +714,7 @@ const setDriverLaneWidgetValue = (node, value) => {
     app.graph.setDirtyCanvas?.(true, true);
 };
 
-async function loadLinkedEditorDrivers(node) {
+async function loadLinkedEditorDrivers(node, dispatch) {
     const resolution = resolveProjectSource(node);
     if (resolution.status !== "resolved") {
         return {
@@ -727,11 +737,9 @@ async function loadLinkedEditorDrivers(node) {
     }
 
     const url = `/sonder-editor/project/${encodeURIComponent(projectId)}/scenes/${encodeURIComponent(sceneId)}/bridge-drivers`;
-    const resp = await fetch(api.apiURL(url));
-    if (!resp.ok) {
-        throw new Error(`Bridge driver fetch failed: ${resp.status}`);
-    }
-    const payload = await resp.json();
+    const payload = await requestBridgeDriverPayload({
+        url: api.apiURL(url), ...dispatch, nodeId: node.id,
+    });
     const rows = Array.isArray(payload?.drivers) ? payload.drivers : [];
     const sourceLabel = payload?.source === "snapshot" ? "Snapshot drivers for running job" : "Live editor drivers";
     const sceneName = payload?.scene_name || "Scene";
@@ -861,7 +869,7 @@ function renderDriverPanel(node, payload = { status: "", drivers: [] }) {
     }
 }
 
-function refreshBridgeDriverPanel(node) {
+function refreshBridgeDriverPanel(node, dispatch) {
     if (!isDriverSelector(node)) return;
     const state = ensureNodeState(node);
     if (!state.driverPanel) return;
@@ -870,12 +878,12 @@ function refreshBridgeDriverPanel(node) {
     const editorNode = resolution.status === "resolved" ? resolution.editor : null;
     const controller = editorNode?._sonderController || null;
     if (controller && !controller.state?.projectDir && typeof controller.whenProjectReady === "function") {
-        controller.whenProjectReady(() => refreshBridgeDriverPanel(node));
+        controller.whenProjectReady(() => scheduleBridgeDriverRefresh({ origin: "project_ready", targets: [node] }));
     }
 
     const token = ++state.driverRefreshToken;
     state.driverStatus.textContent = "Loading drivers...";
-    loadLinkedEditorDrivers(node)
+    loadLinkedEditorDrivers(node, dispatch)
         .then((payload) => {
             if (token !== state.driverRefreshToken) return;
             renderDriverPanel(node, payload);
@@ -923,7 +931,7 @@ function installDriverPanel(node) {
         cursor:pointer;
     `);
     refreshBtn.textContent = "Refresh";
-    refreshBtn.addEventListener("click", () => refreshBridgeDriverPanel(node));
+    refreshBtn.addEventListener("click", () => scheduleBridgeDriverRefresh({ origin: "manual", force: true, targets: [node] }));
     header.append(title, refreshBtn);
 
     const select = style(document.createElement("select"), `
@@ -938,7 +946,7 @@ function installDriverPanel(node) {
     `);
     select.addEventListener("change", () => {
         setDriverLaneWidgetValue(node, select.value);
-        refreshBridgeDriverPanel(node);
+        scheduleBridgeDriverRefresh({ origin: "lifecycle", targets: [node] });
     });
     const status = style(document.createElement("div"), "color:#7f8d9b;font-size:10px;line-height:1.25;");
     const list = style(document.createElement("div"), "display:flex;flex-direction:column;max-height:138px;overflow:auto;");
@@ -955,7 +963,7 @@ function installDriverPanel(node) {
     state.driverSelect = select;
     state.driverStatus = status;
     state.driverList = list;
-    refreshBridgeDriverPanel(node);
+    scheduleBridgeDriverRefresh({ origin: "lifecycle", targets: [node] });
 }
 
 // ── Per-node install ─────────────────────────────────────────────────
@@ -991,9 +999,9 @@ const installNode = (node) => {
             if (isBridge(this)) refreshNodeShape(this);
             if (isStart(this)) {
                 mirrorProjectWire(this);
-                refreshBridgeGuidePanel(this);
+                scheduleBridgeGuideRefresh({ origin: "lifecycle", targets: [this] });
             }
-            if (isDriverSelector(this)) refreshBridgeDriverPanel(this);
+            if (isDriverSelector(this)) scheduleBridgeDriverRefresh({ origin: "lifecycle", targets: [this] });
         } catch (e) {
             console.warn("[Sonder Bridge] connection-change handler error:", e);
         }
@@ -1007,9 +1015,9 @@ const installNode = (node) => {
             if (isBridge(node)) refreshNodeShape(node);
             if (isStart(node)) {
                 mirrorProjectWire(node);
-                refreshBridgeGuidePanel(node);
+                scheduleBridgeGuideRefresh({ origin: "lifecycle", targets: [node] });
             }
-            if (isDriverSelector(node)) refreshBridgeDriverPanel(node);
+            if (isDriverSelector(node)) scheduleBridgeDriverRefresh({ origin: "lifecycle", targets: [node] });
         } catch (e) {
             console.warn("[Sonder Bridge] initial-shape error:", e);
         }

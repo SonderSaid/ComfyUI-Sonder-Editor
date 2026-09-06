@@ -270,7 +270,7 @@ async def _sonder_security_middleware(request: web.Request, handler):
     return _apply_sonder_security_headers(request, response)
 
 
-def _remember_request_project(request: web.Request, project: TimelineProject) -> None:
+def _remember_request_project(request: web.Request, project: TimelineProject | None) -> None:
     try:
         request["sonder_editor_project"] = project
     except Exception:
@@ -434,6 +434,7 @@ def _diagnostic_header(request: web.Request, name: str) -> str:
 
 
 _READ_SHAPED_POST_ROUTES = (
+    re.compile(r"^/sonder-editor/project/[^/]+/render_timeline/[^/]+/cancel$"),
     re.compile(r"^/sonder-editor/project/[^/]+/prompt-context/profiles/verify$"),
     re.compile(r"^/sonder-editor/project/[^/]+/scenes/[^/]+/prompt-context/compile$"),
     re.compile(r"^/sonder-editor/project/[^/]+/reveal$"),
@@ -6922,13 +6923,12 @@ def _direct_project_dir_from_request(request: web.Request) -> str | None:
     return project_dir
 
 
-def _render_cache_project_dir(request: web.Request) -> str:
-    """Resolve derived cache storage without parsing the project for folder ids.
+def _project_dir_without_model(request: web.Request, *, remember_project: bool = True) -> str:
+    """Resolve contained project storage without parsing folder-id requests.
 
-    render_cache_root accepts a directory; cache maintenance neither reads nor
-    writes project document state, so its If-Match gate and repair saves do not
-    apply. Retain the repair-free, version-unchecked load for canonical ids that
-    differ from folder names until that alias lookup can resolve without a model.
+    Cache maintenance and export job ownership need only the directory. Retain
+    the repair-free, version-unchecked load for canonical ids that differ from
+    folder names until that alias lookup can resolve without a model.
     """
     project_dir = _direct_project_dir_from_request(request)
     if not project_dir:
@@ -6936,6 +6936,10 @@ def _render_cache_project_dir(request: web.Request) -> str:
             request, repair_missing_frames=False, version_checked=False,
         )
         project_dir = str(getattr(project, "project_dir", "") or "")
+        if not remember_project:
+            # Ownership-only export reads must not advance the browser's version
+            # map. The completed-result load records the version of its payload.
+            _remember_request_project(request, None)
     if not project_dir:
         # An empty root resolves to CWD and would make its cache evictable.
         raise _bad_project_request("Project directory could not be resolved")
@@ -8536,14 +8540,12 @@ def _timeline_export_job_response(request: web.Request, job) -> dict:
     return payload
 
 
-def _timeline_job_matches_project(job, project: TimelineProject) -> bool:
+def _timeline_job_matches_project(job, project_dir: str) -> bool:
     job_project_dir = str(getattr(job, "project_dir", "") or "")
-    project_dir = str(getattr(project, "project_dir", "") or "")
-    if job_project_dir and project_dir:
-        return os.path.normcase(os.path.realpath(job_project_dir)) == os.path.normcase(os.path.realpath(project_dir))
-    job_project_id = str(getattr(job, "project_id", "") or "")
-    project_id = str(getattr(project, "project_id", "") or "")
-    return bool(job_project_id and project_id and job_project_id == project_id)
+    return bool(job_project_dir and project_dir) and (
+        os.path.normcase(os.path.realpath(job_project_dir))
+        == os.path.normcase(os.path.realpath(project_dir))
+    )
 
 
 def _compile_prompt_context_candidate_sync(
@@ -9290,27 +9292,27 @@ if routes is not None:
     @routes.get("/sonder-editor/project/{project_id}/render_timeline/{job_id}")
     async def api_get_render_timeline_job(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project_dir = await asyncio.to_thread(_project_dir_without_model, request, remember_project=False)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
         job = _TIMELINE_EXPORTS.get(request.match_info.get("job_id", ""))
         if not job:
             return web.json_response({"error": "Export job not found", "code": "not_found"}, status=404)
-        if not _timeline_job_matches_project(job, project):
+        if not _timeline_job_matches_project(job, project_dir):
             return web.json_response({"error": "Export job not found", "code": "not_found"}, status=404)
-        return web.json_response(_timeline_export_job_response(request, job))
+        return web.json_response(await asyncio.to_thread(_timeline_export_job_response, request, job))
 
     @routes.post("/sonder-editor/project/{project_id}/render_timeline/{job_id}/cancel")
     async def api_cancel_render_timeline_job(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project_dir = await asyncio.to_thread(_project_dir_without_model, request, remember_project=False)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
         job_id = request.match_info.get("job_id", "")
         job = _TIMELINE_EXPORTS.get(job_id)
         if not job:
             return web.json_response({"error": "Export job not found", "code": "not_found"}, status=404)
-        if not _timeline_job_matches_project(job, project):
+        if not _timeline_job_matches_project(job, project_dir):
             return web.json_response({"error": "Export job not found", "code": "not_found"}, status=404)
         job = _TIMELINE_EXPORTS.cancel(job_id)
         if not job:
@@ -9324,7 +9326,8 @@ if routes is not None:
     @routes.get("/sonder-editor/project/{project_id}/cache/renders")
     async def api_list_render_cache(request: web.Request) -> web.Response:
         try:
-            project_dir = await asyncio.to_thread(_render_cache_project_dir, request)
+            # Derived cache maintenance needs storage only; it never writes project state.
+            project_dir = await asyncio.to_thread(_project_dir_without_model, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -9359,7 +9362,8 @@ if routes is not None:
             max_size_bytes = raw_budget
 
         try:
-            project_dir = await asyncio.to_thread(_render_cache_project_dir, request)
+            # Derived cache maintenance needs storage only; it never writes project state.
+            project_dir = await asyncio.to_thread(_project_dir_without_model, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -9377,7 +9381,8 @@ if routes is not None:
     @routes.delete("/sonder-editor/project/{project_id}/cache/renders/{filename}")
     async def api_delete_render_cache_entry(request: web.Request) -> web.Response:
         try:
-            project_dir = await asyncio.to_thread(_render_cache_project_dir, request)
+            # Derived cache maintenance needs storage only; it never writes project state.
+            project_dir = await asyncio.to_thread(_project_dir_without_model, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -11105,8 +11110,19 @@ if routes is not None:
           the full scene-level key set so the frontend can prune stale per-guide
           overrides against the scene, not against the rendered window.
         """
+        # Entry events count physical dispatches even when the response is fast.
+        # Client ids are diagnostic correlation only, never project authority.
+        record_diag_event(
+            "bridge_guides_route_entry",
+            project_id=str(request.match_info.get("project_id", "") or ""),
+            rel_url=str(request.rel_url),
+            request_id=_diagnostic_header(request, "X-Sonder-Guide-Request-Id"),
+            generation=_diagnostic_header(request, "X-Sonder-Guide-Generation"),
+            origin=_diagnostic_header(request, "X-Sonder-Guide-Origin"),
+            node_id=_diagnostic_header(request, "X-Sonder-Guide-Node-Id"),
+        )
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 

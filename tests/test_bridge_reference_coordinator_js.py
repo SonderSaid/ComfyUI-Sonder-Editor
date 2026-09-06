@@ -24,7 +24,7 @@ def _run_node(script: str):
 
 
 def test_reference_coordinator_joins_one_generation_and_keeps_only_latest_trailing():
-    module_url = (ROOT / "web/js/bridge_reference_coordinator.js").as_uri()
+    module_url = (ROOT / "web/js/bridge_read_coordinator.js").as_uri()
     script = f"""
 const mod = await import({json.dumps(module_url)});
 const gates = [];
@@ -34,7 +34,7 @@ const gate = () => {{
   const promise = new Promise((yes, no) => {{ resolve = yes; reject = no; }});
   return {{ promise, resolve, reject }};
 }};
-const coordinator = mod.createBridgeReferenceCoordinator({{
+const coordinator = mod.createBridgeReadCoordinator({{
   request(meta) {{
     calls.push(meta);
     const pending = gate();
@@ -74,7 +74,7 @@ console.log(JSON.stringify({{
 
 
 def test_reference_coordinator_rejection_is_generation_scoped_and_urls_do_not_join():
-    module_url = (ROOT / "web/js/bridge_reference_coordinator.js").as_uri()
+    module_url = (ROOT / "web/js/bridge_read_coordinator.js").as_uri()
     script = f"""
 const mod = await import({json.dumps(module_url)});
 const gates = [];
@@ -84,7 +84,7 @@ const gate = () => {{
   const promise = new Promise((yes, no) => {{ resolve = yes; reject = no; }});
   return {{ promise, resolve, reject }};
 }};
-const coordinator = mod.createBridgeReferenceCoordinator({{
+const coordinator = mod.createBridgeReadCoordinator({{
   request(meta) {{
     calls.push(meta);
     const pending = gate();
@@ -119,7 +119,7 @@ console.log(JSON.stringify({{
 
 
 def test_reference_coordinator_default_dispatch_has_diagnostics_and_never_aborts_shared_work():
-    module_url = (ROOT / "web/js/bridge_reference_coordinator.js").as_uri()
+    module_url = (ROOT / "web/js/bridge_read_coordinator.js").as_uri()
     script = f"""
 const calls = [];
 globalThis.fetch = async (url, options = {{}}) => {{
@@ -127,7 +127,7 @@ globalThis.fetch = async (url, options = {{}}) => {{
   return {{ ok: true, status: 200, json: async () => ({{ references: [] }}) }};
 }};
 const mod = await import({json.dumps(module_url)});
-const coordinator = mod.createBridgeReferenceCoordinator();
+const coordinator = mod.createBridgeReadCoordinator();
 await Promise.all([
   coordinator.request({{ url: "/shape?a=1", generation: "same", origin: "startup" }}),
   coordinator.request({{ url: "/shape?a=1", generation: "same", origin: "startup" }}),
@@ -149,11 +149,11 @@ console.log(JSON.stringify({{
 
 
 def test_reference_coordinator_evicts_success_rejection_and_many_distinct_urls():
-    module_url = (ROOT / "web/js/bridge_reference_coordinator.js").as_uri()
+    module_url = (ROOT / "web/js/bridge_read_coordinator.js").as_uri()
     script = f"""
 const mod = await import({json.dumps(module_url)});
 let calls = 0;
-const coordinator = mod.createBridgeReferenceCoordinator({{
+const coordinator = mod.createBridgeReadCoordinator({{
   request(meta) {{
     calls += 1;
     if (meta.url === "/reject") return Promise.reject(new Error("no"));
@@ -230,8 +230,8 @@ export const resolveProjectSource = () => ({
         "./keyboard_ownership.js": (tmp_path / "keyboard.mjs").as_uri(),
         "./project_source_resolver.js": (tmp_path / "resolver.mjs").as_uri(),
         "./reference_bridge_shape.js": (ROOT / "web/js/reference_bridge_shape.js").as_uri(),
-        "./bridge_reference_coordinator.js": (
-            ROOT / "web/js/bridge_reference_coordinator.js"
+        "./bridge_read_coordinator.js": (
+            ROOT / "web/js/bridge_read_coordinator.js"
         ).as_uri(),
     }
     for old, new in replacements.items():

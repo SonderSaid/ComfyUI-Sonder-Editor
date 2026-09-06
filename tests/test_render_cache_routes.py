@@ -114,14 +114,14 @@ def test_unresolved_empty_directory_never_reaches_cache_or_cwd(tmp_path, monkeyp
                                  {'max_size_bytes': 9_007_199_254_740_992}])
 def test_budget_rejected_before_directory_resolution(monkeypatch, body):
     module = _load_route_module(monkeypatch)
-    monkeypatch.setattr(module, '_render_cache_project_dir', _forbid)
+    monkeypatch.setattr(module, '_project_dir_without_model', _forbid)
     response = asyncio.run(module.api_sweep_render_cache(DummyRequest(body=body, method='POST')))
     assert response.status == 400
 
 
 def test_invalid_json_rejected_before_directory_resolution(monkeypatch):
     module = _load_route_module(monkeypatch)
-    monkeypatch.setattr(module, '_render_cache_project_dir', _forbid)
+    monkeypatch.setattr(module, '_project_dir_without_model', _forbid)
 
     class InvalidJsonRequest(DummyRequest):
         async def json(self):

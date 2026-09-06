@@ -494,7 +494,7 @@ def test_render_timeline_status_rejects_cross_project_job(tmp_path, monkeypatch)
         public_status=lambda: {"job_id": "job-1", "status": "running", "phase": "queued"},
     )
     manager = SimpleNamespace(get=lambda _job_id: job)
-    monkeypatch.setattr(route_module, "_load_project_from_request", lambda _request: project)
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda _request, **kwargs: project)
     monkeypatch.setattr(route_module, "_TIMELINE_EXPORTS", manager)
 
     handler = _route_handler(route_module, "GET", "/sonder-editor/project/{project_id}/render_timeline/{job_id}")
@@ -521,7 +521,7 @@ def test_render_timeline_cancel_rejects_cross_project_job_without_cancelling(tmp
         return job
 
     manager.cancel = cancel
-    monkeypatch.setattr(route_module, "_load_project_from_request", lambda _request: project)
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda _request, **kwargs: project)
     monkeypatch.setattr(route_module, "_TIMELINE_EXPORTS", manager)
 
     handler = _route_handler(route_module, "POST", "/sonder-editor/project/{project_id}/render_timeline/{job_id}/cancel")
