@@ -362,6 +362,38 @@ export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
     widget._applyTemplateConstraintMetadata();
     widget._updateResolutionInputMode();
 
+    const modelLabel = document.createElement("span");
+    modelLabel.style.cssText = labelCss({ marginLeft: "6px" });
+    modelLabel.textContent = "Model:";
+    const channelsLabel = document.createElement("span");
+    channelsLabel.style.cssText = labelCss({ marginLeft: "6px" });
+    channelsLabel.textContent = "Channels:";
+    widget._templateSelect.setAttribute("aria-label", "Model template");
+    widget._channelTemplateBtn = document.createElement("button");
+    widget._channelTemplateBtn.type = "button";
+    widget._channelTemplateBtn.setAttribute("aria-haspopup", "menu");
+    // A button needs one extra padding pixel per side to match the native select.
+    widget._channelTemplateBtn.style.cssText = `${topSelectCss({ width: "150px", fontSize: "9px", padding: "2px 4px" })} display:inline-flex; align-items:center; gap:4px; line-height:${TYPE.t11}px; white-space:nowrap;`;
+    widget._channelTemplateLabel = document.createElement("span");
+    widget._channelTemplateLabel.style.cssText = "flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; text-align:left;";
+    const channelMenuArrow = document.createElement("span");
+    channelMenuArrow.textContent = "▾";
+    channelMenuArrow.setAttribute("aria-hidden", "true");
+    widget._channelTemplateBtn.append(widget._channelTemplateLabel, channelMenuArrow);
+    // Capture before the menu's outside-mousedown dismissal, so a second
+    // pointer click toggles closed instead of reopening the just-closed menu.
+    let channelMenuWasOpen = false;
+    widget._channelTemplateBtn.addEventListener("pointerdown", () => {
+        channelMenuWasOpen = widget._contextMenuEl?.isConnected
+            && widget._channelTemplateMenuAnchor === widget._channelTemplateBtn;
+    });
+    widget._channelTemplateBtn.addEventListener("click", (event) => {
+        if (event.detail > 0 && channelMenuWasOpen) widget._hideContextMenu();
+        else widget._openChannelTemplateMenu(event.currentTarget);
+        channelMenuWasOpen = false;
+    });
+    const templatesGroup = makeInlineGroup(modelLabel, widget._templateSelect, channelsLabel, widget._channelTemplateBtn);
+
     const fpsLabel = document.createElement("span");
     fpsLabel.style.cssText = labelCss({ marginLeft: "6px" });
     fpsLabel.textContent = "FPS:";
@@ -402,12 +434,16 @@ export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
 
     // Scene geometry group — placed on the right of the toolbar row (under the viewport).
     widget._sceneGeometryGroup = document.createElement("div");
-    widget._sceneGeometryGroup.style.cssText = "display:flex; align-items:center; align-content:flex-start; justify-content:center; gap:6px; row-gap:4px; flex-wrap:wrap-reverse; min-width:0; max-width:100%; flex:0 0.5 720px; margin-bottom:3px;";
+    // Grow into spare width so the pair can join geometry on wide displays;
+    // preserve the existing shrink basis and right-align unequal wrapped rows.
+    widget._sceneGeometryGroup.style.cssText = "display:flex; align-items:center; align-content:flex-start; justify-content:flex-end; gap:6px; row-gap:4px; flex-wrap:wrap-reverse; min-width:0; max-width:100%; flex:1 0.5 720px; margin-bottom:3px;";
     widget._sceneGeometryGroup.append(
         makeInlineGroup(widget._durLabel, widget.durationInput),
         makeInlineGroup(resLabel, widget._resWInput, xLabel, widget._resHInput, widget._resMaxHint),
-        widget._aspectRatioSelect, widget._resTierSelect, widget._templateSelect,
-        makeInlineGroup(fpsLabel, widget._fpsInput, widget._fpsSelect)
+        widget._aspectRatioSelect, widget._resTierSelect,
+        makeInlineGroup(fpsLabel, widget._fpsInput, widget._fpsSelect),
+        // Last so wrap-reverse lifts the entire templates pair above geometry.
+        templatesGroup
     );
 }
 
@@ -722,7 +758,18 @@ export function updateQueueChromeStatus(widget) {
     }
 }
 
+export function refreshChannelTemplateControl(widget) {
+    const button = widget._channelTemplateBtn;
+    if (!button) return;
+    const template = widget._channelTemplate();
+    widget._channelTemplateLabel.textContent = template.name;
+    button.title = `${template.name} — project-wide channels: ${template.channels.map((channel) => channel.key).join(", ")}`;
+    button.setAttribute("aria-label", `Channel template: ${template.name} (project-wide)`);
+    button.dataset.sonderChannelTemplate = template.id;
+}
+
 export function updateEditorToolbar(widget) {
+    refreshChannelTemplateControl(widget);
     if (!widget._toolBtnSnap) return;
 
     applyTopButtonVariant(widget._toolBtnSnap, widget.snappingEnabled ? "primary" : "secondary", BUTTON_OPTIONS.secondary, "white-space:nowrap;");

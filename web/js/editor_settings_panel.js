@@ -1608,6 +1608,7 @@ function showSettingsPanel() {
         "Channel Templates",
         "Manage browser-local custom channel definitions. Projects keep their own active value; changes never propagate to closed projects."
     );
+    channelTemplatesSection.dataset.sonderSettingsSection = "channel-templates";
     const channelDefaultRow = createRow(
         channelTemplatesSection,
         "Default for new projects",

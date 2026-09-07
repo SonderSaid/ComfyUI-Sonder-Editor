@@ -338,6 +338,7 @@ import {
     buildEditorSceneBar,
     buildEditorToolbar,
     queueChromeBadges,
+    refreshChannelTemplateControl,
     updateEditorToolbar,
     updateQueueChromeStatus,
 } from "./editor_top_chrome.js";
@@ -5627,6 +5628,7 @@ export class EditorWidget {
             this._resHInput.placeholder = String(this.sceneHeight || DEFAULT_EDITOR_SETTINGS.projectDefaults.height);
         }
         this._rebuildTemplateOptions();
+        refreshChannelTemplateControl(this);
         this._rebuildResolutionTierOptions();
         this._applyTemplateConstraintMetadata();
         if (detectSelections && !this._resolutionSelectionPinned) {
@@ -12311,6 +12313,7 @@ export class EditorWidget {
             // client's scene copies are stale by definition — re-read before
             // the panel and timeline draw from them.
             await this._fetchScenes({ ignoreMutationGate: true, reason: "channel_template_switch" });
+            refreshChannelTemplateControl(this);
             this._promptPanelHandle?.refresh?.();
             this._renderTimeline();
             notifySuccess(`Prompt channels switched to "${next.name}".`);
@@ -12342,6 +12345,34 @@ export class EditorWidget {
         }));
     }
 
+    _openChannelTemplateMenu(anchorEl) {
+        // Outside mousedown dismisses before click; a connected menu here is
+        // the keyboard-triggered toggle (Space/Enter on the opener).
+        if (this._contextMenuEl?.isConnected && this._channelTemplateMenuAnchor === anchorEl) {
+            this._hideContextMenu();
+            return;
+        }
+        this._hideContextMenu();
+        const active = this._channelTemplate();
+        const items = this._promptChannelTemplateOptions().map((option) => ({
+            label: `${option.id === active.id ? "✓ " : ""}${option.name}`,
+            hint: `${option.channelCount} ${option.channelCount === 1 ? "channel" : "channels"}`,
+            action: () => this._setPromptChannelTemplate(option.template),
+        }));
+        items.push({ type: "separator" }, {
+            label: "Manage Channel Templates…",
+            action: () => {
+                this._showSettingsPanel();
+                this._settingsPanelEl?.querySelector('[data-sonder-settings-section="channel-templates"]')
+                    ?.scrollIntoView({ block: "start" });
+            },
+        });
+        const rect = anchorEl.getBoundingClientRect();
+        this._channelTemplateMenuAnchor = anchorEl;
+        this._contextMenuClose = openContextMenu({ x: rect.left, y: rect.bottom, items, focusFirst: true });
+        this._contextMenuEl = this._contextMenuClose.element;
+    }
+
     async _savePromptChannelTemplate(template, { updateActive = false } = {}) {
         const next = getChannelTemplate(template);
         if (next.builtin || !String(next.id || "").startsWith("custom:")) return false;
@@ -12354,6 +12385,7 @@ export class EditorWidget {
             ? current.map((entry) => entry.id === next.id ? next : entry)
             : [...current, next];
         this._updateSettings({ promptChannelTemplates: { customTemplates } });
+        refreshChannelTemplateControl(this);
         notifySuccess(`Channel template "${next.name}" saved.`);
         return true;
     }
@@ -16144,6 +16176,7 @@ export class EditorWidget {
         this._contextMenuClose?.();
         this._contextMenuClose = null;
         this._contextMenuEl = null;
+        this._channelTemplateMenuAnchor = null;
     }
 
     // ── Keyboard Shortcut Overlay ────────────────────────────────────
