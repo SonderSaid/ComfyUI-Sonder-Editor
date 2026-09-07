@@ -478,11 +478,19 @@ export function buildEditorToolbar(widget) {
         widget._updateToolbar();
     });
 
-    const cutHereBtn = makeToolButton("\u2307 Split Here", "", "Split clip/audio at playhead", async () => {
+    const cutHereBtn = makeToolButton("\u2307 Split Here", "", "Split clip/audio/Reference at playhead", async () => {
+        // Reference items are selected through the same `selectedItems` path and
+        // divide the same way, so they belong in this filter. Their `-1` end
+        // means "follow scene end", which is the bar the user actually sees.
+        const splitSpan = (item) => (item.type === "reference"
+            ? [item.data.start_frame || 0,
+                item.data.end_frame === -1 ? widget.totalFrames : item.data.end_frame]
+            : [item.data.timeline_start_frame, item.data.timeline_end_frame]);
         const selectedTargets = widget.selectedItems
-            .filter((item) => (item.type === "clip" || item.type === "audio")
-                && widget.playhead > item.data.timeline_start_frame
-                && widget.playhead < item.data.timeline_end_frame);
+            .filter((item) => (item.type === "clip" || item.type === "audio"
+                    || item.type === "reference")
+                && widget.playhead > splitSpan(item)[0]
+                && widget.playhead < splitSpan(item)[1]);
         if (selectedTargets.length) {
             for (const hit of selectedTargets) {
                 await widget._splitClipAtFrame(hit, widget.playhead);
@@ -499,7 +507,7 @@ export function buildEditorToolbar(widget) {
             await widget._splitClipAtFrame({ type: "audio", id: audio.track_id, data: audio }, widget.playhead);
         }
     });
-    cutHereBtn.title = "Split clip/audio at current playhead position";
+    cutHereBtn.title = "Split the selected clip, audio or Reference item at the current playhead position";
 
     const frameLabel = document.createElement("span");
     frameLabel.style.cssText = labelCss({ marginLeft: "2px", fontSize: "9px" });

@@ -14,6 +14,7 @@ import {
     validateMemberDraft,
     validateReferenceDraft,
 } from "./reference_library_model.js";
+import { openContextMenu } from "./editor_context_menu.js";
 
 const css = {
     input: "width:100%;box-sizing:border-box;background:#151a20;border:1px solid #38414b;border-radius:6px;color:#e6ebf0;padding:6px 8px;font:11px 'Segoe UI',sans-serif;",
@@ -182,17 +183,10 @@ export function mountReferenceLibrary(container, host) {
     const openTimelineMenu = (event, payload) => {
         event.preventDefault();
         event.stopPropagation();
-        document.querySelector('[data-reference-timeline-menu="true"]')?.remove();
-        const menu = el("div", "", "position:fixed;z-index:10020;padding:4px;border:1px solid #43505c;border-radius:6px;background:#182028;box-shadow:0 8px 22px rgba(0,0,0,.45);");
-        menu.dataset.referenceTimelineMenu = "true";
-        menu.style.left = `${event.clientX}px`;
-        menu.style.top = `${event.clientY}px`;
-        const add = el("button", "Add to timeline", `${css.button}border:0;background:transparent;display:block;width:100%;text-align:left;`);
-        add.disabled = !payload.members.length;
-        add.addEventListener("click", () => { menu.remove(); host.addToTimeline?.(payload); });
-        menu.appendChild(add);
-        document.body.appendChild(menu);
-        setTimeout(() => document.addEventListener("pointerdown", () => menu.remove(), { once: true }), 0);
+        openContextMenu({ x: event.clientX, y: event.clientY, items: [
+            { label: "Add to timeline", disabled: !payload.members.length,
+                action: () => host.addToTimeline?.(payload) },
+        ] });
     };
 
     const reset = () => {

@@ -15,6 +15,18 @@ a fresh `[Unreleased]` block.
 - Removed MiniMax H3 Base task-mode and first/last Guide setup controls and automatic alignment prose; the Base prompt format and Guides Bridge remain available.
 
 ### Added
+- Reference lanes can be reordered. **Move Lane Up** and **Move Lane Down** sit
+  in the lane header menu; lane order numbers the MiniMax H3 Picture, Video and
+  Audio ordinals, so the move renumbers them and says what else changes with
+  them, including that a Reference Selector naming a lane by number now points
+  at the other lane.
+- Staged Reference items can be split, with the razor tool or **Split Here**,
+  the way clips, audio and prompt sections already are. Both halves keep
+  identical staging, and a half running to scene end keeps following it.
+- Dragging a Library member onto an already-staged Reference bar adds it to that
+  item instead of refusing. The drag highlight now also respects the lane's
+  declared model input, so a still image no longer looks like a valid landing on
+  a Video reference lane.
 - The toolbar now pairs labeled Model and Channels template controls, with a project-wide channel picker and a shortcut to Manage Channel Templates.
 - Added links to Project-Sample, the LTX 2.3 example project hosted on Hugging Face.
 - Reference recipes carry a **Prompt suffix** beside the existing prefix and
@@ -41,6 +53,8 @@ a fresh `[Unreleased]` block.
   text to the prompt being compiled.
 
 ### Fixed
+- The Reference Library's right-click **Add to timeline** action now runs and its menu dismisses with Escape or an outside click.
+- Reference lane configuration preserves lane identity and checks known lane IDs so edits cannot silently retarget a reordered lane.
 - Gallery metadata loads correctly for absolute project directories and ignores stale callbacks after switching projects.
 - Export refusals remain visible when controls re-enable; retry clears the previous request error.
 - Improve editor responsiveness during timeline export polling and coalesce repeated Guides Bridge and Driver Selector refreshes.

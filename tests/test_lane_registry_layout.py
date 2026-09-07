@@ -178,3 +178,46 @@ def test_authoritative_asset_drop_keeps_occupancy_and_overlap_checks_out_of_hove
         "Asset hover is advisory; only the authoritative asset drop checks "
         "occupancy and overlap."
     )
+
+
+def test_recipe_lane_collapse_round_trip_follows_identity_after_move():
+    module_url = (ROOT / "web/js/lane_registry.js").as_uri()
+    _run_node(f"""
+import assert from 'node:assert/strict';
+const {{buildTrackLayout, laneCollapseKey, descriptorFor}} = await import({module_url!r});
+const scene = {{reference_lane_count: 2,
+  reference_lane_recipes: [{{lane_id: 'a'}}, {{lane_id: 'b'}}]}};
+const descriptor = descriptorFor('reference');
+const collapsedKeys = new Set([laneCollapseKey(scene, descriptor, 0)]);
+const refs = () => buildTrackLayout({{scene, collapsedKeys}})
+  .filter(row => row.type === 'reference');
+assert.deepEqual(refs().map(row => row.collapsed), [true, false]);
+scene.reference_lane_recipes.reverse();
+assert.deepEqual(refs().map(row => row.collapsed), [false, true]);
+collapsedKeys.add(laneCollapseKey(scene, descriptor, 0));
+assert.deepEqual(refs().map(row => row.collapsed), [true, true]);
+collapsedKeys.delete(laneCollapseKey(scene, descriptor, 1));
+assert.deepEqual(refs().map(row => row.collapsed), [true, false]);
+// No legacy index fallback for materialized lanes.
+assert.equal(buildTrackLayout({{scene, collapsedKeys: new Set(['reference:0'])}})
+  .find(row => row.type === 'reference').collapsed, false);
+// Default lanes remain index-keyed until a recipe is materialized.
+const defaultScene = {{reference_lane_count: 1, reference_lane_recipes: []}};
+assert.equal(laneCollapseKey(defaultScene, descriptor, 0), 'reference:0');
+assert.equal(buildTrackLayout({{scene: defaultScene, collapsedKeys: new Set(['reference:0'])}})
+  .find(row => row.type === 'reference').collapsed, true);
+// Every fixed/positional family still reads precisely the key its writer uses.
+for (const row of buildTrackLayout({{scene: defaultScene}})) {{
+  const key = laneCollapseKey(defaultScene, descriptorFor(row.type), row.laneIndex);
+  const rebuilt = buildTrackLayout({{scene: defaultScene, collapsedKeys: new Set([key])}});
+  assert.equal(rebuilt.filter(r => r.collapsed).length, 1);
+  assert.equal(rebuilt.find(r => r.type === row.type && r.laneIndex === row.laneIndex).collapsed, true);
+}}
+""")
+
+
+def test_collapse_settings_writer_delegates_to_layout_key_authority():
+    source = (ROOT / "web/js/editor_widget.js").read_text(encoding="utf-8")
+    method = source.split("    _trackCollapseKey(entry) {", 1)[1].split("\n    }", 1)[0]
+    assert "return laneCollapseKey(this.activeScene, descriptorFor(entry.type), entry.laneIndex || 0)" in method
+    assert "reference_lane_recipes" not in method

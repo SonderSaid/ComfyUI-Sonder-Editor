@@ -232,7 +232,7 @@ import { getActiveReferenceDrag, mountReferenceLibrary, referenceMemberMediaKind
 import { openReferenceMediaEditor, REFERENCE_MEDIA_EDITOR_SHORTCUTS } from "./reference_media_editor.js";
 import { formatReferenceTag, shouldApplyReferenceResponse } from "./reference_library_model.js";
 import { mountReferenceLanePanel } from "./editor_reference_panel.js";
-import { referenceConfigurationAdvisories } from "./reference_lane_identity.js";
+import { referenceConfigurationAdvisories, resolveReferenceDropVerdict } from "./reference_lane_identity.js";
 import { REFERENCE_LANE_CAUSE, classifyReferenceChunks } from "./reference_resolution.js";
 import { deriveCurrentSceneAssetIds } from "./current_scene_assets.js";
 import { notifyInfo, notifySuccess, notifyWarning, notifyError, notifyProgress } from "./editor_notifications.js";
@@ -314,6 +314,7 @@ import {
     isRenderClip,
     isVariableLane,
     laneAcceptsAssetType,
+    laneCollapseKey,
     laneCountFor,
     laneItemsForType,
     laneLabel,
@@ -527,6 +528,22 @@ const SCENE_BAR_HEIGHT = 36;
 const FULLSCREEN_SIDEBAR_DEFAULT_WIDTH = 240; // fallback only; first-run width is computed proportionally
 const FULLSCREEN_SIDEBAR_MIN_WIDTH = 180;
 const FULLSCREEN_SIDEBAR_DEFAULT_FRACTION = 0.382; // first-run gallery sidebar ≈ golden-ratio 38.2% of the editor area
+// Reference items are source-less half-open scopes, exactly like prompt
+// sections, so they divide the same way clips, audio and prompts do.
+const SPLITTABLE_ITEM_TYPES = new Set(["clip", "audio", "prompt", "reference"]);
+
+// A refusal the user cannot read is indistinguishable from a broken drag, and
+// one message covering every cause names the wrong one three times out of four.
+const REFERENCE_DROP_REFUSALS = {
+    locked: "That Reference lane is locked — unlock it on the lane header.",
+    collapsed: "That Reference lane is collapsed — expand it to stage into it.",
+    media_kind: "That Reference lane already uses a different media kind. Drop on the ruler to make a new lane.",
+    population: "That Reference lane's model input does not accept this member's media. Drop on the ruler to make a new lane.",
+    occupied: "A staged Reference already covers this frame. Drop directly on the bar to add a member to it.",
+    duplicate_member: "That member is already staged on this Reference item.",
+    default: "That Reference lane is locked, occupied at this frame, or uses a different media kind.",
+};
+
 const FULLSCREEN_TIMELINE_MIN_HEIGHT = 160;
 const FULLSCREEN_TIMELINE_FALLBACK_MAX_HEIGHT = 600;
 
@@ -3525,6 +3542,22 @@ export class EditorWidget {
             }
             return found.length === 1 ? found[0] : -1;
         };
+        // Whether history reordered this lane family rather than only resizing it.
+        // Compares durable lane ids position by position; a family without them
+        // reports false, which preserves the equal-count shortcut exactly as it
+        // behaved before lane move existed.
+        const laneOrderChanged = (laneType, count) => {
+            const spec = laneSpecs[laneType];
+            if (!spec?.recipes || !authoredScene) return false;
+            const idsOf = (scene) => {
+                const list = Array.isArray(scene?.[spec.recipes]) ? scene[spec.recipes] : [];
+                return list.slice(0, count).map((value) => String(value?.lane_id || ""));
+            };
+            const authoredIds = idsOf(authoredScene);
+            const orderedIds = idsOf(orderedScene);
+            if (authoredIds.length !== orderedIds.length) return true;
+            return authoredIds.some((laneId, index) => laneId && laneId !== orderedIds[index]);
+        };
         const rebaseLaneIndex = (laneType, laneIndex) => {
             const index = Number(laneIndex);
             const spec = laneSpecs[laneType];
@@ -3534,10 +3567,21 @@ export class EditorWidget {
             // New lanes are append-only. Preserve their offset from the authored
             // tail when an earlier history action restored or removed lanes.
             if (index >= authoredCount) return orderedCount + (index - authoredCount);
-            // Lane topology changes only through add/remove operations today.
-            // With equal counts every numeric slot is stable even when history
-            // moved all of its contents or changed its presentation config.
-            if (authoredCount === orderedCount) return index;
+            // With equal counts every numeric slot USED to be stable, because
+            // lane topology only ever changed through add/remove. Move Lane
+            // Up/Down broke that premise for movable families: a swap leaves the
+            // count identical while every index means a different lane.
+            // `update_lane_config` keeps its authored expected.lane_id through
+            // this rebase as a check on the resolved target; `remove_lane` and
+            // item lane_index fields still have no lane identity guard, so a
+            // pass-through index could delete or rewrite the OTHER lane. Fall through to the anchor whenever the authored
+            // and ordered lane-id sequences actually disagree; when they agree —
+            // every case that existed before — the shortcut still applies, so no
+            // scene lacking durable ids starts refusing.
+            if (authoredCount === orderedCount
+                    && !laneOrderChanged(laneType, authoredCount)) {
+                return index;
+            }
             const matched = findLaneByAnchor(
                 orderedScene, laneType, laneAnchor(authoredScene, laneType, index));
             if (matched >= 0) return matched;
@@ -3674,6 +3718,28 @@ export class EditorWidget {
                         "reference", operation.fields.lane_index);
                 }
                 break;
+            case "split_reference_item":
+                // Deliberately NOT projected forward, unlike its update/delete
+                // siblings. `frame` is a geometric position the author picked
+                // against a bar they could see, and `expected.resolved_end_frame`
+                // exists precisely so a concurrent extent change refuses instead
+                // of cutting a bar of a different length at the same pixel.
+                // Re-snapshotting either value against the ordered scene would
+                // make that guard check the current state against itself and it
+                // could never fire. A moved bound therefore refuses, and
+                // `_splitClipAtFrameWithinGesture` toasts the refusal.
+                break;
+            case "move_lane":
+                if (laneSpecs[operation.lane_type]) {
+                    // Both endpoints rebase; the durable `expected` lane ids
+                    // stay as authored and become the server-side check on
+                    // whether this rebase landed on the intended lanes.
+                    operation.from_index = rebaseLaneIndex(
+                        operation.lane_type, operation.from_index);
+                    operation.to_index = rebaseLaneIndex(
+                        operation.lane_type, operation.to_index);
+                }
+                break;
             case "update_audio_track":
                 if (Object.hasOwn(operation.fields || {}, "lane_index")) {
                     operation.fields.lane_index = rebaseLaneIndex(
@@ -3800,7 +3866,10 @@ export class EditorWidget {
             || this._claimHistoryPostSnapshotCapture(intent?.sceneId);
         if (capturedHistoryEntry) capturedHistoryEntry._postSnapshotCaptureClaimed = true;
         this._pendingHistoryEntryByMutationKey ||= new Map();
-        const willCoalesce = coalesce !== false
+        // Config edits authored on opposite sides of a lane move belong to
+        // different physical queue positions, even when their keys match.
+        const sealsLaneOrder = intent?.operations?.some((op) => op.type === "move_lane") === true;
+        const willCoalesce = !sealsLaneOrder && coalesce !== false
             && this._projectMutationQueue.hasPendingKey?.(
                 key, { currentEpochOnly: true }) === true;
         if (willCoalesce) {
@@ -3855,6 +3924,7 @@ export class EditorWidget {
             })
             : null;
         const promise = this._projectMutationQueue.enqueue({
+            sealCoalescing: sealsLaneOrder,
             key,
             label,
             coalesce,
@@ -4397,9 +4467,49 @@ export class EditorWidget {
                 ? this.activeScene[descriptor.recipeAttr]
                 : [];
             while (recipes.length > count) recipes.pop();
-            while (recipes.length < count) recipes.push(this._defaultReferenceLaneRecipe());
+            // The server mints these identities. A local draft id would become
+            // a false expected.lane_id on a config edit queued before creation.
+            while (recipes.length < count) recipes.push({ ...this._defaultReferenceLaneRecipe(), lane_id: "" });
             this.activeScene[descriptor.recipeAttr] = recipes;
         }
+    }
+
+    /** Swap two lanes of a movable family in the local scene, optimistically.
+     *
+     *  Without this the timeline keeps drawing the OLD order for the whole
+     *  round trip — measured in seconds on a large project — so the author can
+     *  act on a lane header that has already moved. The queue's history rebase
+     *  now retargets a queued index across a reorder, but showing the truth is
+     *  the actual fix; the rebase is the safety net behind it.
+     */
+    _applyLocalMoveLane(laneType, fromIndex, toIndex) {
+        const descriptor = descriptorFor(laneType);
+        if (!this.activeScene || !descriptor?.laneMovable) return false;
+        fromIndex = parseInt(fromIndex, 10);
+        toIndex = parseInt(toIndex, 10);
+        if (!Number.isFinite(fromIndex) || !Number.isFinite(toIndex)) return false;
+        if (fromIndex === toIndex) return false;
+        const count = Math.max(1, parseInt(this.activeScene[descriptor.countField], 10) || 1);
+        if (Math.min(fromIndex, toIndex) < 0 || Math.max(fromIndex, toIndex) >= count) return false;
+        // Check EVERY array before touching any of them. Refuse rather than
+        // half-apply: a short array here means the local scene disagrees with
+        // the server about lane shape, and a configs-swapped/recipes-unswapped
+        // scene is worse than the stale one it replaced.
+        const highest = Math.max(fromIndex, toIndex);
+        const lists = [this.activeScene[descriptor.configsField]];
+        if (descriptor.recipeAttr) lists.push(this.activeScene[descriptor.recipeAttr]);
+        if (lists.some((list) => !Array.isArray(list) || list.length <= highest)) return false;
+        for (const list of lists) {
+            const held = list[fromIndex];
+            list[fromIndex] = list[toIndex];
+            list[toIndex] = held;
+        }
+        for (const item of laneItemsForType(this.activeScene, descriptor.trackType, null)) {
+            const index = item[descriptor.itemsSource.indexField] || 0;
+            if (index === fromIndex) item[descriptor.itemsSource.indexField] = toIndex;
+            else if (index === toIndex) item[descriptor.itemsSource.indexField] = fromIndex;
+        }
+        return true;
     }
 
     _applyLocalRemoveLane(laneType, laneIndex, itemPolicy = "require_empty", targetLane = null) {
@@ -6130,17 +6240,6 @@ export class EditorWidget {
         return { media_kind: "image", recipe_id: "", recipe: {}, ...overrides, lane_id: laneId };
     }
 
-    // media_kind is a hard lane property: a staging drop may adopt a kind only
-    // on a lane the user has never configured. Anything else — a chosen recipe,
-    // a detached custom recipe, or an explicit Media toggle — is authored lane
-    // state that a wrong-media drop must not silently repurpose.
-    _isUnconfiguredReferenceLaneRecipe(recipe) {
-        const value = recipe || {};
-        return (value.media_kind || "image") === "image"
-            && !String(value.recipe_id || "")
-            && !Object.keys(value.recipe || {}).length;
-    }
-
     _trackConfigForFixedType(type) {
         const field = descriptorFor(type)?.fixedConfigField;
         return (field && this.activeScene?.[field]) || this._defaultLaneConfig();
@@ -6777,7 +6876,7 @@ export class EditorWidget {
 
     _trackCollapseKey(entry) {
         if (!entry) return "";
-        return `${entry.type}:${entry.laneIndex}`;
+        return laneCollapseKey(this.activeScene, descriptorFor(entry.type), entry.laneIndex || 0);
     }
 
     _readStoredTrackCollapseState(scene = this.activeScene, settings = this._settings) {
@@ -8147,7 +8246,7 @@ export class EditorWidget {
                 if (this._razorMode) {
                     // Razor mode: split clip or audio at click position
                     const hit = this._hitTestItem(x, rawY);
-                    if (hit && (hit.type === "clip" || hit.type === "audio" || hit.type === "prompt")) {
+                    if (hit && SPLITTABLE_ITEM_TYPES.has(hit.type)) {
                         this._splitClipAtFrame(hit, frame);
                     }
                     return;
@@ -8801,7 +8900,8 @@ export class EditorWidget {
                 rawY, Math.max(0, this._xToFrame(x)));
             e.dataTransfer.dropEffect = target && target.kind !== "invalid" ? "copy" : "none";
             const prev = this._dropHoverTarget;
-            if (prev?.kind !== target?.kind || prev?.layoutIdx !== target?.layoutIdx) {
+            if (prev?.kind !== target?.kind || prev?.layoutIdx !== target?.layoutIdx
+                    || prev?.itemId !== target?.itemId) {
                 this._dropHoverTarget = target;
                 this._renderTimeline();
             }
@@ -8968,6 +9068,25 @@ export class EditorWidget {
 
                     menuItems.push({ label: "Rename Lane", action: () => this._startLaneRename(headerHit.layoutIdx) });
                     menuItems.push({ label: `Add ${label} Lane`, action: () => this._addLane(entry.type) });
+                    // Gated on the DESCRIPTOR, not the track type. Lane order
+                    // means something different in every family — video lane
+                    // order is compositing order, Reference lane order numbers
+                    // the H3 population ordinals — so only a family whose
+                    // reorder has been designed and tested opts in.
+                    if (descriptor.laneMovable) {
+                        const laneIndex = entry.laneIndex || 0;
+                        for (const [moveLabel, direction] of [["Move Lane Up", -1], ["Move Lane Down", 1]]) {
+                            const target = laneIndex + direction;
+                            if (target < 0 || target >= laneCount) continue;
+                            const moveLocked = this._isLaneLocked(entry.type, laneIndex)
+                                || this._isLaneLocked(entry.type, target);
+                            menuItems.push({
+                                label: moveLocked ? `${moveLabel} (locked)` : moveLabel,
+                                action: moveLocked ? () => {} : () => void this._moveReferenceLane(entry, direction),
+                                disabled: moveLocked,
+                            });
+                        }
+                    }
                     if (this._isLaneSelected(entry) && (this._selectedLanes || []).length > 1) {
                         const selectedLaneDeletes = this._selectedLaneDeleteEntries();
                         if (selectedLaneDeletes.length > 0) {
@@ -9275,11 +9394,19 @@ export class EditorWidget {
             const layoutIdx = this._layoutIndexFromRawY(rawY);
             const entry = layoutIdx >= 0 ? this._trackLayout[layoutIdx] : null;
             if (entry?.type !== TRACK_TYPE.REFERENCE) return { kind: "invalid" };
-            // Same predicate the drop uses, so the highlight cannot promise a
-            // landing the drop then refuses on kind, lock, or frame overlap.
-            const mediaKind = this._referencePayloadMediaKind(referenceDrag);
-            const canUse = this._referenceLaneAcceptor(mediaKind, frame);
-            return canUse(entry) ? { kind: "lane", layoutIdx } : { kind: "invalid" };
+            // Same resolver the drop uses, so the highlight cannot promise a
+            // landing the drop then refuses on kind, population, lock, or a
+            // member already staged. Hover is always an explicit pointer
+            // position, so it is allowed to see the append verdict.
+            const resolve = this._referenceDropResolver(referenceDrag, frame);
+            const verdict = resolve(entry, { allowAppend: true });
+            if (verdict.verdict === "create") return { kind: "lane", layoutIdx };
+            // Two different landings must not look identical: append outlines
+            // the bar it will extend, not the whole lane row.
+            if (verdict.verdict === "append") {
+                return { kind: "referenceItem", layoutIdx, itemId: verdict.itemId };
+            }
+            return { kind: "invalid" };
         }
         const dragAsset = getActiveDragAsset?.() || null;
         const assetType = dragAsset?.asset_type || "";
@@ -9327,49 +9454,141 @@ export class EditorWidget {
             || this._defaultReferenceLaneRecipe();
     }
 
-    /** One acceptance rule for Reference lanes, shared by hover and drop.
-     *
-     *  Hover used to check only lane type, collapse and lock, so every unlocked
-     *  Reference lane highlighted and showed `copy` — then the drop refused on
-     *  media kind or frame overlap. Sharing this predicate is what makes the
-     *  drag stop promising a landing the drop will reject.
-     */
-    _referenceLaneAcceptor(mediaKind, startFrame) {
-        const scene = this.activeScene;
-        if (!scene || !mediaKind) return () => false;
-        const duration = Math.max(1, parseInt(scene.duration_frames, 10)
-            || this.totalFrames || 1);
-        const frame = Math.min(duration - 1, Math.max(0, Math.round(Number(startFrame) || 0)));
-        const overlapsFrame = (laneIndex) => (scene.reference_items || []).some((item) => {
-            if ((item.lane_index || 0) !== laneIndex) return false;
-            const end = item.end_frame === -1 ? duration : item.end_frame;
-            return (item.start_frame || 0) <= frame && end > frame;
-        });
-        return (entry) => {
-            if (!entry || entry.collapsed) return false;
-            if (this._isLaneLocked(entry.type, entry.laneIndex || 0)) return false;
-            if (overlapsFrame(entry.laneIndex || 0)) return false;
-            const recipe = this._referenceLaneRecipe(entry.laneIndex || 0);
-            if (recipe.media_kind === mediaKind) return true;
-            const occupied = (scene.reference_items || []).some((item) =>
-                (item.lane_index || 0) === (entry.laneIndex || 0));
-            return !occupied && this._isUnconfiguredReferenceLaneRecipe(recipe);
+    /** Facts about one Reference lane, in the pure resolver's shape. */
+    _referenceLaneFacts(entry) {
+        const laneIndex = entry?.laneIndex || 0;
+        return {
+            laneIndex,
+            collapsed: !!entry?.collapsed,
+            locked: !!this._isLaneLocked(entry?.type, laneIndex),
+            recipe: this._referenceLaneRecipe(laneIndex),
+            items: (this.activeScene?.reference_items || [])
+                .filter((item) => (item.lane_index || 0) === laneIndex),
         };
     }
 
-    _referencePayloadMediaKind(payload) {
+    /** The dragged members in the resolver's shape, or null when unusable.
+     *
+     *  An unresolvable member still blocks placement — the lane cannot be typed
+     *  from it — but it is NOT the mixed-kind case, which the library refuses
+     *  earlier at `dragstart`. Both sides classify a member through the same
+     *  shared rule so they cannot drift.
+     */
+    _referenceDropMembers(payload) {
+        const members = [];
         const kinds = new Set();
         for (const memberRef of payload?.members || []) {
             const resolved = this._referenceMemberForRef(memberRef);
             const asset = resolved ? this._findAssetById(resolved.member.asset_id) : null;
-            // An unresolvable member still blocks placement — the lane cannot be
-            // typed from it — but it is NOT the mixed-kind case, which the
-            // library refuses earlier at `dragstart`. Both sides classify a
-            // member through the same shared rule so they cannot drift.
-            if (!resolved || !asset) return "";
+            if (!resolved || !asset) return null;
             kinds.add(referenceMemberMediaKind(resolved.member, asset));
+            members.push({
+                member_id: resolved.member.member_id,
+                assetType: asset.asset_type || "",
+                hasAudio: asset.has_audio === true,
+            });
         }
-        return kinds.size === 1 ? [...kinds][0] : "";
+        return kinds.size === 1 ? { mediaKind: [...kinds][0], members } : null;
+    }
+
+    /** One drop rule for Reference lanes, shared by hover and drop.
+     *
+     *  Hover used to check only lane type, collapse and lock, so every unlocked
+     *  Reference lane highlighted and showed `copy` — then the drop refused on
+     *  media kind or frame overlap. Sharing this resolver is what makes the drag
+     *  stop promising a landing the drop will reject, and it is why appending to
+     *  an occupied bar extends the SAME rule rather than adding a second path.
+     *
+     *  The verdict rule itself is pure and lives in `reference_lane_identity.js`
+     *  so it can be exercised directly; this method only gathers the facts.
+     */
+    _referenceDropResolver(payload, startFrame) {
+        const scene = this.activeScene;
+        const drag = scene ? this._referenceDropMembers(payload) : null;
+        const rejected = { verdict: "reject", reason: "media_kind", itemId: "" };
+        if (!drag) return () => rejected;
+        const sceneDuration = Math.max(1, parseInt(scene.duration_frames, 10)
+            || this.totalFrames || 1);
+        return (entry, { allowAppend = false } = {}) => resolveReferenceDropVerdict(
+            entry?.type === TRACK_TYPE.REFERENCE ? this._referenceLaneFacts(entry) : null,
+            {
+                mediaKind: drag.mediaKind,
+                frame: startFrame,
+                sceneDuration,
+                members: drag.members,
+                allowAppend,
+            },
+        );
+    }
+
+    _referencePayloadMediaKind(payload) {
+        return this._referenceDropMembers(payload)?.mediaKind || "";
+    }
+
+    /** Append dragged Library members to an already-staged Reference item.
+     *
+     *  Append-only by design: `_member_slots` numbers H3 ordinals by member
+     *  order within the item, so inserting at the drop position would silently
+     *  renumber every member after it. Reordering stays in the lane overlay's
+     *  Members section, where it already lives.
+     */
+    async _appendReferenceMembers(...args) {
+        return this._withMutationGesture(
+            "appendReferenceMembers", () => this._appendReferenceMembersWithinGesture(...args));
+    }
+
+    async _appendReferenceMembersWithinGesture(referenceItemId, payload) {
+        const scene = this.activeScene;
+        const item = (scene?.reference_items || []).find(
+            (candidate) => candidate.reference_item_id === referenceItemId);
+        if (!item) return;
+        const priorMembers = (item.members || []).map((value) => ({ ...value }));
+        const members = [
+            ...priorMembers,
+            ...(payload.members || []).map((value) => ({ ...value })),
+        ];
+        const laneIndex = item.lane_index || 0;
+        // The cap is HARD — `nodes/reference_core.py` raises when a lane's
+        // reserved span exceeds `hard.max_members` — but the append still
+        // ALLOWS the over-cap state, because the overlay's `+ Add member`
+        // picker allows it and a stricter rule for one of two paths into the
+        // same durable state would be a second authority. What changes is that
+        // the breach is said out loud at the moment it happens, while undo is
+        // still one keystroke away, instead of only inside a collapsed group
+        // in an overlay this author has not opened.
+        const cap = Number(this._referenceLaneRecipe(laneIndex)?.recipe?.hard?.max_members);
+        const overCap = Number.isFinite(cap) && cap >= 0 && members.length > cap;
+
+        this._pushUndo("add reference member");
+        try {
+            const result = await this._runSceneMutation([{
+                type: "update_reference_item",
+                reference_item_id: referenceItemId,
+                fields: { members },
+                expected: {
+                    members: priorMembers,
+                    reference_item_id: referenceItemId,
+                },
+            }], {
+                key: `scene:${this.activeSceneId}:reference-append:${referenceItemId}:${Date.now()}`,
+                label: "add reference member",
+                coalesce: false,
+                refreshScenes: false,
+            });
+            this._reconcileActiveSceneFromMutation(result, { reason: "reference_append", ignoreTimelineGate: true });
+            this._buildTrackLayout();
+            this._renderTimeline();
+            this._refreshPromptContextDependencyConsumers();
+            if (overCap) {
+                notifyWarning(
+                    `${members.length} staged members exceed this lane recipe's hard cap of ${cap}; the render will be refused. Undo, or raise the cap in Reference Lane Setup.`,
+                    { source: "reference-stage-over-cap" });
+            }
+        } catch (error) {
+            notifyWarning(error?.message || "Reference member was not added.", { source: "reference-stage-refused" });
+            await this._fetchScenes({ ignoreMutationGate: true, reason: "reference_append_error" });
+            this._refreshPromptContextDependencyConsumers();
+        }
     }
 
     async _placeReferencePayload(...args) {
@@ -9398,15 +9617,32 @@ export class EditorWidget {
             } else {
                 const layoutIdx = this._layoutIndexFromRawY(trackRawY);
                 explicitEntry = layoutIdx >= 0 ? this._trackLayout[layoutIdx] : null;
-                if (explicitEntry?.type !== TRACK_TYPE.REFERENCE || explicitEntry.collapsed) return;
+                // A collapsed lane deliberately falls THROUGH to the resolver:
+                // returning here made "nothing happened, no explanation" the
+                // outcome, which is the case the refusal messages exist for.
+                if (explicitEntry?.type !== TRACK_TYPE.REFERENCE) return;
             }
         }
         const referenceEntries = (this._trackLayout || []).filter((entry) => entry.type === TRACK_TYPE.REFERENCE);
-        const canUse = this._referenceLaneAcceptor(mediaKind, startFrame);
+        const resolve = this._referenceDropResolver(payload, startFrame);
+        // Append is reachable ONLY from an explicit pointer hit on a bar.
+        // `addToTimeline` places at the playhead with no coordinates; if the
+        // shared rule simply started accepting occupied frames, that Library
+        // button would stop creating an item and silently start appending to
+        // whatever sits under the playhead, with no drag and no hover.
+        const canUse = (entry) => resolve(entry).verdict === "create";
         let entry = explicitEntry;
-        if (entry && !canUse(entry)) {
-            notifyWarning("That Reference lane is locked, occupied at this frame, or uses a different media kind.", { source: "reference-stage-refused" });
-            return;
+        if (entry) {
+            const verdict = resolve(entry, { allowAppend: true });
+            if (verdict.verdict === "append") {
+                return this._appendReferenceMembers(verdict.itemId, payload);
+            }
+            if (verdict.verdict !== "create") {
+                notifyWarning(REFERENCE_DROP_REFUSALS[verdict.reason]
+                    || REFERENCE_DROP_REFUSALS.default,
+                    { source: "reference-stage-refused" });
+                return;
+            }
         }
         // The ruler is the only auto-lane-creation zone, matching the asset drop
         // rule. Falling through to `find(canUse)` here would silently stage into
@@ -9423,11 +9659,13 @@ export class EditorWidget {
         }
         const existingRecipe = this._referenceLaneRecipe(laneIndex);
         if (existingRecipe.media_kind !== mediaKind || !entry) {
+            const laneId = String(scene.reference_lane_recipes?.[laneIndex]?.lane_id || "").trim();
             operations.push({
                 type: "update_lane_config",
                 lane_type: "reference",
                 lane_index: laneIndex,
                 fields: { reference_recipe: this._defaultReferenceLaneRecipe({ media_kind: mediaKind }) },
+                ...(laneId ? { expected: { lane_id: laneId } } : {}),
             });
         }
         const nextStart = (scene.reference_items || [])
@@ -10288,7 +10526,10 @@ export class EditorWidget {
                 locked: !!target.locked,
                 hidden: !!target.hidden,
             };
-            operations.push({ type: "update_lane_config", lane_type: laneType, lane_index: laneIndex, fields });
+            const laneId = String(sceneRef?.[descriptorFor(laneType)?.recipeAttr]?.[laneIndex]?.lane_id || "").trim();
+            operations.push({ type: "update_lane_config", lane_type: laneType, lane_index: laneIndex, fields,
+                ...(laneId ? { expected: { lane_id: laneId } } : {}),
+            });
             const cfg = { ...fields };
             if (laneType === "guide") sceneRef.guide_track_config = cfg;
             else if (laneType === "prompt") sceneRef.prompt_track_config = cfg;
@@ -10418,7 +10659,10 @@ export class EditorWidget {
                     || sceneRef?.[descriptor.recipeAttr]?.[laneIndex]
                     || this._defaultReferenceLaneRecipe();
             }
-            operations.push({ type: "update_lane_config", lane_type: laneType, lane_index: laneIndex, fields });
+            const laneId = String(sceneRef?.[descriptorFor(laneType)?.recipeAttr]?.[laneIndex]?.lane_id || "").trim();
+            operations.push({ type: "update_lane_config", lane_type: laneType, lane_index: laneIndex, fields,
+                ...(laneId ? { expected: { lane_id: laneId } } : {}),
+            });
             // Optimistic per-lane scene write (icon-flicker fix, now scoped):
             // _buildTrackLayout re-derives icon state from scene configs, so any
             // rebuild during the in-flight window must already see the new value.
@@ -10439,21 +10683,25 @@ export class EditorWidget {
                     sceneRef[listKey] = list;
                     if (descriptor?.recipeAttr && fields.reference_recipe) {
                         const recipes = Array.isArray(sceneRef[descriptor.recipeAttr]) ? sceneRef[descriptor.recipeAttr] : [];
-                        while (recipes.length <= laneIndex) recipes.push(this._defaultReferenceLaneRecipe());
-                        recipes[laneIndex] = { ...fields.reference_recipe };
+                        while (recipes.length <= laneIndex) recipes.push({ ...this._defaultReferenceLaneRecipe(), lane_id: "" });
+                        // Only an identity already read from the scene is known
+                        // durable. A panel draft cannot mint it optimistically.
+                        recipes[laneIndex] = { ...fields.reference_recipe, lane_id: laneId };
                         sceneRef[descriptor.recipeAttr] = recipes;
                     }
                 }
             }
         }
         if (!operations.length) return;
-        // Coalesce burst toggles by (lane_type, lane_index): each op carries the
-        // lane's full 4-field config, so latest-wins per lane and union across
-        // lanes is exactly right — no cross-lane loss, no field merging needed.
+        // Latest config wins per durable lane; positional families and lanes
+        // without a known id retain their index key. Distinct lanes that occupy
+        // the same index across a reorder must not erase each other's edits.
         const merge = (oldIntent, nextIntent) => {
             const byLane = new Map();
             for (const op of [...(oldIntent?.operations || []), ...(nextIntent?.operations || [])]) {
-                byLane.set(`${op.lane_type}:${op.lane_index || 0}`, op);
+                const laneKey = op.expected?.lane_id
+                    ? `lane:${op.expected.lane_id}` : `index:${op.lane_index || 0}`;
+                byLane.set(`${op.lane_type}:${laneKey}`, op);
             }
             return { ...nextIntent, operations: [...byLane.values()] };
         };
@@ -10463,7 +10711,9 @@ export class EditorWidget {
                 label: "lane config",
                 coalesce: true,
                 merge,
-                refreshScenes: false,
+                // Adopt server-minted bootstrap ids through the normal guarded
+                // scene reconciler; pending newer edits defer to the idle refresh.
+                refreshScenes: true,
             });
         } catch (e) {
             console.warn("[Sonder] Failed to save lane config:", e);
@@ -10888,6 +11138,110 @@ export class EditorWidget {
         } catch (e) {
             await this._fetchScenes({ ignoreMutationGate: true, reason: "delete_lane_items_error" });
             console.warn("[Sonder] Failed to delete lane items:", e);
+        }
+    }
+
+    async _moveReferenceLane(...args) {
+        return this._withMutationGesture(
+            "moveReferenceLane", () => this._moveReferenceLaneWithinGesture(...args));
+    }
+
+    /** Swap one Reference lane with its neighbour.
+     *
+     *  Lane order is not presentation: `population_lane_ids` numbers the MiniMax
+     *  H3 `Picture N` / `Video N` / `Audio N` ordinals by it, and multi-lane
+     *  Selector decode concatenates lanes in numeric order. Until now the only
+     *  way to change that order was to delete a lane and re-stage it.
+     */
+    async _moveReferenceLaneWithinGesture(entry, direction) {
+        const scene = this.activeScene;
+        // Reference is currently the only `laneMovable` family, and this method
+        // is its implementation, not a generic one: the server op refuses a lane
+        // family that carries no durable per-lane id, and the lock/recipe reads
+        // below are Reference-specific. A second movable family needs its own
+        // path here, or the descriptor-gated menu entry would silently do
+        // nothing — check this before setting `lane_movable` anywhere else.
+        if (!scene || !this.projectDir || entry?.type !== TRACK_TYPE.REFERENCE) return;
+        const fromIndex = entry.laneIndex || 0;
+        const toIndex = fromIndex + (Number(direction) < 0 ? -1 : 1);
+        if (toIndex < 0 || toIndex >= laneCountFor(scene, TRACK_TYPE.REFERENCE)) return;
+        if (this._isLaneLocked(TRACK_TYPE.REFERENCE, fromIndex)
+                || this._isLaneLocked(TRACK_TYPE.REFERENCE, toIndex)) {
+            notifyWarning("A locked Reference lane cannot be moved.",
+                { source: "reference-lane-move-refused" });
+            return;
+        }
+        const recipes = scene.reference_lane_recipes || [];
+        const fromLaneId = String(recipes[fromIndex]?.lane_id || "");
+        const toLaneId = String(recipes[toIndex]?.lane_id || "");
+        // Lane index alone is not identity here — changing it is the point of
+        // the gesture — so the exact-prior-value contract is spelled in durable
+        // lane ids, which is also what makes the queue's history rebase of the
+        // two indices checkable on the server.
+        if (!fromLaneId || !toLaneId) {
+            notifyWarning("This Reference lane has no durable id yet; open Reference Lane Setup once, then move it.",
+                { source: "reference-lane-move-refused" });
+            return;
+        }
+        // A lane selection holds `{type, laneIndex}` and drives the destructive
+        // `Delete N Selected Lanes` entry. Repointing it across a move would be
+        // guessing at intent on a destructive control, so the selection is
+        // cleared instead. (The collapsed flag needs no handling: its key is the
+        // durable lane id, so it travels with the lane on its own.)
+        this._clearLaneSelection();
+        // Captured BEFORE the write: the overlay may be showing either swapped
+        // lane or an unrelated third one, and following a hard-coded endpoint
+        // would silently retarget it at a lane the user never opened.
+        const openOverlayLaneId = String(
+            recipes[this._referencePanelHandle?.laneIndex ?? -1]?.lane_id || "");
+
+        this._pushUndo("move reference lane");
+        if (!this._applyLocalMoveLane("reference", fromIndex, toIndex)) {
+            this._discardLastUndo("move reference lane");
+            notifyWarning("The Reference lane move could not be applied — refresh and try again.",
+                { source: "reference-lane-move-refused" });
+            return;
+        }
+        this._renderSceneAfterLocalMutation({ viewport: false });
+        try {
+            const result = await this._runSceneMutation([{
+                type: "move_lane",
+                lane_type: "reference",
+                from_index: fromIndex,
+                to_index: toIndex,
+                expected: { from_lane_id: fromLaneId, to_lane_id: toLaneId },
+            }], {
+                key: `scene:${this.activeSceneId}:reference-move-lane:${fromLaneId}:${Date.now()}`,
+                label: "move reference lane",
+                coalesce: false,
+                refreshScenes: false,
+            });
+            this._reconcileActiveSceneFromMutation(result, { reason: "reference_lane_move", ignoreTimelineGate: true });
+            this._buildTrackLayout();
+            this._renderTimeline();
+            // Ordinals changed, so every surface that reads the compiled setup
+            // manifest has to recompute.
+            this._refreshPromptContextDependencyConsumers();
+            // An overlay open on the moved lane must follow the LANE, not the
+            // index; a stale index silently shows another lane's data.
+            if (openOverlayLaneId) {
+                this._referencePanelHandle?.followLane?.(openOverlayLaneId);
+            }
+            const lowerLane = Math.min(fromIndex, toIndex) + 1;
+            const upperLane = Math.max(fromIndex, toIndex) + 1;
+            notifyInfo(
+                `Reference lanes ${lowerLane} and ${upperLane} swapped. `
+                + "MiniMax H3 ordinals renumber, a multi-lane Selector's Bridge payloads move between "
+                + "slots because decode concatenates lanes in numeric order, "
+                + "an over-cap population may now drop a different member, "
+                + `and any Reference Selector naming lane ${lowerLane} or ${upperLane} `
+                + "now points at the other lane — its numbers are workflow-authored and are not rewritten.",
+                { source: "reference-lane-moved" });
+        } catch (error) {
+            notifyWarning(error?.message || "The Reference lane move was refused.",
+                { source: "reference-lane-move-refused" });
+            await this._fetchScenes({ ignoreMutationGate: true, reason: "reference_lane_move_error" });
+            this._refreshPromptContextDependencyConsumers();
         }
     }
 
@@ -15626,6 +15980,32 @@ export class EditorWidget {
         });
     }
 
+    /** Say when a split leaves a Context chip bound to only one of two halves.
+     *
+     *  Only a generic-profile chip binds `source.reference_item_id`; under a
+     *  format that declares physical populations (H3) chips bind semantic units
+     *  and member ids and are unaffected. For the generic chip the consequence
+     *  is severe rather than cosmetic: an unresolvable binding is appended to
+     *  compile ERRORS, which `prompt_bridge` and `editor_node` raise, so every
+     *  window over the right half REFUSES the render until the author rebinds.
+     *
+     *  Cloning the binding onto the right half — what `clone_for_split` does for
+     *  prompt sections — is wrong here and is deliberately not done: both halves
+     *  live on one lane, one item per lane wins a window, so the clone would be
+     *  unresolvable in exactly the windows the original resolves.
+     */
+    _warnOnSplitReferenceChipBindings(result) {
+        const outcome = (result?.payload?.results || []).find(
+            (value) => value?.type === "split_reference_item");
+        const count = Number(outcome?.bound_attachment_count || 0);
+        if (!Number.isFinite(count) || count <= 0) return;
+        notifyWarning(
+            `${count} Context chip${count === 1 ? " is" : "s are"} bound to the item you split. `
+            + "A chip names one item, so it still resolves only on the left half; "
+            + "rebind it, or a render over the right half will be refused.",
+            { source: "reference-split-chip-binding" });
+    }
+
     /** Split a clip at the given frame (razor tool). */
     async _splitClipAtFrame(...args) {
         return this._withMutationGesture(
@@ -15634,14 +16014,22 @@ export class EditorWidget {
 
     async _splitClipAtFrameWithinGesture(hit, frame) {
         if (!this.projectDir || !this.activeScene) return;
-        if (hit.type !== "clip" && hit.type !== "audio" && hit.type !== "prompt") return;
-        const start = hit.type === "prompt" ? hit.data.start_frame : hit.data.timeline_start_frame;
-        const end = hit.type === "prompt" ? hit.data.end_frame : hit.data.timeline_end_frame;
+        if (!SPLITTABLE_ITEM_TYPES.has(hit.type)) return;
+        const sourceLess = hit.type === "prompt" || hit.type === "reference";
+        const start = sourceLess ? hit.data.start_frame : hit.data.timeline_start_frame;
+        // A Reference item's `-1` end means "follow scene end"; the razor drew
+        // against the resolved bar, so the bounds check must use the same value
+        // the user saw, and the server is told which one that was.
+        const resolvedEnd = hit.type === "reference" && hit.data.end_frame === -1
+            ? this.totalFrames
+            : (sourceLess ? hit.data.end_frame : hit.data.timeline_end_frame);
+        const end = resolvedEnd;
         if (frame <= start || frame >= end) return;
         // Block split on locked lanes
         if (hit.type === "clip" && this._isLaneLocked(this._clipTrackType(hit.data), hit.data.track_index || 0)) return;
         if (hit.type === "audio" && this._isLaneLocked(TRACK_TYPE.AUDIO, hit.data.lane_index || 0)) return;
         if (hit.type === "prompt" && this._isPromptTrackLocked()) return;
+        if (hit.type === "reference" && this._isLaneLocked(TRACK_TYPE.REFERENCE, hit.data.lane_index || 0)) return;
         const applyLinked = this._isLinkedItem(hit);
         if (applyLinked && this._expandItemsWithLinked([hit]).some((item) => this._isItemLocked(item))) {
             notifyWarning("Split refused because one or more linked items are locked.", { source: "timeline-split-refused" });
@@ -15659,27 +16047,49 @@ export class EditorWidget {
             ? { type: "split_clip", clip_id: hit.id, frame, apply_linked: applyLinked }
             : hit.type === "audio"
                 ? { type: "split_audio_track", track_id: hit.id, frame, apply_linked: applyLinked }
-                : {
-                    type: "split_prompt_section",
-                    index: hit.id,
-                    frame,
-                    apply_linked: applyLinked,
-                    expected: {
-                        start_frame: hit.data?.start_frame,
-                        end_frame: hit.data?.end_frame,
-                        prompt_id: hit.data?.prompt_id || "",
-                    },
-                };
+                : hit.type === "reference"
+                    ? {
+                        type: "split_reference_item",
+                        reference_item_id: hit.id,
+                        frame,
+                        expected: {
+                            reference_item_id: hit.id,
+                            start_frame: hit.data?.start_frame,
+                            end_frame: hit.data?.end_frame,
+                            resolved_end_frame: resolvedEnd,
+                        },
+                    }
+                    : {
+                        type: "split_prompt_section",
+                        index: hit.id,
+                        frame,
+                        apply_linked: applyLinked,
+                        expected: {
+                            start_frame: hit.data?.start_frame,
+                            end_frame: hit.data?.end_frame,
+                            prompt_id: hit.data?.prompt_id || "",
+                        },
+                    };
 
         try {
-            await this._runSceneMutation([operation], {
+            const result = await this._runSceneMutation([operation], {
                 key: `scene:${sceneId}:split:${hit.type}:${hit.id}:${Date.now()}`,
                 label: `split ${hit.type}`,
                 coalesce: false,
             });
+            if (hit.type === "reference") {
+                this._buildTrackLayout();
+                this._refreshPromptContextDependencyConsumers();
+                this._warnOnSplitReferenceChipBindings(result);
+            }
             this._renderTimeline();
         } catch (e) {
             await this._fetchScenes({ ignoreMutationGate: true, reason: "split_item_error" });
+            if (hit.type === "reference") {
+                notifyWarning(e?.message || "The Reference split was refused — timeline restored.",
+                    { source: "reference-split-refused" });
+                this._refreshPromptContextDependencyConsumers();
+            }
             console.warn(`[Sonder] Failed to split ${hit.type}:`, e);
         }
     }

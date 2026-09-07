@@ -27,6 +27,12 @@ class LaneDescriptor:
     supports_multi_lane_delete: bool = False
     supports_compaction: bool = False
     lane_removable: bool = False
+    # Whether one lane of this family may swap places with another.  Lane
+    # order is meaningful per family and means something different in each:
+    # video lane order is compositing order, Reference lane order numbers
+    # the MiniMax H3 population ordinals.  Only the families whose reorder
+    # has been designed and tested opt in.
+    lane_movable: bool = False
     snapshot_count_attr: str = ""
     snapshot_configs_attr: str = ""
     recipe_attr: str = ""
@@ -120,6 +126,7 @@ LANE_DESCRIPTORS = (
         item_id_attr="reference_item_id",
         item_predicate="all",
         lane_removable=True,
+        lane_movable=True,
         snapshot_count_attr="reference_lane_count",
         snapshot_configs_attr="reference_lane_configs",
         recipe_attr="reference_lane_recipes",
@@ -219,6 +226,20 @@ def trim_lane_recipes(
     while len(recipes) > target_count:
         recipes.pop()
     pad_config_list(recipes, target_count, factory)
+
+
+def swap_list_entries(values: list, first: int, second: int) -> None:
+    """Exchange two entries in an index-parallel lane array, in place.
+
+    Callers pad the list to the lane count first; a swap must never be the
+    thing that lengthens an array, because a padded-on-demand entry would then
+    carry a freshly minted identity instead of the one that moved.
+    """
+    if first == second:
+        return
+    if not (0 <= first < len(values) and 0 <= second < len(values)):
+        raise IndexError(f"swap out of range: {first}, {second}")
+    values[first], values[second] = values[second], values[first]
 
 
 def ensure_lane_index(

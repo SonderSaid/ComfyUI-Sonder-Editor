@@ -5468,6 +5468,166 @@ console.log(JSON.stringify({{equal,structural}}));
     assert result["structural"]["fields"]["track_index"] == 1
 
 
+def test_local_lane_move_swaps_items_configs_and_recipes_or_refuses_whole():
+    """The optimistic apply is what stops the author acting on a stale order.
+
+    Without it the timeline draws the OLD lane order for the whole round trip -
+    seconds on a large project - which is exactly the window in which a delete
+    or a recipe edit can be aimed at a lane that has already moved.
+    """
+    widget = _source("web/js/editor_widget.js")
+    apply_local = _method(widget, "_applyLocalMoveLane", "_applyLocalRemoveLane")
+    registry_url = (ROOT / "web/js/lane_registry.js").as_uri()
+    result = _run_node(f"""
+const {{descriptorFor, laneItemsForType}} = await import({json.dumps(registry_url)});
+globalThis.descriptorFor = descriptorFor;
+globalThis.laneItemsForType = laneItemsForType;
+class Harness {{
+{apply_local}
+}}
+const scene = () => ({{
+  scene_id: "scene", reference_lane_count: 3,
+  reference_lane_configs: [{{name:"A"}},{{name:"B"}},{{name:"C"}}],
+  reference_lane_recipes: [{{lane_id:"a"}},{{lane_id:"b"}},{{lane_id:"c"}}],
+  reference_items: [
+    {{reference_item_id:"on-a", lane_index:0}},
+    {{reference_item_id:"on-b", lane_index:1}},
+    {{reference_item_id:"on-c", lane_index:2}}],
+}});
+const h = new Harness();
+h.activeScene = scene();
+const moved = h._applyLocalMoveLane("reference", 0, 1);
+const after = h.activeScene;
+// A family the descriptor does not mark movable must be refused outright.
+const h2 = new Harness(); h2.activeScene = scene();
+h2.activeScene.video_lane_count = 2;
+h2.activeScene.video_lane_configs = [{{name:"V0"}},{{name:"V1"}}];
+const videoRefused = h2._applyLocalMoveLane("video", 0, 1);
+// A short recipe array means the local scene disagrees with the server about
+// lane shape; refuse rather than half-apply.
+const h3 = new Harness(); h3.activeScene = scene();
+h3.activeScene.reference_lane_recipes = [{{lane_id:"a"}}];
+const shortRefused = h3._applyLocalMoveLane("reference", 0, 1);
+const shortConfigs = h3.activeScene.reference_lane_configs.map((c) => c.name);
+console.log(JSON.stringify({{
+  moved,
+  configs: after.reference_lane_configs.map((c) => c.name),
+  recipes: after.reference_lane_recipes.map((r) => r.lane_id),
+  items: after.reference_items.map((i) => [i.reference_item_id, i.lane_index]),
+  videoRefused, shortRefused, shortConfigs,
+}}));
+""")
+    assert result["moved"] is True
+    assert result["configs"] == ["B", "A", "C"]
+    assert result["recipes"] == ["b", "a", "c"]
+    assert result["items"] == [["on-a", 1], ["on-b", 0], ["on-c", 2]]
+    assert result["videoRefused"] is False
+    assert result["shortRefused"] is False
+    # Refused means nothing moved, not "configs swapped and recipes did not".
+    assert result["shortConfigs"] == ["A", "B", "C"]
+
+
+def test_equal_count_lane_rebase_retargets_a_reordered_reference_family():
+    """Move Lane Up/Down changes lane MEANING without changing lane COUNT.
+
+    The equal-count shortcut used to return the authored index unchanged on the
+    stated premise that "lane topology changes only through add/remove". Only
+    `move_lane` requires durable identity and `update_lane_config` validates
+    an authored id when supplied. `remove_lane` and item `lane_index` fields
+    still carry no lane identity, so passing through an index can target the
+    OTHER lane. A scene whose lane ids are unchanged must still take the shortcut,
+    or every project without durable ids starts refusing queued lane edits.
+    """
+    widget = _source("web/js/editor_widget.js")
+    rebase = _method(widget, "_historyExpectedProjection", "_queueProjectMutation")
+    result = _run_node(f"""
+class Harness {{
+{rebase}
+}}
+const counts={{video_lane_count:2,motion_driver_lane_count:2,
+  audio_lane_count:2,reference_lane_count:2}};
+const configs=[{{name:"A"}},{{name:"B"}}];
+const configLists={{video_lane_configs:configs,motion_driver_lane_configs:configs,
+  audio_lane_configs:configs,reference_lane_configs:configs}};
+const authored={{scene_id:"scene",...counts,...configLists,
+  reference_lane_recipes:[{{lane_id:"lane-a"}},{{lane_id:"lane-b"}}],
+  clips:[],audio_tracks:[],reference_items:[]}};
+// Same count, swapped ids: exactly what `move_lane` produces.
+const swapped={{...authored,
+  reference_lane_recipes:[{{lane_id:"lane-b"}},{{lane_id:"lane-a"}}]}};
+const unchanged={{...authored}};
+const ops=()=>[
+  {{type:"remove_lane",lane_type:"reference",lane_index:1,item_policy:"require_empty"}},
+  {{type:"update_lane_config",lane_type:"reference",lane_index:1,fields:{{name:"x"}}}},
+  {{type:"create_reference_item",fields:{{lane_index:1}}}},
+  // A family with no durable ids must be untouched by the new branch.
+  {{type:"create_audio_track",fields:{{lane_index:1}}}},
+];
+const moved=new Harness()._rebaseSceneMutationIntentForHistory(
+  {{sceneId:"scene",operations:ops()}},swapped,authored).operations;
+const still=new Harness()._rebaseSceneMutationIntentForHistory(
+  {{sceneId:"scene",operations:ops()}},unchanged,authored).operations;
+console.log(JSON.stringify({{moved,still}}));
+""")
+    moved = result["moved"]
+    # The authored intent named the lane that WAS at index 1 (`lane-b`); after
+    # the swap that lane sits at index 0, and every op follows it there.
+    assert moved[0]["lane_index"] == 0
+    assert moved[1]["lane_index"] == 0
+    assert moved[2]["fields"]["lane_index"] == 0
+    # Audio has no durable lane ids and no reorder, so it keeps the shortcut.
+    assert moved[3]["fields"]["lane_index"] == 1
+    still = result["still"]
+    assert [still[0]["lane_index"], still[1]["lane_index"],
+            still[2]["fields"]["lane_index"], still[3]["fields"]["lane_index"]] == [1, 1, 1, 1]
+
+
+def test_reference_split_expectations_are_never_projected_forward():
+    """`resolved_end_frame` guards an extent the razor drew; rebasing kills it.
+
+    Its update/delete siblings re-snapshot `expected` onto the current item,
+    which is right for an id-identified edit. A split is different: `frame` is a
+    geometric position picked against a visible bar, so re-snapshotting would
+    make the guard compare the current state against itself and never fire —
+    cutting a bar of a different length at the same pixel.
+    """
+    widget = _source("web/js/editor_widget.js")
+    rebase = _method(widget, "_historyExpectedProjection", "_queueProjectMutation")
+    result = _run_node(f"""
+class Harness {{
+{rebase}
+}}
+const counts={{video_lane_count:1,motion_driver_lane_count:1,
+  audio_lane_count:1,reference_lane_count:1}};
+const configs=[{{name:"A"}}];
+const configLists={{video_lane_configs:configs,motion_driver_lane_configs:configs,
+  audio_lane_configs:configs,reference_lane_configs:configs}};
+const item={{reference_item_id:"item",lane_index:0,start_frame:0,end_frame:-1}};
+const authored={{scene_id:"scene",duration_frames:100,...counts,...configLists,
+  reference_lane_recipes:[{{lane_id:"lane-a"}}],
+  clips:[],audio_tracks:[],reference_items:[item]}};
+// History changed the scene duration, so the `-1` bar is a different extent.
+const ordered={{...authored,duration_frames:400}};
+const operations=[
+  {{type:"split_reference_item",reference_item_id:"item",frame:50,
+    expected:{{reference_item_id:"item",start_frame:0,end_frame:-1,
+      resolved_end_frame:100}}}},
+  {{type:"update_reference_item",reference_item_id:"item",fields:{{muted:true}},
+    expected:{{reference_item_id:"item",start_frame:9,end_frame:-1}}}},
+];
+const out=new Harness()._rebaseSceneMutationIntentForHistory(
+  {{sceneId:"scene",operations}},ordered,authored).operations;
+console.log(JSON.stringify(out));
+""")
+    split, update = result
+    # Authored values survive verbatim, so the server refuses rather than cutting.
+    assert split["expected"]["resolved_end_frame"] == 100
+    assert split["frame"] == 50
+    # The sibling op still projects, proving the split's exemption is deliberate
+    # rather than the rebase having stopped working.
+    assert update["expected"]["start_frame"] == 0
+
+
 def test_history_order_context_keeps_live_publishers_and_receipt_owners():
     widget = _source("web/js/editor_widget.js")
     contexts = _method(widget, "_beginHistoryOrderContext", "_captureProjectDependencies")
@@ -9194,3 +9354,162 @@ console.log(JSON.stringify({{changed:Object.keys(host.calls[0].operations.at(-1)
  creates:host.calls.slice(2).map(call=>call.operations.filter(op=>op.unit).length)}}));
 """)
     assert result == {"changed": ["visual"], "afterOldFailure": "B", "ownUndo": True, "creates": [1, 1]}
+
+
+def test_lane_config_emitters_use_scene_identity_and_merge_by_durable_lane():
+    widget = _source("web/js/editor_widget.js")
+    save = _method(widget, "async _saveLaneConfigWithinGesture", "async _addLane")
+    registry = (ROOT / "web/js/lane_registry.js").as_uri()
+    result = _run_node(f"""
+import {{descriptorFor, laneTypeFor}} from {registry!r};
+class Harness {{
+{save}
+  constructor() {{ this.projectDir='project'; this.activeSceneId='scene'; this.calls=[]; }}
+  _laneTypeForEntry(entry) {{ return laneTypeFor(entry.type); }}
+  _defaultLaneConfig() {{ return {{}}; }}
+  _defaultReferenceLaneRecipe() {{ return {{lane_id:'client-minted', media_kind:'image'}}; }}
+  async _runSceneMutation(operations, options) {{ this.calls.push({{operations, options}}); }}
+}}
+const h = new Harness();
+const scene = laneId => ({{reference_lane_count:1,
+  reference_lane_recipes:laneId ? [{{lane_id:laneId, media_kind:'image'}}] : [],
+  reference_lane_configs:[{{}}]}});
+const entry = name => ({{type:'reference', laneIndex:0, customName:name,
+  referenceRecipe:{{media_kind:'image', recipe_id:'', recipe:{{}}}}}});
+h.activeScene=scene('lane-a');
+await h._saveLaneConfigWithinGesture(entry('A'));
+h.activeScene=scene('lane-b');
+await h._saveLaneConfigWithinGesture(entry('B'));
+const merge=h.calls[0].options.merge;
+const merged=merge(h.calls[0],h.calls[1]);
+// Same durable lane moved to a different index replaces its prior config.
+const sameLane=merge(h.calls[0], {{operations:[{{...h.calls[0].operations[0],lane_index:1,
+  fields:{{name:'A latest'}}}}]}});
+h.activeScene=scene('');
+await h._saveLaneConfigWithinGesture(entry('Default'));
+h.activeScene={{video_lane_count:1,video_lane_configs:[{{}}]}};
+await h._saveLaneConfigWithinGesture({{type:'video',laneIndex:0,customName:'Video'}});
+console.log(JSON.stringify({{expected:h.calls.slice(0,2).map(c=>c.operations[0].expected),
+  merged:merged.operations.map(op=>op.fields.name),
+  sameLane:sameLane.operations,
+  bootstrapExpected:h.calls[2].operations[0].expected ?? null,
+  videoExpected:h.calls[3].operations[0].expected ?? null}}));
+""")
+    assert result["expected"] == [{"lane_id": "lane-a"}, {"lane_id": "lane-b"}]
+    assert result["merged"] == ["A", "B"]
+    assert len(result["sameLane"]) == 1
+    assert result["sameLane"][0]["fields"]["name"] == "A latest"
+    assert result["sameLane"][0]["lane_index"] == 1
+    assert result["bootstrapExpected"] is None
+    assert result["videoExpected"] is None
+
+
+def test_reference_config_bootstrap_and_move_barrier_use_real_queue_adapter():
+    widget = _source("web/js/editor_widget.js")
+    methods = "\n".join([
+        _method(widget, "_queueProjectMutation", "_runSceneMutation"),
+        _method(widget, "_runSceneMutation", "_acceptPromptAttachmentConfiguration"),
+        _method(widget, "async _saveLaneConfigWithinGesture", "async _addLane"),
+        _method(widget, "_applyLocalSetLaneCount", "_applyLocalMoveLane"),
+        _method(widget, "_trimLocalLaneConfigs", "_compactEmptyMediaLaneLocal"),
+    ])
+    queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
+    registry_url = (ROOT / "web/js/lane_registry.js").as_uri()
+    result = _run_node(f"""
+import assert from 'node:assert/strict';
+import {{ProjectMutationQueue}} from {queue_url!r};
+import {{descriptorFor,laneTypeFor}} from {registry_url!r};
+globalThis.notifyError=()=>{{}}; globalThis.notifyWarning=()=>{{}};
+class Harness {{
+{methods}
+  constructor(scene) {{
+    this.projectDir='project';this.activeSceneId='scene';this.calls=[];this.errors=[];
+    this.server=structuredClone(scene);this.activeScene=structuredClone(scene);
+    this._projectMutationQueue=new ProjectMutationQueue();
+    this._sceneMutationInvalidationSeq=0;this._queueFetchSeq=0;
+  }}
+  _claimHistoryPostSnapshotCapture() {{return null;}}
+  _stampHistoryPostSnapshot() {{}}
+  _snapshotProjectMutationContext() {{return {{projectId:'project',sceneId:'scene'}};}}
+  _mutationDiagnosticHeaders() {{return {{}};}}
+  _laneTypeForEntry(entry) {{return laneTypeFor(entry.type);}}
+  _defaultLaneConfig() {{return {{name:'',color:'',locked:false,hidden:false}};}}
+  _defaultReferenceLaneRecipe() {{return {{lane_id:'client-draft',media_kind:'image'}};}}
+  _reconcileActiveSceneFromMutation(result) {{
+    if (this._projectMutationQueue.isBusy()) {{this.deferred=true;return true;}}
+    this.activeScene=structuredClone(result.payload.scene);return true;
+  }}
+  _schedulePostMutationSceneRefresh() {{this.deferred=true;}}
+  async _fetchScenes() {{this.errors.push('refused');}}
+  _buildTrackLayout() {{}} _renderTimeline() {{}}
+  async _runVersionedProjectMutation(_url, init) {{
+    const ops=JSON.parse(init.body).operations;
+    const scene=structuredClone(this.server);
+    for(const op of ops) {{
+      this.calls.push(structuredClone(op));
+      if(op.type==='set_lane_count') scene.reference_lane_count=op.count;
+      while(scene.reference_lane_recipes.length<scene.reference_lane_count) {{
+        const i=scene.reference_lane_recipes.length;
+        scene.reference_lane_recipes.push({{lane_id:'server-'+i,media_kind:'image'}});
+        scene.reference_lane_configs[i] ||= this._defaultLaneConfig();
+      }}
+      if(op.type==='move_lane') {{
+        for(const key of ['reference_lane_recipes','reference_lane_configs'])
+          [scene[key][0],scene[key][1]]=[scene[key][1],scene[key][0]];
+      }}
+      if(op.type==='update_lane_config') {{
+        const id=scene.reference_lane_recipes[op.lane_index].lane_id;
+        if(op.expected && op.expected.lane_id!==id) throw Error('identity_mismatch');
+        const {{reference_recipe,...fields}}=op.fields;
+        Object.assign(scene.reference_lane_configs[op.lane_index], fields);
+        if(reference_recipe) scene.reference_lane_recipes[op.lane_index]={{...reference_recipe,lane_id:id}};
+      }}
+    }}
+    this.server=scene;return {{payload:{{scene:structuredClone(scene)}}}};
+  }}
+}}
+const make = () => ({{scene_id:'scene',reference_lane_count:1,
+  reference_lane_recipes:[],reference_lane_configs:[{{}}]}});
+const entry=(index,name) => ({{type:'reference',laneIndex:index,customName:name,
+  referenceRecipe:{{lane_id:'client-draft',media_kind:'image'}}}});
+// A first panel recipe save reconciles the canonical id before the second.
+const sequential=new Harness(make());
+await sequential._saveLaneConfigWithinGesture(entry(0,'first'));
+assert.equal(sequential.activeScene.reference_lane_recipes[0].lane_id,'server-0');
+await sequential._saveLaneConfigWithinGesture(entry(0,'second'));
+assert.equal(sequential.calls[1].expected.lane_id,'server-0');
+assert.equal(sequential.server.reference_lane_configs[0].name,'second');
+// Creation is pending: local recipes must not pretend their ids are durable.
+const pending=new Harness(make());let release;
+const block=pending._projectMutationQueue.enqueue({{key:'blocked',coalesce:false,
+  run:async()=>await new Promise(resolve=>release=resolve)}});
+await Promise.resolve();
+pending._applyLocalSetLaneCount('reference',2);
+const create=pending._runSceneMutation([{{type:'set_lane_count',lane_type:'reference',count:2}}],
+  {{key:'create',coalesce:false}});
+const edit=pending._saveLaneConfigWithinGesture(entry(1,'queued rename'));
+assert.equal(pending.activeScene.reference_lane_recipes[1].lane_id,'');
+release();await Promise.all([block,create,edit]);
+assert.equal(pending.calls[1].expected,undefined);
+assert.equal(pending.server.reference_lane_configs[1].name,'queued rename');
+// The real adapter seals coalescing at Move Lane; edits stay on their side.
+const scene=make();scene.reference_lane_count=2;
+scene.reference_lane_recipes=[{{lane_id:'a'}},{{lane_id:'b'}}];
+scene.reference_lane_configs=[{{}},{{}}];
+const moved=new Harness(scene);let unblock;
+const blocker=moved._projectMutationQueue.enqueue({{key:'blocked',coalesce:false,
+  run:async()=>await new Promise(resolve=>unblock=resolve)}});
+await Promise.resolve();
+const first=moved._saveLaneConfigWithinGesture(entry(0,'A edit'));
+const move=moved._runSceneMutation([{{type:'move_lane',lane_type:'reference',from_index:0,to_index:1,
+  expected:{{from_lane_id:'a',to_lane_id:'b'}}}}],{{key:'move',coalesce:false}});
+moved.activeScene.reference_lane_recipes.reverse();
+moved.activeScene.reference_lane_configs.reverse();
+const second=moved._saveLaneConfigWithinGesture(entry(0,'B edit'));
+unblock();await Promise.all([blocker,first,move,second]);
+assert.deepEqual(moved.calls.map(op=>op.type),['update_lane_config','move_lane','update_lane_config']);
+assert.deepEqual(moved.server.reference_lane_configs.map(c=>c.name),['B edit','A edit']);
+assert.deepEqual([...sequential.errors,...pending.errors,...moved.errors],[]);
+console.log(JSON.stringify({{passed:true}}));
+""")
+    assert result["passed"] is True

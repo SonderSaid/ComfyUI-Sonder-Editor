@@ -1308,6 +1308,23 @@ export function _drawClips(host, ctx, width) {
                 ctx.strokeStyle = selected ? COLORS.accent : COLORS.referenceBorder;
                 ctx.lineWidth = selected ? 1.5 : 1;
                 ctx.strokeRect(x1 + 1, y + 2, x2 - x1 - 2, h - 4);
+                // Drag-append landing preview. A drop onto an occupied bar adds
+                // a member to THAT item rather than creating one, so it outlines
+                // the bar: the lane-row highlight above means "a new item lands
+                // here", and two different landings must not look identical.
+                if (host._dropHoverTarget?.kind === "referenceItem"
+                        && host._dropHoverTarget.itemId === item.reference_item_id) {
+                    ctx.save();
+                    // A hidden lane still accepts drops, so the landing preview
+                    // must not inherit the bar's dimmed alpha.
+                    ctx.globalAlpha = 1;
+                    ctx.fillStyle = "rgba(99, 179, 237, 0.22)";
+                    ctx.fillRect(x1 + 1, y + 2, x2 - x1 - 2, h - 4);
+                    ctx.strokeStyle = COLORS.accent;
+                    ctx.lineWidth = 2;
+                    ctx.strokeRect(x1 + 2, y + 3, Math.max(0, x2 - x1 - 4), Math.max(0, h - 6));
+                    ctx.restore();
+                }
                 const resolvedMembers = (item.members || []).map((memberRef) => host._referenceMemberForRef?.(memberRef)).filter(Boolean);
                 const label = item.prompt_override
                     || resolvedMembers.map(({ reference }) => reference.name).filter((value, index, values) => values.indexOf(value) === index).join(" + ")

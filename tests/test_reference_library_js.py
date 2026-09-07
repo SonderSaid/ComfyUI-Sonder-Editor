@@ -289,7 +289,7 @@ def test_fullscreen_queue_lifecycle_executes_twice_and_preserves_state():
     """)
 
 
-def test_reference_library_scroll_preserves_only_comparable_visible_lists():
+def test_reference_library_scroll_and_context_menu_pointer_lifecycle():
     library = (ROOT / "web" / "js" / "editor_reference_library.js").as_uri()
     _run_node(f"""
         import assert from 'node:assert/strict';
@@ -329,6 +329,11 @@ def test_reference_library_scroll_preserves_only_comparable_visible_lists():
                     preventDefault() {{}}, stopPropagation() {{}}, ...event,
                 }});
             }}
+            get isConnected() {{ return this === document.body || !!this.parentElement?.isConnected; }}
+            contains(node) {{ return node === this || this.children.some(child => child.contains(node)); }}
+            removeEventListener(key, fn) {{
+                this.listeners.set(key, (this.listeners.get(key) || []).filter(item => item !== fn));
+            }}
             getClientRects() {{ return this._visible ? [{{ width: 300 }}] : []; }}
             focus() {{}}
             setSelectionRange() {{}}
@@ -359,14 +364,14 @@ def test_reference_library_scroll_preserves_only_comparable_visible_lists():
             }}
         }}
 
-        globalThis.document = {{
-            createElement: (tag) => new Element(tag),
-            body: new Element('body'),
-            querySelector: () => null,
-            addEventListener() {{}},
-        }};
+        globalThis.document = new Element('document');
+        document.createElement = tag => new Element(tag);
+        document.body = new Element('body');
+        globalThis.window = new Element('window');
+        globalThis.requestAnimationFrame = () => 0;
         const {{ mountReferenceLibrary }} = await import({library!r});
         const container = new Element('container');
+        document.body.appendChild(container);
         const reference = (id, name) => ({{
             reference_id: id, name, kind: 'character', reference_class: 'subject',
             description: '', members: [],
@@ -376,7 +381,9 @@ def test_reference_library_scroll_preserves_only_comparable_visible_lists():
                 reference('b', 'Beta')], assets: [], scenes: [], semanticUnits: [],
             catalog: [], loading: false, error: '',
         }};
+        const timelineAdds = [];
         const host = {{
+            addToTimeline: payload => timelineAdds.push(payload),
             getData: () => data,
             mutate: async (operations) => {{
                 for (const operation of operations) {{
@@ -475,8 +482,34 @@ def test_reference_library_scroll_preserves_only_comparable_visible_lists():
         const save = container.querySelectorAll('button').find(
             (button) => button.textContent === 'Save');
         save.emit('click');
-        await new Promise((resolve) => setTimeout(resolve, 0));
+        await new Promise((resolve) => setTimeout(resolve, 20));
         assert.equal(body().scrollTop, 88, 'member save returns to list offset');
+        const all = node => [node, ...node.children.flatMap(all)];
+        const menuRow = () => all(document.body).find(node =>
+            node.attributes.role === 'menuitem' || node.tag === 'button' && node.textContent === 'Add to timeline' && !container.contains(node));
+        const targets = all(container).filter(node => node.listeners.has('contextmenu'));
+        assert.equal(targets.length, 2, 'card header and single-member row');
+        for (const target of targets) {{
+            target.emit('contextmenu', {{clientX: 40, clientY: 50}});
+            await new Promise(resolve => setTimeout(resolve, 20));
+            const row = menuRow();
+            assert.ok(row);
+            document.emit('pointerdown', {{target: row}});
+            document.emit('mousedown', {{target: row}});
+            if (row.isConnected) row.emit('click');
+            assert.equal(timelineAdds.length, targets.indexOf(target) + 1);
+            assert.equal(menuRow(), undefined, 'action dismisses menu');
+            assert.deepEqual(timelineAdds.at(-1).members, [{{entity_id:'member-ref', member_id:'m1'}}]);
+        }}
+        targets[1].emit('contextmenu');
+        await new Promise(resolve => setTimeout(resolve, 20));
+        window.emit('keydown', {{key:'Escape', stopImmediatePropagation() {{}}}});
+        assert.equal(menuRow(), undefined, 'Escape dismisses canonical menu');
+        targets[1].emit('contextmenu');
+        await new Promise(resolve => setTimeout(resolve, 20));
+        document.emit('mousedown', {{target: container}});
+        assert.equal(menuRow(), undefined, 'outside press dismisses menu');
+        assert.equal(timelineAdds.length, 2, 'dismissals never run the action');
         mounted.destroy();
     """)
 

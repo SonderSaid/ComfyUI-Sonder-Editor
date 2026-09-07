@@ -2152,6 +2152,20 @@ class Scene:
         ]
         pad_lane_configs(scene, LaneConfig)
         pad_lane_recipes(scene, ReferenceLaneRecipe)
+        # Loading a recipe-less default scene must give a GET and the following
+        # mutation the same identity, even before any write has persisted it.
+        # Keep every authored id; only absent ids use this deterministic seed.
+        # Retain until no saved scene can lack a lane recipe/id. This is an
+        # in-memory load repair, never a rewrite at rest.
+        raw_recipes = data.get("reference_lane_recipes", [])
+        seen_lane_ids = {str(recipe.get("lane_id") or "") for recipe in raw_recipes
+                         if isinstance(recipe, dict) and recipe.get("lane_id")}
+        for index, recipe in enumerate(scene.reference_lane_recipes):
+            raw_recipe = raw_recipes[index] if index < len(raw_recipes) else {}
+            if not str(raw_recipe.get("lane_id") or ""):
+                recipe.lane_id = _deterministic_reference_id(
+                    scene.scene_id, f"reference-lane/{index}", seen_lane_ids)
+                seen_lane_ids.add(recipe.lane_id)
         # No setup-binding repair: Reference lane membership is derived from
         # each recipe's declared model input, so there is nothing stale to
         # rebind.  A Base setup record is loaded and preserved as authored.

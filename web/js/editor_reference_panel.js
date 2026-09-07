@@ -179,7 +179,14 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         pickerQuery: "",
         busy: false,
     };
-    const disclosureKey = (kind, value) => `${state.laneIndex}:${kind}:${String(value || "")}`;
+    // Keyed on the lane's DURABLE id, not its index. Lane order is now
+    // user-controlled, so an index-keyed memory would hand a moved lane the
+    // other lane's expanded groups. A lane with no materialized recipe yet has
+    // no durable id and keeps an index spelling; it cannot have been moved,
+    // because the move op refuses without one.
+    const laneMemoryKey = () => String(host.activeScene?.reference_lane_recipes?.[
+        state.laneIndex]?.lane_id || "").trim() || `index:${state.laneIndex}`;
+    const disclosureKey = (kind, value) => `${laneMemoryKey()}:${kind}:${String(value || "")}`;
     const disclosureOpen = (kind, value, fallback = false) =>
         disclosureMemory.isOpen(disclosureKey(kind, value), fallback);
     const rememberDisclosure = (kind, value, open) => {
@@ -839,9 +846,9 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         }) || [];
         if (!laneAdvisories.length) return;
         const details = el("details", "", `border:1px solid ${COLORS.border};border-radius:7px;padding:0 8px;`);
-        details.open = disclosureOpen("advisories", laneRecipe().lane_id || state.laneIndex, false);
+        details.open = disclosureOpen("advisories", "", false);
         details.addEventListener("toggle", () => rememberDisclosure(
-            "advisories", laneRecipe().lane_id || state.laneIndex, details.open));
+            "advisories", "", details.open));
         details.appendChild(el("summary", `Advisories (${laneAdvisories.length})`, `font-size:11px;color:${COLORS.textMuted};padding:7px 0;cursor:pointer;`));
         for (const advisory of laneAdvisories) {
             const silent = advisory.voice === "silent-loss";
@@ -1636,6 +1643,28 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         close,
         refresh: render,
         get laneIndex() { return state.laneIndex; },
+        /** Re-point this overlay at one lane by its DURABLE id.
+         *
+         *  Every accessor above reads `state.laneIndex`, so after a lane move a
+         *  stale index shows another lane's recipe, items and lock state with no
+         *  sign anything is wrong. The host calls this instead of poking the
+         *  index, which is why the index stays read-only on this handle.
+         */
+        followLane(laneId) {
+            const wanted = String(laneId || "").trim();
+            if (!mounted || !wanted) return false;
+            const recipes = host.activeScene?.reference_lane_recipes || [];
+            const index = recipes.findIndex(
+                (recipe) => String(recipe?.lane_id || "").trim() === wanted);
+            if (index < 0) return false;
+            if (index !== state.laneIndex) {
+                state.laneIndex = index;
+                state.pickerItemId = "";
+                state.pickerQuery = "";
+            }
+            render();
+            return true;
+        },
     };
     host._referencePanelHandle = handle;
     return handle;

@@ -411,7 +411,12 @@ def test_reference_panel_keeps_details_collapsed_and_offers_inspectable_thumbnai
     panel = (ROOT / "web" / "js" / "editor_reference_panel.js").read_text(
         encoding="utf-8")
     assert 'disclosureOpen("item", item.reference_item_id, false)' in panel
-    assert 'disclosureOpen("advisories", laneRecipe().lane_id || state.laneIndex, false)' in panel
+    assert 'disclosureOpen("advisories", "", false)' in panel
+    # Lane order is user-controlled, so the memory is keyed on the lane's durable
+    # id; an index key would hand a moved lane the other lane's expanded groups.
+    assert '`${laneMemoryKey()}:${kind}:${String(value || "")}`' in panel
+    assert "reference_lane_recipes?.[" in panel
+    assert "state.laneIndex]?.lane_id" in panel
     assert 'rememberDisclosure(\n            "advisories"' in panel
     assert "createMemberDraft(resolved?.member || null, asset || null)" in panel
     assert "host._openReferenceMediaEditor?.({ asset, draft, readOnly: true })" in panel

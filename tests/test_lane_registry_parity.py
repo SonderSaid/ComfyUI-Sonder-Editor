@@ -60,6 +60,7 @@ const flattened = mod.LANE_DESCRIPTORS.map((descriptor) => ({{
   supportsMultiLaneDelete: descriptor.supportsMultiLaneDelete,
   supportsCompaction: descriptor.supportsCompaction,
   laneRemovable: descriptor.laneRemovable,
+  laneMovable: descriptor.laneMovable,
 }}));
 console.log(JSON.stringify({{
   descriptors: flattened,
@@ -85,6 +86,7 @@ console.log(JSON.stringify({{
         "supportsMultiLaneDelete": "supports_multi_lane_delete",
         "supportsCompaction": "supports_compaction",
         "laneRemovable": "lane_removable",
+        "laneMovable": "lane_movable",
     }
     py = {
         descriptor.track_type: {
@@ -98,6 +100,7 @@ console.log(JSON.stringify({{
         "trackType", "laneType", "variable", "headerControllable", "countField",
         "configsField", "recipeAttr", "fixedConfigField", "maxItemsPerLane",
         "supportsMultiLaneDelete", "supportsCompaction", "laneRemovable",
+        "laneMovable",
     }
     js_only = {
         "layoutOrder", "laneOrder", "labelPrefix", "labelSingular", "labelFixed",

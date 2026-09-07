@@ -39,6 +39,7 @@ export const LANE_DESCRIPTORS = freeze([
         supportsMultiLaneDelete: true,
         supportsCompaction: true,
         laneRemovable: true,
+        laneMovable: false,
     }),
     freeze({
         trackType: TRACK_TYPE.AUDIO,
@@ -74,6 +75,7 @@ export const LANE_DESCRIPTORS = freeze([
         supportsMultiLaneDelete: true,
         supportsCompaction: true,
         laneRemovable: true,
+        laneMovable: false,
     }),
     freeze({
         trackType: TRACK_TYPE.MOTION_DRIVER,
@@ -109,6 +111,7 @@ export const LANE_DESCRIPTORS = freeze([
         supportsMultiLaneDelete: false,
         supportsCompaction: false,
         laneRemovable: true,
+        laneMovable: false,
     }),
     freeze({
         trackType: TRACK_TYPE.REFERENCE,
@@ -144,6 +147,7 @@ export const LANE_DESCRIPTORS = freeze([
         supportsMultiLaneDelete: false,
         supportsCompaction: false,
         laneRemovable: true,
+        laneMovable: true,
     }),
     freeze({
         trackType: TRACK_TYPE.GUIDES,
@@ -179,6 +183,7 @@ export const LANE_DESCRIPTORS = freeze([
         supportsMultiLaneDelete: false,
         supportsCompaction: false,
         laneRemovable: false,
+        laneMovable: false,
     }),
     freeze({
         trackType: TRACK_TYPE.PROMPT_GLOBAL,
@@ -209,6 +214,7 @@ export const LANE_DESCRIPTORS = freeze([
         supportsMultiLaneDelete: false,
         supportsCompaction: false,
         laneRemovable: false,
+        laneMovable: false,
     }),
     freeze({
         trackType: TRACK_TYPE.PROMPT,
@@ -244,6 +250,7 @@ export const LANE_DESCRIPTORS = freeze([
         supportsMultiLaneDelete: false,
         supportsCompaction: false,
         laneRemovable: false,
+        laneMovable: false,
     }),
 ]);
 
@@ -362,6 +369,19 @@ function fallbackColor(descriptor, laneIndex, theme) {
     return "";
 }
 
+/** Browser-local collapse identity shared by layout reads and settings writes. */
+export function laneCollapseKey(scene, descriptor, laneIndex) {
+    // Recipe-backed families follow their durable lane through moves and Undo.
+    // Index keys are not a legacy fallback for a materialized recipe: they can
+    // name a different lane after a reorder. A recipe-less lane starts expanded
+    // once when its first recipe gives it a durable id.
+    const laneId = descriptor?.recipeAttr
+        ? String(scene?.[descriptor.recipeAttr]?.[laneIndex]?.lane_id || "").trim()
+        : "";
+    return laneId ? `${descriptor.trackType}:lane:${laneId}`
+        : `${descriptor.trackType}:${laneIndex}`;
+}
+
 export function buildTrackLayout({ scene, collapsedKeys = null, theme = {} } = {}) {
     const layout = [];
     for (const descriptor of [...LANE_DESCRIPTORS].sort((left, right) => left.layoutOrder - right.layoutOrder)) {
@@ -380,7 +400,7 @@ export function buildTrackLayout({ scene, collapsedKeys = null, theme = {} } = {
                     label: config.name || laneLabel(scene, descriptor.trackType, laneIndex),
                     customName: config.name || "",
                     laneIndex,
-                    collapsed: collapsedKeys?.has(`${descriptor.trackType}:${laneIndex}`) || false,
+                    collapsed: collapsedKeys?.has(laneCollapseKey(scene, descriptor, laneIndex)) || false,
                     color: config.color || fallbackColor(descriptor, laneIndex, theme),
                     locked: config.locked || false,
                     hidden: config.hidden || false,
@@ -398,7 +418,7 @@ export function buildTrackLayout({ scene, collapsedKeys = null, theme = {} } = {
             label: descriptor.labelFixed,
             customName: "",
             laneIndex: 0,
-            collapsed: collapsedKeys?.has(`${descriptor.trackType}:0`) || false,
+            collapsed: collapsedKeys?.has(laneCollapseKey(scene, descriptor, 0)) || false,
             color: "",
             locked: !!config.locked,
             hidden: !!config.hidden,

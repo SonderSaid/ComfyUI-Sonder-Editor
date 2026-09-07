@@ -133,6 +133,7 @@ from .lane_registry import (
     pad_config_list,
     pad_lane_configs,
     pad_lane_recipes,
+    swap_list_entries,
     trim_lane_recipes,
     variable_descriptor,
 )
@@ -1828,6 +1829,7 @@ def _apply_scene_fields(project: TimelineProject, scene: Scene, fields: dict) ->
 
 
 def _apply_lane_configs(scene: Scene, fields: dict) -> None:
+    # Legacy positional replacement; removable once no client emits it.
     if not isinstance(fields, dict):
         _mutation_error("update_lane_configs requires fields", 400)
     for descriptor in LANE_DESCRIPTORS:
@@ -1885,6 +1887,18 @@ def _apply_lane_config(scene: Scene, op: dict) -> dict:
         config = _lane_config(scene, lane_type, lane_index)
     else:
         _mutation_error(f"Unknown lane type: {lane_type}", 400)
+    if descriptor.recipe_attr and "expected" in op:
+        # Unlike move_lane, config writes bootstrap recipe-less default lanes
+        # and lanes minted earlier in this batch, whose id the client cannot
+        # know yet. Expected stays optional until every lane has a durable id
+        # at creation and no caller writes before it can read one.
+        recipes = getattr(scene, descriptor.recipe_attr)
+        lane_id = str(recipes[lane_index].lane_id or "")
+        expected = op["expected"]
+        if (not isinstance(expected, dict) or not lane_id
+                or expected.get("lane_id") != lane_id):
+            _mutation_error("Reference lane identity mismatch", 409,
+                            "identity_mismatch")
     if "name" in fields:
         config.name = str(fields["name"] or "")
     if "color" in fields:
@@ -1901,7 +1915,8 @@ def _apply_lane_config(scene: Scene, op: dict) -> dict:
         previous_lane_id = str(previous_recipe.lane_id or "")
         raw_recipe = (dict(fields["reference_recipe"])
                       if isinstance(fields["reference_recipe"], dict) else {})
-        if not str(raw_recipe.get("lane_id") or ""):
+        # An incoming draft cannot replace a materialized lane's identity.
+        if previous_lane_id:
             raw_recipe["lane_id"] = previous_lane_id
         next_recipe = ReferenceLaneRecipe.from_dict(raw_recipe)
         if (
@@ -2291,6 +2306,79 @@ def _remove_media_lane(scene: Scene, lane_type: str, lane_index: int, item_polic
     _trim_lane_configs(scene, descriptor, lane_index, next_count)
     if descriptor.max_items_per_lane == 1:
         _validate_single_driver_per_lane(scene)
+
+
+def _move_media_lane(scene: Scene, lane_type: str, from_index: int, to_index: int, expected) -> dict:
+    """Exchange two lanes of one movable family, with everything index-parallel.
+
+    Lane order is read by the H3 setup compiler (`population_lane_ids` numbers
+    Picture/Video/Audio ordinals by it) and by Selector decode order, so this
+    is a control over an ordering the backend already consumes, not cosmetics.
+
+    Every array keyed by lane index moves together: the items on either lane,
+    the `LaneConfig`, and the materialized recipe.  The recipe object moves
+    WHOLE — `lane_id` travels with it and is never regenerated, because it is
+    the only key the H3 slot resolver looks a lane up by.
+    """
+    descriptor = variable_descriptor(lane_type)
+    if descriptor is None or not descriptor.lane_movable:
+        _mutation_error(f"Cannot move lane type: {lane_type}", 400)
+    from_index = _mutation_int(from_index, "from_index")
+    to_index = _mutation_int(to_index, "to_index")
+    count = _scene_lane_count(scene, lane_type)
+    for label, index in (("from_index", from_index), ("to_index", to_index)):
+        if index < 0 or index >= count:
+            _mutation_error(f"Lane index out of range: {index}", 404, "item_not_found")
+    if from_index == to_index:
+        _mutation_error("move_lane requires two distinct lanes", 400,
+                        "invalid_lane_operation")
+    _require_lane_unlocked(scene, lane_type, from_index)
+    _require_lane_unlocked(scene, lane_type, to_index)
+
+    # Lane index alone is not identity here — changing it is the whole point of
+    # the operation — so the exact-prior-value contract every other Reference
+    # mutation uses is spelled in durable lane ids.  This is checked BEFORE the
+    # recipe branch, so a family that opts into `lane_movable` without a durable
+    # per-lane id cannot inherit a swap with no identity check at all.
+    if not isinstance(expected, dict):
+        _mutation_error("move_lane requires an expected lane identity", 400,
+                        "identity_mismatch")
+    if not descriptor.recipe_attr:
+        _mutation_error(
+            f"Lane type {lane_type} carries no durable lane identity to move by",
+            400, "invalid_lane_operation")
+
+    # Pad BEFORE reading identity or swapping: either array may legitimately be
+    # shorter than the lane count, and a swap must never be what lengthens it.
+    pad_config_list(getattr(scene, descriptor.configs_attr),
+                    count, LaneConfig)
+    if descriptor.recipe_attr:
+        pad_config_list(getattr(scene, descriptor.recipe_attr),
+                        count, ReferenceLaneRecipe)
+        recipes = getattr(scene, descriptor.recipe_attr)
+        actual = {
+            "from_lane_id": str(getattr(recipes[from_index], "lane_id", "") or ""),
+            "to_lane_id": str(getattr(recipes[to_index], "lane_id", "") or ""),
+        }
+        for key, value in actual.items():
+            # A blank stored id would otherwise match a blank `expected` and let
+            # any pair of unidentifiable lanes swap.
+            if not value or str(expected.get(key) or "") != value:
+                _mutation_error("Reference lane identity mismatch", 409,
+                                "identity_mismatch")
+        swap_list_entries(recipes, from_index, to_index)
+
+    for item in getattr(scene, descriptor.items_attr, []) or []:
+        if not item_matches_descriptor(item, descriptor):
+            continue
+        index = int(getattr(item, descriptor.item_index_attr, 0) or 0)
+        if index == from_index:
+            setattr(item, descriptor.item_index_attr, to_index)
+        elif index == to_index:
+            setattr(item, descriptor.item_index_attr, from_index)
+
+    swap_list_entries(getattr(scene, descriptor.configs_attr), from_index, to_index)
+    return {"from_index": from_index, "to_index": to_index}
 
 
 def _validated_fit_mode(value) -> str:
@@ -3117,6 +3205,39 @@ def _reference_item_expected(item: ReferenceItem, expected, keys) -> None:
             _mutation_error("Reference item identity mismatch", 409, "identity_mismatch")
 
 
+def member_population_compatible(
+    population: str,
+    media_kind: str,
+    asset_type: str,
+    *,
+    has_audio: bool = False,
+) -> bool:
+    """Whether one asset may be staged on a Reference lane, by media alone.
+
+    Extracted so the browser can mirror the RULE rather than a reimplementation
+    of it: inside `_canonical_reference_member_refs` this was interleaved with
+    member lookup, uniqueness, intent/role validation and `_mutation_error`
+    raises, leaving a JS parity test nothing to compare against.
+
+    `population` is read from the lane recipe's `soft["physical_population"]`
+    exactly as the caller reads it — deliberately WITHOUT
+    `minimax_h3.lane_population`'s `recipe_id` fallback, so a bare-bodied lane
+    carrying only `recipe_id` stays as permissive here as it is at staging.
+
+    Mirrored in `web/js/reference_lane_identity.js` as
+    `memberPopulationCompatible`.
+    """
+    if media_kind == "image":
+        if population == "pictures":
+            return asset_type == "image"
+        if population == "videos":
+            return asset_type == "video"
+        return asset_type in {"image", "video"}
+    if media_kind == "video":
+        return asset_type == "video"
+    return asset_type == "audio" or (asset_type == "video" and bool(has_audio))
+
+
 def _canonical_reference_member_refs(
     project: TimelineProject,
     raw_members,
@@ -3155,19 +3276,12 @@ def _canonical_reference_member_refs(
         if asset is None:
             _mutation_error(f"Reference member asset not found: {member.asset_id}", 404, "asset_not_found")
         asset_type = str(getattr(asset, "asset_type", "") or "")
-        if media_kind == "image":
-            population = str(soft.get("physical_population") or "")
-            if population == "pictures":
-                compatible = asset_type == "image"
-            elif population == "videos":
-                compatible = asset_type == "video"
-            else:
-                compatible = asset_type in {"image", "video"}
-        elif media_kind == "video":
-            compatible = asset_type == "video"
-        else:
-            compatible = asset_type == "audio" or (
-                asset_type == "video" and bool(getattr(asset, "has_audio", False)))
+        compatible = member_population_compatible(
+            str(soft.get("physical_population") or ""),
+            media_kind,
+            asset_type,
+            has_audio=bool(getattr(asset, "has_audio", False)),
+        )
         if not compatible:
             _mutation_error(
                 f"Reference member {member_id} is incompatible with the {media_kind} lane",
@@ -3570,6 +3684,119 @@ def _apply_update_reference_item(project: TimelineProject, scene: Scene, operati
     return item
 
 
+def _reference_item_resolved_end(scene: Scene, item: ReferenceItem) -> int:
+    """The end frame a Reference bar is DRAWN to, sentinel resolved."""
+    end_frame = int(getattr(item, "end_frame", -1))
+    if end_frame >= 0:
+        return end_frame
+    return max(int(getattr(item, "start_frame", 0) or 0) + 1,
+               int(getattr(scene, "duration_frames", 0) or 0))
+
+
+def _reference_item_chip_bindings(scene: Scene, reference_item_id: str) -> int:
+    """Enabled generic Reference chips bound to one staged item, scene-wide.
+
+    Only a generic-profile chip binds `source.reference_item_id`; an
+    unresolvable binding lands in compile ERRORS, which `prompt_bridge` and
+    `editor_node` raise, so a split of a bound item refuses the render until
+    the author rebinds.  The count is reported, never repaired: cloning the
+    binding onto the right half — what `clone_for_split` does for prompt
+    sections — would be unresolvable in exactly the windows the original
+    resolves, because one lane yields one winner and one chip names one item.
+    """
+    item_id = str(reference_item_id or "")
+    if not item_id:
+        return 0
+    collections = [getattr(scene, "global_attachments", []) or []]
+    for section in getattr(scene, "prompt_sections", []) or []:
+        collections.append(getattr(section, "attachments", []) or [])
+    count = 0
+    for attachments in collections:
+        for attachment in attachments:
+            if not isinstance(attachment, dict) or not attachment.get("enabled"):
+                continue
+            if str(attachment.get("kind") or "") != "reference":
+                continue
+            source = attachment.get("source")
+            source = source if isinstance(source, dict) else {}
+            if str(source.get("reference_item_id") or "") == item_id:
+                count += 1
+    return count
+
+
+def _apply_split_reference_item(scene: Scene, operation: dict) -> dict:
+    """Divide one staged Reference item in two, staging preserved verbatim.
+
+    A dedicated op rather than a client-side shrink-plus-create: staged members
+    carry `visual_intent`, `audio_intent` and `role` on top of their ids, and a
+    create round-trip does not pass `legacy_members`, so it can refuse a
+    stored-and-valid role that an update tolerates.  Copying the member dicts
+    means a split can never quietly rewrite staging it was only meant to divide.
+    """
+    item = _find_reference_item(scene, str(operation.get("reference_item_id", "") or ""))
+    lane_index = int(getattr(item, "lane_index", 0) or 0)
+    _require_lane_unlocked(scene, "reference", lane_index)
+    frame = _mutation_int(operation.get("frame"), "frame")
+
+    expected = _require_expected(
+        operation.get("expected"),
+        {"reference_item_id", "start_frame", "end_frame", "resolved_end_frame"},
+        "reference item split",
+    )
+    resolved_end = _reference_item_resolved_end(scene, item)
+    # `resolved_end_frame` is in the guard because under `end_frame = -1` the
+    # real bound comes from `scene.duration_frames`, which is not otherwise in
+    # `expected`: a concurrent duration change would pass a start/end guard and
+    # split a bar of a different extent than the razor drew.
+    actual = {
+        "reference_item_id": str(getattr(item, "reference_item_id", "") or ""),
+        "start_frame": int(getattr(item, "start_frame", 0) or 0),
+        "end_frame": int(getattr(item, "end_frame", -1)),
+        "resolved_end_frame": resolved_end,
+    }
+    for key, value in actual.items():
+        if not _expected_matches(value, expected.get(key)):
+            _mutation_error("Reference item identity mismatch", 409, "identity_mismatch")
+
+    start_frame = actual["start_frame"]
+    if not (start_frame < frame < resolved_end):
+        _mutation_error("Split frame must be within the Reference item range",
+                        400, "invalid_range")
+
+    right = ReferenceItem(
+        reference_item_id=uuid.uuid4().hex,
+        lane_index=lane_index,
+        start_frame=frame,
+        # The stored end, sentinel included: a block running to scene end keeps
+        # following scene end on the half that should.
+        end_frame=actual["end_frame"],
+        members=copy.deepcopy(list(getattr(item, "members", []) or [])),
+        prompt_override=str(getattr(item, "prompt_override", "") or ""),
+        strength=float(getattr(item, "strength", 1.0)),
+        sequence_frames=int(getattr(item, "sequence_frames", 0) or 0),
+        muted=bool(getattr(item, "muted", False)),
+    )
+    while any(existing.reference_item_id == right.reference_item_id
+              for existing in scene.reference_items):
+        right.reference_item_id = uuid.uuid4().hex
+    item.end_frame = frame
+
+    # Both halves hold by construction; validating anyway means a later edit to
+    # either side of this op cannot skip the lane invariant.
+    _require_no_reference_overlap(scene, lane_index, item.start_frame, item.end_frame,
+                                  ignore=item)
+    _require_no_reference_overlap(scene, lane_index, right.start_frame, right.end_frame,
+                                  ignore=item)
+    scene.reference_items.append(right)
+    return {
+        "reference_item_id": item.reference_item_id,
+        "right_reference_item_id": right.reference_item_id,
+        "frame": frame,
+        "bound_attachment_count": _reference_item_chip_bindings(
+            scene, item.reference_item_id),
+    }
+
+
 def _apply_delete_reference_item(scene: Scene, operation: dict) -> ReferenceItem:
     item = _find_reference_item(scene, str(operation.get("reference_item_id", "") or ""))
     _require_lane_unlocked(scene, "reference", int(item.lane_index))
@@ -3836,6 +4063,15 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
             op.get("target_lane"),
         )
         return {"type": op_type}
+    if op_type == "move_lane":
+        result = _move_media_lane(
+            scene,
+            str(op.get("lane_type", "")),
+            op.get("from_index"),
+            op.get("to_index"),
+            op.get("expected"),
+        )
+        return {"type": op_type, "lane_type": str(op.get("lane_type", "")), **result}
     if op_type == "consolidate_items":
         return _consolidate_media_items(scene, op)
     if op_type == "create_clip":
@@ -3946,6 +4182,8 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
     if op_type == "delete_reference_item":
         item = _apply_delete_reference_item(scene, op)
         return {"type": op_type, "reference_item_id": item.reference_item_id}
+    if op_type == "split_reference_item":
+        return {"type": op_type, **_apply_split_reference_item(scene, op)}
     if op_type == "bulk_delete_items":
         _apply_bulk_delete_items(
             scene,

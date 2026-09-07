@@ -563,24 +563,158 @@ def test_reference_bulk_delete_local_path_does_not_leak_state_between_methods():
     assert "referenceIds" not in mutation_item
 
 
-def test_wrong_media_drop_cannot_repurpose_a_configured_reference_lane():
-    """media_kind is a hard lane property: only a never-configured lane adopts it.
+def _drop_verdicts(cases):
+    """Run the shared Reference drop resolver under node and return verdicts.
 
-    The rule lives in `_referenceLaneAcceptor`, which hover and drop now share
-    so the drag cannot promise a landing the drop refuses.
+    Behavioral rather than source-string: the tests this replaced asserted exact
+    lines inside `_referenceLaneAcceptor`, and rewriting a string test to match
+    the strings you just wrote proves nothing. The rule itself is pure and lives
+    in `reference_lane_identity.js` precisely so it can be executed.
     """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for Reference drop resolver coverage")
+    module_url = (ROOT / "web" / "js" / "reference_lane_identity.js").as_uri()
+    script = """
+const mod = await import(%s);
+const cases = %s;
+const out = {};
+for (const [name, spec] of Object.entries(cases)) {
+  out[name] = mod.resolveReferenceDropVerdict(spec.lane, spec.options);
+}
+console.log(JSON.stringify(out));
+""" % (json.dumps(module_url), json.dumps(cases))
+    return json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+
+
+def _lane(recipe, items=(), **flags):
+    return {"laneIndex": 0, "collapsed": False, "locked": False,
+            "recipe": recipe, "items": list(items), **flags}
+
+
+def _options(media_kind="image", frame=10, members=(("m1", "image"),),
+             allow_append=False):
+    return {
+        "mediaKind": media_kind,
+        "frame": frame,
+        "sceneDuration": 100,
+        "members": [{"member_id": mid, "assetType": kind} for mid, kind in members],
+        "allowAppend": allow_append,
+    }
+
+
+_IMAGE_LANE = {"media_kind": "image", "recipe_id": "", "recipe": {}}
+_AUDIO_LANE = {"media_kind": "audio", "recipe_id": "sonder:generic_audio",
+               "recipe": {"soft": {}}}
+_H3_VIDEO_LANE = {"media_kind": "image", "recipe_id": "sonder:minimax_h3_video",
+                  "recipe": {"soft": {"physical_population": "videos"}}}
+_H3_PICTURE_LANE = {"media_kind": "image", "recipe_id": "sonder:minimax_h3_picture",
+                    "recipe": {"soft": {"physical_population": "pictures"}}}
+_BARE_RECIPE_ID_LANE = {"media_kind": "image",
+                        "recipe_id": "sonder:minimax_h3_picture", "recipe": {}}
+_STAGED = [{"reference_item_id": "staged", "start_frame": 0, "end_frame": -1,
+            "members": [{"member_id": "already"}]}]
+
+
+def test_wrong_media_drop_cannot_repurpose_a_configured_reference_lane():
+    """media_kind is a hard lane property: only a never-configured lane adopts it."""
+    verdicts = _drop_verdicts({
+        # A blank lane adopts the dragged kind.
+        "adopt": {"lane": _lane(_IMAGE_LANE),
+                  "options": _options("audio", members=(("m1", "audio"),))},
+        # A configured lane of the other kind does not.
+        "configured": {"lane": _lane(_AUDIO_LANE), "options": _options("image")},
+        # Neither does a blank-recipe lane that already holds an item.
+        "occupiedBlank": {"lane": _lane(_IMAGE_LANE, _STAGED),
+                          "options": _options("audio", frame=90,
+                                              members=(("m1", "audio"),))},
+        "locked": {"lane": _lane(_IMAGE_LANE, locked=True), "options": _options()},
+        "collapsed": {"lane": _lane(_IMAGE_LANE, collapsed=True), "options": _options()},
+    })
+    assert verdicts["adopt"]["verdict"] == "create"
+    assert verdicts["configured"] == {"verdict": "reject", "reason": "media_kind",
+                                      "itemId": ""}
+    assert verdicts["occupiedBlank"]["reason"] == "media_kind"
+    assert verdicts["locked"]["reason"] == "locked"
+    assert verdicts["collapsed"]["reason"] == "collapsed"
+
+
+def test_reference_hover_narrows_by_population_exactly_as_staging_does():
+    """An H3 Video lane carries `media_kind: "image"` but takes only video.
+
+    The acceptor compared only `media_kind`, so a still image highlighted as a
+    valid landing and the drop was then refused with
+    `reference_media_kind_mismatch` - the honesty gap the shared predicate
+    exists to prevent.
+    """
+    verdicts = _drop_verdicts({
+        "stillOnVideoLane": {"lane": _lane(_H3_VIDEO_LANE), "options": _options()},
+        "videoOnVideoLane": {"lane": _lane(_H3_VIDEO_LANE),
+                             "options": _options(members=(("m1", "video"),))},
+        "videoOnPictureLane": {"lane": _lane(_H3_PICTURE_LANE),
+                               "options": _options(members=(("m1", "video"),))},
+        "stillOnPictureLane": {"lane": _lane(_H3_PICTURE_LANE), "options": _options()},
+        # The divergence case: a bare-bodied lane carrying only `recipe_id`
+        # resolves to "" server-side (image OR video legal). Mirroring
+        # `lanePopulation`'s `recipe_id` fallback here would make the client
+        # STRICTER than the server and silently block a legal staging.
+        "bareRecipeIdTakesVideo": {"lane": _lane(_BARE_RECIPE_ID_LANE),
+                                   "options": _options(members=(("m1", "video"),))},
+        "bareRecipeIdTakesImage": {"lane": _lane(_BARE_RECIPE_ID_LANE),
+                                   "options": _options()},
+    })
+    assert verdicts["stillOnVideoLane"]["reason"] == "population"
+    assert verdicts["videoOnVideoLane"]["verdict"] == "create"
+    assert verdicts["videoOnPictureLane"]["reason"] == "population"
+    assert verdicts["stillOnPictureLane"]["verdict"] == "create"
+    assert verdicts["bareRecipeIdTakesVideo"]["verdict"] == "create"
+    assert verdicts["bareRecipeIdTakesImage"]["verdict"] == "create"
+
+
+def test_reference_append_needs_an_explicit_pointer_hit_on_the_bar():
+    """`addToTimeline` passes no coordinates; it must never silently append."""
+    verdicts = _drop_verdicts({
+        "noCoordinates": {"lane": _lane(_IMAGE_LANE, _STAGED),
+                          "options": _options(allow_append=False)},
+        "onTheBar": {"lane": _lane(_IMAGE_LANE, _STAGED),
+                     "options": _options(allow_append=True)},
+        # A frame the bar does not cover still creates, even with append allowed.
+        "pastTheBar": {"lane": _lane(_IMAGE_LANE, [
+            {"reference_item_id": "staged", "start_frame": 0, "end_frame": 20,
+             "members": [{"member_id": "already"}]}]),
+            "options": _options(frame=50, allow_append=True)},
+        "duplicateMember": {"lane": _lane(_IMAGE_LANE, _STAGED),
+                            "options": _options(members=(("already", "image"),),
+                                                allow_append=True)},
+        # Population narrowing runs BEFORE occupancy, so an append cannot slip a
+        # member past a rule a create would have refused.
+        "appendNarrows": {"lane": _lane(_H3_VIDEO_LANE, _STAGED),
+                          "options": _options(allow_append=True)},
+    })
+    assert verdicts["noCoordinates"] == {"verdict": "reject", "reason": "occupied",
+                                         "itemId": ""}
+    assert verdicts["onTheBar"] == {"verdict": "append", "reason": "",
+                                    "itemId": "staged"}
+    assert verdicts["pastTheBar"]["verdict"] == "create"
+    assert verdicts["duplicateMember"]["reason"] == "duplicate_member"
+    assert verdicts["appendNarrows"]["reason"] == "population"
+
+
+def test_reference_hover_and_drop_run_the_same_resolver():
+    """One resolver, two call sites - the highlight cannot outrun the drop."""
     source = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
-    can_use = source.split("_referenceLaneAcceptor(mediaKind, startFrame) {", 1)[1]
-    can_use = can_use.split("\n    }", 1)[0]
-    assert "if (recipe.media_kind === mediaKind) return true;" in can_use
-    assert "return !occupied && this._isUnconfiguredReferenceLaneRecipe(recipe);" in can_use
-    # Both consumers go through it, so neither can drift from the other.
-    assert "const canUse = this._referenceLaneAcceptor(mediaKind, startFrame);" in source
-    assert "const canUse = this._referenceLaneAcceptor(mediaKind, frame);" in source
-    unconfigured = source.split("_isUnconfiguredReferenceLaneRecipe(recipe) {", 1)[1].split("\n    }", 1)[0]
-    assert 'value.media_kind || "image") === "image"' in unconfigured
-    assert '!String(value.recipe_id || "")' in unconfigured
-    assert '!Object.keys(value.recipe || {}).length' in unconfigured
+    hover = source.split("\n    _resolveDropHoverTarget(", 1)[1]
+    hover = hover.split("\n    /** The effective recipe of one Reference lane", 1)[0]
+    assert "this._referenceDropResolver(referenceDrag, frame)" in hover
+    place = source.split("async _placeReferencePayloadWithinGesture(", 1)[1]
+    place = place.split("\n    async _handleAssetDrop(", 1)[0]
+    assert "this._referenceDropResolver(payload, startFrame)" in place
+    # The create-only predicate is what `find()` uses, so the no-coordinate
+    # `addToTimeline` path can never reach the append verdict.
+    assert 'const canUse = (entry) => resolve(entry).verdict === "create";' in place
+    assert "if (!entry && !forceNewLane) entry = referenceEntries.find(canUse)" in place
 
 
 def test_mixed_kind_drag_is_refused_but_an_unresolved_member_is_not():
@@ -665,7 +799,7 @@ def test_reference_drops_follow_the_zone_model_like_asset_drops():
     hover = source.split("\n    _resolveDropHoverTarget(", 1)[1]
     hover = hover.split("\n    _referencePayloadMediaKind(", 1)[0]
     assert 'return { kind: "ruler" };' in hover
-    assert "this._referenceLaneAcceptor(mediaKind, frame)" in hover
+    assert "this._referenceDropResolver(referenceDrag, frame)" in hover
     # The kind-blind highlight is what promised landings the drop refused.
     assert "!this._isLaneLocked(entry.type, entry.laneIndex || 0)\n" not in hover
 
@@ -683,15 +817,15 @@ def test_reference_drop_resolves_lane_recipes_through_one_authority():
     source = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
     # One authority, reachable from both the acceptor and the placement path.
     assert "_referenceLaneRecipe(laneIndex) {" in source
-    acceptor = source.split("_referenceLaneAcceptor(mediaKind, startFrame) {", 1)[1]
-    acceptor = acceptor.split("\n    }", 1)[0]
-    assert "this._referenceLaneRecipe(entry.laneIndex || 0)" in acceptor
+    facts = source.split("_referenceLaneFacts(entry) {", 1)[1]
+    facts = facts.split("\n    }", 1)[0]
+    assert "this._referenceLaneRecipe(laneIndex)" in facts
     place = source.split("async _placeReferencePayload(", 1)[1]
     place = place.split("\n    async _handleAssetDrop(", 1)[0]
     assert "const existingRecipe = this._referenceLaneRecipe(laneIndex);" in place
     # The unbound call must not come back in either direction.
     assert "recipeFor(" not in place, "unbound recipeFor is back in the drop path"
-    assert "recipeFor(" not in acceptor
+    assert "recipeFor(" not in facts
 
 
 def test_reference_library_can_explain_a_refused_drag():
@@ -1293,3 +1427,579 @@ console.log(JSON.stringify({{
                for value in result["values"])
     # No setup record anywhere in the scene, yet every staged member attaches.
     assert result["eligible"] == [True, True, True]
+# ── Lane move ─────────────────────────────────────────────────────────────
+
+
+def _movable_scene():
+    _, scene = _project_with_reference("image")
+    scene.reference_lane_count = 3
+    scene.reference_lane_configs = [LaneConfig(name="A"), LaneConfig(name="B"),
+                                    LaneConfig(name="C")]
+    scene.reference_lane_recipes = [
+        ReferenceLaneRecipe(lane_id="lane-a", recipe_id="a"),
+        ReferenceLaneRecipe(lane_id="lane-b", recipe_id="b"),
+        ReferenceLaneRecipe(lane_id="lane-c", recipe_id="c"),
+    ]
+    return scene
+
+
+def _expected_move(scene, first, second):
+    return {"from_lane_id": scene.reference_lane_recipes[first].lane_id,
+            "to_lane_id": scene.reference_lane_recipes[second].lane_id}
+
+
+def test_move_lane_swaps_items_configs_and_recipes_together():
+    """Every array keyed by lane index moves at once, `lane_id` included."""
+    scene = _movable_scene()
+    scene.reference_items = [
+        ReferenceItem(reference_item_id="on-a", lane_index=0, start_frame=0, end_frame=10,
+                      members=[{"entity_id": "entity-1", "member_id": "member-1"}]),
+        ReferenceItem(reference_item_id="on-b", lane_index=1, start_frame=0, end_frame=10,
+                      members=[{"entity_id": "entity-1", "member_id": "member-1"}]),
+        ReferenceItem(reference_item_id="on-c", lane_index=2, start_frame=0, end_frame=10,
+                      members=[{"entity_id": "entity-1", "member_id": "member-1"}]),
+    ]
+
+    routes._move_media_lane(scene, "reference", 0, 1, _expected_move(scene, 0, 1))
+
+    assert [recipe.recipe_id for recipe in scene.reference_lane_recipes] == ["b", "a", "c"]
+    # The recipe object moves WHOLE: `lane_id` travels with it and is never
+    # regenerated, because it is the only key the H3 slot resolver looks a lane
+    # up by.
+    assert [recipe.lane_id for recipe in scene.reference_lane_recipes] == [
+        "lane-b", "lane-a", "lane-c"]
+    assert [config.name for config in scene.reference_lane_configs] == ["B", "A", "C"]
+    assert {item.reference_item_id: item.lane_index
+            for item in scene.reference_items} == {"on-a": 1, "on-b": 0, "on-c": 2}
+    assert scene.reference_lane_count == 3
+
+
+def test_move_lane_pads_short_config_and_recipe_arrays_before_swapping():
+    """Either array may legitimately be shorter than the lane count."""
+    scene = _movable_scene()
+    scene.reference_lane_configs = [LaneConfig(name="A")]
+    scene.reference_lane_recipes = [ReferenceLaneRecipe(lane_id="lane-a", recipe_id="a")]
+
+    padded_expected = {"from_lane_id": "lane-a", "to_lane_id": ""}
+    with pytest.raises(routes.ProjectMutationRequestError) as mismatch:
+        routes._move_media_lane(scene, "reference", 0, 1, padded_expected)
+    # Padding minted a real durable id rather than leaving a blank, so the guard
+    # refuses instead of moving a lane whose identity the caller never saw.
+    assert mismatch.value.code == "identity_mismatch"
+    assert len(scene.reference_lane_recipes) == 3
+    assert len(scene.reference_lane_configs) == 3
+
+    routes._move_media_lane(scene, "reference", 0, 1, _expected_move(scene, 0, 1))
+    assert scene.reference_lane_recipes[1].recipe_id == "a"
+
+
+def test_move_lane_refusals_cover_identity_locks_range_and_lane_type():
+    scene = _movable_scene()
+    with pytest.raises(routes.ProjectMutationRequestError) as stale:
+        routes._move_media_lane(scene, "reference", 0, 1,
+                                {"from_lane_id": "lane-a", "to_lane_id": "lane-c"})
+    assert stale.value.code == "identity_mismatch"
+
+    with pytest.raises(routes.ProjectMutationRequestError) as missing:
+        routes._move_media_lane(scene, "reference", 0, 1, None)
+    assert missing.value.code == "identity_mismatch"
+
+    with pytest.raises(routes.ProjectMutationRequestError) as out_of_range:
+        routes._move_media_lane(scene, "reference", 0, 9, _expected_move(scene, 0, 0))
+    assert out_of_range.value.code == "item_not_found"
+
+    with pytest.raises(routes.ProjectMutationRequestError) as same:
+        routes._move_media_lane(scene, "reference", 1, 1, _expected_move(scene, 1, 1))
+    assert same.value.code == "invalid_lane_operation"
+
+    scene.reference_lane_configs[1].locked = True
+    with pytest.raises(routes.ProjectMutationRequestError) as locked:
+        routes._move_media_lane(scene, "reference", 0, 1, _expected_move(scene, 0, 1))
+    assert locked.value.code == "track_locked"
+    scene.reference_lane_configs[1].locked = False
+
+    # A generic op accepting any lane_type because the client offers only one
+    # would be an untested video/audio reorder waiting to be called, and video
+    # lane order is compositing order.
+    for lane_type in ("video", "audio", "motion_driver"):
+        with pytest.raises(routes.ProjectMutationRequestError) as refused:
+            routes._move_media_lane(scene, lane_type, 0, 1, {})
+        assert "Cannot move lane type" in str(refused.value)
+    # Nothing above mutated the scene.
+    assert [recipe.recipe_id for recipe in scene.reference_lane_recipes] == ["a", "b", "c"]
+
+
+def test_h3_ordinals_and_over_cap_truncation_follow_a_lane_move():
+    """The capability, and the invisible consequence that rides with it."""
+    first_entity, first_asset = _h3_picture("woman", "portrait")
+    second_entity, second_asset = _h3_picture("man", "headshot")
+    recipes = [_h3_lane_recipe("lane-a"), _h3_lane_recipe("lane-b")]
+    items = [_picture_item("a", 0, "woman", "portrait"),
+             _picture_item("b", 1, "man", "headshot")]
+    scene = _h3_scene(recipes, items)
+
+    before = _h3_resolve(scene, [first_entity, second_entity], [first_asset, second_asset])
+    assert [(row["member_id"], row["picture_ordinal"])
+            for row in before["setup_manifest"]["pictures"]] == [
+        ("portrait", 1), ("headshot", 2)]
+
+    routes._move_media_lane(scene, "reference", 0, 1,
+                            {"from_lane_id": "lane-a", "to_lane_id": "lane-b"})
+
+    after = _h3_resolve(scene, [first_entity, second_entity], [first_asset, second_asset])
+    assert [(row["member_id"], row["picture_ordinal"])
+            for row in after["setup_manifest"]["pictures"]] == [
+        ("headshot", 1), ("portrait", 2)]
+
+
+def test_move_lane_changes_which_member_an_over_cap_population_drops():
+    """`collect()` accumulates in lane order and then truncates `rows[:cap]`."""
+    entities = []
+    assets = []
+    lane_items = []
+    # 10 Pictures over two lanes; H3 exposes 9, so exactly one loses its ordinal.
+    for index in range(10):
+        entity, asset = _h3_picture(f"e{index}", f"m{index}")
+        entities.append(entity)
+        assets.append(asset)
+    first_members = [{"entity_id": f"e{i}", "member_id": f"m{i}"} for i in range(5)]
+    second_members = [{"entity_id": f"e{i}", "member_id": f"m{i}"} for i in range(5, 10)]
+    lane_items.append(ReferenceItem(reference_item_id="first", lane_index=0,
+                                    start_frame=0, end_frame=-1, members=first_members))
+    lane_items.append(ReferenceItem(reference_item_id="second", lane_index=1,
+                                    start_frame=0, end_frame=-1, members=second_members))
+    scene = _h3_scene([_h3_lane_recipe("lane-a"), _h3_lane_recipe("lane-b")], lane_items)
+
+    before = {row["member_id"] for row in
+              _h3_resolve(scene, entities, assets)["setup_manifest"]["pictures"]}
+    routes._move_media_lane(scene, "reference", 0, 1,
+                            {"from_lane_id": "lane-a", "to_lane_id": "lane-b"})
+    after = {row["member_id"] for row in
+             _h3_resolve(scene, entities, assets)["setup_manifest"]["pictures"]}
+
+    assert len(before) == len(after) == 9
+    assert before != after, "the dropped member must change with lane order"
+
+
+# ── Item split ────────────────────────────────────────────────────────────
+
+
+def _split_scene(end_frame=-1, members=None):
+    project, scene = _project_with_reference("image")
+    scene.reference_lane_recipes[0] = ReferenceLaneRecipe(
+        lane_id="lane-a", media_kind="image",
+        recipe={"soft": {"role_fields": ["visual_intent", "audio_intent", "role"]}})
+    scene.reference_items = [ReferenceItem(
+        reference_item_id="item", lane_index=0, start_frame=10, end_frame=end_frame,
+        members=members or [{"entity_id": "entity-1", "member_id": "member-1"}],
+        prompt_override="portrait", strength=0.4, sequence_frames=17, muted=True,
+    )]
+    return project, scene
+
+
+def _split_expected(scene, item_id="item"):
+    item = next(value for value in scene.reference_items
+                if value.reference_item_id == item_id)
+    return {
+        "reference_item_id": item.reference_item_id,
+        "start_frame": item.start_frame,
+        "end_frame": item.end_frame,
+        "resolved_end_frame": routes._reference_item_resolved_end(scene, item),
+    }
+
+
+def test_split_reference_item_copies_staging_verbatim_and_keeps_the_sentinel():
+    """A create round-trip cannot be trusted with staged member fields.
+
+    `_apply_create_reference_item` does not pass `legacy_members` while
+    `_apply_update_reference_item` does, so a stored-and-valid `role` that an
+    update tolerates through the `unchanged()` escape is refused on create.
+    A dedicated op deep-copies the member dicts instead.
+    """
+    staged = [{"entity_id": "entity-1", "member_id": "member-1",
+               "visual_intent": "preserve", "role": "retired_alias"}]
+    project, scene = _split_scene(members=staged)
+
+    result = routes._apply_split_reference_item(scene, {
+        "reference_item_id": "item", "frame": 50,
+        "expected": _split_expected(scene),
+    })
+
+    left = next(value for value in scene.reference_items
+                if value.reference_item_id == "item")
+    right = next(value for value in scene.reference_items
+                 if value.reference_item_id == result["right_reference_item_id"])
+    assert (left.start_frame, left.end_frame) == (10, 50)
+    # `-1` stays on the RIGHT half: a block running to scene end keeps following
+    # scene end on the half that should.
+    assert (right.start_frame, right.end_frame) == (50, -1)
+    assert right.members == staged and left.members == staged
+    assert right.members is not left.members
+    assert (right.prompt_override, right.strength, right.sequence_frames, right.muted) == (
+        "portrait", 0.4, 17, True)
+    assert right.lane_index == 0
+
+    # The contrast the op exists for, on the SAME lane and the SAME recipe, so
+    # the only difference is that a create passes no `legacy_members`: an update
+    # tolerates the stored role through the `unchanged()` escape, a create
+    # refuses it, and a client-side shrink-plus-create would have destroyed it.
+    tolerated = routes._apply_update_reference_item(project, scene, {
+        "reference_item_id": "item",
+        "fields": {"members": staged},
+        "expected": {"members": staged},
+    })
+    assert tolerated.members[0]["role"] == "retired_alias"
+    with pytest.raises(routes.ProjectMutationRequestError) as refused:
+        routes._apply_create_reference_item(project, scene, {
+            "lane_index": 0, "start_frame": 0, "end_frame": 5, "members": staged})
+    assert refused.value.code == "unsupported_reference_role"
+
+
+def test_split_reference_item_keeps_an_authored_end_on_the_right_half():
+    _, scene = _split_scene(end_frame=80)
+    result = routes._apply_split_reference_item(scene, {
+        "reference_item_id": "item", "frame": 40,
+        "expected": _split_expected(scene),
+    })
+    right = next(value for value in scene.reference_items
+                 if value.reference_item_id == result["right_reference_item_id"])
+    assert (right.start_frame, right.end_frame) == (40, 80)
+
+
+def test_split_reference_item_refuses_out_of_range_stale_end_and_locks():
+    _, scene = _split_scene()
+    for frame in (10, 9, 100, 200):
+        with pytest.raises(routes.ProjectMutationRequestError) as invalid:
+            routes._apply_split_reference_item(scene, {
+                "reference_item_id": "item", "frame": frame,
+                "expected": _split_expected(scene)})
+        assert invalid.value.code == "invalid_range", frame
+
+    # A concurrent duration change moves the real bound under an `end_frame`
+    # of -1 without touching any stored field, which is why the resolved end is
+    # in the guard at all.
+    stale = _split_expected(scene)
+    scene.duration_frames = 200
+    with pytest.raises(routes.ProjectMutationRequestError) as mismatch:
+        routes._apply_split_reference_item(scene, {
+            "reference_item_id": "item", "frame": 50, "expected": stale})
+    assert mismatch.value.code == "identity_mismatch"
+
+    with pytest.raises(routes.ProjectMutationRequestError) as missing:
+        routes._apply_split_reference_item(scene, {
+            "reference_item_id": "item", "frame": 50,
+            "expected": {"reference_item_id": "item"}})
+    assert missing.value.code == "missing_expected_identity"
+
+    scene.reference_lane_configs[0].locked = True
+    with pytest.raises(routes.ProjectMutationRequestError) as locked:
+        routes._apply_split_reference_item(scene, {
+            "reference_item_id": "item", "frame": 50,
+            "expected": _split_expected(scene)})
+    assert locked.value.code == "track_locked"
+    assert len(scene.reference_items) == 1
+
+
+def test_split_reference_item_does_not_move_any_bridge_payload():
+    """`reserved_span` is a max over the lane; both halves carry one member list."""
+    _, scene = _split_scene()
+    before = max(len(item.members) for item in scene.reference_items)
+    routes._apply_split_reference_item(scene, {
+        "reference_item_id": "item", "frame": 50, "expected": _split_expected(scene)})
+    after = max(len(item.members) for item in scene.reference_items)
+    assert before == after == 1
+
+
+def test_split_reference_item_reports_a_bound_chip_rather_than_cloning_it():
+    """Cloning would be unresolvable exactly where the original resolves."""
+    from server.timeline_state import PromptSection
+
+    _, scene = _split_scene()
+    bound = {"attachment_id": "chip-1", "kind": "reference", "enabled": True,
+             "source": {"reference_item_id": "item"}}
+    disabled = {"attachment_id": "chip-2", "kind": "reference", "enabled": False,
+                "source": {"reference_item_id": "item"}}
+    other = {"attachment_id": "chip-3", "kind": "reference", "enabled": True,
+             "source": {"reference_item_id": "somewhere-else"}}
+    scene.global_attachments = [dict(bound)]
+    scene.prompt_sections = [PromptSection(
+        start_frame=0, end_frame=100,
+        attachments=[dict(bound), dict(disabled), dict(other)])]
+
+    result = routes._apply_split_reference_item(scene, {
+        "reference_item_id": "item", "frame": 50, "expected": _split_expected(scene)})
+
+    assert result["bound_attachment_count"] == 2
+    right_id = result["right_reference_item_id"]
+    bindings = [str((value.get("source") or {}).get("reference_item_id") or "")
+                for value in scene.global_attachments
+                + scene.prompt_sections[0].attachments]
+    assert right_id not in bindings
+
+
+# ── Member append ─────────────────────────────────────────────────────────
+
+
+def test_append_refuses_a_member_already_staged_on_the_item():
+    project, scene = _project_with_reference("image")
+    scene.reference_items = [ReferenceItem(
+        reference_item_id="item", lane_index=0, start_frame=0, end_frame=-1,
+        members=[{"entity_id": "entity-1", "member_id": "member-1"}])]
+    with pytest.raises(routes.ProjectMutationRequestError) as duplicate:
+        routes._apply_update_reference_item(project, scene, {
+            "reference_item_id": "item",
+            "fields": {"members": [{"member_id": "member-1"},
+                                   {"member_id": "member-1"}]},
+            "expected": {"members": [{"entity_id": "entity-1",
+                                      "member_id": "member-1"}]},
+        })
+    assert duplicate.value.code == "invalid_reference_item"
+
+
+def test_append_past_the_hard_cap_is_allowed_by_the_route():
+    """The route must not invent a stricter rule than `+ Add member` already has.
+
+    Two paths into one durable state with two different limits would be a second
+    authority; the drop instead SAYS so immediately, and `nodes/reference_core`
+    keeps refusing the render.
+    """
+    project, scene = _project_with_reference("image")
+    scene.reference_lane_recipes[0] = ReferenceLaneRecipe(
+        lane_id="lane-a", media_kind="image", recipe={"hard": {"max_members": 1}})
+    second_asset = Asset(asset_id="asset-2", name="Two", asset_type="image",
+                         path="media/two.image")
+    project.assets.append(second_asset)
+    project.references[0].members.append(
+        ReferenceMember(member_id="member-2", asset_id="asset-2"))
+    scene.reference_items = [ReferenceItem(
+        reference_item_id="item", lane_index=0, start_frame=0, end_frame=-1,
+        members=[{"entity_id": "entity-1", "member_id": "member-1"}])]
+
+    item = routes._apply_update_reference_item(project, scene, {
+        "reference_item_id": "item",
+        "fields": {"members": [{"member_id": "member-1"}, {"member_id": "member-2"}]},
+        "expected": {"members": [{"entity_id": "entity-1", "member_id": "member-1"}]},
+    })
+    assert [value["member_id"] for value in item.members] == ["member-1", "member-2"]
+
+
+def test_member_population_compatibility_matches_between_python_and_the_browser():
+    """The mirror is compared against the EXTRACTED rule, not a reimplementation."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for population parity coverage")
+    module_url = (ROOT / "web" / "js" / "reference_lane_identity.js").as_uri()
+    cases = [
+        {"population": population, "mediaKind": media_kind,
+         "assetType": asset_type, "hasAudio": has_audio}
+        for population in ("", "pictures", "videos", "standalone_audios", "unknown")
+        for media_kind in ("image", "video", "audio")
+        for asset_type in ("image", "video", "audio", "")
+        for has_audio in (True, False)
+    ]
+    script = """
+const mod = await import(%s);
+const cases = %s;
+console.log(JSON.stringify(cases.map((c) => mod.memberPopulationCompatible(
+  c.population, c.mediaKind, c.assetType, { hasAudio: c.hasAudio }))));
+""" % (json.dumps(module_url), json.dumps(cases))
+    browser = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+    python = [routes.member_population_compatible(
+        case["population"], case["mediaKind"], case["assetType"],
+        has_audio=case["hasAudio"]) for case in cases]
+    assert browser == python
+    # The parity must be non-trivial in both directions.
+    assert any(python) and not all(python)
+def test_new_reference_ops_reach_their_handlers_through_the_dispatch():
+    """The field names the client actually sends, checked end to end.
+
+    Every other test in this file calls `routes._move_media_lane` /
+    `routes._apply_split_reference_item` directly, so a typo in the dispatch —
+    or in `from_index` / `to_index` / `reference_item_id` / `frame` — would be
+    invisible. This is the only coverage of the operation envelope itself.
+    """
+    project, scene = _split_scene()
+    # `_project_with_reference` already gives this scene two lanes; name the
+    # second one so the move's identity guard has something exact to compare.
+    scene.reference_lane_recipes[1] = ReferenceLaneRecipe(
+        lane_id="lane-b", media_kind="image")
+
+    split = routes._apply_scene_mutation_operation(project, scene, {
+        "type": "split_reference_item",
+        "reference_item_id": "item",
+        "frame": 50,
+        "expected": _split_expected(scene),
+    })
+    assert split["type"] == "split_reference_item"
+    assert split["reference_item_id"] == "item"
+    assert split["right_reference_item_id"] != "item"
+    assert split["bound_attachment_count"] == 0
+    assert {item.reference_item_id for item in scene.reference_items} == {
+        "item", split["right_reference_item_id"]}
+
+    move = routes._apply_scene_mutation_operation(project, scene, {
+        "type": "move_lane",
+        "lane_type": "reference",
+        "from_index": 0,
+        "to_index": 1,
+        "expected": {"from_lane_id": "lane-a", "to_lane_id": "lane-b"},
+    })
+    assert move == {"type": "move_lane", "lane_type": "reference",
+                    "from_index": 0, "to_index": 1}
+    assert [recipe.lane_id for recipe in scene.reference_lane_recipes] == [
+        "lane-b", "lane-a"]
+    assert {item.lane_index for item in scene.reference_items} == {1}
+
+    # An unknown lane type reaches the same refusal through the envelope.
+    with pytest.raises(routes.ProjectMutationRequestError):
+        routes._apply_scene_mutation_operation(project, scene, {
+            "type": "move_lane", "lane_type": "video",
+            "from_index": 0, "to_index": 1, "expected": {},
+        })
+
+
+def test_move_lane_refuses_a_family_that_carries_no_durable_lane_identity():
+    """The identity guard must not live inside the recipe branch.
+
+    `lane_movable` is the documented gate for "designed and tested", but nothing
+    forces a durable identity to travel with that opt-in: a future family
+    without `recipe_attr` would otherwise inherit a swap that accepts `{}` and
+    reorders durable state on a bare index.
+    """
+    scene = _movable_scene()
+    with pytest.raises(routes.ProjectMutationRequestError) as missing:
+        routes._move_media_lane(scene, "reference", 0, 1, "not-a-dict")
+    assert missing.value.code == "identity_mismatch"
+
+    # A stored blank id must not match a blank `expected`.
+    scene.reference_lane_recipes[0].lane_id = ""
+    scene.reference_lane_recipes[1].lane_id = ""
+    with pytest.raises(routes.ProjectMutationRequestError) as blank:
+        routes._move_media_lane(scene, "reference", 0, 1,
+                                {"from_lane_id": "", "to_lane_id": ""})
+    assert blank.value.code == "identity_mismatch"
+    assert [recipe.recipe_id for recipe in scene.reference_lane_recipes] == ["a", "b", "c"]
+
+
+def test_splitting_can_raise_an_item_over_the_reference_frame_threshold():
+    """A consequence of splitting, disclosed rather than prevented.
+
+    `resolve_effective_references` scores coverage as
+    `overlap / (item_end - item_start)`, so halving an item's own span doubles
+    its coverage of the same window. An item the threshold used to drop can
+    start applying after a split. Inherent to dividing a scope; pinned so it is
+    a known property rather than a surprise in a render.
+    """
+    _, scene = _split_scene(end_frame=100)
+    scene.duration_frames = 100
+    # `_split_scene` mutes its item to prove the split copies that flag; the
+    # resolver skips muted items outright, so unmute it here.
+    scene.reference_items[0].muted = False
+    before = resolve_effective_references(
+        reference_items=scene.reference_items, lane_count=1,
+        scene_duration=100, window_start=0, window_end=30,
+        lane_configs=scene.reference_lane_configs, frame_threshold_pct=50)
+    assert before[0] is None, "30 of 90 frames is under a 50% threshold"
+
+    routes._apply_split_reference_item(scene, {
+        "reference_item_id": "item", "frame": 40,
+        "expected": _split_expected(scene)})
+    after = resolve_effective_references(
+        reference_items=scene.reference_items, lane_count=1,
+        scene_duration=100, window_start=0, window_end=30,
+        lane_configs=scene.reference_lane_configs, frame_threshold_pct=50)
+    assert after[0] is not None, "the left half now covers the window"
+    assert after[0]["item"].reference_item_id == "item"
+
+
+@pytest.mark.parametrize("expected", [{"lane_id": "wrong"}, {}, None, "lane-a", {"lane_id": 1}])
+def test_lane_config_identity_refusal_precedes_field_writes(expected):
+    scene = _movable_scene()
+    before = scene.to_dict()
+    with pytest.raises(routes.ProjectMutationRequestError) as caught:
+        routes._apply_lane_config(scene, {
+            "lane_type": "reference", "lane_index": 0, "expected": expected,
+            "fields": {"name": "Wrong target", "locked": True, "hidden": True,
+                       "reference_recipe": {"lane_id": "replacement"}},
+        })
+    assert caught.value.status == 409
+    assert caught.value.code == "identity_mismatch"
+    assert scene.to_dict() == before
+
+
+@pytest.mark.parametrize("with_expected", [True, False])
+def test_lane_config_stored_id_wins_over_client_minted_recipe(with_expected):
+    scene = _movable_scene()
+    lane_id = scene.reference_lane_recipes[0].lane_id
+    op = {"lane_type": "reference", "lane_index": 0,
+          "fields": {"name": "Renamed", "locked": True, "hidden": True,
+                     "reference_recipe": {"lane_id": "client-minted", "media_kind": "image"}}}
+    if with_expected:
+        op["expected"] = {"lane_id": lane_id}
+    routes._apply_lane_config(scene, op)
+    assert scene.reference_lane_recipes[0].lane_id == lane_id
+    assert scene.reference_lane_configs[0].name == "Renamed"
+    assert scene.reference_lane_configs[0].locked
+    assert scene.reference_lane_configs[0].hidden
+
+
+def test_lane_config_bootstraps_recipe_less_default_and_same_batch_appended_lane():
+    scene = Scene(scene_id="bootstrap", reference_lane_count=1, reference_lane_recipes=[])
+    project = TimelineProject(project_id="project", scenes=[scene])
+    routes._apply_scene_mutation_operation(project, scene, {
+        "type": "update_lane_config", "lane_type": "reference", "lane_index": 0,
+        "fields": {"name": "Default rename"},
+    })
+    first_id = scene.reference_lane_recipes[0].lane_id
+    assert first_id
+    assert scene.reference_lane_configs[0].name == "Default rename"
+    routes._apply_scene_mutation_operation(project, scene, {
+        "type": "set_lane_count", "lane_type": "reference", "count": 2,
+    })
+    second_id = scene.reference_lane_recipes[1].lane_id
+    routes._apply_scene_mutation_operation(project, scene, {
+        "type": "update_lane_config", "lane_type": "reference", "lane_index": 1,
+        "fields": {"name": "Appended", "reference_recipe": {"lane_id": "client-minted"}},
+    })
+    assert scene.reference_lane_configs[1].name == "Appended"
+    assert scene.reference_lane_recipes[1].lane_id == second_id != first_id
+
+
+def test_lane_config_positional_family_keeps_writing_without_recipe_identity():
+    scene = Scene(scene_id="scene", video_lane_count=1)
+    routes._apply_lane_config(scene, {
+        "lane_type": "video", "lane_index": 0, "fields": {"name": "Video", "locked": True},
+    })
+    assert scene.video_lane_configs[0].name == "Video"
+    assert scene.video_lane_configs[0].locked
+
+
+@pytest.mark.parametrize("raw_recipes", [[], [{"media_kind": "image"}], [{"lane_id": "", "media_kind": "image"}]])
+def test_loaded_bootstrap_lane_identity_survives_get_then_mutation(raw_recipes):
+    import copy
+    raw = Scene(scene_id="bootstrap", reference_lane_count=2).to_dict()
+    raw["reference_lane_recipes"] = raw_recipes
+    before = copy.deepcopy(raw)
+    read = Scene.from_dict(raw)
+    write = Scene.from_dict(raw)
+    assert [r.lane_id for r in read.reference_lane_recipes] == [r.lane_id for r in write.reference_lane_recipes]
+    assert len({r.lane_id for r in read.reference_lane_recipes}) == 2
+    routes._apply_lane_config(write, {
+        "lane_type": "reference", "lane_index": 0,
+        "expected": {"lane_id": read.reference_lane_recipes[0].lane_id},
+        "fields": {"name": "First durable edit", "reference_recipe": {"lane_id": "client-draft"}},
+    })
+    assert write.reference_lane_configs[0].name == "First durable edit"
+    round_trip = Scene.from_dict(write.to_dict())
+    assert round_trip.reference_lane_recipes[0].lane_id == read.reference_lane_recipes[0].lane_id
+    assert raw == before, "read repair must not mutate the saved input"
+
+
+def test_loaded_reference_lanes_preserve_authored_ids_while_padding_missing_recipes():
+    raw = Scene(scene_id="existing", reference_lane_count=3).to_dict()
+    raw["reference_lane_recipes"] = [{"lane_id": "authored-b"}, {"lane_id": "authored-a"}]
+    scene = Scene.from_dict(raw)
+    assert [r.lane_id for r in scene.reference_lane_recipes[:2]] == ["authored-b", "authored-a"]
+    assert scene.reference_lane_recipes[2].lane_id not in {"authored-b", "authored-a", ""}
