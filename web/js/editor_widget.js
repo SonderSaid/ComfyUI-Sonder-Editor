@@ -9484,8 +9484,9 @@ export class EditorWidget {
         }
 
         // Take-aware drop: if asset has take_metadata, auto-place at original position
-        if (asset.generation_params?.selection_start !== undefined && asset.generation_params?.scene_id === this.activeScene.scene_id) {
-            frame = asset.generation_params.selection_start;
+        const generation = asset.generation_summary || asset.generation_params;
+        if (generation?.selection_start !== undefined && generation?.scene_id === this.activeScene.scene_id) {
+            frame = generation.selection_start;
         }
 
         if (asset.asset_type === "image" && this._isGuideTrackLocked()) {
@@ -13390,16 +13391,11 @@ export class EditorWidget {
     async _fetchPromptHistory() {
         const dirName = this._projectDirName();
         if (!dirName) return [];
-        try {
-            const resp = await fetch(api.apiURL(`/sonder-editor/project/${encodeURIComponent(dirName)}`));
-            if (!resp.ok) return [];
-            const data = await resp.json();
-            const history = data?.metadata?.prompt_history;
-            return Array.isArray(history) ? history.slice().reverse() : [];
-        } catch (e) {
-            console.warn("[Sonder] Failed to fetch prompt history:", e);
-            return [];
-        }
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${encodeURIComponent(dirName)}/prompt-history`));
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data?.error || "Prompt history could not be loaded.");
+        if (!Array.isArray(data)) throw new Error("Prompt history response is invalid.");
+        return data.slice().reverse();
     }
 
     _reconcilePromptSetupIdentityCreates(entry, intents, expectedSections) {
@@ -18321,7 +18317,11 @@ export class EditorWidget {
                 this._exportNotif.resolve({ tier: "error", message: error?.message || "Export failed." });
                 this._exportNotif = null;
             }
-            ui.errorEl.textContent = error?.message || "Export failed.";
+            ui.requestError = error?.message === "export_running"
+                ? "An export is already running. Wait for it to finish before starting another."
+                : (error?.message || "Export failed.");
+            ui.errorEl.textContent = ui.requestError;
+            ui.progressEl.textContent = "";
             this._restoreExportControls(ui);
         } finally {
             if (this._exportStartDiagnostics === startDiagnostics) {
@@ -18371,7 +18371,9 @@ export class EditorWidget {
                     this._exportNotif.resolve({ tier: "error", message: error?.message || "Export failed." });
                     this._exportNotif = null;
                 }
-                ui.errorEl.textContent = error?.message || "Export failed.";
+                ui.requestError = error?.message || "Export failed.";
+                ui.errorEl.textContent = ui.requestError;
+                ui.progressEl.textContent = "";
                 this._restoreExportControls(ui);
             }
         }, 650);

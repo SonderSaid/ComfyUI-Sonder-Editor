@@ -718,7 +718,8 @@ def resolve_source_color_interpretation(asset=None, abs_path: str = "", *, allow
     if interpretation is None or isinstance(interpretation, tuple):
         return interpretation
 
-    generation_params = getattr(asset, "generation_params", None) or {} if asset is not None else {}
+    generation_params = (asset.inline_generation_params if hasattr(asset, "inline_generation_params")
+                         else (getattr(asset, "generation_params", None) or {})) if asset is not None else {}
     is_self_encode = bool(
         generation_params.get("save_preset")
         or (generation_params.get("codec") and generation_params.get("pix_fmt"))

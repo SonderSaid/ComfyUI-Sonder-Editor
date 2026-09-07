@@ -437,7 +437,7 @@ function buildExportPanel(host) {
         linkedTakePlacement.disabled = !placeAsTake.checked;
         takePlacementMuted.disabled = !placeAsTake.checked;
         const valid = includeVideo.checked || includeAudio.checked;
-        errorEl.textContent = valid ? "" : "Enable video or audio to export";
+        errorEl.textContent = valid ? (ui.requestError || "") : "Enable video or audio to export";
         exportBtn.disabled = !valid;
         setButtonVariant(exportBtn, valid ? "primary" : "muted");
     };
@@ -447,9 +447,8 @@ function buildExportPanel(host) {
     includeVideo.addEventListener("change", syncState);
     includeAudio.addEventListener("change", syncState);
     placeAsTake.addEventListener("change", syncState);
+    const ui = { errorEl, progressEl, controls, exportBtn, closeBtn, cancelBtn, syncState, requestError: "" };
     syncState();
-
-    const ui = { errorEl, progressEl, controls, exportBtn, closeBtn, cancelBtn, syncState };
 
     exportBtn.addEventListener("click", async () => {
         const sceneDuration = Math.max(0, parseInt(host.activeScene?.duration_frames, 10) || 0);
@@ -478,6 +477,7 @@ function buildExportPanel(host) {
         closeBtn.disabled = true;
         progressEl.style.display = "";
         progressEl.textContent = "Starting export...";
+        ui.requestError = "";
         errorEl.textContent = "";
         cancelBtn.textContent = "Cancel Export";
         cancelBtn.onclick = () => host._cancelTimelineExport(progressEl);

@@ -17,6 +17,20 @@ ROOT = Path(__file__).resolve().parents[1]
 TEST_PACKAGE = "video_editor_testpkg"
 
 
+def test_save_bridge_resolves_completed_split_queue_job(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    pm = importlib.import_module(f"{TEST_PACKAGE}.server.project_manager")
+    ts = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+    project = pm.create_project("Terminal snapshot", base_dir=str(tmp_path))
+    project.generation_queue = [ts.GenerationJob(job_id="terminal", status="completed",
+        params={"snapshot_version": 1}, prompt_sections=[{"prompt": "kept"}])]
+    pm.save_project(project, notify=False)
+    loaded = pm.load_project(project.project_dir)
+    resolved = io_nodes._find_queue_job(loaded, "terminal")
+    assert resolved.status == "completed"
+    assert resolved.prompt_sections == [{"prompt": "kept"}]
+
+
 def _import_io_nodes(tmp_path, monkeypatch):
     pytest.importorskip("torch")
     pytest.importorskip("cv2")
@@ -239,6 +253,7 @@ def test_bridge_upgrades_blank_same_path_placeholder(tmp_path, monkeypatch):
     assert [asset.asset_id for asset in same_path] == ["auto-sync-placeholder"]
     upgraded = same_path[0]
     assert upgraded.folder == "Test Transfer"
+    importlib.import_module(f"{TEST_PACKAGE}.server.project_storage").hydrate_asset(upgraded)
     assert upgraded.generation_params["editor_export"]["produced_by"]["tool"] == "sonder-editor"
 
 
@@ -256,6 +271,7 @@ def test_bridge_marks_asset_workflow_when_downstream_file_embeds_it(tmp_path, mo
     io_nodes._finalize_prompt_bridges(prompt_key)
 
     restored = _load_saved_project(project_manager, project)
+    importlib.import_module(f"{TEST_PACKAGE}.server.project_storage").hydrate_asset(restored.assets[0])
     editor_export = restored.assets[0].generation_params["editor_export"]
     assert editor_export["has_embedded_workflow"] is True
     assert "workflow_sha256" in editor_export
@@ -287,6 +303,7 @@ def test_bridge_section_display_type_propagates(tmp_path, monkeypatch):
     io_nodes._finalize_prompt_bridges(prompt_key)
 
     restored = _load_saved_project(project_manager, project)
+    importlib.import_module(f"{TEST_PACKAGE}.server.project_storage").hydrate_asset(restored.assets[0])
     tracked = restored.assets[0].generation_params["editor_export"]["tracked_metadata"]
     assert tracked[0]["display_type"] == "power_loras"
     assert tracked[0]["fields"]["power_loras"][0]["name"] == "a.safetensors"

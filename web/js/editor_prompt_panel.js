@@ -4693,6 +4693,8 @@ Server value: ${serverValue}` : ""}`;
                     item.append(row, detail);
                     historyWrap.appendChild(item);
                 }
+            } catch (error) {
+                historyWrap.textContent = `History unavailable: ${error.message || error}`;
             } finally {
                 historyBtn.disabled = false;
             }

@@ -136,6 +136,7 @@ function emit(state, demand, kind, details = {}) {
 }
 
 function demandCanJoin(active, incoming) {
+    if (!(incoming.provenanceIds || []).every((id) => (active.provenanceIds || []).includes(id))) return false;
     if (active.waveId !== incoming.waveId) return false;
     if (active.epoch !== incoming.epoch) return false;
     if (MODE_RANK[active.mode] < MODE_RANK[incoming.mode]) return false;
@@ -146,6 +147,7 @@ function demandCanJoin(active, incoming) {
 
 function mergeDemand(target, incoming) {
     if (!target) return incoming;
+    target.provenanceIds = [...new Set([...(target.provenanceIds || []), ...(incoming.provenanceIds || [])])];
     target.waveId = incoming.waveId;
     target.unknownVersion = incoming.unknownVersion;
     target.requiredVersion = maxVersion(target.requiredVersion, incoming.requiredVersion);
@@ -167,6 +169,7 @@ function mergeDemand(target, incoming) {
 
 function resultSatisfiesDemand(result, demand, state) {
     if (!result || result.error) return false;
+    if (!(demand.provenanceIds || []).every((id) => (result.provenanceIds || []).includes(id))) return false;
     if (result.epoch < demand.epoch || result.epoch < state.mutationEpoch) return false;
     if (MODE_RANK[result.mode] < MODE_RANK[demand.mode]) return false;
     if (demand.mode === "sync" && result.policySignature !== demand.policySignature) return false;
@@ -191,20 +194,39 @@ function pruneExhausted(state, now = Date.now()) {
     }
 }
 
-function defaultRequest(demand) {
+async function defaultRequest(demand) {
     const api = window.comfyAPI.api.api;
     const query = demand.policySignature;
     const url = api.apiURL(
         `/sonder-editor/project/${encodeURIComponent(demand.projectId)}/assets${demand.mode === "sync" ? "/sync" : ""}?${query}`,
     );
-    if (demand.mode === "sync") {
-        return postProjectJsonWithReconcile(
+    const result = demand.mode === "sync"
+        ? await postProjectJsonWithReconcile(
             url,
             { method: "POST" },
             { projectId: demand.projectId },
-        );
+        )
+        : await fetchProjectJson(url, {}, { projectId: demand.projectId });
+    const provenance = {};
+    const listed = new Map((result.payload?.assets || []).map((asset) => [asset.asset_id, asset.provenance_revision]));
+    // Bounded sequential requests share this pass's mutation epoch and follow-up
+    // ownership. Never run a separate provenance coordinator beside assets.
+    const ids = (demand.provenanceIds || []).filter((id) => listed.has(id));
+    for (let offset = 0; offset < ids.length; offset += 64) {
+        const batch = ids.slice(offset, offset + 64);
+        const query = new URLSearchParams();
+        for (const id of batch) query.append("asset_id", id);
+        const detail = await fetchProjectJson(api.apiURL(
+            `/sonder-editor/project/${encodeURIComponent(demand.projectId)}/assets/provenance?${query}`),
+            {}, { projectId: demand.projectId });
+        if (!batch.every((id) => detail.payload.revisions?.[id] === listed.get(id))) {
+            const error = new Error("Assets changed while loading provenance; retry the refresh.");
+            error.code = "asset_provenance_changed";
+            throw error;
+        }
+        Object.assign(provenance, detail.payload.provenance);
     }
-    return fetchProjectJson(url, {}, { projectId: demand.projectId });
+    return { ...result, payload: { ...result.payload, provenance } };
 }
 
 export function createAssetRefreshCoordinator({
@@ -325,6 +347,7 @@ export function createAssetRefreshCoordinator({
             }
 
             const result = {
+                provenanceIds: demand.provenanceIds || [],
                 payload,
                 response,
                 projectId: state.projectId,
@@ -411,6 +434,7 @@ export function createAssetRefreshCoordinator({
         const waiter = deferred();
         const policy = policyFromInput(input.policy);
         const demand = {
+            provenanceIds: [...new Set((input.provenanceIds || []).map(String))],
             projectId,
             mode,
             waveId,
@@ -464,6 +488,7 @@ export function createAssetRefreshCoordinator({
         mutationEpochs.set(normalized, state.mutationEpoch);
         if (state.active) {
             const followup = {
+                provenanceIds: [...(state.active.provenanceIds || []), ...(state.pending?.provenanceIds || [])],
                 projectId: normalized,
                 mode: "read",
                 waveId: allocateAssetRefreshWave(`mutation-${state.mutationEpoch}`),

@@ -1,4 +1,7 @@
 import json
+import copy
+import hashlib
+import io
 import os
 import logging
 import threading
@@ -9,12 +12,14 @@ from typing import Callable
 
 from .atomic_io import atomic_replace
 from . import external_links
+from . import project_storage
 from .path_security import path_within
 from .timeline_state import TimelineProject, project_prompt_fields_with_unknowns
 
 logger = logging.getLogger("sonder_editor")
 
 PROJECT_SUBDIRS = [
+    "state",
     "media",
     os.path.join("media", "Exports"),
     "renders",
@@ -59,7 +64,7 @@ def _project_write_lock(project_dir: str) -> threading.Lock:
         return lock
 
 
-def _read_project_json(project_file: str) -> dict:
+def _read_project_json(project_file: str, *, signature_out=None, version_source=None) -> dict:
     """Read one project file through a short Windows sharing-violation retry.
 
     The caller owns the canonical per-project lock when it participates in a
@@ -74,7 +79,20 @@ def _read_project_json(project_file: str) -> dict:
             time.sleep(delay)
         try:
             with open(project_file, "r", encoding="utf-8") as f:
-                return json.load(f)
+                if signature_out is None and version_source is None:
+                    return json.load(f)
+                text = f.read()
+                digest = hashlib.sha256(text.encode("utf-8")).digest()
+                known = getattr(version_source, "_validated_document", None)
+                # This is proof of byte-equivalence to a fully parsed/published
+                # document, never a second version authority. Changed bytes,
+                # including malformed JSON with a matching version, parse fully.
+                if known is not None and digest == known[0]:
+                    return {"modified_at": known[1]}
+                data = json.load(io.StringIO(text))
+                if signature_out is not None:
+                    signature_out.append((digest, str(data.get("modified_at", "") or "")))
+                return data
         except PermissionError as exc:
             if first_error is None:
                 first_error = exc
@@ -211,11 +229,15 @@ def save_project(
         current_data = None
         if expected_modified_at:
             if os.path.isfile(project_file):
-                current_data = _read_project_json(project_file)
+                current_data = _read_project_json(project_file, version_source=project)
                 actual_modified_at = str(current_data.get("modified_at", "") or "")
             else:
                 actual_modified_at = ""
             if actual_modified_at != expected_modified_at:
+                # A cached equal-byte read contains only the version; the
+                # conflict's healing projection still needs its complete source.
+                if os.path.isfile(project_file):
+                    current_data = _read_project_json(project_file)
                 raise ProjectVersionConflict(
                     project_dir=project.project_dir,
                     expected_modified_at=expected_modified_at,
@@ -226,6 +248,17 @@ def save_project(
         if bump_modified_at:
             project.modified_at = datetime.now().isoformat()
         data = project.to_dict(include_internal=True)
+        # Bare writers also re-read the root: a model loaded before migration
+        # must never roll its frozen descriptors back to an inline layout.
+        if (not expected_modified_at or "storage" in data
+                or getattr(project, "_staged_components", {})
+                or bool(data.get("generation_queue"))
+                or any(asset.get("generation_params") for asset in data.get("assets", []))
+                or "prompt_history" in data.get("metadata", {})
+                or (current_data and "storage" in current_data)):
+            current_data = _read_project_json(project_file) if os.path.isfile(project_file) else {}
+            data = project_storage.assemble_for_save(
+                project, data, current_data, bump_modified_at=bump_modified_at)
         # One authoritative encode owns both persistence and compatibility
         # shadow normalization. Pretty printing is deliberately retained; the
         # incidents this path protects were diagnosed from readable files.
@@ -237,7 +270,12 @@ def save_project(
             # string subsequently parsed into the compatibility shadow.
             with open(tmp_file, "w", encoding="utf-8", newline="") as f:
                 f.write(serialized)
+                if "storage" in data:
+                    f.flush()
+                    os.fsync(f.fileno())
             atomic_replace(tmp_file, project_file)
+            if "storage" in data:
+                project_storage.sync_directory(project.project_dir)
         finally:
             # atomic_replace removes its temp after exhausted PermissionError,
             # but a partial write or unrelated OSError used to leak a full-size
@@ -254,8 +292,70 @@ def save_project(
         # failed CAS/write must not make unsaved state look durable in memory.
         if hasattr(project, "_raw_data"):
             project._raw_data = json.loads(serialized)
+        project._validated_document = (
+            hashlib.sha256(serialized.encode("utf-8")).digest(),
+            str(data.get("modified_at", "") or ""),
+        )
+        if "storage" in data:
+            project.metadata.pop("prompt_history", None)
+            project._staged_components = {}
+            for job in project.generation_queue:
+                descriptor = data["storage"]["components"].get(project_storage.job_component_name(job.job_id))
+                if descriptor is not None:
+                    job._frozen_descriptor = descriptor
+                    if not getattr(job, "_frozen_unhydrated", False):
+                        job._frozen_original = {
+                            field: copy.deepcopy(getattr(job, field))
+                            for field in project_storage.FROZEN_JOB_FIELDS}
+            for asset in project.assets:
+                descriptor = data["storage"]["components"].get(project_storage.asset_component_name(asset.asset_id))
+                if descriptor is not None:
+                    prior_descriptor = getattr(asset, "_generation_descriptor", None)
+                    if (prior_descriptor is None and getattr(asset, "_generation_base_known", False)
+                            and asset.generation_params_for_storage == getattr(asset, "_generation_original", None)):
+                        # A captured absence is a real base, not an undeclared
+                        # legacy payload. An unrelated save cannot rebase it.
+                        continue
+                    if prior_descriptor is None and not getattr(asset, "_generation_unhydrated", False):
+                        cold_bytes = json.dumps({key: value for key, value in asset.generation_params.items()
+                            if key not in project_storage.INLINE_GENERATION_PARAM_KEYS},
+                            ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                        cold_hash = hashlib.sha256(cold_bytes).hexdigest()
+                        if cold_hash != descriptor["sha256"]:
+                            # A pre-migration model retained someone else's
+                            # component. Its full inline payload still has the
+                            # old content identity and must not acquire new CAS
+                            # authority merely through an unrelated save.
+                            asset._generation_descriptor = {
+                                "path": f"state/{project_storage.asset_component_name(asset.asset_id)}-{cold_hash}.json",
+                                "sha256": cold_hash, "bytes": len(cold_bytes)}
+                            asset._generation_original = copy.deepcopy(asset.generation_params)
+                            asset._generation_project_dir = project.project_dir
+                            continue
+                    if (prior_descriptor is not None and prior_descriptor != descriptor
+                            and (getattr(asset, "_generation_unhydrated", False)
+                                 or asset.generation_params == getattr(asset, "_generation_original", None))):
+                        # Adoption of an undeclared disk component does not
+                        # certify this model's older payload as its contents.
+                        # Keep the matching base so a later edit conflicts.
+                        continue
+                    asset._generation_descriptor = copy.deepcopy(descriptor)
+                    asset._generation_base_known = True
+                    asset._generation_project_dir = project.project_dir
+                    if not getattr(asset, "_generation_unhydrated", False):
+                        asset._generation_original = copy.deepcopy(asset.generation_params)
+                else:
+                    if (getattr(asset, "_generation_descriptor", None) is not None
+                            and asset.generation_params_for_storage == getattr(asset, "_generation_original", None)):
+                        continue
+                    if hasattr(asset, "_generation_descriptor"):
+                        del asset._generation_descriptor
+                    asset._generation_base_known = True
+                    asset._generation_original = copy.deepcopy(asset.generation_params_for_storage)
         if hasattr(project, "_expected_modified_at"):
             setattr(project, "_expected_modified_at", getattr(project, "modified_at", ""))
+        from .project_storage_lifecycle import pin_project
+        pin_project(project)
     # #36 diagnostic: every save with the caller's immediate stack frame so the diag ring
     # shows WHO bumped modified_at. Pairs with `project_version_conflict_409` events to
     # trace concurrent writers. Lazy import avoids circular dependency at module load.
@@ -291,9 +391,16 @@ def load_project(project_dir: str) -> TimelineProject:
         raise FileNotFoundError(f"No project.json found in {project_dir}")
 
     with _project_write_lock(project_dir):
-        data = _read_project_json(project_file)
+        signature = []
+        data = _read_project_json(project_file, signature_out=signature)
+        project_storage.validate_storage(project_dir, data)
 
-    project = TimelineProject.from_dict(data, project_dir=project_dir)
+        project = TimelineProject.from_dict(data, project_dir=project_dir)
+        project_storage.attach_job_descriptors(project, data)
+        project_storage.attach_asset_descriptors(project, data)
+        project._validated_document = signature[0]
+        from .project_storage_lifecycle import pin_project
+        pin_project(project)
 
     # Ensure subdirectories exist (in case of manual moves)
     for subdir in PROJECT_SUBDIRS:

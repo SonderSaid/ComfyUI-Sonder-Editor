@@ -202,7 +202,8 @@ def _filtered_guides(project):
     if queue_job_id:
         for job in getattr(project, "generation_queue", []) or []:
             if getattr(job, "job_id", "") == queue_job_id:
-                queue_job = job
+                from ..server.project_storage import hydrate_job
+                queue_job = hydrate_job(project, job)
                 break
 
     snapshot_version = _queue_snapshot_version(queue_job) if queue_job else 0

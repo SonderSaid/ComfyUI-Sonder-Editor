@@ -97,10 +97,8 @@ def _find_queue_job(project):
     job_id = str(context.get("queue_job_ref_id", "") or "")
     if not job_id:
         return None
-    return next(
-        (job for job in (getattr(project, "generation_queue", []) or []) if getattr(job, "job_id", "") == job_id),
-        None,
-    )
+    from ..server.project_storage import resolve_queue_job
+    return resolve_queue_job(project, job_id)
 
 
 def _snapshot_catalog_project(project, job):

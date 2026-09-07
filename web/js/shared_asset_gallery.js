@@ -37,6 +37,7 @@ import {
 import { resolveInspectOverlayScope } from "./inspect_overlay_scope.js";
 import { mountMediaScrubBar } from "./media_scrub_bar.js";
 import { openContextMenu } from "./editor_context_menu.js";
+import { requestProjectAssetRefresh, getProjectAssetMutationEpoch } from "./asset_refresh_coordinator.js";
 
 const DEFAULT_SORT_MODE = DEFAULT_EDITOR_SETTINGS.gallery.sortMode;
 const DEFAULT_GALLERY_TAB = DEFAULT_EDITOR_SETTINGS.gallery.activeTab;
@@ -475,6 +476,10 @@ function editorExportFor(asset) {
 }
 
 function embeddedWorkflowFlag(asset) {
+    if (asset?.generation_summary) {
+        const flag = asset.generation_summary.has_embedded_workflow;
+        return typeof flag === "boolean" ? flag : null;
+    }
     const value = editorExportFor(asset).has_embedded_workflow;
     return typeof value === "boolean" ? value : null;
 }
@@ -565,7 +570,7 @@ function trackedFieldMatches(asset, name, value) {
 }
 
 function canOpenWorkflowFor(asset) {
-    if (editorExportFor(asset).has_embedded_workflow) return true;
+    if (embeddedWorkflowFlag(asset) === true) return true;
     return new Set(["png", "mp4", "m4v", "mov", "mkv"]).has(assetExtension(asset));
 }
 
@@ -712,6 +717,63 @@ function makeSectionTitle(label) {
 }
 
 export function mountSharedAssetGallery(container, options = {}) {
+    let provenancePending = null;
+    let provenanceGeneration = 0;
+    let provenanceProjectDir = null;
+    let dataProjectDir = null;
+    let provenanceError = "";
+    const provenanceErrors = new Map();
+    const provenanceKey = (asset) => `${asset?.asset_id}:${asset?.provenance_revision}`;
+
+    function syncProvenanceProject() {
+        const projectDir = currentProjectDir();
+        if (provenanceProjectDir !== projectDir) {
+            provenanceProjectDir = projectDir;
+            provenanceGeneration++;
+            provenancePending = null;
+            provenanceErrors.clear();
+            provenanceError = "";
+        }
+        return projectDir;
+    }
+
+    function ensureProvenance(assets) {
+        const projectDir = syncProvenanceProject();
+        const needed = (assets || []).filter((asset) => asset?.provenance_revision && !asset.generation_params
+            && !provenanceErrors.has(provenanceKey(asset)));
+        if (!needed.length || provenancePending || state.destroyed) return;
+        const projectId = projectIdFromDir(projectDir);
+        if (!projectId) return;
+        const generation = ++provenanceGeneration;
+        const isCurrent = () => !state.destroyed && currentProjectDir() === projectDir
+            && provenanceGeneration === generation;
+        const ids = needed.map((asset) => asset.asset_id);
+        provenancePending = requestProjectAssetRefresh({ projectId, provenanceIds: ids,
+            reason: "gallery-provenance" });
+        provenancePending.then((result) => {
+            if (!isCurrent()
+                || result.epoch !== getProjectAssetMutationEpoch(projectId)) return;
+            for (const asset of result.payload.assets || []) {
+                if (Object.prototype.hasOwnProperty.call(result.payload.provenance || {}, asset.asset_id)) {
+                    asset.generation_params = result.payload.provenance[asset.asset_id];
+                }
+            }
+            provenanceError = "";
+            setData(result.payload);
+        }).catch((error) => {
+            if (!isCurrent()) return;
+            provenanceError = error.message || String(error);
+            for (const asset of needed) provenanceErrors.set(provenanceKey(asset), provenanceError);
+            notifyError(`Metadata unavailable: ${provenanceError}`);
+        }).finally(() => {
+            if (!isCurrent()) return;
+            provenancePending = null;
+            if (!state.destroyed) {
+                render();
+                if (state.overlayState.open) renderInspectOverlay();
+            }
+        });
+    }
     const initialSettings = getEditorSettings();
     const initialInspectorSettings = initialSettings.inspector || DEFAULT_INSPECTOR_SETTINGS;
     const ownerId = typeof options.ownerId === "string" && options.ownerId
@@ -2679,6 +2741,13 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     function renderTrackedMetadataSection(asset, options = {}) {
+        if (asset?.provenance_revision && !asset.generation_params) {
+            ensureProvenance([asset]);
+            const message = document.createElement("div");
+            const error = provenanceErrors.get(provenanceKey(asset));
+            message.textContent = error ? `Metadata unavailable: ${error}` : "Loading metadata…";
+            return message;
+        }
         const entries = trackedMetadataEntries(asset);
         if (!entries.length) return null;
         const surface = options.surface || "fullscreen";
@@ -2959,6 +3028,13 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     function renderGenerationSection(asset) {
+        if (asset?.provenance_revision && !asset.generation_params) {
+            ensureProvenance([asset]);
+            const message = document.createElement("div");
+            const error = provenanceErrors.get(provenanceKey(asset));
+            message.textContent = error ? `Metadata unavailable: ${error}` : "Loading metadata…";
+            return message;
+        }
         const wrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;`);
         if (asset.prompt) {
             wrap.appendChild(makeSectionTitle("Prompt"));
@@ -3157,7 +3233,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     function assetFps(asset) {
         const candidates = [
             asset?.metadata?.fps,
-            asset?.generation_params?.fps,
+            asset?.generation_summary?.fps ?? asset?.generation_params?.fps,
             asset?.fps,
         ];
         for (const value of candidates) {
@@ -6367,6 +6443,10 @@ export function mountSharedAssetGallery(container, options = {}) {
 
     function render() {
         if (state.destroyed) return;
+        const metadataQuery = parseAssetSearchQuery(state.query);
+        if (metadataQuery.trackedTerms.length || metadataQuery.fieldTerms.length) {
+            ensureProvenance(data.assets);
+        }
         ensureProjectPrefs();
         refreshCurrentSceneAssetIdsFromHost();
         updateControlState();
@@ -6608,7 +6688,10 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         if (!renderedAnything) {
             const empty = style(document.createElement("div"), `padding:10px;border-radius:6px;background:${THEME.bg2};color:${THEME.fg2};font-size:10px;`);
-            empty.textContent = data.assets.length ? "No assets match the current filter." : "No assets in this project yet. Drag files here or use Import.";
+            const metadataSearch = metadataQuery.trackedTerms.length || metadataQuery.fieldTerms.length;
+            empty.textContent = metadataSearch && provenanceError ? `Metadata search unavailable: ${provenanceError}`
+                : metadataSearch && provenancePending ? "Loading metadata for search…"
+                : data.assets.length ? "No assets match the current filter." : "No assets in this project yet. Drag files here or use Import.";
             listScroller.appendChild(empty);
         }
 
@@ -6689,6 +6772,8 @@ export function mountSharedAssetGallery(container, options = {}) {
         render();
     });
     searchInput.addEventListener("input", () => {
+        provenanceError = "";
+        provenanceErrors.clear();
         state.query = searchInput.value || "";
         state.allowAutoFocus = true;
         render();
@@ -6889,7 +6974,9 @@ export function mountSharedAssetGallery(container, options = {}) {
             extension: asset?.extension || "",
             media_probe_signature: asset?.media_probe_signature || "",
             imported_at: asset?.imported_at || "",
-            generation_params: asset?.generation_params || {},
+            provenance_revision: asset?.provenance_revision || "",
+            generation_summary: asset?.generation_summary || {},
+            generation_params: asset?.provenance_revision ? undefined : (asset?.generation_params || {}),
         });
     }
 
@@ -6996,13 +7083,22 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     function setData(nextData) {
+        syncProvenanceProject();
         const payload = Array.isArray(nextData) ? { assets: nextData, folders: [] } : (nextData || {});
         if (Object.prototype.hasOwnProperty.call(payload, "currentSceneAssetIds")) {
             state.currentSceneAssetIds = normalizeAssetIdSet(payload.currentSceneAssetIds);
         }
-        const previousAssets = data.assets;
-        const previousFolders = data.folders;
+        const sameProject = dataProjectDir === currentProjectDir();
+        dataProjectDir = currentProjectDir();
+        const previousAssets = sameProject ? data.assets : [];
+        const previousFolders = sameProject ? data.folders : [];
         const nextAssets = Array.isArray(payload.assets) ? [...payload.assets] : [];
+        for (const asset of nextAssets) {
+            const previous = previousAssets.find((entry) => entry.asset_id === asset.asset_id);
+            if (!asset.generation_params && asset.provenance_revision && previous?.provenance_revision === asset.provenance_revision
+                && previous.generation_params) asset.generation_params = previous.generation_params;
+        }
+        provenanceError = "";
         const nextFolders = Array.isArray(payload.folders) ? payload.folders.map(normalizeFolderName).filter(Boolean) : [];
         const additiveAssets = additiveRefreshAssets(previousAssets, nextAssets, previousFolders, nextFolders);
         data.assets = nextAssets;

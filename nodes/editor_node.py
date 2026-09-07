@@ -665,11 +665,12 @@ class SonderEditor:
 
     @staticmethod
     def _peek_queue_job(proj: TimelineProject):
+        from ..server.project_storage import hydrate_job
         queue = getattr(proj, "generation_queue", []) or []
         for desired_status in ("running", "pending"):
             for job in queue:
                 if (getattr(job, "status", "pending") or "pending").lower() == desired_status:
-                    return job
+                    return hydrate_job(proj, job)
         return None
 
     def _consume_queue_job(self, proj: TimelineProject):
@@ -700,7 +701,8 @@ class SonderEditor:
                     last_conflict = exc
                     proj = load_project(proj.project_dir)
                     break
-                return proj, job
+                from ..server.project_storage import hydrate_job
+                return proj, hydrate_job(proj, job)
             else:
                 return proj, None
         raise RuntimeError("Queue job claim conflicted with an editor save; retry the prompt.") from last_conflict

@@ -329,7 +329,8 @@ def _find_queue_job(project, queue_job_id: str):
         return None
     for job in getattr(project, "generation_queue", []) or []:
         if getattr(job, "job_id", "") == queue_job_id:
-            return job
+            from ..server.project_storage import hydrate_job
+            return hydrate_job(project, job)
     return None
 
 

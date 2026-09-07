@@ -503,7 +503,8 @@ def test_versioned_media_sync_does_not_stale_overwrite_generated_registration(tm
     ]
     assert [asset.asset_id for asset in same_path] == ["bridge-asset"]
     assert same_path[0].folder == "Test Transfer"
-    assert same_path[0].generation_params["editor_export"]["produced_by"]["node"] == "SonderSaveBridge"
+    from server.project_storage import hydrate_asset
+    assert hydrate_asset(same_path[0]).generation_params["editor_export"]["produced_by"]["node"] == "SonderSaveBridge"
     assert result.get_asset("bridge-asset") is not None
 
 

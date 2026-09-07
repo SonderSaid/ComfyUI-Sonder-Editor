@@ -281,6 +281,25 @@ def project_media_root(project_or_dir, *, must_exist: bool = False) -> str:
     )
 
 
+def project_state_root(project_or_dir, *, must_exist: bool = False) -> str:
+    return _project_subroot(project_or_dir, "state", purpose="project state root",
+                            must_exist=must_exist)
+
+
+def project_state_path(project_or_dir, relative_path: str, *, must_exist=False) -> str:
+    root = project_state_root(project_or_dir)
+    if not root:
+        return ""
+    try:
+        rel = normalize_project_relative_path(relative_path)
+    except PathSecurityError:
+        return ""
+    if rel.startswith("state/"):
+        rel = rel[6:]
+    return resolve_under_root(root, rel, purpose="project state component",
+                              must_exist=must_exist)
+
+
 def project_cache_root(project_or_dir, *, must_exist: bool = False) -> str:
     return _project_subroot(
         project_or_dir,

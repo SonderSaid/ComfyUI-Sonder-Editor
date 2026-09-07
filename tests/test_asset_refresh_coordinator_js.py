@@ -71,6 +71,31 @@ console.log(JSON.stringify({{
     assert len(set(result["requestIds"])) == 1
 
 
+def test_provenance_demand_unions_followup_and_survives_mutation_epoch():
+    script = f"""
+const {{ createAssetRefreshCoordinator }} = await import({json.dumps(MODULE_URL)});
+const pending = [], calls = [];
+const coordinator = createAssetRefreshCoordinator({{
+    getLiveVersion: () => "",
+    request: demand => new Promise(resolve => {{
+        calls.push([...demand.provenanceIds]); pending.push(resolve);
+    }}),
+}});
+const first = coordinator.request({{projectId:'p', waveId:'one', provenanceIds:['a']}});
+const second = coordinator.request({{projectId:'p', waveId:'one', provenanceIds:['b']}});
+coordinator.markMutation('p');
+pending.shift()({{payload:{{assets:[]}}, response:{{status:200,headers:{{get:()=>''}}}}}});
+await new Promise(resolve=>setTimeout(resolve,0));
+pending.shift()({{payload:{{assets:[]}}, response:{{status:200,headers:{{get:()=>''}}}}}});
+const result=await Promise.all([first,second]);
+console.log(JSON.stringify({{calls, epochs:result.map(r=>r.epoch)}}));
+"""
+    result = _run_node(script)
+    assert result["calls"][0] == ["a"]
+    assert set(result["calls"][1]) == {"a", "b"}
+    assert result["epochs"] == [1, 1]
+
+
 def test_newer_version_and_sync_policy_schedule_single_followup():
     script = f"""
 const {{ createAssetRefreshCoordinator }} = await import({json.dumps(MODULE_URL)});

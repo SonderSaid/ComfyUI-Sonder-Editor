@@ -669,7 +669,8 @@ def test_timeline_export_non_take_writes_under_media_exports(tmp_path, monkeypat
     assert asset.folder == "Exports"
     assert asset.path.replace("\\", "/").startswith("media/Exports/")
     assert os.path.isfile(project_dir / asset.path)
-    assert "editor_export" in asset.generation_params
+    from server.project_storage import hydrate_asset
+    assert "editor_export" in hydrate_asset(asset).generation_params
 
 
 def test_timeline_export_registration_reuses_same_path_asset(tmp_path, monkeypatch):

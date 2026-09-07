@@ -58,7 +58,8 @@ def _find_ref_job(project):
         return None
     for job in getattr(project, "generation_queue", []) or []:
         if getattr(job, "job_id", "") == job_id:
-            return job
+            from ..server.project_storage import hydrate_job
+            return hydrate_job(project, job)
     return None
 
 

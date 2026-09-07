@@ -412,6 +412,8 @@ def _place_video_take(
     fit_mode: str = DEFAULT_FIT_MODE,
     crop_position: str = DEFAULT_CROP_POSITION,
 ) -> ClipReference:
+    from .project_storage import hydrate_asset
+    hydrate_asset(asset)
     total_frames = max(1, int(asset.frame_count or (end - start) or 1))
     existing_lanes = [int(getattr(clip, "track_index", 0) or 0) for clip in getattr(scene, "clips", [])]
     new_lane = (max(existing_lanes) if existing_lanes else -1) + 1
@@ -578,6 +580,8 @@ def _register_export_asset(
     asset.sample_rate = int(technical_metadata.get("sample_rate", 0) or 0)
     asset.has_audio = bool(technical_metadata.get("has_audio", False))
     asset.folder = _normalize_asset_folder(folder)
+    from .project_storage import hydrate_asset
+    hydrate_asset(asset)
     asset.generation_params = dict(generation_params)
     if asset.folder:
         _ensure_asset_folder(project, asset.folder)

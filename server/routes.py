@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import copy
 import json
 import logging
@@ -177,6 +178,11 @@ _SONDER_CSP = (
 try:
     from server import PromptServer
     routes = PromptServer.instance.routes
+    app = getattr(PromptServer.instance, "app", None)
+    if app is not None:
+        from .project_storage_lifecycle import start_storage_maintenance, stop_storage_maintenance
+        app.on_startup.append(start_storage_maintenance)
+        app.on_cleanup.append(stop_storage_maintenance)
 except Exception:
     routes = None
     logger.warning("PromptServer not available — Sonder Editor API routes disabled")
@@ -4646,7 +4652,8 @@ def _record_prompt_history(project: TimelineProject, jobs: list) -> None:
 
     if not isinstance(getattr(project, "metadata", None), dict):
         return
-    history = project.metadata.get("prompt_history")
+    from .project_storage import read_prompt_history, stage_prompt_history
+    history = read_prompt_history(project)
     if not isinstance(history, list):
         history = []
 
@@ -4777,6 +4784,7 @@ def _record_prompt_history(project: TimelineProject, jobs: list) -> None:
     if len(history) > PROMPT_HISTORY_CAP:
         history = history[-PROMPT_HISTORY_CAP:]
     project.metadata["prompt_history"] = history
+    stage_prompt_history(project, history)
 
 
 def _queue_payload(project: TimelineProject) -> list[dict]:
@@ -6182,10 +6190,20 @@ def _asset_payload(
     project: TimelineProject,
     asset: Asset,
     *,
+    lean: bool = False,
     media_snapshot: dict[str, dict] | None = None,
     thumbnail_snapshot: dict[str, dict] | None = None,
 ) -> dict:
-    payload = asset.to_dict()
+    from .project_storage import generation_summary, INLINE_GENERATION_PARAM_KEYS, provenance_revision
+    payload = asset.to_dict(include_provenance=not lean)
+    params = payload.pop("generation_params", {})
+    if not lean:
+        payload["generation_params"] = params
+    payload["generation_summary"] = {**{key: value for key, value in params.items() if key in INLINE_GENERATION_PARAM_KEYS}, **(
+        dict(getattr(asset, "_generation_summary", {}))
+        if getattr(asset, "_generation_unhydrated", False) else generation_summary(params))}
+    descriptor = getattr(asset, "_generation_descriptor", None)
+    payload["provenance_revision"] = provenance_revision(params, payload["generation_summary"], descriptor)
     source_path = _asset_abspath(project, asset)
     source_rel = _normalize_project_relpath(getattr(asset, "path", "") or "")
     cache_key = _asset_cache_key(project, asset)
@@ -6215,6 +6233,7 @@ def _asset_payloads(project: TimelineProject, assets) -> list[dict]:
         _asset_payload(
             project,
             asset,
+            lean=True,
             media_snapshot=media_snapshot,
             thumbnail_snapshot=thumbnail_snapshot,
         )
@@ -7666,6 +7685,10 @@ def _find_asset_usages(project: TimelineProject, asset: Asset) -> dict:
                 "status": job.status,
             })
         status = str(getattr(job, "status", "pending") or "pending").lower()
+        if status not in {"pending", "running"}:
+            continue
+        from .project_storage import hydrate_job
+        hydrate_job(project, job)
         snapshots = (getattr(job, "reference_input_snapshots", [])
                      if isinstance(getattr(job, "reference_input_snapshots", []), list)
                      else [])
@@ -8047,10 +8070,11 @@ def _apply_uploaded_metadata(
 
 
 def _same_path_import_placeholder(asset: Asset) -> bool:
+    from .project_storage import has_generation_provenance
     return (
         not str(getattr(asset, "trashed_at", "") or "")
         and not str(getattr(asset, "prompt", "") or "")
-        and not (getattr(asset, "generation_params", None) or {})
+        and not has_generation_provenance(asset)
         and not str(getattr(asset, "folder", "") or "")
     )
 
@@ -9410,6 +9434,34 @@ if routes is not None:
     # -----------------------------------------------------------------------
     # Asset management
     # -----------------------------------------------------------------------
+
+    @routes.get("/sonder-editor/project/{project_id}/assets/provenance")
+    async def api_asset_provenance_batch(request: web.Request) -> web.Response:
+        from .project_storage import read_asset_provenance_batch, ProjectStorageError
+        ids = request.query.getall("asset_id", [])
+        if not ids or len(ids) > 64:
+            return _json_error("Request between 1 and 64 asset ids", 400)
+        try:
+            def read_batch():
+                return read_asset_provenance_batch(_project_dir_without_model(request), ids)
+            return web.json_response(await asyncio.to_thread(read_batch))
+        except FileNotFoundError as exc:
+            return _json_error(str(exc), 404)
+        except ProjectStorageError as exc:
+            return _json_error(str(exc), 409)
+
+    @routes.get("/sonder-editor/project/{project_id}/assets/{asset_id}/provenance")
+    async def api_asset_provenance(request: web.Request) -> web.Response:
+        from .project_storage import read_asset_provenance, ProjectStorageError
+        def read_provenance():
+            return read_asset_provenance(_project_dir_without_model(request),
+                                        request.match_info.get("asset_id", ""))
+        try:
+            return web.json_response(await asyncio.to_thread(read_provenance))
+        except FileNotFoundError as exc:
+            return _json_error(str(exc), 404)
+        except ProjectStorageError as exc:
+            return _json_error(str(exc), 409)
 
     @routes.get("/sonder-editor/project/{project_id}/assets")
     async def api_list_assets(request: web.Request) -> web.Response:
@@ -11149,7 +11201,8 @@ if routes is not None:
             except (TypeError, ValueError):
                 snap_ver = 0
             if snap_ver > 0:
-                active_job = job
+                from .project_storage import hydrate_job
+                active_job = hydrate_job(project, job)
                 break
 
         if active_job is not None:
@@ -11233,7 +11286,8 @@ if routes is not None:
             except (TypeError, ValueError):
                 snap_ver = 0
             if snap_ver > 0:
-                active_job = job
+                from .project_storage import hydrate_job
+                active_job = hydrate_job(project, job)
                 break
 
         driver_descriptor = descriptor_for_lane_type("motion_driver")
@@ -11365,7 +11419,8 @@ if routes is not None:
                 and str(getattr(job, "status", "") or "").lower() == "running"
                 and snapshot_version > 0
             ):
-                active_job = job
+                from .project_storage import hydrate_job
+                active_job = hydrate_job(project, job)
                 break
         if active_job is not None:
             lane_count = max(1, int(getattr(active_job, "reference_lane_count", 1) or 1))
@@ -11616,7 +11671,8 @@ if routes is not None:
             except (TypeError, ValueError):
                 snap_ver = 0
             if snap_ver > 0:
-                active_job = job
+                from .project_storage import hydrate_job
+                active_job = hydrate_job(project, job)
                 break
 
         def _coerce_threshold(source) -> float:
@@ -12389,6 +12445,18 @@ if routes is not None:
     # -----------------------------------------------------------------------
     # Render queue
     # -----------------------------------------------------------------------
+
+    @routes.get("/sonder-editor/project/{project_id}/prompt-history")
+    async def api_get_prompt_history(request: web.Request) -> web.Response:
+        from .project_storage import read_prompt_history, ProjectStorageError
+        def read_history():
+            return read_prompt_history(_project_dir_without_model(request))
+        try:
+            return web.json_response(await asyncio.to_thread(read_history))
+        except FileNotFoundError as exc:
+            return _json_error(str(exc), 404)
+        except ProjectStorageError as exc:
+            return _json_error(str(exc), 409)
 
     @routes.get("/sonder-editor/project/{project_id}/queue")
     async def api_list_queue(request: web.Request) -> web.Response:

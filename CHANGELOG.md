@@ -21,6 +21,9 @@ a fresh `[Unreleased]` block.
   lanes created before this change pick the suffix up on open.
 
 ### Changed
+- Large-project saves keep prompt history, queued render snapshots and asset provenance in separate immutable components. History updates reuse unchanged entries, and background cleanup protects active readers.
+- Older projects migrate on their first edit with an exact backup; that first edit has a one-time migration cost. Copy the whole project folder, including `state/`, when moving a project.
+- Gallery lists stay small while metadata search and inspection load provenance on demand. Nodes, generated takes, exports and single-asset responses retain complete metadata.
 - Simplified shortcut help: Undo and Redo show their actions, and Ctrl+V reads “Paste”.
 - The Reference lane panel's derived-prompt row names the two exits that can
   carry the text — a Reference Context chip and the Prompt Bridge output — and
@@ -34,6 +37,8 @@ a fresh `[Unreleased]` block.
   text to the prompt being compiled.
 
 ### Fixed
+- Gallery metadata loads correctly for absolute project directories and ignores stale callbacks after switching projects.
+- Export refusals remain visible when controls re-enable; retry clears the previous request error.
 - Improve editor responsiveness during timeline export polling and coalesce repeated Guides Bridge and Driver Selector refreshes.
 - Media drops that add lanes now create those lanes, the clip or audio track,
   extracted audio, and their link in one project write instead of two.

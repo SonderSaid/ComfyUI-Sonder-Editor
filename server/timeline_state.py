@@ -71,8 +71,14 @@ REFERENCE_TAG_PRESETS = (
 
 def _overlay_unknown_record(raw: Any, canonical: dict) -> dict:
     """Overlay known canonical fields while retaining unknown persisted keys."""
-    result = copy.deepcopy(raw) if isinstance(raw, dict) else {}
-    result.update(copy.deepcopy(canonical))
+    # Canonical keys replace raw values wholesale. Copy only unknown raw keys;
+    # retain the detached deep-copy contract for callers mutating the result.
+    canonical_copy = copy.deepcopy(canonical)
+    result = {
+        key: canonical_copy[key] if key in canonical_copy else copy.deepcopy(value)
+        for key, value in raw.items()
+    } if isinstance(raw, dict) else {}
+    result.update(canonical_copy)
     return result
 
 
@@ -878,7 +884,7 @@ class Asset:
     path: str = ""                          # relative path inside project media/
     # Generation provenance — how was this asset created?
     prompt: str = ""
-    generation_params: dict = field(default_factory=dict)  # seed, cfg, sampler, model, etc.
+    generation_params: dict = field(default_factory=dict, repr=False)  # transparently hydrated provenance
     # Technical metadata
     width: int = 0
     height: int = 0
@@ -904,7 +910,30 @@ class Asset:
     trashed_at: str = ""                    # ISO timestamp when moved to trash
     trash_previous_folder: str = ""         # folder before trashing, used for restore
 
-    def to_dict(self) -> dict:
+    def __getattribute__(self, name):
+        if name == "generation_params" and object.__getattribute__(self, "__dict__").get("_generation_unhydrated", False):
+            from .project_storage import hydrate_asset
+            hydrate_asset(self)
+        return object.__getattribute__(self, name)
+
+    def __setattr__(self, name, value):
+        if name == "generation_params" and self.__dict__.get("_generation_unhydrated", False):
+            from .project_storage import hydrate_asset
+            hydrate_asset(self)
+        object.__setattr__(self, name, value)
+
+    @property
+    def generation_params_for_storage(self):
+        """Backing value only: persistence must never trigger disk reads."""
+        return object.__getattribute__(self, "generation_params")
+
+    @property
+    def inline_generation_params(self):
+        from .project_storage import INLINE_GENERATION_PARAM_KEYS
+        return {key: value for key, value in self.generation_params_for_storage.items()
+                if key in INLINE_GENERATION_PARAM_KEYS}
+
+    def to_dict(self, *, include_provenance=True) -> dict:
         return {
             "asset_id": self.asset_id,
             "name": self.name,
@@ -912,7 +941,7 @@ class Asset:
             "artifact_kind": self.artifact_kind,
             "path": self.path,
             "prompt": self.prompt,
-            "generation_params": self.generation_params,
+            "generation_params": self.generation_params if include_provenance else self.generation_params_for_storage,
             "width": self.width,
             "height": self.height,
             "frame_count": self.frame_count,
@@ -2496,6 +2525,10 @@ class GenerationJob:
     result_asset_id: str = ""
 
     def to_dict(self) -> dict:
+        if getattr(self, "_frozen_unhydrated", False):
+            from .project_storage import FROZEN_JOB_FIELDS
+            return {key: value for key, value in vars(self).items()
+                    if not key.startswith("_") and key not in FROZEN_JOB_FIELDS}
         return {
             "job_id": self.job_id,
             "clip_id": self.clip_id,
@@ -2765,7 +2798,7 @@ class TimelineProject:
             "frame_constraint": self.frame_constraint,
             "dimension_constraint": self.dimension_constraint,
             "scenes": [s.to_dict() for s in self.scenes],
-            "assets": [a.to_dict() for a in self.assets],
+            "assets": [a.to_dict(include_provenance=False) for a in self.assets],
             "references": [reference.to_dict() for reference in self.references],
             "reference_recipes": [dict(recipe) for recipe in self.reference_recipes if isinstance(recipe, dict)],
             "prompt_context_profiles": [dict(profile) for profile in self.prompt_context_profiles],

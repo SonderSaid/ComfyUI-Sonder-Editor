@@ -95,6 +95,24 @@ def _route_handler(route_module, method, path):
     raise AssertionError(f"Route not found: {method} {path}")
 
 
+def test_prompt_history_route_reads_component_without_loading_model(monkeypatch, tmp_path):
+    from server.project_manager import create_project, save_project
+    route_module = _load_route_module(monkeypatch)
+    project = create_project("History endpoint", base_dir=str(tmp_path))
+    history = [{"hash": "test", "sections": [{"channels": {"visual": "frozen"}}]}]
+    project.metadata["prompt_history"] = copy.deepcopy(history)
+    save_project(project, notify=False)
+    monkeypatch.setattr(route_module, "_get_base_dir", lambda: str(tmp_path))
+    def forbidden(*args, **kwargs):
+        raise AssertionError("History endpoint must not load a project model")
+    monkeypatch.setattr(route_module, "_load_project_from_request", forbidden)
+    handler = _route_handler(route_module, "GET", "/sonder-editor/project/{project_id}/prompt-history")
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": os.path.basename(project.project_dir)}, method="GET")))
+    assert response.status == 200
+    assert _response_json(response) == history
+
+
 def _response_json(response):
     return json.loads(response.body.decode("utf-8"))
 

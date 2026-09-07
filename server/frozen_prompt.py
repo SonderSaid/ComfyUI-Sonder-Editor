@@ -150,6 +150,8 @@ def validate_marker_absent_v022(job) -> None:
 
 
 def classify_frozen_prompt(job) -> str:
+    if getattr(job, "_frozen_unhydrated", False):
+        raise FrozenPromptEnvelopeError("queue_snapshot_unhydrated", "Queue snapshot must be hydrated before prompt classification")
     marker = prompt_context_format(job)
     if marker is None:
         validate_marker_absent_v022(job)

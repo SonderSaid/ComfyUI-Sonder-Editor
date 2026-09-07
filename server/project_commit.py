@@ -3,13 +3,13 @@ import logging
 from .project_manager import ProjectVersionConflict, load_project, save_project
 from .lane_registry import VARIABLE_LANE_DESCRIPTORS
 from .timeline_state import LaneConfig, TimelineProject
+from .project_storage import has_generation_provenance, hydrate_asset
 
 logger = logging.getLogger("sonder_editor")
 
 
 def _asset_is_generated(asset) -> bool:
-    params = getattr(asset, "generation_params", None) or {}
-    return bool(params)
+    return has_generation_provenance(asset)
 
 
 def _clip_is_generated(clip) -> bool:
@@ -28,7 +28,7 @@ def _same_path_placeholder_can_upgrade(asset) -> bool:
     return (
         not str(getattr(asset, "trashed_at", "") or "")
         and not str(getattr(asset, "prompt", "") or "")
-        and not (getattr(asset, "generation_params", None) or {})
+        and not has_generation_provenance(asset)
         and not str(getattr(asset, "folder", "") or "")
     )
 
@@ -36,11 +36,13 @@ def _same_path_placeholder_can_upgrade(asset) -> bool:
 def _asset_has_generated_registration(asset) -> bool:
     return bool(
         str(getattr(asset, "prompt", "") or "")
-        or (getattr(asset, "generation_params", None) or {})
+        or has_generation_provenance(asset)
     )
 
 
 def _copy_generated_asset_registration(target, source) -> bool:
+    hydrate_asset(target)
+    hydrate_asset(source)
     changed = False
     for attr in (
         "name",
@@ -217,6 +219,7 @@ def _merge_generated_outputs(current: TimelineProject, produced: TimelineProject
 
     if asset_id_remap:
         for asset in touched_assets:
+            hydrate_asset(asset)
             params = getattr(asset, "generation_params", None)
             if not params:
                 continue

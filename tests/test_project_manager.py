@@ -14,6 +14,69 @@ from server.project_manager import create_project, load_project, save_project, l
 from server.timeline_state import ClipReference, Scene
 
 
+@pytest.mark.parametrize("raw", [{}, {"known": {"old": [1]}},
+    {"future": {"nested": [2]}, "known": {"old": [1]}}])
+def test_unknown_overlay_preserves_output_and_detached_values(raw):
+    from server.timeline_state import _overlay_unknown_record
+    canonical = {"known": {"new": [3]}}
+    expected = copy.deepcopy(raw)
+    expected.update(copy.deepcopy(canonical))
+    actual = _overlay_unknown_record(raw, canonical)
+    assert actual == expected
+    assert json.dumps(actual) == json.dumps(expected)
+    actual["known"]["new"].append(4)
+    assert canonical == {"known": {"new": [3]}}
+    if "future" in actual:
+        actual["future"]["nested"].append(5)
+        assert raw["future"]["nested"] == [2]
+
+
+def test_cas_validated_bytes_skip_parse_but_external_edit_is_parsed(tmp_path, monkeypatch):
+    from server import project_manager as pm
+    project = create_project("Validated CAS", base_dir=str(tmp_path))
+    project = load_project(project.project_dir)
+    original_load = json.load
+    calls = []
+
+    def counted_load(handle):
+        calls.append(True)
+        return original_load(handle)
+
+    monkeypatch.setattr(json, "load", counted_load)
+    save_project(project, expected_modified_at=project.modified_at, notify=False)
+    assert not calls
+    project_file = os.path.join(project.project_dir, "project.json")
+    with open(project_file, encoding="utf-8") as handle:
+        data = json.loads(handle.read())
+    data["modified_at"] = "external-version"
+    data["project_id"] = "external-id"
+    with open(project_file, "w", encoding="utf-8") as handle:
+        json.dump(data, handle)
+    with pytest.raises(pm.ProjectVersionConflict) as exc:
+        save_project(project, expected_modified_at=project.modified_at, notify=False)
+    assert calls
+    assert exc.value.current_data["project_id"] == "external-id"
+    assert exc.value.actual_modified_at == "external-version"
+
+
+def test_cas_certificate_uses_published_version_when_shared_model_changes(tmp_path, monkeypatch):
+    from server import project_manager as pm
+    project = create_project("Certificate Race", base_dir=str(tmp_path))
+    replace = pm.atomic_replace
+
+    def replace_then_mutate(src, dst):
+        replace(src, dst)
+        project.add_scene(Scene(name="Unsaved concurrent scene"))
+        project.modified_at = "unsaved-concurrent-version"
+
+    monkeypatch.setattr(pm, "atomic_replace", replace_then_mutate)
+    save_project(project, notify=False)
+    path = os.path.join(project.project_dir, "project.json")
+    on_disk = pm._read_project_json(path)
+    assert on_disk["modified_at"] != project.modified_at
+    assert pm._read_project_json(path, version_source=project)["modified_at"] == on_disk["modified_at"]
+
+
 def test_create_project():
     with tempfile.TemporaryDirectory() as base_dir:
         project = create_project("Test Video", fps=30.0, width=1920, height=1080, template_id="ltx-2.3", base_dir=base_dir)
