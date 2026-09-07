@@ -1697,6 +1697,10 @@ def test_d7_one_audio_carries_several_roles_in_one_line(compiled):
 def test_d8_paired_audio_remains_absent():
     """D8 — recorded as a deliberate gap, not a defect."""
     assert not hasattr(minimax_h3, "MAX_VIDEO_PAIRED_AUDIO")
+    for retired in ("TASK_MODES", "SETUP_MODES", "active_setup",
+                    "implicit_base_setup", "setup_validation_errors",
+                    "IMPLICIT_BASE_SETUP_ID", "IMPLICIT_BASE_SETUP_NAME"):
+        assert not hasattr(minimax_h3, retired)
     assert {minimax_h3.PICTURES_POPULATION, minimax_h3.VIDEOS_POPULATION,
             minimax_h3.STANDALONE_AUDIOS_POPULATION} == {
         "pictures", "videos", "standalone_audios"}

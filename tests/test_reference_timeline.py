@@ -342,7 +342,7 @@ def test_h3_population_membership_is_derived_without_any_setup_record():
     entity, asset = _h3_picture("woman", "portrait")
     scene = _h3_scene([_h3_lane_recipe("pictures")],
                       [_picture_item("item", 0, "woman", "portrait")])
-    assert scene.minimax_h3_conditioning_setups == []
+    assert "minimax_h3_conditioning_setups" not in scene.to_dict()
 
     resolved = _h3_resolve(scene, [entity], [asset])
 
@@ -1130,7 +1130,7 @@ def test_bridge_references_uses_effective_window_and_h3_video_image_labels(monke
     # No setup record anywhere: the lane's declared model input is what makes
     # these `Video N` slots, so the Bridge panel labels a brand-new scene the
     # same as one that inherited a conditioning setup.
-    assert scene.minimax_h3_conditioning_setups == []
+    assert "minimax_h3_conditioning_setups" not in scene.to_dict()
     project = TimelineProject(
         project_id="project-1", assets=assets, references=references,
         scenes=[scene])

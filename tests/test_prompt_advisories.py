@@ -82,11 +82,11 @@ def test_missing_h3_reference_definitions_are_advisory():
     assert not (expected & _codes(result, "errors"))
 
 
-def test_missing_h3_shot_identity_is_advisory():
+def test_retired_base_task_mode_does_not_request_shot_identity():
     result = _compile(template="minimax_h3_base", context={
         "setup_manifest": {"setup": {"mode": "base", "task_mode": "I2VA"}},
     })
-    assert "missing_h3_shot_identity" in _codes(result, "warnings")
+    assert "missing_h3_shot_identity" not in _codes(result, "warnings")
     assert "missing_h3_shot_identity" not in _codes(result, "errors")
 
 

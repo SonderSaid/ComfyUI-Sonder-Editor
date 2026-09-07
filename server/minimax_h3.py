@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import copy
 import math
-import uuid
 
 from .reference_resolution import resolve_effective_references
 from .reference_prompt_formatter import as_plain_record
@@ -12,8 +11,6 @@ from .reference_prompt_formatter import reference_member_labels
 
 
 SETUP_VERSION = "minimax_h3_setup_v1"
-TASK_MODES = {"T2VA", "I2VA", "FL2VA", "L2VA"}
-SETUP_MODES = {"base", "reference"}
 MAX_PICTURES = 9
 MAX_VIDEOS = 3
 MAX_STANDALONE_AUDIO = 3
@@ -22,44 +19,31 @@ PICTURES_POPULATION = "pictures"
 VIDEOS_POPULATION = "videos"
 STANDALONE_AUDIOS_POPULATION = "standalone_audios"
 
-# Neither H3 mode needs an authored setup, so compilation synthesizes one.  That
+# Full Reference uses one implicit setup.  That
 # synthetic setup must be byte-identical on every compile: a fresh UUID would
 # change `setup_manifest`, and therefore the compiled content hash, on each
 # preview, and would disagree with the id the live Bridge selector resolves.
-IMPLICIT_BASE_SETUP_ID = "implicit_minimax_h3_base"
-IMPLICIT_BASE_SETUP_NAME = "MiniMax H3 Base"
 IMPLICIT_REFERENCE_SETUP_ID = "implicit_minimax_h3_reference"
 IMPLICIT_REFERENCE_SETUP_NAME = "MiniMax H3 Full Reference"
 
 
 def normalize_setup(raw) -> dict:
-    raw = raw if isinstance(raw, dict) else {}
-    # Default only *absent* values.  Coercing an explicit unknown mode or task
-    # mode to base/T2VA silently rewrites authored intent and makes the
-    # invalid-mode validation below unreachable; `setup_validation_errors`
-    # reports the preserved value instead.
-    mode = str(raw.get("mode") or "").strip() or "base"
-    task_mode = str(raw.get("task_mode") or "").strip().upper() or "T2VA"
+    """Return the fixed Full Reference setup, preserving its frozen hash shape.
 
-    def ids(key):
-        result = []
-        for value in raw.get(key) or []:
-            value = str(value or "").strip()
-            if value and value not in result:
-                result.append(value)
-        return result
-
+    Vestigial Base keys can go when a Full Reference hash change is intended.
+    Authored records are no longer interpreted by this resolver.
+    """
     return {
         "schema": SETUP_VERSION,
-        "setup_id": str(raw.get("setup_id") or "").strip() or uuid.uuid4().hex,
-        "name": str(raw.get("name") or "MiniMax H3 Reference Setup"),
-        "mode": mode,
-        "task_mode": task_mode,
-        "first_guide_id": str(raw.get("first_guide_id") or ""),
-        "last_guide_id": str(raw.get("last_guide_id") or ""),
-        "picture_lane_ids": ids("picture_lane_ids"),
-        "video_lane_ids": ids("video_lane_ids"),
-        "audio_lane_ids": ids("audio_lane_ids"),
+        "setup_id": IMPLICIT_REFERENCE_SETUP_ID,
+        "name": IMPLICIT_REFERENCE_SETUP_NAME,
+        "mode": "reference",
+        "task_mode": "T2VA",
+        "first_guide_id": "",
+        "last_guide_id": "",
+        "picture_lane_ids": [],
+        "video_lane_ids": [],
+        "audio_lane_ids": [],
     }
 
 
@@ -104,31 +88,6 @@ def population_lane_ids(lane_recipes, population) -> list[str]:
     return result
 
 
-def setup_validation_errors(setup) -> list[dict]:
-    """Report preserved-but-unsupported setup values as controlled diagnostics."""
-    value = setup if isinstance(setup, dict) else {}
-    errors = []
-    mode = str(value.get("mode") or "")
-    if mode not in SETUP_MODES:
-        errors.append({"code": "invalid_h3_setup_mode",
-                       "message": f"MiniMax H3 setup mode {mode!r} is not supported."})
-    task_mode = str(value.get("task_mode") or "")
-    if task_mode not in TASK_MODES:
-        errors.append({"code": "invalid_h3_task_mode",
-                       "message": f"MiniMax H3 task mode {task_mode!r} is not supported."})
-    return errors
-
-
-def implicit_base_setup(task_mode="T2VA") -> dict:
-    """The deterministic Base setup used when a scene authored none."""
-    return normalize_setup({
-        "setup_id": IMPLICIT_BASE_SETUP_ID,
-        "name": IMPLICIT_BASE_SETUP_NAME,
-        "mode": "base",
-        "task_mode": task_mode,
-    })
-
-
 def implicit_reference_setup() -> dict:
     """The deterministic Full Reference setup.  There is no authored variant.
 
@@ -143,21 +102,6 @@ def implicit_reference_setup() -> dict:
         "name": IMPLICIT_REFERENCE_SETUP_NAME,
         "mode": "reference",
     })
-
-
-def active_setup(scene_or_dict) -> dict | None:
-    """The scene's authored setup.  Base-only: Reference mode never calls this."""
-    if isinstance(scene_or_dict, dict):
-        setups = scene_or_dict.get("minimax_h3_conditioning_setups") or []
-        active_id = str(scene_or_dict.get("active_minimax_h3_setup_id") or "")
-    else:
-        setups = getattr(scene_or_dict, "minimax_h3_conditioning_setups", []) or []
-        active_id = str(getattr(scene_or_dict, "active_minimax_h3_setup_id", "") or "")
-    normalized = [normalize_setup(value) for value in setups if isinstance(value, dict)]
-    if active_id:
-        return next((value for value in normalized
-                     if value["setup_id"] == active_id), None)
-    return normalized[0] if len(normalized) == 1 else None
 
 
 def _entity_lookup(references):
@@ -309,31 +253,6 @@ def resolve_setup(*, setup, guide_frames=None, reference_items=None,
     for declaration in population_declarations:
         manifest.setdefault(str(declaration.get("key") or ""), [])
         ordinals.setdefault(str(declaration.get("ordinal_key") or ""), {})
-    guide_lookup = {str(as_plain_record(g).get("guide_id") or ""): as_plain_record(g)
-                    for g in guide_frames or []}
-    invalid = setup_validation_errors(value)
-    if invalid:
-        # An unsupported mode has no trustworthy slot plan, so stop before the
-        # base/reference branch rather than resolving under a guessed mode.
-        return {"setup_manifest": manifest, "ordinal_manifest": ordinals,
-                "unit_picture_ordinals": {}, "unit_source_labels": {},
-                "unit_source_members": {},
-                "errors": invalid, "warnings": warnings}
-    if value["mode"] == "base":
-        required_first = value["task_mode"] in {"I2VA", "FL2VA"}
-        required_last = value["task_mode"] in {"FL2VA", "L2VA"}
-        for role, guide_id, required in (
-                ("first", value["first_guide_id"], required_first),
-                ("last", value["last_guide_id"], required_last)):
-            guide = guide_lookup.get(guide_id)
-            if guide and not guide.get("muted"):
-                manifest["guides"].append({"role": role, **copy.deepcopy(guide)})
-            elif required:
-                errors.append({"code": f"missing_{role}_guide",
-                               "message": f"{value['task_mode']} requires a {role}-frame Guide."})
-        return {"setup_manifest": manifest, "ordinal_manifest": ordinals,
-                "errors": errors, "warnings": warnings}
-
     recipe_lookup = _recipe_lookup(lane_recipes)
     winners = resolve_effective_references(
         reference_items=reference_items or [], lane_count=lane_count,

@@ -25,21 +25,11 @@ def resolve_scene_prompt_context(project, scene, template, window_start,
         str(value) for value in resolved_profile.get("validators") or []
         if isinstance(value, str)
     }
-    if "minimax_base_setup" in validator_ids:
-        setup = minimax_h3.active_setup(scene)
-        if setup is None:
-            config = getattr(scene, "prompt_context_profile_config", {}) or {}
-            setup = minimax_h3.implicit_base_setup(config.get("task_mode", "T2VA"))
-        if setup["mode"] != "base":
-            result["errors"].append({"code": "setup_mode_mismatch",
-                                     "message": "MiniMax H3 Base requires a Base conditioning setup."})
-        else:
-            result = minimax_h3.resolve_setup(
-                setup=setup, guide_frames=scene.guide_frames,
-                scene_duration=scene.duration_frames,
-                window_start=window_start, window_end=window_end,
-                profile=resolved_profile)
-    elif "minimax_reference_setup" in validator_ids:
+    if "minimax_base_format" in validator_ids:
+        # Base is text-only. Keep physical reference chips inapplicable and
+        # avoid resolving generic Reference lanes for this format.
+        return result
+    if "minimax_reference_setup" in validator_ids:
         # No registration step: every Reference lane whose recipe declares a
         # physical population participates, so there is nothing a scene can
         # fail to author and no stored setup to consult.

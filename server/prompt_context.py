@@ -1896,7 +1896,7 @@ BUILTIN_PROFILES = {
                             "event_policy": copy.deepcopy(
                                 MINIMAX_VOCAL_EVENT_POLICY)},
         }, writing_aids=_minimax_aids("integrated_multimodal_description"),
-        validators=["minimax_base_setup", "managed_speakers"],
+        validators=["minimax_base_format", "managed_speakers"],
         identity_kinds=[{**MINIMAX_SUBJECT_KIND,
                          "referenced_label_template": ""}],
         speaker_policy={**DEFAULT_SPEAKER_POLICY,
@@ -2183,7 +2183,11 @@ def normalize_profile(raw, *, builtin=False) -> dict:
     validators = []
     for validator in raw.get("validators") or []:
         if isinstance(validator, str):
-            if validator not in {"minimax_base_setup", "minimax_reference_setup",
+            # Retired setup ids in stored forks are discarded, not migrated to
+            # format identity. Remove this tolerance when such forks retire.
+            if validator == "minimax_base_setup":
+                continue
+            if validator not in {"minimax_base_format", "minimax_reference_setup",
                                   "managed_speakers"}:
                 raise ValueError("unknown_profile_validator")
             validators.append(validator)
@@ -2505,7 +2509,7 @@ def _vocal_identity_expression(unit_id, attachment, context) -> str:
     h3_unstaged_repair_case = (
         "minimax_reference_setup" in validators and not has_staged_source)
     if (unit.get("sources") and not h3_unstaged_repair_case
-            and "minimax_base_setup" not in validators):
+            and "minimax_base_format" not in validators):
         return ""
     definition, _source = _subject_definition(
         attachment.get("config") or {}, unit, context)
@@ -4299,7 +4303,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         if isinstance(value, str)
     }
     is_h3_reference_profile = "minimax_reference_setup" in profile_validator_ids
-    is_h3_base_profile = "minimax_base_setup" in profile_validator_ids
+    is_h3_base_profile = "minimax_base_format" in profile_validator_ids
     is_h3_profile = is_h3_reference_profile or is_h3_base_profile
     vocal_event_policy = effective_vocal_event_policy(resolved_profile)
 
@@ -6198,36 +6202,6 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
 
     setup_manifest = context.get("setup_manifest") or {}
     setup_value = setup_manifest.get("setup") or {}
-    if is_h3_base_profile:
-        task_mode = str(setup_value.get("task_mode") or "T2VA").upper()
-        try:
-            duration = max(0.0, (float(window_end) - float(window_start)) / float(fps))
-        except (TypeError, ValueError, ZeroDivisionError):
-            duration = 0.0
-        shot_count = sum(1 for value in segments if value.get("_opens_shot"))
-        final_shot = max(1, shot_count)
-        instruction = ""
-        if task_mode in {"I2VA", "FL2VA", "L2VA"} and shot_count == 0:
-            warnings.append({"code": "missing_h3_shot_identity", "message":
-                             f"{task_mode} Picture alignment is clearer with at least one authored Shot chip."})
-        if task_mode == "I2VA":
-            instruction = ("For the target video, at 0.00 seconds into the target video, "
-                           "<Picture 1> (from [Shot 1]) is fully referenced.")
-        elif task_mode == "FL2VA":
-            instruction = ("How the reference pictures align with the target video — "
-                           "Picture 1 (from Shot 1) aligns with the 0.00-second mark of the "
-                           f"target video; Picture 2 (from Shot {final_shot}) aligns with the "
-                           f"{duration:.2f}-second mark of the target video.")
-        elif task_mode == "L2VA":
-            instruction = ("How the reference pictures align with the target video — "
-                           f"<Picture 1> (from [Shot {final_shot}]) aligns with the "
-                           f"{duration:.2f}-second mark of the target video.")
-        if instruction:
-            final_prompt = f"{instruction}\n\n{final_prompt}" if final_prompt else instruction
-        if task_mode not in {"T2VA", "I2VA", "FL2VA", "L2VA"}:
-            errors.append({"code": "invalid_h3_task_mode",
-                           "message": "MiniMax H3 task mode is invalid."})
-
     effective_values = {}
     for key in keys:
         values = []

@@ -13497,8 +13497,6 @@ export class EditorWidget {
                               source_channel_template_id: sourceChannelTemplateId = null,
                               prompt_context_profile_id: promptContextProfileId = null,
                               prompt_context_profile_config: promptContextProfileConfig = null,
-                              minimax_h3_conditioning_setups: minimaxSetups = null,
-                              active_minimax_h3_setup_id: activeMinimaxSetupId = null,
                               prompt_context_profiles: promptContextProfiles = null,
                               prompt_semantic_units: promptSemanticUnits = null,
                               prompt_semantic_unit_creates:
@@ -13621,12 +13619,6 @@ export class EditorWidget {
         if (promptContextProfileConfig !== null) {
             sceneFields.prompt_context_profile_config = structuredClone(promptContextProfileConfig || {});
         }
-        if (minimaxSetups !== null) {
-            sceneFields.minimax_h3_conditioning_setups = structuredClone(minimaxSetups || []);
-        }
-        if (activeMinimaxSetupId !== null) {
-            sceneFields.active_minimax_h3_setup_id = String(activeMinimaxSetupId || "");
-        }
         if (willExtend) sceneFields.duration_frames = nextDuration;
         const expectedSceneFields = {};
         for (const field of ["global_channels", "global_channel_docs", "global_attachments"]) {
@@ -13692,12 +13684,6 @@ export class EditorWidget {
             }
             if (promptContextProfileConfig !== null) {
                 sceneRef.prompt_context_profile_config = structuredClone(promptContextProfileConfig || {});
-            }
-            if (minimaxSetups !== null) {
-                sceneRef.minimax_h3_conditioning_setups = structuredClone(minimaxSetups || []);
-            }
-            if (activeMinimaxSetupId !== null) {
-                sceneRef.active_minimax_h3_setup_id = String(activeMinimaxSetupId || "");
             }
             sceneRef.prompt_sections = [...nextSections]
                 .sort((a, b) => (a.start_frame || 0) - (b.start_frame || 0));
@@ -13799,8 +13785,6 @@ export class EditorWidget {
             global_attachments: structuredClone(scene.global_attachments || []),
             prompt_context_profile_id: scene.prompt_context_profile_id || "",
             prompt_context_profile_config: structuredClone(scene.prompt_context_profile_config || {}),
-            minimax_h3_conditioning_setups: structuredClone(scene.minimax_h3_conditioning_setups || []),
-            active_minimax_h3_setup_id: scene.active_minimax_h3_setup_id || "",
             // Browser templates are cross-project. Carry the dependency closure
             // needed to resolve stable semantic ids, then import it in the same
             // version-checked transaction as the scene content. Physical

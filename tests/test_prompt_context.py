@@ -752,34 +752,6 @@ def test_generic_reference_recipe_profile_and_capability_are_enforced():
     assert {"reference_profile_incompatible", "reference_capability_incompatible"} <= codes
 
 
-def test_h3_base_setup_requires_declared_guides():
-    result = minimax_h3.resolve_setup(
-        setup={"mode": "base", "task_mode": "FL2VA",
-               "first_guide_id": "first", "last_guide_id": "last"},
-        guide_frames=[GuideFrame(guide_id="first", asset_id="image")],
-        scene_duration=100, window_start=0, window_end=100)
-    assert [value["code"] for value in result["errors"]] == ["missing_last_guide"]
-
-
-def test_h3_setup_overflow_is_preserved_until_validation():
-    """Normalization still preserves an over-cap declaration rather than trimming.
-
-    Nothing reads these ids any more — Reference lane membership is derived
-    from each recipe's declared model input — but a stored record is preserved
-    as authored rather than rewritten at rest.
-    """
-    setup = minimax_h3.normalize_setup({
-        "mode": "reference",
-        "picture_lane_ids": [f"lane-{index}" for index in range(10)],
-    })
-    assert len(setup["picture_lane_ids"]) == 10
-    result = minimax_h3.resolve_setup(
-        setup=setup, reference_items=[], lane_recipes=[], lane_count=10,
-        scene_duration=100, window_start=0, window_end=100)
-    assert result["errors"] == []
-    assert result["setup_manifest"]["pictures"] == []
-
-
 def test_h3_reference_presentation_order_and_independent_audio_ordinals():
     picture_asset = Asset(asset_id="pi", asset_type="image")
     video_asset = Asset(asset_id="vi", asset_type="video", duration_sec=5,
@@ -1652,13 +1624,7 @@ def test_writing_aid_optional_flag_round_trips_and_rejects_a_non_boolean():
         })
 
 
-def test_removing_the_guide_binding_leaves_physical_delivery_intact():
-    """The chip binding is gone; the compiler-composed alignment line is not.
-
-    The binding described what `MiniMaxH3AddGuide` now delivers physically from
-    the Guides Bridge. The picture-alignment instruction was never a chip's
-    output — it is composed from the task mode — so it must survive untouched.
-    """
+def test_base_keeps_authored_prose_without_composing_guide_alignment():
     text = prompt_context.normalize_attachment({
         "kind": "custom", "config": {"text": "Use <Picture 1> as the pose"}})
     compiled = prompt_context.compile_prompt_context(
@@ -1666,25 +1632,14 @@ def test_removing_the_guide_binding_leaves_physical_delivery_intact():
         window_start=0, window_end=10, fps=24, template="minimax_h3_base",
         context={"setup_manifest": {"setup": {"mode": "base", "task_mode": "I2VA"},
                                     "guides": [{"role": "first"}]}})
-    assert compiled["prompt"].startswith(
-        "For the target video, at 0.00 seconds into the target video, "
-        "<Picture 1> (from [Shot 1]) is fully referenced.")
+    assert "fully referenced" not in compiled["prompt"]
+    assert "aligns with" not in compiled["prompt"]
     # The three retired validators must not fire under any spelling.
     assert not {"invalid_h3_guide_role", "missing_h3_guide_binding",
                 "unbound_h3_picture_guidance"} & {
                     value["code"] for value in compiled["errors"]}
     # Authored custom text still compiles as ordinary prose.
     assert "Use <Picture 1> as the pose" in compiled["prompt"]
-
-
-def test_physical_guide_validation_still_belongs_to_the_setup():
-    """`missing_first_guide` is the physical contract and is untouched."""
-    resolved = minimax_h3.resolve_setup(
-        setup={"mode": "base", "task_mode": "I2VA", "first_guide_id": "absent"},
-        guide_frames=[],
-        profile=prompt_context.BUILTIN_PROFILES["minimax_h3_base@1"])
-    assert any(error["code"] == "missing_first_guide"
-               for error in resolved["errors"])
 
 
 def test_no_guide_binding_control_or_config_survives_anywhere():

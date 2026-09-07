@@ -213,7 +213,7 @@ PROMPT_CHANNEL_TEMPLATE_PRESETS = {
     "minimax_h3_base": _template(
         "minimax_h3_base", "MiniMax H3",
         "MiniMax H3's three core fields for text- and keyframe-driven "
-        "generation (T2VA / I2VA / FL2VA / L2VA).",
+        "generation.",
         _MINIMAX_BASE_CHANNELS,
         field_separator="\n\n", label_separator=": ", labels=LABELS_ALWAYS,
         shot_marker_channel="integrated_multimodal_description",

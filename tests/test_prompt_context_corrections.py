@@ -60,47 +60,13 @@ def _compile_base(project, scene):
         window_start=0, window_end=48, fps=24.0)
 
 
-# 1 / 18 — implicit Base setup identity and strict mode validation.
-
-def test_implicit_h3_base_setup_is_stable_and_hashes_identically():
-    assert (minimax_h3.implicit_base_setup()
-            == minimax_h3.implicit_base_setup("T2VA"))
-    assert (minimax_h3.implicit_base_setup()["setup_id"]
-            == minimax_h3.IMPLICIT_BASE_SETUP_ID)
-
+def test_base_has_no_setup_and_hashes_identically():
     project, scene = _h3_base_project()
     first = _compile_base(project, scene)
     second = _compile_base(project, scene)
     assert first["errors"] == []
-    assert (first["setup_manifest"]["setup"]["setup_id"]
-            == minimax_h3.IMPLICIT_BASE_SETUP_ID)
-    # A fresh UUID per compile changed the manifest and therefore the frozen
-    # content hash on every preview.
+    assert first["setup_manifest"] == {}
     assert first["content_hash"] == second["content_hash"]
-
-
-def test_unknown_h3_mode_and_task_mode_are_reported_not_coerced():
-    setup = minimax_h3.normalize_setup({"mode": "wormhole", "task_mode": "X2Y"})
-    assert setup["mode"] == "wormhole"
-    assert setup["task_mode"] == "X2Y"
-    codes = {value["code"] for value in minimax_h3.setup_validation_errors(setup)}
-    assert codes == {"invalid_h3_setup_mode", "invalid_h3_task_mode"}
-    # Absent values still default.
-    blank = minimax_h3.normalize_setup({})
-    assert (blank["mode"], blank["task_mode"]) == ("base", "T2VA")
-    assert minimax_h3.setup_validation_errors(blank) == []
-
-    resolved = minimax_h3.resolve_setup(setup=setup, scene_duration=10,
-                                        window_start=0, window_end=10)
-    assert {value["code"] for value in resolved["errors"]} == codes
-
-    scene = Scene(scene_id="scene")
-    with pytest.raises(routes.ProjectMutationRequestError) as refused:
-        routes._apply_scene_fields(None, scene, {
-            "minimax_h3_conditioning_setups": [{"setup_id": "s", "mode": "wormhole"}],
-            "active_minimax_h3_setup_id": "s",
-        })
-    assert refused.value.code == "invalid_h3_setup_mode"
 
 
 # 2 — malformed custom profiles must not crash compilation.
@@ -633,20 +599,22 @@ def _history_job(task_mode, setup_id):
                                              "task_mode": task_mode}})
 
 
-def test_prompt_history_separates_task_mode_and_setup_for_identical_text():
+def test_prompt_history_keeps_profile_config_but_ignores_retired_setup():
     project = TimelineProject(project_id="project")
     routes._record_prompt_history(project, [
-        _history_job("T2VA", minimax_h3.IMPLICIT_BASE_SETUP_ID),
-        _history_job("I2VA", minimax_h3.IMPLICIT_BASE_SETUP_ID),
+        _history_job("T2VA", "retired-implicit-base"),
+        _history_job("I2VA", "retired-implicit-base"),
         _history_job("I2VA", "authored-setup"),
     ])
     history = project.metadata["prompt_history"]
-    assert len({entry["hash"] for entry in history}) == 3
+    assert len({entry["hash"] for entry in history}) == 2
+    assert all("minimax_h3_conditioning_setups" not in entry
+               and "active_minimax_h3_setup_id" not in entry for entry in history)
 
     # A byte-identical re-enqueue still collapses onto its existing entry.
     routes._record_prompt_history(project, [
-        _history_job("T2VA", minimax_h3.IMPLICIT_BASE_SETUP_ID)])
-    assert len(project.metadata["prompt_history"]) == 3
+        _history_job("T2VA", "retired-implicit-base")])
+    assert len(project.metadata["prompt_history"]) == 2
 
 
 def test_assetless_vocal_identity_survives_queue_history_and_project_reload():
@@ -5381,3 +5349,82 @@ def test_split_here_writes_the_break_as_its_own_node():
     # Growing must remain the DEFAULT: ordinary typing depends on it to keep the
     # id the caret is bookmarked against alive across the re-render.
     assert "asOwnNode && target && model.nodes[target.index]?.type" in chips
+
+
+@pytest.mark.parametrize("task_mode", ["T2VA", "I2VA", "FL2VA", "L2VA", "future"])
+def test_base_guides_never_add_alignment_prose(task_mode):
+    from server.timeline_state import GuideFrame
+    project, scene = _h3_base_project(task_mode)
+    scene.guide_frames = [GuideFrame(guide_id="first", asset_id="image", frame_index=0)]
+    compiled = _compile_base(project, scene)
+    assert compiled["errors"] == []
+    assert compiled["setup_manifest"] == {}
+    assert "A quiet room." in compiled["prompt"]
+    assert not any(text in compiled["prompt"] for text in
+                   ("Picture", "aligns with", "fully referenced"))
+    assert not {"missing_h3_shot_identity", "invalid_h3_task_mode"} & {
+        row["code"] for row in compiled["warnings"] + compiled["errors"]}
+
+
+def test_base_reference_chip_keeps_inapplicable_diagnostic():
+    project, scene = _h3_base_project()
+    scene.reference_items = [ReferenceItem(reference_item_id="item", lane_index=0,
+        start_frame=0, end_frame=-1, members=[{"entity_id": "person", "member_id": "portrait"}])]
+    scene.reference_lane_recipes = [ReferenceLaneRecipe(lane_id="lane", recipe={
+        "soft": {"physical_population": "pictures"}})]
+    project.references = [ReferenceEntity(reference_id="person", name="Person", members=[
+        ReferenceMember(member_id="portrait", asset_id="image")])]
+    project.assets = [Asset(asset_id="image", asset_type="image")]
+    scene.prompt_sections[0].attachments = [prompt_context.normalize_attachment({
+        "attachment_id": "chip", "kind": "reference",
+        "source": {"reference_item_id": "item"}})]
+    compiled = _compile_base(project, scene)
+    assert {row["code"] for row in compiled["errors"]} == {
+        "undeclared_reference_capability", "reference_source_not_applicable"}
+    assert "reference_profile_incompatible" not in {
+        row["code"] for row in compiled["warnings"]}
+
+
+def test_base_format_identity_and_retired_fork_normalization():
+    project, scene = _h3_base_project()
+    project.prompt_semantic_units = [prompt_context.normalize_semantic_unit({
+        "semantic_unit_id": "speaker", "name": "Narrator", "definition": "A narrator",
+        "sources": [{"entity_id": "person", "member_id": "portrait"}]})]
+    event = prompt_context.normalize_attachment({
+        "attachment_id": "vocal", "kind": "vocal_event",
+        "source": {"subject_ids": ["speaker"]},
+        "config": {"event_type": "voiceover", "text": "Hello"}})
+    scene.prompt_sections[0].attachments = [event]
+    scene.prompt_sections[0].channel_docs = {"integrated_multimodal_description": {"nodes": [
+        {"type": "attachment", "node_id": "voice", "attachment_id": "vocal"}]}}
+    # Built-in selected-identity policy does not require a free-form phrase.
+    assert _compile_base(project, scene)["errors"] == []
+    base = prompt_context.BUILTIN_PROFILES["minimax_h3_base@1"]
+    assert base["validators"] == ["minimax_base_format", "managed_speakers"]
+    context = {"profile": base, "semantic_units_by_id": {
+        "speaker": project.prompt_semantic_units[0]}}
+    assert prompt_context._vocal_identity_expression("speaker", event, context) == "A narrator"
+    raw = copy.deepcopy(base)
+    raw["capabilities"]["vocal_event"]["event_policy"]["identity_prefix"] = "explicit"
+    raw.update(profile_id="explicit_base", version="1")
+    explicit = prompt_context.normalize_profile(raw)
+    project.prompt_context_profiles = [explicit]
+    scene.prompt_context_profile_id = "explicit_base@1"
+    assert "missing_voiceover_subject_phrase" in {
+        row["code"] for row in _compile_base(project, scene)["errors"]}
+    raw.update(profile_id="base_fork", version="1", validators=["minimax_base_setup", "managed_speakers"])
+    fork = prompt_context.normalize_profile(raw)
+    assert fork["validators"] == ["managed_speakers"]
+    assert prompt_context._vocal_identity_expression("speaker", event, {**context, "profile": fork}) == ""
+    project.prompt_context_profiles = [fork]
+    scene.prompt_context_profile_id = "base_fork@1"
+    assert "missing_voiceover_subject_phrase" not in {
+        row["code"] for row in _compile_base(project, scene)["errors"]}
+
+
+def test_full_reference_implicit_setup_preserves_frozen_shape():
+    assert minimax_h3.implicit_reference_setup() == {
+        "schema": "minimax_h3_setup_v1", "setup_id": "implicit_minimax_h3_reference",
+        "name": "MiniMax H3 Full Reference", "mode": "reference", "task_mode": "T2VA",
+        "first_guide_id": "", "last_guide_id": "", "picture_lane_ids": [],
+        "video_lane_ids": [], "audio_lane_ids": []}

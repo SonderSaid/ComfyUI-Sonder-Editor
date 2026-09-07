@@ -257,8 +257,8 @@ def test_round_trip_keeps_context_documents_attachments_and_dependencies():
     assert out["prompt_context_profile_config"] == {"mode": "strict"}
     assert out["prompt_context_profiles"][0]["profile_id"] == "custom:test"
     assert out["prompt_semantic_units"][0]["semantic_unit_id"] == "unit-1"
-    assert out["minimax_h3_conditioning_setups"][0]["setup_id"] == "setup-1"
-    assert out["active_minimax_h3_setup_id"] == "setup-1"
+    assert "minimax_h3_conditioning_setups" not in out
+    assert "active_minimax_h3_setup_id" not in out
 
 
 def test_round_trip_is_idempotent():

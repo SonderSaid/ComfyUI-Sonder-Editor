@@ -3491,51 +3491,8 @@ Server value: ${serverValue}` : ""}`;
             fields: { prompt_context_profile_id: profile.value },
         }], "change prompt context profile"));
 
-        const setups = Array.isArray(scene.minimax_h3_conditioning_setups)
-            ? structuredClone(scene.minimax_h3_conditioning_setups) : [];
-        const active = setups.find((value) => value.setup_id === scene.active_minimax_h3_setup_id)
-            || (setups.length === 1 ? setups[0] : null);
         const uid = () => globalThis.crypto?.randomUUID?.().replaceAll("-", "")
             || `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
-        const templateId = host._channelTemplate().id;
-
-        if (templateId === "minimax_h3_base") {
-            const controls = document.createElement("div");
-            controls.style.cssText = "display:flex;gap:6px;align-items:center;flex-wrap:wrap;";
-            const task = document.createElement("select"); task.style.cssText = chromeInputCss();
-            for (const value of ["T2VA", "I2VA", "FL2VA", "L2VA"]) {
-                const option = document.createElement("option"); option.value = value;
-                option.textContent = value; task.appendChild(option);
-            }
-            task.value = active?.mode === "base" ? active.task_mode || "T2VA" : "T2VA";
-            const guideSelect = (label, selected) => {
-                const select = document.createElement("select"); select.style.cssText = chromeInputCss();
-                const none = document.createElement("option"); none.value = "";
-                none.textContent = `${label}: none`; select.appendChild(none);
-                for (const guide of scene.guide_frames || []) {
-                    if (guide.muted) continue;
-                    const option = document.createElement("option"); option.value = guide.guide_id || "";
-                    option.textContent = `${label}: ${guide.frame_index === -1 ? "last" : `${guide.frame_index}f`}`;
-                    select.appendChild(option);
-                }
-                select.value = selected || ""; return select;
-            };
-            const first = guideSelect("First frame", active?.mode === "base" ? active.first_guide_id : "");
-            const last = guideSelect("Last frame", active?.mode === "base" ? active.last_guide_id : "");
-            const save = makeBtn("Use H3 Base setup", "Bind task mode and physical Guide anchors", "primary");
-            save.addEventListener("click", () => {
-                const setup = { ...(active?.mode === "base" ? active : {}),
-                    schema: "minimax_h3_setup_v1", setup_id: active?.mode === "base" ? active.setup_id : uid(),
-                    name: "MiniMax H3 Base Setup", mode: "base", task_mode: task.value,
-                    first_guide_id: first.value, last_guide_id: last.value };
-                commit([{ type: "update_scene_fields", fields: {
-                    prompt_context_profile_config: { task_mode: task.value },
-                    minimax_h3_conditioning_setups: [...setups.filter((value) => value.setup_id !== setup.setup_id), setup],
-                    active_minimax_h3_setup_id: setup.setup_id,
-                } }], "configure MiniMax H3 Base");
-            });
-            controls.append(task, first, last, save); card.appendChild(controls);
-        }
         const candidate = currentCandidatePayload() || {};
         lastIdentityCandidateSignature = identityCandidateSignature(candidate);
         const profileKey = profile.value || defaultProfile;

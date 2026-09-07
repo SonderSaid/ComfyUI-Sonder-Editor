@@ -367,7 +367,7 @@ def merge_scene_history(base: dict, target: dict, stored: dict) -> dict:
     for field in (
         "name", "duration_frames", "generation_params",
         "prompt_context_profile_id", "prompt_context_profile_config",
-        "active_minimax_h3_setup_id", "guide_track_config",
+        "guide_track_config",
         "prompt_track_config", "global_prompt_track_config",
     ):
         _merge_value(result, field, base, target, stored, conflicts)
@@ -396,7 +396,6 @@ def merge_scene_history(base: dict, target: dict, stored: dict) -> dict:
          frozenset({"prompt", "channels"}), ("channel_docs",)),
         ("linked_item_groups", "group_id", False, frozenset(), ()),
         ("global_attachments", "attachment_id", False, frozenset(), ()),
-        ("minimax_h3_conditioning_setups", "setup_id", False, frozenset(), ()),
     )
     for field, key, per_field, excluded, mapping_fields in collection_specs:
         _merge_collection(result, field, key, base, target, stored, conflicts,

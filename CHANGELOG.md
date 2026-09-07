@@ -11,6 +11,9 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Removed
+- Removed MiniMax H3 Base task-mode and first/last Guide setup controls and automatic alignment prose; the Base prompt format and Guides Bridge remain available.
+
 ### Added
 - The toolbar now pairs labeled Model and Channels template controls, with a project-wide channel picker and a shortcut to Manage Channel Templates.
 - Added links to Project-Sample, the LTX 2.3 example project hosted on Hugging Face.

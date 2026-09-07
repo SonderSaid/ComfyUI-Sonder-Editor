@@ -965,9 +965,6 @@ function normalizePromptTemplates(templates) {
             prompt_context_profile_config: raw.prompt_context_profile_config
                 && typeof raw.prompt_context_profile_config === "object"
                 ? structuredClone(raw.prompt_context_profile_config) : {},
-            minimax_h3_conditioning_setups: cloneRecordArray(
-                raw.minimax_h3_conditioning_setups),
-            active_minimax_h3_setup_id: String(raw.active_minimax_h3_setup_id || ""),
             prompt_context_profiles: cloneRecordArray(raw.prompt_context_profiles),
             prompt_semantic_units: cloneRecordArray(raw.prompt_semantic_units),
             // Records which channel set the text was AUTHORED under, so applying

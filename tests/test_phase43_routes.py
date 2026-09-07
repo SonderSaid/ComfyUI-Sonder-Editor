@@ -1027,23 +1027,17 @@ def test_scene_restore_duration_change_conflicts_with_concurrent_last_frame_guid
     assert project.scenes[0].duration_frames == 48
 
 
-def test_scene_restore_atomically_restores_reference_lane_ids_and_h3_setup(tmp_path, monkeypatch):
+def test_scene_restore_restores_reference_lanes_and_preserves_retired_setup(tmp_path, monkeypatch):
     route_module = _load_route_module(monkeypatch)
     project_dir = tmp_path / "project"
     project_dir.mkdir()
-    scene = Scene(
-        scene_id="scene-1", name="Scene", reference_lane_count=1,
-        reference_lane_configs=[LaneConfig()],
-        reference_lane_recipes=[ReferenceLaneRecipe(
-            lane_id="current", recipe={"soft": {"physical_population": "pictures"}})],
-        minimax_h3_conditioning_setups=[{
+    scene = Scene.from_dict({**Scene(scene_id="scene-1", name="Scene", reference_lane_count=1, reference_lane_configs=[LaneConfig()], reference_lane_recipes=[ReferenceLaneRecipe(
+            lane_id="current", recipe={"soft": {"physical_population": "pictures"}})]).to_dict(), 'minimax_h3_conditioning_setups': [{
             "schema": "minimax_h3_setup_v1", "setup_id": "setup",
             "name": "Setup", "mode": "reference", "task_mode": "T2VA",
             "picture_lane_ids": ["current"], "video_lane_ids": [],
             "audio_lane_ids": [],
-        }],
-        active_minimax_h3_setup_id="setup",
-    )
+        }], 'active_minimax_h3_setup_id': "setup"})
     project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
     monkeypatch.setattr(route_module, "_load_project_from_request",
                         lambda request, **kwargs: project)
@@ -1082,7 +1076,7 @@ def test_scene_restore_atomically_restores_reference_lane_ids_and_h3_setup(tmp_p
     assert [value["lane_id"] for value in payload["reference_lane_recipes"]] == [
         "old-a", "old-b"]
     assert payload["minimax_h3_conditioning_setups"][0]["picture_lane_ids"] == [
-        "old-a", "old-b"]
+        "current"]
 
 
 def test_scene_restore_does_not_normalize_untouched_h3_setup_data(
@@ -1094,9 +1088,7 @@ def test_scene_restore_does_not_normalize_untouched_h3_setup_data(
         "picture_lane_ids": [], "video_lane_ids": [], "audio_lane_ids": [],
         "future_field": {"preserve": True},
     }
-    scene = Scene(scene_id="scene-1", name="After",
-                  minimax_h3_conditioning_setups=[copy.deepcopy(setup)],
-                  active_minimax_h3_setup_id="setup")
+    scene = Scene.from_dict({**Scene(scene_id="scene-1", name="After").to_dict(), 'minimax_h3_conditioning_setups': [copy.deepcopy(setup)], 'active_minimax_h3_setup_id': "setup"})
     project = TimelineProject(project_id="project", project_dir=str(tmp_path),
                               scenes=[scene])
     monkeypatch.setattr(route_module, "_load_project_from_request",
@@ -1166,18 +1158,13 @@ def test_scene_put_preserves_omitted_reference_lane_id_and_setup_binding(tmp_pat
     route_module = _load_route_module(monkeypatch)
     project_dir = tmp_path / "project"
     project_dir.mkdir()
-    scene = Scene(
-        scene_id="scene-1", reference_lane_count=1,
-        reference_lane_configs=[LaneConfig()],
-        reference_lane_recipes=[ReferenceLaneRecipe(
-            lane_id="stable", recipe={"soft": {"physical_population": "pictures"}})],
-        minimax_h3_conditioning_setups=[{
+    scene = Scene.from_dict({**Scene(scene_id="scene-1", reference_lane_count=1, reference_lane_configs=[LaneConfig()], reference_lane_recipes=[ReferenceLaneRecipe(
+            lane_id="stable", recipe={"soft": {"physical_population": "pictures"}})]).to_dict(), 'minimax_h3_conditioning_setups': [{
             "schema": "minimax_h3_setup_v1", "setup_id": "setup",
             "name": "Setup", "mode": "reference", "task_mode": "T2VA",
             "picture_lane_ids": ["stable"], "video_lane_ids": [],
             "audio_lane_ids": [],
-        }], active_minimax_h3_setup_id="setup",
-    )
+        }], 'active_minimax_h3_setup_id': "setup"})
     project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
     monkeypatch.setattr(route_module, "save_project", lambda project: None)
@@ -2526,3 +2513,47 @@ def test_bridge_guides_route_resolves_minus_one_frame_index(tmp_path, monkeypatc
     assert [row["guide_key"] for row in payload["guides"]] == ["asset-1:99"]
     assert [row["frame_index"] for row in payload["guides"]] == [99]
     assert payload["all_guide_keys"] == ["asset-1:99"]
+
+
+def test_duplicate_preserves_retired_setup_records_through_rebuild(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    retired = [{"setup_id": "base", "mode": "base", "task_mode": "FL2VA",
+                "first_guide_id": "old-guide", "future": {"nested": [1, 2]},
+                "picture_lane_ids": [f"lane-{i}" for i in range(12)]}]
+    scene = Scene.from_dict({"scene_id": "scene-1", "name": "Original",
+        "minimax_h3_conditioning_setups": retired, "active_minimax_h3_setup_id": "base"})
+    project = TimelineProject(project_id="project", project_dir=str(tmp_path), scenes=[scene])
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request, **kwargs: project)
+    saved = []
+    monkeypatch.setattr(route_module, "save_project", lambda project, **kwargs: saved.append(project.to_dict()))
+    duplicate = _route_handler(route_module, "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/duplicate")
+    response = asyncio.run(duplicate(DummyRequest(match_info={"project_id": "project", "scene_id": "scene-1"})))
+    assert response.status == 201
+    payload = _response_json(response)
+    assert payload["scene_id"] != "scene-1"
+    assert payload["minimax_h3_conditioning_setups"] == retired
+    assert payload["active_minimax_h3_setup_id"] == "base"
+    assert saved[-1]["scenes"][-1]["minimax_h3_conditioning_setups"] == retired
+    assert scene.to_dict()["minimax_h3_conditioning_setups"] == retired
+
+
+def test_retired_setup_only_history_is_committed_noop(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene.from_dict({"scene_id": "scene-1", "name": "Original",
+        "minimax_h3_conditioning_setups": [{"setup_id": "base", "task_mode": "I2VA"}],
+        "active_minimax_h3_setup_id": "base"})
+    project = TimelineProject(project_id="project", project_dir=str(tmp_path), scenes=[scene])
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request, **kwargs: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project, **kwargs: None)
+    base = scene.to_dict()
+    target = copy.deepcopy(base)
+    target["minimax_h3_conditioning_setups"][0]["task_mode"] = "T2VA"
+    target["active_minimax_h3_setup_id"] = "retired-other"
+    token = route_module._SCENE_RESTORE_RECEIPTS.issue("project", "scene-1")
+    restore = _route_handler(route_module, "PUT",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/restore")
+    response = asyncio.run(restore(DummyRequest(match_info={"project_id": "project", "scene_id": "scene-1"},
+        body={"base_scene": base, "target_scene": target, "restore_token": token})))
+    assert response.status == 200
+    assert _response_json(response)["scene"] == base

@@ -1800,28 +1800,6 @@ def _apply_scene_fields(project: TimelineProject, scene: Scene, fields: dict) ->
         scene.prompt_context_profile_config = (
             dict(fields["prompt_context_profile_config"])
             if isinstance(fields["prompt_context_profile_config"], dict) else {})
-    if ("minimax_h3_conditioning_setups" in fields
-            or "active_minimax_h3_setup_id" in fields):
-        raw_setups = fields.get(
-            "minimax_h3_conditioning_setups",
-            scene.minimax_h3_conditioning_setups,
-        )
-        setups = []
-        for raw_setup in (raw_setups if isinstance(raw_setups, list) else []):
-            if not isinstance(raw_setup, dict):
-                continue
-            normalized_setup = minimax_h3.normalize_setup(raw_setup)
-            invalid_setup = minimax_h3.setup_validation_errors(normalized_setup)
-            if invalid_setup:
-                _mutation_error(str(invalid_setup[0]["message"]), 400,
-                                str(invalid_setup[0]["code"]))
-            setups.append(normalized_setup)
-        active_setup_id = str(fields.get(
-            "active_minimax_h3_setup_id",
-            scene.active_minimax_h3_setup_id,
-        ) or "")
-        scene.minimax_h3_conditioning_setups = setups
-        scene.active_minimax_h3_setup_id = active_setup_id
     if "generation_params" in fields:
         scene.generation_params = fields["generation_params"] if isinstance(fields["generation_params"], dict) else {}
     if "width" in fields:
@@ -2004,15 +1982,6 @@ def _require_media_target_bounds_fit(scene: Scene, targets: list[tuple[object, i
 
 def _validate_scene_history_merge(scene: Scene) -> None:
     """Reject a merged scene that ordinary mutation routes cannot construct."""
-    for raw_setup in getattr(scene, "minimax_h3_conditioning_setups", []) or []:
-        if not isinstance(raw_setup, dict):
-            _mutation_error("A merged H3 setup is invalid", 409,
-                            "scene_merge_invalid")
-        normalized_setup = minimax_h3.normalize_setup(raw_setup)
-        invalid_setup = minimax_h3.setup_validation_errors(normalized_setup)
-        if invalid_setup:
-            _mutation_error(str(invalid_setup[0]["message"]), 409,
-                            "scene_merge_invalid")
     raw_duration = int(getattr(scene, "duration_frames", 0) or 0)
     if raw_duration < 0:
         _mutation_error("Scene duration cannot be negative", 409,
@@ -4321,11 +4290,6 @@ def _freeze_reference_input_snapshots(
         reference, member = resolved
         entity_ids.add(str(reference.reference_id or ""))
         asset_ids.add(str(member.asset_id or ""))
-    asset_ids.update(
-        str(value.get("asset_id") or "")
-        for value in (setup_manifest.get("guides", []) or [])
-        if isinstance(value, dict)
-    )
     entity_ids.discard("")
     asset_ids.discard("")
     source_scene = project.get_scene(getattr(job, "scene_id", ""))
@@ -4717,8 +4681,6 @@ def _record_prompt_history(project: TimelineProject, jobs: list) -> None:
         dependency_units = [frozen_units[unit_id]
                             for unit_id in sorted(semantic_unit_ids)
                             if unit_id in frozen_units] if is_v1 else []
-        setup_manifest = getattr(job, "minimax_h3_setup_snapshot", {}) or {}
-        active_setup = copy.deepcopy(setup_manifest.get("setup") or {})
         if (not global_text and not global_channels and not global_channel_docs
                 and not global_attachments and not sections):
             continue
@@ -4730,13 +4692,8 @@ def _record_prompt_history(project: TimelineProject, jobs: list) -> None:
             source_template) if source_template else {})
         profile_config = copy.deepcopy(
             params.get("prompt_context_profile_config") or {})
-        # Profile selection, its configuration, and the active H3 setup all
-        # change the model-facing prompt.  Leaving them out of the digest
-        # collapsed two genuinely different runs — identical authored text
-        # under different task modes — into one history entry.  The frozen
-        # content hash covers what the setup record no longer can: in Full
-        # Reference the setup is now one constant implicit record, so two runs
-        # differing only in which lanes served slots would otherwise collide.
+        # The frozen content hash distinguishes physical Reference inputs;
+        # profile selection/configuration and template retain authored context.
         digest = hashlib.sha256(json.dumps(
             {"global": global_text, "global_channels": global_channels,
              "global_channel_docs": global_channel_docs,
@@ -4745,9 +4702,6 @@ def _record_prompt_history(project: TimelineProject, jobs: list) -> None:
              "prompt_context_profile_config": profile_config,
              "prompt_context_profiles": dependency_profiles,
              "prompt_semantic_units": dependency_units,
-             "minimax_h3_conditioning_setups": ([active_setup] if active_setup
-                                                else []),
-             "active_minimax_h3_setup_id": str(active_setup.get("setup_id") or ""),
              "prompt_context_content_hash": str(
                  params.get("prompt_context_content_hash") or ""),
              "source_channel_template": source_template_value}, sort_keys=True
@@ -4773,8 +4727,6 @@ def _record_prompt_history(project: TimelineProject, jobs: list) -> None:
             "prompt_context_profile_config": profile_config,
             "prompt_context_profiles": dependency_profiles,
             "prompt_semantic_units": dependency_units,
-            "minimax_h3_conditioning_setups": [active_setup] if active_setup else [],
-            "active_minimax_h3_setup_id": str(active_setup.get("setup_id") or ""),
             "source_channel_template_id": source_template.get("id", ""),
             "source_channel_template": source_template_value,
             "sections": sections,
@@ -8592,8 +8544,8 @@ def _compile_prompt_context_candidate_sync(
     allowed = {
         "prompt_sections", "global_channels", "global_channel_docs",
         "global_attachments", "prompt_context_profile_id",
-        "prompt_context_profile_config", "minimax_h3_conditioning_setups",
-        "active_minimax_h3_setup_id", "guide_frames", "reference_items",
+        "prompt_context_profile_config",
+        "guide_frames", "reference_items",
         "reference_lane_recipes", "reference_lane_configs",
         "reference_lane_count", "duration_frames", "fps",
     }
@@ -10822,17 +10774,6 @@ if routes is not None:
                 )
             if descriptor.recipe_attr and descriptor.recipe_attr in body:
                 _replace_reference_lane_recipes(scene, body[descriptor.recipe_attr])
-        setup_fields = {
-            key: body[key] for key in (
-                "minimax_h3_conditioning_setups",
-                "active_minimax_h3_setup_id",
-            ) if key in body
-        }
-        if setup_fields:
-            try:
-                _apply_scene_fields(project, scene, setup_fields)
-            except ProjectMutationRequestError as exc:
-                return _mutation_json_error(exc)
         if "guide_track_config" in body:
             scene.guide_track_config = LaneConfig.from_dict(body["guide_track_config"])
         if "prompt_track_config" in body:

@@ -221,7 +221,6 @@ def _preserve_scene_unknown_fields(raw: Any, canonical: dict) -> dict:
         ("audio_tracks", "track_id"),
         ("reference_items", "reference_item_id"),
         ("linked_item_groups", "group_id"),
-        ("minimax_h3_conditioning_setups", "setup_id"),
         ("reference_lane_recipes", "lane_id"),
     ):
         result[field_name] = _overlay_unknown_keyed_records(
@@ -1778,8 +1777,6 @@ class Scene:
     prompt_sections: list = field(default_factory=list)  # list[PromptSection]
     prompt_context_profile_id: str = ""
     prompt_context_profile_config: dict = field(default_factory=dict)
-    minimax_h3_conditioning_setups: list = field(default_factory=list)
-    active_minimax_h3_setup_id: str = ""
     generation_params: dict = field(default_factory=dict)  # seed, cfg, sampler, model, etc.
     batch_config: BatchConfig = field(default_factory=BatchConfig)
     guide_frames: list = field(default_factory=list)    # list[GuideFrame]
@@ -2042,8 +2039,6 @@ class Scene:
             "prompt_sections": [p.to_dict() for p in self.prompt_sections],
             "prompt_context_profile_id": self.prompt_context_profile_id,
             "prompt_context_profile_config": dict(self.prompt_context_profile_config),
-            "minimax_h3_conditioning_setups": [dict(value) for value in self.minimax_h3_conditioning_setups],
-            "active_minimax_h3_setup_id": self.active_minimax_h3_setup_id,
             "generation_params": self.generation_params,
             "batch_config": self.batch_config.to_dict(),
             "guide_frames": [g.to_dict() for g in self.guide_frames],
@@ -2096,9 +2091,6 @@ class Scene:
             prompt_context_profile_id=str(data.get("prompt_context_profile_id") or ""),
             prompt_context_profile_config=(dict(data.get("prompt_context_profile_config"))
                                            if isinstance(data.get("prompt_context_profile_config"), dict) else {}),
-            minimax_h3_conditioning_setups=[dict(value) for value in data.get("minimax_h3_conditioning_setups", [])
-                                            if isinstance(value, dict)],
-            active_minimax_h3_setup_id=str(data.get("active_minimax_h3_setup_id") or ""),
             generation_params=data.get("generation_params", {}),
             batch_config=BatchConfig.from_dict(data.get("batch_config", {})),
             asset_ids=data.get("asset_ids", []),

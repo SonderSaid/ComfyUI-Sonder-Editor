@@ -183,10 +183,11 @@ def test_declared_scene_write_set_restores_and_out_of_scope_fields_survive():
         "name", "generation_params", "prompt_context_profile_id",
         "prompt_context_profile_config", "global_prompt_track_config",
         "guide_track_config", "prompt_track_config",
-        "active_minimax_h3_setup_id",
-        "linked_item_groups", "minimax_h3_conditioning_setups",
+        "linked_item_groups",
     ):
         assert merged[field] == target[field]
+    assert merged["minimax_h3_conditioning_setups"] == stored["minimax_h3_conditioning_setups"]
+    assert merged["active_minimax_h3_setup_id"] == stored["active_minimax_h3_setup_id"]
     assert merged["saved_selections"] == [
         {"name": "keep"}, {"name": "concurrent"}]
     assert merged["asset_ids"] == ["asset", "concurrent"]
@@ -305,7 +306,6 @@ def test_keyed_item_fields_revert_without_erasing_concurrent_fields(
 @pytest.mark.parametrize(("field", "key"), [
     ("linked_item_groups", "group_id"),
     ("global_attachments", "attachment_id"),
-    ("minimax_h3_conditioning_setups", "setup_id"),
 ])
 def test_whole_value_members_revert_and_preserve_concurrent_new_members(field, key):
     target = _scene(**{field: [{key: "owned", "value": "before"}]})

@@ -105,7 +105,7 @@ export const PROMPT_CHANNEL_TEMPLATE_PRESETS = {
         SONDER_CHANNELS, { labels: LABELS_ALWAYS, shotMarkerChannel: "visual" }),
     minimax_h3_base: template("minimax_h3_base", "MiniMax H3",
         "MiniMax H3's three core fields for text- and keyframe-driven "
-        + "generation (T2VA / I2VA / FL2VA / L2VA).",
+        + "generation.",
         MINIMAX_BASE_CHANNELS,
         {
             fieldSeparator: "\n\n", labelSeparator: ": ", labels: LABELS_ALWAYS,
