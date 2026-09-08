@@ -231,12 +231,18 @@ Three recipe fields shape the derived text:
 - **Prompt prefix** — static text placed once at the front, not repeated per
   member.
 - **Per-member token** — a pattern expanded once per staged member.
-  Placeholders are `{n}` (member number from 1), `{index}` (from 0), `{prompt}`
-  (the member's own text), `{name}` (its prompt-safe `Entity_Member` label),
-  and `{entity_name}` / `{member_name}` for the pieces separately. So
-  `<Subject {n}> is {prompt}, from <Picture {n}>` composes a sentence rather
-  than prefixing a token. With no `{prompt}` or `{name}`, the member text is
-  appended after the pattern.
+  Use `{n}` for numbering from 1, `{index}` from 0, and `{prompt}` for the
+  member's prompt text. `{name}` supplies its prompt-safe `Entity_Member`
+  label; `{entity_name}` and `{member_name}` supply the parts separately.
+
+  For example, `Reference {n}: {prompt}` produces
+  `Reference 1: a woman in a red coat`. If the pattern contains none of the
+  text or name placeholders, the member's text is appended after it. Leave
+  the field empty to use the member's text, falling back to its name.
+
+  `{n}` and `{index}` describe positions within the recipe output. For MiniMax
+  H3 Subject/Picture numbering, use the H3 Prompt Context setup, which
+  resolves those identities across lanes.
 - **Prompt suffix** — static text placed once after the whole thing, for a
   format whose reference block is closed by a second label. LTX IC-LoRA
   Ingredients uses it for `Generated video:`, which leads the prompt you write

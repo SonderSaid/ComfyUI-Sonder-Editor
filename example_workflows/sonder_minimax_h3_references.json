@@ -18,29 +18,9 @@
       "flags": {},
       "order": 0,
       "mode": 0,
-      "inputs": [
-        {
-          "localized_name": "unet_name",
-          "name": "unet_name",
-          "type": "COMBO",
-          "widget": {
-            "name": "unet_name"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "weight_dtype",
-          "name": "weight_dtype",
-          "type": "COMBO",
-          "widget": {
-            "name": "weight_dtype"
-          },
-          "link": null
-        }
-      ],
+      "inputs": [],
       "outputs": [
         {
-          "localized_name": "MODEL",
           "name": "MODEL",
           "type": "MODEL",
           "links": [
@@ -83,20 +63,9 @@
       "flags": {},
       "order": 1,
       "mode": 0,
-      "inputs": [
-        {
-          "localized_name": "vae_name",
-          "name": "vae_name",
-          "type": "COMBO",
-          "widget": {
-            "name": "vae_name"
-          },
-          "link": null
-        }
-      ],
+      "inputs": [],
       "outputs": [
         {
-          "localized_name": "VAE",
           "name": "VAE",
           "type": "VAE",
           "links": [
@@ -137,39 +106,9 @@
       "flags": {},
       "order": 2,
       "mode": 0,
-      "inputs": [
-        {
-          "localized_name": "clip_name",
-          "name": "clip_name",
-          "type": "COMBO",
-          "widget": {
-            "name": "clip_name"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "type",
-          "name": "type",
-          "type": "COMBO",
-          "widget": {
-            "name": "type"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "device",
-          "name": "device",
-          "shape": 7,
-          "type": "COMBO",
-          "widget": {
-            "name": "device"
-          },
-          "link": null
-        }
-      ],
+      "inputs": [],
       "outputs": [
         {
-          "localized_name": "CLIP",
           "name": "CLIP",
           "type": "CLIP",
           "links": [
@@ -214,20 +153,9 @@
       "flags": {},
       "order": 3,
       "mode": 0,
-      "inputs": [
-        {
-          "localized_name": "vae_name",
-          "name": "vae_name",
-          "type": "COMBO",
-          "widget": {
-            "name": "vae_name"
-          },
-          "link": null
-        }
-      ],
+      "inputs": [],
       "outputs": [
         {
-          "localized_name": "VAE",
           "name": "VAE",
           "type": "VAE",
           "links": [
@@ -358,29 +286,9 @@
       "flags": {},
       "order": 4,
       "mode": 0,
-      "inputs": [
-        {
-          "localized_name": "unet_name",
-          "name": "unet_name",
-          "type": "COMBO",
-          "widget": {
-            "name": "unet_name"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "weight_dtype",
-          "name": "weight_dtype",
-          "type": "COMBO",
-          "widget": {
-            "name": "weight_dtype"
-          },
-          "link": null
-        }
-      ],
+      "inputs": [],
       "outputs": [
         {
-          "localized_name": "MODEL",
           "name": "MODEL",
           "type": "MODEL",
           "links": [
@@ -1038,33 +946,28 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "clip",
           "name": "clip",
           "type": "CLIP",
           "link": 621
         },
         {
-          "localized_name": "vae",
           "name": "vae",
           "type": "VAE",
           "link": 620
         },
         {
-          "localized_name": "first_frame",
           "name": "first_frame",
           "shape": 7,
           "type": "IMAGE",
           "link": null
         },
         {
-          "localized_name": "last_frame",
           "name": "last_frame",
           "shape": 7,
           "type": "IMAGE",
           "link": null
         },
         {
-          "localized_name": "prompt",
           "name": "prompt",
           "type": "STRING",
           "widget": {
@@ -1073,7 +976,6 @@
           "link": 618
         },
         {
-          "localized_name": "width",
           "name": "width",
           "type": "INT",
           "widget": {
@@ -1082,7 +984,6 @@
           "link": 612
         },
         {
-          "localized_name": "height",
           "name": "height",
           "type": "INT",
           "widget": {
@@ -1091,7 +992,6 @@
           "link": 613
         },
         {
-          "localized_name": "length",
           "name": "length",
           "type": "INT",
           "widget": {
@@ -1102,7 +1002,6 @@
       ],
       "outputs": [
         {
-          "localized_name": "positive",
           "name": "positive",
           "type": "CONDITIONING",
           "links": [
@@ -1110,7 +1009,6 @@
           ]
         },
         {
-          "localized_name": "LATENT",
           "name": "LATENT",
           "type": "LATENT",
           "links": []
@@ -1562,13 +1460,11 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "audio",
           "name": "audio",
           "type": "AUDIO",
           "link": 920
         },
         {
-          "localized_name": "vae",
           "name": "vae",
           "type": "VAE",
           "link": 935
@@ -1576,7 +1472,6 @@
       ],
       "outputs": [
         {
-          "localized_name": "LATENT",
           "name": "LATENT",
           "type": "LATENT",
           "links": [
@@ -1934,13 +1829,11 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "samples",
           "name": "samples",
           "type": "LATENT",
           "link": 929
         },
         {
-          "localized_name": "mask",
           "name": "mask",
           "type": "MASK",
           "link": 931
@@ -1948,7 +1841,6 @@
       ],
       "outputs": [
         {
-          "localized_name": "LATENT",
           "name": "LATENT",
           "type": "LATENT",
           "links": [
@@ -1978,13 +1870,11 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "samples",
           "name": "samples",
           "type": "LATENT",
           "link": 930
         },
         {
-          "localized_name": "mask",
           "name": "mask",
           "type": "MASK",
           "link": 932
@@ -1992,7 +1882,6 @@
       ],
       "outputs": [
         {
-          "localized_name": "LATENT",
           "name": "LATENT",
           "type": "LATENT",
           "links": [
@@ -2022,13 +1911,11 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "video_latent",
           "name": "video_latent",
           "type": "LATENT",
           "link": 909
         },
         {
-          "localized_name": "audio_latent",
           "name": "audio_latent",
           "type": "LATENT",
           "link": 910
@@ -2036,7 +1923,6 @@
       ],
       "outputs": [
         {
-          "localized_name": "latent",
           "name": "latent",
           "type": "LATENT",
           "links": [
@@ -2144,7 +2030,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 106,
+      "order": 110,
       "mode": 0,
       "inputs": [
         {
@@ -2189,7 +2075,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 113,
+      "order": 117,
       "mode": 0,
       "inputs": [
         {
@@ -2232,7 +2118,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 109,
+      "order": 113,
       "mode": 0,
       "inputs": [
         {
@@ -2277,7 +2163,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 110,
+      "order": 114,
       "mode": 0,
       "inputs": [
         {
@@ -2322,7 +2208,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 111,
+      "order": 115,
       "mode": 0,
       "inputs": [
         {
@@ -2367,7 +2253,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 112,
+      "order": 116,
       "mode": 0,
       "inputs": [
         {
@@ -2412,7 +2298,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 107,
+      "order": 111,
       "mode": 0,
       "inputs": [
         {
@@ -2577,7 +2463,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 105,
+      "order": 109,
       "mode": 0,
       "inputs": [
         {
@@ -2666,57 +2552,18 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "pixels",
           "name": "pixels",
           "type": "IMAGE",
           "link": 919
         },
         {
-          "localized_name": "vae",
           "name": "vae",
           "type": "VAE",
           "link": 936
-        },
-        {
-          "localized_name": "tile_size",
-          "name": "tile_size",
-          "type": "INT",
-          "widget": {
-            "name": "tile_size"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "overlap",
-          "name": "overlap",
-          "type": "INT",
-          "widget": {
-            "name": "overlap"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "temporal_size",
-          "name": "temporal_size",
-          "type": "INT",
-          "widget": {
-            "name": "temporal_size"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "temporal_overlap",
-          "name": "temporal_overlap",
-          "type": "INT",
-          "widget": {
-            "name": "temporal_overlap"
-          },
-          "link": null
         }
       ],
       "outputs": [
         {
-          "localized_name": "LATENT",
           "name": "LATENT",
           "type": "LATENT",
           "links": [
@@ -2760,13 +2607,11 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "samples",
           "name": "samples",
           "type": "LATENT",
           "link": 599
         },
         {
-          "localized_name": "vae",
           "name": "vae",
           "type": "VAE",
           "link": 601
@@ -2774,7 +2619,6 @@
       ],
       "outputs": [
         {
-          "localized_name": "AUDIO",
           "name": "AUDIO",
           "type": "AUDIO",
           "links": [
@@ -2806,57 +2650,18 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "samples",
           "name": "samples",
           "type": "LATENT",
           "link": 915
         },
         {
-          "localized_name": "vae",
           "name": "vae",
           "type": "VAE",
           "link": 914
-        },
-        {
-          "localized_name": "tile_size",
-          "name": "tile_size",
-          "type": "INT",
-          "widget": {
-            "name": "tile_size"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "overlap",
-          "name": "overlap",
-          "type": "INT",
-          "widget": {
-            "name": "overlap"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "temporal_size",
-          "name": "temporal_size",
-          "type": "INT",
-          "widget": {
-            "name": "temporal_size"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "temporal_overlap",
-          "name": "temporal_overlap",
-          "type": "INT",
-          "widget": {
-            "name": "temporal_overlap"
-          },
-          "link": null
         }
       ],
       "outputs": [
         {
-          "localized_name": "IMAGE",
           "name": "IMAGE",
           "type": "IMAGE",
           "links": [
@@ -2940,7 +2745,6 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "select",
           "name": "select",
           "type": "INT",
           "widget": {
@@ -2949,26 +2753,7 @@
           "link": 654
         },
         {
-          "localized_name": "branches",
-          "name": "branches",
-          "type": "INT",
-          "widget": {
-            "name": "branches"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "lanes",
-          "name": "lanes",
-          "type": "INT",
-          "widget": {
-            "name": "lanes"
-          },
-          "link": null
-        },
-        {
           "label": "0: COND",
-          "localized_name": "0: COND",
           "name": "b0_l0",
           "shape": 7,
           "type": "CONDITIONING",
@@ -2976,7 +2761,6 @@
         },
         {
           "label": "   MODEL",
-          "localized_name": "   MODEL",
           "name": "b0_l1",
           "shape": 7,
           "type": "MODEL",
@@ -2984,7 +2768,6 @@
         },
         {
           "label": "1: COND",
-          "localized_name": "1: COND",
           "name": "b1_l0",
           "shape": 7,
           "type": "CONDITIONING",
@@ -2992,7 +2775,6 @@
         },
         {
           "label": "   MODEL",
-          "localized_name": "   MODEL",
           "name": "b1_l1",
           "shape": 7,
           "type": "MODEL",
@@ -3000,7 +2782,6 @@
         },
         {
           "label": "2: COND",
-          "localized_name": "2: COND",
           "name": "b2_l0",
           "shape": 7,
           "type": "CONDITIONING",
@@ -3008,7 +2789,6 @@
         },
         {
           "label": "   MODEL",
-          "localized_name": "   MODEL",
           "name": "b2_l1",
           "shape": 7,
           "type": "MODEL",
@@ -3018,7 +2798,6 @@
       "outputs": [
         {
           "label": "COND",
-          "localized_name": "COND",
           "name": "A",
           "type": "CONDITIONING",
           "links": [
@@ -3027,7 +2806,6 @@
         },
         {
           "label": "MODEL",
-          "localized_name": "MODEL",
           "name": "B",
           "type": "MODEL",
           "links": [
@@ -3643,441 +3421,104 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "project",
           "name": "project",
           "type": "SONDER_PROJECT",
           "link": 603
         },
         {
           "label": "value_0",
-          "localized_name": "value_0",
           "name": "values.value_0",
           "shape": 7,
           "type": "*",
           "link": 769
         },
         {
-          "localized_name": "value_1",
           "name": "values.value_1",
           "shape": 7,
           "type": "*",
           "link": 770
         },
         {
-          "localized_name": "label_0",
-          "name": "label_0",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_0"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_1",
-          "name": "label_1",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_1"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_2",
-          "name": "label_2",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_2"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_3",
-          "name": "label_3",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_3"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_4",
-          "name": "label_4",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_4"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_5",
-          "name": "label_5",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_5"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_6",
-          "name": "label_6",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_6"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_7",
-          "name": "label_7",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_7"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_8",
-          "name": "label_8",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_8"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_9",
-          "name": "label_9",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_9"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_10",
-          "name": "label_10",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_10"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_11",
-          "name": "label_11",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_11"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_12",
-          "name": "label_12",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_12"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_13",
-          "name": "label_13",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_13"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_14",
-          "name": "label_14",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_14"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_15",
-          "name": "label_15",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_15"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_16",
-          "name": "label_16",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_16"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_17",
-          "name": "label_17",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_17"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_18",
-          "name": "label_18",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_18"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_19",
-          "name": "label_19",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_19"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_20",
-          "name": "label_20",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_20"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_21",
-          "name": "label_21",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_21"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_22",
-          "name": "label_22",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_22"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_23",
-          "name": "label_23",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_23"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_24",
-          "name": "label_24",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_24"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_25",
-          "name": "label_25",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_25"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_26",
-          "name": "label_26",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_26"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_27",
-          "name": "label_27",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_27"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_28",
-          "name": "label_28",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_28"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_29",
-          "name": "label_29",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_29"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_30",
-          "name": "label_30",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_30"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "label_31",
-          "name": "label_31",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "label_31"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "value_11",
-          "name": "values.value_11",
-          "shape": 7,
-          "type": "*",
-          "link": 985
-        },
-        {
-          "localized_name": "value_12",
-          "name": "values.value_12",
-          "shape": 7,
-          "type": "*",
-          "link": 986
-        },
-        {
-          "localized_name": "value_13",
           "name": "values.value_13",
           "shape": 7,
           "type": "*",
           "link": 987
         },
         {
-          "localized_name": "value_14",
           "name": "values.value_14",
           "shape": 7,
           "type": "*",
           "link": null
         },
         {
-          "localized_name": "value_2",
-          "name": "values.value_2",
-          "shape": 7,
-          "type": "*",
-          "link": 771
-        },
-        {
-          "localized_name": "value_3",
-          "name": "values.value_3",
-          "shape": 7,
-          "type": "*",
-          "link": 772
-        },
-        {
-          "localized_name": "value_4",
-          "name": "values.value_4",
-          "shape": 7,
-          "type": "*",
-          "link": 773
-        },
-        {
-          "localized_name": "value_5",
           "name": "values.value_5",
           "shape": 7,
           "type": "*",
           "link": 774
         },
         {
-          "localized_name": "value_6",
           "name": "values.value_6",
           "shape": 7,
           "type": "*",
           "link": 777
         },
         {
-          "localized_name": "value_7",
           "name": "values.value_7",
           "shape": 7,
           "type": "*",
           "link": 981
         },
         {
-          "localized_name": "value_8",
           "name": "values.value_8",
           "shape": 7,
           "type": "*",
           "link": 982
         },
         {
-          "localized_name": "value_9",
           "name": "values.value_9",
           "shape": 7,
           "type": "*",
           "link": 983
         },
         {
-          "localized_name": "value_10",
           "name": "values.value_10",
           "shape": 7,
           "type": "*",
           "link": 984
+        },
+        {
+          "name": "values.value_11",
+          "shape": 7,
+          "type": "*",
+          "link": 985
+        },
+        {
+          "name": "values.value_12",
+          "shape": 7,
+          "type": "*",
+          "link": 986
+        },
+        {
+          "name": "values.value_2",
+          "shape": 7,
+          "type": "*",
+          "link": 771
+        },
+        {
+          "name": "values.value_3",
+          "shape": 7,
+          "type": "*",
+          "link": 772
+        },
+        {
+          "name": "values.value_4",
+          "shape": 7,
+          "type": "*",
+          "link": 773
         }
       ],
       "outputs": [
         {
-          "localized_name": "project",
           "name": "project",
           "type": "SONDER_PROJECT",
           "links": [
@@ -4431,7 +3872,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 117,
+      "order": 107,
       "mode": 0,
       "inputs": [
         {
@@ -4761,7 +4202,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 114,
+      "order": 105,
       "mode": 0,
       "inputs": [
         {
@@ -4851,7 +4292,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 115,
+      "order": 106,
       "mode": 0,
       "inputs": [
         {
@@ -4898,47 +4339,40 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "positive",
           "name": "positive",
           "type": "CONDITIONING",
           "link": 802
         },
         {
-          "localized_name": "latent",
           "name": "latent",
           "type": "LATENT",
           "link": 798
         },
         {
-          "localized_name": "vae",
           "name": "vae",
           "shape": 7,
           "type": "VAE",
           "link": 1015
         },
         {
-          "localized_name": "audio_vae",
           "name": "audio_vae",
           "shape": 7,
           "type": "VAE",
           "link": 1016
         },
         {
-          "localized_name": "image",
           "name": "image",
           "shape": 7,
           "type": "IMAGE",
           "link": 797
         },
         {
-          "localized_name": "audio",
           "name": "audio",
           "shape": 7,
           "type": "AUDIO",
           "link": null
         },
         {
-          "localized_name": "frame_idx",
           "name": "frame_idx",
           "type": "INT",
           "widget": {
@@ -4949,7 +4383,6 @@
       ],
       "outputs": [
         {
-          "localized_name": "positive",
           "name": "positive",
           "type": "CONDITIONING",
           "links": [
@@ -5011,82 +4444,70 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "clip",
           "name": "clip",
           "type": "CLIP",
           "link": 684
         },
         {
-          "localized_name": "vae",
           "name": "vae",
           "type": "VAE",
           "link": 685
         },
         {
-          "localized_name": "audio_vae",
           "name": "audio_vae",
           "type": "VAE",
           "link": 686
         },
         {
           "label": "ref_image_0",
-          "localized_name": "ref_image_0",
           "name": "ref_images.ref_image_0",
           "shape": 7,
           "type": "IMAGE",
           "link": 687
         },
         {
-          "localized_name": "ref_image_1",
           "name": "ref_images.ref_image_1",
           "shape": 7,
           "type": "IMAGE",
           "link": 1022
         },
         {
-          "localized_name": "ref_image_2",
           "name": "ref_images.ref_image_2",
           "shape": 7,
           "type": "IMAGE",
           "link": 1043
         },
         {
-          "localized_name": "ref_image_3",
           "name": "ref_images.ref_image_3",
           "shape": 7,
           "type": "IMAGE",
           "link": 1044
         },
         {
-          "localized_name": "ref_image_4",
           "name": "ref_images.ref_image_4",
           "shape": 7,
           "type": "IMAGE",
           "link": 1045
         },
         {
-          "localized_name": "ref_image_5",
           "name": "ref_images.ref_image_5",
           "shape": 7,
           "type": "IMAGE",
           "link": 1046
         },
         {
-          "localized_name": "ref_image_6",
           "name": "ref_images.ref_image_6",
           "shape": 7,
           "type": "IMAGE",
           "link": 1047
         },
         {
-          "localized_name": "ref_image_7",
           "name": "ref_images.ref_image_7",
           "shape": 7,
           "type": "IMAGE",
           "link": 1048
         },
         {
-          "localized_name": "ref_image_8",
           "name": "ref_images.ref_image_8",
           "shape": 7,
           "type": "IMAGE",
@@ -5094,21 +4515,18 @@
         },
         {
           "label": "ref_video_0",
-          "localized_name": "ref_video_0",
           "name": "ref_videos.ref_video_0",
           "shape": 7,
           "type": "IMAGE",
           "link": 1050
         },
         {
-          "localized_name": "ref_video_1",
           "name": "ref_videos.ref_video_1",
           "shape": 7,
           "type": "IMAGE",
           "link": 1051
         },
         {
-          "localized_name": "ref_video_2",
           "name": "ref_videos.ref_video_2",
           "shape": 7,
           "type": "IMAGE",
@@ -5116,7 +4534,6 @@
         },
         {
           "label": "ref_video_audio_0",
-          "localized_name": "ref_video_audio_0",
           "name": "ref_video_audios.ref_video_audio_0",
           "shape": 7,
           "type": "AUDIO",
@@ -5124,28 +4541,24 @@
         },
         {
           "label": "ref_audio_0",
-          "localized_name": "ref_audio_0",
           "name": "ref_audios.ref_audio_0",
           "shape": 7,
           "type": "AUDIO",
           "link": 1053
         },
         {
-          "localized_name": "ref_audio_1",
           "name": "ref_audios.ref_audio_1",
           "shape": 7,
           "type": "AUDIO",
           "link": 1054
         },
         {
-          "localized_name": "ref_audio_2",
           "name": "ref_audios.ref_audio_2",
           "shape": 7,
           "type": "AUDIO",
           "link": 1055
         },
         {
-          "localized_name": "prompt",
           "name": "prompt",
           "type": "STRING",
           "widget": {
@@ -5154,7 +4567,6 @@
           "link": 703
         },
         {
-          "localized_name": "width",
           "name": "width",
           "type": "INT",
           "widget": {
@@ -5163,7 +4575,6 @@
           "link": 704
         },
         {
-          "localized_name": "height",
           "name": "height",
           "type": "INT",
           "widget": {
@@ -5172,27 +4583,16 @@
           "link": 705
         },
         {
-          "localized_name": "length",
           "name": "length",
           "type": "INT",
           "widget": {
             "name": "length"
           },
           "link": 706
-        },
-        {
-          "localized_name": "ref_image_size",
-          "name": "ref_image_size",
-          "type": "COMBO",
-          "widget": {
-            "name": "ref_image_size"
-          },
-          "link": null
         }
       ],
       "outputs": [
         {
-          "localized_name": "positive",
           "name": "positive",
           "type": "CONDITIONING",
           "links": [
@@ -5201,7 +4601,6 @@
           ]
         },
         {
-          "localized_name": "LATENT",
           "name": "LATENT",
           "type": "LATENT",
           "links": []
@@ -5241,7 +4640,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 59,
+      "order": 58,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -5282,7 +4681,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 60,
+      "order": 59,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -5324,20 +4723,17 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "project",
           "name": "project",
           "type": "SONDER_PROJECT",
           "link": 795
         },
         {
-          "localized_name": "flow_control",
           "name": "flow_control",
           "type": "FLOW_CONTROL",
           "link": 793
         },
         {
           "label": "COND",
-          "localized_name": "COND",
           "name": "value_0",
           "shape": 7,
           "type": "*",
@@ -5345,7 +4741,6 @@
         },
         {
           "label": "value_1",
-          "localized_name": "value_1",
           "name": "value_1",
           "shape": 7,
           "type": "*",
@@ -5355,7 +4750,6 @@
       "outputs": [
         {
           "label": "COND",
-          "localized_name": "COND",
           "name": "value_0",
           "type": "*",
           "links": [
@@ -5364,7 +4758,6 @@
         },
         {
           "label": "value_1",
-          "localized_name": "value_1",
           "name": "value_1",
           "type": "*",
           "links": null
@@ -5388,7 +4781,7 @@
         835.5135087298459
       ],
       "flags": {},
-      "order": 61,
+      "order": 60,
       "mode": 0,
       "inputs": [],
       "outputs": [],
@@ -5416,7 +4809,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 62,
+      "order": 61,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -5501,7 +4894,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 63,
+      "order": 62,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -5541,7 +4934,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 116,
+      "order": 118,
       "mode": 0,
       "inputs": [
         {
@@ -5586,7 +4979,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 64,
+      "order": 63,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -5626,7 +5019,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 65,
+      "order": 64,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -5698,160 +5091,6 @@
       "bgcolor": "#272e27"
     },
     {
-      "id": 552,
-      "type": "BasicScheduler",
-      "pos": [
-        -3917.4638200830686,
-        5265.273681212465
-      ],
-      "size": [
-        210,
-        106
-      ],
-      "flags": {},
-      "order": 97,
-      "mode": 0,
-      "inputs": [
-        {
-          "localized_name": "model",
-          "name": "model",
-          "type": "MODEL",
-          "link": 1137
-        },
-        {
-          "localized_name": "scheduler",
-          "name": "scheduler",
-          "type": "COMBO",
-          "widget": {
-            "name": "scheduler"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "steps",
-          "name": "steps",
-          "type": "INT",
-          "widget": {
-            "name": "steps"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "denoise",
-          "name": "denoise",
-          "type": "FLOAT",
-          "widget": {
-            "name": "denoise"
-          },
-          "link": null
-        }
-      ],
-      "outputs": [
-        {
-          "localized_name": "SIGMAS",
-          "name": "SIGMAS",
-          "type": "SIGMAS",
-          "links": [
-            1140,
-            1148
-          ]
-        }
-      ],
-      "title": "Detail BasicScheduler",
-      "properties": {
-        "Node name for S&R": "BasicScheduler"
-      },
-      "widgets_values": [
-        "bong_tangent",
-        8,
-        0.5
-      ],
-      "widgets_values_named": {
-        "scheduler": "bong_tangent",
-        "steps": 8,
-        "denoise": 0.5
-      },
-      "color": "#232",
-      "bgcolor": "#353"
-    },
-    {
-      "id": 553,
-      "type": "BasicScheduler",
-      "pos": [
-        -3919.283271690103,
-        5404.8086400598195
-      ],
-      "size": [
-        210,
-        106
-      ],
-      "flags": {},
-      "order": 98,
-      "mode": 0,
-      "inputs": [
-        {
-          "localized_name": "model",
-          "name": "model",
-          "type": "MODEL",
-          "link": 1138
-        },
-        {
-          "localized_name": "scheduler",
-          "name": "scheduler",
-          "type": "COMBO",
-          "widget": {
-            "name": "scheduler"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "steps",
-          "name": "steps",
-          "type": "INT",
-          "widget": {
-            "name": "steps"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "denoise",
-          "name": "denoise",
-          "type": "FLOAT",
-          "widget": {
-            "name": "denoise"
-          },
-          "link": null
-        }
-      ],
-      "outputs": [
-        {
-          "localized_name": "SIGMAS",
-          "name": "SIGMAS",
-          "type": "SIGMAS",
-          "links": [
-            1145,
-            1149
-          ]
-        }
-      ],
-      "title": "Upscale BasicScheduler",
-      "properties": {
-        "Node name for S&R": "BasicScheduler"
-      },
-      "widgets_values": [
-        "bong_tangent",
-        4,
-        0.25
-      ],
-      "widgets_values_named": {
-        "scheduler": "bong_tangent",
-        "steps": 4,
-        "denoise": 0.25
-      },
-      "color": "#232",
-      "bgcolor": "#353"
-    },
-    {
       "id": 554,
       "type": "SonderLazyCluster",
       "pos": [
@@ -5869,7 +5108,6 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "select",
           "name": "select",
           "type": "INT",
           "widget": {
@@ -5878,26 +5116,7 @@
           "link": 1150
         },
         {
-          "localized_name": "branches",
-          "name": "branches",
-          "type": "INT",
-          "widget": {
-            "name": "branches"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "lanes",
-          "name": "lanes",
-          "type": "INT",
-          "widget": {
-            "name": "lanes"
-          },
-          "link": null
-        },
-        {
           "label": "0: SAMPLER",
-          "localized_name": "0: SAMPLER",
           "name": "b0_l0",
           "shape": 7,
           "type": "SAMPLER",
@@ -5905,7 +5124,6 @@
         },
         {
           "label": "   SIGMAS",
-          "localized_name": "   SIGMAS",
           "name": "b0_l1",
           "shape": 7,
           "type": "SIGMAS",
@@ -5913,7 +5131,6 @@
         },
         {
           "label": "1: SAMPLER",
-          "localized_name": "1: SAMPLER",
           "name": "b1_l0",
           "shape": 7,
           "type": "SAMPLER",
@@ -5921,7 +5138,6 @@
         },
         {
           "label": "   SIGMAS",
-          "localized_name": "   SIGMAS",
           "name": "b1_l1",
           "shape": 7,
           "type": "SIGMAS",
@@ -5929,7 +5145,6 @@
         },
         {
           "label": "2: SAMPLER",
-          "localized_name": "2: SAMPLER",
           "name": "b2_l0",
           "shape": 7,
           "type": "SAMPLER",
@@ -5937,7 +5152,6 @@
         },
         {
           "label": "   SIGMAS",
-          "localized_name": "   SIGMAS",
           "name": "b2_l1",
           "shape": 7,
           "type": "SIGMAS",
@@ -5947,7 +5161,6 @@
       "outputs": [
         {
           "label": "SAMPLER",
-          "localized_name": "SAMPLER",
           "name": "A",
           "type": "SAMPLER",
           "links": [
@@ -5956,7 +5169,6 @@
         },
         {
           "label": "SIGMAS",
-          "localized_name": "SIGMAS",
           "name": "B",
           "type": "SIGMAS",
           "links": [
@@ -5995,7 +5207,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 66,
+      "order": 65,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -6035,7 +5247,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 68,
+      "order": 66,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -6077,24 +5289,13 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "project",
           "name": "project",
           "type": "SONDER_PROJECT",
           "link": 584
-        },
-        {
-          "localized_name": "reference_lanes",
-          "name": "reference_lanes",
-          "type": "STRING",
-          "widget": {
-            "name": "reference_lanes"
-          },
-          "link": null
         }
       ],
       "outputs": [
         {
-          "localized_name": "reference_set",
           "name": "reference_set",
           "type": "SONDER_REFERENCE_SET",
           "links": [
@@ -6102,13 +5303,11 @@
           ]
         },
         {
-          "localized_name": "has_reference",
           "name": "has_reference",
           "type": "INT",
           "links": []
         },
         {
-          "localized_name": "reference_strength",
           "name": "reference_strength",
           "type": "FLOAT",
           "links": null
@@ -6144,31 +5343,26 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "noise",
           "name": "noise",
           "type": "NOISE",
           "link": 1153
         },
         {
-          "localized_name": "guider",
           "name": "guider",
           "type": "GUIDER",
           "link": 233
         },
         {
-          "localized_name": "sampler",
           "name": "sampler",
           "type": "SAMPLER",
           "link": 647
         },
         {
-          "localized_name": "sigmas",
           "name": "sigmas",
           "type": "SIGMAS",
           "link": 648
         },
         {
-          "localized_name": "latent_image",
           "name": "latent_image",
           "type": "LATENT",
           "link": 646
@@ -6176,7 +5370,6 @@
       ],
       "outputs": [
         {
-          "localized_name": "output",
           "name": "output",
           "type": "LATENT",
           "links": [
@@ -6184,7 +5377,6 @@
           ]
         },
         {
-          "localized_name": "denoised_output",
           "name": "denoised_output",
           "type": "LATENT",
           "links": []
@@ -6210,7 +5402,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 69,
+      "order": 67,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -6297,13 +5489,11 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "model",
           "name": "model",
           "type": "MODEL",
           "link": 1161
         },
         {
-          "localized_name": "conditioning",
           "name": "conditioning",
           "type": "CONDITIONING",
           "link": 1018
@@ -6311,7 +5501,6 @@
       ],
       "outputs": [
         {
-          "localized_name": "GUIDER",
           "name": "GUIDER",
           "type": "GUIDER",
           "links": [
@@ -6343,7 +5532,6 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "noise_seed",
           "name": "noise_seed",
           "type": "INT",
           "widget": {
@@ -6354,7 +5542,6 @@
       ],
       "outputs": [
         {
-          "localized_name": "NOISE",
           "name": "NOISE",
           "type": "NOISE",
           "links": [
@@ -6390,33 +5577,13 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "model",
           "name": "model",
           "type": "MODEL",
           "link": 559
-        },
-        {
-          "localized_name": "lora_name",
-          "name": "lora_name",
-          "type": "COMBO",
-          "widget": {
-            "name": "lora_name"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "strength_model",
-          "name": "strength_model",
-          "type": "FLOAT",
-          "widget": {
-            "name": "strength_model"
-          },
-          "link": null
         }
       ],
       "outputs": [
         {
-          "localized_name": "MODEL",
           "name": "MODEL",
           "type": "MODEL",
           "links": [
@@ -6454,33 +5621,13 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "model",
           "name": "model",
           "type": "MODEL",
           "link": 569
-        },
-        {
-          "localized_name": "lora_name",
-          "name": "lora_name",
-          "type": "COMBO",
-          "widget": {
-            "name": "lora_name"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "strength_model",
-          "name": "strength_model",
-          "type": "FLOAT",
-          "widget": {
-            "name": "strength_model"
-          },
-          "link": null
         }
       ],
       "outputs": [
         {
-          "localized_name": "MODEL",
           "name": "MODEL",
           "type": "MODEL",
           "links": [
@@ -6518,14 +5665,12 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "project",
           "name": "project",
           "type": "SONDER_PROJECT",
           "link": 794
         },
         {
           "label": "COND",
-          "localized_name": "COND",
           "name": "value_0",
           "shape": 7,
           "type": "*",
@@ -6533,35 +5678,14 @@
         },
         {
           "label": "value_1",
-          "localized_name": "value_1",
           "name": "value_1",
           "shape": 7,
           "type": "*",
-          "link": null
-        },
-        {
-          "localized_name": "iteration_index",
-          "name": "iteration_index",
-          "type": "INT",
-          "widget": {
-            "name": "iteration_index"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "bridge_overrides_json",
-          "name": "bridge_overrides_json",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "bridge_overrides_json"
-          },
           "link": null
         }
       ],
       "outputs": [
         {
-          "localized_name": "flow_control",
           "name": "flow_control",
           "type": "FLOW_CONTROL",
           "links": [
@@ -6569,7 +5693,6 @@
           ]
         },
         {
-          "localized_name": "image",
           "name": "image",
           "type": "IMAGE",
           "links": [
@@ -6577,7 +5700,6 @@
           ]
         },
         {
-          "localized_name": "frame_index",
           "name": "frame_index",
           "type": "INT",
           "links": [
@@ -6585,14 +5707,12 @@
           ]
         },
         {
-          "localized_name": "strength",
           "name": "strength",
           "type": "FLOAT",
           "links": null
         },
         {
           "label": "COND",
-          "localized_name": "COND",
           "name": "value_0",
           "type": "*",
           "links": [
@@ -6601,7 +5721,6 @@
         },
         {
           "label": "value_1",
-          "localized_name": "value_1",
           "name": "value_1",
           "type": "*",
           "links": null
@@ -6639,26 +5758,14 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "reference_set",
           "name": "reference_set",
           "type": "SONDER_REFERENCE_SET",
           "link": 587
-        },
-        {
-          "localized_name": "unused_slots",
-          "name": "unused_slots",
-          "shape": 7,
-          "type": "COMBO",
-          "widget": {
-            "name": "unused_slots"
-          },
-          "link": null
         }
       ],
       "outputs": [
         {
           "label": "r01 · Picture 1 · Sonder Main Character (subject)",
-          "localized_name": "r01 · Picture 1 · Sonder Main Character (subject)",
           "name": "r01",
           "type": "IMAGE",
           "links": [
@@ -6667,7 +5774,6 @@
         },
         {
           "label": "r02 · (unused)",
-          "localized_name": "r02 · (unused)",
           "name": "r02",
           "type": "IMAGE",
           "links": [
@@ -6676,7 +5782,6 @@
         },
         {
           "label": "r03 · Picture 2 · Monster (subject)",
-          "localized_name": "r03 · Picture 2 · Monster (subject)",
           "name": "r03",
           "type": "IMAGE",
           "links": [
@@ -6684,8 +5789,7 @@
           ]
         },
         {
-          "label": "r04 (unused)",
-          "localized_name": "r04 (unused)",
+          "label": "r04 · (unused)",
           "name": "r04",
           "type": "IMAGE",
           "links": [
@@ -6694,7 +5798,6 @@
         },
         {
           "label": "r05 (unused)",
-          "localized_name": "r05 (unused)",
           "name": "r05",
           "type": "IMAGE",
           "links": [
@@ -6703,7 +5806,6 @@
         },
         {
           "label": "r06 (unused)",
-          "localized_name": "r06 (unused)",
           "name": "r06",
           "type": "IMAGE",
           "links": [
@@ -6712,7 +5814,6 @@
         },
         {
           "label": "r07 (unused)",
-          "localized_name": "r07 (unused)",
           "name": "r07",
           "type": "IMAGE",
           "links": [
@@ -6721,7 +5822,6 @@
         },
         {
           "label": "r08 (unused)",
-          "localized_name": "r08 (unused)",
           "name": "r08",
           "type": "IMAGE",
           "links": [
@@ -6730,7 +5830,6 @@
         },
         {
           "label": "r09 (unused)",
-          "localized_name": "r09 (unused)",
           "name": "r09",
           "type": "IMAGE",
           "links": [
@@ -6766,77 +5865,19 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "model",
           "name": "model",
           "type": "MODEL",
           "link": 1160
         },
         {
-          "localized_name": "vae",
           "name": "vae",
           "shape": 7,
           "type": "VAE",
-          "link": null
-        },
-        {
-          "localized_name": "max_resolution",
-          "name": "max_resolution",
-          "type": "INT",
-          "widget": {
-            "name": "max_resolution"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "jpeg_quality",
-          "name": "jpeg_quality",
-          "type": "INT",
-          "widget": {
-            "name": "jpeg_quality"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "suppress_default_preview",
-          "name": "suppress_default_preview",
-          "type": "BOOLEAN",
-          "widget": {
-            "name": "suppress_default_preview"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "preview_frames",
-          "name": "preview_frames",
-          "type": "INT",
-          "widget": {
-            "name": "preview_frames"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "preview_fps",
-          "name": "preview_fps",
-          "type": "INT",
-          "widget": {
-            "name": "preview_fps"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "tiny_vae",
-          "name": "tiny_vae",
-          "shape": 7,
-          "type": "COMBO",
-          "widget": {
-            "name": "tiny_vae"
-          },
           "link": null
         }
       ],
       "outputs": [
         {
-          "localized_name": "MODEL",
           "name": "MODEL",
           "type": "MODEL",
           "links": [
@@ -6870,85 +5911,6 @@
       "bgcolor": "#535"
     },
     {
-      "id": 551,
-      "type": "BasicScheduler",
-      "pos": [
-        -3918.163182837542,
-        5124.053292747794
-      ],
-      "size": [
-        210,
-        106
-      ],
-      "flags": {
-        "collapsed": false
-      },
-      "order": 96,
-      "mode": 0,
-      "inputs": [
-        {
-          "localized_name": "model",
-          "name": "model",
-          "type": "MODEL",
-          "link": 1136
-        },
-        {
-          "localized_name": "scheduler",
-          "name": "scheduler",
-          "type": "COMBO",
-          "widget": {
-            "name": "scheduler"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "steps",
-          "name": "steps",
-          "type": "INT",
-          "widget": {
-            "name": "steps"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "denoise",
-          "name": "denoise",
-          "type": "FLOAT",
-          "widget": {
-            "name": "denoise"
-          },
-          "link": null
-        }
-      ],
-      "outputs": [
-        {
-          "localized_name": "SIGMAS",
-          "name": "SIGMAS",
-          "type": "SIGMAS",
-          "links": [
-            1135,
-            1139
-          ]
-        }
-      ],
-      "title": "First BasicScheduler",
-      "properties": {
-        "Node name for S&R": "BasicScheduler"
-      },
-      "widgets_values": [
-        "sgm_uniform",
-        8,
-        1
-      ],
-      "widgets_values_named": {
-        "scheduler": "sgm_uniform",
-        "steps": 8,
-        "denoise": 1
-      },
-      "color": "#232",
-      "bgcolor": "#353"
-    },
-    {
       "id": 490,
       "type": "SonderSelector",
       "pos": [
@@ -6960,37 +5922,16 @@
         143.10289004740025
       ],
       "flags": {},
-      "order": 70,
+      "order": 68,
       "mode": 0,
-      "inputs": [
-        {
-          "localized_name": "choice",
-          "name": "choice",
-          "type": "COMBO",
-          "widget": {
-            "name": "choice"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "choice_list",
-          "name": "choice_list",
-          "type": "STRING",
-          "widget": {
-            "name": "choice_list"
-          },
-          "link": null
-        }
-      ],
+      "inputs": [],
       "outputs": [
         {
-          "localized_name": "selection",
           "name": "selection",
           "type": "STRING",
           "links": null
         },
         {
-          "localized_name": "index",
           "name": "index",
           "type": "INT",
           "links": [
@@ -7026,7 +5967,7 @@
         961.2602593978918
       ],
       "flags": {},
-      "order": 72,
+      "order": 69,
       "mode": 0,
       "inputs": [],
       "outputs": [],
@@ -7052,7 +5993,7 @@
         889.2666239886139
       ],
       "flags": {},
-      "order": 73,
+      "order": 70,
       "mode": 0,
       "inputs": [],
       "outputs": [],
@@ -7079,16 +6020,16 @@
         492.80069698833313
       ],
       "flags": {},
-      "order": 74,
+      "order": 71,
       "mode": 0,
       "inputs": [],
       "outputs": [],
       "properties": {},
       "widgets_values": [
-        "## Custom Nodes Required\n\nFour packs, all installable through **ComfyUI Manager**. Everything else in this graph is native ComfyUI, including all four MiniMax H3 nodes.\n\n### Sonder Editor\n\n**[ComfyUI-Sonder-Editor](https://github.com/SonderSaid/ComfyUI-Sonder-Editor)** · Manager: `sonder-editor`\n\nThe timeline video editor this workflow is built around, and the source of every `Sonder` node here: the Editor itself, the Reference Selector and Bridges, the Guides Bridges, the Masks Bridge, the Selectors, the Cluster, Save Video, and the Metadata Collector.\n\n**Requires version `<X.Y.Z>` or newer.** The Reference nodes do not exist in earlier releases, and the workflow will load with them missing.\n\n### RES4LYF\n\n**[ClownsharkBatwing/RES4LYF](https://github.com/ClownsharkBatwing/RES4LYF)**\n\nProvides the **res_2s** Sampler and **bong_tangent** Scheduler inside the Sampler/Scheduler Settings subgraph, and the **SeedGenerator**.\n\n### rgthree-comfy\n\n**[rgthree/rgthree-comfy](https://github.com/rgthree/rgthree-comfy)**\n\nProvides the **Power Lora Loader**, which holds the optional style LoRAs in one node instead of a chain of loaders.\n\n⚠️ If you have issues with this node rendering, turn off Nodes 2.0 or just remove this one and replace with your standard lora loader.\n\n### ComfyUI-KJNodes\n\n**[kijai/ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes)**\n\nProvides the **Set** and **Get** nodes that carry values across the graph without long wires. There are around a hundred of them here, so without this pack the workflow opens as a field of broken links rather than a graph with a few missing nodes.\n\n\n**Model Preview Override** replaces ComfyUI's default latent preview with a real decoded video preview while sampling, using the `taeh3` tiny VAE. It earns its place by letting you abandon bad runs early. The composition is readable long before the last step, so you can cancel a generation that clearly is not working and start the next one, instead of sitting through several minutes of sampling to confirm what you already knew at 20%.\n"
+        "## Custom Nodes Required\n\nFour packs, all installable through **ComfyUI Manager**. Everything else in this graph is native ComfyUI, including all four MiniMax H3 nodes.\n\n### Sonder Editor\n\n**[ComfyUI-Sonder-Editor](https://github.com/SonderSaid/ComfyUI-Sonder-Editor)** · Manager: `sonder-editor`\n\nThe timeline video editor this workflow is built around, and the source of every `Sonder` node here: the Editor itself, the Reference Selector and Bridges, the Guides Bridges, the Masks Bridge, the Selectors, the Cluster, Save Video, and the Metadata Collector.\n\n**Requires Sonder Editor 0.4.0 or newer.** Use this version for the current Reference features and workflow guidance.\n\n### RES4LYF\n\n**[ClownsharkBatwing/RES4LYF](https://github.com/ClownsharkBatwing/RES4LYF)**\n\nProvides the **beta57** scheduler used for the upscale pass and the **SeedGenerator**. The selected **er_sde** sampler and **sgm_uniform** scheduler are native ComfyUI.\n\n### rgthree-comfy\n\n**[rgthree/rgthree-comfy](https://github.com/rgthree/rgthree-comfy)**\n\nProvides the **Power Lora Loader**, which holds the optional style LoRAs in one node instead of a chain of loaders.\n\n⚠️ If you have issues with this node rendering, turn off Nodes 2.0 or just remove this one and replace with your standard lora loader.\n\n### ComfyUI-KJNodes\n\n**[kijai/ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes)**\n\nProvides the **Set** and **Get** nodes that carry values across the graph without long wires. There are around a hundred of them here, so without this pack the workflow opens as a field of broken links rather than a graph with a few missing nodes.\n\n\n**Model Preview Override** replaces ComfyUI's default latent preview with a real decoded video preview while sampling, using the `taeh3` tiny VAE. It earns its place by letting you abandon bad runs early. The composition is readable long before the last step, so you can cancel a generation that clearly is not working and start the next one, instead of sitting through several minutes of sampling to confirm what you already knew at 20%.\n"
       ],
       "widgets_values_named": {
-        "text": "## Custom Nodes Required\n\nFour packs, all installable through **ComfyUI Manager**. Everything else in this graph is native ComfyUI, including all four MiniMax H3 nodes.\n\n### Sonder Editor\n\n**[ComfyUI-Sonder-Editor](https://github.com/SonderSaid/ComfyUI-Sonder-Editor)** · Manager: `sonder-editor`\n\nThe timeline video editor this workflow is built around, and the source of every `Sonder` node here: the Editor itself, the Reference Selector and Bridges, the Guides Bridges, the Masks Bridge, the Selectors, the Cluster, Save Video, and the Metadata Collector.\n\n**Requires version `<X.Y.Z>` or newer.** The Reference nodes do not exist in earlier releases, and the workflow will load with them missing.\n\n### RES4LYF\n\n**[ClownsharkBatwing/RES4LYF](https://github.com/ClownsharkBatwing/RES4LYF)**\n\nProvides the **res_2s** Sampler and **bong_tangent** Scheduler inside the Sampler/Scheduler Settings subgraph, and the **SeedGenerator**.\n\n### rgthree-comfy\n\n**[rgthree/rgthree-comfy](https://github.com/rgthree/rgthree-comfy)**\n\nProvides the **Power Lora Loader**, which holds the optional style LoRAs in one node instead of a chain of loaders.\n\n⚠️ If you have issues with this node rendering, turn off Nodes 2.0 or just remove this one and replace with your standard lora loader.\n\n### ComfyUI-KJNodes\n\n**[kijai/ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes)**\n\nProvides the **Set** and **Get** nodes that carry values across the graph without long wires. There are around a hundred of them here, so without this pack the workflow opens as a field of broken links rather than a graph with a few missing nodes.\n\n\n**Model Preview Override** replaces ComfyUI's default latent preview with a real decoded video preview while sampling, using the `taeh3` tiny VAE. It earns its place by letting you abandon bad runs early. The composition is readable long before the last step, so you can cancel a generation that clearly is not working and start the next one, instead of sitting through several minutes of sampling to confirm what you already knew at 20%.\n"
+        "text": "## Custom Nodes Required\n\nFour packs, all installable through **ComfyUI Manager**. Everything else in this graph is native ComfyUI, including all four MiniMax H3 nodes.\n\n### Sonder Editor\n\n**[ComfyUI-Sonder-Editor](https://github.com/SonderSaid/ComfyUI-Sonder-Editor)** · Manager: `sonder-editor`\n\nThe timeline video editor this workflow is built around, and the source of every `Sonder` node here: the Editor itself, the Reference Selector and Bridges, the Guides Bridges, the Masks Bridge, the Selectors, the Cluster, Save Video, and the Metadata Collector.\n\n**Requires Sonder Editor 0.4.0 or newer.** Use this version for the current Reference features and workflow guidance.\n\n### RES4LYF\n\n**[ClownsharkBatwing/RES4LYF](https://github.com/ClownsharkBatwing/RES4LYF)**\n\nProvides the **beta57** scheduler used for the upscale pass and the **SeedGenerator**. The selected **er_sde** sampler and **sgm_uniform** scheduler are native ComfyUI.\n\n### rgthree-comfy\n\n**[rgthree/rgthree-comfy](https://github.com/rgthree/rgthree-comfy)**\n\nProvides the **Power Lora Loader**, which holds the optional style LoRAs in one node instead of a chain of loaders.\n\n⚠️ If you have issues with this node rendering, turn off Nodes 2.0 or just remove this one and replace with your standard lora loader.\n\n### ComfyUI-KJNodes\n\n**[kijai/ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes)**\n\nProvides the **Set** and **Get** nodes that carry values across the graph without long wires. There are around a hundred of them here, so without this pack the workflow opens as a field of broken links rather than a graph with a few missing nodes.\n\n\n**Model Preview Override** replaces ComfyUI's default latent preview with a real decoded video preview while sampling, using the `taeh3` tiny VAE. It earns its place by letting you abandon bad runs early. The composition is readable long before the last step, so you can cancel a generation that clearly is not working and start the next one, instead of sitting through several minutes of sampling to confirm what you already knew at 20%.\n"
       },
       "color": "#222",
       "bgcolor": "#000"
@@ -7200,22 +6141,11 @@
       "flags": {
         "collapsed": false
       },
-      "order": 75,
+      "order": 72,
       "mode": 0,
-      "inputs": [
-        {
-          "localized_name": "sampler_name",
-          "name": "sampler_name",
-          "type": "COMBO",
-          "widget": {
-            "name": "sampler_name"
-          },
-          "link": null
-        }
-      ],
+      "inputs": [],
       "outputs": [
         {
-          "localized_name": "SAMPLER",
           "name": "SAMPLER",
           "type": "SAMPLER",
           "links": [
@@ -7240,57 +6170,6 @@
       "bgcolor": "#535"
     },
     {
-      "id": 556,
-      "type": "KSamplerSelect",
-      "pos": [
-        -3702.7409240803618,
-        5228.441372090501
-      ],
-      "size": [
-        272.95078125,
-        58
-      ],
-      "flags": {
-        "collapsed": false
-      },
-      "order": 76,
-      "mode": 0,
-      "inputs": [
-        {
-          "localized_name": "sampler_name",
-          "name": "sampler_name",
-          "type": "COMBO",
-          "widget": {
-            "name": "sampler_name"
-          },
-          "link": null
-        }
-      ],
-      "outputs": [
-        {
-          "localized_name": "SAMPLER",
-          "name": "SAMPLER",
-          "type": "SAMPLER",
-          "links": [
-            1151,
-            1152
-          ]
-        }
-      ],
-      "title": "First Pass KSamplerSelect",
-      "properties": {
-        "Node name for S&R": "KSamplerSelect"
-      },
-      "widgets_values": [
-        "dpmpp_sde_gpu"
-      ],
-      "widgets_values_named": {
-        "sampler_name": "dpmpp_sde_gpu"
-      },
-      "color": "#323",
-      "bgcolor": "#535"
-    },
-    {
       "id": 561,
       "type": "SonderSelector",
       "pos": [
@@ -7302,37 +6181,16 @@
         179.69488040104625
       ],
       "flags": {},
-      "order": 77,
+      "order": 73,
       "mode": 0,
-      "inputs": [
-        {
-          "localized_name": "choice",
-          "name": "choice",
-          "type": "COMBO",
-          "widget": {
-            "name": "choice"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "choice_list",
-          "name": "choice_list",
-          "type": "STRING",
-          "widget": {
-            "name": "choice_list"
-          },
-          "link": null
-        }
-      ],
+      "inputs": [],
       "outputs": [
         {
-          "localized_name": "selection",
           "name": "selection",
           "type": "STRING",
           "links": null
         },
         {
-          "localized_name": "index",
           "name": "index",
           "type": "INT",
           "links": [
@@ -7367,22 +6225,11 @@
         102
       ],
       "flags": {},
-      "order": 78,
+      "order": 74,
       "mode": 0,
-      "inputs": [
-        {
-          "localized_name": "seed",
-          "name": "seed",
-          "type": "INT",
-          "widget": {
-            "name": "seed"
-          },
-          "link": null
-        }
-      ],
+      "inputs": [],
       "outputs": [
         {
-          "localized_name": "seed",
           "name": "seed",
           "type": "INT",
           "links": [
@@ -7390,7 +6237,6 @@
           ]
         },
         {
-          "localized_name": "seed+1",
           "name": "seed+1",
           "type": "INT",
           "links": []
@@ -7426,33 +6272,13 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "model",
           "name": "model",
           "type": "MODEL",
           "link": 610
-        },
-        {
-          "localized_name": "shift_video",
-          "name": "shift_video",
-          "type": "FLOAT",
-          "widget": {
-            "name": "shift_video"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "shift_audio",
-          "name": "shift_audio",
-          "type": "FLOAT",
-          "widget": {
-            "name": "shift_audio"
-          },
-          "link": null
         }
       ],
       "outputs": [
         {
-          "localized_name": "MODEL",
           "name": "MODEL",
           "type": "MODEL",
           "links": [
@@ -7488,7 +6314,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 118,
+      "order": 108,
       "mode": 0,
       "inputs": [
         {
@@ -7528,210 +6354,39 @@
       ],
       "size": [
         758.00251094844,
-        836
+        845
       ],
       "flags": {},
       "order": 136,
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "project",
           "name": "project",
           "type": "SONDER_PROJECT",
           "link": 956
         },
         {
-          "localized_name": "frames",
           "name": "frames",
           "type": "IMAGE",
           "link": 957
         },
         {
-          "localized_name": "audio",
           "name": "audio",
           "shape": 7,
           "type": "AUDIO",
           "link": 955
         },
         {
-          "localized_name": "filename_prefix",
-          "name": "filename_prefix",
-          "type": "STRING",
-          "widget": {
-            "name": "filename_prefix"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "fps",
           "name": "fps",
           "type": "FLOAT",
           "widget": {
             "name": "fps"
           },
           "link": 958
-        },
-        {
-          "localized_name": "mode",
-          "name": "mode",
-          "type": "COMBO",
-          "widget": {
-            "name": "mode"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "place_audio_on_timeline",
-          "name": "place_audio_on_timeline",
-          "type": "BOOLEAN",
-          "widget": {
-            "name": "place_audio_on_timeline"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "mark_queue_complete",
-          "name": "mark_queue_complete",
-          "type": "BOOLEAN",
-          "widget": {
-            "name": "mark_queue_complete"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "embed_metadata",
-          "name": "embed_metadata",
-          "shape": 7,
-          "type": "BOOLEAN",
-          "widget": {
-            "name": "embed_metadata"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "save_preset",
-          "name": "save_preset",
-          "shape": 7,
-          "type": "COMBO",
-          "widget": {
-            "name": "save_preset"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "custom_output_kind",
-          "name": "custom_output_kind",
-          "shape": 7,
-          "type": "COMBO",
-          "widget": {
-            "name": "custom_output_kind"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "custom_container",
-          "name": "custom_container",
-          "shape": 7,
-          "type": "COMBO",
-          "widget": {
-            "name": "custom_container"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "custom_video_codec",
-          "name": "custom_video_codec",
-          "shape": 7,
-          "type": "COMBO",
-          "widget": {
-            "name": "custom_video_codec"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "custom_pix_fmt",
-          "name": "custom_pix_fmt",
-          "shape": 7,
-          "type": "COMBO",
-          "widget": {
-            "name": "custom_pix_fmt"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "custom_crf",
-          "name": "custom_crf",
-          "shape": 7,
-          "type": "INT",
-          "widget": {
-            "name": "custom_crf"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "custom_encoder_preset",
-          "name": "custom_encoder_preset",
-          "shape": 7,
-          "type": "COMBO",
-          "widget": {
-            "name": "custom_encoder_preset"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "custom_audio_codec",
-          "name": "custom_audio_codec",
-          "shape": 7,
-          "type": "COMBO",
-          "widget": {
-            "name": "custom_audio_codec"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "custom_audio_bitrate_kbps",
-          "name": "custom_audio_bitrate_kbps",
-          "shape": 7,
-          "type": "INT",
-          "widget": {
-            "name": "custom_audio_bitrate_kbps"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "custom_png_compression",
-          "name": "custom_png_compression",
-          "shape": 7,
-          "type": "INT",
-          "widget": {
-            "name": "custom_png_compression"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "autoplay_preview",
-          "name": "autoplay_preview",
-          "shape": 7,
-          "type": "BOOLEAN",
-          "widget": {
-            "name": "autoplay_preview"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "color_drift_correction",
-          "name": "color_drift_correction",
-          "shape": 7,
-          "type": "BOOLEAN",
-          "widget": {
-            "name": "color_drift_correction"
-          },
-          "link": null
         }
       ],
       "outputs": [
         {
-          "localized_name": "output_path",
           "name": "output_path",
           "type": "STRING",
           "links": null
@@ -7799,7 +6454,7 @@
         795.6389161211682
       ],
       "flags": {},
-      "order": 79,
+      "order": 75,
       "mode": 0,
       "inputs": [],
       "outputs": [],
@@ -7831,26 +6486,14 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "reference_set",
           "name": "reference_set",
           "type": "SONDER_REFERENCE_SET",
           "link": 590
-        },
-        {
-          "localized_name": "unused_slots",
-          "name": "unused_slots",
-          "shape": 7,
-          "type": "COMBO",
-          "widget": {
-            "name": "unused_slots"
-          },
-          "link": null
         }
       ],
       "outputs": [
         {
           "label": "r01",
-          "localized_name": "r01",
           "name": "r01",
           "type": "IMAGE",
           "links": [
@@ -7859,7 +6502,6 @@
         },
         {
           "label": "r02",
-          "localized_name": "r02",
           "name": "r02",
           "type": "IMAGE",
           "links": [
@@ -7868,7 +6510,6 @@
         },
         {
           "label": "r03",
-          "localized_name": "r03",
           "name": "r03",
           "type": "IMAGE",
           "links": [
@@ -7877,91 +6518,78 @@
         },
         {
           "label": "r04",
-          "localized_name": "r04",
           "name": "r04",
           "type": "IMAGE",
           "links": null
         },
         {
           "label": "r05",
-          "localized_name": "r05",
           "name": "r05",
           "type": "IMAGE",
           "links": null
         },
         {
           "label": "r06",
-          "localized_name": "r06",
           "name": "r06",
           "type": "IMAGE",
           "links": null
         },
         {
           "label": "r07",
-          "localized_name": "r07",
           "name": "r07",
           "type": "IMAGE",
           "links": null
         },
         {
           "label": "r08",
-          "localized_name": "r08",
           "name": "r08",
           "type": "IMAGE",
           "links": null
         },
         {
           "label": "r09",
-          "localized_name": "r09",
           "name": "r09",
           "type": "IMAGE",
           "links": null
         },
         {
           "label": "r10",
-          "localized_name": "r10",
           "name": "r10",
           "type": "IMAGE",
           "links": null
         },
         {
           "label": "r11",
-          "localized_name": "r11",
           "name": "r11",
           "type": "IMAGE",
           "links": null
         },
         {
           "label": "r12",
-          "localized_name": "r12",
           "name": "r12",
           "type": "IMAGE",
           "links": null
         },
         {
           "label": "r13",
-          "localized_name": "r13",
           "name": "r13",
           "type": "IMAGE",
           "links": null
         },
         {
           "label": "r14",
-          "localized_name": "r14",
           "name": "r14",
           "type": "IMAGE",
           "links": null
         },
         {
           "label": "r15",
-          "localized_name": "r15",
           "name": "r15",
           "type": "IMAGE",
           "links": null
         },
         {
           "label": "r16",
-          "localized_name": "r16",
           "name": "r16",
           "type": "IMAGE",
           "links": null
@@ -7995,24 +6623,13 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "project",
           "name": "project",
           "type": "SONDER_PROJECT",
           "link": 586
-        },
-        {
-          "localized_name": "reference_lanes",
-          "name": "reference_lanes",
-          "type": "STRING",
-          "widget": {
-            "name": "reference_lanes"
-          },
-          "link": null
         }
       ],
       "outputs": [
         {
-          "localized_name": "reference_set",
           "name": "reference_set",
           "type": "SONDER_REFERENCE_SET",
           "links": [
@@ -8020,13 +6637,11 @@
           ]
         },
         {
-          "localized_name": "has_reference",
           "name": "has_reference",
           "type": "INT",
           "links": []
         },
         {
-          "localized_name": "reference_strength",
           "name": "reference_strength",
           "type": "FLOAT",
           "links": null
@@ -8062,24 +6677,13 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "project",
           "name": "project",
           "type": "SONDER_PROJECT",
           "link": 585
-        },
-        {
-          "localized_name": "reference_lanes",
-          "name": "reference_lanes",
-          "type": "STRING",
-          "widget": {
-            "name": "reference_lanes"
-          },
-          "link": null
         }
       ],
       "outputs": [
         {
-          "localized_name": "reference_set",
           "name": "reference_set",
           "type": "SONDER_REFERENCE_SET",
           "links": [
@@ -8087,13 +6691,11 @@
           ]
         },
         {
-          "localized_name": "has_reference",
           "name": "has_reference",
           "type": "INT",
           "links": []
         },
         {
-          "localized_name": "reference_strength",
           "name": "reference_strength",
           "type": "FLOAT",
           "links": null
@@ -8129,26 +6731,14 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "reference_set",
           "name": "reference_set",
           "type": "SONDER_REFERENCE_SET",
           "link": 592
-        },
-        {
-          "localized_name": "unused_slots",
-          "name": "unused_slots",
-          "shape": 7,
-          "type": "COMBO",
-          "widget": {
-            "name": "unused_slots"
-          },
-          "link": null
         }
       ],
       "outputs": [
         {
           "label": "a01 · Audio 1 · Settings (context)",
-          "localized_name": "a01 · Audio 1 · Settings (context)",
           "name": "a01",
           "type": "AUDIO",
           "links": [
@@ -8157,7 +6747,6 @@
         },
         {
           "label": "a02 · Audio 2 · Sonder Main Character (subject)",
-          "localized_name": "a02 · Audio 2 · Sonder Main Character (subject)",
           "name": "a02",
           "type": "AUDIO",
           "links": [
@@ -8166,7 +6755,6 @@
         },
         {
           "label": "a03 (unused)",
-          "localized_name": "a03 (unused)",
           "name": "a03",
           "type": "AUDIO",
           "links": [
@@ -8187,33 +6775,6 @@
       "bgcolor": "#000"
     },
     {
-      "id": 116,
-      "type": "MarkdownNote",
-      "pos": [
-        -4543.338539294459,
-        3480.617059649708
-      ],
-      "size": [
-        684.9439173898554,
-        1002.0783869113143
-      ],
-      "flags": {},
-      "order": 67,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [],
-      "title": "Note: MiniMax H3",
-      "properties": {},
-      "widgets_values": [
-        "## MiniMax H3\n\n[MiniMax H3](https://www.minimax.io/blog/minimax-h3) is MiniMax's general-purpose, omni-modal generation model. It jointly understands text, image, video, and audio, and generates video with **native stereo audio**: voice, sound effects, and music are modeled jointly in a single forward pass, not layered on afterward.\n\nMiniMax describes H3 as reaching 2K and roughly 15 seconds. The open weights this workflow runs on work at H3's native canvas of a **768px short edge, up to 1344x768, at 24fps**.\n\n## About this workflow\n\nThe graph is staged by the **Sonder Editor**. You arrange clips, image guides, References, and prompts on the timeline, mark the range you want, and the editor supplies the graph with the prompt, dimensions, length, and every conditioning input for exactly that range.\n\n**Nothing in the graph needs rewiring, muting, or bypassing to change what you generate.** Every choice is made in the editor or in a Sonder Selector.\n\n### What it does\n\n- **Three generation modes.** `fl2va`, `ref2va`, and a hybrid that runs reference conditioning through the fl2va model.\n- **Text, keyframe, and reference driven generation from one graph.** Guides and References on the timeline decide which, not rewiring.\n- **References that respect time.** A Reference enters at the section you assigned it to, and is absent everywhere else.\n- **Independent video and audio masks.** Regenerate one channel while the other drives it.\n- **Long-form chaining.** Frozen precontext frames carry each section into the next.\n- **Three sampling passes.** One for new content, one for detail, one for a final upscale.\n- **Native synchronized audio throughout.** Speech, effects, and music are generated with their picture, never stitched on afterward.\n\n> Each of these is covered in depth in the **Generation Settings** note.\n\n## Set these two in the editor first ⚠️\n\nBoth are one-time per project, and both fail quietly if you skip them.\n\n**1. Model template -> MiniMax H3.** In the toolbar above the timeline. This is what makes the editor calculate resolution and length on H3's grid: fixed 24fps, dimensions in multiples of 32, and lengths on the 17n+5 frame grid. Without it the editor has no model constraints to snap to and the numbers it hands the graph will not be valid H3 sizes.\n\n**2. Channels template -> MiniMax H3 (full reference).** In the editor settings. This is what lets References attach themselves to prompts, by giving the prompt the six reference sections H3 expects for subjects, pictures, video and audio.\n\n⚠️ Pick the right one: the channels list also contains a preset called plain **MiniMax H3**, which is the three-field text and keyframe format. It is a valid choice for `fl2va` work, but References will not attach to it. The one with **(full reference)** in the name is the one this workflow is built around.\n\n> 📖 **[Reference guide](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/references.md)**: the full walkthrough of staging References, assigning spans, and attaching them to prompt sections.\n\n### Learn more about Sonder Editor\n\nThis workflow is deliberately narrow. It covers MiniMax H3 and the Reference system, and leaves the rest of the editor out.\n\nThe **[Sonder LTX 2.3 Playground](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/example_workflows/sonder_ltx_2_3_playground.json)** is the wide version, and the place those features are explained properly. Every node in it carries its own note, and its notes explain four example scenes:\n\n- **Interrogation, T2V Prompt Relay.** One global prompt plus timed local prompts driving motion, expression, and scene changes with no guides or drivers at all.\n- **Interrogation, Upscale / Detail.** The same clip refined through separate 720p and 1080p passes, with the denoise values, batch sizes, and context-frame counts each pass actually used, and how to retake a bad seam without redoing the scene.\n- **Pretty People, I2V.** Image guides placed at chosen frames, which is a more flexible form of first-frame / last-frame work.\n- **Dance, T2V IC-LoRA Driver.** A pose clip driving generation without being rendered itself, and how to switch the whole driver branch off for sections that have no driver.\n\nIt also covers the parts this workflow does not touch: batching a long timeline through the render queue, comparing takes in the gallery, and recording what produced each result with the Metadata Collector.\n\nRepository and written guides: **[ComfyUI-Sonder-Editor](https://github.com/SonderSaid/ComfyUI-Sonder-Editor#documentation)**."
-      ],
-      "widgets_values_named": {
-        "text": "## MiniMax H3\n\n[MiniMax H3](https://www.minimax.io/blog/minimax-h3) is MiniMax's general-purpose, omni-modal generation model. It jointly understands text, image, video, and audio, and generates video with **native stereo audio**: voice, sound effects, and music are modeled jointly in a single forward pass, not layered on afterward.\n\nMiniMax describes H3 as reaching 2K and roughly 15 seconds. The open weights this workflow runs on work at H3's native canvas of a **768px short edge, up to 1344x768, at 24fps**.\n\n## About this workflow\n\nThe graph is staged by the **Sonder Editor**. You arrange clips, image guides, References, and prompts on the timeline, mark the range you want, and the editor supplies the graph with the prompt, dimensions, length, and every conditioning input for exactly that range.\n\n**Nothing in the graph needs rewiring, muting, or bypassing to change what you generate.** Every choice is made in the editor or in a Sonder Selector.\n\n### What it does\n\n- **Three generation modes.** `fl2va`, `ref2va`, and a hybrid that runs reference conditioning through the fl2va model.\n- **Text, keyframe, and reference driven generation from one graph.** Guides and References on the timeline decide which, not rewiring.\n- **References that respect time.** A Reference enters at the section you assigned it to, and is absent everywhere else.\n- **Independent video and audio masks.** Regenerate one channel while the other drives it.\n- **Long-form chaining.** Frozen precontext frames carry each section into the next.\n- **Three sampling passes.** One for new content, one for detail, one for a final upscale.\n- **Native synchronized audio throughout.** Speech, effects, and music are generated with their picture, never stitched on afterward.\n\n> Each of these is covered in depth in the **Generation Settings** note.\n\n## Set these two in the editor first ⚠️\n\nBoth are one-time per project, and both fail quietly if you skip them.\n\n**1. Model template -> MiniMax H3.** In the toolbar above the timeline. This is what makes the editor calculate resolution and length on H3's grid: fixed 24fps, dimensions in multiples of 32, and lengths on the 17n+5 frame grid. Without it the editor has no model constraints to snap to and the numbers it hands the graph will not be valid H3 sizes.\n\n**2. Channels template -> MiniMax H3 (full reference).** In the editor settings. This is what lets References attach themselves to prompts, by giving the prompt the six reference sections H3 expects for subjects, pictures, video and audio.\n\n⚠️ Pick the right one: the channels list also contains a preset called plain **MiniMax H3**, which is the three-field text and keyframe format. It is a valid choice for `fl2va` work, but References will not attach to it. The one with **(full reference)** in the name is the one this workflow is built around.\n\n> 📖 **[Reference guide](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/references.md)**: the full walkthrough of staging References, assigning spans, and attaching them to prompt sections.\n\n### Learn more about Sonder Editor\n\nThis workflow is deliberately narrow. It covers MiniMax H3 and the Reference system, and leaves the rest of the editor out.\n\nThe **[Sonder LTX 2.3 Playground](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/example_workflows/sonder_ltx_2_3_playground.json)** is the wide version, and the place those features are explained properly. Every node in it carries its own note, and its notes explain four example scenes:\n\n- **Interrogation, T2V Prompt Relay.** One global prompt plus timed local prompts driving motion, expression, and scene changes with no guides or drivers at all.\n- **Interrogation, Upscale / Detail.** The same clip refined through separate 720p and 1080p passes, with the denoise values, batch sizes, and context-frame counts each pass actually used, and how to retake a bad seam without redoing the scene.\n- **Pretty People, I2V.** Image guides placed at chosen frames, which is a more flexible form of first-frame / last-frame work.\n- **Dance, T2V IC-LoRA Driver.** A pose clip driving generation without being rendered itself, and how to switch the whole driver branch off for sections that have no driver.\n\nIt also covers the parts this workflow does not touch: batching a long timeline through the render queue, comparing takes in the gallery, and recording what produced each result with the Metadata Collector.\n\nRepository and written guides: **[ComfyUI-Sonder-Editor](https://github.com/SonderSaid/ComfyUI-Sonder-Editor#documentation)**."
-      },
-      "color": "#222",
-      "bgcolor": "#000"
-    },
-    {
       "id": 118,
       "type": "MarkdownNote",
       "pos": [
@@ -8225,7 +6786,7 @@
         446.4627069650228
       ],
       "flags": {},
-      "order": 58,
+      "order": 76,
       "mode": 0,
       "inputs": [],
       "outputs": [],
@@ -8256,85 +6817,57 @@
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "project",
           "name": "project",
           "type": "SONDER_PROJECT",
           "link": 921
         },
         {
-          "localized_name": "video_latent",
           "name": "video_latent",
           "shape": 7,
           "type": "LATENT",
           "link": 925
         },
         {
-          "localized_name": "audio_latent",
           "name": "audio_latent",
           "shape": 7,
           "type": "LATENT",
           "link": 926
         },
         {
-          "localized_name": "video_vae",
           "name": "video_vae",
           "shape": 7,
           "type": "VAE",
           "link": 924
         },
         {
-          "localized_name": "audio_vae",
           "name": "audio_vae",
           "shape": 7,
           "type": "VAE",
           "link": 923
-        },
-        {
-          "localized_name": "edit_video",
-          "name": "edit_video",
-          "type": "BOOLEAN",
-          "widget": {
-            "name": "edit_video"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "edit_audio",
-          "name": "edit_audio",
-          "type": "BOOLEAN",
-          "widget": {
-            "name": "edit_audio"
-          },
-          "link": null
         }
       ],
       "outputs": [
         {
-          "localized_name": "video_mask_start_time",
           "name": "video_mask_start_time",
           "type": "FLOAT",
           "links": null
         },
         {
-          "localized_name": "video_mask_end_time",
           "name": "video_mask_end_time",
           "type": "FLOAT",
           "links": null
         },
         {
-          "localized_name": "audio_mask_start_time",
           "name": "audio_mask_start_time",
           "type": "FLOAT",
           "links": null
         },
         {
-          "localized_name": "audio_mask_end_time",
           "name": "audio_mask_end_time",
           "type": "FLOAT",
           "links": null
         },
         {
-          "localized_name": "video_mask",
           "name": "video_mask",
           "type": "MASK",
           "links": [
@@ -8342,7 +6875,6 @@
           ]
         },
         {
-          "localized_name": "audio_mask",
           "name": "audio_mask",
           "type": "MASK",
           "links": [
@@ -8378,198 +6910,11 @@
       "flags": {
         "resizable": true
       },
-      "order": 71,
+      "order": 77,
       "mode": 0,
-      "inputs": [
-        {
-          "localized_name": "project",
-          "name": "project",
-          "type": "COMBO",
-          "widget": {
-            "name": "project"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "project_name",
-          "name": "project_name",
-          "type": "STRING",
-          "widget": {
-            "name": "project_name"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "fps",
-          "name": "fps",
-          "type": "FLOAT",
-          "widget": {
-            "name": "fps"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "width",
-          "name": "width",
-          "type": "INT",
-          "widget": {
-            "name": "width"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "height",
-          "name": "height",
-          "type": "INT",
-          "widget": {
-            "name": "height"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "scene_id",
-          "name": "scene_id",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "scene_id"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "selection_start",
-          "name": "selection_start",
-          "shape": 7,
-          "type": "INT",
-          "widget": {
-            "name": "selection_start"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "selection_end",
-          "name": "selection_end",
-          "shape": 7,
-          "type": "INT",
-          "widget": {
-            "name": "selection_end"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "pre_context_frames",
-          "name": "pre_context_frames",
-          "shape": 7,
-          "type": "INT",
-          "widget": {
-            "name": "pre_context_frames"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "post_context_frames",
-          "name": "post_context_frames",
-          "shape": 7,
-          "type": "INT",
-          "widget": {
-            "name": "post_context_frames"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "mask_pre_offset",
-          "name": "mask_pre_offset",
-          "shape": 7,
-          "type": "INT",
-          "widget": {
-            "name": "mask_pre_offset"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "mask_post_offset",
-          "name": "mask_post_offset",
-          "shape": 7,
-          "type": "INT",
-          "widget": {
-            "name": "mask_post_offset"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "take_placement_mode",
-          "name": "take_placement_mode",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "take_placement_mode"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "take_placement_linked",
-          "name": "take_placement_linked",
-          "shape": 7,
-          "type": "BOOLEAN",
-          "widget": {
-            "name": "take_placement_linked"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "take_placement_muted",
-          "name": "take_placement_muted",
-          "shape": 7,
-          "type": "BOOLEAN",
-          "widget": {
-            "name": "take_placement_muted"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "render_cache_max_bytes",
-          "name": "render_cache_max_bytes",
-          "shape": 7,
-          "type": "INT",
-          "widget": {
-            "name": "render_cache_max_bytes"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "render_queue_active",
-          "name": "render_queue_active",
-          "shape": 7,
-          "type": "BOOLEAN",
-          "widget": {
-            "name": "render_queue_active"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "take_fit_mode",
-          "name": "take_fit_mode",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "take_fit_mode"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "take_crop_position",
-          "name": "take_crop_position",
-          "shape": 7,
-          "type": "STRING",
-          "widget": {
-            "name": "take_crop_position"
-          },
-          "link": null
-        }
-      ],
+      "inputs": [],
       "outputs": [
         {
-          "localized_name": "project",
           "name": "project",
           "type": "SONDER_PROJECT",
           "links": [
@@ -8577,7 +6922,6 @@
           ]
         },
         {
-          "localized_name": "rendered_frames",
           "name": "rendered_frames",
           "type": "IMAGE",
           "links": [
@@ -8585,25 +6929,21 @@
           ]
         },
         {
-          "localized_name": "guide_images",
           "name": "guide_images",
           "type": "IMAGE",
           "links": []
         },
         {
-          "localized_name": "guide_idx",
           "name": "guide_idx",
           "type": "STRING",
           "links": null
         },
         {
-          "localized_name": "guide_strengths",
           "name": "guide_strengths",
           "type": "STRING",
           "links": null
         },
         {
-          "localized_name": "prompt",
           "name": "prompt",
           "type": "STRING",
           "links": [
@@ -8612,7 +6952,6 @@
           ]
         },
         {
-          "localized_name": "frame_count",
           "name": "frame_count",
           "type": "INT",
           "links": [
@@ -8620,7 +6959,6 @@
           ]
         },
         {
-          "localized_name": "fps",
           "name": "fps",
           "type": "FLOAT",
           "links": [
@@ -8628,7 +6966,6 @@
           ]
         },
         {
-          "localized_name": "width",
           "name": "width",
           "type": "INT",
           "links": [
@@ -8636,7 +6973,6 @@
           ]
         },
         {
-          "localized_name": "height",
           "name": "height",
           "type": "INT",
           "links": [
@@ -8644,7 +6980,6 @@
           ]
         },
         {
-          "localized_name": "audio",
           "name": "audio",
           "type": "AUDIO",
           "links": [
@@ -8652,13 +6987,11 @@
           ]
         },
         {
-          "localized_name": "mask_start_time",
           "name": "mask_start_time",
           "type": "FLOAT",
           "links": []
         },
         {
-          "localized_name": "mask_end_time",
           "name": "mask_end_time",
           "type": "FLOAT",
           "links": []
@@ -8726,11 +7059,10 @@
         725.5526215439918
       ],
       "flags": {},
-      "order": 108,
+      "order": 112,
       "mode": 0,
       "inputs": [
         {
-          "localized_name": "source",
           "name": "source",
           "type": "*",
           "link": 889
@@ -8738,7 +7070,6 @@
       ],
       "outputs": [
         {
-          "localized_name": "STRING",
           "name": "STRING",
           "type": "STRING",
           "links": null
@@ -8752,6 +7083,219 @@
       "widgets_values_named": {},
       "color": "#432",
       "bgcolor": "#653"
+    },
+    {
+      "id": 551,
+      "type": "BasicScheduler",
+      "pos": [
+        -3918.163182837542,
+        5124.053292747794
+      ],
+      "size": [
+        210,
+        106
+      ],
+      "flags": {
+        "collapsed": false
+      },
+      "order": 96,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 1136
+        }
+      ],
+      "outputs": [
+        {
+          "name": "SIGMAS",
+          "type": "SIGMAS",
+          "links": [
+            1135,
+            1139
+          ]
+        }
+      ],
+      "title": "First BasicScheduler",
+      "properties": {
+        "Node name for S&R": "BasicScheduler"
+      },
+      "widgets_values": [
+        "sgm_uniform",
+        10,
+        1
+      ],
+      "widgets_values_named": {
+        "scheduler": "sgm_uniform",
+        "steps": 10,
+        "denoise": 1
+      },
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 556,
+      "type": "KSamplerSelect",
+      "pos": [
+        -3702.7409240803618,
+        5228.441372090501
+      ],
+      "size": [
+        272.95078125,
+        58
+      ],
+      "flags": {
+        "collapsed": false
+      },
+      "order": 78,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "SAMPLER",
+          "type": "SAMPLER",
+          "links": [
+            1151,
+            1152
+          ]
+        }
+      ],
+      "title": "First Pass KSamplerSelect",
+      "properties": {
+        "Node name for S&R": "KSamplerSelect"
+      },
+      "widgets_values": [
+        "er_sde"
+      ],
+      "widgets_values_named": {
+        "sampler_name": "er_sde"
+      },
+      "color": "#323",
+      "bgcolor": "#535"
+    },
+    {
+      "id": 553,
+      "type": "BasicScheduler",
+      "pos": [
+        -3919.283271690103,
+        5404.8086400598195
+      ],
+      "size": [
+        210,
+        106
+      ],
+      "flags": {},
+      "order": 98,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 1138
+        }
+      ],
+      "outputs": [
+        {
+          "name": "SIGMAS",
+          "type": "SIGMAS",
+          "links": [
+            1145,
+            1149
+          ]
+        }
+      ],
+      "title": "Upscale BasicScheduler",
+      "properties": {
+        "Node name for S&R": "BasicScheduler"
+      },
+      "widgets_values": [
+        "beta57",
+        4,
+        0.25
+      ],
+      "widgets_values_named": {
+        "scheduler": "beta57",
+        "steps": 4,
+        "denoise": 0.25
+      },
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 552,
+      "type": "BasicScheduler",
+      "pos": [
+        -3917.4638200830686,
+        5265.273681212465
+      ],
+      "size": [
+        210,
+        106
+      ],
+      "flags": {},
+      "order": 97,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 1137
+        }
+      ],
+      "outputs": [
+        {
+          "name": "SIGMAS",
+          "type": "SIGMAS",
+          "links": [
+            1140,
+            1148
+          ]
+        }
+      ],
+      "title": "Detail BasicScheduler",
+      "properties": {
+        "Node name for S&R": "BasicScheduler"
+      },
+      "widgets_values": [
+        "sgm_uniform",
+        6,
+        0.5
+      ],
+      "widgets_values_named": {
+        "scheduler": "sgm_uniform",
+        "steps": 6,
+        "denoise": 0.5
+      },
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 116,
+      "type": "MarkdownNote",
+      "pos": [
+        -4543.338539294459,
+        3480.617059649708
+      ],
+      "size": [
+        684.9439173898554,
+        1002.0783869113143
+      ],
+      "flags": {},
+      "order": 79,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Note: MiniMax H3",
+      "properties": {},
+      "widgets_values": [
+        "## MiniMax H3\n\n[MiniMax H3](https://www.minimax.io/blog/minimax-h3) is MiniMax's general-purpose, omni-modal generation model. It jointly understands text, image, video, and audio, and generates video with **native stereo audio**: voice, sound effects, and music are modeled jointly in a single forward pass, not layered on afterward.\n\nMiniMax describes H3 as reaching 2K and roughly 15 seconds. The open weights this workflow runs on work at H3's native canvas of a **768px short edge, up to 1344x768, at 24fps**.\n\n## About this workflow\n\nThis workflow was submitted to the Comfy H3 Sync Challenge alongside the [entry video](https://youtu.be/n-NdAQk7I8A). The video was produced entirely with this workflow, without external post-production, color correction, or audio correction.\n\nThe graph is staged by the **Sonder Editor**. You arrange clips, image guides, References, and prompts on the timeline, mark the range you want, and the editor supplies the graph with the prompt, dimensions, length, and every conditioning input for exactly that range.\n\n**Nothing in the graph needs rewiring, muting, or bypassing to change what you generate.** Every choice is made in the editor or in a Sonder Selector.\n\n### What it does\n\n- **Three generation modes.** `fl2va`, `ref2va`, and a hybrid that runs reference conditioning through the fl2va model.\n- **Text, keyframe, and reference driven generation from one graph.** Guides and References on the timeline decide which, not rewiring.\n- **References that respect time.** A Reference enters at the section you assigned it to, and is absent everywhere else.\n- **Independent video and audio masks.** Regenerate one channel while the other drives it.\n- **Long-form chaining.** Frozen precontext frames carry each section into the next.\n- **Three sampling passes.** One for new content, one for detail, one for a final upscale.\n- **Native synchronized audio throughout.** Speech, effects, and music are generated with their picture, never stitched on afterward.\n\n> Each of these is covered in depth in the **Generation Settings** note.\n\n## Set these two in the editor first ⚠️\n\nBoth are one-time per project, and both fail quietly if you skip them.\n\n**1. Model template -> MiniMax H3.** In the toolbar above the timeline. This is what makes the editor calculate resolution and length on H3's grid: fixed 24fps, dimensions in multiples of 32, and lengths on the 17n+5 frame grid. Without it the editor has no model constraints to snap to and the numbers it hands the graph will not be valid H3 sizes.\n\n**2. Channels template -> MiniMax H3 (full reference).** In the toolbar or in the editor settings. This is what lets References attach themselves to prompts, by giving the prompt the six reference sections H3 expects for subjects, pictures, video and audio.\n\n⚠️ Pick the right one: the channels list also contains a preset called plain **MiniMax H3**, which is the three-field text and keyframe format. It is a valid choice for `fl2va` work, but References will not attach to it. The one with **(full reference)** in the name is the one this workflow is built around.\n\n> 📖 **[Reference guide](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/references.md)**: the full walkthrough of staging References, assigning spans, and attaching them to prompt sections.\n\n### Learn more about Sonder Editor\n\nThis workflow is deliberately narrow. It covers MiniMax H3 and the Reference system, and leaves the rest of the editor out.\n\nThe **[Sonder LTX 2.3 Playground](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/example_workflows/sonder_ltx_2_3_playground.json)** is the wide version, and the place those features are explained properly. Every node in it carries its own note, and its notes explain four example scenes:\n\n- **Interrogation, T2V Prompt Relay.** One global prompt plus timed local prompts driving motion, expression, and scene changes with no guides or drivers at all.\n- **Interrogation, Upscale / Detail.** The same clip refined through separate 720p and 1080p passes, with the denoise values, batch sizes, and context-frame counts each pass actually used, and how to retake a bad seam without redoing the scene.\n- **Pretty People, I2V.** Image guides placed at chosen frames, which is a more flexible form of first-frame / last-frame work.\n- **Dance, T2V IC-LoRA Driver.** A pose clip driving generation without being rendered itself, and how to switch the whole driver branch off for sections that have no driver.\n\nIt also covers the parts this workflow does not touch: batching a long timeline through the render queue, comparing takes in the gallery, and recording what produced each result with the Metadata Collector.\n\nRepository and written guides: **[ComfyUI-Sonder-Editor](https://github.com/SonderSaid/ComfyUI-Sonder-Editor#documentation)**."
+      ],
+      "widgets_values_named": {
+        "text": "## MiniMax H3\n\n[MiniMax H3](https://www.minimax.io/blog/minimax-h3) is MiniMax's general-purpose, omni-modal generation model. It jointly understands text, image, video, and audio, and generates video with **native stereo audio**: voice, sound effects, and music are modeled jointly in a single forward pass, not layered on afterward.\n\nMiniMax describes H3 as reaching 2K and roughly 15 seconds. The open weights this workflow runs on work at H3's native canvas of a **768px short edge, up to 1344x768, at 24fps**.\n\n## About this workflow\n\nThis workflow was submitted to the Comfy H3 Sync Challenge alongside the [entry video](https://youtu.be/n-NdAQk7I8A). The video was produced entirely with this workflow, without external post-production, color correction, or audio correction.\n\nThe graph is staged by the **Sonder Editor**. You arrange clips, image guides, References, and prompts on the timeline, mark the range you want, and the editor supplies the graph with the prompt, dimensions, length, and every conditioning input for exactly that range.\n\n**Nothing in the graph needs rewiring, muting, or bypassing to change what you generate.** Every choice is made in the editor or in a Sonder Selector.\n\n### What it does\n\n- **Three generation modes.** `fl2va`, `ref2va`, and a hybrid that runs reference conditioning through the fl2va model.\n- **Text, keyframe, and reference driven generation from one graph.** Guides and References on the timeline decide which, not rewiring.\n- **References that respect time.** A Reference enters at the section you assigned it to, and is absent everywhere else.\n- **Independent video and audio masks.** Regenerate one channel while the other drives it.\n- **Long-form chaining.** Frozen precontext frames carry each section into the next.\n- **Three sampling passes.** One for new content, one for detail, one for a final upscale.\n- **Native synchronized audio throughout.** Speech, effects, and music are generated with their picture, never stitched on afterward.\n\n> Each of these is covered in depth in the **Generation Settings** note.\n\n## Set these two in the editor first ⚠️\n\nBoth are one-time per project, and both fail quietly if you skip them.\n\n**1. Model template -> MiniMax H3.** In the toolbar above the timeline. This is what makes the editor calculate resolution and length on H3's grid: fixed 24fps, dimensions in multiples of 32, and lengths on the 17n+5 frame grid. Without it the editor has no model constraints to snap to and the numbers it hands the graph will not be valid H3 sizes.\n\n**2. Channels template -> MiniMax H3 (full reference).** In the toolbar or in the editor settings. This is what lets References attach themselves to prompts, by giving the prompt the six reference sections H3 expects for subjects, pictures, video and audio.\n\n⚠️ Pick the right one: the channels list also contains a preset called plain **MiniMax H3**, which is the three-field text and keyframe format. It is a valid choice for `fl2va` work, but References will not attach to it. The one with **(full reference)** in the name is the one this workflow is built around.\n\n> 📖 **[Reference guide](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/references.md)**: the full walkthrough of staging References, assigning spans, and attaching them to prompt sections.\n\n### Learn more about Sonder Editor\n\nThis workflow is deliberately narrow. It covers MiniMax H3 and the Reference system, and leaves the rest of the editor out.\n\nThe **[Sonder LTX 2.3 Playground](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/example_workflows/sonder_ltx_2_3_playground.json)** is the wide version, and the place those features are explained properly. Every node in it carries its own note, and its notes explain four example scenes:\n\n- **Interrogation, T2V Prompt Relay.** One global prompt plus timed local prompts driving motion, expression, and scene changes with no guides or drivers at all.\n- **Interrogation, Upscale / Detail.** The same clip refined through separate 720p and 1080p passes, with the denoise values, batch sizes, and context-frame counts each pass actually used, and how to retake a bad seam without redoing the scene.\n- **Pretty People, I2V.** Image guides placed at chosen frames, which is a more flexible form of first-frame / last-frame work.\n- **Dance, T2V IC-LoRA Driver.** A pose clip driving generation without being rendered itself, and how to switch the whole driver branch off for sections that have no driver.\n\nIt also covers the parts this workflow does not touch: batching a long timeline through the render queue, comparing takes in the gallery, and recording what produced each result with the Metadata Collector.\n\nRepository and written guides: **[ComfyUI-Sonder-Editor](https://github.com/SonderSaid/ComfyUI-Sonder-Editor#documentation)**."
+      },
+      "color": "#222",
+      "bgcolor": "#000"
     }
   ],
   "links": [
@@ -8768,7 +7312,7 @@
       133,
       0,
       143,
-      3,
+      1,
       "CONDITIONING"
     ],
     [
@@ -9176,7 +7720,7 @@
       373,
       0,
       143,
-      5,
+      3,
       "CONDITIONING"
     ],
     [
@@ -9184,7 +7728,7 @@
       344,
       0,
       143,
-      4,
+      2,
       "MODEL"
     ],
     [
@@ -9192,7 +7736,7 @@
       343,
       0,
       143,
-      6,
+      4,
       "MODEL"
     ],
     [
@@ -9224,7 +7768,7 @@
       330,
       0,
       176,
-      39,
+      13,
       "MODEL"
     ],
     [
@@ -9232,7 +7776,7 @@
       348,
       0,
       176,
-      40,
+      14,
       "CLIP"
     ],
     [
@@ -9240,7 +7784,7 @@
       346,
       0,
       176,
-      41,
+      15,
       "MODEL"
     ],
     [
@@ -9248,7 +7792,7 @@
       345,
       0,
       176,
-      42,
+      5,
       "MODEL"
     ],
     [
@@ -9256,7 +7800,7 @@
       328,
       0,
       176,
-      43,
+      6,
       "NOISE"
     ],
     [
@@ -9544,7 +8088,7 @@
       320,
       0,
       485,
-      4,
+      3,
       "FLOAT"
     ],
     [
@@ -9552,7 +8096,7 @@
       373,
       0,
       143,
-      7,
+      5,
       "CONDITIONING"
     ],
     [
@@ -9560,7 +8104,7 @@
       344,
       0,
       143,
-      8,
+      6,
       "MODEL"
     ],
     [
@@ -9576,7 +8120,7 @@
       514,
       0,
       176,
-      44,
+      7,
       "INT"
     ],
     [
@@ -9584,7 +8128,7 @@
       513,
       0,
       176,
-      45,
+      8,
       "SAMPLER"
     ],
     [
@@ -9592,7 +8136,7 @@
       512,
       0,
       176,
-      46,
+      9,
       "SIGMAS"
     ],
     [
@@ -9600,7 +8144,7 @@
       511,
       0,
       176,
-      47,
+      10,
       "SAMPLER"
     ],
     [
@@ -9608,7 +8152,7 @@
       509,
       0,
       176,
-      35,
+      11,
       "SIGMAS"
     ],
     [
@@ -9616,7 +8160,7 @@
       508,
       0,
       176,
-      36,
+      12,
       "SAMPLER"
     ],
     [
@@ -9624,7 +8168,7 @@
       510,
       0,
       176,
-      37,
+      3,
       "SIGMAS"
     ],
     [
@@ -9768,7 +8312,7 @@
       551,
       0,
       554,
-      4,
+      2,
       "SIGMAS"
     ],
     [
@@ -9856,7 +8400,7 @@
       555,
       0,
       554,
-      5,
+      3,
       "SAMPLER"
     ],
     [
@@ -9864,7 +8408,7 @@
       555,
       0,
       554,
-      7,
+      5,
       "SAMPLER"
     ],
     [
@@ -9872,7 +8416,7 @@
       552,
       0,
       554,
-      6,
+      4,
       "SIGMAS"
     ],
     [
@@ -9880,7 +8424,7 @@
       553,
       0,
       554,
-      8,
+      6,
       "SIGMAS"
     ],
     [
@@ -9896,7 +8440,7 @@
       556,
       0,
       554,
-      3,
+      1,
       "SAMPLER"
     ],
     [
@@ -10086,10 +8630,10 @@
     "VHS_MetadataImage": true,
     "VHS_KeepIntermediate": true,
     "ds": {
-      "scale": 0.6673600655124309,
+      "scale": 0.7340960720636751,
       "offset": [
-        4730.855050610231,
-        -3261.3477804898007
+        4668.997315780202,
+        -3310.138270593625
       ]
     },
     "favoritedWidgets": {

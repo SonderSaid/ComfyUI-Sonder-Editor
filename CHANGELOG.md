@@ -11,6 +11,12 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-08
+
+Registry users upgrading from 0.2.2 also receive the features listed under
+0.3.0 below. Version 0.3.0 was released through Git; its Registry publication
+failed. This release includes those features and the changes below.
+
 ### Removed
 - Removed MiniMax H3 Base task-mode and first/last Guide setup controls and automatic alignment prose; the Base prompt format and Guides Bridge remain available.
 
@@ -37,6 +43,7 @@ a fresh `[Unreleased]` block.
   lanes created before this change pick the suffix up on open.
 
 ### Changed
+- Updated the MiniMax H3 example sampling defaults, dependency notes, and setup guidance.
 - Large-project saves keep prompt history, queued render snapshots and asset provenance in separate immutable components. History updates reuse unchanged entries, and background cleanup protects active readers.
 - Older projects migrate on their first edit with an exact backup; that first edit has a one-time migration cost. Copy the whole project folder, including `state/`, when moving a project.
 - Gallery lists stay small while metadata search and inspection load provenance on demand. Nodes, generated takes, exports and single-asset responses retain complete metadata.
@@ -53,6 +60,7 @@ a fresh `[Unreleased]` block.
   text to the prompt being compiled.
 
 ### Fixed
+- Clarified per-member prompt patterns in the Reference guide and tooltip, directing MiniMax H3 numbering to Prompt Context.
 - The Reference Library's right-click **Add to timeline** action now runs and its menu dismisses with Escape or an outside click.
 - Reference lane configuration preserves lane identity and checks known lane IDs so edits cannot silently retarget a reordered lane.
 - Gallery metadata loads correctly for absolute project directories and ignores stale callbacks after switching projects.

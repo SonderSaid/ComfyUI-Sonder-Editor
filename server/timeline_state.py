@@ -689,11 +689,13 @@ REFERENCE_RECIPE_FIELDS = (
     {"key": "prompt_tokens", "section": "soft", "group": "Prompt", "label": "Per-member token",
      "type": "string", "default": "",
      "applies_to": [], "requires": "", "requires_value": "",
-     "help": "Repeated once per staged member. Placeholders: {n} member number from 1, {index} from 0, "
-             "{prompt} the member's own text, {name} its prompt-safe Entity_Member label, "
-             "{entity_name} and {member_name} the explicit normalized pieces. Use as many as you like, e.g. "
-             "'<Subject {n}> is {prompt}, from <Picture {n}>'. With no {prompt}/{name} the member text is "
-             "appended after the pattern. Each expansion is also emitted on its own p01-p16 output."},
+     "help": "Pattern repeated for each staged member. Example: Reference {n}: {prompt}.\n\n"
+             "{n}: number from 1; {index}: from 0; {prompt}: member text; "
+             "{name}: prompt-safe combined name; {entity_name} / {member_name}: separate name parts.\n\n"
+             "Without a text or name placeholder, member text is appended. Empty uses member text "
+             "or its name. Each expansion also feeds a Prompt Bridge p01–p16 output.\n\n"
+             "For MiniMax H3 Subject/Picture numbering, use H3 Prompt Context; "
+             "{n} is local to the recipe output."},
     {"key": "prompt_suffix", "section": "soft", "group": "Prompt", "label": "Prompt suffix",
      "type": "string", "default": "",
      "applies_to": [], "requires": "", "requires_value": "",
