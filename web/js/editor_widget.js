@@ -434,21 +434,39 @@ function coerceBoolean(value, defaultValue = false) {
     return defaultValue;
 }
 
+const PROJECT_ERROR_MESSAGES = {
+    project_version_conflict: {
+        default: "The project changed while this operation was running. Try again.",
+        preview: "The preview could not refresh because the project changed while it was compiling. Any previous preview remains visible; your next edit will try again.",
+        history: "The project kept changing while scene history was applied. Try again.",
+    },
+};
+
+function projectErrorMessage(error, fallback = "Request failed.", context = "default") {
+    const messages = PROJECT_ERROR_MESSAGES[error?.code];
+    return messages?.[context] || messages?.default || error?.message || fallback;
+}
+
+export function importFailureMessage({ file, error } = {}) {
+    const message = projectErrorMessage(error, "Import failed.");
+    return file?.name ? `${file.name}: ${message}` : message;
+}
+
 async function readResponseError(resp, fallback = "Request failed.") {
+    let payload = null;
+    let message = fallback;
     try {
-        const payload = await resp.clone().json();
-        if (payload?.error) return String(payload.error);
-        if (payload?.message) return String(payload.message);
+        payload = await resp.clone().json();
+        message = payload?.error || payload?.message || fallback;
     } catch {
-        // Fall through to text response.
+        try { message = await resp.text() || fallback; } catch { /* Use fallback. */ }
     }
-    try {
-        const text = await resp.text();
-        if (text) return text;
-    } catch {
-        // Ignore parse failures and use fallback.
-    }
-    return fallback;
+    const error = new Error(String(message));
+    error.status = resp.status;
+    error.code = payload?.code || "";
+    error.payload = payload;
+    error.message = projectErrorMessage(error, fallback);
+    return error;
 }
 
 export function buildProjectAssetViewURL(projectDir, sourcePath) {
@@ -499,8 +517,7 @@ export async function importFileIntoProject(projectDir, file, folder = "", diagn
     }, diagnostics));
 
     if (!importResp.ok) {
-        const message = await readResponseError(importResp, `Import failed: ${importResp.status}`);
-        throw new Error(message);
+        throw await readResponseError(importResp, `Import failed: ${importResp.status}`);
     }
 
     return true;
@@ -517,7 +534,7 @@ export async function replaceAssetInProject(projectDir, assetId, file, diagnosti
         body: formData,
     }, diagnostics));
     if (!resp.ok) {
-        throw new Error(await readResponseError(resp, `Asset replace failed: ${resp.status}`));
+        throw await readResponseError(resp, `Asset replace failed: ${resp.status}`);
     }
     return await resp.json();
 }
@@ -13479,11 +13496,10 @@ export class EditorWidget {
                     code: payload?.code || (response.ok
                         ? "preview_invalid_response"
                         : `preview_http_${response.status}`),
-                    message: payload?.code === "project_version_conflict"
-                        ? "The preview could not refresh because the project changed while it was compiling. Any previous preview remains visible; your next edit will try again."
-                        : payload?.error || (response.ok
-                            ? "Prompt Context candidate preview returned no usable payload."
-                            : "Prompt Context candidate preview failed."),
+                    message: projectErrorMessage(
+                        { code: payload?.code, message: payload?.error },
+                        response.ok ? "Prompt Context candidate preview returned no usable payload."
+                            : "Prompt Context candidate preview failed.", "preview"),
                 } : null;
                 this._promptContextCandidateCache = !failed ? {
                     ...payload, _candidate_scene_id: sceneId,
@@ -21388,9 +21404,7 @@ export class EditorWidget {
             error.status = response.status;
             error.code = payload?.code || "";
             error.payload = payload;
-            if (error.code === "project_version_conflict") {
-                error.message = "The project kept changing while scene history was applied. Try again.";
-            }
+            error.message = projectErrorMessage(error, fallback, "history");
             return error;
         };
         const adopt = (scene) => {
@@ -22947,10 +22961,10 @@ export class EditorWidget {
             if (!failures.length && imported === total) {
                 handle.resolve({ message: `Imported ${imported} file${imported === 1 ? "" : "s"}` });
             } else if (imported > 0) {
-                const first = failures[0]?.error?.message || "one file failed";
+                const first = importFailureMessage(failures[0]);
                 handle.resolve({ tier: "warning", message: `Imported ${imported} of ${total} files. ${first}` });
             } else {
-                const first = failures[0]?.error?.message || "No files imported.";
+                const first = importFailureMessage(failures[0]);
                 handle.resolve({ tier: "error", message: first });
             }
         } catch (e) {
@@ -22974,7 +22988,7 @@ export class EditorWidget {
             }
         } catch (e) {
             console.warn("[Sonder] File import error:", e);
-            notifyError(e?.message || "Import failed.", { source: "import" });
+            notifyError(importFailureMessage({ file, error: e }), { source: "import" });
         }
     }
 

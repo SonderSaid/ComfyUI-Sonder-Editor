@@ -11,6 +11,9 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Fixed
+- Fixed false project conflicts during multi-file import and replacement, preserved committed replacement media when cleanup fails, and named failed imports in gallery notifications.
+
 ## [0.4.0] - 2026-09-08
 
 Registry users upgrading from 0.2.2 also receive the features listed under

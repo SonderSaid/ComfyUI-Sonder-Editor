@@ -30,7 +30,7 @@ import {
     releaseEditorSession,
 } from "./editor_session_client.js";
 import { connectProjectSync } from "./cross_tab_sync.js";
-import { EditorWidget, buildProjectAssetViewURL, importFileIntoProject, replaceAssetInProject } from "./editor_widget.js";
+import { EditorWidget, buildProjectAssetViewURL, importFileIntoProject, replaceAssetInProject, importFailureMessage } from "./editor_widget.js";
 import { loadMediaAsBlob, mountSharedAssetGallery } from "./shared_asset_gallery.js";
 import { deriveCurrentSceneAssetIds } from "./current_scene_assets.js";
 import {
@@ -3187,10 +3187,10 @@ export class EditorNodeController {
             if (!failures.length && imported === total) {
                 handle.resolve({ message: `Imported ${imported} file${imported === 1 ? "" : "s"}` });
             } else if (imported > 0) {
-                const first = failures[0]?.error?.message || "one file failed";
+                const first = importFailureMessage(failures[0]);
                 handle.resolve({ tier: "warning", message: `Imported ${imported} of ${total} files. ${first}` });
             } else {
-                const first = failures[0]?.error?.message || "No files imported.";
+                const first = importFailureMessage(failures[0]);
                 handle.resolve({ tier: "error", message: first });
             }
         } catch (e) {

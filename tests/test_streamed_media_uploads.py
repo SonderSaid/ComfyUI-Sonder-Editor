@@ -380,3 +380,197 @@ def test_frontend_import_and_replace_post_directly_to_sonder():
     assert 'formData.append("folder", folder)' in helper_region
     assert 'api.apiURL("/upload/image")' not in helper_region
     assert "uploadFileToComfyInput" not in text
+
+
+def test_sequential_imports_advertise_committed_versions(tmp_path, monkeypatch):
+    route_module = _reload_routes(monkeypatch)
+    project = _saved_project(tmp_path)
+    monkeypatch.setattr(route_module, "_configured_base_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(upload_streaming, "UPLOAD_DISK_RESERVE_BYTES", 0)
+    monkeypatch.setattr(route_module, "_extract_asset_media_metadata", lambda *_a, **_kw: _valid_video_metadata())
+    monkeypatch.setattr(route_module, "_regenerate_thumbnail_if_current", lambda *_a, **_kw: None)
+
+    async def scenario():
+        app = web.Application(middlewares=[
+            route_module._project_conflict_middleware,
+            route_module._project_version_header_middleware,
+        ])
+        path = "/sonder-editor/project/{project_id}/assets/import"
+        app.router.add_post(path, _route_handler(route_module, "POST", path))
+        async with TestClient(TestServer(app)) as client:
+            version = ""
+            observations = []
+            for index in range(8):
+                before = load_project(project.project_dir).modified_at
+                form = FormData()
+                form.add_field("file", b"video", filename=f"clip-{index}.mp4")
+                response = await client.post(
+                    "/sonder-editor/project/project/assets/import", data=form,
+                    headers={"If-Match": version} if version else {},
+                )
+                await response.read()
+                header = response.headers.get("X-Sonder-Project-Modified-At")
+                after = load_project(project.project_dir).modified_at
+                observations.append((response.status, before, header, after))
+                assert header, observations
+                version = max(version, header)
+            assert [row[0] for row in observations] == [201] * 8, observations
+            assert all(header == after for _, _, header, after in observations), observations
+            assert len(load_project(project.project_dir).assets) == 8
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("operation", ["import", "replace"])
+@pytest.mark.parametrize("stale", [False, True])
+def test_streamed_routes_return_committed_header_with_stale_client(tmp_path, monkeypatch, operation, stale):
+    route_module = _reload_routes(monkeypatch)
+    asset = Asset(asset_id="asset-1", name="clip.mp4", asset_type="video", path="media/clip.mp4")
+    project = _saved_project(tmp_path, asset=asset)
+    Path(project.project_dir, asset.path).write_bytes(b"old")
+    monkeypatch.setattr(route_module, "_configured_base_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(upload_streaming, "UPLOAD_DISK_RESERVE_BYTES", 0)
+    monkeypatch.setattr(route_module, "_extract_asset_media_metadata", lambda *_a, **_kw: _valid_video_metadata())
+    monkeypatch.setattr(route_module, "_regenerate_thumbnail_if_current", lambda *_a, **_kw: None)
+    before = project.modified_at
+
+    async def scenario():
+        app = web.Application(middlewares=[route_module._project_conflict_middleware,
+                                          route_module._project_version_header_middleware])
+        suffix = "import" if operation == "import" else "{asset_id}/replace"
+        path = "/sonder-editor/project/{project_id}/assets/" + suffix
+        app.router.add_post(path, _route_handler(route_module, "POST", path))
+        async with TestClient(TestServer(app)) as client:
+            form = FormData()
+            form.add_field("file", b"replacement", filename="new.mp4")
+            response = await client.post(path.replace("{project_id}", "project").replace("{asset_id}", "asset-1"),
+                                         data=form, headers={"If-Match": "2000-01-01T00:00:00" if stale else before})
+            assert response.status == (201 if operation == "import" else 200), await response.text()
+            saved = load_project(project.project_dir)
+            assert saved.modified_at != before
+            assert response.headers["X-Sonder-Project-Modified-At"] == saved.modified_at
+            assert response.headers["X-Sonder-Project-Id"] == saved.project_id
+            payload = await response.json()
+            result = payload if operation == "import" else payload["asset"]
+            assert Path(project.project_dir, result["path"]).read_bytes() == b"replacement"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure", ["backup_cleanup", "post_commit_exception", "save"])
+def test_replace_rollback_authority_ends_at_commit(tmp_path, monkeypatch, failure):
+    asset = Asset(asset_id="asset-1", name="clip.mp4", asset_type="video", path="media/clip.mp4")
+    project = _saved_project(tmp_path, asset=asset)
+    source = Path(project.project_dir, asset.path)
+    source.write_bytes(b"old-video")
+    initial_signature = routes._media_probe_signature(str(source))
+    staging = source.parent / upload_streaming.UPLOAD_STAGING_DIRNAME
+    staging.mkdir()
+    staged = staging / ("4" * 32 + ".part.mp4")
+    staged.write_bytes(b"new-video-with-different-length")
+    monkeypatch.setattr(routes, "_extract_asset_media_metadata", lambda *_a, **_kw: _valid_video_metadata())
+    real_remove = os.remove
+    real_save = routes.save_project
+    cleanup_attempts = []
+
+    def remove(path, *args, **kwargs):
+        if ".rollback." in str(path):
+            cleanup_attempts.append(str(path))
+            if failure == "backup_cleanup":
+                raise PermissionError("injected backup cleanup failure")
+            if failure == "post_commit_exception":
+                raise RuntimeError("injected post-commit failure")
+        return real_remove(path, *args, **kwargs)
+
+    def save(project, **kwargs):
+        if failure == "save":
+            raise OSError("injected save failure")
+        return real_save(project, **kwargs)
+
+    monkeypatch.setattr(routes.os, "remove", remove)
+    monkeypatch.setattr(routes, "save_project", save)
+
+    def commit():
+        return routes._streamed_replace_commit(project.project_dir, asset.asset_id, "video", asset.path,
+                                              initial_signature, str(staged), "new.mp4")
+
+    if failure == "backup_cleanup":
+        commit()
+    else:
+        with pytest.raises(RuntimeError if failure == "post_commit_exception" else OSError):
+            commit()
+    saved = load_project(project.project_dir)
+    if failure == "save":
+        assert source.read_bytes() == b"old-video"
+        assert staged.read_bytes() == b"new-video-with-different-length"
+        assert saved.modified_at == project.modified_at
+    else:
+        assert cleanup_attempts
+        assert source.read_bytes() == b"new-video-with-different-length"
+        assert saved.modified_at != project.modified_at
+        assert saved.get_asset(asset.asset_id).media_probe_signature == routes._media_probe_signature(str(source))
+        assert not staged.exists()
+
+
+@pytest.mark.parametrize("host_kind", ["fullscreen", "dormant"])
+def test_upload_errors_keep_codes_and_name_failed_file(host_kind):
+    import json
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for browser helper tests")
+    source = (Path(__file__).parents[1] / "web/js/editor_widget.js").read_text(encoding="utf-8")
+    helpers = source[source.index("const PROJECT_ERROR_MESSAGES"):source.index("export function buildProjectAssetViewURL")]
+    uploads = source[source.index("export async function importFileIntoProject"):source.index("// ── Constants")]
+    method = source[source.index("    async _importFilesWithProgressWithinGesture("):source.index("    async _importFile(file")]
+    if host_kind == "dormant":
+        controller = (Path(__file__).parents[1] / "web/js/editor_node_controller.js").read_text(encoding="utf-8")
+        start = controller.index("    async importFiles(")
+        end = controller.index("\n    }", start) + len("\n    }")
+        method = controller[start:end]
+    script = helpers.replace("export ", "") + uploads.replace("export ", "") + "\nconst host = {" + method + "};\n" + r'''
+const assert = (await import("node:assert/strict")).default;
+const api = {apiURL: (url) => url};
+const markProjectAssetMutation = () => {};
+const withEditorMutationDiagnostics = (init) => init;
+let requests = 0;
+globalThis.fetch = async () => {
+    requests++;
+    return new Response(JSON.stringify({error:"project_version_conflict",code:"project_version_conflict"}), {status:409});
+};
+const file = new Blob(["bad"]); file.name = "failed clip.mp4";
+for (const action of [() => importFileIntoProject("project", file), () => replaceAssetInProject("project", "asset", file)]) {
+    await assert.rejects(action, e => e.code === "project_version_conflict" && e.status === 409
+        && e.message.includes("project changed") && !e.message.includes("project_version_conflict"));
+}
+assert.equal(requests, 2); // No re-upload/retry layer.
+const raw = await readResponseError(new Response("Disk full", {status:507}));
+assert.equal(raw.message, "Disk full"); assert.equal(raw.status, 507);
+assert.equal(importFailureMessage({file, error:raw}), "failed clip.mp4: Disk full");
+assert.match(projectErrorMessage({code:"project_version_conflict"}, "fallback", "preview"), /preview/);
+assert.match(projectErrorMessage({code:"project_version_conflict"}, "fallback", "history"), /scene history/);
+let resolved; let refreshed = 0;
+const notifyProgress = () => ({update() {}, resolve(value) { resolved = value; }});
+host.projectDir = "project"; host._fetchAssets = async () => { refreshed++; };
+globalThis.fetch = async () => ++requests % 2
+    ? new Response("{}", {status:201})
+    : new Response(JSON.stringify({error:"Cannot probe media"}), {status:400});
+if (host.importFiles) {
+    host.state = {projectDir: "project"};
+    host._invalidateModules = () => {};
+    host._reloadExpandedModuleIfNeeded = () => {};
+    host._refreshAfterAssetMutation = host._fetchAssets;
+    await host.importFiles([file, file]);
+} else {
+    await host._importFilesWithProgressWithinGesture({}, [file, file]);
+}
+assert.equal(refreshed, 1);
+assert.equal(resolved.tier, "warning");
+assert.equal(resolved.message, "Imported 1 of 2 files. failed clip.mp4: Cannot probe media");
+console.log(JSON.stringify({ok:true}));
+'''
+    result = subprocess.run([node, "--input-type=module", "-e", script], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"ok": True}

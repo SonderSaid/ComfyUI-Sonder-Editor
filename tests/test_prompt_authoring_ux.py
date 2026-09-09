@@ -38,6 +38,11 @@ def _run_node(script: str):
                   + headers + script)
         for host in ("Harness", "Host"):
             script = script.replace("class " + host + " {", "class " + host + " {\n" + gesture)
+    if "projectErrorMessage(" in script:
+        widget = _source("web/js/editor_widget.js")
+        errors = widget[widget.index("const PROJECT_ERROR_MESSAGES"):
+                        widget.index("export function importFailureMessage")]
+        script = errors + script
     result = subprocess.run(
         [node, "--input-type=module"], input=script, capture_output=True,
         text=True, encoding="utf-8")
@@ -1822,9 +1827,7 @@ await timers.find((timer) => timer.ms === 1000 && !timer.cancelled).fn();
 const success = structuredClone(subject._promptContextCandidateCache);
 console.log(JSON.stringify({failedState, superseded, success}));
 """
-    result = json.loads(subprocess.run(
-        [node, "--input-type=module", "-e", script], capture_output=True,
-        text=True, encoding="utf-8", check=True).stdout)
+    result = _run_node(script)
     for state in (result["failedState"], result["superseded"]):
         assert state["_failed"] is True
         assert state["_stale"] is True
@@ -1895,9 +1898,7 @@ await timers.filter((timer) => timer.ms === 0 && !timer.cancelled).at(-1).fn();
 const second = structuredClone(subject._promptContextCandidateCache);
 console.log(JSON.stringify({first, second}));
 """
-    result = json.loads(subprocess.run(
-        [node, "--input-type=module", "-e", script], capture_output=True,
-        text=True, encoding="utf-8", check=True).stdout)
+    result = _run_node(script)
     for state in (result["first"], result["second"]):
         assert state["_failed"] is True
         message = state["errors"][0]["message"]
@@ -2107,9 +2108,7 @@ console.log(JSON.stringify({
   counts: subject.counts,
 }));
 """
-    result = json.loads(subprocess.run(
-        [node, "--input-type=module", "-e", script], capture_output=True,
-        text=True, encoding="utf-8", check=True).stdout)
+    result = _run_node(script)
     assert result == {
         "code": "preview_invalid_response", "stale": True, "failed": True,
         "staleTimerCancelled": True,

@@ -7304,12 +7304,12 @@ def _load_project_from_request(request: web.Request, *, repair_missing_frames: b
                                version_checked: bool = True) -> TimelineProject:
     """Load project from project_id path parameter.
 
-    Read-only POST routes may disable the mutating header gate when they own
-    an explicit body gate or exact readback contract; they must also disable
-    opportunistic repair writes.
+    Routes may disable the header gate for exact readback or when their commit
+    owns the applicable body-version/CAS/content preconditions. Such loads must
+    disable opportunistic repair writes; the route still owns its commit checks.
     """
     if not version_checked and repair_missing_frames:
-        raise ValueError("Read-only candidate loads cannot repair project data")
+        raise ValueError("Version-unchecked loads cannot repair project data")
     if "path" in request.query:
         raise _bad_project_request("?path is no longer supported for project routes")
     try:
@@ -8443,6 +8443,7 @@ def _streamed_replace_commit(
 
         backup_path = ""
         published = False
+        committed = False
         try:
             if same_path:
                 staging_dir = os.path.dirname(staged_path)
@@ -8460,6 +8461,9 @@ def _streamed_replace_commit(
 
             try:
                 save_project(current, expected_modified_at=base_modified_at)
+                # Durable metadata now owns the published bytes. No later failure
+                # (including cleanup) may restore the old media beneath it.
+                committed = True
             except ProjectVersionConflict as exc:
                 last_conflict = exc
                 if same_path:
@@ -8470,8 +8474,11 @@ def _streamed_replace_commit(
                 backup_path = ""
                 continue
 
-            if backup_path and os.path.lexists(backup_path):
-                os.remove(backup_path)
+            if backup_path:
+                try:
+                    os.remove(backup_path)
+                except OSError:
+                    logger.warning("Failed to remove replacement rollback entry: %s", backup_path)
             if old_rel_path != next_rel_path and os.path.isfile(old_abs_path):
                 shared_old_path = any(
                     other.asset_id != asset.asset_id and other.path == old_rel_path
@@ -8484,6 +8491,8 @@ def _streamed_replace_commit(
                         logger.warning("Failed to remove replaced asset file: %s", old_abs_path)
             return current, asset
         except Exception:
+            if committed:
+                raise
             if published:
                 try:
                     if same_path:
@@ -9747,7 +9756,13 @@ if routes is not None:
         request_content_type = getattr(request, "content_type", "application/json")
         if request_content_type == "multipart/form-data":
             try:
-                project = await asyncio.to_thread(_load_project_from_request, request, repair_missing_frames=False)
+                # Upload bytes are not derived from a client project version.
+                # Remove this exemption if the multipart body gains a client base
+                # version, or the commit stops owning CAS/content preconditions.
+                project = await asyncio.to_thread(
+                    _load_project_from_request, request,
+                    repair_missing_frames=False, version_checked=False,
+                )
             except FileNotFoundError as e:
                 return _json_error(str(e), 404)
             media_dir = project_media_root(project)
@@ -9768,6 +9783,9 @@ if routes is not None:
                         upload.filename,
                         folder,
                     )
+                    # The commit reloads its own object; the pre-upload object
+                    # would stamp a version older than this successful write.
+                    _remember_request_project(request, committed_project)
                     if asset.asset_type in {"video", "image", "audio"}:
                         await asyncio.to_thread(
                             _regenerate_thumbnail_if_current,
@@ -10573,7 +10591,13 @@ if routes is not None:
         request_content_type = getattr(request, "content_type", "application/json")
         if request_content_type == "multipart/form-data":
             try:
-                initial_project = await asyncio.to_thread(_load_project_from_request, request, repair_missing_frames=False)
+                # Upload bytes are not derived from a client project version.
+                # Remove this exemption if the multipart body gains a client base
+                # version, or the commit stops owning CAS/content preconditions.
+                initial_project = await asyncio.to_thread(
+                    _load_project_from_request, request,
+                    repair_missing_frames=False, version_checked=False,
+                )
             except FileNotFoundError as e:
                 return _json_error(str(e), 404)
             asset_id = request.match_info["asset_id"]
@@ -10611,6 +10635,9 @@ if routes is not None:
                         upload.path,
                         upload.filename,
                     )
+                    # The commit reloads its own object; the pre-upload object
+                    # would stamp a version older than this successful write.
+                    _remember_request_project(request, committed_project)
                     await asyncio.to_thread(
                         _delete_asset_cache_files_locked,
                         committed_project,
