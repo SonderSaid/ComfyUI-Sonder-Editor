@@ -1585,7 +1585,7 @@ def test_bridge_shape_module_stays_free_of_browser_imports():
 # One fixture set, resolved in Python and in node. A lane of two items where the
 # window clips one of them, swept across thresholds.
 _THRESHOLD_ITEMS = [
-    {"reference_item_id": "wide", "lane_index": 0, "start_frame": 0, "end_frame": 100, "members": [{"member_id": "m"}]},
+    {"reference_item_id": "wide", "lane_index": 0, "start_frame": 0, "end_frame": 40, "members": [{"member_id": "m"}]},
     {"reference_item_id": "narrow", "lane_index": 0, "start_frame": 40, "end_frame": 60, "members": [{"member_id": "m"}]},
     {"reference_item_id": "other", "lane_index": 1, "start_frame": 0, "end_frame": 10, "members": [{"member_id": "m"}]},
 ]
@@ -1593,11 +1593,17 @@ _THRESHOLD_CASES = [
     {"windowStart": 40, "windowEnd": 60, "frameThresholdPct": 0},
     {"windowStart": 40, "windowEnd": 60, "frameThresholdPct": 50},
     {"windowStart": 40, "windowEnd": 60, "frameThresholdPct": 100},
-    # The window clips only a sliver of both items on lane 0.
+    # A short window clips narrow; 5/7 coverage clears 30 but not 90.
     {"windowStart": 55, "windowEnd": 62, "frameThresholdPct": 0},
     {"windowStart": 55, "windowEnd": 62, "frameThresholdPct": 30},
     {"windowStart": 55, "windowEnd": 62, "frameThresholdPct": 90},
     {"windowStart": 0, "windowEnd": 100, "frameThresholdPct": 25},
+    # Each contains the other in one direction, at the strictest threshold.
+    {"windowStart": 10, "windowEnd": 20, "frameThresholdPct": 100},
+    {"windowStart": 0, "windowEnd": 100, "frameThresholdPct": 100},
+    # Equal specificity: later start wins; a non-overlapping lane remains empty.
+    {"windowStart": 20, "windowEnd": 50, "frameThresholdPct": 40},
+    {"windowStart": 8, "windowEnd": 50, "frameThresholdPct": 90},
 ]
 
 
@@ -1639,7 +1645,12 @@ console.log(JSON.stringify(rows));
 
     # The fixtures must actually exercise the behaviour, not agree vacuously.
     # Off: most-specific-wins picks the tightly-scoped item.
-    assert expected[0][0] == "narrow"
+    assert expected == [
+        ["narrow", None], ["narrow", None], ["narrow", None],
+        ["narrow", None], ["narrow", None], [None, None],
+        ["narrow", "other"], ["wide", None], ["narrow", "other"],
+        ["narrow", None], [None, None],
+    ]
     # A threshold above the clipped coverage empties the lane entirely — the
     # deliberate difference from the prompt rule, which always keeps one.
     assert expected[5][0] is None, "a high threshold must be able to leave a lane with nothing"
@@ -1691,8 +1702,8 @@ def test_reference_verdicts_report_why_each_item_did_or_did_not_resolve():
     if not node_bin:
         pytest.skip("node is required for the verdict test")
     items = [
-        # Lane 0: `narrow` sits inside `wide`, so a window over it wins on coverage.
-        {"reference_item_id": "wide", "lane_index": 0, "start_frame": 0, "end_frame": 100},
+        # Lane 0 has adjacent scopes; narrow wins on specificity.
+        {"reference_item_id": "wide", "lane_index": 0, "start_frame": 0, "end_frame": 40},
         {"reference_item_id": "narrow", "lane_index": 0, "start_frame": 40, "end_frame": 60},
         {"reference_item_id": "elsewhere", "lane_index": 0, "start_frame": 80, "end_frame": 100},
         {"reference_item_id": "muted", "lane_index": 0, "start_frame": 40, "end_frame": 60, "muted": True},
@@ -1707,11 +1718,11 @@ const items = {json.dumps(items)};
 const shared = {{ referenceItems: items, laneCount: 2, sceneDuration: 100, laneConfigs: [{{}}, {{ hidden: true }}] }};
 const named = (result) => Object.fromEntries(
   [...result.verdicts].map(([index, verdict]) => [items[index].reference_item_id, verdict]));
-const plain = resolveReferenceVerdicts({{ ...shared, windowStart: 40, windowEnd: 60 }});
+const plain = resolveReferenceVerdicts({{ ...shared, windowStart: 35, windowEnd: 60 }});
 console.log(JSON.stringify({{
   plain: named(plain),
-  // Same window, threshold above `wide`'s 20% coverage but under `narrow`'s 100%.
-  thresholded: named(resolveReferenceVerdicts({{ ...shared, windowStart: 40, windowEnd: 60, frameThresholdPct: 50 }})),
+  // Same window: wide covers 5/25, narrow is fully contained.
+  thresholded: named(resolveReferenceVerdicts({{ ...shared, windowStart: 35, windowEnd: 60, frameThresholdPct: 50 }})),
   // Threshold above every candidate: the lane resolves to nothing at all.
   emptied: named(resolveReferenceVerdicts({{ ...shared, windowStart: 55, windowEnd: 62, frameThresholdPct: 90 }})),
   labels: REFERENCE_VERDICT_LABEL,
@@ -1797,8 +1808,8 @@ def test_threshold_batch_warnings_name_the_lane_the_count_and_the_right_remedy()
     # Each cause carries its own remedy and its own count.
     assert "reserved Bridge slots" in block
     assert "Lower the Reference Threshold in Settings" in block
-    assert "the staged item." in block
-    assert "Lower it in Settings, or widen the staged item." in block
+    assert "extend the staged range into those chunks." in block
+    assert "Lower it in Settings, or extend the staged range into those chunks." in block
     assert "does not overlap this batch" in block
     assert "Unmute the item or unhide the " in block
     # Scope drops are announced too, but transiently — they are the feature
@@ -1824,10 +1835,10 @@ def test_batch_chunk_classifier_separates_threshold_scope_and_excluded():
     cases = {
         # Scoped to the first chunk only: overlaps nothing later, threshold off.
         "scope": (thirds, [{"lane_index": 0, "start_frame": 0, "end_frame": 100}], 0),
-        # Spans the whole batch, but uneven chunks cover too little of its span.
-        "threshold": (uneven, [{"lane_index": 0, "start_frame": 0, "end_frame": 300}], 40),
+        # Crosses both outer chunks, contains the short middle chunk.
+        "threshold": (uneven, [{"lane_index": 0, "start_frame": 140, "end_frame": 210}], 40),
         # Both causes on ONE lane: wins chunk 1, thresholded in 2, absent in 3.
-        "mixed": (thirds, [{"lane_index": 0, "start_frame": 0, "end_frame": 150}], 40),
+        "mixed": (thirds, [{"lane_index": 0, "start_frame": 0, "end_frame": 120}], 40),
         # Deliberate silence: muted everywhere, so it can never flip.
         "muted": (thirds, [{"lane_index": 0, "start_frame": 0, "end_frame": 300, "muted": True}], 0),
         # lane_index spellings the scorer normalizes: undefined -> 0, "2" -> 2, 1.7 -> 1.

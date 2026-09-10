@@ -336,11 +336,16 @@ def resolve_segments(sections, window_start, window_end, labels_on=True,
     4. Boundary-spill threshold (only when boundary_threshold_pct > 0): only
        the FIRST and LAST segments can be clipped by the window edge. Drop a
        window-clipped end segment whose in-window coverage is below
-       boundary_threshold_pct% of its source section's AUTHORED length, and
+       boundary_threshold_pct% of the shorter of its AUTHORED length and the
+       window length. Evaluate both ends before absorption; drop the lower
+       coverage first (trailing first on a tie), and
        let the neighbor absorb the freed span (hold-until-next). Never reduce
        below one surviving segment, so a window sitting inside a single long
        section is never emptied. Stops frame-constraint snapping from
        bleeding a few frames of an adjacent section into the generation.
+       Test each original end only once: cascading leading drops would change
+       legacy first-wins overlaps. Remove this limit only when that legacy
+       overlap path is retired.
 
     Each returned segment additionally carries `section_start` (the source
     section's authored start_frame) so callers can map a window-local segment
@@ -408,26 +413,26 @@ def resolve_segments(sections, window_start, window_end, labels_on=True,
             "end": cov_end - window_start,
         })
 
-    # Pass 4 — boundary-spill threshold. Only the first and last segments can
-    # be window-clipped (middle segments are bounded by neighbors). Drop a
-    # clipped end whose in-window coverage is a small fraction of its source
-    # section's authored length; the neighbor absorbs the freed span. The
-    # len>=2 guards keep at least one surviving segment so the window is never
-    # emptied (e.g. a selection entirely inside one long section).
+    # Pass 4 — compare the original clipped ends before either absorbs a span.
+    # Each drop keeps at least one survivor; threshold zero is a total no-op.
     if boundary_threshold_pct > 0 and len(segments) >= 2:
         frac = boundary_threshold_pct / 100.0
-        last = segments[-1]
-        last_authored_len = max(1, last["authored_end"] - last["authored_start"])
-        if (last["authored_end"] > window_end
-                and (last["end"] - last["start"]) < frac * last_authored_len):
-            freed_end = last["end"]
-            segments.pop()
-            segments[-1]["end"] = freed_end
-        if len(segments) >= 2:
-            first = segments[0]
-            first_authored_len = max(1, first["authored_end"] - first["authored_start"])
-            if (first["authored_start"] < window_start
-                    and (first["end"] - first["start"]) < frac * first_authored_len):
+        candidates = []
+        for end_order, segment in ((0, segments[-1]), (1, segments[0])):
+            eligible = (segment["authored_end"] > window_end if end_order == 0
+                        else segment["authored_start"] < window_start)
+            authored_len = segment["authored_end"] - segment["authored_start"]
+            coverage = ((segment["end"] - segment["start"])
+                        / max(1, min(authored_len, window_end - window_start)))
+            if eligible and coverage < frac:
+                candidates.append((coverage, end_order))
+        for _, end_order in sorted(candidates):
+            if len(segments) < 2:
+                break
+            if end_order == 0:
+                freed_end = segments.pop()["end"]
+                segments[-1]["end"] = freed_end
+            else:
                 segments.pop(0)
                 segments[0]["start"] = 0
 

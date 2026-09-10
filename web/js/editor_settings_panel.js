@@ -1520,7 +1520,7 @@ function showSettingsPanel() {
         const thresholdControls = createRow(
             promptsSection,
             "Boundary Prompt Threshold % (project-wide)",
-            "Ignore a prompt section in a render window when the selection only clips a small sliver of it at the window edge (under N% of that section's length). 0 = off. Saved into the project."
+            "Ignore a clipped boundary prompt section when its in-window coverage is under N% of the shorter of the section and render window. A section containing the window or fully inside it stays. Lower coverage drops first; at least one section stays. 0 = off. Saved into the project."
         );
         const thresholdInput = document.createElement("input");
         thresholdInput.type = "number";
@@ -1550,7 +1550,7 @@ function showSettingsPanel() {
         const referenceControls = createRow(
             promptsSection,
             "Reference Threshold % (project-wide)",
-            "Ignore a staged Reference item in a render window when the window only covers a small part of that item's own span (under N%). Unlike prompts this can leave a lane with no reference at all, so has_reference reports 0 for that window. Batches warn when that changes mid-batch, naming whether the threshold or the staged range caused it. 0 = off. Saved into the project."
+            "Ignore a staged Reference item when its overlap is under N% of the shorter of the item and render window. An item containing the window or fully inside it stays. Unlike prompts this can leave a lane with no reference. Batches warn when that changes, naming whether the threshold or staged range caused it. 0 = off. Saved into the project."
         );
         const referenceInput = document.createElement("input");
         referenceInput.type = "number";

@@ -12841,7 +12841,7 @@ export class EditorWidget {
 
     /** Project-durable boundary-spill threshold (%). Drops a prompt section
      *  from a render window when the selection only clips a small sliver of it
-     *  at the window edge (under N% of that section's own length); 0 = off.
+     *  at the window edge (under N% of the shorter section/window span); 0 = off.
      *  Same project-metadata mutation exemption as the delimiter/labels. */
     async _setPromptFrameThreshold(...args) {
         return this._withMutationGesture(
@@ -12912,10 +12912,10 @@ export class EditorWidget {
         if (thresholdFlips.length) {
             notifyWarning(
                 `${named(thresholdFlips, REFERENCE_LANE_CAUSE.BELOW_THRESHOLD)} — dropped from chunks this `
-                + "item does overlap, because each chunk covers too little of its own span for the current "
+                + "item does overlap, because the overlap is too small relative to the shorter item/chunk span for the current "
                 + "Reference Threshold. If a Reference Selector includes this lane, its reserved Bridge slots "
-                + "emit unused fallbacks in those chunks. Lower the Reference Threshold in Settings, or widen "
-                + "the staged item.",
+                + "emit unused fallbacks in those chunks. Lower the Reference Threshold in Settings, or "
+                + "extend the staged range into those chunks.",
                 { source: "reference-batch-flip", duration: 0 },
             );
         }
@@ -12937,8 +12937,8 @@ export class EditorWidget {
             // lane about overlap it does not have a problem with.
             const remedies = {
                 [REFERENCE_LANE_CAUSE.BELOW_THRESHOLD]:
-                    "Each chunk covers too little of the item's own span for the current Reference Threshold. "
-                    + "Lower it in Settings, or widen the staged item.",
+                    "The overlap is too small relative to the shorter item/chunk span for the current Reference Threshold. "
+                    + "Lower it in Settings, or extend the staged range into those chunks.",
                 [REFERENCE_LANE_CAUSE.OUTSIDE]:
                     "The staged range does not overlap this batch. Move or extend the item to cover it.",
                 [REFERENCE_LANE_CAUSE.EXCLUDED]:

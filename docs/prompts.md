@@ -37,8 +37,11 @@ beside the Channel selector. Switching is presentation only; it never moves or
 flattens authored text or chips.
 
 - **Boundary Prompt Threshold** (project-wide) drops a section from a window
-  when the selection clips only a tiny edge sliver of it — so frame snapping
-  can't bleed a neighbor's text into your generation. The timeline shows
+  when its clipped coverage is below that percentage of the shorter of its
+  authored span and the render window. Containment in either direction stays;
+  lower-coverage ends drop first (trailing first on ties), with at least one
+  section kept. Short windows can retain neighbors that previously dropped,
+  including at the default 10%. The timeline shows
   affected slivers with a dim "Ignored" hatch, and sections that *will*
   compose get a strong accent.
 - Lane hiding is part of composition: Prompt lane hidden → global-only

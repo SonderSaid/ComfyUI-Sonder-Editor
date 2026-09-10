@@ -168,7 +168,9 @@ export const REFERENCE_VERDICT_LABEL = Object.freeze({
  * drift here changes the winners and fails that comparison.
  *
  * `frameThresholdPct` drops an item whose in-window overlap is under that
- * percentage of its OWN span, before the survivors are scored. Unlike the
+ * percentage of the shorter of its span and the window span, before survivors
+ * are scored by overlap / item span. Containment in either direction always
+ * clears the threshold. Unlike the
  * prompt boundary threshold there is no never-empty guard: a lane may resolve
  * to nothing, which is what makes a reference stop applying outside its scope.
  *
@@ -217,7 +219,8 @@ export function resolveReferenceVerdicts({
             verdicts.set(itemIndex, REFERENCE_VERDICT.OUTSIDE);
             return;
         }
-        const coverage = overlap / (itemEnd - itemStart);
+        const specificity = overlap / (itemEnd - itemStart);
+        const coverage = overlap / Math.max(1, Math.min(itemEnd - itemStart, end - start));
         if (threshold > 0 && coverage < threshold) {
             verdicts.set(itemIndex, REFERENCE_VERDICT.BELOW_THRESHOLD);
             return;
@@ -225,7 +228,7 @@ export function resolveReferenceVerdicts({
         // A candidate that clears the threshold is provisionally the winner and
         // demotes whoever held the lane; most-specific-wins is resolved by the
         // scan order, so the loser's verdict is only final once it completes.
-        const score = [coverage, itemStart, itemIndex];
+        const score = [specificity, itemStart, itemIndex];
         const previous = scores[laneIndex];
         const wins = !previous
             || score[0] > previous[0]

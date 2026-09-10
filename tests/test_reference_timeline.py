@@ -1887,8 +1887,8 @@ def test_splitting_can_raise_an_item_over_the_reference_frame_threshold():
     """A consequence of splitting, disclosed rather than prevented.
 
     `resolve_effective_references` scores coverage as
-    `overlap / (item_end - item_start)`, so halving an item's own span doubles
-    its coverage of the same window. An item the threshold used to drop can
+    `overlap / min(item_span, window_span)`. Shortening the item below
+    the window span can raise its coverage of the same window. An item the threshold used to drop can
     start applying after a split. Inherent to dividing a scope; pinned so it is
     a known property rather than a surprise in a render.
     """
@@ -1899,18 +1899,18 @@ def test_splitting_can_raise_an_item_over_the_reference_frame_threshold():
     scene.reference_items[0].muted = False
     before = resolve_effective_references(
         reference_items=scene.reference_items, lane_count=1,
-        scene_duration=100, window_start=0, window_end=30,
+        scene_duration=100, window_start=0, window_end=15,
         lane_configs=scene.reference_lane_configs, frame_threshold_pct=50)
-    assert before[0] is None, "30 of 90 frames is under a 50% threshold"
+    assert before[0] is None, "5 / min(90, 15) is under a 50% threshold"
 
     routes._apply_split_reference_item(scene, {
-        "reference_item_id": "item", "frame": 40,
+        "reference_item_id": "item", "frame": 20,
         "expected": _split_expected(scene)})
     after = resolve_effective_references(
         reference_items=scene.reference_items, lane_count=1,
-        scene_duration=100, window_start=0, window_end=30,
+        scene_duration=100, window_start=0, window_end=15,
         lane_configs=scene.reference_lane_configs, frame_threshold_pct=50)
-    assert after[0] is not None, "the left half now covers the window"
+    assert after[0] is not None, "5 / min(10, 15) now meets the threshold exactly"
     assert after[0]["item"].reference_item_id == "item"
 
 
@@ -2003,3 +2003,39 @@ def test_loaded_reference_lanes_preserve_authored_ids_while_padding_missing_reci
     scene = Scene.from_dict(raw)
     assert [r.lane_id for r in scene.reference_lane_recipes[:2]] == ["authored-b", "authored-a"]
     assert scene.reference_lane_recipes[2].lane_id not in {"authored-b", "authored-a", ""}
+
+
+@pytest.mark.parametrize("item_bounds, window", [
+    ((0, -1), (55, 62)), ((40, 60), (0, 100)), ((40, 60), (40, 60)),
+])
+def test_reference_containment_survives_threshold_100(item_bounds, window):
+    item = ReferenceItem(reference_item_id="contained", start_frame=item_bounds[0],
+                         end_frame=item_bounds[1])
+    result = resolve_effective_references(reference_items=[item], lane_count=1,
+        scene_duration=100, window_start=window[0], window_end=window[1],
+        frame_threshold_pct=100)
+    assert result[0]["item"] is item
+
+
+def test_reference_threshold_does_not_replace_specificity_score():
+    # Broad covers 80% of the window versus scoped's 20%, but scoped covers
+    # all of its own span. Both survive a threshold that filters a third item.
+    items = [ReferenceItem(reference_item_id=name, start_frame=start, end_frame=end)
+             for name, start, end in [("broad", 0, 80), ("scoped", 80, 85), ("sliver", 85, 100)]]
+    result = resolve_effective_references(reference_items=items, lane_count=1,
+        scene_duration=100, window_start=60, window_end=86, frame_threshold_pct=30)
+    assert result[0]["item"].reference_item_id == "scoped"
+
+
+@pytest.mark.parametrize("existing, proposed", [
+    ((0, 100), (40, 60)), ((0, -1), (40, 60)), ((40, 60), (0, -1)),
+])
+def test_reference_lane_guard_rejects_containment_promotion_geometry(existing, proposed):
+    scene = Scene(scene_id="guard", duration_frames=100, reference_lane_count=1,
+        reference_items=[ReferenceItem(start_frame=existing[0], end_frame=existing[1])])
+    before = scene.to_dict()
+    with pytest.raises(routes.ProjectMutationRequestError) as caught:
+        routes._require_no_reference_overlap(scene, 0, *proposed)
+    assert caught.value.status == 409
+    assert caught.value.code == "lane_collision"
+    assert scene.to_dict() == before

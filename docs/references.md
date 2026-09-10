@@ -191,17 +191,21 @@ panel alike:
 |---|---|
 | **In window** | Most-specific-wins resolved this item; it's the one the model receives. |
 | **Superseded** | Another item on this lane covers this window more tightly, so that one is sent instead. |
-| **Below threshold** | The window covers too little of this item's own span, so nothing is sent. |
+| **Below threshold** | The overlap is below the threshold relative to the shorter item/window span, so this item is not sent. |
 | **Outside window** | The item doesn't overlap the window. |
 | **Excluded** | Muted, or on a hidden lane, so it never participates. |
 
 ![Four Reference lanes across a render window: solid bars are in window, while a Superseded item and a Below threshold item are dimmed and hatched](images/reference-verdicts.webp)
-<p align="center"><em>Only the solid bars reach the model. <strong>Superseded</strong> lost to an item covering the window more tightly; <strong>Below threshold</strong> was dropped because the window clips too little of its own span.</em></p>
+<p align="center"><em>Only the solid bars reach the model. <strong>Superseded</strong> lost to an item covering the window more tightly; <strong>Below threshold</strong> was dropped because its overlap is too small relative to the shorter item/window span.</em></p>
 
-**Reference Threshold %** (Settings, project-wide) is what drops an item whose
-own span the window barely touches. Unlike prompts, this can leave a lane with
-*nothing* — the lane reports no reference at all, which is exactly what makes a
-reference stop applying outside its scope.
+**Reference Threshold %** (Settings, project-wide) measures overlap divided by
+the shorter of the item span and render-window span. An item containing the
+window, or fully inside it, scores 100% and stays even at threshold 100.
+Crossing an edge reduces coverage smoothly; a short neighbor mostly inside a
+long window can still stay. Unlike prompts, filtering can leave a lane with
+*nothing*. Lower the threshold or extend the staged range into the window.
+Surviving items still compete by overlap divided by their own span; winner
+scoring is unchanged.
 
 With no selection nothing is marked, since the marks answer "what will this
 render use", which isn't a question until a window exists.

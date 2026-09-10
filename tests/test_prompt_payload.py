@@ -7,6 +7,8 @@ Frame ranges are half-open [start, end) throughout.
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from server import prompt_payload as pp
@@ -496,3 +498,33 @@ def test_build_relay_payload_global_passthrough_untouched():
     # trimmed, never rewritten.
     payload = pp.build_relay_payload("  keep | pipes [3] and\nnewlines  ", [])
     assert payload["global_prompt"] == "keep | pipes [3] and\nnewlines"
+
+
+@pytest.mark.parametrize("window, threshold, expected", [
+    ((990, 1500), 80, [("B", 0, 510)]),  # regression: 98% loses to 2%
+    ((900, 1900), 10, [("A", 0, 100), ("B", 100, 1000)]),  # exact threshold
+    ((900, 1500), 10, [("A", 0, 100), ("B", 100, 600)]),  # shorter window
+    ((600, 1200), 80, [("A", 0, 600)]),  # both below, leading dominates
+    ((800, 1400), 80, [("B", 0, 600)]),  # both below, trailing dominates
+    ((800, 1200), 80, [("A", 0, 400)]),  # tie drops trailing first
+])
+def test_threshold_short_windows_and_drop_order(window, threshold, expected):
+    segments = pp.resolve_segments(_sections((0, 1000, "A"), (1000, 2000, "B")),
+                                   *window, labels_on=False,
+                                   boundary_threshold_pct=threshold)
+    assert [(s["text"], s["start"], s["end"]) for s in segments] == expected
+
+
+def test_threshold_both_ends_use_pre_absorption_coverage():
+    segments = pp.resolve_segments(
+        _sections((0, 1000, "A"), (1000, 1020, "B"), (1020, 2020, "C")),
+        990, 1050, labels_on=False, boundary_threshold_pct=80)
+    assert [(s["text"], s["start"], s["end"]) for s in segments] == [("B", 0, 60)]
+
+
+def test_threshold_legacy_overlaps_test_each_original_end_only_once():
+    segments = pp.resolve_segments(
+        _sections((0, 20, "X"), (0, 40, "Y"), (0, 1000, "Z")),
+        5, 900, labels_on=False, boundary_threshold_pct=80)
+    assert [(s["text"], s["start"], s["end"]) for s in segments] == [
+        ("Y", 0, 35), ("Z", 35, 895)]

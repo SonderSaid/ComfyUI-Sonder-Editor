@@ -78,7 +78,7 @@ const PEG_SOURCE_FIELD = {
 const VERDICT_EXPLANATION = {
     winner: "Most-specific-wins resolves this item for the current window; it is the one the model receives.",
     superseded: "Another item on this lane covers this window more tightly, so that one is sent instead. Restage or rescope to change which wins.",
-    below_threshold: "The window covers too little of this item's own span for the Reference Threshold, so nothing is sent. Lower the threshold in Settings, or widen the item.",
+    below_threshold: "The overlap is too small relative to the shorter of the item and window for the Reference Threshold, so this item is not sent. Lower the threshold in Settings, or extend the staged range into the window.",
     outside: "This item does not overlap the current generation window.",
     excluded: "Muted, or on a hidden lane, so it never participates.",
 };

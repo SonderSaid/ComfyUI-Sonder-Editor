@@ -49,7 +49,9 @@ def resolve_effective_references(
     scoring. Muted items and hidden lanes do not participate.
 
     `frame_threshold_pct` drops an item whose in-window overlap is under that
-    percentage of its OWN span, before the survivors are scored. Unlike the
+    percentage of the shorter of its span and the window span, before the
+    survivors are scored by overlap / item span. Containment in either
+    direction always clears the threshold. Unlike the
     prompt boundary threshold there is no never-empty guard: References resolve
     to a single winner per lane, so a lane may legitimately resolve to nothing
     and report `has_reference = 0` for that window. That is the point of the
@@ -99,10 +101,11 @@ def resolve_effective_references(
         overlap = max(0, min(item_end, end) - max(item_start, start))
         if overlap <= 0:
             continue
-        coverage = overlap / (item_end - item_start)
+        specificity = overlap / (item_end - item_start)
+        coverage = overlap / max(1, min(item_end - item_start, end - start))
         if threshold > 0 and coverage < threshold:
             continue
-        score = (coverage, item_start, item_index)
+        score = (specificity, item_start, item_index)
         if scores[lane_index] is None or score > scores[lane_index]:
             scores[lane_index] = score
             winners[lane_index] = {"laneIndex": lane_index, "item": item}

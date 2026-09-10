@@ -748,7 +748,7 @@ def test_inert_lane_keeps_reserved_image_slot_under_both_policies(
             "hard": {"assembly": "slots", "max_members": 16},
         },
     )
-    windows = [(12, 30), (0, -1)] if inert_cause == "threshold" else [(0, -1), (0, -1)]
+    windows = [(12, 30), (0, 14)] if inert_cause == "threshold" else [(0, -1), (0, -1)]
     if inert_cause == "out_of_window":
         windows[1] = (40, -1)
     project = _multi_lane_project(tmp_path, recipe, [1, 1], windows=windows)

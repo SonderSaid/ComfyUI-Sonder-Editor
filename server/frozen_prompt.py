@@ -3,9 +3,12 @@
 The marker-absent branch is a deliberate public compatibility path.  It is
 kept isolated from Prompt Context so queued v0.2.2 jobs cannot accidentally
 start consulting live scene state or newly-added compiler authorities.
+It shares the current boundary-threshold rule in prompt_payload: frozen
+numbers do not freeze that rule, so threshold coverage changes may alter a
+v0.2.2 replay. Isolation preserves input authority, not exact historical text.
 
 Expiry: remove the marker-absent branch only in a deliberate breaking release
-that drops the published v0.2.2 queue contract.
+that drops the published v0.2.2 queue input contract.
 """
 
 from __future__ import annotations
