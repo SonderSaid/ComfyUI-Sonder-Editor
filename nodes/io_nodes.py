@@ -2126,6 +2126,15 @@ class SonderSaveBridge:
             },
         }
 
+    @classmethod
+    def VALIDATE_INPUTS(cls, **_kwargs):
+        # target_folder is a combo declared as [""]; its real options are the project's
+        # asset folders, which only the browser knows (installBridgeFolderPicker in
+        # web/js/extension.js). ComfyUI validates widget values against the *static*
+        # INPUT_TYPES list, so without this hatch every real folder label is refused
+        # before execution. Same reason as SonderGuidesBridge/SonderLoopClose.
+        return True
+
     def prepare_output(self, project, target_folder="", prefix="", mark_queue_complete=False, prompt=None, unique_id=None):
         prompt_key, prompt_key_source = _resolve_bridge_prompt_key(prompt)
         bridge_node_id = str(unique_id or uuid.uuid4().hex[:8])

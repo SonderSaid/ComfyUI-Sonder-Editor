@@ -13,6 +13,7 @@ a fresh `[Unreleased]` block.
 
 ### Fixed
 - Fixed false project conflicts during multi-file import and replacement, preserved committed replacement media when cleanup fails, and named failed imports in gallery notifications.
+- Sonder Save Bridge accepts a typed or existing **Target Folder** again. Picking or typing any label other than Root previously failed the run during prompt validation; the label is now created when the outputs register.
 
 ## [0.4.0] - 2026-09-08
 

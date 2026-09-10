@@ -1,6 +1,7 @@
 """Tests for the Sonder save bridge backend registration flow."""
 
 import importlib
+import inspect
 import json
 import os
 import shutil
@@ -166,6 +167,42 @@ def test_bridge_registers_image_output(tmp_path, monkeypatch):
     assert asset.folder == "FreshTake"
     assert asset.path.startswith(os.path.join("media", "Bridge_Test_"))
     assert asset.path.endswith("_0001.png")
+
+
+def test_target_folder_outside_the_declared_combo_is_accepted(tmp_path, monkeypatch):
+    """A real folder label must survive ComfyUI's prompt validation.
+
+    `target_folder` is a combo whose declared options are only [""] — the project's
+    actual folders are injected client-side by installBridgeFolderPicker and are never
+    part of INPUT_TYPES. ComfyUI validates widget values against that *static* list and
+    refuses the prompt with `value_not_in_list` before any node runs, unless the class
+    declares VALIDATE_INPUTS naming the input or taking **kwargs. Without that hatch
+    every folder a user can actually pick fails the render, and only Root works.
+
+    The registration tests above call prepare_output() directly, so they pass either
+    way; this asserts the contract ComfyUI itself reads.
+    """
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    bridge_cls = io_nodes.SonderSaveBridge
+    label = "FreshTake"
+
+    declared = bridge_cls.INPUT_TYPES()["required"]["target_folder"][0]
+    assert isinstance(declared, list), "target_folder is expected to stay a combo"
+    assert label not in declared, (
+        "declaration alone would accept the label, so this test no longer proves anything"
+    )
+
+    validate = getattr(bridge_cls, "VALIDATE_INPUTS", None)
+    assert validate is not None, (
+        "SonderSaveBridge must declare VALIDATE_INPUTS or ComfyUI refuses every folder label"
+    )
+
+    # Mirror ComfyUI's own guard in execution.validate_inputs: the combo membership
+    # check is skipped only when the argspec names the input or accepts **kwargs.
+    spec = inspect.getfullargspec(validate)
+    assert "target_folder" in spec.args or spec.varkw is not None
+
+    assert validate(target_folder=label) is True
 
 
 def test_bridge_retains_native_preview_source_until_scheduled_cleanup(tmp_path, monkeypatch):
