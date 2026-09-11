@@ -4615,6 +4615,11 @@ def _compose_frozen_job_prompt(project: TimelineProject, job: GenerationJob) -> 
     except (TypeError, ValueError):
         reference_threshold = 0.0
     params["reference_frame_threshold"] = reference_threshold  # frozen for reproducibility
+    policy = prompt_context.normalize_reference_prose_policy(
+        params.get("reference_prose_policy", metadata.get("reference_prose_policy")))
+    # Requeue echoes params; retain this until requeue stops round-tripping them.
+    # Execution itself reads the frozen compiled prompt, not this policy.
+    params["reference_prose_policy"] = policy
     job.params = params
     window_start = max(0, int(getattr(job, "selection_start", 0) or 0)
                        - int(getattr(job, "pre_context_frames", 0) or 0))
@@ -4665,7 +4670,7 @@ def _compose_frozen_job_prompt(project: TimelineProject, job: GenerationJob) -> 
         window_start=window_start, window_end=window_end, fps=job_fps,
         labels_on=params.get("prompt_channel_labels", False) is True,
         delimiter=delimiter, prompt_threshold=threshold,
-        reference_threshold=reference_threshold)
+        reference_threshold=reference_threshold, reference_prose_policy=policy)
     if compiled["errors"]:
         first = compiled["errors"][0]
         _mutation_error(str(first.get("message") or "Prompt context is invalid"),

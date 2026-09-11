@@ -754,6 +754,12 @@ export function propagateLinkedPromptAttachment(configuredRaw, targetRaw,
         }
     }
     const propagated = structuredClone(configured);
+    // Prose suppression, like capability enabled flags, is local to each chip.
+    // A split sibling must retain its own sparse override (including inheritance).
+    delete propagated.config.reference_prose;
+    if (Object.hasOwn(target.config, "reference_prose")) {
+        propagated.config.reference_prose = target.config.reference_prose;
+    }
     propagated.capabilities = (propagated.capabilities || []).map((value) => {
         const capabilityId = String(value?.capability_id || value?.kind || "");
         const next = { ...value };
@@ -1412,6 +1418,18 @@ function placementDisplayLabel(value, { renderedAtAnchor = false,
         || placement.replaceAll("_", " ").replace(/^./, (char) => char.toUpperCase());
 }
 
+function referenceProseBadge(attachment) {
+    const policy = attachment.kind === "reference" ? attachment.config?.reference_prose : "";
+    if (!["keep", "drop"].includes(policy)) return null;
+    const badge = document.createElement("span");
+    badge.dataset.sonderReferenceProse = policy;
+    badge.textContent = policy;
+    badge.title = `Out-of-window text: ${policy === "keep" ? "Keep" : "Drop"} (chip override)`;
+    badge.contentEditable = "false";
+    badge.style.cssText = `font:600 8px system-ui;color:${COLORS.text};text-transform:uppercase;letter-spacing:.04em;white-space:nowrap;flex:0 0 auto;`;
+    return badge;
+}
+
 function contextChipLabel(label, { inline = false } = {}) {
     const chipLabel = document.createElement("span");
     chipLabel.dataset.sonderContextChipLabel = "1";
@@ -1994,6 +2012,10 @@ export function createPromptDocumentEditor({
                 affordanceHost.style.cssText = "position:absolute;top:0;left:100%;"
                     + "display:inline-flex;align-items:center;gap:2px;"
                     + "white-space:nowrap;z-index:1;";
+                // A prose handle stays identity-only mid-sentence; its badge
+                // joins the focus affordances instead of changing paragraph flow.
+                const proseBadge = referenceProseBadge(attachment);
+                if (proseBadge) affordanceHost.appendChild(proseBadge);
                 affordanceHost.append(editGlyph, remove);
                 chip.style.cssText += "position:relative;";
                 chip.append(chipLabel, affordanceHost);
@@ -2024,7 +2046,10 @@ export function createPromptDocumentEditor({
                 chip.addEventListener("focusin", () => reveal(true));
                 chip.addEventListener("focusout", () => reveal(false));
             } else {
-                chip.append(chipLabel, editGlyph, remove);
+                chip.appendChild(chipLabel);
+                const proseBadge = referenceProseBadge(attachment);
+                if (proseBadge) chip.appendChild(proseBadge);
+                chip.append(editGlyph, remove);
             }
             chip.addEventListener("click", (event) => {
                 event.preventDefault();
@@ -4251,6 +4276,7 @@ export function configurePromptAttachment(rawAttachment, {
     scene = null, references = [], semanticUnits = [], channelKey = "", profileId = "generic@1",
     scope = "", origin = "", profile = null, placementPhases = [], managedSpeakerSubjectIds = [],
     ordinalManifest = {}, candidate = null, anchoredChannels = [],
+    referenceProsePolicy = "drop",
 } = {}) {
     const attachment = normalizePromptAttachment(rawAttachment);
     const resolvedProfile = profile && typeof profile === "object"
@@ -4536,6 +4562,7 @@ export function configurePromptAttachment(rawAttachment, {
                 referenceOptions.push([selectedReference, `Unavailable: ${selectedReference} — rebind source`, false]);
             }
             controls.reference = selectField(referenceOptions, selectedReference);
+            controls.storedReference = selectedReference;
             referenceOptions.forEach((value, index) => {
                 if (controls.reference.options[index]) {
                     controls.reference.options[index].disabled = value[2] === false;
@@ -4653,6 +4680,13 @@ export function configurePromptAttachment(rawAttachment, {
             // declare that field's capability.
             const referenceRows = [referenceFieldRow("Reference", controls.reference,
                 "Choose a semantic Subject or a physical source from the active conditioning setup.")];
+            const inheritedProse = referenceProsePolicy === "keep" ? "Keep" : "Drop";
+            controls.referenceProse = selectField([
+                ["", `Project default → ${inheritedProse}`], ["drop", "Drop"], ["keep", "Keep"],
+            ], ["drop", "keep"].includes(attachment.config.reference_prose)
+                ? attachment.config.reference_prose : "");
+            referenceRows.push(referenceFieldRow("Out-of-window text", controls.referenceProse,
+                "When this Reference does not condition the window, keep or drop this chip's authored text. This choice is local to this chip, including linked copies."));
             // Name the rung. Without it this fieldset and the identity editor's
             // defaults group looked like two copies of one panel, with nothing
             // saying which was which or which way inheritance ran.
@@ -5157,7 +5191,11 @@ export function configurePromptAttachment(rawAttachment, {
                 attachment.source.subject_ids = distinctSubjectIds;
             } else if (attachment.kind === "reference") {
                 if (!controls.reference.value) return;
-                if (controls.reference.selectedOptions[0]?.disabled) return;
+                // Eligibility gates new bindings, not edits to a saved chip.
+                // Inactive References still need editable prose policy; source
+                // deletion/format errors remain the compiler's responsibility.
+                if (controls.reference.selectedOptions[0]?.disabled
+                    && controls.reference.value !== controls.storedReference) return;
                 const itemMatch = controls.reference.value.match(/^item:(.+)$/);
                 const physicalMatch = controls.reference.value.match(
                     /^physical:(picture|video|audio):(.+)$/);
@@ -5174,6 +5212,11 @@ export function configurePromptAttachment(rawAttachment, {
                 } else {
                     attachment.source.semantic_unit_ids = [controls.reference.value];
                     delete attachment.source.reference_item_id;
+                }
+                if (controls.referenceProse.value) {
+                    attachment.config.reference_prose = controls.referenceProse.value;
+                } else {
+                    delete attachment.config.reference_prose;
                 }
                 delete attachment.config.audio_speaker_subject_id;
                 // Collected from the SAME control map the rows were built from.
@@ -5679,11 +5722,13 @@ export function createScopeChipRow({ attachments = [], previews = {}, disabled =
         // the chip, not an action on it.
         holder.style.cssText = "display:flex;align-items:center;gap:3px;min-width:0;max-width:100%;";
         holder.appendChild(makeChip(attachment));
+        const proseBadge = referenceProseBadge(attachment);
+        if (proseBadge) holder.appendChild(proseBadge);
         if ((groupCounts.get(attachment.emission_group_id) || 0) > 1) {
             const linked = document.createElement("span");
             linked.dataset.sonderLinkedAttachment = "1";
             linked.textContent = "linked";
-            linked.title = "Edits to this configured chip propagate to every linked section.";
+            linked.title = "Authored content propagates to linked sections; enabled flags and out-of-window text choices stay local.";
             linked.style.cssText = `font:8px system-ui;color:${CHIP_PALETTE.linked};text-transform:uppercase;letter-spacing:.04em;`;
             holder.appendChild(linked);
         }

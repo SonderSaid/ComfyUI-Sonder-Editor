@@ -11,11 +11,16 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Added
+- Project-wide Keep/Drop for out-of-window Reference text, with independent per-chip overrides and visible markers.
+
 ### Changed
+- Non-winning Reference chips warn instead of refusing generation; deleted bindings still block. Legacy project-less replay now composes prompts for non-winning Reference chips.
 - Boundary Prompt and Reference thresholds measure overlap relative to the shorter item/window span; short windows can retain neighbors previously dropped, including at the default prompt threshold of 10%.
 - Frozen threshold values use the current coverage rule when resolved again, including legacy v0.2.2 prompt replay.
 
 ### Fixed
+- Reference chip dialogs save and close when their existing source is inactive, including later linked copies.
 - References covering the entire render window survive every threshold; high Boundary Prompt thresholds retain the stronger section instead of a neighboring sliver.
 - Fixed false project conflicts during multi-file import and replacement, preserved committed replacement media when cleanup fails, and named failed imports in gallery notifications.
 - Sonder Save Bridge accepts a typed or existing **Target Folder** again. Picking or typing any label other than Root previously failed the run during prompt validation; the label is now created when the outputs register.

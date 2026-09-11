@@ -314,6 +314,7 @@ function syncSettingsPanelControls() {
     }
     if (controls.promptSectionDelimiter) controls.promptSectionDelimiter.value = String(this._promptSectionDelimiter ?? ".");
     if (controls.promptFrameThreshold) controls.promptFrameThreshold.value = String(this._promptFrameThreshold ?? 10);
+    if (controls.referenceProsePolicy) controls.referenceProsePolicy.value = this._referenceProsePolicy || "drop";
     if (controls.referenceFrameThreshold) controls.referenceFrameThreshold.value = String(this._referenceFrameThreshold ?? 0);
     if (controls.allowExternalProjectLinks) {
         const resolved = this._serverSettingsLoaded === true;
@@ -1571,6 +1572,26 @@ function showSettingsPanel() {
         });
         referenceControls.appendChild(referenceInput);
         controls.referenceFrameThreshold = referenceInput;
+    }
+    {
+        const host = createRow(promptsSection,
+            "Out-of-window Reference text (project-wide)",
+            "Keep or drop chip text when its Reference is not used in the render window.");
+        const select = document.createElement("select");
+        select.style.cssText = chromeInputCss({ fontSize: "11px", padding: "4px 8px", textAlign: "left" });
+        for (const [value, label] of [["drop", "Drop"], ["keep", "Keep"]]) {
+            const option = document.createElement("option");
+            option.value = value; option.textContent = label; select.appendChild(option);
+        }
+        select.value = this._referenceProsePolicy || "drop";
+        select.addEventListener("change", () => {
+            Promise.resolve(this._setReferenceProsePolicy(select.value))
+                .catch(() => {})
+                .finally(() => { select.value = this._referenceProsePolicy || "drop"; });
+        });
+        select.addEventListener("keydown", (event) => event.stopPropagation());
+        host.appendChild(select);
+        controls.referenceProsePolicy = select;
     }
     // — Browser-local preferences
     createCheckbox(

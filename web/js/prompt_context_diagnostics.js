@@ -23,7 +23,13 @@ export function buildPromptContextDiagnostics(payload) {
                 origin: String(raw?.origin || ""),
                 semantic_unit_id: String(raw?.semantic_unit_id || ""),
             };
-            if (diagnostic.attachment_id) {
+            if (Array.isArray(raw?.attachments) && raw.attachments.length) {
+                for (const owner of raw.attachments) {
+                    const id = String(owner?.attachment_id || "");
+                    if (id) (byAttachment[id] ||= []).push({ ...diagnostic,
+                        attachment_id: id, origin: String(owner?.origin || "") });
+                }
+            } else if (diagnostic.attachment_id) {
                 (byAttachment[diagnostic.attachment_id] ||= []).push(diagnostic);
             } else {
                 general.push(diagnostic);

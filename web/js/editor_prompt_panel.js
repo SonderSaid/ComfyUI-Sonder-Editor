@@ -1882,6 +1882,7 @@ Server value: ${serverValue}` : ""}`;
         const configureDraftAttachment = (attachment, nodeId = "") => {
             const context = draftAttachmentContext(nodeId);
             return configurePromptAttachment(attachment, {
+                referenceProsePolicy: host._referenceProsePolicy,
                 scene: context.scene,
                 references: host._references || [],
                 semanticUnits: writingSemanticUnits(),
@@ -2745,6 +2746,7 @@ Server value: ${serverValue}` : ""}`;
                         onAdd: async (kind) => {
                             const configured = acceptDraftConfiguration(
                                 await configurePromptAttachment({ kind }, {
+                                referenceProsePolicy: host._referenceProsePolicy,
                                 scene: attachmentScene,
                                 references: host._references || [],
                                 semanticUnits: writingSemanticUnits(),
@@ -2772,6 +2774,7 @@ Server value: ${serverValue}` : ""}`;
                         onActivate: async (attachment) => {
                             const configured = acceptDraftConfiguration(
                                 await configurePromptAttachment(attachment, {
+                                referenceProsePolicy: host._referenceProsePolicy,
                                 scene: attachmentScene,
                                 references: host._references || [],
                                 semanticUnits: writingSemanticUnits(),
@@ -3747,6 +3750,7 @@ Server value: ${serverValue}` : ""}`;
                 || `Global ${key}. Each section chooses whether to take it.`;
 
             const configureGlobalAttachment = (attachment, anchoredChannels = [key]) => configurePromptAttachment(attachment, {
+                referenceProsePolicy: host._referenceProsePolicy,
                 scene: { ...(scene || {}), _context_channel_keys: globalKeys,
                     _context_reference_frame_threshold: host._referenceFrameThreshold || 0 },
                 references: host._references || [], channelKey: key,
@@ -3932,6 +3936,7 @@ Server value: ${serverValue}` : ""}`;
             .filter((node) => node.type === "attachment")
             .map((node) => node.attachment_id));
         const configureGlobalScope = (attachment) => configurePromptAttachment(attachment, {
+            referenceProsePolicy: host._referenceProsePolicy,
             scene: { ...(scene || {}), _context_channel_keys: globalKeys,
                 _context_reference_frame_threshold: host._referenceFrameThreshold || 0 },
             references: host._references || [], channelKey: globalKeys[0] || "visual",
@@ -4110,6 +4115,7 @@ Server value: ${serverValue}` : ""}`;
                 caption.textContent = key;
                 caption.title = channel.description || `${key} channel`;
                 const configureChannelAttachment = (attachment, anchoredChannels = [key]) => configurePromptAttachment(attachment, {
+                    referenceProsePolicy: host._referenceProsePolicy,
                     scene: { ...(scene || {}), _context_channel_keys: channelKeys,
                         _context_consumer_start: section.start_frame,
                         _context_consumer_end: section.end_frame,
@@ -4313,6 +4319,7 @@ Server value: ${serverValue}` : ""}`;
             };
             const scopeHost = document.createElement("div");
             const configureScope = (attachment) => configurePromptAttachment(attachment, {
+                referenceProsePolicy: host._referenceProsePolicy,
                 scene: { ...(scene || {}), _context_channel_keys: channelKeys,
                     _context_consumer_start: section.start_frame,
                     _context_consumer_end: section.end_frame,

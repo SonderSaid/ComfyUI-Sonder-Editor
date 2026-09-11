@@ -2,7 +2,7 @@
 
 from . import minimax_h3, prompt_channel_templates, prompt_context
 from .reference_prompt_formatter import build_reference_formatter_context
-from .reference_resolution import resolve_effective_references
+from .reference_resolution import resolve_effective_references, resolve_reference_staging
 
 
 def resolve_scene_prompt_context(project, scene, template, window_start,
@@ -25,6 +25,12 @@ def resolve_scene_prompt_context(project, scene, template, window_start,
         str(value) for value in resolved_profile.get("validators") or []
         if isinstance(value, str)
     }
+    staging = resolve_reference_staging(
+        reference_items=scene.reference_items, lane_count=scene.reference_lane_count,
+        scene_duration=scene.duration_frames, window_start=window_start,
+        window_end=window_end, lane_configs=scene.reference_lane_configs,
+        frame_threshold_pct=reference_threshold)
+    result["reference_staging"] = staging
     if "minimax_base_format" in validator_ids:
         # Base is text-only. Keep physical reference chips inapplicable and
         # avoid resolving generic Reference lanes for this format.
@@ -62,6 +68,7 @@ def resolve_scene_prompt_context(project, scene, template, window_start,
             setup_data=result,
         )
         result["generic_references"] = formatter_context["generic_references"]
+    result["reference_staging"] = staging
     return result
 
 
@@ -70,6 +77,7 @@ def compile_live_scene_prompt_context(project, scene, *, template,
                                       labels_on=False, delimiter=".",
                                       prompt_threshold=0.0,
                                       reference_threshold=0.0,
+                                      reference_prose_policy=None,
                                       copy_plan_for=None) -> dict:
     """Compile one live scene with the same complete context used by preview.
 
@@ -104,6 +112,10 @@ def compile_live_scene_prompt_context(project, scene, *, template,
             profile=prompt_context.profile_key(resolved_profile),
             custom_profiles=project.prompt_context_profiles,
             context={
+                "reference_staging": setup_result["reference_staging"],
+                "reference_prose_policy": prompt_context.normalize_reference_prose_policy(
+                    (getattr(project, "metadata", None) or {}).get("reference_prose_policy")
+                    if reference_prose_policy is None else reference_prose_policy),
                 "setup_manifest": setup_result.get("setup_manifest", {}),
                 "ordinal_manifest": setup_result.get("ordinal_manifest", {}),
                 "unit_picture_ordinals": setup_result.get("unit_picture_ordinals", {}),

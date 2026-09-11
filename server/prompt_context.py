@@ -17,6 +17,7 @@ import uuid
 from collections import defaultdict
 
 from . import prompt_channel_templates, prompt_payload, prompt_tokens
+from .reference_resolution import REFERENCE_VERDICT_LABEL
 
 
 FORMAT_VERSION = "prompt_context_v1"
@@ -133,6 +134,23 @@ DORMANT_REFERENCE_REASON = (
     "No selected Reference source is staged in this window, so this authored "
     "chip text stays out of the prompt."
 )
+REFERENCE_PROSE_POLICIES = ("drop", "keep")
+DEFAULT_REFERENCE_PROSE_POLICY = "drop"
+PRESERVED_REFERENCE_REASON = (
+    "No selected Reference source conditions this window; authored chip text is kept by policy."
+)
+
+
+def normalize_reference_prose_policy(value):
+    """Read-time coercion only; None denotes inheritance, never a stored default."""
+    return value if value in REFERENCE_PROSE_POLICIES else DEFAULT_REFERENCE_PROSE_POLICY
+
+
+def resolve_reference_prose_policy(attachment, context):
+    override = (attachment.get("config") or {}).get("reference_prose")
+    if override in REFERENCE_PROSE_POLICIES:
+        return override
+    return normalize_reference_prose_policy((context or {}).get("reference_prose_policy"))
 
 DEFAULT_CONTRIBUTION_CATALOG = {
     "*": [
@@ -967,8 +985,8 @@ def dormant_reference_identities(attachment, context) -> list[str]:
     return result
 
 
-def reference_chip_dormant(attachment, context) -> bool:
-    """Whether none of a Reference chip's selected sources won this window.
+def reference_chip_conditions_window(attachment, context) -> bool:
+    """Whether any of a Reference chip's selected sources won this window.
 
     Like ``dormant_reference_identities``, this is stage-derived and cannot
     soften a blocking diagnostic. Compiler callers enforce that precedence.
@@ -979,7 +997,7 @@ def reference_chip_dormant(attachment, context) -> bool:
     dormant_unit_ids = dormant_reference_identities(attachment, context)
     # Missing and assetless identities are validation states, not dormancy.
     if selected_unit_ids and len(dormant_unit_ids) != len(selected_unit_ids):
-        return False
+        return True
 
     profile = (context.get("profile")
                if isinstance(context, dict) else {}) or {}
@@ -994,9 +1012,19 @@ def reference_chip_dormant(attachment, context) -> bool:
             has_declared_physical_source or physical_ids)
         known = ordinals.get(ordinal_key) or {}
         if any(source_id in known for source_id in physical_ids):
-            return False
+            return True
 
-    return bool(selected_unit_ids or has_declared_physical_source)
+    # Whole-chip prose has three OR limbs: a semantic unit, physical member,
+    # or item binding. One live source is sufficient even with mixed bindings.
+    item_id = str(source.get("reference_item_id") or "")
+    if item_id and item_id in (context.get("generic_references") or {}):
+        return True
+    return not bool(selected_unit_ids or has_declared_physical_source or item_id)
+
+
+def reference_prose_suppressed(attachment, context) -> bool:
+    return (not reference_chip_conditions_window(attachment, context)
+            and resolve_reference_prose_policy(attachment, context) == "drop")
 
 
 def prompt_token_declarations(profile) -> dict:
@@ -3117,6 +3145,67 @@ def _reference_capability_parts(attachment, capability, context) -> list[tuple]:
     labels = _reference_labels(attachment, context)
     units = context.get("semantic_units_by_id") or {}
     profile = context.get("profile") or {}
+    if (kind in {"definitions", "retention"}
+            and not reference_chip_conditions_window(attachment, context)
+            and resolve_reference_prose_policy(attachment, context) == "keep"):
+        # No provider ordinal exists for an unstaged source. Preserve authored
+        # prose using its library name, without inventing physical/shot claims.
+        lines = []
+        selected = [("subject", str(unit_id), units.get(str(unit_id)) or {})
+                    for unit_id in attachment["source"].get("semantic_unit_ids") or []]
+        for declaration in physical_population_declarations(profile):
+            selected.extend((str(declaration.get("key") or "physical"), str(member_id),
+                             _members_by_id(context).get(str(member_id)) or {})
+                            for member_id in attachment["source"].get(
+                                str(declaration.get("source_key") or "")) or [])
+        audio_populations = {str(row.get("key") or "") for row in
+                             physical_population_declarations(profile)
+                             if row.get("token_kind") == "audio"}
+        for population, source_id, record in selected:
+            name = str(record.get("name") or record.get("handle") or
+                       ("Prompt identity" if population == "subject" else "Reference"))
+            if kind == "definitions":
+                field = "audio_definition" if population in audio_populations else "definition"
+                text = str(config.get(field) or record.get("definition")
+                           or record.get("prompt") or "").strip()
+                if population == "subject":
+                    # Catalog prose remains authored even when its member has no
+                    # ordinal. Preserve each source under its own name below.
+                    source_prose = []
+                    for source in record.get("sources") or []:
+                        member = _members_by_id(context).get(str(source.get("member_id") or "")) or {}
+                        prose = str(member.get("prompt") or "").strip()
+                        if prose and prose != text and prose not in source_prose:
+                            source_prose.append(prose)
+                    # Unstaged members have no media ordinals. Keep their own
+                    # authored descriptions independently of the identity's prose;
+                    # a visual definition must never erase a voice description.
+                    text = "; ".join(value for value in [text, *source_prose] if value)
+                if population == "subject" and config.get("audio_definition"):
+                    text = "; ".join(value for value in
+                        [text, str(config["audio_definition"]).strip()] if value)
+                owner = (("subject_definition", source_id) if population == "subject"
+                         else ("physical_definition", population, source_id))
+            else:
+                field = "audio_retention_detail" if population in audio_populations else "retention_detail"
+                text = str(config.get(field) or "").strip()
+                if population == "subject" and config.get("audio_retention_detail"):
+                    text = "; ".join(value for value in
+                        [text, str(config["audio_retention_detail"]).strip()] if value)
+                owner = ("retention_subject", source_id) if population == "subject" else (
+                    "retention_physical", population, source_id)
+            if text:
+                lines.append((owner, [_segment(SEGMENT_TEXT, f"{name}: "),
+                    _segment(SEGMENT_TEXT, text, authored=True)]))
+        if kind == "retention" and isinstance(config.get("retention_details"), dict):
+            # These keys are authored ordinal associations, not source ids.
+            # Preserve them literally once, rather than reassigning every value
+            # to each selected source. The render's ordinal advisory reports them.
+            for label, detail in config["retention_details"].items():
+                if str(detail or "").strip():
+                    lines.append((("authored_retention", attachment["emission_group_id"], str(label)),
+                        [_segment(SEGMENT_TEXT, f"{label}: {detail}", authored=True)]))
+        return lines
     if kind == "definitions":
         lines = []
         for unit_id in attachment["source"].get("semantic_unit_ids") or []:
@@ -3308,6 +3397,8 @@ def _reference_capability_parts(attachment, capability, context) -> list[tuple]:
             appearances = (unit_shots.get(str(unit_id)) if identity_declaration is not None
                            else None) or (context.get("reference_group_shots") or {}).get(
                                attachment.get("emission_group_id"), [])
+            if not reference_chip_conditions_window(attachment, context):
+                appearances = []  # Shared groups/units cannot restore another chip's claim.
             appearance = ""
             if identity_declaration is not None and appearances:
                 appearance = " (appears in " + ", ".join(
@@ -4215,10 +4306,10 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         return any(route not in keys or global_channel_is_inherited(route)
                    for route in routes)
 
-    blocked_global_reference_attachment_ids = {
-        attachment["attachment_id"]
+    blocked_reference_attachments = {
+        (origin, attachment["attachment_id"])
         for attachment, origin in all_attachment_origins
-        if (origin == "global" and attachment.get("kind") == "reference"
+        if (attachment.get("kind") == "reference"
             and len(attachment.get("capabilities") or []) > MAX_CAPABILITIES)
     }
     supported_providers = supported_provider_versions(custom_profiles)
@@ -4490,17 +4581,17 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             actual_global_routes = global_capability_routes.get((
                 attachment["attachment_id"],
                 str(capability.get("capability_id") or ""))) or {route}
-            if (attachment_origin == "global"
-                    and attachment["kind"] == "reference"
-                    and global_capability_selected(attachment, capability)
-                    and any(value not in keys
-                            for value in actual_global_routes)):
+            if (attachment["kind"] == "reference"
+                    and (attachment_origin != "global" or
+                         global_capability_selected(attachment, capability))
+                    and any(value not in keys for value in (
+                        actual_global_routes if attachment_origin == "global" else {route}))):
                 # Rendering reports the route error with the projection that
                 # owns it. Record only precedence here, before dormancy
                 # warnings are finalized, so the later blocker cannot coexist
                 # with or be softened by a dormant state.
-                blocked_global_reference_attachment_ids.add(
-                    attachment["attachment_id"])
+                blocked_reference_attachments.add(
+                    (attachment_origin, attachment["attachment_id"]))
             placement = str(capability.get("placement") or "")
             if placement not in PLACEMENT_PHASES:
                 errors.append({
@@ -4528,11 +4619,10 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                     attachment, capability, resolved_profile))
         for diagnostic in errors[attachment_error_count:]:
             diagnostic.setdefault("origin", attachment_origin)
-        if (attachment_origin == "global"
-                and attachment["kind"] == "reference"
+        if (attachment["kind"] == "reference"
                 and len(errors) > attachment_error_count):
-            blocked_global_reference_attachment_ids.add(
-                attachment["attachment_id"])
+            blocked_reference_attachments.add(
+                (attachment_origin, attachment["attachment_id"]))
 
     context["references_by_id"] = {
         str(value.get("reference_id") or ""): value
@@ -4571,7 +4661,12 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             target[unit_id] = next_number
             used.add(next_number)
     ordinal_manifest = context.get("ordinal_manifest") or {}
-    dormant_identity_candidates = []
+    dormant_candidates = []
+    staging = context.get("reference_staging") or {}
+    staged_items = staging.get("items") or {}
+
+    def dormant_candidate(attachment, origin, *, unit_id="", member_id="", item_id=""):
+        dormant_candidates.append((attachment, origin, unit_id, member_id, item_id))
     if is_h3_reference_profile:
         seen_diagnostics = set()
         current_reference_origin = ""
@@ -4593,12 +4688,9 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         def reference_error(code, message, attachment_id="", **details):
             reference_diagnostic(
                 errors, code, message, attachment_id, **details)
-            # Dormancy is a staging fact, not permission to soften broken
-            # authored state. Global ids are unique within their own normalized
-            # scope, so a section chip reusing the same id cannot poison this
-            # precedence set.
-            if current_reference_origin == "global" and attachment_id:
-                blocked_global_reference_attachment_ids.add(attachment_id)
+            # Scope is part of identity: section ids may repeat a global chip id.
+            if attachment_id:
+                blocked_reference_attachments.add((current_reference_origin, attachment_id))
 
         def reference_warning(code, message, attachment_id="", **details):
             reference_diagnostic(
@@ -4687,16 +4779,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                         attachment["attachment_id"])
                 if sources and unit_id not in (ordinal_manifest.get(
                         identity_ordinal_key(identity_kind)) or {}):
-                    if attachment_origin == "global":
-                        dormant_identity_candidates.append((
-                            attachment["attachment_id"],
-                            unit_id,
-                            str(unit.get("name") or unit_id)))
-                    else:
-                        reference_error(
-                            "reference_source_not_applicable",
-                            f"Prompt identity {unit.get('name') or unit_id!r} has no winning setup member in this window.",
-                            attachment["attachment_id"])
+                    dormant_candidate(attachment, attachment_origin, unit_id=unit_id)
                 elif not sources:
                     reference_warning(
                         "assetless_prompt_identity",
@@ -4774,10 +4857,14 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                                         for row in duplicate_slots) + ".",
                             attachment["attachment_id"])
                     if str(source_id) not in known:
-                        reference_error(
-                            "reference_source_not_applicable",
-                            f"Reference source {source_id!r} is not a winning physical setup slot in this window.",
-                            attachment["attachment_id"])
+                        # No catalog means no deletion verdict (legacy project-less
+                        # compile); keep that existing fail-open contract.
+                        if reference_catalog_available and str(source_id) not in known_member_ids:
+                            reference_error("broken_reference_source",
+                                "A bound physical Reference member no longer exists; rebind the chip.",
+                                attachment["attachment_id"])
+                        else:
+                            dormant_candidate(attachment, attachment_origin, member_id=str(source_id))
                         continue
                     authored = str((
                         config.get("audio_definition")
@@ -4802,13 +4889,16 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         error_count = len(errors)
         item_id = str(attachment.get("source", {}).get("reference_item_id") or "")
         generic_reference = (context.get("generic_references") or {}).get(item_id)
-        if item_id and generic_reference is None:
-            errors.append({
-                "code": "reference_source_not_applicable",
+        if item_id and staging.get("resolved") and item_id not in staged_items:
+            errors.append({"code": "broken_reference_source",
                 "attachment_id": attachment["attachment_id"],
-                "message": (f"Reference item {item_id!r} is deleted, muted, superseded, "
-                            "hidden, or outside this generation window; rebind the visible chip."),
-            })
+                "message": "A bound Reference item no longer exists; rebind the chip."})
+        elif item_id and "minimax_base_format" in set(resolved_profile.get("validators") or []):
+            warnings.append({"code": "reference_not_supported_by_format",
+                "attachment_id": attachment["attachment_id"], "origin": attachment_origin,
+                "message": "This text-only Prompt Format does not support Reference inputs."})
+        elif item_id and generic_reference is None:
+            dormant_candidate(attachment, attachment_origin, item_id=item_id)
         elif item_id:
             profile_key = f"{resolved_profile.get('profile_id')}@{resolved_profile.get('version')}"
             compatible = generic_reference.get("compatible_profiles") or ["generic@1"]
@@ -4823,9 +4913,9 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 errors.append({"code": "reference_capability_incompatible",
                                "attachment_id": attachment["attachment_id"],
                                "message": "The Reference chip requests capabilities its recipe does not expose."})
-        if attachment_origin == "global" and len(errors) > error_count:
-            blocked_global_reference_attachment_ids.add(
-                attachment["attachment_id"])
+        if len(errors) > error_count:
+            blocked_reference_attachments.add(
+                (attachment_origin, attachment["attachment_id"]))
         for diagnostic in errors[error_count:]:
             diagnostic.setdefault("origin", attachment_origin)
     def inspect_attachment_tokens(value, attachment):
@@ -4960,9 +5050,9 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                     **context, "origin": "global", "channel_key": channel,
                     "profile": resolved_profile, "adjacent_raw_text": "",
                 }
-                if (attachment["attachment_id"]
-                        not in blocked_global_reference_attachment_ids
-                        and reference_chip_dormant(
+                if (("global", attachment["attachment_id"])
+                        not in blocked_reference_attachments
+                        and reference_prose_suppressed(
                             attachment, render_context)):
                     continue
                 if capability_kind in {"definitions", "retention"}:
@@ -4976,7 +5066,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                         previous = emitted.get(identity)
                         if previous is not None:
                             if previous != line:
-                                new_blockers.add(attachment["attachment_id"])
+                                new_blockers.add(("global", attachment["attachment_id"]))
                             continue
                         emitted[identity] = line
                         kept.append(line)
@@ -5005,21 +5095,21 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                     value, _diagnostics = inspect_attachment_tokens(
                         value, attachment)
                     if len(value.encode("utf-8")) > MAX_ATTACHMENT_OUTPUT:
-                        new_blockers.add(attachment["attachment_id"])
+                        new_blockers.add(("global", attachment["attachment_id"]))
                         continue
                     previous = emitted.get(identity)
                     if previous is not None:
                         if previous != value:
-                            new_blockers.add(attachment["attachment_id"])
+                            new_blockers.add(("global", attachment["attachment_id"]))
                         continue
                     emitted[identity] = value
                 if len(value.encode("utf-8")) > MAX_ATTACHMENT_OUTPUT:
-                    new_blockers.add(attachment["attachment_id"])
+                    new_blockers.add(("global", attachment["attachment_id"]))
             new_blockers.difference_update(
-                blocked_global_reference_attachment_ids)
+                blocked_reference_attachments)
             if not new_blockers:
                 return
-            blocked_global_reference_attachment_ids.update(new_blockers)
+            blocked_reference_attachments.update(new_blockers)
 
     prevalidated_prompt_token_diagnostics = set()
     if is_h3_reference_profile:
@@ -5035,10 +5125,9 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             if (not attachment.get("enabled", True)
                     or attachment.get("kind") != "reference"):
                 continue
-            if (attachment_origin == "global"
-                    and attachment["attachment_id"]
-                    not in blocked_global_reference_attachment_ids
-                    and reference_chip_dormant(attachment, context)):
+            if ((attachment_origin, attachment["attachment_id"])
+                    not in blocked_reference_attachments
+                    and reference_prose_suppressed(attachment, context)):
                 continue
             for capability in _enabled_capabilities(
                     attachment, resolved_profile):
@@ -5064,48 +5153,28 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             context["h3_summary_task_types"] = _minimax_task_types(
                 context, explicit_summary_task_types, resolved_profile)
         preflight_global_reference_render_blockers()
-        candidate_attachment_ids = {
-            attachment_id for attachment_id, _unit_id, _identity_name
-            in dormant_identity_candidates}
-        for attachment in global_attachment_values:
-            if (not attachment["enabled"]
-                    or attachment["attachment_id"] not in candidate_attachment_ids
-                    or attachment["attachment_id"]
-                    in blocked_global_reference_attachment_ids):
+        candidate_keys = {(origin, attachment["attachment_id"])
+                          for attachment, origin, *_ in dormant_candidates}
+        for attachment, attachment_origin in all_attachment_origins:
+            key = (attachment_origin, attachment["attachment_id"])
+            if (not attachment["enabled"] or key not in candidate_keys
+                    or key in blocked_reference_attachments):
                 continue
-            render_context = {**context, "origin": "global",
+            render_context = {**context, "origin": attachment_origin,
                               "profile": resolved_profile}
-            for capability in _enabled_capabilities(
-                    attachment, resolved_profile):
-                if not global_capability_effective(attachment, capability):
+            for capability in _enabled_capabilities(attachment, resolved_profile):
+                if (attachment_origin == "global" and not
+                        global_capability_effective(attachment, capability)):
                     continue
-                value = _render_reference_capability(
-                    attachment, capability, render_context)
-                _resolved, token_diagnostics = inspect_attachment_tokens(
-                    value, attachment)
+                value = _render_reference_capability(attachment, capability, render_context)
+                _resolved, token_diagnostics = inspect_attachment_tokens(value, attachment)
                 for diagnostic in token_diagnostics:
-                    diagnostic_key = attachment_token_diagnostic_key(
-                        diagnostic, "global")
+                    diagnostic_key = attachment_token_diagnostic_key(diagnostic, attachment_origin)
                     if diagnostic_key in prevalidated_prompt_token_diagnostics:
                         continue
                     prevalidated_prompt_token_diagnostics.add(diagnostic_key)
-                    errors.append({**diagnostic, "origin": "global"})
-                    blocked_global_reference_attachment_ids.add(
-                        attachment["attachment_id"])
-        current_reference_origin = ""
-        for attachment_id, unit_id, identity_name in dormant_identity_candidates:
-            if attachment_id in blocked_global_reference_attachment_ids:
-                continue
-            attachment = global_by_id_for_routes.get(attachment_id)
-            if (attachment is None or not any(
-                    global_capability_effective(attachment, capability)
-                    for capability in _enabled_capabilities(
-                        attachment, resolved_profile))):
-                continue
-            reference_warning(
-                "reference_source_dormant",
-                f"No Reference staged in this window supplies Prompt identity {identity_name!r}, so it is not described here.",
-                attachment_id, origin="global", semantic_unit_id=unit_id)
+                    errors.append({**diagnostic, "origin": attachment_origin})
+                    blocked_reference_attachments.add(key)
     # Retention appearance lists are semantic aggregates over the selected
     # window. Split-derived Reference clones share an emission group, so a
     # combined render produces one definition/retention line while either half
@@ -5168,7 +5237,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 shot_ordinals[str(value["attachment_id"])] = shot_number
         if shot_number:
             for value in section_attachments:
-                if value["enabled"] and value["kind"] == "reference":
+                if (value["enabled"] and value["kind"] == "reference"
+                        and reference_chip_conditions_window(value, context)):
                     group = value["emission_group_id"]
                     if shot_number not in reference_group_shots[group]:
                         reference_group_shots[group].append(shot_number)
@@ -5180,9 +5250,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         for value in global_attachment_values:
             if not value["enabled"] or value["kind"] != "reference":
                 continue
-            if (value["attachment_id"]
-                    not in blocked_global_reference_attachment_ids
-                    and reference_chip_dormant(value, context)):
+            if not reference_chip_conditions_window(value, context):
                 continue
             reference_group_shots[value["emission_group_id"]] = list(
                 range(1, shot_number + 1))
@@ -5262,7 +5330,12 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             return
         projection["state"] = state
         projection["text"] = str(text or "")
-        if projection.get("_scope_inline") and state in {"emitted", "empty"}:
+        if state == "emitted" and (reason == PRESERVED_REFERENCE_REASON
+                                    or projection.get("_preserved_reference")):
+            reason = PRESERVED_REFERENCE_REASON
+        if reason == PRESERVED_REFERENCE_REASON:
+            projection["state_reason"] = reason
+        elif projection.get("_scope_inline") and state in {"emitted", "empty"}:
             projection["state_reason"] = (
                 "Section-scope chips have no caret anchor; this is placed after "
                 "section-prefix contributions and before authored text.")
@@ -5293,13 +5366,18 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 projection, "invalid_field",
                 reason="This capability contains a value outside the Prompt Format vocabulary.")
             return ""
-        if (attachment["kind"] == "reference" and origin == "global"
-                and attachment["attachment_id"]
-                not in blocked_global_reference_attachment_ids
-                and reference_chip_dormant(attachment, render_context)):
+        if (attachment["kind"] == "reference"
+                and (origin, attachment["attachment_id"])
+                not in blocked_reference_attachments
+                and reference_prose_suppressed(attachment, render_context)):
             set_projection_state(
                 projection, "dormant", reason=DORMANT_REFERENCE_REASON)
             return ""
+        preserved = (attachment["kind"] == "reference"
+                     and not reference_chip_conditions_window(attachment, render_context)
+                     and resolve_reference_prose_policy(attachment, render_context) == "keep")
+        if projection is not None:
+            projection["_preserved_reference"] = preserved
         if (attachment["kind"] == "reference"
                 and capability_kind in {"definitions", "retention"}):
             # Definition and retention output is deduped one semantic unit or
@@ -5311,6 +5389,10 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                     attachment, capability, render_context):
                 # Resolve before owner-level dedupe so stable-id aliases that
                 # name the same Subject/slot compare as the same emission.
+                if preserved and authored_ordinal_literals(line, resolved_profile, context):
+                    warnings.append({"code": "authored_ordinal_literal", "origin": origin,
+                        "attachment_id": attachment["attachment_id"], "channel_key": channel,
+                        "message": "Preserved Reference text contains authored ordinal citations; they are sent literally and may not resolve in this window."})
                 line = resolve_attachment_handles(
                     line, attachment, channel, origin)
                 line = resolve_attachment_tokens(line, attachment, origin)
@@ -5368,7 +5450,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                                   "placement": capability.get("placement") or "inline",
                                   "text": value})
                 set_projection_state(projection, "emitted", value,
-                                     "This capability emitted resolved text.")
+                                     PRESERVED_REFERENCE_REASON if preserved else "This capability emitted resolved text.")
             elif resolved_lines:
                 set_projection_state(
                     projection, "deduplicated", "\n".join(resolved_lines),
@@ -5424,6 +5506,10 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         # Compare/store complete semantic output BEFORE stripping the prefix:
         # linked copies must still agree, including their authored prose.
         emitted_groups[identity] = value
+        if preserved and authored_ordinal_literals(value, resolved_profile, context):
+            warnings.append({"code": "authored_ordinal_literal", "origin": origin,
+                "attachment_id": attachment["attachment_id"], "channel_key": channel,
+                "message": "Preserved Reference text contains authored ordinal citations; they are sent literally and may not resolve in this window."})
         summary_candidate = None
         if (value and is_h3_reference_profile and attachment["kind"] == "reference"
                 and capability_kind == "summary"):
@@ -5467,7 +5553,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             if summary_candidate is not None:
                 summary_candidate["emission"] = emission
             set_projection_state(projection, "emitted", value,
-                                 "This capability emitted resolved text.")
+                                 PRESERVED_REFERENCE_REASON if preserved else "This capability emitted resolved text.")
         else:
             set_projection_state(projection, "empty", reason=
                                  "This capability resolved to no text.")
@@ -6401,6 +6487,64 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 projection, "linked_elsewhere", projection.get("text", ""),
                 "Equivalent output was emitted by a linked chip elsewhere.")
 
+    dormant_groups = {}
+    blocking_keys = {(str(row.get("origin") or ""), str(row.get("attachment_id") or ""))
+                     for row in errors if row.get("attachment_id")}
+    for attachment, origin, unit_id, member_id, item_id in dormant_candidates:
+        key = (origin, attachment["attachment_id"])
+        if key in blocked_reference_attachments or key in blocking_keys or ("", key[1]) in blocking_keys:
+            continue
+        if not any(origin != "global" or global_capability_effective(attachment, cap)
+                   for cap in _enabled_capabilities(attachment, resolved_profile)):
+            continue
+        member_ids = [member_id] if member_id else []
+        unit = context["semantic_units_by_id"].get(unit_id) or {}
+        member_ids += [str(row.get("member_id") or "") for row in unit.get("sources") or []]
+        item_ids = [item_id] if item_id else list(dict.fromkeys(
+            value for member in member_ids for value in (staging.get("members") or {}).get(member, [])))
+        if not item_ids:
+            item_ids = [""]
+        names = [str(unit.get("name") or "Prompt identity")] if unit_id else []
+        for reference in context.get("references") or []:
+            for member in reference.get("members") or []:
+                if str(member.get("member_id") or "") in member_ids:
+                    names.append(" · ".join(str(v) for v in
+                        [reference.get("name") or "Reference", member.get("name")] if v))
+        for binding in item_ids:
+            row = staged_items.get(binding) or {}
+            lane = row.get("lane_index")
+            verdict = row.get("verdict") or "unresolved"
+            group = dormant_groups.setdefault((lane, verdict), {
+                "attachments": {}, "names": set(), "unit_ids": set(), "item_ids": set(), "member_ids": set()})
+            group["attachments"][key] = attachment
+            group["names"].update(names or ["Reference chip"])
+            group["item_ids"].update([binding] if binding else [])
+            group["member_ids"].update(member_ids)
+            group["unit_ids"].update([unit_id] if unit_id else [])
+    for (lane, verdict), group in dormant_groups.items():
+        keys_in_group = list(group["attachments"])
+        label = f"Reference lane {lane + 1}" if lane is not None else "Reference sources"
+        # WINNER may still be absent from the formatter (cap/recipe). Never
+        # invent a cause that the physical setup did not publish.
+        cause = REFERENCE_VERDICT_LABEL.get(verdict, "Not resolved in this window")
+        if verdict == "winner":
+            cause = "Not resolved in this window"
+        details = {"verdict": verdict, "lane_index": lane,
+                   "attachment_ids": list(dict.fromkeys(key[1] for key in keys_in_group)),
+                   "attachments": [{"origin": key[0], "attachment_id": key[1]} for key in keys_in_group],
+                   "reference_item_ids": sorted(group["item_ids"]), "member_ids": sorted(group["member_ids"]),
+                   "semantic_unit_ids": sorted(group["unit_ids"])}
+        warnings.append({"code": "reference_source_dormant", **details,
+            "message": f"{label}: {cause}; {len(keys_in_group)} chip(s) have sources not conditioning this pass ({', '.join(sorted(group['names']))})."})
+        kept = [key for key, attachment in group["attachments"].items()
+                if not reference_chip_conditions_window(attachment, context)
+                and resolve_reference_prose_policy(attachment, context) == "keep"]
+        if kept:
+            warnings.append({"code": "reference_prose_preserved", **details,
+                "attachment_ids": list(dict.fromkeys(key[1] for key in kept)),
+                "attachments": [{"origin": key[0], "attachment_id": key[1]} for key in kept],
+                "message": f"{label}: authored text from {len(kept)} chip(s) is kept without Reference conditioning."})
+
     projection_groups = {}
     for projection in sorted(
             attachment_capability_projections,
@@ -6420,6 +6564,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         projection.pop("_anchor_node_id", None)
         projection.pop("_discovery", None)
         projection.pop("_scope_inline", None)
+        projection.pop("_preserved_reference", None)
     # Built HERE, from the context this compile enriched, and never from a
     # dict assembled by a caller. `_reference_capability_parts` reads
     # `semantic_units_by_id` and `profile`, both injected above; a caller that

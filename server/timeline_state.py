@@ -1875,7 +1875,14 @@ class Scene:
                                delimiter=prompt_payload.DEFAULT_SECTION_DELIMITER,
                                boundary_threshold_pct=0.0, template=None,
                                fps=24.0, profile=None, custom_profiles=None,
-                               context=None) -> dict:
+                               context=None, reference_threshold_pct=0.0) -> dict:
+        from .reference_resolution import resolve_reference_staging
+        context = dict(context or {})
+        context.setdefault("reference_staging", resolve_reference_staging(
+            reference_items=self.reference_items, lane_count=self.reference_lane_count,
+            scene_duration=self.duration_frames, window_start=start, window_end=end,
+            lane_configs=self.reference_lane_configs,
+            frame_threshold_pct=reference_threshold_pct))
         global_hidden = bool(getattr(self.global_prompt_track_config, "hidden", False))
         sections_hidden = bool(getattr(self.prompt_track_config, "hidden", False))
         return prompt_context.compile_prompt_context(
@@ -1989,7 +1996,8 @@ class Scene:
                 self.compile_prompt_context(
                     start, end, labels_on=labels_on, delimiter=delimiter,
                     boundary_threshold_pct=boundary_threshold_pct,
-                    template=template, fps=fps))
+                    template=template, fps=fps,
+                    reference_threshold_pct=reference_threshold_pct))
             if isinstance(compile_result_out, dict):
                 compile_result_out.clear()
                 compile_result_out.update(compiled)

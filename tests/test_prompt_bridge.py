@@ -127,7 +127,7 @@ def test_bridge_live_refuses_blocking_prompt_context_diagnostics():
         "scene_id": "scene-1", "context_start": 0, "context_end": 24,
     }
 
-    with pytest.raises(RuntimeError, match="reference_source_not_applicable"):
+    with pytest.raises(RuntimeError, match="broken_reference_source"):
         prompt_bridge.build_window_relay_payload(project)
 
 

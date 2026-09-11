@@ -155,24 +155,24 @@ def test_reference_dormancy_predicates_are_derived_from_winning_sources():
 
     assert prompt_context.dormant_reference_identities(
         attachment, context) == ["dormant"]
-    assert not prompt_context.reference_chip_dormant(attachment, context)
+    assert prompt_context.reference_chip_conditions_window(attachment, context)
 
     attachment["source"]["semantic_unit_ids"] = ["dormant"]
-    assert prompt_context.reference_chip_dormant(attachment, context)
+    assert not prompt_context.reference_chip_conditions_window(attachment, context)
 
     attachment["source"]["semantic_unit_ids"] = ["assetless"]
-    assert not prompt_context.reference_chip_dormant(attachment, context)
+    assert prompt_context.reference_chip_conditions_window(attachment, context)
     attachment["source"]["semantic_unit_ids"] = ["missing"]
-    assert not prompt_context.reference_chip_dormant(attachment, context)
+    assert prompt_context.reference_chip_conditions_window(attachment, context)
 
     attachment["source"] = {
         "semantic_unit_ids": ["dormant"],
         "picture_ids": ["winning-picture"],
     }
-    assert not prompt_context.reference_chip_dormant(attachment, context)
+    assert prompt_context.reference_chip_conditions_window(attachment, context)
 
     attachment["source"] = {"picture_ids": ["unwon-picture"]}
-    assert prompt_context.reference_chip_dormant(attachment, context)
+    assert not prompt_context.reference_chip_conditions_window(attachment, context)
 
     # Classification is attachment-local even when two scopes carry the same
     # UI id; no cross-scope id set is an authority over dormancy.
@@ -180,15 +180,15 @@ def test_reference_dormancy_predicates_are_derived_from_winning_sources():
         "shared", {"semantic_unit_ids": ["staged"]}, {})
     same_id_dormant = _reference_chip(
         "shared", {"semantic_unit_ids": ["dormant"]}, {})
-    assert not prompt_context.reference_chip_dormant(same_id_staged, context)
-    assert prompt_context.reference_chip_dormant(same_id_dormant, context)
+    assert prompt_context.reference_chip_conditions_window(same_id_staged, context)
+    assert not prompt_context.reference_chip_conditions_window(same_id_dormant, context)
 
     attachment["source"] = {
         "semantic_unit_ids": 1,
         "picture_ids": "winning-picture",
     }
     assert prompt_context.dormant_reference_identities(attachment, context) == []
-    assert not prompt_context.reference_chip_dormant(attachment, context)
+    assert prompt_context.reference_chip_conditions_window(attachment, context)
 
 
 def _identity_dormancy_fixture(*, global_chip=None, global_chips=None,
@@ -242,7 +242,7 @@ def _identity_dormancy_fixture(*, global_chip=None, global_chips=None,
         references=[entity], copy_plan_for=copy_plan_for)
 
 
-def test_global_dormant_identity_warns_while_same_id_section_still_blocks():
+def test_dormant_identity_warns_in_both_scopes():
     global_chip = _reference_chip(
         "shared", {"semantic_unit_ids": ["dormant"]}, {},
         capabilities=("definitions",))
@@ -258,13 +258,12 @@ def test_global_dormant_identity_warns_while_same_id_section_still_blocks():
     blocked = [row for row in compiled["errors"]
                if row["code"] == "reference_source_not_applicable"]
     assert len(dormant) == 1
-    assert dormant[0]["message"] == (
-        "No Reference staged in this window supplies Prompt identity "
-        "'Dormant', so it is not described here.")
-    assert dormant[0]["origin"] == "global"
-    assert dormant[0]["semantic_unit_id"] == "dormant"
-    assert len(blocked) == 1
-    assert blocked[0]["origin"] == "section"
+    assert "Dormant" in dormant[0]["message"]
+    assert dormant[0]["attachments"] == [
+        {"origin":"global", "attachment_id":"shared"},
+        {"origin":"section", "attachment_id":"shared"}]
+    assert dormant[0]["semantic_unit_ids"] == ["dormant"]
+    assert not blocked
     projections = [
         row for row in compiled["attachment_capability_projections"]
         if row["attachment_id"] == "shared"
@@ -272,7 +271,7 @@ def test_global_dormant_identity_warns_while_same_id_section_still_blocks():
     assert next(row for row in projections
                 if row["origin"] == "global")["state"] == "dormant"
     assert next(row for row in projections
-                if row["origin"] == "section")["state"] == "unresolved"
+                if row["origin"] == "section")["state"] == "dormant"
 
 
 def test_same_id_section_capability_limit_does_not_poison_global_dormancy():
@@ -296,7 +295,7 @@ def test_same_id_section_capability_limit_does_not_poison_global_dormancy():
     assert len(capability_limit) == 1
     assert capability_limit[0]["origin"] == "section"
     assert any(row["code"] == "reference_source_dormant"
-               and row["origin"] == "global"
+               and {"origin":"global", "attachment_id":"same"} in row["attachments"]
                for row in compiled["warnings"])
     global_projection = next(
         row for row in compiled["attachment_capability_projections"]
@@ -410,7 +409,7 @@ def test_assetless_identity_keeps_its_existing_warning_not_dormancy():
                    for row in compiled["warnings"])
 
 
-def test_dormant_identities_with_equal_names_keep_distinct_warnings():
+def test_dormant_identities_with_equal_names_keep_attribution_in_aggregate():
     units = [
         {"semantic_unit_id": unit_id, "name": "Twin", "kind": "subject",
          "definition": f"the {unit_id} twin",
@@ -433,7 +432,8 @@ def test_dormant_identities_with_equal_names_keep_distinct_warnings():
 
     dormant = [row for row in compiled["warnings"]
                if row["code"] == "reference_source_dormant"]
-    assert [row["semantic_unit_id"] for row in dormant] == ["twin-a", "twin-b"]
+    assert len(dormant) == 1
+    assert dormant[0]["semantic_unit_ids"] == ["twin-a", "twin-b"]
 
 
 def test_fully_dormant_global_chip_suppresses_every_capability():
@@ -495,7 +495,7 @@ def test_dormant_output_and_conflict_preflight_do_not_block():
                    and row["attachment_id"] == "conflicting"
                    for row in compiled["errors"])
     assert any(row["code"] == "reference_source_dormant"
-               and row["attachment_id"] == "conflicting"
+               and "conflicting" in row["attachment_ids"]
                for row in compiled["warnings"])
     assert "CONFLICTING CHIP MENTION" not in compiled["prompt"]
     assert all(row["state"] == "dormant"
@@ -641,8 +641,8 @@ def test_dormant_global_chip_claims_no_shots_but_live_chip_still_does(
     compiled = compile_three_shots(blocked, units=[broken_unit])
     assert any(row["code"] == "broken_reference_source"
                for row in compiled["errors"])
-    assert captured["blocked-shots"]["groups"]["blocked-group"] == [1, 2, 3]
-    assert captured["blocked-shots"]["units"]["broken"] == [1, 2, 3]
+    assert "blocked-group" not in captured["blocked-shots"]["groups"]
+    assert "broken" not in captured["blocked-shots"]["units"]
 
 
 def test_duplicate_global_ids_keep_blockers_attached_to_rendered_chip():

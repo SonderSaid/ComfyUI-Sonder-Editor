@@ -849,6 +849,7 @@ export class EditorWidget {
         this._promptSectionDelimiter = ".";
         this._promptFrameThreshold = 10;
         this._referenceFrameThreshold = 0;
+        this._referenceProsePolicy = "drop";
         this._serverSettings = null;
         this._serverSettingsLoaded = false;
         this._activeProjectLinked = false;
@@ -7189,6 +7190,7 @@ export class EditorWidget {
             // project PUTs (not settings writes); getters back their sync
             get _promptSectionDelimiter() { return editor._promptSectionDelimiter; },
             get _promptFrameThreshold() { return editor._promptFrameThreshold; },
+            get _referenceProsePolicy() { return editor._referenceProsePolicy; },
             get _referenceFrameThreshold() { return editor._referenceFrameThreshold; },
             get _guideCollisionAutoOffset() { return editor._guideCollisionAutoOffset; },
             get _serverSettings() { return editor._serverSettings; },
@@ -7205,6 +7207,7 @@ export class EditorWidget {
             _toggleGuideCollisionAutoOffset: (on) => editor._toggleGuideCollisionAutoOffset(on),
             _setPromptSectionDelimiter: (value) => editor._setPromptSectionDelimiter(value),
             _setPromptFrameThreshold: (value) => editor._setPromptFrameThreshold(value),
+            _setReferenceProsePolicy: (value) => editor._setReferenceProsePolicy(value),
             _setReferenceFrameThreshold: (value) => editor._setReferenceFrameThreshold(value),
             _keyboardConsumerId: (suffix) => editor._keyboardConsumerId(suffix),
             _hideSettingsPanel: () => editor._hideSettingsPanel(),
@@ -11579,6 +11582,7 @@ export class EditorWidget {
                 _context_reference_frame_threshold: this._referenceFrameThreshold || 0,
             };
             const configure = (attachment) => configurePromptAttachment(attachment, {
+                referenceProsePolicy: this._referenceProsePolicy,
                 scene: contextScene,
                 references: this._references || [],
                 semanticUnits: this._promptSemanticUnits || [],
@@ -11755,6 +11759,7 @@ export class EditorWidget {
                     onActivate: async (attachment) => {
                         const configured = this._acceptPromptAttachmentConfiguration(
                             await configurePromptAttachment(attachment, {
+                            referenceProsePolicy: this._referenceProsePolicy,
                             scene: { ...(this.activeScene || {}), _context_channel_keys: keys,
                                 _context_consumer_start: consumerSection?.start_frame ?? Infinity,
                                 _context_consumer_end: consumerSection?.end_frame
@@ -11855,6 +11860,7 @@ export class EditorWidget {
         const scopeHost = document.createElement("div");
         scopeHost.style.cssText = "flex:1 0 100%;min-width:0;";
         const configureScope = (attachment) => configurePromptAttachment(attachment, {
+            referenceProsePolicy: this._referenceProsePolicy,
             scene: { ...(this.activeScene || {}), _context_channel_keys: keys,
                 _context_consumer_start: consumerSection?.start_frame ?? Infinity,
                 _context_consumer_end: consumerSection?.end_frame
@@ -12953,6 +12959,28 @@ export class EditorWidget {
                 );
             }
         }
+    }
+
+    async _setReferenceProsePolicy(value) {
+        return this._withMutationGesture("setReferenceProsePolicy", async (diagnostics) => {
+            const dirName = this._projectDirName();
+            if (!dirName) return;
+            const policy = value === "keep" ? "keep" : "drop";
+            try {
+                await this._queuePromptProjectWrite(
+                    { metadata: { reference_prose_policy: policy } },
+                    { projectId: dirName, label: "Reference text policy", diagnostics });
+                if (this._destroyed || this._projectDirName() !== dirName) return;
+                this._referenceProsePolicy = policy;
+                // Only compiled prose changes; invalidate the candidate through
+                // its existing token/draft-aware owner, including inline projections.
+                this._previewPromptContextCandidate({}, 0);
+            } catch (error) {
+                notifyWarning(error?.message || "Failed to update Reference text policy.",
+                    { source: "reference-prose-policy-refused" });
+                throw error;
+            }
+        });
     }
 
     async _setReferenceFrameThreshold(...args) {
@@ -21847,6 +21875,7 @@ export class EditorWidget {
                 this._promptSectionDelimiter = String(data.metadata?.prompt_section_delimiter ?? ".");
                 // Project-durable boundary-spill threshold % (render-affecting; default 10)
                 this._promptFrameThreshold = Number(data.metadata?.prompt_frame_threshold ?? 10) || 0;
+                this._referenceProsePolicy = data.metadata?.reference_prose_policy === "keep" ? "keep" : "drop";
                 this._referenceFrameThreshold = Number(data.metadata?.reference_frame_threshold ?? 0) || 0;
                 await this._maybeHealFrameConstraint(this.projectDir, dirName, data.frame_constraint);
                 await this._maybeHealDimensionConstraint(this.projectDir, dirName, data.dimension_constraint);

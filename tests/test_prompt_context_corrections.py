@@ -5380,7 +5380,9 @@ def test_base_reference_chip_keeps_inapplicable_diagnostic():
         "source": {"reference_item_id": "item"}})]
     compiled = _compile_base(project, scene)
     assert {row["code"] for row in compiled["errors"]} == {
-        "undeclared_reference_capability", "reference_source_not_applicable"}
+        "undeclared_reference_capability"}
+    assert any(row["code"] == "reference_not_supported_by_format"
+               for row in compiled["warnings"])
     assert "reference_profile_incompatible" not in {
         row["code"] for row in compiled["warnings"]}
 
