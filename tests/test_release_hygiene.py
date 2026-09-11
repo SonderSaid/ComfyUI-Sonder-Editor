@@ -3,8 +3,11 @@ from __future__ import annotations
 import re
 import json
 import os
+import subprocess
 from pathlib import Path
 from urllib.parse import unquote
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -323,4 +326,97 @@ def test_reference_recipe_table_lists_every_builtin_preset():
     assert not missing, (
         "docs/references.md recipe table is missing built-in preset(s):\n"
         + "\n".join(f"  - {name}" for name in missing)
+    )
+
+
+# The one version string, spelled in three places a reader can reach: the
+# package metadata, the README a fetcher actually reads, and the sealed
+# CHANGELOG heading. `**Version X.Y.Z**` is anchored to the line start on
+# purpose — README prose also carries `frontend v1.45.21` and "version 3 of the
+# GNU General Public License", which a bare semver sweep would collect.
+_README_VERSION = re.compile(r"(?m)^\*\*Version (\d+\.\d+\.\d+)\*\*")
+_CHANGELOG_RELEASE = re.compile(r"(?m)^## \[(\d+\.\d+\.\d+)\] - ")
+_RELEASE_TAG = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
+
+
+def _declared_version() -> str:
+    text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    match = re.search(r'(?m)^version\s*=\s*"([^"]+)"', text)
+    assert match, "pyproject.toml must declare [project].version"
+    return match.group(1)
+
+
+def _readme_version() -> str:
+    found = _README_VERSION.findall((ROOT / "README.md").read_text(encoding="utf-8"))
+    assert len(found) == 1, (
+        f"README.md must carry exactly one '**Version X.Y.Z**' line, found {len(found)}"
+    )
+    return found[0]
+
+
+def _changelog_version() -> str:
+    """The newest sealed heading; `[Unreleased]` carries no version and no date."""
+    match = _CHANGELOG_RELEASE.search((ROOT / "CHANGELOG.md").read_text(encoding="utf-8"))
+    assert match, "CHANGELOG.md must carry a dated '## [X.Y.Z] - <date>' heading"
+    return match.group(1)
+
+
+def _release_tags() -> list[tuple[int, int, int]]:
+    """Empty when tags are unreachable, which is the normal state of a shallow
+    CI checkout or a downloaded source tree, not a drift signal."""
+    try:
+        result = subprocess.run(
+            ["git", "tag", "--list", "v*"],
+            cwd=ROOT, capture_output=True, text=True, check=False,
+        )
+    except (OSError, ValueError):
+        return []
+    if result.returncode != 0:
+        return []
+    return [
+        tuple(int(part) for part in match.groups())
+        for match in map(_RELEASE_TAG.match, result.stdout.split())
+        if match
+    ]
+
+
+def test_declared_version_agrees_across_pyproject_readme_and_changelog():
+    """One release, one number, in every place that states it.
+
+    The README line exists because the repository landing page loses its
+    Releases sidebar when converted to markdown, which is how most fetchers
+    read it; without a version in the README body there is nothing current for
+    them to find, and they fall back to whatever they cached. That line is only
+    worth having if forgetting to bump it fails loudly, which is this test.
+
+    Release bumps `pyproject.toml`, the README line and the CHANGELOG heading in
+    one edit, so there is no window where they legitimately differ.
+    """
+    version = _declared_version()
+    assert _readme_version() == version, (
+        f"README.md states {_readme_version()}, pyproject.toml states {version}"
+    )
+    assert _changelog_version() == version, (
+        f"newest CHANGELOG heading is {_changelog_version()}, pyproject.toml states {version}"
+    )
+
+
+def test_no_release_tag_is_ahead_of_the_declared_version():
+    """Deliberately one-sided: a tag may lag, never lead.
+
+    Closeout runs the suite before the release is tagged, so demanding that a
+    tag for the current version already exist would fail at every release and
+    teach everyone to ignore it. Leading is the real defect — it means a tag was
+    cut past the metadata, or a bump was reverted under an existing tag.
+
+    A tag is not a published GitHub Release; this cannot see those. Publishing
+    the Release for a cut tag stays a step in the release ritual.
+    """
+    tags = _release_tags()
+    if not tags:
+        pytest.skip("no release tags reachable (shallow checkout or source archive)")
+    highest = max(tags)
+    declared = tuple(int(part) for part in _declared_version().split("."))
+    assert highest <= declared, (
+        "release tag v%d.%d.%d is ahead of the declared version %s" % (*highest, _declared_version())
     )

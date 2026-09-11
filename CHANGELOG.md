@@ -19,6 +19,7 @@ a fresh `[Unreleased]` block.
 - References covering the entire render window survive every threshold; high Boundary Prompt thresholds retain the stronger section instead of a neighboring sliver.
 - Fixed false project conflicts during multi-file import and replacement, preserved committed replacement media when cleanup fails, and named failed imports in gallery notifications.
 - Sonder Save Bridge accepts a typed or existing **Target Folder** again. Picking or typing any label other than Root previously failed the run during prompt validation; the label is now created when the outputs register.
+- The README states the released version, and no longer suggests the pack may be missing from the Registry.
 
 ## [0.4.0] - 2026-09-08
 
