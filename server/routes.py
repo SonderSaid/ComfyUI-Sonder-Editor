@@ -6665,7 +6665,7 @@ def _extract_audio_from_video(video_path: str, output_path: str) -> bool:
         ffmpeg = _get_ffmpeg()
         result = subprocess.run(
             [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", video_path, "-vn",
-             "-acodec", "pcm_s16le", "-ar", "44100", output_path],
+             "-acodec", "pcm_f32le", "-rf64", "auto", output_path],
             capture_output=True, text=True, timeout=60,
         )
         if result.returncode == 0 and os.path.isfile(output_path):
@@ -8750,7 +8750,6 @@ def _timeline_export_job_response(request: web.Request, job) -> dict:
         "asset": None,
         "scene": None,
         "placed_clip": job.placed_clip,
-        "warnings": list(job.warnings or []),
     }
     try:
         project = _load_project_from_request(request)

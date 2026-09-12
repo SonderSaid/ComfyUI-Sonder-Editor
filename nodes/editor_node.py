@@ -30,7 +30,6 @@ from ..server.media_helpers import (
     FIT_MODES,
     apply_rgb_color_correction,
     color_correction_for_interpretation,
-    decode_audio_samples,
     decode_video_frame,
     fit_frame_to_canvas,
     resolve_source_color_interpretation,
@@ -52,7 +51,7 @@ from ..server.timeline_renderer import render_scene_frames
 logger = logging.getLogger("sonder_editor")
 
 
-def _make_silent_audio(duration_sec: float, sample_rate: int = 44100) -> dict:
+def _make_silent_audio(duration_sec: float, sample_rate: int = 48000) -> dict:
     """Create a silent AUDIO dict compatible with ComfyUI's AUDIO format."""
     num_samples = int(duration_sec * sample_rate)
     waveform = torch.zeros(1, 2, num_samples, dtype=torch.float32)  # (batch, channels, samples)
@@ -245,7 +244,7 @@ class SonderEditor:
         return torch.zeros(1, 1, 1, 3, dtype=torch.float32)
 
     @staticmethod
-    def _minimal_audio_output(sample_rate: int = 44100):
+    def _minimal_audio_output(sample_rate: int = 48000):
         return {
             "waveform": torch.zeros(1, 2, 1, dtype=torch.float32),
             "sample_rate": sample_rate,
@@ -281,7 +280,7 @@ class SonderEditor:
             if guides_needed
             else cls._minimal_image_output()
         )
-        silent_audio = _make_silent_audio(1.0, 44100) if audio_needed else cls._minimal_audio_output()
+        silent_audio = _make_silent_audio(1.0) if audio_needed else cls._minimal_audio_output()
         return (
             proj,
             rendered_image,
@@ -1527,122 +1526,7 @@ class SonderEditor:
 
     def _load_scene_audio(self, proj: TimelineProject, scene: Scene,
                           sel_start: int, sel_end: int) -> dict:
-        """Load and mix audio tracks that overlap the selected frame range.
-
-        Returns a ComfyUI AUDIO dict. Falls back to silent audio if no tracks.
-        """
-        # Scene-level fps override
-        effective_fps = scene.fps if hasattr(scene, 'fps') and scene.fps > 0 else proj.fps
-        duration_sec = (sel_end - sel_start) / effective_fps if effective_fps > 0 else 1.0
-        sample_rate = 44100
-
-        if not scene.audio_tracks:
-            return _make_silent_audio(duration_sec, sample_rate)
-
-        total_samples = int(duration_sec * sample_rate)
-        mixed = torch.zeros(2, total_samples, dtype=torch.float32)
-
-        # Build set of hidden audio lanes
-        hidden_audio_lanes = set()
-        for i, cfg in enumerate(scene.audio_lane_configs):
-            if cfg.hidden:
-                hidden_audio_lanes.add(i)
-
-        any_loaded = False
-        considered_tracks = len(scene.audio_tracks)
-        loaded_tracks = 0
-        failed_tracks = 0
-        for track in scene.audio_tracks:
-            if track.muted:
-                logger.debug("Skipping scene audio track %s: muted", track.source_path)
-                continue
-            if track.lane_index in hidden_audio_lanes:
-                logger.debug(
-                    "Skipping scene audio track %s: hidden lane %s",
-                    track.source_path,
-                    track.lane_index,
-                )
-                continue
-            overlap_start = max(sel_start, int(track.timeline_start_frame or 0))
-            overlap_end = min(sel_end, int(track.timeline_end_frame or 0))
-            if overlap_end <= overlap_start:
-                logger.debug(
-                    "Skipping scene audio track %s: no overlap with range %d-%d",
-                    track.source_path,
-                    sel_start,
-                    sel_end,
-                )
-                continue
-
-            raw_path = track.source_path
-            src_path = resolve_existing_project_path(
-                proj,
-                raw_path,
-                purpose="scene audio track",
-            )
-            if not os.path.isfile(src_path):
-                logger.info(
-                    "Skipping scene audio track %s: file not found or quarantined",
-                    track.source_path,
-                )
-                continue
-
-            try:
-                samples, _sr = decode_audio_samples(
-                    src_path,
-                    sample_rate=sample_rate,
-                    channels=2,
-                    mix_to_mono=False,
-                )
-                waveform = torch.from_numpy(np.ascontiguousarray(samples, dtype=np.float32))
-
-                # Calculate the overlapping source slice and destination offset.
-                track_offset_frames = overlap_start - sel_start
-                audio_offset_frames = overlap_start - int(track.timeline_start_frame or 0)
-                overlap_frames = overlap_end - overlap_start
-
-                track_offset_samples = int(track_offset_frames / effective_fps * sample_rate)
-                # BUG-3 fix: include source_in_frame for trimmed/split audio tracks
-                source_offset_frames = int(getattr(track, "source_in_frame", 0) or 0) + audio_offset_frames
-                audio_offset_samples = int(source_offset_frames / effective_fps * sample_rate)
-                overlap_samples = int(overlap_frames / effective_fps * sample_rate)
-
-                # Trim source audio
-                src_audio = waveform[:, audio_offset_samples:audio_offset_samples + overlap_samples]
-                available = min(overlap_samples, total_samples - track_offset_samples)
-                if available <= 0:
-                    logger.debug(
-                        "Skipping scene audio track %s: no buffer space after offsets",
-                        track.source_path,
-                    )
-                    continue
-                src_audio = src_audio[:, :available]
-
-                # Mix in with volume
-                end_sample = track_offset_samples + src_audio.shape[1]
-                if end_sample > total_samples:
-                    src_audio = src_audio[:, :total_samples - track_offset_samples]
-                    end_sample = total_samples
-
-                mixed[:, track_offset_samples:end_sample] += src_audio * track.volume
-                any_loaded = True
-                loaded_tracks += 1
-            except Exception as e:
-                failed_tracks += 1
-                logger.warning("Failed to decode/mix scene audio track %s: %s", track.source_path, e)
-                continue
-
-        if not any_loaded:
-            logger.info(
-                "Scene audio fell back to silence: considered=%d loaded=%d failed=%d range=%d-%d",
-                considered_tracks,
-                loaded_tracks,
-                failed_tracks,
-                sel_start,
-                sel_end,
-            )
-            return _make_silent_audio(duration_sec, sample_rate)
-
-        # Clamp to prevent clipping
-        mixed = mixed.clamp(-1.0, 1.0)
-        return {"waveform": mixed.unsqueeze(0), "sample_rate": sample_rate}
+        """Use the same unbounded float mix and sample clock as timeline export."""
+        from ..server.audio_pipeline import scene_audio_samples
+        samples, sample_rate = scene_audio_samples(proj, scene, sel_start, sel_end)
+        return {"waveform": torch.from_numpy(samples).unsqueeze(0), "sample_rate": sample_rate}

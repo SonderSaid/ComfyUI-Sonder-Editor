@@ -71,6 +71,7 @@ from ..server.media_helpers import (
     SAVE_VIDEO_PRESET_ORDER,
     SAVE_VIDEO_PRESETS,
     encode_video,
+    discard_audio_file,
     extract_embedded_workflow_metadata,
     get_ffmpeg_path,
     metadata_for_save_preset,
@@ -1606,7 +1607,7 @@ def _tensor_to_frames(tensor: torch.Tensor) -> list[np.ndarray]:
 
 
 def _save_audio_waveform(audio: dict, output_path: str) -> tuple[int, torch.Tensor]:
-    """Persist a ComfyUI AUDIO dict as a waveform file and return sample rate plus waveform."""
+    """Persist supplied samples without preparation; delivery owns resampling and gain."""
     waveform = audio["waveform"]
     if waveform.dim() == 3:
         waveform = waveform.squeeze(0)
@@ -1802,7 +1803,8 @@ class SonderSaveVideo:
             }
 
         audio_tmp = None
-        if audio is not None:
+        audio_alerts = []
+        if audio is not None and not (custom_spec and custom_spec["audio_codec"] == "none"):
             # Write the transient mux WAV to ComfyUI's temp dir, NOT media/, so the
             # editor's media-folder scan never ffprobes it mid-life — otherwise the
             # os.remove below races that probe handle and raises WinError 32 (sharing
@@ -1814,7 +1816,9 @@ class SonderSaveVideo:
             try:
                 _save_audio_waveform(audio, audio_tmp)
             except Exception as e:
-                logger.warning("Failed to save temp audio: %s", e)
+                discard_audio_file(audio_tmp)
+                from ..server.media_helpers import audio_failure_alert
+                audio_alerts.append(audio_failure_alert(output_path, e))
                 audio_tmp = None
 
         has_audio = bool(audio_tmp) and not (custom_spec and custom_spec["audio_codec"] == "none")
@@ -1825,6 +1829,11 @@ class SonderSaveVideo:
             h,
             custom_options if custom_spec else None,
         )
+        audio_rel_path, audio_abs_path = "", ""
+        take_context = getattr(project, "_execution_context", None) or {}
+        if has_audio and mode == "Take" and place_audio_on_timeline and project.get_scene(take_context.get("scene_id", "")):
+            audio_filename = f"{os.path.splitext(output_filename)[0]}_audio.wav"
+            audio_rel_path, audio_abs_path = _project_media_file(project, audio_filename, purpose="take audio output path")
         ffmpeg_started_at = time.perf_counter()
         logger.info(
             "ffmpeg start: save_video output=%s preset=%s frames=%d audio=%s timeout=%ss",
@@ -1854,10 +1863,13 @@ class SonderSaveVideo:
                 output_path=output_path,
                 fps=fps,
                 audio_path=audio_tmp,
+                work_dir=folder_paths.get_temp_directory(),
+                allow_audio_fallback=True,
                 custom_options=custom_options if custom_spec else None,
                 timeout=encode_timeout,
                 embed_metadata=file_metadata,
                 progress_callback=encode_progress_cb,
+                audio_sidecar_path=audio_abs_path or None,
             )
         except subprocess.TimeoutExpired:
             logger.warning(
@@ -1867,14 +1879,15 @@ class SonderSaveVideo:
             )
             raise
         finally:
-            if audio_tmp and os.path.isfile(audio_tmp):
-                os.remove(audio_tmp)
+            discard_audio_file(audio_tmp)
         logger.info(
             "ffmpeg end: save_video output=%s preset=%s duration=%.2fs",
             output_path,
             preset_id,
             time.perf_counter() - ffmpeg_started_at,
         )
+        has_audio = bool(encode_metadata.get("has_audio", has_audio))
+        audio_alerts.extend(encode_metadata.get("alerts") or [])
         asset_generation_params = dict(encode_metadata)
         asset_generation_params["editor_export"] = asset_editor_export
         asset_generation_params[COLOR_DRIFT_METADATA_KEY] = drift_record
@@ -1891,6 +1904,7 @@ class SonderSaveVideo:
             fps=fps,
             duration_sec=total_frames / fps if fps > 0 else 0.0,
             has_audio=has_audio,
+            sample_rate=(encode_metadata.get("audio_processing") or {}).get("sample_rate", 0),
             generation_params=dict(asset_generation_params),
         )
         project.add_asset(asset)
@@ -2006,12 +2020,17 @@ class SonderSaveVideo:
                 )
                 scene.clips.append(clip)
                 placed_audio_track = None
-                if place_audio_on_timeline and has_audio and audio is not None:
-                    audio_filename = f"{os.path.splitext(output_filename)[0]}_audio.wav"
-                    audio_rel_path, audio_abs_path = _project_media_file(project, audio_filename, purpose="take audio output path")
+                if audio_abs_path and has_audio and encode_metadata.get("audio_sidecar_ready") and os.path.isfile(audio_abs_path):
+                    audio_asset = None
+                    audio_lane_count = scene.audio_lane_count
+                    audio_lane_configs = list(scene.audio_lane_configs)
+                    audio_tracks = list(scene.audio_tracks)
                     try:
-                        sample_rate, waveform = _save_audio_waveform(audio, audio_abs_path)
-                        audio_duration_sec = waveform.shape[-1] / sample_rate if sample_rate > 0 else 0.0
+                        from ..server.audio_pipeline import mapped_float_wav
+                        with mapped_float_wav(audio_abs_path) as (sample_rate, samples):
+                            if not len(samples):
+                                raise ValueError("Prepared timeline audio is empty")
+                            audio_duration_sec = len(samples) / sample_rate
                         audio_asset = Asset(
                             name=f"{output_filename} (audio)",
                             asset_type="audio",
@@ -2053,6 +2072,13 @@ class SonderSaveVideo:
                         logger.info("Take audio auto-placed on lane %d at frames %d-%d", new_audio_lane, timeline_start_frame, timeline_end_frame)
                     except Exception as e:
                         logger.warning("Take mode audio auto-placement failed for %s: %s", output_filename, e)
+                        if audio_asset is not None and audio_asset in project.assets:
+                            project.assets.remove(audio_asset)
+                        scene.audio_lane_count = audio_lane_count
+                        scene.audio_lane_configs[:] = audio_lane_configs
+                        scene.audio_tracks[:] = audio_tracks
+                        discard_audio_file(audio_abs_path)
+                        audio_alerts.append(f"Saved {output_filename}, but its timeline audio could not be placed")
                 if take_placement_linked and placed_audio_track is not None:
                     scene.linked_item_groups.append({
                         "group_id": uuid.uuid4().hex[:8],
@@ -2091,6 +2117,9 @@ class SonderSaveVideo:
                     "type": "output",
                     "fps": fps,
                     "has_audio": has_audio,
+                    "audio_processing": encode_metadata.get("audio_processing", {}),
+                    "warnings": encode_metadata.get("warnings", []),
+                    "alerts": audio_alerts,
                     "poster": poster[0] if poster else None,
                 }],
             },
@@ -2206,12 +2235,15 @@ class SonderPreviewVideo:
         h, w = rgb_frames[0].shape[:2]
 
         audio_tmp = None
+        audio_alerts = []
         if audio is not None:
             audio_tmp = os.path.join(temp_dir, f"_tmp_preview_audio_{uuid.uuid4().hex[:6]}.wav")
             try:
                 _save_audio_waveform(audio, audio_tmp)
             except Exception as e:
-                logger.warning("Failed to save temp preview audio: %s", e)
+                discard_audio_file(audio_tmp)
+                from ..server.media_helpers import audio_failure_alert
+                audio_alerts.append(audio_failure_alert(preview_path, e))
                 audio_tmp = None
         has_audio = bool(audio_tmp)
 
@@ -2225,12 +2257,14 @@ class SonderPreviewVideo:
             encode_timeout,
         )
         try:
-            encode_video(
+            encode_metadata = encode_video(
                 rgb_frames,
                 preset_id=preset_id,
                 output_path=preview_path,
                 fps=fps,
                 audio_path=audio_tmp,
+                work_dir=folder_paths.get_temp_directory(),
+                allow_audio_fallback=True,
                 timeout=encode_timeout,
             )
         except subprocess.TimeoutExpired:
@@ -2241,13 +2275,15 @@ class SonderPreviewVideo:
             )
             raise
         finally:
-            if audio_tmp and os.path.isfile(audio_tmp):
-                os.remove(audio_tmp)
+            discard_audio_file(audio_tmp)
         logger.info(
             "ffmpeg end: preview output=%s duration=%.2fs",
             preview_path,
             time.perf_counter() - ffmpeg_started_at,
         )
+
+        has_audio = bool(encode_metadata.get("has_audio", has_audio))
+        audio_alerts.extend(encode_metadata.get("alerts") or [])
 
         # First-frame poster for the inline player (shown before playback starts).
         poster = _save_preview_thumbnail(cv2.cvtColor(rgb_frames[0], cv2.COLOR_RGB2BGR), "sonder_preview")
@@ -2259,6 +2295,9 @@ class SonderPreviewVideo:
                 "type": "temp",
                 "fps": fps,
                 "has_audio": has_audio,
+                "audio_processing": encode_metadata.get("audio_processing", {}),
+                "warnings": encode_metadata.get("warnings", []),
+                "alerts": audio_alerts,
                 "poster": poster[0] if poster else None,
             }],
         }}

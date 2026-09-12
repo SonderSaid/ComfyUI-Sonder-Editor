@@ -22,6 +22,7 @@ from .media_helpers import (
     FIT_MODES,
     MAX_SAVE_VIDEO_ENCODE_TIMEOUT_SECONDS,
     MediaOperationCancelled,
+    _preset_audio_args,
     audio_only_export_spec,
     encode_audio,
     encode_video,
@@ -33,7 +34,10 @@ from .media_helpers import (
     resolve_custom_export_options,
     run_ffmpeg_command,
     save_video_encode_timeout_seconds,
+    transient_temp_dir as _transient_temp_dir,
 )
+from .audio_pipeline import active_contributors, audible_sources, copy_audio_file, effective_volume
+from .media_helpers import probe_audio_metadata
 from .atomic_io import atomic_replace
 from .path_security import (
     log_path_quarantine,
@@ -56,19 +60,7 @@ from .timeline_state import (
 from .lane_registry import ensure_lane_index, hidden_lane_indexes
 
 
-def _transient_temp_dir() -> str:
-    """Temp dir for transient export work files (the mux WAV). Never the project
-    ``media/`` tree — files there get ffprobed by the editor's asset scan mid-life,
-    racing their cleanup ``os.remove`` (WinError 32). Uses ComfyUI's temp dir, with
-    a system-temp fallback when ``folder_paths`` is unavailable (e.g. unit tests)."""
-    try:
-        import folder_paths
-        temp_dir = folder_paths.get_temp_directory()
-    except Exception:
-        import tempfile
-        temp_dir = tempfile.gettempdir()
-    os.makedirs(temp_dir, exist_ok=True)
-    return temp_dir
+
 
 logger = logging.getLogger("sonder_editor")
 
@@ -95,6 +87,8 @@ class TimelineExportJob:
     result_scene_id: str = ""
     placed_clip: dict | None = None
     warnings: list[str] = field(default_factory=list)
+    alerts: list[str] = field(default_factory=list)
+    audio_processing: dict = field(default_factory=dict)
     frames_done: int = 0
     frames_total: int = 0
     created_at: float = field(default_factory=time.time)
@@ -108,6 +102,9 @@ class TimelineExportJob:
             "status": self.status,
             "phase": self.phase,
         }
+        payload["warnings"] = list(self.warnings)
+        payload["alerts"] = list(self.alerts)
+        payload["audio_processing"] = dict(self.audio_processing)
         if self.message:
             payload["message"] = self.message
         if self.frames_total > 0:
@@ -307,23 +304,13 @@ def _video_sources(project: TimelineProject, scene: Scene, start: int, end: int)
 
 
 def _audio_sources(project: TimelineProject, scene: Scene, start: int, end: int) -> list[dict]:
-    hidden = hidden_lane_indexes(scene, "audio")
     sources = []
-    for track in getattr(scene, "audio_tracks", []) or []:
-        if getattr(track, "lane_index", 0) in hidden or getattr(track, "muted", False):
-            continue
+    for track, _path in audible_sources(project, scene):
         overlap_start = max(start, int(track.timeline_start_frame or 0))
         overlap_end = min(end, int(track.timeline_end_frame or 0))
         if overlap_end <= overlap_start:
             continue
         source_path = str(getattr(track, "source_path", "") or "")
-        abs_path = resolve_existing_project_path(
-            project,
-            source_path,
-            purpose="timeline export audio source",
-        )
-        if not os.path.isfile(abs_path):
-            continue
         asset = next((item for item in project.assets if item.path == source_path), None)
         source_in = int(getattr(track, "source_in_frame", 0) or 0) + (overlap_start - int(track.timeline_start_frame or 0))
         sources.append({
@@ -333,9 +320,10 @@ def _audio_sources(project: TimelineProject, scene: Scene, start: int, end: int)
             "source_out": source_in + (overlap_end - overlap_start),
             "timeline_start": overlap_start,
             "timeline_end": overlap_end,
-            "volume": float(getattr(track, "volume", 1.0) or 1.0),
+            "volume": effective_volume(track),
         })
     return sources
+
 
 
 def _editor_export_metadata(
@@ -451,6 +439,7 @@ def _place_embedded_audio_take(
     muted: bool = False,
     cancel_event=None,
     cleanup_paths: list[str] | None = None,
+    prepared_audio_path: str | None = None,
 ) -> tuple[AudioTrack, str] | None:
     if not getattr(video_asset, "has_audio", False):
         return None
@@ -477,29 +466,19 @@ def _place_embedded_audio_take(
     if cleanup_paths is not None:
         cleanup_paths.append(audio_abs_path)
 
-    cmd = [
-        get_ffmpeg_path(),
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-i",
-        str(video_path),
-        "-vn",
-        "-ac",
-        "2",
-        "-ar",
-        "44100",
-        "-c:a",
-        "pcm_s16le",
-        str(audio_abs_path),
-    ]
-    run_ffmpeg_command(
-        cmd,
-        timeout=max(30, int(getattr(video_asset, "duration_sec", 0.0) or 0) + 60),
-        cancel_event=cancel_event,
-    )
-    if not os.path.isfile(audio_abs_path) or os.path.getsize(audio_abs_path) <= 1024:
+    if prepared_audio_path:
+        copy_audio_file(prepared_audio_path, audio_abs_path, cancel_event=cancel_event)
+    else:
+        cmd = [get_ffmpeg_path(), "-hide_banner", "-loglevel", "error", "-y", "-i", str(video_path),
+               "-vn", "-c:a", "pcm_f32le", "-rf64", "auto", str(audio_abs_path)]
+        run_ffmpeg_command(cmd, timeout=max(30, int(getattr(video_asset, "duration_sec", 0.0) or 0) + 60),
+                           cancel_event=cancel_event)
+    from .audio_pipeline import mapped_float_wav
+    try:
+        with mapped_float_wav(audio_abs_path) as (sample_rate, samples):
+            if not len(samples):
+                raise ValueError("Prepared timeline audio is empty")
+    except (OSError, ValueError):
         try:
             if os.path.isfile(audio_abs_path):
                 os.remove(audio_abs_path)
@@ -511,38 +490,50 @@ def _place_embedded_audio_take(
 
     fps = effective_scene_fps(project, scene)
     total_frames = max(1, end - start)
-    audio_asset = _register_export_asset(
-        project,
-        audio_abs_path,
-        asset_type="audio",
-        folder=folder,
-        technical_metadata={
-            "duration_sec": total_frames / fps,
-            "sample_rate": 44100,
-        },
-        generation_params={
-            **dict(generation_params),
-            "source_video_asset_id": video_asset.asset_id,
-            "extracted_for_take_audio": True,
-        },
-    )
+    previous_assets = list(project.assets)
+    previous_tracks = list(scene.audio_tracks)
+    previous_configs = list(scene.audio_lane_configs)
+    previous_count = scene.audio_lane_count
+    try:
+        audio_asset = _register_export_asset(
+            project,
+            audio_abs_path,
+            asset_type="audio",
+            folder=folder,
+            technical_metadata={
+                "duration_sec": total_frames / fps,
+                "sample_rate": sample_rate,
+            },
+            generation_params={
+                **dict(generation_params),
+                "source_video_asset_id": video_asset.asset_id,
+                "extracted_for_take_audio": not bool(prepared_audio_path),
+                "prepared_float_sidecar": bool(prepared_audio_path),
+            },
+        )
 
-    existing_lanes = [int(getattr(track, "lane_index", 0) or 0) for track in getattr(scene, "audio_tracks", [])]
-    new_lane = (max(existing_lanes) if existing_lanes else -1) + 1
-    ensure_lane_index(scene, "audio", new_lane, LaneConfig)
+        existing_lanes = [int(getattr(track, "lane_index", 0) or 0) for track in getattr(scene, "audio_tracks", [])]
+        new_lane = (max(existing_lanes) if existing_lanes else -1) + 1
+        ensure_lane_index(scene, "audio", new_lane, LaneConfig)
 
-    track = AudioTrack(
-        source_path=audio_asset.path,
-        timeline_start_frame=start,
-        timeline_end_frame=end,
-        source_in_frame=0,
-        total_source_frames=total_frames,
-        source_origin_frame=0,
-        muted=bool(muted),
-        lane_index=new_lane,
-    )
-    scene.audio_tracks.append(track)
-    return track, audio_abs_path
+        track = AudioTrack(
+            source_path=audio_asset.path,
+            timeline_start_frame=start,
+            timeline_end_frame=end,
+            source_in_frame=0,
+            total_source_frames=total_frames,
+            source_origin_frame=0,
+            muted=bool(muted),
+            lane_index=new_lane,
+        )
+        scene.audio_tracks.append(track)
+        return track, audio_abs_path
+    except BaseException:
+        project.assets[:] = previous_assets
+        scene.audio_tracks[:] = previous_tracks
+        scene.audio_lane_configs[:] = previous_configs
+        scene.audio_lane_count = previous_count
+        raise
 
 
 def _register_export_asset(
@@ -687,8 +678,6 @@ class TimelineExportManager:
         include_audio = _coerce_bool(body.get("include_audio"), True)
         if not include_video and not include_audio:
             raise ValueError("Enable video or audio to export")
-        if not include_video and not getattr(scene, "audio_tracks", []):
-            raise ValueError("Audio-only export requires at least one scene audio track")
 
         return {
             "scene_id": scene_id,
@@ -755,11 +744,17 @@ class TimelineExportManager:
                 job.frames_done = 0
                 rgb_frames = iter_scene_frames(project, scene, start, end, cancel_event=job.cancel_event)
 
+            work_dir = _transient_temp_dir()
+            prepared_audio_path = None
+            if place_as_take and include_video:
+                prepared_audio_path = os.path.join(work_dir, f"_tmp_export_prepared_{job.job_id}.wav")
+                cleanup_paths.append(prepared_audio_path)
             mixed_audio_path = None
             mixed_audio_contributors = []
-            if include_audio and getattr(scene, "audio_tracks", []):
+            audio_enabled = include_audio and (not include_video or bool(_preset_audio_args(preset_id, custom_options)))
+            if audio_enabled:
                 self._set_phase(job, "mixing_audio", "Mixing audio...")
-                mixed_audio_path = os.path.join(_transient_temp_dir(), f"_tmp_export_audio_{job.job_id}.wav")
+                mixed_audio_path = os.path.join(work_dir, f"_tmp_export_audio_{job.job_id}.wav")
                 cleanup_paths.append(mixed_audio_path)
                 mixed_audio_contributors = mix_scene_audio_to_wav(
                     project,
@@ -769,8 +764,13 @@ class TimelineExportManager:
                     mixed_audio_path,
                     cancel_event=job.cancel_event,
                 )
-            elif include_audio:
-                job.warnings.append("Scene has no audio tracks; exported video has no audio stream.")
+
+            has_output_audio = audio_enabled and bool(active_contributors(mixed_audio_contributors))
+            if audio_enabled and not has_output_audio:
+                job.warnings.append(
+                    "Selected window has no audible audio; exported video has no audio stream"
+                    if include_video else "Selected window has no audible audio; exported audio is silent"
+                )
 
             self._check_cancel(job)
             self._set_phase(job, "encoding", "Encoding...")
@@ -810,7 +810,9 @@ class TimelineExportManager:
                     preset_id=preset_id,
                     output_path=temp_output_path,
                     fps=fps,
-                    audio_path=mixed_audio_path if mixed_audio_path and os.path.isfile(mixed_audio_path) else None,
+                    audio_path=mixed_audio_path if has_output_audio else None,
+                    audio_sidecar_path=prepared_audio_path,
+                    work_dir=work_dir,
                     custom_options=custom_options,
                     timeout=export_timeout,
                     cancel_event=job.cancel_event,
@@ -826,15 +828,17 @@ class TimelineExportManager:
                 if not mixed_audio_path or not os.path.isfile(mixed_audio_path):
                     raise ValueError("Audio-only export had no mixed audio source")
                 audio_spec = audio_only_export_spec(preset_id, custom_options)
-                encode_audio(
+                audio_metadata = encode_audio(
                     mixed_audio_path,
                     temp_output_path,
                     codec=audio_spec["codec"],
                     container=audio_spec["container"],
                     bitrate_kbps=audio_spec.get("bitrate_kbps"),
+                    bits=audio_spec.get("bits"),
+                    work_dir=work_dir,
                     cancel_event=job.cancel_event,
                 )
-                encode_metadata = dict(audio_spec["metadata"])
+                encode_metadata = {**audio_spec["metadata"], **(audio_metadata or {})}
 
             self._check_cancel(job)
             atomic_replace(temp_output_path, final_output_path)
@@ -847,8 +851,11 @@ class TimelineExportManager:
             _pre_item_ids = snapshot_item_ids(current_project)
             current_scene = current_project.get_scene(job.request["scene_id"])
             if place_as_take and include_video and not current_scene:
-                job.warnings.append("Target scene was deleted; placement skipped.")
+                job.warnings.append("Target scene was deleted; placement skipped")
 
+            job.audio_processing = dict(encode_metadata.get("audio_processing") or {})
+            job.warnings.extend(encode_metadata.get("warnings") or [])
+            job.alerts.extend(encode_metadata.get("alerts") or [])
             generation_params = dict(encode_metadata)
             generation_params["editor_export"] = editor_export
 
@@ -860,12 +867,13 @@ class TimelineExportManager:
                     "fps": fps,
                     "duration_sec": frame_count / fps if fps > 0 else 0.0,
                 })
-                technical["has_audio"] = bool(mixed_audio_path and os.path.isfile(mixed_audio_path) and mixed_audio_contributors is not None)
+                technical["has_audio"] = has_output_audio
+                technical["sample_rate"] = job.audio_processing.get("sample_rate", 0)
                 asset_type = "video"
             else:
                 technical = {
                     "duration_sec": (end - start) / fps if fps > 0 else 0.0,
-                    "sample_rate": 44100,
+                    "sample_rate": job.audio_processing.get("sample_rate", 48000),
                 }
                 asset_type = "audio"
 
@@ -895,7 +903,7 @@ class TimelineExportManager:
                 job.placed_clip = clip.to_dict()
                 job.result_scene_id = current_scene.scene_id
                 placed_audio_track = None
-                if asset.has_audio:
+                if asset.has_audio and encode_metadata.get("audio_sidecar_ready") and prepared_audio_path and os.path.isfile(prepared_audio_path):
                     try:
                         audio_take = _place_embedded_audio_take(
                             current_project,
@@ -908,16 +916,17 @@ class TimelineExportManager:
                             muted=take_placement_muted,
                             cancel_event=job.cancel_event,
                             cleanup_paths=cleanup_paths,
+                            prepared_audio_path=prepared_audio_path,
                         )
                         if audio_take:
                             placed_audio_track, placed_audio_cleanup_path = audio_take
                         else:
-                            job.warnings.append("Placed video take, but embedded audio extraction did not produce a timeline audio track.")
+                            job.alerts.append("Placed video take, but no usable timeline audio was produced")
                     except (TimelineRenderCancelled, MediaOperationCancelled):
                         raise
                     except Exception as exc:
                         logger.warning("Timeline export take audio extraction failed: %s", exc)
-                        job.warnings.append("Placed video take, but embedded audio extraction failed.")
+                        job.alerts.append("Placed video take, but its timeline audio could not be created")
                 if take_placement_linked and placed_audio_track is not None:
                     current_scene.linked_item_groups.append({
                         "group_id": uuid.uuid4().hex[:8],

@@ -62,12 +62,17 @@ def _import_io_nodes(tmp_path, monkeypatch):
         sys.modules[TEST_PACKAGE] = pkg
 
     importlib.invalidate_caches()
-    return importlib.import_module(f"{TEST_PACKAGE}.nodes.io_nodes")
+    module = importlib.import_module(f"{TEST_PACKAGE}.nodes.io_nodes")
+    monkeypatch.setattr(module, "folder_paths", folder_paths)
+    return module
 
 
 def _fake_encode_video_success(io_nodes, calls=None):
     def fake_encode_video(frames_iter, *, preset_id, output_path, fps, audio_path=None, custom_options=None, timeout=90, **kwargs):
         Path(output_path).write_bytes(b"video")
+        if audio_path and kwargs.get("audio_sidecar_path"):
+            import shutil
+            shutil.copyfile(audio_path, kwargs["audio_sidecar_path"])
         if calls is not None:
             calls.append({
                 "preset_id": preset_id,
@@ -78,7 +83,8 @@ def _fake_encode_video_success(io_nodes, calls=None):
                 "timeout": timeout,
                 **kwargs,
             })
-        return io_nodes.metadata_for_save_preset(preset_id, custom_options)
+        return {**io_nodes.metadata_for_save_preset(preset_id, custom_options),
+                "audio_sidecar_ready": bool(audio_path and kwargs.get("audio_sidecar_path"))}
 
     return fake_encode_video
 
@@ -3114,7 +3120,6 @@ def test_save_video_untrimmed_take_audio_and_video_exclude_constraint_padding(tm
     monkeypatch.setattr(io_nodes, "encode_video", _fake_encode_video_success(io_nodes))
     monkeypatch.setattr(io_nodes, "save_project", lambda project: None)
     monkeypatch.setattr(thumbnail_service, "ensure_thumbnail", lambda *args, **kwargs: None)
-    monkeypatch.setattr(io_nodes, "write_audio_wav", lambda path, samples, sample_rate: Path(path).write_bytes(b"audio"))
 
     node = io_nodes.SonderSaveVideo()
     frames = torch.zeros(9, 2, 2, 3, dtype=torch.float32)
@@ -3337,7 +3342,8 @@ def test_save_video_take_mode_creates_audio_track_when_audio_present(tmp_path, m
     saved_audio_paths = []
 
     def fake_write_audio_wav(path, samples, sample_rate):
-        Path(path).write_bytes(b"audio")
+        from server.audio_pipeline import write_float_wav
+        write_float_wav(path, samples, sample_rate)
         saved_audio_paths.append(path)
 
     monkeypatch.setattr(io_nodes, "encode_video", _fake_encode_video_success(io_nodes))
@@ -3380,7 +3386,8 @@ def test_save_video_take_mode_creates_audio_track_when_audio_present(tmp_path, m
         {"type": "clip", "id": scene.clips[-1].clip_id},
         {"type": "audio", "id": scene.audio_tracks[-1].track_id},
     ]
-    assert any(str(path).endswith("_audio.wav") for path in saved_audio_paths)
+    assert len(saved_audio_paths) == 1  # Only supplied AUDIO is written; the encoder owns the sidecar.
+    assert (project_dir / audio_assets[0].path).is_file()
 
 
 def test_save_video_passes_audio_and_computed_timeout_to_encoder(tmp_path, monkeypatch):
@@ -3551,12 +3558,8 @@ def test_load_scene_audio_caps_track_to_timeline_trim(tmp_path, monkeypatch):
     waveform = (torch.arange(200, dtype=torch.float32) / 1000.0).unsqueeze(0)
     stereo_samples = editor_node.np.vstack([waveform.numpy(), waveform.numpy()])
 
-    def fake_decode_audio_samples(path, *, sample_rate, channels, mix_to_mono=True, **kwargs):
-        assert channels == 2
-        assert mix_to_mono is False
-        return stereo_samples.copy(), sample_rate
-
-    monkeypatch.setattr(editor_node, "decode_audio_samples", fake_decode_audio_samples)
+    from scipy.io import wavfile
+    wavfile.write(audio_path, sample_rate, stereo_samples.T)
 
     track = types.SimpleNamespace(
         muted=False,
@@ -3587,105 +3590,28 @@ def test_load_scene_audio_caps_track_to_timeline_trim(tmp_path, monkeypatch):
     assert torch.allclose(mixed[20:], torch.zeros(20))
 
 
-def test_load_scene_audio_logs_missing_source_and_silent_fallback(tmp_path, monkeypatch, caplog):
-    editor_node = _import_editor_node(tmp_path, monkeypatch)
 
-    def fail_decode_audio_samples(*args, **kwargs):
-        raise AssertionError("unexpected decode")
-
-    monkeypatch.setattr(editor_node, "decode_audio_samples", fail_decode_audio_samples)
-
-    track = types.SimpleNamespace(
-        muted=False,
-        lane_index=0,
-        timeline_start_frame=0,
-        timeline_end_frame=12,
-        source_path="missing.wav",
-        source_in_frame=0,
-        volume=1.0,
-    )
-    scene = types.SimpleNamespace(
-        fps=0.0,
-        audio_tracks=[track],
-        audio_lane_configs=[],
-    )
-    project = types.SimpleNamespace(
-        fps=24.0,
-        project_dir=str(tmp_path),
-    )
-
-    caplog.set_level("INFO", logger="sonder_editor")
-
-    node = editor_node.SonderEditor()
-    audio = node._load_scene_audio(project, scene, 0, 12)
-
-    assert audio["sample_rate"] == 44100
-    assert "file not found" in caplog.text
-    assert "fell back to silence" in caplog.text
+def test_load_scene_audio_omits_missing_source_and_returns_silence(tmp_path, monkeypatch):
+    editor = _import_editor_node(tmp_path, monkeypatch)
+    state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+    project = state.TimelineProject(project_dir=str(tmp_path), fps=24)
+    scene = state.Scene(audio_tracks=[state.AudioTrack(source_path="missing.wav",timeline_end_frame=12)])
+    result = editor.SonderEditor()._load_scene_audio(project,scene,0,12)
+    assert result["sample_rate"] == 48000
+    assert tuple(result["waveform"].shape) == (1,2,24000)
+    assert result["waveform"].count_nonzero() == 0
 
 
-def test_load_scene_audio_skips_failed_track_and_keeps_good_mix(tmp_path, monkeypatch, caplog):
-    editor_node = _import_editor_node(tmp_path, monkeypatch)
-    torch = importlib.import_module("torch")
 
-    media_dir = tmp_path / "media"
-    media_dir.mkdir()
-    bad_path = media_dir / "bad.wav"
-    good_path = media_dir / "good.wav"
-    bad_path.write_bytes(b"bad")
-    good_path.write_bytes(b"good")
+def test_load_scene_audio_refuses_corrupt_audible_source(tmp_path, monkeypatch):
+    editor = _import_editor_node(tmp_path, monkeypatch)
+    state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+    (tmp_path / "bad.wav").write_bytes(b"bad")
+    project = state.TimelineProject(project_dir=str(tmp_path),fps=24)
+    scene = state.Scene(audio_tracks=[state.AudioTrack(source_path="bad.wav",timeline_end_frame=24)])
+    with pytest.raises(RuntimeError, match="Could not probe usable audio"):
+        editor.SonderEditor()._load_scene_audio(project,scene,0,24)
 
-    sample_rate = 44100
-    fps = 44100.0
-    good_samples = editor_node.np.ones((2, 10), dtype=editor_node.np.float32) * 0.25
-
-    def fake_decode_audio_samples(path, *, sample_rate, channels, mix_to_mono=True, **kwargs):
-        assert channels == 2
-        assert mix_to_mono is False
-        if str(path).endswith("bad.wav"):
-            raise RuntimeError("decode failed")
-        return good_samples.copy(), sample_rate
-
-    monkeypatch.setattr(editor_node, "decode_audio_samples", fake_decode_audio_samples)
-
-    bad_track = types.SimpleNamespace(
-        muted=False,
-        lane_index=0,
-        timeline_start_frame=0,
-        timeline_end_frame=10,
-        source_path=os.path.join("media", "bad.wav"),
-        source_in_frame=0,
-        volume=1.0,
-    )
-    good_track = types.SimpleNamespace(
-        muted=False,
-        lane_index=0,
-        timeline_start_frame=0,
-        timeline_end_frame=10,
-        source_path=os.path.join("media", "good.wav"),
-        source_in_frame=0,
-        volume=1.0,
-    )
-    scene = types.SimpleNamespace(
-        fps=fps,
-        audio_tracks=[bad_track, good_track],
-        audio_lane_configs=[],
-    )
-    project = types.SimpleNamespace(
-        fps=fps,
-        project_dir=str(tmp_path),
-    )
-
-    caplog.set_level("WARNING", logger="sonder_editor")
-
-    node = editor_node.SonderEditor()
-    audio = node._load_scene_audio(project, scene, 0, 10)
-
-    mixed = audio["waveform"][0]
-    assert audio["sample_rate"] == sample_rate
-    assert torch.allclose(mixed, torch.from_numpy(good_samples))
-    assert "Failed to decode/mix scene audio track" in caplog.text
-    assert "bad.wav" in caplog.text
 
 
 def test_execute_applies_guide_driver_collision_manifest(tmp_path, monkeypatch):
@@ -4044,3 +3970,122 @@ def test_padding_sits_outside_the_mask_once_post_context_is_present(tmp_path, mo
     zero_ctx = zero_post._execution_context
     assert zero_ctx["frame_count_padding"] > 0
     assert zero_ctx["mask_end_frame"] == zero_ctx["frame_count"]
+
+
+@pytest.mark.parametrize("preset", ["Compatible MP4", "Editing Master MP4"])
+def test_save_video_real_audio_sidecar_shares_verified_gain(tmp_path, monkeypatch, preset):
+    io = _import_io_nodes(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+    import numpy as np
+    from scipy.io import wavfile
+    state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+    scene = state.Scene(scene_id="audio-qa", duration_frames=12)
+    project = state.TimelineProject(project_dir=str(tmp_path), name="Audio QA", scenes=[scene])
+    (tmp_path / "media").mkdir(exist_ok=True)
+    project._execution_context = {"scene_id": scene.scene_id, "selection_start": 0,
+                                  "selection_end": 12, "pre_context_frames": 0, "post_context_frames": 0}
+    monkeypatch.setattr(io, "_save_generated_project", lambda *a, **k: None)
+    original = (1.3 * torch.sin(torch.arange(9600) * (2 * np.pi * 400 / 96000))).repeat(1, 2, 1)
+    supplied = {"waveform": original.clone(), "sample_rate": 96000}
+    result = io.SonderSaveVideo().save_video(project, torch.zeros(12, 32, 32, 3),
+                                            filename_prefix="audio_qa", fps=24, mode="Take",
+                                            audio=supplied, save_preset=preset)
+    video = next(a for a in project.assets if a.asset_type == "video")
+    sidecar = next(a for a in project.assets if a.asset_type == "audio")
+    processing = video.generation_params["audio_processing"]
+    rate, samples = wavfile.read(tmp_path / sidecar.path)
+    assert rate == sidecar.sample_rate == 96000
+    assert samples.shape == (48000, 2)
+    np.testing.assert_allclose(samples[:9600].T, original.numpy()[0] * processing["gain"], atol=1e-7)
+    assert not np.any(samples[9600:])
+    assert torch.equal(supplied["waveform"], original)
+    assert result["ui"]["sonder_video"][0]["warnings"] == processing["warnings"]
+
+
+def test_editor_idle_audio_uses_empty_scene_rate(tmp_path, monkeypatch):
+    editor = _import_editor_node(tmp_path, monkeypatch)
+    assert editor._make_silent_audio(1)['sample_rate'] == 48000
+    assert editor.SonderEditor._minimal_audio_output()['sample_rate'] == 48000
+
+
+@pytest.mark.parametrize('surface', ['save', 'preview'])
+@pytest.mark.parametrize('fault', ['nan', 'empty', 'verification'])
+def test_unpreparable_supplied_audio_preserves_video_with_alert(tmp_path, monkeypatch, surface, fault):
+    io = _import_io_nodes(tmp_path, monkeypatch)
+    torch = importlib.import_module('torch')
+    state = importlib.import_module(f'{TEST_PACKAGE}.server.timeline_state')
+    audio_module = importlib.import_module(f'{TEST_PACKAGE}.server.audio_pipeline')
+    media = importlib.import_module(f'{TEST_PACKAGE}.server.media_helpers')
+    scene = state.Scene(scene_id='qa', duration_frames=4)
+    project = state.TimelineProject(project_dir=str(tmp_path), name='Fallback QA', scenes=[scene])
+    (tmp_path / 'media').mkdir(exist_ok=True)
+    project._execution_context = {'scene_id': 'qa', 'selection_start': 0, 'selection_end': 4}
+    monkeypatch.setattr(io, '_save_generated_project', lambda *a, **k: None)
+    samples = torch.full((1, 2, 0 if fault == 'empty' else 4800), .1)
+    if fault == 'nan':
+        samples[0, 0, 12] = float('nan')
+    if fault == 'verification':
+        original = audio_module.measure_peaks
+        def failed_verification(path, **kwargs):
+            result = original(path, **kwargs)
+            if os.path.basename(path) == 'decoded.wav':
+                result['peak'] = 1.2
+            return result
+        monkeypatch.setattr(audio_module, 'measure_peaks', failed_verification)
+    audio = {'waveform': samples.clone(), 'sample_rate': 48000}
+    frames = torch.zeros(4, 32, 32, 3)
+    if surface == 'save':
+        result = io.SonderSaveVideo().save_video(project, frames, filename_prefix='recover', fps=24,
+                                                mode='Take', audio=audio)
+        path = Path(result['result'][0])
+        assert len(project.assets) == 1 and not project.assets[0].has_audio
+        assert len(scene.clips) == 1 and not scene.audio_tracks and not scene.linked_item_groups
+    else:
+        result = io.SonderPreviewVideo().preview(frames, fps=24, audio=audio)
+        path = tmp_path / 'temp' / result['ui']['sonder_video'][0]['filename']
+    descriptor = result['ui']['sonder_video'][0]
+    assert descriptor['has_audio'] is False
+    assert len(descriptor['alerts']) == 1 and path.name in descriptor['alerts'][0]
+    assert 'without audio' in descriptor['alerts'][0]
+    assert descriptor['warnings'] == [] and descriptor['audio_processing'] == {}
+    assert 'Audio:' not in media._ffmpeg_input_text(path)
+    import cv2
+    cap = cv2.VideoCapture(str(path))
+    try:
+        assert cap.get(cv2.CAP_PROP_FRAME_COUNT) == 4
+    finally:
+        cap.release()
+    torch.testing.assert_close(audio['waveform'], samples, equal_nan=True)
+    assert not list((tmp_path / 'temp').glob('_tmp_*'))
+    assert not list((tmp_path / 'temp').glob('sonder_audio_delivery_*'))
+
+
+@pytest.mark.parametrize('fault', ['copy', 'placement'])
+def test_save_audio_sidecar_failure_keeps_delivered_audio_and_warns(tmp_path, monkeypatch, fault):
+    io = _import_io_nodes(tmp_path, monkeypatch)
+    torch = importlib.import_module('torch')
+    state = importlib.import_module(f'{TEST_PACKAGE}.server.timeline_state')
+    audio_module = importlib.import_module(f'{TEST_PACKAGE}.server.audio_pipeline')
+    thumbs = importlib.import_module(f'{TEST_PACKAGE}.server.thumbnail_service')
+    scene = state.Scene(scene_id='qa', duration_frames=4)
+    project = state.TimelineProject(project_dir=str(tmp_path), name='Sidecar QA', scenes=[scene])
+    (tmp_path / 'media').mkdir(exist_ok=True)
+    project._execution_context = {'scene_id': 'qa', 'selection_start': 0, 'selection_end': 4}
+    monkeypatch.setattr(io, '_save_generated_project', lambda *a, **k: None)
+    if fault == 'copy':
+        def fail_copy(src, target, **kwargs):
+            Path(target).write_bytes(b'partial')
+            raise OSError('test sidecar disk failure')
+        monkeypatch.setattr(audio_module, 'copy_audio_file', fail_copy)
+    else:
+        def fail_audio_thumb(kind, *args, **kwargs):
+            if kind == 'audio':
+                raise OSError('test placement failure')
+        monkeypatch.setattr(thumbs, 'ensure_thumbnail', fail_audio_thumb)
+    result = io.SonderSaveVideo().save_video(project, torch.zeros(4, 32, 32, 3), fps=24, mode='Take',
+        audio={'waveform': torch.full((1, 2, 4800), .1), 'sample_rate': 48000})
+    descriptor = result['ui']['sonder_video'][0]
+    assert descriptor['has_audio'] and descriptor['alerts']
+    assert len(project.assets) == 1 and project.assets[0].has_audio
+    assert len(scene.clips) == 1 and not scene.audio_tracks and not scene.linked_item_groups
+    assert not list((tmp_path / 'media').glob('*_audio.wav'))

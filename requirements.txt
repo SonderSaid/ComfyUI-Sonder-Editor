@@ -4,9 +4,9 @@
 # ComfyUI already ships a torch build matched to your GPU/CUDA. If a bare
 # `torch`/`torchaudio` is pip-installed (e.g. by ComfyUI-Manager resolving
 # requirements), it can overwrite that build with a mismatched, often
-# CPU-only wheel and break GPU acceleration. Audio features use torchaudio;
-# if it is missing, install the build that matches your existing torch/CUDA
-# version manually. See the "Troubleshooting" section of README.md.
+# CPU-only wheel and break GPU acceleration. Audio decode, mixing and export
+# use FFmpeg; torchaudio is only an optional waveform-thumbnail fallback.
+# See the "Troubleshooting" section of README.md.
 
 # Image / array — ships with ComfyUI; listed for standalone environments
 numpy

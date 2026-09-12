@@ -133,7 +133,7 @@ def test_resize_interpolation_picks_area_on_downscale_and_lanczos_on_upscale():
 def test_decode_audio_samples_can_return_channel_first_stereo(monkeypatch):
     pcm = np.array(
         [1000, -1000, 2000, -2000, 3000, -3000, 4000, -4000],
-        dtype=np.int16,
+        dtype=np.float32,
     ).tobytes()
 
     def fake_run(cmd, capture_output, timeout):
@@ -156,29 +156,17 @@ def test_decode_audio_samples_can_return_channel_first_stereo(monkeypatch):
     expected = np.array(
         [[1000, 2000, 3000, 4000], [-1000, -2000, -3000, -4000]],
         dtype=np.float32,
-    ) / 32768.0
+    )
     assert sample_rate == 48000
     assert samples.shape == (2, 4)
     assert np.allclose(samples, expected)
 
 
 def test_write_audio_wav_writes_channel_first_float_pcm(tmp_path):
-    output_path = tmp_path / "audio.wav"
-    samples = np.array(
-        [[0.0, 0.5, -1.0], [1.0, -0.5, 0.25]],
-        dtype=np.float32,
-    )
-
-    write_audio_wav(str(output_path), samples, 8000)
-
-    with wave.open(str(output_path), "rb") as wav_file:
-        assert wav_file.getnchannels() == 2
-        assert wav_file.getsampwidth() == 2
-        assert wav_file.getframerate() == 8000
-        pcm = np.frombuffer(wav_file.readframes(3), dtype="<i2").reshape(-1, 2)
-
-    expected = np.array(
-        [[0, 32767], [16383, -16383], [-32767, 8191]],
-        dtype=np.int16,
-    )
-    assert np.array_equal(pcm, expected)
+    from scipy.io import wavfile
+    samples = np.array([[0, .50000006, -1.3], [1.5, -.5, .25]], dtype=np.float32)
+    output = tmp_path / "audio.wav"
+    write_audio_wav(output, samples, 8000)
+    rate, decoded = wavfile.read(output)
+    assert rate == 8000 and decoded.dtype == np.float32
+    np.testing.assert_array_equal(decoded.T, samples)

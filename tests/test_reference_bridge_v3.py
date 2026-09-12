@@ -1015,8 +1015,8 @@ def test_audio_bridge_nothing_preserves_live_payload_and_omits_fallbacks(
 
     tolerant = core.decode_reference_audios(absent, "unrecognised")
     assert len(tolerant) == 16
-    assert all(value["sample_rate"] == 44100 for value in tolerant)
-    assert all(tuple(value["waveform"].shape) == (1, 2, 44100) for value in tolerant)
+    assert all(value["sample_rate"] == 48000 for value in tolerant)
+    assert all(tuple(value["waveform"].shape) == (1, 2, 48000) for value in tolerant)
     assert tolerant[0] is not tolerant[1]
     assert tolerant[0]["waveform"] is not tolerant[1]["waveform"]
     tolerant[0]["waveform"][0, 0, 0] = 1.0
@@ -1224,6 +1224,7 @@ def test_audio_bridge_emits_one_trimmed_member_per_slot(monkeypatch, tmp_path):
     assert len(values) == 16
     assert [value["waveform"] for value in values[:3]] == ["member0", "member1", "member2"]
     assert values[3]["waveform"].shape[1] == 2
+    assert all(value["sample_rate"] == 44100 for value in values)
 
 
 def test_authored_strength_and_sequence_length_reach_selector_and_temporal_assembly(monkeypatch, tmp_path):

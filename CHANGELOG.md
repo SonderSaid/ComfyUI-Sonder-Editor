@@ -15,12 +15,19 @@ a fresh `[Unreleased]` block.
 - Project-wide Keep/Drop for out-of-window Reference text, with independent per-chip overrides and visible markers.
 
 ### Changed
+- Editing Master MP4 and audio-only exports now use 24-bit FLAC; ProRes uses 24-bit PCM and FFV1 uses 24-bit FLAC.
+- Silent Editor output uses 48 kHz; Reference placeholders follow the highest live native rate, or 48 kHz when empty. Audio socket shapes and ordering remain unchanged.
+- Stored audio volumes above 100% now render at 100%, matching timeline playback; stored project values remain intact.
+- Audio processing now requires FFmpeg 7.0 or newer.
 - Non-winning Reference chips warn instead of refusing generation; deleted bindings still block. Legacy project-less replay now composes prompts for non-winning Reference chips.
 - Boundary Prompt and Reference thresholds measure overlap relative to the shorter item/window span; short windows can retain neighbors previously dropped, including at the default prompt threshold of 10%.
 - Frozen threshold values use the current coverage rule when resolved again, including legacy v0.2.2 prompt replay.
 
 ### Fixed
+- Save Video and Preview retain valid video when supplied audio cannot be prepared, with visible alerts; failed take-audio placement rolls back its additions without discarding the video. Audio processing uses the configured temp volume and avoids unnecessary copies.
+- Corrupt audio only blocks windows using that source; empty, muted and zero-volume windows export video without manufacturing silent audio tracks. RF64 float WAVs now read back correctly, and digital silence stays silent in integer delivery.
 - Reference chip dialogs save and close when their existing source is inactive, including later linked copies.
+- Audio exports retain track balance when clips end, including mono dialogue mixed with stereo music; editor audio and exports share sample-accurate float mixing, float sidecars, and reported constant headroom protection.
 - References covering the entire render window survive every threshold; high Boundary Prompt thresholds retain the stronger section instead of a neighboring sliver.
 - Fixed false project conflicts during multi-file import and replacement, preserved committed replacement media when cleanup fails, and named failed imports in gallery notifications.
 - Sonder Save Bridge accepts a typed or existing **Target Folder** again. Picking or typing any label other than Root previously failed the run during prompt validation; the label is now created when the outputs register.

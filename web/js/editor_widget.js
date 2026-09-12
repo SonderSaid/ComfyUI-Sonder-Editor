@@ -18887,7 +18887,12 @@ export class EditorWidget {
     async _handleTimelineExportComplete(data) {
         const asset = data?.result?.asset || null;
         this._exportJobId = "";
-        const msg = asset?.name ? `Exported ${asset.name}` : "Export complete";
+        const summary = asset?.name ? `Exported ${asset.name}` : "Export complete";
+        const warnings = Array.isArray(data?.warnings) ? data.warnings : [];
+        const msg = [summary, ...warnings].map(text => String(text).trim().replace(/\.+$/, "")).filter(Boolean).join(". ") + ".";
+        for (const alert of Array.isArray(data?.alerts) ? data.alerts : []) {
+            notifyWarning(alert, { source: "timeline-export-audio" });
+        }
         // Resolve (and detach) the progress handle before hiding the panel so the
         // hide-path's cancel cleanup does not dismiss the success toast.
         if (this._exportNotif) {

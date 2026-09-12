@@ -427,3 +427,50 @@ console.log(JSON.stringify({{
     assert controller_asset["mode"] == "read"
     assert controller_asset["reason"] == "save_video_complete"
     assert result["saveCounter"] == 1
+
+
+def test_audio_completion_notices_keep_headroom_routine_and_failures_sticky():
+    source = EXTENSION.read_text(encoding='utf-8')
+    notices = []
+    marker = '                const descriptor = message?.sonder_video?.[0];'
+    for section in source.split(marker)[1:]:
+        notices.append(marker + section.split('                if (descriptor) {', 1)[0])
+    assert len(notices) == 2
+    for code in notices:
+        result = _run_node(f"""
+const calls = [];
+const notifyInfo = (message, options) => calls.push({{tier:'info', message}});
+const notifyWarning = (message, options) => calls.push({{tier:'warning', message}});
+const callback = function(message) {{ {code} }};
+callback.call({{id:7}}, {{sonder_video:[{{warnings:['Audio reduced by 2.8 dB'], alerts:['Saved video without audio']}}]}});
+console.log(JSON.stringify(calls));
+""")
+        assert result == [{'tier': 'info', 'message': 'Audio reduced by 2.8 dB'},
+                          {'tier': 'warning', 'message': 'Saved video without audio'}]
+
+
+def test_timeline_export_notice_summary_precedes_reduction_without_double_periods():
+    source = (ROOT / 'web/js/editor_widget.js').read_text(encoding='utf-8')
+    method = _between(source, '    async _handleTimelineExportComplete(data)', '    // ── Render Queue')
+    result = _run_node(f"""
+const calls = [];
+const notifyWarning = message => calls.push({{tier:'warning', message}});
+const notifySuccess = message => calls.push({{tier:'success', message}});
+class Harness {{
+{method}
+_hideExportPanel() {{}}
+async _fetchAssets() {{}}
+async _fetchScenes() {{}}
+_inspectAssetInGallery() {{}}
+}}
+const editor = new Harness();
+editor._exportNotif = {{resolve: (options) => calls.push({{tier:'resolved', ...options}})}};
+await editor._handleTimelineExportComplete({{result:{{asset:{{name:'clip.mp4'}}}}, warnings:['Audio reduced by 2.8 dB.']}});
+await editor._handleTimelineExportComplete({{result:{{asset:{{name:'quiet.mp4'}}}}, warnings:[]}});
+await editor._handleTimelineExportComplete({{alerts:['Timeline audio could not be placed']}});
+console.log(JSON.stringify(calls));
+""")
+    assert result[0] == {'tier': 'resolved', 'message': 'Exported clip.mp4. Audio reduced by 2.8 dB.'}
+    assert result[1] == {'tier': 'success', 'message': 'Exported quiet.mp4.'}
+    assert result[2] == {'tier': 'warning', 'message': 'Timeline audio could not be placed'}
+    assert result[3] == {'tier': 'success', 'message': 'Export complete.'}

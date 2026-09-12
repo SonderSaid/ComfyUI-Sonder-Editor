@@ -370,7 +370,7 @@ def _empty_image(width: int, height: int) -> torch.Tensor:
     return torch.zeros((1, max(1, height), max(1, width), 3), dtype=torch.float32)
 
 
-def _silent_audio(duration_sec=1.0, sample_rate=44100) -> dict:
+def _silent_audio(duration_sec=1.0, sample_rate=48000) -> dict:
     samples = max(1, int(max(0.0, duration_sec) * sample_rate))
     return {"waveform": torch.zeros((1, 2, samples), dtype=torch.float32), "sample_rate": sample_rate}
 
@@ -783,7 +783,7 @@ def _member_prompts(records: list[dict[str, Any]], recipe: dict,
 
 def _audio_output(record: dict[str, Any]) -> dict:
     member = record["member"]
-    samples, sample_rate = decode_audio_samples(record["path"], sample_rate=44100, channels=2, mix_to_mono=False)
+    samples, sample_rate = decode_audio_samples(record["path"], channels=2, mix_to_mono=False)
     start = max(0, round(_float(getattr(member, "source_start_sec", 0.0)) * sample_rate))
     raw_end = getattr(member, "source_end_sec", None)
     end = samples.shape[1] if raw_end is None else min(samples.shape[1], max(start + 1, round(_float(raw_end) * sample_rate)))
@@ -1035,7 +1035,6 @@ def decode_reference_audios(reference_set, unused_slots="placeholder") -> tuple:
     """Return a01..a16 with each selected lane occupying a stable span."""
     ref = reference_set if isinstance(reference_set, dict) else {}
     contexts = _reference_decode_contexts(ref, "audio")
-    fallback = (lambda: None) if unused_slots == "nothing" else _silent_audio
     reservations = [
         context["reserved_span"]
         if context["media_kind"] == "audio" and "audio_slots" in context.get("live", set())
@@ -1047,9 +1046,13 @@ def decode_reference_audios(reference_set, unused_slots="placeholder") -> tuple:
     for context, reserved in zip(contexts, reservations):
         lane_values = _decode_lane_audios(context)
         values.extend(lane_values[:reserved])
-        values.extend(fallback() for _ in range(max(0, reserved - len(lane_values))))
-    values.extend(fallback() for _ in range(MAX_REFERENCE_SLOTS - len(values)))
-    return tuple(values)
+        values.extend(None for _ in range(max(0, reserved - len(lane_values))))
+    values.extend(None for _ in range(MAX_REFERENCE_SLOTS - len(values)))
+    # Live slots keep their own native rates. Placeholders share the highest live
+    # rate (48 kHz when none are live), avoiding an unrelated legacy 44.1 kHz clock.
+    rate = max((value["sample_rate"] for value in values if value is not None), default=48000)
+    return tuple(_silent_audio(sample_rate=rate) if value is None and unused_slots != "nothing" else value
+                 for value in values)
 
 
 def decode_reference_prompts(reference_set) -> tuple:

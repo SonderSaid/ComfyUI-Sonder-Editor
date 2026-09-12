@@ -254,7 +254,7 @@ def test_audio_duration_falls_back_to_ffmpeg_duration_when_ffprobe_missing(monke
             raise FileNotFoundError("ffprobe")
         return Result(
             returncode=1,
-            stderr="Input #0, mp3\n  Duration: 00:00:16.69, start: 0.025057, bitrate: 192 kb/s\n",
+            stderr="Input #0, mp3\n  Duration: 00:00:16.69, start: 0.025057, bitrate: 192 kb/s\n  Stream #0:0: Audio: mp3, 48000 Hz, stereo\n",
         )
 
     monkeypatch.setattr(media_helpers, "_mutagen_audio_metadata", lambda _path: (0.0, 0))

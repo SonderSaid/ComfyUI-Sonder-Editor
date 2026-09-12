@@ -16,9 +16,7 @@ from .media_helpers import (
     apply_rgb_color_correction,
     color_correction_for_interpretation,
     fit_frame_to_canvas,
-    get_ffmpeg_path,
     resolve_source_color_interpretation,
-    run_ffmpeg_command,
 )
 from .path_security import resolve_existing_project_path
 from .render_cache import (
@@ -755,132 +753,13 @@ def render_scene_frames(
         store_activity.__exit__(None, None, None)
 
 
-def _audio_contributors(
-    project: TimelineProject,
-    scene: Scene,
-    start_frame: int,
-    end_frame: int,
-) -> list[dict]:
-    fps = effective_scene_fps(project, scene)
-    hidden_lanes = hidden_lane_indexes(scene, "audio")
-    contributors = []
-    for track in getattr(scene, "audio_tracks", []) or []:
-        if getattr(track, "muted", False):
-            continue
-        if getattr(track, "lane_index", 0) in hidden_lanes:
-            continue
-        overlap_start = max(start_frame, int(track.timeline_start_frame or 0))
-        overlap_end = min(end_frame, int(track.timeline_end_frame or 0))
-        if overlap_end <= overlap_start:
-            continue
-        source_path = _resolve_project_media_path(project, track.source_path)
-        if not os.path.isfile(source_path):
-            logger.info("Skipping export audio track %s: file not found", track.source_path)
-            continue
-        source_start = int(track.source_in_frame or 0) + (overlap_start - int(track.timeline_start_frame or 0))
-        contributors.append({
-            "track": track,
-            "path": source_path,
-            "source_start_sec": max(0.0, source_start / fps),
-            "duration_sec": max(0.0, (overlap_end - overlap_start) / fps),
-            "delay_ms": max(0, int(round(((overlap_start - start_frame) / fps) * 1000.0))),
-            "volume": float(getattr(track, "volume", 1.0) if getattr(track, "volume", 1.0) is not None else 1.0),
-        })
-    return contributors
+def _audio_contributors(project, scene, start_frame, end_frame):
+    from .audio_pipeline import scene_audio_spec
+    return scene_audio_spec(project, scene, start_frame, end_frame)[2]
 
 
-def mix_scene_audio_to_wav(
-    project: TimelineProject,
-    scene: Scene,
-    start_frame: int,
-    end_frame: int,
-    output_wav: str,
-    *,
-    cancel_event=None,
-) -> list[dict]:
-    """Mix scene audio tracks into a stereo 44.1kHz WAV for [start_frame, end_frame)."""
-    _check_cancel(cancel_event)
-    fps = effective_scene_fps(project, scene)
-    duration_sec = max(0.001, (max(start_frame, end_frame) - start_frame) / fps)
-    contributors = _audio_contributors(project, scene, start_frame, end_frame)
-    os.makedirs(os.path.dirname(output_wav), exist_ok=True)
 
-    if not contributors:
-        cmd = [
-            get_ffmpeg_path(),
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "anullsrc=channel_layout=stereo:sample_rate=44100",
-            "-t",
-            f"{duration_sec:.6f}",
-            "-c:a",
-            "pcm_s16le",
-            str(output_wav),
-        ]
-        run_ffmpeg_command(cmd, timeout=max(30, int(duration_sec) + 30), cancel_event=cancel_event)
-        _check_cancel(cancel_event)
-        return []
-
-    cmd = [get_ffmpeg_path(), "-hide_banner", "-loglevel", "error", "-y"]
-    for entry in contributors:
-        cmd += [
-            "-ss",
-            f"{entry['source_start_sec']:.6f}",
-            "-t",
-            f"{entry['duration_sec']:.6f}",
-            "-i",
-            str(entry["path"]),
-        ]
-    silence_index = len(contributors)
-    cmd += [
-        "-f",
-        "lavfi",
-        "-t",
-        f"{duration_sec:.6f}",
-        "-i",
-        "anullsrc=channel_layout=stereo:sample_rate=44100",
-    ]
-
-    filters = []
-    labels = []
-    for idx, entry in enumerate(contributors):
-        label = f"a{idx}"
-        labels.append(f"[{label}]")
-        delay = int(entry["delay_ms"])
-        filters.append(
-            f"[{idx}:a]"
-            "asetpts=PTS-STARTPTS,"
-            f"volume={entry['volume']:.6f},"
-            f"adelay={delay}|{delay}"
-            f"[{label}]"
-        )
-    silence_label = "silence"
-    filters.append(f"[{silence_index}:a]anull[{silence_label}]")
-    mix_inputs = labels + [f"[{silence_label}]"]
-    filters.append(
-        "".join(mix_inputs)
-        + f"amix=inputs={len(mix_inputs)}:duration=longest,"
-        + f"volume={len(mix_inputs):.6f},"
-        + "aformat=sample_fmts=s16:channel_layouts=stereo[mix]"
-    )
-    cmd += [
-        "-filter_complex",
-        ";".join(filters),
-        "-map",
-        "[mix]",
-        "-ar",
-        "44100",
-        "-c:a",
-        "pcm_s16le",
-        "-t",
-        f"{duration_sec:.6f}",
-        str(output_wav),
-    ]
-    run_ffmpeg_command(cmd, timeout=max(30, int(duration_sec) + 60), cancel_event=cancel_event)
-    _check_cancel(cancel_event)
-    return contributors
+def mix_scene_audio_to_wav(project, scene, start_frame, end_frame, output_wav, *, cancel_event=None):
+    """Shared float renderer; callers retain cancellation and persistence ownership."""
+    from .audio_pipeline import mix_scene_audio_to_wav as render_audio
+    return render_audio(project, scene, start_frame, end_frame, output_wav, cancel_event=cancel_event)

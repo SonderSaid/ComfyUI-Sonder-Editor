@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import lru_cache
 import json
 import logging
 import math
@@ -10,7 +11,6 @@ import subprocess
 import tempfile
 import threading
 import time
-import wave
 from typing import Iterable, Iterator
 
 import cv2
@@ -103,7 +103,7 @@ SAVE_VIDEO_PRESETS = {
         "codec": "libx264",
         "pix_fmt": "yuv420p",
         "browser_preview_compatible": True,
-        "description": "Browser-safe MP4 for everyday review and sharing; BT.709 tagged.",
+        "description": "Browser-safe MP4 for everyday review and sharing with AAC 192 kb/s audio; BT.709 tagged.",
     },
     "High Quality MP4": {
         "extension": ".mp4",
@@ -113,37 +113,37 @@ SAVE_VIDEO_PRESETS = {
         "codec": "libx264",
         "pix_fmt": "yuv420p",
         "browser_preview_compatible": True,
-        "description": "Browser-safe MP4 with higher visual quality and larger files; BT.709 tagged.",
+        "description": "Browser-safe MP4 with higher visual quality, larger files and AAC 256 kb/s audio; BT.709 tagged.",
     },
     "Editing Master MP4": {
         "extension": ".mp4",
         "tensor_mode": "round",
         "video_args": ["-c:v", "libx264", "-preset", "veryslow", "-crf", "10", "-pix_fmt", "yuv444p", "-movflags", "+faststart"],
-        "audio_args": ["-c:a", "aac", "-b:a", "256k"],
+        "audio_args": ["-c:a", "flac", "-bits_per_raw_sample", "24"],
         "codec": "libx264",
         "pix_fmt": "yuv444p",
         "browser_preview_compatible": False,
-        "description": "High-fidelity 4:4:4 MP4 for internal round trips; BT.709 tagged; browser preview may not decode it.",
+        "description": "High-fidelity 4:4:4 MP4 with 24-bit FLAC audio for internal round trips; BT.709 tagged. Check 4:4:4 video and FLAC-in-MP4 support in your target application.",
     },
     "ProRes 422 HQ": {
         "extension": ".mov",
         "tensor_mode": "round",
         "video_args": ["-c:v", "prores_ks", "-profile:v", "3", "-pix_fmt", "yuv422p10le", "-vendor", "apl0", "-bits_per_mb", "8000"],
-        "audio_args": ["-c:a", "pcm_s16le"],
+        "audio_args": ["-c:a", "pcm_s24le"],
         "codec": "prores_ks",
         "pix_fmt": "yuv422p10le",
         "browser_preview_compatible": False,
-        "description": "Large editing handoff file with 10-bit ProRes video and PCM audio; BT.709 tagged.",
+        "description": "Large editing handoff file with 10-bit ProRes video and 24-bit PCM audio; BT.709 tagged.",
     },
     "Lossless FFV1 (RGB)": {
         "extension": ".mkv",
         "tensor_mode": "round",
         "video_args": ["-c:v", "ffv1", "-level", "3", "-coder", "1", "-context", "1", "-g", "1", "-slices", "24", "-slicecrc", "1", "-pix_fmt", "gbrp"],
-        "audio_args": ["-c:a", "flac"],
+        "audio_args": ["-c:a", "flac", "-bits_per_raw_sample", "24"],
         "codec": "ffv1",
         "pix_fmt": "gbrp",
         "browser_preview_compatible": False,
-        "description": "Lossless RGB archive/diagnostic output with FLAC audio; very large files.",
+        "description": "Lossless RGB archive/diagnostic output with 24-bit FLAC audio; very large files.",
     },
     CUSTOM_SAVE_VIDEO_PRESET: {
         "extension": ".mp4",
@@ -157,6 +157,21 @@ SAVE_VIDEO_PRESETS = {
 
 _FFMPEG_PATH: str | None = None
 _FFPROBE_PATH: str | None = None
+
+
+def transient_temp_dir() -> str:
+    """Temp dir for transient export work files (the mux WAV). Never the project
+    ``media/`` tree — files there get ffprobed by the editor's asset scan mid-life,
+    racing their cleanup ``os.remove`` (WinError 32). Uses ComfyUI's temp dir, with
+    a system-temp fallback when ``folder_paths`` is unavailable (e.g. unit tests)."""
+    try:
+        import folder_paths
+        temp_dir = folder_paths.get_temp_directory()
+    except Exception:
+        import tempfile
+        temp_dir = tempfile.gettempdir()
+    os.makedirs(temp_dir, exist_ok=True)
+    return temp_dir
 
 
 def _first_existing_path(candidates: Iterable[str]) -> str:
@@ -215,6 +230,19 @@ def _find_ffmpeg() -> str:
         os.path.expanduser(r"~\ffmpeg\bin\ffmpeg.exe"),
     ])
     return _first_existing_path(candidates)
+
+
+@lru_cache(maxsize=8)
+def require_audio_ffmpeg(path: str) -> str:
+    """Supported audio floor: FFmpeg 7.0 (libavformat 61), including development builds."""
+    try:
+        result = subprocess.run([path, "-version"], capture_output=True, text=True, timeout=10)
+        match = re.search(r"libavformat\s+(\d+)\.", result.stdout or "")
+        if result.returncode == 0 and match and int(match.group(1)) >= 61:
+            return path
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"Could not verify FFmpeg 7.0 or newer at '{path}': {exc}") from exc
+    raise RuntimeError(f"Audio processing requires FFmpeg 7.0 or newer; update the selected binary '{path}' and restart ComfyUI")
 
 
 def get_ffmpeg_path() -> str:
@@ -381,29 +409,26 @@ def _mutagen_audio_metadata(path: str) -> tuple[float, int]:
 
 def probe_audio_metadata(path: str) -> dict:
     duration, sample_rate = _mutagen_audio_metadata(path)
-    if duration > 0:
+    if duration > 0 and sample_rate > 0:
         return {"duration_sec": duration, "sample_rate": sample_rate}
-
-    data = _ffprobe_json(
-        path,
-        "stream=sample_rate,duration:format=duration",
-        select_streams="a:0",
-    )
+    data = _ffprobe_json(path, "stream=sample_rate,duration:format=duration", select_streams="a:0")
     stream = next(iter(data.get("streams", []) or []), {})
-    fmt = data.get("format", {}) or {}
-    duration = _finite_positive_float(stream.get("duration")) or _finite_positive_float(fmt.get("duration"))
-    sample_rate = _finite_positive_int(stream.get("sample_rate"))
-    if duration > 0:
-        return {"duration_sec": duration, "sample_rate": sample_rate}
-
-    text = _ffmpeg_input_text(path)
-    duration = _duration_from_ffmpeg_text(text)
+    duration = (_finite_positive_float(stream.get("duration"))
+                or _finite_positive_float((data.get("format", {}) or {}).get("duration")) or duration)
+    sample_rate = _finite_positive_int(stream.get("sample_rate")) or sample_rate
+    if duration <= 0 or sample_rate <= 0:
+        text = _ffmpeg_input_text(path)
+        duration = duration or _duration_from_ffmpeg_text(text)
+        match = re.search(r"Audio:[^\r\n]*?([0-9]+) Hz", text)
+        if match:
+            sample_rate = int(match.group(1))
     if duration <= 0:
         _returncode, text = _ffmpeg_decode_null_text(path, stream="0:a:0", timeout=120)
         duration = _duration_from_ffmpeg_text(text)
-    if duration <= 0:
-        raise MediaProbeError(f"Could not probe usable audio duration for {os.path.basename(path)}")
+    if duration <= 0 or sample_rate <= 0:
+        raise MediaProbeError(f"Could not probe usable audio duration and sample rate for {os.path.basename(path)}")
     return {"duration_sec": duration, "sample_rate": sample_rate}
+
 
 
 def probe_audio_duration(path: str) -> float:
@@ -844,6 +869,8 @@ def probe_media_metadata(path: str, asset_type: str, *, strict: bool = False) ->
     try:
         if asset_type == "video":
             metadata.update(probe_video_metadata(path))
+            if metadata.get("has_audio"):
+                metadata["sample_rate"] = probe_audio_metadata(path)["sample_rate"]
         elif asset_type == "image":
             metadata.update(probe_image_metadata(path))
         elif asset_type == "audio":
@@ -859,13 +886,17 @@ def probe_media_metadata(path: str, asset_type: str, *, strict: bool = False) ->
 def decode_audio_samples(
     path: str,
     *,
-    sample_rate: int = 44100,
+    sample_rate: int | None = None,
     channels: int = 1,
     mix_to_mono: bool = True,
     timeout: int | float = 60,
 ) -> tuple[np.ndarray, int]:
-    sample_rate = max(1, int(sample_rate or 44100))
+    from .audio_pipeline import resample_filter, stereo_filter
+    sample_rate = int(sample_rate or probe_audio_metadata(path)["sample_rate"])
     channels = max(1, int(channels or 1))
+    filters = resample_filter(sample_rate)
+    if channels == 2:
+        filters += "," + stereo_filter()
     try:
         result = subprocess.run(
             [
@@ -876,7 +907,9 @@ def decode_audio_samples(
                 "-i",
                 str(path),
                 "-f",
-                "s16le",
+                "f32le",
+                "-af",
+                filters,
                 "-ac",
                 str(channels),
                 "-ar",
@@ -891,7 +924,7 @@ def decode_audio_samples(
     if result.returncode != 0 or not result.stdout:
         stderr = (result.stderr or b"").decode(errors="replace").strip()
         raise MediaProbeError(f"Could not decode audio samples for {os.path.basename(path)}: {stderr[:240]}")
-    samples = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+    samples = np.frombuffer(result.stdout, dtype="<f4").copy()
     if channels > 1:
         samples = samples.reshape(-1, channels)
         if mix_to_mono:
@@ -902,31 +935,10 @@ def decode_audio_samples(
 
 
 def write_audio_wav(path: str, samples: np.ndarray, sample_rate: int) -> None:
-    """Write float audio samples to a 16-bit PCM WAV file.
+    """Write channel-first float32 PCM without clipping; RF64 handles large files."""
+    from .audio_pipeline import write_float_wav
+    write_float_wav(path, samples, sample_rate)
 
-    Accepts mono samples shaped (N,) or channel-first samples shaped (channels, N).
-    """
-    sample_rate = max(1, int(sample_rate or 44100))
-    arr = np.asarray(samples, dtype=np.float32)
-    if arr.ndim == 0:
-        arr = arr.reshape(1)
-    if arr.ndim == 1:
-        channels = 1
-        interleaved = arr
-    elif arr.ndim == 2:
-        channels = int(arr.shape[0])
-        if channels < 1:
-            raise ValueError("Audio waveform must have at least one channel")
-        interleaved = arr.T.reshape(-1)
-    else:
-        raise ValueError(f"Unsupported audio waveform shape for WAV export: {arr.shape}")
-
-    pcm = (np.clip(interleaved, -1.0, 1.0) * 32767.0).astype("<i2")
-    with wave.open(str(path), "wb") as wav_file:
-        wav_file.setnchannels(channels)
-        wav_file.setsampwidth(2)
-        wav_file.setframerate(sample_rate)
-        wav_file.writeframes(pcm.tobytes())
 
 
 def _parse_metadata_json(value):
@@ -2033,7 +2045,7 @@ def _video_args_with_metadata_movflags(video_args: list[str], output_path: str) 
     return args
 
 
-def encode_video(
+def _encode_video_prepared(
     frames_iter: Iterable[np.ndarray],
     *,
     preset_id: str,
@@ -2100,29 +2112,10 @@ def encode_video(
     if embed_metadata:
         cmd += ["-map_metadata", str(metadata_input_index)]
     if has_audio:
-        cmd += ["-map", "0:v:0", "-map", "1:a:0", *audio_args]
-        # The video's frame count is the contract: the project records it as the take's
-        # source length, and the next chained render reads pre-context right up to the
-        # final frame. `-shortest` cannot carry that contract — it ends the mux at the
-        # SHORTER stream, and generated audio routinely lands a few hundredths of a
-        # second under the video window, so ffmpeg silently dropped trailing frames.
-        # (ffmpeg <7 applied `-shortest` loosely and usually wrote them anyway, which
-        # is why this only began corrupting chained context on ffmpeg 7.x.) A dropped
-        # frame is not a cosmetic tail: the next chunk composites it as black, and that
-        # black frame is the last thing the model sees before the generation boundary.
-        #
-        # So bound the output by the video's own duration instead, and `apad` the audio
-        # to fill it. Padding without a bound would run forever; bounding without
-        # padding would leave a short-audio tail. Both directions are then exact:
-        # short audio is padded with silence, long audio is cut at the video end.
-        if total_frames > 0:
-            cmd += ["-af", "apad", "-t", f"{total_frames / fps_value:.6f}"]
-        else:
-            # Length is genuinely unknown (streaming caller that declared nothing).
-            # Retain `-shortest` so the mux still terminates; it can be removed once
-            # every audio-bearing caller passes frames as an array or declares
-            # `expected_frame_count`.
-            cmd += ["-shortest"]
+        cmd += ["-map", "0:v:0", "-map", "1:a:0", "-c:a", "copy"]
+        # Audio was already padded/trimmed and verified to this video window.
+        # Keep every requested video frame; copying audio must never use -shortest.
+        cmd += ["-t", f"{total_frames / fps_value:.12f}"]
     elif embed_metadata:
         cmd += ["-map", "0:v:0"]
     cmd += [str(output_path), "-y"]
@@ -2180,20 +2173,19 @@ def audio_only_export_spec(
     custom_options: dict | None = None,
 ) -> dict:
     preset_id = normalize_save_preset(preset_id)
-    if preset_id == CUSTOM_SAVE_VIDEO_PRESET:
-        spec = resolve_custom_export_options(custom_options)
-        codec = str(spec["audio_codec"])
-        bitrate_kbps = int(spec["audio_bitrate_kbps"])
-    else:
-        audio_args = _preset_audio_args(preset_id, custom_options)
-        codec, bitrate_kbps = _audio_codec_bitrate_from_args(audio_args)
+    from .audio_pipeline import delivery_precision
+    audio_args = _preset_audio_args(preset_id, custom_options)
+    codec, bitrate_kbps = _audio_codec_bitrate_from_args(audio_args)
+    bits = None
+    if "-bits_per_raw_sample" in audio_args:
+        bits = int(audio_args[audio_args.index("-bits_per_raw_sample") + 1])
 
     if codec == "none" or not codec:
         raise ValueError("Selected preset does not define an audio codec for audio-only export")
-    if codec == "aac":
+    if codec in {"aac", "alac"}:
         extension = ".m4a"
         container = "m4a"
-    elif codec == "pcm_s16le":
+    elif codec in {"pcm_s16le", "pcm_s24le"}:
         extension = ".wav"
         container = "wav"
     elif codec == "flac":
@@ -2217,48 +2209,115 @@ def audio_only_export_spec(
         "container": container,
         "extension": extension,
         "bitrate_kbps": bitrate_kbps,
+        "bits": delivery_precision(codec, bits),
         "metadata": metadata,
     }
 
 
+def discard_audio_file(path):
+    """Best-effort recovery cleanup must not destroy an otherwise valid result."""
+    try:
+        if path and os.path.isfile(path):
+            os.remove(path)
+        return True
+    except OSError as exc:
+        logger.warning("Could not remove incomplete audio file %s: %s", path, exc)
+        return False
+
+
+def audio_failure_alert(output_path, exc):
+    reason = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
+    return f"Saved {os.path.basename(output_path)} without audio: {reason[:400]}"
+
+
+def encode_video(
+    frames_iter: Iterable[np.ndarray], *, preset_id: str, output_path: str, fps: float,
+    audio_path: str | None = None, custom_options: dict | None = None, timeout: int = 90,
+    cancel_event=None, embed_metadata: dict[str, str] | None = None, progress_callback=None,
+    expected_frame_count: int | None = None, audio_sidecar_path: str | None = None,
+    work_dir: str | None = None, allow_audio_fallback: bool = False,
+) -> dict:
+    """Verify audio before video work; Save/Preview may retain video if preparation fails."""
+    from contextlib import ExitStack
+    from .audio_pipeline import copy_audio_file, prepared_audio
+    args = _preset_audio_args(normalize_save_preset(preset_id), custom_options)
+    frames, count, _h, _w = _prepare_frame_stream(frames_iter)
+    count = count if count is not None else _finite_positive_int(expected_frame_count)
+    kwargs = dict(preset_id=preset_id, output_path=output_path, fps=fps,
+                  custom_options=custom_options, timeout=timeout, cancel_event=cancel_event,
+                  embed_metadata=embed_metadata, progress_callback=progress_callback,
+                  expected_frame_count=count)
+    try:
+        with ExitStack() as stack:
+            delivery, alerts = None, []
+            if audio_path and args:
+                if count <= 0:
+                    raise ValueError("Audio-bearing video exports require an authoritative frame count")
+                try:
+                    delivery = stack.enter_context(prepared_audio(
+                        audio_path, args, duration=count / max(.001, float(fps or 24.0)),
+                        cancel_event=cancel_event, timeout=timeout, work_dir=work_dir))
+                except MediaOperationCancelled:
+                    raise
+                except Exception as exc:
+                    if not allow_audio_fallback:
+                        raise
+                    logger.warning("Audio preparation failed for %s: %s", output_path, exc)
+                    alerts.append(audio_failure_alert(output_path, exc))
+            # Only preparation is recoverable. A video failure must never retry
+            # an exhausted stream or mask the original encoder error.
+            metadata = _encode_video_prepared(frames, audio_path=delivery[0] if delivery else None, **kwargs)
+            metadata["has_audio"] = delivery is not None
+            metadata["audio_sidecar_ready"] = False
+            if delivery:
+                _, prepared, result = delivery
+                metadata["audio_processing"] = result
+                metadata["warnings"] = result["warnings"]
+                if audio_sidecar_path:
+                    try:
+                        copy_audio_file(prepared, audio_sidecar_path, cancel_event=cancel_event)
+                        metadata["audio_sidecar_ready"] = True
+                    except MediaOperationCancelled:
+                        raise
+                    except Exception as exc:
+                        logger.warning("Prepared take audio copy failed for %s: %s", output_path, exc)
+                        discard_audio_file(audio_sidecar_path)
+                        alerts.append(f"Saved {os.path.basename(output_path)}, but its timeline audio could not be created")
+            if alerts:
+                metadata["alerts"] = alerts
+            return metadata
+    except BaseException:
+        for path in (output_path, audio_sidecar_path):
+            discard_audio_file(path)
+        raise
+    finally:
+        close = getattr(frames, "close", None)
+        if close:
+            close()
+
+
 def encode_audio(
-    input_wav: str,
-    output_path: str,
-    *,
-    codec: str,
-    container: str,
-    bitrate_kbps: int | None = None,
-    timeout: int | float | None = 90,
-    cancel_event=None,
-) -> None:
-    codec = str(codec or "").strip()
-    container = str(container or "").strip()
-    if codec not in {"aac", "pcm_s16le", "flac"}:
-        raise ValueError(f"Unsupported audio codec: {codec}")
+    input_wav: str, output_path: str, *, codec: str, container: str,
+    bitrate_kbps: int | None = None, timeout: int | float | None = 90,
+    cancel_event=None, bits: int | None = None, audio_sidecar_path: str | None = None,
+    work_dir: str | None = None,
+) -> dict:
+    """Encode verified delivery audio, preserving the prepared float sidecar if requested."""
+    from .audio_pipeline import copy_audio_file, prepared_audio
     if container not in {"m4a", "wav", "flac"}:
         raise ValueError(f"Unsupported audio container: {container}")
-
     args = ["-c:a", codec]
     if codec == "aac":
-        args += ["-b:a", f"{int(bitrate_kbps or 192)}k"]
-    cmd = [
-        get_ffmpeg_path(),
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-i",
-        str(input_wav),
-        "-vn",
-        *args,
-        str(output_path),
-    ]
+        args += ["-b:a", f"{bitrate_kbps or 192}k"]
+    if bits:
+        args += ["-bits_per_raw_sample", str(bits)]
     try:
-        run_ffmpeg_command(cmd, timeout=timeout, cancel_event=cancel_event)
-    except MediaOperationCancelled:
-        try:
-            if os.path.isfile(output_path):
-                os.remove(output_path)
-        except OSError:
-            pass
+        with prepared_audio(input_wav, args, timeout=timeout, cancel_event=cancel_event, work_dir=work_dir) as (encoded, prepared, result):
+            copy_audio_file(encoded, output_path, cancel_event=cancel_event)
+            if audio_sidecar_path:
+                copy_audio_file(prepared, audio_sidecar_path, cancel_event=cancel_event)
+            return {"audio_processing": result, "warnings": result["warnings"]}
+    except BaseException:
+        for path in (output_path, audio_sidecar_path):
+            discard_audio_file(path)
         raise

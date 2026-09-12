@@ -65,6 +65,47 @@ the render window, so driver and result stay in lockstep on the timeline.
 
 https://github.com/user-attachments/assets/7c8459fb-6d10-4b84-9bc6-a1e98308c3f1
 
+## Audio fidelity
+
+Editor AUDIO and timeline export share floating-point mixing, preserving timing,
+track balance and dynamics. Source decoding retains native rates; scene mixing
+uses the highest audible source rate across the scene. New WAV sidecars use the
+prepared mix's rate, including any conversion required by the delivery codec.
+Mono sources retain their level when duplicated into the stereo mix.
+Intermediate AUDIO may exceed full scale without clipping.
+
+Saved and previewed results may receive one constant, linked gain reduction to
+leave approximately 1 dB of peak headroom. Completion messages report any reduction;
+generation provenance records the rate, precision, measured peaks and applied gain.
+Quiet material is never boosted. Encoded audio is checked for overload before
+video encoding. Timeline sidecars bypass delivery compression and carry the same
+gain. Existing sidecars remain unchanged.
+
+Video exports omit the audio stream when the selected window has no audible
+contributors, including muted, hidden, or zero-volume tracks. Audio-only exports
+of silent windows still produce a file. Consecutive windows can therefore have
+different stream layouts. Missing files are logged; corrupt audio blocks only a
+window that uses it and names the source.
+
+If supplied AUDIO cannot be prepared, Save Video and Preview keep the video and
+show a persistent warning explaining the missing audio. Failed take-audio
+placement also warns while retaining the delivered video. Routine headroom
+notices dismiss automatically. Editing Master audio-only exports use `.flac`;
+check FLAC-in-MP4 support in your target NLE before choosing its video preset.
+
+| Preset | Audio delivery |
+|---|---|
+| Compatible MP4 | AAC, 192 kb/s |
+| High Quality MP4 | AAC, 256 kb/s |
+| Editing Master MP4 | FLAC, 24-bit |
+| ProRes 422 HQ | PCM, 24-bit |
+| Lossless FFV1 (RGB) | FLAC, 24-bit |
+
+Integer delivery uses rounding and triangular dither once; digital silence stays
+silent. Lossless audio codecs preserve this prepared PCM representation. Explicit Custom choices retain their
+meaning, including 16-bit PCM. Live browser scheduling and device output can differ
+from an offline render; faithful mixing preserves balance, timing and dynamics.
+
 ## Highlights
 
 - **Multi-lane timeline** — video/audio lanes with drag, trim, split, snapping,
@@ -175,7 +216,7 @@ ComfyUI.
   processes `widget.options.hidden` (including frontend v1.45.21 and current
   stable builds); earlier frontend builds retain the legacy LiteGraph fallback.
 - **Python 3.10+** (matching your ComfyUI environment).
-- **ffmpeg** — required for video/audio decode, encode, and export. The
+- **FFmpeg 7.0+** — required for video/audio decode, encode, and export. The
   `imageio-ffmpeg` dependency bundles a usable ffmpeg automatically, but a
   system-wide `ffmpeg` on your `PATH` is recommended for the widest format
   support.
@@ -279,8 +320,8 @@ It includes four scenes with their media, prompts, guides, and generated takes.
 ComfyUI ships a torch build matched to your GPU/CUDA. This pack intentionally
 does **not** list `torch`/`torchaudio` in its requirements so an automatic
 `pip install` can't overwrite that build with a mismatched (often CPU-only)
-wheel. If audio features need `torchaudio` and it's missing, install the build
-that matches your existing torch/CUDA version manually.
+wheel. Sonder's audio decode, mixing and export use FFmpeg. An optional waveform
+thumbnail fallback can use ComfyUI's existing `torchaudio` installation.
 
 **`cv2` import errors after installing another custom node.**
 This pack uses `opencv-python-headless` (no GUI dependencies, correct for a
@@ -290,7 +331,9 @@ break. If you hit this, pick one variant for your whole environment (headless is
 the safe choice for ComfyUI) and reinstall it so it's the only OpenCV present.
 
 **`ffmpeg` not found / export or decode fails.**
-Install `ffmpeg` and make sure it's on your `PATH`, then restart ComfyUI. The
+Install FFmpeg **7.0 or newer** and make sure it's on your `PATH`, then restart ComfyUI.
+Audio preparation checks the selected binary; an older system installation takes
+precedence over the bundled binary and must be updated or removed from `PATH`. The
 bundled `imageio-ffmpeg` binary is used as a fallback, but a system ffmpeg is
 more capable across formats.
 

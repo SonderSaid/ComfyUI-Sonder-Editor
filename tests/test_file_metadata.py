@@ -82,6 +82,13 @@ def test_encode_video_metadata_with_audio_map_intact(tmp_path, monkeypatch):
     monkeypatch.setattr(media, "_run_ffmpeg_streaming_frames", fake_run)
     monkeypatch.setattr(media, "get_ffmpeg_path", lambda: "ffmpeg")
 
+    from contextlib import contextmanager
+    pipeline=importlib.import_module(f"{TEST_PACKAGE}.server.audio_pipeline")
+    @contextmanager
+    def fake_prepared(source, args, **kwargs):
+        yield source, source, {"warnings": [], "gain": 1.0}
+    monkeypatch.setattr(pipeline, "prepared_audio", fake_prepared)
+
     media.encode_video(
         np.zeros((1, 2, 2, 3), dtype=np.uint8),
         preset_id="Compatible MP4",
@@ -98,6 +105,7 @@ def test_encode_video_metadata_with_audio_map_intact(tmp_path, monkeypatch):
     audio_map = cmd.index("-map", video_map + 1)
     assert cmd[video_map:video_map + 2] == ["-map", "0:v:0"]
     assert cmd[audio_map:audio_map + 2] == ["-map", "1:a:0"]
+
 
 
 def test_encode_video_no_metadata_kwarg_keeps_old_command(tmp_path, monkeypatch):

@@ -1302,6 +1302,12 @@ app.registerExtension({
             nodeType.prototype.onExecuted = function (message) {
                 origOnExecuted?.apply(this, arguments);
                 const descriptor = message?.sonder_video?.[0];
+                for (const warning of descriptor?.warnings || []) {
+                    notifyInfo(warning, { source: `audio-delivery:${this.id}` });
+                }
+                for (const alert of descriptor?.alerts || []) {
+                    notifyWarning(alert, { source: `audio-delivery:${this.id}` });
+                }
                 if (descriptor) {
                     try {
                         mountNodeVideoPreview(this, descriptor);
@@ -1336,6 +1342,12 @@ app.registerExtension({
             nodeType.prototype.onExecuted = function (message) {
                 origOnExecuted?.apply(this, arguments);
                 const descriptor = message?.sonder_video?.[0];
+                for (const warning of descriptor?.warnings || []) {
+                    notifyInfo(warning, { source: `audio-delivery:${this.id}` });
+                }
+                for (const alert of descriptor?.alerts || []) {
+                    notifyWarning(alert, { source: `audio-delivery:${this.id}` });
+                }
                 if (descriptor) {
                     try {
                         mountNodeVideoPreview(this, descriptor);

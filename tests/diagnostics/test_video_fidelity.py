@@ -708,6 +708,15 @@ def test_encode_video_preset_commands_and_tensor_modes(tmp_path, monkeypatch):
 
     monkeypatch.setattr(media_helpers, "get_ffmpeg_path", lambda: "ffmpeg")
     captured = _install_fake_streaming_popen(media_helpers, monkeypatch)
+    from contextlib import contextmanager
+    pipeline = importlib.import_module(f"{TEST_PACKAGE}.server.audio_pipeline")
+    prepared_calls = []
+    @contextmanager
+    def fake_prepared(source, args, **kwargs):
+        prepared_calls.append((args, kwargs))
+        yield source, source, {"warnings": [], "gain": 1.0}
+    monkeypatch.setattr(pipeline, "prepared_audio", fake_prepared)
+
 
     assert media_helpers.SAVE_VIDEO_PRESET_ORDER[0] == "Compatible MP4"
     assert media_helpers.SAVE_VIDEO_PRESET_ORDER[-1] == "Custom"
@@ -717,9 +726,9 @@ def test_encode_video_preset_commands_and_tensor_modes(tmp_path, monkeypatch):
     cases = [
         ("Compatible MP4", ".mp4", "libx264", "yuv420p", "round", ["-c:a", "aac", "-b:a", "192k"]),
         ("High Quality MP4", ".mp4", "libx264", "yuv420p", "round", ["-c:a", "aac", "-b:a", "256k"]),
-        ("Editing Master MP4", ".mp4", "libx264", "yuv444p", "round", ["-c:a", "aac", "-b:a", "256k"]),
-        ("ProRes 422 HQ", ".mov", "prores_ks", "yuv422p10le", "round", ["-c:a", "pcm_s16le"]),
-        ("Lossless FFV1 (RGB)", ".mkv", "ffv1", "gbrp", "round", ["-c:a", "flac"]),
+        ("Editing Master MP4", ".mp4", "libx264", "yuv444p", "round", ["-c:a", "flac", "-bits_per_raw_sample", "24"]),
+        ("ProRes 422 HQ", ".mov", "prores_ks", "yuv422p10le", "round", ["-c:a", "pcm_s24le"]),
+        ("Lossless FFV1 (RGB)", ".mkv", "ffv1", "gbrp", "round", ["-c:a", "flac", "-bits_per_raw_sample", "24"]),
     ]
     for preset, extension, codec, pix_fmt, tensor_mode, audio_args in cases:
         meta = media_helpers.encode_video(
@@ -752,8 +761,8 @@ def test_encode_video_preset_commands_and_tensor_modes(tmp_path, monkeypatch):
         elif extension == ".mp4":
             assert cmd.count("-movflags") == 1
             assert cmd[cmd.index("-movflags") + 1] == "+faststart"
-        for idx, arg in enumerate(audio_args):
-            assert cmd[cmd.index(audio_args[0]) + idx] == arg
+        assert prepared_calls[-1][0] == audio_args
+        assert cmd[cmd.index("-c:a") + 1] == "copy"
 
     custom_options = {
         "custom_output_kind": "Video File",
@@ -786,8 +795,8 @@ def test_encode_video_preset_commands_and_tensor_modes(tmp_path, monkeypatch):
     assert cmd[cmd.index("-preset") + 1] == "medium"
     assert cmd[cmd.index("-vf") + 1] == EXPECTED_BT709_COLOR_VF
     assert meta["color_space"] == "bt709"
-    assert cmd[cmd.index("-c:a") + 1] == "aac"
-    assert cmd[cmd.index("-b:a") + 1] == "320k"
+    assert cmd[cmd.index("-c:a") + 1] == "copy"
+    assert prepared_calls[-1][0] == ["-c:a", "aac", "-b:a", "320k"]
     assert cmd.count("-map") == 2
     assert cmd[cmd.index("-map") + 1] == "0:v:0"
     assert cmd[cmd.index("-map", cmd.index("-map") + 1) + 1] == "1:a:0"
@@ -811,7 +820,8 @@ def test_encode_video_preset_commands_and_tensor_modes(tmp_path, monkeypatch):
     assert prores_meta["audio_mode"] == "pcm_s16le"
     assert prores_cmd[prores_cmd.index("-profile:v") + 1] == "3"
     assert prores_cmd[prores_cmd.index("-movflags") + 1] == "+write_colr"
-    assert prores_cmd[prores_cmd.index("-c:a") + 1] == "pcm_s16le"
+    assert prores_cmd[prores_cmd.index("-c:a") + 1] == "copy"
+    assert prepared_calls[-1][0] == ["-c:a", "pcm_s16le"]
 
     ffv1_meta = media_helpers.encode_video(
         frames,
@@ -833,7 +843,8 @@ def test_encode_video_preset_commands_and_tensor_modes(tmp_path, monkeypatch):
     assert ffv1_meta["color_space"] == "rgb"
     assert "-vf" not in ffv1_cmd
     assert ffv1_cmd[ffv1_cmd.index("-slicecrc") + 1] == "1"
-    assert ffv1_cmd[ffv1_cmd.index("-c:a") + 1] == "flac"
+    assert ffv1_cmd[ffv1_cmd.index("-c:a") + 1] == "copy"
+    assert prepared_calls[-1][0] == ["-c:a", "flac"]
 
     no_audio_meta = media_helpers.encode_video(
         frames,
@@ -853,6 +864,7 @@ def test_encode_video_preset_commands_and_tensor_modes(tmp_path, monkeypatch):
     assert "-c:a" not in no_audio_cmd
     assert no_audio_cmd[no_audio_cmd.index("-vf") + 1] == EXPECTED_BT709_COLOR_VF
     assert no_audio_cmd.count("-movflags") == 1  # mp4: color args must not add a second pair
+
 
 
 def test_encode_video_evens_odd_dimensions(tmp_path, monkeypatch):
@@ -1716,7 +1728,7 @@ def _decoded_audio_seconds(ffmpeg: str, path: Path) -> float:
     return len(result.stdout) / 4 / 48000.0
 
 
-def test_encode_video_audio_mux_is_bounded_by_video_not_audio(tmp_path, monkeypatch):
+def test_encode_video_copies_prepared_audio_with_video_duration_bound(tmp_path, monkeypatch):
     """Command-shape guard for the chained-context corruption: a muxed encode must
     bound the output by the VIDEO duration and pad the audio, never let `-shortest`
     end the file at a short audio stream. See encode_video for why."""
@@ -1730,6 +1742,15 @@ def test_encode_video_audio_mux_is_bounded_by_video_not_audio(tmp_path, monkeypa
 
     monkeypatch.setattr(media_helpers, "get_ffmpeg_path", lambda: "ffmpeg")
     captured = _install_fake_streaming_popen(media_helpers, monkeypatch)
+    from contextlib import contextmanager
+    pipeline = importlib.import_module(f"{TEST_PACKAGE}.server.audio_pipeline")
+    prepared_calls = []
+    @contextmanager
+    def fake_prepared(source, args, **kwargs):
+        prepared_calls.append((args, kwargs))
+        yield source, source, {"warnings": [], "gain": 1.0}
+    monkeypatch.setattr(pipeline, "prepared_audio", fake_prepared)
+
 
     for preset in media_helpers.SAVE_VIDEO_PRESET_ORDER:
         if preset == media_helpers.CUSTOM_SAVE_VIDEO_PRESET:
@@ -1743,9 +1764,10 @@ def test_encode_video_audio_mux_is_bounded_by_video_not_audio(tmp_path, monkeypa
         )
         cmd = captured["cmds"][-1]
         assert "-shortest" not in cmd, preset
-        assert cmd[cmd.index("-af") + 1] == "apad", preset
+        assert "-af" not in cmd
+        assert prepared_calls[-1][1]["duration"] == 121 / 24.0
         # 121 frames at 24 fps — the exact case that lost its final frame.
-        assert cmd[cmd.index("-t") + 1] == f"{121 / 24.0:.6f}", preset
+        assert cmd[cmd.index("-t") + 1] == f"{121 / 24.0:.12f}", preset
 
     # No audio: no pad, no duration bound, no -shortest.
     media_helpers.encode_video(
@@ -1768,19 +1790,14 @@ def test_encode_video_audio_mux_is_bounded_by_video_not_audio(tmp_path, monkeypa
     )
     cmd = captured["cmds"][-1]
     assert "-shortest" not in cmd
-    assert cmd[cmd.index("-t") + 1] == f"{121 / 24.0:.6f}"
+    assert cmd[cmd.index("-t") + 1] == f"{121 / 24.0:.12f}"
 
-    # Undeclared streaming length still has to terminate.
-    media_helpers.encode_video(
-        iter(list(frames)),
-        preset_id="Compatible MP4",
-        output_path=str(tmp_path / "undeclared.mp4"),
-        fps=24,
-        audio_path=str(audio_path),
-    )
-    cmd = captured["cmds"][-1]
-    assert "-shortest" in cmd
-    assert "-t" not in cmd
+    # Refuse an unknown duration instead of allowing audio to truncate video.
+    with pytest.raises(ValueError, match="authoritative frame count"):
+        media_helpers.encode_video(iter(list(frames)), preset_id="Compatible MP4",
+                                   output_path=str(tmp_path / "undeclared.mp4"),
+                                   fps=24, audio_path=str(audio_path))
+
 
 
 def test_encode_video_keeps_every_frame_against_short_and_long_audio(tmp_path, monkeypatch):

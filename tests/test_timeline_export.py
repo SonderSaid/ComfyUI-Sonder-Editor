@@ -240,91 +240,40 @@ def test_iter_scene_frames_close_releases_capture(tmp_path):
     assert captures and captures[0].released is True
 
 
-def test_audio_mix_single_track_uses_silence_pad_without_atrim(tmp_path, monkeypatch):
-    import server.timeline_renderer as timeline_renderer
-
-    project_dir = tmp_path / "project"
-    (project_dir / "media").mkdir(parents=True)
-    audio_path = project_dir / "media" / "audio.wav"
-    audio_path.write_bytes(b"audio")
-    project = TimelineProject(project_dir=str(project_dir), project_id="project-1", name="Project")
-    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=24)
-    scene.audio_tracks = [
-        AudioTrack(
-            source_path=os.path.join("media", "audio.wav"),
-            timeline_start_frame=0,
-            timeline_end_frame=24,
-        )
-    ]
-
-    captured = {}
-
-    def fake_run_ffmpeg(cmd, **_kwargs):
-        captured["cmd"] = cmd
-
-    monkeypatch.setattr(timeline_renderer, "run_ffmpeg_command", fake_run_ffmpeg)
-
-    contributors = timeline_renderer.mix_scene_audio_to_wav(
-        project,
-        scene,
-        0,
-        24,
-        str(project_dir / "media" / "mixed.wav"),
-    )
-
-    filter_complex = captured["cmd"][captured["cmd"].index("-filter_complex") + 1]
+def test_audio_mix_single_track_keeps_level_and_pads_output_window(tmp_path):
+    from scipy.io import wavfile
+    import numpy as np
+    from server.timeline_renderer import mix_scene_audio_to_wav
+    rate = 48000
+    wavfile.write(tmp_path / "audio.wav", rate, np.full((rate // 2, 2), .2, np.float32))
+    project = TimelineProject(project_dir=str(tmp_path), fps=24)
+    scene = Scene(audio_tracks=[AudioTrack(source_path="audio.wav", timeline_start_frame=i * 12,
+                                          timeline_end_frame=(i+1) * 12) for i in range(1)])
+    contributors = mix_scene_audio_to_wav(project, scene, 0, 48, str(tmp_path / "mix.wav"))
+    actual_rate, mixed = wavfile.read(tmp_path / "mix.wav")
     assert len(contributors) == 1
-    assert "normalize=" not in filter_complex
-    assert "atrim" not in filter_complex
-    assert "apad" not in filter_complex
-    assert "amix=inputs=2:duration=longest" in filter_complex
-    assert "anullsrc=channel_layout=stereo:sample_rate=44100" in captured["cmd"]
-    assert "-ss" in captured["cmd"]
+    assert actual_rate == rate and len(mixed) == rate * 2
+    np.testing.assert_allclose(mixed[:1 * rate // 2], .2, atol=1e-7)
+    assert not np.any(mixed[1 * rate // 2:])
 
 
-def test_audio_mix_multiple_tracks_pads_to_full_export_duration(tmp_path, monkeypatch):
-    import server.timeline_renderer as timeline_renderer
 
-    project_dir = tmp_path / "project"
-    (project_dir / "media").mkdir(parents=True)
-    (project_dir / "media" / "audio-a.wav").write_bytes(b"audio-a")
-    (project_dir / "media" / "audio-b.wav").write_bytes(b"audio-b")
-    project = TimelineProject(project_dir=str(project_dir), project_id="project-1", name="Project")
-    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=48)
-    scene.audio_tracks = [
-        AudioTrack(
-            source_path=os.path.join("media", "audio-a.wav"),
-            timeline_start_frame=0,
-            timeline_end_frame=12,
-        ),
-        AudioTrack(
-            source_path=os.path.join("media", "audio-b.wav"),
-            timeline_start_frame=12,
-            timeline_end_frame=24,
-        ),
-    ]
-
-    captured = {}
-
-    def fake_run_ffmpeg(cmd, **_kwargs):
-        captured["cmd"] = cmd
-
-    monkeypatch.setattr(timeline_renderer, "run_ffmpeg_command", fake_run_ffmpeg)
-
-    contributors = timeline_renderer.mix_scene_audio_to_wav(
-        project,
-        scene,
-        0,
-        48,
-        str(project_dir / "media" / "mixed.wav"),
-    )
-
-    filter_complex = captured["cmd"][captured["cmd"].index("-filter_complex") + 1]
+def test_audio_mix_sequential_tracks_keep_unscaled_level_and_pad_output_window(tmp_path):
+    from scipy.io import wavfile
+    import numpy as np
+    from server.timeline_renderer import mix_scene_audio_to_wav
+    rate = 48000
+    wavfile.write(tmp_path / "audio.wav", rate, np.full((rate // 2, 2), .2, np.float32))
+    project = TimelineProject(project_dir=str(tmp_path), fps=24)
+    scene = Scene(audio_tracks=[AudioTrack(source_path="audio.wav", timeline_start_frame=i * 12,
+                                          timeline_end_frame=(i+1) * 12) for i in range(2)])
+    contributors = mix_scene_audio_to_wav(project, scene, 0, 48, str(tmp_path / "mix.wav"))
+    actual_rate, mixed = wavfile.read(tmp_path / "mix.wav")
     assert len(contributors) == 2
-    assert "amix=inputs=3:duration=longest" in filter_complex
-    assert "atrim" not in filter_complex
-    assert "apad" not in filter_complex
-    assert "anullsrc=channel_layout=stereo:sample_rate=44100" in captured["cmd"]
+    assert actual_rate == rate and len(mixed) == rate * 2
+    np.testing.assert_allclose(mixed[:2 * rate // 2], .2, atol=1e-7)
+    assert not np.any(mixed[2 * rate // 2:])
+
 
 
 def test_audio_mix_real_ffmpeg_short_source_pads_to_export_duration(tmp_path):
@@ -383,8 +332,9 @@ def test_audio_mix_real_ffmpeg_short_source_pads_to_export_duration(tmp_path):
         str(output),
     )
 
-    with wave.open(str(output), "rb") as handle:
-        duration = handle.getnframes() / float(handle.getframerate())
+    from scipy.io import wavfile
+    rate, samples = wavfile.read(output)
+    duration = len(samples) / rate
     assert len(contributors) == 1
     assert duration == pytest.approx(2.0, abs=1 / 44100)
 
@@ -410,7 +360,7 @@ def test_render_timeline_routes_return_job_payload(monkeypatch, tmp_path):
         warnings = ["warn"]
 
         def public_status(self):
-            return {"job_id": self.job_id, "status": self.status, "phase": self.phase}
+            return {"job_id": self.job_id, "status": self.status, "phase": self.phase, "warnings": self.warnings, "alerts": []}
 
     class FakeManager:
         def start(self, _project, _body):
@@ -437,7 +387,9 @@ def test_render_timeline_routes_return_job_payload(monkeypatch, tmp_path):
     assert payload["result"]["asset"]["asset_id"] == "asset-1"
     assert payload["result"]["scene"]["scene_id"] == "scene-1"
     assert payload["result"]["placed_clip"]["clip_id"] == "clip-1"
-    assert payload["result"]["warnings"] == ["warn"]
+    assert payload["warnings"] == ["warn"]
+    assert payload["alerts"] == []
+    assert "warnings" not in payload["result"]
 
     cancel_resp = asyncio.run(cancel(DummyRequest(match_info={"project_id": "project-1", "job_id": "job-1"})))
     assert _response_json(cancel_resp)["phase"] == "cancelling"
@@ -728,7 +680,7 @@ def test_timeline_export_cleans_temp_audio_after_success(tmp_path, monkeypatch):
     def fake_mix(_project, _scene, _start, _end, output_wav, **_kwargs):
         with open(output_wav, "wb") as handle:
             handle.write(b"mixed")
-        return []
+        return [{"volume": 1.0, "sample_count": 8000}]
 
     def fake_encode(frames_iter, *, output_path, audio_path=None, **_kwargs):
         assert audio_path and os.path.isfile(audio_path)
@@ -788,13 +740,17 @@ def test_timeline_export_take_with_audio_adds_paired_audio_track(tmp_path, monke
     def fake_mix(_project, _scene, _start, _end, output_wav, **_kwargs):
         with open(output_wav, "wb") as handle:
             handle.write(b"mixed")
-        return []
+        return [{"volume": 1.0, "sample_count": 8000}]
 
     def fake_encode(frames_iter, *, output_path, audio_path=None, **_kwargs):
         assert audio_path and os.path.isfile(audio_path)
         with open(output_path, "wb") as handle:
             handle.write(b"video")
+        from scipy.io import wavfile
+        wavfile.write(_kwargs["audio_sidecar_path"], 48000, np.full((8000, 2), .2, np.float32))
         return {
+            "audio_processing": {"sample_rate": 48000, "gain": 1.0},
+            "audio_sidecar_ready": True,
             "save_preset": "Compatible MP4",
             "codec": "libx264",
             "pix_fmt": "yuv420p",
@@ -804,8 +760,7 @@ def test_timeline_export_take_with_audio_adds_paired_audio_track(tmp_path, monke
         }
 
     def fake_run_ffmpeg(cmd, **_kwargs):
-        with open(cmd[-1], "wb") as handle:
-            handle.write(b"audio" * 512)
+        pytest.fail("Take sidecar must bypass the encoded video")
 
     monkeypatch.setattr(timeline_export, "iter_scene_frames", fake_iter)
     monkeypatch.setattr(timeline_export, "mix_scene_audio_to_wav", fake_mix)
@@ -839,3 +794,137 @@ def test_timeline_export_take_with_audio_adds_paired_audio_track(tmp_path, monke
     assert paired_tracks[0].timeline_start_frame == 0
     assert paired_tracks[0].timeline_end_frame == 4
     assert os.path.isfile(project_dir / paired_tracks[0].source_path)
+
+
+@pytest.mark.parametrize('mode', ['empty', 'zero_volume', 'outside', 'muted', 'hidden', 'custom_none'])
+def test_real_video_export_does_not_manufacture_audio_stream_or_take(tmp_path, monkeypatch, mode):
+    from server import media_helpers as media
+    project_dir = tmp_path / 'project'
+    (project_dir / 'media').mkdir(parents=True)
+    media.write_audio_wav(project_dir / 'media' / 'source.wav', np.full((2, 8000), .125, np.float32), 48000)
+    scene = Scene(scene_id='scene', name='Scene', duration_frames=48,
+                  video_lane_configs=[LaneConfig()], audio_lane_configs=[LaneConfig(hidden=mode == 'hidden')])
+    if mode != 'empty':
+        scene.audio_tracks = [AudioTrack(source_path='media/source.wav', timeline_start_frame=24 if mode == 'outside' else 0,
+            timeline_end_frame=28 if mode == 'outside' else 4, volume=0 if mode == 'zero_volume' else 1,
+            muted=mode == 'muted')]
+    before = len(scene.audio_tracks)
+    project = TimelineProject(project_dir=str(project_dir), project_id='project', name='Project',
+                              scenes=[scene], resolution=(32, 32), fps=24)
+    save_project(project)
+    monkeypatch.setattr(timeline_export, '_transient_temp_dir', lambda: str(tmp_path))
+    monkeypatch.setattr(timeline_export, 'iter_scene_frames', lambda *a, **k: iter(np.zeros((4, 32, 32, 3), np.uint8)))
+    monkeypatch.setattr(timeline_export, 'ensure_thumbnail', lambda *a, **k: True)
+    manager = TimelineExportManager(max_workers=1, ttl_seconds=60)
+    body = {'scene_id': 'scene', 'range': {'start': 0, 'end': 4}, 'include_video': True,
+            'include_audio': True, 'place_as_take': True, 'save_preset': 'Compatible MP4'}
+    if mode == 'custom_none':
+        body.update(save_preset='Custom', custom_options={'custom_audio_codec': 'none'})
+    job = manager.start(project, body)
+    job.future.result(timeout=30)
+    assert job.status == 'completed', job.error
+    saved = load_project(str(project_dir))
+    asset = saved.get_asset(job.result_asset_id)
+    assert not asset.has_audio
+    assert 'Audio:' not in media._ffmpeg_input_text(project_dir / asset.path)
+    assert len(saved.scenes[0].audio_tracks) == before
+    assert len(saved.scenes[0].clips) == 1
+    assert not saved.scenes[0].linked_item_groups
+    assert not [a for a in saved.assets if a.asset_type == 'audio']
+    assert not list(tmp_path.glob('_tmp_export_*.wav'))
+    if mode != 'custom_none':
+        assert any('no audible audio' in warning for warning in job.warnings)
+    else:
+        assert not job.warnings
+
+
+def test_real_audio_only_empty_window_produces_silent_file_and_notice(tmp_path, monkeypatch):
+    from server import media_helpers as media
+    project_dir = tmp_path / 'project'
+    (project_dir / 'media').mkdir(parents=True)
+    scene = Scene(scene_id='scene', name='Scene', duration_frames=4)
+    project = TimelineProject(project_dir=str(project_dir), project_id='project', name='Project', scenes=[scene], fps=24)
+    save_project(project)
+    monkeypatch.setattr(timeline_export, '_transient_temp_dir', lambda: str(tmp_path))
+    monkeypatch.setattr(timeline_export, 'ensure_thumbnail', lambda *a, **k: True)
+    manager = TimelineExportManager(max_workers=1, ttl_seconds=60)
+    job = manager.start(project, {'scene_id': 'scene', 'range': {'start': 0, 'end': 4},
+        'include_video': False, 'include_audio': True, 'save_preset': 'Compatible MP4'})
+    job.future.result(timeout=30)
+    assert job.status == 'completed', job.error
+    saved = load_project(str(project_dir))
+    asset = saved.get_asset(job.result_asset_id)
+    samples, rate = media.decode_audio_samples(project_dir / asset.path)
+    assert rate == 48000 and not np.any(samples)
+    assert asset.asset_type == 'audio'
+    assert not saved.scenes[0].audio_tracks
+    assert any('exported audio is silent' in warning for warning in job.warnings)
+
+
+def test_take_sidecar_rejects_garbage_larger_than_an_empty_header(tmp_path, monkeypatch):
+    (tmp_path / 'media').mkdir()
+    (tmp_path / 'media/video.mp4').write_bytes(b'video')
+    source = tmp_path / 'garbage.wav'
+    source.write_bytes(b'garbage' * 100)
+    project = TimelineProject(project_dir=str(tmp_path))
+    scene = Scene()
+    asset = Asset(asset_id='video', asset_type='video', path='media/video.mp4', has_audio=True)
+    cleanup = []
+    monkeypatch.setattr(timeline_export, 'get_ffmpeg_path', lambda: pytest.fail('prepared sidecar does not need an extraction command'))
+    assert _place_embedded_audio_take(project, scene, asset, 0, 24, '', {},
+        cleanup_paths=cleanup, prepared_audio_path=str(source)) is None
+    assert not project.assets and not scene.audio_tracks
+    assert not (tmp_path / 'media/video_audio.wav').exists() and not cleanup
+
+
+def test_failed_timeline_audio_placement_rolls_back_audio_asset_and_lane(tmp_path, monkeypatch):
+    from server import media_helpers as media
+    project_dir = tmp_path / 'project'
+    (project_dir / 'media').mkdir(parents=True)
+    media.write_audio_wav(project_dir / 'media/source.wav', np.full((2, 8000), .1, np.float32), 48000)
+    scene = Scene(scene_id='scene', name='Scene', duration_frames=4,
+        audio_tracks=[AudioTrack(source_path='media/source.wav', timeline_end_frame=4)],
+        audio_lane_configs=[LaneConfig()], video_lane_configs=[LaneConfig()])
+    project = TimelineProject(project_dir=str(project_dir), name='Project', scenes=[scene], fps=24, resolution=(32,32))
+    save_project(project)
+    monkeypatch.setattr(timeline_export, '_transient_temp_dir', lambda: str(tmp_path))
+    monkeypatch.setattr(timeline_export, 'iter_scene_frames', lambda *a, **k: iter(np.zeros((4,32,32,3),np.uint8)))
+    monkeypatch.setattr(timeline_export, 'ensure_thumbnail', lambda *a, **k: True)
+    original = timeline_export.ensure_lane_index
+    def failed_lane(scene, family, *args):
+        original(scene, family, *args)
+        if family == 'audio':
+            raise RuntimeError('test failed audio placement after lane creation')
+    monkeypatch.setattr(timeline_export, 'ensure_lane_index', failed_lane)
+    manager = TimelineExportManager(max_workers=1, ttl_seconds=60)
+    job = manager.start(project, {'scene_id':'scene','range':{'start':0,'end':4},
+        'include_video':True,'include_audio':True,'place_as_take':True,'save_preset':'Compatible MP4'})
+    job.future.result(timeout=30)
+    assert job.status == 'completed' and job.alerts
+    saved = load_project(str(project_dir))
+    assert len(saved.assets) == 1 and saved.assets[0].asset_type == 'video'
+    assert (project_dir / saved.assets[0].path).is_file()
+    assert len(saved.scenes[0].audio_tracks) == 1
+    assert len(saved.scenes[0].audio_lane_configs) == 1
+    assert not list((project_dir / 'media').glob('*_audio.wav'))
+
+
+def test_embedded_take_extraction_preserves_native_mono_samples(tmp_path, monkeypatch):
+    from server import audio_pipeline as audio, media_helpers as media
+    (tmp_path / 'media').mkdir()
+    samples = np.array([[.25, -.125, 1.25, -1.375] * 1000], np.float32)
+    source = tmp_path / 'source.wav'
+    media.write_audio_wav(source, samples, 32000)
+    video = tmp_path / 'media' / 'mono.mov'
+    media.run_ffmpeg_command([media.get_ffmpeg_path(), '-y', '-f', 'lavfi', '-i', 'color=s=32x32:r=24:d=0.125',
+        '-i', str(source), '-c:v', 'libx264', '-c:a', 'pcm_f32le', str(video)], timeout=30)
+    monkeypatch.setattr(timeline_export, 'ensure_thumbnail', lambda *a, **k: True)
+    project = TimelineProject(project_dir=str(tmp_path), fps=24)
+    scene = Scene()
+    asset = Asset(asset_id='mono', asset_type='video', path='media/mono.mov', has_audio=True, duration_sec=.125)
+    result = _place_embedded_audio_take(project, scene, asset, 0, 3, '', {})
+    assert result is not None
+    track, _ = result
+    with audio.mapped_float_wav(tmp_path / track.source_path) as (rate, prepared):
+        assert rate == 32000
+        np.testing.assert_array_equal(np.array(prepared.T, copy=True), samples)
