@@ -247,12 +247,13 @@ export function createPlaybackSourceCache({
         return identityFor(sourcePath, options)?.cacheKey || "";
     }
 
-    async function resolve(sourcePath, { forceBlob = false, releaseHolders = null } = {}) {
+    async function resolve(sourcePath, { forceBlob = false, releaseHolders = null, acquisitionHolder = null } = {}) {
         const identity = identityFor(sourcePath, { forceBlob });
         if (!identity || isDestroyed()) return null;
         retireOutdatedPathEntries(identity, "revision-replaced", releaseHolders);
         const cached = entries.get(identity.cacheKey);
         if (cached?.promise && !cached.pendingEviction) {
+            if (acquisitionHolder) addHolder(cached.key, acquisitionHolder);
             cached.live = entryIsLive(cached);
             cached.lastUsedAtMs = now();
             safeRecord(cached.inFlight ? "cache_coalesced" : "cache_hit", cached);
@@ -285,6 +286,7 @@ export function createPlaybackSourceCache({
             everHeld: false,
         };
         entries.set(entry.key, entry);
+        if (acquisitionHolder) addHolder(entry.key, acquisitionHolder);
         safeRecord("cache_miss", entry);
         entry.promise = Promise.resolve().then(async () => {
             if (entries.get(entry.key) !== entry || entry.pendingEviction || isDestroyed()) return null;

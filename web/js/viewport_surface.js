@@ -32,8 +32,8 @@ export function _planPlaybackPreRoll({ fps, currentFrame, targetFrame, targetSou
 
 export function _rollingPrebufferAtTarget(currentTime, targetTime, tolerance) {
     return Number.isFinite(currentTime) && Number.isFinite(targetTime)
-        // Sub-millisecond media-clock quantization is not a previous source frame;
-        // the target is a frame center, so this epsilon stays well inside it.
+        // Tolerate measured sub-millisecond clock quantization, never a whole
+        // preceding frame. Rolling callers supply the frame timestamp.
         && currentTime >= targetTime - 0.001 && currentTime <= targetTime + tolerance;
 }
 
@@ -2706,11 +2706,21 @@ export function createViewportSurface(options = {}) {
     // streaming mode (guide-snapshot capture is a frame-accuracy correctness
     // path). Surface auto/blob loads and forced-blob loads share `blob:...`;
     // explicit direct opt-in gets its own `direct:...` entry.
-    function resolveMediaSourceUrl(sourcePath, { forceBlob = false } = {}) {
-        return sourceCache.resolve(sourcePath, {
-            forceBlob,
-            releaseHolders: (mediaEl) => removeMediaSource(mediaEl),
-        });
+    async function resolveMediaSourceUrl(sourcePath, { forceBlob = false } = {}) {
+        // Each awaiting consumer owns a temporary holder until it either adopts
+        // the URL into its element or abandons it. Coalesced consumers are independent.
+        const holder = {};
+        const cacheKey = sourceCache.cacheKeyFor(sourcePath, { forceBlob });
+        const releaseAcquisition = () => sourceCache.releaseHolder(cacheKey, holder);
+        holder._sonderReleaseSourceRef = releaseAcquisition;
+        try {
+            const resolved = await sourceCache.resolve(sourcePath, {
+                forceBlob, acquisitionHolder: holder,
+                releaseHolders: (mediaEl) => removeMediaSource(mediaEl),
+            });
+            if (!resolved) { releaseAcquisition(); return null; }
+            return { ...resolved, releaseAcquisition };
+        } catch (error) { releaseAcquisition(); throw error; }
     }
 
     function getOrCreateVideo(layer) {
@@ -3135,10 +3145,14 @@ export function createViewportSurface(options = {}) {
         const resolved = await resolveMediaSourceUrl(sourcePath, { forceBlob });
         const cacheKey = resolved?.cacheKey || requestedCacheKey;
         if (!resolved?.url || state.destroyed || mediaEl._sonderSourceRequestToken !== requestToken) {
+            resolved?.releaseAcquisition();
             maybeReleaseSourceCacheEntry(cacheKey);
             return null;
         }
-        if (!acquireMediaElementSource(mediaEl, cacheKey, resolved.url)) return null;
+        let acquired;
+        try { acquired = acquireMediaElementSource(mediaEl, cacheKey, resolved.url); }
+        finally { resolved.releaseAcquisition(); }
+        if (!acquired) return null;
         return await waitForMediaReady(mediaEl, 1);
     }
 
@@ -3234,6 +3248,7 @@ export function createViewportSurface(options = {}) {
         const resolved = await resolveMediaSourceUrl(sourcePath);
         const sourceCacheKey = resolved?.cacheKey || requestedSourceCacheKey;
         if (!resolved?.url || !stillCurrent()) {
+            resolved?.releaseAcquisition();
             maybeReleaseSourceCacheEntry(sourceCacheKey);
             return null;
         }
@@ -3241,7 +3256,10 @@ export function createViewportSurface(options = {}) {
         entry.decodeJob = null;
         entry.decodeJobState = "queued";
         entry.decodeJobPriority = entry.decodePriority || DECODE_PRIORITY_LOW;
-        if (!acquireMediaElementSource(video, sourceCacheKey, resolved.url)) {
+        let acquired;
+        try { acquired = acquireMediaElementSource(video, sourceCacheKey, resolved.url); }
+        finally { resolved.releaseAcquisition(); }
+        if (!acquired) {
             maybeReleaseSourceCacheEntry(sourceCacheKey);
             return null;
         }
@@ -3369,7 +3387,9 @@ export function createViewportSurface(options = {}) {
                 activePreRolls++;
                 entry.preRollPromise = playbackDecodeLimiter.run(DECODE_PRIORITY_LOW, async () => {
                     if (!current()) return;
-                    const video = await seekMedia(entry.video, sourceFrameTime(plan.leadInSourceFrame), {
+                    const video = await seekMedia(entry.video, // Rolling clocks target the frame timestamp, not the paused-seek center.
+                    // A center-plus-jitter clock can already draw the following frame.
+                    Math.max(0, sourceFrameTime(plan.leadInSourceFrame) - 0.5 / fps()), {
                         requireTarget: true, tolerance: prebufferTargetTimeTolerance(), signal: entry.preRollAbort.signal,
                     });
                     if (!current()) return;
@@ -3391,7 +3411,7 @@ export function createViewportSurface(options = {}) {
         if (!entry?.video || entry.video.error) return false;
         if (entry.video.seeking || (entry.video.readyState || 0) < 2) return false;
         if (entry.preRollPhase === "lead-in") return false;
-        if (entry.preRollPhase === "rolling") return _rollingPrebufferAtTarget(Number(entry.video.currentTime), targetTime, firstDrawTolerance());
+        if (entry.preRollPhase === "rolling") return _rollingPrebufferAtTarget(Number(entry.video.currentTime), Math.max(0, targetTime - 0.5 / fps()), Math.min(firstDrawTolerance(), 0.45 / fps()));
         return isMediaAtTarget(
             entry.video,
             clampMediaTargetTime(entry.video, targetTime),

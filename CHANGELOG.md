@@ -27,6 +27,8 @@ a fresh `[Unreleased]` block.
 - Frozen threshold values use the current coverage rule when resolved again, including legacy v0.2.2 prompt replay.
 
 ### Fixed
+- Incoming pre-rolled clips target their source-frame timestamp so startup jitter does not advance the picture by one frame at a cut.
+- Cancelled playback prefetches release their acquisition protection, allowing the memory target to reclaim them while preserving other consumers and immediate teardown cancellation.
 - The Save Video preset description no longer paints over the widgets below it; the help box now reserves the height its text actually needs.
 - Fullscreen playback pre-rolls eligible incoming clips to reduce boundary freezes; clips without source lead-in keep normal preparation.
 - Passed playback clips release their media holders so the memory target can reclaim idle sources; scrubbing back under pressure may re-fetch them.

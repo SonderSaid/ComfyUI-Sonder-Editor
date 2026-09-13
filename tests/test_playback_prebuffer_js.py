@@ -930,7 +930,7 @@ source=source.replaceAll(/from "(\.\/[^"]+)"/g,(_,p)=>'from '+JSON.stringify(new
 source=source.replace('        renderFrame,\n        togglePlayback,','        _state: state, _sourceCache: sourceCache, _drain: drainPendingReleases, _abortPreRolls: abortPreRolls,\n        renderFrame,\n        togglePlayback,');
 const {createViewportSurface}=await import('data:text/javascript;base64,'+Buffer.from(source).toString('base64'));
 let fetches=0;globalThis.fetch=async()=>{fetches++;return {ok:true,blob:async()=>new Blob([new Uint8Array(100)])};};
-const events = [], raf = [], videos = [], draws = [], frames=[];
+const drawnSourceFrames=[];const events = [], raf = [], videos = [], draws = [], frames=[];
 globalThis.window = {SONDER_DEBUG_SESSION:true, __SONDER_CANVAS_DIAG:{record:(kind,payload)=>events.push({kind,...payload})},__SONDER_DIAG_CLEARERS:new Set(),setTimeout,clearTimeout};
 class Video extends EventTarget {
  constructor(){super();this.readyState=0;this.videoWidth=320;this.videoHeight=180;this.duration=100;this.paused=true;this.seeking=false;this._time=0;this.callbacks=new Map();this.next=0; videos.push(this);}
@@ -938,7 +938,7 @@ class Video extends EventTarget {
  set src(v){this._src=v;this.readyState=4;}
  get currentTime(){return this._time;}
  set currentTime(v){this._time=v;queueMicrotask(()=>this.dispatchEvent(new Event('seeked')));}
- play(){this.paused=false;return Promise.resolve();}
+ play(){this.paused=false;this.startupTicks=1;return Promise.resolve();}
  pause(){this.paused=true;}
  load(){}
  removeAttribute(k){if(k==="src"){delete this._src;this.readyState=0;}else delete this[k];}
@@ -948,7 +948,7 @@ class Video extends EventTarget {
 }
 globalThis.document={visibilityState:'visible',hasFocus:()=>true,querySelectorAll:()=>[],createElement:()=>new Video()};
 globalThis.requestAnimationFrame=cb=>{raf.push(cb);return raf.length;};globalThis.cancelAnimationFrame=()=>{};
-const ctx=new Proxy({globalAlpha:1,drawImage:(el)=>draws.push(el)}, {get:(t,k)=>k in t?t[k]:()=>{},set:(t,k,v)=>{t[k]=v;return true;}});
+const ctx=new Proxy({globalAlpha:1,drawImage:(el)=>{draws.push(el);if(frame>=8 && frame<=11)drawnSourceFrames.push(Math.floor(el.currentTime*24+0.5+1e-6));}}, {get:(t,k)=>k in t?t[k]:()=>{},set:(t,k,v)=>{t[k]=v;return true;}});
 let frame=0;
 const scene={clips:[{clip_id:'a',source_path:'a.mp4',timeline_start_frame:0,timeline_end_frame:8,source_in_frame:0},{clip_id:'b',source_path:'b.mp4',timeline_start_frame:8,timeline_end_frame:30,source_in_frame:12}],audio_tracks:[],guide_frames:[]};
 const surface=createViewportSurface({canvas:{width:320,height:180,getContext:()=>ctx},getScene:()=>scene,getFrame:()=>frame,setFrame:v=>{frame=v;frames.push(v);},getTotalFrames:()=>30,getFps:()=>24,getAssetForSourcePath:()=>({width:320,height:180,media_kind:'video'}),buildViewUrl:p=>'https://fixture/'+p,getStreamingMode:()=> 'auto',getDecodeConcurrency:()=>8,isAdaptiveRebufferEnabled:()=>false});
@@ -961,7 +961,7 @@ if (__AUDIO__) { scene.audio_tracks=[{track_id:'audio-a',source_path:'audio-a.wa
 const base=performance.now();
 for(let i=0;i<20;i++){
 if (__ABORT__ && i===6) {const e=[...surface._state.prebufferCache.values()].find(e=>e.preRollPhase==='rolling');surface._abortPreRolls('test-rebuffer');await settle();abortRestored=!!e && e.preRollPhase==='target' && e.video.paused && Math.abs(e.video.currentTime-e.targetTime)<1e-6;}
-if (__CLEAR__ && i===12){beforeClear=events.filter(e=>e.kind==="playback_presentation_mismatch").length;for(const clear of window.__SONDER_DIAG_CLEARERS)clear();}for(const v of videos)if(!v.paused)v._time+=1/24;for(const cb of raf.splice(0))cb(base+i*1000/24+0.1);await settle();}
+if (__CLEAR__ && i===12){beforeClear=events.filter(e=>e.kind==="playback_presentation_mismatch").length;for(const clear of window.__SONDER_DIAG_CLEARERS)clear();}for(const v of videos)if(!v.paused){if(v.startupTicks)v.startupTicks--;else v._time+=1/24;}for(const cb of raf.splice(0))cb(base+i*1000/24+0.1);await settle();}
 const releasedPassed=!surface._state.videoCache.a && !videos[0].src;
 const idleBeforeStop=surface._sourceCache.snapshot().idleEntries;
 const fetchesBeforeStop=fetches;
@@ -975,7 +975,7 @@ const adoptedRetained=adopted.src==='adopted' && !surface._state.pendingRelease.
 surface._state.prebufferCache.delete('audit');
 const audioReleased=!surface._state.audioCache['audio-a'];
 const audioVisible=surface._state.audioCache['audio-b'];
-console.log(JSON.stringify({audioReleased,audioVisibleRetained:!!audioVisible?.src,abortRestored,releasedPassed,idleBeforeStop,stopPreserved,adoptedRetained,beforeClear, sameRun:events.filter(e=>e.kind==="playback_run_start").every(e=>e.playbackRunId===firstStart.playbackRunId), frames, videos:videos.length,draws:draws.length,stop:events.find(e=>e.kind==='playback_run_stop')?.presentation,videoStates:videos.map(v=>({src:v.src,time:v.currentTime,paused:v.paused})),claims:events.filter(e=>e.kind==='playback_prebuffer_claim').length, kinds:[...new Set(events.map(e=>e.kind))]}));
+console.log(JSON.stringify({drawnSourceFrames,audioReleased,audioVisibleRetained:!!audioVisible?.src,abortRestored,releasedPassed,idleBeforeStop,stopPreserved,adoptedRetained,beforeClear, sameRun:events.filter(e=>e.kind==="playback_run_start").every(e=>e.playbackRunId===firstStart.playbackRunId), frames, videos:videos.length,draws:draws.length,stop:events.find(e=>e.kind==='playback_run_stop')?.presentation,videoStates:videos.map(v=>({src:v.src,time:v.currentTime,paused:v.paused})),claims:events.filter(e=>e.kind==='playback_prebuffer_claim').length, kinds:[...new Set(events.map(e=>e.kind))]}));
 surface.destroy();
 
 
@@ -1162,3 +1162,48 @@ def test_audio_departure_releases_holder_and_stop_preserves_visible_audio():
     result = _presentation_harness(audio=True)
     assert result["audioReleased"] is True
     assert result["audioVisibleRetained"] is True
+
+
+def test_cancelled_acquisitions_expire_budget_protection_without_stranding_coalesced_consumer():
+    result = _run_node(_budget_harness("""
+for(let i=0;i<8;i++) {
+ const path=`cancelled-${i}`;live.push(path);const holder={};
+ const result=await cache.resolve(path,{acquisitionHolder:holder});
+ cache.releaseHolder(result.cacheKey,holder);
+}
+const cancelled=cache.snapshot();
+live.push('shared');const abandoned={},survivor={};
+const one=cache.resolve('shared',{acquisitionHolder:abandoned});
+const two=cache.resolve('shared',{acquisitionHolder:survivor});
+const a=await one;cache.releaseHolder(a.cacheKey,abandoned);
+await load('pressure');release('pressure');
+const b=await two;const video={};const adopted=cache.addHolder(b.cacheKey,video);
+cache.releaseHolder(b.cacheKey,survivor);
+console.log(JSON.stringify({cancelled,adopted,sameUrl:a.url===b.url,sharedHolders:cache.entries.get(b.cacheKey).holders.size}));
+"""))
+    assert result["cancelled"]["retainedBytes"] <= 600
+    assert result["cancelled"]["heldEntries"] == 0
+    assert result["cancelled"]["budgetPending"] is False
+    assert result["adopted"] is True
+    assert result["sameUrl"] is True
+    assert result["sharedHolders"] == 1
+
+
+def test_rolling_draws_target_source_frames_without_half_frame_advance():
+    result = _presentation_harness()
+    assert result["drawnSourceFrames"] == [12,13,14,15]
+
+
+def test_pending_acquisition_holder_yields_to_scene_teardown():
+    module_url = (ROOT / "web/js/playback_source_cache.js").as_uri()
+    result = _run_node(f"""
+const {{createPlaybackSourceCache}}=await import({json.dumps(module_url)});
+let aborted=false;
+const cache=createPlaybackSourceCache({{getLiveSourcePaths:()=>['a'],buildDirectUrl:()=>'/a',fetchMedia:(_,{{signal}})=>new Promise((resolve,reject)=>signal.addEventListener('abort',()=>{{aborted=true;reject(new DOMException('Aborted','AbortError'));}}))}});
+const holder={{}};const key=cache.cacheKeyFor('a');holder._sonderReleaseSourceRef=()=>cache.releaseHolder(key,holder);
+const pending=cache.resolve('a',{{acquisitionHolder:holder}});await Promise.resolve();
+cache.reconcile('scene-switch',{{force:true,releaseHolders:h=>h._sonderReleaseSourceRef?.()}});
+await pending;
+console.log(JSON.stringify({{aborted,entries:cache.snapshot().entryCount}}));
+""")
+    assert result == {"aborted": True, "entries": 0}
