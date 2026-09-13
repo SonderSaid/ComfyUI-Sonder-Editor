@@ -672,12 +672,16 @@ def test_sonder_save_and_preview_real_ffmpeg_paths_match_diagnostic_flags(tmp_pa
     save_cmd = _cmd_for(save_path.name)
     preview_cmd = _cmd_for(preview_video)
     save_tail = save_cmd[save_cmd.index("-c:v") :]
-    assert save_tail[:20] == [
+    # Slice by the expectation's own length rather than a hand-counted literal, so a
+    # later preset argument change fails on content instead of on arithmetic.
+    expected_save_head = [
         "-c:v", "libx264", "-preset", "slow", "-crf", "18", "-pix_fmt", "yuv420p",
+        "-g", "48",
         "-movflags", "+faststart",
         "-vf", EXPECTED_BT709_COLOR_VF,
         *EXPECTED_BT709_COLOR_FLAGS,
     ]
+    assert save_tail[: len(expected_save_head)] == expected_save_head
     assert save_cmd.count("-movflags") == 1  # a second pair would override +faststart
     assert preview_cmd[preview_cmd.index("-c:v") + 1] == "libx264"
     assert preview_cmd[preview_cmd.index("-pix_fmt", preview_cmd.index("-c:v")) + 1] == "yuv420p"
@@ -723,14 +727,17 @@ def test_encode_video_preset_commands_and_tensor_modes(tmp_path, monkeypatch):
     assert "Legacy" not in media_helpers.SAVE_VIDEO_PRESET_ORDER
     assert media_helpers.normalize_save_preset("Legacy") == "Compatible MP4"
 
+    # `expected_gop` is the `-g` value the preset must emit, or None when it must emit no
+    # `-g` at all. The None rows are the point of the column: ProRes is intra by codec and
+    # must not acquire a GOP flag from a later "make the table uniform" edit.
     cases = [
-        ("Compatible MP4", ".mp4", "libx264", "yuv420p", "round", ["-c:a", "aac", "-b:a", "192k"]),
-        ("High Quality MP4", ".mp4", "libx264", "yuv420p", "round", ["-c:a", "aac", "-b:a", "256k"]),
-        ("Editing Master MP4", ".mp4", "libx264", "yuv444p", "round", ["-c:a", "flac", "-bits_per_raw_sample", "24"]),
-        ("ProRes 422 HQ", ".mov", "prores_ks", "yuv422p10le", "round", ["-c:a", "pcm_s24le"]),
-        ("Lossless FFV1 (RGB)", ".mkv", "ffv1", "gbrp", "round", ["-c:a", "flac", "-bits_per_raw_sample", "24"]),
+        ("Compatible MP4", ".mp4", "libx264", "yuv420p", "round", ["-c:a", "aac", "-b:a", "192k"], "48"),
+        ("High Quality MP4", ".mp4", "libx264", "yuv420p", "round", ["-c:a", "aac", "-b:a", "256k"], "48"),
+        ("Editing Master MP4", ".mp4", "libx264", "yuv444p", "round", ["-c:a", "flac", "-bits_per_raw_sample", "24"], "1"),
+        ("ProRes 422 HQ", ".mov", "prores_ks", "yuv422p10le", "round", ["-c:a", "pcm_s24le"], None),
+        ("Lossless FFV1 (RGB)", ".mkv", "ffv1", "gbrp", "round", ["-c:a", "flac", "-bits_per_raw_sample", "24"], "1"),
     ]
-    for preset, extension, codec, pix_fmt, tensor_mode, audio_args in cases:
+    for preset, extension, codec, pix_fmt, tensor_mode, audio_args, expected_gop in cases:
         meta = media_helpers.encode_video(
             frames,
             preset_id=preset,
@@ -746,6 +753,14 @@ def test_encode_video_preset_commands_and_tensor_modes(tmp_path, monkeypatch):
         assert meta["color_managed"] is True
         assert cmd[cmd.index("-c:v") + 1] == codec
         assert cmd[cmd.index("-pix_fmt", cmd.index("-c:v")) + 1] == pix_fmt
+        if expected_gop is None:
+            assert "-g" not in cmd, f"{preset} must not emit a keyframe interval"
+        else:
+            assert cmd[cmd.index("-g") + 1] == expected_gop
+        # `-sc_threshold` is a libx264 private option; passing it would make every encode
+        # depend on a build exposing it, for no seek benefit `-g` does not already give.
+        assert "-sc_threshold" not in cmd
+        assert "-keyint_min" not in cmd
         if pix_fmt == "gbrp":
             assert "-vf" not in cmd
             assert "-colorspace" not in cmd
@@ -897,6 +912,59 @@ def test_encode_video_evens_odd_dimensions(tmp_path, monkeypatch):
     )
     even_cmd = captured["cmds"][-1]
     assert even_cmd[even_cmd.index("-vf") + 1] == EXPECTED_BT709_COLOR_VF
+
+
+def _count_keyframes(ffmpeg: str, media_path: Path) -> int:
+    """Keyframes actually present in the encoded file.
+
+    Uses ffmpeg rather than ffprobe because `_require_ffmpeg` guarantees ffmpeg is
+    available while `_probe_ffprobe` degrades to unavailable, and a GOP assertion that
+    silently skips is worse than no assertion.
+    """
+    result = subprocess.run(
+        [ffmpeg, "-hide_banner", "-skip_frame", "nokey", "-i", str(media_path),
+         "-an", "-fps_mode", "passthrough", "-f", "null", "-"],
+        capture_output=True, text=True, timeout=180,
+    )
+    matches = re.findall(r"frame=\s*(\d+)", result.stderr or "")
+    return int(matches[-1]) if matches else -1
+
+
+def test_preset_keyframe_intervals_are_real_not_just_argv(tmp_path, monkeypatch):
+    """The `-g` flags must produce actual keyframes, not merely appear in argv.
+
+    Argv assertions prove intent; only a real encode proves the encoder accepted the
+    option and placed the keyframes. This is also the guard that a future ffmpeg build
+    still accepts the flags at all - a rejected option fails the encode outright, which
+    would break every export rather than only playback.
+    """
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    ffmpeg = _require_ffmpeg(io_nodes)
+    np = pytest.importorskip("numpy")
+    media_helpers = importlib.import_module(f"{TEST_PACKAGE}.server.media_helpers")
+    monkeypatch.setattr(media_helpers, "get_ffmpeg_path", lambda: ffmpeg)
+
+    # 100 frames of changing content so the encoder has a reason to emit P-frames;
+    # a static clip can collapse to trivial GOPs and hide a missing interval.
+    rng = np.random.default_rng(7)
+    base = rng.integers(0, 255, size=(64, 96, 3), dtype=np.uint8)
+    frames = np.stack([np.roll(base, shift, axis=1) for shift in range(100)], axis=0)
+
+    # preset -> (max spacing between keyframes, minimum keyframes expected)
+    expectations = {
+        "Compatible MP4": (48, 100 // 48),
+        "High Quality MP4": (48, 100 // 48),
+        "Editing Master MP4": (1, 100),
+    }
+    for preset, (max_spacing, min_keyframes) in expectations.items():
+        out_path = tmp_path / f"gop_{preset.replace(' ', '_')}.mp4"
+        media_helpers.encode_video(frames, preset_id=preset, output_path=str(out_path), fps=24)
+        assert out_path.is_file(), f"{preset} produced no file"
+        keyframes = _count_keyframes(ffmpeg, out_path)
+        assert keyframes >= min_keyframes, (preset, keyframes, min_keyframes)
+        if max_spacing == 1:
+            # All-intra: every frame is a keyframe, so seek cost is position-independent.
+            assert keyframes == 100, (preset, keyframes)
 
 
 def test_browser_simulation_round_trip_bt709(tmp_path, monkeypatch):

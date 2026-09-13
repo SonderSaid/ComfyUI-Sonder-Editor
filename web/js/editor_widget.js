@@ -236,6 +236,7 @@ import { referenceConfigurationAdvisories, resolveReferenceDropVerdict } from ".
 import { REFERENCE_LANE_CAUSE, classifyReferenceChunks } from "./reference_resolution.js";
 import { deriveCurrentSceneAssetIds } from "./current_scene_assets.js";
 import { notifyInfo, notifySuccess, notifyWarning, notifyError, notifyProgress } from "./editor_notifications.js";
+import { shouldSkipVideoLoad } from "./media_preview_support.js";
 import {
     collapseChannelsForTemplate,
     composeSectionText,
@@ -2735,6 +2736,11 @@ export class EditorWidget {
             sourceStartSec: draft?.source_start_sec ?? 0,
             sourceEndSec: draft?.source_end_sec ?? null,
             mediaUrl: this._buildViewURL(asset.path),
+            // The host owns networking, so it resolves the still; the module only
+            // renders it. `_referenceAssetPreviewUrl` already returns the thumbnail
+            // for video assets, which is exactly the poster wanted here.
+            posterUrl: asset.asset_type === "video" ? (this._referenceAssetPreviewUrl(asset) || "") : "",
+            previewUnavailable: shouldSkipVideoLoad(asset),
             waveformUrl: projectDir && ["audio", "video"].includes(asset.asset_type)
                 ? api.apiURL(`/sonder-editor/project/${encodeURIComponent(projectDir)}/waveform/${encodeURIComponent(asset.asset_id)}`)
                 : "",
@@ -21974,6 +21980,9 @@ export class EditorWidget {
             getPrebufferBoundaryDepth: () => this._settings?.playback?.prebufferBoundaryDepth ?? 2,
             getPrebufferMaxEntries: () => this._settings?.playback?.prebufferMaxEntries ?? 8,
             getDecodeConcurrency: () => this._settings?.playback?.decodeConcurrency ?? 2,
+            // `?? null` not `|| null`: a stored null means unlimited and must not
+            // be coerced, and there is no 0-means-off case for this cache.
+            getSourceCacheMaxBytes: () => this._settings?.playback?.sourceCacheMaxBytes ?? null,
             notifyInfo: (message, opts) => notifyInfo(message, opts),
             notifyWarning: (message, opts) => notifyWarning(message, opts),
             onFrameChange: (frame, meta = {}) => {

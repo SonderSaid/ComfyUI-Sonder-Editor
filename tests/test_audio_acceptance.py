@@ -311,8 +311,14 @@ def test_preset_audio_descriptions_and_documentation_match_delivery():
     js = (root / 'web/js/editor_settings.js').read_text(encoding='utf-8')
     js = js.split('export const SAVE_PRESET_OPTIONS = [', 1)[1].split('];', 1)[0]
     descriptions = dict(re.findall(r'value: "([^"]+)"[^\n]*description: "([^"]+)"', js))
-    readme = (root / 'README.md').read_text(encoding='utf-8')
-    rows = dict(re.findall(r'^\| ([^|]+?) \| ([^|]+?) \|$', readme, re.M))
+    # The audio-delivery table lives with the Save Video / Export preset docs, not
+    # in the README: the README copy was redundant and said nothing the reader
+    # could act on. Keep this pointed at the page that explains the presets.
+    doc_path = root / 'docs/assets-and-gallery.md'
+    rows = dict(re.findall(r'^\| ([^|]+?) \| ([^|]+?) \|$', doc_path.read_text(encoding='utf-8'), re.M))
+    expected = [n for n in media.SAVE_VIDEO_PRESETS if n != media.CUSTOM_SAVE_VIDEO_PRESET]
+    missing = [n for n in expected if n not in rows]
+    assert not missing, f'{doc_path} is missing audio-delivery rows for {missing}'
     for name, preset in media.SAVE_VIDEO_PRESETS.items():
         if name == media.CUSTOM_SAVE_VIDEO_PRESET:
             continue

@@ -94,11 +94,19 @@ SAVE_VIDEO_PRESET_ORDER = [
     CUSTOM_SAVE_VIDEO_PRESET,
 ]
 
+# `-g` bounds in-clip seek cost. Without it x264 defaults to keyint=250 (~10.4 s at
+# 24 fps), so a seek decodes from the last keyframe and costs time proportional to how
+# far into the GOP it lands - measured 214 ms mean / 469 ms max on a 40 s export, versus
+# 19/34 ms at `-g 48`. Delivery presets use 48 (2 s, the web convention); 24 measured
+# only 11/19 ms, which is below one frame interval and not worth the extra 5% size.
+# `-sc_threshold`/`-keyint_min` are deliberately NOT passed: `-g` already sets the
+# maximum GOP and scene detection only inserts keyframes earlier, while `-sc_threshold`
+# is a libx264 private option whose absence in a future build would fail every encode.
 SAVE_VIDEO_PRESETS = {
     "Compatible MP4": {
         "extension": ".mp4",
         "tensor_mode": DEFAULT_TENSOR_MODE,
-        "video_args": ["-c:v", "libx264", "-preset", "slow", "-crf", "18", "-pix_fmt", "yuv420p", "-movflags", "+faststart"],
+        "video_args": ["-c:v", "libx264", "-preset", "slow", "-crf", "18", "-pix_fmt", "yuv420p", "-g", "48", "-movflags", "+faststart"],
         "audio_args": ["-c:a", "aac", "-b:a", "192k"],
         "codec": "libx264",
         "pix_fmt": "yuv420p",
@@ -108,7 +116,7 @@ SAVE_VIDEO_PRESETS = {
     "High Quality MP4": {
         "extension": ".mp4",
         "tensor_mode": DEFAULT_TENSOR_MODE,
-        "video_args": ["-c:v", "libx264", "-preset", "slow", "-crf", "14", "-pix_fmt", "yuv420p", "-movflags", "+faststart"],
+        "video_args": ["-c:v", "libx264", "-preset", "slow", "-crf", "14", "-pix_fmt", "yuv420p", "-g", "48", "-movflags", "+faststart"],
         "audio_args": ["-c:a", "aac", "-b:a", "256k"],
         "codec": "libx264",
         "pix_fmt": "yuv420p",
@@ -118,12 +126,16 @@ SAVE_VIDEO_PRESETS = {
     "Editing Master MP4": {
         "extension": ".mp4",
         "tensor_mode": "round",
-        "video_args": ["-c:v", "libx264", "-preset", "veryslow", "-crf", "10", "-pix_fmt", "yuv444p", "-movflags", "+faststart"],
+        # All-intra (`-g 1`): this is a round-trip master, so seeking is the point.
+        # Every frame a keyframe makes seek cost constant (69 ms mean, 73 ms max, versus
+        # 319/502 long-GOP) and removes the reference-chain and frame-reordering decode
+        # burden that `-preset veryslow` otherwise imposes. Costs ~2.3x the file size.
+        "video_args": ["-c:v", "libx264", "-preset", "veryslow", "-crf", "10", "-pix_fmt", "yuv444p", "-g", "1", "-movflags", "+faststart"],
         "audio_args": ["-c:a", "flac", "-bits_per_raw_sample", "24"],
         "codec": "libx264",
         "pix_fmt": "yuv444p",
         "browser_preview_compatible": False,
-        "description": "High-fidelity 4:4:4 MP4 with 24-bit FLAC audio for internal round trips; BT.709 tagged. Check 4:4:4 video and FLAC-in-MP4 support in your target application.",
+        "description": "MP4, H.264 CRF 10 all-intra, yuv444p, FLAC 24-bit audio, BT.709 tagged; recommended round-trip master. Browser/OS preview not guaranteed.",
     },
     "ProRes 422 HQ": {
         "extension": ".mov",

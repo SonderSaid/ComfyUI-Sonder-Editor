@@ -13,6 +13,7 @@ import {
 } from "./editor_settings.js";
 import { register as registerKeyboardConsumer, PRIORITY as KEY_PRIORITY } from "./keyboard_ownership.js";
 import { resolveEffectiveStreamingMode } from "./media_streaming.js";
+import { shouldSkipVideoLoad, videoTrackFailedToDecode } from "./media_preview_support.js";
 import { notifyError, notifyInfo, notifySuccess } from "./editor_notifications.js";
 import {
     cancelAutomaticThumbnailRepairs,
@@ -1137,6 +1138,14 @@ export function mountSharedAssetGallery(container, options = {}) {
     function loadGalleryMediaAsBlob(asset, mediaEl) {
         const url = buildAssetViewUrl(currentProjectDir(), asset?.path);
         if (!url || !mediaEl) return { cleanup: () => {} };
+        // A codec the browser has no decoder for never reaches a picture, so do
+        // not spend the transfer discovering that — opening a 500 MB FFV1 asset
+        // used to download the whole file to display black. Only positive
+        // provenance evidence gets here; anything unknown still loads and is
+        // caught at runtime by watchVideoDecodeFailure.
+        if (asset?.asset_type === "video" && shouldSkipVideoLoad(asset)) {
+            return { cleanup: () => {}, skippedUndecodable: true };
+        }
         // Video-only direct-streaming branch: no fetch, no LRU entry — the
         // browser HTTP cache + Range cover overlay re-renders. Audio and
         // images stay on the blob/LRU path below.
@@ -1228,6 +1237,43 @@ export function mountSharedAssetGallery(container, options = {}) {
         surface.style.backgroundSize = "";
         surface.style.backgroundPosition = "";
         surface.style.backgroundRepeat = "";
+    }
+
+    // Watches a <video> for the silent no-decoder failure: readyState reaches
+    // HAVE_METADATA (or better) while videoWidth stays 0 and no 'error' ever
+    // fires. Also listens for genuine load errors, which no gallery video
+    // surface handled before this — both holes close with one helper.
+    // Returns a cleanup fn for the surface's existing cleanup chain.
+    function watchVideoDecodeFailure(video, onUnavailable) {
+        if (!video || typeof onUnavailable !== "function") return () => {};
+        let done = false;
+        const finish = () => {
+            if (done) return;
+            done = true;
+            detach();
+            onUnavailable();
+        };
+        const check = () => {
+            if (done) return;
+            if (videoTrackFailedToDecode(video)) finish();
+        };
+        const onError = () => finish();
+        // Some builds settle without firing a further event once metadata is in;
+        // a single late poll closes that without a running timer.
+        const timer = setTimeout(check, 4000);
+        function detach() {
+            clearTimeout(timer);
+            video.removeEventListener("loadedmetadata", check);
+            video.removeEventListener("loadeddata", check);
+            video.removeEventListener("error", onError);
+        }
+        video.addEventListener("loadedmetadata", check);
+        video.addEventListener("loadeddata", check);
+        video.addEventListener("error", onError);
+        return () => {
+            done = true;
+            detach();
+        };
     }
 
     function revealImageAfterDecode(img, onReveal = null) {
@@ -4314,6 +4360,21 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         if (asset.asset_type === "video") {
             const stage = style(document.createElement("div"), `position:relative;flex:1 1 auto;min-height:0;border-radius:12px;background:#020507;border:1px solid #24323e;display:flex;align-items:center;justify-content:center;overflow:hidden;`);
+            // Codec the browser cannot decode: show the server-generated still
+            // (ffmpeg decodes what Chromium will not) and say so, rather than the
+            // black rectangle this used to be. Transport is deliberately omitted -
+            // the audio track decodes and currentTime advances, so a live scrub bar
+            // over a frozen frame reads as a stall rather than an explanation.
+            if (shouldSkipVideoLoad(asset)) {
+                applyThumbnailPlaceholder(stage, asset);
+                const note = style(document.createElement("div"), `margin:auto;padding:10px 14px;border-radius:8px;background:rgba(2,5,7,.78);color:${CHROME.textDim};font-size:12px;text-align:center;max-width:80%;`);
+                note.textContent = asset.has_thumbnail
+                    ? "No browser preview for this codec. The file is intact and exports normally."
+                    : "No browser preview for this codec, and no thumbnail is available yet. The file is intact and exports normally.";
+                stage.appendChild(note);
+                content.appendChild(stage);
+                return;
+            }
             const video = style(document.createElement("video"), `width:100%;height:100%;object-fit:contain;display:block;background:#000;user-select:none;`);
             video.draggable = false;
             // metadata, not auto: direct-streamed overlay video must not full-preroll
@@ -4366,7 +4427,21 @@ export function mountSharedAssetGallery(container, options = {}) {
                     video.currentTime = dur > 0 ? clamp(nextTime, 0, dur - 0.001) : Math.max(0, nextTime);
                 },
             };
+            // Imports carry no recorded codec, so the static hint cannot see them.
+            // This catches the same silent failure at runtime and degrades to the
+            // same presentation rather than leaving a black stage.
+            const downgradeToStill = () => {
+                video.pause();
+                video.style.display = "none";
+                applyThumbnailPlaceholder(stage, asset);
+                playbackRow.style.display = "none";
+                scrub.el.style.display = "none";
+                const note = style(document.createElement("div"), `margin:auto;padding:10px 14px;border-radius:8px;background:rgba(2,5,7,.78);color:${CHROME.textDim};font-size:12px;text-align:center;max-width:80%;`);
+                note.textContent = "No browser preview for this codec. The file is intact and exports normally.";
+                stage.appendChild(note);
+            };
             state.overlayState.cleanupFns.push(
+                watchVideoDecodeFailure(video, downgradeToStill),
                 attachZoomPan(stage, video),
                 attachRightClickVideoScrub(stage, scrubTransport, [video], { fps: assetFps(asset) }),
                 scrub.cleanup,
@@ -4762,6 +4837,23 @@ export function mountSharedAssetGallery(container, options = {}) {
                     configureDecodedImage(layerA, compareA, { highPriority: true, placeholderSurface: contentGroupA }),
                     configureDecodedImage(layerB, compareB, { highPriority: true, placeholderSurface: contentGroupB }),
                 );
+            } else {
+                // Per side: an undecodable layer shows its server still instead of a
+                // black rectangle. The placeholder sits on the content group, so the
+                // divider/side-by-side geometry is untouched.
+                for (const [sideAsset, layer, group] of [[compareA, layerA, contentGroupA],
+                                                         [compareB, layerB, contentGroupB]]) {
+                    if (shouldSkipVideoLoad(sideAsset)) {
+                        applyThumbnailPlaceholder(group, sideAsset);
+                        layer.style.display = "none";
+                    } else {
+                        state.overlayState.cleanupFns.push(watchVideoDecodeFailure(layer, () => {
+                            layer.pause();
+                            layer.style.display = "none";
+                            applyThumbnailPlaceholder(group, sideAsset);
+                        }));
+                    }
+                }
             }
             contentGroupA.appendChild(layerA);
             contentGroupB.appendChild(layerB);
@@ -5443,6 +5535,12 @@ export function mountSharedAssetGallery(container, options = {}) {
         if (assetIsMissing(asset)) {
             badges.appendChild(galleryStatusPill("Missing", "failed"));
         }
+        // "idle", not "failed": the file is intact and exports normally - only this
+        // browser has no decoder for it. A red badge would tell users their archive
+        // master is broken.
+        if (asset.asset_type === "video" && shouldSkipVideoLoad(asset)) {
+            badges.appendChild(galleryStatusPill("No Preview", "idle"));
+        }
         titleRow.append(title, badges);
         const pathLine = style(document.createElement("div"), `color:${assetIsMissing(asset) ? THEME.statusFailed : THEME.fg2};font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
         pathLine.textContent = asset.path || "-";
@@ -5468,6 +5566,21 @@ export function mountSharedAssetGallery(container, options = {}) {
             img.src = buildAssetViewUrl(projectDir, asset.path);
             img.alt = assetDisplayName(asset);
             previewSurface.appendChild(img);
+        } else if (asset.asset_type === "video" && shouldSkipVideoLoad(asset)) {
+            // Mirrors the Missing-asset block above: explain instead of rendering
+            // a black <video> that will never show a frame. The still comes from
+            // the server thumbnail, which ffmpeg produced from this same file.
+            previewSurface.style.height = "220px";
+            previewSurface.style.minHeight = "180px";
+            previewSurface.style.flex = "0 0 auto";
+            applyThumbnailPlaceholder(previewSurface, asset);
+            const noPreviewWrap = style(document.createElement("div"), `padding:14px;text-align:center;display:flex;flex-direction:column;gap:6px;align-items:center;background:rgba(2,5,7,.72);border-radius:8px;`);
+            const noPreviewTitle = style(document.createElement("div"), `color:${THEME.fg1};font-size:11px;font-weight:700;`);
+            noPreviewTitle.textContent = "No Browser Preview";
+            const noPreviewText = style(document.createElement("div"), `color:${THEME.fg2};font-size:10px;line-height:1.45;max-width:280px;`);
+            noPreviewText.textContent = "This browser has no decoder for this codec, so no picture can be shown. The file is intact and exports normally.";
+            noPreviewWrap.append(noPreviewTitle, noPreviewText);
+            previewSurface.appendChild(noPreviewWrap);
         } else if (asset.asset_type === "video") {
             previewSurface.style.height = "220px";
             previewSurface.style.minHeight = "180px";

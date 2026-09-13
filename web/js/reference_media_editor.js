@@ -53,6 +53,13 @@ export function openReferenceMediaEditor({
     sourceStartSec = 0,
     sourceEndSec = null,
     mediaUrl = "",
+    // Server-generated still, used when the browser has no decoder for this
+    // codec. The crop box stays fully interactive over it: geometry comes from
+    // `asset.width`/`height` (see mediaNaturalWidth below), not from the decoded
+    // frame, so cropping a ProRes reference still works - only the moving
+    // picture is missing. Refusing to open the editor would be strictly worse.
+    posterUrl = "",
+    previewUnavailable = false,
     waveformUrl = "",
     readOnly = false,
     initialViewMode = "source",
@@ -112,11 +119,24 @@ export function openReferenceMediaEditor({
         media.preload = mediaType === "audio" ? "auto" : "metadata";
         media.playsInline = true;
     }
+    // Undecodable video: keep the real <video> element - trim needs its duration
+    // and currentTime, and its audio track decodes fine - but paint the server
+    // still behind it so the frame area is not black. Crop geometry already falls
+    // back to `asset.width` (see mediaNaturalWidth), so the box stays accurate.
+    const posterBehindMedia = mediaType === "video" && previewUnavailable && !!posterUrl;
 
     let cropBox = null;
     const handles = new Map();
     if (visual) {
         media.style.cssText = "position:absolute;display:block;user-select:none;max-width:none;max-height:none;";
+        if (posterBehindMedia) {
+            mediaFrame.style.backgroundImage = `url("${posterUrl}")`;
+            mediaFrame.style.backgroundSize = "contain";
+            mediaFrame.style.backgroundPosition = "center";
+            mediaFrame.style.backgroundRepeat = "no-repeat";
+            // Let the still show through; the element stays laid out and functional.
+            media.style.opacity = "0";
+        }
         mediaFrame.appendChild(media);
         cropBox = node("div", "", `position:absolute;border:2px solid #72b9e6;box-shadow:0 0 0 9999px rgba(0,0,0,.58);box-sizing:border-box;touch-action:none;cursor:${readOnly ? "default" : "grab"};z-index:3;`);
         cropBox.dataset.referenceGeometryRole = "crop-box";

@@ -15,8 +15,10 @@ a fresh `[Unreleased]` block.
 - Project-wide Keep/Drop for out-of-window Reference text, with independent per-chip overrides and visible markers.
 
 ### Changed
+- Video presets now set a keyframe interval so clips scrub and play smoothly: Editing Master MP4 is all-intra (every frame a keyframe; it scrubs instantly but files are roughly 2.3x larger), and Compatible/High Quality MP4 place a keyframe every 2 seconds.
 - Fullscreen playback keeps a soft memory target for the video it holds in RAM, freeing idle media oldest-first. Media in use by the playhead or prebuffer is never dropped, so the figure can exceed the target on heavy scenes.
 - Editing Master MP4 and audio-only exports now use 24-bit FLAC; ProRes uses 24-bit PCM and FFV1 uses 24-bit FLAC.
+- The Editing Master MP4 preset description now names it the recommended round-trip master and warns that browser and OS preview are not guaranteed.
 - Silent Editor output uses 48 kHz; Reference placeholders follow the highest live native rate, or 48 kHz when empty. Audio socket shapes and ordering remain unchanged.
 - Stored audio volumes above 100% now render at 100%, matching timeline playback; stored project values remain intact.
 - Audio processing now requires FFmpeg 7.0 or newer.
@@ -25,10 +27,12 @@ a fresh `[Unreleased]` block.
 - Frozen threshold values use the current coverage rule when resolved again, including legacy v0.2.2 prompt replay.
 
 ### Fixed
-- Playback memory presets retain their selected values, default to the named 1 GB preset, and hide the custom-unit suffix beside named presets.
-- Paused previews avoid fetching fully covered video layers and fall back when the covering media cannot resolve or cover the canvas.
-- Passed playback clips release their media holders so the memory target can reclaim idle sources; scrubbing back under pressure may re-fetch them.
+- The Save Video preset description no longer paints over the widgets below it; the help box now reserves the height its text actually needs.
 - Fullscreen playback pre-rolls eligible incoming clips to reduce boundary freezes; clips without source lead-in keep normal preparation.
+- Passed playback clips release their media holders so the memory target can reclaim idle sources; scrubbing back under pressure may re-fetch them.
+- Paused previews avoid fetching fully covered video layers and fall back when the covering media cannot resolve or cover the canvas.
+- Playback memory presets retain their selected values, default to the named 1 GB preset, and hide the custom-unit suffix beside named presets.
+- ProRes and Lossless FFV1 assets show a still frame and an explanation in the asset gallery instead of a black rectangle; this browser has no decoder for those codecs, and the files remain intact and export normally.
 - Save Video and Preview retain valid video when supplied audio cannot be prepared, with visible alerts; failed take-audio placement rolls back its additions without discarding the video. Audio processing uses the configured temp volume and avoids unnecessary copies.
 - Corrupt audio only blocks windows using that source; empty, muted and zero-volume windows export video without manufacturing silent audio tracks. RF64 float WAVs now read back correctly, and digital silence stays silent in integer delivery.
 - Reference chip dialogs save and close when their existing source is inactive, including later linked copies.

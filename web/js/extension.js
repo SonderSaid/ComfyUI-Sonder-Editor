@@ -438,13 +438,72 @@ function customPresetDescription(node) {
     return `${container}, ${codec}, ${pixFmt}${quality}, ${audio} audio.`;
 }
 
+// Every text-affecting property of the preset help box, shared verbatim by the
+// live element and the measuring probe below. They must wrap identically, so a
+// change here has to stay in one place — the probe is what decides how much
+// vertical space the node reserves, and the live element is what paints into it.
+const SAVE_PRESET_HELP_TEXT_STYLE = `
+    box-sizing: border-box;
+    padding: 5px 8px;
+    font-family: ${FONT.sans};
+    font-size: 10px;
+    line-height: 1.35;
+    white-space: normal;
+`;
+const SAVE_PRESET_HELP_MIN_HEIGHT = 30;
+// Headroom for roughly seven wrapped lines. A bound still exists so a pathological
+// description cannot grow the node without limit; nothing shipped comes near it.
+const SAVE_PRESET_HELP_MAX_HEIGHT = 96;
+// Observed inset between the node width and the DOM widget's laid-out width.
+// Only used before the element has been laid out, when `offsetWidth` reads 0.
+const SAVE_PRESET_HELP_INSET = 20;
+const SAVE_PRESET_HELP_FALLBACK_WIDTH = 288;
+
+let savePresetHelpProbe = null;
+
+function measureSavePresetHelpHeight(text, width) {
+    if (typeof document === "undefined") return SAVE_PRESET_HELP_MIN_HEIGHT;
+    if (!savePresetHelpProbe) {
+        savePresetHelpProbe = document.createElement("div");
+        savePresetHelpProbe.setAttribute("aria-hidden", "true");
+        savePresetHelpProbe.style.cssText =
+            `position:absolute; left:-9999px; top:0; visibility:hidden; ${SAVE_PRESET_HELP_TEXT_STYLE}`;
+        document.body.appendChild(savePresetHelpProbe);
+    }
+    savePresetHelpProbe.style.width = `${Math.max(1, Math.round(Number(width) || 0))}px`;
+    savePresetHelpProbe.textContent = String(text || "");
+    return savePresetHelpProbe.scrollHeight;
+}
+
+// Reserve what the current description actually needs instead of a constant.
+// A fixed reservation silently let the longest preset paint over the widgets
+// below it, and left the next long description free to do the same.
+// `offsetWidth` is layout pixels and is unaffected by the canvas zoom transform;
+// the passed width wins when present so a node resize converges immediately
+// rather than lagging a layout behind.
+function savePresetHelpHeight(widget, nodeWidth) {
+    const element = widget?.element;
+    const outer = Number(nodeWidth);
+    const width = Number.isFinite(outer) && outer > 0
+        ? outer - SAVE_PRESET_HELP_INSET
+        : (Number(element?.offsetWidth) || SAVE_PRESET_HELP_FALLBACK_WIDTH);
+    const measured = measureSavePresetHelpHeight(element?.textContent, width);
+    return Math.min(SAVE_PRESET_HELP_MAX_HEIGHT, Math.max(SAVE_PRESET_HELP_MIN_HEIGHT, measured));
+}
+
+// Returns true when the text actually changed, so the caller can re-lay out the
+// node. Switching preset changes this text without changing any widget value,
+// so the old `if (changed)` resize never fired for the case that needed it most.
 function updateSavePresetHelp(node, helpEl) {
-    if (!helpEl) return;
+    if (!helpEl) return false;
     const presetWidget = findWidget(node, "save_preset");
     const preset = savePresetOption(presetWidget?.value || DEFAULT_SAVE_PRESET);
     const description = preset.value === CUSTOM_SAVE_PRESET ? customPresetDescription(node) : preset.description;
-    helpEl.textContent = description || "";
-    helpEl.title = description || "";
+    const next = description || "";
+    if (helpEl.textContent === next) return false;
+    helpEl.textContent = next;
+    helpEl.title = next;
+    return true;
 }
 
 function resizeSaveVideoNode(node) {
@@ -472,24 +531,19 @@ function installSaveVideoPresetUi(node) {
 
     const helpEl = document.createElement("div");
     helpEl.style.cssText = `
-        box-sizing: border-box;
         width: 100%;
-        min-height: 30px;
-        padding: 5px 8px;
+        min-height: ${SAVE_PRESET_HELP_MIN_HEIGHT}px;
         color: ${THEME.fg1};
-        font-family: ${FONT.sans};
-        font-size: 10px;
-        line-height: 1.35;
-        white-space: normal;
+        ${SAVE_PRESET_HELP_TEXT_STYLE}
     `;
     const helpWidget = node.addDOMWidget("sonder_save_preset_help", "SonderSavePresetHelp", helpEl, {
         serialize: false,
         hideOnZoom: false,
-        getMinHeight: () => 30,
-        getMaxHeight: () => 54,
-        getHeight: () => 40,
+        getMinHeight: () => SAVE_PRESET_HELP_MIN_HEIGHT,
+        getMaxHeight: () => SAVE_PRESET_HELP_MAX_HEIGHT,
+        getHeight: () => savePresetHelpHeight(helpWidget, node.size?.[0]),
     });
-    helpWidget.computeSize = (width) => [width, 40];
+    helpWidget.computeSize = (width) => [width, savePresetHelpHeight(helpWidget, width)];
 
     const presetIndex = node.widgets.findIndex((widget) => widget.name === "save_preset");
     const helpIndex = node.widgets.indexOf(helpWidget);
@@ -547,9 +601,9 @@ function installSaveVideoPresetUi(node) {
         }
         visibilityChanged = setWidgetVisible(findWidget(node, "place_audio_on_timeline"), isTake) || visibilityChanged;
         changed = visibilityChanged || changed;
-        updateSavePresetHelp(node, helpEl);
+        const helpChanged = updateSavePresetHelp(node, helpEl);
         if (visibilityChanged) commitWidgetVisibility(node, { dirty: false });
-        if (changed) resizeSaveVideoNode(node);
+        if (changed || helpChanged) resizeSaveVideoNode(node);
     };
 
     node._sonderSyncSavePresetUi = sync;

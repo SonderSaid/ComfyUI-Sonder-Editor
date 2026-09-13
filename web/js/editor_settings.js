@@ -98,7 +98,7 @@ export const TAKE_PLACEMENT_MODE_OPTIONS = [
 export const SAVE_PRESET_OPTIONS = [
     { value: "Compatible MP4", label: "Compatible MP4", description: "MP4, H.264, yuv420p, AAC 192 kbps, BT.709 tagged, browser preview compatible." },
     { value: "High Quality MP4", label: "High Quality MP4", description: "MP4, H.264 CRF 14, yuv420p, AAC 256 kbps, BT.709 tagged, browser preview compatible." },
-    { value: "Editing Master MP4", label: "Editing Master MP4", description: "MP4, H.264 CRF 10, yuv444p, FLAC 24-bit, BT.709 tagged. Check 4:4:4 video and FLAC-in-MP4 support in your target application." },
+    { value: "Editing Master MP4", label: "Editing Master MP4", description: "MP4, H.264 CRF 10 all-intra, yuv444p, FLAC 24-bit audio, BT.709 tagged; recommended round-trip master. Browser/OS preview not guaranteed." },
     { value: "ProRes 422 HQ", label: "ProRes 422 HQ", description: "MOV, ProRes 422 HQ, yuv422p10le, PCM 24-bit audio, BT.709 tagged; editing handoff file." },
     { value: "Lossless FFV1 (RGB)", label: "Lossless FFV1 (RGB)", description: "MKV, FFV1 lossless RGB, gbrp, FLAC 24-bit audio; archive/diagnostic output." },
     { value: "Custom", label: "Custom", description: "Expose allowlisted expert controls for video files or PNG image sequences." },
