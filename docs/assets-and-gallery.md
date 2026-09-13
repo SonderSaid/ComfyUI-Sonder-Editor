@@ -2,8 +2,7 @@
 
 Every piece of media in a project — imports, generated takes, captures,
 exports — lives in the **asset gallery** under **Assets** in the editor's left sidebar. The
-same gallery powers the dormant node card's Assets module, so what you see
-here is what you see there.
+same gallery powers the dormant node card's Assets module.
 
 The fullscreen and mounted sidebar also has a **References** tab. It groups
 reusable image, voice, and video assets into project-level characters, locations,
@@ -58,8 +57,7 @@ rules are in [Editor Basics](editor-basics.md#dropping-assets-onto-the-timeline)
   Library members. Timeline-addressed usages can navigate to their scene;
   Library rows identify the owning entity and member instead.
 - **Open Source Workflow** loads the ComfyUI workflow embedded in a
-  generated file (PNG/MP4/M4V/MOV/MKV) straight onto the canvas — every
-  generated asset can carry its own recipe.
+  generated file (PNG/MP4/M4V/MOV/MKV) straight onto the canvas.
 
 ## Generated assets & tracked metadata
 
@@ -68,8 +66,8 @@ in the graph show a **tracked metadata** section in the inspector, above the
 raw generation dump:
 
 - **Field rows are clickable filters** — clicking toggles a
-  `field:<name>=<value>` search token, turning the inspector into a search
-  surface ("show me everything generated with this seed/model/LoRA").
+  `field:<name>=<value>` search token ("show me everything generated with this
+  seed/model/LoRA").
   Free-form tracked search uses `tracked:<text>`.
 - **Pins** lift fields you care about to a *Pinned Fields* card at the top
   (right-click a field or section header). Pins re-apply to any asset
@@ -142,6 +140,47 @@ active selection) to a file through a streaming compositing path:
   linked, muted take placement).
 - Exports show determinate progress and land in the gallery's `Exports`
   folder; place-as-take exports land in Root like takes.
+
+## Audio fidelity
+
+Editor AUDIO and timeline export share floating-point mixing, preserving timing,
+track balance and dynamics. Source decoding retains native rates; scene mixing
+uses the highest audible source rate across the scene. New WAV sidecars use the
+prepared mix's rate, including any conversion required by the delivery codec.
+Mono sources retain their level when duplicated into the stereo mix.
+Intermediate AUDIO may exceed full scale without clipping.
+
+Saved and previewed results may receive one constant, linked gain reduction to
+leave approximately 1 dB of peak headroom. Completion messages report any reduction;
+generation provenance records the rate, precision, measured peaks and applied gain.
+Quiet material is never boosted. Encoded audio is checked for overload before
+video encoding. Timeline sidecars bypass delivery compression and carry the same
+gain. Existing sidecars remain unchanged.
+
+Video exports omit the audio stream when the selected window has no audible
+contributors, including muted, hidden, or zero-volume tracks. Audio-only exports
+of silent windows still produce a file. Consecutive windows can therefore have
+different stream layouts. Missing files are logged; corrupt audio blocks only a
+window that uses it and names the source.
+
+If supplied AUDIO cannot be prepared, Save Video and Preview keep the video and
+show a persistent warning explaining the missing audio. Failed take-audio
+placement also warns while retaining the delivered video. Routine headroom
+notices dismiss automatically. Editing Master audio-only exports use `.flac`;
+check FLAC-in-MP4 support in your target NLE before choosing its video preset.
+
+| Preset | Audio delivery |
+|---|---|
+| Compatible MP4 | AAC, 192 kb/s |
+| High Quality MP4 | AAC, 256 kb/s |
+| Editing Master MP4 | FLAC, 24-bit |
+| ProRes 422 HQ | PCM, 24-bit |
+| Lossless FFV1 (RGB) | FLAC, 24-bit |
+
+Integer delivery uses rounding and triangular dither once; digital silence stays
+silent. Lossless audio codecs preserve this prepared PCM representation.
+Explicit Custom choices retain their meaning, including 16-bit PCM. Live browser
+scheduling and device output can differ from an offline render.
 
 ## Gallery & overlay shortcuts
 

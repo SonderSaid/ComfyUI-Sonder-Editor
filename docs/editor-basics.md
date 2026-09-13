@@ -148,7 +148,7 @@ selection is refused before the drag starts.
 An expanded Library card also offers **Add to timeline**, which stages at the
 playhead on the first compatible lane, making a new one only if none fits.
 
-Lane rules, recipes, and what a lane resolves to for a render window are in
+Lane rules, recipes, and what a lane resolves to for a generation window are in
 [References](references.md).
 
 ### Prompt sections
@@ -218,8 +218,7 @@ renders.
 - **Playback preferences** (loop selection, auto-scroll, return-to-start,
   playback resolution) are personal and live in Settings ▸ Playback.
 - Heavy scenes rebuffer adaptively: if decoding falls behind, playhead and
-  audio pause together and resume in sync — audio never drifts ahead of the
-  picture.
+  audio pause together and resume in sync.
 
 ## Mount in Tab
 

@@ -3,13 +3,68 @@
 A **Reference** is a reusable piece of a project — a character, a location, a
 prop, an outfit — kept in one place and used wherever it applies.
 
-Three surfaces divide the work, and it helps to keep them apart:
+Three surfaces divide the work:
 
 | Surface | What it is for |
 |---|---|
 | **Reference Library** — sidebar | Registering and managing References and their media. |
 | **Reference lanes and recipes** — timeline | When a Reference applies, and how it is served to your graph. |
 | **Reference Prompting** — Prompt Management | Naming References in prompts, and deriving text from them dynamically. |
+
+In practice you meet them in that order — who or what it is, when and how it
+applies, then what the prompt says about it:
+
+```
+1 ── WHO / WHAT ───────────────── Reference Library, sidebar ──
+
+    Anna ─┬─ closeup   image   "a woman in a red coat"
+          ├─ sheet     image   "full turnaround, neutral light"
+          └─ voice     audio   "low, unhurried"
+
+    One Reference, several members. Each member owns its media,
+    its @handle, and its own prompt text.
+
+                 │  drag a member onto a Reference lane
+                 ▼
+
+2 ── WHEN & HOW ─────────────────── Reference lane, timeline ──
+
+    the staged item   frame range · strength · Active
+    the lane recipe   how the members are assembled, and which
+                      Bridge outputs go live
+
+    For a generation window every staged item gets a verdict:
+    In window / Superseded / Below threshold / Outside / Excluded
+
+                 │  the winner now serves the graph twice
+                 ▼
+
+3 ── WHAT IT SAYS ABOUT IT ───────────────── the prompt text ──
+
+    The recipe composes one string from the members you staged:
+
+        prefix  ·  one expansion per member  ·  suffix
+
+    Attach it as a Context chip, or wire the Prompt Bridge. That
+    choice decides which socket below carries it.
+
+
+── the two servings, converging on your graph ─────────────────
+
+  Sonder Editor ─┬─ project ──> Reference Selector
+                 │                      │  one reference_set
+                 │          ┌───────────┼───────────┐
+                 │          ▼           ▼           ▼
+                 │       Image       Audio       Prompt
+                 │       Bridge      Bridge      Bridge
+                 │       r01..r16    a01..a16    reference_prompt
+                 │       └─── the media ───┘     └─ the text ─┘
+                 │
+                 └─ prompt ───────────────────> the text again, if
+                                                you attached a chip
+                                                instead — already
+                                                compiled in
+```
 
 Assets themselves are covered in [Assets & Gallery](assets-and-gallery.md),
 timeline gestures in [Editor Basics](editor-basics.md), and generation in
@@ -153,8 +208,10 @@ Several model contracts need one extra setup detail outside the recipe:
   (`1.133:1`). A portrait face crop is therefore pillarboxed to roughly 59–66%
   frame fill unless the Library member's crop box matches that aspect.
 - **LTX IC-LoRA Ingredients** needs both `Reference sheet: [...]` and
-  `Generated video: [...]`. The recipe supplies the Reference-sheet prefix;
-  author the Generated-video description on the prompt track.
+  `Generated video: [...]`. The recipe supplies both labels — `Reference
+  sheet:` as its prefix and `Generated video:` as its suffix — so the derived
+  prompt arrives already closed. What is still yours is the generated-video
+  description that follows the label, written on the prompt track.
 - **MiniMax H3 Pictures** assumes the consuming node's `ref_image_size` is
   `max`. The node defaults to `match`, which rescales to the generation's pixel
   area and discards the recipe's 2048-short-edge preparation. The recipe mirrors
@@ -181,7 +238,7 @@ Grid sheets choose the column count that gives their actual members the most
 fitted image area. Four square members form a `2×2`; four portrait members form
 the accepted `4×1` layout rather than reserving empty cells.
 
-## What a render window resolves to
+## What a generation window resolves to
 
 Staging an item doesn't guarantee the model sees it. For the current generation
 window every staged item gets a verdict, shown on the timeline and in the lane
@@ -195,7 +252,7 @@ panel alike:
 | **Outside window** | The item doesn't overlap the window. |
 | **Excluded** | Muted, or on a hidden lane, so it never participates. |
 
-![Four Reference lanes across a render window: solid bars are in window, while a Superseded item and a Below threshold item are dimmed and hatched](images/reference-verdicts.webp)
+![Four Reference lanes across a generation window: solid bars are in window, while a Superseded item and a Below threshold item are dimmed and hatched](images/reference-verdicts.webp)
 <p align="center"><em>Only the solid bars reach the model. <strong>Superseded</strong> lost to an item covering the window more tightly; <strong>Below threshold</strong> was dropped because its overlap is too small relative to the shorter item/window span.</em></p>
 
 **Reference Threshold %** (Settings, project-wide) measures overlap divided by
@@ -208,7 +265,7 @@ Surviving items still compete by overlap divided by their own span; winner
 scoring is unchanged.
 
 With no selection nothing is marked, since the marks answer "what will this
-render use", which isn't a question until a window exists.
+render use".
 
 Queueing a **batch** predicts all of this per chunk before anything runs, and
 says whether a lane drops because of the threshold or because that chunk falls
@@ -244,13 +301,17 @@ Three recipe fields shape the derived text:
   text or name placeholders, the member's text is appended after it. Leave
   the field empty to use the member's text, falling back to its name.
 
-  `{n}` and `{index}` describe positions within the recipe output. For MiniMax
-  H3 Subject/Picture numbering, use the H3 Prompt Context setup, which
-  resolves those identities across lanes.
+  `{n}` and `{index}` describe positions within the recipe output, not MiniMax
+  H3 ordinals. H3 Subject/Picture numbering comes from the recipe's **Model
+  input** — Pictures, Videos or Standalone Audio, which the built-in H3 recipes
+  already set. Lane order then numbers those slots across lanes, and **Move
+  Lane Up** / **Move Lane Down** in the lane header menu renumbers them. A
+  Reference Context chip reads the ordinals from the compiled setup, so you
+  never count them by hand.
 - **Prompt suffix** — static text placed once after the whole thing, for a
   format whose reference block is closed by a second label. LTX IC-LoRA
   Ingredients uses it for `Generated video:`, which leads the prompt you write
-  next, so the two halves of that grammar stay one definition.
+  next.
 
 Each per-member expansion also goes out on its own numbered Prompt Bridge
 output, so a graph can wire one member's text separately from the aggregate.
@@ -274,7 +335,7 @@ actually win the window, or the provider expects numbered labels you would
 otherwise count by hand, **attach a Context chip to the prompt field** instead.
 **+ Attach** picks the target Reference or identity and configures its
 overrides in the same dialog; the chip then resolves against the selected
-render window when the prompt compiles.
+generation window when the prompt compiles.
 
 This is how **MiniMax H3 (full reference)** prompts are built. That format
 declares subject, picture, video, and audio populations, and the chips take
@@ -290,6 +351,46 @@ Beside it, **Identity Prompting** authors semantic prompt identities —
 provider-neutral records that may combine several Library members or exist from
 a description alone. An identity is not a Reference, and the Library never
 creates one for you; see [Prompts](prompts.md).
+
+### When the Reference isn't in the window
+
+A chip can name a Reference that doesn't win the current window — its lane is
+muted or hidden, its item is superseded, below threshold, or simply outside.
+The render still goes ahead, and the chip raises an advisory instead of
+blocking the job.
+
+That is what makes a deliberate reference-free pass possible: for a final
+low-denoise upscale you mute the Reference lane so nothing influences detail,
+and every chip bound to that lane follows the mute. The node path reads the
+same fact the same way — a muted lane yields `has_reference = 0`, so the gate
+skips the Bridges.
+
+A **deleted** source is a different matter and does block. That is broken
+authoring rather than a fact about this window.
+
+What becomes of the chip's own authored text is a policy you choose:
+
+| Policy | What reaches the prompt |
+|---|---|
+| **Drop** (default) | Nothing. The chip's text stays out of the prompt. |
+| **Keep** | The authored text, with no Reference conditioning the render. |
+
+Set it project-wide in **Settings ▸ Prompts ▸ Out-of-window Reference text**.
+Any single chip may disagree: its configure dialog carries an **Out-of-window
+text** row offering *Project default*, *Drop* and *Keep*, and a chip that
+overrides the project shows a small `KEEP` or `DROP` badge. The override is
+local to that chip **including linked copies**, so splitting a section leaves
+the two halves free to differ.
+
+Keep preserves what *you* wrote, not what the compiler would have claimed for
+you. A derived appearance clause such as `(appears in [Shot 3])` follows the
+conditioning rather than the prose, so it is not added for a chip that isn't
+conditioning the window under either policy.
+
+Advisories aggregate per lane and cause, so muting a lane on a dense timeline
+reads as one advisory naming every affected chip. When text is kept a second
+advisory says so. Either way every affected chip is still marked individually in the
+Prompt panel.
 
 ### Mentions
 

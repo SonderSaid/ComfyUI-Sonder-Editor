@@ -15,21 +15,22 @@ prompting, and queueing are pure editing operations that never touch a model.
 Generation happens in *your* ComfyUI graph, with whatever model you wire up.
 
 What the editor *hands* to your graph, however, is only useful if your model
-can act on it. The editing features always work; the **generation features
-light up based on what your chosen model supports**:
+can act on it. What each generation feature needs from your model:
 
 | If you want to… | Your model needs… |
 |---|---|
 | Chain clips into long-form video, or regenerate/inpaint a section inside existing footage | **Masked (in-context) generation** — the ability to hold provided frames fixed and generate the rest |
 | Drive video from audio, or audio from video | **Joint audio-video generation** |
 | Feed time-aligned prompt sections into the sampler | **Prompt relay support** in your workflow |
-| Use Drivers — unrendered clips that steer motion, composition, look, or characters | **Reference/conditioning inputs** for that kind of signal |
+| Use Drivers — unrendered video clips that steer motion, composition, look, or characters | **Video conditioning inputs** for that kind of signal |
+| Use References — reusable characters, locations, props and voices, staged per window | **Reference image, video or audio inputs** — a dedicated reference slot, or any image input that will take an assembled sheet |
 | Use guide frames | **Image conditioning at arbitrary frames** |
 
-The showcase workflows use **LTX 2.3** because it currently has the most
-complete suite of these capabilities in one model — not because the editor
-depends on it. Model templates ship for Wan, HunyuanVideo, CogVideoX and
-others, and the Free template removes all constraints for anything else.
+The showcase workflows use **LTX 2.3** and **MiniMax H3** — LTX 2.3 because it
+has a complete suite of these capabilities in one model, and MiniMax H3 to
+show References wired against dedicated reference inputs. Neither is a
+dependency. Model templates ship for Wan, HunyuanVideo, CogVideoX and others,
+and the Free template removes all constraints for anything else.
 
 ## The generation window
 
@@ -84,8 +85,8 @@ in the toolbar's scene-geometry group.
   your values.
 
 Built-in templates: **No Model Template (Free)**, **LTX 2.3**,
-**Wan 2.1 / 2.2 (14B)**, **Wan 2.2 (TI2V-5B)**, **HunyuanVideo 1.5**,
-**CogVideoX 1.5 (T2V)**, and **CogVideoX 1.5 (I2V)**. Manage them in
+**MiniMax H3**, **Wan 2.1 / 2.2 (14B)**, **Wan 2.2 (TI2V-5B)**,
+**HunyuanVideo 1.5**, **CogVideoX 1.5 (T2V)**, and **CogVideoX 1.5 (I2V)**. Manage them in
 **Settings ▸ Model Templates**: create custom templates, edit any built-in
 (with reset), and pick the default for new projects. Template definitions
 live in your browser; the project stores only the selected template id, and
@@ -95,7 +96,7 @@ Switching to a template with a *different* frame rule clears the In/Out
 selection (the old endpoints would be off-grid); same-rule switches keep it.
 Already-queued jobs are never affected.
 
-When your render window does not land on the frame rule, the editor rounds
+When your generation window does not land on the frame rule, the editor rounds
 **up** rather than trimming your selection, and fills the extra frames itself:
 video holds the last frame, audio mirrors the end of its own window. Those
 frames are trimmed from where the Take is placed on your timeline, so you do
@@ -103,7 +104,7 @@ not have to think about them - but they are inside the generated file.
 
 ## Prompts
 
-The Global document and every prompt section in the render window compile
+The Global document and every prompt section in the generation window compile
 into the one prompt a job carries. Composition, Channel Templates, prompt
 formats, Context chips, and the Prompt Management panel are covered in
 [Prompts](prompts.md).
@@ -123,7 +124,15 @@ Guide frames condition generation with a reference image at a specific frame
 - For LTX-style workflows, **Settings ▸ Guides** exposes a project-durable
   *Guide collision auto-offset* toggle (default on) that moves single-image
   guides off temporal slots already occupied by a Driver, recording the
-  applied move in the generated asset's metadata.
+  applied move in the generated asset's metadata. With the toggle off,
+  queueing warns about unresolved collisions instead.
+- Guides reach a graph two ways, and you pick one. The editor node's
+  `guide_images` output carries every guide in the window as a single IMAGE
+  batch, with `guide_idx` and `guide_strengths` as lists aligned to it, for a
+  consumer that takes them all at once. **Sonder Guides Bridge Start / End**
+  instead wrap your generation body in a loop and emit one guide per pass, for
+  a consumer that takes a single guide per call. Do not inject the same project
+  guides through both.
 
 ## Drivers
 
@@ -133,7 +142,19 @@ appearing in output (their editing rules are in
 **strength** (0–1). Downstream, the **Sonder Driver Selector** resolves one
 Driver lane by position — without decoding media — and exposes a `has_driver`
 flag for lazy routing; the **Sonder Driver Bridge** then decodes that lane's
-frames for the render window.
+frames for the generation window.
+
+## References
+
+Reference items stage Library members — characters, locations, props,
+voices — over frame ranges, and reach the model as media assembled by the
+lane's recipe plus prompt text derived from those members (authoring is in
+[References](references.md)). Each item has a **strength** (0–1) and a mute
+toggle, and for any generation window each lane resolves which of its items
+applies. Downstream, the **Sonder Reference Selector** resolves one or more
+lanes by position — without decoding media — and exposes a `has_reference`
+flag for lazy routing; the **Image**, **Audio** and **Prompt Bridges** then
+decode what it resolved.
 
 ## Wiring your graph
 
@@ -176,7 +197,7 @@ Notes worth knowing:
   with post-context keeps the filler on both channels - so treat the filler as
   something the model sees, not something it replaces.
 - Wire only half a pair and that channel emits a keep-everything mask and logs
-  a warning. A latent that was not encoded from this render window is refused
+  a warning. A latent that was not encoded from this generation window is refused
   outright rather than masked at the wrong scale.
 - The two mask outputs are **not** interchangeable. Video is a batch with one
   entry per latent frame; audio is a single image whose time axis differs by
@@ -290,5 +311,4 @@ Rules of thumb:
   example, a clip inside its pre-context window) changes that job's result.
   While jobs are pending or running, leave the timeline content inside their
   windows alone; edit freely outside them.
-- The queue row always shows the frozen range/context/mask — what you see in
-  the row is what will render.
+- The queue row always shows the frozen range/context/mask.

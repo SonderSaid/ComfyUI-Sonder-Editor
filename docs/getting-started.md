@@ -84,7 +84,7 @@ upscaling, image guides, and driver-controlled generation already.
 Queue the ComfyUI prompt as usual. The editor hands your window — geometry,
 prompt, and (empty) timeline — to the workflow; when **Sonder Save Video**
 finishes, the result comes back as a project asset and, as a **take**,
-lands on a fresh lane on your timeline, ready to play in context.
+lands on a fresh lane on your timeline.
 
 > Your sampler should run a **full denoise (1.0)** for this first pass — an
 > empty timeline renders as black frames, and only a full denoise generates
@@ -106,7 +106,7 @@ Drag an asset from the gallery onto the **ruler strip** at the top of the
 timeline to give it a new lane (a video with sound creates linked
 video + audio lanes). Trim by dragging clip edges, split with razor mode
 (`C`). Existing footage, your kept takes, guide images, and Drivers all
-combine on the same timeline — that's where the editor starts paying off.
+combine on the same timeline.
 
 ![A working timeline: imported clips, placed takes, a Driver lane, guide frames, and prompts](images/timeline-editing.webp)
 

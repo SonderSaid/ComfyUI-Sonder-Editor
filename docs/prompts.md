@@ -16,7 +16,7 @@ References that feed prompts are in [References](references.md).
 
 ## How the output prompt is composed
 
-The **Global** document plus every prompt section in the render window compile
+The **Global** document plus every prompt section in the generation window compile
 into one provider-ready prompt. The project's Channel Template defines the
 fields—Standard, Visual/Speech/Sound, MiniMax H3, or a custom set—and its
 **prompt format** (technical: Prompt Context Profile) owns labels, separators,
@@ -38,12 +38,16 @@ flattens authored text or chips.
 
 - **Boundary Prompt Threshold** (project-wide) drops a section from a window
   when its clipped coverage is below that percentage of the shorter of its
-  authored span and the render window. Containment in either direction stays;
+  authored span and the generation window. Containment in either direction stays;
   lower-coverage ends drop first (trailing first on ties), with at least one
   section kept. Short windows can retain neighbors that previously dropped,
   including at the default 10%. The timeline shows
   affected slivers with a dim "Ignored" hatch, and sections that *will*
   compose get a strong accent.
+- **Out-of-window Reference text** (project-wide) decides whether a Reference
+  Context chip still contributes its authored text when its Reference is not
+  conditioning the window. Drop is the default; any chip can override it. See
+  [References](references.md#when-the-reference-isnt-in-the-window).
 - Lane hiding is part of composition: Prompt lane hidden → global-only
   output; Global hidden → sections only; both hidden → empty prompt.
 - **Takes global** on a section decides, per channel, whether that field picks
@@ -123,17 +127,16 @@ field, not to drop a line. Splitting a section keeps this intact: the halves
 carry separate chips that still deduplicate against each other in a combined
 render.
 
-**+ Attach** adds one, and the same dialog configures it before it exists rather
-than sending you hunting for it afterwards. A chip carries a small `✎` because
+**+ Attach** adds one, and the same dialog configures it before it exists. A
+chip carries a small `✎` because
 it is an editor, not a static token. Chips sit either inline in a field or in the
 section's own context row, depending on where the format places them.
 
 A chip can also be switched off for a single field without being removed. That
-field then says the capability is disabled and contributes no text, so a chip
-you have silenced stays visible rather than vanishing from the section.
+field then says the capability is disabled and contributes no text.
 
 Because a chip resolves against a window, editing a section that falls **outside
-the current render window** shows scene-wide numbering instead — the panel says
+the current generation window** shows scene-wide numbering instead — the panel says
 so, and warns that those numbers can differ from what the section will render.
 
 | Chip | What it contributes |
@@ -188,7 +191,7 @@ Prompt Management. Which identity kinds exist is declared by your prompt format.
 **Reference Prompting** shows the physical media your prompt format asks for —
 editable handles and per-member defaults — and, below that, the prompt text each
 staged Reference derives from its lane recipe, read-only, with whether it falls
-in the current render window and which parts the recipe added. The derived list
+in the current generation window and which parts the recipe added. The derived list
 does not depend on the format declaring anything, so it is there on the default
 Generic format too. Edit that text in Reference Lane Setup; this screen reports
 it.
@@ -222,8 +225,7 @@ from the same compiler the render uses, for checking what the draft becomes.
 ![Writing mode in Source view: channel heading lines, a --- break between blocks, and each chip's contribution shown as prose beneath the text it attaches to](images/writing-mode-source.webp)
 
 **Nothing here reaches your prompts until you Apply** — and nothing your prompts
-do reaches the draft on its own either. Traffic moves only when you ask, in
-whichever direction you ask for:
+do reaches the draft on its own either.
 
 - **Apply** replaces the lane's sections with the draft blocks, in one undoable
   step. It means *make the lane match this draft*, so it also replaces any
