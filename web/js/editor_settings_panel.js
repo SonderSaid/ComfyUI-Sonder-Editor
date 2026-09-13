@@ -50,6 +50,20 @@ const RENDER_CACHE_SIZE_PRESETS = [
     { value: "unlimited", label: "Unlimited" },
 ];
 
+// Deliberately has no "Off": unlike the render cache, this one backs blob-mode
+// playback, so a zero budget would evict every source the instant it is released.
+// Smallest offered value matches the 250,000,000-byte normalizer floor.
+const PLAYBACK_SOURCE_CACHE_PRESETS = [
+    { value: String(Math.round(0.25 * DECIMAL_GB_BYTES)), label: "256 MB" },
+    { value: String(Math.round(0.5 * DECIMAL_GB_BYTES)), label: "512 MB" },
+    { value: String(1 * DECIMAL_GB_BYTES), label: "1 GB" },
+    { value: String(2 * DECIMAL_GB_BYTES), label: "2 GB" },
+    { value: String(4 * DECIMAL_GB_BYTES), label: "4 GB" },
+    { value: "unlimited", label: "Unlimited" },
+];
+
+export { PLAYBACK_SOURCE_CACHE_PRESETS as _PLAYBACK_SOURCE_CACHE_PRESETS };
+
 const TRASH_SIZE_MB_PRESETS = [
     { value: "250", label: "250 MB" },
     { value: "500", label: "500 MB" },
@@ -553,6 +567,7 @@ function showSettingsPanel() {
         };
         // The persisted number alone cannot distinguish a chosen preset from a
         // user-edited custom number that happens to match a preset.
+        let suffix = null;
         let customSelected = presetValueFor(config.getter()) === "custom";
         const sync = () => {
             const value = currentValue();
@@ -562,6 +577,7 @@ function showSettingsPanel() {
             select.value = selectedPreset;
             const showCustom = selectedPreset === "custom";
             input.style.display = showCustom ? "" : "none";
+            if (suffix) suffix.style.display = showCustom ? "" : "none";
             input.value = formatValue(value === null ? coerce(config.customDefault) : value);
         };
 
@@ -594,7 +610,7 @@ function showSettingsPanel() {
 
         inputRow.append(select, input);
         if (config.inputSuffix) {
-            const suffix = document.createElement("span");
+            suffix = document.createElement("span");
             suffix.textContent = config.inputSuffix;
             suffix.style.cssText = "font-size:10px;color:#8f98a3;";
             inputRow.appendChild(suffix);
@@ -1202,6 +1218,31 @@ function showSettingsPanel() {
             step: 1,
             getter: () => this._settings.playback.decodeConcurrency,
             onChange: (value) => updateCategory("playback", "decodeConcurrency", Math.round(value)),
+        }
+    );
+    createPresetNumberInput(
+        playbackSection,
+        "sourceCacheMaxBytes",
+        "Playback Media Memory Target",
+        "Soft target for whole-file video kept in memory during fullscreen playback. This is RAM, not disk. Media still in use by the playhead or prebuffer is never dropped, so the real figure can exceed the target on heavy scenes; the editor frees idle media first, oldest last-used first.",
+        {
+            options: PLAYBACK_SOURCE_CACHE_PRESETS,
+            min: 0,
+            max: Number.MAX_SAFE_INTEGER,
+            step: 1,
+            integer: true,
+            allowNull: true,
+            customDefault: 1 * DECIMAL_GB_BYTES,
+            inputMin: 0.25,
+            inputMax: Number.MAX_SAFE_INTEGER / DECIMAL_GB_BYTES,
+            inputStep: 0.25,
+            inputSuffix: "GB",
+            formatInput: (value) => Number(value) / DECIMAL_GB_BYTES,
+            parseInput: (value) => Math.round(Number(value) * DECIMAL_GB_BYTES),
+            getter: () => this._settings.playback?.sourceCacheMaxBytes === null
+                ? null
+                : (this._settings.playback?.sourceCacheMaxBytes ?? DEFAULT_EDITOR_SETTINGS.playback.sourceCacheMaxBytes),
+            onChange: (value) => updateCategory("playback", "sourceCacheMaxBytes", value),
         }
     );
     addSectionReset(

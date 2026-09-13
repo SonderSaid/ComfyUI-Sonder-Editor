@@ -684,6 +684,11 @@ console.log(JSON.stringify({{
     rafTicksAfterClear: stop.rafTicks,
 }}));
 """
+    captured = _presentation_harness(clear=True)
+    assert captured["beforeClear"] > 0
+    assert captured["sameRun"] is True
+    assert captured["stop"]["boundaryStaleDraws"] == 0
+    assert captured["stop"]["staleDraws"] == 8
     result = _run_node(script)
     assert result == {
         "sameRun": True,
@@ -715,3 +720,445 @@ def test_production_scheduler_and_abort_paths_use_the_tested_seams():
     assert "entry.abortController?.abort?.();" in source
     assert "await waitForMediaReady(video, 2, 1500, { signal });" in source
     assert "signal," in source[source.index("async function loadPrebufferEntry"):source.index("function publishPrebufferEntryReady")]
+
+
+def _budget_harness(body: str, max_bytes: str = "600"):
+    """Source cache wired to a byte budget, with per-path blob sizes.
+
+    Each source yields a 100-byte blob so totals are easy to reason about; the
+    default 600-byte budget therefore holds six entries.
+    """
+    module_url = (ROOT / "web" / "js" / "playback_source_cache.js").as_uri()
+    return f"""
+const {{ createPlaybackSourceCache }} = await import({json.dumps(module_url)});
+const events = [];
+let clock = 0;
+const assets = new Map();
+const assetFor = (path) => {{
+    if (!assets.has(path)) assets.set(path, {{ asset_id: path, media_probe_signature: "1:1" }});
+    return assets.get(path);
+}};
+let live = [];
+const cache = createPlaybackSourceCache({{
+    getAssetForSourcePath: assetFor,
+    getLiveSourcePaths: () => live,
+    buildDirectUrl: (path) => `view://${{path}}`,
+    fetchMedia: async () => ({{ ok: true, blob: async () => ({{ size: 100 }}) }}),
+    createObjectUrl: () => `blob:${{Math.random()}}`,
+    revokeObjectUrl: () => {{}},
+    now: () => ++clock,
+    recordEvent: (event) => events.push(event),
+    getMaxRetainedBytes: () => {max_bytes},
+}});
+const holders = new Map();
+async function load(path, holderId = path) {{
+    live = [...new Set([...live, path])];
+    const res = await cache.resolve(path);
+    const holder = {{ path }};
+    cache.addHolder(res.cacheKey, holder);
+    holders.set(`${{path}}|${{holderId}}`, {{ key: res.cacheKey, holder }});
+    return res;
+}}
+function release(path, holderId = path) {{
+    const h = holders.get(`${{path}}|${{holderId}}`);
+    cache.releaseHolder(h.key, h.holder);
+}}
+const evictedFor = () => events.filter((e) => e.action === "evicted" && e.reason === "byte-budget")
+    .map((e) => e.sourcePath);
+{body}
+"""
+
+
+def test_byte_budget_evicts_idle_entries_oldest_first():
+    script = _budget_harness("""
+for (const n of [1, 2, 3, 4, 5, 6]) { await load(`media/c${n}.mp4`); release(`media/c${n}.mp4`); }
+// 600 bytes retained, exactly at budget - nothing evicted yet.
+const atBudget = cache.snapshot().retainedBytes;
+const evictedAtBudget = evictedFor().length;
+await load("media/c7.mp4");
+console.log(JSON.stringify({
+    atBudget,
+    evictedAtBudget,
+    evicted: evictedFor(),
+    snapshot: cache.snapshot(),
+}));
+""")
+    result = _run_node(script)
+    assert result["atBudget"] == 600
+    assert result["evictedAtBudget"] == 0
+    # c1 is the least recently used idle entry, so it goes first.
+    assert result["evicted"] == ["media/c1.mp4"]
+    assert result["snapshot"]["retainedBytes"] == 600
+
+
+def test_byte_budget_never_evicts_a_held_source():
+    """The safety invariant: a held blob backs a playing or prebuffering element.
+
+    Freeing it would black-frame the viewport to save memory, so the budget
+    reports the overage and stops instead.
+    """
+    script = _budget_harness("""
+for (const n of [1, 2, 3, 4, 5, 6, 7, 8]) { await load(`media/c${n}.mp4`); }
+console.log(JSON.stringify({
+    evicted: evictedFor(),
+    snapshot: cache.snapshot(),
+    pressure: events.filter((e) => e.action === "budget_pressure").length > 0,
+}));
+""")
+    result = _run_node(script)
+    assert result["evicted"] == [], "a held source was evicted"
+    assert result["snapshot"]["retainedBytes"] == 800
+    assert result["snapshot"]["overBudgetBytes"] == 200
+    assert result["snapshot"]["budgetPending"] is True
+    assert result["pressure"] is True
+
+
+def test_byte_budget_protects_the_entry_the_caller_is_about_to_hold():
+    """resolve() returns before addHolder runs, leaving a window where the freshly
+    fetched entry is holder-less. Evicting it there would make the fetch waste."""
+    script = _budget_harness("""
+for (const n of [1, 2, 3, 4, 5, 6]) { await load(`media/c${n}.mp4`); release(`media/c${n}.mp4`); }
+const fresh = await cache.resolve("media/c7.mp4");
+console.log(JSON.stringify({
+    evicted: evictedFor(),
+    freshStillPresent: cache.entries.has(fresh.cacheKey),
+    canStillHold: cache.addHolder(fresh.cacheKey, {}),
+}));
+""")
+    result = _run_node(script)
+    assert result["freshStillPresent"] is True
+    assert result["canStillHold"] is True, "the entry the caller was about to claim was evicted"
+    assert "media/c7.mp4" not in result["evicted"]
+
+
+def test_byte_budget_skips_entries_that_were_never_held():
+    """Mid-handoff entries look idle but are not.
+
+    Between resolve() resolving and the caller's continuation running addHolder,
+    an entry has no holders. Evicting it there strands that caller with
+    addHolder === false and no retry.
+    """
+    script = _budget_harness("""
+for (const n of [1, 2, 3, 4, 5, 6]) { await load(`media/c${n}.mp4`); release(`media/c${n}.mp4`); }
+// Resolved but never held - simulates a caller whose continuation has not run.
+await cache.resolve("media/pending.mp4");
+await load("media/c8.mp4");
+console.log(JSON.stringify({ evicted: evictedFor() }));
+""")
+    result = _run_node(script)
+    assert "media/pending.mp4" not in result["evicted"]
+
+
+def test_unlimited_budget_reproduces_pre_budget_behaviour():
+    script = _budget_harness("""
+for (const n of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) { await load(`media/c${n}.mp4`); release(`media/c${n}.mp4`); }
+console.log(JSON.stringify({
+    evicted: evictedFor(),
+    snapshot: cache.snapshot(),
+}));
+""", max_bytes="null")
+    result = _run_node(script)
+    assert result["evicted"] == []
+    assert result["snapshot"]["retainedBytes"] == 1000
+    assert result["snapshot"]["budgetBytes"] is None
+    assert result["snapshot"]["overBudgetBytes"] == 0
+    assert result["snapshot"]["budgetPending"] is False
+
+
+def test_byte_budget_sweep_tolerates_snapshot_reentrancy():
+    """recordEvent calls snapshot() in the real host (viewport_surface records
+    cache state on every event) while the sweep emits events mid-iteration."""
+    module_url = (ROOT / "web" / "js" / "playback_source_cache.js").as_uri()
+    script = f"""
+const {{ createPlaybackSourceCache }} = await import({json.dumps(module_url)});
+let clock = 0;
+const snapshots = [];
+let cache;
+cache = createPlaybackSourceCache({{
+    getAssetForSourcePath: (path) => ({{ asset_id: path, media_probe_signature: "1:1" }}),
+    getLiveSourcePaths: () => [],
+    buildDirectUrl: (path) => `view://${{path}}`,
+    fetchMedia: async () => ({{ ok: true, blob: async () => ({{ size: 100 }}) }}),
+    createObjectUrl: () => `blob:${{Math.random()}}`,
+    revokeObjectUrl: () => {{}},
+    now: () => ++clock,
+    recordEvent: () => {{ if (cache) snapshots.push(cache.snapshot().retainedBytes); }},
+    getMaxRetainedBytes: () => 300,
+}});
+for (const n of [1, 2, 3, 4, 5]) {{
+    const res = await cache.resolve(`media/c${{n}}.mp4`);
+    const holder = {{}};
+    cache.addHolder(res.cacheKey, holder);
+    cache.releaseHolder(res.cacheKey, holder);
+}}
+console.log(JSON.stringify({{ completed: true, finalBytes: cache.snapshot().retainedBytes, sampled: snapshots.length > 0 }}));
+"""
+    result = _run_node(script)
+    assert result["completed"] is True
+    assert result["sampled"] is True
+    assert result["finalBytes"] <= 300
+
+
+def test_source_cache_presets_survive_normalization_and_default_matches():
+    settings_url = (ROOT / "web/js/editor_settings.js").as_uri()
+    panel_url = (ROOT / "web/js/editor_settings_panel.js").as_uri()
+    result = _run_node(f"""
+const {{ DEFAULT_EDITOR_SETTINGS, normalizeEditorSettings }} = await import({json.dumps(settings_url)});
+const {{ _PLAYBACK_SOURCE_CACHE_PRESETS: presets }} = await import({json.dumps(panel_url)});
+console.log(JSON.stringify({{
+    defaultValue: DEFAULT_EDITOR_SETTINGS.playback.sourceCacheMaxBytes,
+    presets: presets.map(p => {{
+        const value = p.value === "unlimited" ? null : Number(p.value);
+        return [value, normalizeEditorSettings({{playback: {{sourceCacheMaxBytes: value}}}}).playback.sourceCacheMaxBytes];
+    }}),
+}}));
+""")
+    assert result["defaultValue"] == 1_000_000_000
+    assert [result["defaultValue"], result["defaultValue"]] in result["presets"]
+    assert all(before == after for before, after in result["presets"])
+    panel = (ROOT / "web/js/editor_settings_panel.js").read_text(encoding="utf-8")
+    assert 'if (suffix) suffix.style.display = showCustom ? "" : "none";' in panel
+
+
+def _presentation_harness(sampled=True, clear=False, abort=False, audio=False):
+    script = r"""
+const {readFileSync} = await import('node:fs');
+const moduleUrl=__MODULE_URL__;
+let source=readFileSync(new URL(moduleUrl),'utf8');
+source=source.replaceAll(/from "(\.\/[^"]+)"/g,(_,p)=>'from '+JSON.stringify(new URL(p,moduleUrl).href));
+// Observe the actual closure; do not replace its state transitions.
+source=source.replace('        renderFrame,\n        togglePlayback,','        _state: state, _sourceCache: sourceCache, _drain: drainPendingReleases, _abortPreRolls: abortPreRolls,\n        renderFrame,\n        togglePlayback,');
+const {createViewportSurface}=await import('data:text/javascript;base64,'+Buffer.from(source).toString('base64'));
+let fetches=0;globalThis.fetch=async()=>{fetches++;return {ok:true,blob:async()=>new Blob([new Uint8Array(100)])};};
+const events = [], raf = [], videos = [], draws = [], frames=[];
+globalThis.window = {SONDER_DEBUG_SESSION:true, __SONDER_CANVAS_DIAG:{record:(kind,payload)=>events.push({kind,...payload})},__SONDER_DIAG_CLEARERS:new Set(),setTimeout,clearTimeout};
+class Video extends EventTarget {
+ constructor(){super();this.readyState=0;this.videoWidth=320;this.videoHeight=180;this.duration=100;this.paused=true;this.seeking=false;this._time=0;this.callbacks=new Map();this.next=0; videos.push(this);}
+ get src(){return this._src;}
+ set src(v){this._src=v;this.readyState=4;}
+ get currentTime(){return this._time;}
+ set currentTime(v){this._time=v;queueMicrotask(()=>this.dispatchEvent(new Event('seeked')));}
+ play(){this.paused=false;return Promise.resolve();}
+ pause(){this.paused=true;}
+ load(){}
+ removeAttribute(k){if(k==="src"){delete this._src;this.readyState=0;}else delete this[k];}
+ requestVideoFrameCallback(cb){this.callbacks.set(++this.next,cb);return this.next;}
+ cancelVideoFrameCallback(id){this.callbacks.delete(id);}
+ present(time){for(const [id,cb] of [...this.callbacks]){this.callbacks.delete(id);cb(performance.now(),{mediaTime:time,presentedFrames:1});}}
+}
+globalThis.document={visibilityState:'visible',hasFocus:()=>true,querySelectorAll:()=>[],createElement:()=>new Video()};
+globalThis.requestAnimationFrame=cb=>{raf.push(cb);return raf.length;};globalThis.cancelAnimationFrame=()=>{};
+const ctx=new Proxy({globalAlpha:1,drawImage:(el)=>draws.push(el)}, {get:(t,k)=>k in t?t[k]:()=>{},set:(t,k,v)=>{t[k]=v;return true;}});
+let frame=0;
+const scene={clips:[{clip_id:'a',source_path:'a.mp4',timeline_start_frame:0,timeline_end_frame:8,source_in_frame:0},{clip_id:'b',source_path:'b.mp4',timeline_start_frame:8,timeline_end_frame:30,source_in_frame:12}],audio_tracks:[],guide_frames:[]};
+const surface=createViewportSurface({canvas:{width:320,height:180,getContext:()=>ctx},getScene:()=>scene,getFrame:()=>frame,setFrame:v=>{frame=v;frames.push(v);},getTotalFrames:()=>30,getFps:()=>24,getAssetForSourcePath:()=>({width:320,height:180,media_kind:'video'}),buildViewUrl:p=>'https://fixture/'+p,getStreamingMode:()=> 'auto',getDecodeConcurrency:()=>8,isAdaptiveRebufferEnabled:()=>false});
+const settle=async()=>{for(let i=0;i<30;i++)await Promise.resolve();};
+surface.startPlayback();await settle();
+if (__SAMPLED__) for (const video of videos) video.present(Math.floor(video.currentTime*24)/24);
+const firstStart=events.find(e=>e.kind==="playback_run_start");
+let beforeClear=null;let abortRestored=null;
+if (__AUDIO__) { scene.audio_tracks=[{track_id:'audio-a',source_path:'audio-a.wav',timeline_start_frame:0,timeline_end_frame:8,source_in_frame:0},{track_id:'audio-b',source_path:'audio-b.wav',timeline_start_frame:8,timeline_end_frame:30,source_in_frame:0}]; }
+const base=performance.now();
+for(let i=0;i<20;i++){
+if (__ABORT__ && i===6) {const e=[...surface._state.prebufferCache.values()].find(e=>e.preRollPhase==='rolling');surface._abortPreRolls('test-rebuffer');await settle();abortRestored=!!e && e.preRollPhase==='target' && e.video.paused && Math.abs(e.video.currentTime-e.targetTime)<1e-6;}
+if (__CLEAR__ && i===12){beforeClear=events.filter(e=>e.kind==="playback_presentation_mismatch").length;for(const clear of window.__SONDER_DIAG_CLEARERS)clear();}for(const v of videos)if(!v.paused)v._time+=1/24;for(const cb of raf.splice(0))cb(base+i*1000/24+0.1);await settle();}
+const releasedPassed=!surface._state.videoCache.a && !videos[0].src;
+const idleBeforeStop=surface._sourceCache.snapshot().idleEntries;
+const fetchesBeforeStop=fetches;
+const visibleBeforeStop=surface._state.videoCache.b;
+surface.stopPlayback();await settle();
+const stopPreserved=surface._state.videoCache.b===visibleBeforeStop && !!visibleBeforeStop.src && fetches===fetchesBeforeStop;
+// A live prebuffer that re-adopts a parked element removes pending membership.
+const adopted=new Video();adopted.src='adopted';surface._state.prebufferCache.set('audit',{video:adopted,claimedByActive:true});
+surface._state.pendingRelease.add(adopted);surface._drain();
+const adoptedRetained=adopted.src==='adopted' && !surface._state.pendingRelease.has(adopted);
+surface._state.prebufferCache.delete('audit');
+const audioReleased=!surface._state.audioCache['audio-a'];
+const audioVisible=surface._state.audioCache['audio-b'];
+console.log(JSON.stringify({audioReleased,audioVisibleRetained:!!audioVisible?.src,abortRestored,releasedPassed,idleBeforeStop,stopPreserved,adoptedRetained,beforeClear, sameRun:events.filter(e=>e.kind==="playback_run_start").every(e=>e.playbackRunId===firstStart.playbackRunId), frames, videos:videos.length,draws:draws.length,stop:events.find(e=>e.kind==='playback_run_stop')?.presentation,videoStates:videos.map(v=>({src:v.src,time:v.currentTime,paused:v.paused})),claims:events.filter(e=>e.kind==='playback_prebuffer_claim').length, kinds:[...new Set(events.map(e=>e.kind))]}));
+surface.destroy();
+
+
+
+"""
+    script = script.replace("__MODULE_URL__", json.dumps((ROOT / "web/js/viewport_surface.js").as_uri()))
+    return _run_node(script.replace("__SAMPLED__", json.dumps(sampled)).replace("__CLEAR__", json.dumps(clear)).replace("__ABORT__",json.dumps(abort)).replace("__AUDIO__",json.dumps(audio)))
+
+
+def test_presentation_counters_detect_frozen_and_unsampled_boundary_draws():
+    frozen = _presentation_harness()
+    assert frozen["claims"] == 1
+    assert frozen["stop"]["staleDraws"] > 0
+    assert frozen["stop"]["boundaryStaleDraws"] == 3
+    assert frozen["stop"]["boundaryUnsampledDraws"] == 0
+    missing = _presentation_harness(sampled=False)
+    assert missing["claims"] == 1
+    assert missing["stop"]["boundaryUnsampledDraws"] == 4
+    assert missing["stop"]["verifiedDraws"] == 0
+    assert missing["stop"]["staleDraws"] == 0
+
+
+def test_presented_frame_classifier_never_extrapolates_or_verifies_missing_samples():
+    module_url = (ROOT / "web/js/viewport_surface.js").as_uri()
+    result = _run_node(f"""
+const {{ _classifyPresentedFrame: classify }} = await import({json.dumps(module_url)});
+const args = {{presentedMediaTime: 10/24, presentedAtMs: 100, nowMs: 120, expectedSourceFrame:12, fps:24, maxSampleAgeMs:250}};
+console.log(JSON.stringify({{
+    frozen:classify(args), later:classify({{...args,nowMs:200}}),
+    old:classify({{...args,nowMs:400}}), unsupported:classify({{...args,supported:false}}),
+    missing:classify({{...args,presentedMediaTime:null}}),
+}}));
+""")
+    assert result["frozen"]["deltaFrames"] == -2
+    assert result["frozen"]["stale"] is True
+    assert result["later"]["presentedSourceFrame"] == result["frozen"]["presentedSourceFrame"]
+    assert result["old"]["reason"] == "sample-stale"
+    assert result["old"]["verified"] is False
+    assert result["old"]["stale"] is False
+    assert result["unsupported"]["reason"] == "unsupported"
+    assert result["missing"]["verified"] is False
+
+
+def test_byte_budget_shared_source_retains_other_holder_and_newest_idle_survives():
+    result = _run_node(_budget_harness("""
+await load('old'); release('old');
+await load('shared', 'first'); await load('shared', 'second');
+release('shared', 'first');
+const sharedHeld = cache.snapshot().heldEntries;
+await load('newest'); release('newest');
+const idle = cache.snapshot().idleEntries;
+await load('pressure');
+console.log(JSON.stringify({sharedHeld,idle,evicted:evictedFor(),snapshot:cache.snapshot()}));
+""", max_bytes="300"))
+    assert result["sharedHeld"] == 1
+    assert result["idle"] == 2
+    assert result["evicted"] == ["old"]
+    assert result["snapshot"]["heldEntries"] == 2
+
+
+def test_playback_releases_passed_holder_and_preserves_stop_frame_and_readopted_media():
+    result = _presentation_harness()
+    assert result["releasedPassed"] is True
+    assert result["idleBeforeStop"] == 1
+    assert result["stopPreserved"] is True
+    assert result["adoptedRetained"] is True
+
+
+def _live_culling_harness(missing=False, failed=False, transparent=False, partial=False, image=False, wrong_dimensions=False):
+    script = r"""
+const {readFileSync} = await import('node:fs');
+const moduleUrl=__MODULE_URL__;
+let source=readFileSync(new URL(moduleUrl),'utf8');
+source=source.replaceAll(/from "(\.\/[^"]+)"/g,(_,p)=>'from '+JSON.stringify(new URL(p,moduleUrl).href));
+// Observe the actual closure; do not replace its state transitions.
+source=source.replace('        renderFrame,\n        togglePlayback,','        _state: state, _sourceCache: sourceCache, _drain: drainPendingReleases,\n        renderFrame,\n        togglePlayback,');
+const {createViewportSurface}=await import('data:text/javascript;base64,'+Buffer.from(source).toString('base64'));
+let fetches=0;globalThis.fetch=async(url)=>{if (__FAILED__ && url.endsWith('b.mp4')) throw new Error('decode unavailable');fetches++;return {ok:true,blob:async()=>new Blob([new Uint8Array(100)])};};
+const texts=[];const events = [], raf = [], videos = [], draws = [], frames=[];
+globalThis.window = {SONDER_DEBUG_SESSION:true, __SONDER_CANVAS_DIAG:{record:(kind,payload)=>events.push({kind,...payload})},__SONDER_DIAG_CLEARERS:new Set(),setTimeout,clearTimeout};
+class Video extends EventTarget {
+ constructor(){super();this.readyState=0;this.videoWidth=320;this.videoHeight=180;this.duration=100;this.paused=true;this.seeking=false;this._time=0;this.callbacks=new Map();this.next=0; videos.push(this);}
+ get src(){return this._src;}
+ set src(v){this._src=v;this.readyState=4;if(__WRONG_DIMENSIONS__ && videos[0]===this){this.videoWidth=180;this.videoHeight=320;}if(__FAILED__ && v.endsWith('b.mp4'))this.error={code:4};}
+ get currentTime(){return this._time;}
+ set currentTime(v){this._time=v;queueMicrotask(()=>{this.dispatchEvent(new Event('seeked'));queueMicrotask(()=>this.present(v));});}
+ play(){this.paused=false;return Promise.resolve();}
+ pause(){this.paused=true;}
+ load(){}
+ removeAttribute(k){if(k==="src"){delete this._src;this.readyState=0;}else delete this[k];}
+ requestVideoFrameCallback(cb){this.callbacks.set(++this.next,cb);return this.next;}
+ cancelVideoFrameCallback(id){this.callbacks.delete(id);}
+ present(time){for(const [id,cb] of [...this.callbacks]){this.callbacks.delete(id);cb(performance.now(),{mediaTime:time,presentedFrames:1});}}
+}
+globalThis.Image=class {constructor(){this.width=320;this.height=180;this.naturalWidth=320;this.naturalHeight=180;} set src(v){this._src=v;queueMicrotask(()=>this.onload?.());}};
+globalThis.document={visibilityState:'visible',hasFocus:()=>true,querySelectorAll:()=>[],createElement:()=>new Video()};
+globalThis.requestAnimationFrame=cb=>{raf.push(cb);return raf.length;};globalThis.cancelAnimationFrame=()=>{};
+const ctx=new Proxy({globalAlpha:1,fillText:t=>texts.push(t),drawImage:(el)=>draws.push(el)}, {get:(t,k)=>k in t?t[k]:()=>{},set:(t,k,v)=>{t[k]=v;return true;}});
+let frame=0;
+const scene={clips:[{clip_id:'a',source_path:'a.mp4',timeline_start_frame:0,timeline_end_frame:8,source_in_frame:0},{clip_id:'b',source_path:'b.mp4',timeline_start_frame:0,timeline_end_frame:30,source_in_frame:0,track_index:1}],audio_tracks:[],guide_frames:[]};
+if (__TRANSPARENT__)scene.clips.forEach(c=>c.opacity=0);
+if (__PARTIAL__)scene.clips[1].opacity=0.5;
+if (__WRONG_DIMENSIONS__)scene.clips[1].fit_mode='fit';
+const surface=createViewportSurface({canvas:{width:320,height:180,getContext:()=>ctx},getScene:()=>scene,getFrame:()=>frame,setFrame:v=>{frame=v;frames.push(v);},getTotalFrames:()=>30,getFps:()=>24,getAssetForSourcePath:p=>({width:__MISSING__ && p==='b.mp4'?0:320,height:__MISSING__ && p==='b.mp4'?0:180,asset_type:__IMAGE__ && p==='b.mp4'?'image':'video'}),buildViewUrl:p=>'https://fixture/'+p,getStreamingMode:()=> 'auto',getDecodeConcurrency:()=>8,isAdaptiveRebufferEnabled:()=>false});
+const settle=async()=>{for(let i=0;i<30;i++)await Promise.resolve();};
+surface.setLiveMediaEnabled(true);await settle();await new Promise(resolve=>setTimeout(resolve,10));await settle();
+const holders=[...surface._sourceCache.entries.values()].map(e=>({path:e.sourcePath,holders:[...e.holders].map(v=>Object.keys(surface._state.videoCache).find(k=>surface._state.videoCache[k]===v))}));
+console.log(JSON.stringify({videos:videos.length,fetches,holders,draws:draws.map(v=>Object.keys(surface._state.videoCache).find(k=>surface._state.videoCache[k]===v)),texts}));surface.destroy();
+"""
+    script=script.replace("__MODULE_URL__",json.dumps((ROOT / "web/js/viewport_surface.js").as_uri()))
+    for key,value in [("MISSING",missing),("FAILED",failed),("TRANSPARENT",transparent),("PARTIAL",partial),("IMAGE",image),("WRONG_DIMENSIONS",wrong_dimensions)]:
+        script=script.replace("__"+key+"__",json.dumps(value))
+    return _run_node(script)
+
+
+def test_live_preview_culls_only_with_resolved_coverage_and_preserves_draw_order():
+    covered = _live_culling_harness()
+    assert covered["videos"] == 1
+    assert covered["fetches"] == 1
+    assert covered["holders"] == [{"path": "b.mp4", "holders": ["b"]}]
+    assert covered["draws"] == ["b"]
+    missing = _live_culling_harness(missing=True)
+    assert missing["videos"] == 2
+    assert missing["draws"] == ["a", "b"]
+    failed = _live_culling_harness(failed=True)
+    assert failed["videos"] == 2
+    assert failed["draws"] == ["a"]
+    transparent = _live_culling_harness(transparent=True)
+    assert "Loading preview..." not in transparent["texts"]
+    partial = _live_culling_harness(partial=True)
+    assert partial["draws"] == ["a", "b"]
+
+
+def test_live_preview_does_not_cull_for_alpha_images_or_wrong_decoded_dimensions():
+    image = _live_culling_harness(image=True)
+    assert image["videos"] == 1
+    assert image["draws"] == ["a", None]
+    mismatch = _live_culling_harness(wrong_dimensions=True)
+    assert mismatch["videos"] == 2
+    assert mismatch["fetches"] == 2
+    assert mismatch["draws"] == ["a", "b"]
+
+
+def test_preroll_planner_horizons_budgets_discontinuities_and_one_sided_claim():
+    module_url = (ROOT / "web/js/viewport_surface.js").as_uri()
+    result = _run_node(f"""
+const {{_planPlaybackPreRoll:plan,_rollingPrebufferAtTarget:claim}}=await import({json.dumps(module_url)});
+const a={{fps:24,currentFrame:90,targetFrame:100,targetSourceFrame:56,sourceInFrame:56,clipLengthFrames:68,rebuffering:false,decodeConcurrency:8,activePreRolls:0,phase:'target'}};
+console.log(JSON.stringify({{
+ leads:[24,30,60,12].map(fps=>plan({{...a,fps}}).leadInFrames),
+ horizon:[90,94,97,100].map(currentFrame=>plan({{...a,currentFrame}}).action),
+ start:plan({{...a,currentFrame:97,phase:'lead-in'}}).action,
+ noRoom:[0,2].map(sourceInFrame=>plan({{...a,currentFrame:94,sourceInFrame}}).reason),
+ short:plan({{...a,currentFrame:94,clipLengthFrames:3}}).reason,
+ budget:plan({{...a,currentFrame:94,activePreRolls:2}}).reason,
+ single:plan({{...a,currentFrame:94,decodeConcurrency:1}}).reason,
+ abort:[{{rebuffering:true,currentFrame:98}},{{currentFrame:101}},{{currentFrame:94}}].map(v=>plan({{...a,phase:'rolling',...v}}).action),
+ hold:plan({{...a,phase:'rolling',currentFrame:100}}).action,
+ claim:[claim(2-1/24,2,1/24),claim(2,2,1/24),claim(2+2/24,2,1/24)],
+}}));
+""")
+    assert result == {"leads": [3,4,6,2], "horizon": ["hold","park-lead-in","skip","skip"],
+        "start":"start-roll", "noRoom":["no-room","no-room"], "short":"no-room",
+        "budget":"budget", "single":"budget", "abort":["abort","abort","abort"],
+        "hold":"hold", "claim":[False,True,False]}
+
+
+def test_preroll_survives_current_safety_reclassification_and_lands():
+    result = _presentation_harness()
+    assert result["stop"]["preRollStarted"] == 1
+    assert result["stop"]["preRollLanded"] == 1
+    assert result["stop"]["preRollRollingFrames"] > 0
+    assert result["stop"]["preRollAborted"] == 0
+
+
+def test_preroll_abort_restores_parked_target_without_releasing_its_source():
+    result = _presentation_harness(abort=True)
+    assert result["abortRestored"] is True
+    assert result["stop"]["preRollAborted"] == 1
+    assert result["stopPreserved"] is True
+
+
+def test_audio_departure_releases_holder_and_stop_preserves_visible_audio():
+    result = _presentation_harness(audio=True)
+    assert result["audioReleased"] is True
+    assert result["audioVisibleRetained"] is True

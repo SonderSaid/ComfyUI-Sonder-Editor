@@ -15,6 +15,7 @@ a fresh `[Unreleased]` block.
 - Project-wide Keep/Drop for out-of-window Reference text, with independent per-chip overrides and visible markers.
 
 ### Changed
+- Fullscreen playback keeps a soft memory target for the video it holds in RAM, freeing idle media oldest-first. Media in use by the playhead or prebuffer is never dropped, so the figure can exceed the target on heavy scenes.
 - Editing Master MP4 and audio-only exports now use 24-bit FLAC; ProRes uses 24-bit PCM and FFV1 uses 24-bit FLAC.
 - Silent Editor output uses 48 kHz; Reference placeholders follow the highest live native rate, or 48 kHz when empty. Audio socket shapes and ordering remain unchanged.
 - Stored audio volumes above 100% now render at 100%, matching timeline playback; stored project values remain intact.
@@ -24,6 +25,10 @@ a fresh `[Unreleased]` block.
 - Frozen threshold values use the current coverage rule when resolved again, including legacy v0.2.2 prompt replay.
 
 ### Fixed
+- Playback memory presets retain their selected values, default to the named 1 GB preset, and hide the custom-unit suffix beside named presets.
+- Paused previews avoid fetching fully covered video layers and fall back when the covering media cannot resolve or cover the canvas.
+- Passed playback clips release their media holders so the memory target can reclaim idle sources; scrubbing back under pressure may re-fetch them.
+- Fullscreen playback pre-rolls eligible incoming clips to reduce boundary freezes; clips without source lead-in keep normal preparation.
 - Save Video and Preview retain valid video when supplied audio cannot be prepared, with visible alerts; failed take-audio placement rolls back its additions without discarding the video. Audio processing uses the configured temp volume and avoids unnecessary copies.
 - Corrupt audio only blocks windows using that source; empty, muted and zero-volume windows export video without manufacturing silent audio tracks. RF64 float WAVs now read back correctly, and digital silence stays silent in integer delivery.
 - Reference chip dialogs save and close when their existing source is inactive, including later linked copies.

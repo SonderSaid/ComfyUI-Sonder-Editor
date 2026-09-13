@@ -6,6 +6,37 @@ function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
 }
 
+const PLAYBACK_PRE_ROLL_LEAD_MS = 125;
+const PLAYBACK_PRE_ROLL_MAX_CONCURRENT = 2;
+// Measured play() clock startup consumes about one scene frame in Chrome/Edge.
+// Start that much earlier while keeping the source lead-in unchanged.
+const PLAYBACK_PRE_ROLL_START_MARGIN_FRAMES = 1;
+
+export function _planPlaybackPreRoll({ fps, currentFrame, targetFrame, targetSourceFrame,
+    sourceInFrame, clipLengthFrames, rebuffering, decodeConcurrency, activePreRolls, phase = "target" } = {}) {
+    const leadInFrames = clamp(Math.ceil(PLAYBACK_PRE_ROLL_LEAD_MS * fps / 1000), 2, 6);
+    const distance = targetFrame - currentFrame;
+    const result = (action, reason = "") => ({ action, leadInFrames, leadInSourceFrame: targetSourceFrame - leadInFrames, reason });
+    if (phase !== "target" && (rebuffering || distance < 0 || distance > (phase === "rolling" ? leadInFrames + PLAYBACK_PRE_ROLL_START_MARGIN_FRAMES + 1 : 2 * leadInFrames))) return result("abort", "discontinuity");
+    if (rebuffering) return result("hold", "rebuffering");
+    if (phase === "rolling") return result("hold");
+    if (distance <= 0) return result(phase === "lead-in" ? "abort" : "skip", "missed-boundary");
+    if (distance > 2 * leadInFrames) return result("hold");
+    // Remove this fallback when zero-room priming lands, or real-project
+    // preRollSkippedNoRoom measurements establish it is negligible.
+    if (sourceInFrame < leadInFrames || targetSourceFrame < leadInFrames || clipLengthFrames < leadInFrames + 1) return result("skip", "no-room");
+    if (decodeConcurrency <= 1 || (phase === "target" && activePreRolls >= PLAYBACK_PRE_ROLL_MAX_CONCURRENT)) return result("skip", "budget");
+    if (phase === "target") return result(distance > leadInFrames + PLAYBACK_PRE_ROLL_START_MARGIN_FRAMES ? "park-lead-in" : "skip", "late");
+    return result(distance <= leadInFrames + PLAYBACK_PRE_ROLL_START_MARGIN_FRAMES ? "start-roll" : "hold");
+}
+
+export function _rollingPrebufferAtTarget(currentTime, targetTime, tolerance) {
+    return Number.isFinite(currentTime) && Number.isFinite(targetTime)
+        // Sub-millisecond media-clock quantization is not a previous source frame;
+        // the target is a frame center, so this epsilon stays well inside it.
+        && currentTime >= targetTime - 0.001 && currentTime <= targetTime + tolerance;
+}
+
 const PLAYBACK_COMMIT_HOLD_MS = 400;
 const PLAYBACK_TAIL_HOLD_MAX_MS = 2000;
 const PLAYBACK_OPAQUE_OPACITY = 0.999;
@@ -77,6 +108,35 @@ function createPlaybackSourcePerfCounters() {
     };
 }
 
+function createPresentationCounters() {
+    return {
+        verifiedDraws: 0, unverifiedDraws: 0,
+        staleDraws: 0, staleFrameTotal: 0, maxStaleFrames: 0,
+        boundaryStaleDraws: 0, boundaryUnsampledDraws: 0,
+        preRollStarted: 0, preRollLanded: 0, preRollAborted: 0,
+        preRollSkippedNoRoom: 0, preRollSkippedBudget: 0, preRollRollingFrames: 0,
+    };
+}
+
+export function _classifyPresentedFrame({
+    presentedMediaTime, presentedAtMs, nowMs, expectedSourceFrame, fps, maxSampleAgeMs,
+    supported = true,
+} = {}) {
+    const missing = { verified: false, presentedSourceFrame: null, deltaFrames: null, stale: false };
+    if (!supported) return { ...missing, reason: "unsupported", sampleAgeMs: null };
+    if (![presentedMediaTime, presentedAtMs, nowMs, expectedSourceFrame, fps].every(Number.isFinite) || fps <= 0) {
+        return { ...missing, reason: "no-sample", sampleAgeMs: null };
+    }
+    // Never advance this sample using wall time: that would assume away a freeze.
+    const presentedSourceFrame = Math.floor(presentedMediaTime * fps + 1e-6);
+    const deltaFrames = presentedSourceFrame - expectedSourceFrame;
+    const sampleAgeMs = Math.max(0, nowMs - presentedAtMs);
+    if (!Number.isFinite(maxSampleAgeMs) || sampleAgeMs > maxSampleAgeMs) {
+        return { verified: false, presentedSourceFrame, deltaFrames, stale: false, reason: "sample-stale", sampleAgeMs };
+    }
+    return { verified: true, presentedSourceFrame, deltaFrames, stale: deltaFrames < 0, reason: deltaFrames < 0 ? "stale" : "sampled", sampleAgeMs };
+}
+
 function createPlaybackPerfCounters(startedAtMs = 0) {
     return {
         startedAtMs,
@@ -89,6 +149,7 @@ function createPlaybackPerfCounters(startedAtMs = 0) {
         maxFramesBehind: 0,
         canvasBackingResizes: 0,
         sourceCache: createPlaybackSourcePerfCounters(),
+        presentation: createPresentationCounters(),
         timings: Object.fromEntries(PLAYBACK_PERF_STAGE_NAMES.map((name) => [name, {
             count: 0,
             totalMs: 0,
@@ -143,6 +204,7 @@ function serializePlaybackPerfCounters(counters) {
             peakInFlightEntries: counters?.sourceCache?.peakInFlightEntries || 0,
             evictionsByReason: Object.fromEntries(counters?.sourceCache?.evictionsByReason || []),
         },
+        presentation: { ...counters?.presentation },
         timings,
     };
 }
@@ -966,6 +1028,7 @@ function drawEdgePadBars(ctx, element, rect, canvasW, canvasH, srcW, srcH) {
 
 function removeMediaSource(mediaEl) {
     if (!mediaEl) return;
+    mediaEl._sonderCancelPresentationTracker?.();
     try {
         mediaEl.pause?.();
     } catch (error) {}
@@ -1411,6 +1474,9 @@ export function createViewportSurface(options = {}) {
     const getPrebufferBoundaryDepth = options.getPrebufferBoundaryDepth || (() => PLAYBACK_PREBUFFER_BOUNDARY_DEPTH);
     const getPrebufferMaxEntries = options.getPrebufferMaxEntries || (() => PLAYBACK_PREBUFFER_MAX_ENTRIES);
     const getDecodeConcurrency = options.getDecodeConcurrency || (() => 2);
+    // null = unlimited, matching the cache's own contract. Defaulting to null
+    // keeps a host that does not supply this on the pre-budget behaviour.
+    const getSourceCacheMaxBytes = options.getSourceCacheMaxBytes || (() => null);
     // Injected notification emitter (Core `notifyInfo`-shaped: returns a handle with
     // update/resolve/dismiss, or null). No-op fallback keeps the surface decoupled.
     const notifyInfo = options.notifyInfo || (() => null);
@@ -1423,6 +1489,7 @@ export function createViewportSurface(options = {}) {
         isDestroyed: () => state.destroyed,
         isDiagnosticsEnabled: playbackPerfActive,
         recordEvent: recordSourceCacheEvent,
+        getMaxRetainedBytes: getSourceCacheMaxBytes,
     });
     state.sourceUrlCache = sourceCache.entries;
 
@@ -1562,6 +1629,86 @@ export function createViewportSurface(options = {}) {
 
     function playbackPerfActive() {
         return typeof window !== "undefined" && window.SONDER_DEBUG_SESSION === true;
+    }
+
+    function trackVideoPresentation(video, layerKey) {
+        if (!video || !playbackPerfActive()) return;
+        if (video._sonderPresentationTracker) {
+            video._sonderPresentationTracker.layerKey = layerKey;
+            return;
+        }
+        if (typeof video.requestVideoFrameCallback !== "function") return;
+        const tracker = { layerKey, sample: null, callbackId: null, cancelled: false, mismatchKey: "", mismatchAtMs: -Infinity };
+        video._sonderPresentationTracker = tracker;
+        video._sonderCancelPresentationTracker = () => {
+            tracker.cancelled = true;
+            if (tracker.callbackId !== null) video.cancelVideoFrameCallback?.(tracker.callbackId);
+            delete video._sonderPresentationTracker;
+            delete video._sonderCancelPresentationTracker;
+        };
+        const sampleFrame = (timestamp, metadata) => {
+            if (tracker.cancelled) return;
+            if (!playbackPerfActive() || state.destroyed) {
+                video._sonderCancelPresentationTracker?.();
+                return;
+            }
+            tracker.sample = { ...metadata, presentedAtMs: timestamp };
+            if (window.SONDER_DEBUG_PLAYBACK_BOUNDARY) {
+                // Use the existing bounded diagnostic ring, not an unbounded array.
+                viewportDiagRecord("playback_presentation_raw", {
+                    t: timestamp, layerKey: tracker.layerKey, mediaTime: metadata.mediaTime,
+                    presentedFrames: metadata.presentedFrames, currentTime: video.currentTime,
+                    frame: currentFrame(), playbackRunId: state.playbackRunId,
+                    ...videoFrameCallbackMetadataTelemetry(metadata),
+                });
+            }
+            tracker.callbackId = video.requestVideoFrameCallback(sampleFrame);
+        };
+        tracker.callbackId = video.requestVideoFrameCallback(sampleFrame);
+    }
+
+    function notePresentedVideoDraw(renderable, frame) {
+        if (!playbackPerfActive()) return;
+        const video = renderable.element;
+        const tracker = video?._sonderPresentationTracker;
+        const sample = tracker?.sample;
+        const expectedSourceFrame = clipSourceFrame(renderable.layer, frame);
+        const nowMs = performance.now();
+        const result = _classifyPresentedFrame({
+            presentedMediaTime: sample?.mediaTime, presentedAtMs: sample?.presentedAtMs,
+            nowMs, expectedSourceFrame, fps: fps(), maxSampleAgeMs: Math.max(250, 6 * 1000 / fps()),
+            supported: typeof video?.requestVideoFrameCallback === "function",
+        });
+        const claimFrame = video?._sonderPresentationClaimFrame;
+        const framesSinceClaim = Number.isFinite(claimFrame) ? frame - claimFrame : null;
+        const boundary = framesSinceClaim !== null && framesSinceClaim >= 0 && framesSinceClaim <= 3;
+        updatePlaybackPerfCounters((counters) => {
+            const bucket = counters.presentation;
+            if (result.verified) {
+                bucket.verifiedDraws += 1;
+                if (result.stale) {
+                    bucket.staleDraws += 1;
+                    bucket.staleFrameTotal += -result.deltaFrames;
+                    bucket.maxStaleFrames = Math.max(bucket.maxStaleFrames, -result.deltaFrames);
+                    if (boundary) bucket.boundaryStaleDraws += 1;
+                }
+            } else {
+                bucket.unverifiedDraws += 1;
+                if (boundary) bucket.boundaryUnsampledDraws += 1;
+            }
+        });
+        if (result.deltaFrames !== 0 || !result.verified) {
+            const key = `${renderable.layer.key}|${result.deltaFrames}|${prebufferSourceTargetKey(renderable.layer, frame)}`;
+            if (!tracker || tracker.mismatchKey !== key || nowMs - tracker.mismatchAtMs >= 500) {
+                if (tracker) { tracker.mismatchKey = key; tracker.mismatchAtMs = nowMs; }
+                recordPlaybackTelemetry("playback_presentation_mismatch", {
+                    layerKey: renderable.layer.key, expectedSourceFrame, ...result,
+                    presentedFrames: sample?.presentedFrames ?? null, mediaTime: sample?.mediaTime ?? null,
+                    currentTime: video?.currentTime ?? null, framesSinceClaim,
+                    preRollPhase: renderable.active?.claimedPrebufferEntry?.preRollPhase || "target",
+                });
+            }
+        }
     }
 
     function playbackEnvironmentSnapshot() {
@@ -2579,6 +2726,7 @@ export function createViewportSurface(options = {}) {
             video.playsInline = true;
             state.videoCache[layer.key] = video;
         }
+        trackVideoPresentation(state.videoCache[layer.key], layer.key);
         return state.videoCache[layer.key];
     }
 
@@ -2891,6 +3039,7 @@ export function createViewportSurface(options = {}) {
     function discardPrebufferEntry(entry) {
         if (!entry) return;
         if (entry.claimedByActive) return;
+        abortPreRoll(entry, "discard", { restore: false });
         removePlaybackWarmEntriesByOwner("prebuffer", entry.key, "prebuffer-discarded");
         entry.cancelled = true;
         try {
@@ -2946,18 +3095,27 @@ export function createViewportSurface(options = {}) {
             return !!(entry.decodeJobState === "queued" && entry.decodeJob);
     }
 
-    // Release outgoing elements parked by claimPrebufferedVideo. On a normal
-    // drain (post-commit) skip anything still referenced by an active video;
-    // force=true (teardown) releases everything.
+    // Remove the cache handle in the same step as parking: a later lookup must
+    // never adopt an element whose source is about to be stripped.
+    function parkPlaybackMedia(cache, key, element) {
+        element.pause();
+        if (cache[key] === element) delete cache[key];
+        state.pendingRelease.add(element);
+    }
+
+    // Post-commit teardown of parked elements. Adoption cancels pending release;
+    // both active media and live prebuffers retain their source ownership.
     function drainPendingReleases(force = false) {
         if (!state.pendingRelease.size) return;
         const inUse = new Set();
         if (!force) {
             for (const active of state.activePlaybackVideos.values()) inUse.add(active.video);
+            for (const active of state.activePlaybackAudios.values()) inUse.add(active.audio);
+            for (const entry of state.prebufferCache.values()) inUse.add(entry.video);
         }
         for (const el of Array.from(state.pendingRelease)) {
-            if (!force && inUse.has(el)) continue;
             state.pendingRelease.delete(el);
+            if (!force && inUse.has(el)) continue;
             removeMediaSource(el);
         }
     }
@@ -3052,6 +3210,7 @@ export function createViewportSurface(options = {}) {
 
     async function loadPrebufferEntry(entry) {
         if (!entry?.video || !entry.sourcePath) return null;
+        trackVideoPresentation(entry.video, entry.layerKey || entry.layer?.key);
         const sourcePath = entry.sourcePath;
         const layer = entry.layer;
         const targetFrame = entry.targetFrame;
@@ -3143,9 +3302,96 @@ export function createViewportSurface(options = {}) {
         return entry.ready ? video : null;
     }
 
+    function abortPreRoll(entry, reason, { restore = true } = {}) {
+        if (!entry || entry.claimedByActive || !entry.preRollPhase || entry.preRollPhase === "target") return;
+        recordPlaybackTelemetry("playback_preroll_abort", { reason, frame: currentFrame(), targetFrame: entry.targetFrame,
+            currentTime: entry.video.currentTime, targetTime: entry.targetTime, phase: entry.preRollPhase });
+        entry.preRollToken = (entry.preRollToken || 0) + 1;
+        entry.preRollAbort?.abort();
+        entry.preRollAbort = null;
+        entry.video.pause();
+        entry.preRollPhase = "target";
+        entry.preRollDisabled = true;
+        entry.ready = false;
+        updatePlaybackPerfCounters(c => { c.presentation.preRollAborted += 1; });
+        if (!restore || entry.cancelled || state.destroyed) return;
+        // Restoring is limiter-owned too; an abort cannot resurrect a discarded entry.
+        const token = entry.preRollToken;
+        const current = () => !state.destroyed && !entry.cancelled && !entry.claimedByActive
+            && entry.preRollToken === token && state.prebufferCache.get(entry.key) === entry;
+        entry.preRollPromise = playbackDecodeLimiter.run(DECODE_PRIORITY_HIGH, async () => {
+            if (!current()) return;
+            const video = await seekMedia(entry.video, entry.targetTime, { requireTarget: true, tolerance: prebufferTargetTimeTolerance(), signal: entry.abortController.signal });
+            if (video && current()) entry.ready = true;
+        }, { shouldRun: current }).catch(() => {});
+    }
+
+    function abortPreRolls(reason) {
+        for (const entry of state.prebufferCache.values()) abortPreRoll(entry, reason);
+    }
+
+    function schedulePreRolls(frame) {
+        const entries = [...state.prebufferCache.values()].filter(e => !e.cancelled && !e.claimedByActive);
+        const nearest = Math.min(...entries.filter(e => e.targetFrame > frame && (e.scheduleOrigin === "upcoming" || e.preRollPhase === "lead-in" || e.preRollPhase === "rolling")).map(e => e.targetFrame));
+        let activePreRolls = entries.filter(e => e.preRollPhase === "lead-in" || e.preRollPhase === "rolling").length;
+        for (const entry of entries) {
+            const phase = entry.preRollPhase || "target";
+            const plan = _planPlaybackPreRoll({ fps: fps(), currentFrame: frame, targetFrame: entry.targetFrame,
+                targetSourceFrame: entry.targetSourceFrame, sourceInFrame: Number(entry.layer?.clip?.source_in_frame) || 0,
+                clipLengthFrames: entry.layer?.clip?.timeline_end_frame - entry.layer?.clip?.timeline_start_frame,
+                rebuffering: state.playbackRebuffering, decodeConcurrency: normalizedDecodeConcurrency(), activePreRolls, phase });
+            // Once per scene frame, not per RAF. A skipped evaluation may abort a
+            // roll (even across a five-frame gap); it must never extend its horizon.
+            if (plan.action === "abort") { abortPreRoll(entry, plan.reason); activePreRolls--; continue; }
+            if (phase === "rolling") {
+                updatePlaybackPerfCounters(c => { c.presentation.preRollRollingFrames += 1; });
+                continue;
+            }
+            if (entry.preRollDisabled || entry.targetFrame !== nearest || !entry.ready) continue;
+            if (plan.action === "skip") {
+                if (!entry.preRollSkipCounted) {
+                    entry.preRollSkipCounted = true;
+                    updatePlaybackPerfCounters(c => {
+                        if (plan.reason === "no-room") c.presentation.preRollSkippedNoRoom++;
+                        else if (plan.reason === "budget") c.presentation.preRollSkippedBudget++;
+                    });
+                }
+                continue;
+            }
+            if (plan.action === "park-lead-in") {
+                entry.preRollPhase = "lead-in";
+                entry.preRollLeadReady = false;
+                entry.preRollToken = (entry.preRollToken || 0) + 1;
+                entry.preRollAbort = new AbortController();
+                const token = entry.preRollToken;
+                const current = () => !state.destroyed && !entry.cancelled && !entry.claimedByActive
+                    && entry.preRollToken === token && state.prebufferCache.get(entry.key) === entry;
+                activePreRolls++;
+                entry.preRollPromise = playbackDecodeLimiter.run(DECODE_PRIORITY_LOW, async () => {
+                    if (!current()) return;
+                    const video = await seekMedia(entry.video, sourceFrameTime(plan.leadInSourceFrame), {
+                        requireTarget: true, tolerance: prebufferTargetTimeTolerance(), signal: entry.preRollAbort.signal,
+                    });
+                    if (!current()) return;
+                    if (video) entry.preRollLeadReady = true;
+                    else abortPreRoll(entry, "lead-seek-failed");
+                }, { shouldRun: current }).catch(() => { if (current()) abortPreRoll(entry, "lead-seek-failed"); });
+            } else if (plan.action === "start-roll" && entry.preRollLeadReady) {
+                entry.preRollPhase = "rolling";
+                updatePlaybackPerfCounters(c => { c.presentation.preRollStarted++; });
+                try {
+                    const promise = entry.video.play();
+                    promise?.catch(() => abortPreRoll(entry, "play-rejected"));
+                } catch (_) { abortPreRoll(entry, "play-rejected"); }
+            }
+        }
+    }
+
     function prebufferEntryMediaAtTarget(entry, targetTime) {
         if (!entry?.video || entry.video.error) return false;
         if (entry.video.seeking || (entry.video.readyState || 0) < 2) return false;
+        if (entry.preRollPhase === "lead-in") return false;
+        if (entry.preRollPhase === "rolling") return _rollingPrebufferAtTarget(Number(entry.video.currentTime), targetTime, firstDrawTolerance());
         return isMediaAtTarget(
             entry.video,
             clampMediaTargetTime(entry.video, targetTime),
@@ -3857,6 +4103,9 @@ export function createViewportSurface(options = {}) {
             state.pendingRelease.add(outgoing);
         }
         state.videoCache[layer.key] = entry.video;
+        entry.video._sonderPresentationClaimFrame = frame;
+        if (entry.preRollPhase === "rolling") updatePlaybackPerfCounters(c => { c.presentation.preRollLanded++; });
+        trackVideoPresentation(entry.video, layer.key);
         if (active) {
             active.layer = layer;
             active.video = entry.video;
@@ -5102,6 +5351,7 @@ export function createViewportSurface(options = {}) {
         for (const target of targets) {
             ensurePrebufferedLayer(target.layer, target.targetFrame, { ...target, snapshot });
         }
+        schedulePreRolls(snapshot.frame);
     }
 
     async function loadGuideLayer(snapshot) {
@@ -5231,7 +5481,7 @@ export function createViewportSurface(options = {}) {
         return imageLikeCoversCanvas(layerCoverageElement(layer, frame), opacity, fitOptionsFor(layer?.clip));
     }
 
-    function requiredClipLayersAfterCoverage(snapshot) {
+    function requiredClipLayersAfterCoverage(snapshot, { videoCoverageOnly = false } = {}) {
         const requiredTopDown = [];
         let coveredByUpper = false;
         for (const layer of [...(snapshot?.playableClipLayers || [])].reverse()) {
@@ -5239,7 +5489,8 @@ export function createViewportSurface(options = {}) {
             if (opacity <= 0) continue;
             if (coveredByUpper) continue;
             requiredTopDown.push(layer);
-            if (layerCoversCanvasForPlayback(layer, snapshot.frame)) {
+            if ((!videoCoverageOnly || layer.asset?.asset_type !== "image")
+                && layerCoversCanvasForPlayback(layer, snapshot.frame)) {
                 coveredByUpper = true;
             }
         }
@@ -6119,9 +6370,21 @@ export function createViewportSurface(options = {}) {
     async function renderLiveComposite(snapshot, renderToken) {
         const guideImage = await loadGuideLayer(snapshot);
         if (state.destroyed || state.isPlaying || renderToken !== state.renderToken) return;
-        const renderableLayers = await Promise.all(
-            snapshot.playableClipLayers.map((layer) => resolveRenderableLayer(layer, snapshot.frame))
+        // Image dimensions cannot prove opacity: PNG/WebP may reveal lower layers.
+        const required = [...requiredClipLayersAfterCoverage(snapshot, { videoCoverageOnly: true })].reverse();
+        let renderableLayers = await Promise.all(
+            required.map((layer) => resolveRenderableLayer(layer, snapshot.frame))
         );
+        if (state.destroyed || state.isPlaying || renderToken !== state.renderToken) return;
+        // Metadata is only a fetch-avoidance hint. Resolved dimensions and opacity
+        // must actually cover the canvas before omitted lower layers stay omitted.
+        const resolvedCoverage = renderableLayers.some((renderable) => renderable?.type === "video" && renderable.element
+            && imageLikeCoversCanvas(renderable.element, renderable.opacity, fitOptionsFor(renderable.clip)));
+        if (required.length < snapshot.playableClipLayers.length && !resolvedCoverage) {
+            const resolvedByKey = new Map(required.map((layer, index) => [layer.key, renderableLayers[index]]));
+            renderableLayers = await Promise.all(snapshot.playableClipLayers.map((layer) =>
+                resolvedByKey.has(layer.key) ? resolvedByKey.get(layer.key) : resolveRenderableLayer(layer, snapshot.frame)));
+        }
         if (state.destroyed || state.isPlaying || renderToken !== state.renderToken) return;
         drawBlack();
         let drewAny = false;
@@ -6218,7 +6481,7 @@ export function createViewportSurface(options = {}) {
         }
         for (const [key, active] of Array.from(state.activePlaybackVideos.entries())) {
             if (desiredVideoKeys.has(key)) continue;
-            active.video.pause();
+            parkPlaybackMedia(state.videoCache, key, active.video);
             active.readyForDraw = false;
             active.pendingPrepare = null;
             state.activePlaybackVideos.delete(key);
@@ -6291,7 +6554,7 @@ export function createViewportSurface(options = {}) {
         }
         for (const [key, active] of Array.from(state.activePlaybackAudios.entries())) {
             if (desiredAudioKeys.has(key)) continue;
-            active.audio.pause();
+            parkPlaybackMedia(state.audioCache, key, active.audio);
             state.activePlaybackAudios.delete(key);
         }
         samplePlaybackQualityTelemetry();
@@ -6486,6 +6749,7 @@ export function createViewportSurface(options = {}) {
         for (const renderable of preflight.renderables || []) {
             const fitItem = renderable.type === "guide" ? renderable.guide : renderable.layer?.clip;
             const layerDrawStartedAt = telemetryActive ? performance.now() : 0;
+            if (renderable.type === "video" && renderable.active) syncPreparedVideoPlayback(renderable.active, renderable.layer, snapshot.frame);
             const didDraw = drawImageLike(renderable.element, { opacity: renderable.opacity, ...fitOptionsFor(fitItem) });
             if (telemetryActive) {
                 const layerDrawMs = performance.now() - layerDrawStartedAt;
@@ -6503,10 +6767,10 @@ export function createViewportSurface(options = {}) {
             }
             if (didDraw) {
                 drewAny = true;
+                if (renderable.type === "video") notePresentedVideoDraw(renderable, snapshot.frame);
                 if (renderable.type === "video" && renderable.active) {
                     renderable.active.firstDrawComplete = true;
                     renderable.active.readyForDraw = true;
-                    syncPreparedVideoPlayback(renderable.active, renderable.layer, snapshot.frame);
                     notePlaybackWarmLayer(renderable.layer, snapshot.frame, "warm", "composite-commit");
                     if (renderable.layer?.key) {
                         committedVideoKeys.push(renderable.layer.key);
@@ -6997,6 +7261,7 @@ export function createViewportSurface(options = {}) {
         captureRebufferToastPressure(now);
         captureRebufferHeavyPressure(now);
         state.playbackRebuffering = true;
+        abortPreRolls("rebuffer");
         // Hold at the current (runaway) frame: audio has already played to ~here, so
         // catching the frozen video up to this frame keeps audio continuous (no
         // rewind) and resyncs A/V where the listener already is.
@@ -7258,18 +7523,25 @@ export function createViewportSurface(options = {}) {
         finishTick();
     }
 
-    function clearActivePlaybackMedia() {
-        for (const active of state.activePlaybackVideos.values()) {
+    function clearActivePlaybackMedia({ preserveFrame = null } = {}) {
+        const snapshot = Number.isFinite(preserveFrame) ? buildFrameSnapshot(preserveFrame) : null;
+        const visibleVideoKeys = new Set(snapshot ? requiredClipLayersAfterCoverage(snapshot).map(layer => layer.key) : []);
+        const visibleAudioKeys = new Set(snapshot ? snapshot.audioLayers.map(layer => layer.key) : []);
+        for (const [key, active] of state.activePlaybackVideos) {
             active.video.pause();
             active.readyForDraw = false;
             active.pendingPrepare = null;
+            if (visibleVideoKeys.has(key)) state.pendingRelease.delete(active.video);
+            else parkPlaybackMedia(state.videoCache, key, active.video);
         }
         state.activePlaybackVideos.clear();
-        for (const active of state.activePlaybackAudios.values()) {
+        for (const [key, active] of state.activePlaybackAudios) {
             active.audio.pause();
+            if (visibleAudioKeys.has(key)) state.pendingRelease.delete(active.audio);
+            else parkPlaybackMedia(state.audioCache, key, active.audio);
         }
         state.activePlaybackAudios.clear();
-        drainPendingReleases(true);
+        drainPendingReleases();
     }
 
     function stopPlayback({ preservePlayhead = false, reason = "playback-stop" } = {}) {
@@ -7286,7 +7558,9 @@ export function createViewportSurface(options = {}) {
         finishPlaybackPerfRun(reason);
         flushBlockReasonTelemetry();
         resetRebufferState();
-        clearActivePlaybackMedia();
+        const stopFrame = !preservePlayhead && shouldReturnToPlaybackStart()
+            ? state.playbackSessionStartFrame : currentFrame();
+        clearActivePlaybackMedia({ preserveFrame: stopFrame });
         clearPrebufferCache();
         state.prebufferMissTelemetryKeys.clear();
         state.prebufferMissTelemetryEmitted = 0;

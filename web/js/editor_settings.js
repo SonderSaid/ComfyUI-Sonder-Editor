@@ -335,6 +335,14 @@ export const DEFAULT_EDITOR_SETTINGS = {
         prebufferBoundaryDepth: 12,
         prebufferMaxEntries: 64,
         decodeConcurrency: 8,
+        // Soft target for retained whole-file playback blobs, in bytes. These are
+        // real resident RAM (measured ~+495 MB process working set for 458 MB of
+        // blobs), and before this existed a session retained 235-526 MB with zero
+        // evictions. `null` = unlimited, which reproduces exactly that.
+        // Unlike renderCacheMaxBytes, 0 does NOT mean "off": this cache backs
+        // blob-mode playback, so a zero budget would thrash every entry. The
+        // normalizer floors any positive value at 256 MB for that reason.
+        sourceCacheMaxBytes: 1_000_000_000,
         streamingMode: "auto",
         adaptiveRebuffer: true,
         rebufferEnterMs: 250,
@@ -1293,6 +1301,14 @@ export function normalizeEditorSettings(source = null) {
                 defaults.playback.decodeConcurrency,
                 true,
             ),
+            // null survives as null (unlimited). Any other value is floored at
+            // the smallest offered preset (250,000,000 bytes, labelled 256 MB).
+            sourceCacheMaxBytes: stored?.playback?.sourceCacheMaxBytes === null
+                ? null
+                : (Number.isFinite(Number(stored?.playback?.sourceCacheMaxBytes))
+                    && Number(stored?.playback?.sourceCacheMaxBytes) > 0
+                    ? Math.max(250_000_000, Math.round(Number(stored.playback.sourceCacheMaxBytes)))
+                    : defaults.playback.sourceCacheMaxBytes),
             streamingMode,
             adaptiveRebuffer: stored?.playback?.adaptiveRebuffer == null
                 ? defaults.playback.adaptiveRebuffer

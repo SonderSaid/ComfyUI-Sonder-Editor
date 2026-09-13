@@ -54,6 +54,12 @@ export function createPlaybackSourceCache({
     isDestroyed = () => false,
     isDiagnosticsEnabled = () => true,
     recordEvent = () => {},
+    // Soft byte budget for retained blobs. `null` = unlimited (reproduces the
+    // pre-budget behaviour exactly). NOTE: unlike the render cache, 0 does NOT
+    // mean "off" here - this cache is load-bearing for blob-mode playback and a
+    // zero budget would evict every entry the instant it is released. Callers
+    // must pass null for unlimited; see editor_settings.playbackSourceCacheMaxBytes.
+    getMaxRetainedBytes = () => null,
 } = {}) {
     const entries = new Map();
     let lastFetchCompletedAtMs = 0;
@@ -140,6 +146,79 @@ export function createPlaybackSourceCache({
         return true;
     }
 
+    function normalizedMaxRetainedBytes() {
+        const raw = getMaxRetainedBytes();
+        if (raw === null || raw === undefined) return null;
+        const numeric = Number(raw);
+        if (!Number.isFinite(numeric) || numeric <= 0) return null;
+        return numeric;
+    }
+
+    function retainedBytesTotal() {
+        let total = 0;
+        for (const entry of entries.values()) total += Math.max(0, Number(entry.blobSize) || 0);
+        return total;
+    }
+
+    // Evict idle blobs oldest-first until the retained total fits the budget.
+    //
+    // This is a TARGET, not a maximum, and deliberately so: a held entry backs a
+    // <video> that is playing or prebuffering, and yanking its object URL would
+    // black-frame the viewport to save memory. When only held entries remain we
+    // report the overage and stop - the same contract `enforce_render_cache_budget`
+    // uses server-side.
+    //
+    // This intentionally evicts entries that are still `live` (i.e. still
+    // referenced by the current scene), which amends the durable rule
+    // "Prebuffer holder release must not evict a live source" to "...must not
+    // evict a HELD source". A live-but-idle blob can be re-fetched; the seek that
+    // follows is cheap now that presets are short-GOP.
+    function enforceByteBudget(reason = "budget", { protectKey = "" } = {}) {
+        const budget = normalizedMaxRetainedBytes();
+        if (budget === null) return 0;
+        let retained = retainedBytesTotal();
+        if (retained <= budget) return 0;
+
+        const candidates = [];
+        for (const entry of entries.values()) {
+            if (entry.key === protectKey) continue;      // the caller is about to hold this
+            if (entry.holders?.size) continue;           // never yank a playing/prebuffering source
+            if (entry.inFlight) continue;                // aborting frees zero bytes and breaks a load
+            if (entry.pendingEviction || entry.evicted) continue;
+            if (!(Number(entry.blobSize) > 0)) continue; // direct mode retains nothing
+            // An entry that has never been held is mid-handoff: `resolve()` has
+            // returned but the caller's continuation has not run `addHolder` yet.
+            // Evicting it here would strand that caller with addHolder === false.
+            if (!entry.everHeld) continue;
+            candidates.push(entry);
+        }
+        candidates.sort((a, b) => (a.lastUsedAtMs || 0) - (b.lastUsedAtMs || 0));
+
+        let freed = 0;
+        for (const entry of candidates) {
+            if (retained <= budget) break;
+            const size = Math.max(0, Number(entry.blobSize) || 0); // revokeEntryUrl zeroes this
+            if (finalizeEviction(entry, "byte-budget")) {
+                retained -= size;
+                freed += size;
+            }
+        }
+        if (retained > budget) {
+            safeRecord("budget_pressure", null, {
+                reason,
+                budgetBytes: budget,
+                retainedBytes: retained,
+                overBudgetBytes: retained - budget,
+                freedBytes: freed,
+                // Held entries are unevictable by design, so the budget bounds only
+                // the idle tail. Sustained pressure here means prebuffer admission
+                // - not this sweep - is what needs to react.
+                heldEntries: [...entries.values()].filter((e) => e.holders?.size).length,
+            });
+        }
+        return freed;
+    }
+
     function markEntryObsolete(entry, reason, releaseHolders = null) {
         if (!entry || entry.pendingEviction) return;
         entry.live = false;
@@ -200,6 +279,10 @@ export function createPlaybackSourceCache({
             evictionReason: "",
             createdAtMs: now(),
             lastUsedAtMs: now(),
+            // Set on the first addHolder. Until then the entry may be mid-handoff
+            // between resolve() returning and the caller claiming it, so the byte
+            // budget must not treat it as idle.
+            everHeld: false,
         };
         entries.set(entry.key, entry);
         safeRecord("cache_miss", entry);
@@ -232,6 +315,10 @@ export function createPlaybackSourceCache({
                 safeRecord("fetch_completed", entry, {
                     durationMs: Math.max(0, entry.lastUsedAtMs - startedAtMs),
                 });
+                // The only moment retained bytes rise. Protect the entry we just
+                // fetched: the caller is about to addHolder it, and evicting it
+                // here would make this fetch pure waste.
+                enforceByteBudget("fetch-completed", { protectKey: entry.key });
                 return { cacheKey: entry.key, url: entry.objectUrl };
             } catch (error) {
                 entry.inFlight = false;
@@ -267,6 +354,7 @@ export function createPlaybackSourceCache({
         const entry = entries.get(cacheKey);
         if (!entry || entry.pendingEviction || !holder) return false;
         entry.holders.add(holder);
+        entry.everHeld = true;
         entry.lastUsedAtMs = now();
         return true;
     }
@@ -278,7 +366,10 @@ export function createPlaybackSourceCache({
         entry.lastUsedAtMs = now();
         if (!entry.holders.size && (entry.pendingEviction || !entry.live)) {
             finalizeEviction(entry, entry.evictionReason || "source-not-live");
+            return true;
         }
+        // The only moment a new eviction candidate appears without bytes rising.
+        if (!entry.holders.size) enforceByteBudget("holder-released");
         return true;
     }
 
@@ -322,6 +413,8 @@ export function createPlaybackSourceCache({
             if (entry.pendingEviction) pendingEvictionEntries += 1;
         }
         const age = (value) => value > 0 ? Math.max(0, timestamp - value) : null;
+        const budgetBytes = normalizedMaxRetainedBytes();
+        const overBudgetBytes = budgetBytes === null ? 0 : Math.max(0, retainedBytes - budgetBytes);
         return {
             entryCount: entries.size,
             heldEntries,
@@ -329,6 +422,12 @@ export function createPlaybackSourceCache({
             inFlightEntries,
             pendingEvictionEntries,
             retainedBytes,
+            budgetBytes,
+            overBudgetBytes,
+            // True when the budget is exceeded and only held entries remain, i.e.
+            // nothing more can be freed without black-framing playback. Sustained
+            // `budgetPending` is the signal that prebuffer admission needs to react.
+            budgetPending: overBudgetBytes > 0,
             lastFetchCompletedAgeMs: age(lastFetchCompletedAtMs),
             lastObjectUrlCreatedAgeMs: age(lastObjectUrlCreatedAtMs),
             lastEvictedAgeMs: age(lastEvictedAtMs),
