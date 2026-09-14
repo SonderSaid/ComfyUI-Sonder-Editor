@@ -11,10 +11,19 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-14
+
+Audio processing now has a minimum FFmpeg version. If exports or previews
+start refusing audio after this upgrade, see **Troubleshooting** in the
+README — a system `ffmpeg` on your `PATH` takes precedence over the binary
+this pack bundles, and an older one must be updated or removed.
+
 ### Added
 - Project-wide Keep/Drop for out-of-window Reference text, with independent per-chip overrides and visible markers.
 
 ### Changed
+- Audio processing now requires FFmpeg 7.0 or newer. An older binary is refused by name rather than mixing incorrectly, and a system `ffmpeg` on `PATH` takes precedence over the bundled one, so an older system install must be updated or removed.
+- The pack now requires `imageio-ffmpeg` 0.6.0 or newer, whose bundled ffmpeg meets the audio floor above; a fresh install no longer leaves an older bundled binary in place. `Pillow` is pinned to 9.1 or newer for the resampling API the thumbnailer already used, and `imageio`, which the pack never imported, is no longer installed.
 - Playback auto-scroll advances by pages, keeping more upcoming timeline content visible.
 - Video presets now set a keyframe interval so clips scrub and play smoothly: Editing Master MP4 is all-intra (every frame a keyframe; it scrubs instantly but files are roughly 2.3x larger), and Compatible/High Quality MP4 place a keyframe every 2 seconds.
 - Fullscreen playback keeps a soft memory target for the video it holds in RAM, freeing idle media oldest-first. Media in use by the playhead or prebuffer is never dropped, so the figure can exceed the target on heavy scenes.
@@ -22,10 +31,10 @@ a fresh `[Unreleased]` block.
 - The Editing Master MP4 preset description now names it the recommended round-trip master and warns that browser and OS preview are not guaranteed.
 - Silent Editor output uses 48 kHz; Reference placeholders follow the highest live native rate, or 48 kHz when empty. Audio socket shapes and ordering remain unchanged.
 - Stored audio volumes above 100% now render at 100%, matching timeline playback; stored project values remain intact.
-- Audio processing now requires FFmpeg 7.0 or newer.
 - Non-winning Reference chips warn instead of refusing generation; deleted bindings still block. Legacy project-less replay now composes prompts for non-winning Reference chips.
 - Boundary Prompt and Reference thresholds measure overlap relative to the shorter item/window span; short windows can retain neighbors previously dropped, including at the default prompt threshold of 10%.
 - Frozen threshold values use the current coverage rule when resolved again, including legacy v0.2.2 prompt replay.
+- The README and guides are corrected and expanded: the editor node's outputs, its three surfaces, project creation and a minimal text-to-video graph are documented, MiniMax H3 is listed among the built-in model templates, and out-of-window Reference chip text, lane reorder and the References section of Generating are covered for the first time. "Render window" is now "generation window" throughout, matching the toolbar.
 
 ### Fixed
 - Reduce small-viewport playback draw cost with a bounded source-sized video scratch canvas.
@@ -42,7 +51,7 @@ a fresh `[Unreleased]` block.
 - Corrupt audio only blocks windows using that source; empty, muted and zero-volume windows export video without manufacturing silent audio tracks. RF64 float WAVs now read back correctly, and digital silence stays silent in integer delivery.
 - Reference chip dialogs save and close when their existing source is inactive, including later linked copies.
 - Audio exports retain track balance when clips end, including mono dialogue mixed with stereo music; editor audio and exports share sample-accurate float mixing, float sidecars, and reported constant headroom protection.
-- References covering the entire render window survive every threshold; high Boundary Prompt thresholds retain the stronger section instead of a neighboring sliver.
+- References covering the entire generation window survive every threshold; high Boundary Prompt thresholds retain the stronger section instead of a neighboring sliver.
 - Fixed false project conflicts during multi-file import and replacement, preserved committed replacement media when cleanup fails, and named failed imports in gallery notifications.
 - Sonder Save Bridge accepts a typed or existing **Target Folder** again. Picking or typing any label other than Root previously failed the run during prompt validation; the label is now created when the outputs register.
 - The README states the released version, and no longer suggests the pack may be missing from the Registry.

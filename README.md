@@ -1,6 +1,6 @@
 # ComfyUI-Sonder-Editor
 
-**Version 0.4.0** — see the [CHANGELOG](CHANGELOG.md) for release notes.
+**Version 0.5.0** — see the [CHANGELOG](CHANGELOG.md) for release notes.
 
 Sonder Editor is a timeline-based video editor for ComfyUI, built for iterative
 long-form generation. Arrange scenes, clips, audio, guide frames and prompts on
@@ -251,12 +251,18 @@ ComfyUI.
 
 ## Requirements
 
-- **ComfyUI**
-- **Python 3.10+** (matching your ComfyUI environment).
-- **FFmpeg 7.0+** — required for video/audio decode, encode, and export. The
-  `imageio-ffmpeg` dependency bundles a usable ffmpeg automatically, but a
-  system-wide `ffmpeg` on your `PATH` is recommended for the widest format
-  support.
+- **ComfyUI** — 0.5.0 was validated on ComfyUI **0.34.0** with frontend
+  **1.51.10**. That is what this release was tested against, not a minimum;
+  other versions are expected to work. The V3 nodes noted above load only on
+  builds that provide `comfy_api`, and the complete V1 set loads otherwise.
+- **Python 3.10+** (matching your ComfyUI environment; validated on 3.12).
+- **FFmpeg 7.0+** — required for video/audio decode, encode, and export. Audio
+  processing verifies the binary it selected and refuses an older one by name
+  rather than mixing incorrectly. The `imageio-ffmpeg` dependency (0.6.0 or
+  newer) bundles a suitable ffmpeg automatically, and a system-wide `ffmpeg` on
+  your `PATH` is recommended for the widest format support — but note that a
+  system ffmpeg takes precedence over the bundled one, so an older system
+  install must be updated or removed from `PATH`.
 - `torch` is provided by ComfyUI and is **not** installed by this pack (see
   [Troubleshooting](#troubleshooting)).
 

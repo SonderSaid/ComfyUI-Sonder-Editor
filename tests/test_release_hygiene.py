@@ -337,6 +337,14 @@ def test_reference_recipe_table_lists_every_builtin_preset():
 _README_VERSION = re.compile(r"(?m)^\*\*Version (\d+\.\d+\.\d+)\*\*")
 _CHANGELOG_RELEASE = re.compile(r"(?m)^## \[(\d+\.\d+\.\d+)\] - ")
 _RELEASE_TAG = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
+# The validated-on line is prose that ages silently: nothing fails when a
+# release ships against a newer ComfyUI and the bullet still names the old one,
+# and the reader has no way to tell a deliberate statement from a forgotten one.
+# Matched against whitespace-collapsed text so the bullet may wrap freely.
+_README_VALIDATED = re.compile(
+    r"- \*\*ComfyUI\*\* — (\d+\.\d+\.\d+) was validated on ComfyUI "
+    r"\*\*(\d[\w.]*)\*\* with frontend \*\*(\d[\w.]*)\*\*"
+)
 
 
 def _declared_version() -> str:
@@ -398,6 +406,30 @@ def test_declared_version_agrees_across_pyproject_readme_and_changelog():
     )
     assert _changelog_version() == version, (
         f"newest CHANGELOG heading is {_changelog_version()}, pyproject.toml states {version}"
+    )
+
+
+def test_readme_states_what_this_version_was_validated_against():
+    """The ComfyUI bullet states a measurement, so it must name THIS release.
+
+    It carries no minimum — none is enforced anywhere in the pack, and inventing
+    one would be a guess. What it carries instead is the pair of versions the
+    release was actually exercised on, which is only useful while the release
+    number beside them is current. Re-run the check and restate the line, or
+    delete the bullet; a stale one is worse than none, because it reads as
+    deliberate. The frontend number cited in the Autogrow note above is a
+    different claim — an observation about that feature at that version — and is
+    deliberately not covered here.
+    """
+    collapsed = " ".join((ROOT / "README.md").read_text(encoding="utf-8").split())
+    found = _README_VALIDATED.findall(collapsed)
+    assert len(found) == 1, (
+        f"README.md must carry exactly one ComfyUI validated-on line, found {len(found)}"
+    )
+    stated, comfyui, frontend = found[0]
+    assert stated == _declared_version(), (
+        f"README.md says {stated} was validated on ComfyUI {comfyui} / frontend"
+        f" {frontend}, but this release is {_declared_version()}"
     )
 
 

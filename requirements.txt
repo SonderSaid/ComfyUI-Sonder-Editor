@@ -10,15 +10,20 @@
 
 # Image / array — ships with ComfyUI; listed for standalone environments
 numpy
-Pillow
+# Image.Resampling enum, used by the thumbnailer.
+Pillow>=9.1
 
 # Video I/O
 # NOTE: opencv-python-headless is used deliberately (no GUI deps). Some other
 # custom nodes install full `opencv-python`; the two conflict. See README
 # "Troubleshooting" if cv2 imports break after installing another node pack.
 opencv-python-headless
-imageio
-imageio-ffmpeg
+# 0.6.0 bundles ffmpeg 7.1, satisfying the FFmpeg 7.0 audio floor enforced by
+# server/media_helpers.require_audio_ffmpeg. Pinned because a bare requirement
+# leaves an already-installed older imageio-ffmpeg — and its older bundled
+# binary — untouched. A system ffmpeg on PATH is still preferred over this one,
+# so an old system install must be updated regardless of this pin.
+imageio-ffmpeg>=0.6.0
 
 # Numeric / signal helpers
 scipy
