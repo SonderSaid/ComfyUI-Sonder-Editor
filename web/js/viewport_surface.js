@@ -1,6 +1,7 @@
 import { FONT, THEME } from "./editor_theme.js";
 import { snapshotGraphPreviewDiagnostics } from "./graph_preview_ownership.js";
 import { createPlaybackSourceCache } from "./playback_source_cache.js";
+import { createVideoScratchCache, videoDestDownscale, VIDEO_SCRATCH_SCALE_THRESHOLD } from "./viewport_video_scratch.js";
 
 function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
@@ -148,6 +149,12 @@ function createPlaybackPerfCounters(startedAtMs = 0) {
         maxRafGapMs: 0,
         maxFramesBehind: 0,
         canvasBackingResizes: 0,
+        timelineRenderCount: 0,
+        timelinePlaybackFrames: 0,
+        timelineCacheHits: 0,
+        videoScratchDraws: 0,
+        videoScratchDirectDraws: 0,
+        videoScratchPeakEntries: 0,
         sourceCache: createPlaybackSourcePerfCounters(),
         presentation: createPresentationCounters(),
         timings: Object.fromEntries(PLAYBACK_PERF_STAGE_NAMES.map((name) => [name, {
@@ -186,6 +193,14 @@ function serializePlaybackPerfCounters(counters) {
         maxRafGapMs: Math.round((counters?.maxRafGapMs || 0) * 10) / 10,
         maxFramesBehind: counters?.maxFramesBehind || 0,
         canvasBackingResizes: counters?.canvasBackingResizes || 0,
+        timelineRenderCount: counters?.timelineRenderCount || 0,
+        timelinePlaybackFrames: counters?.timelinePlaybackFrames || 0,
+        timelineCacheHits: counters?.timelineCacheHits || 0,
+        timelineCacheHit: counters?.timelinePlaybackFrames ? counters.timelineCacheHits / counters.timelinePlaybackFrames : 0,
+        timelineRendersPerFrame: counters?.timelinePlaybackFrames ? counters.timelineRenderCount / counters.timelinePlaybackFrames : 0,
+        videoScratchDraws: counters?.videoScratchDraws || 0,
+        videoScratchDirectDraws: counters?.videoScratchDirectDraws || 0,
+        videoScratchPeakEntries: counters?.videoScratchPeakEntries || 0,
         sourceCache: {
             cacheHits: counters?.sourceCache?.cacheHits || 0,
             cacheCoalesced: counters?.sourceCache?.cacheCoalesced || 0,
@@ -1340,6 +1355,9 @@ export function createViewportSurface(options = {}) {
         audioFreezeLogged: false,
         audioReleaseLogged: false,
         renderToken: 0,
+        compositePassSeq: 0,
+        lastVideoScratchDraw: false,
+        slowVideoDrawReported: false,
         sourceUrlCache: new Map(),
         activePlaybackVideos: new Map(),
         activePlaybackAudios: new Map(),
@@ -1748,6 +1766,7 @@ export function createViewportSurface(options = {}) {
     }
 
     function resetPlaybackPerfCounters(timestamp = performance.now()) {
+        state.slowVideoDrawReported = false;
         state.playbackPerfWindow = createPlaybackPerfCounters(timestamp);
         state.playbackPerfRun = createPlaybackPerfCounters(timestamp);
         state.playbackLastRafTimestamp = null;
@@ -1764,8 +1783,16 @@ export function createViewportSurface(options = {}) {
         updatePlaybackPerfCounters((counters) => addPlaybackPerfTiming(counters, stage, durationMs));
     }
 
+    function recordTimelineRender() {
+        updatePlaybackPerfCounters((counters) => { counters.timelineRenderCount += 1; });
+    }
+
     function recordPlaybackHostMetrics(metrics) {
         if (!metrics || typeof metrics !== "object") return;
+        if (typeof metrics.timelineCacheHit === "boolean") updatePlaybackPerfCounters((counters) => {
+            counters.timelinePlaybackFrames += 1;
+            if (metrics.timelineCacheHit) counters.timelineCacheHits += 1;
+        });
         recordPlaybackPerfTiming("autoScroll", metrics.autoScrollMs);
         recordPlaybackPerfTiming("timeline", metrics.timelineMs);
         recordPlaybackPerfTiming("toolbar", metrics.toolbarMs);
@@ -2136,6 +2163,7 @@ export function createViewportSurface(options = {}) {
     }
 
     function clearPlaybackWarmState(reason = "clear") {
+        if (reason === "scene-switch") videoScratchCache.clear();
         const hadEntries = state.playbackWarmEntries.size > 0;
         state.playbackWarmContentToken += 1;
         if (reason !== "media-cache-clear") {
@@ -2488,6 +2516,8 @@ export function createViewportSurface(options = {}) {
         return snapshot;
     }
 
+    const videoScratchCache = createVideoScratchCache();
+
     function getCanvasContext() {
         if (!state.canvas) return null;
         if (!state.ctx) {
@@ -2497,6 +2527,7 @@ export function createViewportSurface(options = {}) {
     }
 
     function drawBlack() {
+        state.compositePassSeq += 1;
         const ctx = getCanvasContext();
         if (!ctx || !state.canvas) return null;
         ctx.fillStyle = THEME.bg0;
@@ -2521,7 +2552,8 @@ export function createViewportSurface(options = {}) {
         }
     }
 
-    function drawImageLike(element, { opacity = 1, fitMode = "pad_edge", cropPosition = "center" } = {}) {
+    function drawImageLike(element, { opacity = 1, fitMode = "pad_edge", cropPosition = "center", allowScratch = false } = {}) {
+        state.lastVideoScratchDraw = false;
         const ctx = getCanvasContext();
         if (!ctx || !state.canvas || !element) return false;
         const canvasW = state.canvas.width;
@@ -2529,11 +2561,44 @@ export function createViewportSurface(options = {}) {
         const width = element.videoWidth || element.naturalWidth || element.width || canvasW;
         const height = element.videoHeight || element.naturalHeight || element.height || canvasH;
         const mode = VIEWPORT_FIT_MODES.has(fitMode) ? fitMode : "pad_edge";
+        let source = element;
+        const isVideo = element.videoWidth > 0 && element.videoHeight > 0;
+        if (allowScratch && isVideo && element.readyState >= 2
+            && videoDestDownscale(mode, width, height, canvasW, canvasH) <= VIDEO_SCRATCH_SCALE_THRESHOLD) {
+            const scratch = videoScratchCache.acquire(width, height, state.compositePassSeq);
+            if (scratch && !scratch.ctx.isContextLost?.()) {
+                scratch.ctx.save();
+                try {
+                    // Replace every pixel, including transparent pixels. readyState
+                    // prevents a no-op copy from exposing another clip's old frame.
+                    // Seeking may still show a pre-seek frame, as the direct path did.
+                    scratch.ctx.globalCompositeOperation = "copy";
+                    scratch.ctx.drawImage(element, 0, 0);
+                    if (!scratch.ctx.isContextLost?.()) {
+                        source = scratch.canvas;
+                        state.lastVideoScratchDraw = true;
+                    }
+                } catch {
+                    // Allocation/context loss must leave the direct path available.
+                } finally {
+                    scratch.ctx.restore();
+                }
+            }
+        }
+        if (allowScratch && isVideo) updatePlaybackPerfCounters((counters) => {
+            counters[state.lastVideoScratchDraw ? "videoScratchDraws" : "videoScratchDirectDraws"] += 1;
+            counters.videoScratchPeakEntries = Math.max(counters.videoScratchPeakEntries, videoScratchCache.stats().entries);
+        });
         const previousAlpha = ctx.globalAlpha;
+        const previousSmoothingQuality = ctx.imageSmoothingQuality;
+        // At 554x313 from 1920x1088, low matches the direct preview within
+        // two channel levels; high changed edges by up to 36 with no speed gain.
+        // Keep the measured existing preview interpolation on this extra hop.
+        if (state.lastVideoScratchDraw) ctx.imageSmoothingQuality = "low";
         ctx.globalAlpha = clamp(Number(opacity) || 0, 0, 1);
         try {
             if (mode === "stretch") {
-                ctx.drawImage(element, 0, 0, canvasW, canvasH);
+                ctx.drawImage(source, 0, 0, canvasW, canvasH);
             } else if (mode === "cover") {
                 // Source sub-rect that fills the canvas, anchored by cropPosition.
                 // Math mirrors the backend cover crop so preview and render agree.
@@ -2548,13 +2613,13 @@ export function createViewportSurface(options = {}) {
                 let sy = yExtra / 2;
                 if (cropPosition === "top") sy = 0;
                 else if (cropPosition === "bottom") sy = yExtra;
-                ctx.drawImage(element, sx, sy, srcW, srcH, 0, 0, canvasW, canvasH);
+                ctx.drawImage(source, sx, sy, srcW, srcH, 0, 0, canvasW, canvasH);
             } else {
                 // fit / pad_edge: contain, centered.
                 const rect = fitRect(width, height, canvasW, canvasH);
-                ctx.drawImage(element, rect.x, rect.y, rect.width, rect.height);
+                ctx.drawImage(source, rect.x, rect.y, rect.width, rect.height);
                 if (mode === "pad_edge") {
-                    drawEdgePadBars(ctx, element, rect, canvasW, canvasH, width, height);
+                    drawEdgePadBars(ctx, source, rect, canvasW, canvasH, width, height);
                 }
             }
             return true;
@@ -2562,6 +2627,7 @@ export function createViewportSurface(options = {}) {
             return false;
         } finally {
             ctx.globalAlpha = previousAlpha;
+            ctx.imageSmoothingQuality = previousSmoothingQuality;
         }
     }
 
@@ -6605,6 +6671,8 @@ export function createViewportSurface(options = {}) {
             currentTime: roundTelemetryMs(video?.currentTime || 0),
             drawMs: roundTelemetryMs(drawMs),
             drew: !!didDraw,
+            scratch: state.lastVideoScratchDraw,
+            destScale: videoDestDownscale(layer?.clip?.fit_mode || "pad_edge", video?.videoWidth, video?.videoHeight, state.canvas?.width, state.canvas?.height),
         };
     }
 
@@ -6770,12 +6838,17 @@ export function createViewportSurface(options = {}) {
             const fitItem = renderable.type === "guide" ? renderable.guide : renderable.layer?.clip;
             const layerDrawStartedAt = telemetryActive ? performance.now() : 0;
             if (renderable.type === "video" && renderable.active) syncPreparedVideoPlayback(renderable.active, renderable.layer, snapshot.frame);
-            const didDraw = drawImageLike(renderable.element, { opacity: renderable.opacity, ...fitOptionsFor(fitItem) });
+            const didDraw = drawImageLike(renderable.element, { opacity: renderable.opacity, ...fitOptionsFor(fitItem), allowScratch: true });
             if (telemetryActive) {
                 const layerDrawMs = performance.now() - layerDrawStartedAt;
                 if (renderable.type === "video") {
                     videoDrawMs += layerDrawMs;
-                    videoDraws.push(playbackVideoDrawTelemetry(renderable, layerDrawMs, didDraw, snapshot.frame));
+                    const drawTelemetry = playbackVideoDrawTelemetry(renderable, layerDrawMs, didDraw, snapshot.frame);
+                    videoDraws.push(drawTelemetry);
+                    if (!state.slowVideoDrawReported && layerDrawMs > 8 && drawTelemetry.destScale <= VIDEO_SCRATCH_SCALE_THRESHOLD) {
+                        state.slowVideoDrawReported = true;
+                        recordPlaybackTelemetry("playback_slow_video_draw", { frame: snapshot.frame, ...drawTelemetry });
+                    }
                 } else if (renderable.type === "image") {
                     imageDrawMs += layerDrawMs;
                 } else if (renderable.type === "guide") {
@@ -7638,6 +7711,7 @@ export function createViewportSurface(options = {}) {
     }
 
     function clearMediaCache() {
+        videoScratchCache.clear();
         clearActivePlaybackMedia();
         clearPrebufferCache();
         resetPlaybackCompositeState();
@@ -7730,6 +7804,7 @@ export function createViewportSurface(options = {}) {
         stopPlayback,
         captureSourceFrame,
         clearMediaCache,
+        recordTimelineRender,
         clearPlaybackWarmState,
         invalidatePlaybackComposite,
         destroy,

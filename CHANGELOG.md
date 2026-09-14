@@ -15,6 +15,7 @@ a fresh `[Unreleased]` block.
 - Project-wide Keep/Drop for out-of-window Reference text, with independent per-chip overrides and visible markers.
 
 ### Changed
+- Playback auto-scroll advances by pages, keeping more upcoming timeline content visible.
 - Video presets now set a keyframe interval so clips scrub and play smoothly: Editing Master MP4 is all-intra (every frame a keyframe; it scrubs instantly but files are roughly 2.3x larger), and Compatible/High Quality MP4 place a keyframe every 2 seconds.
 - Fullscreen playback keeps a soft memory target for the video it holds in RAM, freeing idle media oldest-first. Media in use by the playhead or prebuffer is never dropped, so the figure can exceed the target on heavy scenes.
 - Editing Master MP4 and audio-only exports now use 24-bit FLAC; ProRes uses 24-bit PCM and FFV1 uses 24-bit FLAC.
@@ -27,6 +28,8 @@ a fresh `[Unreleased]` block.
 - Frozen threshold values use the current coverage rule when resolved again, including legacy v0.2.2 prompt replay.
 
 ### Fixed
+- Reduce small-viewport playback draw cost with a bounded source-sized video scratch canvas.
+- Reuse unchanged timeline layers during playback to reduce per-frame repaint work.
 - Incoming pre-rolled clips target their source-frame timestamp so startup jitter does not advance the picture by one frame at a cut.
 - Cancelled playback prefetches release their acquisition protection, allowing the memory target to reclaim them while preserving other consumers and immediate teardown cancellation.
 - The Save Video preset description no longer paints over the widgets below it; the help box now reserves the height its text actually needs.

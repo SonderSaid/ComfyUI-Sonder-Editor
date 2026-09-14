@@ -2152,7 +2152,9 @@ export class EditorWidget {
         // Reference entities are unchanged by an asset-only refresh, but their
         // names, thumbnails, Trash, and Missing presentation are asset-backed.
         this._referenceLibraryHandle?.render?.();
-        this._clearPlaybackWarmOverlay("assets-refresh");
+        this._clearPlaybackWarmOverlay("assets-refresh", { render: false });
+        // Asset-backed labels/missing-media pixels change even without warm state.
+        this._renderTimeline();
         sessionDiagRecord("asset_refresh_apply", {
             request_id: requestId,
             mutation_epoch: epoch,
@@ -7530,10 +7532,20 @@ export class EditorWidget {
 
     // ── Timeline Rendering ─────────────────────────────────────────────
     _renderTimeline() {
+        return this._paintTimelineFrame(false);
+    }
+
+    _renderTimelinePlaybackFrame() {
+        return this._paintTimelineFrame(true);
+    }
+
+    _paintTimelineFrame(playbackFrame) {
         const measurePlayback = isSessionDiagEnabled() && this.isPlaying;
         const timelineStartedAt = measurePlayback ? performance.now() : 0;
         this._refreshPlayheadInput?.();
-        const canvasResult = TimelineCanvas._renderTimeline(this);
+        const canvasResult = playbackFrame
+            ? TimelineCanvas._renderTimelinePlaybackFrame(this) : TimelineCanvas._renderTimeline(this);
+        if (measurePlayback) this._viewportSurface?.recordTimelineRender?.();
         const timelineFinishedAt = measurePlayback ? performance.now() : 0;
         this._updateToolbar();
         if (!measurePlayback) return null;
@@ -7542,6 +7554,7 @@ export class EditorWidget {
             timelineMs: timelineFinishedAt - timelineStartedAt,
             toolbarMs: toolbarFinishedAt - timelineFinishedAt,
             canvasBackingResized: !!canvasResult?.backingChanged,
+            timelineCacheHit: !!canvasResult?.timelineCacheHit,
         };
     }
 
@@ -17832,6 +17845,7 @@ export class EditorWidget {
     }
 
     _exitFullscreen() {
+        TimelineCanvas._releaseTimelineLayerCache(this);
         // Re-entry must ask again even if the previous open's request is pending.
         this._renderCacheSweepGeneration += 1;
         this._renderCacheSweepSeq += 1;
@@ -18175,13 +18189,14 @@ export class EditorWidget {
     _maybeAutoScrollToPlayhead() {
         if (!this._settings?.playback?.autoScrollPlayhead) return;
         const visibleFrames = this._visibleTimelineFrameSpan();
-        const marginFrames = Math.max(2, Math.floor(visibleFrames * 0.12));
+        // Keep a non-empty interior even when fewer than four frames fit.
+        const marginFrames = Math.min(visibleFrames * 0.12, Math.max(2, Math.floor(visibleFrames * 0.12)));
         const leftBound = this.scrollX + marginFrames;
         const rightBound = this.scrollX + visibleFrames - marginFrames;
         if (this.playhead < leftBound) {
             this.scrollX = Math.max(0, this.playhead - marginFrames);
         } else if (this.playhead > rightBound) {
-            this.scrollX = Math.max(0, this.playhead - visibleFrames + marginFrames);
+            this.scrollX = Math.max(0, this.playhead - marginFrames);
         }
         this._clampScrollX();
     }
@@ -21893,6 +21908,8 @@ export class EditorWidget {
                 this._syncSceneResolutionControls({ detectSelections: false });
                 this._updateViewportHeader();
                 this._resizeViewportCanvas();
+                // Project-only refresh changes Reference verdicts and inherited FPS.
+                this._renderTimeline();
             }
         } catch (e) {
             console.warn("[Sonder] Failed to fetch project settings:", e);
@@ -21993,7 +22010,7 @@ export class EditorWidget {
                     this._maybeAutoScrollToPlayhead();
                 }
                 const autoScrollFinishedAt = measurePlayback ? performance.now() : 0;
-                const timelineMetrics = this._renderTimeline();
+                const timelineMetrics = this.isPlaying ? this._renderTimelinePlaybackFrame() : this._renderTimeline();
                 if (!measurePlayback) return null;
                 return {
                     autoScrollMs: autoScrollFinishedAt - autoScrollStartedAt,
@@ -23068,6 +23085,7 @@ export class EditorWidget {
     destroy() {
         if (this._destroyed) return;
         this._destroyed = true;
+        TimelineCanvas._releaseTimelineLayerCache(this);
         this._queuedHistoryNotification?.dismiss();
         this._queuedHistoryNotification = null;
         this._queuedHistoryOperationCount = 0;

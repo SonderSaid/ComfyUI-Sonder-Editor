@@ -176,7 +176,100 @@ export function _drawTimelineItemRail(host, ctx, x, y, w, h, color) {
         ctx.fillRect(x + 2, y + 2, Math.max(0, w - 4), 2);
         ctx.restore();
     }
+// Derived pixels only; the host continues to own all scene/geometry state.
+export function _invalidateTimelineLayerCache(host) {
+    if (host._timelineLayerCache) host._timelineLayerCache.valid = false;
+}
+
+export function _releaseTimelineLayerCache(host) {
+    const cache = host._timelineLayerCache;
+    if (!cache) return;
+    for (const layer of [cache.fixed, cache.scroll]) {
+        layer.canvas.width = 0;
+        layer.canvas.height = 0;
+    }
+    host._timelineLayerCache = null;
+}
+
+function paintLayer(host, ctx, width, canvasH, rulerH, scrollContent, painter) {
+    ctx.save();
+    try {
+        const x = scrollContent ? host._labelW : 0;
+        ctx.beginPath();
+        ctx.rect(x, rulerH, Math.max(0, width - x), Math.max(0, canvasH - rulerH));
+        ctx.clip();
+        ctx.translate(0, -host.scrollY);
+        painter(ctx, width);
+    } finally { ctx.restore(); }
+}
+
+function paintScrollContent(host, ctx, width) {
+    host._drawSelection(ctx, width);
+    host._drawGuideMarkers(ctx, width);
+    host._drawClips(ctx, width);
+}
+
+function timelineCacheForFrame(host, width, canvasH, rulerH) {
+    const gestureFree = !host.isDragging && !host.dragType && !host._selectionDraftAnchor
+        && host._snapIndicator == null && !host._dropHoverTarget && !host._trimItem;
+    if (!gestureFree || width <= 0 || canvasH <= rulerH) {
+        _invalidateTimelineLayerCache(host);
+        return { cache: null, hit: false };
+    }
+    // Sample only after paintTimeline clamps scroll and synchronizes dimensions.
+    const key = [width, canvasH, host._labelW, rulerH, host.pixelsPerFrame,
+        host.scrollX, host.scrollY, host.activeScene?.duration_frames ?? host.totalFrames, gestureFree];
+    let cache = host._timelineLayerCache;
+    if (cache?.valid && key.every((v, i) => v === cache.key[i])
+        && !cache.fixed.ctx.isContextLost?.() && !cache.scroll.ctx.isContextLost?.()) return { cache, hit: true };
+    if (cache) cache.valid = false;
+    if (!cache) {
+        const createCanvas = () => host.timelineCanvas.ownerDocument?.createElement("canvas")
+            ?? (typeof document === "undefined" ? null : document.createElement("canvas"));
+        const layers = [];
+        try {
+            for (let i = 0; i < 2; i++) {
+                const canvas = createCanvas();
+                if (!canvas) throw new Error("Canvas unavailable");
+                const layer = { canvas, ctx: null };
+                layers.push(layer);
+                layer.ctx = canvas.getContext("2d");
+                if (!layer.ctx) throw new Error("Canvas context unavailable");
+            }
+        } catch {
+            for (const { canvas } of layers) { canvas.width = 0; canvas.height = 0; }
+            return { cache: null, hit: false };
+        }
+        cache = host._timelineLayerCache = { fixed: layers[0], scroll: layers[1], valid: false, key: null };
+    }
+    for (const [layer, scrollContent] of [[cache.fixed, false], [cache.scroll, true]]) {
+        if (layer.ctx.isContextLost?.()) return { cache: null, hit: false };
+        if (layer.canvas.width !== width) layer.canvas.width = width;
+        if (layer.canvas.height !== canvasH - rulerH) layer.canvas.height = canvasH - rulerH;
+        layer.ctx.clearRect(0, 0, width, canvasH - rulerH);
+        layer.ctx.save();
+        try {
+            layer.ctx.translate(0, -rulerH);
+            paintLayer(host, layer.ctx, width, canvasH, rulerH, scrollContent,
+                (ctx, w) => scrollContent ? paintScrollContent(host, ctx, w) : host._drawTracks(ctx, w));
+        } finally { layer.ctx.restore(); }
+        if (layer.ctx.isContextLost?.()) return { cache: null, hit: false };
+    }
+    cache.key = key;
+    cache.valid = true;
+    return { cache, hit: false };
+}
+
 export function _renderTimeline(host) {
+    _invalidateTimelineLayerCache(host);
+    return paintTimeline(host, false);
+}
+
+export function _renderTimelinePlaybackFrame(host) {
+    return paintTimeline(host, true);
+}
+
+function paintTimeline(host, playbackFrame) {
         const canvas = host.timelineCanvas;
         const rect = canvas.parentElement?.getBoundingClientRect();
         const width = rect ? Math.floor(rect.width) : 400;
@@ -189,6 +282,12 @@ export function _renderTimeline(host) {
         const { backingChanged, styleChanged } = _syncTimelineCanvasDimensions(canvas, width, canvasH);
 
         const ctx = canvas.getContext("2d");
+        if (!ctx || ctx.isContextLost?.()) {
+            _invalidateTimelineLayerCache(host);
+            return { backingChanged, styleChanged, timelineCacheHit: false };
+        }
+        const { cache, hit } = playbackFrame
+            ? timelineCacheForFrame(host, width, canvasH, rulerH) : { cache: null, hit: false };
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         ctx.save();
 
@@ -216,30 +315,22 @@ export function _renderTimeline(host) {
         }
         host._drawPlayheadTriangle(ctx, width);
 
-        ctx.save();
-        ctx.beginPath();
-        ctx.rect(0, rulerH, width, Math.max(0, canvasH - rulerH));
-        ctx.clip();
-        ctx.translate(0, -host.scrollY);
-        host._drawTracks(ctx, width);
-        ctx.restore();
-
-        ctx.save();
-        ctx.beginPath();
-        ctx.rect(host._labelW, rulerH, Math.max(0, width - host._labelW), Math.max(0, canvasH - rulerH));
-        ctx.clip();
-        ctx.translate(0, -host.scrollY);
-        host._drawSelection(ctx, width);
-        host._drawGuideMarkers(ctx, width);
-        host._drawClips(ctx, width);
-        host._drawPlayheadLine(ctx, width);
-        ctx.restore();
+        paintLayer(host, ctx, width, canvasH, rulerH, false, (layerCtx, w) => {
+            if (cache) layerCtx.drawImage(cache.fixed.canvas, 0, rulerH + host.scrollY);
+            else host._drawTracks(layerCtx, w);
+        });
+        paintLayer(host, ctx, width, canvasH, rulerH, true, (layerCtx, w) => {
+            if (cache) layerCtx.drawImage(cache.scroll.canvas, 0, rulerH + host.scrollY);
+            else paintScrollContent(host, layerCtx, w);
+            // Remains in the original content clip/translation stack.
+            host._drawPlayheadLine(layerCtx, w);
+        });
 
         host._drawDragSelectOverlay?.(ctx, width, canvasH);
         host._drawSnapIndicator(ctx, width, canvasH);
         host._drawVerticalScrollbar(ctx, width, canvasH);
         ctx.restore();
-        return { backingChanged, styleChanged };
+        return { backingChanged, styleChanged, timelineCacheHit: hit };
     }
 
 export function _labelW(host) {
