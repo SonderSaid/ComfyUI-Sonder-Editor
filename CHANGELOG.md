@@ -11,6 +11,13 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Changed
+- Eligible Undo and Redo actions update the timeline after the history token arrives, before the restore finishes; failed predictions reconcile safely.
+
+### Fixed
+- Undo preserves existing out-of-bounds and overlapping timeline items while refusing new merge conflicts.
+- Undo refusal messages identify the violated rule and affected timeline items, lanes, and frame ranges.
+
 ## [0.5.0] - 2026-09-14
 
 Audio processing now has a minimum FFmpeg version. If exports or previews

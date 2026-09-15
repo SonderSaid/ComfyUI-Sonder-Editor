@@ -15,6 +15,44 @@ _MISSING = object()
 _DURABLE_RECEIPT_LIMIT = 128
 
 
+# The token response and merge executor share this authority, never a JS mirror.
+MERGED_WRITE_FIELDS = {
+    "scalar": (
+        "name", "duration_frames", "generation_params",
+        "prompt_context_profile_id", "prompt_context_profile_config",
+        "guide_track_config",
+        "prompt_track_config", "global_prompt_track_config",
+    ),
+    "mapping": ("global_channel_docs",),
+    "collection": (
+        ("clips", "clip_id", True, frozenset(), ()),
+        ("audio_tracks", "track_id", True, frozenset(), ()),
+        ("guide_frames", "guide_id", True, frozenset(), ()),
+        ("reference_items", "reference_item_id", True, frozenset(), ()),
+        ("prompt_sections", "prompt_id", True,
+         frozenset({"prompt", "channels"}), ("channel_docs",)),
+        ("linked_item_groups", "group_id", False, frozenset(), ()),
+        ("global_attachments", "attachment_id", False, frozenset(), ()),
+    ),
+    "bundle": (
+        ("video_lane_family", ("video_lane_count", "video_lane_configs")),
+        ("motion_driver_lane_family", (
+            "motion_driver_lane_count", "motion_driver_lane_configs")),
+        ("audio_lane_family", ("audio_lane_count", "audio_lane_configs")),
+        ("reference_lane_family", (
+            "reference_lane_count", "reference_lane_configs",
+            "reference_lane_recipes")),
+    ),
+}
+MERGED_DERIVED_FIELDS = ("global_channels", "prompt")
+
+
+def scene_history_write_fields() -> list[str]:
+    return [*MERGED_WRITE_FIELDS["scalar"], *MERGED_WRITE_FIELDS["mapping"],
+            *(spec[0] for spec in MERGED_WRITE_FIELDS["collection"]),
+            *(field for _, fields in MERGED_WRITE_FIELDS["bundle"] for field in fields)]
+
+
 class SceneMergeConflict(Exception):
     """The stored scene changed on a value the history operation must reverse."""
 
@@ -364,12 +402,7 @@ def merge_scene_history(base: dict, target: dict, stored: dict) -> dict:
     result = copy.deepcopy(stored)
     conflicts: list[dict] = []
 
-    for field in (
-        "name", "duration_frames", "generation_params",
-        "prompt_context_profile_id", "prompt_context_profile_config",
-        "guide_track_config",
-        "prompt_track_config", "global_prompt_track_config",
-    ):
+    for field in MERGED_WRITE_FIELDS["scalar"]:
         _merge_value(result, field, base, target, stored, conflicts)
 
     for field in ("width", "height"):
@@ -384,33 +417,16 @@ def merge_scene_history(base: dict, target: dict, stored: dict) -> dict:
         _conflict(conflicts, "fps", base_fps, target_fps,
                   stored.get("fps", _MISSING))
 
-    _merge_mapping(result, "global_channel_docs", base, target, stored,
-                   conflicts, "global_channel_docs")
+    for field in MERGED_WRITE_FIELDS["mapping"]:
+        _merge_mapping(result, field, base, target, stored, conflicts, field)
 
-    collection_specs = (
-        ("clips", "clip_id", True, frozenset(), ()),
-        ("audio_tracks", "track_id", True, frozenset(), ()),
-        ("guide_frames", "guide_id", True, frozenset(), ()),
-        ("reference_items", "reference_item_id", True, frozenset(), ()),
-        ("prompt_sections", "prompt_id", True,
-         frozenset({"prompt", "channels"}), ("channel_docs",)),
-        ("linked_item_groups", "group_id", False, frozenset(), ()),
-        ("global_attachments", "attachment_id", False, frozenset(), ()),
-    )
+    collection_specs = MERGED_WRITE_FIELDS["collection"]
     for field, key, per_field, excluded, mapping_fields in collection_specs:
         _merge_collection(result, field, key, base, target, stored, conflicts,
                           per_field=per_field, excluded=excluded,
                           mapping_fields=mapping_fields)
 
-    for path, keys in (
-        ("video_lane_family", ("video_lane_count", "video_lane_configs")),
-        ("motion_driver_lane_family", (
-            "motion_driver_lane_count", "motion_driver_lane_configs")),
-        ("audio_lane_family", ("audio_lane_count", "audio_lane_configs")),
-        ("reference_lane_family", (
-            "reference_lane_count", "reference_lane_configs",
-            "reference_lane_recipes")),
-    ):
+    for path, keys in MERGED_WRITE_FIELDS["bundle"]:
         _merge_bundle(result, keys, base, target, stored, conflicts, path)
 
     _validate_lane_shrink_members(result, base, target, stored, conflicts)

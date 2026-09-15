@@ -4256,6 +4256,7 @@ console.log(JSON.stringify({{before,after:JSON.stringify(h._undoStack),
 def test_history_catch_compensation_uses_owner_token_without_deadlock():
     widget = _source("web/js/editor_widget.js")
     undo = _method(widget, "_undo", "_redo")
+    rollback = _method(widget, "_rollbackHistoryOptimisticPaint", "_restoreScene")
     helpers = _method(widget, "_recordHistoryRefusal", "_setWidgetValue")
     queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
     result = _run_node(f"""
@@ -4267,6 +4268,7 @@ globalThis.sessionDiagRecord=()=>{{}};
 class Harness {{
 {undo}
 {helpers}
+{rollback}
   constructor(){{this.activeSceneId="scene";this.activeScene={{scene_id:"scene"}};
     this._undoStack=[{{sceneId:"scene",snapshot:{{scene_id:"scene",value:"before"}},
       postSnapshot:{{scene_id:"scene",value:"after"}},label:"composite",

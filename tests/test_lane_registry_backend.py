@@ -233,11 +233,9 @@ def test_remove_driver_lane_move_revalidates_single_item_limit():
     )
     with pytest.raises(routes.ProjectMutationRequestError) as raised:
         routes._remove_media_lane(scene, "motion_driver", lane_index, "move_items", target_lane=0)
-    assert (raised.value.message, raised.value.status, raised.value.code) == (
-        "Only one driver clip is allowed per driver lane",
-        409,
-        "driver_lane_occupied",
-    )
+    assert (raised.value.status, raised.value.code) == (409, "driver_lane_occupied")
+    assert raised.value.message.startswith("Only one driver clip is allowed per driver lane")
+    assert {raised.value.details["item_id"], raised.value.details["other_item_id"]} == {"destination", "occupied"}
 
 
 def test_generated_commit_skips_registry_only_future_lane_family(monkeypatch):

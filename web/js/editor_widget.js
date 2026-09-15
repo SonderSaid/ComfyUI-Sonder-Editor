@@ -1650,7 +1650,7 @@ export class EditorWidget {
         }
     }
 
-    _setActiveScene(scene, { lifecycleToken = null } = {}) {
+    _setActiveScene(scene, { lifecycleToken = null, optimisticHistory = false } = {}) {
         const lifecycleOwnsSwitch = !!(lifecycleToken
             && this._sceneHistoryLifecycleOwner === lifecycleToken
             && lifecycleToken.allowSceneSwitch);
@@ -1660,6 +1660,19 @@ export class EditorWidget {
                 { source: "scene-switch-history-pending" });
             return false;
         }
+        if (!optimisticHistory && this._deferredHistoryAdoption) {
+            const pending = this._deferredHistoryAdoption;
+            this._deferredHistoryAdoption = null;
+            if (pending.projectDir === this.projectDir && pending.sceneId === scene.scene_id) {
+                this._activateGraphUndoSuppression?.("editor-history-deferred-adopt");
+            }
+        }
+        const pendingHistorySelection = this._pendingHistorySelection;
+        const historySelection = pendingHistorySelection?.projectDir === this.projectDir
+            && pendingHistorySelection?.sceneId === scene.scene_id ? pendingHistorySelection : null;
+        if (!historySelection) this._pendingHistorySelection = null;
+        const ownsHistorySelection = historySelection && this.selectedItems === historySelection.selectionAfter
+            && this._historySelectionKey() === historySelection.selectionAfterKey;
         const hasActiveScene = !!this.activeScene;
         const preservePendingFrameSelection = !hasActiveScene && this.activeSceneId === scene.scene_id;
         const isSameScene = hasActiveScene && this.activeSceneId === scene.scene_id;
@@ -1716,8 +1729,18 @@ export class EditorWidget {
 
         this.activeScene = scene;
         this.activeSceneId = scene.scene_id;
+        if (!optimisticHistory) {
+            this._authoritativeSceneSeq = (Number(this._authoritativeSceneSeq) || 0) + 1;
+        }
+
         if (isSameScene || preservePendingFrameSelection) {
             this._reconcileSelection();
+        }
+        if (ownsHistorySelection) {
+            // Canonical reconciliation may replace the hit array without any
+            // user selection action. Carry ownership through that replacement.
+            historySelection.selectionAfter = this.selectedItems;
+            historySelection.selectionAfterKey = this._historySelectionKey();
         }
         this._buildTrackLayout();
         const nextWarmSignature = this._buildPlaybackWarmSceneSignature();
@@ -1754,6 +1777,10 @@ export class EditorWidget {
         this._assetGallery?.refreshCurrentScene?.();
         if (this._promptContextConsumersMounted()) {
             this._previewPromptContextCandidate({}, this._promptContextPreviewDelay(0));
+        }
+        if (!optimisticHistory && historySelection?.restoreSelectionOnAdopt) {
+            if (ownsHistorySelection) this._restoreHistorySelection(historySelection);
+            if (this._pendingHistorySelection === historySelection) this._pendingHistorySelection = null;
         }
     }
 
@@ -4006,7 +4033,7 @@ export class EditorWidget {
                         this._recordHistoryOrderedScene?.(
                             queuedValue?.historyOrderContext, result?.payload?.scene);
                         this._stampHistoryPostSnapshot(
-                            queuedHistoryEntry, result?.payload?.scene);
+                            queuedHistoryEntry, result?.payload?.scene, result?.response);
                     }
                     return result;
                 } catch (mutationError) {
@@ -19708,7 +19735,7 @@ export class EditorWidget {
         return entry;
     }
 
-    _stampHistoryPostSnapshot(entry, scene) {
+    _stampHistoryPostSnapshot(entry, scene, response = null) {
         if (!entry || entry.kind || entry.postSnapshot || !scene?.scene_id
                 || !this._undoStack.includes(entry)
                 || String(entry.sceneId || "") !== String(scene.scene_id)) {
@@ -19719,6 +19746,10 @@ export class EditorWidget {
         // GET payloads are intentionally never fallbacks: both may include
         // concurrent work that this operation merely observed.
         entry.postSnapshot = structuredClone(scene);
+        // Bind the version to this exact response. A newer GET can advance the
+        // shared version map while response.json() is still being awaited.
+        entry.postSnapshotProjectVersion = response?.headers?.get("X-Sonder-Project-Modified-At") || null;
+        entry.postSnapshotVersionSource = "acknowledged_scene";
         return true;
     }
 
@@ -19964,6 +19995,9 @@ export class EditorWidget {
             // reverse action: unchanged fields preserve later work and changed
             // fields conflict instead of overwriting it.
             opposite.postSnapshot = structuredClone(entry.snapshot);
+            // Receipt scenes are query-time state, never an authoritative base.
+            opposite.postSnapshotProjectVersion = null;
+            opposite.postSnapshotVersionSource = "ambiguous_receipt";
             if (typeof this._materializeHistoryOpposite === "function") {
                 this._materializeHistoryOpposite(
                     oppositeStack, oppositeReservation, opposite);
@@ -20717,6 +20751,7 @@ export class EditorWidget {
             promptIdentityCreateIntents:
                 structuredClone(entry.promptIdentityCreateIntents || []),
         };
+        const historyPaint = { entry, responseVersion: null };
         const priorAuxiliaryState = entry._ambiguousAuxiliaryState || {};
         let referencesApplied = priorAuxiliaryState.referencesApplied === true;
         let promptIdentityApplied = priorAuxiliaryState.promptIdentityApplied === true;
@@ -20735,7 +20770,8 @@ export class EditorWidget {
             }
             const restoredScene = await this._restoreScene(
                 entry.sceneId, entry.snapshot, entry.postSnapshot,
-                entry.restoreToken, diagnostics);
+                entry.restoreToken, diagnostics, historyPaint);
+            if (historyPaint.painted) this._finishHistoryOptimisticPaint(historyPaint);
             // Deliberate asymmetry, not an inconsistency: the same object is
             // authoritative for one use and untrusted for the other. As the
             // ordered scene it answers "what is durable at this queue position"
@@ -20748,6 +20784,10 @@ export class EditorWidget {
             delete entry._ambiguousAuxiliaryState;
             opposite.postSnapshot = structuredClone(
                 this._historyBaseForRestoredScene?.(restoredScene) || restoredScene);
+            opposite.postSnapshotProjectVersion = historyPaint.responseVersion;
+            // This version describes the response; the snapshot is the pinned
+            // restore target, not proof of exact committed bytes.
+            opposite.postSnapshotVersionSource = "restore_target";
             if (entry.promptIdentityCreateIntents?.length) {
                 const cleanupPlan = promptIdentityCleanupPlan(
                     entry.promptIdentityCreateIntents);
@@ -20794,6 +20834,7 @@ export class EditorWidget {
                 materializeOpposite(opposite);
             }
         } catch (error) {
+            this._rollbackHistoryOptimisticPaint(historyPaint);
             // The source entry remains reserved in place until every durable
             // participant has completed. Keep it there while attempting
             // best-effort compensation so a second failure cannot erase the
@@ -20819,6 +20860,10 @@ export class EditorWidget {
                     { source: "undo-restore-ambiguous" });
                 return;
             }
+            // A queued edit may have captured an optimistic scene that never
+            // committed. Resolve and rebase it at its physical queue position.
+            // Required until history no longer replaces scene objects locally.
+            historyOrderContext?.scenes?.set(entry.sceneId, null);
             delete entry.restoreToken;
             restoreEntryAfterFailure();
             const compensationErrors = [];
@@ -21237,6 +21282,7 @@ export class EditorWidget {
             promptIdentityCreateIntents:
                 structuredClone(entry.promptIdentityCreateIntents || []),
         };
+        const historyPaint = { entry, responseVersion: null };
         const priorAuxiliaryState = entry._ambiguousAuxiliaryState || {};
         let referencesApplied = priorAuxiliaryState.referencesApplied === true;
         let promptIdentityApplied = priorAuxiliaryState.promptIdentityApplied === true;
@@ -21302,7 +21348,8 @@ export class EditorWidget {
             }
             const restoredScene = await this._restoreScene(
                 entry.sceneId, entry.snapshot, entry.postSnapshot,
-                entry.restoreToken, diagnostics);
+                entry.restoreToken, diagnostics, historyPaint);
+            if (historyPaint.painted) this._finishHistoryOptimisticPaint(historyPaint);
             // Deliberate asymmetry, not an inconsistency: the same object is
             // authoritative for one use and untrusted for the other. As the
             // ordered scene it answers "what is durable at this queue position"
@@ -21315,10 +21362,15 @@ export class EditorWidget {
             delete entry._ambiguousAuxiliaryState;
             opposite.postSnapshot = structuredClone(
                 this._historyBaseForRestoredScene?.(restoredScene) || restoredScene);
+            opposite.postSnapshotProjectVersion = historyPaint.responseVersion;
+            // This version describes the response; the snapshot is the pinned
+            // restore target, not proof of exact committed bytes.
+            opposite.postSnapshotVersionSource = "restore_target";
             if (consumeEntry()) {
                 materializeOpposite(opposite);
             }
         } catch (error) {
+            this._rollbackHistoryOptimisticPaint(historyPaint);
             if (error?.restoreAmbiguous && error?.restoreToken) {
                 this._markHistoryOrderContextAmbiguous?.(
                     historyOrderContext, entry.sceneId, error.restoreToken, {
@@ -21343,6 +21395,10 @@ export class EditorWidget {
                     { source: "redo-restore-ambiguous" });
                 return;
             }
+            // A queued edit may have captured an optimistic scene that never
+            // committed. Resolve and rebase it at its physical queue position.
+            // Required until history no longer replaces scene objects locally.
+            historyOrderContext?.scenes?.set(entry.sceneId, null);
             delete entry.restoreToken;
             restoreEntryAfterFailure();
             const compensationErrors = [];
@@ -21422,8 +21478,143 @@ export class EditorWidget {
         });
     }
 
+    _historyObservedProjectVersion() {
+        const dirName = this.projectDir?.split(/[/\\]/).pop();
+        return dirName ? (getProjectVersion(dirName) || null) : null;
+    }
+
+    _historyOptimisticEligibility(entry, capabilities) {
+        const skip = (skip_reason) => ({ would_paint: false, skip_reason });
+        // Expiry: remove these carve-outs only when typed/reference/identity
+        // history owns a local apply whose compensation cannot race repaint.
+        if (entry?.kind) return skip("typed_entry");
+        if (entry?.referenceOperations?.length || entry?.promptIdentityChange
+                || entry?.promptIdentityCreateIntents?.length) return skip("auxiliary_operations");
+        if (!entry?.snapshot || entry.snapshot.scene_id !== entry.sceneId) return skip("scene_mismatch");
+        if (entry.postSnapshotProjectVersion == null) return skip("no_authoritative_base");
+        if (entry.postSnapshotProjectVersion !== this._historyObservedProjectVersion()) return skip("version_mismatch");
+        if (this.isDragging) return skip("dragging");
+        if (this._timelineMutationDepth) return skip("timeline_mutation");
+        if (!entry.postSnapshot) return skip("missing_post_snapshot");
+        if (!Array.isArray(capabilities?.merged_write_fields)
+                || !Array.isArray(capabilities?.merged_derived_fields)) return skip("missing_merge_capabilities");
+        const writable = new Set(capabilities.merged_write_fields);
+        const derived = new Set(capabilities.merged_derived_fields);
+        const keys = new Set([...Object.keys(entry.snapshot), ...Object.keys(entry.postSnapshot)]);
+        for (const key of keys) {
+            if (derived.has(key)) continue;
+            if (JSON.stringify(entry.snapshot[key]) !== JSON.stringify(entry.postSnapshot[key])
+                    && !writable.has(key)) return skip("outside_write_set");
+        }
+        return { would_paint: true, skip_reason: "" };
+    }
+
+    _paintHistoryOptimistically(state) {
+        const entry = state.entry;
+        if (entry.snapshot?.scene_id !== entry.sceneId) {
+            throw new Error("History paint target does not match its scene.");
+        }
+        state.projectDir = this.projectDir;
+        state.sceneId = entry.sceneId;
+        state.authoritativeSeq = Number(this._authoritativeSceneSeq) || 0;
+        // A reverse entry's postSnapshot is a pinned merge base, not the
+        // currently displayed scene; it can omit preserved concurrent work.
+        // Rollback owns a separate UI snapshot and never edits that merge base.
+        state.sceneBefore = structuredClone(this.activeScene);
+        // Mark before any graph-affecting call so a partial render/adopt throw
+        // still reaches fallback rollback in the caller's existing catch.
+        state.painted = true;
+        state.selectionBefore = (this.selectedItems || []).map(({ type, id }) => ({ type, id }));
+        state.primarySelectionBefore = this.selectedItem && { type: this.selectedItem.type, id: this.selectedItem.id };
+        state.inspectorBefore = !!this._itemEditorEl;
+        this._activateGraphUndoSuppression?.("editor-history-optimistic");
+        const scene = structuredClone(entry.snapshot);
+        this._replaceSceneInList(scene);
+        this._setActiveScene(scene, { optimisticHistory: true });
+        state.selectionAfter = this.selectedItems;
+        state.selectionAfterKey = this._historySelectionKey();
+        this._pendingHistorySelection = state;
+        this._renderTimeline();
+        this._renderViewportFrame();
+        // This is a prediction superseded by adopt(), never proof of a merge.
+        // Cost: target/rollback clones + _setActiveScene stringify + full scene render.
+    }
+
+    _historySelectionKey() {
+        return JSON.stringify((this.selectedItems || []).map(({ type, id }) => [type, id]));
+    }
+
+    _restoreHistorySelection(state) {
+        if (state.projectDir !== this.projectDir || state.sceneId !== this.activeSceneId) return;
+        // Restore only selection removed by this paint; a later click owns its
+        // own array/selection keys and must never be replaced by old UI intent.
+        if (this.selectedItems !== state.selectionAfter
+                || this._historySelectionKey() !== state.selectionAfterKey) return;
+        const restored = (state.selectionBefore || []).map(({ type, id }) =>
+            this._findSceneItemBySelection(type, id)).filter(Boolean);
+        this.selectedItems = restored;
+        const primary = state.primarySelectionBefore;
+        this.selectedItem = (primary && this._findSceneItemBySelection(primary.type, primary.id))
+            || restored.at(-1) || null;
+        if (state.inspectorBefore && this.selectedItem && !this._itemEditorEl) this._showItemEditor();
+        this._renderTimeline();
+    }
+
+    _finishHistoryOptimisticPaint(state) {
+        if (this._pendingHistorySelection === state) this._pendingHistorySelection = null;
+        state.painted = false;
+    }
+
+    _rollbackHistoryOptimisticPaint(state) {
+        if (!state?.painted) return;
+        state.painted = false;
+        if (this._destroyed || this.projectDir !== state.projectDir
+                || this.activeSceneId !== state.sceneId) {
+            this._finishHistoryOptimisticPaint(state);
+            return;
+        }
+        // A 409 may already have fetched another author's newer scene. Never
+        // replace it with this entry's stale base, even if the request refused.
+        if ((Number(this._authoritativeSceneSeq) || 0) !== state.authoritativeSeq) {
+            // The authoritative scene wins, but a refresh is not a user click.
+            // Restore only selection removed by our paint, into that scene.
+            try { this._restoreHistorySelection(state); }
+            catch (error) { console.warn("[Sonder] History selection restore failed:", error); }
+            this._finishHistoryOptimisticPaint(state);
+            return;
+        }
+        if (this.isDragging || this._timelineMutationDepth) {
+            // Mouse-up drains a canonical refresh after the drag's own commit;
+            // replacing objects here would orphan drag/trim data references.
+            this._pendingScenesRefresh = true;
+            this._deferredHistoryAdoption = { projectDir: this.projectDir, sceneId: state.sceneId };
+            state.restoreSelectionOnAdopt = true;
+            return;
+        }
+        try {
+            this._activateGraphUndoSuppression?.("editor-history-rollback");
+            const scene = structuredClone(state.sceneBefore);
+            this._replaceSceneInList(scene);
+            const selectionOwned = this.selectedItems === state.selectionAfter
+                && this._historySelectionKey() === state.selectionAfterKey;
+            this._setActiveScene(scene, { optimisticHistory: true });
+            if (selectionOwned) {
+                state.selectionAfter = this.selectedItems;
+                state.selectionAfterKey = this._historySelectionKey();
+                this._restoreHistorySelection(state);
+            }
+            this._renderTimeline();
+            this._renderViewportFrame();
+        } catch (error) {
+            // Rendering failure must not escape receipt/tombstone settlement.
+            this._pendingScenesRefresh = true;
+            console.warn("[Sonder] History rollback render needs refresh:", error);
+        }
+        this._finishHistoryOptimisticPaint(state);
+    }
+
     async _restoreScene(sceneId, targetSnapshot, baseSnapshot, existingRestoreToken = "",
-        diagnostics = null) {
+        diagnostics = null, historyPaint = null) {
         if (!this.projectDir) throw new Error("No project is open for scene restore.");
         if (!baseSnapshot) throw new Error(
             "Scene history is missing its authoritative result; refresh the editor.");
@@ -21469,6 +21660,13 @@ export class EditorWidget {
             // seconds. Re-arm at the graph-affecting adoption point for both
             // the direct response and receipt-reconciliation paths.
             this._activateGraphUndoSuppression?.("editor-history-adopt");
+            if (this.isDragging || this._timelineMutationDepth) {
+                // Canonical settlement also replaces the object graph. Keep
+                // the dragged objects alive until mouse-up/queue drain.
+                this._pendingScenesRefresh = true;
+                this._deferredHistoryAdoption = { projectDir: this.projectDir, sceneId };
+                return scene;
+            }
             if (this.activeSceneId !== sceneId) this.activeSceneId = sceneId;
             this._replaceSceneInList?.(scene);
             this._setActiveScene(scene);
@@ -21484,6 +21682,7 @@ export class EditorWidget {
         };
 
         let restoreToken = String(existingRestoreToken || "");
+        let mergeCapabilities = null;
         if (!restoreToken) {
             const tokenResponse = await fetch(
                 api.apiURL(tokenUrl), diagnosticInit({ method: "POST" }));
@@ -21495,6 +21694,7 @@ export class EditorWidget {
                     `Scene history token failed (${tokenResponse.status}).`);
             }
             const tokenPayload = await tokenResponse.json();
+            mergeCapabilities = tokenPayload;
             restoreToken = String(tokenPayload?.restore_token || "");
             if (!restoreToken) throw new Error("Scene history token was not returned.");
         }
@@ -21538,6 +21738,7 @@ export class EditorWidget {
             return ambiguousError;
         };
         const adoptReconciledScene = (scene) => {
+            if (historyPaint) historyPaint.responseVersion = null;
             try {
                 const adopted = adopt(scene);
                 this._rememberReconciledHistoryBase?.(adopted, targetSnapshot);
@@ -21547,6 +21748,17 @@ export class EditorWidget {
             }
         };
 
+        // Inside the serial queue slot and caller's try/catch, after the
+        // existing token round trip. Do not hoist paint to claim time: the serial
+        // slot and caller catch must own every paint and failure exit.
+        if (historyPaint?.entry) {
+            const eligibility = this._historyOptimisticEligibility(historyPaint.entry, mergeCapabilities);
+            sessionDiagRecord("history_optimistic_paint", {
+                ...eligibility, scene_id: sceneId,
+                version_source: historyPaint.entry.postSnapshotVersionSource || "unknown",
+            });
+            if (eligibility.would_paint) this._paintHistoryOptimistically(historyPaint);
+        }
         let restoreResponse;
         try {
             // Do not use postProjectJsonWithReconcile here. Re-sending the same
@@ -21589,7 +21801,7 @@ export class EditorWidget {
                 restoreResponse, `Scene restore failed (${restoreResponse.status}).`);
             if (error.code === "scene_restore_token_expired" && existingRestoreToken) {
                 return this._restoreScene(
-                    sceneId, targetSnapshot, baseSnapshot, "", restoreDiagnostics);
+                    sceneId, targetSnapshot, baseSnapshot, "", restoreDiagnostics, historyPaint);
             }
             if (restoreResponse.status >= 500) {
                 const receiptScene = await reconcileReceipt();
@@ -21603,6 +21815,9 @@ export class EditorWidget {
                 });
             }
             throw error;
+        }
+        if (historyPaint) {
+            historyPaint.responseVersion = restoreResponse.headers?.get("X-Sonder-Project-Modified-At") || null;
         }
         try {
             const payload = await restoreResponse.json();

@@ -1597,7 +1597,7 @@ def _scene_restore_invariant_case(case):
     return base, target, stored
 
 
-@pytest.mark.parametrize("case", ["empty_lane", "lane", "prompt", "guide", "duration"])
+@pytest.mark.parametrize("case", ["empty_lane", "lane", "prompt", "guide"])
 def test_scene_restore_rejects_invalid_merged_scene(case, tmp_path, monkeypatch):
     route_module = _load_route_module(monkeypatch)
     base, target, stored = _scene_restore_invariant_case(case)

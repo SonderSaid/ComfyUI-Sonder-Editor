@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import copy
+from types import SimpleNamespace
 import json
 import logging
 import math
@@ -83,6 +84,8 @@ from .project_manager import (
     register_project_saved_hook,
 )
 from .scene_history_merge import (
+    MERGED_DERIVED_FIELDS,
+    scene_history_write_fields,
     SceneMergeConflict,
     SceneRestoreReceiptStore,
     has_durable_scene_restore_receipt,
@@ -926,27 +929,27 @@ def _ensure_scene_lane_config_lengths(scene: Scene) -> None:
         _set_scene_lane_count(scene, descriptor.lane_type, _scene_lane_count(scene, descriptor.lane_type))
 
 
-def _validate_single_driver_per_lane(scene: Scene) -> None:
+def _single_driver_violations(scene):
     lane_count = _scene_lane_count(scene, "motion_driver")
-    occupied: dict[int, str] = {}
+    occupied = {}
     for clip in getattr(scene, "clips", []) or []:
         if getattr(clip, "role", "render") != "motion_driver":
             continue
-        lane_index = int(getattr(clip, "track_index", 0) or 0)
-        if lane_index < 0 or lane_index >= lane_count:
-            _mutation_error(
-                f"Driver clip is on missing driver lane {lane_index}",
-                409,
-                "driver_lane_missing",
-            )
-        prior_clip_id = occupied.get(lane_index)
-        if prior_clip_id is not None:
-            _mutation_error(
-                "Only one driver clip is allowed per driver lane",
-                409,
-                "driver_lane_occupied",
-            )
-        occupied[lane_index] = getattr(clip, "clip_id", "") or ""
+        lane = int(getattr(clip, "track_index", 0) or 0)
+        bounds = list(_media_item_bounds(clip))
+        if lane < 0 or lane >= lane_count:
+            yield _history_violation("driver_lane_missing", "Driver clip is on a missing driver lane",
+                                     "clip", clip.clip_id, None, "motion_driver", lane, bounds)
+        if lane in occupied:
+            yield _history_violation("driver_lane_occupied", "Only one driver clip is allowed per driver lane",
+                                     "clip", clip.clip_id, occupied[lane], "motion_driver", lane, bounds)
+        occupied[lane] = clip.clip_id
+
+
+def _validate_single_driver_per_lane(scene: Scene) -> None:
+    # Preserve raising for callers whose exception path compensates a create.
+    for violation in _single_driver_violations(scene):
+        _raise_history_violation(violation)
 
 
 def _preflight_driver_lane_target(scene: Scene, clip: ClipReference, target_role: str, target_lane: int) -> None:
@@ -1089,30 +1092,23 @@ def _validate_prompt_identity(section: PromptSection, expected: dict | None) -> 
             _mutation_error("Prompt section identity mismatch", 409, "identity_mismatch")
 
 
-def _require_no_prompt_overlap(scene: Scene, start_frame: int, end_frame: int,
-                               ignore=None) -> None:
-    """Reject a section range that intersects another section (half-open).
-
-    `ignore` may be a PromptSection (range updates) or a set of sections
-    (swap final-state validation). Pre-existing stored overlaps are not
-    auto-mutated — the resolver's first-wins clipping covers them at read
-    time — but no NEW overlap may be created.
-    """
-    if end_frame <= start_frame:
-        _mutation_error("Prompt section range is invalid", 400, "invalid_range")
-    if isinstance(ignore, (list, tuple)):
-        ignored = list(ignore)
-    elif ignore is None:
-        ignored = []
-    else:
-        ignored = [ignore]
+def _prompt_overlapping_items(scene, start_frame, end_frame, ignore=None):
+    ignored = list(ignore) if isinstance(ignore, (list, tuple)) else ([] if ignore is None else [ignore])
     for other in scene.prompt_sections:
-        # Identity comparison only — PromptSection __eq__ is value-based and
-        # would skip a different-but-identical section.
+        # Identity, not value equality: distinct identical sections still collide.
         if any(other is item for item in ignored):
             continue
-        if other.start_frame < end_frame and other.end_frame > start_frame:
-            _mutation_error("Prompt sections cannot overlap", 409, "prompt_overlap")
+        if _media_bounds_overlap(start_frame, end_frame, other.start_frame, other.end_frame):
+            yield other
+
+
+def _require_no_prompt_overlap(scene: Scene, start_frame: int, end_frame: int,
+                               ignore=None) -> None:
+    """Refuse newly authored overlap; preserve pre-existing stored overlaps."""
+    if end_frame <= start_frame:
+        _mutation_error("Prompt section range is invalid", 400, "invalid_range")
+    for other in _prompt_overlapping_items(scene, start_frame, end_frame, ignore):
+        _mutation_error("Prompt sections cannot overlap", 409, "prompt_overlap")
 
 
 LINK_ITEM_TYPES = {"clip", "audio", "guide", "prompt"}
@@ -1302,22 +1298,40 @@ def _rewrite_link_groups_for_deleted(scene: Scene, refs: list[dict]) -> None:
     _prune_linked_item_groups(scene)
 
 
-def _validate_prompt_target_ranges(scene: Scene, targets: dict[str, tuple[PromptSection, int, int]]) -> None:
-    sections = [item[0] for item in targets.values()]
-    ranges = []
+def _prompt_range_violations(targets):
     for section, start, end in targets.values():
         if end <= start:
-            _mutation_error("Prompt section range is invalid", 400, "invalid_range")
-        if start < 0 or (int(getattr(scene, "duration_frames", 0) or 0) > 0 and end > int(scene.duration_frames)):
-            _mutation_error("Prompt section range is outside the scene", 409, "invalid_range")
-        _require_no_prompt_overlap(scene, start, end, ignore=sections)
-        ranges.append((section, start, end))
-    for idx, (section, start, end) in enumerate(ranges):
-        for other, other_start, other_end in ranges[idx + 1:]:
-            if section is other:
-                continue
-            if start < other_end and end > other_start:
-                _mutation_error("Prompt sections cannot overlap", 409, "prompt_overlap")
+            yield _history_violation("invalid_range", "Prompt section range is invalid",
+                                     "prompt", section.prompt_id, None, "prompt", 0, [start, end], status=400)
+
+
+def _prompt_target_bounds_violations(scene, targets):
+    yield from _prompt_range_violations(targets)
+    duration = int(getattr(scene, "duration_frames", 0) or 0)
+    for section, start, end in targets.values():
+        if start < 0 or (duration > 0 and end > duration):
+            yield _history_violation("invalid_range", "Prompt section range is outside the scene",
+                                     "prompt", section.prompt_id, None, "prompt", 0, [start, end])
+
+
+def _prompt_target_overlap_violations(scene, targets):
+    sections = [item[0] for item in targets.values()]
+    ranges = list(targets.values())
+    for index, (section, start, end) in enumerate(ranges):
+        candidates = ranges[index + 1:] + [
+            (other, other.start_frame, other.end_frame) for other in _prompt_overlapping_items(scene, start, end, sections)]
+        for other, other_start, other_end in candidates:
+            if other is not section and _media_bounds_overlap(start, end, other_start, other_end):
+                yield _history_violation("prompt_overlap", "Prompt sections cannot overlap",
+                                         "prompt", section.prompt_id, other.prompt_id, "prompt", 0,
+                                         [[start, end], [other_start, other_end]])
+
+
+def _validate_prompt_target_ranges(scene: Scene, targets: dict[str, tuple[PromptSection, int, int]]) -> None:
+    for violation in _prompt_target_bounds_violations(scene, targets):
+        _raise_history_violation(violation)
+    for violation in _prompt_target_overlap_violations(scene, targets):
+        _raise_history_violation(violation)
 
 
 def _apply_ref_muted(scene: Scene, ref: dict, muted: bool) -> None:
@@ -1995,158 +2009,200 @@ def _require_media_target_bounds_fit(scene: Scene, targets: list[tuple[object, i
                 _mutation_error("Timeline item overlaps another item on the lane", 409, "lane_collision")
 
 
-def _validate_scene_history_merge(scene: Scene) -> None:
-    """Reject a merged scene that ordinary mutation routes cannot construct."""
-    raw_duration = int(getattr(scene, "duration_frames", 0) or 0)
-    if raw_duration < 0:
-        _mutation_error("Scene duration cannot be negative", 409,
-                        "scene_merge_invalid")
-    duration = raw_duration
+def _history_violation(code, message, item_type=None, item_id=None,
+                       other_item_id=None, lane_type=None, lane_index=None,
+                       bounds=None, status=409):
+    details = dict(item_type=item_type, item_id=item_id,
+                   other_item_id=other_item_id, lane_type=lane_type,
+                   lane_index=lane_index, bounds=bounds)
+    location = []
+    if item_id is not None:
+        location.append(f"{item_type} {item_id}")
+    if other_item_id is not None:
+        location.append(f"with {other_item_id}")
+    if lane_type is not None:
+        location.append(f"{lane_type} lane {lane_index}")
+    if bounds is not None:
+        location.append(f"frames {bounds}")
+    return dict(code=code, message=message + (": " + ", ".join(location) if location else ""),
+                details=details, status=status)
+
+
+def _raise_history_violation(violation):
+    _mutation_error(violation["message"], violation["status"],
+                    violation["code"], violation["details"])
+
+
+def _normalize_merged_scene_ordering(scene):
+    # Eager even when no generator is consumed, or validation refuses.
+    scene.prompt_sections.sort(key=lambda item: int(getattr(item, "start_frame", 0) or 0))
+    scene.guide_frames.sort(key=lambda item: int(getattr(item, "frame_index", 0) or 0))
+
+
+def _scene_history_coherence_violations(scene):
     for descriptor in VARIABLE_LANE_DESCRIPTORS:
         try:
-            raw_lane_count = int(getattr(scene, descriptor.count_attr))
+            count = int(getattr(scene, descriptor.count_attr))
         except (TypeError, ValueError):
-            _mutation_error("A merged lane family has an invalid lane count", 409,
-                            "scene_merge_invalid")
-        if raw_lane_count < 1:
-            _mutation_error("A merged lane family has no lanes", 409,
-                            "scene_merge_invalid")
-    media_targets = []
-    for clip in getattr(scene, "clips", []) or []:
-        lane_type = _clip_lane_type(clip)
-        lane_index = int(getattr(clip, "track_index", 0) or 0)
-        lane_count = _scene_lane_count(scene, lane_type)
-        if lane_index < 0 or lane_index >= lane_count:
-            _mutation_error(
-                f"Clip {getattr(clip, 'clip_id', '')} is on missing {lane_type} lane {lane_index}",
-                409, "scene_merge_invalid")
-        start, end = _media_item_bounds(clip)
-        if start < 0 or end <= start or (duration > 0 and end > duration):
-            _mutation_error("A clip range is outside the merged scene", 409,
-                            "scene_merge_invalid")
-        media_targets.append((clip, start, end, lane_type, lane_index))
+            count = 0
+        if count < 1:
+            yield _history_violation("lane_family_empty", "A merged lane family has no valid lanes",
+                                     lane_type=descriptor.lane_type)
+    # Expiry: move together only when the ordinary batch's whole-scene driver
+    # sweep becomes differential; otherwise a restore can wedge all editing.
+    yield from _single_driver_violations(scene)
+    seen = {}
+    for guide in scene.guide_frames:
+        frame = int(getattr(guide, "frame_index", 0) or 0)
+        if frame in seen:
+            yield _history_violation("guide_frame_duplicate", "Guide frames must be unique",
+                                     "guide", guide.guide_id, seen[frame], "guide", 0, [frame, frame + 1])
+        seen[frame] = guide.guide_id
 
-    for track in getattr(scene, "audio_tracks", []) or []:
-        lane_index = int(getattr(track, "lane_index", 0) or 0)
-        lane_count = _scene_lane_count(scene, "audio")
-        if lane_index < 0 or lane_index >= lane_count:
-            _mutation_error(
-                f"Audio track {getattr(track, 'track_id', '')} is on missing audio lane {lane_index}",
-                409, "scene_merge_invalid")
-        start, end = _media_item_bounds(track)
-        if start < 0 or end <= start or (duration > 0 and end > duration):
-            _mutation_error("An audio range is outside the merged scene", 409,
-                            "scene_merge_invalid")
-        media_targets.append((track, start, end, "audio", lane_index))
 
-    _validate_single_driver_per_lane(scene)
-    _require_media_target_bounds_fit(scene, media_targets)
+def _scene_history_content_violations(scene):
+    # No scene-window bounds or media-overlap check: ordinary writers can
+    # produce these states. Differential validation must not resurrect them.
+    duration = int(getattr(scene, "duration_frames", 0) or 0)
+    # Expiry: remove after legacy PUT /scenes/{id} clamps like scene mutations.
+    if duration < 0:
+        yield _history_violation("scene_duration_negative", "Scene duration cannot be negative",
+                                 bounds=[0, duration])
+    for collection, item_type, id_field in ((scene.clips, "clip", "clip_id"),
+                                             (scene.audio_tracks, "audio", "track_id"),
+                                             (scene.reference_items, "reference", "reference_item_id")):
+        for item in collection:
+            lane_type, lane = _media_item_lane(item)
+            # Backstop for the residue not covered by _validate_lane_shrink_members.
+            if lane < 0 or lane >= _scene_lane_count(scene, lane_type):
+                yield _history_violation(f"{item_type}_lane_missing", "Timeline item is on a missing lane",
+                                         item_type, getattr(item, id_field), None, lane_type, lane,
+                                         list(_media_item_bounds(item)))
+    for item in scene.reference_items:
+        lane = int(getattr(item, "lane_index", 0) or 0)
+        for other in _reference_overlapping_items(scene, lane, int(item.start_frame or 0), int(item.end_frame), ignore=item):
+            yield _history_violation("reference_overlap", "Reference items cannot overlap on one lane",
+                                     "reference", item.reference_item_id, other.reference_item_id, "reference", lane,
+                                     [list(_reference_effective_bounds(duration, item)), list(_reference_effective_bounds(duration, other))])
+    targets = {str(section.prompt_id or index): (section, int(section.start_frame or 0), int(section.end_frame or 0))
+               for index, section in enumerate(scene.prompt_sections)}
+    # Ordinary prompt writers refuse empty/reversed ranges, but allow negative
+    # starts and ends past duration. Preserve this distinction in history too.
+    yield from _prompt_range_violations(targets)
+    yield from _prompt_target_overlap_violations(scene, targets)
 
-    for item in getattr(scene, "reference_items", []) or []:
-        lane_index = int(getattr(item, "lane_index", 0) or 0)
-        lane_count = _scene_lane_count(scene, "reference")
-        if lane_index < 0 or lane_index >= lane_count:
-            _mutation_error(
-                f"Reference item {getattr(item, 'reference_item_id', '')} is on missing Reference lane {lane_index}",
-                409, "scene_merge_invalid")
-        start = int(getattr(item, "start_frame", 0) or 0)
-        end = int(getattr(item, "end_frame", -1))
-        if (start < 0 or (duration > 0 and start >= duration)
-                or (end >= 0 and (end <= start or (duration > 0 and end > duration)))):
-            _mutation_error("A Reference range is outside the merged scene", 409,
-                            "scene_merge_invalid")
-        _require_no_reference_overlap(scene, lane_index, start, end, ignore=item)
 
-    prompt_targets = {
-        str(getattr(section, "prompt_id", "") or index): (
-            section,
-            int(getattr(section, "start_frame", 0) or 0),
-            int(getattr(section, "end_frame", 0) or 0),
-        )
-        for index, section in enumerate(getattr(scene, "prompt_sections", []) or [])
-    }
-    _validate_prompt_target_ranges(scene, prompt_targets)
-    scene.prompt_sections.sort(
-        key=lambda section: int(getattr(section, "start_frame", 0) or 0))
+def _history_violation_identity(violation):
+    details = violation["details"]
+    return (violation["code"], frozenset(value for value in
+            (details["item_id"], details["other_item_id"]) if value is not None),
+            details["lane_type"], details["lane_index"])
 
-    seen_guide_frames = set()
-    for guide in getattr(scene, "guide_frames", []) or []:
-        frame_index = int(getattr(guide, "frame_index", 0) or 0)
-        if frame_index < -1 or (duration > 0 and frame_index >= duration):
-            _mutation_error("A guide is outside the merged scene", 409,
-                            "scene_merge_invalid")
-        if frame_index in seen_guide_frames:
-            _mutation_error("Guide frames must be unique", 409,
-                            "scene_merge_invalid")
-        seen_guide_frames.add(frame_index)
-    scene.guide_frames.sort(key=lambda guide: int(getattr(guide, "frame_index", 0) or 0))
 
-    # Deliberately not enforced here: source-media bounds (legacy split fields
-    # are ambiguous), lane locks, asset existence, model recipe semantics, or
-    # queue-idle geometry rules. Geometry is conflict-only and never written by
-    # history; the remaining checks are not structural merge invariants.
+_HISTORY_PARTICIPANT_TYPES = {
+    "clip": ("clips", "clip_id", ClipReference),
+    "audio": ("audio_tracks", "track_id", AudioTrack),
+    "reference": ("reference_items", "reference_item_id", ReferenceItem),
+    "prompt": ("prompt_sections", "prompt_id", PromptSection),
+}
+
+
+def _history_violation_in_source(violation, raw, indexes):
+    """Re-evaluate only participating members, without rebuilding/mutating Scene."""
+    if not isinstance(raw, dict):
+        return False
+    details = violation["details"]
+    source = SimpleNamespace(duration_frames=raw.get("duration_frames", 0),
+                             clips=[], audio_tracks=[], reference_items=[], prompt_sections=[])
+    for descriptor in VARIABLE_LANE_DESCRIPTORS:
+        setattr(source, descriptor.count_attr, raw.get(descriptor.count_attr, 1))
+    spec = _HISTORY_PARTICIPANT_TYPES.get(details["item_type"])
+    if spec:
+        collection, id_field, member_type = spec
+        if collection not in indexes:
+            indexes[collection] = {str(item.get(id_field) or ""): item
+                                   for item in raw.get(collection, []) if isinstance(item, dict)}
+        participant_ids = _history_violation_identity(violation)[1]
+        members = [indexes[collection].get(str(item_id)) for item_id in participant_ids]
+        if any(member is None for member in members):
+            return False
+        setattr(source, collection, [member_type.from_dict(copy.deepcopy(member)) for member in members])
+    identity = _history_violation_identity(violation)
+    return any(_history_violation_identity(candidate) == identity
+               for candidate in _scene_history_content_violations(source))
+
+
+def _validate_scene_history_merge(scene: Scene, target_scene=None, stored_scene=None) -> None:
+    """Reject coherence damage and content violations manufactured by the merge."""
+    _normalize_merged_scene_ordering(scene)
+    for violation in _scene_history_coherence_violations(scene):
+        _raise_history_violation(violation)
+    indexes = ({}, {})
+    checked = set()
+    for violation in _scene_history_content_violations(scene):
+        identity = _history_violation_identity(violation)
+        if identity in checked:
+            continue
+        checked.add(identity)
+        # Identity is participants + lane, not geometry. An already overlapping
+        # pair may overlap differently after restore. Expiry: revisit only once
+        # editing prevents overlaps AND a migration clears existing conflicts.
+        if any(_history_violation_in_source(violation, raw, cache)
+               for raw, cache in zip((target_scene, stored_scene), indexes)):
+            continue
+        _raise_history_violation(violation)
 
 
 def _validate_scene_history_link_groups(raw_scene: dict) -> None:
-    """Refuse link dependencies that deserialization would otherwise prune."""
+    """Refuse raw link damage before deserialization silently repairs it."""
+    def refuse(code, message, item_type="link_group", item_id=None, other_item_id=None):
+        _raise_history_violation(_history_violation(
+            code, message, item_type, item_id, other_item_id))
+
     groups = raw_scene.get("linked_item_groups", [])
     if not isinstance(groups, list):
-        _mutation_error("Merged linked groups are invalid", 409,
-                        "scene_merge_invalid")
+        refuse("link_groups_invalid", "Merged linked groups are invalid")
     if not groups:
         return
     collection_ids = {}
     for field_name, item_type, id_field in (
-        ("clips", "clip", "clip_id"),
-        ("audio_tracks", "audio", "track_id"),
-        ("guide_frames", "guide", "guide_id"),
-        ("prompt_sections", "prompt", "prompt_id"),
+        ("clips", "clip", "clip_id"), ("audio_tracks", "audio", "track_id"),
+        ("guide_frames", "guide", "guide_id"), ("prompt_sections", "prompt", "prompt_id"),
     ):
-        raw_members = raw_scene.get(field_name, [])
-        if not isinstance(raw_members, list):
-            _mutation_error("A merged scene collection is invalid", 409,
-                            "scene_merge_invalid")
+        members = raw_scene.get(field_name, [])
+        if not isinstance(members, list):
+            refuse("link_collection_invalid", "A merged scene collection is invalid", item_type)
         member_ids = set()
-        for member in raw_members:
+        for member in members:
             if not isinstance(member, dict):
-                _mutation_error("A merged scene member is invalid", 409,
-                                "scene_merge_invalid")
+                refuse("link_member_invalid", "A merged scene member is invalid", item_type)
             member_id = str(member.get(id_field) or "")
             if not member_id or member_id in member_ids:
-                _mutation_error("Merged scene member ids must be stable and unique", 409,
-                                "scene_merge_invalid")
+                refuse("link_member_id_invalid", "Merged scene member ids must be stable and unique", item_type, member_id)
             member_ids.add(member_id)
         collection_ids[item_type] = member_ids
-
-    seen_group_ids = set()
-    globally_linked = set()
+    seen_group_ids, globally_linked = set(), set()
     for group in groups:
         if not isinstance(group, dict):
-            _mutation_error("A merged linked group is invalid", 409,
-                            "scene_merge_invalid")
+            refuse("link_group_invalid", "A merged linked group is invalid")
         group_id = str(group.get("group_id") or "")
         if not group_id or group_id in seen_group_ids:
-            _mutation_error("Merged linked group ids must be stable and unique", 409,
-                            "scene_merge_invalid")
+            refuse("link_group_id_invalid", "Merged linked group ids must be stable and unique", item_id=group_id)
         seen_group_ids.add(group_id)
         items = group.get("items", [])
         if not isinstance(items, list) or len(items) < 2:
-            _mutation_error("A merged linked group requires two existing items", 409,
-                            "scene_merge_invalid")
+            refuse("link_group_incomplete", "A merged linked group requires two existing items", item_id=group_id)
         group_refs = set()
         for item in items:
             if not isinstance(item, dict):
-                _mutation_error("A merged linked item is invalid", 409,
-                                "scene_merge_invalid")
+                refuse("link_member_invalid", "A merged linked item is invalid", item_id=group_id)
             item_type, item_id = _link_ref_key(item)
             ref = (item_type, item_id)
-            if (item_type not in LINK_ITEM_TYPES
-                    or not item_id
+            if (item_type not in LINK_ITEM_TYPES or not item_id
                     or item_id not in collection_ids.get(item_type, set())
-                    or ref in group_refs
-                    or ref in globally_linked):
-                _mutation_error("A merged linked group references invalid or duplicate items", 409,
-                                "scene_merge_invalid")
+                    or ref in group_refs or ref in globally_linked):
+                refuse("link_member_unavailable", "Linked group references an invalid or duplicate item",
+                       item_type, item_id, group_id)
             group_refs.add(ref)
             globally_linked.add(ref)
 
@@ -3369,26 +3425,29 @@ def _clamp_reference_items_to_scene(scene: Scene) -> None:
             item.end_frame = min(duration, max(item.start_frame + 1, end_frame))
 
 
-def _require_no_reference_overlap(
-    scene: Scene,
-    lane_index: int,
-    start_frame: int,
-    end_frame: int,
-    *,
-    ignore: ReferenceItem | None = None,
-) -> None:
-    resolved_end = max(0, int(getattr(scene, "duration_frames", 0) or 0)) if end_frame < 0 else end_frame
+def _reference_effective_bounds(duration, item):
+    start = int(getattr(item, "start_frame", 0) or 0)
+    end = int(getattr(item, "end_frame", -1))
+    return start, max(start + 1, int(duration or 0)) if end < 0 else end
+
+
+def _reference_overlapping_items(scene, lane_index, start_frame, end_frame, *, ignore=None):
+    duration = int(getattr(scene, "duration_frames", 0) or 0)
+    resolved_end = max(0, duration) if end_frame < 0 else end_frame
     if resolved_end <= start_frame:
         resolved_end = start_frame + 1
     for other in getattr(scene, "reference_items", []) or []:
         if other is ignore or int(getattr(other, "lane_index", 0) or 0) != lane_index:
             continue
-        other_start = int(getattr(other, "start_frame", 0) or 0)
-        other_end = int(getattr(other, "end_frame", -1))
-        if other_end < 0:
-            other_end = max(other_start + 1, int(getattr(scene, "duration_frames", 0) or 0))
+        other_start, other_end = _reference_effective_bounds(duration, other)
         if _media_bounds_overlap(start_frame, resolved_end, other_start, other_end):
-            _mutation_error("Reference items cannot overlap on one lane", 409, "lane_collision")
+            yield other
+
+
+def _require_no_reference_overlap(scene: Scene, lane_index: int, start_frame: int,
+                                  end_frame: int, *, ignore: ReferenceItem | None = None) -> None:
+    for other in _reference_overlapping_items(scene, lane_index, start_frame, end_frame, ignore=ignore):
+        _mutation_error("Reference items cannot overlap on one lane", 409, "lane_collision")
 
 
 def _reference_lane_recipe(scene: Scene, lane_index: int) -> ReferenceLaneRecipe:
@@ -11134,7 +11193,9 @@ if routes is not None:
             return _json_error(f"Scene not found: {scene_id}", 404)
         project_id = str(request.match_info.get("project_id", "") or "")
         token = _SCENE_RESTORE_RECEIPTS.issue(project_id, scene_id)
-        return web.json_response({"restore_token": token})
+        return web.json_response({"restore_token": token,
+                                  "merged_write_fields": scene_history_write_fields(),
+                                  "merged_derived_fields": list(MERGED_DERIVED_FIELDS)})
 
     @routes.get("/sonder-editor/project/{project_id}/scenes/{scene_id}/restore-token/{token}")
     async def api_get_scene_restore_token(request: web.Request) -> web.Response:
@@ -11255,9 +11316,11 @@ if routes is not None:
             # defaults without ever injecting explicit nulls.
             merged_dict["scene_id"] = scene_id
             try:
+                # Expiry: keep raw validation first until Scene stops silently
+                # repairing stable member ids and pruning invalid linked groups.
                 _validate_scene_history_link_groups(merged_dict)
                 merged_scene = Scene.from_dict(merged_dict)
-                _validate_scene_history_merge(merged_scene)
+                _validate_scene_history_merge(merged_scene, target_scene, stored_scene)
             except (TypeError, ValueError) as exc:
                 exc = ProjectMutationRequestError(
                     f"Merged scene data is invalid: {exc}", 409,
@@ -11281,6 +11344,7 @@ if routes is not None:
                     "error": exc.message,
                     "code": "scene_merge_invalid",
                     "invariant": exc.code,
+                    "details": exc.details or {},
                 }
                 _SCENE_RESTORE_RECEIPTS.finish(
                     token, project_id, scene_id, status="refused", payload=payload)
@@ -11289,6 +11353,7 @@ if routes is not None:
                     project_id=project_id,
                     scene_id=scene_id,
                     invariant=exc.code,
+                    **(exc.details or {}),
                 )
                 return web.json_response(payload, status=409)
 
