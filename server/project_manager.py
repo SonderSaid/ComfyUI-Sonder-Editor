@@ -32,15 +32,15 @@ _PROJECT_SAVED_HOOKS: list[Callable[[TimelineProject], None]] = []
 
 # Per-project write serialization. `save_project` runs from genuinely different OS
 # threads — the ComfyUI prompt worker, the `sonder-bridge-*` daemon, `asyncio.to_thread`
-# workers, and ~45 routes directly on the aiohttp event loop. File syscalls release the
+# workers. Direct project route I/O also runs in workers. File syscalls release the
 # GIL, so concurrent read/replace on the single `project.json` collide on Windows
 # (WinError 5 on os.replace, Errno 13 on the version-check open). This lock makes the
 # read-version-check → tmp-write → atomic_replace a true compare-and-swap. It is a
 # deliberate, scoped override of the former "no inter-thread lock" stance (see
 # `atomic_io.py` and durable_rules): the bounded retry alone failed under
-# editor-concurrent-with-render load. Held only around one uncontended save (low-ms,
-# since serializing our own writers means os.replace succeeds first try) — never across
-# the notify hooks — so the event loop is not stalled (route-blocking threshold is 0.5s).
+# editor-concurrent-with-render load. Held around one save — never across notify
+# hooks. Automatic component migration can hold it for seconds, so HTTP readers
+# as well as writers must wait off the event loop (blocking threshold is 0.5s).
 # Keyed by the canonicalized path so the output→Images symlink's two spellings (and any
 # `.`/case variance) map to ONE lock; otherwise the gate would not actually serialize.
 _PROJECT_WRITE_LOCKS: dict[str, threading.Lock] = {}
@@ -206,7 +206,13 @@ def create_project(
         template_id=template_id or "free",
     )
 
-    save_project(project)
+    try:
+        save_project(project, expected_absent=True)
+    except ProjectVersionConflict:
+        # Another creator won after the existence check. It owns this folder;
+        # never overwrite its new project with our independently minted ids.
+        project = load_project(project_dir)
+        return (project, False) if return_created else project
     logger.info("Created project '%s' at %s", name, project_dir)
     return (project, True) if return_created else project
 
@@ -217,6 +223,7 @@ def save_project(
     expected_modified_at: str | None = None,
     bump_modified_at: bool = True,
     notify: bool = True,
+    expected_absent: bool = False,
 ) -> None:
     project_file = os.path.join(project.project_dir, "project.json")
     if expected_modified_at is None:
@@ -227,6 +234,12 @@ def save_project(
     # lock (below) — they broadcast / schedule cross-thread work and must not be held.
     with _project_write_lock(project.project_dir):
         current_data = None
+        if expected_absent and os.path.exists(project_file):
+            current_data = _read_project_json(project_file)
+            raise ProjectVersionConflict(
+                project_dir=project.project_dir, expected_modified_at="",
+                actual_modified_at=str(current_data.get("modified_at", "") or ""),
+                current_data=project_conflict_projection(current_data))
         if expected_modified_at:
             if os.path.isfile(project_file):
                 current_data = _read_project_json(project_file, version_source=project)
@@ -327,12 +340,16 @@ def save_project(
                             # old content identity and must not acquire new CAS
                             # authority merely through an unrelated save.
                             asset._generation_descriptor = {
-                                "path": f"state/{project_storage.asset_component_name(asset.asset_id)}-{cold_hash}.json",
+                                "path": project_storage.component_relative_path(
+                                    project_storage.asset_component_name(asset.asset_id), cold_hash,
+                                    data["storage"]["format_version"]),
                                 "sha256": cold_hash, "bytes": len(cold_bytes)}
                             asset._generation_original = copy.deepcopy(asset.generation_params)
                             asset._generation_project_dir = project.project_dir
                             continue
-                    if (prior_descriptor is not None and prior_descriptor != descriptor
+                    if (prior_descriptor is not None
+                            and (prior_descriptor["sha256"], prior_descriptor["bytes"])
+                                != (descriptor["sha256"], descriptor["bytes"])
                             and (getattr(asset, "_generation_unhydrated", False)
                                  or asset.generation_params == getattr(asset, "_generation_original", None))):
                         # Adoption of an undeclared disk component does not

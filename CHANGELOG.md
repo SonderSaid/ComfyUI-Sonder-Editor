@@ -12,6 +12,8 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Changed
+- Durable components use shorter full-hash filenames (storage format 3); format-2 projects migrate automatically on their next version-bumping save. Newly migrated projects cannot be opened by 0.5.0 or earlier. Format-1 projects retain their format until a history edit, then migrate on the following save.
+- Project route reads and saves run off the event loop, including the first automatic component migration.
 - Eligible Undo and Redo actions update the timeline after the history token arrives, before the restore finishes; failed predictions reconcile safely.
 
 ### Fixed

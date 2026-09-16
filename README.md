@@ -362,6 +362,15 @@ It includes four scenes with their media, prompts, guides, and generated takes.
 
 ## Troubleshooting
 
+**An older Sonder version refuses a project saved by a newer one.**
+This version stores durable components under shorter full-hash filenames.
+Format-2 projects migrate automatically on their next version-bumping save;
+reading a project does not migrate it. Once migrated to storage format 3,
+the project requires this version or newer. Keep the complete project folder, including
+`state/`, when moving it. Shorter paths prevent future path-length failures;
+they cannot repair a project that already fails to open at its current location.
+Use a shallower folder to open and migrate such a project first.
+
 **The Editor is blank or shows raw controls after installing through Manager.**
 After Manager finishes restarting ComfyUI, refresh the browser page as well
 (`F5` or `Ctrl+R`). A backend restart can leave the open page without the

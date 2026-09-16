@@ -139,7 +139,7 @@ def storage_of(data):
     storage = data["storage"]
     if (not isinstance(storage, dict)
             or type(storage.get("format_version")) is not int
-            or storage["format_version"] not in (1, 2)
+            or storage["format_version"] not in (1, 2, 3)
             or not isinstance(storage.get("components"), dict)):
         raise ProjectStorageError("Unsupported or malformed project storage format")
     if "prompt_history" not in storage["components"]:
@@ -166,8 +166,11 @@ def descriptor_path(project_dir, name, descriptor, *, state_root=None):
     if (not re.fullmatch(r"prompt_history|history_entry|(?:queue|provenance)_[0-9a-f]{64}", name)
             or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
             or type(count) is not int or count < 0
-            or path != f"state/{name}-{digest}.json"):
+            or path not in (f"state/{digest}.json", f"state/{name}-{digest}.json")):
         raise ProjectStorageError(f"{name}: invalid component path, hash, or byte length")
+    # Legacy spelling expires only after the maintainer inventory (including
+    # retained manifests) has migrated and every rebase/CAS consumer is
+    # path-insensitive, so stale in-process readers no longer need this form.
     if state_root is not None:
         return os.path.join(state_root, path[6:])
     resolved = project_state_path(project_dir, path)
@@ -176,7 +179,7 @@ def descriptor_path(project_dir, name, descriptor, *, state_root=None):
     return resolved
 
 
-def read_component(project_dir, name, descriptor, *, state_root=None, state_entries=None):
+def _read_component_bytes(project_dir, name, descriptor, *, state_root=None, state_entries=None):
     path = descriptor_path(project_dir, name, descriptor, state_root=state_root)
     if state_entries is not None:
         info = state_entries.get(os.path.basename(path))
@@ -192,6 +195,12 @@ def read_component(project_dir, name, descriptor, *, state_root=None, state_entr
         raise ProjectStorageError(f"{name}: component byte length mismatch")
     if hashlib.sha256(payload).hexdigest() != descriptor["sha256"]:
         raise ProjectStorageError(f"{name}: component SHA-256 mismatch")
+    return payload
+
+
+def read_component(project_dir, name, descriptor, *, state_root=None, state_entries=None):
+    payload = _read_component_bytes(project_dir, name, descriptor,
+                                    state_root=state_root, state_entries=state_entries)
     try:
         return json.loads(payload)
     except (ValueError, UnicodeError) as exc:
@@ -229,16 +238,30 @@ def publish_bytes(path, payload):
                 pass
 
 
-def publish_component(project_dir, name, value):
-    payload = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+def component_relative_path(name, digest, format_version):
+    if format_version not in (1, 2, 3):
+        raise ProjectStorageError("Unsupported component publication format")
+    return f"state/{digest}.json" if format_version == 3 else f"state/{name}-{digest}.json"
+
+
+def _publish_component_bytes(project_dir, name, payload, *, format_version):
+    """One verify-if-exists authority for serialized and byte-exact publication."""
     digest = hashlib.sha256(payload).hexdigest()
-    descriptor = {"path": f"state/{name}-{digest}.json", "sha256": digest, "bytes": len(payload)}
+    descriptor = {"path": component_relative_path(name, digest, format_version),
+                  "sha256": digest, "bytes": len(payload)}
     path = descriptor_path(project_dir, name, descriptor)
     if os.path.exists(path):
         read_component(project_dir, name, descriptor)
     else:
         publish_bytes(path, payload)
     return descriptor
+
+
+def publish_component(project_dir, name, value, *, format_version=2):
+    # Legacy default supports explicit old-format fixtures/tools. Save assembly
+    # always supplies the document format; remove with the legacy reader.
+    payload = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return _publish_component_bytes(project_dir, name, payload, format_version=format_version)
 
 
 def validate_storage(project_dir, data):
@@ -291,7 +314,7 @@ def _read_history_component(project_dir, descriptor, format_version=None, *, rea
     value = read("prompt_history", descriptor)
     # Maintainer format-1 projects remain readable until their next history write.
     # Remove this branch only once that inventory has migrated to indexed history.
-    if isinstance(value, list) and format_version != 2:
+    if isinstance(value, list) and (format_version or 0) < 2:
         return value, []
     if (format_version == 1 or not isinstance(value, dict)
             or value.get("kind") != "prompt_history_index"
@@ -302,12 +325,31 @@ def _read_history_component(project_dir, descriptor, format_version=None, *, rea
     return [read("history_entry", entry) for entry in entries], entries
 
 
-def publish_history(project_dir, history):
+def publish_history(project_dir, history, *, format_version=2):
     if not isinstance(history, list):
         raise ProjectStorageError("prompt_history: expected a history list")
-    entries = [publish_component(project_dir, "history_entry", entry) for entry in history]
+    entries = [publish_component(project_dir, "history_entry", entry, format_version=format_version)
+               for entry in history]
     return publish_component(project_dir, "prompt_history", {
-        "kind": "prompt_history_index", "schema_version": 1, "entries": entries})
+        "kind": "prompt_history_index", "schema_version": 1, "entries": entries},
+        format_version=format_version)
+
+
+def _repack_components(project_dir, components):
+    """Copy 2→3 after CAS, leaving old bytes and retained manifests untouched."""
+    for name, descriptor in list(components.items()):
+        if name == "prompt_history":
+            index = read_component(project_dir, name, descriptor)
+            # Only the index changes content. Preserve unknown index/descriptor
+            # fields while replacing paths to byte-exact child publications.
+            for child in index["entries"]:
+                child.update(_publish_component_bytes(project_dir, "history_entry",
+                    _read_component_bytes(project_dir, "history_entry", child), format_version=3))
+            replacement = publish_component(project_dir, name, index, format_version=3)
+        else:
+            replacement = _publish_component_bytes(project_dir, name,
+                _read_component_bytes(project_dir, name, descriptor), format_version=3)
+        components[name] = {**descriptor, **replacement}
 
 
 def read_prompt_history(project_or_dir):
@@ -382,6 +424,7 @@ def assemble_for_save(project, data, current, *, bump_modified_at):
     has_history = isinstance(data.get("metadata"), dict) and "prompt_history" in data["metadata"]
     has_provenance = any(asset.get("generation_params") for asset in data.get("assets", []))
     migrate = old is None and bump_modified_at and (has_history or bool(staged) or bool(data.get("generation_queue")) or has_provenance)
+    repack = old is not None and old["format_version"] == 2 and bump_modified_at
     if old is None and not migrate:
         return data
     job_ids = [job.get("job_id") for job in data.get("generation_queue", [])]
@@ -392,7 +435,7 @@ def assemble_for_save(project, data, current, *, bump_modified_at):
         raise ProjectStorageError("Provenance storage requires unique nonempty asset ids")
     if old:
         validate_storage(project.project_dir, current)
-    storage = copy.deepcopy(old) if old else {"format_version": 2, "components": {}}
+    storage = copy.deepcopy(old) if old else {"format_version": 3, "components": {}}
     components = storage["components"]
     for name, (base, value) in staged.items():
         if components.get(name) != base:
@@ -400,13 +443,16 @@ def assemble_for_save(project, data, current, *, bump_modified_at):
                 expected_modified_at=str(project._raw_data.get("modified_at", "")),
                 actual_modified_at=str(current.get("modified_at", "")),
                 current_data=project_conflict_projection(current))
-    if migrate and current:
+    if (migrate or repack) and current:
         # Backup original bytes, not a reconstruction. It is permanent and is
         # verified before the first split document can become authoritative.
         with open(os.path.join(project.project_dir, "project.json"), "rb") as handle:
             legacy = handle.read()
         digest = hashlib.sha256(legacy).hexdigest()
-        backup = project_state_path(project.project_dir, f"legacy/project-{digest}.json")
+        # Keep the permanent root backup within the same path budget as a
+        # component. The former legacy/project-<hash>.json costs 15 extra chars.
+        # GC only sweeps component .json names; .bak and old legacy/ stay intact.
+        backup = project_state_path(project.project_dir, f"{digest}.bak")
         if not backup:
             raise ProjectStorageError("Legacy backup path is not contained")
         if not os.path.exists(backup):
@@ -418,13 +464,15 @@ def assemble_for_save(project, data, current, *, bump_modified_at):
     if migrate:
         components["prompt_history"] = publish_history(project.project_dir,
             staged["prompt_history"][1] if "prompt_history" in staged
-            else data.get("metadata", {}).get("prompt_history", []))
+            else data.get("metadata", {}).get("prompt_history", []),
+            format_version=storage["format_version"])
     for name, (_, value) in staged.items():
         if name != "prompt_history":
             raise ProjectStorageError(f"Unsupported staged component: {name}")
         if not migrate:
-            components[name] = publish_history(project.project_dir, value)
-        storage["format_version"] = 2
+            components[name] = publish_history(project.project_dir, value,
+                format_version=storage["format_version"])
+        storage["format_version"] = max(storage["format_version"], 2)
     split_queue = bump_modified_at or "queue" in storage.get("partitions", [])
     if split_queue:
         jobs_by_id = {job.job_id: job for job in project.generation_queue}
@@ -443,7 +491,8 @@ def assemble_for_save(project, data, current, *, bump_modified_at):
                 if not bump_modified_at:
                     raise ProjectStorageError("A no-bump save cannot stage queue snapshots")
                 if name not in components:
-                    components[name] = publish_component(project.project_dir, name, payload)
+                    components[name] = publish_component(project.project_dir, name, payload,
+                        format_version=storage["format_version"])
         for name in list(components):
             if name.startswith("queue_") and name not in queue_names:
                 del components[name]
@@ -482,7 +531,8 @@ def assemble_for_save(project, data, current, *, bump_modified_at):
                         # A stale legacy model has not declared a replacement
                         # for a descriptor that only appeared after it loaded.
                         if base is not None or base_known or name not in components:
-                            components[name] = publish_component(project.project_dir, name, cold)
+                            components[name] = publish_component(project.project_dir, name, cold,
+                                format_version=storage["format_version"])
                     elif base is not None or base_known:
                         components.pop(name, None)
             record["generation_params"] = {key: value for key, value in params.items()
@@ -509,10 +559,15 @@ def assemble_for_save(project, data, current, *, bump_modified_at):
             raise ProjectStorageError("Prompt history must be explicitly staged")
     if isinstance(data.get("metadata"), dict):
         data["metadata"].pop("prompt_history", None)
+    if repack:
+        _repack_components(project.project_dir, components)
+        storage["format_version"] = 3
     storage["recovery_previous"] = previous
     if bump_modified_at:
         storage["authoring_previous"] = previous
     data["storage"] = storage
+    if repack:
+        validate_storage(project.project_dir, data)
     return data
 
 
@@ -548,7 +603,7 @@ def collect_unreferenced_components(project_dir):
         root = project_state_root(project_dir, must_exist=True)
         removed = []
         for entry in os.scandir(root):
-            if not re.fullmatch(r"(?:prompt_history|history_entry|(?:queue|provenance)_[0-9a-f]{64})-[0-9a-f]{64}\.json", entry.name):
+            if not re.fullmatch(r"(?:(?:prompt_history|history_entry|(?:queue|provenance)_[0-9a-f]{64})-)?[0-9a-f]{64}\.json", entry.name):
                 continue
             path = project_state_path(project_dir, entry.name)
             if path and path not in keep and entry.is_file(follow_symlinks=False):

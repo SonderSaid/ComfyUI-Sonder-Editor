@@ -111,7 +111,7 @@ def test_history_migration_backup_and_roundtrip(tmp_path):
     assert "prompt_history" not in data["metadata"]
     assert data["metadata"]["other"] == expected["other"]
     assert ps.read_prompt_history(pm.load_project(project.project_dir)) == expected["prompt_history"]
-    backups = list((path.parent / "state" / "legacy").glob("*.json"))
+    backups = list((path.parent / "state").glob("*.bak"))
     assert len(backups) == 1
     assert backups[0].read_bytes() == original
 
@@ -209,7 +209,7 @@ def test_gc_keeps_current_previous_and_permanent_legacy_backup(tmp_path):
     removed = ps.collect_unreferenced_components(project.project_dir)
     assert removed
     assert ps.read_prompt_history(project.project_dir) == [{"hash": "3"}]
-    assert list((path.parent / "state" / "legacy").glob("*.json"))
+    assert list((path.parent / "state").glob("*.bak"))
     data = json.loads(path.read_bytes())
     for descriptor in data["storage"]["recovery_previous"].values():
         assert (path.parent / descriptor["path"]).is_file()
@@ -337,8 +337,8 @@ def test_crash_after_each_queue_publication_keeps_legacy_root(tmp_path, monkeypa
     before = path.read_bytes()
     publish = ps.publish_component
     published = []
-    def publish_then_crash(project_dir, name, value):
-        descriptor = publish(project_dir, name, value)
+    def publish_then_crash(project_dir, name, value, **kwargs):
+        descriptor = publish(project_dir, name, value, **kwargs)
         if name.startswith("queue_"):
             published.append(descriptor)
             if len(published) == fail_after:
@@ -473,3 +473,83 @@ def test_provenance_marker_cannot_be_reinterpreted_without_partition(tmp_path):
     with pytest.raises(ps.ProjectStorageError, match="marker requires"):
         pm.save_project(project, notify=False)
     assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("fast", [False, True])
+@pytest.mark.parametrize("spelling", ["short", "legacy"])
+def test_descriptor_spelling_binds_digest_and_name(tmp_path, fast, spelling):
+    digest = "a" * 64
+    name = ps.asset_component_name("asset")
+    relative = f"state/{digest}.json" if spelling == "short" else f"state/{name}-{digest}.json"
+    descriptor = {"path": relative, "sha256": digest, "bytes": 0}
+    root = tmp_path / "state"
+    root.mkdir()
+    kwargs = {"state_root": str(root)} if fast else {}
+    assert Path(ps.descriptor_path(str(tmp_path), name, descriptor, **kwargs)) == tmp_path / relative
+    for invalid in (f"state/{'b' * 64}.json", "../escape.json", f"state/nested/{digest}.json",
+                    str(tmp_path / 'outside.json'), f"state/{digest}.txt", "state/CON.json",
+                    f"state/{ps.asset_component_name('other')}-{digest}.json"):
+        with pytest.raises(ps.ProjectStorageError):
+            ps.descriptor_path(str(tmp_path), name, {**descriptor, "path": invalid}, **kwargs)
+
+
+def _rewrite_components_short(project_dir, raw):
+    """Test-only conversion independent of the production writer/migration."""
+    import hashlib
+    components = raw["storage"]["components"]
+    for name, descriptor in list(components.items()):
+        payload = (Path(project_dir) / descriptor["path"]).read_bytes()
+        if name == "prompt_history":
+            index = json.loads(payload)
+            for child in index["entries"]:
+                child_bytes = (Path(project_dir) / child["path"]).read_bytes()
+                child["path"] = f"state/{child['sha256']}.json"
+                (Path(project_dir) / child["path"]).write_bytes(child_bytes)
+            payload = json.dumps(index).encode()
+        digest = hashlib.sha256(payload).hexdigest()
+        replacement = {"path": f"state/{digest}.json", "sha256": digest, "bytes": len(payload)}
+        (Path(project_dir) / replacement["path"]).write_bytes(payload)
+        components[name] = replacement
+    raw["storage"]["format_version"] = 3
+
+
+def test_format_three_reader_and_mixed_retention_gc(tmp_path):
+    from test_component_migration import stored_project
+    project, path, history = stored_project(tmp_path)
+    raw = json.loads(path.read_bytes())
+    legacy = copy.deepcopy(raw["storage"]["components"])
+    raw["storage"]["recovery_previous"] = copy.deepcopy(legacy)
+    raw["storage"]["authoring_previous"] = copy.deepcopy(legacy)
+    _rewrite_components_short(project.project_dir, raw)
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    loaded = pm.load_project(project.project_dir)
+    assert loaded.assets[0].generation_params["prompt"] == "original a"
+    assert ps.read_prompt_history(loaded) == history
+    orphan = path.parent / "state" / ("f" * 64 + ".json")
+    orphan.write_bytes(b"orphan")
+    unknown = path.parent / "state" / "unknown.json"
+    unknown.write_bytes(b"keep")
+    assert ps.collect_unreferenced_components(project.project_dir) == [orphan.name]
+    assert unknown.exists()
+    assert all((path.parent / item["path"]).exists() for item in legacy.values())
+    raw["storage"]["format_version"] = 99
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(ps.ProjectStorageError, match="Unsupported"):
+        pm.load_project(project.project_dir)
+
+
+def test_format_one_history_reader_and_gc(tmp_path):
+    project, path = legacy_project(tmp_path)
+    history = ps.read_prompt_history(project)
+    pm.save_project(project, notify=False)
+    raw = json.loads(path.read_bytes())
+    raw["storage"]["format_version"] = 1
+    raw["storage"]["components"]["prompt_history"] = ps.publish_component(project.project_dir, "prompt_history", history)
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    loaded = pm.load_project(project.project_dir)
+    assert ps.read_prompt_history(loaded) == history
+    ps.collect_unreferenced_components(project.project_dir)
+    raw["storage"]["format_version"] = 3
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(ps.ProjectStorageError, match="history index"):
+        pm.load_project(project.project_dir)

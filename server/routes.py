@@ -9223,7 +9223,7 @@ if routes is not None:
         base_dir = _configured_base_dir()
         if not base_dir:
             return _json_error("base_dir required", 400)
-        projects = list_projects(base_dir)
+        projects = await asyncio.to_thread(list_projects, base_dir)
         return web.json_response({"projects": projects})
 
     @routes.get("/sonder-editor/project/{project_id}")
@@ -9254,7 +9254,7 @@ if routes is not None:
     async def api_verify_prompt_context_profile_create(request: web.Request) -> web.Response:
         """Read-only exact-definition recovery after an uncertain immutable create."""
         try:
-            project = _load_project_from_request(
+            project = await asyncio.to_thread(_load_project_from_request, 
                 request, repair_missing_frames=False, version_checked=False)
             attempted = _normalize_prompt_context_profile_create(project, await request.json())
         except FileNotFoundError as exc:
@@ -9394,7 +9394,7 @@ if routes is not None:
         if not base_dir:
             return _json_error("base_dir is required", 400)
 
-        try:
+        def create_configured_project():
             project, was_created = create_project(
                 name, fps, width, height, template_id, base_dir,
                 return_created=True)
@@ -9409,8 +9409,16 @@ if routes is not None:
                     prompt_channel_templates.project_template_value(channel_template))
                 changed = True
             if changed:
-                save_project(project)
+                save_project(project, expected_modified_at=project.modified_at)
+            return project
+
+        try:
+            # Cancellation cannot strand a newly created root between creation
+            # and requested initialization; the complete worker owns both.
+            project = await asyncio.to_thread(create_configured_project)
             return web.json_response(project.to_dict(), status=201)
+        except ProjectVersionConflict:
+            raise
         except Exception as e:
             logger.exception("Failed to create project")
             return _json_error(str(e), 500)
@@ -9418,7 +9426,7 @@ if routes is not None:
     @routes.put("/sonder-editor/project/{project_id}")
     async def api_update_project(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -9521,7 +9529,7 @@ if routes is not None:
                 _release_incompatible_scene_profiles(project, nxt)
             project.metadata.update(incoming)
 
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
         return web.json_response(project.to_dict())
 
     @routes.post("/sonder-editor/project/{project_id}/reveal")
@@ -9532,7 +9540,7 @@ if routes is not None:
         project_dir = _direct_project_dir_from_request(request)
         if not project_dir:
             try:
-                project = _load_project_from_request(request)
+                project = await asyncio.to_thread(_load_project_from_request, request)
                 project_dir = getattr(project, "project_dir", "") or ""
             except FileNotFoundError as e:
                 return _json_error(str(e), 404)
@@ -9550,7 +9558,7 @@ if routes is not None:
     @routes.post("/sonder-editor/project/{project_id}/render_timeline")
     async def api_start_render_timeline(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -9801,7 +9809,7 @@ if routes is not None:
     async def api_list_dormant_assets(request: web.Request) -> web.Response:
         """List lightweight asset data without scanning/syncing media folders."""
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -9888,7 +9896,7 @@ if routes is not None:
             return _json_error("Content-Type must be application/json or multipart/form-data", 415)
 
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -9959,7 +9967,7 @@ if routes is not None:
             asset.folder = _normalize_asset_folder(body["folder"])
             _ensure_asset_folder(project, asset.folder)
         project.add_asset(asset)
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
 
         if asset_type in {"video", "image", "audio"}:
             thumb_path = _asset_thumbnail_path(project, asset)
@@ -9971,7 +9979,7 @@ if routes is not None:
     @routes.post("/sonder-editor/project/{project_id}/assets/folders")
     async def api_create_asset_folder(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -9985,13 +9993,13 @@ if routes is not None:
             return _json_error("Folder name required", 400)
 
         _ensure_asset_folder(project, folder)
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
         return web.json_response({"folders": _collect_asset_folders(project)})
 
     @routes.put("/sonder-editor/project/{project_id}/assets/folders")
     async def api_rename_asset_folder(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10013,13 +10021,13 @@ if routes is not None:
         except ValueError as e:
             return _json_error(str(e), 400)
 
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
         return web.json_response({"folders": folders, "assets_moved": assets_moved})
 
     @routes.delete("/sonder-editor/project/{project_id}/assets/folders")
     async def api_delete_asset_folder(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10063,7 +10071,7 @@ if routes is not None:
         except OSError as e:
             return _json_error(str(e), 500)
 
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
         return web.json_response({
             "trashed_folder": _normalize_asset_folder(folder),
             "trashed_assets": len(trashed_assets),
@@ -10073,7 +10081,7 @@ if routes is not None:
     async def api_viewport_snapshot_asset(request: web.Request) -> web.Response:
         """Register a browser-captured viewport source-frame snapshot as an image asset."""
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10150,7 +10158,7 @@ if routes is not None:
                 generation_params=generation_params,
             )
             project.add_asset(asset)
-            save_project(project)
+            await asyncio.to_thread(save_project, project)
 
             thumb_path = _asset_thumbnail_path(project, asset)
             if thumb_path:
@@ -10164,7 +10172,7 @@ if routes is not None:
     async def api_extract_frame(request: web.Request) -> web.Response:
         """Extract a single video frame and save as an image asset."""
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10238,7 +10246,7 @@ if routes is not None:
                 },
             )
             project.add_asset(asset)
-            save_project(project)
+            await asyncio.to_thread(save_project, project)
 
             # Generate thumbnail
             thumb_path = _asset_thumbnail_path(project, asset)
@@ -10256,7 +10264,7 @@ if routes is not None:
     @routes.put("/sonder-editor/project/{project_id}/assets/bulk-move")
     async def api_bulk_move_assets(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10279,13 +10287,13 @@ if routes is not None:
         for asset in assets:
             asset.folder = folder
 
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
         return web.json_response({"updated": len(assets)})
 
     @routes.post("/sonder-editor/project/{project_id}/assets/bulk-usages")
     async def api_bulk_asset_usages(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10306,7 +10314,7 @@ if routes is not None:
     @routes.post("/sonder-editor/project/{project_id}/assets/bulk-delete")
     async def api_bulk_delete_assets(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10347,7 +10355,7 @@ if routes is not None:
                 trashed_ids.append(asset.asset_id)
         except ValueError as e:
             return _json_error(str(e), 400)
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
         return web.json_response({
             "trashed": trashed_ids,
         })
@@ -10355,7 +10363,7 @@ if routes is not None:
     @routes.post("/sonder-editor/project/{project_id}/assets/restore")
     async def api_restore_asset(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10373,7 +10381,7 @@ if routes is not None:
             return _json_error(f"Asset not found: {asset_id}", 404)
 
         payload = _restore_project_asset(project, asset)
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
         return web.json_response({
             **payload,
             "asset": _asset_payload(project, asset),
@@ -10382,7 +10390,7 @@ if routes is not None:
     @routes.post("/sonder-editor/project/{project_id}/assets/bulk-restore")
     async def api_bulk_restore_assets(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10403,13 +10411,13 @@ if routes is not None:
             _restore_project_asset(project, asset)
             restored_ids.append(asset.asset_id)
 
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
         return web.json_response({"restored": restored_ids})
 
     @routes.post("/sonder-editor/project/{project_id}/assets/permanent")
     async def api_permanent_delete_asset(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10450,14 +10458,14 @@ if routes is not None:
         except OSError as e:
             return _json_error(str(e), 500)
 
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
         payload.update(reference_cleanup)
         return web.json_response(payload)
 
     @routes.post("/sonder-editor/project/{project_id}/assets/bulk-permanent-delete")
     async def api_bulk_permanent_delete_assets(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10504,7 +10512,7 @@ if routes is not None:
         except OSError as e:
             return _json_error(str(e), 500)
 
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
         return web.json_response({
             "deleted": deleted_ids,
             "usages_orphaned": usage["usage_count"],
@@ -10514,7 +10522,7 @@ if routes is not None:
     @routes.post("/sonder-editor/project/{project_id}/assets/empty-trash")
     async def api_empty_asset_trash(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10542,7 +10550,7 @@ if routes is not None:
         except OSError as e:
             return _json_error(str(e), 500)
 
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
         return web.json_response({
             "deleted": deleted_ids,
             "emptied": len(deleted_ids),
@@ -10553,7 +10561,7 @@ if routes is not None:
     async def api_update_asset(request: web.Request) -> web.Response:
         """Update asset properties (e.g. name)."""
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10575,13 +10583,13 @@ if routes is not None:
         if "favorite" in body:
             asset.favorite = bool(body["favorite"])
 
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
         return web.json_response(_asset_payload(project, asset))
 
     @routes.get("/sonder-editor/project/{project_id}/assets/{asset_id}/workflow")
     async def api_get_asset_workflow(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10598,7 +10606,7 @@ if routes is not None:
     @routes.get("/sonder-editor/project/{project_id}/assets/{asset_id}/usages")
     async def api_get_asset_usages(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10612,7 +10620,7 @@ if routes is not None:
     @routes.delete("/sonder-editor/project/{project_id}/assets/{asset_id}")
     async def api_delete_asset(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10649,7 +10657,7 @@ if routes is not None:
             payload = _trash_project_asset(project, asset)
         except ValueError as e:
             return _json_error(str(e), 400)
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
         return web.json_response(payload)
 
     @routes.post("/sonder-editor/project/{project_id}/assets/{asset_id}/replace")
@@ -10756,7 +10764,7 @@ if routes is not None:
             return _json_error("Content-Type must be application/json or multipart/form-data", 415)
 
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10793,7 +10801,7 @@ if routes is not None:
                     thumb_path,
                 )
 
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
         return web.json_response({
             "asset": _asset_payload(project, asset),
             "usage": _find_asset_usages(project, asset),
@@ -10811,7 +10819,7 @@ if routes is not None:
             return fast_response
 
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10862,7 +10870,7 @@ if routes is not None:
             return fast_response
 
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10909,7 +10917,7 @@ if routes is not None:
             return fast_response
 
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10959,7 +10967,7 @@ if routes is not None:
     @routes.post("/sonder-editor/project/{project_id}/scenes")
     async def api_create_scene(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10974,14 +10982,14 @@ if routes is not None:
             prompt=body.get("prompt", ""),
         )
         project.add_scene(scene)
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
 
         return web.json_response(scene.to_dict(), status=201)
 
     @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/duplicate")
     async def api_duplicate_scene(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -11039,13 +11047,13 @@ if routes is not None:
 
         new_scene = Scene.from_dict(payload)
         project.add_scene(new_scene)
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
         return web.json_response(new_scene.to_dict(), status=201)
 
     @routes.get("/sonder-editor/project/{project_id}/scenes/{scene_id}")
     async def api_get_scene(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -11059,7 +11067,7 @@ if routes is not None:
     @routes.put("/sonder-editor/project/{project_id}/scenes/{scene_id}")
     async def api_update_scene(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -11137,7 +11145,7 @@ if routes is not None:
         except ProjectMutationRequestError as e:
             return _mutation_json_error(e)
 
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
         return web.json_response(scene.to_dict())
 
     @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/mutations")
@@ -11169,7 +11177,7 @@ if routes is not None:
     @routes.delete("/sonder-editor/project/{project_id}/scenes/{scene_id}")
     async def api_delete_scene(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -11177,7 +11185,7 @@ if routes is not None:
         if not project.remove_scene(scene_id):
             return _json_error(f"Scene not found: {scene_id}", 404)
 
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
         return web.json_response({"status": "deleted"})
 
     # -----------------------------------------------------------------------
@@ -11187,7 +11195,7 @@ if routes is not None:
     @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/restore-token")
     async def api_issue_scene_restore_token(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(
+            project = await asyncio.to_thread(_load_project_from_request, 
                 request, repair_missing_frames=False, version_checked=False)
         except FileNotFoundError as exc:
             return _json_error(str(exc), 404)
@@ -11203,7 +11211,7 @@ if routes is not None:
     @routes.get("/sonder-editor/project/{project_id}/scenes/{scene_id}/restore-token/{token}")
     async def api_get_scene_restore_token(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(
+            project = await asyncio.to_thread(_load_project_from_request, 
                 request, repair_missing_frames=False, version_checked=False)
         except FileNotFoundError as exc:
             return _json_error(str(exc), 404)
@@ -11233,7 +11241,7 @@ if routes is not None:
     async def api_restore_scene(request: web.Request) -> web.Response:
         """Three-way merge a scene history reversal onto current durable state."""
         try:
-            project = _load_project_from_request(
+            project = await asyncio.to_thread(_load_project_from_request, 
                 request, repair_missing_frames=False, version_checked=False)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
@@ -11369,7 +11377,7 @@ if routes is not None:
                 project, token, project_id, scene_id)
             base_modified_at = str(getattr(project, "modified_at", "") or "")
             try:
-                save_project(project, expected_modified_at=base_modified_at)
+                await asyncio.to_thread(save_project, project, expected_modified_at=base_modified_at)
             except ProjectVersionConflict as exc:
                 if attempt >= 2:
                     payload = {
@@ -11382,7 +11390,8 @@ if routes is not None:
                     _SCENE_RESTORE_RECEIPTS.finish(
                         token, project_id, scene_id, status="refused", payload=payload)
                     raise
-                project = load_project(str(getattr(project, "project_dir", "") or ""))
+                project = await asyncio.to_thread(load_project, str(getattr(project, "project_dir", "") or ""))
+                _remember_request_project(request, project)
                 continue
 
             payload = {"scene": merged_scene.to_dict(), "restore_token": token}
@@ -11403,7 +11412,7 @@ if routes is not None:
     @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/guides")
     async def api_add_guide(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -11424,7 +11433,7 @@ if routes is not None:
         except ProjectMutationRequestError as e:
             return _mutation_json_error(e)
 
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
         return web.json_response(guide.to_dict(), status=201)
 
     @routes.get("/sonder-editor/project/{project_id}/scenes/{scene_id}/bridge-guides")
@@ -12149,7 +12158,7 @@ if routes is not None:
     @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/guides/swap")
     async def api_swap_guides(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -12186,13 +12195,13 @@ if routes is not None:
 
         guide_a.frame_index, guide_b.frame_index = frame_b, frame_a
         scene.guide_frames.sort(key=lambda g: g.frame_index)
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
         return web.json_response({"guides": [guide_a.to_dict(), guide_b.to_dict()]})
 
     @routes.patch("/sonder-editor/project/{project_id}/scenes/{scene_id}/guides/{frame_index}")
     async def api_update_guide(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -12222,13 +12231,13 @@ if routes is not None:
         except ProjectMutationRequestError as e:
             return _mutation_json_error(e)
 
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
         return web.json_response(guide.to_dict())
 
     @routes.delete("/sonder-editor/project/{project_id}/scenes/{scene_id}/guides/{frame_index}")
     async def api_delete_guide(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -12245,7 +12254,7 @@ if routes is not None:
         except ProjectMutationRequestError as e:
             return _mutation_json_error(e)
 
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
         return web.json_response({"status": "deleted"})
 
     # -----------------------------------------------------------------------
@@ -12255,7 +12264,7 @@ if routes is not None:
     @routes.delete("/sonder-editor/project/{project_id}/scenes/{scene_id}/clips/{clip_id}")
     async def api_delete_clip(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -12284,13 +12293,13 @@ if routes is not None:
         if should_compact_lane:
             _compact_empty_media_lane(scene, "video", deleted_lane)
 
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
         return web.json_response({"status": "deleted"})
 
     @routes.put("/sonder-editor/project/{project_id}/scenes/{scene_id}/clips/{clip_id}")
     async def api_update_clip(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -12313,14 +12322,14 @@ if routes is not None:
         except ProjectMutationRequestError as e:
             return _mutation_json_error(e)
 
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
         return web.json_response(clip.to_dict())
 
     @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/clips/{clip_id}/split")
     async def api_split_clip(request: web.Request) -> web.Response:
         """Split a clip at a given frame into two clips."""
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -12349,7 +12358,7 @@ if routes is not None:
             )
         except ProjectMutationRequestError as e:
             return _mutation_json_error(e)
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
 
         if body.get("apply_linked"):
             return web.json_response({"scene": scene.to_dict(), **result})
@@ -12364,7 +12373,7 @@ if routes is not None:
     @routes.delete("/sonder-editor/project/{project_id}/scenes/{scene_id}/audio_tracks/{track_id}")
     async def api_delete_audio_track(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -12393,13 +12402,13 @@ if routes is not None:
         if should_compact_lane:
             _compact_empty_media_lane(scene, "audio", deleted_lane)
 
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
         return web.json_response({"status": "deleted"})
 
     @routes.put("/sonder-editor/project/{project_id}/scenes/{scene_id}/audio_tracks/{track_id}")
     async def api_update_audio_track(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -12448,14 +12457,14 @@ if routes is not None:
         if "lane_index" in body:
             track.lane_index = int(body["lane_index"])
 
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
         return web.json_response(track.to_dict())
 
     @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/audio_tracks/{track_id}/split")
     async def api_split_audio_track(request: web.Request) -> web.Response:
         """Split an audio track at a given frame into two tracks."""
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -12484,7 +12493,7 @@ if routes is not None:
             )
         except ProjectMutationRequestError as e:
             return _mutation_json_error(e)
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
 
         if body.get("apply_linked"):
             return web.json_response({"scene": scene.to_dict(), **result})
@@ -12499,7 +12508,7 @@ if routes is not None:
     @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/prompt_sections")
     async def api_add_prompt_section(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -12529,14 +12538,14 @@ if routes is not None:
             section = _apply_create_prompt_section(scene, body)
         except ProjectMutationRequestError as e:
             return _mutation_json_error(e)
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
 
         return web.json_response(section.to_dict(), status=201)
 
     @routes.put("/sonder-editor/project/{project_id}/scenes/{scene_id}/prompt_sections/{index}")
     async def api_update_prompt_section(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -12588,14 +12597,14 @@ if routes is not None:
                 body["global_channel_exceptions"])
 
         scene.prompt_sections.sort(key=lambda s: s.start_frame)
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
 
         return web.json_response(section.to_dict())
 
     @routes.delete("/sonder-editor/project/{project_id}/scenes/{scene_id}/prompt_sections/{index}")
     async def api_delete_prompt_section(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -12613,7 +12622,7 @@ if routes is not None:
         prompt_id = getattr(scene.prompt_sections[idx], "prompt_id", "")
         scene.prompt_sections.pop(idx)
         _rewrite_link_groups_for_deleted(scene, [_link_ref("prompt", prompt_id)])
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
 
         return web.json_response({"status": "deleted"})
 
@@ -12624,7 +12633,7 @@ if routes is not None:
     @routes.get("/sonder-editor/project/{project_id}/scenes/{scene_id}/saved_selections")
     async def api_list_saved_selections(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -12637,7 +12646,7 @@ if routes is not None:
     @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/saved_selections")
     async def api_add_saved_selection(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -12660,13 +12669,13 @@ if routes is not None:
             "mask_post_offset": _coerce_nonnegative_int(body.get("mask_post_offset", 0)),
         }
         scene.saved_selections.append(entry)
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
         return web.json_response({"index": len(scene.saved_selections) - 1, "entry": entry})
 
     @routes.put("/sonder-editor/project/{project_id}/scenes/{scene_id}/saved_selections/{index}")
     async def api_update_saved_selection(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -12698,13 +12707,13 @@ if routes is not None:
         if "mask_post_offset" in body:
             scene.saved_selections[idx]["mask_post_offset"] = _coerce_nonnegative_int(body["mask_post_offset"])
 
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
         return web.json_response(scene.saved_selections[idx])
 
     @routes.delete("/sonder-editor/project/{project_id}/scenes/{scene_id}/saved_selections/{index}")
     async def api_delete_saved_selection(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -12717,7 +12726,7 @@ if routes is not None:
             return _json_error("Selection index out of range", 404)
 
         scene.saved_selections.pop(idx)
-        save_project(project)
+        await asyncio.to_thread(save_project, project)
         return web.json_response({"status": "deleted"})
 
     # -----------------------------------------------------------------------

@@ -982,9 +982,9 @@ def test_failed_provenance_write_must_not_destroy_a_completed_export(tmp_path, m
     fired = []
     original = storage.publish_component
 
-    def fail_provenance(project_dir, name, value):
+    def fail_provenance(project_dir, name, value, **kwargs):
         if not name.startswith("provenance_"):
-            return original(project_dir, name, value)
+            return original(project_dir, name, value, **kwargs)
         fired.append(name)
         outputs = [p for p in (root / "media").rglob("*") if p.is_file() and p.name != "source.wav"]
         assert len(outputs) == (2 if mode == "take_av" else 1)

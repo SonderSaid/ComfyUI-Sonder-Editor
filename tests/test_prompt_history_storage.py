@@ -27,7 +27,10 @@ def test_changed_entry_publishes_only_entry_and_index(tmp_path, monkeypatch):
     ps.stage_prompt_history(p, history)
     pm.save_project(p, notify=False)
     assert len(written) == 2
-    assert {name.split("-")[0] for name, _ in written} == {"history_entry", "prompt_history"}
+    descriptor = p._raw_data["storage"]["components"]["prompt_history"]
+    index = ps.read_component(p.project_dir, "prompt_history", descriptor)
+    assert {name for name, _ in written} == {
+        Path(descriptor["path"]).name, Path(index["entries"][0]["path"]).name}
     assert sum(size for _, size in written) < len(json.dumps(history)) / 2
     assert ps.read_prompt_history(p.project_dir) == history
 
@@ -72,7 +75,9 @@ def test_history_publication_failure_preserves_root_and_shadow(tmp_path, monkeyp
     original = ps.publish_bytes
     def fail(path, data):
         original(path, data)
-        if (boundary == "entry" and Path(path).name.startswith("history_entry-")) or (boundary == "index" and Path(path).name.startswith("prompt_history-")):
+        value = json.loads(data)
+        is_index = isinstance(value, dict) and value.get("kind") == "prompt_history_index"
+        if (boundary == "entry" and not is_index) or (boundary == "index" and is_index):
             raise OSError("injected")
     monkeypatch.setattr(ps, "publish_bytes", fail)
     if boundary == "root":
