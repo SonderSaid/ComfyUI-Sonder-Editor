@@ -373,14 +373,31 @@ def save_project(
             setattr(project, "_expected_modified_at", getattr(project, "modified_at", ""))
         from .project_storage_lifecycle import pin_project
         pin_project(project)
-    # #36 diagnostic: every save with the caller's immediate stack frame so the diag ring
-    # shows WHO bumped modified_at. Pairs with `project_version_conflict_409` events to
-    # trace concurrent writers. Lazy import avoids circular dependency at module load.
+    # #36 diagnostic: every save with the frames that identify WHO bumped modified_at,
+    # to pair with `project_version_conflict_409` when tracing concurrent writers.
+    #
+    # Two fields, because one frame cannot answer it any more. `caller` is the immediate
+    # one and always has: off the pool it is the prompt worker or the bridge daemon, and
+    # on the pool it distinguishes the internal save paths that call save_project inline
+    # — `_save_versioned_sync_phase` saves at two different lines, and
+    # `_apply_project_versioned_sync` once per CAS attempt, which only the line number
+    # separates. But where `save_project` IS the submitted callable, that frame is only
+    # the pool's own runner in `concurrent/futures/thread.py`. `submitted_by` answers
+    # those, naming the route that queued the work; it is absent when there is no pool
+    # task, or when the submitter could not be attributed honestly. Lazy imports avoid a
+    # circular dependency at module load.
     try:
         from .session_registry import record_diag_event as _record_diag_event
+        from .project_storage_lifecycle import project_io_caller as _project_io_caller
         import sys as _sys
         _caller = _sys._getframe(1)
         _caller_info = f"{os.path.basename(_caller.f_code.co_filename)}:{_caller.f_lineno} {_caller.f_code.co_name}"
+        _submitted_by = {}
+        _submitter = _project_io_caller()
+        if _submitter:
+            _sub_file, _sub_line, _sub_name = _submitter
+            _submitted_by["submitted_by"] = (
+                f"{os.path.basename(_sub_file)}:{_sub_line} {_sub_name}")
         _canonical_project_id = str(getattr(project, "project_id", "") or "")
         _project_dir = str(getattr(project, "project_dir", "") or "")
         _folder_project_id = os.path.basename(os.path.normpath(_project_dir)) if _project_dir else ""
@@ -391,6 +408,7 @@ def save_project(
             modified_at=str(getattr(project, "modified_at", "") or ""),
             bumped=bool(bump_modified_at),
             caller=_caller_info,
+            **_submitted_by,
         )
     except Exception:
         logger.debug("save_project failed to emit diag event", exc_info=True)

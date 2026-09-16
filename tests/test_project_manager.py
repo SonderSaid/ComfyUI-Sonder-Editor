@@ -461,6 +461,11 @@ def test_save_project_diag_uses_folder_alias(monkeypatch):
         assert details["modified_at"] == project.modified_at
         assert details["bumped"] is True
         assert details["caller"]
+        # This save is on the calling thread, not the project pool, so `caller` is a real
+        # frame and there is no submitter to name. `submitted_by` is absent rather than
+        # empty: a present-but-blank field would read as "the pool could not identify
+        # it", which is a different and wrong claim about an off-pool save.
+        assert "submitted_by" not in details
 
 
 def test_load_project_missing():

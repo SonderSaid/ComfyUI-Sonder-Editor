@@ -2092,17 +2092,40 @@ export class EditorWidget {
 
         const dirName = this.projectDir.split(/[/\\]/).pop();
         try {
-            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${scene.scene_id}`), withEditorMutationDiagnostics({
-                method: "DELETE",
-            }, diagnostics));
+            // Versioned rather than a bare fetch: the server now refuses a delete
+            // whose document moved under it, and a bare fetch would discard that 409
+            // and repaint the row as if the delete had worked.
+            await this._runVersionedProjectMutation(
+                `/sonder-editor/project/${dirName}/scenes/${scene.scene_id}`,
+                withEditorMutationDiagnostics({ method: "DELETE" }, diagnostics),
+                { projectId: dirName });
+        } catch (e) {
+            console.warn("[Sonder] Failed to delete scene:", e);
+            this._notifyMutationRefusal(e, `Deleting "${scene.name}"`);
+            // Refused or failed: the row is still there, so resync rather than leaving
+            // the timeline showing a delete that did not happen.
+            await this._fetchScenes({
+                reason: "delete_scene_failed",
+                sceneHistoryLifecycleToken: lifecycleToken,
+            }).catch(() => {});
+            this._endSceneHistoryLifecycle(lifecycleToken);
+            return;
+        }
+        try {
+            // Outside the mutation's own try, the same way duplicate does it: past this
+            // point the delete has COMMITTED, so nothing here may be reported as a
+            // refusal. `_fetchScenes` swallows its own failures and returns false, so
+            // today this placement changes no message — it keeps the three gestures one
+            // shape and stops a future throwing refresh from being toasted as a refusal.
+            // The post-commit case that DOES reach the user is a lost answer from the
+            // mutation itself, and `_notifyMutationRefusal` is where that is classified.
+            //
             // _fetchScenes preserves the active scene when it still exists, so deleting a
             // non-active scene keeps the user in place; deleting the active one falls to scene 0.
             await this._fetchScenes({
                 reason: "delete_scene",
                 sceneHistoryLifecycleToken: lifecycleToken,
             });
-        } catch (e) {
-            console.warn("[Sonder] Failed to delete scene:", e);
         } finally {
             this._endSceneHistoryLifecycle(lifecycleToken);
         }
@@ -2122,19 +2145,36 @@ export class EditorWidget {
         if (isActive && !lifecycleToken) return;
         const dirName = this.projectDir.split(/[/\\]/).pop();
 
+        let newScene = null;
         try {
-            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${scene.scene_id}/duplicate`), withEditorMutationDiagnostics({
-                method: "POST",
-            }, diagnostics));
-
-            if (!resp.ok) return;
-            const newScene = await resp.json();
+            // `if (!resp.ok) return` used to swallow every refusal silently, so a
+            // duplicate that never happened was indistinguishable from one the user
+            // simply did not see. The versioned client raises instead.
+            const result = await this._runVersionedProjectMutation(
+                `/sonder-editor/project/${dirName}/scenes/${scene.scene_id}/duplicate`,
+                withEditorMutationDiagnostics({ method: "POST" }, diagnostics),
+                { projectId: dirName });
+            newScene = result?.payload;
+            // `parseResponsePayload` yields null for an empty body and the raw text for
+            // a non-JSON one, where `resp.json()` used to throw. Only the server can
+            // send this shape, but a proxy 2xx must not push a string into `scenes`.
+            if (!newScene || typeof newScene !== "object" || Array.isArray(newScene))
+                throw new Error("The server did not return the duplicated scene.");
+        } catch (e) {
+            console.warn("[Sonder] Failed to duplicate scene:", e);
+            // Nothing was painted optimistically, so there is nothing to roll back and
+            // no resync is owed — say so rather than promising a reload that never comes.
+            this._notifyMutationRefusal(e, `Duplicating "${scene.name}"`, { resynced: false });
+            this._endSceneHistoryLifecycle(lifecycleToken);
+            return;
+        }
+        try {
+            // Outside the mutation's own try: a render failure here must not be
+            // reported as a refusal, because the duplicate has already committed.
             this.scenes.push(newScene);
             // Duplicating the active scene jumps to the copy (existing flow); duplicating a
             // non-active scene from the switcher leaves the user on their current scene.
             if (isActive) this._setActiveScene(newScene, { lifecycleToken });
-        } catch (e) {
-            console.warn("[Sonder] Failed to duplicate scene:", e);
         } finally {
             this._endSceneHistoryLifecycle(lifecycleToken);
         }
@@ -2271,6 +2311,54 @@ export class EditorWidget {
                         body: JSON.stringify(intent.body) },
                     { projectId: intent.projectId, retryOnConflict, maxAttempts: retryOnConflict ? 2 : 1 });
             },
+        });
+    }
+
+    // Scene delete/duplicate and saved-selection delete each own their own gesture
+    // and history lifecycle, so they do not go through `_queueProjectMutation` — but
+    // they still need its notification rule. A refused write that only reappears as a
+    // repainted row is silent data loss from the user's side; they are told instead.
+    // Shares the `project-mutation-failed` source so a burst yields one counted toast.
+    _notifyMutationRefusal(error, label, { resynced = true } = {}) {
+        const conflicted = error?.code === "project_version_conflict";
+        // "It failed" and "I could not find out" are different claims, and only one is
+        // safe to make. `fetchProjectJson` attaches `status` only when a complete
+        // response arrived, so its absence means this client never learned the outcome:
+        // the connection dropped, or dropped while the body was being read — which
+        // happens AFTER the server has committed and saved — or the body came back
+        // unusable from a 2xx, which is also a commit we simply could not read. Saying
+        // `${label} failed.` there is a definite claim about work that may already be
+        // durable, and the row then vanishes on the next resync.
+        //
+        // The message deliberately names no mechanism. "The server never answered" was
+        // the first wording and it is false for the unusable-2xx case, where the server
+        // answered perfectly well. It also promises no reload: the dominant case is a
+        // server that is simply gone, and the resync that follows is `_fetchScenes`,
+        // which swallows its own failure and returns false — so a promise to reload is
+        // one this code cannot keep. Tell the user what to do instead.
+        const answered = Number.isInteger(error?.status);
+        // Label first, raw text to `detail` — the same precedence `_queueProjectMutation`
+        // uses. `error.message` is set on every failure path (`fetchProjectJson` fills it
+        // from the body, the browser fills it for a dropped connection), so leading with
+        // it would render a destructive action as "Failed to fetch" with no mention of
+        // what the user was doing. These share its `project-mutation-failed` source, so a
+        // merged toast must still say which gesture it counted.
+        const message = conflicted
+            ? (resynced
+                ? `${label} was refused — the project changed elsewhere. Reloading the latest version.`
+                : `${label} was refused — the project changed elsewhere.`)
+            : answered
+                ? `${label} failed.`
+                : `${label} could not be confirmed. Reload to see whether it applied.`;
+        // Tier is unchanged from before this classification existed, deliberately. Moving
+        // the unconfirmed class to `notifyWarning` merged it with the conflict warnings —
+        // same key, same tier, and `_applyOpts` overwrites the message — so one toast
+        // read "…was refused ×3" over a gesture that may well have committed. It also
+        // split the outage class away from the sticky errors `_queueProjectMutation`
+        // already emits, which stacks a fresh toast per gesture instead of counting them.
+        (conflicted ? notifyWarning : notifyError)(message, {
+            source: "project-mutation-failed",
+            detail: error?.message || null,
         });
     }
 
@@ -18570,12 +18658,42 @@ export class EditorWidget {
 
     async _deleteSavedSelectionWithinGesture(diagnostics, idx) {
         if (!this.activeScene) return;
+        const expected = this.activeScene.saved_selections?.[idx];
+        // Nothing to name means nothing to delete; a bare index would be a positional
+        // request against a list this client can no longer describe.
+        if (!expected || typeof expected !== "object") return;
         try {
             const dirName = encodeURIComponent(this._projectDirName());
             const sceneId = this.activeScene.scene_id;
-            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/saved_selections/${idx}`), withEditorMutationDiagnostics({ method: "DELETE" }, diagnostics));
-            await this._fetchScenes();
-        } catch (e) { console.error("Delete saved selection failed:", e); }
+            // The index is a hint; this snapshot of the row the user clicked is the
+            // authority. Sending it lets the server re-resolve after a concurrent
+            // commit instead of refusing — the prompt worker writes job status out of
+            // band, so during a render the version moves under gestures that have
+            // nothing to do with the queue. Without it the server stays positional.
+            //
+            // `retryOnConflict` is on because the snapshot travels with the retry: a
+            // re-send resolves by identity rather than by a position that may have
+            // moved. It covers the one case the server cannot — an `If-Match` already
+            // stale on arrival — and heals from the 409 body, so it costs a single
+            // round trip and no scene refetch.
+            await this._runVersionedProjectMutation(
+                `/sonder-editor/project/${dirName}/scenes/${sceneId}/saved_selections/${idx}`,
+                withEditorMutationDiagnostics({
+                    method: "DELETE",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ expected }),
+                }, diagnostics),
+                { projectId: this._projectDirName() });
+        } catch (e) {
+            console.error("Delete saved selection failed:", e);
+            this._notifyMutationRefusal(e, "Deleting the saved selection");
+            await this._fetchScenes().catch(() => {});
+            return;
+        }
+        // Outside the mutation's own try: past this point the delete has COMMITTED, so
+        // nothing here may be reported as a refusal. Same shape as the scene delete above
+        // and the duplicate before it; see there for why this costs no message today.
+        await this._fetchScenes();
     }
 
     async _renameSavedSelection(...args) {

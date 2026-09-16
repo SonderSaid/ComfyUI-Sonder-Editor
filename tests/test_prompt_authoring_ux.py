@@ -6612,10 +6612,16 @@ def test_active_scene_delete_holds_lifecycle_through_delayed_refresh():
 const notices=[]; globalThis.notifyInfo=(message)=>notices.push(message);
 globalThis.confirm=()=>true; globalThis.api={{apiURL:(value)=>value}};
 let releaseDelete;
-globalThis.fetch=()=>new Promise((resolve)=>{{releaseDelete=()=>resolve({{ok:true}});}});
 class Harness {{
 {history_lifecycle}
 {delete_scene}
+  // The delete goes through the versioned client now, so the deferral this test
+  // measures hangs off that call rather than a bare fetch.
+  _runVersionedProjectMutation(){{return new Promise((resolve)=>{{
+    releaseDelete=()=>resolve({{payload:{{status:"deleted"}}}});}});}}
+  // Pushed into `notices` deliberately: the happy path must never refuse, so an
+  // unexpected call fails the assertion loudly instead of passing silently.
+  _notifyMutationRefusal(error,label){{notices.push("unexpected refusal: "+label);}}
   constructor(){{this._historyOperationInFlight=false;this._undoStack=[];
     this._redoStack=[];this._sceneHistoryLifecycleOwner=null;
     this.activeSceneId="A";this.activeScene={{scene_id:"A",name:"A"}};
@@ -6651,6 +6657,190 @@ console.log(JSON.stringify({{ownerDuringDelete:!!ownerDuringDelete,blockedAttach
         "finalOwner": None,
         "notices": ["Another scene change is still finishing. Try again in a moment."],
     }
+
+
+def test_mutation_refusal_notice_names_the_gesture_and_picks_its_tier():
+    """The label leads; raw server/transport text goes to `detail`.
+
+    `error.message` is populated on every failure path, so a message that prefers it
+    renders a destructive action as "Failed to fetch" with no mention of what the
+    user did — and these share `_queueProjectMutation`'s coalescing source, so a
+    merged toast must still name the gesture it counted.
+    """
+    widget = _source("web/js/editor_widget.js")
+    notify = _method(widget, "_notifyMutationRefusal", "_hasPromptToolDrafts")
+    result = _run_node(f"""
+const calls=[];
+const record=(tier)=>(message,options)=>calls.push({{tier,message,
+  detail:options?.detail??null,source:options?.source??null}});
+globalThis.notifyWarning=record("warning"); globalThis.notifyError=record("error");
+class Harness {{
+{notify}
+}}
+const h=new Harness();
+const conflict=new Error("Project changed"); conflict.code="project_version_conflict";
+h._notifyMutationRefusal(conflict, 'Deleting "Saloon"');
+h._notifyMutationRefusal(conflict, 'Duplicating "Saloon"', {{resynced:false}});
+h._notifyMutationRefusal(new Error("Failed to fetch"), 'Deleting "Saloon"');
+h._notifyMutationRefusal(undefined, "Deleting the saved selection");
+const refused=new Error("Scene not found"); refused.status=404;
+h._notifyMutationRefusal(refused, 'Deleting "Saloon"');
+console.log(JSON.stringify(calls));
+""")
+    assert result == [
+        {
+            "tier": "warning",
+            "message": 'Deleting "Saloon" was refused — the project changed elsewhere.'
+                       " Reloading the latest version.",
+            "detail": "Project changed",
+            "source": "project-mutation-failed",
+        },
+        {
+            "tier": "warning",
+            "message": 'Duplicating "Saloon" was refused — the project changed elsewhere.',
+            "detail": "Project changed",
+            "source": "project-mutation-failed",
+        },
+        {
+            # No `status`, so this client never learned the outcome. The delete may well
+            # have committed before the socket died, and "failed." would be a definite
+            # claim about durable work it never got to read back. The wording names no
+            # mechanism and promises no reload — both were wrong in the first attempt.
+            # The tier stays `error`: moving this class to `warning` merged it with the
+            # conflict warnings into one toast that spoke for both.
+            "tier": "error",
+            "message": 'Deleting "Saloon" could not be confirmed. Reload to see whether'
+                       " it applied.",
+            "detail": "Failed to fetch",
+            "source": "project-mutation-failed",
+        },
+        {
+            "tier": "error",
+            "message": "Deleting the saved selection could not be confirmed. Reload to"
+                       " see whether it applied.",
+            "detail": None,
+            "source": "project-mutation-failed",
+        },
+        {
+            # A refusal the server actually sent. Definite, and still an error.
+            "tier": "error",
+            "message": 'Deleting "Saloon" failed.',
+            "detail": "Scene not found",
+            "source": "project-mutation-failed",
+        },
+    ]
+
+
+def test_an_unconfirmed_outcome_does_not_merge_into_a_refusal_toast():
+    """Two outcome classes share one coalescing source; the survivor speaks for both.
+
+    `_notifyMutationRefusal` sends every class under `project-mutation-failed`, and
+    `notify()` merges a same-key **same-tier** entry while `_applyOpts` overwrites the
+    message and bumps a count. A first attempt at the committed-delete fix put the
+    unconfirmed class on `notifyWarning`, which is the conflict refusals' tier: the two
+    then merged, and one toast read "... was refused" with a count of 2 over a gesture
+    that may well have committed. The tier difference is what keeps "definitely did not
+    happen" apart from "may have happened", so it is load-bearing and worth pinning.
+
+    This drives the real notifications module rather than recorder stubs, because the
+    stubs cannot see coalescing at all.
+    """
+    widget = _source("web/js/editor_widget.js")
+    notify = _method(widget, "_notifyMutationRefusal", "_hasPromptToolDrafts")
+    module = (ROOT / "web/js/editor_notifications.js").as_uri()
+    toasts = _run_node(f"""
+const N=await import({json.dumps(module)});
+globalThis.notifyWarning=N.notifyWarning; globalThis.notifyError=N.notifyError;
+class Harness {{
+{notify}
+}}
+const h=new Harness();
+const seen=[];
+N.subscribe((list)=>{{ seen.length=0; for (const n of list) seen.push(
+  {{tier:n.tier, message:n.message, count:n.count}}); }});
+const conflict=new Error("Project changed"); conflict.code="project_version_conflict";
+h._notifyMutationRefusal(new Error("Failed to fetch"), 'Deleting "Saloon"');
+h._notifyMutationRefusal(conflict, 'Duplicating "Rooftop"');
+console.log(JSON.stringify(seen));
+""")
+    assert len(toasts) == 2, (
+        f"an unconfirmed outcome and a refusal collapsed into one toast: {toasts}")
+    unconfirmed = [t for t in toasts if "could not be confirmed" in t["message"]]
+    refused = [t for t in toasts if "was refused" in t["message"]]
+    assert len(unconfirmed) == 1 and len(refused) == 1, toasts
+    assert unconfirmed[0]["count"] == 1 and refused[0]["count"] == 1, (
+        f"a toast counted a gesture it does not describe: {toasts}")
+
+
+def test_saved_selection_delete_names_the_row_it_clicked_not_just_its_position():
+    """The index is a hint; the snapshot the server re-resolves against is the point.
+
+    Replaces an earlier test that asserted `retryOnConflict: false, maxAttempts: 1`.
+    That was the right contract while the request carried nothing but a position — a
+    re-send would have named whatever row had drifted into it. Carrying the row makes
+    a re-send safe, and it is what lets the server settle a conflict instead of
+    refusing a gesture during every render.
+    """
+    widget = _source("web/js/editor_widget.js")
+    delete_selection = _method(
+        widget, "_deleteSavedSelectionWithinGesture", "_renameSavedSelection")
+    result = _run_node(f"""
+globalThis.api={{apiURL:(value)=>value}};
+globalThis.withEditorMutationDiagnostics=(init)=>init;
+const calls=[]; const notices=[]; let refreshed=0;
+class Harness {{
+{delete_selection}
+  constructor(){{this.activeScene={{scene_id:"S",saved_selections:[
+    {{name:"zero",start:0,end:1}},{{name:"one",start:2,end:3}},
+    {{name:"two",start:4,end:5}}]}};}}
+  _projectDirName(){{return "project";}}
+  _runVersionedProjectMutation(path,init,opts){{
+    calls.push({{path,method:init.method,body:JSON.parse(init.body),...opts}});
+    const error=new Error("stale"); error.code="project_version_conflict"; throw error;}}
+  _notifyMutationRefusal(error,label){{notices.push(label);}}
+  async _fetchScenes(){{refreshed += 1;}}
+}}
+const h=new Harness();
+await h._deleteSavedSelectionWithinGesture(null, 2);
+console.log(JSON.stringify({{calls,notices,refreshed}}));
+""")
+    assert result == {
+        "calls": [{
+            "path": "/sonder-editor/project/project/scenes/S/saved_selections/2",
+            "method": "DELETE",
+            # The row the user clicked, so a retry resolves by identity rather than
+            # by a position another writer may already have shifted.
+            "body": {"expected": {"name": "two", "start": 4, "end": 5}},
+            "projectId": "project",
+        }],
+        # A refusal the server would not settle is still shown, and still resyncs.
+        "notices": ["Deleting the saved selection"],
+        "refreshed": 1,
+    }
+
+
+def test_saved_selection_delete_sends_nothing_when_it_cannot_name_the_row():
+    """No snapshot means a bare positional request, which is what this replaced."""
+    widget = _source("web/js/editor_widget.js")
+    delete_selection = _method(
+        widget, "_deleteSavedSelectionWithinGesture", "_renameSavedSelection")
+    result = _run_node(f"""
+globalThis.api={{apiURL:(value)=>value}};
+globalThis.withEditorMutationDiagnostics=(init)=>init;
+const calls=[]; const notices=[]; let refreshed=0;
+class Harness {{
+{delete_selection}
+  constructor(){{this.activeScene={{scene_id:"S",saved_selections:[{{name:"only"}}]}};}}
+  _projectDirName(){{return "project";}}
+  _runVersionedProjectMutation(path,init,opts){{calls.push(path);}}
+  _notifyMutationRefusal(error,label){{notices.push(label);}}
+  async _fetchScenes(){{refreshed += 1;}}
+}}
+const h=new Harness();
+await h._deleteSavedSelectionWithinGesture(null, 4);
+console.log(JSON.stringify({{calls,notices,refreshed}}));
+""")
+    assert result == {"calls": [], "notices": [], "refreshed": 0}
 
 
 def test_scene_refresh_cannot_supersede_a_foreign_lifecycle_owner():

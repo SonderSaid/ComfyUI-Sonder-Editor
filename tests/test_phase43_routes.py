@@ -62,6 +62,14 @@ def _route_handler(route_module, method, path):
     raise AssertionError(f"Route not found: {method} {path}")
 
 
+def _mutations_handler(route_module):
+    return _route_handler(
+        route_module,
+        "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/mutations",
+    )
+
+
 def _response_json(response):
     return json.loads(response.body.decode("utf-8"))
 
@@ -1942,7 +1950,7 @@ def test_duplicate_scene_route_deep_copies_scene_and_regenerates_child_ids(tmp_p
     )
 
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+    monkeypatch.setattr(route_module, "save_project", lambda project, **kwargs: None)
 
     duplicate_scene = _route_handler(
         route_module,
@@ -2163,19 +2171,20 @@ def test_delete_last_clip_compacts_empty_video_lane(tmp_path, monkeypatch):
         LaneConfig(name="Lane 2"),
         LaneConfig(name="Lane 3"),
     ]
+    # Drivers occupy their own lane space, so driver lane 1 must actually exist.
+    # The retired DELETE route never validated this; the mutations pipeline does.
+    scene.motion_driver_lane_count = 2
     scene.clips = [delete_me, higher, driver]
     project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
 
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
     monkeypatch.setattr(route_module, "save_project", lambda project: None)
 
-    delete_clip = _route_handler(
-        route_module,
-        "DELETE",
-        "/sonder-editor/project/{project_id}/scenes/{scene_id}/clips/{clip_id}",
-    )
-    response = asyncio.run(delete_clip(DummyRequest(
-        match_info={"scene_id": "scene-1", "clip_id": "delete-me"},
+    # Clip deletion moved to the scene mutations pipeline in 0.6.0 and the
+    # standalone DELETE route was retired; lane compaction is what is under test.
+    response = asyncio.run(_mutations_handler(route_module)(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={"operations": [{"type": "delete_clip", "clip_id": "delete-me"}]},
     )))
 
     assert response.status == 200
@@ -2205,14 +2214,11 @@ def test_delete_clip_preserve_lane_keeps_empty_video_lane(tmp_path, monkeypatch)
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
     monkeypatch.setattr(route_module, "save_project", lambda project: None)
 
-    delete_clip = _route_handler(
-        route_module,
-        "DELETE",
-        "/sonder-editor/project/{project_id}/scenes/{scene_id}/clips/{clip_id}",
-    )
-    response = asyncio.run(delete_clip(DummyRequest(
-        match_info={"scene_id": "scene-1", "clip_id": "clip-1"},
-        query={"preserve_lane": "1"},
+    response = asyncio.run(_mutations_handler(route_module)(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={"operations": [{
+            "type": "delete_clip", "clip_id": "clip-1", "preserve_lane": True,
+        }]},
     )))
 
     assert response.status == 200
@@ -2251,13 +2257,11 @@ def test_delete_last_audio_track_compacts_empty_audio_lane(tmp_path, monkeypatch
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
     monkeypatch.setattr(route_module, "save_project", lambda project: None)
 
-    delete_audio = _route_handler(
-        route_module,
-        "DELETE",
-        "/sonder-editor/project/{project_id}/scenes/{scene_id}/audio_tracks/{track_id}",
-    )
-    response = asyncio.run(delete_audio(DummyRequest(
-        match_info={"scene_id": "scene-1", "track_id": "delete-me"},
+    response = asyncio.run(_mutations_handler(route_module)(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={"operations": [{
+            "type": "delete_audio_track", "track_id": "delete-me",
+        }]},
     )))
 
     assert response.status == 200

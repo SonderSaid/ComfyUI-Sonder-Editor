@@ -60,6 +60,8 @@ from .frozen_reference import (
     FrozenReferenceSnapshotError,
     decode_frozen_reference_catalog,
 )
+from .project_storage import ProjectStorageError
+from .project_storage_lifecycle import run_project_io
 from .render_cache import (
     RenderCacheActiveError,
     RenderCacheError,
@@ -383,7 +385,12 @@ async def _project_conflict_middleware(request: web.Request, handler):
             current.get("project_id", "") or project_id,
             exc.actual_modified_at or current.get("modified_at", ""),
         )
-        return response
+        # This middleware is the OUTERMOST one, so a handler that raises unwinds past
+        # `_sonder_security_middleware` and never reaches its `_apply_sonder_security_headers`
+        # call. Every other editor response carries the headers and CSP; a 409 built
+        # here would not, and versioned mutations make 409 an ordinary outcome rather
+        # than an edge case.
+        return _apply_sonder_security_headers(request, response)
 
 
 try:
@@ -1090,6 +1097,72 @@ def _validate_prompt_identity(section: PromptSection, expected: dict | None) -> 
                 != prompt_payload.normalize_channel_exceptions(
                     getattr(section, "global_channel_exceptions", None))):
             _mutation_error("Prompt section identity mismatch", 409, "identity_mismatch")
+
+
+
+# Saved selections carry no durable id, so their identity is the value snapshot the
+# caller read. Guides and prompt sections snapshot alongside a durable id; this is the
+# same `expected` contract with the snapshot doing the whole job.
+SAVED_SELECTION_IDENTITY_FIELDS = (
+    "name", "start", "end", "pre_context_frames", "post_context_frames",
+    "mask_pre_offset", "mask_post_offset",
+)
+
+
+def saved_selection_identity_snapshot(expected) -> dict | None:
+    """The usable snapshot in a request body, or None.
+
+    An empty or field-less dict constrains nothing, so it must NOT buy the identity
+    addressing that lets the server re-resolve and retry — that is precisely the
+    "acquire a stronger policy by omission" hazard `_apply_project_versioned_sync`
+    exists to prevent. Such a body degrades to positional addressing, which is the
+    safe direction: one attempt, refuse on conflict.
+    """
+    if not isinstance(expected, dict):
+        return None
+    if not any(key in expected for key in SAVED_SELECTION_IDENTITY_FIELDS):
+        return None
+    return expected
+
+
+def _saved_selection_matches(entry, expected: dict) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    return all(
+        _expected_matches(entry.get(key), expected[key])
+        for key in SAVED_SELECTION_IDENTITY_FIELDS
+        if key in expected
+    )
+
+
+def _resolve_saved_selection_index(selections, idx: int, expected: dict | None) -> int:
+    """Which row the caller named, with the index as a hint and the snapshot as authority.
+
+    Without a snapshot the index means whatever the document the caller read said it
+    meant, and nothing else — so it is used as-is and the mutation gets no retry.
+
+    With one, the index is still tried first, which keeps two identical selections
+    resolving to the row the caller actually clicked. Only when the document has moved
+    under it do we search, and then a single match is the caller's row wherever it
+    drifted to. Two matches are genuinely ambiguous: the rows are indistinguishable by
+    value and their positions are all that separate them, so removing either would be
+    a guess. Refusing is recoverable — the editor resyncs and the user clicks again —
+    while deleting the wrong row is not.
+    """
+    if expected is None:
+        if idx < 0 or idx >= len(selections):
+            _mutation_error("Selection index out of range", 404, "selection_index_out_of_range")
+        return idx
+    if 0 <= idx < len(selections) and _saved_selection_matches(selections[idx], expected):
+        return idx
+    matches = [position for position, entry in enumerate(selections)
+               if _saved_selection_matches(entry, expected)]
+    if not matches:
+        _mutation_error("Saved selection identity mismatch", 409, "identity_mismatch")
+    if len(matches) > 1:
+        _mutation_error(
+            "Saved selection identity is ambiguous", 409, "identity_ambiguous")
+    return matches[0]
 
 
 def _prompt_overlapping_items(scene, start_frame, end_frame, ignore=None):
@@ -5057,26 +5130,110 @@ def _load_project_after_queue_conflict(
     return load_project(project_dir)
 
 
-def _apply_queue_versioned_sync(request: web.Request, apply_fn, max_attempts: int = 3):
+def _apply_project_versioned_sync(
+    request: web.Request,
+    apply_fn,
+    *,
+    addressing: str = "positional",
+    rebase_stale_precondition: bool = False,
+):
+    """Load, apply and commit one project mutation as a compare-and-swap.
+
+    `apply_fn(project) -> (changed, payload)` does pure in-memory work and may raise
+    to refuse; the caller renders the refusal on the event loop, because a worker
+    must not build a `web.Response`. `base_modified_at` is read BEFORE `apply_fn`
+    because the model mutators stamp `modified_at` in memory — reading it after
+    yields a fabricated version that can never match disk.
+
+    `addressing` is the single axis that decides BOTH re-application policies, so a
+    caller cannot acquire one by omission:
+
+    * `"positional"` (default) — the operation names a row by list position, or by
+      anything else whose meaning depends on the document it was read from. One
+      attempt, and a stale precondition is refused. Re-applying such an operation to
+      a document the caller never saw removes a different row than the one named.
+    * `"identity"` — the operation names its target by a durable id that means the
+      same thing in any version. Re-applying after a SAVE conflict is contention the
+      server resolves on the caller's behalf, not a precondition it stated, so the
+      loop reloads and retries.
+
+    `rebase_stale_precondition` is separate and narrower: it governs only the INITIAL
+    load, when the client's `If-Match` is already stale before any work happens. It
+    is a deliberate tolerance for callers whose version legitimately lags through no
+    fault of their own — see `_apply_queue_versioned_sync`, the only place it is set,
+    for the reason and its limits.
+    """
+    if addressing not in ("identity", "positional"):
+        raise ValueError(f"addressing must be 'identity' or 'positional', got {addressing!r}")
+    max_attempts = 3 if addressing == "identity" else 1
     project: TimelineProject | None = None
     for attempt in range(max_attempts):
         if project is None:
-            try:
+            if rebase_stale_precondition:
+                try:
+                    project = _load_project_from_request(request)
+                except ProjectVersionConflict as exc:
+                    project = _load_project_after_queue_conflict(exc)
+            else:
                 project = _load_project_from_request(request)
-            except ProjectVersionConflict as exc:
-                project = _load_project_after_queue_conflict(exc)
         base_modified_at = str(getattr(project, "modified_at", "") or "")
+        if not base_modified_at:
+            # `save_project` only compares when this is truthy, so an empty version
+            # would quietly downgrade this call to an unguarded write and make
+            # `addressing` meaningless. Fail loudly instead: a project with no
+            # version cannot be committed under a precondition at all.
+            raise RuntimeError(
+                f"Project at {getattr(project, 'project_dir', '')!r} has no modified_at; "
+                "refusing to commit a versioned mutation without a precondition")
         changed, payload = apply_fn(project)
         if not changed:
+            _remember_request_project(request, project)
             return project, payload
         try:
             save_project(project, expected_modified_at=base_modified_at)
+            # A CAS retry replaces the object the request first remembered. The
+            # version-header middleware must stamp the one that actually committed,
+            # or the client immediately regresses to a stale version.
+            _remember_request_project(request, project)
             return project, payload
         except ProjectVersionConflict as exc:
             if attempt >= max_attempts - 1:
                 raise
             project = _load_project_after_queue_conflict(exc, project)
-    raise RuntimeError("Queue mutation retry loop exhausted")
+    raise RuntimeError("Project mutation retry loop exhausted")
+
+
+def _apply_queue_versioned_sync(request: web.Request, apply_fn):
+    """Queue mutations rebase a stale `If-Match` instead of refusing it.
+
+    The reason is not the client's fault and it cannot avoid it: the ComfyUI prompt
+    worker writes job status outside the request cycle. `_consume_queue_job` flips
+    pending → running and saves, and its failure path saves again, each bumping
+    `modified_at` with no HTTP response the browser can learn it from — and the
+    websocket self-echo is deliberately delayed (see durable_rules). So during any
+    active render every queue gesture arrives already stale, and refusing it would
+    make the queue unusable exactly when it is being used. `5eab30c` introduced this
+    tolerance; rapid gestures coalescing on `POST /queue/mutations` compound it but
+    are not its cause — add and batch use unique keys and never coalesce.
+
+    What the tolerance costs, stated plainly rather than assumed away. Four of the
+    six callers name a durable `job_id` or a status set predicate, so rebasing cannot
+    touch a row the caller did not name. The two enqueue callers (`add_one`,
+    `add_batch`) are creates: they mint a new job and freeze a compiled prompt
+    context, channel template and setup manifest from the scene of whatever document
+    they loaded. Rebased onto a version the caller never saw, they freeze that
+    version's scene. That is benign for the case this tolerance exists for, because
+    an out-of-band status write does not touch scene content — but it is NOT benign
+    if another editor changed the scene in the same window, and nothing here can tell
+    those apart.
+
+    Expiry: delete this wrapper and call `_apply_project_versioned_sync` directly once
+    queue status transitions stop being written outside the request cycle, or once the
+    client can observe them before its next gesture. At that point a stale version
+    means what it says and should be refused.
+    """
+    return _apply_project_versioned_sync(
+        request, apply_fn, addressing="identity", rebase_stale_precondition=True)
 
 
 def _apply_queue_mutation_operations(project: TimelineProject, operations: list) -> tuple[bool, dict]:
@@ -6312,9 +6469,11 @@ def _snapshot_files_under(root_dir: str, rel_prefix: str = "") -> dict[str, dict
                     rel_path = _normalize_project_relpath(os.path.join(current_rel, entry.name))
                     try:
                         # Direct browser uploads stage beside their final destination so
-                        # the publish rename stays on one physical volume. This reserved
-                        # directory is transactional state, never project media.
-                        if entry.name == UPLOAD_STAGING_DIRNAME:
+                        # the publish rename stays on one physical volume. Permanent
+                        # asset deletion stages the same way, so a refused commit can put
+                        # the media back. Both reserved directories are transactional
+                        # state, never project media.
+                        if entry.name in (UPLOAD_STAGING_DIRNAME, TRASH_STAGING_DIRNAME):
                             continue
                         try:
                             if entry.is_symlink() and not trust_links:
@@ -6758,8 +6917,15 @@ def _prepare_video_audio_asset(project: TimelineProject, asset: Asset) -> Asset 
     Shared by dual-drop clip creation and audio-only video drops. Reuses the
     derived ``media/{asset_id}_audio.wav`` path so repeated drops of the same
     video dedupe to one audio asset. Returns the audio Asset, or None when the
-    video has no usable audio. Blocking (ffmpeg/ffprobe/thumbnail) — call via
-    asyncio.to_thread from route handlers.
+    video has no usable audio. Blocking (ffmpeg/ffprobe/thumbnail) — never call it
+    from a route handler directly.
+
+    It reaches this function through the scene mutations batch, so in practice it
+    runs on the PROJECT pool rather than the default one: its result feeds the same
+    compare-and-swap, so it cannot be split off without splitting the commit. That is
+    the one place project threads carry ffmpeg work, and `durable_rules` bounds it to
+    one media-I/O create per batch — which is what keeps the pool's sizing reasoning
+    about lock contention rather than encode time.
     """
     video_path = _asset_abspath(project, asset)
     asset_key = _asset_storage_key(project, asset, purpose="derived audio asset id")
@@ -6843,13 +7009,26 @@ def _sync_media_folder(
 
     Returns True if any changes were made (new assets discovered or repaired).
     """
+    # Reconcile any media a crash left in trash staging before deciding what the
+    # folder contains; a restored file must be visible to the scan below.
+    #
+    # Its result is deliberately NOT folded into `changed`. The sweep only moves bytes
+    # back to paths the document already records, and whether an asset's media exists is
+    # computed per request rather than stored, so a restore dirties nothing. `changed`
+    # is what tells `_save_versioned_sync_phase` the in-memory document differs from
+    # disk; feeding a filesystem-only outcome into it buys a full CAS write of an
+    # unchanged document, seconds of lock hold on a large project, on the gallery
+    # Refresh that follows every crash recovery. Where a restored file genuinely does
+    # imply a document change — its probe state can be read again now the bytes are
+    # back — the repair passes below detect that and report it themselves.
+    _sweep_trash_staging(project)
     changed = False
     if purge_trashed:
         changed = _purge_expired_trashed_assets(
             project,
             retention_days=trash_retention_days,
             max_size_mb=trash_max_size_mb,
-        )
+        ) or changed
     media_dir = project_media_root(project, must_exist=True)
     if not os.path.isdir(media_dir):
         return changed
@@ -8005,8 +8184,13 @@ def _favorite_asset_summary(asset: Asset) -> dict:
     }
 
 
-def _asset_trash_protection(project: TimelineProject, assets: list[Asset]) -> dict:
-    usage = _aggregate_asset_usages(project, assets)
+def _asset_trash_protection(project: TimelineProject, assets: list[Asset],
+                            *, usage: dict | None = None) -> dict:
+    # `_aggregate_asset_usages` walks every scene's clips, tracks, guides, references
+    # and queue, and reaches the per-project write lock through `hydrate_job`. Callers
+    # that already computed it in the worker which loaded the project pass it in, so
+    # the scan happens once, there, rather than again on the event loop.
+    usage = _aggregate_asset_usages(project, assets) if usage is None else usage
     favorites = [
         _favorite_asset_summary(asset)
         for asset in assets
@@ -8022,8 +8206,9 @@ def _asset_trash_protection(project: TimelineProject, assets: list[Asset]) -> di
     }
 
 
-def _asset_trash_conflict_payload(project: TimelineProject, assets: list[Asset], error: str) -> dict:
-    protection = _asset_trash_protection(project, assets)
+def _asset_trash_conflict_payload(project: TimelineProject, assets: list[Asset], error: str,
+                                  *, protection: dict | None = None) -> dict:
+    protection = _asset_trash_protection(project, assets) if protection is None else protection
     return {
         "error": error,
         "usages": protection["usages"],
@@ -8116,10 +8301,22 @@ def _asset_cache_file_paths(project: TimelineProject, asset: Asset) -> list[str]
     ]
 
 
-def _delete_asset_source_file(project: TimelineProject, asset: Asset, excluded_asset_ids: set[str] | None = None) -> None:
-    source_path = _require_asset_media_source(project, asset, operation="Asset delete")
+def _exclusive_asset_source_path(
+    project: TimelineProject,
+    asset: Asset,
+    excluded_asset_ids: set[str] | None = None,
+    *,
+    operation: str = "Asset delete",
+) -> str | None:
+    """This asset's own source file, or None when nothing may touch it.
+
+    None means either the file is already gone, or a surviving asset still points at
+    the same path — moving or deleting it would take media out from under that asset.
+    One authority so deletion and staging cannot drift apart.
+    """
+    source_path = _require_asset_media_source(project, asset, operation=operation)
     if not os.path.isfile(source_path):
-        return
+        return None
 
     excluded = excluded_asset_ids or set()
     shared_source = any(
@@ -8128,10 +8325,411 @@ def _delete_asset_source_file(project: TimelineProject, asset: Asset, excluded_a
         and other.path == asset.path
         for other in project.assets
     )
-    if shared_source:
-        return
+    return None if shared_source else source_path
 
-    os.remove(source_path)
+
+def _delete_asset_source_file(project: TimelineProject, asset: Asset, excluded_asset_ids: set[str] | None = None) -> None:
+    source_path = _exclusive_asset_source_path(project, asset, excluded_asset_ids)
+    if source_path:
+        os.remove(source_path)
+
+
+TRASH_STAGING_DIRNAME = ".trash-staging"
+
+# Staged paths owned by a live batch in THIS process.
+#
+# `_sweep_trash_staging` infers intent from disk state: record still present and the
+# original path empty means the removal never committed, so restore. That is also the
+# exact mid-flight state of a delete gesture — `_apply_project_versioned_sync` holds
+# no lock between its load and its save, so a concurrent gallery Refresh lands inside
+# the window, "recovers" bytes the gesture is still removing, and the commit then
+# drops the record and leaves them for the next scan to adopt as a new asset. The
+# resurrection the staging exists to prevent, through the door the sweep opened.
+#
+# Process liveness is the discriminator a marker file cannot be: a crash leaves the
+# same bytes and the same marker, but it does not leave this set populated. Empty
+# after a restart is precisely when reconciling is the right answer.
+_STAGED_IN_FLIGHT: set[str] = set()
+_STAGED_IN_FLIGHT_LOCK = threading.Lock()
+
+
+def _mark_staged_in_flight(path: str) -> None:
+    with _STAGED_IN_FLIGHT_LOCK:
+        _STAGED_IN_FLIGHT.add(os.path.normcase(os.path.abspath(path)))
+
+
+def _clear_staged_in_flight(path: str) -> None:
+    with _STAGED_IN_FLIGHT_LOCK:
+        _STAGED_IN_FLIGHT.discard(os.path.normcase(os.path.abspath(path)))
+
+
+def _staged_in_flight(path: str) -> bool:
+    with _STAGED_IN_FLIGHT_LOCK:
+        return os.path.normcase(os.path.abspath(path)) in _STAGED_IN_FLIGHT
+
+
+class _StagedMediaBatch:
+    """Media moved aside so a refused commit can put it back.
+
+    Emptying the trash used to `os.remove` the bytes and then save, so a lost
+    compare-and-swap returned 409 *after* the files were gone and left project
+    records pointing at deleted media. `If-Match` could not help: the destruction
+    preceded the guard.
+
+    Committing first and deleting afterwards is not the fix either. A failed unlink
+    would leave a file under `media/` that `_sync_media_folder` re-registers as a
+    brand-new untrashed asset on the next gallery Refresh, resurrecting emptied
+    trash under a fresh id — worse than today's failure mode, which keeps the record
+    relinkable.
+
+    Staging is the third door. The bytes leave the scanned tree before the commit
+    and are unlinked only once the document that dropped them is durable.
+    `_snapshot_files_under` skips this directory by name, the way it already skips
+    upload staging, so a leaked file is invisible to every scan rather than coming
+    back as an asset. Cache files are deliberately NOT staged: thumbnails, strips
+    and waveforms are regenerable, so dropping them early costs a rebuild, not data.
+
+    The staged name is the asset id alone — no basename. That keeps the identity a sweep
+    needs, and makes the staged path predictable: a fixed `media/.trash-staging/` prefix
+    and an id-only leaf, rather than however long a user-influenced filename happens to
+    be.
+
+    Predictable is not the same as safe, and the difference is worth stating because
+    this replaces an `os.remove` that could not fail this way. The id is VALIDATED, not
+    sanitized: `_asset_storage_key` goes through `safe_route_token`, a blocklist that
+    rejects separators, `..`, `:`, NUL and encoded separators — containment holds — but
+    it caps no length and rejects no other Windows-illegal character. So an id read from
+    a tolerated `project.json` can still be 300 characters, or contain `<` or `|`, and
+    the move is where that is discovered.
+
+    Length moves the same way. The prefix is 21 characters against `media/`'s 6, so
+    staging is shorter only when the basename exceeds the id by more than 15. Ids are 8
+    hex by default (`Asset.asset_id`, `timeline_state.py`), so for a short
+    discovery-registered name staging LENGTHENS the path — `media/a.png` (11) becomes
+    29 — and on a project near the Windows ceiling the removal can now fail where the
+    plain unlink would not have.
+
+    Data is safe either way: whichever of `os.makedirs` or `os.replace` raises, `stage`
+    re-raises and the gesture's `except BaseException: rollback()` puts earlier moves
+    back. What is lost is the quality of the refusal. The delete routes catch `OSError`
+    and render a bare 500 — and `except FileNotFoundError` runs first, so the
+    path-not-found flavour Windows reports for an over-long path is answered 404, both
+    of which describe the failure worse than the structured `unsafe_asset_id` refusal
+    seventeen lines down. Expiry: drop this caveat once the staged leaf is proven
+    writable before the first move of a batch, which covers length and character alike;
+    a length-only pre-check would not.
+    """
+
+    def __init__(self, project_dir: str) -> None:
+        self._project_dir = project_dir
+        self._root = os.path.join(project_dir, "media", TRASH_STAGING_DIRNAME)
+        self._moves: list[tuple[str, str, str, str]] = []
+
+    def stage(self, project: TimelineProject, asset: Asset,
+              excluded_asset_ids: set[str] | None = None) -> None:
+        source_path = _exclusive_asset_source_path(project, asset, excluded_asset_ids)
+        if not source_path:
+            return
+        # An asset id is untrusted input and is never path authority (durable rule).
+        # A quarantined id cannot be staged, and staging is what makes the removal
+        # reversible — so refuse the gesture rather than delete it irreversibly.
+        key = _asset_storage_key(project, asset, purpose="trash staging")
+        if not key:
+            raise _AssetDeleteRefused({
+                "error": f"Asset id cannot be used as a filename: {asset.asset_id!r}",
+                "code": "unsafe_asset_id",
+            }, status=400)
+        os.makedirs(self._root, exist_ok=True)
+        staged_path = os.path.join(self._root, key)
+        # Claim it before the move: a scan that runs between the rename and the mark
+        # would see an unclaimed staged file and "recover" it out from under us.
+        _mark_staged_in_flight(staged_path)
+        try:
+            os.replace(source_path, staged_path)
+        except BaseException:
+            _clear_staged_in_flight(staged_path)
+            raise
+        # The RECORDED spelling travels with the move, not just the resolved path:
+        # rollback compares it against the committed document, which stores
+        # project-relative paths.
+        self._moves.append((staged_path, source_path, str(asset.asset_id),
+                            _normalize_project_relpath(getattr(asset, "path", "") or "")))
+
+    def rollback(self) -> None:
+        """Restore staged media — but only where the document still points at it.
+
+        Whether the *asset* survives is the wrong question. Two different writers can
+        leave our bytes unreferenced, and only one of them removes the id:
+
+        * one commits the same removal — the asset is gone entirely;
+        * one replaces the asset's media. A replacement whose extension differs mints
+          a new path, repoints the record and commits, keeping the id untouched. The
+          `os.path.exists(original_path)` guard below does not see it either, because
+          moving the path away leaves the old one empty.
+
+        Restoring in either case puts bytes back where nothing records them, and the
+        next media scan adopts an unrecorded file under `media/` as a brand-new
+        untrashed asset — the resurrection this class exists to prevent. So the
+        question is about the PATH: does the committed document still reference the
+        location these bytes came from?
+
+        Dropping them when it does not is not a guess. Both replacement paths
+        (`_replace_project_asset`, `_streamed_replace_commit`) delete the old file
+        themselves once the path changes and no other asset shares it; they skipped it
+        only because we had already moved it aside.
+        """
+        recorded_paths = self._recorded_media_paths()
+        unresolved: list[tuple[str, str, str, str]] = []
+        for staged_path, original_path, asset_id, original_rel_path in reversed(self._moves):
+            if original_rel_path not in recorded_paths:
+                # Nothing in the committed document points here any more, so these
+                # bytes are unreachable from inside the product and putting them back
+                # only makes them a new asset.
+                try:
+                    os.remove(staged_path)
+                except OSError:
+                    logger.warning("Could not discard superseded staged media: %s",
+                                   staged_path, exc_info=True)
+                    unresolved.append(
+                        (staged_path, original_path, asset_id, original_rel_path))
+                continue
+            if os.path.exists(original_path):
+                # Something else already occupies the path — a same-extension media
+                # replacement or a generated commit that landed while these bytes were
+                # aside. It is newer than what we hold; do not clobber it.
+                logger.warning("Staged media has been superseded on disk: %s", original_path)
+                unresolved.append(
+                    (staged_path, original_path, asset_id, original_rel_path))
+                continue
+            try:
+                os.makedirs(os.path.dirname(original_path), exist_ok=True)
+                os.replace(staged_path, original_path)
+            except OSError:
+                # Keep it tracked rather than dropping it: an untracked staged file
+                # is media nothing can find again.
+                logger.exception("Could not restore staged media to %s", original_path)
+                unresolved.append(
+                    (staged_path, original_path, asset_id, original_rel_path))
+        # Whatever is left is no longer this batch's to protect — a later sweep should
+        # be free to reconcile it.
+        for move in self._moves:
+            _clear_staged_in_flight(move[0])
+        self._moves = unresolved
+        self._remove_root_if_empty()
+
+    def discard(self) -> None:
+        """The document that dropped these committed; the bytes are unreferenced."""
+        unresolved: list[tuple[str, str, str, str]] = []
+        for move in reversed(self._moves):
+            try:
+                os.remove(move[0])
+            except OSError:
+                logger.warning(
+                    "Emptied trash left a staged file behind: %s", move[0], exc_info=True)
+                unresolved.append(move)
+        for move in self._moves:
+            _clear_staged_in_flight(move[0])
+        self._moves = unresolved
+        self._remove_root_if_empty()
+
+    def _recorded_media_paths(self) -> set[str]:
+        """Media paths the committed root still references, project-relative.
+
+        Paths rather than asset ids, because an id outlives a replacement that moves
+        the media out from under it — see `rollback`. Reading every asset's path also
+        answers the sharing case for free: if a second asset has come to point at the
+        location we staged from, it is still referenced and the bytes go back.
+
+        An unreadable root means we cannot tell; treat every staged path as still
+        referenced so the bytes are restored. An orphan a later sweep can reconcile
+        beats media deleted on a guess.
+        """
+        try:
+            with open(os.path.join(self._project_dir, "project.json"), "rb") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            logger.warning("Could not read %s to decide a staged-media rollback",
+                           self._project_dir, exc_info=True)
+            return {move[3] for move in self._moves}
+        return {
+            _normalize_project_relpath(asset.get("path", ""))
+            for asset in (data.get("assets") or [])
+            if isinstance(asset, dict)
+        }
+
+    def _remove_root_if_empty(self) -> None:
+        try:
+            os.rmdir(self._root)
+        except OSError:
+            pass
+
+
+def _active_snapshot_job(project: TimelineProject, scene_id: str):
+    """The running job whose frozen snapshot this scene's bridges must read, hydrated.
+
+    One rule, previously copied into all four bridge routes with cosmetic drift
+    between the copies. `hydrate_job` takes the per-project write lock, so this must
+    run in a worker: an automatic component migration can hold that lock for seconds,
+    and a bare call in a coroutine body stalls the event loop for the rest of it.
+    """
+    for job in getattr(project, "generation_queue", []) or []:
+        if getattr(job, "scene_id", "") != scene_id:
+            continue
+        if str(getattr(job, "status", "") or "").lower() != "running":
+            continue
+        params = getattr(job, "params", {}) or {}
+        try:
+            snapshot_version = (
+                int(params.get("snapshot_version", 0) or 0) if isinstance(params, dict) else 0)
+        except (TypeError, ValueError, OverflowError):
+            snapshot_version = 0
+        if snapshot_version > 0:
+            from .project_storage import hydrate_job
+            return hydrate_job(project, job)
+    return None
+
+
+def _load_scene_for_bridge(request: web.Request, scene_id: str):
+    """Load the project, resolve the scene and hydrate its active job in ONE worker.
+
+    Everything the bridge routes do afterwards is in-memory projection, so this call
+    is the whole of their project-lock exposure.
+    """
+    project = _load_project_from_request(request)
+    scene = project.get_scene(scene_id)
+    if scene is None:
+        _mutation_error(f"Scene not found: {scene_id}", 404, "scene_not_found")
+    return project, scene, _active_snapshot_job(project, scene_id)
+
+
+def _sweep_trash_staging(project: TimelineProject) -> bool:
+    """Reconcile media stranded in trash staging by a crash or a failed restore.
+
+    A staged file is named for its asset id, so the document can still say what
+    should happen to it: if the asset is still recorded, the removal never committed
+    and the bytes belong back at its recorded path; if it is not, the removal did
+    commit and the bytes are unreferenced. Without this, a process death between the
+    move and the unlink would strand user media in a directory every scan
+    deliberately ignores, with no path back from inside the product.
+
+    Runs on the media scan, which is the gallery's entry and Refresh point. Returns True
+    when a file was restored — a filesystem fact, for logging and tests. It is NOT a
+    dirty flag and must not be fed to one: a restore only puts bytes back at a path the
+    document already records, and media presence is computed per request rather than
+    stored, so nothing here needs saving. `_sync_media_folder` says so where it drops
+    this result on the floor.
+
+    Narrower than `_StagedMediaBatch.rollback`, and deliberately so. The staged name
+    carries the asset id and nothing else, so this pass cannot tell which path the bytes
+    came from and has to trust the record's current one. That is
+    sound for the case it exists for: a process death between the move and the commit
+    leaves the pre-stage document on disk, where the recorded path IS the origin. It is
+    only wrong if a writer repointed the asset's media after the stage and before the
+    crash, which would restore old bytes under the new name. Expiry: remove this
+    caveat once a staged file can carry its origin path without lengthening the staged
+    path — a sidecar index under the staging root would do it.
+    """
+    root = os.path.join(getattr(project, "project_dir", "") or "", "media", TRASH_STAGING_DIRNAME)
+    if not os.path.isdir(root):
+        return False
+    recorded = {str(getattr(asset, "asset_id", "") or ""): asset
+                for asset in (getattr(project, "assets", None) or [])}
+    restored = False
+    try:
+        staged_names = os.listdir(root)
+    except OSError:
+        # Another scan on this project swept the root and `os.rmdir`d it between the
+        # `isdir` above and here — concurrent Refreshes are ordinary now that project
+        # routes run on their own pool. A janitor losing a race has nothing to report
+        # and must not take the gallery refresh down with it: the caller's await sits
+        # outside the route's try, so an escape here is a 500 on the whole refresh.
+        return False
+    for name in staged_names:
+        staged_path = os.path.join(root, name)
+        if not os.path.isfile(staged_path):
+            continue
+        if _staged_in_flight(staged_path):
+            # A delete gesture in this process owns it. Its on-disk state is
+            # indistinguishable from a crash, so only liveness can tell them apart.
+            continue
+        asset = recorded.get(name)
+        if asset is None:
+            try:
+                os.remove(staged_path)
+            except OSError:
+                logger.warning("Could not reclaim staged media %s", staged_path, exc_info=True)
+            continue
+        # `_asset_abspath`, not the raising `_require_asset_media_source`. That one is a
+        # gate for destructive gestures — refusing to empty the trash on a record it
+        # cannot resolve is right. This is a best-effort reconciliation pass that now
+        # runs first in every media scan, so a single unresolvable record must not take
+        # the gallery refresh down with it, and strand its own staged media in the
+        # process: this sweep is the only way those bytes come back. `_asset_abspath`
+        # still calls `log_path_quarantine`, so a quarantined path stays on the record.
+        original_path = _asset_abspath(project, asset)
+        if not original_path or os.path.exists(original_path):
+            continue
+        try:
+            os.makedirs(os.path.dirname(original_path), exist_ok=True)
+            os.replace(staged_path, original_path)
+            restored = True
+            logger.info("Restored staged media for asset %s", name)
+        except OSError:
+            logger.warning("Could not restore staged media for asset %s", name, exc_info=True)
+    try:
+        os.rmdir(root)
+    except OSError:
+        pass
+    return restored
+
+
+def _apply_asset_delete_gesture(request: web.Request, build_payload, *, addressing="identity"):
+    """Run a media-destroying mutation with its whole staging lifecycle in ONE worker.
+
+    The stage → commit → discard-or-rollback decision must not straddle the event-loop
+    boundary. `asyncio.to_thread` cannot cancel a worker: if the awaiting task is
+    cancelled — aiohttp does this on shutdown, and on client disconnect when
+    `handler_cancellation` is on — a rollback scheduled from an exception handler would
+    run concurrently with a commit still in flight, mutating the same batch from two
+    threads. Keeping the terminal step in the worker makes the ordering unconditional.
+    """
+    batch: list[_StagedMediaBatch] = []
+
+    def apply_fn(project: TimelineProject) -> tuple[bool, dict]:
+        if batch:
+            # A CAS retry recomputes the target set, so undo the previous attempt's
+            # moves and start from the document as it now stands.
+            batch.pop().rollback()
+        staged = _StagedMediaBatch(project.project_dir)
+        batch.append(staged)
+        return build_payload(project, staged)
+
+    try:
+        project, payload = _apply_project_versioned_sync(
+            request, apply_fn, addressing=addressing)
+    except BaseException:
+        if batch:
+            batch[-1].rollback()
+        raise
+    if batch:
+        # Durable metadata no longer references these bytes, so they can go. A failed
+        # unlink leaks inside the staging directory, which every scan skips by name.
+        batch[-1].discard()
+    return project, payload
+
+
+class _AssetDeleteRefused(Exception):
+    """A refusal raised inside a worker, carrying the body the route must render.
+
+    These refusals have structured bodies (`usages`, `usage_count`) that predate the
+    `{error, code}` mutation-error shape and that the gallery reads, so they are
+    carried verbatim rather than flattened through `_mutation_json_error`.
+    """
+
+    def __init__(self, body: dict, status: int = 409) -> None:
+        super().__init__(str(body.get("error", "Asset delete refused")))
+        self.body = body
+        self.status = status
 
 
 def _delete_project_asset(project: TimelineProject, asset: Asset, usages_orphaned: int = 0) -> dict:
@@ -8586,6 +9184,15 @@ def _streamed_replace_commit(
 
 
 def _regenerate_thumbnail_if_current(project_dir: str, asset_id: str, expected_signature: str) -> None:
+    # Stays on the DEFAULT pool, unlike the rest of the project reads. This function
+    # is mostly ffmpeg: putting it on the project pool would occupy threads the
+    # project routes need, which is the starvation that pool exists to stop, pointed
+    # the other way. The cost accepted here is that its two `load_project` reads can
+    # park a default-pool thread behind a migrating save.
+    # Expiry: fold this into the project pool once the project resolution is hoisted
+    # out — pass an absolute source path in and the ffmpeg half stops touching project
+    # state at all. Same applies to `_generate_strip_if_current` and
+    # `_generate_waveform_if_current`.
     project = load_project(project_dir)
     asset = project.get_asset(asset_id)
     if asset is None:
@@ -9223,7 +9830,7 @@ if routes is not None:
         base_dir = _configured_base_dir()
         if not base_dir:
             return _json_error("base_dir required", 400)
-        projects = await asyncio.to_thread(list_projects, base_dir)
+        projects = await run_project_io(list_projects, base_dir)
         return web.json_response({"projects": projects})
 
     @routes.get("/sonder-editor/project/{project_id}")
@@ -9233,7 +9840,7 @@ if routes is not None:
                 project = _load_project_from_request(request)
                 return json.dumps(project.to_dict(), ensure_ascii=False)
 
-            body = await asyncio.to_thread(load_and_serialize_project)
+            body = await run_project_io(load_and_serialize_project)
             return web.Response(text=body, content_type="application/json")
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
@@ -9241,7 +9848,7 @@ if routes is not None:
     @routes.get("/sonder-editor/project/{project_id}/references")
     async def api_get_references(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(
+            project = await run_project_io(
                 _load_project_from_request,
                 request,
                 repair_missing_frames=False,
@@ -9254,7 +9861,7 @@ if routes is not None:
     async def api_verify_prompt_context_profile_create(request: web.Request) -> web.Response:
         """Read-only exact-definition recovery after an uncertain immutable create."""
         try:
-            project = await asyncio.to_thread(_load_project_from_request, 
+            project = await run_project_io(_load_project_from_request, 
                 request, repair_missing_frames=False, version_checked=False)
             attempted = _normalize_prompt_context_profile_create(project, await request.json())
         except FileNotFoundError as exc:
@@ -9292,7 +9899,7 @@ if routes is not None:
         if not isinstance(body, dict):
             return _json_error("Prompt Context candidate must be an object", 400)
         try:
-            project = await asyncio.to_thread(
+            project = await run_project_io(
                 _load_project_from_request, request,
                 repair_missing_frames=False, version_checked=False)
         except FileNotFoundError as exc:
@@ -9329,7 +9936,7 @@ if routes is not None:
         if not isinstance(operations, list) or not operations:
             return _json_error("operations must be a non-empty list", 400)
         try:
-            project, payload = await asyncio.to_thread(
+            project, payload = await run_project_io(
                 _apply_reference_mutations_sync,
                 request,
                 operations,
@@ -9344,7 +9951,7 @@ if routes is not None:
     @routes.get("/sonder-editor/project/{project_id}/dormant_summary")
     async def api_get_dormant_summary(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -9415,7 +10022,7 @@ if routes is not None:
         try:
             # Cancellation cannot strand a newly created root between creation
             # and requested initialization; the complete worker owns both.
-            project = await asyncio.to_thread(create_configured_project)
+            project = await run_project_io(create_configured_project)
             return web.json_response(project.to_dict(), status=201)
         except ProjectVersionConflict:
             raise
@@ -9426,7 +10033,7 @@ if routes is not None:
     @routes.put("/sonder-editor/project/{project_id}")
     async def api_update_project(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -9529,7 +10136,7 @@ if routes is not None:
                 _release_incompatible_scene_profiles(project, nxt)
             project.metadata.update(incoming)
 
-        await asyncio.to_thread(save_project, project)
+        await run_project_io(save_project, project)
         return web.json_response(project.to_dict())
 
     @routes.post("/sonder-editor/project/{project_id}/reveal")
@@ -9540,7 +10147,7 @@ if routes is not None:
         project_dir = _direct_project_dir_from_request(request)
         if not project_dir:
             try:
-                project = await asyncio.to_thread(_load_project_from_request, request)
+                project = await run_project_io(_load_project_from_request, request)
                 project_dir = getattr(project, "project_dir", "") or ""
             except FileNotFoundError as e:
                 return _json_error(str(e), 404)
@@ -9558,7 +10165,7 @@ if routes is not None:
     @routes.post("/sonder-editor/project/{project_id}/render_timeline")
     async def api_start_render_timeline(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -9589,7 +10196,7 @@ if routes is not None:
     @routes.get("/sonder-editor/project/{project_id}/render_timeline/{job_id}")
     async def api_get_render_timeline_job(request: web.Request) -> web.Response:
         try:
-            project_dir = await asyncio.to_thread(_project_dir_without_model, request, remember_project=False)
+            project_dir = await run_project_io(_project_dir_without_model, request, remember_project=False)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
         job = _TIMELINE_EXPORTS.get(request.match_info.get("job_id", ""))
@@ -9597,12 +10204,12 @@ if routes is not None:
             return web.json_response({"error": "Export job not found", "code": "not_found"}, status=404)
         if not _timeline_job_matches_project(job, project_dir):
             return web.json_response({"error": "Export job not found", "code": "not_found"}, status=404)
-        return web.json_response(await asyncio.to_thread(_timeline_export_job_response, request, job))
+        return web.json_response(await run_project_io(_timeline_export_job_response, request, job))
 
     @routes.post("/sonder-editor/project/{project_id}/render_timeline/{job_id}/cancel")
     async def api_cancel_render_timeline_job(request: web.Request) -> web.Response:
         try:
-            project_dir = await asyncio.to_thread(_project_dir_without_model, request, remember_project=False)
+            project_dir = await run_project_io(_project_dir_without_model, request, remember_project=False)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
         job_id = request.match_info.get("job_id", "")
@@ -9624,7 +10231,7 @@ if routes is not None:
     async def api_list_render_cache(request: web.Request) -> web.Response:
         try:
             # Derived cache maintenance needs storage only; it never writes project state.
-            project_dir = await asyncio.to_thread(_project_dir_without_model, request)
+            project_dir = await run_project_io(_project_dir_without_model, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -9660,7 +10267,7 @@ if routes is not None:
 
         try:
             # Derived cache maintenance needs storage only; it never writes project state.
-            project_dir = await asyncio.to_thread(_project_dir_without_model, request)
+            project_dir = await run_project_io(_project_dir_without_model, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -9679,7 +10286,7 @@ if routes is not None:
     async def api_delete_render_cache_entry(request: web.Request) -> web.Response:
         try:
             # Derived cache maintenance needs storage only; it never writes project state.
-            project_dir = await asyncio.to_thread(_project_dir_without_model, request)
+            project_dir = await run_project_io(_project_dir_without_model, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -9717,7 +10324,7 @@ if routes is not None:
         try:
             def read_batch():
                 return read_asset_provenance_batch(_project_dir_without_model(request), ids)
-            return web.json_response(await asyncio.to_thread(read_batch))
+            return web.json_response(await run_project_io(read_batch))
         except FileNotFoundError as exc:
             return _json_error(str(exc), 404)
         except ProjectStorageError as exc:
@@ -9730,7 +10337,7 @@ if routes is not None:
             return read_asset_provenance(_project_dir_without_model(request),
                                         request.match_info.get("asset_id", ""))
         try:
-            return web.json_response(await asyncio.to_thread(read_provenance))
+            return web.json_response(await run_project_io(read_provenance))
         except FileNotFoundError as exc:
             return _json_error(str(exc), 404)
         except ProjectStorageError as exc:
@@ -9740,7 +10347,7 @@ if routes is not None:
     async def api_list_assets(request: web.Request) -> web.Response:
         """List saved assets in a project, optionally filtered by type."""
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request, repair_missing_frames=False)
+            project = await run_project_io(_load_project_from_request, request, repair_missing_frames=False)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -9753,7 +10360,7 @@ if routes is not None:
         if not include_trashed:
             assets = [asset for asset in assets if not _asset_is_trashed(asset)]
 
-        result = await asyncio.to_thread(_asset_payloads, project, assets)
+        result = await run_project_io(_asset_payloads, project, assets)
 
         return web.json_response({
             "project_id": project.project_id,
@@ -9766,7 +10373,7 @@ if routes is not None:
     async def api_sync_assets(request: web.Request) -> web.Response:
         """Synchronize media-folder discovery/repair/trash cleanup, then return assets."""
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -9779,7 +10386,7 @@ if routes is not None:
             None,
         )
 
-        project = await asyncio.to_thread(
+        project = await run_project_io(
             _sync_media_folder_versioned,
             project,
             trash_retention_days,
@@ -9797,7 +10404,7 @@ if routes is not None:
         if not include_trashed:
             assets = [asset for asset in assets if not _asset_is_trashed(asset)]
 
-        result = await asyncio.to_thread(_asset_payloads, project, assets)
+        result = await run_project_io(_asset_payloads, project, assets)
         return web.json_response({
             "project_id": project.project_id,
             "modified_at": project.modified_at,
@@ -9809,13 +10416,13 @@ if routes is not None:
     async def api_list_dormant_assets(request: web.Request) -> web.Response:
         """List lightweight asset data without scanning/syncing media folders."""
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
         include_trashed = _query_flag(request.query.get("include_trashed"))
         assets = project.assets if include_trashed else [asset for asset in project.assets if not _asset_is_trashed(asset)]
-        result = await asyncio.to_thread(_asset_payloads, project, assets)
+        result = await run_project_io(_asset_payloads, project, assets)
 
         return web.json_response({
             "project_id": project.project_id,
@@ -9833,7 +10440,7 @@ if routes is not None:
                 # Upload bytes are not derived from a client project version.
                 # Remove this exemption if the multipart body gains a client base
                 # version, or the commit stops owning CAS/content preconditions.
-                project = await asyncio.to_thread(
+                project = await run_project_io(
                     _load_project_from_request, request,
                     repair_missing_frames=False, version_checked=False,
                 )
@@ -9850,7 +10457,7 @@ if routes is not None:
                     allowed_text_fields={"folder"},
                 ) as upload:
                     folder = _normalize_asset_folder(upload.fields.get("folder", ""))
-                    committed_project, asset = await asyncio.to_thread(
+                    committed_project, asset = await run_project_io(
                         _streamed_import_commit,
                         project.project_dir,
                         upload.path,
@@ -9867,7 +10474,7 @@ if routes is not None:
                             asset.asset_id,
                             asset.media_probe_signature,
                         )
-                    payload = await asyncio.to_thread(_asset_payload, committed_project, asset)
+                    payload = await run_project_io(_asset_payload, committed_project, asset)
                     logger.info(
                         "Streamed asset import completed bytes=%s duration_ms=%s active=%s",
                         upload.size,
@@ -9896,7 +10503,7 @@ if routes is not None:
             return _json_error("Content-Type must be application/json or multipart/form-data", 415)
 
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -9967,7 +10574,7 @@ if routes is not None:
             asset.folder = _normalize_asset_folder(body["folder"])
             _ensure_asset_folder(project, asset.folder)
         project.add_asset(asset)
-        await asyncio.to_thread(save_project, project)
+        await run_project_io(save_project, project)
 
         if asset_type in {"video", "image", "audio"}:
             thumb_path = _asset_thumbnail_path(project, asset)
@@ -9979,7 +10586,7 @@ if routes is not None:
     @routes.post("/sonder-editor/project/{project_id}/assets/folders")
     async def api_create_asset_folder(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -9993,13 +10600,13 @@ if routes is not None:
             return _json_error("Folder name required", 400)
 
         _ensure_asset_folder(project, folder)
-        await asyncio.to_thread(save_project, project)
+        await run_project_io(save_project, project)
         return web.json_response({"folders": _collect_asset_folders(project)})
 
     @routes.put("/sonder-editor/project/{project_id}/assets/folders")
     async def api_rename_asset_folder(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10021,16 +10628,11 @@ if routes is not None:
         except ValueError as e:
             return _json_error(str(e), 400)
 
-        await asyncio.to_thread(save_project, project)
+        await run_project_io(save_project, project)
         return web.json_response({"folders": folders, "assets_moved": assets_moved})
 
     @routes.delete("/sonder-editor/project/{project_id}/assets/folders")
     async def api_delete_asset_folder(request: web.Request) -> web.Response:
-        try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
-        except FileNotFoundError as e:
-            return _json_error(str(e), 404)
-
         body = {}
         try:
             body = await request.json()
@@ -10038,14 +10640,27 @@ if routes is not None:
             pass
 
         folder = body.get("folder", "")
-        try:
+
+        # The usage scan takes the per-project write lock through `hydrate_job`.
+        def load_and_aggregate_usages():
+            project = _load_project_from_request(request)
             assets_to_delete = _find_assets_in_folder(project, folder)
+            usage = _aggregate_asset_usages(project, assets_to_delete)
+            return (project, assets_to_delete, usage,
+                    _asset_trash_protection(project, assets_to_delete, usage=usage))
+
+        try:
+            project, assets_to_delete, queued_usage, protection = await run_project_io(
+                load_and_aggregate_usages)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
+        except ProjectStorageError:
+            # Durable storage is unreadable. That is a server-side integrity failure,
+            # not a malformed request, and its message carries an absolute path.
+            raise
         except ValueError as e:
             return _json_error(str(e), 400)
 
-        queued_usage = _aggregate_asset_usages(project, assets_to_delete)
         if _has_pending_frozen_input_usage(queued_usage):
             return web.json_response({
                 "error": "One or more assets are frozen by a pending Reference generation",
@@ -10055,10 +10670,12 @@ if routes is not None:
             }, status=409)
         force = bool(body.get("force", False))
         if not force and assets_to_delete:
-            protection = _asset_trash_protection(project, assets_to_delete)
             if protection["protected"]:
                 return web.json_response(
-                    _asset_trash_conflict_payload(project, assets_to_delete, "One or more assets in this folder are used or favorited"),
+                    _asset_trash_conflict_payload(
+                        project, assets_to_delete,
+                        "One or more assets in this folder are used or favorited",
+                        protection=protection),
                     status=409,
                 )
 
@@ -10071,7 +10688,7 @@ if routes is not None:
         except OSError as e:
             return _json_error(str(e), 500)
 
-        await asyncio.to_thread(save_project, project)
+        await run_project_io(save_project, project)
         return web.json_response({
             "trashed_folder": _normalize_asset_folder(folder),
             "trashed_assets": len(trashed_assets),
@@ -10081,7 +10698,7 @@ if routes is not None:
     async def api_viewport_snapshot_asset(request: web.Request) -> web.Response:
         """Register a browser-captured viewport source-frame snapshot as an image asset."""
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10158,7 +10775,7 @@ if routes is not None:
                 generation_params=generation_params,
             )
             project.add_asset(asset)
-            await asyncio.to_thread(save_project, project)
+            await run_project_io(save_project, project)
 
             thumb_path = _asset_thumbnail_path(project, asset)
             if thumb_path:
@@ -10172,7 +10789,7 @@ if routes is not None:
     async def api_extract_frame(request: web.Request) -> web.Response:
         """Extract a single video frame and save as an image asset."""
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10246,7 +10863,7 @@ if routes is not None:
                 },
             )
             project.add_asset(asset)
-            await asyncio.to_thread(save_project, project)
+            await run_project_io(save_project, project)
 
             # Generate thumbnail
             thumb_path = _asset_thumbnail_path(project, asset)
@@ -10264,7 +10881,7 @@ if routes is not None:
     @routes.put("/sonder-editor/project/{project_id}/assets/bulk-move")
     async def api_bulk_move_assets(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10287,50 +10904,63 @@ if routes is not None:
         for asset in assets:
             asset.folder = folder
 
-        await asyncio.to_thread(save_project, project)
+        await run_project_io(save_project, project)
         return web.json_response({"updated": len(assets)})
 
     @routes.post("/sonder-editor/project/{project_id}/assets/bulk-usages")
     async def api_bulk_asset_usages(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
-        except FileNotFoundError as e:
-            return _json_error(str(e), 404)
-
-        try:
             body = await request.json()
         except json.JSONDecodeError:
             return _json_error("Invalid JSON body", 400)
+        asset_ids = body.get("asset_ids", [])
+
+        def load_and_aggregate_usages() -> dict:
+            project = _load_project_from_request(request)
+            return _aggregate_asset_usages(
+                project, _resolve_assets_from_ids(project, asset_ids))
 
         try:
-            assets = _resolve_assets_from_ids(project, body.get("asset_ids", []))
+            usages = await run_project_io(load_and_aggregate_usages)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
+        except ProjectStorageError:
+            # Durable storage is unreadable. That is a server-side integrity failure,
+            # not a malformed request, and its message carries an absolute path.
+            raise
         except ValueError as e:
             return _json_error(str(e), 400)
-
-        return web.json_response(_aggregate_asset_usages(project, assets))
+        return web.json_response(usages)
 
     @routes.post("/sonder-editor/project/{project_id}/assets/bulk-delete")
     async def api_bulk_delete_assets(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
-        except FileNotFoundError as e:
-            return _json_error(str(e), 404)
-
-        try:
             body = await request.json()
         except json.JSONDecodeError:
             return _json_error("Invalid JSON body", 400)
+        asset_ids = body.get("asset_ids", [])
+
+        # The usage scan takes the per-project write lock through `hydrate_job`;
+        # keep it in the same worker as the load rather than on the event loop.
+        def load_and_aggregate_usages():
+            project = _load_project_from_request(request)
+            assets = _resolve_assets_from_ids(project, asset_ids)
+            usage = _aggregate_asset_usages(project, assets)
+            # Reuses that aggregation rather than repeating the walk on the loop.
+            return project, assets, usage, _asset_trash_protection(project, assets, usage=usage)
 
         try:
-            assets = _resolve_assets_from_ids(project, body.get("asset_ids", []))
+            project, assets, queued_usage, protection = await run_project_io(
+                load_and_aggregate_usages)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
+        except ProjectStorageError:
+            # Durable storage is unreadable. That is a server-side integrity failure,
+            # not a malformed request, and its message carries an absolute path.
+            raise
         except ValueError as e:
             return _json_error(str(e), 400)
 
-        queued_usage = _aggregate_asset_usages(project, assets)
         if _has_pending_frozen_input_usage(queued_usage):
             return web.json_response({
                 "error": "One or more assets are frozen by a pending Reference generation",
@@ -10340,10 +10970,11 @@ if routes is not None:
             }, status=409)
         force = bool(body.get("force", False))
         if not force:
-            protection = _asset_trash_protection(project, assets)
             if protection["protected"]:
                 return web.json_response(
-                    _asset_trash_conflict_payload(project, assets, "One or more assets are used or favorited"),
+                    _asset_trash_conflict_payload(
+                        project, assets, "One or more assets are used or favorited",
+                        protection=protection),
                     status=409,
                 )
 
@@ -10355,7 +10986,7 @@ if routes is not None:
                 trashed_ids.append(asset.asset_id)
         except ValueError as e:
             return _json_error(str(e), 400)
-        await asyncio.to_thread(save_project, project)
+        await run_project_io(save_project, project)
         return web.json_response({
             "trashed": trashed_ids,
         })
@@ -10363,7 +10994,7 @@ if routes is not None:
     @routes.post("/sonder-editor/project/{project_id}/assets/restore")
     async def api_restore_asset(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10381,7 +11012,7 @@ if routes is not None:
             return _json_error(f"Asset not found: {asset_id}", 404)
 
         payload = _restore_project_asset(project, asset)
-        await asyncio.to_thread(save_project, project)
+        await run_project_io(save_project, project)
         return web.json_response({
             **payload,
             "asset": _asset_payload(project, asset),
@@ -10390,7 +11021,7 @@ if routes is not None:
     @routes.post("/sonder-editor/project/{project_id}/assets/bulk-restore")
     async def api_bulk_restore_assets(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10411,16 +11042,11 @@ if routes is not None:
             _restore_project_asset(project, asset)
             restored_ids.append(asset.asset_id)
 
-        await asyncio.to_thread(save_project, project)
+        await run_project_io(save_project, project)
         return web.json_response({"restored": restored_ids})
 
     @routes.post("/sonder-editor/project/{project_id}/assets/permanent")
     async def api_permanent_delete_asset(request: web.Request) -> web.Response:
-        try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
-        except FileNotFoundError as e:
-            return _json_error(str(e), 404)
-
         try:
             body = await request.json()
         except json.JSONDecodeError:
@@ -10429,139 +11055,169 @@ if routes is not None:
         asset_id = str(body.get("asset_id", "")).strip()
         if not asset_id:
             return _json_error("asset_id is required", 400)
-
-        asset = project.get_asset(asset_id)
-        if not asset:
-            return _json_error(f"Asset not found: {asset_id}", 404)
-
-        usage = _find_asset_usages(project, asset)
-        if _has_pending_frozen_input_usage(usage):
-            return web.json_response({
-                "error": "Asset is frozen by a pending Reference generation",
-                "code": "queued_reference_input",
-                "usages": usage["usages"],
-                "usage_count": usage["usage_count"],
-            }, status=409)
         force = bool(body.get("force", False))
-        if usage["usage_count"] > 0 and not force:
-            return web.json_response({
-                "error": "Asset is in use",
-                "usages": usage["usages"],
-                "usage_count": usage["usage_count"],
-            }, status=409)
+
+        def permanent_delete(project: TimelineProject, staged) -> tuple[bool, dict]:
+            asset = project.get_asset(asset_id)
+            if not asset:
+                _mutation_error(f"Asset not found: {asset_id}", 404, "asset_not_found")
+
+            usage = _find_asset_usages(project, asset)
+            if _has_pending_frozen_input_usage(usage):
+                raise _AssetDeleteRefused({
+                    "error": "Asset is frozen by a pending Reference generation",
+                    "code": "queued_reference_input",
+                    "usages": usage["usages"],
+                    "usage_count": usage["usage_count"],
+                })
+            if usage["usage_count"] > 0 and not force:
+                raise _AssetDeleteRefused({
+                    "error": "Asset is in use",
+                    "usages": usage["usages"],
+                    "usage_count": usage["usage_count"],
+                })
+
+            reference_cleanup = _remove_reference_members_for_assets(project, {asset.asset_id})
+            staged.stage(project, asset)
+            _delete_asset_cache_files(project, asset)
+            project.remove_asset(asset.asset_id)
+            payload = {
+                "deleted": True,
+                "asset_id": asset.asset_id,
+                "usages_orphaned": usage["usage_count"],
+                **reference_cleanup,
+            }
+            return True, payload
 
         try:
-            reference_cleanup = _remove_reference_members_for_assets(project, {asset.asset_id})
-            payload = _delete_project_asset(project, asset, usage["usage_count"])
+            _project, payload = await run_project_io(
+                _apply_asset_delete_gesture, request, permanent_delete)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+        except _AssetDeleteRefused as exc:
+            return web.json_response(exc.body, status=exc.status)
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
         except ValueError as e:
             return _json_error(str(e), 400)
         except OSError as e:
             return _json_error(str(e), 500)
-
-        await asyncio.to_thread(save_project, project)
-        payload.update(reference_cleanup)
         return web.json_response(payload)
 
     @routes.post("/sonder-editor/project/{project_id}/assets/bulk-permanent-delete")
     async def api_bulk_permanent_delete_assets(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
-        except FileNotFoundError as e:
-            return _json_error(str(e), 404)
-
-        try:
             body = await request.json()
         except json.JSONDecodeError:
             return _json_error("Invalid JSON body", 400)
 
-        try:
-            assets = _resolve_assets_from_ids(project, body.get("asset_ids", []))
-        except FileNotFoundError as e:
-            return _json_error(str(e), 404)
-        except ValueError as e:
-            return _json_error(str(e), 400)
-
-        usage = _aggregate_asset_usages(project, assets)
-        if _has_pending_frozen_input_usage(usage):
-            return web.json_response({
-                "error": "One or more assets are frozen by a pending Reference generation",
-                "code": "queued_reference_input",
-                "usages": usage["usages"],
-                "usage_count": usage["usage_count"],
-            }, status=409)
+        asset_ids = body.get("asset_ids", [])
         force = bool(body.get("force", False))
-        if usage["usage_count"] > 0 and not force:
-            return web.json_response({
-                "error": "One or more assets are still in use",
-                "usages": usage["usages"],
-                "usage_count": usage["usage_count"],
-            }, status=409)
 
-        deleted_ids = []
-        try:
+        def bulk_permanent_delete(project: TimelineProject, staged) -> tuple[bool, dict]:
+            assets = _resolve_assets_from_ids(project, asset_ids)
+            usage = _aggregate_asset_usages(project, assets)
+            if _has_pending_frozen_input_usage(usage):
+                raise _AssetDeleteRefused({
+                    "error": "One or more assets are frozen by a pending Reference generation",
+                    "code": "queued_reference_input",
+                    "usages": usage["usages"],
+                    "usage_count": usage["usage_count"],
+                })
+            if usage["usage_count"] > 0 and not force:
+                raise _AssetDeleteRefused({
+                    "error": "One or more assets are still in use",
+                    "usages": usage["usages"],
+                    "usage_count": usage["usage_count"],
+                })
+
             _require_asset_media_sources(project, assets, operation="Asset bulk delete")
             reference_cleanup = _remove_reference_members_for_assets(
                 project,
                 {asset.asset_id for asset in assets},
             )
+            deleted_ids = []
             for asset in assets:
-                _delete_project_asset(project, asset)
+                staged.stage(project, asset)
+                _delete_asset_cache_files(project, asset)
+                project.remove_asset(asset.asset_id)
                 deleted_ids.append(asset.asset_id)
+            return True, {
+                "deleted": deleted_ids,
+                "usages_orphaned": usage["usage_count"],
+                **reference_cleanup,
+            }
+
+        try:
+            _project, payload = await run_project_io(
+                _apply_asset_delete_gesture, request, bulk_permanent_delete)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+        except _AssetDeleteRefused as exc:
+            return web.json_response(exc.body, status=exc.status)
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
         except ValueError as e:
             return _json_error(str(e), 400)
         except OSError as e:
             return _json_error(str(e), 500)
-
-        await asyncio.to_thread(save_project, project)
-        return web.json_response({
-            "deleted": deleted_ids,
-            "usages_orphaned": usage["usage_count"],
-            **reference_cleanup,
-        })
+        return web.json_response(payload)
 
     @routes.post("/sonder-editor/project/{project_id}/assets/empty-trash")
     async def api_empty_asset_trash(request: web.Request) -> web.Response:
-        try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
-        except FileNotFoundError as e:
-            return _json_error(str(e), 404)
-
-        deleted_ids = []
-        try:
+        # One worker owns the whole gesture: `_aggregate_asset_usages` reaches
+        # `hydrate_job`, which takes the per-project write lock, and the media moves
+        # are filesystem work. Neither belongs on the event loop.
+        def empty_trash(project: TimelineProject, staged) -> tuple[bool, dict]:
             trashed_assets = list(_project_trashed_assets(project))
             queued_usage = _aggregate_asset_usages(project, trashed_assets)
             if _has_pending_frozen_input_usage(queued_usage):
-                return web.json_response({
+                raise _AssetDeleteRefused({
                     "error": "Trash contains an asset frozen by a pending Reference generation",
                     "code": "queued_reference_input",
                     "usages": queued_usage["usages"],
                     "usage_count": queued_usage["usage_count"],
-                }, status=409)
+                })
             _require_asset_media_sources(project, trashed_assets, operation="Asset empty trash")
             reference_cleanup = _remove_reference_members_for_assets(
                 project,
                 {asset.asset_id for asset in trashed_assets},
             )
+            deleted_ids = []
             for asset in trashed_assets:
-                _delete_project_asset(project, asset)
+                # Same order the delete path used, so the shared-source guard sees
+                # exactly the assets it saw before: stage, drop regenerable caches,
+                # then remove the record.
+                staged.stage(project, asset)
+                _delete_asset_cache_files(project, asset)
+                project.remove_asset(asset.asset_id)
                 deleted_ids.append(asset.asset_id)
+            return True, {
+                "deleted": deleted_ids,
+                "emptied": len(deleted_ids),
+                **reference_cleanup,
+            }
+
+        try:
+            _project, payload = await run_project_io(
+                _apply_asset_delete_gesture, request, empty_trash)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+        except _AssetDeleteRefused as exc:
+            return web.json_response(exc.body, status=exc.status)
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
         except ValueError as e:
             return _json_error(str(e), 400)
         except OSError as e:
             return _json_error(str(e), 500)
-
-        await asyncio.to_thread(save_project, project)
-        return web.json_response({
-            "deleted": deleted_ids,
-            "emptied": len(deleted_ids),
-            **reference_cleanup,
-        })
+        return web.json_response(payload)
 
     @routes.put("/sonder-editor/project/{project_id}/assets/{asset_id}")
     async def api_update_asset(request: web.Request) -> web.Response:
         """Update asset properties (e.g. name)."""
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10583,13 +11239,13 @@ if routes is not None:
         if "favorite" in body:
             asset.favorite = bool(body["favorite"])
 
-        await asyncio.to_thread(save_project, project)
+        await run_project_io(save_project, project)
         return web.json_response(_asset_payload(project, asset))
 
     @routes.get("/sonder-editor/project/{project_id}/assets/{asset_id}/workflow")
     async def api_get_asset_workflow(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10605,30 +11261,29 @@ if routes is not None:
 
     @routes.get("/sonder-editor/project/{project_id}/assets/{asset_id}/usages")
     async def api_get_asset_usages(request: web.Request) -> web.Response:
+        asset_id = request.match_info["asset_id"]
+
+        # `_find_asset_usages` reaches `hydrate_job`, which takes the per-project
+        # write lock a migrating save can hold for seconds. One worker owns the load
+        # and the usage scan together.
+        def load_and_find_usages() -> dict:
+            project = _load_project_from_request(request)
+            asset = project.get_asset(asset_id)
+            if not asset:
+                _mutation_error(f"Asset not found: {asset_id}", 404, "asset_not_found")
+            return _find_asset_usages(project, asset)
+
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            usages = await run_project_io(load_and_find_usages)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
-
-        asset_id = request.match_info["asset_id"]
-        asset = project.get_asset(asset_id)
-        if not asset:
-            return _json_error(f"Asset not found: {asset_id}", 404)
-
-        return web.json_response(_find_asset_usages(project, asset))
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
+        return web.json_response(usages)
 
     @routes.delete("/sonder-editor/project/{project_id}/assets/{asset_id}")
     async def api_delete_asset(request: web.Request) -> web.Response:
-        try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
-        except FileNotFoundError as e:
-            return _json_error(str(e), 404)
-
         asset_id = request.match_info["asset_id"]
-        asset = project.get_asset(asset_id)
-        if not asset:
-            return _json_error(f"Asset not found: {asset_id}", 404)
-
         body = {}
         try:
             parsed_body = await request.json()
@@ -10637,7 +11292,27 @@ if routes is not None:
         except Exception:
             pass
         force = bool(body.get("force", False))
-        queued_usage = _find_asset_usages(project, asset)
+
+        # `_find_asset_usages` reaches `hydrate_job`, which takes the per-project
+        # write lock; scanning on the loop stalls it for a migrating save's duration.
+        def load_and_find_usages():
+            project = _load_project_from_request(request)
+            asset = project.get_asset(asset_id)
+            if not asset:
+                _mutation_error(f"Asset not found: {asset_id}", 404, "asset_not_found")
+            # The protection scan walks the same scenes again, so it belongs in this
+            # worker too. Only computed when it can actually refuse.
+            protection = None if force else _asset_trash_protection(project, [asset])
+            return project, asset, _find_asset_usages(project, asset), protection
+
+        try:
+            project, asset, queued_usage, protection = await run_project_io(
+                load_and_find_usages)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
+
         if _has_pending_frozen_input_usage(queued_usage):
             return web.json_response({
                 "error": "Asset is frozen by a pending Reference generation",
@@ -10646,10 +11321,11 @@ if routes is not None:
                 "usage_count": queued_usage["usage_count"],
             }, status=409)
         if not force:
-            protection = _asset_trash_protection(project, [asset])
             if protection["protected"]:
                 return web.json_response(
-                    _asset_trash_conflict_payload(project, [asset], "Asset is used or favorited"),
+                    _asset_trash_conflict_payload(
+                        project, [asset], "Asset is used or favorited",
+                        protection=protection),
                     status=409,
                 )
 
@@ -10657,29 +11333,39 @@ if routes is not None:
             payload = _trash_project_asset(project, asset)
         except ValueError as e:
             return _json_error(str(e), 400)
-        await asyncio.to_thread(save_project, project)
+        await run_project_io(save_project, project)
         return web.json_response(payload)
 
     @routes.post("/sonder-editor/project/{project_id}/assets/{asset_id}/replace")
     async def api_replace_asset(request: web.Request) -> web.Response:
         request_content_type = getattr(request, "content_type", "application/json")
         if request_content_type == "multipart/form-data":
-            try:
+            asset_id = request.match_info["asset_id"]
+
+            # One worker: the load, and the usage scan that reaches `hydrate_job`'s
+            # per-project write lock. Scanning on the loop stalls it for as long as a
+            # migrating save holds that lock.
+            def load_and_check_frozen_usage():
                 # Upload bytes are not derived from a client project version.
                 # Remove this exemption if the multipart body gains a client base
                 # version, or the commit stops owning CAS/content preconditions.
-                initial_project = await asyncio.to_thread(
-                    _load_project_from_request, request,
-                    repair_missing_frames=False, version_checked=False,
-                )
+                initial_project = _load_project_from_request(
+                    request, repair_missing_frames=False, version_checked=False)
+                initial_asset = initial_project.get_asset(asset_id)
+                if not initial_asset:
+                    _mutation_error(f"Asset not found: {asset_id}", 404, "asset_not_found")
+                frozen = _has_pending_frozen_input_usage(
+                    _find_asset_usages(initial_project, initial_asset))
+                return initial_project, initial_asset, frozen
+
+            try:
+                initial_project, initial_asset, frozen_usage = await run_project_io(
+                    load_and_check_frozen_usage)
             except FileNotFoundError as e:
                 return _json_error(str(e), 404)
-            asset_id = request.match_info["asset_id"]
-            initial_asset = initial_project.get_asset(asset_id)
-            if not initial_asset:
-                return _json_error(f"Asset not found: {asset_id}", 404)
-            if _has_pending_frozen_input_usage(
-                    _find_asset_usages(initial_project, initial_asset)):
+            except ProjectMutationRequestError as e:
+                return _mutation_json_error(e)
+            if frozen_usage:
                 return _json_error(
                     "Asset is frozen by a pending Reference generation", 409)
             try:
@@ -10699,7 +11385,7 @@ if routes is not None:
                     os.path.dirname(initial_abs_path),
                     allowed_text_fields=set(),
                 ) as upload:
-                    committed_project, committed_asset = await asyncio.to_thread(
+                    committed_project, committed_asset = await run_project_io(
                         _streamed_replace_commit,
                         initial_project.project_dir,
                         asset_id,
@@ -10723,7 +11409,7 @@ if routes is not None:
                         committed_asset.asset_id,
                         committed_asset.media_probe_signature,
                     )
-                    payload = await asyncio.to_thread(
+                    payload = await run_project_io(
                         lambda: {
                             "asset": _asset_payload(committed_project, committed_asset),
                             "usage": _find_asset_usages(committed_project, committed_asset),
@@ -10763,16 +11449,23 @@ if routes is not None:
         if request_content_type != "application/json":
             return _json_error("Content-Type must be application/json or multipart/form-data", 415)
 
+        asset_id = request.match_info["asset_id"]
+
+        def load_and_check_frozen_usage():
+            project = _load_project_from_request(request)
+            asset = project.get_asset(asset_id)
+            if not asset:
+                _mutation_error(f"Asset not found: {asset_id}", 404, "asset_not_found")
+            return project, asset, _has_pending_frozen_input_usage(
+                _find_asset_usages(project, asset))
+
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project, asset, frozen_usage = await run_project_io(load_and_check_frozen_usage)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
-
-        asset_id = request.match_info["asset_id"]
-        asset = project.get_asset(asset_id)
-        if not asset:
-            return _json_error(f"Asset not found: {asset_id}", 404)
-        if _has_pending_frozen_input_usage(_find_asset_usages(project, asset)):
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
+        if frozen_usage:
             return _json_error(
                 "Asset is frozen by a pending Reference generation", 409)
 
@@ -10801,11 +11494,16 @@ if routes is not None:
                     thumb_path,
                 )
 
-        await asyncio.to_thread(save_project, project)
-        return web.json_response({
-            "asset": _asset_payload(project, asset),
-            "usage": _find_asset_usages(project, asset),
-        })
+        await run_project_io(save_project, project)
+        # Mirrors the multipart path: the usage scan takes the project lock, so it is
+        # built in a worker rather than while constructing the response.
+        payload = await run_project_io(
+            lambda: {
+                "asset": _asset_payload(project, asset),
+                "usage": _find_asset_usages(project, asset),
+            }
+        )
+        return web.json_response(payload)
 
     @routes.get("/sonder-editor/project/{project_id}/thumbnail/{asset_id}")
     async def api_get_thumbnail(request: web.Request) -> web.Response:
@@ -10819,7 +11517,7 @@ if routes is not None:
             return fast_response
 
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10870,7 +11568,7 @@ if routes is not None:
             return fast_response
 
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10917,7 +11615,7 @@ if routes is not None:
             return fast_response
 
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10958,7 +11656,7 @@ if routes is not None:
                     "scenes": [scene.to_dict() for scene in project.scenes_ordered()]
                 }, ensure_ascii=False)
 
-            body = await asyncio.to_thread(load_and_serialize_scenes)
+            body = await run_project_io(load_and_serialize_scenes)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10967,7 +11665,7 @@ if routes is not None:
     @routes.post("/sonder-editor/project/{project_id}/scenes")
     async def api_create_scene(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -10982,78 +11680,90 @@ if routes is not None:
             prompt=body.get("prompt", ""),
         )
         project.add_scene(scene)
-        await asyncio.to_thread(save_project, project)
+        await run_project_io(save_project, project)
 
         return web.json_response(scene.to_dict(), status=201)
 
     @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/duplicate")
     async def api_duplicate_scene(request: web.Request) -> web.Response:
+        scene_id = request.match_info["scene_id"]
+
+        # Everything here is re-derived from the document each attempt, deliberately:
+        # a CAS retry re-mints the ids and re-resolves the unique copy name against
+        # whatever landed meanwhile, so a concurrent duplicate cannot produce two
+        # scenes with the same name. The first attempt's scene is never saved, so a
+        # retry cannot append twice.
+        def duplicate_scene(project: TimelineProject) -> tuple[bool, dict]:
+            source_scene = project.get_scene(scene_id)
+            if not source_scene:
+                _mutation_error(f"Scene not found: {scene_id}", 404, "scene_not_found")
+
+            payload = source_scene.to_dict()
+            payload.pop("scene_id", None)
+            for clip_payload in payload.get("clips", []) or []:
+                if isinstance(clip_payload, dict):
+                    clip_payload.pop("clip_id", None)
+            for track_payload in payload.get("audio_tracks", []) or []:
+                if isinstance(track_payload, dict):
+                    track_payload.pop("track_id", None)
+            reference_item_id_map = {}
+            for item_payload in payload.get("reference_items", []) or []:
+                if isinstance(item_payload, dict):
+                    previous_id = str(item_payload.get("reference_item_id") or "")
+                    next_id = uuid.uuid4().hex
+                    item_payload["reference_item_id"] = next_id
+                    if previous_id:
+                        reference_item_id_map[previous_id] = next_id
+
+            def remap_reference_attachment_sources(attachments):
+                for attachment in attachments or []:
+                    if not isinstance(attachment, dict):
+                        continue
+                    source = attachment.get("source")
+                    if not isinstance(source, dict):
+                        continue
+                    source_id = str(source.get("reference_item_id") or "")
+                    if source_id in reference_item_id_map:
+                        source["reference_item_id"] = reference_item_id_map[source_id]
+                    if isinstance(source.get("reference_item_ids"), list):
+                        source["reference_item_ids"] = [
+                            reference_item_id_map.get(str(value), str(value))
+                            for value in source["reference_item_ids"]
+                        ]
+
+            remap_reference_attachment_sources(payload.get("global_attachments"))
+            for section_payload in payload.get("prompt_sections", []) or []:
+                if isinstance(section_payload, dict):
+                    remap_reference_attachment_sources(section_payload.get("attachments"))
+
+            existing_names = {scene.name for scene in project.scenes}
+            copy_base = f"{source_scene.name} (copy)"
+            copy_name = copy_base
+            suffix = 2
+            while copy_name in existing_names:
+                copy_name = f"{copy_base} {suffix}"
+                suffix += 1
+            payload["name"] = copy_name
+            payload["order"] = max(
+                (getattr(scene, "order", 0) for scene in project.scenes), default=-1) + 1
+
+            new_scene = Scene.from_dict(payload)
+            project.add_scene(new_scene)
+            return True, new_scene.to_dict()
+
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            _project, payload = await run_project_io(
+                _apply_project_versioned_sync, request, duplicate_scene, addressing="identity")
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
-
-        source_scene = project.get_scene(request.match_info["scene_id"])
-        if not source_scene:
-            return _json_error(f"Scene not found: {request.match_info['scene_id']}", 404)
-
-        payload = source_scene.to_dict()
-        payload.pop("scene_id", None)
-        for clip_payload in payload.get("clips", []) or []:
-            if isinstance(clip_payload, dict):
-                clip_payload.pop("clip_id", None)
-        for track_payload in payload.get("audio_tracks", []) or []:
-            if isinstance(track_payload, dict):
-                track_payload.pop("track_id", None)
-        reference_item_id_map = {}
-        for item_payload in payload.get("reference_items", []) or []:
-            if isinstance(item_payload, dict):
-                previous_id = str(item_payload.get("reference_item_id") or "")
-                next_id = uuid.uuid4().hex
-                item_payload["reference_item_id"] = next_id
-                if previous_id:
-                    reference_item_id_map[previous_id] = next_id
-
-        def remap_reference_attachment_sources(attachments):
-            for attachment in attachments or []:
-                if not isinstance(attachment, dict):
-                    continue
-                source = attachment.get("source")
-                if not isinstance(source, dict):
-                    continue
-                source_id = str(source.get("reference_item_id") or "")
-                if source_id in reference_item_id_map:
-                    source["reference_item_id"] = reference_item_id_map[source_id]
-                if isinstance(source.get("reference_item_ids"), list):
-                    source["reference_item_ids"] = [
-                        reference_item_id_map.get(str(value), str(value))
-                        for value in source["reference_item_ids"]
-                    ]
-
-        remap_reference_attachment_sources(payload.get("global_attachments"))
-        for section_payload in payload.get("prompt_sections", []) or []:
-            if isinstance(section_payload, dict):
-                remap_reference_attachment_sources(section_payload.get("attachments"))
-
-        existing_names = {scene.name for scene in project.scenes}
-        copy_base = f"{source_scene.name} (copy)"
-        copy_name = copy_base
-        suffix = 2
-        while copy_name in existing_names:
-            copy_name = f"{copy_base} {suffix}"
-            suffix += 1
-        payload["name"] = copy_name
-        payload["order"] = max((getattr(scene, "order", 0) for scene in project.scenes), default=-1) + 1
-
-        new_scene = Scene.from_dict(payload)
-        project.add_scene(new_scene)
-        await asyncio.to_thread(save_project, project)
-        return web.json_response(new_scene.to_dict(), status=201)
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
+        return web.json_response(payload, status=201)
 
     @routes.get("/sonder-editor/project/{project_id}/scenes/{scene_id}")
     async def api_get_scene(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -11067,7 +11777,7 @@ if routes is not None:
     @routes.put("/sonder-editor/project/{project_id}/scenes/{scene_id}")
     async def api_update_scene(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -11145,7 +11855,7 @@ if routes is not None:
         except ProjectMutationRequestError as e:
             return _mutation_json_error(e)
 
-        await asyncio.to_thread(save_project, project)
+        await run_project_io(save_project, project)
         return web.json_response(scene.to_dict())
 
     @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/mutations")
@@ -11160,7 +11870,7 @@ if routes is not None:
             return _json_error("operations must be a list", 400)
 
         try:
-            project, payload = await asyncio.to_thread(
+            project, payload = await run_project_io(
                 _apply_scene_mutations_sync,
                 request,
                 request.match_info["scene_id"],
@@ -11176,17 +11886,29 @@ if routes is not None:
 
     @routes.delete("/sonder-editor/project/{project_id}/scenes/{scene_id}")
     async def api_delete_scene(request: web.Request) -> web.Response:
+        scene_id = request.match_info["scene_id"]
+        removed_once = []
+
+        def delete_scene(project: TimelineProject) -> tuple[bool, dict]:
+            if project.remove_scene(scene_id):
+                removed_once.append(True)
+                return True, {"status": "deleted"}
+            if removed_once:
+                # A CAS retry found the scene already gone, so another writer removed
+                # it between our attempts. The caller asked for it to be absent and it
+                # is; 404-ing a completed delete would report a failure that did not
+                # happen. Same idempotent-delete stance the queue routes take.
+                return False, {"status": "deleted"}
+            _mutation_error(f"Scene not found: {scene_id}", 404, "scene_not_found")
+
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            _project, payload = await run_project_io(
+                _apply_project_versioned_sync, request, delete_scene, addressing="identity")
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
-
-        scene_id = request.match_info["scene_id"]
-        if not project.remove_scene(scene_id):
-            return _json_error(f"Scene not found: {scene_id}", 404)
-
-        await asyncio.to_thread(save_project, project)
-        return web.json_response({"status": "deleted"})
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
+        return web.json_response(payload)
 
     # -----------------------------------------------------------------------
     # Scene restore (undo/redo support)
@@ -11195,7 +11917,7 @@ if routes is not None:
     @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/restore-token")
     async def api_issue_scene_restore_token(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, 
+            project = await run_project_io(_load_project_from_request, 
                 request, repair_missing_frames=False, version_checked=False)
         except FileNotFoundError as exc:
             return _json_error(str(exc), 404)
@@ -11211,7 +11933,7 @@ if routes is not None:
     @routes.get("/sonder-editor/project/{project_id}/scenes/{scene_id}/restore-token/{token}")
     async def api_get_scene_restore_token(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, 
+            project = await run_project_io(_load_project_from_request, 
                 request, repair_missing_frames=False, version_checked=False)
         except FileNotFoundError as exc:
             return _json_error(str(exc), 404)
@@ -11241,7 +11963,7 @@ if routes is not None:
     async def api_restore_scene(request: web.Request) -> web.Response:
         """Three-way merge a scene history reversal onto current durable state."""
         try:
-            project = await asyncio.to_thread(_load_project_from_request, 
+            project = await run_project_io(_load_project_from_request, 
                 request, repair_missing_frames=False, version_checked=False)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
@@ -11377,7 +12099,7 @@ if routes is not None:
                 project, token, project_id, scene_id)
             base_modified_at = str(getattr(project, "modified_at", "") or "")
             try:
-                await asyncio.to_thread(save_project, project, expected_modified_at=base_modified_at)
+                await run_project_io(save_project, project, expected_modified_at=base_modified_at)
             except ProjectVersionConflict as exc:
                 if attempt >= 2:
                     payload = {
@@ -11390,7 +12112,7 @@ if routes is not None:
                     _SCENE_RESTORE_RECEIPTS.finish(
                         token, project_id, scene_id, status="refused", payload=payload)
                     raise
-                project = await asyncio.to_thread(load_project, str(getattr(project, "project_dir", "") or ""))
+                project = await run_project_io(load_project, str(getattr(project, "project_dir", "") or ""))
                 _remember_request_project(request, project)
                 continue
 
@@ -11412,7 +12134,7 @@ if routes is not None:
     @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/guides")
     async def api_add_guide(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -11433,7 +12155,7 @@ if routes is not None:
         except ProjectMutationRequestError as e:
             return _mutation_json_error(e)
 
-        await asyncio.to_thread(save_project, project)
+        await run_project_io(save_project, project)
         return web.json_response(guide.to_dict(), status=201)
 
     @routes.get("/sonder-editor/project/{project_id}/scenes/{scene_id}/bridge-guides")
@@ -11460,37 +12182,20 @@ if routes is not None:
             origin=_diagnostic_header(request, "X-Sonder-Guide-Origin"),
             node_id=_diagnostic_header(request, "X-Sonder-Guide-Node-Id"),
         )
+        scene_id = request.match_info["scene_id"]
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project, scene, active_job = await run_project_io(
+                _load_scene_for_bridge, request, scene_id)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
-
-        scene_id = request.match_info["scene_id"]
-        scene = project.get_scene(scene_id)
-        if not scene:
-            return _json_error(f"Scene not found: {scene_id}", 404)
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
 
         duration = max(0, int(getattr(scene, "duration_frames", 0) or 0))
         window_start = 0
         window_end = duration
 
         # Pick snapshot from a running job for this scene if one exists.
-        active_job = None
-        for job in getattr(project, "generation_queue", []) or []:
-            if getattr(job, "scene_id", "") != scene_id:
-                continue
-            status = str(getattr(job, "status", "") or "").lower()
-            if status != "running":
-                continue
-            params = getattr(job, "params", {}) or {}
-            try:
-                snap_ver = int(params.get("snapshot_version", 0) or 0) if isinstance(params, dict) else 0
-            except (TypeError, ValueError):
-                snap_ver = 0
-            if snap_ver > 0:
-                from .project_storage import hydrate_job
-                active_job = hydrate_job(project, job)
-                break
 
         if active_job is not None:
             guides_src = [
@@ -11551,31 +12256,14 @@ if routes is not None:
         This panel is informational. Execution remains authoritative through
         the project._execution_context queue_job_ref_id consumed by the node.
         """
+        scene_id = request.match_info["scene_id"]
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project, scene, active_job = await run_project_io(
+                _load_scene_for_bridge, request, scene_id)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
-
-        scene_id = request.match_info["scene_id"]
-        scene = project.get_scene(scene_id)
-        if not scene:
-            return _json_error(f"Scene not found: {scene_id}", 404)
-
-        active_job = None
-        for job in getattr(project, "generation_queue", []) or []:
-            if getattr(job, "scene_id", "") != scene_id:
-                continue
-            if str(getattr(job, "status", "") or "").lower() != "running":
-                continue
-            params = getattr(job, "params", {}) or {}
-            try:
-                snap_ver = int(params.get("snapshot_version", 0) or 0) if isinstance(params, dict) else 0
-            except (TypeError, ValueError):
-                snap_ver = 0
-            if snap_ver > 0:
-                from .project_storage import hydrate_job
-                active_job = hydrate_job(project, job)
-                break
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
 
         driver_descriptor = descriptor_for_lane_type("motion_driver")
         if active_job is not None:
@@ -11667,14 +12355,14 @@ if routes is not None:
             generation=_diagnostic_header(request, "X-Sonder-Reference-Generation"),
             origin=_diagnostic_header(request, "X-Sonder-Reference-Origin"),
         )
+        scene_id = request.match_info["scene_id"]
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project, scene, active_job = await run_project_io(
+                _load_scene_for_bridge, request, scene_id)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
-        scene_id = request.match_info["scene_id"]
-        scene = project.get_scene(scene_id)
-        if not scene:
-            return _json_error(f"Scene not found: {scene_id}", 404)
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
         duration = max(0, int(getattr(scene, "duration_frames", 0) or 0))
 
         def _query_int(name, default):
@@ -11694,21 +12382,6 @@ if routes is not None:
             except (TypeError, ValueError, OverflowError):
                 return 0.0
 
-        active_job = None
-        for job in getattr(project, "generation_queue", []) or []:
-            params = getattr(job, "params", {}) or {}
-            try:
-                snapshot_version = int(params.get("snapshot_version", 0) or 0) if isinstance(params, dict) else 0
-            except (TypeError, ValueError, OverflowError):
-                snapshot_version = 0
-            if (
-                getattr(job, "scene_id", "") == scene_id
-                and str(getattr(job, "status", "") or "").lower() == "running"
-                and snapshot_version > 0
-            ):
-                from .project_storage import hydrate_job
-                active_job = hydrate_job(project, job)
-                break
         if active_job is not None:
             lane_count = max(1, int(getattr(active_job, "reference_lane_count", 1) or 1))
             configs = [LaneConfig.from_dict(value) if isinstance(value, dict) else value for value in (active_job.reference_lane_configs or [])]
@@ -11933,34 +12606,18 @@ if routes is not None:
           structural preview: execution payloads rebase tags/lengths to the
           render window and will not textually match this response.
         """
+        scene_id = request.match_info["scene_id"]
         try:
-            # Project load is filesystem work — keep it off the event loop.
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            # Project load, scene lookup and job hydration are filesystem and
+            # project-lock work — one worker owns all of it.
+            project, scene, active_job = await run_project_io(
+                _load_scene_for_bridge, request, scene_id)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
-
-        scene_id = request.match_info["scene_id"]
-        scene = project.get_scene(scene_id)
-        if not scene:
-            return _json_error(f"Scene not found: {scene_id}", 404)
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
 
         duration = max(0, int(getattr(scene, "duration_frames", 0) or 0))
-
-        active_job = None
-        for job in getattr(project, "generation_queue", []) or []:
-            if getattr(job, "scene_id", "") != scene_id:
-                continue
-            if str(getattr(job, "status", "") or "").lower() != "running":
-                continue
-            params = getattr(job, "params", {}) or {}
-            try:
-                snap_ver = int(params.get("snapshot_version", 0) or 0) if isinstance(params, dict) else 0
-            except (TypeError, ValueError):
-                snap_ver = 0
-            if snap_ver > 0:
-                from .project_storage import hydrate_job
-                active_job = hydrate_job(project, job)
-                break
 
         def _coerce_threshold(source) -> float:
             if not isinstance(source, dict):
@@ -12158,7 +12815,7 @@ if routes is not None:
     @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/guides/swap")
     async def api_swap_guides(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -12195,13 +12852,13 @@ if routes is not None:
 
         guide_a.frame_index, guide_b.frame_index = frame_b, frame_a
         scene.guide_frames.sort(key=lambda g: g.frame_index)
-        await asyncio.to_thread(save_project, project)
+        await run_project_io(save_project, project)
         return web.json_response({"guides": [guide_a.to_dict(), guide_b.to_dict()]})
 
     @routes.patch("/sonder-editor/project/{project_id}/scenes/{scene_id}/guides/{frame_index}")
     async def api_update_guide(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -12231,75 +12888,33 @@ if routes is not None:
         except ProjectMutationRequestError as e:
             return _mutation_json_error(e)
 
-        await asyncio.to_thread(save_project, project)
+        await run_project_io(save_project, project)
         return web.json_response(guide.to_dict())
 
-    @routes.delete("/sonder-editor/project/{project_id}/scenes/{scene_id}/guides/{frame_index}")
-    async def api_delete_guide(request: web.Request) -> web.Response:
-        try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
-        except FileNotFoundError as e:
-            return _json_error(str(e), 404)
-
-        scene_id = request.match_info["scene_id"]
-        scene = project.get_scene(scene_id)
-        if not scene:
-            return _json_error(f"Scene not found: {scene_id}", 404)
-        if getattr(scene.guide_track_config, "locked", False):
-            return _json_error("Guide track is locked", 409)
-
-        frame_index = int(request.match_info["frame_index"])
-        try:
-            _apply_delete_guide(scene, frame_index)
-        except ProjectMutationRequestError as e:
-            return _mutation_json_error(e)
-
-        await asyncio.to_thread(save_project, project)
-        return web.json_response({"status": "deleted"})
+    # Guide deletion is owned by the scene mutations pipeline's `delete_guide`
+    # operation. The standalone DELETE route was retired when the pipeline took
+    # ownership: guides resolve identity by durable `guide_id`, so addressing one
+    # by `frame_index` alone can delete a guide another writer just moved into
+    # that frame. The pipeline still takes `frame_index`, but it also ACCEPTS an
+    # `expected` identity snapshot (optional server-side, always sent by the
+    # shipped client) which this route had no way to send.
 
     # -----------------------------------------------------------------------
     # Clips (video on timeline)
     # -----------------------------------------------------------------------
 
-    @routes.delete("/sonder-editor/project/{project_id}/scenes/{scene_id}/clips/{clip_id}")
-    async def api_delete_clip(request: web.Request) -> web.Response:
-        try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
-        except FileNotFoundError as e:
-            return _json_error(str(e), 404)
-
-        scene_id = request.match_info["scene_id"]
-        scene = project.get_scene(scene_id)
-        if not scene:
-            return _json_error(f"Scene not found: {scene_id}", 404)
-
-        clip_id = request.match_info["clip_id"]
-        clip = next((c for c in scene.clips if c.clip_id == clip_id), None)
-        if not clip:
-            return _json_error(f"Clip not found: {clip_id}", 404)
-        try:
-            _require_clip_unlocked(scene, clip)
-        except ProjectMutationRequestError as e:
-            return _mutation_json_error(e)
-
-        deleted_lane = clip.track_index or 0
-        should_compact_lane = _is_render_clip(clip) and request.query.get("preserve_lane") != "1"
-        original_count = len(scene.clips)
-        scene.clips = [c for c in scene.clips if c.clip_id != clip_id]
-
-        if len(scene.clips) == original_count:
-            return _json_error(f"Clip not found: {clip_id}", 404)
-
-        if should_compact_lane:
-            _compact_empty_media_lane(scene, "video", deleted_lane)
-
-        await asyncio.to_thread(save_project, project)
-        return web.json_response({"status": "deleted"})
+    # Clip deletion is owned by the scene mutations pipeline's `delete_clip`
+    # operation. The standalone DELETE route was retired when the pipeline took
+    # ownership: `_delete_clip` is a strict superset of what it did — same lock
+    # check, same `preserve_lane` compaction — and additionally rewrites link
+    # groups for the deleted clip, which this route omitted, leaving stale link
+    # references behind. Both address the clip by `clip_id`; the difference is
+    # the link rewrite, not the addressing.
 
     @routes.put("/sonder-editor/project/{project_id}/scenes/{scene_id}/clips/{clip_id}")
     async def api_update_clip(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -12322,14 +12937,14 @@ if routes is not None:
         except ProjectMutationRequestError as e:
             return _mutation_json_error(e)
 
-        await asyncio.to_thread(save_project, project)
+        await run_project_io(save_project, project)
         return web.json_response(clip.to_dict())
 
     @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/clips/{clip_id}/split")
     async def api_split_clip(request: web.Request) -> web.Response:
         """Split a clip at a given frame into two clips."""
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -12358,7 +12973,7 @@ if routes is not None:
             )
         except ProjectMutationRequestError as e:
             return _mutation_json_error(e)
-        await asyncio.to_thread(save_project, project)
+        await run_project_io(save_project, project)
 
         if body.get("apply_linked"):
             return web.json_response({"scene": scene.to_dict(), **result})
@@ -12370,45 +12985,16 @@ if routes is not None:
     # Audio tracks (audio on timeline)
     # -----------------------------------------------------------------------
 
-    @routes.delete("/sonder-editor/project/{project_id}/scenes/{scene_id}/audio_tracks/{track_id}")
-    async def api_delete_audio_track(request: web.Request) -> web.Response:
-        try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
-        except FileNotFoundError as e:
-            return _json_error(str(e), 404)
-
-        scene_id = request.match_info["scene_id"]
-        scene = project.get_scene(scene_id)
-        if not scene:
-            return _json_error(f"Scene not found: {scene_id}", 404)
-
-        track_id = request.match_info["track_id"]
-        track = next((t for t in scene.audio_tracks if t.track_id == track_id), None)
-        if not track:
-            return _json_error(f"Audio track not found: {track_id}", 404)
-        try:
-            _require_audio_unlocked(scene, track)
-        except ProjectMutationRequestError as e:
-            return _mutation_json_error(e)
-
-        deleted_lane = track.lane_index or 0
-        should_compact_lane = request.query.get("preserve_lane") != "1"
-        original_count = len(scene.audio_tracks)
-        scene.audio_tracks = [t for t in scene.audio_tracks if t.track_id != track_id]
-
-        if len(scene.audio_tracks) == original_count:
-            return _json_error(f"Audio track not found: {track_id}", 404)
-
-        if should_compact_lane:
-            _compact_empty_media_lane(scene, "audio", deleted_lane)
-
-        await asyncio.to_thread(save_project, project)
-        return web.json_response({"status": "deleted"})
+    # Audio-track deletion is owned by the scene mutations pipeline's
+    # `delete_audio_track` operation. The standalone DELETE route was retired when
+    # the pipeline took ownership: `_delete_audio_track` is a strict superset of
+    # what it did, additionally rewriting link groups for the deleted track. Both
+    # address the track by `track_id`; the difference is the link rewrite.
 
     @routes.put("/sonder-editor/project/{project_id}/scenes/{scene_id}/audio_tracks/{track_id}")
     async def api_update_audio_track(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -12457,14 +13043,14 @@ if routes is not None:
         if "lane_index" in body:
             track.lane_index = int(body["lane_index"])
 
-        await asyncio.to_thread(save_project, project)
+        await run_project_io(save_project, project)
         return web.json_response(track.to_dict())
 
     @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/audio_tracks/{track_id}/split")
     async def api_split_audio_track(request: web.Request) -> web.Response:
         """Split an audio track at a given frame into two tracks."""
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -12493,7 +13079,7 @@ if routes is not None:
             )
         except ProjectMutationRequestError as e:
             return _mutation_json_error(e)
-        await asyncio.to_thread(save_project, project)
+        await run_project_io(save_project, project)
 
         if body.get("apply_linked"):
             return web.json_response({"scene": scene.to_dict(), **result})
@@ -12508,7 +13094,7 @@ if routes is not None:
     @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/prompt_sections")
     async def api_add_prompt_section(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -12538,14 +13124,14 @@ if routes is not None:
             section = _apply_create_prompt_section(scene, body)
         except ProjectMutationRequestError as e:
             return _mutation_json_error(e)
-        await asyncio.to_thread(save_project, project)
+        await run_project_io(save_project, project)
 
         return web.json_response(section.to_dict(), status=201)
 
     @routes.put("/sonder-editor/project/{project_id}/scenes/{scene_id}/prompt_sections/{index}")
     async def api_update_prompt_section(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -12597,34 +13183,18 @@ if routes is not None:
                 body["global_channel_exceptions"])
 
         scene.prompt_sections.sort(key=lambda s: s.start_frame)
-        await asyncio.to_thread(save_project, project)
+        await run_project_io(save_project, project)
 
         return web.json_response(section.to_dict())
 
-    @routes.delete("/sonder-editor/project/{project_id}/scenes/{scene_id}/prompt_sections/{index}")
-    async def api_delete_prompt_section(request: web.Request) -> web.Response:
-        try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
-        except FileNotFoundError as e:
-            return _json_error(str(e), 404)
-
-        scene_id = request.match_info["scene_id"]
-        scene = project.get_scene(scene_id)
-        if not scene:
-            return _json_error(f"Scene not found: {scene_id}", 404)
-        if getattr(scene.prompt_track_config, "locked", False):
-            return _json_error("Prompt track is locked", 409)
-
-        idx = int(request.match_info["index"])
-        if idx < 0 or idx >= len(scene.prompt_sections):
-            return _json_error(f"Prompt section index out of range: {idx}", 404)
-
-        prompt_id = getattr(scene.prompt_sections[idx], "prompt_id", "")
-        scene.prompt_sections.pop(idx)
-        _rewrite_link_groups_for_deleted(scene, [_link_ref("prompt", prompt_id)])
-        await asyncio.to_thread(save_project, project)
-
-        return web.json_response({"status": "deleted"})
+    # Prompt-section deletion is owned by the scene mutations pipeline's
+    # `delete_prompt_section` operation. The standalone DELETE route was retired
+    # when the pipeline took ownership: addressing a section by list position
+    # alone means a concurrent insert or delete silently shifts the target, so the
+    # caller removes a section it never named. The pipeline still takes `index`,
+    # but it also ACCEPTS an `expected` identity snapshot — optional server-side
+    # (`_validate_prompt_identity` returns early without one), always sent by the
+    # shipped client — which this route had no way to send.
 
     # -----------------------------------------------------------------------
     # Saved selections
@@ -12633,7 +13203,7 @@ if routes is not None:
     @routes.get("/sonder-editor/project/{project_id}/scenes/{scene_id}/saved_selections")
     async def api_list_saved_selections(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -12646,7 +13216,7 @@ if routes is not None:
     @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/saved_selections")
     async def api_add_saved_selection(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -12669,13 +13239,13 @@ if routes is not None:
             "mask_post_offset": _coerce_nonnegative_int(body.get("mask_post_offset", 0)),
         }
         scene.saved_selections.append(entry)
-        await asyncio.to_thread(save_project, project)
+        await run_project_io(save_project, project)
         return web.json_response({"index": len(scene.saved_selections) - 1, "entry": entry})
 
     @routes.put("/sonder-editor/project/{project_id}/scenes/{scene_id}/saved_selections/{index}")
     async def api_update_saved_selection(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            project = await run_project_io(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -12707,27 +13277,49 @@ if routes is not None:
         if "mask_post_offset" in body:
             scene.saved_selections[idx]["mask_post_offset"] = _coerce_nonnegative_int(body["mask_post_offset"])
 
-        await asyncio.to_thread(save_project, project)
+        await run_project_io(save_project, project)
         return web.json_response(scene.saved_selections[idx])
 
     @routes.delete("/sonder-editor/project/{project_id}/scenes/{scene_id}/saved_selections/{index}")
     async def api_delete_saved_selection(request: web.Request) -> web.Response:
+        scene_id = request.match_info["scene_id"]
+        idx = int(request.match_info["index"])
+        # Tolerant, like `api_delete_asset_folder`: a DELETE without a body is a valid
+        # older or non-browser caller, and it still works — positionally.
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            body = await request.json()
+        except Exception:
+            body = {}
+        expected = saved_selection_identity_snapshot(
+            body.get("expected") if isinstance(body, dict) else None)
+
+        # The addressing follows the evidence the caller supplied, not the call site.
+        # A snapshot makes the operation genuinely identity-addressed — the row means
+        # the same thing in any version — which is what earns the retry. Without one,
+        # `idx` means only what the caller's own document said, so a single attempt and
+        # a refusal on conflict is the only safe policy.
+        #
+        # The retry is what makes the gesture usable during a render: the prompt worker
+        # commits job status out of band (`_consume_queue_job`), so the version moves
+        # under a gesture that has nothing to do with the queue, and a refusal there
+        # costs the user a round trip to reach the same outcome.
+        def delete_saved_selection(project: TimelineProject) -> tuple[bool, dict]:
+            scene = project.get_scene(scene_id)
+            if not scene:
+                _mutation_error("Scene not found", 404, "scene_not_found")
+            target = _resolve_saved_selection_index(scene.saved_selections, idx, expected)
+            removed = scene.saved_selections.pop(target)
+            return True, {"status": "deleted", "index": target, "entry": removed}
+
+        try:
+            _project, payload = await run_project_io(
+                _apply_project_versioned_sync, request, delete_saved_selection,
+                addressing="identity" if expected is not None else "positional")
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
-
-        scene = project.get_scene(request.match_info["scene_id"])
-        if not scene:
-            return _json_error("Scene not found", 404)
-
-        idx = int(request.match_info["index"])
-        if idx < 0 or idx >= len(scene.saved_selections):
-            return _json_error("Selection index out of range", 404)
-
-        scene.saved_selections.pop(idx)
-        await asyncio.to_thread(save_project, project)
-        return web.json_response({"status": "deleted"})
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
+        return web.json_response(payload)
 
     # -----------------------------------------------------------------------
     # Render queue
@@ -12739,7 +13331,7 @@ if routes is not None:
         def read_history():
             return read_prompt_history(_project_dir_without_model(request))
         try:
-            return web.json_response(await asyncio.to_thread(read_history))
+            return web.json_response(await run_project_io(read_history))
         except FileNotFoundError as exc:
             return _json_error(str(exc), 404)
         except ProjectStorageError as exc:
@@ -12752,7 +13344,7 @@ if routes is not None:
                 project = _load_project_from_request(request)
                 return json.dumps([job.to_dict() for job in project.generation_queue], ensure_ascii=False)
 
-            body = await asyncio.to_thread(load_and_serialize_queue)
+            body = await run_project_io(load_and_serialize_queue)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -12778,7 +13370,7 @@ if routes is not None:
             return True, job.to_dict()
 
         try:
-            project, payload = await asyncio.to_thread(_apply_queue_versioned_sync, request, add_one)
+            project, payload = await run_project_io(_apply_queue_versioned_sync, request, add_one)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
         except ProjectMutationRequestError as e:
@@ -12820,7 +13412,7 @@ if routes is not None:
             }
 
         try:
-            project, payload = await asyncio.to_thread(_apply_queue_versioned_sync, request, add_batch)
+            project, payload = await run_project_io(_apply_queue_versioned_sync, request, add_batch)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
         except ProjectMutationRequestError as e:
@@ -12843,7 +13435,7 @@ if routes is not None:
             return _json_error("operations must be a list", 400)
 
         try:
-            project, payload = await asyncio.to_thread(
+            project, payload = await run_project_io(
                 _apply_queue_versioned_sync,
                 request,
                 lambda queue_project: _apply_queue_mutation_operations(queue_project, operations),
@@ -12890,7 +13482,7 @@ if routes is not None:
             return changed, job.to_dict()
 
         try:
-            project, payload = await asyncio.to_thread(_apply_queue_versioned_sync, request, update_one)
+            project, payload = await run_project_io(_apply_queue_versioned_sync, request, update_one)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
         if payload is None:
@@ -12908,7 +13500,7 @@ if routes is not None:
             return changed, {"status": "deleted", "removed": removed, "queue": payload["queue"]}
 
         try:
-            project, payload = await asyncio.to_thread(_apply_queue_versioned_sync, request, delete_one)
+            project, payload = await run_project_io(_apply_queue_versioned_sync, request, delete_one)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
         except ProjectMutationRequestError as exc:
@@ -12928,7 +13520,7 @@ if routes is not None:
             return changed, {"status": "cleared", "removed": removed, "queue": payload["queue"]}
 
         try:
-            project, payload = await asyncio.to_thread(_apply_queue_versioned_sync, request, clear_queue)
+            project, payload = await run_project_io(_apply_queue_versioned_sync, request, clear_queue)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
         except ProjectMutationRequestError as exc:

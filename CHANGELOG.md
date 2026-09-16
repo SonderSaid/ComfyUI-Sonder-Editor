@@ -14,9 +14,16 @@ a fresh `[Unreleased]` block.
 ### Changed
 - Durable components use shorter full-hash filenames (storage format 3); format-2 projects migrate automatically on their next version-bumping save. Newly migrated projects cannot be opened by 0.5.0 or earlier. Format-1 projects retain their format until a history edit, then migrate on the following save.
 - Project route reads and saves run off the event loop, including the first automatic component migration.
+- Project reads and saves now use their own worker threads, so a long automatic migration no longer delays thumbnails, media probes or uploads waiting behind it.
 - Eligible Undo and Redo actions update the timeline after the history token arrives, before the restore finishes; failed predictions reconcile safely.
 
+### Removed
+- The standalone `DELETE` routes for clips, guides, prompt sections and audio tracks. These operations are owned by the scene mutations endpoint, which accepts an identity snapshot of the target that the old routes could not send, and which rewrites the link groups they left behind.
+
 ### Fixed
+- Version-conflict responses now carry the editor's security headers and content policy, which they previously shipped without.
+- Emptying the trash, or permanently deleting assets, no longer removes the media before the change is saved. If the save cannot proceed, the files are put back and the assets stay in the trash; previously the media was already gone and the gallery was left pointing at missing files.
+- Deleting or duplicating a scene, or deleting a saved selection, no longer discards a change made at the same moment elsewhere. All three settle against the newer version and still succeed, including while a render is writing to the project in the background. A saved-selection delete that can no longer identify the row it named — because the row itself changed, or because two rows are now identical — is refused rather than removing a different selection, and the editor says so instead of quietly restoring the row. When the connection drops before an answer arrives, the editor now says the outcome could not be confirmed and suggests reloading, rather than reporting a failure for work the server may already have saved.
 - Finished timeline exports survive registration failures and late cancellation, with retained paths and gallery recovery guidance.
 - Undo preserves existing out-of-bounds and overlapping timeline items while refusing new merge conflicts.
 - Undo refusal messages identify the violated rule and affected timeline items, lanes, and frame ranges.

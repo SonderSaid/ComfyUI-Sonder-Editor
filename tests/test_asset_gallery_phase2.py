@@ -450,7 +450,7 @@ def test_import_rejects_unprobeable_media_and_removes_copy(tmp_path, monkeypatch
     ))
 
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: save_calls.append(saved_project))
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **kwargs: save_calls.append(saved_project))
 
     def fail_probe(*_args, **_kwargs):
         raise route_module.MediaProbeError("Could not probe audio metadata")
@@ -715,7 +715,7 @@ def test_pending_reference_snapshot_blocks_delete_and_replace_even_with_force(tm
     )]
     _write_project_file(project, asset.path, b"original")
     monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(module, "save_project", lambda project: None)
+    monkeypatch.setattr(module, "save_project", lambda project, **kwargs: None)
 
     delete_request = DummyRequest(
         match_info={"project_id": "phase-2", "asset_id": "asset-1"},
@@ -1013,7 +1013,7 @@ def test_update_asset_route_accepts_favorite_without_disturbing_name_folder(tmp_
     save_calls = []
 
     monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(module, "save_project", lambda project: save_calls.append(project))
+    monkeypatch.setattr(module, "save_project", lambda project, **kwargs: save_calls.append(project))
 
     request = DummyRequest(
         match_info={"project_id": "phase-2", "asset_id": "asset-1"},
@@ -1053,7 +1053,7 @@ def test_delete_asset_route_returns_409_for_in_use_soft_delete(tmp_path, monkeyp
     project.scenes = [scene]
 
     monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(module, "save_project", lambda project: None)
+    monkeypatch.setattr(module, "save_project", lambda project, **kwargs: None)
 
     request = DummyRequest(match_info={"project_id": "phase-2", "asset_id": "asset-1"}, body={"force": False})
     response = asyncio.run(module.api_delete_asset(request))
@@ -1079,7 +1079,7 @@ def test_delete_asset_route_force_soft_deletes_in_use_asset(tmp_path, monkeypatc
     project.scenes = [scene]
 
     monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(module, "save_project", lambda project: None)
+    monkeypatch.setattr(module, "save_project", lambda project, **kwargs: None)
 
     request = DummyRequest(match_info={"project_id": "phase-2", "asset_id": "asset-1"}, body={"force": True})
     response = asyncio.run(module.api_delete_asset(request))
@@ -1100,7 +1100,7 @@ def test_delete_asset_route_returns_409_for_favorite_soft_delete(tmp_path, monke
     project.assets = [asset]
 
     monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(module, "save_project", lambda project: None)
+    monkeypatch.setattr(module, "save_project", lambda project, **kwargs: None)
 
     request = DummyRequest(match_info={"project_id": "phase-2", "asset_id": "asset-1"}, body={"force": False})
     response = asyncio.run(module.api_delete_asset(request))
@@ -1120,7 +1120,7 @@ def test_delete_asset_route_force_soft_deletes_favorite_asset(tmp_path, monkeypa
     project.assets = [asset]
 
     monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(module, "save_project", lambda project: None)
+    monkeypatch.setattr(module, "save_project", lambda project, **kwargs: None)
 
     request = DummyRequest(match_info={"project_id": "phase-2", "asset_id": "asset-1"}, body={"force": True})
     response = asyncio.run(module.api_delete_asset(request))
@@ -1142,7 +1142,7 @@ def test_bulk_delete_assets_route_returns_409_for_used_or_favorite_assets(tmp_pa
     project.scenes = [scene]
 
     monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(module, "save_project", lambda project: None)
+    monkeypatch.setattr(module, "save_project", lambda project, **kwargs: None)
 
     request = DummyRequest(match_info={"project_id": "phase-2"}, body={"asset_ids": ["used", "fav", "plain"], "force": False})
     response = asyncio.run(module.api_bulk_delete_assets(request))
@@ -1166,7 +1166,7 @@ def test_bulk_delete_assets_route_force_soft_deletes_protected_selection(tmp_pat
     project.scenes = [scene]
 
     monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(module, "save_project", lambda project: None)
+    monkeypatch.setattr(module, "save_project", lambda project, **kwargs: None)
 
     request = DummyRequest(match_info={"project_id": "phase-2"}, body={"asset_ids": ["used", "fav"], "force": True})
     response = asyncio.run(module.api_bulk_delete_assets(request))
@@ -1194,7 +1194,7 @@ def test_restore_asset_route_restores_previous_folder(tmp_path, monkeypatch):
     project.metadata["asset_folders"] = ["Shots"]
 
     monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(module, "save_project", lambda project: None)
+    monkeypatch.setattr(module, "save_project", lambda project, **kwargs: None)
 
     request = DummyRequest(match_info={"project_id": "phase-2"}, body={"asset_id": "asset-1"})
     response = asyncio.run(module.api_restore_asset(request))
@@ -1218,7 +1218,7 @@ def test_permanent_delete_asset_route_returns_409_for_in_use_asset(tmp_path, mon
     project.scenes = [scene]
 
     monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(module, "save_project", lambda project: None)
+    monkeypatch.setattr(module, "save_project", lambda project, **kwargs: None)
 
     request = DummyRequest(match_info={"project_id": "phase-2"}, body={"asset_id": "asset-1", "force": False})
     response = asyncio.run(module.api_permanent_delete_asset(request))
@@ -1244,7 +1244,7 @@ def test_permanent_delete_asset_route_force_removes_asset_from_registry(tmp_path
     _write_asset_cache(project, asset.asset_id)
 
     monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(module, "save_project", lambda project: None)
+    monkeypatch.setattr(module, "save_project", lambda project, **kwargs: None)
 
     request = DummyRequest(match_info={"project_id": "phase-2"}, body={"asset_id": "asset-1", "force": True})
     response = asyncio.run(module.api_permanent_delete_asset(request))
@@ -1273,7 +1273,7 @@ def test_delete_asset_folder_route_soft_deletes_contained_assets(tmp_path, monke
     project.scenes = [scene]
 
     monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(module, "save_project", lambda project: None)
+    monkeypatch.setattr(module, "save_project", lambda project, **kwargs: None)
 
     request = DummyRequest(match_info={"project_id": "phase-2"}, body={"folder": "Shots", "force": True})
     response = asyncio.run(module.api_delete_asset_folder(request))
@@ -1303,7 +1303,7 @@ def test_delete_asset_folder_route_returns_409_for_used_or_favorite_contents(tmp
     project.scenes = [scene]
 
     monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(module, "save_project", lambda project: None)
+    monkeypatch.setattr(module, "save_project", lambda project, **kwargs: None)
 
     request = DummyRequest(match_info={"project_id": "phase-2"}, body={"folder": "Shots", "force": False})
     response = asyncio.run(module.api_delete_asset_folder(request))
@@ -1348,7 +1348,12 @@ def test_render_cache_routes_list_and_delete_project_cache_files(tmp_path, monke
         threaded_calls.append(function)
         return function(*args, **kwargs)
 
+    # Off-loop work is split across two pools now: project reads go to the dedicated
+    # project pool, ffmpeg and render-cache work stays on the default one. Record
+    # both, so this still asserts the ORDER of the off-loop steps rather than which
+    # pool happened to run them.
     monkeypatch.setattr(module.asyncio, "to_thread", tracked_to_thread)
+    monkeypatch.setattr(module, "run_project_io", tracked_to_thread)
 
     response = asyncio.run(module.api_list_render_cache(DummyRequest(match_info={"project_id": "project"})))
     payload = _response_json(response)
@@ -1407,7 +1412,12 @@ def test_render_cache_sweep_route_validates_budget_and_runs_off_loop(tmp_path, m
         threaded_calls.append(function)
         return function(*args, **kwargs)
 
+    # Off-loop work is split across two pools now: project reads go to the dedicated
+    # project pool, ffmpeg and render-cache work stays on the default one. Record
+    # both, so this still asserts the ORDER of the off-loop steps rather than which
+    # pool happened to run them.
     monkeypatch.setattr(module.asyncio, "to_thread", tracked_to_thread)
+    monkeypatch.setattr(module, "run_project_io", tracked_to_thread)
     response = asyncio.run(module.api_sweep_render_cache(DummyRequest(
         match_info={"project_id": "project"},
         body={"max_size_bytes": 5},

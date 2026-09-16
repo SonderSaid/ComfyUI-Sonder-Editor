@@ -13,7 +13,6 @@ def test_route_migration_keeps_loop_live_and_concurrent_reader_off_lock(tmp_path
     project, path, history = stored_project(tmp_path)
     routes = _load_route_module(monkeypatch)
     monkeypatch.setattr(routes, "_get_base_dir", lambda: str(tmp_path))
-    monkeypatch.setattr(routes, "_PROJECT_BASE_DIR", str(tmp_path), raising=False)
     original_load = routes._load_project_from_request
     entered = threading.Event()
     release = threading.Event()
@@ -31,13 +30,26 @@ def test_route_migration_keeps_loop_live_and_concurrent_reader_off_lock(tmp_path
         load_threads.append(threading.get_ident())
         return original_load(*args, **kwargs)
 
+    # `api_list_projects` calls `list_projects`, never `_load_project_from_request`,
+    # so without its own recorder the listing route contributed nothing to the thread
+    # assertion below — its only check was `status == 200`.
+    original_list = routes.list_projects
+
+    def listing_load(*args, **kwargs):
+        load_threads.append(threading.get_ident())
+        return original_list(*args, **kwargs)
+
     monkeypatch.setattr(ps, "_repack_components", repack)
     monkeypatch.setattr(routes, "_load_project_from_request", load)
+    monkeypatch.setattr(routes, "list_projects", listing_load)
     update = _route_handler(routes, "PUT", "/sonder-editor/project/{project_id}")
     get = _route_handler(routes, "GET", "/sonder-editor/project/{project_id}")
     listing = _route_handler(routes, "GET", "/sonder-editor/projects")
-    # Timer prevents a deadlock from hanging the test if a reader regresses.
-    watchdog = threading.Timer(4, release.set)
+    # Deadlock guard only. Its window must stay clear of the assertion it protects:
+    # the writer waits 5s, the assertion runs ~30ms after `entered`, and a watchdog
+    # that fired first would release the writer and fail the test for the wrong
+    # reason. 30s is far outside both.
+    watchdog = threading.Timer(30, release.set)
     watchdog.start()
 
     async def run():
@@ -54,7 +66,8 @@ def test_route_migration_keeps_loop_live_and_concurrent_reader_off_lock(tmp_path
         release.set()
         response, read_response, list_response = await asyncio.gather(writing, reading, listing_task)
         assert response.status == read_response.status == list_response.status == 200
-        assert all(t != loop_thread for t in save_thread + load_threads)
+        assert all(t != loop_thread for t in save_thread + load_threads), (
+            "a project read or the migrating save ran on the event loop")
         assert json.loads(response.body)["name"] == "Renamed"
         # The real route still honors its normal version-conflict contract.
         stale = DummyRequest(match_info={"project_id": path.parent.name}, body={"name": "stale"},

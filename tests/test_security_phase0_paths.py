@@ -144,7 +144,13 @@ def _make_hostile_asset_id_project(tmp_path, *, trashed: bool = False, folder: s
     return project, asset, external_files
 
 
-def test_permanent_delete_skips_hostile_asset_id_cache_paths(tmp_path):
+# `_delete_project_asset` is no longer what the permanent-delete and empty-trash
+# ROUTES call — they stage media through `_StagedMediaBatch` and refuse a hostile id
+# outright (see `tests/test_asset_trash_staging.py`). These three keep covering the
+# helper itself, which the trash purge and the folder delete still use; they are named
+# for the helper so they cannot be mistaken for route coverage again.
+
+def test_asset_removal_helper_skips_hostile_asset_id_cache_paths(tmp_path):
     project, asset, external_files = _make_hostile_asset_id_project(tmp_path)
 
     routes._delete_project_asset(project, asset)
@@ -153,7 +159,7 @@ def test_permanent_delete_skips_hostile_asset_id_cache_paths(tmp_path):
     assert all(path.exists() for path in external_files)
 
 
-def test_bulk_permanent_delete_skips_hostile_asset_id_cache_paths(tmp_path):
+def test_asset_removal_helper_skips_hostile_cache_paths_for_every_asset(tmp_path):
     project, asset, external_files = _make_hostile_asset_id_project(tmp_path)
 
     for target in list(project.assets):
@@ -163,7 +169,7 @@ def test_bulk_permanent_delete_skips_hostile_asset_id_cache_paths(tmp_path):
     assert all(path.exists() for path in external_files)
 
 
-def test_empty_trash_skips_hostile_asset_id_cache_paths(tmp_path):
+def test_asset_removal_helper_skips_hostile_cache_paths_for_trashed_assets(tmp_path):
     project, asset, external_files = _make_hostile_asset_id_project(tmp_path, trashed=True)
 
     for target in list(routes._project_trashed_assets(project)):
