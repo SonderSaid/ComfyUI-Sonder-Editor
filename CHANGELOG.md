@@ -15,6 +15,7 @@ a fresh `[Unreleased]` block.
 - Eligible Undo and Redo actions update the timeline after the history token arrives, before the restore finishes; failed predictions reconcile safely.
 
 ### Fixed
+- Finished timeline exports survive registration failures and late cancellation, with retained paths and gallery recovery guidance.
 - Undo preserves existing out-of-bounds and overlapping timeline items while refusing new merge conflicts.
 - Undo refusal messages identify the violated rule and affected timeline items, lanes, and frame ranges.
 

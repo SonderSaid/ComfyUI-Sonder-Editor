@@ -18755,6 +18755,16 @@ export class EditorWidget {
         return "Exporting...";
     }
 
+    _exportRetainedMessage(data) {
+        if (!data?.retained_path) return "";
+        const paths = Array.isArray(data.retained_paths) && data.retained_paths.length
+            ? data.retained_paths : [data.retained_path];
+        const outcome = data.status === "cancelled"
+            ? "Export cancelled. Finished files were retained."
+            : (data.error || "Finished files were saved, but project registration could not be confirmed.");
+        return `${outcome}\nSaved in this project:\n${paths.join("\n")}\nRefresh the gallery to discover unregistered files as basic assets. Missing provenance and take placement cannot be recovered by discovery.`;
+    }
+
     // Determinate frame counter from the export status payload, or null
     // (indeterminate) when the backend hasn't reported frame counts.
     _exportProgressFromData(data) {
@@ -18791,17 +18801,10 @@ export class EditorWidget {
             const data = await resp.json();
             const jobId = data.job_id || "";
             this._exportStartPending = false;
-            // Panel torn down, or the user pressed Cancel before the job id
-            // arrived: do not adopt the job into (possibly stale) UI; cancel it
-            // on the backend so it cannot run orphaned, and reset if still open.
-            if (this._exportPanelToken !== token || this._exportCancelRequested) {
-                const cancelRequested = this._exportCancelRequested;
-                this._exportCancelRequested = false;
+            // A torn-down panel cannot adopt the response. A still-mounted
+            // cancellation must keep polling: the file may already be published.
+            if (this._exportPanelToken !== token) {
                 if (jobId) this._postExportCancel(jobId, startDiagnostics.cancel || diagnostics);
-                if (cancelRequested && this._exportPanelToken === token) {
-                    this._exportJobId = "";
-                    this._resetExportControlsAfterCancel(ui);
-                }
                 return;
             }
             if (!jobId) {
@@ -18810,6 +18813,10 @@ export class EditorWidget {
                 throw new Error("Export did not start.");
             }
             this._exportJobId = jobId;
+            if (this._exportCancelRequested) {
+                this._exportCancelRequested = false;
+                this._postExportCancel(jobId, startDiagnostics.cancel || diagnostics);
+            }
             // Global progress surface (toast + foreground pill) for the export.
             // The panel's own progressEl stays as the modal-local affordance.
             this._exportNotif = notifyProgress({
@@ -18874,10 +18881,24 @@ export class EditorWidget {
                     return;
                 }
                 if (data.status === "failed") {
-                    throw new Error(data.error || "Export failed.");
+                    throw new Error(this._exportRetainedMessage(data) || data.error || "Export failed.");
                 }
                 if (data.status === "cancelled") {
                     this._exportJobId = "";
+                    const retainedMessage = this._exportRetainedMessage(data);
+                    if (retainedMessage) {
+                        if (this._exportNotif) {
+                            this._exportNotif.resolve({ tier: "warning", message: retainedMessage });
+                            this._exportNotif = null;
+                        } else {
+                            notifyWarning(retainedMessage, { source: "export" });
+                        }
+                        ui.requestError = retainedMessage;
+                        ui.errorEl.textContent = retainedMessage;
+                        ui.progressEl.textContent = "";
+                        this._restoreExportControls(ui);
+                        return;
+                    }
                     if (this._exportNotif) { this._exportNotif.dismiss(); this._exportNotif = null; }
                     this._resetExportControlsAfterCancel(ui);
                     return;
@@ -18908,7 +18929,7 @@ export class EditorWidget {
 
     async _cancelTimelineExportWithinGesture(diagnostics, progressEl) {
         // Cancel pressed before the backend returned a job id: flag it so the
-        // pending start cancels the late job and resets the panel.
+        // pending start cancels the late job and polls its final outcome.
         if (this._exportStartPending && !this._exportJobId) {
             if (this._exportStartDiagnostics) this._exportStartDiagnostics.cancel = diagnostics;
             this._exportCancelRequested = true;

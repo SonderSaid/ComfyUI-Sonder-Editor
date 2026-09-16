@@ -928,3 +928,184 @@ def test_embedded_take_extraction_preserves_native_mono_samples(tmp_path, monkey
     with audio.mapped_float_wav(tmp_path / track.source_path) as (rate, prepared):
         assert rate == 32000
         np.testing.assert_array_equal(np.array(prepared.T, copy=True), samples)
+
+
+def _real_export_project(tmp_path, monkeypatch, *, audio=False):
+    from server import media_helpers as media
+    project_dir = tmp_path / "project"
+    (project_dir / "media").mkdir(parents=True)
+    scene = Scene(scene_id="scene", name="Scene", duration_frames=4,
+                  video_lane_configs=[LaneConfig()], audio_lane_configs=[LaneConfig()])
+    if audio:
+        media.write_audio_wav(project_dir / "media/source.wav", np.full((2, 8000), .125, np.float32), 48000)
+        scene.audio_tracks = [AudioTrack(source_path="media/source.wav", timeline_end_frame=4)]
+    project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene],
+                              resolution=(32, 32), fps=24)
+    save_project(project, notify=False)
+    monkeypatch.setattr(timeline_export, "_transient_temp_dir", lambda: str(tmp_path))
+    return project, project_dir
+
+
+def _run_real_export(project, *, video=True, audio=False, take=False):
+    manager = TimelineExportManager(max_workers=1, ttl_seconds=60)
+    try:
+        job = manager.start(project, {"scene_id": "scene", "range": {"start": 0, "end": 4},
+            "include_video": video, "include_audio": audio or not video,
+            "save_preset": "Compatible MP4", "place_as_take": take, "save_provenance": False})
+        job.future.result(timeout=30)
+        return job
+    finally:
+        manager._executor.shutdown(wait=True)
+
+
+def _assert_four_frame_video(path):
+    import cv2
+    capture = cv2.VideoCapture(str(path))
+    shapes = []
+    try:
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            shapes.append(frame.shape)
+    finally:
+        capture.release()
+    assert shapes == [(32, 32, 3)] * 4
+
+
+@pytest.mark.parametrize("mode", ["video", "audio", "take_av"])
+def test_failed_provenance_write_must_not_destroy_a_completed_export(tmp_path, monkeypatch, mode):
+    from server import project_storage as storage, media_helpers as media
+    project, root = _real_export_project(tmp_path, monkeypatch, audio=mode == "take_av")
+    before = (root / "project.json").read_bytes()
+    published = []
+    fired = []
+    original = storage.publish_component
+
+    def fail_provenance(project_dir, name, value):
+        if not name.startswith("provenance_"):
+            return original(project_dir, name, value)
+        fired.append(name)
+        outputs = [p for p in (root / "media").rglob("*") if p.is_file() and p.name != "source.wav"]
+        assert len(outputs) == (2 if mode == "take_av" else 1)
+        for path in outputs:
+            if path.suffix == ".mp4":
+                _assert_four_frame_video(path)
+            else:
+                samples, rate = media.decode_audio_samples(path)
+                # AAC decoding may include the final codec block's padding.
+                assert rate == 48000 and samples.shape[-1] >= 8000
+            published.append((path, path.read_bytes()))
+        raise FileNotFoundError(2, "injected provenance publication failure", "state/component.json")
+
+    monkeypatch.setattr(storage, "publish_component", fail_provenance)
+    job = _run_real_export(project, video=mode != "audio", audio=mode == "take_av", take=mode == "take_av")
+    assert len(fired) == 1
+    assert job.status == "failed" and job.code == "export_registration_failed"
+    assert "injected provenance publication failure" in job.error
+    assert (root / "project.json").read_bytes() == before
+    assert not load_project(str(root)).assets
+    assert job.retained_path in job.retained_paths
+    assert set(job.retained_paths) == {path.relative_to(root).as_posix() for path, _ in published}
+    for path, payload in published:
+        assert path.read_bytes() == payload
+        assert ".tmp." not in path.name
+    assert job.public_status()["retained_paths"] == job.retained_paths
+    assert not list(root.rglob("*.tmp*"))
+    assert not list(tmp_path.glob("_tmp_export_*.wav"))
+
+
+@pytest.mark.parametrize("when", ["before_publish", "after_publish", "audio_copy", "after_audio_placement"])
+def test_export_cancellation_respects_publication_boundary(tmp_path, monkeypatch, when):
+    project, root = _real_export_project(tmp_path, monkeypatch, audio=when in {"audio_copy", "after_audio_placement"})
+    before = (root / "project.json").read_bytes()
+    fired = []
+    if when == "before_publish":
+        original = timeline_export.encode_video
+        def cancel_encode(*args, **kwargs):
+            result = original(*args, **kwargs)
+            fired.append(True)
+            kwargs["cancel_event"].set()
+            return result
+        monkeypatch.setattr(timeline_export, "encode_video", cancel_encode)
+    elif when == "after_publish":
+        original = TimelineExportManager._check_cancel
+        def cancel_published(self, job):
+            if job.retained_path:
+                fired.append(True)
+                job.cancel_event.set()
+            original(self, job)
+        monkeypatch.setattr(TimelineExportManager, "_check_cancel", cancel_published)
+    elif when == "audio_copy":
+        original = timeline_export.copy_audio_file
+        def cancel_copy(*args, **kwargs):
+            fired.append(True)
+            kwargs["cancel_event"].set()
+            return original(*args, **kwargs)
+        monkeypatch.setattr(timeline_export, "copy_audio_file", cancel_copy)
+    else:
+        original = timeline_export._place_embedded_audio_take
+        def cancel_placed(*args, **kwargs):
+            result = original(*args, **kwargs)
+            assert result is not None
+            fired.append(True)
+            kwargs["cancel_event"].set()
+            return result
+        monkeypatch.setattr(timeline_export, "_place_embedded_audio_take", cancel_placed)
+    with_audio = when in {"audio_copy", "after_audio_placement"}
+    job = _run_real_export(project, audio=with_audio, take=True)
+    assert len(fired) == 1 and job.status == "cancelled"
+    assert (root / "project.json").read_bytes() == before
+    saved = load_project(str(root))
+    assert not saved.assets and not saved.scenes[0].clips
+    outputs = [p for p in (root / "media").rglob("*") if p.is_file() and p.name != "source.wav"]
+    if when == "before_publish":
+        assert not outputs and not job.retained_path
+        assert "retained_path" not in job.public_status()
+    else:
+        assert len(outputs) == (2 if when == "after_audio_placement" else 1)
+        _assert_four_frame_video(root / job.retained_path)
+        assert set(job.public_status()["retained_paths"]) == {p.relative_to(root).as_posix() for p in outputs}
+    assert not list(root.rglob("*.tmp*"))
+    assert not list(tmp_path.glob("_tmp_export_*.wav"))
+
+
+def test_error_after_project_commit_preserves_referenced_export(tmp_path, monkeypatch):
+    from server import project_manager as pm
+    project, root = _real_export_project(tmp_path, monkeypatch)
+    original = pm.atomic_replace
+    fired = []
+    def fail_after_replace(src, dst):
+        original(src, dst)
+        fired.append(dst)
+        raise OSError("injected error after root replacement")
+    monkeypatch.setattr(pm, "atomic_replace", fail_after_replace)
+    job = _run_real_export(project)
+    assert len(fired) == 1 and job.status == "failed"
+    assert job.code == "export_registration_failed"
+    saved = load_project(str(root))
+    assert len(saved.assets) == 1
+    assert saved.assets[0].path.replace("\\", "/") == job.retained_path
+    _assert_four_frame_video(root / job.retained_path)
+    assert "could not be confirmed" in job.error
+
+
+def test_failed_audio_registration_after_validation_cleans_unplaced_wav(tmp_path, monkeypatch):
+    project, root = _real_export_project(tmp_path, monkeypatch, audio=True)
+    original = timeline_export._register_export_asset
+    fired = []
+    def fail_audio(project, output_path, **kwargs):
+        if kwargs["asset_type"] == "audio":
+            from server.audio_pipeline import mapped_float_wav
+            with mapped_float_wav(output_path) as (_, samples):
+                assert len(samples) > 0
+            fired.append(output_path)
+            raise OSError("injected audio registration failure after validation")
+        return original(project, output_path, **kwargs)
+    monkeypatch.setattr(timeline_export, "_register_export_asset", fail_audio)
+    job = _run_real_export(project, audio=True, take=True)
+    assert len(fired) == 1 and job.status == "completed" and job.alerts
+    assert not list((root / "media").glob("*_audio.wav"))
+    saved = load_project(str(root))
+    assert len(saved.assets) == 1 and len(saved.scenes[0].audio_tracks) == 1
+    assert "retained_path" not in job.public_status()

@@ -6872,7 +6872,10 @@ def _sync_media_folder(
     known_paths = {str(a.path or "").replace("\\", "/") for a in project.assets}
     for rel_path, file_info in media_snapshot.items():
         media_child = rel_path[len("media/"):] if rel_path.startswith("media/") else rel_path
-        if "/" in media_child:
+        # Discover retained timeline exports, but never arbitrary nested outputs
+        # (e.g. PNG sequences). Keep folder empty so generated commits can upgrade
+        # a same-path discovery placeholder with its actual provenance and folder.
+        if "/" in media_child and not (media_child.startswith("Exports/") and media_child.count("/") == 1):
             continue
 
         filepath = file_info.get("path") or resolve_project_path(project, rel_path, purpose="media sync file")

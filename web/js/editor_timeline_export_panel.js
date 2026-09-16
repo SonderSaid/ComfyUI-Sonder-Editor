@@ -408,7 +408,7 @@ function buildExportPanel(host) {
     const takePlacementMuted = makeCheckboxRow("New take starts muted", !!host._settings?.render?.takePlacementMuted, "Place exported takes muted so they do not affect the active composite until enabled.");
 
     const errorEl = document.createElement("div");
-    errorEl.style.cssText = `min-height:16px;font-size:11px;color:${COLORS.warningText};`;
+    errorEl.style.cssText = `min-height:16px;font-size:11px;color:${COLORS.warningText};white-space:pre-wrap;overflow-wrap:anywhere;`;
     body.appendChild(errorEl);
     const progressEl = document.createElement("div");
     progressEl.style.cssText = `display:none;font-size:11px;color:${COLORS.textMuted};padding:8px 10px;border:1px solid ${COLORS.borderSoft};border-radius:8px;background:${COLORS.panelMuted};`;

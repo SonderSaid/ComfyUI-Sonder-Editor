@@ -389,6 +389,15 @@ precedence over the bundled binary and must be updated or removed from `PATH`. T
 bundled `imageio-ffmpeg` binary is used as a fallback, but a system ffmpeg is
 more capable across formats.
 
+**An export says the files were saved but registration could not be confirmed.**
+The exported video and audio are finished and safe — the message names their
+paths inside the project. Only the project bookkeeping failed, so press
+**Refresh** in the gallery and the files are registered as basic assets; their
+generation details and automatic take placement are not recovered. On Windows
+this is usually the 260-character path limit, which the message calls out when
+it can detect it: move or rename the project so its folder path is shorter, or
+enable Long Path support in Windows, then export again.
+
 **I can't link a project on another drive or a UNC share.**
 Enable **Allow External Project Links** in Editor Settings first, then use
 **Link project folder...** from the project menu and paste the server-visible

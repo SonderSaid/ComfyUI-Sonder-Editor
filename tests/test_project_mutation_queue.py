@@ -869,6 +869,9 @@ def test_pending_export_cancel_retains_original_gesture(close_panel):
         const w = makeWidget(), requests = [];
         w._exportPanelToken = 7;
         w._resetExportControlsAfterCancel = () => {};
+        // The still-mounted cancel now follows terminal status; this test owns
+        // gesture attribution only, with polling covered by export UI tests.
+        w._pollTimelineExport = () => {};
         let release;
         globalThis.fetch = async (url, init) => {
             requests.push({url, headers:new Headers(init.headers)});
@@ -878,7 +881,7 @@ def test_pending_export_cancel_retains_original_gesture(close_panel):
             }
             return new Response('{}');
         };
-        const pending = w._startTimelineExport({}, {});
+        const pending = w._startTimelineExport({}, {progressEl:{textContent:''}});
         """ + ("w._hideExportPanel();" if close_panel else "await w._cancelTimelineExport(null);") + """
         assert.equal(starts().length, 2);
         const cancelId = starts()[1].marker_id;

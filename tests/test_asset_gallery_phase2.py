@@ -64,6 +64,58 @@ def _response_json(response):
     return json.loads(response.body.decode("utf-8"))
 
 
+def test_discovery_includes_only_direct_exports_and_media_root(tmp_path):
+    from PIL import Image
+    from pathlib import Path
+    project = _make_project(tmp_path)
+    expected = {"media/root.png", "media/Exports/retained.png"}
+    excluded = {"media/Exports/deeper/frame.png", "media/sequence/frame.png",
+                "media/Exports/_tmp_work.png", "media/Exports/encode.tmp.png"}
+    for relative in expected | excluded:
+        path = Path(project.project_dir) / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (2, 2)).save(path)
+    assert routes._sync_media_folder(project, purge_trashed=False)
+    assert {asset.path.replace("\\", "/") for asset in project.assets} == expected
+    assert all(asset.folder == "" and not asset.generation_params for asset in project.assets)
+    assert not routes._sync_media_folder(project, purge_trashed=False)
+
+
+def test_discovered_export_conflict_merge_preserves_provenance_and_placeholder_id(tmp_path):
+    from PIL import Image
+    from pathlib import Path
+    from server.project_commit import save_generated_project, snapshot_item_ids, created_ids_since
+    from server.project_storage import has_generation_provenance
+    project = _make_project(tmp_path)
+    save_project(project, notify=False)
+    produced = load_project(project.project_dir)
+    base = produced.modified_at
+    before = snapshot_item_ids(produced)
+    path = Path(project.project_dir) / "media/Exports/export.png"
+    path.parent.mkdir(exist_ok=True)
+    Image.new("RGB", (4, 4)).save(path)
+    produced.add_asset(Asset(asset_id="export-created", name="Export", asset_type="image",
+        path="media/Exports/export.png", folder="Exports", width=4, height=4,
+        generation_params={"editor_export": {"scene_id": "scene", "diagnostic": "must survive merge"}}))
+    discovery = load_project(project.project_dir)
+    assert routes._sync_media_folder(discovery, purge_trashed=False)
+    placeholder_id = discovery.assets[0].asset_id
+    assert not discovery.assets[0].folder and not has_generation_provenance(discovery.assets[0])
+    # A concurrent authoring write forces the established conflict/merge path.
+    discovery.name = "Concurrent edit"
+    save_project(discovery, notify=False)
+    committed = save_generated_project(produced, base, created_ids=created_ids_since(before, produced))
+    assert committed._asset_id_remap == {"export-created": placeholder_id}
+    saved = load_project(project.project_dir)
+    assert saved.name == "Concurrent edit" and len(saved.assets) == 1
+    asset = saved.assets[0]
+    assert asset.asset_id == placeholder_id and asset.folder == "Exports"
+    assert has_generation_provenance(asset)
+    assert asset.generation_params["editor_export"]["diagnostic"] == "must survive merge"
+    raw = json.loads((Path(project.project_dir) / "project.json").read_text(encoding="utf-8"))
+    assert raw["assets"][0]["has_frozen_provenance"] is True
+
+
 def _load_route_module(monkeypatch):
     fake_prompt_server = SimpleNamespace(instance=SimpleNamespace(routes=web.RouteTableDef()))
     monkeypatch.setattr(server, "PromptServer", fake_prompt_server, raising=False)

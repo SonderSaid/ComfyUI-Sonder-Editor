@@ -20,6 +20,60 @@ def legacy_project(tmp_path):
     return pm.load_project(project.project_dir), path
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+def test_publication_uses_short_sibling_temp_without_changing_final_path(tmp_path, monkeypatch, legacy):
+    import builtins
+    import re
+    name = "project-" + "a" * 64 + ".json" if legacy else ps.asset_component_name("asset") + "-" + "a" * 64 + ".json"
+    directory = tmp_path / "state" / "legacy" if legacy else tmp_path / "state"
+    destination = directory / name
+    # Simulate a boundary between the actual final path and the former long temp.
+    # This checks the real constructed open path on every OS, without a registry toggle.
+    limit = len(str(destination))
+    assert len(str(destination) + "." + "b" * 32 + ".tmp") > limit
+    if not legacy:
+        assert len(name) == 145
+    opened = []
+    replacements = []
+    original_replace = ps.atomic_replace
+    def bounded_open(path, mode="r", *args, **kwargs):
+        if "w" in mode:
+            opened.append(Path(path))
+            if len(str(path)) > limit:
+                raise FileNotFoundError(2, "simulated legacy path boundary", str(path))
+        return builtins.open(path, mode, *args, **kwargs)
+    def checked_replace(src, dst):
+        replacements.append((Path(src), Path(dst)))
+        assert Path(src).parent == directory
+        assert re.fullmatch(r"[0-9a-f]{32}\.tmp", Path(src).name)
+        assert len(Path(src).name) == 36
+        original_replace(src, dst)
+    monkeypatch.setattr(ps, "open", bounded_open, raising=False)
+    monkeypatch.setattr(ps, "atomic_replace", checked_replace)
+    ps.publish_bytes(str(destination), b'{"kept":"exact bytes"}')
+    assert len(opened) == len(replacements) == 1
+    assert replacements == [(opened[0], destination)]
+    assert destination.read_bytes() == b'{"kept":"exact bytes"}'
+    assert not opened[0].exists()
+    assert list(directory.iterdir()) == [destination]
+
+
+def test_failed_short_temp_publication_preserves_destination_and_cleans_temp(tmp_path, monkeypatch):
+    destination = tmp_path / "state" / "existing.json"
+    destination.parent.mkdir()
+    destination.write_bytes(b"original")
+    attempts = []
+    def fail_replace(src, dst):
+        attempts.append(Path(src))
+        assert Path(src).read_bytes() == b"replacement"
+        raise OSError("replacement failed")
+    monkeypatch.setattr(ps, "atomic_replace", fail_replace)
+    with pytest.raises(OSError, match="replacement failed"):
+        ps.publish_bytes(str(destination), b"replacement")
+    assert len(attempts) == 1 and not attempts[0].exists()
+    assert destination.read_bytes() == b"original"
+
+
 def test_whole_folder_portability_and_root_only_copy_refusal(tmp_path):
     project, path = legacy_project(tmp_path)
     project.assets = [Asset(asset_id="portable", generation_params={"fps": 24, "prompt": "kept"})]

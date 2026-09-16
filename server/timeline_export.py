@@ -83,6 +83,8 @@ class TimelineExportJob:
     message: str = "Queued..."
     code: str = ""
     error: str = ""
+    retained_path: str = ""
+    retained_paths: list[str] = field(default_factory=list)
     result_asset_id: str = ""
     result_scene_id: str = ""
     placed_clip: dict | None = None
@@ -115,6 +117,9 @@ class TimelineExportJob:
             payload["error"] = self.error or "Export failed"
         if self.status == "cancelled":
             payload["cancelled"] = True
+        if self.status in {"failed", "cancelled"} and self.retained_path:
+            payload["retained_path"] = self.retained_path
+            payload["retained_paths"] = list(self.retained_paths)
         return payload
 
 
@@ -842,7 +847,11 @@ class TimelineExportManager:
 
             self._check_cancel(job)
             atomic_replace(temp_output_path, final_output_path)
+            # Published media survives every later registration/cancellation error.
+            cleanup_paths.remove(final_output_path)
             cleanup_paths.remove(temp_output_path)
+            job.retained_path = _rel_media_path(project.project_dir, final_output_path).replace("\\", "/")
+            job.retained_paths.append(job.retained_path)
             self._check_cancel(job)
 
             self._set_phase(job, "registering", "Registering asset...")
@@ -920,6 +929,10 @@ class TimelineExportManager:
                         )
                         if audio_take:
                             placed_audio_track, placed_audio_cleanup_path = audio_take
+                            # Validation alone is too early: failed placement still owns cleanup.
+                            cleanup_paths.remove(placed_audio_cleanup_path)
+                            job.retained_paths.append(_rel_media_path(
+                                current_project.project_dir, placed_audio_cleanup_path).replace("\\", "/"))
                         else:
                             job.alerts.append("Placed video take, but no usable timeline audio was produced")
                     except (TimelineRenderCancelled, MediaOperationCancelled):
@@ -936,14 +949,14 @@ class TimelineExportManager:
                         ],
                     })
 
+            # Audio preparation/placement can take time after the previous cancel check.
+            # Once the commit starts it must finish atomically; cancellation cannot undo it.
+            self._check_cancel(job)
             committed_project = save_generated_project(
                 current_project,
                 base_modified_at,
                 created_ids=created_ids_since(_pre_item_ids, current_project),
             )
-            cleanup_paths.remove(final_output_path)
-            if placed_audio_cleanup_path and placed_audio_cleanup_path in cleanup_paths:
-                cleanup_paths.remove(placed_audio_cleanup_path)
             job.result_asset_id = _resolve_committed_asset_id(committed_project, asset.asset_id)
             job.status = "completed"
             job.phase = "done"
@@ -952,6 +965,8 @@ class TimelineExportManager:
             job.status = "cancelled"
             job.phase = "cancelled"
             job.message = "Cancelled"
+            if job.retained_path:
+                job.message = "Export cancelled. Finished files were retained."
             for path in cleanup_paths:
                 try:
                     if path and os.path.isfile(path):
@@ -962,9 +977,17 @@ class TimelineExportManager:
             logger.exception("Timeline export failed")
             job.status = "failed"
             job.phase = "failed"
-            job.code = "export_failed"
+            job.code = "export_registration_failed" if job.retained_path else "export_failed"
             job.error = str(exc)
-            job.message = str(exc)
+            if job.retained_path:
+                # A save can raise after root publication; do not assert that registration
+                # definitely did not happen, or mask that ambiguous outcome as success.
+                job.error = f"Finished files were saved, but project registration could not be confirmed. {exc}"
+                if (os.name == "nt" and isinstance(exc, OSError)
+                        and (getattr(exc, "winerror", None) == 206
+                             or (exc.errno == 2 and len(str(exc.filename or "")) >= 260))):
+                    job.error += " A Windows path-length limit (MAX_PATH) may be the cause."
+            job.message = job.error
             for path in cleanup_paths:
                 try:
                     if path and os.path.isfile(path):

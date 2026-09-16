@@ -211,7 +211,9 @@ def sync_directory(directory):
 
 def publish_bytes(path, payload):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f"{path}.{uuid.uuid4().hex}.tmp"
+    # A sibling stays on the destination volume without extending its long name.
+    # This also serves state/legacy backups; use the destination's own directory.
+    tmp = os.path.join(os.path.dirname(path), f"{uuid.uuid4().hex}.tmp")
     try:
         with open(tmp, "wb") as handle:
             handle.write(payload)
