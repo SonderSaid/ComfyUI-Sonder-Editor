@@ -371,6 +371,10 @@ the project requires this version or newer. Keep the complete project folder, in
 they cannot repair a project that already fails to open at its current location.
 Use a shallower folder to open and migrate such a project first.
 
+**Video does not play in the editor when ComfyUI runs with `--disable-api-nodes`.**
+That option makes ComfyUI replace the editor's content security policy with one
+that blocks the video the editor loads for playback. Start ComfyUI without it.
+
 **The Editor is blank or shows raw controls after installing through Manager.**
 After Manager finishes restarting ComfyUI, refresh the browser page as well
 (`F5` or `Ctrl+R`). A backend restart can leave the open page without the

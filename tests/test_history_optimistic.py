@@ -28,32 +28,6 @@ def _run_history_node(body):
     ''' + body)
 
 
-def test_all_optimistic_gates_and_derived_mirrors():
-    _run_history_node('''
-        const w=makeHistoryWidget();
-        assert.equal(w._historyOptimisticEligibility(entry(), capabilities).would_paint,true);
-        for (const [patch,reason] of [
-            [{kind:'reference_change'},'typed_entry'],
-            [{referenceOperations:[{}]},'auxiliary_operations'],
-            [{promptIdentityChange:{}},'auxiliary_operations'],
-            [{promptIdentityCreateIntents:[{}]},'auxiliary_operations'],
-            [{postSnapshotProjectVersion:null},'no_authoritative_base'],
-            [{postSnapshotProjectVersion:'older'},'version_mismatch'],
-            [{snapshot:{scene_id:'wrong'}},'scene_mismatch'],
-        ]) assert.equal(w._historyOptimisticEligibility({...entry(),...patch},capabilities).skip_reason,reason);
-        w.isDragging=true;
-        assert.equal(w._historyOptimisticEligibility(entry(),capabilities).skip_reason,'dragging');
-        w.isDragging=false;w._timelineMutationDepth=1;
-        assert.equal(w._historyOptimisticEligibility(entry(),capabilities).skip_reason,'timeline_mutation');
-        w._timelineMutationDepth=0;
-        assert.equal(w._historyOptimisticEligibility(entry(),null).skip_reason,'missing_merge_capabilities');
-        const derived=entry(); derived.snapshot.prompt='derived';derived.snapshot.global_channels={main:'derived'};
-        assert.equal(w._historyOptimisticEligibility(derived,capabilities).would_paint,true);
-        derived.snapshot.fps=30;
-        assert.equal(w._historyOptimisticEligibility(derived,capabilities).skip_reason,'outside_write_set');
-    ''')
-
-
 @pytest.mark.parametrize('operation', ['Undo', 'Redo'])
 def test_plain_history_failure_tombstones_order_context(operation):
     _run_history_node('''
@@ -314,3 +288,293 @@ def test_deferred_selection_cannot_cross_project_or_scene(switch):
     """ + ("w.projectDir='other';" if switch=='project' else "w.activeSceneId='other';") + """
         w._restoreHistorySelection(state);
     """)
+
+
+# ---------------------------------------------------------------------------
+# The skip-reason map is exhaustive, and the warning speaks only for contract
+# failures
+# ---------------------------------------------------------------------------
+def _widget_source():
+    from pathlib import Path
+
+    return (Path(__file__).resolve().parents[1]
+            / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
+
+
+def _eligibility_skip_reasons():
+    """Every `skip("…")` literal in `_historyOptimisticEligibility`."""
+    import re
+
+    source = _widget_source()
+    start = source.index("    _historyOptimisticEligibility(")
+    end = source.find("    _warnHistoryOptimisticSkip(", start)
+    assert end > start, (
+        "could not find the end of _historyOptimisticEligibility. It is bounded "
+        "by the next method, _warnHistoryOptimisticSkip; if that was renamed, "
+        "update this anchor rather than widening the slice, or reasons from "
+        "unrelated methods will be read as this predicate's")
+    reasons = set(re.findall(r'skip\(\s*"(\w+)"', source[start:end]))
+    assert reasons, "no skip reasons found; the slice missed the predicate"
+    # Lexical, so a computed `skip(someVar)` would be invisible here and would
+    # silently return to being an unclassified reason. Nothing produces one
+    # today; this is the limit of the scan, not a claim about the code.
+    assert 'skip(' not in re.sub(r'skip\(\s*"', '', source[start:end]), (
+        "a skip() call with a non-literal reason cannot be classified by this "
+        "scan; make it a literal or classify it by hand")
+    return reasons
+
+
+def _declared_skip_reasons():
+    """The `HISTORY_OPTIMISTIC_SKIP_REASONS` map, as name -> classification."""
+    import re
+
+    source = _widget_source()
+    start = source.index("const HISTORY_OPTIMISTIC_SKIP_REASONS = Object.freeze({")
+    body = source[start:source.index("});", start)]
+    declared = dict(re.findall(r"^\s*(\w+):\s*\"(benign|contract)\",", body, re.M))
+    assert declared, "the skip-reason map did not parse"
+    return declared
+
+
+def test_every_optimistic_skip_reason_is_classified():
+    """A new reason must be decided, not defaulted.
+
+    A deny-list would default it to warning and ship console noise with every
+    future carve-out; an allow-list would default it to silence, which is the
+    silent default this map exists to remove.
+    """
+    produced = _eligibility_skip_reasons()
+    declared = _declared_skip_reasons()
+    assert produced == set(declared), (
+        "HISTORY_OPTIMISTIC_SKIP_REASONS and the reasons the predicate can "
+        "actually return have diverged. Undeclared (these would be silent): "
+        f"{sorted(produced - set(declared))}; declared but unreachable (dead "
+        f"entries): {sorted(set(declared) - produced)}")
+
+
+def test_every_contract_reason_has_advice_and_no_benign_one_does():
+    """The warning must be able to say what to do about each reason it speaks for."""
+    import re
+
+    declared = _declared_skip_reasons()
+    source = _widget_source()
+    start = source.index("const HISTORY_OPTIMISTIC_CONTRACT_ADVICE = Object.freeze({")
+    advice = set(re.findall(r"^\s*(\w+):", source[start:source.index("});", start)], re.M))
+    contract = {name for name, kind in declared.items() if kind == "contract"}
+    assert advice == contract, (
+        f"advice is missing for {sorted(contract - advice)} and is dead for "
+        f"{sorted(advice - contract)}")
+
+
+def test_the_optimistic_warning_speaks_once_per_claim_and_only_for_contract():
+    """Benign reasons are the common case; warning on them would be noise.
+
+    `version_mismatch` alone fires whenever the project moved under a pending
+    write, which at the measured route floor is most of the time.
+    """
+    _run_history_node('''
+        const w=makeHistoryWidget();
+        const warnings=[]; console.warn=(...a)=>warnings.push(a.join(' '));
+
+        for (const reason of ['typed_entry','auxiliary_operations','dragging',
+                'timeline_mutation','version_mismatch','no_authoritative_base']) {
+            assert.equal(w._warnHistoryOptimisticSkip({skip_reason:reason}),false,
+                `benign reason ${reason} must not warn`);
+        }
+        assert.equal(warnings.length,0,'benign reasons produced console output');
+
+        assert.equal(w._warnHistoryOptimisticSkip(
+            {skip_reason:'outside_write_set',skip_detail:'fps'}),true);
+        assert.equal(warnings.length,1);
+        assert.ok(warnings[0].includes('[Sonder]'));
+        assert.ok(warnings[0].includes('outside_write_set'));
+        assert.ok(warnings[0].includes('fps'));
+
+        // Same claim again: silent. A different field is a different claim.
+        assert.equal(w._warnHistoryOptimisticSkip(
+            {skip_reason:'outside_write_set',skip_detail:'fps'}),false);
+        assert.equal(warnings.length,1);
+        assert.equal(w._warnHistoryOptimisticSkip(
+            {skip_reason:'outside_write_set',skip_detail:'width'}),true);
+        assert.equal(warnings.length,2);
+
+        // A successful paint says nothing at all.
+        assert.equal(w._warnHistoryOptimisticSkip(
+            {would_paint:true,skip_reason:'',skip_detail:''}),false);
+        assert.equal(warnings.length,2);
+    ''')
+
+
+def test_skip_detail_names_every_offending_field_and_no_values():
+    """It is spread into the diag ring, which users send in.
+
+    Naming the fields is what makes the warning actionable; naming their values
+    would move authored text across a trust boundary that nothing downstream
+    re-checks.
+    """
+    _run_history_node('''
+        const w=makeHistoryWidget();
+        const e=entry();
+        // Inserted in an order whose natural key order is NOT alphabetical, so
+        // the assertion below fails if the sort is dropped.
+        e.snapshot.width=640; e.snapshot.fps=30;
+        e.postSnapshot.width=1280; e.postSnapshot.fps=24;
+        // An unknown key carrying authored text, the shape a hand-edited or
+        // imported project.json produces. Its NAME may be reported; its value
+        // must not be, and this one is genuinely an offender so the assertion
+        // is not vacuous the way a writable field would make it.
+        e.snapshot.note_to_self='ship before friday'; e.postSnapshot.note_to_self='shipped';
+        const result=w._historyOptimisticEligibility(e,capabilities);
+        assert.equal(result.skip_reason,'outside_write_set');
+        assert.equal(result.skip_detail,'fps, note_to_self, width');
+        assert.ok(!result.skip_detail.includes('friday'));
+        assert.ok(!result.skip_detail.includes('shipped'));
+        // Purely additive: the shape every existing consumer reads is unchanged.
+        assert.equal(result.would_paint,false);
+        assert.equal(w._historyOptimisticEligibility(entry(),capabilities).skip_detail,'');
+    ''')
+
+
+def test_skip_detail_is_bounded_as_well_as_sorted():
+    """`Scene.to_dict()` overlays unknown top-level keys from the project file.
+
+    So the offending-key set is not a closed vocabulary, and an old or
+    hand-edited document can contribute arbitrarily many names to a string that
+    lands in the diagnostic bundle. Names stay safe to show; an unbounded list
+    stops being useful.
+    """
+    _run_history_node('''
+        const w=makeHistoryWidget();
+        const e=entry();
+        for (let i=0;i<40;i++) {
+            const key='unknown_future_field_'+String(i).padStart(2,'0');
+            e.snapshot[key]=i; e.postSnapshot[key]=i+1;
+        }
+        const result=w._historyOptimisticEligibility(e,capabilities);
+        assert.equal(result.skip_reason,'outside_write_set');
+        assert.ok(result.skip_detail.includes('(+28 more)'),
+            'expected a summarised tail, got: '+result.skip_detail);
+        assert.equal(result.skip_detail.split(',').length,12,
+            'twelve names, the last carrying the summary suffix');
+        // Sorted, so the same document always produces the same dedup key.
+        assert.ok(result.skip_detail.startsWith('unknown_future_field_00, unknown_future_field_01'));
+        // Still names only, never values.
+        assert.ok(!/\\b\\d+\\b/.test(result.skip_detail.replace(/unknown_future_field_\\d+/g,'')
+            .replace(/\\(\\+28 more\\)/,'')));
+    ''')
+
+
+def test_every_declared_reason_is_exercised_against_the_real_predicate():
+    """Generated from the source, so prose cannot satisfy it.
+
+    The first version of this sliced this file's own text and looked for the
+    reason name in quotes anywhere in a test body. A Python comment saying
+    `# 'zzz_fake' is totally covered` passed it, which is the same badge-without-
+    work shape the rebase tripwire rejects for an empty `case`. This drives each
+    reason through the real predicate instead and asserts it comes back.
+
+    Every reason needs a patch that provokes it. A reason with no patch fails
+    here, which is the point: a new carve-out has to be reachable to be declared.
+    """
+    patches = {
+        "typed_entry": "{kind:'reference_change'}",
+        "auxiliary_operations": "{referenceOperations:[{}]}",
+        "scene_mismatch": "{snapshot:{scene_id:'wrong'}}",
+        "no_authoritative_base": "{postSnapshotProjectVersion:null}",
+        "version_mismatch": "{postSnapshotProjectVersion:'older'}",
+        "missing_post_snapshot": "{postSnapshot:null}",
+        "outside_write_set": "{snapshot:{scene_id:'scene',name:'before',fps:30}}",
+        # Provoked through the widget or the capabilities argument, not the entry.
+        "dragging": None,
+        "timeline_mutation": None,
+        "missing_merge_capabilities": None,
+    }
+    declared = _declared_skip_reasons()
+    unprovoked = sorted(set(declared) - set(patches))
+    assert not unprovoked, (
+        "these skip reasons are declared but nothing here provokes them, so "
+        "nothing proves the predicate can still produce them. Add a patch that "
+        f"reaches the branch: {unprovoked}")
+    stale = sorted(set(patches) - set(declared))
+    assert not stale, f"patches for reasons that no longer exist: {stale}"
+
+    rows = ",".join(f"[{patch},'{reason}']"
+                    for reason, patch in sorted(patches.items()) if patch)
+    _run_history_node('''
+        const w=makeHistoryWidget();
+        assert.equal(w._historyOptimisticEligibility(entry(),capabilities).would_paint,true);
+        for (const [patch,reason] of [''' + rows + ''']) {
+            assert.equal(
+                w._historyOptimisticEligibility({...entry(),...patch},capabilities).skip_reason,
+                reason, 'expected ' + reason);
+        }
+        w.isDragging=true;
+        assert.equal(w._historyOptimisticEligibility(entry(),capabilities).skip_reason,'dragging');
+        w.isDragging=false; w._timelineMutationDepth=1;
+        assert.equal(w._historyOptimisticEligibility(entry(),capabilities).skip_reason,'timeline_mutation');
+        w._timelineMutationDepth=0;
+        assert.equal(w._historyOptimisticEligibility(entry(),null).skip_reason,
+            'missing_merge_capabilities');
+    ''')
+
+
+def test_the_real_restore_path_warns_for_a_contract_skip():
+    """The production wiring, not the method in isolation.
+
+    `_warnHistoryOptimisticSkip` had four tests and one caller, and none of the
+    four touched the caller -- deleting `this._warnHistoryOptimisticSkip(...)`
+    from `_restoreScene` left the whole file green. This drives the real restore
+    round trip and asserts the line reaches the console.
+    """
+    _run_history_node('''
+        const w=makeHistoryWidget(), e=entry();
+        // fps differs between the entry's two snapshots and is outside the
+        // write set, which is the reachable contract skip.
+        e.snapshot.fps=30; e.postSnapshot.fps=24;
+        const warnings=[]; console.warn=(...a)=>warnings.push(a.join(' '));
+        let calls=0;
+        globalThis.fetch=async()=>{
+            calls++;
+            if(calls===1) return new Response(JSON.stringify({restore_token:'token',...capabilities}));
+            return new Response(JSON.stringify({scene:e.snapshot}));
+        };
+        await w._restoreScene(e.sceneId,e.snapshot,e.postSnapshot,'',null,{entry:e});
+        assert.equal(warnings.length,1,
+            'the restore path did not warn; is the call site still wired?');
+        assert.ok(warnings[0].includes('outside_write_set'), warnings[0]);
+        assert.ok(warnings[0].includes('fps'), warnings[0]);
+        // Says "History", not "Undo": _restoreScene serves Redo too.
+        assert.ok(warnings[0].includes('History could not be painted'), warnings[0]);
+    ''')
+
+
+def test_the_warning_emits_one_line_per_field_not_per_combination():
+    """`outside_write_set` names every offender at once.
+
+    Keying dedup on the joined set meant each subset that ever raced produced a
+    fresh line -- three fields can race as seven distinct combinations. The
+    acceptance criterion is one line per reason+field.
+    """
+    _run_history_node('''
+        const w=makeHistoryWidget();
+        const warnings=[]; console.warn=(...a)=>warnings.push(a.join(' '));
+        const say=(detail)=>w._warnHistoryOptimisticSkip(
+            {skip_reason:'outside_write_set',skip_detail:detail});
+
+        assert.equal(say('fps'),true);
+        assert.equal(say('width'),true);
+        // Every remaining combination of the two is already accounted for.
+        assert.equal(say('fps, width'),false);
+        assert.equal(say('width'),false);
+        assert.equal(say('fps'),false);
+        assert.equal(warnings.length,2);
+
+        // A genuinely new field still speaks, and names only itself. Checked on
+        // the named-fields segment, because the advice text legitimately
+        // mentions fps/width/height as the deliberate exclusions.
+        assert.equal(say('fps, height, width'),true);
+        assert.equal(warnings.length,3);
+        const named=(line)=>line.slice(line.indexOf('): ')+3, line.indexOf('. '));
+        assert.equal(named(warnings[2]),'height',
+            'already-reported fields repeated: '+named(warnings[2]));
+    ''')

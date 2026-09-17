@@ -88,6 +88,71 @@ function getDiagClearerRegistry() {
     return window.__SONDER_DIAG_CLEARERS;
 }
 
+// Every reason `_historyOptimisticEligibility` can decline to paint for, and
+// whether it describes ordinary conditions or a mis-registered mutation surface.
+//
+// Exhaustive on purpose. A deny-list would default a newly added reason to
+// warning, so every future carve-out would ship console noise; an allow-list
+// would default it to silence, which is the silent default this map exists to
+// remove. A map makes the next author choose, and
+// `test_history_optimistic.py` fails when a `skip("…")` literal is missing here.
+const HISTORY_OPTIMISTIC_SKIP_REASONS = Object.freeze({
+    // Ordinary and frequent: a carve-out, a concurrent write, or a live gesture.
+    typed_entry: "benign",
+    auxiliary_operations: "benign",
+    dragging: "benign",
+    timeline_mutation: "benign",
+    version_mismatch: "benign",
+    no_authoritative_base: "benign",
+    // The history contract is not being met; a developer should hear about it.
+    outside_write_set: "contract",
+    missing_merge_capabilities: "contract",
+    scene_mismatch: "contract",
+    missing_post_snapshot: "contract",
+});
+
+const HISTORY_OPTIMISTIC_CONTRACT_ADVICE = Object.freeze({
+    // `fps`, `width` and `height` are DELIBERATELY outside the write set --
+    // geometry is compared but never written back, and an fps change retimes
+    // every frame-based field so history refuses it outright. Telling someone to
+    // classify those would break `test_geometry_is_conflict_only_and_never_written`
+    // and the timebase refusal it pins. They are also the likely names here,
+    // because a concurrent fps or resolution change lands in the diff of an
+    // unrelated gesture's entry.
+    outside_write_set: "If those are fps/width/height this is concurrency, not a"
+        + " defect: they are deliberately compared-but-never-written, so Undo"
+        + " ignores them by design. Any other name is a field nobody classified"
+        + " -- decide it in MERGED_WRITE_FIELDS or in the history classification"
+        + " in tests/test_scene_history_merge.py.",
+    missing_merge_capabilities: "The restore-token response did not carry the"
+        + " merge capabilities this client needs; the server and client are out"
+        + " of step.",
+    // Not "impossible": `_setActiveScene` deliberately moves `activeSceneId`
+    // while leaving `activeScene` behind when the matching payload has not
+    // arrived, so an entry pushed in that window carries the old scene's
+    // snapshot under the new id. The branch also covers a missing snapshot.
+    scene_mismatch: "The entry has no snapshot, or its snapshot belongs to a"
+        + " different scene than the entry claims -- which happens if an entry"
+        + " was pushed while the active scene id had moved ahead of its payload.",
+    // Expiry: both callers currently return before the predicate can see this
+    // (`if (!entry.postSnapshot)` in the undo and redo paths), so it is declared
+    // for completeness rather than because it can fire here. Drop it to benign
+    // if those guards are ever the only owner by design.
+    missing_post_snapshot: "The entry never received a canonical post-state. With"
+        + " a restore token this is a pending receipt the next Undo reconciles;"
+        + " without one the mutation that created the entry never stamped it.",
+});
+
+// Warn-once keys, so a repeatable condition costs one line per session rather
+// than one per Undo. Follows `project_source_resolver.js`'s dedup, and
+// additionally re-arms on `window.SonderClearDiag()` so a capture run starts
+// clean like every other in-memory diagnostic set on the page.
+const _historyOptimisticWarned = new Set();
+getDiagClearerRegistry()?.add(() => _historyOptimisticWarned.clear());
+
+// How many offending field names `skip_detail` names before it summarises.
+const HISTORY_OPTIMISTIC_DETAIL_LIMIT = 12;
+
 function clearSessionDiagnostics() {
     let sources = 0;
     const captureId = rotateSessionDiagCaptureId();
@@ -21623,7 +21688,18 @@ export class EditorWidget {
     }
 
     _historyOptimisticEligibility(entry, capabilities) {
-        const skip = (skip_reason) => ({ would_paint: false, skip_reason });
+        // `skip_detail` names the fields responsible, never their values: this
+        // object is spread into `sessionDiagRecord` and reaches the
+        // Ctrl+Alt+Shift+D bundle a user sends in, so an authored value here
+        // would cross a trust boundary that nothing downstream re-checks.
+        //
+        // "Names" is not the same as "a closed developer-chosen vocabulary":
+        // `Scene.to_dict()` overlays unknown top-level keys straight from the
+        // user's project.json, so a hand-edited or imported document can put its
+        // own key names in here. That is why the list below is capped as well as
+        // sorted -- a name is safe to show, an unbounded list of them is not.
+        const skip = (skip_reason, skip_detail = "") =>
+            ({ would_paint: false, skip_reason, skip_detail });
         // Expiry: remove these carve-outs only when typed/reference/identity
         // history owns a local apply whose compensation cannot race repaint.
         if (entry?.kind) return skip("typed_entry");
@@ -21640,12 +21716,71 @@ export class EditorWidget {
         const writable = new Set(capabilities.merged_write_fields);
         const derived = new Set(capabilities.merged_derived_fields);
         const keys = new Set([...Object.keys(entry.snapshot), ...Object.keys(entry.postSnapshot)]);
+        // Collect every offending field rather than returning on the first. A
+        // new lane family arrives as three fields at once, and naming one of
+        // them sends the reader looking for a single-field cause.
+        const outside = [];
         for (const key of keys) {
             if (derived.has(key)) continue;
             if (JSON.stringify(entry.snapshot[key]) !== JSON.stringify(entry.postSnapshot[key])
-                    && !writable.has(key)) return skip("outside_write_set");
+                    && !writable.has(key)) outside.push(key);
         }
-        return { would_paint: true, skip_reason: "" };
+        if (outside.length) {
+            // Bounded as well as sorted. The key set is not a closed vocabulary:
+            // `Scene.to_dict()` overlays unknown top-level keys from the user's
+            // own project file, so an old or hand-edited document can contribute
+            // arbitrarily many names to a string that ends up in the diagnostic
+            // bundle. Names are safe to show; an unbounded list is not useful.
+            const named = outside.sort();
+            const shown = named.slice(0, HISTORY_OPTIMISTIC_DETAIL_LIMIT);
+            return skip("outside_write_set", named.length > shown.length
+                ? `${shown.join(", ")} (+${named.length - shown.length} more)`
+                : shown.join(", "));
+        }
+        return { would_paint: true, skip_reason: "", skip_detail: "" };
+    }
+
+    /** Say once, outside the diagnostic ring, when a history paint was declined
+     *  for a reason that means the mutation surface is mis-registered.
+     *
+     *  Deliberately says "History" rather than "Undo": `_restoreScene` serves
+     *  both directions and does not know which one it is serving, so naming one
+     *  would mislabel the other and -- because the dedup key does not carry the
+     *  operation -- then silence the direction that was named.
+     *
+     *  The ring is gated on `window.SONDER_DEBUG_SESSION`, which
+     *  `sonder_editor_bugs.md` records as having no in-product toggle and a
+     *  separate switch from the server's env var of the same name. A developer
+     *  who adds a scene field outside the history write set would therefore get
+     *  no signal at all. This is deliberately a console warning and not a
+     *  notification: `durable_rules.md` says not to notify diagnostic-only
+     *  events, and this is one. It is not a user preference either, so it gets
+     *  no `editor_settings.js` entry -- there is nothing here a user would tune.
+     *
+     *  Ownership split with the tracked gesture-attribution entry: that entry
+     *  owns decoupling gesture-id minting from the ring. This owns one
+     *  developer-facing warning and does not widen the ring's gate. The cost of
+     *  that split, stated so the next person debugging it does not have to read
+     *  this file: an ungated warning beside a gated ring means a console line
+     *  can appear with an empty `__SONDER_CANVAS_DIAG`. */
+    _warnHistoryOptimisticSkip(eligibility) {
+        const reason = String(eligibility?.skip_reason || "");
+        if (!reason || HISTORY_OPTIMISTIC_SKIP_REASONS[reason] !== "contract") return false;
+        const detail = String(eligibility?.skip_detail || "");
+        // Keyed per field, not per combination. `outside_write_set` names every
+        // offender at once, so keying on the joined set would emit a fresh line
+        // for every subset that ever races -- three fields alone can produce
+        // seven. One line per field, the first time that field appears.
+        const fields = detail ? detail.split(", ") : [""];
+        const unseen = fields.filter(
+            (field) => !_historyOptimisticWarned.has(`${reason}|${field}`));
+        if (!unseen.length) return false;
+        for (const field of unseen) _historyOptimisticWarned.add(`${reason}|${field}`);
+        console.warn(
+            `[Sonder] History could not be painted optimistically (${reason})`
+            + `${unseen.filter(Boolean).length ? `: ${unseen.join(", ")}` : ""}. `
+            + HISTORY_OPTIMISTIC_CONTRACT_ADVICE[reason]);
+        return true;
     }
 
     _paintHistoryOptimistically(state) {
@@ -21896,6 +22031,12 @@ export class EditorWidget {
                 ...eligibility, scene_id: sceneId,
                 version_source: historyPaint.entry.postSnapshotVersionSource || "unknown",
             });
+            // Warn from here rather than inside the predicate, so the predicate
+            // stays a pure probe that tests can call without spraying stderr.
+            // Production output would be identical either way -- there is one
+            // production caller and the dedup is module-level -- so this is
+            // about keeping the predicate side-effect free, nothing more.
+            this._warnHistoryOptimisticSkip(eligibility);
             if (eligibility.would_paint) this._paintHistoryOptimistically(historyPaint);
         }
         let restoreResponse;
