@@ -1109,3 +1109,115 @@ def test_failed_audio_registration_after_validation_cleans_unplaced_wav(tmp_path
     saved = load_project(str(root))
     assert len(saved.assets) == 1 and len(saved.scenes[0].audio_tracks) == 1
     assert "retained_path" not in job.public_status()
+
+
+# ---------------------------------------------------------------------------
+# The export panel is the second transport the HTTP middleware cannot see: the failure
+# is written onto the job and polled back, so `str(exc)` put the absolute path into
+# `job.error` — and into `job.message`, which `_exportPhaseMessage` reads FIRST.
+# ---------------------------------------------------------------------------
+
+STORAGE_SENTINEL_PATH = r"C:\__SECRET_ABSOLUTE_PATH__\state\ab.json"
+
+
+def _export_job_failing_on_commit(tmp_path, monkeypatch, *, retained):
+    """Run a stubbed export whose durable commit raises a storage-integrity failure."""
+    from server.project_storage import ProjectStorageError
+
+    project_dir = tmp_path / "project"
+    (project_dir / "media").mkdir(parents=True)
+    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=4,
+                  video_lane_configs=[LaneConfig()])
+    project = TimelineProject(project_dir=str(project_dir), project_id="project-1",
+                              name="Project", scenes=[scene], resolution=(2, 2))
+    save_project(project)
+
+    def fake_iter(_project, _scene, start, end, **_kwargs):
+        for idx in range(start, end):
+            yield np.full((2, 2, 3), idx, dtype=np.uint8)
+
+    def fake_encode(frames_iter, *, output_path, timeout, progress_callback=None, **_kwargs):
+        for _frame in frames_iter:
+            pass
+        with open(output_path, "wb") as handle:
+            handle.write(b"video")
+        return {"save_preset": "Compatible MP4", "codec": "libx264", "pix_fmt": "yuv420p",
+                "container": "mp4", "tensor_mode": "round", "browser_preview_compatible": True}
+
+    def unreadable_storage(*_args, **_kwargs):
+        raise ProjectStorageError(
+            f"provenance_ab: missing or unreadable component: {STORAGE_SENTINEL_PATH}")
+
+    monkeypatch.setattr(timeline_export, "encode_video", fake_encode)
+    monkeypatch.setattr(timeline_export, "ensure_thumbnail", lambda *_a, **_kw: True)
+    monkeypatch.setattr(timeline_export, "_technical_video_metadata",
+                        lambda _path, fallback: dict(fallback))
+    if retained:
+        # `retained_path` is set the moment the encoded file is published, which is
+        # before registration — so any failure from here on lands in the ambiguity
+        # branch, and the finished files really are on disk.
+        monkeypatch.setattr(timeline_export, "iter_scene_frames", fake_iter)
+        monkeypatch.setattr(timeline_export, "save_generated_project", unreadable_storage)
+    else:
+        # The job's own `load_project` is the ordinary non-retained raise site: it runs
+        # inside the same `try`, strictly before `retained_path` is set, and
+        # `validate_storage` fails there on any unreadable component.
+        #
+        # Deliberately NOT frame preparation: `resolve_source_color_interpretation`
+        # reads `inline_generation_params`, which goes through
+        # `generation_params_for_storage` and bypasses `Asset.__getattribute__`, so it
+        # never hydrates and never raises this. `iter_scene_frames` is also a generator
+        # function, so a raise inside it would surface during consumption in
+        # `encode_video`, not at the call site.
+        monkeypatch.setattr(timeline_export, "iter_scene_frames", fake_iter)
+        monkeypatch.setattr(timeline_export, "load_project", unreadable_storage)
+
+    manager = TimelineExportManager(max_workers=1, ttl_seconds=60)
+    job = manager.start(load_project(str(project_dir)), {
+        "scene_id": "scene-1",
+        "range": {"start": 0, "end": 4},
+        "include_video": True,
+        "include_audio": False,
+        "save_preset": "Compatible MP4",
+        "place_as_take": False,
+    })
+    job.future.result(timeout=30)
+    return job
+
+
+def test_export_failure_reports_unreadable_storage_without_the_server_path(tmp_path, monkeypatch):
+    from server.project_storage import PROJECT_STORAGE_UNREADABLE_MESSAGE
+
+    job = _export_job_failing_on_commit(tmp_path, monkeypatch, retained=False)
+
+    assert job.status == "failed"
+    assert not job.retained_path
+    assert job.code == "project_storage_unreadable"
+    assert job.error == PROJECT_STORAGE_UNREADABLE_MESSAGE
+    # `_exportPhaseMessage` reads `message` before `error`; an arm that leaves it behind
+    # shows a stale phase string where the failure should be.
+    assert job.message == PROJECT_STORAGE_UNREADABLE_MESSAGE
+    assert STORAGE_SENTINEL_PATH not in job.error
+    assert STORAGE_SENTINEL_PATH not in job.message
+
+
+def test_export_retention_still_names_the_saved_files_without_the_state_path(tmp_path, monkeypatch):
+    """The retention branch deliberately prints retained media paths — that is the user's
+
+    work and they need to find it. What it must stop printing is the `state/` component
+    path of the durable store it could not read.
+    """
+    from server.project_storage import PROJECT_STORAGE_UNREADABLE_MESSAGE
+
+    job = _export_job_failing_on_commit(tmp_path, monkeypatch, retained=True)
+
+    assert job.status == "failed"
+    assert job.retained_path
+    # Pinned here as well as in the non-retained case: a fix that shaped only the
+    # message and left `export_registration_failed` behind would otherwise pass.
+    assert job.code == "project_storage_unreadable"
+    assert "could not be confirmed" in job.error
+    assert PROJECT_STORAGE_UNREADABLE_MESSAGE in job.error
+    assert job.message == job.error
+    assert STORAGE_SENTINEL_PATH not in job.error
+    assert STORAGE_SENTINEL_PATH not in job.message

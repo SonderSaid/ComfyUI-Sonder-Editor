@@ -4089,3 +4089,73 @@ def test_save_audio_sidecar_failure_keeps_delivered_audio_and_warns(tmp_path, mo
     assert len(project.assets) == 1 and project.assets[0].has_audio
     assert len(scene.clips) == 1 and not scene.audio_tracks and not scene.linked_item_groups
     assert not list((tmp_path / 'media').glob('*_audio.wav'))
+
+
+# ---------------------------------------------------------------------------
+# The third transport, and the only one that is permanent: a claimed queue job's
+# failure is written into `project.json` and served back by GET /project/{id}/queue.
+# `str(e)` there means an absolute server path is saved into the user's project file,
+# where no later redaction can reach it.
+# ---------------------------------------------------------------------------
+
+STORAGE_SENTINEL_PATH = r"C:\__SECRET_ABSOLUTE_PATH__\state\ab.json"
+
+
+def test_queue_job_failure_never_writes_a_server_path_into_the_project(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    from server.project_manager import create_project, load_project
+    from server.timeline_state import GenerationJob, Scene
+
+    # Take the class and the copy from the node's own module, not from `server.*`.
+    # `_import_editor_node` loads the pack under an alias package, so
+    # `<alias>.server.project_storage.ProjectStorageError` is a different class object
+    # from `server.project_storage.ProjectStorageError` and an `isinstance` check in the
+    # node would never match a class raised from the other. ComfyUI imports the pack
+    # once, so that split exists only in this harness — raising the node's own class is
+    # what reproduces production, and importing from `server.*` here would fail the test
+    # for a reason that cannot happen in the product.
+    ProjectStorageError = editor_node.ProjectStorageError
+    PROJECT_STORAGE_UNREADABLE_MESSAGE = editor_node.PROJECT_STORAGE_UNREADABLE_MESSAGE
+
+    base = tmp_path / "projects"
+    base.mkdir()
+    created = create_project("Queue failure", 24.0, 64, 64, "free", str(base))
+    project = load_project(created.project_dir)
+    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=8)
+    project.add_scene(scene)
+    job = GenerationJob(job_id="job-1", scene_id="scene-1", status="running",
+                        selection_start=0, selection_end=4)
+    project.generation_queue = [job]
+    from server.project_manager import save_project as real_save
+    real_save(project, notify=False)
+
+    loaded = load_project(created.project_dir)
+    monkeypatch.setattr(editor_node, "load_project", lambda _dir: loaded)
+    monkeypatch.setattr(editor_node, "_resolve_project_choice_dir",
+                        lambda _base, _choice: created.project_dir)
+    monkeypatch.setattr(editor_node.SonderEditor, "_execution_reaches_terminal_save",
+                        lambda self, prompt, unique_id: True)
+    monkeypatch.setattr(editor_node.SonderEditor, "_consume_queue_job",
+                        lambda self, proj: (proj, proj.generation_queue[0]))
+
+    def unreadable_storage(*_args, **_kwargs):
+        raise ProjectStorageError(
+            f"provenance_ab: missing or unreadable component: {STORAGE_SENTINEL_PATH}")
+
+    monkeypatch.setattr(editor_node.SonderEditor, "_render_scene_frames", unreadable_storage)
+
+    with pytest.raises(ProjectStorageError):
+        editor_node.SonderEditor().execute(
+            project="Queue failure", project_name="Queue failure", fps=24.0,
+            width=64, height=64, scene_id="scene-1",
+            selection_start=0, selection_end=4)
+
+    # Assert on the decoded value, not the raw file text: `json.dumps` escapes the
+    # backslashes in a Windows path, so a substring check against the document would
+    # pass today while the path is sitting in it.
+    saved_job = load_project(created.project_dir).generation_queue[0]
+    assert saved_job.status == "failed"
+    assert saved_job.error == PROJECT_STORAGE_UNREADABLE_MESSAGE
+    assert STORAGE_SENTINEL_PATH not in saved_job.error
+    assert "__SECRET_ABSOLUTE_PATH__" not in (
+        Path(created.project_dir) / "project.json").read_text(encoding="utf-8")

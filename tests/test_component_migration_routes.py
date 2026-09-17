@@ -72,7 +72,7 @@ def test_route_migration_keeps_loop_live_and_concurrent_reader_off_lock(tmp_path
         # The real route still honors its normal version-conflict contract.
         stale = DummyRequest(match_info={"project_id": path.parent.name}, body={"name": "stale"},
             method="PUT", headers={"If-Match": project.modified_at})
-        response = await routes._project_conflict_middleware(stale, update)
+        response = await routes._project_error_middleware(stale, update)
         assert response.status == 409
 
     try:

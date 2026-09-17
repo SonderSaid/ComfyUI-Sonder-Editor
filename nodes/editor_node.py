@@ -16,6 +16,7 @@ import torch
 import folder_paths
 
 from ..server.project_manager import ProjectVersionConflict, load_project, create_project, save_project
+from ..server.project_storage import PROJECT_STORAGE_UNREADABLE_MESSAGE, ProjectStorageError
 from ..server import external_links
 from ..server import prompt_channel_templates
 from ..server import prompt_payload
@@ -1449,7 +1450,15 @@ class SonderEditor:
                 e,
             )
             if proj is not None and queue_job is not None and queue_job_consumed:
-                self._mark_queue_job_failed(proj, queue_job, str(e))
+                # `GenerationJob.error` is a serialized field: it is written into
+                # `project.json` and served by `GET /project/{id}/queue`. A path written
+                # here is permanent — no later redaction reaches a value already on
+                # disk — so this is the one transport where the shaping has to happen
+                # before the write rather than at the response boundary.
+                self._mark_queue_job_failed(
+                    proj, queue_job,
+                    PROJECT_STORAGE_UNREADABLE_MESSAGE
+                    if isinstance(e, ProjectStorageError) else str(e))
             raise
 
     def _render_scene_frames(self, proj: TimelineProject, scene: Scene,

@@ -7,6 +7,7 @@ true of the queue routes it was written for, false in general.
 """
 import asyncio
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -330,10 +331,10 @@ def test_a_project_without_a_version_is_refused_rather_than_saved_unguarded(tmp_
 
 
 def test_a_version_conflict_409_carries_the_editor_security_headers(tmp_path, monkeypatch):
-    """The conflict middleware is outermost, so nothing downstream adds them for it.
+    """The project error middleware is outermost, so nothing downstream adds them for it.
 
     `_sonder_security_middleware` applies the headers on its way out, which never runs
-    when a handler raises: the exception unwinds past it to the conflict middleware,
+    when a handler raises: the exception unwinds past it to the project error middleware,
     which builds the 409 itself. Versioned mutations make that an ordinary response.
     """
     routes = _load_route_module(monkeypatch)
@@ -345,7 +346,7 @@ def test_a_version_conflict_409_carries_the_editor_security_headers(tmp_path, mo
 
     request = DummyRequest(match_info={"project_id": "project"}, method="PUT",
                            path="/sonder-editor/project/project")
-    response = asyncio.run(routes._project_conflict_middleware(request, raising_handler))
+    response = asyncio.run(routes._project_error_middleware(request, raising_handler))
 
     assert response.status == 409
     assert response.headers["X-Content-Type-Options"] == "nosniff"
@@ -535,3 +536,122 @@ def test_only_a_snapshot_carrying_identity_fields_counts_as_one(monkeypatch):
     usable = {"name": "x"}
     assert routes.saved_selection_identity_snapshot(usable) is usable
     assert routes.saved_selection_identity_snapshot({"start": 0}) is not None
+
+
+# ---------------------------------------------------------------------------
+# The same middleware owns the other condition a handler signals by raising: durable
+# storage the server cannot read. It is not a client error, its message can carry an
+# absolute path, and a raise that reaches aiohttp loses the editor security headers
+# entirely — the exact hole the 409 arm above was written to close.
+# ---------------------------------------------------------------------------
+
+STORAGE_SENTINEL_PATH = r"C:\__SECRET_ABSOLUTE_PATH__\state\ab.json"
+
+
+def _storage_failure_response(routes, *, method="POST"):
+    from server.project_storage import ProjectStorageError
+
+    async def raising_handler(_request):
+        raise ProjectStorageError(
+            f"provenance_ab: missing or unreadable component: {STORAGE_SENTINEL_PATH}")
+
+    request = DummyRequest(match_info={"project_id": "project"}, method=method,
+                           path="/sonder-editor/project/project/assets/empty-trash")
+    return asyncio.run(routes._project_error_middleware(request, raising_handler))
+
+
+def _storage_failure_body(response):
+    return json.loads(response.body.decode("utf-8"))
+
+
+def test_unreadable_storage_is_a_shaped_server_error(monkeypatch):
+    """One condition, one code. A SHA-256 mismatch is not fixed by resubmitting."""
+    routes = _load_route_module(monkeypatch)
+    response = _storage_failure_response(routes)
+    payload = _storage_failure_body(response)
+
+    assert response.status == 500
+    assert payload["code"] == "project_storage_unreadable"
+    assert payload["error"] == routes.PROJECT_STORAGE_UNREADABLE_MESSAGE
+    assert set(payload) == {"error", "code"}
+
+
+def test_unreadable_storage_never_renders_the_server_path(monkeypatch):
+    """Redaction is unconditional.
+
+    Only one of the raise sites interpolates a path today, so a policy that redacted
+    conditionally would keep working right up to the moment a new raise site added one,
+    and would then fail silently.
+    """
+    routes = _load_route_module(monkeypatch)
+    response = _storage_failure_response(routes)
+    payload = _storage_failure_body(response)
+
+    # Decoded values, not the wire text: JSON escapes the backslashes in a Windows
+    # path, so `sentinel not in response.body` passes today while the path is in it.
+    assert all(STORAGE_SENTINEL_PATH not in str(value) for value in payload.values())
+    assert "__SECRET_ABSOLUTE_PATH__" not in response.body.decode("utf-8")
+    assert "ab.json" not in response.body.decode("utf-8")
+
+
+def test_unreadable_storage_carries_the_editor_security_headers(monkeypatch):
+    """`_sonder_security_middleware` is inner, so it never runs on a raise.
+
+    Without the arm this response is built by aiohttp outside the application: plain
+    text, a force-closed connection, and none of the four headers or the CSP.
+    """
+    routes = _load_route_module(monkeypatch)
+    response = _storage_failure_response(routes)
+
+    for header in routes._SONDER_SECURITY_HEADERS:
+        assert response.headers[header] == routes._SONDER_SECURITY_HEADERS[header]
+    assert response.headers["Content-Security-Policy"] == routes._SONDER_CSP
+
+
+def test_unreadable_storage_advertises_no_project_version(monkeypatch):
+    """Version headers do not widen to failed responses, and this one would be a lie:
+
+    the version we could report is read from the state we have just failed to read.
+    """
+    routes = _load_route_module(monkeypatch)
+    response = _storage_failure_response(routes)
+
+    assert "X-Sonder-Project-Modified-At" not in response.headers
+
+
+def test_unreadable_storage_diag_event_carries_no_message(monkeypatch):
+    """The diag ring is client-reachable, so it is a second copy of the same secret.
+
+    `get_diag_state` is served at `GET /sonder-editor/session/{project_id}/diag`, so an
+    arm written as `record_diag_event(..., error=str(exc))` would ship the path through
+    a route none of the redaction checks touch. Mirror the 409 arm's fields exactly.
+    """
+    routes = _load_route_module(monkeypatch)
+    events = []
+    monkeypatch.setattr(routes, "record_diag_event",
+                        lambda kind, **details: events.append((kind, details)))
+
+    _storage_failure_response(routes)
+
+    assert len(events) == 1, events
+    kind, details = events[0]
+    assert kind == "project_storage_unreadable_500"
+    assert set(details) == {"project_id", "path", "method"}
+    assert all(STORAGE_SENTINEL_PATH not in str(value) for value in details.values())
+    assert all("__SECRET_ABSOLUTE_PATH__" not in str(value) for value in details.values())
+
+
+def test_unreadable_storage_logs_the_component_and_path_it_hides(monkeypatch, caplog):
+    """The redacted message points at the server log, so the log must actually have it.
+
+    `logger.exception` in the arm replaces aiohttp's own `log_exception`, which stops
+    firing once the middleware returns a response instead of letting the raise through.
+    """
+    routes = _load_route_module(monkeypatch)
+    with caplog.at_level(logging.ERROR):
+        _storage_failure_response(routes)
+
+    records = [record for record in caplog.records if record.levelno >= logging.ERROR]
+    assert any(STORAGE_SENTINEL_PATH in record.getMessage()
+               or STORAGE_SENTINEL_PATH in str(record.exc_info[1] if record.exc_info else "")
+               for record in records), [record.getMessage() for record in records]

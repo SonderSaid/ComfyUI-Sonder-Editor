@@ -126,8 +126,36 @@ def resolve_queue_job(project, job_id):
                                      if job.job_id == job_id), None))
 
 
-class ProjectStorageError(ValueError):
-    """A durable component cannot safely be read or published."""
+class ProjectStorageError(Exception):
+    """A durable component cannot safely be read or published.
+
+    Deliberately NOT a `ValueError`: that is this codebase's de-facto "the client sent
+    something malformed" channel, and `except ValueError: _json_error(str(e), 400)`
+    claimed this at six route sites, reporting a server-side integrity failure as the
+    caller's mistake and rendering a message that can carry an absolute path. Not an
+    `OSError` either — the `except OSError as e: _json_error(str(e), 500)` arms beside
+    those would keep the disclosure at a new status — and not a `RuntimeError`, where
+    `ProjectVersionConflict` already lives. `tests/test_project_storage.py` pins all
+    three out.
+    """
+
+
+# What the client is told when one of these escapes a request. Lives here, beside the
+# exception, so `routes.py`, `timeline_export.py` and `nodes/editor_node.py` cannot
+# drift into three wordings of the same failure.
+#
+# Redaction is unconditional. Only one raise site interpolates a path today, so a
+# policy that redacted conditionally would keep working right up to the moment a new
+# raise site added one, and would then fail silently.
+#
+# The copy promises only what the log always delivers. An earlier wording promised that
+# the log "names the component that failed", which is false for the raise sites whose
+# message carries no component at all — "Unsupported or malformed project storage
+# format", "Project state directory is missing or invalid", and a dozen more.
+PROJECT_STORAGE_UNREADABLE_MESSAGE = (
+    "This project's stored data could not be read. Details are in the ComfyUI "
+    "server log."
+)
 
 
 def storage_of(data):

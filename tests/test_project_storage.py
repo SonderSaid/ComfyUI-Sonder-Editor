@@ -553,3 +553,21 @@ def test_format_one_history_reader_and_gc(tmp_path):
     path.write_text(json.dumps(raw), encoding="utf-8")
     with pytest.raises(ps.ProjectStorageError, match="history index"):
         pm.load_project(project.project_dir)
+
+
+def test_storage_integrity_failure_is_not_a_client_error():
+    """A durable-storage failure must not be claimable by a request-validation handler.
+
+    `routes.py` uses `except ValueError: return _json_error(str(e), 400)` as its de-facto
+    "the client sent something malformed" channel. A component that cannot be read is the
+    opposite condition — the server cannot read its own state — and one raise site's
+    message carries an absolute filesystem path. The base class is the only thing keeping
+    those two channels apart, so it is pinned here rather than left to the reviewer of the
+    next `except ValueError`. `OSError` and `RuntimeError` are pinned out for the same
+    reason: `except OSError as e: _json_error(str(e), 500)` arms would keep the leak at a
+    new status, and `ProjectVersionConflict` already lives under `RuntimeError`.
+    """
+    assert issubclass(ps.ProjectStorageError, Exception)
+    assert not issubclass(ps.ProjectStorageError, ValueError)
+    assert not issubclass(ps.ProjectStorageError, OSError)
+    assert not issubclass(ps.ProjectStorageError, RuntimeError)

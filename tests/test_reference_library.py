@@ -736,7 +736,7 @@ def test_reference_mutation_rejects_stale_if_match(monkeypatch, tmp_path):
             "fields": {"name": "Character", "kind": "character", "reference_class": "subject"},
         }]},
     )
-    response = asyncio.run(route_module._project_conflict_middleware(request, handler))
+    response = asyncio.run(route_module._project_error_middleware(request, handler))
     payload = json.loads(response.body.decode("utf-8"))
     assert response.status == 409
     assert payload["code"] == "project_version_conflict"

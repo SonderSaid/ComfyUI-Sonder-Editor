@@ -60,7 +60,7 @@ from .frozen_reference import (
     FrozenReferenceSnapshotError,
     decode_frozen_reference_catalog,
 )
-from .project_storage import ProjectStorageError
+from .project_storage import PROJECT_STORAGE_UNREADABLE_MESSAGE, ProjectStorageError
 from .project_storage_lifecycle import run_project_io
 from .render_cache import (
     RenderCacheActiveError,
@@ -347,8 +347,33 @@ def _public_project_data(data: dict | None) -> dict:
     }
 
 
+def _middleware_project_id(request: web.Request) -> str:
+    """The route's project id for a middleware-built response, never raising.
+
+    A middleware arm runs *because* something already failed, so it cannot assume the
+    request is well-formed enough to have `match_info` at all — losing the id must
+    degrade the diagnostic, not replace one failure with another.
+    """
+    try:
+        return str(request.match_info.get("project_id", "") or "")
+    except Exception:
+        return ""
+
+
 @web.middleware
-async def _project_conflict_middleware(request: web.Request, handler):
+async def _project_error_middleware(request: web.Request, handler):
+    """Owns every project failure a handler signals by raising rather than returning.
+
+    Outermost of Sonder's four middlewares, which is what makes it the only place that
+    can answer these: a raise unwinds past `_sonder_security_middleware` without ever
+    reaching its header pass, so a response built anywhere below would ship without the
+    editor headers and CSP — and a raise that escapes entirely is answered by aiohttp
+    outside the application, as `text/plain` on a force-closed connection.
+
+    Two arms today: a version conflict, which is an ordinary outcome of versioned
+    mutations, and durable storage the server cannot read, which is not the caller's
+    fault and whose message can carry an absolute filesystem path.
+    """
     try:
         return await handler(request)
     except ProjectVersionConflict as exc:
@@ -356,11 +381,7 @@ async def _project_conflict_middleware(request: web.Request, handler):
         # diag ring shows when stale `If-Match` headers collide with concurrent writers.
         # Lets us correlate snap-back symptoms with the request path that 409'd.
         try:
-            project_id = ""
-            try:
-                project_id = str(request.match_info.get("project_id", "") or "")
-            except Exception:
-                project_id = ""
+            project_id = _middleware_project_id(request)
             record_diag_event(
                 "project_version_conflict_409",
                 project_id=project_id,
@@ -370,7 +391,7 @@ async def _project_conflict_middleware(request: web.Request, handler):
                 actual_modified_at=str(exc.actual_modified_at or ""),
             )
         except Exception:
-            logger.debug("project_conflict_middleware failed to emit diag event", exc_info=True)
+            logger.debug("project_error_middleware failed to emit diag event", exc_info=True)
         current = _public_project_data(exc.current_data)
         payload = {
             "error": "project_version_conflict",
@@ -391,15 +412,77 @@ async def _project_conflict_middleware(request: web.Request, handler):
         # here would not, and versioned mutations make 409 an ordinary outcome rather
         # than an edge case.
         return _apply_sonder_security_headers(request, response)
+    except ProjectStorageError:
+        # The server cannot read its own durable state. That is a server error, not a
+        # malformed request, and the message can carry an absolute filesystem path — so
+        # it goes to the log and a curated string goes to the client.
+        #
+        # One arm rather than per-route guards, because the guard cannot be completed:
+        # `Asset.__getattribute__` hydrates `generation_params` on access, and
+        # `Asset.to_dict()`/`_asset_payload()` read it on the handler's behalf, so the
+        # raise point is not a call name anything can be scanned for. Three separate
+        # passes at writing the guard missed twelve sites;
+        # `tests/test_project_storage_route_policy.py` keeps the remaining explicit
+        # arms closed by AST scan instead.
+        project_id = _middleware_project_id(request)
+        # Replaces aiohttp's own `log_exception`, which stops firing once this returns a
+        # response instead of letting the raise through. This is the only record of what
+        # actually failed, so it is what the curated copy points the user at.
+        #
+        # Read through `getattr` for the same reason the id is: this arm runs because
+        # something already failed, and it must not fail a second time and hand back the
+        # bare aiohttp 500 it exists to replace.
+        request_path = str(getattr(request, "path", "") or "")
+        request_method = str(getattr(request, "method", "") or "")
+        logger.exception(
+            "Sonder project storage unreadable project_id=%s path=%s method=%s",
+            project_id, request_path, request_method)
+        try:
+            # No message field: `get_diag_state` is served over HTTP, so the ring is
+            # client-reachable and would be a second copy of the same path. Mirror the
+            # 409 arm's fields exactly.
+            record_diag_event(
+                "project_storage_unreadable_500",
+                project_id=project_id,
+                path=request_path,
+                method=request_method,
+            )
+        except Exception:
+            logger.debug("project_error_middleware failed to emit diag event", exc_info=True)
+        response = web.json_response(
+            {"error": PROJECT_STORAGE_UNREADABLE_MESSAGE,
+             "code": "project_storage_unreadable"},
+            status=500,
+        )
+        # Deliberately no `component` field: the three GET routes already know their
+        # component from the route, and most raise sites carry no component name to
+        # give — `project_storage.py` says how many. Expiry: if a consumer appears, carry it as an attribute on
+        # the exception — never by parsing `str(exc)`.
+        #
+        # Deliberately no version headers either: they do not widen to failed
+        # responses, and the version we could report is read from the state this
+        # request has just failed to read.
+        return _apply_sonder_security_headers(request, response)
 
 
 try:
     app = PromptServer.instance.app if routes is not None else None
-    if app is not None and not getattr(app, "_sonder_project_conflict_middleware", False):
-        app.middlewares.append(_project_conflict_middleware)
-        setattr(app, "_sonder_project_conflict_middleware", True)
+    # The flag is renamed with the middleware, deliberately, and the reverse was tried
+    # first. It lives on the persistent `PromptServer.instance.app`, so an in-process
+    # re-import after an upgrade sees whichever spelling the previous import wrote:
+    #   * renamed (this) — the old flag is set, the new one is not, so a second copy is
+    #     appended. First-appended is outermost, so the old armless object becomes a
+    #     pass-through wrapper and the new inner copy answers. Correct response.
+    #   * kept — the old flag is already True, so this middleware is never appended and
+    #     the previous function object, which has no `ProjectStorageError` arm, stays
+    #     installed. Every storage failure then escapes to aiohttp as `text/plain` with
+    #     no headers: exactly the window this work exists to close.
+    # Both cases resolve at the next ComfyUI restart, which a Python change needs anyway.
+    if app is not None and not getattr(app, "_sonder_project_error_middleware", False):
+        app.middlewares.append(_project_error_middleware)
+        setattr(app, "_sonder_project_error_middleware", True)
 except Exception:
-    logger.debug("Could not install Sonder project conflict middleware", exc_info=True)
+    logger.debug("Could not install Sonder project error middleware", exc_info=True)
 
 
 @web.middleware
@@ -413,7 +496,7 @@ async def _project_version_header_middleware(request: web.Request, handler):
             if project is not None:
                 _attach_project_version_headers(
                     response,
-                    getattr(project, "project_id", "") or request.match_info.get("project_id", ""),
+                    getattr(project, "project_id", "") or _middleware_project_id(request),
                     getattr(project, "modified_at", ""),
                 )
     except Exception:
@@ -485,7 +568,7 @@ async def _route_timing_middleware(request: web.Request, handler):
             # roadmap work still cites physical write-request counts.
             record_diag_event(
                 "mutation_route_entry",
-                project_id=str(request.match_info.get("project_id", "") or ""),
+                project_id=_middleware_project_id(request),
                 path=path,
                 method=method,
                 gesture_id=_diagnostic_header(request, "X-Sonder-Gesture-Id"),
@@ -510,14 +593,9 @@ async def _route_timing_middleware(request: web.Request, handler):
         if elapsed >= _ROUTE_TIMING_THRESHOLD_S:
             try:
                 if _sonder_route_path(path).startswith("/sonder-editor/"):
-                    project_id = ""
-                    try:
-                        project_id = str(request.match_info.get("project_id", "") or "")
-                    except Exception:
-                        project_id = ""
                     record_diag_event(
                         "route_blocking",
-                        project_id=project_id,
+                        project_id=_middleware_project_id(request),
                         path=path,
                         method=request.method,
                         duration_ms=elapsed * 1000.0,
@@ -10026,6 +10104,18 @@ if routes is not None:
             return web.json_response(project.to_dict(), status=201)
         except ProjectVersionConflict:
             raise
+        except ProjectStorageError:
+            # `create_project` LOADS when the folder already exists
+            # (`project_manager.py`), so re-creating a project whose durable storage is
+            # unreadable raises here; the `save_project` in `create_configured_project`
+            # is the second route. The broad catch below would render the message, so
+            # the middleware owns this class instead.
+            #
+            # Not `project.to_dict()`: that serialises assets with
+            # `include_provenance=False`, which reads `generation_params_for_storage` —
+            # the backing value, deliberately bypassing hydration so persistence never
+            # triggers a disk read.
+            raise
         except Exception as e:
             logger.exception("Failed to create project")
             return _json_error(str(e), 500)
@@ -10317,7 +10407,7 @@ if routes is not None:
 
     @routes.get("/sonder-editor/project/{project_id}/assets/provenance")
     async def api_asset_provenance_batch(request: web.Request) -> web.Response:
-        from .project_storage import read_asset_provenance_batch, ProjectStorageError
+        from .project_storage import read_asset_provenance_batch
         ids = request.query.getall("asset_id", [])
         if not ids or len(ids) > 64:
             return _json_error("Request between 1 and 64 asset ids", 400)
@@ -10327,12 +10417,10 @@ if routes is not None:
             return web.json_response(await run_project_io(read_batch))
         except FileNotFoundError as exc:
             return _json_error(str(exc), 404)
-        except ProjectStorageError as exc:
-            return _json_error(str(exc), 409)
 
     @routes.get("/sonder-editor/project/{project_id}/assets/{asset_id}/provenance")
     async def api_asset_provenance(request: web.Request) -> web.Response:
-        from .project_storage import read_asset_provenance, ProjectStorageError
+        from .project_storage import read_asset_provenance
         def read_provenance():
             return read_asset_provenance(_project_dir_without_model(request),
                                         request.match_info.get("asset_id", ""))
@@ -10340,8 +10428,6 @@ if routes is not None:
             return web.json_response(await run_project_io(read_provenance))
         except FileNotFoundError as exc:
             return _json_error(str(exc), 404)
-        except ProjectStorageError as exc:
-            return _json_error(str(exc), 409)
 
     @routes.get("/sonder-editor/project/{project_id}/assets")
     async def api_list_assets(request: web.Request) -> web.Response:
@@ -10654,10 +10740,6 @@ if routes is not None:
                 load_and_aggregate_usages)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
-        except ProjectStorageError:
-            # Durable storage is unreadable. That is a server-side integrity failure,
-            # not a malformed request, and its message carries an absolute path.
-            raise
         except ValueError as e:
             return _json_error(str(e), 400)
 
@@ -10781,6 +10863,18 @@ if routes is not None:
             if thumb_path:
                 await asyncio.to_thread(ensure_thumbnail, "image", out_path, thumb_path)
             return web.json_response(_asset_payload(project, asset), status=201)
+        except ProjectStorageError:
+            # `save_project` above publishes durable components and raises this when one
+            # cannot be written or re-read. The broad catch below would render the
+            # message, which for one raise site is an absolute path; the middleware owns
+            # this class.
+            #
+            # NOT via `_asset_payload`: the asset it is given was constructed in this
+            # same `try`, so `_generation_unhydrated` — set only by
+            # `attach_asset_descriptors` at load — is absent and nothing hydrates. That
+            # matters for the expiry condition: this guard stays as long as a durable
+            # write is in the `try`, regardless of what happens to `_asset_payload`.
+            raise
         except Exception as e:
             logger.warning("Failed to register viewport snapshot: %s", e)
             return _json_error(str(e), 500)
@@ -10874,6 +10968,12 @@ if routes is not None:
 
         except ImportError:
             return _json_error("cv2 (OpenCV) not available", 500)
+        except ProjectStorageError:
+            # Same shape as the snapshot route: the reachable raise is the `save_project`
+            # inside this `try`, not `_asset_payload`, whose asset is freshly built here
+            # and therefore never hydrates. The broad catch below would render the
+            # message; the middleware owns this class.
+            raise
         except Exception as e:
             logger.warning("Failed to extract frame: %s", e)
             return _json_error(str(e), 500)
@@ -10924,10 +11024,6 @@ if routes is not None:
             usages = await run_project_io(load_and_aggregate_usages)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
-        except ProjectStorageError:
-            # Durable storage is unreadable. That is a server-side integrity failure,
-            # not a malformed request, and its message carries an absolute path.
-            raise
         except ValueError as e:
             return _json_error(str(e), 400)
         return web.json_response(usages)
@@ -10954,10 +11050,6 @@ if routes is not None:
                 load_and_aggregate_usages)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
-        except ProjectStorageError:
-            # Durable storage is unreadable. That is a server-side integrity failure,
-            # not a malformed request, and its message carries an absolute path.
-            raise
         except ValueError as e:
             return _json_error(str(e), 400)
 
@@ -13327,15 +13419,13 @@ if routes is not None:
 
     @routes.get("/sonder-editor/project/{project_id}/prompt-history")
     async def api_get_prompt_history(request: web.Request) -> web.Response:
-        from .project_storage import read_prompt_history, ProjectStorageError
+        from .project_storage import read_prompt_history
         def read_history():
             return read_prompt_history(_project_dir_without_model(request))
         try:
             return web.json_response(await run_project_io(read_history))
         except FileNotFoundError as exc:
             return _json_error(str(exc), 404)
-        except ProjectStorageError as exc:
-            return _json_error(str(exc), 409)
 
     @routes.get("/sonder-editor/project/{project_id}/queue")
     async def api_list_queue(request: web.Request) -> web.Response:

@@ -22,7 +22,7 @@ def request(module, method='GET', project_id='project', origin=None):
                               headers=headers, match_info={'project_id': project_id, 'job_id': 'job'})
     handler = module.api_cancel_render_timeline_job if method == 'POST' else module.api_get_render_timeline_job
     for middleware in [module._route_timing_middleware, module._sonder_security_middleware,
-                       module._project_version_header_middleware, module._project_conflict_middleware]:
+                       module._project_version_header_middleware, module._project_error_middleware]:
         handler = partial(middleware, handler=handler)
     return asyncio.run(handler(req))
 

@@ -47,6 +47,7 @@ from .path_security import (
 )
 from .project_commit import created_ids_since, save_generated_project, snapshot_item_ids
 from .project_manager import load_project
+from .project_storage import PROJECT_STORAGE_UNREADABLE_MESSAGE, ProjectStorageError
 from .thumbnail_service import ensure_thumbnail
 from .timeline_renderer import (
     TimelineRenderCancelled,
@@ -973,6 +974,30 @@ class TimelineExportManager:
                         os.remove(path)
                 except OSError:
                     pass
+        except ProjectStorageError:
+            # The export panel polls this job, so `str(exc)` here is the same disclosure
+            # the HTTP middleware closes — and the middleware cannot see this path,
+            # because the failure is written onto the job rather than raised through a
+            # request. One shared constant so the two transports cannot drift into two
+            # wordings of the same failure.
+            #
+            # No cleanup loop: the `finally` below already removes `cleanup_paths`, and
+            # the sibling arms' copies of it are redundant with that, not additional.
+            logger.exception("Timeline export failed: project storage unreadable")
+            job.status = "failed"
+            job.phase = "failed"
+            job.code = "project_storage_unreadable"
+            job.error = PROJECT_STORAGE_UNREADABLE_MESSAGE
+            if job.retained_path:
+                # Same ambiguity the arm below preserves: a save can raise after root
+                # publication, so do not assert registration definitely did not happen.
+                # `_exportRetainedMessage` still prints the retained media paths, which
+                # is the user's own work and the point of the branch.
+                job.error = ("Finished files were saved, but project registration could "
+                             f"not be confirmed. {PROJECT_STORAGE_UNREADABLE_MESSAGE}")
+            # `_exportPhaseMessage` reads `message` before `error`, so an arm that left
+            # this behind would show a stale phase string where the failure belongs.
+            job.message = job.error
         except Exception as exc:
             logger.exception("Timeline export failed")
             job.status = "failed"

@@ -1525,7 +1525,7 @@ def test_scene_restore_save_conflict_retry_is_bounded_and_receipted(
         body={"base_scene": base, "target_scene": target,
               "restore_token": token})
 
-    response = asyncio.run(route_module._project_conflict_middleware(request, handler))
+    response = asyncio.run(route_module._project_error_middleware(request, handler))
     receipt = route_module._SCENE_RESTORE_RECEIPTS.get(token, "project", "scene-1")
 
     assert response.status == 409
@@ -1847,7 +1847,7 @@ def test_scene_restore_real_disk_merge_is_durable_through_conflict_middleware(
               "restore_token": token})
 
     async def through_conflict_middleware(inner_request):
-        return await route_module._project_conflict_middleware(inner_request, handler)
+        return await route_module._project_error_middleware(inner_request, handler)
 
     response = asyncio.run(route_module._project_version_header_middleware(
         request, through_conflict_middleware))

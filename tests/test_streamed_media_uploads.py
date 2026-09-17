@@ -1,5 +1,6 @@
 import asyncio
 import importlib
+import json
 import os
 from types import SimpleNamespace
 from pathlib import Path
@@ -392,7 +393,7 @@ def test_sequential_imports_advertise_committed_versions(tmp_path, monkeypatch):
 
     async def scenario():
         app = web.Application(middlewares=[
-            route_module._project_conflict_middleware,
+            route_module._project_error_middleware,
             route_module._project_version_header_middleware,
         ])
         path = "/sonder-editor/project/{project_id}/assets/import"
@@ -435,7 +436,7 @@ def test_streamed_routes_return_committed_header_with_stale_client(tmp_path, mon
     before = project.modified_at
 
     async def scenario():
-        app = web.Application(middlewares=[route_module._project_conflict_middleware,
+        app = web.Application(middlewares=[route_module._project_error_middleware,
                                           route_module._project_version_header_middleware])
         suffix = "import" if operation == "import" else "{asset_id}/replace"
         path = "/sonder-editor/project/{project_id}/assets/" + suffix
@@ -574,3 +575,61 @@ console.log(JSON.stringify({ok:true}));
     result = subprocess.run([node, "--input-type=module", "-e", script], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Both multipart branches build their response payload with `_asset_payload`, inside
+# the `try`, and `_asset_payload` reads `generation_params` — the attribute whose lazy
+# hydration is a component read. Their `except (ValueError, MediaProbeError)` arm then
+# reported a durable-storage failure as a 400 validation error and rendered its
+# message. These need the real-app harness: the payload build sits inside
+# `async with receive_project_upload(...)`, which a DummyRequest cannot drive.
+# ---------------------------------------------------------------------------
+
+STORAGE_SENTINEL_PATH = r"C:\__SECRET_ABSOLUTE_PATH__\state\ab.json"
+
+
+@pytest.mark.parametrize("operation", ["import", "replace"])
+def test_streamed_routes_report_unreadable_storage_as_a_server_error(tmp_path, monkeypatch, operation):
+    from server.project_storage import ProjectStorageError
+
+    route_module = _reload_routes(monkeypatch)
+    asset = Asset(asset_id="asset-1", name="clip.mp4", asset_type="video", path="media/clip.mp4")
+    project = _saved_project(tmp_path, asset=asset)
+    Path(project.project_dir, asset.path).write_bytes(b"old")
+    monkeypatch.setattr(route_module, "_configured_base_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(upload_streaming, "UPLOAD_DISK_RESERVE_BYTES", 0)
+    monkeypatch.setattr(route_module, "_extract_asset_media_metadata", lambda *_a, **_kw: _valid_video_metadata())
+    monkeypatch.setattr(route_module, "_regenerate_thumbnail_if_current", lambda *_a, **_kw: None)
+
+    def unreadable_provenance(*_args, **_kwargs):
+        raise ProjectStorageError(
+            f"provenance_ab: missing or unreadable component: {STORAGE_SENTINEL_PATH}")
+
+    # The real raise point is an attribute read inside this call; patching the payload
+    # builder puts the failure exactly where lazy hydration puts it, without having to
+    # stage a component that disappears mid-request.
+    monkeypatch.setattr(route_module, "_asset_payload", unreadable_provenance)
+
+    async def scenario():
+        app = web.Application(middlewares=[route_module._project_error_middleware,
+                                           route_module._project_version_header_middleware])
+        suffix = "import" if operation == "import" else "{asset_id}/replace"
+        path = "/sonder-editor/project/{project_id}/assets/" + suffix
+        app.router.add_post(path, _route_handler(route_module, "POST", path))
+        async with TestClient(TestServer(app)) as client:
+            form = FormData()
+            form.add_field("file", b"payload", filename="new.mp4")
+            response = await client.post(
+                path.replace("{project_id}", "project").replace("{asset_id}", "asset-1"),
+                data=form)
+            text = await response.text()
+            assert response.status == 500, text
+            body = json.loads(text)
+            assert body["code"] == "project_storage_unreadable"
+            assert body["error"] == route_module.PROJECT_STORAGE_UNREADABLE_MESSAGE
+            # Decoded, not raw: JSON escapes the backslashes in a Windows path, so a
+            # substring check against the wire text passes while the path is in it.
+            assert all(STORAGE_SENTINEL_PATH not in str(value) for value in body.values())
+
+    asyncio.run(scenario())

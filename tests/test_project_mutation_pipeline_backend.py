@@ -1950,7 +1950,7 @@ def test_asset_sync_stale_version_returns_409_conflict(monkeypatch, tmp_path):
         method="POST",
         path="/sonder-editor/project/proj/assets/sync",
     )
-    response = asyncio.run(route_module._project_conflict_middleware(request, handler))
+    response = asyncio.run(route_module._project_error_middleware(request, handler))
     payload = _response_json(response)
 
     assert response.status == 409
@@ -1986,7 +1986,7 @@ def test_save_path_version_mismatch_returns_projection_and_healing_headers(
         match_info={"project_id": "proj"},
         method="POST", path="/sonder-editor/project/proj/test-save")
     response = asyncio.run(
-        route_module._project_conflict_middleware(request, stale_save))
+        route_module._project_error_middleware(request, stale_save))
     payload = _response_json(response)
 
     assert response.status == 409
@@ -2977,7 +2977,7 @@ def test_candidate_body_is_the_only_version_gate_and_conflicts_heal(
         headers={"If-Match": "stale-header"},
         body={"base_modified_at": "stale-body" if body_stale else project.modified_at,
               "scene": scene.to_dict()})
-    response = asyncio.run(route_module._project_conflict_middleware(request, handler))
+    response = asyncio.run(route_module._project_error_middleware(request, handler))
     payload = _response_json(response)
     assert response.status == (409 if body_stale else 200)
     if body_stale:
@@ -3053,7 +3053,7 @@ def test_compile_conflict_projection_does_not_serialize_full_project(
         match_info={"project_id": "proj", "scene_id": "scene"},
         body={"base_modified_at": "stale", "scene": scene.to_dict()})
 
-    response = asyncio.run(route_module._project_conflict_middleware(request, handler))
+    response = asyncio.run(route_module._project_error_middleware(request, handler))
     payload = _response_json(response)
 
     assert response.status == 409
@@ -3296,3 +3296,63 @@ def test_profile_uncertain_create_verification_uses_exact_server_normalization(m
     response = asyncio.run(handler(DummyRequest(body=changed)))
     assert _response_json(response)["matches"] is False
     assert project.to_dict() == before
+
+
+# ---------------------------------------------------------------------------
+# A durable-storage integrity failure is the server's problem, not the caller's.
+# These four handlers each caught it through `ValueError` and answered 400 — three
+# of them rendering a message that carries an absolute filesystem path. Driven per
+# family rather than through one seam, because they reach storage by different
+# entry points and only the family's own entry point proves its arm is gone.
+# ---------------------------------------------------------------------------
+
+STORAGE_SENTINEL_PATH = r"C:\__SECRET_ABSOLUTE_PATH__\state\ab.json"
+
+
+def _storage_failure():
+    from server.project_storage import ProjectStorageError
+    return ProjectStorageError(
+        f"provenance_ab: missing or unreadable component: {STORAGE_SENTINEL_PATH}")
+
+
+_STORAGE_FAMILIES = {
+    # The body must satisfy each route's own preconditions. A body that trips an
+    # earlier guard produces the same `DID NOT RAISE` as an unfixed route, so the case
+    # would read as proof of the defect while testing nothing — `asset_id is required`
+    # is what the empty body for `permanent_delete` actually proved.
+    "permanent_delete": ("POST", "/sonder-editor/project/{project_id}/assets/permanent",
+                         "_apply_asset_delete_gesture", {"asset_id": "asset-1"}),
+    "bulk_permanent_delete": ("POST", "/sonder-editor/project/{project_id}/assets/bulk-permanent-delete",
+                              "_apply_asset_delete_gesture", {"asset_ids": ["asset-1"]}),
+    "empty_trash": ("POST", "/sonder-editor/project/{project_id}/assets/empty-trash",
+                    "_apply_asset_delete_gesture", {}),
+    "profile_verify": ("POST", "/sonder-editor/project/{project_id}/prompt-context/profiles/verify",
+                       "_load_project_from_request", {"content_hash": "x"}),
+}
+
+
+@pytest.mark.parametrize("family", sorted(_STORAGE_FAMILIES))
+def test_storage_failure_is_never_answered_as_a_bad_request(monkeypatch, family):
+    route_module = _load_route_module(monkeypatch)
+    method, path, entry_point, body = _STORAGE_FAMILIES[family]
+    reached = []
+
+    def raise_storage_failure(*_args, **_kwargs):
+        reached.append(entry_point)
+        raise _storage_failure()
+
+    monkeypatch.setattr(route_module, entry_point, raise_storage_failure)
+    handler = _route_handler(route_module, method, path)
+    request = DummyRequest(match_info={"project_id": "proj"}, method=method, body=body)
+
+    with pytest.raises(route_module.ProjectStorageError) as caught:
+        response = asyncio.run(handler(request))
+        # Reported here rather than left to `DID NOT RAISE`, which cannot distinguish
+        # "the route still claims the exception" from "the route never got that far".
+        assert reached, (
+            f"{family} returned {response.status} without reaching {entry_point}: "
+            f"{_response_json(response)}")
+
+    assert reached == [entry_point]
+    # The message keeps the path deliberately — it goes to the log, never the client.
+    assert STORAGE_SENTINEL_PATH in str(caught.value)
