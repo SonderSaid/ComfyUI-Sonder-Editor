@@ -367,3 +367,361 @@ def test_restore_receipts_are_count_bounded_and_ttl_prunes_every_entry(monkeypat
     clock["now"] = 111.0
     assert store.get(first, "project", "scene") is None
     assert store.get(third, "project", "scene") is None
+
+
+# ---------------------------------------------------------------------------
+# Every Scene field is classified for history, or the suite fails
+# ---------------------------------------------------------------------------
+# A field outside the declared write set is silently never restored by Undo, and
+# nothing said so: `test_declared_scene_write_set_...` above names its fields by
+# hand, so a newly added Scene field is not flagged by it. These dicts close
+# that, and they deliberately carry prose -- the class alone does not say why a
+# field earns it.
+#
+# Kept alongside the two hand-written tests above rather than replacing them:
+# those are behavioural probes with realistic retimed payloads (the fps case
+# asserts the conflict path), while this layer is the exhaustive classification
+# that fails when the model grows a field. Two layers, one authority each.
+
+# Compared by the merge so a concurrent edit still conflicts, but never written
+# back -- `_merge_value(..., write=False)` in scene_history_merge.
+CONFLICT_ONLY_FIELDS = {
+    "width": "Inherited geometry: 0 means 'follow the project'. Restoring a "
+             "stored value would pin an inherited scene to a literal size.",
+    "height": "Inherited geometry, as width.",
+}
+
+# Refuses in both directions, even when stored never moved.
+TIMEBASE_REFUSE_FIELDS = {
+    "fps": "An FPS mutation retimes every frame-based field before returning "
+           "its scene, so restoring those fields against a stored FPS corrupts "
+           "the timebase. Expiry: revisit when geometry-aware undo exists.",
+}
+
+# No scene mutation can write these, so a scene-mutation undo has nothing to
+# reverse in them. Asserted below against the real dispatcher allow-list rather
+# than trusted, because that is the part that can change under us.
+PASS_THROUGH_FIELDS = {
+    "order": "Scene position, assigned once by TimelineProject.add_scene. "
+             "Nothing reorders scenes, so no mutation can change it.",
+    "saved_selections": "Owned by its own REST routes under the scene "
+                        "(`/scenes/{id}/saved_selections`), never by a scene "
+                        "mutation.",
+    # The three below have NO writer at all -- not in `server/`, not in
+    # `nodes/`. They round-trip through to_dict/from_dict and nothing else
+    # touches them. Saying "owned by X" would be an invention; the honest
+    # statement is that they are durable state nobody currently writes, which is
+    # a different and more interesting fact than "history does not restore it".
+    #
+    # Expiry: each leaves this dict when a writer appears -- at which point the
+    # question "should Undo restore it?" becomes live and must be answered, not
+    # inherited.
+    "is_bridge": "No writer in server/ or nodes/; set only in tests and by "
+                 "deserialization. Undo has nothing to reverse because nothing "
+                 "changes it.",
+    "batch_config": "No writer in server/ or nodes/ -- there are no batch "
+                    "routes that assign it. Deserialized and re-serialized only.",
+    "asset_ids": "No writer in server/ or nodes/. Nothing maintains it today, "
+                 "so 'derived membership' would describe an intention rather "
+                 "than the code.",
+}
+
+# Re-stamped by the restore route from the URL, never merged from a document.
+IDENTITY_FIELDS = {
+    "scene_id": "Taken from match_info at the raise site; a merged document "
+                "must never be able to rename the scene it restores into.",
+}
+
+
+def _scene_field_names():
+    import dataclasses
+
+    from server.timeline_state import Scene
+
+    keys = set(Scene(scene_id="probe").to_dict())
+    fields = {f.name for f in dataclasses.fields(Scene) if not f.name.startswith("_")}
+    assert keys == fields, (
+        "Scene.to_dict() and the dataclass fields disagree, so neither is a "
+        "trustworthy enumeration: {}".format(keys ^ fields))
+    return keys
+
+
+def _dispatcher_writable_scene_fields():
+    """Input keys `_apply_scene_fields` membership-tests directly.
+
+    Deliberately narrow, and narrower than "fields a scene mutation can write":
+    it reads `"x" in fields` tests in one function. It does not follow the four
+    helpers that function calls (`_set_scene_lane_count`, `retime_scene_geometry`,
+    `_clamp_reference_items_to_scene`, `_ensure_scene_lane_config_lengths`), and
+    it does not look at the other 37 dispatcher branches at all.
+
+    That is enough for the one claim it supports -- that the pass-through five are
+    not in this allow-list -- and not enough for the stronger claim that nothing
+    writes them, which is asserted separately by having checked every assignment
+    in `server/` and `nodes/` by hand and recorded the result in the dict's prose.
+
+    `descriptor.count_attr in fields` is resolved through VARIABLE_LANE_DESCRIPTORS
+    because a constant-only scan reports 12 when the real list is 16, and the four
+    it would miss are exactly the lane counts a new lane family adds.
+    """
+    import ast
+    from pathlib import Path
+
+    from server.lane_registry import VARIABLE_LANE_DESCRIPTORS
+
+    source = Path(__file__).resolve().parents[1] / "server" / "routes.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    function = next(
+        (node for node in ast.walk(tree)
+         if isinstance(node, ast.FunctionDef) and node.name == "_apply_scene_fields"),
+        None)
+    assert function is not None, "_apply_scene_fields not found; the scan is blind"
+
+    writable, unresolved = set(), []
+    for node in ast.walk(function):
+        if not (isinstance(node, ast.Compare)
+                and any(isinstance(op, (ast.In, ast.NotIn)) for op in node.ops)):
+            continue
+        if any(isinstance(op, ast.NotIn) for op in node.ops):
+            # A negative membership test reads a key just as much as a positive
+            # one; treating it as invisible rather than unresolved is how a
+            # scan silently understates the surface it is asserting about.
+            unresolved.append(f"negative membership: {ast.unparse(node)}")
+            continue
+        if not any(isinstance(c, ast.Name) and c.id == "fields"
+                   for c in node.comparators):
+            continue
+        if isinstance(node.left, ast.Constant) and isinstance(node.left.value, str):
+            writable.add(node.left.value)
+        elif ast.unparse(node.left) == "descriptor.count_attr":
+            writable |= {d.count_attr for d in VARIABLE_LANE_DESCRIPTORS}
+        else:
+            unresolved.append(ast.unparse(node.left))
+    assert not unresolved, (
+        "a membership test this scan cannot resolve makes the pass-through "
+        "classification unprovable; resolve it explicitly: {}".format(unresolved))
+    return writable
+
+
+def test_every_scene_field_has_a_history_classification():
+    from server.scene_history_merge import (
+        MERGED_DERIVED_FIELDS, scene_history_write_fields)
+
+    classified = {}
+    for name, group in (("write", scene_history_write_fields()),
+                        ("derived", MERGED_DERIVED_FIELDS),
+                        ("conflict-only", CONFLICT_ONLY_FIELDS),
+                        ("timebase-refuse", TIMEBASE_REFUSE_FIELDS),
+                        ("pass-through", PASS_THROUGH_FIELDS),
+                        ("identity", IDENTITY_FIELDS)):
+        for field in group:
+            assert field not in classified, (
+                "{} is claimed by both {} and {}".format(field, classified[field], name))
+            classified[field] = name
+
+    fields = _scene_field_names()
+    assert not fields - set(classified), (
+        "a new Scene field is not classified for history, so Undo's behaviour "
+        "for it is undeclared. Add it to the write set if Undo should restore "
+        "it, or to one of the dicts above with a reason: {}".format(
+            sorted(fields - set(classified))))
+    assert not set(classified) - fields, (
+        "these are classified but are no longer Scene fields, so the entry has "
+        "rotted: {}".format(sorted(set(classified) - fields)))
+
+
+def test_pass_through_fields_are_unreachable_from_scene_mutations():
+    """The pass-through rationale, machine-checked rather than narrated."""
+    writable = _dispatcher_writable_scene_fields()
+    reachable = writable & set(PASS_THROUGH_FIELDS)
+    assert not reachable, (
+        "these are classified pass-through -- 'no scene mutation can change "
+        "them, so an undo has nothing to reverse' -- but update_scene_fields "
+        "now writes them, so the classification is false: {}".format(sorted(reachable)))
+    assert set(CONFLICT_ONLY_FIELDS) | set(TIMEBASE_REFUSE_FIELDS) <= writable, (
+        "geometry and timebase are classified as conflict-only *because* a "
+        "mutation can write them; if it no longer can, they are pass-through")
+
+
+@pytest.mark.parametrize("field,base_value,target_value", [
+    ("width", 1280, 640),
+    ("height", 720, 480),
+    ("fps", 48.0, 24.0),
+    ("order", 2, 1),
+    ("is_bridge", True, False),
+    ("asset_ids", ["b"], ["a"]),
+    ("scene_id", "scene", "other"),
+])
+def test_unwritten_classes_never_restore_their_field(field, base_value, target_value):
+    """Column 1 of the class table: base != target, stored == base.
+
+    Everything outside the write set keeps stored. `fps` is the exception that
+    makes it a class of its own -- it refuses here rather than passing through.
+    """
+    base = _scene(**{field: base_value})
+    target = _scene(**{field: target_value})
+    stored = copy.deepcopy(base)
+
+    if field in TIMEBASE_REFUSE_FIELDS:
+        with pytest.raises(SceneMergeConflict):
+            merge_scene_history(base, target, stored)
+        return
+    assert merge_scene_history(base, target, stored)[field] == base_value
+
+
+@pytest.mark.parametrize("field,expect_conflict", [
+    ("width", True), ("height", True), ("fps", True),
+    ("order", False), ("is_bridge", False), ("asset_ids", False),
+])
+def test_column_two_separates_compared_fields_from_pass_through(field, expect_conflict):
+    """Column 2: base != target and stored moved too.
+
+    This is the cell that tells a compared field from an ignored one. Without it
+    conflict-only and pass-through are indistinguishable, because both keep
+    stored whenever stored did not move.
+    """
+    values = {"width": (1280, 640, 1920), "height": (720, 480, 1080),
+              "fps": (48.0, 24.0, 30.0), "order": (2, 1, 3),
+              "is_bridge": (True, False, True), "asset_ids": (["b"], ["a"], ["c"])}
+    base_value, target_value, stored_value = values[field]
+    base = _scene(**{field: base_value})
+    target = _scene(**{field: target_value})
+    stored = _scene(**{field: stored_value})
+
+    if expect_conflict:
+        with pytest.raises(SceneMergeConflict):
+            merge_scene_history(base, target, stored)
+    else:
+        assert merge_scene_history(base, target, stored)[field] == stored_value
+
+
+def test_derived_fields_do_not_survive_the_persistence_boundary():
+    """What separates `derived` from `pass-through`.
+
+    Under the merge alone the two are indistinguishable -- both keep stored and
+    neither conflicts -- so classifying by merge behaviour would let them be
+    collapsed with no visible change.
+
+    Derived from the dicts rather than hardcoded, because an earlier version
+    named its two fields inline and therefore could not fail when a pass-through
+    field was misclassified as derived. It also states the boundary per field:
+    `prompt` is recomputed on the way OUT (`Scene.to_dict`), while
+    `global_channels` is rebuilt on the way IN (`Scene.__post_init__`). An
+    earlier attempt asserted the save-side rule for both and was simply wrong
+    about `global_channels`, which `to_dict` writes verbatim.
+    """
+    from server.scene_history_merge import MERGED_DERIVED_FIELDS
+    from server.timeline_state import BatchConfig, Scene
+
+    assert set(MERGED_DERIVED_FIELDS) == {"global_channels", "prompt"}, (
+        "the derived class changed; this test asserts a per-field boundary and "
+        "a new member needs its own")
+
+    # `prompt`: recomputed at to_dict, so a stale direct assignment never leaves.
+    scene = Scene(scene_id="scene")
+    scene.set_global_prompt("authored text")
+    scene.prompt = "stale direct assignment"
+    assert scene.to_dict()["prompt"] == "authored text"
+
+    # `global_channels`: rebuilt at from_dict from the documents, so a stale
+    # value does not survive a round trip even though to_dict copies it.
+    document = scene.to_dict()
+    document["global_channels"] = {"visual": "stale"}
+    assert Scene.from_dict(document).to_dict()["global_channels"] != {"visual": "stale"}
+
+    # A pass-through field, by contrast, round-trips unchanged: persistence may
+    # normalise its shape once (saved_selections gains its default keys), but it
+    # is never recomputed from somewhere else the way a derived field is. That
+    # is what makes the two classes different, and why collapsing them would
+    # change behaviour even though the merge treats them identically.
+    held = {"order": 7, "is_bridge": True, "batch_config": BatchConfig(max_frames=8),
+            "saved_selections": [{"name": "keep"}], "asset_ids": ["a"]}
+    assert set(held) == set(PASS_THROUGH_FIELDS), (
+        "a pass-through field has no round-trip value here, so nothing proves it "
+        f"survives: {sorted(set(PASS_THROUGH_FIELDS) ^ set(held))}")
+    for field, value in held.items():
+        setattr(scene, field, value)
+    once = scene.to_dict()
+    twice = Scene.from_dict(once).to_dict()
+    for field in PASS_THROUGH_FIELDS:
+        assert twice[field] == once[field], field
+    # And the values really are the ones set, not defaults that would pass above.
+    assert once["order"] == 7 and once["is_bridge"] is True
+    assert once["batch_config"]["max_frames"] == 8
+    assert once["asset_ids"] == ["a"]
+    assert once["saved_selections"][0]["name"] == "keep"
+
+
+# One probe value triple per declared write field. A field declared writable with
+# no entry here fails: `write` is the cheapest class and the default a new field
+# drifts into, and it was the one class with a partition but no predicate. A
+# field can be listed in MERGED_WRITE_FIELDS without the merge actually writing
+# it, and the browser paints an optimistic Undo for anything in that list
+# (`_historyOptimisticEligibility` treats `writable` membership as paintable), so
+# a wrong entry paints a change the server will never apply.
+_WRITE_FIELD_PROBES = {
+    "name": ("after", "before"),
+    "duration_frames": (48, 24),
+    "generation_params": ({"seed": 2}, {"seed": 1}),
+    "prompt_context_profile_id": ("after", "before"),
+    "prompt_context_profile_config": ({"mode": "after"}, {"mode": "before"}),
+    "guide_track_config": ({"hidden": True}, {"hidden": False}),
+    "prompt_track_config": ({"hidden": True}, {"hidden": False}),
+    "global_prompt_track_config": ({"hidden": True}, {"hidden": False}),
+    "global_channel_docs": ({"main": {"text": "after"}}, {"main": {"text": "before"}}),
+    "clips": ([{"clip_id": "c", "timeline_start_frame": 8}],
+              [{"clip_id": "c", "timeline_start_frame": 4}]),
+    "audio_tracks": ([{"track_id": "a", "timeline_start_frame": 8}],
+                     [{"track_id": "a", "timeline_start_frame": 4}]),
+    "guide_frames": ([{"guide_id": "g", "frame_index": 8}],
+                     [{"guide_id": "g", "frame_index": 4}]),
+    "reference_items": ([{"reference_item_id": "r", "start_frame": 8}],
+                        [{"reference_item_id": "r", "start_frame": 4}]),
+    "prompt_sections": ([{"prompt_id": "p", "start_frame": 8, "end_frame": 12}],
+                        [{"prompt_id": "p", "start_frame": 4, "end_frame": 12}]),
+    "linked_item_groups": ([{"group_id": "g", "items": [2, 3]}],
+                           [{"group_id": "g", "items": [1, 2]}]),
+    "global_attachments": ([{"attachment_id": "x", "role": "after"}],
+                           [{"attachment_id": "x", "role": "before"}]),
+    "video_lane_count": (2, 1),
+    "video_lane_configs": ([{}, {}], [{}]),
+    "motion_driver_lane_count": (2, 1),
+    "motion_driver_lane_configs": ([{}, {}], [{}]),
+    "audio_lane_count": (2, 1),
+    "audio_lane_configs": ([{}, {}], [{}]),
+    "reference_lane_count": (2, 1),
+    "reference_lane_configs": ([{}, {}], [{}]),
+    "reference_lane_recipes": ([{"a": 1}], [{}]),
+}
+
+
+def test_every_declared_write_field_has_a_probe():
+    """`write` is the only class the partition cannot check on its own.
+
+    Membership comes from `scene_history_write_fields()` itself, so the
+    classification test is circular for it: whatever is declared is, by
+    definition, in the class. This is the decision-forcing point for that class.
+    """
+    from server.scene_history_merge import scene_history_write_fields
+
+    declared = set(scene_history_write_fields())
+    missing = sorted(declared - set(_WRITE_FIELD_PROBES))
+    assert not missing, (
+        "these are declared writable by history but nothing proves the merge can "
+        f"actually write them. Add a (base, target) probe pair: {missing}")
+    stale = sorted(set(_WRITE_FIELD_PROBES) - declared)
+    assert not stale, f"probes for fields no longer declared writable: {stale}"
+
+
+@pytest.mark.parametrize("field", sorted(_WRITE_FIELD_PROBES))
+def test_a_declared_write_field_is_actually_written(field):
+    """Column 1 for the write class: base != target, stored == base -> target."""
+    base_value, target_value = _WRITE_FIELD_PROBES[field]
+    base = _scene(**{field: base_value})
+    target = _scene(**{field: target_value})
+    merged = merge_scene_history(base, target, copy.deepcopy(base))
+    assert merged[field] == target_value, (
+        f"{field} is declared in MERGED_WRITE_FIELDS but the merge did not "
+        "write it. The browser paints an optimistic Undo for anything in that "
+        "list, so a field declared here but unwritten paints a change the "
+        "server will never apply")

@@ -206,3 +206,51 @@ def test_differential_check_never_constructs_another_scene(monkeypatch):
     raw = scene.to_dict()
     monkeypatch.setattr(module.Scene, "from_dict", lambda *args: pytest.fail("Full Scene reconstruction"))
     module._validate_scene_history_merge(scene, raw, raw)
+
+
+def test_the_route_restamps_scene_id_over_whatever_the_merge_returned(monkeypatch, tmp_path):
+    """The `identity` class, probed at the line that implements it.
+
+    A first version of this passed `scene_id: "impostor"` in the base and target
+    documents and asserted the restore still landed on `scene-1`. That proved
+    nothing: `get_scene` matches the URL id exactly, `scene_id` is in no write
+    list, and the merge returns stored's value untouched -- so the re-stamp was a
+    no-op on that input and deleting it would not have failed the test.
+
+    The only way to exercise the re-stamp is to make the merge hand the route a
+    document with the wrong id, which no ordinary input can do.
+    """
+    module = _load_route_module(monkeypatch)
+    real_merge = module.merge_scene_history
+
+    def merge_returning_a_foreign_id(base, target, stored):
+        merged = real_merge(base, target, stored)
+        merged["scene_id"] = "impostor"
+        return merged
+
+    monkeypatch.setattr(module, "merge_scene_history", merge_returning_a_foreign_id)
+
+    stored = Scene(scene_id="scene-1", duration_frames=24, name="after").to_dict()
+    base = copy.deepcopy(stored)
+    target = copy.deepcopy(stored)
+    target["name"] = "before"
+
+    project = TimelineProject(project_id="project", project_dir=str(tmp_path),
+                              scenes=[Scene.from_dict(copy.deepcopy(stored))])
+    monkeypatch.setattr(module, "_load_project_from_request", lambda request, **kw: project)
+    monkeypatch.setattr(module, "save_project", lambda project, **kw: None)
+    handler = _route_handler(
+        module, "PUT", "/sonder-editor/project/{project_id}/scenes/{scene_id}/restore")
+    token = module._SCENE_RESTORE_RECEIPTS.issue("project", "scene-1")
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "project", "scene_id": "scene-1"},
+        body={"base_scene": base, "target_scene": target, "restore_token": token})))
+    payload = _response_json(response)
+
+    assert response.status == 200, payload
+    assert payload["scene"]["scene_id"] == "scene-1", (
+        "a merged document carrying a foreign scene_id was persisted under that "
+        "id; the route's re-stamp is what prevents a restore from renaming or "
+        "redirecting the scene it restores into")
+    assert [scene.scene_id for scene in project.scenes] == ["scene-1"]
+    assert payload["scene"]["name"] == "before"
