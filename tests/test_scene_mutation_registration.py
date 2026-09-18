@@ -36,6 +36,8 @@ import functools
 import re
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 
 ROUTES = ROOT / "server/routes.py"
@@ -1500,9 +1502,12 @@ _FORWARDING_SCOPES = frozenset({
 # otherwise matches, and reads as a call site with no enclosing scope.
 _ENQUEUE_RE = re.compile(r"\.\s*_(?:runSceneMutation|queueProjectMutation)\s*\(")
 _ARROW_MERGE_RE = re.compile(r"\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*=>")
+_FUNCTION_MERGE_RE = re.compile(r"\bfunction\s*\w*\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)")
+_IMPORT_RE = re.compile(r"\bimport\s*\{([^}]*)\}\s*from\s*[\"']([^\"']+)[\"']")
 
 
-def _merge_is_effective(extent_code: str, scope_body: str) -> bool:
+def _merge_is_effective(extent_code: str, scope_body: str,
+                        module_source: str = "") -> bool:
     """Does this site pass a merge that can actually preserve the older intent?
 
     Lexical presence is not enough. `merge: (a, b) => b` is the silent default
@@ -1529,11 +1534,185 @@ def _merge_is_effective(extent_code: str, scope_body: str) -> bool:
         body = definition.group(1)
     else:
         return False
-    arrow = _ARROW_MERGE_RE.search(body)
-    if not arrow:
+    if _reads_its_older_argument(body):
+        return True
+    # A bare identifier: either a `const` in the same method or a name imported
+    # from a sibling module. The SHARED merge is the second shape
+    # (`scene_mutation_coalescing.js`), and without this the scanner would read
+    # a gesture passing it as having no effective merge -- which is fail-closed
+    # but reports the opposite of the truth, and whose cheapest repair is to
+    # inline a second copy of the merge. That is how two sources of truth get
+    # created, so the scanner follows the import instead.
+    identifier = re.match(r"\s*([A-Za-z_$][\w$]*)\s*[,}\n]", body)
+    if not identifier:
         return False
-    older = arrow.group(1)
-    return re.search(rf"\b{re.escape(older)}\b", body[arrow.end():]) is not None
+    name = identifier.group(1)
+    local = re.search(rf"\b(?:const|let)\s+{re.escape(name)}\s*=\s*(.+)",
+                      scope_body, re.S)
+    if local and _reads_its_older_argument(local.group(1)):
+        return True
+    return _imported_merge_reads_its_older_argument(module_source, name)
+
+
+def _reads_its_older_argument(text: str) -> bool:
+    """Does this two-parameter definition reference its FIRST parameter?
+
+    Covers both spellings a merge can take: an arrow and a declared function.
+    `merge: (a, b) => b` is the silent default wearing a badge, and so is
+    `function merge(a, b) { return b; }`.
+    """
+    matches = [found for found in
+               (_ARROW_MERGE_RE.search(text), _FUNCTION_MERGE_RE.search(text))
+               if found]
+    if not matches:
+        return False
+    # The EARLIEST match only. Trying one pattern and then falling through to
+    # the other over the same text let a badge merge -- `(a, b) => b` -- be
+    # certified by an unrelated two-parameter `function (a, b)` further down the
+    # extent. The merge is whatever comes first after `merge:`; anything later
+    # belongs to something else.
+    found = min(matches, key=lambda one: one.start())
+    older = found.group(1)
+    return re.search(rf"\b{re.escape(older)}\b", text[found.end():]) is not None
+
+
+def _imported_merge_reads_its_older_argument(module_source: str, name: str) -> bool:
+    """Follow `name` to its export and ask the same question of it.
+
+    Bounded to the declaration's OWN parameter list and body, not to a text
+    window. Two looser attempts failed in opposite directions and both are worth
+    recording: capturing only what follows the name dropped the `function`
+    keyword, so every imported merge read as ineffective; capturing to the next
+    top-level `export` reached a non-exported helper below it, so a
+    ONE-parameter export passed on that helper's two parameters.
+
+    Returns False when the name is not imported, the module is outside
+    `web/js`, the export cannot be found, or it does not take two parameters --
+    every one of which fails closed at the caller.
+    """
+    if not module_source:
+        return False
+    for match in _IMPORT_RE.finditer(module_source):
+        # `{ exported as local }`: look the definition up by its EXPORTED name
+        # and match the call site by its LOCAL one. Using the local name for
+        # both made every aliased import unresolvable, which fails closed but
+        # reports the opposite of the truth.
+        aliases = {}
+        for part in match.group(1).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            head, _, tail = part.partition(" as ")
+            aliases[(tail or head).strip()] = head.strip()
+        if name not in aliases:
+            continue
+        exported_name = aliases[name]
+        target = JS_DIR / Path(match.group(2)).name
+        if not target.is_file():
+            return False
+        text = target.read_text(encoding="utf-8")
+        mask = _code_mask(text)
+        exported = re.search(
+            rf"\bexport\s+(?:function|const|let)\s+{re.escape(exported_name)}\b", text)
+        if not exported:
+            return False
+        open_paren = text.find("(", exported.end())
+        if open_paren < 0:
+            return False
+        close_paren = _match_delimiter(text, open_paren, "(", ")", mask)
+        if close_paren < 0:
+            return False
+        parameters = _parameter_names(text[open_paren + 1:close_paren])
+        if len(parameters) != 2:
+            return False
+        body = _definition_body(text, close_paren, mask)
+        if not body:
+            return False
+        return re.search(rf"\b{re.escape(parameters[0])}\b", body) is not None
+    return False
+
+
+def _parameter_names(inside: str) -> list[str]:
+    """The declared names, one per top-level comma, defaults stripped.
+
+    `re.findall(r"\\w+")` over the whole list was wrong in both directions:
+    `(older, newer = null)` counted three "parameters" and the definition was
+    rejected, and a destructured or typed list would count more still.
+    """
+    names, depth, current = [], 0, []
+    for char in inside:
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        if char == "," and depth == 0:
+            names.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+    names.append("".join(current))
+    resolved = []
+    for name in names:
+        head = name.split("=")[0].strip()
+        if not re.fullmatch(r"[A-Za-z_$][\w$]*", head):
+            return []          # destructured or otherwise unreadable: fail closed
+        resolved.append(head)
+    return [name for name in resolved if name]
+
+
+def _definition_body(text: str, close_paren: int, mask: bytearray) -> str:
+    """The body belonging to THIS definition, block or concise.
+
+    Searching forward for the next `{` was a fail-OPEN bug: a concise arrow
+    (`(a, b) => b`) has no block, so the search landed on an unrelated block
+    later in the module and the first-parameter check ran against a stranger's
+    code. `merge: (a, b) => b` is precisely the silent default this tripwire
+    exists to reject, so resolving it against someone else's body is the one
+    outcome that must not happen.
+    """
+    cursor = close_paren + 1
+    while cursor < len(text) and text[cursor] in " \t\r\n":
+        cursor += 1
+    if text.startswith("=>", cursor):
+        cursor += 2
+        while cursor < len(text) and text[cursor] in " \t\r\n":
+            cursor += 1
+    if cursor >= len(text):
+        return ""
+    if text[cursor] == "{":
+        end = _match_delimiter(text, cursor, "{", "}", mask)
+        return text[cursor:end + 1] if end > 0 else ""
+    # A concise body runs to the statement terminator at depth zero.
+    depth, start = 0, cursor
+    while cursor < len(text):
+        if mask[cursor]:
+            char = text[cursor]
+            if char in "([{":
+                depth += 1
+            elif char in ")]}":
+                depth -= 1
+            elif char == ";" and depth == 0:
+                return text[start:cursor]
+        cursor += 1
+    return text[start:]
+
+
+# A `coalesce` this scan cannot read. Shorthand (`coalesce,`), a bare variable
+# or any computed expression all mean "whichever caller is calling decides", and
+# the decision then lives in the callers rather than at the enqueue. Reading
+# those as `true` was a hole: `_updateItemPropertyWithinGesture` passes shorthand
+# and `editor_widget.js` calls it with `{ coalesce: false }` and a traced reason
+# for a Reference strength edit, on the stable key `reference:${id}:field:strength`.
+# That is a real refusal on a repeating key and neither tripwire could see it.
+_COALESCE_LITERAL_RE = re.compile(r"\bcoalesce\s*:\s*(?:true|false)\b")
+_COALESCE_PRESENT_RE = re.compile(r"\bcoalesce\s*(?::|,|\})")
+
+
+def _coalesce_is_caller_supplied(extent_code: str) -> bool:
+    """`coalesce` is stated but not as a literal, so its value is not here."""
+    if not _COALESCE_PRESENT_RE.search(extent_code):
+        return False
+    return not _COALESCE_LITERAL_RE.search(extent_code)
 
 
 def _scan_enqueue_sites(sources: tuple) -> tuple:
@@ -1569,15 +1748,27 @@ def _scan_enqueue_sites(sources: tuple) -> tuple:
                        key=lambda s: s[2] - s[1], default=None)
             scope_body = (_code_only(source[span[1]:span[2]], mask[span[1]:span[2]])
                           if span else "")
+            # Read from the RAW extent, not `code`: the key is a template
+            # literal, which `_code_mask` blanks, so the masked copy sees an
+            # empty string where every one of these sites states its key.
+            key_shape, key_interpolations = _enqueue_key(
+                source, mask, span, paren, end)
             sites.append({
                 "module": module,
                 "scope": scope,
                 "line": source.count("\n", 0, match.start()) + 1,
-                # Shorthand, a variable, a computed value, or omission all
-                # resolve to `true` at least sometimes, and the queue's own
-                # default is `true`, so only an explicit `false` reads as "no".
+                "key_shape": key_shape,
+                "key_interpolations": key_interpolations,
+                # Omission resolves to the queue's own default, `true`. An
+                # explicit `false` is a refusal. Anything else -- shorthand, a
+                # variable, a computed value -- is CALLER-SUPPLIED and cannot be
+                # read here at all, which is a third answer and not a synonym
+                # for either: `_updateItemPropertyWithinGesture` takes
+                # `coalesce` in its options bag and passes it through, and one
+                # live caller declines with a traced reason.
                 "coalesces": not re.search(r"\bcoalesce\s*:\s*false\b", code),
-                "effective_merge": _merge_is_effective(code, scope_body),
+                "coalesce_is_caller_supplied": _coalesce_is_caller_supplied(code),
+                "effective_merge": _merge_is_effective(code, scope_body, source),
                 "operands": tuple(by_scope.get(scope, ())),
             })
     return tuple(sites)
@@ -3134,3 +3325,1174 @@ def _scope_body(item) -> str:
         if name == item["scope"] and start <= item["offset"] <= end:
             return source[start:end]
     raise AssertionError(f"no scope body found for {item['scope']}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 -- an enqueue that CANNOT coalesce says why
+# ---------------------------------------------------------------------------
+# The tripwire above is one-way: it asks whether an opted-IN gesture is safe.
+# Nothing asks the opposite question, and the opposite question is where the
+# measured cost is -- six lane-header clicks at 24.2 s, one burst at 460 s,
+# because every gesture pays the route floor on its own.
+#
+# There are TWO spellings of "this will not coalesce" and only one of them is
+# visible to a naive scan:
+#
+#   1. `coalesce: false`, an explicit decision. 17 live sites -- it was 20
+#      before umbrella Phase C stage 1 retired three of them.
+#   2. A key that can never repeat, because an interpolation in it changes on
+#      every call. 29 live sites -- the MORE common spelling, and the flag is
+#      redundant wherever it appears beside one.
+#
+# A uniquified key defeats coalescing exactly as well as the flag, so a review
+# that only looked at flags would report two thirds of the surface as reviewed
+# while never having read its keys. Both are findings here, classified
+# differently because the reason each owes is different: a flag owes "why we
+# refuse a merge we could have", a key owes "why two of these must never be one
+# write".
+#
+# Keyed `module:scope:key-shape`, never a line number: a line-keyed entry rots
+# on an unrelated edit above it, and the staleness test would then report the
+# site as fixed when nothing about it had changed. The key shape is the right
+# discriminator for a tripwire about keys -- it distinguishes the two enqueues
+# inside one scope, and an entry dies the moment the key it describes changes.
+
+# Pinned rather than bounded: the split between the two spellings is the
+# finding that justified two tripwires instead of one.
+EXPECTED_STABLE_KEY_OPT_OUTS = 17
+EXPECTED_UNIQUIFIED_KEY_OPT_OUTS = 29
+EXPECTED_CALLER_SUPPLIED_OPT_OUTS = 1
+
+STABLE = "stable"
+UNIQUIFYING = "uniquifying"
+
+DECLINED = "declined"
+UNREACHABLE = "unreachable"
+CALLER_SUPPLIED = "caller_supplied"
+
+
+def _skip_quoted(source: str, index: int) -> int:
+    """Index just past the plain string opening at `index`."""
+    quote = source[index]
+    index += 1
+    while index < len(source):
+        if source[index] == "\\":
+            index += 2
+            continue
+        if source[index] == quote:
+            return index + 1
+        if source[index] == "\n":
+            return index
+        index += 1
+    return index
+
+
+def _template_end(source: str, start: int) -> int:
+    """Index of the backtick closing the template literal opening at `start`.
+
+    Written rather than reusing `_code_mask`, which treats a template as one
+    flat string and so mistakes a NESTED template's opening backtick for the
+    outer one's close. One live key nests -- `_deleteSelectedLanesAndItemsWithinGesture`
+    builds its key from `operations.map(...)` -- so the flat reading cuts that
+    key in half and loses the interpolation that names the lanes.
+    """
+    index = start + 1
+    while index < len(source):
+        char = source[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == "`":
+            return index
+        if char == "$" and source[index + 1:index + 2] == "{":
+            close = _interpolation_end(source, index + 1)
+            if close < 0:
+                return -1
+            index = close + 1
+            continue
+        index += 1
+    return -1
+
+
+def _interpolation_end(source: str, brace: int) -> int:
+    """Index of the `}` closing the `${` whose brace is at `brace`.
+
+    Comments are skipped, because a `}` inside one closes the interpolation
+    early and the expression recorded is then a fragment -- which fails
+    `test_every_key_interpolation_is_classified` loudly, but names the wrong
+    thing. Regex literals are deliberately NOT tracked, for the reason
+    `_code_mask` gives: telling `/` division from a regex needs token context,
+    and no live key contains one. A key that grows one fails the same
+    classification test rather than passing quietly.
+    """
+    depth = 0
+    index = brace
+    while index < len(source):
+        char = source[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == "/" and source[index + 1:index + 2] == "/":
+            stop = source.find("\n", index)
+            index = len(source) if stop < 0 else stop
+            continue
+        if char == "/" and source[index + 1:index + 2] == "*":
+            stop = source.find("*/", index + 2)
+            index = len(source) if stop < 0 else stop + 2
+            continue
+        if char == "`":
+            close = _template_end(source, index)
+            if close < 0:
+                return -1
+            index = close + 1
+            continue
+        if char in "'\"":
+            index = _skip_quoted(source, index)
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return -1
+
+
+def _template_parts(source: str, start: int) -> tuple[str, tuple[str, ...]]:
+    """`(shape with every interpolation as ${}, the interpolated expressions)`."""
+    end = _template_end(source, start)
+    if end < 0:
+        return "<unterminated>", ()
+    shape, expressions = [], []
+    index = start + 1
+    while index < end:
+        char = source[index]
+        if char == "\\":
+            shape.append(source[index:index + 2])
+            index += 2
+            continue
+        if char == "$" and source[index + 1:index + 2] == "{":
+            close = _interpolation_end(source, index + 1)
+            expressions.append(
+                re.sub(r"\s+", " ", source[index + 2:close]).strip())
+            shape.append("${}")
+            index = close + 1
+            continue
+        shape.append(char)
+        index += 1
+    return "".join(shape), tuple(expressions)
+
+
+_KEY_RE = re.compile(r"\bkey\s*(?P<form>:|,|\})")
+_KEY_DEFAULT = "<_runSceneMutation default>"
+_KEY_UNRESOLVED = "<unresolved>"
+
+
+def _binding_templates(source: str, span, name: str) -> tuple[str, tuple[str, ...]]:
+    """Every template literal in `const <name> = ...`, up to its statement end.
+
+    A key can be a ternary over two templates -- `_updateItemPropertyWithinGesture`
+    picks a different shape for a one-field write than for a multi-field one --
+    so both branches are read and both contribute interpolations. Taking only
+    the first would classify the site on half its evidence.
+    """
+    if not span:
+        return _KEY_UNRESOLVED, ()
+    body = source[span[1]:span[2]]
+    match = re.search(r"\b(?:const|let|var)\s+" + re.escape(name) + r"\s*=", body)
+    if not match:
+        return _KEY_UNRESOLVED, ()
+    index = span[1] + match.end()
+    shapes, expressions = [], []
+    while index < span[2]:
+        char = source[index]
+        if char == ";":
+            break
+        if char == "`":
+            shape, found = _template_parts(source, index)
+            shapes.append(shape)
+            expressions.extend(found)
+            index = _template_end(source, index) + 1
+            continue
+        if char in "'\"":
+            index = _skip_quoted(source, index)
+            continue
+        index += 1
+    if not shapes:
+        return _KEY_UNRESOLVED, ()
+    return " | ".join(shapes), tuple(expressions)
+
+
+def _enqueue_key(source: str, mask: bytearray, span, paren: int,
+                 end: int) -> tuple[str, tuple[str, ...]]:
+    """The key this enqueue takes, as `(shape, interpolated expressions)`.
+
+    Walks the call rather than searching it, because the enqueue's FIRST
+    argument is a list of operations and an operation may legitimately carry a
+    field called `key`. A plain search takes the first match and would file the
+    site under a key that does not exist -- silently, since the shape it records
+    still looks like a key. Only a `key` directly inside the options object
+    counts: array depth 0, brace depth 1, paren depth 1.
+
+    An absent `key:` is NOT unresolved: `_runSceneMutation` supplies
+    `scene:${targetSceneId}:mutation`, which repeats. Reading it as unresolved
+    would report the default -- the most coalescible key in the file -- as a
+    site nobody can classify. A SPREAD in the options object is different: the
+    key may be in there and the scan cannot see it, so that is unresolved and
+    fails closed.
+    """
+    parens = braces = arrays = 0
+    spread_in_options = False
+    index = paren
+    while index <= end:
+        if not mask[index]:
+            index += 1
+            continue
+        char = source[index]
+        if char == "(":
+            parens += 1
+        elif char == ")":
+            parens -= 1
+        elif char == "[":
+            arrays += 1
+        elif char == "]":
+            arrays -= 1
+        elif char == "{":
+            braces += 1
+        elif char == "}":
+            braces -= 1
+        at_options = parens == 1 and braces == 1 and arrays == 0
+        if at_options and source.startswith("...", index):
+            spread_in_options = True
+        if at_options and source.startswith("key", index):
+            match = _KEY_RE.match(source, index)
+            if match:
+                if match.group("form") != ":":
+                    return _binding_templates(source, span, "key")
+                value = match.end()
+                while value < end and source[value] in " \n\t\r":
+                    value += 1
+                if source[value] == "`":
+                    return _template_parts(source, value)
+                if source[value] in "'\"":
+                    stop = _skip_quoted(source, value)
+                    return source[value + 1:stop - 1], ()
+                identifier = re.match(r"[A-Za-z_$][\w$]*", source[value:])
+                if not identifier:
+                    return _KEY_UNRESOLVED, ()
+                return _binding_templates(source, span, identifier.group(0))
+        index += 1
+    if spread_in_options:
+        return _KEY_UNRESOLVED, ()
+    return _KEY_DEFAULT, ()
+
+
+# Every expression a live key interpolates, and whether two gestures of the same
+# kind produce the same value for it.
+#
+# Fail closed by construction: an expression that is not listed fails
+# `test_every_key_interpolation_is_classified`, so a new uniquifier spelling
+# cannot slip in as "probably stable". That matters because the list is not
+# guessable -- `dropSeq`, `tempId`, `batchId` and `++this._referenceMutationSeq`
+# are four different ways of writing `Date.now()`.
+#
+# Expiry: an entry leaves when no key interpolates the expression.
+KEY_INTERPOLATIONS = {
+    # -- uniquifying: a new value on every call -------------------------------
+    "Date.now()": (UNIQUIFYING, "wall clock, read per gesture"),
+    "dropContext.sceneId": (STABLE, "the scene a drop landed in"),
+    "dropSeq": (UNIQUIFYING,
+                "`${Date.now().toString(36)}-${Math.random()...}` minted per drop "
+                "in `_handleAssetDrop`"),
+    "tempId": (UNIQUIFYING,
+               "`temp-queue-${Date.now()...}-${Math.random()...}` minted per "
+               "queue addition"),
+    "batchId": (UNIQUIFYING, "`crypto.randomUUID()` minted per batch"),
+    "++this._referenceMutationSeq": (UNIQUIFYING,
+                                     "pre-incremented counter on the widget"),
+    # -- stable: the same gesture on the same target repeats it ---------------
+    "this.activeSceneId": (STABLE, "the scene being edited"),
+    "host.activeSceneId": (STABLE, "the scene being edited, from a panel host"),
+    "sceneId": (STABLE, "the scene being edited"),
+    "entry.sceneId": (STABLE, "the scene a history entry belongs to"),
+    "scene.scene_id": (STABLE, "a scene record's durable id"),
+    "projectId": (STABLE, "the project being edited"),
+    "laneType": (STABLE, "a lane family name from `lane_registry.js`"),
+    "laneIndex": (STABLE, "a lane's position"),
+    "type": (STABLE, "an item type name"),
+    "id": (STABLE, "an item's durable id or positional address"),
+    "hit.type": (STABLE, "the item type under the cursor"),
+    "hit.id": (STABLE, "the item id under the cursor"),
+    "clipId": (STABLE, "a clip's durable id"),
+    "clip.clip_id": (STABLE, "a clip's durable id"),
+    "track.track_id": (STABLE, "an audio track's durable id"),
+    "item.reference_item_id": (STABLE, "a Reference item's durable id"),
+    "referenceItemId": (STABLE, "a Reference item's durable id"),
+    "before.prompt_id": (STABLE, "a prompt section's durable id"),
+    "groupId": (STABLE, "a link group's durable id"),
+    "fromLaneId": (STABLE, "a Reference lane's durable id"),
+    "guide.frame_index": (STABLE, "a guide's frame, which is its address"),
+    "this.playhead": (STABLE, "the playhead frame; two gestures at one frame "
+                              "address the same target"),
+    "idx": (STABLE, "a prompt section's list index"),
+    "oldIdx": (STABLE, "the guide frame a move starts from"),
+    "keySuffix": (STABLE, "a literal discriminator -- \"clip\", \"audio\", "
+                          "\"driver\" -- passed by `_handleAssetDrop`"),
+    "selectionKey": (STABLE, "the sorted `type:id` set a mute toggle covers. "
+                             "Repeats for two toggles over the same selection -- "
+                             "one edit -- and differs for a different selection, "
+                             "which is a second edit owing its own undo entry"),
+    "laneKey": (STABLE, "the sorted `laneType:laneIndex` set a lane-header "
+                        "visibility gesture touches. Repeats for two clicks on "
+                        "the same lane -- which is one edit -- and differs for "
+                        "two lanes, which are two edits and must keep two undo "
+                        "entries"),
+    "fieldNames[0]": (STABLE, "the single field name a property write sets"),
+    "fieldNames.join(\"-\")": (STABLE, "the sorted field names a property write sets"),
+    "operations.map((op) => `${op.lane_type}:${op.lane_index}`).join(\",\")":
+        (STABLE, "the lane set the gesture deletes"),
+}
+
+
+def _key_repeats(interpolations: tuple) -> bool:
+    return all(KEY_INTERPOLATIONS.get(expression, (UNIQUIFYING, ""))[0] == STABLE
+               for expression in interpolations)
+
+
+def _coalescing_opt_out_findings(sites=None) -> dict:
+    """Every enqueue that will not coalesce, and which way it says so."""
+    findings = {}
+    for site in (sites if sites is not None else _enqueue_call_sites()):
+        if site["scope"] in _FORWARDING_SCOPES:
+            continue
+        shape = site["key_shape"]
+        key = f"{site['module']}:{site['scope']}:{shape}"
+        if shape in (_KEY_UNRESOLVED, "<unterminated>"):
+            findings[key] = (_KEY_UNRESOLVED,
+                             "the key cannot be read, so neither tripwire can "
+                             "classify this site")
+            continue
+        if not _key_repeats(site["key_interpolations"]):
+            findings[key] = (UNREACHABLE, "the key interpolates "
+                             + ", ".join(
+                                 expression for expression in site["key_interpolations"]
+                                 if KEY_INTERPOLATIONS.get(
+                                     expression, (UNIQUIFYING, ""))[0] != STABLE))
+            continue
+        # Before the `coalesces` check, because that one reads an unreadable
+        # `coalesce` as `true` and would file a caller's refusal as consent.
+        if site["coalesce_is_caller_supplied"]:
+            findings[key] = (CALLER_SUPPLIED,
+                             "`coalesce` is passed through from the caller, so "
+                             "the decision is not at this enqueue")
+            continue
+        if not site["coalesces"]:
+            findings[key] = (DECLINED, "`coalesce: false` on a key that repeats")
+    return findings
+
+
+# Every enqueue that will not coalesce, with the traced reason it owes.
+#
+# `UNREACHABLE` -- the key cannot repeat, so the `coalesce: false` beside it is
+# redundant and the real decision is the key. The reason answers "why must two
+# of these never be one write".
+#
+# `DECLINED` -- the key repeats and the flag refuses a merge that was available.
+# The reason answers "what would a merge lose", and where umbrella Phase C owns
+# the answer it names the landing, so an entry that is waiting on work says so
+# rather than reading as settled.
+#
+# Not a permission list: a site here is still a site paying a full document
+# write per gesture. `sonder_editor_bugs.md` measures that at 24.2 s for six
+# clicks and 460 s for one burst.
+#
+# Expiry: an entry leaves when its site coalesces, or when its key shape
+# changes -- the key IS the dict key, so a reworded key kills the entry and the
+# staleness test reports it.
+COALESCE_OPT_OUT_REVIEWED = {
+
+    # -- the key cannot repeat -----------------------------------------------
+
+    "editor_prompt_panel.js:commit:scene:${}:prompt-context:${}": (
+        UNREACHABLE,
+        "the Prompt panel's own dispatcher. Each commit carries a whole "
+        "prompt-context document built from the panel's draft, and two drafts "
+        "are two documents. A sibling surface umbrella Phase C leaves out of "
+        "scope."),
+    "editor_reference_panel.js:writeItem:scene:${}:reference-panel:${}:${}": (
+        UNREACHABLE,
+        "the Reference panel's own dispatcher; the key already names the item, "
+        "so the clock is what keeps two edits of ONE item apart. Sibling "
+        "surface, out of umbrella Phase C's scope."),
+    "editor_reference_panel.js:runItemOperation:scene:${}:reference-panel-op:${}": (
+        UNREACHABLE,
+        "the Reference panel's own dispatcher, operations built outside the "
+        "scope. Sibling surface, out of umbrella Phase C's scope."),
+    "editor_widget.js:_mutateReferences:references:${}": (
+        UNREACHABLE,
+        "the project-level Reference dispatcher. The counter gives every "
+        "mutation its own slot so an entity create and a later member write "
+        "are never merged. Sibling surface, out of umbrella Phase C's scope."),
+    "editor_widget.js:_queueSelectedPromptSectionsWithinGesture:project:queue:prompt-sections:${}": (
+        UNREACHABLE,
+        "the render-queue dispatcher. Each batch is a distinct set of jobs; "
+        "merging two would enqueue one. Sibling surface."),
+    "editor_widget.js:_addToRenderQueueWithinGesture:project:queue:add:${}": (
+        UNREACHABLE,
+        "the render-queue dispatcher; each addition is its own job. Sibling "
+        "surface."),
+    "editor_widget.js:_addBatchToRenderQueueWithinGesture:project:queue:batch:${}": (
+        UNREACHABLE,
+        "the render-queue dispatcher; each batch is its own set of jobs. "
+        "Sibling surface."),
+
+    "editor_widget.js:_appendReferenceMembersWithinGesture:scene:${}:reference-append:${}:${}": (
+        UNREACHABLE,
+        "each append sends the WHOLE new member list as `fields.members`, guarded by "
+        "`expected: { members: priorMembers }` read from the reconciled scene. "
+        "The gesture has no local apply and does not touch `item.members`, so "
+        "the two appends chain through the server round trip rather than "
+        "through local state -- which is exactly what the uniquified key "
+        "preserves. Two appends are two additions and neither may be dropped. "
+        "(Umbrella Phase C §3 Class C keeps it that way: its Reference local "
+        "apply is geometry-only precisely so that lengthening `item.members` "
+        "optimistically cannot turn the second append into a 409.)"),
+    "editor_widget.js:_placeReferencePayloadWithinGesture:scene:${}:reference-stage:${}": (
+        UNREACHABLE,
+        "`create_reference_item` creates a row, alongside the lane it needs. "
+        "Two placements are two items."),
+    "editor_widget.js:_handleAssetDropWithinGesture:scene:${}:drop:${}:${}": (
+        UNREACHABLE,
+        "`create_clip` / `create_audio_track` / `create_guide`: each drop "
+        "imports its own media. `dropSeq` separates one drop from the next and "
+        "`keySuffix` separates the several writes WITHIN a drop, which is why "
+        "the same scope holds two shapes."),
+    "editor_widget.js:_handleAssetDropWithinGesture:scene:${}:drop:${}:guide": (
+        UNREACHABLE,
+        "the guide half of the same drop gesture; see the clip/audio shape "
+        "above."),
+    "editor_widget.js:_saveNewPromptSectionWithinGesture:prompt:${}:create:${}": (
+        UNREACHABLE,
+        "`_apply_create_prompt_section` creates a row; two creates are two "
+        "sections."),
+    "editor_widget.js:_applyPromptSetupWithinGesture:prompt:${}:apply:${}": (
+        UNREACHABLE,
+        "`_apply_replace_prompt_sections` replaces the whole collection behind "
+        "`_validate_prompt_replacement_identity`, whose `expected` describes "
+        "the collection the author replaced, and the batch prepends "
+        "`create_prompt_semantic_unit` intents that are consumed once. It also "
+        "carries `retryOnConflict: false`, which "
+        "`test_a_caller_that_declines_a_retry_also_declines_coalescing` "
+        "requires be paired with a coalescing refusal."),
+    "editor_widget.js:_createLinkGroupFromSelectionWithinGesture:scene:${}:link-items:${}": (
+        UNREACHABLE,
+        "`_add_link_group` runs `_unlink_refs` first, so two link gestures are "
+        "not two assignments to one row."),
+    "editor_widget.js:_unlinkSelectedItemsWithinGesture:scene:${}:unlink-items:${}": (
+        UNREACHABLE,
+        "`_unlink_refs` then `_prune_linked_item_groups`; a second gesture's "
+        "refs are only meaningful against the groups the first one left."),
+    "editor_widget.js:_deleteSelectedItemsWithinGesture:scene:${}:delete-selected:${}": (
+        UNREACHABLE,
+        "`_apply_bulk_delete_items` removes the rows `items` names; a second "
+        "gesture names the rows the first left, so replacement would drop one "
+        "delete while telling its author it worked."),
+    "editor_widget.js:_moveItemToNewLaneWithinGesture:scene:${}:move-item-new-lane:${}": (
+        UNREACHABLE,
+        "the key names no item, so a stable one would let two moves of "
+        "DIFFERENT items collide; and the gesture sends `set_lane_count` with "
+        "an absolute computed from the local scene. Umbrella Phase C stage 2 L6 "
+        "gives it a local apply and does not change the key."),
+    "editor_widget.js:_consolidateSelectedItemsToLaneWithinGesture:scene:${}:consolidate:${}:${}": (
+        UNREACHABLE,
+        "`_consolidate_media_items` compacts the lanes it empties and returns "
+        "`final_target_lane`, so a second consolidation's `target_lane` means "
+        "something only after the first has been applied. Umbrella Phase C "
+        "stage 2 L6 gives it a local apply and does not change the key."),
+    "editor_widget.js:_moveReferenceLaneWithinGesture:scene:${}:reference-move-lane:${}:${}": (
+        UNREACHABLE,
+        "`_move_media_lane` reorders by from/to index, so a second move's "
+        "indices describe the order the first produced."),
+    "editor_widget.js:_commitItemMove:scene:${}:move-commit:${}": (
+        UNREACHABLE,
+        "a drag commit emits one operation per moved item across arbitrary "
+        "lanes and types, and the key names the gesture rather than any item -- "
+        "so a stable key would let one drag's commit replace another's."),
+    "editor_widget.js:_commitTrim:scene:${}:trim-commit:${}": (
+        UNREACHABLE,
+        "a trim commit has the same shape as a drag commit: one operation per "
+        "trimmed item, a key that names no item."),
+    "editor_widget.js:_splitClipAtFrameWithinGesture:scene:${}:split:${}:${}:${}": (
+        UNREACHABLE,
+        "`_apply_split_linked` cuts at a frame inside the item's CURRENT "
+        "bounds, which the previous cut changed. Umbrella Phase C stage 2 L3 "
+        "adds the explicit `coalesce: false` this key already enforces, because "
+        "that landing batches several targets into one gesture."),
+    "editor_widget.js:_replaceClipSource:clip:${}:replace-source:${}": (
+        UNREACHABLE,
+        "`_apply_replace_clip_source` re-derives bounds from the new asset's "
+        "length, so two replacements are not two assignments to one row."),
+    "editor_widget.js:_replaceAudioSource:audio:${}:replace-source:${}": (
+        UNREACHABLE,
+        "`_apply_replace_audio_source` is the audio twin; same reasoning."),
+    "editor_widget.js:_runUndoWithinGesture:prompt:${}:identity-cleanup:${}": (
+        UNREACHABLE,
+        "a history-internal identity write naming one entry's semantic-unit "
+        "cleanup, consumed once. Merging two would leave one entry's units "
+        "unreconciled."),
+    "editor_widget.js:_finalizeCommittedHistoryAmbiguityWithinGesture:prompt:${}:identity-cleanup:${}": (
+        UNREACHABLE,
+        "the same identity cleanup, reached when a history ambiguity is "
+        "resolved as committed."),
+    "editor_widget.js:_finalizeRefusedHistoryAmbiguityWithinGesture:prompt:${}:identity-redo-refused:${}": (
+        UNREACHABLE,
+        "the same identity cleanup, reached when a history ambiguity is "
+        "resolved as refused."),
+    "editor_widget.js:_runRedoWithinGesture:prompt:${}:identity-redo:${}": (
+        UNREACHABLE,
+        "a history-internal identity write for one redo, consumed once."),
+    "editor_widget.js:_runRedoWithinGesture:prompt:${}:identity-redo-compensation:${}": (
+        UNREACHABLE,
+        "the compensating identity write for one redo, consumed once."),
+
+    # -- the key repeats and the flag refuses a merge -------------------------
+    "editor_widget.js:_updateItemPropertyWithinGesture:${}:${}:field:${} | ${}:${}:fields:${}": (
+        CALLER_SUPPLIED,
+        "the only gesture whose coalescing is decided by its CALLERS: it takes "
+        "`coalesce` in its options bag and passes it through as shorthand, so "
+        "neither the flag nor the key answers the question here. Most callers "
+        "take the default and coalesce behind an effective merge. One declines "
+        "-- the Reference strength input in the item editor -- with a traced "
+        "reason beside it: the guard is built from the unmutated item and a "
+        "Reference `identity_mismatch` is terminal, so a merged burst would "
+        "settle every collapsed author from one refusal. Filed here rather than "
+        "as DECLINED because a refusal that lives in the callers is a different "
+        "fact from one stated at the enqueue, and reading the shorthand as "
+        "`true` hid it from both tripwires."),
+
+
+    "editor_widget.js:_updateSceneGlobalContextWithinGesture:scene:${}:global_prompt_context": (
+        DECLINED,
+        "already coalesced ONE LAYER UP, which is why umbrella Phase C stage 1 "
+        "L3 left it alone rather than merging it. Every live caller reaches it "
+        "through `savePromptDraft` (`web/js/prompt_edit_intent.js`), which "
+        "single-flights per draft key -- `if (row.pending) { row.saveAgain = "
+        "true; return row.pending; }` -- and then re-saves the freshest draft "
+        "in its own loop. A burst of typing is therefore already one write in "
+        "flight plus one more carrying the merged latest value, which is "
+        "exactly what queue coalescing would produce; and the draft layer also "
+        "owns the baseline reconciliation (`mergePromptRecords`) that the queue "
+        "cannot do. `commitGlobalScope` in `editor_prompt_panel.js` is declared "
+        "and never called, so it is not a second path. Coalescing here would "
+        "add no write saving and two hazards: `fields.prompt_edit` is a "
+        "per-record delta the shared merge preserves rather than folds, and the "
+        "gesture carries its own revision-token rollback that selects the "
+        "NEWEST author where a coalesced group needs the oldest -- two "
+        "head-ness mechanisms for no gain."),
+    "editor_widget.js:_updateSceneFpsWithinGesture:scene:${}:fps": (
+        DECLINED,
+        "`_fpsUpdatePending` already serialises fps by DROPPING a second "
+        "gesture and re-syncing the control, so nothing accumulates behind this "
+        "key and there is nothing to coalesce. Umbrella Phase C stage 1 L3 TOOK "
+        "option (a) -- keep the drop -- and the reason is stronger than the "
+        "plan's: retiming is applied entirely from the response by "
+        "`reconcileRetimedScene`, using a `scale` and a `previousState` "
+        "captured before the write. That is client state the queue never sees "
+        "and a merge could not recompute for a collapsed group, so coalescing "
+        "fps is not merely unnecessary, it is not expressible. Whether "
+        "drop-and-resync is right behaviour at all is a separate UX question "
+        "the plan hands on, and it is NOT settled here."),
+
+    "editor_widget.js:_moveItemToFrameWithinGesture:${}:${}:timeline": (
+        DECLINED,
+        "the Reference branch sends `expected: { start_frame, end_frame }` read "
+        "from the live scene record -- a before-value claim. The gesture writes "
+        "no optimistic state today, so two of them read the same values and a "
+        "merge would be safe by accident rather than by design; umbrella Phase "
+        "C stage 2 L6 adds the local apply that makes the oldest-`expected` "
+        "merge load-bearing. Declined until that landing supplies one."),
+    "editor_widget.js:_addLaneWithinGesture:scene:${}:${}-lane-count": (
+        DECLINED,
+        "`set_lane_count` carries an absolute, and two authored lane additions "
+        "would also collapse into ONE undo entry -- `willCoalesce` discards the "
+        "superseded gesture's entry in `_queueProjectMutation`. One Ctrl+Z per "
+        "authored gesture is the reason to decline here, not the payload."),
+    "editor_widget.js:_removeLaneWithinGesture:scene:${}:${}-remove-lane:${}": (
+        DECLINED,
+        "`_remove_media_lane` shifts every lane above the one it removes, so a "
+        "second removal at the same index names a DIFFERENT lane. The key "
+        "carries the index, which is exactly the value the first removal "
+        "invalidates."),
+    "editor_widget.js:_removeLaneWithItemsWithinGesture:scene:${}:${}-remove-lane:${}": (
+        DECLINED,
+        "the delete-the-items variant of the removal above, and the same lane "
+        "renumbering applies. Its key shape matches, which is why the scope is "
+        "part of the entry key."),
+    "editor_widget.js:_removeLaneDeletingItemsWithinGesture:scene:${}:${}-delete-lane-and-items:${}": (
+        DECLINED,
+        "a third removal entry point; `_remove_media_lane` renumbers the lanes "
+        "above it just the same."),
+    "editor_widget.js:_deleteSelectedLanesAndItemsWithinGesture:scene:${}:delete-selected-lanes:${}": (
+        DECLINED,
+        "the same lane renumbering over a SET: the key lists the lane types and "
+        "indices the gesture deletes, and the first deletion renumbers them."),
+    "editor_widget.js:_deleteItemsInLaneWithinGesture:scene:${}:${}-delete-lane-items:${}": (
+        DECLINED,
+        "`_apply_bulk_delete_items` names the rows it removes; a second gesture "
+        "on the same lane names the rows the first left, so a replacement drops "
+        "one delete while telling its author it worked."),
+    "editor_widget.js:_moveGuideToFrameWithinGesture:guide:${}:${}:move": (
+        DECLINED,
+        "`_apply_move_guide` is addressed by `from_frame_index`, which the "
+        "previous move changed -- and the key carries that index."),
+    "editor_widget.js:_addClipFrameToGuidesWithinGesture:guide:${}:${}:create": (
+        DECLINED,
+        "`_apply_create_guide` creates a row from a CLIENT-minted `guide_id`, "
+        "behind a `_guideReplacementGuard` describing what occupied the frame. "
+        "Two creates at one playhead mint two ids, and a replacement discards "
+        "one while telling its author it worked."),
+    "editor_widget.js:_showGuideManagementPopup:guide:${}:${}:delete": (
+        DECLINED,
+        "`_apply_delete_guide` is consumed once and carries an identity "
+        "`expected` including `guide_id`, so a second delete at the same frame "
+        "describes a guide the first one removed."),
+    "editor_widget.js:_showGuideManagementPopupLegacy:guide:${}:${}:delete": (
+        DECLINED,
+        "the legacy popup's copy of the same delete; same reasoning, and the "
+        "matching key shape is why the scope is part of the entry key."),
+    "editor_widget.js:_updatePromptSectionWithinGesture:prompt:${}:${}:fields": (
+        DECLINED,
+        "`_apply_update_prompt_section` is addressed by LIST INDEX, and "
+        "`_split_prompt_object` re-sorts `prompt_sections` while "
+        "`_apply_swap_prompt_sections` reorders them; its `fields` can also "
+        "carry `channels` / `channel_docs`, which the server applies key by "
+        "key."),
+    "editor_widget.js:_deletePromptSectionWithinGesture:prompt:${}:${}:delete": (
+        DECLINED,
+        "`_apply_delete_prompt_section` is addressed by list index and the key "
+        "carries that index, which the first deletion renumbers."),
+    "editor_widget.js:_updateLinkedPromptAttachmentWithinGesture:prompt:${}:linked:${}": (
+        DECLINED,
+        "carries `retryOnConflict: false` as a stated caller override, and "
+        "`test_a_caller_that_declines_a_retry_also_declines_coalescing` "
+        "requires the pair: the override lives in the `run` closure, which a "
+        "joining gesture replaces."),
+    "editor_widget.js:_queuePromptProjectWrite:prompt-project:${}": (
+        DECLINED,
+        "not a scene mutation at all -- `run` PUTs the whole project, and the "
+        "intent is a `structuredClone` of the caller's body, so a replaced "
+        "intent loses every field the newer body does not carry. The scene "
+        "dispatcher's merge vocabulary does not apply to it."),
+}
+
+
+def test_every_key_interpolation_is_classified():
+    """A new uniquifier spelling must not read as "probably stable".
+
+    The classification is not guessable -- `dropSeq`, `tempId`, `batchId` and
+    `++this._referenceMutationSeq` are four different ways of writing
+    `Date.now()`, and each is used exactly once or twice. An unlisted
+    expression therefore fails here rather than defaulting, and the default it
+    would otherwise take (`UNIQUIFYING`) is itself the fail-closed direction.
+    """
+    seen = set()
+    for site in _enqueue_call_sites():
+        if site["scope"] in _FORWARDING_SCOPES:
+            continue
+        seen.update(site["key_interpolations"])
+    unknown = sorted(seen - set(KEY_INTERPOLATIONS))
+    assert not unknown, (
+        "a mutation key interpolates expressions nobody has classified: "
+        f"{unknown}. Say whether each one repeats across two gestures of the "
+        "same kind (STABLE) or changes on every call (UNIQUIFYING). A "
+        "uniquified key defeats coalescing exactly as well as "
+        "`coalesce: false` and is invisible to the flag scan.")
+    dead = sorted(set(KEY_INTERPOLATIONS) - seen)
+    assert not dead, (
+        f"no mutation key interpolates these any more, so the entries are "
+        f"documentation of nothing: {dead}")
+
+
+def test_every_enqueue_that_cannot_coalesce_says_why():
+    """The tripwire this landing exists for, in both its spellings.
+
+    A site reaches here because it declared `coalesce: false` on a key that
+    repeats, or because its key can never repeat. Either way it pays the full
+    route floor once per gesture, and the reason has to be traced -- the
+    umbrella's whole complaint is about defaults nobody chose.
+    """
+    findings = _coalescing_opt_out_findings()
+    unreviewed = {key: why for key, why in findings.items()
+                  if key not in COALESCE_OPT_OUT_REVIEWED}
+    assert not unreviewed, (
+        "these enqueues will not coalesce and no one has said why. Each gesture "
+        "therefore costs a whole document write -- sonder_editor_bugs.md "
+        "measures six clicks at 24.2 s and one burst at 460 s. Add an entry to "
+        "COALESCE_OPT_OUT_REVIEWED: UNREACHABLE with the reason two of these "
+        "must never be one write, or DECLINED with what a merge would lose. "
+        "Trace the reason -- it is a claim about code: "
+        + "; ".join(f"{key} -- {why[0]}: {why[1]}"
+                    for key, why in sorted(unreviewed.items())))
+
+
+def test_an_opt_out_entry_describes_the_spelling_it_is_filed_under():
+    """A `DECLINED` reason answers a different question from an `UNREACHABLE` one.
+
+    Filing a uniquified key as `DECLINED` would claim a merge was refused when
+    none was ever possible, and filing a real refusal as `UNREACHABLE` would
+    hide the decision behind the key. The classes are not interchangeable and
+    the scan knows which is which, so it checks rather than trusts.
+    """
+    findings = _coalescing_opt_out_findings()
+    wrong = {key: (entry[0], findings[key][0])
+             for key, entry in COALESCE_OPT_OUT_REVIEWED.items()
+             if key in findings and entry[0] != findings[key][0]}
+    assert not wrong, (
+        "these entries are filed under the wrong spelling (entry, actual): "
+        f"{wrong}")
+    assert not [key for key, entry in COALESCE_OPT_OUT_REVIEWED.items()
+                if entry[0] not in (DECLINED, UNREACHABLE, CALLER_SUPPLIED)], (
+        "an entry declares a class that is none of DECLINED, UNREACHABLE "
+        "or CALLER_SUPPLIED")
+    for key, (_, reason) in COALESCE_OPT_OUT_REVIEWED.items():
+        assert len(reason) > 40, (
+            f"{key} carries a reason too short to be a traced one: {reason!r}")
+
+
+def test_opt_out_entries_are_not_stale():
+    """An entry must be able to die, or it is documentation of a gap.
+
+    The entry key is the KEY SHAPE, so this fires when a site starts coalescing
+    AND when its key is reworded -- which is the point. A reworded key is a new
+    decision about whether two gestures are one edit, and the old reason
+    described the old key.
+    """
+    findings = _coalescing_opt_out_findings()
+    gone = sorted(set(COALESCE_OPT_OUT_REVIEWED) - set(findings))
+    assert not gone, (
+        "these enqueues now coalesce, or their key shape changed, so the entry "
+        f"describes something that is no longer there: {gone}")
+
+
+def test_an_unreadable_key_can_never_be_reviewed():
+    """Fail closed: an entry cannot buy a pass for a key the scan cannot read.
+
+    `_KEY_UNRESOLVED` is not one of the two classes an entry may declare, so a
+    site whose key resolves to nothing stays a finding no matter what is filed
+    for it. Without this, the cheapest repair for an unreadable key would be to
+    file it rather than to spell it.
+    """
+    assert _KEY_UNRESOLVED not in (DECLINED, UNREACHABLE, CALLER_SUPPLIED)
+    filed = {key for key, entry in COALESCE_OPT_OUT_REVIEWED.items()
+             if entry[0] == _KEY_UNRESOLVED}
+    assert not filed, f"an entry claims the unresolved class: {sorted(filed)}"
+    findings = _coalescing_opt_out_findings()
+    unreadable = sorted(key for key, why in findings.items()
+                        if why[0] == _KEY_UNRESOLVED)
+    assert not unreadable, (
+        "these enqueues state a key the scanner cannot read, so neither "
+        f"coalescing tripwire can classify them: {unreadable}. Spell the key as "
+        "a template literal at the call site, or as a `const` in the same "
+        "method.")
+
+
+def test_the_opt_out_scan_sees_both_spellings():
+    """Liveness. A tripwire that finds nothing has never been observed to work.
+
+    Pinned rather than bounded, per this module's convention: the split between
+    the two spellings is the finding that justified building two tripwires
+    instead of one, and it should move only deliberately.
+    """
+    findings = _coalescing_opt_out_findings()
+    declined = [key for key, why in findings.items() if why[0] == DECLINED]
+    unreachable = [key for key, why in findings.items() if why[0] == UNREACHABLE]
+    assert len(declined) == EXPECTED_STABLE_KEY_OPT_OUTS, (
+        f"stable-key opt-outs moved: {len(declined)} found, "
+        f"{EXPECTED_STABLE_KEY_OPT_OUTS} pinned")
+    assert len(unreachable) == EXPECTED_UNIQUIFIED_KEY_OPT_OUTS, (
+        f"uniquified-key opt-outs moved: {len(unreachable)} found, "
+        f"{EXPECTED_UNIQUIFIED_KEY_OPT_OUTS} pinned")
+    caller_supplied = [key for key, why in findings.items()
+                       if why[0] == CALLER_SUPPLIED]
+    assert len(caller_supplied) == EXPECTED_CALLER_SUPPLIED_OPT_OUTS, (
+        f"caller-supplied coalescing moved: {len(caller_supplied)} found, "
+        f"{EXPECTED_CALLER_SUPPLIED_OPT_OUTS} pinned")
+    # The remaining measured entry must be present and filed as a real refusal,
+    # or the tripwire is passing it for the wrong reason. Lane-header visibility
+    # visibility, selected mute and clip-role conversion all coalesce now, which
+    # is why `EXPECTED_STABLE_KEY_OPT_OUTS` went 20 -> 17 across stage 1: a count
+    # that only ever grows would not be a ratchet.
+    for retired in ("_applyHeaderVisibilityBulkWithinGesture",
+                    "_toggleSelectedMuteWithinGesture",
+                    "_convertClipRoleWithinGesture"):
+        assert not any(retired in key for key in findings), (
+            f"{retired} coalesces now; an entry for it would be stale")
+    # `_moveItemToFrameWithinGesture` is the surviving DECLINED entry umbrella
+    # Phase C still owes an answer for -- stage 2 L6 gives it the local apply
+    # that makes its oldest-`expected` merge load-bearing.
+    assert any("_moveItemToFrameWithinGesture" in key for key in declined)
+    # And every site that owns a decision must have produced a readable key.
+    # The forwarding helpers are excluded for the same reason they are excluded
+    # from the findings: `_runSceneMutation` spells its key `key || <default>`,
+    # which is plumbing for whatever its caller passed rather than a key of its
+    # own, and reading it would report the receiver instead of the decision.
+    for site in _enqueue_call_sites():
+        if site["scope"] in _FORWARDING_SCOPES:
+            continue
+        assert site["key_shape"] not in (_KEY_UNRESOLVED, "<unterminated>"), (
+            f"{site['module']}:{site['scope']}:{site['line']} states a key the "
+            "scanner cannot read")
+
+
+def test_a_coalescing_site_is_not_reported_as_an_opt_out():
+    """The five live coalescing gestures must clear both tripwires.
+
+    They have stable keys and do not pass `coalesce: false`, so any of them
+    appearing as a finding means the key reader or the flag reader has broken
+    in a way the other tests would not notice.
+    """
+    findings = _coalescing_opt_out_findings()
+    for scope in ("_updateSceneResolutionWithinGesture", "_renameSceneWithinGesture",
+                  "_updateSceneDurationWithinGesture", "_saveLaneConfigWithinGesture"):
+        assert not [key for key in findings if f":{scope}:" in key], (
+            f"{scope} coalesces on a repeating key and must not read as an opt-out")
+    # `_updateItemPropertyWithinGesture` is deliberately NOT in that list. It
+    # was, and the assertion pinned a hole shut: the gesture passes `coalesce`
+    # through from its callers, one of which declines on a stable key, and
+    # asserting it could never be a finding is what kept that invisible.
+    assert [key for key, why in findings.items()
+            if ":_updateItemPropertyWithinGesture:" in key
+            and why[0] == CALLER_SUPPLIED], (
+        "the pass-through gesture must read as caller-supplied, or the third "
+        "spelling of `will not coalesce` is unwatched again")
+
+
+def test_the_opt_out_tripwires_produce_the_findings_they_claim():
+    """Drives both predicates over fixtures, with exact findings.
+
+    Without this the real modules decide whether the tripwire has ever been
+    exercised at all, and both assertions above would be satisfied by a
+    predicate that returns the same thing for every input.
+    """
+    def findings(js):
+        return _coalescing_opt_out_findings(
+            _scan_enqueue_sites((("fixture.js", js),)))
+
+    declined = findings(
+        'async function gesture() {\n'
+        '  await host._runSceneMutation(ops, { key: `scene:${sceneId}:x`,\n'
+        '    coalesce: false });\n}\n')
+    assert list(declined) == ["fixture.js:gesture:scene:${}:x"]
+    assert declined["fixture.js:gesture:scene:${}:x"][0] == DECLINED
+
+    unreachable = findings(
+        'async function gesture() {\n'
+        '  await host._runSceneMutation(ops, { key: `scene:${sceneId}:x:${Date.now()}`,\n'
+        '    coalesce: true });\n}\n')
+    assert list(unreachable) == ["fixture.js:gesture:scene:${}:x:${}"]
+    assert unreachable["fixture.js:gesture:scene:${}:x:${}"][0] == UNREACHABLE, (
+        "a uniquified key must be a finding even when the flag says `true` -- "
+        "that is the whole reason there are two tripwires")
+
+    assert not findings(
+        'async function gesture() {\n'
+        '  await host._runSceneMutation(ops, { key: `scene:${sceneId}:x` });\n}\n'), (
+        "a coalescing gesture on a repeating key is not an opt-out")
+
+    assert not findings(
+        'async function gesture() {\n'
+        '  await host._runSceneMutation(ops, { label: "no key" });\n}\n'), (
+        "an absent key is `_runSceneMutation`'s own scene-scoped default, which "
+        "repeats; reading it as unresolved would report the most coalescible "
+        "key in the file as unclassifiable")
+
+    nested = findings(
+        'async function gesture() {\n'
+        '  await host._runSceneMutation(ops, {\n'
+        '    key: `scene:${sceneId}:lanes:${ops.map((op) => `${op.lane_index}`).join(",")}`,\n'
+        '    coalesce: false });\n}\n')
+    assert list(nested) == ["fixture.js:gesture:scene:${}:lanes:${}"], (
+        "a nested template literal inside an interpolation must not cut the key "
+        "in half -- one live key is spelled exactly this way")
+
+    ternary = findings(
+        'async function gesture() {\n'
+        '  const key = names.length === 1\n'
+        '    ? `${type}:${id}:field:${names[0]}`\n'
+        '    : `${type}:${id}:fields:${Date.now()}`;\n'
+        '  await host._runSceneMutation(ops, { key, coalesce: true });\n}\n')
+    assert list(ternary) == ["fixture.js:gesture:${}:${}:field:${} | ${}:${}:fields:${}"], (
+        "both branches of a ternary key must be read; taking only the first "
+        "would classify the site on half its evidence")
+
+
+def test_the_key_reader_is_not_fooled_by_the_operations_argument():
+    """A `key` field inside an operation is not this enqueue's key.
+
+    The first argument is a list of operations and an operation may carry a
+    field called `key`; a plain search takes the first match and files the site
+    under a key that does not exist -- silently, because the shape it records
+    still looks like one. The reader walks the call instead and accepts only
+    array depth 0, brace depth 1.
+    """
+    findings = _coalescing_opt_out_findings(_scan_enqueue_sites((("fixture.js",
+        'async function gesture() {\n'
+        '  await host._runSceneMutation(\n'
+        '    [{ type: "update_scene_fields", fields: { key: "decoy" } }],\n'
+        '    { key: `scene:${sceneId}:real`, coalesce: false });\n}\n'),)))
+    assert list(findings) == ["fixture.js:gesture:scene:${}:real"], (
+        "the decoy inside the operations argument was read as the enqueue's key")
+
+
+def test_a_spread_options_object_is_unreadable_rather_than_the_default():
+    """An absent key means the default; a spread means the scan cannot see it.
+
+    Reading a spread as "no key stated" reports the most coalescible key in the
+    file for a site whose real key it never saw, and `_KEY_UNRESOLVED` is not a
+    class an entry may claim -- so this fails the suite until the key is spelled
+    where the scan can read it.
+    """
+    findings = _coalescing_opt_out_findings(_scan_enqueue_sites((("fixture.js",
+        'async function gesture() {\n'
+        '  await host._runSceneMutation(ops, { ...options, coalesce: false });\n}\n'),)))
+    assert [why[0] for why in findings.values()] == [_KEY_UNRESOLVED]
+
+
+def test_a_caller_supplied_coalesce_is_its_own_answer():
+    """Neither `true` nor `false`: the decision is in the callers.
+
+    Reading shorthand as `true` is what hid the live Reference-strength refusal
+    from both tripwires, so the fixture pins all three spellings apart.
+    """
+    def classes(js):
+        return sorted(why[0] for why in _coalescing_opt_out_findings(
+            _scan_enqueue_sites((("fixture.js", js),))).values())
+
+    assert classes(
+        'async function gesture() {\n'
+        '  await host._runSceneMutation(ops, { key: `scene:${sceneId}:x`, coalesce });\n}\n'
+    ) == [CALLER_SUPPLIED]
+    assert classes(
+        'async function gesture() {\n'
+        '  await host._runSceneMutation(ops, { key: `scene:${sceneId}:x`,\n'
+        '    coalesce: opts.coalesce });\n}\n'
+    ) == [CALLER_SUPPLIED]
+    assert classes(
+        'async function gesture() {\n'
+        '  await host._runSceneMutation(ops, { key: `scene:${sceneId}:x`,\n'
+        '    coalesce: true });\n}\n'
+    ) == []
+    assert classes(
+        'async function gesture() {\n'
+        '  await host._runSceneMutation(ops, { key: `scene:${sceneId}:x`,\n'
+        '    coalesce: false });\n}\n'
+    ) == [DECLINED]
+
+
+# Every shape an exported merge can take, and what each must resolve to. The
+# first row is the one that matters most: a concise arrow ignoring its older
+# argument is `merge: (a, b) => b` wearing a badge, and an earlier version of
+# the resolver PASSED it -- searching forward for a `{` found an unrelated
+# block later in the module and ran the first-parameter check against that.
+# Failing open is the one outcome this tripwire must never have.
+IMPORTED_MERGE_SHAPES = [
+    pytest.param("export const probeMerge = (a, b) => b;\n"
+                 "function later(older, newer) { return older + newer; }\n",
+                 False, id="concise-arrow-ignores-older"),
+    pytest.param("export const probeMerge = (older, newer) => older.concat(newer);\n",
+                 True, id="concise-arrow-reads-older"),
+    pytest.param("export const probeMerge = (older, newer) => {\n"
+                 "    return { ...newer, ...older };\n};\n",
+                 True, id="block-arrow-reads-older"),
+    pytest.param("export function probeMerge(older, newer = null) {\n"
+                 "    return older || newer;\n}\n",
+                 True, id="declared-function-with-a-default"),
+    pytest.param("export function probeMerge(older, newer) {\n"
+                 "    return newer;\n}\n",
+                 False, id="declared-function-ignores-older"),
+    pytest.param("export function probeMerge(only) {\n    return only;\n}\n"
+                 "function later(older, newer) { return older; }\n",
+                 False, id="one-parameter"),
+    pytest.param("export const probeMerge = ({ older, newer }) => older;\n",
+                 False, id="destructured-is-unreadable-so-fails-closed"),
+]
+
+
+@pytest.mark.parametrize("module_body,effective", IMPORTED_MERGE_SHAPES)
+def test_an_imported_merge_resolves_to_its_own_definition(
+        module_body, effective, tmp_path, monkeypatch):
+    """Follow the import, and bound the answer to THAT definition.
+
+    `JS_DIR` is redirected rather than writing a probe module into `web/js`,
+    which ships in the published pack -- a test that leaves a file there on a
+    hard failure would publish it.
+    """
+    (tmp_path / "zz_probe.js").write_text(module_body, encoding="utf-8")
+    monkeypatch.setattr("test_scene_mutation_registration.JS_DIR", tmp_path)
+    source = "\n".join([
+        'import { probeMerge } from "./zz_probe.js";',
+        "async function gesture() {",
+        "  await host._runSceneMutation(ops, { key: `scene:${sceneId}:x`,",
+        "    coalesce: true, merge: probeMerge });",
+        "}",
+        "",
+    ])
+    site = _scan_enqueue_sites((("fixture.js", source),))[0]
+    assert site["effective_merge"] is effective
+
+
+def test_an_aliased_import_resolves_by_its_exported_name(tmp_path, monkeypatch):
+    """`{ exported as local }` is looked up one way and matched the other.
+
+    Using the local name for both made every aliased import unresolvable, which
+    fails closed but reports the opposite of the truth -- and the cheapest
+    repair for that is to stop importing the shared merge.
+    """
+    (tmp_path / "zz_probe.js").write_text(
+        "export const probeMerge = (older, newer) => ({ ...newer, ...older });\n",
+        encoding="utf-8")
+    monkeypatch.setattr("test_scene_mutation_registration.JS_DIR", tmp_path)
+    source = "\n".join([
+        'import { probeMerge as myMerge } from "./zz_probe.js";',
+        "async function gesture() {",
+        "  await host._runSceneMutation(ops, { key: `scene:${sceneId}:x`,",
+        "    coalesce: true, merge: myMerge });",
+        "}",
+        "",
+    ])
+    assert _scan_enqueue_sites((("fixture.js", source),))[0]["effective_merge"]
+
+
+def test_a_badge_merge_is_not_certified_by_a_later_function():
+    """The merge is whatever comes first after `merge:`.
+
+    Trying the arrow pattern and then falling through to the function pattern
+    over the same text let `(a, b) => b` be certified by an unrelated
+    two-parameter function further down the extent.
+    """
+    assert not _reads_its_older_argument(
+        "(a, b) => b, failureMessage: function name(older, newer) { return older; }")
+    assert _reads_its_older_argument("(older, newer) => ({ ...newer, ...older })")
+
+
+# ---------------------------------------------------------------------------
+# A coalescing site whose operations are built somewhere else
+# ---------------------------------------------------------------------------
+# The payload checks above resolve operands by ENCLOSING SCOPE. That is right
+# for a gesture that builds its own operations, and blind to one that calls a
+# helper: `_applyHeaderVisibilityBulkWithinGesture` sends `update_lane_config`
+# from its own body and five more operation types from
+# `_buildLinkedMuteOperations` -> `_muteOperationForItem`, none of which the
+# scan attributes to it. So the sub-keyed and opaque-payload checks are reading
+# a fraction of what that site sends, and clearing it on that fraction.
+#
+# The answer is not to widen the attribution -- a helper's operations belong to
+# every caller and attributing them to one would be worse than seeing none. It
+# is to notice that the site's payload cannot be read here, and require the
+# protection that does not depend on reading it: an effective merge, which
+# preserves whatever it cannot classify.
+
+# Captures the leading underscore, because that is part of the scope NAME the
+# resolver records. Dropping it made every call miss and the transitive hop
+# silently never fire.
+_CALL_RE = re.compile(r"\bthis\.(_\w+)\s*\(")
+
+
+def _operation_emitting_scopes(sources: tuple) -> dict:
+    """Per module, the scopes that own an operation literal or reach one."""
+    reaching = {}
+    for module, source in sources:
+        mask = _code_mask(source)
+        scopes = _scopes(source, mask)
+        bodies = {}
+        for name, begin, end in scopes:
+            bodies.setdefault(name, set()).update(
+                _CALL_RE.findall(_code_only(source[begin:end], mask[begin:end])))
+        emitters = {literal["scope"] for literal in _scan(source, module)}
+        # The forwarding helpers are the enqueue itself, not a payload builder,
+        # and every gesture calls one -- leaving them in made the closure swallow
+        # the whole file and reported three whole-value gestures as delegating.
+        emitters -= _FORWARDING_SCOPES
+        # Transitive: `_buildLinkedMuteOperations` owns no literal itself, it
+        # calls `_muteOperationForItem`. One hop would miss it.
+        changed = True
+        while changed:
+            changed = False
+            for name, called in bodies.items():
+                if name in _FORWARDING_SCOPES:
+                    continue        # never re-admitted by the closure either
+                if name not in emitters and called & emitters:
+                    emitters.add(name)
+                    changed = True
+        reaching[module] = (emitters, bodies)
+    return reaching
+
+
+def _sites_with_operations_built_elsewhere(sources=None) -> dict:
+    """Coalescing sites that call an operation emitter and supply no merge."""
+    sources = sources or tuple(
+        (module, (JS_DIR / module).read_text(encoding="utf-8"))
+        for module in EMITTING_MODULES)
+    reaching = _operation_emitting_scopes(sources)
+    findings = {}
+    for site in _scan_enqueue_sites(sources):
+        if site["scope"] in _FORWARDING_SCOPES or not site["coalesces"]:
+            continue
+        if site["effective_merge"]:
+            continue
+        emitters, bodies = reaching[site["module"]]
+        called = bodies.get(site["scope"], set()) & emitters
+        if called:
+            findings[f"{site['module']}:{site['scope']}"] = sorted(called)
+    return findings
+
+
+def test_a_coalescing_site_that_builds_its_payload_elsewhere_supplies_a_merge():
+    """Because the payload checks cannot see what it sends.
+
+    They resolve operands by enclosing scope, so a gesture that delegates gets
+    cleared on the fraction it happens to build inline. An effective merge is
+    the protection that does not depend on reading the payload: it preserves
+    what it cannot classify.
+    """
+    findings = _sites_with_operations_built_elsewhere()
+    assert not findings, (
+        "these coalescing sites build operations in a helper, so the sub-keyed "
+        "and opaque-payload checks above are reading only part of what they "
+        "send -- and they supply no merge, so wholesale replacement decides "
+        f"what survives: {findings}. Pass `coalesceSceneMutationIntents`, or "
+        "record the site with a traced reason.")
+
+
+def test_the_hidden_operand_scan_finds_the_helper_chain_it_was_written_for():
+    """Liveness, and the transitive hop specifically.
+
+    `_buildLinkedMuteOperations` owns no operation literal -- it calls
+    `_muteOperationForItem`, which does. A one-hop reachability check would
+    report the lane-header gesture as building everything inline, which is the
+    blindness this test exists to disprove.
+    """
+    sources = tuple((module, (JS_DIR / module).read_text(encoding="utf-8"))
+                    for module in EMITTING_MODULES)
+    emitters, bodies = _operation_emitting_scopes(sources)["editor_widget.js"]
+    assert "_muteOperationForItem" in emitters, "the direct emitter is not seen"
+    assert "_buildLinkedMuteOperations" in emitters, (
+        "the transitive hop is not followed, so a gesture that delegates twice "
+        "reads as building its own payload")
+    assert "_buildLinkedMuteOperations" in bodies["_applyHeaderVisibilityBulkWithinGesture"]
+
+    # And the predicate must produce a finding when the merge goes.
+    fixture = (
+        'function _muteOperationForItem(item) {\n'
+        '  return { type: "update_prompt_section", index: item.id,\n'
+        '    fields: { muted: true } };\n}\n'
+        'function _buildMutes(items) {\n'
+        '  return items.map((item) => this._muteOperationForItem(item));\n}\n'
+        'async function gesture() {\n'
+        '  const operations = this._buildMutes(items);\n'
+        '  await host._runSceneMutation(operations, {\n'
+        '    key: `scene:${sceneId}:x`, coalesce: true });\n}\n')
+    found = _sites_with_operations_built_elsewhere((("fixture.js", fixture),))
+    assert list(found) == ["fixture.js:gesture"], (
+        f"the predicate did not fire on a delegating coalescing site: {found}")

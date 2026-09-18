@@ -1509,3 +1509,425 @@ def test_the_prompt_section_structure_agrees_across_languages():
     empty = _js_guard_values(guard, json.dumps({"prompt_sections": []}),
                              "out.push(host._promptSectionsReplacementGuard().sections);\n")
     assert empty[0] == routes._prompt_section_structure(Scene(scene_id="empty")) == []
+
+
+def _header_visibility_burst(clicks: int) -> str:
+    """Drive the real lane-header gesture `clicks` times through the real queue.
+
+    Each gesture's mute operation carries a DISTINCT guard value, numbered by
+    the order the gesture was authored. That is what makes the assertions below
+    able to tell a merge from wholesale replacement: with every gesture reading
+    the same value, both produce the same payload and the test proves nothing.
+    Faithful to the shape that matters -- `_muteOperationForItem` reads
+    `item.data.muted` at BUILD time, so each gesture in a burst sees what the
+    previous one's optimistic apply left.
+    """
+    return """
+        const w = makeWidget(), sent = [], settled = [];
+        w.activeScene = {scene_id:'scene', video_lane_configs:[{}], video_lane_count:1};
+        w._headerVisibilitySeq = 0;
+        w._isLaneVisibilityControlDisabled = () => false;
+        w._laneTypeForEntry = () => 'video';
+        w._defaultLaneConfig = () => ({});
+        w._trackItemsForEntry = () => [];
+        w._trackVisibilityState = (entry) => entry.hidden ? 'hidden' : 'visible';
+        w._clearPlaybackWarmOverlay = () => {};
+        w._reconcileSelection = () => {};
+        w._buildTrackLayout = () => {};
+        w._updateToolbar = () => {};
+        // Real entry objects, so `historyEntry`, `_pendingHistoryEntryByMutationKey`
+        // and the `willCoalesce` discard are all live rather than inert.
+        const discarded = [];
+        w._discardUndoEntry = (target) => { discarded.push(target); return true; };
+        const fetches = [];
+        w._fetchScenes = async (options) => { fetches.push(options || {}); };
+        const entries = [];
+        let authored = 0;
+        w._buildLinkedMuteOperations = () => {
+            const seq = authored;
+            authored += 1;
+            return {operations: [{type:'update_reference_item',
+                reference_item_id:'r', expected:{muted: seq}, fields:{muted: seq}}],
+                targets: [], locked: false};
+        };
+        let release = null;
+        w._runSceneMutation = (operations, options) => w._queueProjectMutation({
+            ...options, refreshScenes:false, intent:{operations},
+            run: async (intent) => {
+                sent.push(intent);
+                if (sent.length === 1) await new Promise(r => { release = r; });
+                return {payload:{}};
+            },
+        });
+        const entry = {type:'video', laneIndex:0, hidden:false};
+        const pending = [];
+        const click = (hidden) => {
+            const index = pending.length;
+            const undoEntry = { label: 'toggle track visibility', index };
+            entries.push(undoEntry);
+            pending.push(w._applyHeaderVisibilityBulkWithinGesture([entry], hidden,
+                { undoEntry }).then(() => settled.push(index)));
+        };
+        // Click once and let the queue DISPATCH it, so the rest of the burst
+        // arrives while that write is in flight. That is the shape the measured
+        // entry describes, and it is why the expectation is two writes and not
+        // one: `enqueue` scans `_pending` only and `_pump` shifts the active
+        // slot off before awaiting, so the click in flight cannot be collapsed
+        // into.
+        click(true);
+        await new Promise(r => setTimeout(r, 0));
+        for (let i = 1; i < CLICKS; i += 1) {
+            entry.hidden = i % 2 === 1;
+            click(!entry.hidden);
+        }
+        release();
+        await Promise.all(pending);
+        await new Promise(r => setTimeout(r, 0));
+    """.replace("CLICKS", str(clicks))
+
+
+def test_a_lane_header_burst_costs_two_writes_not_six():
+    """The measured entry, made automatable.
+
+    `sonder_editor_bugs.md` measures six rapid clicks on one lane's hide control
+    at 24.2 s, because each paid the ~1,966 ms route floor on its own. Two
+    writes, not one: one per in-flight window, plus the first.
+    """
+    _run_gesture_node(_header_visibility_burst(6) + """
+        assert.equal(sent.length, 2,
+            `expected two writes for six clicks, got ${sent.length}`);
+        const configs = sent[1].operations.filter(op => op.type === 'update_lane_config');
+        assert.equal(configs.length, 1,
+            'the five collapsed clicks must fold to ONE lane-config operation');
+        assert.equal(configs[0].fields.hidden, false,
+            'the surviving lane config must carry the LAST click, not the first');
+    """)
+
+
+def test_a_coalesced_header_burst_keeps_the_oldest_before_value_guard():
+    """The reason this key needed a merge rather than a flag flip.
+
+    Each gesture reads `expected: { muted }` off state the previous gesture's
+    optimistic apply already changed. Wholesale replacement sends the NEWEST
+    guard, which describes a state the server has not reached; the merge keeps
+    the oldest with the newest `fields`. Both halves are asserted, because a
+    test that only checked the newest value would pass on replacement too --
+    which is exactly how the first version of this test failed to bite.
+    """
+    _run_gesture_node(_header_visibility_burst(6) + """
+        const mutes = sent[1].operations.filter(
+            op => op.type === 'update_reference_item');
+        assert.equal(mutes.length, 1, 'the mute operations must fold per row');
+        assert.equal(mutes[0].expected.muted, 1,
+            'the surviving guard must come from the FIRST gesture of the '
+            + 'collapsed group, not the last');
+        assert.equal(mutes[0].fields.muted, 5,
+            'the surviving value must come from the LAST gesture');
+    """)
+
+
+def test_every_collapsed_header_gesture_settles():
+    """No author is left awaiting a write that was merged away.
+
+    The queue resolves every collapsed waiter from the survivor's single result;
+    this is the property that makes adopting coalescing safe for a gesture whose
+    callers await it.
+    """
+    _run_gesture_node(_header_visibility_burst(4) + """
+        assert.deepEqual(settled.slice().sort(), [0, 1, 2, 3],
+            'every click must settle, however few writes were sent');
+    """)
+
+
+def test_two_lanes_do_not_share_a_visibility_write():
+    """Two clicks on DIFFERENT lane headers are two edits, not one.
+
+    The key names the lanes, not just the scene. Merging across lanes would
+    collapse two undo entries into one, and `_queueProjectMutation`'s merge
+    keeps the NEWEST entry -- whose before-state was captured after the first
+    click already painted. The survivor's reverse delta would then cover only
+    the last lane, and because `video_lane_family` is an atomic bundle in
+    `server/scene_history_merge.py` the stranded lane makes the NEXT entry's
+    restore raise `SceneMergeConflict` rather than merely not reverse it.
+
+    So the assertion is two writes, and it is a regression guard rather than a
+    performance one: the cost of getting this wrong is a blocked Ctrl+Z.
+    """
+    _run_gesture_node("""
+        const w = makeWidget(), sent = [];
+        w.activeScene = {scene_id:'scene', video_lane_configs:[{}, {}], video_lane_count:2};
+        w._headerVisibilitySeq = 0;
+        w._isLaneVisibilityControlDisabled = () => false;
+        w._laneTypeForEntry = () => 'video';
+        w._defaultLaneConfig = () => ({});
+        w._trackItemsForEntry = () => [];
+        w._trackVisibilityState = (entry) => entry.hidden ? 'hidden' : 'visible';
+        w._clearPlaybackWarmOverlay = () => {};
+        w._reconcileSelection = () => {};
+        w._buildTrackLayout = () => {};
+        w._updateToolbar = () => {};
+        w._discardUndoEntry = () => {};
+        w._buildLinkedMuteOperations = () => ({operations: [], targets: [], locked: false});
+        let release = null;
+        w._runSceneMutation = (operations, options) => w._queueProjectMutation({
+            ...options, refreshScenes:false, intent:{operations},
+            run: async (intent) => {
+                sent.push({key: options.key, operations: intent.operations});
+                if (sent.length === 1) await new Promise(r => { release = r; });
+                return {payload:{}};
+            },
+        });
+        const laneA = {type:'video', laneIndex:0, hidden:false};
+        const laneB = {type:'video', laneIndex:1, hidden:false};
+        const pending = [w._applyHeaderVisibilityBulkWithinGesture([laneA], true)];
+        await new Promise(r => setTimeout(r, 0));
+        pending.push(w._applyHeaderVisibilityBulkWithinGesture([laneB], true));
+        pending.push(w._applyHeaderVisibilityBulkWithinGesture([laneB], false));
+        release();
+        await Promise.all(pending);
+        await new Promise(r => setTimeout(r, 0));
+
+        assert.equal(sent.length, 2,
+            `lane A must not share a write with lane B; got ${sent.length}`);
+        assert.notEqual(sent[0].key, sent[1].key,
+            'the two lanes must enqueue under different keys');
+        // The two clicks on lane B DID coalesce with each other -- the second
+        // write carries one operation, not two.
+        assert.equal(sent[1].operations.length, 1,
+            'repeated clicks on ONE lane must still fold');
+        assert.equal(sent[1].operations[0].lane_index, 1);
+        assert.equal(sent[1].operations[0].fields.hidden, false,
+            'and the fold must carry the LAST click');
+    """)
+
+
+def test_a_bulk_selection_keeps_one_key_for_the_whole_selection():
+    """A bulk hide over several lanes is ONE gesture and one edit.
+
+    The lane set is sorted into the key, so repeating the same bulk gesture
+    coalesces with itself while a different selection does not. Without the
+    sort, the same selection reached in a different order would mint a
+    different key and silently stop coalescing.
+    """
+    _run_gesture_node("""
+        const w = makeWidget(), sent = [];
+        w.activeScene = {scene_id:'scene', video_lane_configs:[{}, {}], video_lane_count:2};
+        w._headerVisibilitySeq = 0;
+        w._isLaneVisibilityControlDisabled = () => false;
+        w._laneTypeForEntry = () => 'video';
+        w._defaultLaneConfig = () => ({});
+        w._trackItemsForEntry = () => [];
+        w._trackVisibilityState = (entry) => entry.hidden ? 'hidden' : 'visible';
+        w._clearPlaybackWarmOverlay = () => {};
+        w._reconcileSelection = () => {};
+        w._buildTrackLayout = () => {};
+        w._updateToolbar = () => {};
+        w._discardUndoEntry = () => {};
+        w._buildLinkedMuteOperations = () => ({operations: [], targets: [], locked: false});
+        let release = null;
+        const keys = [];
+        w._runSceneMutation = (operations, options) => w._queueProjectMutation({
+            ...options, refreshScenes:false, intent:{operations},
+            run: async (intent) => {
+                keys.push(options.key);
+                sent.push(intent.operations);
+                if (sent.length === 1) await new Promise(r => { release = r; });
+                return {payload:{}};
+            },
+        });
+        const a = {type:'video', laneIndex:0, hidden:false};
+        const b = {type:'video', laneIndex:1, hidden:false};
+        const pending = [w._applyHeaderVisibilityBulkWithinGesture([a, b], true)];
+        await new Promise(r => setTimeout(r, 0));
+        // Same selection, opposite order: the sort must make the key identical.
+        pending.push(w._applyHeaderVisibilityBulkWithinGesture([b, a], false));
+        pending.push(w._applyHeaderVisibilityBulkWithinGesture([a, b], true));
+        release();
+        await Promise.all(pending);
+        await new Promise(r => setTimeout(r, 0));
+
+        assert.equal(sent.length, 2, 'the two later bulk gestures must fold');
+        assert.equal(keys[0], keys[1],
+            'the same lane set reached in a different order must mint the same key');
+        assert.equal(sent[1].length, 2, 'both lanes are written by the survivor');
+    """)
+
+
+def test_a_coalesced_burst_discards_each_superseded_entry_by_exact_object():
+    """Two entries survive a six-click burst, and four go by identity.
+
+    This is what makes Ctrl+Z after a burst reach the pre-burst state in two
+    steps. It is also the property the landing replaced a label-and-top-of-stack
+    match to get: `_discardLastUndo("toggle track visibility")` would pop
+    whatever happened to be on top, which after queue interleaving can be a
+    newer gesture's entry entirely.
+    """
+    _run_gesture_node(_header_visibility_burst(6) + """
+        assert.equal(discarded.length, 4,
+            `expected four superseded entries, got ${discarded.length}`);
+        assert.deepEqual(discarded.map((one) => one.index), [1, 2, 3, 4],
+            'the discarded entries must be clicks 2-5 -- click 1 was already '
+            + 'dispatched and click 6 is the survivor');
+        // By identity, not by label: every discarded object is the exact entry
+        // that gesture authored.
+        assert.ok(discarded.every((one, at) => one === entries[at + 1]));
+    """)
+
+
+def test_a_failed_coalesced_burst_refetches_once():
+    """Every waiter's `catch` runs; only the newest gesture refreshes.
+
+    The queue settles all six from the survivor's single rejection, so six
+    `catch` blocks run. The `visibilitySeq` gate is what keeps that from
+    becoming six full scene refetches -- and this is the test that shows the
+    gate is doing something, which the burst tests above never reached because
+    they never failed.
+    """
+    _run_gesture_node(_header_visibility_burst(6).replace(
+        "if (sent.length === 1) await new Promise(r => { release = r; });\n"
+        "                return {payload:{}};",
+        "if (sent.length === 1) await new Promise(r => { release = r; });\n"
+        "                throw new Error('refused');") + """
+        assert.equal(fetches.length, 1,
+            `expected exactly one gated refetch, got ${fetches.length}`);
+        assert.equal(fetches[0].reason, 'header_visibility_error');
+        assert.deepEqual(settled.slice().sort((a, b) => a - b), [0, 1, 2, 3, 4, 5],
+            'every gesture must settle even though the write failed');
+    """)
+
+
+def _clip_role_burst(fail: bool = False) -> str:
+    """Two conversions of ONE clip, the only way this key can repeat."""
+    return """
+        const w = makeWidget(), sent = [], restored = [];
+        w.activeScene = {scene_id:'scene', video_lane_count:1, motion_driver_lane_count:1,
+            video_lane_configs:[{}], motion_driver_lane_configs:[{}],
+            clips:[{clip_id:'c1', role:'render', track_index:0, strength:1.0}]};
+        w._applyLocalSetLaneCount = () => {};
+        w._clearSelection = () => {}; w._hideItemEditor = () => {};
+        const heals = [];
+        w._fetchScenes = async (options) => { heals.push(options?.reason); };
+        w._defaultMotionDriverStrength = () => 0.5;
+        w._firstEmptyUnlockedDriverLane = () => 0;
+        w._getAssetForSourcePath = () => ({asset_type:'video'});
+        const clip = w.activeScene.clips[0];
+        const watch = () => restored.push({role: clip.role, track_index: clip.track_index});
+        let release = null;
+        w._runSceneMutation = (operations, options) => w._queueProjectMutation({
+            ...options, refreshScenes:false, intent:{operations},
+            run: async (intent) => {
+                sent.push(intent.operations);
+                if (sent.length === 1) await new Promise(r => { release = r; });
+                if (FAIL) throw new Error('refused');
+                return {payload:{}};
+            },
+        });
+        const pending = [w._convertClipRoleWithinGesture('c1', 'motion_driver')];
+        await new Promise(r => setTimeout(r, 0));
+        pending.push(w._convertClipRoleWithinGesture('c1', 'render'));
+        pending.push(w._convertClipRoleWithinGesture('c1', 'motion_driver'));
+        release();
+        await Promise.allSettled(pending);
+        await new Promise(r => setTimeout(r, 0));
+        watch();
+    """.replace("FAIL", "true" if fail else "false")
+
+
+def test_two_clip_role_conversions_share_one_write():
+    """The key is per clip, so only conversions of ONE clip can collapse.
+
+    And the lane-count operations must keep their order relative to the clip
+    writes: `set_lane_count` is preserved, so a fold of the clip write would
+    move it in front of a lane count it was authored after.
+    """
+    _run_gesture_node(_clip_role_burst() + """
+        assert.equal(sent.length, 2,
+            `expected two writes for three conversions, got ${sent.length}`);
+        const types = sent[1].map((op) => op.type);
+        assert.deepEqual(types, ['set_lane_count', 'update_clip',
+                                 'set_lane_count', 'update_clip'],
+            `the merged batch reordered: ${types.join(' | ')}`);
+        assert.equal(sent[1].at(-1).fields.role, 'motion_driver',
+            'the last conversion authored must be the last applied');
+    """)
+
+
+def test_a_superseded_role_conversion_does_not_roll_back():
+    """`oldState` predates the group only for its head.
+
+    Three conversions become TWO writes -- the first dispatches alone, the other
+    two collapse -- so there are two heads, one per write, and two restores.
+    Without `onSupersededByCoalescing` there would be three: the superseded
+    gesture would restore its own `oldState`, which is an earlier sibling's
+    optimistic clip rather than anything the server held.
+
+    Two rather than one is the honest number, and the restores are ordered so
+    the later write's head wins locally. Each restoring gesture then refetches,
+    which is what actually returns the clip to server state; the local restore
+    is the fast path, not the authority.
+    """
+    _run_gesture_node(_clip_role_burst(fail=True) + """
+        assert.deepEqual(heals, ['convert_clip_role_error', 'convert_clip_role_error'],
+            `expected one heal per WRITE, got ${JSON.stringify(heals)}`);
+        // And the clip itself, which is what the guard is FOR. Asserting only
+        // the heal count tested the hook's presence, not its placement: moving
+        // `if (!isHead) return;` below the `Object.assign` leaves the count at
+        // two while a superseded gesture restores an earlier sibling's
+        // optimistic clip.
+        assert.deepEqual(restored[0], {role: 'motion_driver', track_index: 0},
+            `the clip must end at the head-of-group state, got `
+            + JSON.stringify(restored[0]));
+    """)
+
+
+def _selected_mute_burst() -> str:
+    """Two mute toggles over a selection holding a Reference item."""
+    return """
+        const w = makeWidget(), sent = [];
+        const item = {type:'reference', id:'r', data:{reference_item_id:'r', muted:false}};
+        w.selectedItems = [item];
+        w.activeScene = {scene_id:'scene'};
+        w._expandItemsWithLinked = (items) => items;
+        w._isItemLocked = () => false;
+        w._linkGroupForItem = () => null;
+        w._reconcileSelection = () => {};
+        w._updateToolbar = () => {};
+        w._itemEditorEl = null;
+        let release = null;
+        w._runSceneMutation = (operations, options) => w._queueProjectMutation({
+            ...options, refreshScenes:false, intent:{operations},
+            run: async (intent) => {
+                sent.push(intent.operations);
+                if (sent.length === 1) await new Promise(r => { release = r; });
+                return {payload:{}};
+            },
+        });
+        const pending = [w._toggleSelectedMuteWithinGesture()];
+        await new Promise(r => setTimeout(r, 0));
+        pending.push(w._toggleSelectedMuteWithinGesture());
+        pending.push(w._toggleSelectedMuteWithinGesture());
+        release();
+        await Promise.all(pending);
+        await new Promise(r => setTimeout(r, 0));
+    """
+
+
+def test_a_selected_mute_burst_keeps_the_oldest_reference_guard():
+    """Its `expected: { muted: !nextMuted }` is a before-value claim.
+
+    Computed from `item.data.muted`, which the previous toggle already wrote
+    locally -- so wholesale replacement would send a guard describing state the
+    server has not reached. The oldest guard with the newest value is what makes
+    a pair of toggles correctly net to no change.
+    """
+    _run_gesture_node(_selected_mute_burst() + """
+        assert.equal(sent.length, 2,
+            `expected two writes for three toggles, got ${sent.length}`);
+        const refs = sent[1].filter((op) => op.type === 'update_reference_item');
+        assert.equal(refs.length, 1, 'the reference mutes must fold to one row');
+        // Toggle 1 muted it. Toggles 2 and 3 unmute then re-mute, so the folded
+        // guard is toggle 2's -- what the server held when the burst began --
+        // and the value is toggle 3's.
+        assert.equal(refs[0].expected.muted, true);
+        assert.equal(refs[0].fields.muted, true);
+    """)

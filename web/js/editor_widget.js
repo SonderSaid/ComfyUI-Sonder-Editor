@@ -393,6 +393,7 @@ import {
     variableLaneTypeFor,
 } from "./lane_registry.js";
 import { deriveRetryOnConflict } from "./scene_mutation_addressing.js";
+import { coalesceSceneMutationIntents } from "./scene_mutation_coalescing.js";
 import { createViewportSurface } from "./viewport_surface.js";
 import {
     EDITOR_COLORS as COLORS,
@@ -2035,6 +2036,19 @@ export class EditorWidget {
                     diagnostics,
                     key: `scene:${sceneId}:fps`,
                     label: "scene fps",
+                    // Deliberately not coalesced, and this is the decision
+                    // umbrella Phase C stage 1 L3 owed rather than a leftover.
+                    // `_fpsUpdatePending` above already serialises fps by
+                    // DROPPING a second gesture and re-syncing the control, so
+                    // nothing accumulates behind this key and there is nothing
+                    // to merge. Coalescing would also need something a merge
+                    // cannot supply: the retime is applied entirely from the
+                    // response by `reconcileRetimedScene`, using a `scale` and a
+                    // `previousState` captured before the write: client state
+                    // the queue never sees and could not recompute for a
+                    // collapsed group. Whether drop-and-resync is the right
+                    // behaviour at all is a separate UX question, recorded in
+                    // the opt-out dict rather than answered here.
                     coalesce: false,
                     reconcileFromResult: reconcileRetimedScene,
                     failureTier: (error) => error?.code === "queue_jobs_pending" ? "warning" : "error",
@@ -8676,10 +8690,17 @@ export class EditorWidget {
                                 (target) => !this._isLaneVisibilityControlDisabled(target)
                             );
                             if (!visibilityEntries.length) break;
-                            this._pushUndo("toggle track visibility");
+                            // Handed down rather than looked up: the gesture
+                            // discards this entry on its refusal paths, and a
+                            // label/top-of-stack match can delete a NEWER
+                            // gesture's entry once the queue interleaves --
+                            // which coalescing on this key makes more likely,
+                            // not less.
+                            const undoEntry = this._pushUndo("toggle track visibility");
                             void this._applyHeaderVisibilityBulk(
                                 visibilityEntries,
-                                this._trackVisibilityState(entry) === "visible"
+                                this._trackVisibilityState(entry) === "visible",
+                                { undoEntry }
                             );
                         }
                         break;
@@ -10779,6 +10800,11 @@ export class EditorWidget {
         this._pushUndo("convert clip role");
         this._applyLocalSetLaneCount(laneType, nextCount);
         Object.assign(clip, body);
+        // `oldState` was captured before THIS gesture's local apply, so it is the
+        // pre-burst clip only for the head of a coalesced group. A later sibling
+        // captured an earlier sibling's optimistic state, and restoring that
+        // would put the clip into a role the server never held.
+        let isHead = true;
         try {
             await this._runSceneMutation(
                 [
@@ -10788,7 +10814,9 @@ export class EditorWidget {
                 {
                     key: `clip:${clipId}:role`,
                     label: "convert clip role",
-                    coalesce: false,
+                    coalesce: true,
+                    merge: coalesceSceneMutationIntents,
+                    onSupersededByCoalescing: () => { isHead = false; },
                 }
             );
             this._clearSelection();
@@ -10796,6 +10824,11 @@ export class EditorWidget {
             this._renderTimeline();
             this._renderViewportFrame();
         } catch (e) {
+            // Only the head restores. Every collapsed sibling's `catch` runs from
+            // the survivor's single rejection, and the refetch below is what
+            // returns the losers to server state -- one refetch, from the head,
+            // rather than one per collapsed gesture.
+            if (!isHead) return;
             Object.assign(clip, oldState);
             await this._fetchScenes({ ignoreMutationGate: true, reason: "convert_clip_role_error" });
             console.warn("[Sonder] Failed to convert clip role:", e);
@@ -10930,10 +10963,20 @@ export class EditorWidget {
         return { operations, targets: expanded, locked: false };
     }
 
+    /** Single-lane visibility toggle. Currently has no caller — the header
+     *  context menu's "hide" zone drives `_applyHeaderVisibilityBulk` directly
+     *  so it can apply to a lane selection. Kept because it is the obvious
+     *  entry point for a future single-lane control, and pushed/handed its own
+     *  undo entry so that reviving it cannot silently reintroduce the
+     *  label-matched discard this landing removed.
+     *  Expiry: delete when a single-lane control exists and calls it, or when
+     *  `tests/test_animatic_visibility_js.py` stops using it as a slice anchor. */
     async _toggleHeaderVisibility(entry) {
         if (!entry) return;
         if (this._isLaneVisibilityControlDisabled(entry)) return;
-        await this._applyHeaderVisibilityBulk([entry], this._trackVisibilityState(entry) === "visible");
+        const undoEntry = this._pushUndo("toggle track visibility");
+        await this._applyHeaderVisibilityBulk(
+            [entry], this._trackVisibilityState(entry) === "visible", { undoEntry });
     }
 
     _isLaneVisibilityControlDisabled(entry) {
@@ -10947,11 +10990,25 @@ export class EditorWidget {
             "applyHeaderVisibilityBulk", () => this._applyHeaderVisibilityBulkWithinGesture(...args));
     }
 
-    async _applyHeaderVisibilityBulkWithinGesture(entries, nextHidden) {
+    async _applyHeaderVisibilityBulkWithinGesture(entries, nextHidden,
+        { undoEntry = null } = {}) {
         const targets = (entries || []).filter(
             (entry) => entry && !this._isLaneVisibilityControlDisabled(entry)
         );
         if (!targets.length) return;
+        // The coalescing key names the LANES this gesture touches, not just the
+        // scene. Two clicks on one lane's hide control are one edit and should
+        // cost one write; two clicks on DIFFERENT lanes are two edits, and
+        // merging them would collapse two undo entries into one whose
+        // before-state was captured after the first click already painted. The
+        // survivor's reverse delta would then cover only the last lane, and
+        // because `video_lane_family` is an atomic bundle in
+        // `server/scene_history_merge.py`, the stranded lane does not merely
+        // fail to reverse -- it makes the next entry's restore conflict.
+        const laneKey = targets
+            .map((target) => `${this._laneTypeForEntry(target) || target.type}:${target.laneIndex || 0}`)
+            .sort()
+            .join(",");
         const visibilitySeq = (this._headerVisibilitySeq || 0) + 1;
         this._headerVisibilitySeq = visibilitySeq;
         const laneConfigTargets = [];
@@ -10982,7 +11039,7 @@ export class EditorWidget {
 
         const mutePlan = this._buildLinkedMuteOperations(unmuteSeeds, false);
         if (mutePlan.locked) {
-            this._discardLastUndo("toggle track visibility");
+            this._discardUndoEntry(undoEntry);
             notifyWarning("Linked unmute refused because one or more linked items are locked.", { source: "timeline-mute-refused" });
             return;
         }
@@ -11018,7 +11075,7 @@ export class EditorWidget {
         }
         operations.push(...mutePlan.operations);
         if (!operations.length) {
-            this._discardLastUndo("toggle track visibility");
+            this._discardUndoEntry(undoEntry);
             return;
         }
 
@@ -11026,10 +11083,65 @@ export class EditorWidget {
         this._clearPlaybackWarmOverlay("lane-visibility-change", { render: false });
         try {
             await this._runSceneMutation(operations, {
-                key: `scene:${this.activeSceneId}:header-visibility`,
+                key: `scene:${this.activeSceneId}:header-visibility:${laneKey}`,
                 label: "toggle track visibility",
-                coalesce: false,
+                // Its own stable key, plus the SHARED merge. Sharing
+                // `scene:<id>:lane-config` instead would merge a visibility
+                // toggle with an unrelated rename, and the mute operations
+                // riding along are not lane configs at all -- two payload
+                // shapes under one key is exactly the merge nobody can state.
+                //
+                // What the merge has to do beyond keeping the last click:
+                // `_buildLinkedMuteOperations` contributes
+                // `update_reference_item` with `expected: { muted }`, a
+                // BEFORE-value claim read at build time, so under wholesale
+                // replacement the survivor's guard would describe the state
+                // after an earlier click's optimistic apply. The shared merge
+                // keeps the oldest `expected` with the newest `fields`.
+                coalesce: true,
+                merge: coalesceSceneMutationIntents,
+                // The exact entry, so the queue stamps this gesture's own
+                // post-state rather than claiming
+                // `_historyPostSnapshotCaptureCandidate`, which expires at a
+                // microtask boundary.
+                historyEntry: undoEntry,
+                // Deliberately NO `onSupersededByCoalescing`, and the reason is
+                // narrower than "the refetch is enough".
+                //
+                // The hook exists so a gesture holding a SNAPSHOT does not
+                // restore a superseded sibling's optimistic state. This gesture
+                // holds none: its `catch` refetches, which adopts whatever the
+                // server holds regardless of which member of the group runs it.
+                // `durable_rules.md` raises the obvious objection -- a refetch
+                // heals nothing when the failure was a dead network -- and that
+                // is accepted here rather than argued away: the optimistic
+                // writes are lane `hidden` flags and `item.data.muted`, which a
+                // later successful refresh corrects, and which no amount of
+                // local rollback could make durable anyway.
+                //
+                // What this does NOT rest on is the `visibilitySeq` gate below.
+                // That gate is about rendering, not recovery, and it is not a
+                // reliable "exactly one": `_headerVisibilitySeq` is bumped
+                // before this gesture's own early returns, so a later refused
+                // click can leave an in-flight failure with a stale sequence
+                // and no refetch at all. `_queueProjectMutation`'s generic
+                // handler also defers an ungated scenes refresh per waiter, so
+                // the gated `_fetchScenes` was never the burst's only one.
+                //
+                // The hook becomes required the moment this gains a snapshot
+                // rollback, because the gate selects the NEWEST gesture while
+                // the rule requires the oldest -- only the head captured its
+                // `previous` before any of the group's local applies.
                 reconcileFromResult: (result) => {
+                    // `visibilitySeq` is a SNAPSHOT and must stay one. Every
+                    // collapsed gesture's waiter is resolved from the survivor's
+                    // single result and each runs its own reconciler, so the
+                    // snapshot is what makes a superseded one bail here.
+                    // Reading `this._headerVisibilitySeq` at call time instead
+                    // would make all of them adopt the scene and schedule a
+                    // refresh. Note what it does NOT save: the repaints at the
+                    // end of this method run per gesture either way, outside
+                    // this gate.
                     if (visibilitySeq !== this._headerVisibilitySeq) return true;
                     return this._reconcileActiveSceneFromMutation(result, { reason: "toggle track visibility" });
                 },
@@ -12919,7 +13031,20 @@ export class EditorWidget {
                 [...identityCreateIntents, { type: "update_scene_fields", fields,
                     expected_prompt_template: template }],
                 { key: `scene:${sceneId}:global_prompt_context`, sceneId,
-                    label: "global prompt context", coalesce: false,
+                    label: "global prompt context",
+                    // Not coalesced, and umbrella Phase C stage 1 L3 checked
+                    // rather than assumed: every live caller reaches this
+                    // through `savePromptDraft`, which already single-flights
+                    // per draft key and re-saves the freshest draft afterwards.
+                    // A typing burst is therefore already one write in flight
+                    // plus one carrying the merged latest value -- what queue
+                    // coalescing would produce -- and the draft layer also owns
+                    // the baseline reconciliation the queue cannot do. Merging
+                    // here would buy nothing and would leave two head-ness
+                    // mechanisms in play, since the revision token below picks
+                    // the NEWEST author where a coalesced group needs the
+                    // oldest.
+                    coalesce: false,
                     failureMessage: "Global prompt save failed. The Prompt tool keeps your draft." });
             if (this._promptEditRevisions.get(key) === revision && result?.payload?.scene) {
                 for (const field of Object.keys(next)) sceneRef[field] = structuredClone(result.payload.scene[field]);
@@ -15424,6 +15549,17 @@ export class EditorWidget {
         }
 
         const nextMuted = !targets.every((item) => !!item.data?.muted);
+        // The key names the SELECTION, for the same reason the lane-header key
+        // names its lanes: two toggles over the same selection are one edit and
+        // should cost one write, while two toggles over different selections are
+        // two edits and must keep two undo entries. Merging those would leave
+        // the first selection changed with no entry that reverses it, because
+        // `willCoalesce` discards the older entry and the survivor's
+        // before-state was captured after the first toggle already painted.
+        const selectionKey = targets
+            .map((item) => `${item.type}:${item.id}`)
+            .sort()
+            .join(",");
         this._pushUndo(nextMuted ? "mute items" : "unmute items");
         const operations = [];
         const emittedLinkedGroups = new Set();
@@ -15473,11 +15609,34 @@ export class EditorWidget {
                 });
             }
         }
-        await this._runSceneMutation(operations, {
-            key: `scene:${this.activeSceneId}:selected-mute`,
-            label: nextMuted ? "mute items" : "unmute items",
-            coalesce: false,
-        });
+        try {
+            await this._runSceneMutation(operations, {
+                key: `scene:${this.activeSceneId}:selected-mute:${selectionKey}`,
+                label: nextMuted ? "mute items" : "unmute items",
+                // The Reference branch's `expected: { muted: !nextMuted }` is a
+                // before-value claim computed from state the previous toggle
+                // already wrote locally, so a replaced intent would send a guard
+                // describing what the server has not reached. The shared merge
+                // keeps the OLDEST guard with the newest value, which for a pair
+                // of toggles correctly nets to no change.
+                coalesce: true,
+                merge: coalesceSceneMutationIntents,
+                // No `onSupersededByCoalescing`: this gesture keeps no snapshot
+                // to restore, so there is no sibling's optimistic state it could
+                // restore by mistake. Its only local write is `item.data.muted`,
+                // which `_queueProjectMutation`'s deferred scenes refresh
+                // overwrites on failure. Add the hook the moment this gesture
+                // starts capturing a `previous`.
+            });
+        } catch {
+            // Swallowed on purpose. `_queueProjectMutation` already toasts
+            // (source-coalesced, so a burst is one toast) and defers the scenes
+            // refresh that corrects the optimistic mute. Before coalescing this
+            // method had no `catch` at all and a rejection escaped to the `void`
+            // call sites as an unhandled rejection; with a collapsed group every
+            // waiter rejects, so that would now be one unhandled rejection per
+            // click rather than one per gesture.
+        }
         this._reconcileSelection();
         if (this._itemEditorEl && this.selectedItem) {
             this._showItemEditor();
