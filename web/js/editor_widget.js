@@ -392,6 +392,7 @@ import {
     trackTypeForClip,
     variableLaneTypeFor,
 } from "./lane_registry.js";
+import { deriveRetryOnConflict } from "./scene_mutation_addressing.js";
 import { createViewportSurface } from "./viewport_surface.js";
 import {
     EDITOR_COLORS as COLORS,
@@ -4122,7 +4123,12 @@ export class EditorWidget {
         failureDetail = null,
         failureTier = "error",
         onSupersededByCoalescing = null,
-        retryOnConflict = true,
+        // No `retryOnConflict` here on purpose. This method has never used one —
+        // it was destructured and dropped — and an unused option that LOOKS like
+        // a policy is the "acquire it by omission" shape `durable_rules.md`
+        // forbids, sitting in the sibling of the method that just removed it.
+        // Each `run` owns its own request, and the two that post scene mutations
+        // derive the policy from the operations they are about to send.
         invalidateQueueFetch = false,
         historyEntry = null,
         diagnostics = null,
@@ -4362,7 +4368,16 @@ export class EditorWidget {
         failureDetail = null,
         failureTier = "error",
         onSupersededByCoalescing = null,
-        retryOnConflict = true,
+        // Only `false` is honoured. The policy is DERIVED from the addressing in
+        // the operations themselves (`scene_mutation_addressing.js`), because
+        // `durable_rules.md` forbids letting it be passed in beside the
+        // addressing it is supposed to follow — "or a caller acquires retry by
+        // omission", which is exactly what the previous `= true` default did. A
+        // caller may still decline a retry the derivation would grant, for a
+        // reason of its own that the addressing cannot see; it can never claim
+        // one. `test_scene_mutation_retry_policy.py` fails the suite if any
+        // scene-path call site passes `true`.
+        retryOnConflict = null,
         expectedModifiedAt = "",
         historyEntry = null,
         diagnostics = null,
@@ -4401,6 +4416,20 @@ export class EditorWidget {
             stampHistory,
             historyFailureOwnedByCaller,
             run: async (queuedIntent, diagnostics) => {
+                // Derived HERE, not at enqueue: coalescing replaces the pending
+                // entry's intent, and a `merge` may combine operations from
+                // several gestures, so the operations actually sent are only
+                // knowable once the queue hands them back. Deriving at the call
+                // site would describe the newest gesture's payload while the
+                // body carried the merged one.
+                // An explicit `If-Match` is a whole-state precondition captured at
+                // one version, and a retry re-sends the request unchanged — so it
+                // would re-send a header that the conflict has just proved stale
+                // and 409 again, deterministically. No caller passes one today;
+                // this is here so that one appearing cannot acquire a retry that
+                // cannot work.
+                const retry = (retryOnConflict === false || !!expectedModifiedAt)
+                    ? false : deriveRetryOnConflict(queuedIntent.operations);
                 return await this._runVersionedProjectMutation(
                     `/sonder-editor/project/${encodeURIComponent(queuedIntent.projectId)}/scenes/${encodeURIComponent(queuedIntent.sceneId)}/mutations`,
                     {
@@ -4412,7 +4441,7 @@ export class EditorWidget {
                         body: JSON.stringify({ operations: queuedIntent.operations }),
                     },
                     { projectId: queuedIntent.projectId,
-                        retryOnConflict, maxAttempts: retryOnConflict ? 2 : 1 }
+                        retryOnConflict: retry, maxAttempts: retry ? 2 : 1 }
                 );
             },
         });
@@ -10198,16 +10227,26 @@ export class EditorWidget {
             },
             run: async (orderedIntent, queuedDiagnostics) => {
                 try {
+                    // The SECOND poster to this route. It builds its own request
+                    // rather than going through `_runSceneMutation`, so it has to
+                    // derive the same policy: `_runVersionedProjectMutation`'s own
+                    // default is the blind `retryOnConflict: true` that
+                    // `durable_rules.md` forbids, and every operation a drop sends
+                    // — `set_lane_count`, `create_clip{track_index}`,
+                    // `create_audio_track{lane_index}` — is positionally
+                    // addressed, so a replay lands the drop on whatever lane that
+                    // index means in the newer document.
+                    const operations = orderedIntent?.operations || [];
+                    const retry = deriveRetryOnConflict(operations);
                     const result = await this._runVersionedProjectMutation(
                         `/sonder-editor/project/${encodeURIComponent(dropContext.projectId)}/scenes/${encodeURIComponent(dropContext.sceneId)}/mutations`,
                         this._withMutationDiagnosticHeaders({
                             method: "POST",
                             headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({
-                                operations: orderedIntent?.operations || [],
-                            }),
+                            body: JSON.stringify({ operations }),
                         }, queuedDiagnostics),
-                        { projectId: dropContext.projectId });
+                        { projectId: dropContext.projectId,
+                            retryOnConflict: retry, maxAttempts: retry ? 2 : 1 });
                     return { ok: true, payload: result?.payload };
                 } catch (error) {
                     // This handler owns drop failure presentation and rollback,
@@ -14463,6 +14502,16 @@ export class EditorWidget {
                 key: `prompt:${this.activeSceneId}:apply:${Date.now()}`,
                 label: "apply prompt setup",
                 coalesce: false,
+                // A deliberate caller override the derivation does not
+                // supersede, preserved rather than re-derived. All four op types
+                // in this batch — create_prompt_semantic_unit,
+                // import_prompt_context_dependencies, replace_prompt_sections and
+                // update_scene_fields — qualify in
+                // `scene_mutation_addressing.js`, so the addressing alone would
+                // grant a retry. The reason this caller declines one is the
+                // lifecycle below, not the addressing: Apply owns a pending
+                // outcome reconciliation, and a second physical attempt is one
+                // more outcome for it to resolve.
                 retryOnConflict: false,
                 // Identity Apply owns a pending outcome-reconciliation
                 // lifecycle. A rejected transport is not terminal until that
@@ -14779,6 +14828,17 @@ export class EditorWidget {
                 coalesce: false,
                 // Exact identity snapshots are a compare-and-swap batch. Never
                 // replay the stale attachment edit onto freshly fetched state.
+                //
+                // A deliberate caller override, not a restatement of the
+                // derivation: every member carries the full `_PROMPT_KEYS`
+                // snapshot including `prompt_id`, which
+                // `_validate_prompt_identity` compares, so
+                // `scene_mutation_addressing.js` derives `true` here and a
+                // replay would be refused rather than misapplied. This caller
+                // declines it anyway — `fields.attachments` is computed FROM the
+                // same array it snapshots, and one propagated group edit landing
+                // a whole network round-trip later is worth less than the user
+                // seeing the refusal and re-authoring against what is there.
                 retryOnConflict: false,
             });
             this._adoptPromptIdentitiesFromMutation(result);

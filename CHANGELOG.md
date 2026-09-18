@@ -16,6 +16,7 @@ a fresh `[Unreleased]` block.
 - Project route reads and saves run off the event loop, including the first automatic component migration.
 - Project reads and saves now use their own worker threads, so a long automatic migration no longer delays thumbnails, media probes or uploads waiting behind it.
 - Eligible Undo and Redo actions update the timeline after the history token arrives, before the restore finishes; failed predictions reconcile safely.
+- When a save collides with another editor or a running render, the editor now retries only the edits it can safely repeat — those that name what they change by an identity the server checks. An edit that names a lane, a section or a position by its place in the list is refused and the timeline restored, instead of being replayed onto a document it was never written against, where it could land on the wrong lane.
 
 ### Removed
 - The standalone `DELETE` routes for clips, guides, prompt sections and audio tracks. These operations are owned by the scene mutations endpoint, which accepts an identity snapshot of the target that the old routes could not send, and which rewrites the link groups they left behind.

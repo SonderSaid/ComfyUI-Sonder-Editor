@@ -38,6 +38,17 @@ def _run_node(script: str):
                   + headers + script)
         for host in ("Harness", "Host"):
             script = script.replace("class " + host + " {", "class " + host + " {\n" + gesture)
+    if ("deriveRetryOnConflict(" in script
+            and "import { deriveRetryOnConflict }" not in script):
+        # Guard on the IMPORT, not the module NAME: `_runSceneMutation`
+        # mentions the file in a comment, which a name-based guard read as
+        # "already imported" and then left the harness without the binding.
+        # A harness that lifts `_runSceneMutation` or the asset-drop `run`
+        # lifts their retry derivation with them: both post scene mutations
+        # and derive the policy from the operations they are about to send.
+        addressing = (ROOT / "web/js/scene_mutation_addressing.js").as_uri()
+        script = ("import { deriveRetryOnConflict } from "
+                  + json.dumps(addressing) + ";" + chr(10)) + script
     if "projectErrorMessage(" in script:
         widget = _source("web/js/editor_widget.js")
         errors = widget[widget.index("const PROJECT_ERROR_MESSAGES"):
