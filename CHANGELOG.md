@@ -16,6 +16,7 @@ a fresh `[Unreleased]` block.
 - Project route reads and saves run off the event loop, including the first automatic component migration.
 - Project reads and saves now use their own worker threads, so a long automatic migration no longer delays thumbnails, media probes or uploads waiting behind it.
 - Eligible Undo and Redo actions update the timeline after the history token arrives, before the restore finishes; failed predictions reconcile safely.
+- Setting a scene's resolution, duration or lane options to the values they already have no longer saves the project. Previously every such edit rewrote the file and moved the project's version, which made other open editors refresh and could make a save in another tab fail and retry for no reason.
 - When a save collides with another editor or a running render, the editor now retries only the edits it can safely repeat — those that name what they change by an identity the server checks. An edit that names a lane, a section or a position by its place in the list is refused and the timeline restored, instead of being replayed onto a document it was never written against, where it could land on the wrong lane.
 
 ### Removed

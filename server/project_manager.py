@@ -217,6 +217,61 @@ def create_project(
     return (project, True) if return_created else project
 
 
+def _require_stored_version(project, project_file: str, expected_modified_at: str):
+    """The compare half of a compare-and-swap. Caller holds the write lock.
+
+    Extracted so that a caller which decides not to write can still state the
+    precondition it was going to write under. Duplicating it would be worse than
+    extracting it: two copies of a conflict check that drift is how a guard ends
+    up reporting a version it did not compare.
+    """
+    if os.path.isfile(project_file):
+        current_data = _read_project_json(project_file, version_source=project)
+        actual_modified_at = str(current_data.get("modified_at", "") or "")
+    else:
+        current_data = None
+        actual_modified_at = ""
+    if actual_modified_at != expected_modified_at:
+        # A cached equal-byte read contains only the version; the conflict's
+        # healing projection still needs its complete source.
+        if os.path.isfile(project_file):
+            current_data = _read_project_json(project_file)
+        raise ProjectVersionConflict(
+            project_dir=project.project_dir,
+            expected_modified_at=expected_modified_at,
+            actual_modified_at=actual_modified_at,
+            current_data=project_conflict_projection(current_data),
+        )
+    return current_data
+
+
+def verify_project_version(project: TimelineProject,
+                           *, expected_modified_at: str | None = None) -> None:
+    """Assert the document still holds the version this request was gated on.
+
+    A route that decides not to write still owes its caller the precondition it
+    would have written under. `save_project` re-checks the stored version inside
+    the write lock, and that check -- not the one at load time -- is the only
+    compare-and-swap `_apply_scene_mutations_sync` has: the lock is released
+    between the load and the commit, so a concurrent writer lands in that window
+    routinely. Skipping the save to avoid a wasted write must not also skip the
+    check, or a detected conflict silently becomes a 200 carrying a scene the
+    document never held, which the client adopts with no version gate of its own.
+
+    Raises `ProjectVersionConflict` exactly as the save would, so the caller's
+    409 path and the client's heal-and-retry are unchanged. With no expected
+    version there is no precondition to keep and this is a no-op, which is the
+    same unguarded write the caller was going to make.
+    """
+    if expected_modified_at is None:
+        expected_modified_at = getattr(project, "_expected_modified_at", None) or None
+    if not expected_modified_at:
+        return
+    project_file = os.path.join(project.project_dir, "project.json")
+    with _project_write_lock(project.project_dir):
+        _require_stored_version(project, project_file, expected_modified_at)
+
+
 def save_project(
     project: TimelineProject,
     *,
@@ -241,22 +296,8 @@ def save_project(
                 actual_modified_at=str(current_data.get("modified_at", "") or ""),
                 current_data=project_conflict_projection(current_data))
         if expected_modified_at:
-            if os.path.isfile(project_file):
-                current_data = _read_project_json(project_file, version_source=project)
-                actual_modified_at = str(current_data.get("modified_at", "") or "")
-            else:
-                actual_modified_at = ""
-            if actual_modified_at != expected_modified_at:
-                # A cached equal-byte read contains only the version; the
-                # conflict's healing projection still needs its complete source.
-                if os.path.isfile(project_file):
-                    current_data = _read_project_json(project_file)
-                raise ProjectVersionConflict(
-                    project_dir=project.project_dir,
-                    expected_modified_at=expected_modified_at,
-                    actual_modified_at=actual_modified_at,
-                    current_data=project_conflict_projection(current_data),
-                )
+            current_data = _require_stored_version(
+                project, project_file, expected_modified_at)
 
         if bump_modified_at:
             project.modified_at = datetime.now().isoformat()

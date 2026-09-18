@@ -82,6 +82,7 @@ from .project_manager import (
     load_project,
     project_conflict_projection,
     save_project,
+    verify_project_version,
     list_projects,
     register_project_saved_hook,
 )
@@ -4844,6 +4845,37 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
     _mutation_error(f"Unsupported mutation operation: {op_type}", 400, "unsupported_project_mutation")
 
 
+# Operations whose handler provably writes nothing outside `scene`, so
+# comparing the scene before and after is an exact answer to "did this batch
+# change anything". Absence from this set means "assume changed", which is the
+# safe direction and leaves every other branch exactly as it was.
+#
+# Both were traced, not assumed. `_apply_scene_fields` takes `project` but reads
+# it only — `effective_scene_fps` and `_require_scene_queue_idle` — and writes
+# only scene attributes. `_apply_lane_config` takes no project at all.
+# `test_a_scene_only_operation_leaves_the_rest_of_the_project_alone` proves it at
+# runtime rather than trusting this comment, because an AST check cannot: the
+# handler legitimately receives `project`.
+#
+# Deliberately NOT here: `split_clip` / `split_audio_track`, whose no-op case and
+# `changed` reporting belong to `split-optimistic-local-apply.md` L1; and
+# `update_clip` / `update_audio_track`, handed to the guard-retrofit successor.
+# Expiry: this set is an allow-list, so it needs no expiry — but every addition
+# owes the same runtime proof.
+_SCENE_ONLY_MUTATIONS = frozenset({
+    "update_scene_fields",
+    "update_lane_config",
+})
+
+
+def _batch_changes_only_the_scene(operations: list) -> bool:
+    """Whether a before/after scene comparison can answer for the whole batch."""
+    return all(
+        isinstance(operation, dict)
+        and str(operation.get("type") or "") in _SCENE_ONLY_MUTATIONS
+        for operation in operations)
+
+
 def _apply_scene_mutations_sync(request: web.Request, scene_id: str, operations: list) -> tuple[TimelineProject, dict]:
     project = _load_project_from_request(request)
     scene = project.get_scene(scene_id)
@@ -4865,17 +4897,53 @@ def _apply_scene_mutations_sync(request: web.Request, scene_id: str, operations:
             _validate_prompt_identity(
                 _find_prompt_section(scene, index), operation.get("expected"))
 
+    # A write that changes nothing is not free: `save_project` bumps
+    # `modified_at`, so a second writer holding the version it legitimately read
+    # then fails its own precondition and has to heal and retry against a
+    # document that never changed. It also fans out a `project_updated`
+    # broadcast. The bump is the cost, not the wasted bytes.
+    #
+    # `Scene.to_dict()` is exactly what `TimelineProject.to_dict` persists for
+    # this scene — `"scenes": [s.to_dict() for s in self.scenes]`, with no
+    # `include_internal` variant — and it is a deterministic projection of
+    # concrete fields. So for a batch that touches nothing else, comparing it
+    # before and after answers "would the saved document differ" exactly, rather
+    # than by a per-field claim some later edit to a handler could silently
+    # invalidate. That matters more than the cost: the response returns this
+    # in-memory scene, so a wrong "unchanged" would hand the client a canonical
+    # scene the disk never received.
+    scene_before = (scene.to_dict()
+                    if _batch_changes_only_the_scene(operations) else None)
+
     results = [
         _apply_scene_mutation_operation(project, scene, operation)
         for operation in operations
     ]
     _validate_single_driver_per_lane(scene)
 
-    save_project(project)
+    committed = scene_before is None or scene.to_dict() != scene_before
+    if committed:
+        save_project(project)
+    else:
+        # Not writing is not the same as having nothing to check. `save_project`
+        # re-compares the stored version inside the write lock, and that is the
+        # ONLY compare-and-swap this route has -- `_load_project_from_request`
+        # releases the lock before the handler body runs, so a second tab, the
+        # prompt worker or the generated-take merge lands in that window
+        # routinely. Dropping the write without keeping the check turned a
+        # detected 409 into a 200 carrying a scene the document never held,
+        # which `_reconcileActiveSceneFromMutation` adopts with no version gate
+        # and which also clears any deferred refresh that would have healed it.
+        # Probed end to end before this line existed.
+        verify_project_version(project)
     payload = {
         "status": "ok",
         "scene_id": scene_id,
         "operation_count": len(operations),
+        # "was this written", not "did anything change": a batch holding any
+        # operation outside `_SCENE_ONLY_MUTATIONS` is assumed to have changed
+        # something and commits, so it reports true whether or not it did.
+        "committed": committed,
         "results": results,
         "scene": scene.to_dict(),
     }
