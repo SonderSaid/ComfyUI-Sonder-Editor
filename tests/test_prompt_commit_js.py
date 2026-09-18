@@ -82,7 +82,12 @@ def test_creator_bar_creates_on_focus_loss_but_never_twice():
 
 def test_global_bar_registers_the_same_flush_hook():
     widget = _source("web/js/editor_widget.js")
-    global_bar = _method(widget, "_showGlobalPromptEditor", "_updateScenePrompt")
+    # Delimiter only: `_updateScenePrompt` was deleted as dead code, so the
+    # slice now ends at the method that really follows the global bar. It is
+    # tighter than before — the old anchor reached past six later method
+    # declarations (264 lines, 7 methods) where this one is the global bar
+    # alone (112 lines, 1 method). Every assertion below still holds.
+    global_bar = _method(widget, "_showGlobalPromptEditor", "_updateSceneGlobalContext")
 
     assert "this._promptEditorCommit = commit;" in global_bar
     assert "this._hidePromptEditor({ commit: false });" in global_bar
@@ -105,7 +110,7 @@ def test_discarding_close_paths_do_not_write_stale_edits():
 def test_timeline_acknowledgements_enrol_live_edits_before_repainting():
     widget = _source("web/js/editor_widget.js")
     section = _method(widget, "_showPromptEditor", "_showGlobalPromptEditor")
-    global_bar = _method(widget, "_showGlobalPromptEditor", "_updateScenePrompt")
+    global_bar = _method(widget, "_showGlobalPromptEditor", "_updateSceneGlobalContext")
 
     for editor, docs_key, attachments_key in (
         (section, "channel_docs", "attachments"),

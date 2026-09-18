@@ -375,6 +375,7 @@ import {
     VARIABLE_TRACK_TYPES,
     buildTrackLayout,
     descriptorFor,
+    descriptorForLaneType,
     isHeaderControllable,
     isMotionDriverClip,
     isRenderClip,
@@ -1932,6 +1933,7 @@ export class EditorWidget {
         const sceneId = this.activeSceneId;
         const prevWidth = sceneRef.width || 0;
         const prevHeight = sceneRef.height || 0;
+        let superseded = false;
         sceneRef.width = w;
         sceneRef.height = h;
         if (this.activeScene === sceneRef && this.activeSceneId === sceneId) {
@@ -1949,16 +1951,27 @@ export class EditorWidget {
                     label: "scene resolution",
                     coalesce: true,
                     refreshScenes: false,
+                    // Only the head of a coalesced group may roll back. The queue
+                    // replaces the older intent outright and settles every collapsed
+                    // waiter from the survivor's single result, so on failure each
+                    // gesture's `catch` runs. The head captured `previous` before any
+                    // of the group's local applies, so it alone holds the state the
+                    // server still has; a superseded sibling would restore an earlier
+                    // sibling's optimistic result -- a state the server never held,
+                    // and one nothing refetches under `refreshScenes: false`.
+                    onSupersededByCoalescing: () => { superseded = true; },
                 }
             );
         } catch (e) {
-            sceneRef.width = prevWidth;
-            sceneRef.height = prevHeight;
-            if (this.activeScene === sceneRef && this.activeSceneId === sceneId) {
-                this._syncSceneResolutionControls({ detectSelections });
-                this._updateViewportHeader();
-                this._resizeViewportCanvas();
-                this._renderViewportFrame();
+            if (!superseded) {
+                sceneRef.width = prevWidth;
+                sceneRef.height = prevHeight;
+                if (this.activeScene === sceneRef && this.activeSceneId === sceneId) {
+                    this._syncSceneResolutionControls({ detectSelections });
+                    this._updateViewportHeader();
+                    this._resizeViewportCanvas();
+                    this._renderViewportFrame();
+                }
             }
             console.warn("[Sonder] Failed to update scene resolution:", e);
         }
@@ -2098,6 +2111,7 @@ export class EditorWidget {
         const sceneRef = this.activeScene;
         const sceneId = this.activeSceneId;
         const prevDuration = sceneRef.duration_frames || this.totalFrames;
+        let superseded = false;
         sceneRef.duration_frames = frames;
         if (this.activeScene === sceneRef && this.activeSceneId === sceneId) {
             this.totalFrames = frames;
@@ -2116,18 +2130,29 @@ export class EditorWidget {
                     label: "scene duration",
                     coalesce: true,
                     refreshScenes: false,
+                    // Only the head of a coalesced group may roll back. The queue
+                    // replaces the older intent outright and settles every collapsed
+                    // waiter from the survivor's single result, so on failure each
+                    // gesture's `catch` runs. The head captured `previous` before any
+                    // of the group's local applies, so it alone holds the state the
+                    // server still has; a superseded sibling would restore an earlier
+                    // sibling's optimistic result -- a state the server never held,
+                    // and one nothing refetches under `refreshScenes: false`.
+                    onSupersededByCoalescing: () => { superseded = true; },
                 }
             );
         } catch (e) {
-            sceneRef.duration_frames = prevDuration;
-            if (this.activeScene === sceneRef && this.activeSceneId === sceneId) {
-                this.totalFrames = prevDuration;
-                this._clampTimelineStateToDuration();
-                this._refreshDurationInput();
-                this._renderTimeline();
-                this._renderViewportFrame();
-                this._updateToolbar();
-                this._updateTransportUI();
+            if (!superseded) {
+                sceneRef.duration_frames = prevDuration;
+                if (this.activeScene === sceneRef && this.activeSceneId === sceneId) {
+                    this.totalFrames = prevDuration;
+                    this._clampTimelineStateToDuration();
+                    this._refreshDurationInput();
+                    this._renderTimeline();
+                    this._renderViewportFrame();
+                    this._updateToolbar();
+                    this._updateTransportUI();
+                }
             }
             console.warn("[Sonder] Failed to update scene duration:", e);
         }
@@ -3877,6 +3902,10 @@ export class EditorWidget {
             }
         };
 
+        // `remove_lane` guards on the lane count it expects to see, and several
+        // removals of one family ride in one batch, so the rebase has to know
+        // how many of them precede each operation.
+        const rebasedLaneRemovals = new Map();
         for (const operation of rebased.operations) {
             if (!operation || typeof operation !== "object") continue;
             switch (operation.type) {
@@ -3923,6 +3952,15 @@ export class EditorWidget {
                     operation.fields.lane_index = rebaseLaneIndex(
                         "reference", operation.fields.lane_index);
                 }
+                // `expected.next_start_frame` and the `end_frame` derived from
+                // it are deliberately NOT restated, unlike `remove_lane`'s count
+                // floor. They are a claim about the lane the author drew
+                // against, not an address history moved: if an Undo added or
+                // removed an item on the target lane, the extent the author drew
+                // no longer describes it, and refusing is the right answer. Same
+                // decision DELIBERATE_NO_PROJECTION records for the splits —
+                // re-snapshotting would make the guard compare the rebase's own
+                // answer against itself.
                 break;
             case "split_reference_item":
                 // Deliberately NOT projected forward, unlike its update/delete
@@ -4012,23 +4050,55 @@ export class EditorWidget {
                         operation.lane_type, operation.lane_index);
                 }
                 break;
-            case "remove_lane":
-                if (laneSpecs[operation.lane_type]) {
+            case "remove_lane": {
+                const laneType = String(operation.lane_type || "");
+                const priorRemovals = rebasedLaneRemovals.get(laneType) || 0;
+                rebasedLaneRemovals.set(laneType, priorRemovals + 1);
+                if (laneSpecs[laneType]) {
                     operation.lane_index = rebaseLaneIndex(
-                        operation.lane_type, operation.lane_index);
+                        laneType, operation.lane_index);
                     if (operation.item_policy === "move_items") {
                         operation.target_lane = rebaseLaneIndex(
-                            operation.lane_type, operation.target_lane);
+                            laneType, operation.target_lane);
+                    }
+                    // The count floor was authored against the pre-history
+                    // count. Left as authored it would refuse every rebased
+                    // removal, turning a retarget that just succeeded into a 409.
+                    //
+                    // `config` and `lane_id` are deliberately NOT restated. They
+                    // are the authored evidence of which lane was meant, and
+                    // `findLaneByAnchor` resolved the new index BY that config —
+                    // so re-snapshotting them would make the guard compare the
+                    // rebase's own answer against itself and it could never fire.
+                    // That is the same reason `move_lane` keeps its authored
+                    // lane ids through a rebase.
+                    if (operation.expected
+                            && Number.isInteger(operation.expected.lane_count)) {
+                        operation.expected.lane_count =
+                            laneCount(orderedScene, laneType) - priorRemovals;
                     }
                 }
                 break;
+            }
             case "consolidate_items":
                 if (laneSpecs[operation.lane_type]) {
                     operation.target_lane = rebaseLaneIndex(
                         operation.lane_type, operation.target_lane);
                 }
                 break;
+            // All three carry `items` built by `_mutationItemFromSelection`,
+            // which addresses a prompt by its LIST INDEX and a guide by its
+            // FRAME INDEX -- and `_item_ref_from_selection` on the server
+            // resolves both positionally. A queued Undo that reorders prompt
+            // sections or moves a guide therefore changes what an unrebased
+            // ref names, so the link pair needs exactly the retarget the bulk
+            // delete already does. Clip and audio members are durable ids and
+            // pass through; `rebaseBulkItem` leaves an unresolvable ref alone
+            // rather than throwing, so this can only improve on the
+            // pass-through it replaces.
             case "bulk_delete_items":
+            case "create_link_group":
+            case "unlink_items":
                 for (const item of operation.items || []) rebaseBulkItem(item);
                 break;
             default:
@@ -4051,6 +4121,7 @@ export class EditorWidget {
         failureMessage = null,
         failureDetail = null,
         failureTier = "error",
+        onSupersededByCoalescing = null,
         retryOnConflict = true,
         invalidateQueueFetch = false,
         historyEntry = null,
@@ -4082,6 +4153,16 @@ export class EditorWidget {
             const supersededEntry = this._pendingHistoryEntryByMutationKey.get(key);
             if (supersededEntry) this._discardUndoEntry(supersededEntry);
             this._pendingHistoryEntryByMutationKey.delete(key);
+            // This enqueue is joining a pending entry, so it is NOT the head of
+            // its coalesced group. A gesture that keeps a local rollback needs to
+            // know that: the queue settles every collapsed waiter from the
+            // survivor's single result, so on failure every one's `catch` runs and
+            // each would restore its own captured `previous`. Only the head's is
+            // the state the server still holds; a later sibling's is an earlier
+            // sibling's optimistic result. Derived from the same `willCoalesce` as
+            // the undo discard above, so the two cannot disagree about which entry
+            // was superseded.
+            onSupersededByCoalescing?.();
         }
         if (capturedHistoryEntry) {
             this._pendingHistoryEntryByMutationKey.set(key, capturedHistoryEntry);
@@ -4280,6 +4361,7 @@ export class EditorWidget {
         failureMessage = null,
         failureDetail = null,
         failureTier = "error",
+        onSupersededByCoalescing = null,
         retryOnConflict = true,
         expectedModifiedAt = "",
         historyEntry = null,
@@ -4311,6 +4393,7 @@ export class EditorWidget {
             failureMessage,
             failureDetail,
             failureTier,
+            onSupersededByCoalescing,
             historyEntry,
             diagnostics,
             ownerToken,
@@ -4718,6 +4801,62 @@ export class EditorWidget {
         return true;
     }
 
+    /**
+     * The `expected` a `remove_lane` operation must carry.
+     *
+     * A lane index is positional and this operation deletes, so a stale index
+     * destroys the wrong lane and everything on it. Two pieces of evidence,
+     * because the first version of this guard shipped with only the weaker one
+     * and an audit disproved it with a working counterexample:
+     *
+     *   - `config`, the lane's normalized settings. This is the identity
+     *     `durable_rules.md` already names for families with no durable id, and
+     *     `findLaneByAnchor` below already resolves by it during a rebase. It is
+     *     what catches a permutation that leaves the lane COUNT unchanged — a
+     *     remove plus an add restores the count while shifting every index above
+     *     the removal.
+     *   - `lane_count`, compared server-side as a FLOOR rather than for
+     *     equality. `set_lane_count` appends and `remove_lane` deletes in place,
+     *     so a family that only grew cannot have moved this caller's lane;
+     *     demanding equality would refuse a concurrent append in which nothing
+     *     moved at all.
+     *   - `lane_id` for `reference`, the only movable family, which settles the
+     *     case identical configs cannot. A blank id is the bootstrap case
+     *     `_apply_lane_config` tolerates, and `move_lane` refuses to swap a
+     *     blank-id lane, so such a lane cannot be reordered behind this caller.
+     *
+     * `priorRemovals` is how many lanes of this family an EARLIER operation in
+     * the same batch already removes. `_deleteSelectedLanesAndItemsWithinGesture`
+     * sends several removals in descending index order, and each one runs
+     * against one fewer lane than the last, so the guard states the floor that
+     * operation expects when it runs rather than when it was authored.
+     */
+    _laneRemovalGuard(laneType, laneIndex, priorRemovals = 0) {
+        // Keyed by LANE type, not track type. The two coincide for every
+        // variable family but not for `guides`/`guide`, and a miss here would
+        // degrade silently to `{ lane_count: 1 }` rather than raising.
+        const descriptor = descriptorForLaneType(laneType);
+        const scene = this.activeScene;
+        const count = Math.max(
+            1, parseInt(scene?.[descriptor?.countField], 10) || 1) - priorRemovals;
+        const configs = descriptor?.configsField ? scene?.[descriptor.configsField] : null;
+        const config = Array.isArray(configs) ? configs[laneIndex] : null;
+        const guard = {
+            lane_count: count,
+            config: {
+                name: String(config?.name || ""),
+                color: String(config?.color || ""),
+                locked: config?.locked === true,
+                hidden: config?.hidden === true,
+            },
+        };
+        const recipes = descriptor?.recipeAttr ? scene?.[descriptor.recipeAttr] : null;
+        const laneId = Array.isArray(recipes)
+            ? String(recipes[laneIndex]?.lane_id || "") : "";
+        if (laneId) guard.lane_id = laneId;
+        return guard;
+    }
+
     _applyLocalRemoveLane(laneType, laneIndex, itemPolicy = "require_empty", targetLane = null) {
         const descriptor = descriptorFor(laneType);
         if (!this.activeScene || !descriptor?.laneRemovable) return false;
@@ -4798,6 +4937,76 @@ export class EditorWidget {
         this._remapSelectedItem("guide", oldFrame, newFrame, moved);
         this._pruneLocalLinkedGroups();
         return moved;
+    }
+
+    /**
+     * The `expected` a `create_guide` operation must carry.
+     *
+     * `create_guide` replaces: the server drops every guide already at the frame
+     * and rewrites its link groups, and `_applyLocalCreateGuide` below mirrors
+     * that. Replacement is therefore deliberate and the author can see it — what
+     * they cannot see is a guide another tab placed, or one a queued Undo
+     * restored, inside the write window. So the guard names what this client
+     * believes it is replacing rather than asserting the frame is empty: an
+     * empty string is the positive claim that nothing was there.
+     *
+     * Read this BEFORE the local apply, which removes the occupant.
+     *
+     * `ignoreGuideId` is for `move_guide`: the guide being moved legitimately
+     * occupies the destination when a drag ends on the frame it started from,
+     * and naming itself as the thing it replaces would be nonsense.
+     */
+    _guideReplacementGuard(frameIndex, ignoreGuideId = "") {
+        const frame = parseInt(frameIndex, 10);
+        const ignore = String(ignoreGuideId || "");
+        const occupant = (this.activeScene?.guide_frames || []).find(
+            (guide) => Number(guide?.frame_index) === frame
+                && String(guide?.guide_id || "") !== ignore);
+        return { replaces_guide_id: String(occupant?.guide_id || "") };
+    }
+
+    /**
+     * The `expected` a `create_reference_item` must carry.
+     *
+     * Both emitters set the new item's `end_frame` to the start of the next item
+     * on the lane, read out of this client's own copy. If that item was deleted
+     * or moved later while the write was in flight, the new item is created
+     * SHORTER than the author drew it, with no overlap and so no refusal. An
+     * item moved EARLIER usually overlaps, which the server refuses on its own —
+     * but not always, so this guard covers that direction too. It does not
+     * cover a concurrent scene-duration shrink.
+     *
+     * `-1` means "no later item", which is also the sentinel both emitters send
+     * for an item that runs to the end of the scene.
+     */
+    _referenceCreationGuard(laneIndex, startFrame) {
+        const lane = Number(laneIndex) || 0;
+        const start = Number(startFrame) || 0;
+        const next = (this.activeScene?.reference_items || [])
+            .filter((item) => (Number(item?.lane_index) || 0) === lane
+                && (Number(item?.start_frame) || 0) > start)
+            .map((item) => Number(item?.start_frame) || 0)
+            .sort((left, right) => left - right)[0];
+        return { next_start_frame: Number.isFinite(next) ? next : -1 };
+    }
+
+    /**
+     * The `expected` a `replace_prompt_sections` must carry.
+     *
+     * The operation assigns the whole collection, so every concurrent edit in
+     * the write window is discarded silently. This names the ordered structure
+     * being replaced; the server refuses if it no longer matches. A content edit
+     * that leaves ids and bounds alone is deliberately not covered — see the
+     * server-side note for why, and where the remainder is tracked.
+     */
+    _promptSectionsReplacementGuard() {
+        return {
+            sections: (this.activeScene?.prompt_sections || []).map((section) => ({
+                prompt_id: String(section?.prompt_id || ""),
+                start_frame: Number(section?.start_frame) || 0,
+                end_frame: Number(section?.end_frame) || 0,
+            })),
+        };
     }
 
     _applyLocalCreateGuide(fields = {}) {
@@ -9784,10 +9993,11 @@ export class EditorWidget {
                 type: "update_reference_item",
                 reference_item_id: referenceItemId,
                 fields: { members },
-                expected: {
-                    members: priorMembers,
-                    reference_item_id: referenceItemId,
-                },
+                // `expected` names only what the server compares. The
+                // branch validates `fields.keys()`, so a `reference_item_id`
+                // here would be required and then ignored -- and the operation
+                // is already addressed by the top-level id above.
+                expected: { members: priorMembers },
             }], {
                 key: `scene:${this.activeSceneId}:reference-append:${referenceItemId}:${Date.now()}`,
                 label: "add reference member",
@@ -9887,16 +10097,18 @@ export class EditorWidget {
                 ...(laneId ? { expected: { lane_id: laneId } } : {}),
             });
         }
-        const nextStart = (scene.reference_items || [])
-            .filter((item) => (item.lane_index || 0) === laneIndex && (item.start_frame || 0) > startFrame)
-            .map((item) => item.start_frame || 0)
-            .sort((left, right) => left - right)[0];
+        // One scan: `end_frame` is derived from the value the guard names, so
+        // the two cannot describe different measurements. Two copies with
+        // slightly different coercions is exactly how a guard ends up asserting
+        // something the payload was not built from.
+        const referenceGuard = this._referenceCreationGuard(laneIndex, startFrame);
         operations.push({
             type: "create_reference_item",
+            expected: referenceGuard,
             fields: {
                 lane_index: laneIndex,
                 start_frame: startFrame,
-                end_frame: Number.isFinite(nextStart) ? nextStart : -1,
+                end_frame: referenceGuard.next_start_frame,
                 members: payload.members,
                 prompt_override: "",
                 strength: 1.0,
@@ -10265,15 +10477,19 @@ export class EditorWidget {
                     source: "asset",
                     strength: this._defaultGuideStrength(),
                 });
+                const guideGuard = this._guideReplacementGuard(frame);
                 this._applyLocalCreateGuide(guideFields);
                 this._renderSceneAfterLocalMutation();
                 const guideResult = await this._runSceneMutation(
-                    [{ type: "create_guide", fields: guideFields }],
+                    [{ type: "create_guide", fields: guideFields,
+                       expected: guideGuard }],
                     {
                         key: `scene:${this.activeSceneId}:drop:${dropSeq}:guide`,
                         label: "drop guide",
                         coalesce: false,
                         refreshScenes: false,
+                        failureMessage: (error) => error?.message
+                            || "Guide drop failed — timeline restored.",
                         diagnostics,
                     });
                 const guidePayload = (guideResult?.payload?.scene?.guide_frames || [])
@@ -11150,6 +11366,7 @@ export class EditorWidget {
             lane_type: laneType,
             lane_index: laneIndex,
             item_policy: "delete_items",
+            expected: this._laneRemovalGuard(laneType, laneIndex),
         };
 
         try {
@@ -11166,6 +11383,8 @@ export class EditorWidget {
                     key: `scene:${this.activeSceneId}:${laneType}-delete-lane-and-items:${laneIndex}`,
                     label: "delete lane and items",
                     coalesce: false,
+                    failureMessage: (error) => error?.message
+                        || "Lane delete failed — timeline restored.",
                 }
             );
         } catch (e) {
@@ -11226,12 +11445,22 @@ export class EditorWidget {
         if (!orderedEntries.length) return;
         if (!confirm(`Delete ${orderedEntries.length} selected lane(s) and all items on them?`)) return;
 
-        const operations = orderedEntries.map((entry) => ({
-            type: "remove_lane",
-            lane_type: this._laneTypeFromTrackType(entry.type),
-            lane_index: entry.laneIndex || 0,
-            item_policy: "delete_items",
-        }));
+        // Descending within a family, so each removal runs against one fewer
+        // lane than the last. The guard has to say which count IT expects.
+        const removedPerType = new Map();
+        const operations = orderedEntries.map((entry) => {
+            const laneType = this._laneTypeFromTrackType(entry.type);
+            const priorRemovals = removedPerType.get(laneType) || 0;
+            removedPerType.set(laneType, priorRemovals + 1);
+            return {
+                type: "remove_lane",
+                lane_type: laneType,
+                lane_index: entry.laneIndex || 0,
+                item_policy: "delete_items",
+                expected: this._laneRemovalGuard(
+                    laneType, entry.laneIndex || 0, priorRemovals),
+            };
+        });
         const undoLabel = "delete selected lanes";
         try {
             this._pushUndo(undoLabel);
@@ -11250,6 +11479,8 @@ export class EditorWidget {
                     key: `scene:${this.activeSceneId}:delete-selected-lanes:${operations.map((op) => `${op.lane_type}:${op.lane_index}`).join(",")}`,
                     label: "delete selected lanes",
                     coalesce: false,
+                    failureMessage: (error) => error?.message
+                        || "Lane delete failed — timeline restored.",
                 }
             );
         } catch (e) {
@@ -11290,6 +11521,7 @@ export class EditorWidget {
             lane_index: laneIndex,
             item_policy: "move_items",
             target_lane: targetLane,
+            expected: this._laneRemovalGuard(laneType, laneIndex),
         };
 
         try {
@@ -11304,6 +11536,8 @@ export class EditorWidget {
                     key: `scene:${this.activeSceneId}:${laneType}-remove-lane:${laneIndex}`,
                     label: "remove lane",
                     coalesce: false,
+                    failureMessage: (error) => error?.message
+                        || "Lane removal failed — timeline restored.",
                 }
             );
         } catch (e) {
@@ -11480,6 +11714,7 @@ export class EditorWidget {
             lane_type: laneType,
             lane_index: laneIndex,
             item_policy: "require_empty",
+            expected: this._laneRemovalGuard(laneType, laneIndex),
         };
         try {
             this._pushUndo(undoLabel);
@@ -11494,6 +11729,8 @@ export class EditorWidget {
                     key: `scene:${this.activeSceneId}:${laneType}-remove-lane:${laneIndex}`,
                     label: "remove lane",
                     coalesce: false,
+                    failureMessage: (error) => error?.message
+                        || "Lane removal failed — timeline restored.",
                 }
             );
         } catch (e) {
@@ -12595,49 +12832,6 @@ export class EditorWidget {
         setTimeout(() => channelInputs.focusFirst(), 50);
     }
 
-    /** Per-channel scene-global text. Sends a channel PATCH — the backend
-     *  merges, so channels not named here keep their value. */
-    async _updateSceneGlobalChannels(...args) {
-        return this._withMutationGesture(
-            "updateSceneGlobalChannels", () => this._updateSceneGlobalChannelsWithinGesture(...args));
-    }
-
-    async _updateSceneGlobalChannelsWithinGesture(patch) {
-        if (!this.activeScene || !this.projectDir) return;
-        if (this._isGlobalPromptTrackLocked()) return;
-        const sceneRef = this.activeScene;
-        const sceneId = this.activeSceneId;
-        const previous = { ...(sceneRef.global_channels || {}) };
-        const next = normalizeChannels({ ...previous, ...patch });
-        if (JSON.stringify(next) === JSON.stringify(normalizeChannels(previous))) return;
-        const undoLabel = "edit global prompt";
-        this._pushUndo(undoLabel);
-        sceneRef.global_channels = next;
-        // Keep the local label-free mirror in step with the channels, exactly
-        // as Scene.to_dict derives it server-side.
-        sceneRef.prompt = composeSectionText(next, false);
-        this._renderSceneAfterLocalMutation({ viewport: false });
-        try {
-            await this._runSceneMutation(
-                [{ type: "update_scene_fields", fields: { global_channels: patch },
-                    expected: { global_channels: structuredClone(previous) } }],
-                {
-                    key: `scene:${sceneId}:global_channels`,
-                    label: "global prompt",
-                    coalesce: true,
-                    refreshScenes: false,
-                }
-            );
-        } catch (e) {
-            if (sceneRef === this.activeScene) {
-                sceneRef.global_channels = previous;
-                sceneRef.prompt = composeSectionText(previous, false);
-            }
-            notifyWarning(e?.message || "Global prompt edit was refused.", { source: "prompt-global-refused" });
-            this._renderTimeline();
-        }
-    }
-
     async _updateSceneGlobalContext(...args) {
         return this._withMutationGesture(
             "updateSceneGlobalContext", () => this._updateSceneGlobalContextWithinGesture(...args));
@@ -12745,44 +12939,6 @@ export class EditorWidget {
      *  first when the template turns per-channel globals off. */
     _globalChannelKeys() {
         return globalChannelKeys(this._channelTemplate());
-    }
-
-    async _updateScenePrompt(...args) {
-        return this._withMutationGesture(
-            "updateScenePrompt", () => this._updateScenePromptWithinGesture(...args));
-    }
-
-    async _updateScenePromptWithinGesture(value) {
-        if (!this.activeScene || !this.projectDir) return;
-        if (this._isGlobalPromptTrackLocked()) return;
-        const sceneRef = this.activeScene;
-        const sceneId = this.activeSceneId;
-        const next = String(value ?? "");
-        const prev = sceneRef.prompt || "";
-        if (next === prev) return;
-        const undoLabel = "edit global prompt";
-        this._pushUndo(undoLabel);
-        sceneRef.prompt = next;
-        this._renderSceneAfterLocalMutation({ viewport: false });
-        try {
-            await this._runSceneMutation(
-                [{ type: "update_scene_fields", fields: { prompt: next }, expected: {
-                    prompt: prev,
-                    global_channel_docs: structuredClone(sceneRef.global_channel_docs || {}),
-                } }],
-                {
-                    key: `scene:${sceneId}:prompt`,
-                    label: "global prompt",
-                    coalesce: true,
-                    refreshScenes: false,
-                }
-            );
-        } catch (e) {
-            if (sceneRef === this.activeScene) sceneRef.prompt = prev;
-            notifyWarning(e?.message || "Global prompt edit was refused.", { source: "prompt-global-refused" });
-            console.warn("[Sonder] Failed to update global prompt:", e);
-            this._renderTimeline();
-        }
     }
 
     /** Open (or refresh) the Prompt Management panel. */
@@ -14187,7 +14343,14 @@ export class EditorWidget {
                         s.global_channel_exceptions),
                 };
             });
-        operations.push({ type: "replace_prompt_sections", sections: nextSections });
+        operations.push({
+            type: "replace_prompt_sections",
+            sections: nextSections,
+            // Read BEFORE anything in this batch touches the scene: the guard
+            // names the collection about to be replaced, not the one replacing
+            // it.
+            expected: this._promptSectionsReplacementGuard(),
+        });
         // Optionally grow the scene to fit the new sections (writing-mode
         // "Apply & Extend"). Merge into the SAME scene-fields op so it stays
         // one mutation + one undo — the undo snapshot is a full scene clone,
@@ -15375,6 +15538,11 @@ export class EditorWidget {
                         frame_index: oldIdx,
                         asset_id: guideData.asset_id || "",
                         guide_id: guideData.guide_id || "",
+                        // The DESTINATION claim. `move_guide` replaces whatever
+                        // sits on the frame it lands on, exactly as
+                        // `create_guide` does, and the keys above only identify
+                        // the guide being moved.
+                        ...this._guideReplacementGuard(newIdx, guideData.guide_id),
                     },
                     ...fields,
                 }],
@@ -15382,6 +15550,8 @@ export class EditorWidget {
                     key: `guide:${this.activeSceneId}:${oldIdx}:move`,
                     label: "move guide",
                     coalesce: false,
+                    failureMessage: (error) => error?.message
+                        || "Move guide failed — timeline restored.",
                 }
             );
         } catch (e) {
@@ -15761,17 +15931,20 @@ export class EditorWidget {
                 source: "asset",
                 strength: this._defaultGuideStrength(),
             });
+            const replacementGuard = this._guideReplacementGuard(this.playhead);
             this._pushUndo("add guide");
             this._applyLocalCreateGuide(fields);
             this._renderSceneAfterLocalMutation();
             this._deferProjectBackedRefresh(["assets"], "guide_snapshot_asset");
             await this._runSceneMutation(
-                [{ type: "create_guide", fields }],
+                [{ type: "create_guide", fields, expected: replacementGuard }],
                 {
                     diagnostics,
                     key: `guide:${this.activeSceneId}:${this.playhead}:create`,
                     label: "add guide",
                     coalesce: false,
+                    failureMessage: (error) => error?.message
+                        || "Add guide failed — timeline restored.",
                 }
             );
         } catch (e) {
@@ -15810,6 +15983,11 @@ export class EditorWidget {
                     key: `scene:${this.activeSceneId}:delete-selected:${Date.now()}`,
                     label: "delete items",
                     coalesce: false,
+                    // The per-item `expected` these items already carry is now
+                    // honoured on the linked path too, so this can refuse where
+                    // it used to delete whatever inherited the position.
+                    failureMessage: (error) => error?.message
+                        || "Delete failed — timeline restored.",
                 }
             );
         } catch (e) {
@@ -16065,6 +16243,10 @@ export class EditorWidget {
                                 frame_index: oldIdx,
                                 asset_id: data.asset_id || "",
                                 guide_id: data.guide_id || "",
+                                // The DESTINATION claim: a drag that lands on an
+                                // occupied frame replaces what is there, and the
+                                // keys above only identify the guide being moved.
+                                ...this._guideReplacementGuard(newIdx, data.guide_id),
                             },
                             ...fields,
                         });

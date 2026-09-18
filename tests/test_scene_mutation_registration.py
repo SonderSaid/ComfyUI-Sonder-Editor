@@ -60,12 +60,20 @@ EMITTING_MODULES = (
 # total does move, which is why both are pinned. Update deliberately when adding
 # or removing an emission; the failure message names the literals that changed.
 EXPECTED_LITERAL_COUNTS = {
-    "editor_widget.js": 82,
+    # 82 -> 80 on 2026-09-17: `_updateSceneGlobalChannelsWithinGesture` and
+    # `_updateScenePromptWithinGesture` were deleted as unreachable code (umbrella
+    # Phase B / L1). They were the only patch-shaped `coalesce: true` emissions.
+    "editor_widget.js": 80,
     "editor_prompt_panel.js": 4,
     "editor_reference_panel.js": 3,
     "prompt_context_chips.js": 1,
     "prompt_identity_transactions.js": 1,
 }
+
+# Scene-mutation enqueue call sites, pinned for the same reason as the
+# literal counts above: a scan that quietly stops matching reports a clean
+# surface forever. Update deliberately when adding or removing an enqueue.
+EXPECTED_ENQUEUE_SITES = 56
 
 # Geometry the client computed from what it could see. Matched with a trailing
 # `[:,}]` so ES6 shorthand counts — `split_clip` passes its frame that way, and a
@@ -89,8 +97,10 @@ _GEOMETRY_RE = re.compile(r"\b(?:%s)\s*[:,}]" % "|".join(GEOMETRY_KEYS))
 # project-template content-hash precondition checked before the dispatch
 # (routes.py, `_apply_scene_mutation_operation`), not a claim about the row this
 # operation names. Treating it as a guard silently certifies
-# `editor_widget.js:12621`, an opaque whole-global-prompt write that carries no
-# row identity at all.
+# `_updateSceneGlobalContextWithinGesture`'s `update_scene_fields`, an opaque
+# whole-global-prompt write that carries no row identity of its own. (A line
+# number was cited here and was already wrong when it was written; scope names
+# are what survive an edit above them.)
 _GUARD_RE = re.compile(r"\bexpected(?:_[ab])?\s*[:,}]")
 
 _OP_ANCHOR_RE = re.compile(r'\{\s*\n?\s*type:\s*"([a-z_]+)"')
@@ -327,7 +337,12 @@ def _payload_fingerprint(extent: str, mask: bytearray | None = None) -> tuple[st
             starts_token = index == 0 or not re.match(r"[\w$.]", code[index - 1])
             if match and starts_token:
                 previous = code[:index].rstrip()
-                is_key = match.group(2) == ":" or (previous and previous[-1] in "{,")
+                # A ternary's middle operand is also followed by `:`. Without
+                # this, `end_frame: ok ? nextStart : -1` reports a phantom key
+                # `nextStart`, and the guard tripwire then fires on a scanner
+                # artifact rather than on a discarded guard.
+                is_key = ((match.group(2) == ":" and not previous.endswith("?"))
+                          or (previous and previous[-1] in "{,"))
                 if is_key:
                     name = match.group(1)
                     if depth == 1:
@@ -344,6 +359,16 @@ def _payload_fingerprint(extent: str, mask: bytearray | None = None) -> tuple[st
                         paths.append(f"{parent}.{name}")
                     index += match.end() - 1
                     continue
+            # A spread inside a payload object hides whatever it carries. Only a
+            # LEADING one was recognised, at the parent level above, so
+            # `fields: { muted, ...geometry }` reported `fields.muted` and
+            # nothing else -- the readable half certifying the unreadable half,
+            # under an exemption whose stated reason is about carrying geometry.
+            # No live emission has this shape, so no pinned fingerprint moves.
+            elif depth == 2 and parent and code.startswith("...", index):
+                paths.append(f"{parent}.<opaque>")
+                index += 3
+                continue
         index += 1
     return tuple(sorted(set(paths)))
 
@@ -773,12 +798,23 @@ def test_the_scans_would_catch_a_regression():
 # emits cannot reach a queued intent, so it needs no entry and gains one
 # automatically the day someone emits it.
 
-# Addressed by durable identity or project-level identity, carrying no lane
-# index and no list position, so there is nothing for a rebase to retarget.
+# Nothing here has an ADDRESS a history action can move, so there is nothing for
+# a rebase to retarget. Two shapes qualify, and the second was added by umbrella
+# Phase B rather than inherited:
+#
+#   1. Addressed by durable identity, or by project-level identity, carrying no
+#      lane index and no list position.
+#   2. Addressed by a RULER COORDINATE -- a frame, or a frame range -- or
+#      carrying no address at all because it replaces a whole collection. A
+#      coordinate still means the same coordinate after an Undo, so retargeting
+#      it would move the mark the author placed rather than follow it. Scene
+#      history does not retime: fps changes are outside it (durable_rules.md),
+#      so nothing in a restore rescales a frame.
 #
 # Expiry: an entry leaves the day its operation gains a field whose meaning
-# depends on the document it was read from -- a list position, a lane index, a
-# frame, or a snapshot of a row's current values.
+# depends on the document it was read from -- a list position, a lane index, or a
+# snapshot of a row's current values used as an address. A frame does not trigger
+# this by itself; that is what clause 2 settles.
 REBASE_EXEMPT = {
     "replace_clip_source": "Names a durable clip_id and an asset_id; no lane or "
                            "position to retarget.",
@@ -788,44 +824,55 @@ REBASE_EXEMPT = {
     "import_prompt_context_dependencies": "Imports project-level profile and "
                                           "semantic-unit closures; no scene "
                                           "member is addressed.",
+    # The three below were REBASE_UNREVIEWED until umbrella Phase B traced them.
+    # All three turn on one distinction, which is why they resolve together: a
+    # rebase retargets an ADDRESS that history moved. A frame is a coordinate the
+    # author picked on the ruler, and it still means that coordinate after an
+    # Undo, so there is nothing to follow.
+    "create_guide": "Addressed by frame_index, a ruler coordinate. Its siblings "
+                    "move_/update_/delete_guide rebase because they follow a "
+                    "guide that MOVED; a create has no prior guide to follow, "
+                    "and retargeting the frame would move the mark the author "
+                    "placed. The replacement hazard that used to sit here is now "
+                    "a guard rather than a rebase: umbrella Phase B gave the "
+                    "operation `expected.replaces_guide_id`, so a queued Undo "
+                    "that puts a different guide on that frame makes the create "
+                    "REFUSE instead of destroying it. Refusing is the right "
+                    "outcome for a coordinate whose contents moved -- the same "
+                    "decision DELIBERATE_NO_PROJECTION records for the splits.",
+    "create_prompt_section": "Addressed by a client-computed start/end frame "
+                             "range, the same coordinate argument. A stale range "
+                             "does not apply silently either: "
+                             "_apply_create_prompt_section calls "
+                             "_require_no_prompt_overlap, so a range history has "
+                             "since occupied is refused rather than written. "
+                             "Refusal is the right outcome for geometry drawn "
+                             "against a layout that no longer exists -- the same "
+                             "decision DELIBERATE_NO_PROJECTION records for the "
+                             "splits.",
+    "replace_prompt_sections": "Carries the whole collection, not an address. "
+                               "There is no index or lane to retarget, and "
+                               "projecting it forward would mean adopting the "
+                               "ordered scene's sections -- replacing the "
+                               "author's intent with the state they were "
+                               "replacing. Rebase was never the tool for the "
+                               "exposure here; umbrella Phase B gave the "
+                               "operation `expected.sections` instead, so a "
+                               "collection that moved refuses. Deliberately NOT "
+                               "restated by a rebase, for the same reason as the "
+                               "splits: it is the authored evidence of what was "
+                               "being replaced.",
 }
 
-# No rationale is defensible from the code today. Saying so is the point: a
-# plausible-sounding invention would stop the next reader looking. The first
-# three are asymmetric with a sibling that *is* rebased; the link pair is not --
-# its only sibling, `delete_link_group`, is never emitted and has no case either.
+# Empty since umbrella Phase B traced its last five entries. It stays as a
+# declared class rather than being deleted: `_rebase_policy_classes` needs
+# somewhere to file an operation whose reason is honestly not yet known, and
+# removing the bucket would leave "invent a reason for REBASE_EXEMPT" as the only
+# way to satisfy the tripwire. Phase A wrote four invented reasons before that
+# lesson was learned.
 #
-# Expiry: umbrella Phase B adopted these (see mutation-authoring-umbrella.md);
-# each entry leaves when that phase either adds a case or records a real reason.
-REBASE_UNREVIEWED = {
-    "create_guide": "Its siblings move_guide, update_guide and delete_guide all "
-                    "rebase through rebaseGuideOperation; the create does not, "
-                    "and its payload is an opaque `fields`. Unreviewed.",
-    "create_prompt_section": "Its siblings update_, delete_ and "
-                             "split_prompt_section all rebase through "
-                             "rebasePromptOperation; the create does not. "
-                             "Unreviewed.",
-    "replace_prompt_sections": "Replaces every prompt section in the scene from "
-                               "a client-computed list, with no guard and no "
-                               "rebase, while a sibling update_scene_fields in "
-                               "the same batch carries `expected`. Unreviewed, "
-                               "and the sharpest of these.",
-    # These two were first written as exempt, on the reasoning that link refs are
-    # durable {type, id} pairs. That was invented from the helper's name and is
-    # false. `_mutationItemFromSelection` sets `id` to a guide's *frame_index*
-    # and a prompt's *list index*, and `_item_ref_from_selection` resolves both
-    # positionally on the server (`_find_prompt_section(scene, int(raw_id))`,
-    # `_find_guide(scene, int(raw_id))`) whenever the id is not already a durable
-    # one. A queued Undo that reorders prompt sections or moves a guide therefore
-    # changes what these refs name. Clip and audio members really are durable;
-    # the operation is only as safe as its weakest member type.
-    "create_link_group": "Carries prompt and guide members addressed by list "
-                         "position and frame index, which the server resolves "
-                         "against whichever document it loads. Whether a queued "
-                         "history action can redirect them is unreviewed.",
-    "unlink_items": "Carries the same positionally-resolved refs as "
-                    "create_link_group.",
-}
+# Expiry: delete this dict only when the rebase policy stops being hand-declared.
+REBASE_UNREVIEWED = {}
 
 # Not projecting is correct here, and saying "defect" would contradict an
 # approved plan. `_historyExpectedProjection` rewrites the `expected` keys that
@@ -1085,22 +1132,27 @@ GUARD_EXEMPT_REASONS = {
                    "about items sitting past the end of their own media, and "
                    "says retrofitting the guard is a larger change than split.",
     "update_audio_track": "As update_clip; the same plan names both.",
-    "remove_lane": "Carries a lane index with no lane identity guard. "
-                   "durable_rules.md already states this in prose -- item lane "
-                   "indices and remove_lane carry no lane identity guard -- so "
-                   "it is acknowledged, not undiscovered.",
     "split_clip": "The Critical defect itself. split-optimistic-local-apply.md "
                   "L1 adds the `expected` bounds guard; until it lands, this "
                   "entry is the record that the gap is known and owned.",
     "split_audio_track": "As split_clip; the same landing covers it.",
     "update_scene_fields": "Scene-level fields have no row to identify -- the "
                            "scene comes from the URL -- so what an `expected` "
-                           "would protect is the field's prior value. Three "
-                           "sibling emissions do carry one and these do not; "
-                           "why is unreviewed.",
+                           "would protect is the field's prior value. Only four "
+                           "of the sixteen fields it writes are compared at all "
+                           "(GUARD_CONTRACTS), and none of these emissions names "
+                           "one. Decided per site in "
+                           "GUARD_SITE_DISPOSITIONS: five are whole-value sets "
+                           "where last-write-wins is correct, and two carry a "
+                           "stronger guard through `promptEditFields` that no "
+                           "lexical scan can see.",
     "unlink_items": "Carries prompt and guide refs the server resolves by list "
                     "position and frame index (`_item_ref_from_selection`), so "
-                    "the refs themselves can go stale. Unreviewed.",
+                    "the refs themselves can go stale. The half a queued history "
+                    "action could move is closed: umbrella Phase B gave this "
+                    "operation a rebase case sharing `rebaseBulkItem`. What is "
+                    "left is a concurrent other writer, which only a server-side "
+                    "guard would catch.",
     # The two sites differ materially, so the reason names both rather than
     # generalising from the worse one.
     "bulk_delete_items": "Two shapes. `_deleteItemsInLaneWithinGesture` carries "
@@ -1109,45 +1161,38 @@ GUARD_EXEMPT_REASONS = {
                          "`_deleteSelectedItemsWithinGesture` passes `items` as "
                          "an identifier, and the array it names DOES carry "
                          "per-item `expected` that the server validates; the "
-                         "scan cannot see through the identifier. The real "
-                         "residual is narrower than 'unguarded': in the "
-                         "`apply_linked` branch non-reference members route "
-                         "through `_item_ref_from_selection`, which never reads "
-                         "`expected` and resolves prompt and guide positionally.",
+                         "scan cannot see through the identifier. The "
+                         "`apply_linked` residual that used to sit here is "
+                         "closed -- `_item_ref_from_selection` validates each "
+                         "item as it resolves it -- so what remains is only the "
+                         "scan's blindness to an identifier.",
     "consolidate_items": "Carries `target_lane` and durable `item_ids`. The lane "
                          "index is not unguarded in the sense that matters -- "
                          "`_rebaseSceneMutationIntentForHistory` retargets it "
                          "through `rebaseLaneIndex`, which the rebase policy "
                          "above records as `rebased`. What carries no guard is "
                          "the item id set, and those are durable.",
-    "replace_prompt_sections": "Replaces every prompt section from a "
-                               "client-computed list with no guard. The "
-                               "sharpest of these; umbrella Phase B owns it.",
     "create_clip": "Additive: there is no prior row for an `expected` to "
                    "describe. Its `track_index` is the rebase question, not this "
                    "one, and `case \"create_clip\"` retargets it.",
     "create_audio_track": "As create_clip; its lane_index is likewise rebased.",
-    "create_guide": "Additive, and its fields are opaque to the scan. Its rebase "
-                    "policy is separately recorded as unreviewed.",
     "create_prompt_section": "Additive; carries client-computed start/end frames "
-                             "with no prior row to compare them against. Its "
-                             "rebase policy is separately unreviewed.",
+                             "with no prior row to compare them against, and "
+                             "`_require_no_prompt_overlap` refuses a range that "
+                             "has since been occupied rather than writing it. Its "
+                             "rebase policy is now REBASE_EXEMPT, on the same "
+                             "coordinate argument.",
     "create_prompt_semantic_unit": "Mints project-level prompt identity. No "
                                    "scene row exists yet or is named.",
     # The two creates that are NOT purely additive. A name-based exemption would
     # have hidden both, which is why there is no computed create class.
-    "create_reference_item": "NOT purely additive, despite the name. Its fields "
-                             "carry `end_frame` and `nextStart` read out of the "
-                             "client's own `scene.reference_items` -- a prior "
-                             "row, in a copy that may be stale -- while a "
-                             "sibling update_lane_config in the same batch does "
-                             "carry `expected`. `lane_index` is rebased; "
-                             "`end_frame` is neither rebased nor guarded.",
     "create_link_group": "NOT purely additive: its entire payload is references "
                          "to pre-existing rows. The client builds per-item "
                          "`expected` and `_item_ref_from_selection` discards it, "
                          "resolving prompt by list index and guide by frame "
-                         "index. Same finding as its rebase entry.",
+                         "index. The queued-history half is closed -- it now has "
+                         "a rebase case sharing `rebaseBulkItem` -- so what "
+                         "remains is a concurrent other writer.",
     "import_prompt_context_dependencies": "Project-level profile and "
                                           "semantic-unit closures; no scene row "
                                           "is addressed, so there is nothing an "
@@ -1179,20 +1224,11 @@ GUARD_EXEMPT_SITES = {
     "editor_prompt_panel.js:renderContextSettings:update_scene_fields": [
         ('fields', 'fields.prompt_context_profile_id', 'type'),
     ],
-    "editor_reference_panel.js:createItem:create_reference_item": [
-        ('fields', 'fields.end_frame', 'fields.lane_index', 'fields.members', 'fields.muted', 'fields.nextStart', 'fields.prompt_override', 'fields.sequence_frames', 'fields.start_frame', 'fields.strength', 'type'),
-    ],
-    "editor_widget.js:_addClipFrameToGuidesWithinGesture:create_guide": [
-        ('fields', 'fields.<opaque>', 'type'),
-    ],
     "editor_widget.js:_applyPromptSetupWithinGesture:create_prompt_semantic_unit": [
         ('handle_suggestion', 'type', 'unit', 'unit.<opaque>'),
     ],
     "editor_widget.js:_applyPromptSetupWithinGesture:import_prompt_context_dependencies": [
         ('profiles', 'profiles.<opaque>', 'semantic_units', 'semantic_units.<opaque>', 'type'),
-    ],
-    "editor_widget.js:_applyPromptSetupWithinGesture:replace_prompt_sections": [
-        ('sections', 'sections.<opaque>', 'type'),
     ],
     "editor_widget.js:_commitItemMove:update_audio_track": [
         ('fields', 'fields.<opaque>', 'track_id', 'type'),
@@ -1221,18 +1257,12 @@ GUARD_EXEMPT_SITES = {
     "editor_widget.js:_deleteSelectedItemsWithinGesture:bulk_delete_items": [
         ('apply_linked', 'items', 'items.<opaque>', 'type'),
     ],
-    "editor_widget.js:_deleteSelectedLanesAndItemsWithinGesture:remove_lane": [
-        ('item_policy', 'lane_index', 'lane_type', 'type'),
-    ],
     "editor_widget.js:_handleAssetDropWithinGesture:create_audio_track": [
         ('fields', 'fields.asset_id', 'fields.lane_index', 'fields.timeline_start_frame', 'type'),
     ],
     "editor_widget.js:_handleAssetDropWithinGesture:create_clip": [
         ('fields', 'fields.asset_id', 'fields.crop_position', 'fields.dual_drop', 'fields.fit_mode', 'fields.role', 'fields.strength', 'fields.timeline_start_frame', 'fields.track_index', 'type'),
-        ('fields', 'fields.asset_id', 'fields.audio_lane_index', 'fields.crop_position', 'fields.dual_drop', 'fields.fit_mode', 'fields.link_video_audio', 'fields.targetAudioLane', 'fields.timeline_start_frame', 'fields.track_index', 'type'),
-    ],
-    "editor_widget.js:_handleAssetDropWithinGesture:create_guide": [
-        ('fields', 'fields.<opaque>', 'type'),
+        ('fields', 'fields.asset_id', 'fields.audio_lane_index', 'fields.crop_position', 'fields.dual_drop', 'fields.fit_mode', 'fields.link_video_audio', 'fields.timeline_start_frame', 'fields.track_index', 'type'),
     ],
     "editor_widget.js:_moveItemToFrameWithinGesture:update_audio_track": [
         ('apply_linked', 'fields', 'fields.timeline_start_frame', 'track_id', 'type'),
@@ -1251,18 +1281,6 @@ GUARD_EXEMPT_SITES = {
     ],
     "editor_widget.js:_muteOperationForItem:update_clip": [
         ('apply_linked', 'clip_id', 'fields', 'fields.muted', 'type'),
-    ],
-    "editor_widget.js:_placeReferencePayloadWithinGesture:create_reference_item": [
-        ('fields', 'fields.end_frame', 'fields.lane_index', 'fields.members', 'fields.muted', 'fields.nextStart', 'fields.prompt_override', 'fields.sequence_frames', 'fields.start_frame', 'fields.strength', 'type'),
-    ],
-    "editor_widget.js:_removeLaneDeletingItemsWithinGesture:remove_lane": [
-        ('item_policy', 'lane_index', 'lane_type', 'type'),
-    ],
-    "editor_widget.js:_removeLaneWithItemsWithinGesture:remove_lane": [
-        ('item_policy', 'lane_index', 'lane_type', 'target_lane', 'type'),
-    ],
-    "editor_widget.js:_removeLaneWithinGesture:remove_lane": [
-        ('item_policy', 'lane_index', 'lane_type', 'type'),
     ],
     "editor_widget.js:_renameSceneWithinGesture:update_scene_fields": [
         ('fields', 'fields.name', 'type'),
@@ -1413,3 +1431,1706 @@ def test_the_guard_scan_would_catch_a_regression():
         'function gesture() { send({ type: "create_clip", fields: { track_index: 1 } }); }\n')
     assert _carries_client_payload(create[0]["extent"], create[0]["mask"])
     assert not _is_guarded(create[0]["extent"], create[0]["mask"])
+
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Phase 4 -- a coalescing gesture whose payload cannot be replaced wholesale
+#            supplies a merge, or says why not
+# ---------------------------------------------------------------------------
+# Coalescing with no `merge` replaces the older intent outright
+# (`project_mutation_queue.js`: `existing.intent = intent`) and settles every
+# collapsed waiter from the survivor's result, so the losing gesture believes it
+# succeeded. That is harmless only when the payload is a whole-value set the
+# newer intent fully subsumes.
+#
+# It is NOT harmless when the server applies the value key-by-key: an inner key
+# the newer intent omits is then never restored from the older one, and the edit
+# is lost. Each entry names the setter that proves the key is sub-keyed.
+#
+# `fields` is deliberately NOT in this list, and the distinction is the whole
+# predicate. `_apply_scene_fields` merges at the *field* level -- it writes only
+# the keys `fields` names -- but each named field's VALUE is replaced outright,
+# so a newer intent naming the same field subsumes the older one. The keys below
+# are the ones whose value is itself applied key by key. Add `fields` and all
+# three live whole-value gestures trip for no reason.
+#
+# Expiry: an entry leaves when its setter stops applying the value key-by-key.
+SUBKEYED_PAYLOAD_VALUES = {
+    "global_channels": "`Scene.set_global_channels` starts from "
+                       "`dict(self.global_channel_docs)` and writes only the keys "
+                       "the patch names, so an omitted channel keeps its stored "
+                       "value rather than the older intent's "
+                       "(`server/timeline_state.py`).",
+    "global_channel_docs": "`Scene.set_global_channel_documents` normalises over "
+                           "`set(self.global_channels) | set(documents)`, and "
+                           "`prompt_context.normalize_channel_documents` rebuilds "
+                           "an omitted key from the stored flat mirror -- so an "
+                           "omitted document is not merely kept, it is "
+                           "reconstructed without its structure.",
+    "channels": "`PromptSection.set_channels` is the section-level twin of "
+                "`set_global_channels`; `_next_prompt_section_content` and "
+                "`_apply_linked_bounds_update` both reach it.",
+    "channel_docs": "`PromptSection.set_channel_documents` is the section-level "
+                    "twin of `set_global_channel_documents`.",
+    "prompt_edit": "`_merge_prompt_edit_fields` applies one change per document "
+                   "and per attachment key, each behind its own `expected`. A "
+                   "replaced intent drops the changes it does not name.",
+}
+
+# A coalescing site with no merge that the scan cannot clear on its own. Keyed
+# `module:scope:op_type` with the payload fingerprint, never a line number: a
+# line-keyed entry rots on an unrelated edit above it, and the staleness test
+# would then report the site as fixed when nothing about it had changed.
+#
+# Seeded EMPTY on 2026-09-17: after the two dead patch-shaped gestures were
+# deleted, every coalescing site either supplies an effective merge or sends a
+# fully transparent whole-value payload. An entry here claims a site is safe
+# although the scan cannot see why, and needs the same tracing as any other.
+COALESCE_WITHOUT_MERGE_REVIEWED: dict = {}
+
+# The forwarding helpers. They are not gestures: they receive `coalesce` and
+# `merge` from their caller and pass both through, so classifying them would
+# report the plumbing rather than any decision. `_runQueueMutation` is here for
+# the same reason; queue mutations are a sibling dispatcher and out of scope.
+_FORWARDING_SCOPES = frozenset({
+    "_runSceneMutation", "_queueProjectMutation", "_runQueueMutation"})
+
+# A receiver is required. `_queueProjectMutation({` -- the declaration itself --
+# otherwise matches, and reads as a call site with no enclosing scope.
+_ENQUEUE_RE = re.compile(r"\.\s*_(?:runSceneMutation|queueProjectMutation)\s*\(")
+_ARROW_MERGE_RE = re.compile(r"\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*=>")
+
+
+def _merge_is_effective(extent_code: str, scope_body: str) -> bool:
+    """Does this site pass a merge that can actually preserve the older intent?
+
+    Lexical presence is not enough. `merge: (a, b) => b` is the silent default
+    wearing a badge -- the same shape Phase A had to reject for `case "x":
+    break;` -- and it is the cheapest possible repair when this tripwire fires.
+    A merge is effective only if its body reads its FIRST parameter, which is
+    the older intent (`project_mutation_queue.js`: `merge(existing.intent, intent)`).
+
+    An unresolvable merge is NOT effective. Failing closed sends the site to the
+    reviewed dict, where a human states why; failing open would let any spelling
+    the matcher cannot read buy a pass.
+    """
+    inline = re.search(r"\bmerge\s*:\s*(.+)", extent_code, re.S)
+    named = re.search(r"\bmerge\s*[,}]", extent_code)
+    body = ""
+    if inline:
+        body = inline.group(1)
+    elif named:
+        # Shorthand `merge,` -- the definition is a `const merge = ...` in the
+        # same method, which is how both real merge-bearing gestures spell it.
+        definition = re.search(r"\bconst\s+merge\s*=\s*(.+)", scope_body, re.S)
+        if not definition:
+            return False
+        body = definition.group(1)
+    else:
+        return False
+    arrow = _ARROW_MERGE_RE.search(body)
+    if not arrow:
+        return False
+    older = arrow.group(1)
+    return re.search(rf"\b{re.escape(older)}\b", body[arrow.end():]) is not None
+
+
+def _scan_enqueue_sites(sources: tuple) -> tuple:
+    """Every scene-mutation enqueue in `sources`, with the decision it makes.
+
+    `sources` is ((module, text), ...) rather than a fixed module list so a
+    fixture can drive the whole predicate end to end. A tripwire that has never
+    been observed to produce a finding is the false-confidence failure this
+    module exists to prevent.
+    """
+    sites = []
+    for module, source in sources:
+        mask = _code_mask(source)
+        scopes = _scopes(source, mask)
+        literals = _scan(source, module)
+        by_scope: dict = {}
+        for literal in literals:
+            by_scope.setdefault(literal["scope"], []).append(literal)
+        for match in _ENQUEUE_RE.finditer(source):
+            if not mask[match.start()]:
+                continue
+            paren = source.index("(", match.start())
+            end = _match_delimiter(source, paren, "(", ")", mask)
+            if end <= 0:
+                raise AssertionError(
+                    f"{module}: unterminated enqueue call at offset {paren}")
+            code = _code_only(source[paren:end + 1], mask[paren:end + 1])
+            scope = _enclosing_scope(scopes, match.start())
+            # Innermost span containing the call, by the same smallest-span rule
+            # `_enclosing_scope` uses, so a shorthand `merge,` can be resolved
+            # against the `const merge = ...` in the method that passes it.
+            span = min((s for s in scopes if s[1] <= match.start() <= s[2]),
+                       key=lambda s: s[2] - s[1], default=None)
+            scope_body = (_code_only(source[span[1]:span[2]], mask[span[1]:span[2]])
+                          if span else "")
+            sites.append({
+                "module": module,
+                "scope": scope,
+                "line": source.count("\n", 0, match.start()) + 1,
+                # Shorthand, a variable, a computed value, or omission all
+                # resolve to `true` at least sometimes, and the queue's own
+                # default is `true`, so only an explicit `false` reads as "no".
+                "coalesces": not re.search(r"\bcoalesce\s*:\s*false\b", code),
+                "effective_merge": _merge_is_effective(code, scope_body),
+                "operands": tuple(by_scope.get(scope, ())),
+            })
+    return tuple(sites)
+
+
+@functools.lru_cache(maxsize=1)
+def _enqueue_call_sites() -> tuple:
+    return _scan_enqueue_sites(tuple(
+        (module, (JS_DIR / module).read_text(encoding="utf-8"))
+        for module in EMITTING_MODULES))
+
+
+def _payload_leaf_keys(literal: dict) -> tuple:
+    """(leaf key names the scan can see, whether any of the payload is opaque)."""
+    names, opaque = set(), False
+    fingerprint = _payload_fingerprint(literal["extent"], literal["mask"])
+    for path in fingerprint:
+        leaf = path.split(".")[-1]
+        if leaf == "<opaque>":
+            opaque = True
+        else:
+            names.add(leaf)
+    # A literal carrying nothing but `type` is a top-level spread
+    # (`{ type: "x", ...build() }`) or an empty payload. Neither is evidence of
+    # a whole-value set, and reading it as one would be an affirmative safety
+    # claim the scan has not earned.
+    if not names - {"type"}:
+        opaque = True
+    return names, opaque
+
+
+def _coalescing_sites_needing_review(sites=None) -> dict:
+    """Coalescing sites with no effective merge that the scan cannot clear."""
+    findings = {}
+    for site in (sites if sites is not None else _enqueue_call_sites()):
+        if not site["coalesces"] or site["effective_merge"]:
+            continue
+        if site["scope"] in _FORWARDING_SCOPES:
+            continue
+        base = f"{site['module']}:{site['scope']}"
+        if not site["operands"]:
+            findings[f"{base}:<operands-built-elsewhere>"] = (
+                "coalesces with no effective merge and builds its operations "
+                "outside this scope, so the payload cannot be read here")
+            continue
+        for literal in site["operands"]:
+            names, opaque = _payload_leaf_keys(literal)
+            fingerprint = _payload_fingerprint(literal["extent"], literal["mask"])
+            key = f"{base}:{literal['op_type']}"
+            hit = sorted(names & set(SUBKEYED_PAYLOAD_VALUES))
+            if hit:
+                findings[key] = (
+                    f"coalesces with no effective merge while sending {hit} on "
+                    f"`{literal['op_type']}`, whose value the server applies key "
+                    f"by key; payload {list(fingerprint)}")
+            elif opaque:
+                findings[key] = (
+                    f"coalesces with no effective merge and `{literal['op_type']}` "
+                    f"carries a payload the scan cannot read, so it cannot be "
+                    f"shown to be a whole-value set; payload {list(fingerprint)}")
+    return findings
+
+
+def test_a_coalescing_gesture_declares_a_merge_or_sends_a_whole_value_payload():
+    """The tripwire: wholesale intent replacement must be a decision, not a default."""
+    findings = _coalescing_sites_needing_review()
+    unreviewed = {key: why for key, why in findings.items()
+                  if key not in COALESCE_WITHOUT_MERGE_REVIEWED}
+    assert not unreviewed, (
+        "coalescing replaces the older intent outright and settles every collapsed "
+        "gesture from the survivor's result, so an intent the newer one does not "
+        "fully subsume is lost while its author is told it succeeded. Supply a "
+        "`merge` that reads its FIRST argument -- see `_updateItemPropertyWithinGesture`: "
+        "union the fields newer-wins, keep the OLDEST `expected` -- or record the "
+        "site in COALESCE_WITHOUT_MERGE_REVIEWED with a traced reason. Do NOT "
+        "reach for `coalesce: false`: sonder_editor_bugs.md measures that at 24.2 s "
+        "for six clicks and 460 s for one burst, and umbrella Phase C owns it. "
+        "A local rollback in the same gesture needs `onSupersededByCoalescing` "
+        "instead, or it restores a superseded sibling's optimistic state: "
+        + "; ".join(f"{key} -- {why}" for key, why in sorted(unreviewed.items())))
+
+
+def test_coalescing_review_entries_are_not_stale():
+    """An entry must be able to die, or it is documentation of a gap."""
+    findings = _coalescing_sites_needing_review()
+    gone = sorted(set(COALESCE_WITHOUT_MERGE_REVIEWED) - set(findings))
+    assert not gone, (
+        "these sites no longer coalesce without an effective merge, so the entry "
+        f"is dead and should go with it: {gone}")
+
+
+def test_the_coalescing_scan_sees_the_decisions_it_classifies():
+    """Liveness, pinned rather than bounded, per this module's convention."""
+    sites = _enqueue_call_sites()
+    assert len(sites) == EXPECTED_ENQUEUE_SITES, (
+        f"enqueue call sites moved: {len(sites)} found, "
+        f"{EXPECTED_ENQUEUE_SITES} pinned. Update deliberately when adding or "
+        "removing a scene-mutation enqueue.")
+    assert any(site["coalesces"] for site in sites), "no site reads as coalescing"
+    assert any(not site["coalesces"] for site in sites), "no site reads as opted out"
+    assert any(site["effective_merge"] for site in sites), (
+        "no site reads as supplying an effective merge, so `_merge_is_effective` "
+        "is rejecting the two real ones and every coalescing site would be a finding")
+    assert all(site["scope"] for site in sites), (
+        "an enqueue resolved to no enclosing scope, which means the receiver-anchored "
+        "regex is matching a declaration again")
+    # The three known whole-value gestures must reach the predicate and clear it,
+    # or it is passing them for the wrong reason.
+    reviewed = _coalescing_sites_needing_review()
+    for scope in ("_updateSceneResolutionWithinGesture", "_renameSceneWithinGesture",
+                  "_updateSceneDurationWithinGesture"):
+        site = next(s for s in sites if s["scope"] == scope)
+        assert site["coalesces"] and not site["effective_merge"], (
+            f"{scope} no longer coalesces without a merge; this test's premise moved")
+        assert not any(key.split(":")[1] == scope for key in reviewed), (
+            f"{scope} sends a whole-value payload and must clear the tripwire")
+
+
+def test_the_coalescing_tripwire_produces_the_findings_it_claims():
+    """Drives the whole predicate over fixtures, with exact findings.
+
+    Without this the tripwire has never been observed to fire at all: the real
+    modules are clean by construction, so every assertion above is satisfied by
+    a predicate that returns nothing for any input.
+    """
+    def findings(js):
+        return _coalescing_sites_needing_review(
+            _scan_enqueue_sites((("fixture.js", js),)))
+
+    subkeyed = findings(
+        'async function gesture() {\n'
+        '  await host._runSceneMutation([{ type: "update_scene_fields",\n'
+        '    fields: { global_channels: patch } }], { coalesce: true });\n}\n')
+    assert list(subkeyed) == ["fixture.js:gesture:update_scene_fields"]
+    assert "global_channels" in subkeyed["fixture.js:gesture:update_scene_fields"]
+
+    opaque = findings(
+        'async function gesture() {\n'
+        '  await host._runSceneMutation([{ type: "update_scene_fields", fields }],\n'
+        '    { coalesce: true });\n}\n')
+    assert list(opaque) == ["fixture.js:gesture:update_scene_fields"]
+    assert "cannot read" in opaque["fixture.js:gesture:update_scene_fields"]
+
+    # A top-level spread leaves only `type` visible. It must not read as a
+    # whole-value set, because the scan has seen no value at all.
+    spread = findings(
+        'async function gesture() {\n'
+        '  await host._runSceneMutation([{ type: "update_scene_fields", ...build() }],\n'
+        '    { coalesce: true });\n}\n')
+    assert list(spread) == ["fixture.js:gesture:update_scene_fields"]
+
+    whole = findings(
+        'async function gesture() {\n'
+        '  await host._runSceneMutation([{ type: "update_scene_fields",\n'
+        '    fields: { width: w, height: h } }], { coalesce: true });\n}\n')
+    assert whole == {}, whole
+
+    opted_out = findings(
+        'async function gesture() {\n'
+        '  await host._runSceneMutation([{ type: "update_scene_fields",\n'
+        '    fields: { global_channels: patch } }], { coalesce: false });\n}\n')
+    assert opted_out == {}, opted_out
+
+    # An identity merge is the cheapest repair when this fires, and it must not
+    # work: it discards the older intent exactly as no merge at all does.
+    noop_merge = findings(
+        'async function gesture() {\n'
+        '  await host._runSceneMutation([{ type: "update_scene_fields",\n'
+        '    fields: { global_channels: patch } }],\n'
+        '    { coalesce: true, merge: (older, next) => next });\n}\n')
+    assert list(noop_merge) == ["fixture.js:gesture:update_scene_fields"], noop_merge
+
+    real_merge = findings(
+        'async function gesture() {\n'
+        '  await host._runSceneMutation([{ type: "update_scene_fields",\n'
+        '    fields: { global_channels: patch } }],\n'
+        '    { coalesce: true, merge: (older, next) => ({ ...older, ...next }) });\n}\n')
+    assert real_merge == {}, real_merge
+
+    # Omitting `coalesce` is a yes: the queue defaults it to true.
+    omitted = findings(
+        'async function gesture() {\n'
+        '  await host._runSceneMutation([{ type: "update_scene_fields",\n'
+        '    fields: { global_channels: patch } }], { label: "x" });\n}\n')
+    assert list(omitted) == ["fixture.js:gesture:update_scene_fields"]
+
+
+def test_the_two_real_merges_are_read_as_effective():
+    """`_merge_is_effective` must clear the gestures it was modelled on."""
+    sites = {site["scope"]: site for site in _enqueue_call_sites()}
+    for scope in ("_saveLaneConfigWithinGesture", "_updateItemPropertyWithinGesture"):
+        assert sites[scope]["effective_merge"], (
+            f"{scope} passes a `const merge` shorthand that preserves the older "
+            "intent; reading it as ineffective would make the tripwire fire on "
+            "the two sites it holds up as correct")
+
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Phase 5 -- a guard the server cannot honour is not a guard
+# ---------------------------------------------------------------------------
+# Phase 4 above catches an emission that carries NO `expected`. This section
+# catches the opposite failure, and it is the one that would quietly destroy
+# Phase 3's signal: an emission that carries an `expected` the server reads and
+# throws away. Probed against the real route handler at 8735aa1 -- a
+# deliberately FALSE `expected` on `update_clip`, and on
+# `update_scene_fields { width }`, both returned 200 and applied the write,
+# while the same shape on `update_scene_fields { global_channels }` returned
+# 409. 23 of the dispatcher's 38 branches ignore any `expected` sent.
+#
+# So `GUARD_EXEMPT_SITES` can be drained without protecting anything: add
+# `expected: { timeline_start_frame: x }` to an `update_clip` emission and the
+# Phase 3 tripwire clears, because it matches a token on the client. The
+# contracts below are what stop that.
+
+_GUARD_NAME_RE = re.compile(r"\bexpected(?:_[ab])?\b")
+
+
+def _object_literal_keys(text: str) -> tuple[str, ...]:
+    """Depth-1 keys of the object literal beginning at `text[0] == '{'`.
+
+    A depth-1 spread contributes `<opaque>` ALONGSIDE the visible keys, wherever
+    it sits. An earlier version only recognised a leading spread, so
+    `{ prompt: p, ...rest }` reported `prompt` and nothing else -- the readable
+    half silently certifying the half that is not readable.
+    """
+    depth, index, keys = 0, 0, []
+    while index < len(text):
+        char = text[index]
+        if char in "{[(":
+            depth += 1
+        elif char in "}])":
+            depth -= 1
+            if depth == 0:
+                break
+        elif depth == 1:
+            if text.startswith("...", index):
+                keys.append("<opaque>")
+                index += 3
+                continue
+            match = re.match(r"([A-Za-z_$][\w$]*)\s*([:,}])", text[index:])
+            starts_token = index == 0 or not re.match(r"[\w$.]", text[index - 1])
+            if match and starts_token:
+                previous = text[:index].rstrip()
+                # As `_payload_fingerprint`: skip a ternary's middle operand.
+                if ((match.group(2) == ":" and not previous.endswith("?"))
+                        or (previous and previous[-1] in "{,")):
+                    keys.append(match.group(1))
+                    # Land ON the matched delimiter, not past it. Without the
+                    # `continue` the trailing `index += 1` steps over a closing
+                    # `}` -- so shorthand as the last key (`{ members }`) left
+                    # the walk inside a literal it had already exited, and it
+                    # went on collecting keys from the rest of the emission as
+                    # if they belonged to the guard. `_payload_fingerprint`
+                    # always had the `continue`; this copy did not.
+                    index += match.end() - 1
+                    continue
+        index += 1
+    return tuple(sorted(set(keys)))
+
+
+def _enclosing_payload_key(code: str, offset: int) -> str:
+    """Innermost `PAYLOAD_KEYS` collection whose value encloses `offset`.
+
+    Innermost by span width, not by declaration order: with a guard nested under
+    `fields` inside `items[]`, order would name whichever key `PAYLOAD_KEYS`
+    happens to list last. No live site nests a guard that way, which is exactly
+    why the tie-break has to be written down rather than observed.
+    """
+    found, width = "", None
+    for key in PAYLOAD_KEYS:
+        for match in re.finditer(r"\b%s\s*:" % key, code):
+            rest = code[match.end():]
+            stripped = rest.lstrip()
+            if not stripped or stripped[0] not in "{[":
+                continue
+            opener = stripped[0]
+            begin = match.end() + (len(rest) - len(stripped))
+            # `code` is already code-only, so every character counts; building
+            # a fresh mask over it would re-read the blanked string quotes.
+            end = _match_delimiter(code, begin, opener,
+                                   "}" if opener == "{" else "]",
+                                   bytearray([1] * len(code)))
+            if end > 0 and begin < offset < end and (width is None or end - begin < width):
+                found, width = key + ("[]" if opener == "[" else ""), end - begin
+    return found
+
+
+def _guard_key_paths(extent: str, mask: bytearray | None = None) -> tuple[tuple[str, str, str], ...]:
+    """Every `expected*` in one emission, as `(container, guard, key)` triples.
+
+    Deliberately depth-agnostic, unlike `_payload_fingerprint`. Four live sites
+    wrap the guard in a conditional spread —
+    `...(laneId ? { expected: { lane_id: laneId } } : {})` — which puts the key
+    below the operation literal's top level, so a depth-1 walker reports them as
+    carrying no guard at all. That is the one direction this extractor must not
+    fail in: reading a guarded site as unguarded silently exempts it from the
+    tripwire below. `container` names the collection the guard sits inside
+    (`items[]` for `bulk_delete_items`) or is empty for an operation-level guard.
+
+    A value that is not an inline object literal records `<opaque>` — ES6
+    shorthand, an identifier, or a computed expression. Opaque is a named class
+    with its own catalogue, never a pass.
+    """
+    code = _code_only(extent, mask)
+    paths = []
+    for match in _GUARD_NAME_RE.finditer(code):
+        start, end = match.start(), match.end()
+        if start and re.match(r"[\w$.]", code[start - 1]):
+            continue  # `expected_type`, `expected_prompt_template`, `x.expected`
+        container = _enclosing_payload_key(code, start)
+        rest = code[end:]
+        stripped = rest.lstrip()
+        if stripped.startswith(":"):
+            value = stripped[1:].lstrip()
+            if value.startswith("{"):
+                keys = _object_literal_keys(value)
+                paths.extend((container, match.group(0), key)
+                             for key in (keys or ("<opaque>",)))
+            else:
+                paths.append((container, match.group(0), "<opaque>"))
+        elif stripped.startswith((",", "}")):
+            paths.append((container, match.group(0), "<opaque>"))  # shorthand
+    return tuple(sorted(set(paths)))
+
+
+# What a branch does with an `expected*` it is sent. Five kinds, because a
+# per-operation boolean cannot hold the three real partials: `update_scene_fields`
+# validates four of the sixteen fields it writes, `update_lane_config` validates
+# one key and only for lane families that have a durable id, and
+# `bulk_delete_items` validates per item and only for three of its five item
+# types. Each entry carries one traced line of evidence -- the validating call,
+# or the absence of one. Phase A's corrections record why that is mandatory:
+# "a reason is a claim about code and has to be traced like one".
+_FIXED = "fixed"                    # compares a closed set of keys
+_WRITTEN_FIELDS = "written_fields"  # compares exactly the keys also in `fields`
+_WHOLE_RECORD = "whole_record"      # requires and compares the complete record
+_PER_ITEM = "per_item"              # the guard lives inside a collection
+_NOTHING = "nothing"                # reads no `expected` on any path
+
+# `_validate_guide_identity` (routes.py:1121) and `_validate_prompt_identity`
+# (:1137) each compare a closed set; the sets are transcribed from the `checks`
+# dicts plus the explicit tail comparisons.
+_GUIDE_KEYS = frozenset({"guide_id", "frame_index", "asset_id", "source",
+                         "strength", "muted"})
+_PROMPT_KEYS = frozenset({"prompt_id", "start_frame", "end_frame", "prompt",
+                          "muted", "channels", "channel_docs", "attachments",
+                          "global_channel_exceptions"})
+
+GUARD_CONTRACTS = {
+    # -- validates a closed key set -------------------------------------------
+    "update_scene_fields": (_FIXED, frozenset({
+        "prompt", "global_channels", "global_channel_docs", "global_attachments"}),
+        "`_validate_global_prompt_expectations` compares exactly "
+        "`_DIRECT_GLOBAL_PROMPT_FIELDS`. The other twelve fields "
+        "`_apply_scene_fields` writes -- name, duration_frames, width, height, "
+        "fps, prompt_context_profile_id, prompt_context_profile_config, "
+        "generation_params and the four `VARIABLE_LANE_DESCRIPTORS` count attrs "
+        "-- are written with no comparison of any kind. "
+        "`_require_prompt_mutation_contract` runs first but only checks that the "
+        "keys are PRESENT, so it is not a second comparison."),
+    "update_lane_config": (_FIXED, frozenset({"lane_id"}),
+        "`_apply_lane_config`, guarded only when the lane descriptor has a "
+        "`recipe_attr` and only on lane_id. The deliberate bootstrap tolerance "
+        "-- expected stays optional -- is owned by durable_rules.md, not by "
+        "this entry."),
+    "move_lane": (_FIXED, frozenset({"from_lane_id", "to_lane_id"}),
+        "`_move_media_lane`. Unlike `_apply_lane_config` it REQUIRES expected "
+        "and refuses a blank stored id, because the lane index is the thing the "
+        "operation changes."),
+    "move_guide": (_FIXED, _GUIDE_KEYS | {"replaces_guide_id"},
+        "Two claims in one `expected`, because the operation touches two frames. "
+        "`_validate_guide_identity` checks the SOURCE guide on both the "
+        "apply_linked path and `_apply_move_guide`; `_validate_guide_destination` "
+        "checks what is about to be replaced at the DESTINATION, which "
+        "`_apply_move_guide` deletes exactly as `_apply_create_guide` does. The "
+        "source validator compares a closed key set and ignores "
+        "`replaces_guide_id`, so the two cannot collide. The guide being moved is "
+        "excluded from the destination check: a drag that ends where it began "
+        "legitimately finds itself there."),
+    "update_guide": (_FIXED, _GUIDE_KEYS,
+        "`_validate_guide_identity`, on both the apply_linked path and "
+        "`_apply_update_guide`."),
+    "delete_guide": (_FIXED, _GUIDE_KEYS,
+        "`_validate_guide_identity`, on both the apply_linked path and "
+        "`_apply_delete_guide`."),
+    "update_prompt_section": (_FIXED, _PROMPT_KEYS,
+        "`_validate_prompt_identity`, on both the apply_linked path and "
+        "`_apply_update_prompt_section`, plus a batch pre-pass in "
+        "`_apply_scene_mutations_sync` that validates every member before the "
+        "first write. `subject_ids` is deliberately ignored rather than "
+        "refused."),
+    "delete_prompt_section": (_FIXED, _PROMPT_KEYS,
+        "`_validate_prompt_identity`, on both the apply_linked path and "
+        "`_apply_delete_prompt_section`."),
+    "split_prompt_section": (_FIXED, _PROMPT_KEYS,
+        "`_validate_prompt_identity`, called in the branch before "
+        "`_apply_split_linked`."),
+    "swap_prompt_sections": (_FIXED, _PROMPT_KEYS,
+        "`_apply_swap_prompt_sections` calls `_validate_prompt_identity` twice, "
+        "under `expected_a` and `expected_b` rather than `expected`."),
+    "create_reference_item": (_FIXED, frozenset({"next_start_frame"}),
+        "The dispatch branch calls `_validate_reference_creation_identity`, which "
+        "recomputes `_next_reference_start_after` and compares it with what the "
+        "caller measured its `end_frame` against. Additive in name only: both "
+        "emitters read the next item's start out of their own copy of the lane. "
+        "Two-sided, despite an earlier claim that `_require_no_reference_overlap` "
+        "owned one direction -- a later item moved EARLIER does not always "
+        "overlap the new extent, and then nothing else refuses it. A concurrent "
+        "scene-duration shrink is the case still uncovered."),
+    "replace_prompt_sections": (_FIXED, frozenset({"sections"}),
+        "The dispatch branch calls `_validate_prompt_replacement_identity`, "
+        "which compares the ordered `_prompt_section_structure` -- prompt ids "
+        "with their bounds -- against what the caller believes it is replacing. "
+        "The operation assigns `scene.prompt_sections` outright, so without this "
+        "every concurrent edit in the write window went silently. A content edit "
+        "that leaves ids and bounds alone is deliberately not covered; the "
+        "validator says why and the bug tracker carries the remainder."),
+    "create_guide": (_FIXED, frozenset({"replaces_guide_id"}),
+        "The dispatch branch calls `_validate_guide_creation_identity` before "
+        "`_apply_create_guide`; it delegates to `_validate_guide_destination`, "
+        "shared with `move_guide`, which compares the caller's claim against "
+        "every guide actually at that frame. `_apply_create_guide` REPLACES -- it "
+        "drops every guide already there and rewrites their link groups through "
+        "`_rewrite_link_groups_for_deleted` -- and the client mirrors that in "
+        "`_applyLocalCreateGuide`, so replacement is deliberate. The guard names "
+        "what is being replaced rather than requiring an empty frame, which lets "
+        "the deliberate case through and refuses the blind one. Scoped to the "
+        "dispatcher: `api_add_guide` still calls `_apply_create_guide` "
+        "unguarded, and has no caller in this repository."),
+    "remove_lane": (_FIXED, frozenset({"lane_count", "config", "lane_id"}),
+        "`_remove_media_lane` calls `_validate_lane_removal_identity`, which "
+        "requires `expected` and compares three things. `config` is the lane's "
+        "normalized settings through `_normalized_lane_config`, the identity "
+        "durable_rules.md already names for families with no durable id and the "
+        "one `findLaneByAnchor` resolves by on the client; it is what catches a "
+        "permutation that leaves the count unchanged. `lane_count` is compared "
+        "as a FLOOR -- a family that only grew cannot have moved the caller's "
+        "lane, because `_set_scene_lane_count` appends -- so demanding equality "
+        "would refuse a concurrent append in which nothing moved. `lane_id` "
+        "settles `reference`, the only movable family, and a blank stored id is "
+        "tolerated as `_apply_lane_config` tolerates it. Known residual, stated "
+        "in the validator: two non-reference lanes with identical configs are "
+        "indistinguishable, which only a document version precondition closes."),
+    "split_reference_item": (_FIXED, frozenset({
+        "reference_item_id", "start_frame", "end_frame", "resolved_end_frame"}),
+        "`_apply_split_reference_item` calls `_require_expected` with those four "
+        "required and then compares each. `resolved_end_frame` is in the set "
+        "because under end_frame == -1 the real bound comes from "
+        "scene.duration_frames, which no other key names."),
+
+    # -- validates whatever `fields` names -------------------------------------
+    "update_reference_item": (_WRITTEN_FIELDS, frozenset(),
+        "`_apply_update_reference_item` calls `_reference_item_expected` with "
+        "`fields.keys()`, and that helper iterates the keys it was given rather "
+        "than the keys `expected` carries. `_require_expected` asserts only that "
+        "those keys are a SUBSET of expected, so an extra key naming no written "
+        "field is neither required nor compared -- it is ignored outright."),
+
+    # -- requires the complete record ------------------------------------------
+    "delete_reference_item": (_WHOLE_RECORD, frozenset(),
+        "`_apply_delete_reference_item` calls `_reference_item_expected` with "
+        "`set(item.to_dict())`, so every key of the stored item is both required "
+        "and compared."),
+    "delete_prompt_semantic_unit_if_unreferenced": (_WHOLE_RECORD, frozenset(),
+        "`_apply_delete_prompt_semantic_unit_if_unreferenced` compares the whole "
+        "dict. A partial projection would authorize deleting later user edits, "
+        "which is why DELIBERATE_NO_PROJECTION holds it too."),
+
+    # -- validates inside a collection -----------------------------------------
+    "create_link_group": (_PER_ITEM, frozenset(),
+        "`_add_link_group` resolves each member through "
+        "`_item_ref_from_selection`, which validates that member's own "
+        "`expected` at the point it resolves the row. The client has always "
+        "built those snapshots in `_mutationItemFromSelection`; until umbrella "
+        "Phase B nothing read them."),
+    "unlink_items": (_PER_ITEM, frozenset(),
+        "`_item_ref_from_selection` per item, validated as each row is "
+        "resolved; `_unlink_refs` then acts on what it returned."),
+    "bulk_delete_items": (_PER_ITEM, frozenset(),
+        "`_apply_bulk_delete_items` reads `items[].expected` and validates guide "
+        "through `_validate_guide_identity`, prompt through "
+        "`_validate_prompt_identity` and reference through "
+        "`_reference_item_expected`. The apply_linked path used to discard all of "
+        "that -- every non-reference item went through "
+        "`_item_ref_from_selection`, which read no expected -- so a guarded "
+        "delete became an unguarded one purely by being linked. Umbrella Phase B "
+        "put the check INSIDE that resolver, at each point a row is resolved: an "
+        "earlier version validated in a separate pass that re-derived the "
+        "resolution beside it, and the two could name different rows, which is "
+        "worse than no guard. Clip and audio items carry no expected and resolve "
+        "by durable id, so there is nothing to compare for them. An "
+        "operation-LEVEL expected is still discarded outright: nothing outside "
+        "the items loop reads one."),
+}
+
+# The 23 that read no `expected` on any path. Held as data rather than as
+# "everything else" so `test_the_guard_contracts_still_match_the_code` can fail
+# in BOTH directions -- an operation that gains validation, and one that loses it.
+#
+# Each names the handler its dispatch branch calls, verified by AST against
+# routes.py rather than typed. An earlier pass of this dict cited line numbers
+# and sixteen of them landed on the PREVIOUS branch's tail -- the reason
+# `test_the_guard_evidence_cites_code_that_exists` now checks every name.
+GUARD_CONTRACTS.update({op: (_NOTHING, frozenset(), evidence) for op, evidence in {
+    "consolidate_items": "`_consolidate_media_items` reads target_lane and "
+                         "item_ids, range-checks the lane and refuses an id it "
+                         "cannot resolve; it reads no expected.",
+    "create_audio_track": "`_apply_create_audio_track` reads fields only.",
+    "create_clip": "`_apply_create_clip` reads fields only.",
+    "create_prompt_section": "`_apply_create_prompt_section` reads fields only. "
+                             "`_require_no_prompt_overlap` is a range check "
+                             "against the other sections, not a claim about a "
+                             "prior row.",
+    "create_prompt_semantic_unit": "`_apply_create_prompt_semantic_unit` mints "
+                                   "project-level identity and reads no "
+                                   "expected, unlike its delete sibling.",
+    "delete_audio_track": "`_delete_audio_track` and `_apply_delete_link_refs` "
+                          "are addressed by durable track_id; nothing compared.",
+    "delete_clip": "`_delete_clip` and `_apply_delete_link_refs` are addressed "
+                   "by durable clip_id; nothing compared.",
+    "delete_link_group": "The only branch with no handler call: "
+                         "`_apply_scene_mutation_operation` filters "
+                         "`scene.linked_item_groups` by group_id inline. "
+                         "Nothing compared.",
+    "import_prompt_context_dependencies": "`_apply_prompt_context_dependencies` "
+                                          "extends project-level lists; no scene "
+                                          "row is addressed.",
+    "replace_audio_source": "`_apply_replace_audio_source`. Its `expected_type` "
+                            "parameter names an ASSET TYPE and is not a row "
+                            "guard -- the decoy a widened pattern certified "
+                            "twice.",
+    "replace_clip_source": "`_apply_replace_clip_source`; the same "
+                           "`expected_type` decoy.",
+    "set_lane_count": "`_set_scene_lane_count` takes a count; there is no row to "
+                      "identify.",
+    "split_audio_track": "`_apply_split_linked` takes a ref and a frame; no "
+                         "bounds are compared.",
+    "split_clip": "`_apply_split_linked`; the Critical defect's enabling "
+                  "condition, and it is server-side.",
+    "update_audio_track": "`_apply_update_audio_track` on the plain path and "
+                          "`_apply_linked_bounds_update` on the linked one. "
+                          "Neither reads expected.",
+    "update_clip": "`_apply_update_clip` on the plain path and "
+                   "`_apply_linked_bounds_update` on the linked one. Neither "
+                   "reads expected: the guard gap under the tracked entry about "
+                   "items sitting past the end of their own media is here, not "
+                   "on the client.",
+    "update_lane_configs": "`_apply_lane_configs`, the legacy positional "
+                           "whole-array replacement; nothing compared.",
+}.items()})
+
+
+# Guard values the scan cannot read through. Recorded per site, never treated as
+# green: an opaque guard is exactly where a discarded one would hide, and the
+# plan's own warning is that "treating opaque as green is a false-confidence
+# test". Each entry says what makes it opaque and where the real keys are built.
+OPAQUE_GUARD_SITES = {
+    "editor_reference_panel.js:renderItems:delete_reference_item":
+        "`expected` is an identifier holding the item snapshot. The contract is "
+        "_WHOLE_RECORD, which requires every key of item.to_dict(), so a lexical "
+        "key list could not certify it either way.",
+    "editor_reference_panel.js:writeItem:update_reference_item":
+        "`expected` is built above the literal from the prior row.",
+    "editor_widget.js:_applyPromptSetupWithinGesture:update_scene_fields":
+        "`expected: expectedSceneFields`, an identifier accumulated field by "
+        "field above the literal, inside a conditional spread.",
+    "editor_widget.js:_commitItemMove:swap_prompt_sections":
+        "`expected_a` is an inline literal and reads fine; `expected_b` is an "
+        "identifier. Half-opaque, and listed because the half that is readable "
+        "must not certify the half that is not.",
+    "editor_widget.js:_deletePromptSectionWithinGesture:delete_prompt_section":
+        "`expected` is an identifier built from the section being deleted.",
+    "editor_widget.js:_updateItemPropertyWithinGesture:update_guide":
+        "`expected` is a computed Object.fromEntries over the changed keys.",
+    "editor_widget.js:_updateItemPropertyWithinGesture:update_reference_item":
+        "As above; the same computed guard serves both operations.",
+    "editor_widget.js:_updatePromptSectionWithinGesture:update_prompt_section":
+        "ES6 shorthand `expected,` -- the shape Phase A's predicate was corrected "
+        "twice to see at all.",
+    **{site:
+       "`expected` is `_referenceCreationGuard(...)` on the host, which BOTH "
+       "surfaces call -- the timeline drop and the Reference panel's Add -- and "
+       "which each then reads `end_frame` back off, so the guard cannot describe "
+       "a different measurement than the payload was built from. It landed as a "
+       "method for that reason and the panel grew a second copy anyway; an audit "
+       "caught it."
+       for site in (
+           "editor_widget.js:_placeReferencePayloadWithinGesture:create_reference_item",
+           "editor_reference_panel.js:createItem:create_reference_item",
+       )},
+    "editor_widget.js:_applyPromptSetupWithinGesture:replace_prompt_sections":
+        "`expected` is `_promptSectionsReplacementGuard()`, which must be read "
+        "before anything in the batch touches the scene -- it names the "
+        "collection about to be replaced, not the one replacing it.",
+    **{"editor_widget.js:%s:move_guide" % scope:
+       "`expected` spreads `_guideReplacementGuard(...)` over its inline source "
+       "identity, so the destination half is not lexical. The source half IS "
+       "readable and correct; listing the site keeps the readable half from "
+       "certifying the half that is not."
+       for scope in ("_commitItemMove", "_moveGuideToFrameWithinGesture")},
+    **{"editor_widget.js:%s:create_guide" % scope:
+       "`expected` is `_guideReplacementGuard(...)`, one builder shared by both "
+       "guide-creating gestures. It must be read BEFORE the local apply, which "
+       "removes the occupant it names -- which is exactly why it is a method and "
+       "not an inline literal at two call sites."
+       for scope in ("_addClipFrameToGuidesWithinGesture",
+                     "_handleAssetDropWithinGesture")},
+    **{"editor_widget.js:%s:remove_lane" % scope:
+       "`expected` is `_laneRemovalGuard(...)`, one builder shared by all four "
+       "removal gestures so the recipe lookup cannot drift between them. "
+       "`test_the_lane_removal_guard_matches_its_contract` runs the builder and "
+       "checks its keys against GUARD_CONTRACTS, which is a stronger check than "
+       "reading the literal would have been."
+       for scope in ("_deleteSelectedLanesAndItemsWithinGesture",
+                     "_removeLaneDeletingItemsWithinGesture",
+                     "_removeLaneWithItemsWithinGesture",
+                     "_removeLaneWithinGesture")},
+    "prompt_identity_transactions.js:promptIdentityCleanupPlan:"
+    "delete_prompt_semantic_unit_if_unreferenced":
+        "`expected` is the complete created unit. _WHOLE_RECORD again.",
+}
+
+# An emission sends an `expected` key the server never compares, and the key is
+# provably inert. Empty, and meant to stay that way.
+#
+# It held one entry for the length of an audit. `_appendReferenceMembersWithinGesture`
+# sent `expected: { members, reference_item_id }` against `fields: { members }`,
+# so `_reference_item_expected` compared `members` alone. Exempting it was the
+# wrong call: the tripwire's own message says to remove the key unless it is
+# provably inert, the emission was already addressed by its top-level
+# `reference_item_id`, and deleting one line was both cheaper than the exemption
+# and the repair that keeps the signal. An exemption dict nobody can empty is the
+# thing this phase exists to drain.
+#
+# Expiry: an entry leaves when the key is removed from the emission, or when the
+# branch starts comparing it. Prefer removing the key.
+DISCARDED_GUARD_KEYS = {}
+
+
+@functools.lru_cache(maxsize=1)
+def _routes_identifiers() -> frozenset[str]:
+    """Every function, class and module-level constant routes.py defines."""
+    tree = ast.parse(ROUTES.read_text(encoding="utf-8"))
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+    for node in tree.body:
+        targets = (node.targets if isinstance(node, ast.Assign)
+                   else [node.target] if isinstance(node, ast.AnnAssign) else [])
+        names.update(target.id for target in targets if isinstance(target, ast.Name))
+    return frozenset(names)
+
+
+@functools.lru_cache(maxsize=1)
+def _client_identifiers() -> frozenset[str]:
+    """Named scopes in the emitting modules, via the scanner's own resolver.
+
+    A guard trace legitimately crosses the boundary -- `create_guide`'s reason
+    only makes sense once you know `_applyLocalCreateGuide` mirrors the server's
+    replace-at-frame -- so the citation check has to know both vocabularies or it
+    would push a true cross-language fact out of the record.
+    """
+    names = set()
+    for module in EMITTING_MODULES:
+        source = (JS_DIR / module).read_text(encoding="utf-8")
+        names.update(name for name, _start, _end in _scopes(source))
+    return frozenset(names)
+
+
+_CITATION_RE = re.compile(r"`([A-Za-z_][\w.]*)`")
+
+
+def _cited_names(evidence: str) -> tuple[str, ...]:
+    """Backticked identifiers in a piece of evidence, bare of any subscript."""
+    return tuple(name.split("[")[0].rstrip(".")
+                 for name in _CITATION_RE.findall(evidence))
+
+
+def _validator_key_set(function_name: str) -> frozenset[str]:
+    """The keys a `_validate_*_identity` helper compares, read out of routes.py.
+
+    The helpers share one shape: a `checks = {...}` dict whose keys are compared
+    in a loop, then zero or more `if "<key>" in expected:` tails for the values
+    that need normalizing first. Reading both is what makes the frozensets above
+    a transcription that can be CHECKED rather than one that has to be trusted.
+    """
+    tree = ast.parse(ROUTES.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.FunctionDef) and node.name == function_name):
+            continue
+        keys = set()
+        for sub in ast.walk(node):
+            if (isinstance(sub, ast.Assign) and isinstance(sub.value, ast.Dict)
+                    and any(isinstance(target, ast.Name) and target.id == "checks"
+                            for target in sub.targets)):
+                keys.update(key.value for key in sub.value.keys
+                            if isinstance(key, ast.Constant))
+            # `if "attachments" in expected:` -- a tail comparison.
+            if (isinstance(sub, ast.Compare) and len(sub.ops) == 1
+                    and isinstance(sub.ops[0], ast.In)
+                    and isinstance(sub.left, ast.Constant)
+                    and isinstance(sub.left.value, str)
+                    and isinstance(sub.comparators[0], ast.Name)
+                    and _GUARD_NAME_RE.fullmatch(sub.comparators[0].id)):
+                keys.add(sub.left.value)
+        assert keys, f"{function_name}: no compared keys found; the walk is blind"
+        return frozenset(keys)
+    raise AssertionError(f"{function_name} not found in routes.py")
+
+
+@functools.lru_cache(maxsize=1)
+def _direct_global_prompt_fields() -> frozenset[str]:
+    """`_DIRECT_GLOBAL_PROMPT_FIELDS`, read out of routes.py rather than copied."""
+    tree = ast.parse(ROUTES.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if not (isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name)
+                and target.id == "_DIRECT_GLOBAL_PROMPT_FIELDS"
+                for target in node.targets)):
+            continue
+        call = node.value
+        assert isinstance(call, ast.Call), "the constant is no longer a frozenset(...)"
+        values = call.args[0]
+        return frozenset(element.value for element in values.elts
+                         if isinstance(element, ast.Constant))
+    raise AssertionError("_DIRECT_GLOBAL_PROMPT_FIELDS not found in routes.py")
+
+
+def _hands_on_a_client_guard(function, call: ast.Call) -> bool:
+    """Does this call hand `function`'s `expected*` parameter a CLIENT guard?
+
+    A function with no such parameter returns True, so the ordinary descent is
+    unaffected -- the helper may read the operation dict itself, which is how
+    `_apply_lane_config` honours one.
+
+    Where the parameter exists, the value decides. `_remove_media_lane` is
+    reached two ways: the dispatcher passes `op.get("expected")`, and
+    `_consolidate_media_items` passes `LANE_INDEX_FROM_SERVER_STATE` because it
+    is vacating a lane it has just emptied from state it already holds. Counting
+    the second would report the whole `consolidate_items` branch as honouring a
+    guard it never reads from the request -- and worse, would make the contract
+    say so while the emissions stayed in the exemption catalogue.
+    """
+    arguments = function.args
+    names = [argument.arg for argument in
+             arguments.posonlyargs + arguments.args + arguments.kwonlyargs]
+    guard_names = {name for name in names if _GUARD_NAME_RE.fullmatch(name)}
+    if not guard_names:
+        return True
+
+    bound = []
+    for keyword in call.keywords:
+        if keyword.arg in guard_names:
+            bound.append(keyword.value)
+    positional = arguments.posonlyargs + arguments.args
+    for index, argument in enumerate(positional):
+        if argument.arg in guard_names and index < len(call.args):
+            bound.append(call.args[index])
+    if not bound:
+        return False
+
+    def names_a_guard(node) -> bool:
+        for sub in ast.walk(node):
+            name = (sub.id if isinstance(sub, ast.Name)
+                    else sub.value if isinstance(sub, ast.Constant)
+                    and isinstance(sub.value, str) else None)
+            if name and _GUARD_NAME_RE.fullmatch(name):
+                return True
+        return False
+
+    return any(names_a_guard(value) for value in bound)
+
+
+@functools.lru_cache(maxsize=1)
+def _branches_reading_expected() -> frozenset[str]:
+    """Dispatcher branches that reach a real `expected` read, by AST.
+
+    Independent of `GUARD_CONTRACTS` on purpose: this is the code half of the
+    comparison, so the dict cannot certify itself. Follows `ast.Name` callees to
+    depth 2 and matches Phase A's corrected pattern `expected(_[ab])?`. The
+    decoys are excluded by `fullmatch` rather than by a narrowed pattern, because
+    a broader one produced a false positive twice -- `expected_type` names an
+    asset type and `expected_prompt_template` a project-template content hash,
+    and neither is a whole-identifier match.
+
+    Bounded to the dispatcher, which is narrower than "the code half". The batch
+    pre-pass in `_apply_scene_mutations_sync` validates `update_prompt_section`
+    identity OUTSIDE this function; that operation also reads `expected` in its
+    own branch, so nothing is missed today, but a guard added only to the
+    pre-pass would leave a `_NOTHING` contract standing as a lie. Widen the walk,
+    not the contract, if that ever happens.
+    """
+    tree = ast.parse(ROUTES.read_text(encoding="utf-8"))
+    functions = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            functions.setdefault(node.name, node)
+    dispatcher = functions.get("_apply_scene_mutation_operation")
+    assert dispatcher is not None, "the dispatcher walk found no dispatcher"
+
+    def reads_guard(node) -> bool:
+        # Three shapes reach a guard: the parameter (`expected: dict | None`),
+        # the local binding, and `op.get("expected")` -- where the name is a
+        # string constant. `fullmatch` is what keeps prose out: a docstring or
+        # comment saying "expected" is not one of these, and `expected_type` and
+        # `expected_prompt_template` fail it as whole identifiers.
+        for sub in ast.walk(node):
+            name = (sub.id if isinstance(sub, ast.Name)
+                    else sub.attr if isinstance(sub, ast.Attribute)
+                    else sub.arg if isinstance(sub, ast.arg)
+                    else sub.value if isinstance(sub, ast.Constant)
+                    and isinstance(sub.value, str) else None)
+            if name and _GUARD_NAME_RE.fullmatch(name):
+                return True
+        return False
+
+    def honours(node, depth: int, seen: frozenset) -> bool:
+        if reads_guard(node):
+            return True
+        if depth <= 0:
+            return False
+        for sub in ast.walk(node):
+            if not (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)):
+                continue
+            callee = sub.func.id
+            if callee in seen or callee not in functions:
+                continue
+            # A helper that TAKES a guard is only honouring one if this call
+            # hands it a guard from the request. `_consolidate_media_items`
+            # removes a lane it has just emptied and passes an explicit
+            # server-state sentinel, so counting `_remove_media_lane`'s parameter
+            # would report the whole `consolidate_items` branch as guarded while
+            # it reads nothing at all from the operation.
+            if not _hands_on_a_client_guard(functions[callee], sub):
+                continue
+            if honours(functions[callee], depth - 1, seen | {callee}):
+                return True
+        return False
+
+    found = set()
+    for statement in ast.walk(dispatcher):
+        if not isinstance(statement, ast.If):
+            continue
+        test = statement.test
+        if not (isinstance(test, ast.Compare) and isinstance(test.left, ast.Name)
+                and test.left.id == "op_type"):
+            continue
+        for comparator in test.comparators:
+            if not (isinstance(comparator, ast.Constant)
+                    and isinstance(comparator.value, str)):
+                continue
+            body = ast.Module(body=statement.body, type_ignores=[])
+            if honours(body, 2, frozenset()):
+                found.add(comparator.value)
+    return frozenset(found)
+
+
+def _guarded_emissions():
+    """Every emission carrying an `expected*`, keyed as the catalogues are."""
+    sites = {}
+    for item in _operation_literals():
+        paths = _guard_key_paths(item["extent"], item["mask"])
+        if not paths:
+            continue
+        key = f"{item['module']}:{item['scope']}:{item['op_type']}"
+        sites.setdefault(key, {"op_type": item["op_type"], "line": item["line"],
+                               "paths": set(), "fields": set()})
+        sites[key]["paths"].update(paths)
+        sites[key]["fields"].update(
+            path.split(".", 1)[1]
+            for path in _payload_fingerprint(item["extent"], item["mask"])
+            if path.startswith("fields."))
+    return sites
+
+
+def test_every_dispatcher_operation_declares_a_guard_contract():
+    """Coverage. A new operation must state what it does with an `expected`."""
+    op_types = _dispatcher_op_types()
+    missing = sorted(op_types - set(GUARD_CONTRACTS))
+    assert not missing, (
+        "these dispatcher operations declare no guard contract, so the tripwire "
+        "below cannot tell a guard they honour from one they discard. Add an "
+        f"entry naming the validating call, or its absence: {missing}")
+    extra = sorted(set(GUARD_CONTRACTS) - op_types)
+    assert not extra, f"contracts for operations the dispatcher no longer has: {extra}"
+    for op_type, (kind, keys, evidence) in sorted(GUARD_CONTRACTS.items()):
+        assert kind in {_FIXED, _WRITTEN_FIELDS, _WHOLE_RECORD, _PER_ITEM,
+                        _NOTHING}, f"{op_type}: unknown contract kind {kind!r}"
+        assert _cited_names(evidence), (
+            f"{op_type}: the evidence names no code. Cite the handler the branch "
+            "calls, in backticks")
+        assert bool(keys) == (kind == _FIXED), (
+            f"{op_type}: only a {_FIXED} contract carries a key set")
+
+
+def test_the_guard_contracts_still_match_the_code():
+    """The dict cannot certify itself; the AST is the other half.
+
+    Fails in both directions. A branch that gains validation makes its
+    `_NOTHING` entry a lie that would keep its emissions in the exemption
+    catalogue forever; a branch that loses validation makes a positive entry a
+    guard the server has quietly stopped honouring.
+    """
+    reading = _branches_reading_expected()
+    declared_none = {op for op, (kind, _keys, _why) in GUARD_CONTRACTS.items()
+                     if kind == _NOTHING}
+    gained = sorted(declared_none & reading)
+    assert not gained, (
+        "these operations are recorded as reading no `expected`, but the "
+        "dispatcher now reaches one. Re-read the branch and give it a contract "
+        "naming the keys it COMPARES -- this walk matches the name, so a bare "
+        "`op.get(\"expected\")` that is never compared is not a guard and a "
+        "generous key set here would silence the tripwire for every emission on "
+        "that operation. Then check whether those emissions can leave "
+        f"GUARD_EXEMPT_SITES: {gained}")
+    lost = sorted((set(GUARD_CONTRACTS) - declared_none) - reading)
+    assert not lost, (
+        "these operations declare a guard contract, but no `expected` read is "
+        "reachable from their dispatch branch any more. A guard the server "
+        f"stopped honouring is worse than one it never had: {lost}")
+
+
+def test_no_emission_sends_a_guard_the_server_discards():
+    """The tripwire this section exists for.
+
+    `GUARD_EXEMPT_SITES` can be drained by adding an `expected` the server
+    throws away -- the Phase 3 predicate matches a token on the client and
+    cannot see the branch. This is what stops that, so read its failure as
+    **add server-side validation**, not as add an exemption. Adding an
+    exemption here re-opens the hole it closes.
+    """
+    findings = []
+    for key, site in sorted(_guarded_emissions().items()):
+        kind, honoured, _evidence = GUARD_CONTRACTS[site["op_type"]]
+        for container, guard, field in sorted(site["paths"]):
+            label = f"{container + '.' if container else ''}{guard}.{field}"
+            if (key, label) in DISCARDED_GUARD_KEYS:
+                continue
+            # Opacity is checked LAST on purpose. For an operation that reads no
+            # `expected` at all, the value's lexical shape is irrelevant -- every
+            # key is discarded whatever it looks like -- so skipping opaque
+            # values first would leave the catalogue drainable by writing
+            # `expected: priorClip` instead of an inline literal. That is the
+            # exact hole this section exists to close, wearing a different hat.
+            if kind == _NOTHING:
+                findings.append(
+                    f"{key} (line {site['line']}) sends {label}, and the "
+                    "dispatch branch reads no `expected` on any path")
+            elif kind == _PER_ITEM and not container:
+                findings.append(
+                    f"{key} (line {site['line']}) sends {label} at the operation "
+                    "level, but the branch reads `expected` only inside its "
+                    "items collection")
+            elif field == "<opaque>":
+                continue  # OPAQUE_GUARD_SITES owns what a scan cannot read
+            elif kind == _FIXED and field not in honoured:
+                findings.append(
+                    f"{key} (line {site['line']}) sends {label}, but the branch "
+                    f"compares only {sorted(honoured)}")
+            elif kind == _WRITTEN_FIELDS and site["fields"] and (
+                    "<opaque>" not in site["fields"]) and field not in site["fields"]:
+                findings.append(
+                    f"{key} (line {site['line']}) sends {label}, but the branch "
+                    f"compares only the written fields {sorted(site['fields'])}")
+    assert not findings, (
+        "an `expected` the server does not compare is not a guard -- it "
+        "satisfies the Phase 3 catalogue and protects nothing. Add the "
+        "comparison to the dispatch branch, or remove the key so the emission "
+        "stops claiming a protection it does not have. Do NOT add an exemption "
+        "unless the key is provably inert, and say why in DISCARDED_GUARD_KEYS: "
+        + "; ".join(findings))
+
+
+def test_an_opaque_guard_is_catalogued_rather_than_assumed_honoured():
+    """Opaque is a named class. Silence would be the false-confidence test."""
+    opaque = {key for key, site in _guarded_emissions().items()
+              if any(field == "<opaque>" for _c, _g, field in site["paths"])}
+    unlisted = sorted(opaque - set(OPAQUE_GUARD_SITES))
+    assert not unlisted, (
+        "these emissions carry an `expected` the scan cannot read through, so "
+        "the tripwire above skipped them. Record what makes each opaque and "
+        "where its keys are built, or make the literal readable: "
+        f"{unlisted}")
+    gone = sorted(set(OPAQUE_GUARD_SITES) - opaque)
+    assert not gone, (
+        f"these opaque entries match no guarded emission any more: {gone}")
+
+
+def test_discarded_guard_entries_are_not_stale():
+    """An exemption must be able to die, or it is documentation of a gap."""
+    live = set()
+    for key, site in _guarded_emissions().items():
+        for container, guard, field in site["paths"]:
+            live.add((key, f"{container + '.' if container else ''}{guard}.{field}"))
+    gone = sorted(entry for entry in DISCARDED_GUARD_KEYS if entry not in live)
+    assert not gone, (
+        "these discarded-guard entries no longer match any emission -- the key "
+        f"was removed or the site changed -- so the entry should go with it: {gone}")
+
+    # This is the cheapest way out of the tripwire above, so it is held to the
+    # same standard as the catalogues it can override: a reason that cites code.
+    # Left unpoliced it would be the least-defended dict in the file and the one
+    # a maintainer reaches for first.
+    unevidenced = sorted(entry for entry, note in DISCARDED_GUARD_KEYS.items()
+                         if not _cited_names(note))
+    assert not unevidenced, (
+        "an exemption from the guard tripwire must cite the code proving the key "
+        f"is inert: {unevidenced}")
+
+
+def test_the_guard_extractor_reads_the_shapes_the_tree_uses():
+    """Guards the guard, with exact findings on each live shape."""
+    inline = _scan_text(
+        'function gesture() { send({ type: "update_guide", frame_index: f,'
+        ' expected: { guide_id: id, frame_index: f } }); }\n')
+    assert _guard_key_paths(inline[0]["extent"], inline[0]["mask"]) == (
+        ("", "expected", "frame_index"), ("", "expected", "guide_id"))
+
+    # The shape a depth-1 walker cannot see at all: four live sites use it.
+    spread = _scan_text(
+        'function gesture() { send({ type: "update_lane_config", lane_index: i,'
+        ' ...(laneId ? { expected: { lane_id: laneId } } : {}) }); }\n')
+    assert _guard_key_paths(spread[0]["extent"], spread[0]["mask"]) == (
+        ("", "expected", "lane_id"),)
+
+    shorthand = _scan_text(
+        'function gesture() { send({ type: "update_prompt_section", index: i,'
+        ' expected, fields }); }\n')
+    assert _guard_key_paths(shorthand[0]["extent"], shorthand[0]["mask"]) == (
+        ("", "expected", "<opaque>"),)
+
+    identifier = _scan_text(
+        'function gesture() { send({ type: "delete_guide", frame_index: f,'
+        ' expected: snapshot }); }\n')
+    assert _guard_key_paths(identifier[0]["extent"], identifier[0]["mask"]) == (
+        ("", "expected", "<opaque>"),)
+
+    nested = _scan_text(
+        'function gesture() { send({ type: "bulk_delete_items", items: ['
+        '{ type: "prompt", id: 0, expected: { prompt_id: p } }] }); }\n')
+    assert _guard_key_paths(nested[0]["extent"], nested[0]["mask"]) == (
+        ("items[]", "expected", "prompt_id"),)
+
+    # The two decoys. Certifying either is the specific error Phase A fixed and
+    # this plan's first draft then repeated.
+    for decoy in ("expected_type: \"video\"", "expected_prompt_template: hash"):
+        literal = _scan_text(
+            'function gesture() { send({ type: "update_clip", clip_id: id, '
+            + decoy + " }); }\n")
+        assert _guard_key_paths(literal[0]["extent"], literal[0]["mask"]) == (), decoy
+
+
+def test_the_guard_tripwire_fires_on_a_guard_the_server_discards():
+    """Prove the failure by hand, on the exact repair the ratchet invites.
+
+    `update_clip` is the operation with the most exempted emissions, and the
+    cheapest way to clear them from Phase 3 is to add an `expected` its branch
+    never reads. That must fail here.
+    """
+    faked = _scan_text(
+        'function gesture() { send({ type: "update_clip", clip_id: id,'
+        ' fields: { timeline_start_frame: f },'
+        ' expected: { timeline_start_frame: prior } }); }\n')
+    assert _is_guarded(faked[0]["extent"], faked[0]["mask"]), (
+        "the Phase 3 predicate reads this as guarded -- which is the hole")
+    kind, _keys, _why = GUARD_CONTRACTS["update_clip"]
+    assert kind == _NOTHING
+    paths = _guard_key_paths(faked[0]["extent"], faked[0]["mask"])
+    assert ("", "expected", "timeline_start_frame") in paths
+
+    # And a guard on a field its branch really does compare must pass.
+    honest = _scan_text(
+        'function gesture() { send({ type: "update_scene_fields",'
+        ' fields: { prompt: next }, expected: { prompt: prior } }); }\n')
+    kind, honoured, _why = GUARD_CONTRACTS["update_scene_fields"]
+    assert kind == _FIXED and "prompt" in honoured
+    assert ("", "expected", "prompt") in _guard_key_paths(
+        honest[0]["extent"], honest[0]["mask"])
+    # ... while the same shape on a field it writes but never compares does not.
+    assert "width" not in honoured
+
+
+# ---------------------------------------------------------------------------
+# Phase 5b -- a decision per SITE, not per operation
+# ---------------------------------------------------------------------------
+# Phase A wrote `GUARD_EXEMPT_REASONS` per operation and recorded that splitting
+# it per site was the right thing, left to umbrella Phase B. This is that split.
+# The reason an operation carries no guard is a property of the operation; whether
+# that MATTERS is a property of the call site, and three operations here hold
+# sites on both sides of the line.
+#
+# Three dispositions, and the middle one is the finding that made this worth
+# doing: two emissions the scan calls unguarded are among the best-guarded writes
+# in the tree, because their guard is built by a helper instead of written as a
+# literal.
+_FAIR = "fair"          # nothing an `expected` could name
+_REASONED = "reasoned"  # guarded, or bounded, by something the scan cannot see
+_GAP = "gap"            # a real gap; the note names who owns closing it
+
+GUARD_SITE_DISPOSITIONS = {
+    # -- `update_scene_fields`: the clearest per-field partial ---------------
+    # The scene comes from the URL, so there is no row to identify; what an
+    # `expected` protects here is the prior VALUE of a field. Four of the sixteen
+    # fields get that (GUARD_CONTRACTS). None of these eight names one of them --
+    # but two carry a stronger guard the scan structurally cannot read.
+    "editor_prompt_panel.js:attachReference:update_scene_fields": (_REASONED,
+        "`fields` is `promptEditFields` (prompt_edit_intent.js), which emits "
+        "`prompt_edit: { attachments: { <id>: { expected, value } } }` -- a "
+        "per-attachment exact-prior-value guard that `_merge_prompt_edit_fields` "
+        "requires and then refuses on a content-hash mismatch. Unguarded is the "
+        "scan's word, not the code's: the guard is built by a helper, so no "
+        "`expected` token appears at the emission. Expiry: only if that helper "
+        "stops emitting prompt_edit."),
+    "editor_widget.js:_updateSceneGlobalContextWithinGesture:update_scene_fields": (
+        _REASONED,
+        "The same `promptEditFields` guard, per document and per attachment, plus "
+        "`expected_prompt_template` -- a project-template content hash checked at "
+        "the top of `_apply_scene_mutation_operation`, before any branch. "
+        "Deliberately not matched by `_GUARD_RE`, because it is not a claim about "
+        "a row."),
+    "editor_prompt_panel.js:openProfileEditor:update_scene_fields": (_FAIR,
+        "Writes `prompt_context_profile_id`, one whole-value id set. Last write "
+        "wins is the correct semantic for a whole-value set: an `expected` would "
+        "refuse the second of two profile switches with no wrong outcome to "
+        "prevent."),
+    "editor_prompt_panel.js:renderContextSettings:update_scene_fields": (_FAIR,
+        "The same `prompt_context_profile_id` whole-value set as "
+        "`openProfileEditor`, reached from the Context settings surface."),
+    "editor_widget.js:_renameSceneWithinGesture:update_scene_fields": (_FAIR,
+        "Whole-value `name` set. §1b of the plan established the same reading for "
+        "rename, duration and resolution: idempotent whole-value sets carrying no "
+        "`expected`, so last-write-wins is correct and the coalescing collapse is "
+        "not a defect."),
+    "editor_widget.js:_updateSceneDurationWithinGesture:update_scene_fields": (_FAIR,
+        "Whole-value `duration_frames` set. Note the tail effect is NOT unguarded "
+        "collateral: `_apply_scene_fields` calls `_clamp_reference_items_to_scene`, "
+        "which is derived from the new duration rather than from client state."),
+    "editor_widget.js:_updateSceneResolutionWithinGesture:update_scene_fields": (_FAIR,
+        "Whole-value `width`/`height` set."),
+    "editor_widget.js:_updateSceneFpsWithinGesture:update_scene_fields": (_FAIR,
+        "Whole-value `fps` set, and the one field here with a real server-side "
+        "precondition of its own: `_require_scene_queue_idle` refuses the change "
+        "while that scene has pending or running jobs, and `retime_scene_geometry` "
+        "derives every endpoint from the stored value rather than from anything "
+        "the client computed."),
+
+    # -- `update_clip` / `update_audio_track`: 15 sites, one gap ------------
+    # Sized here, implemented by a successor plan. The sizing fact this adds to
+    # what split-optimistic-local-apply.md already recorded: the gap is
+    # SERVER-SIDE FIRST. `_apply_update_clip` and `_apply_update_audio_track`
+    # read no `expected` on either the plain or the apply_linked path, so adding
+    # one to any of these 15 emissions today would change nothing at all.
+    **{site: (_GAP,
+              "`update_clip`/`update_audio_track` carry timeline geometry against a "
+              "durable id with no prior-value check anywhere on the path. "
+              "Server-side first: the branch must learn to compare before any "
+              "emission is worth changing. Owned by a successor plan; the "
+              "enabling condition for the tracked entry about items sitting past "
+              "the end of their own media.")
+       for site in (
+           "editor_widget.js:_commitItemMove:update_audio_track",
+           "editor_widget.js:_commitItemMove:update_clip",
+           "editor_widget.js:_commitTrim:update_audio_track",
+           "editor_widget.js:_commitTrim:update_clip",
+           "editor_widget.js:_convertClipRoleWithinGesture:update_clip",
+           "editor_widget.js:_moveItemToFrameWithinGesture:update_audio_track",
+           "editor_widget.js:_moveItemToFrameWithinGesture:update_clip",
+           "editor_widget.js:_moveItemToNewLaneWithinGesture:update_audio_track",
+           "editor_widget.js:_moveItemToNewLaneWithinGesture:update_clip",
+           "editor_widget.js:_muteOperationForItem:update_audio_track",
+           "editor_widget.js:_muteOperationForItem:update_clip",
+           "editor_widget.js:_toggleSelectedMuteWithinGesture:update_audio_track",
+           "editor_widget.js:_toggleSelectedMuteWithinGesture:update_clip",
+           "editor_widget.js:_updateItemPropertyWithinGesture:update_audio_track",
+           "editor_widget.js:_updateItemPropertyWithinGesture:update_clip",
+       )},
+
+    # -- creates that really are additive ------------------------------------
+    "editor_widget.js:_handleAssetDropWithinGesture:create_clip": (_FAIR,
+        "Two fingerprints, both additive: no prior row exists for an `expected` "
+        "to describe. Its `track_index` and `audio_lane_index` are the rebase "
+        "question, and `case \"create_clip\"` retargets both."),
+    "editor_widget.js:_handleAssetDropWithinGesture:create_audio_track": (_FAIR,
+        "Additive; no prior row exists. Its `lane_index` is the rebase question "
+        "rather than this one, and `case \"create_audio_track\"` retargets it."),
+    "editor_widget.js:_saveNewPromptSectionWithinGesture:create_prompt_section": (_FAIR,
+        "Additive, and a stale range does not apply silently: "
+        "`_require_no_prompt_overlap` refuses a range history has since occupied. "
+        "The same argument REBASE_EXEMPT records for this operation."),
+    "editor_widget.js:_applyPromptSetupWithinGesture:create_prompt_semantic_unit": (_FAIR,
+        "Mints project-level prompt identity through "
+        "`_apply_create_prompt_semantic_unit`. No scene row exists yet or is "
+        "named."),
+    "editor_widget.js:_runRedoWithinGesture:create_prompt_semantic_unit": (_FAIR,
+        "As `_applyPromptSetupWithinGesture`; Redo re-mints the same identity, and "
+        "`delete_prompt_semantic_unit_if_unreferenced` is the guarded half of "
+        "that pair."),
+    "prompt_context_chips.js:configurePromptAttachment:create_prompt_semantic_unit": (
+        _FAIR, "The same `create_prompt_semantic_unit` mint, from the shared "
+        "`prompt_context_chips.js` editor."),
+    "editor_widget.js:_applyPromptSetupWithinGesture:import_prompt_context_dependencies": (
+        _FAIR,
+        "Project-level profile and semantic-unit closures; no scene row is "
+        "addressed. Carried, not closed: `_apply_prompt_context_dependencies` "
+        "`extend`s the project lists, so two COALESCED imports would drop the "
+        "older one's items. Its only emitter is `coalesce: false`, which is what "
+        "keeps this fair rather than a gap -- Phase 4's residual note owns the "
+        "day that changes."),
+
+    # -- creates that are not purely additive --------------------------------
+
+    # -- collections the client assembled ------------------------------------
+    "editor_widget.js:_createLinkGroupFromSelectionWithinGesture:create_link_group": (
+        _REASONED,
+        "Its whole payload is references to pre-existing rows, and the client "
+        "DOES build per-item `expected` -- `_item_ref_from_selection` (:1327) "
+        "discards it. The positional half of that exposure is now closed on the "
+        "client side: umbrella Phase B gave this operation a rebase case, so a "
+        "queued history action retargets the refs instead of letting them drift. "
+        "What remains is a concurrent OTHER writer, which only the server-side "
+        "guard would catch. Reasoned rather than fair, and reasoned rather than "
+        "gap, because the reachable half is fixed."),
+    "editor_widget.js:_unlinkSelectedItemsWithinGesture:unlink_items": (_REASONED,
+        "The same `_mutationItemFromSelection` refs and the same rebase case; "
+        "unlinking a wrong row is also recoverable in a way that deleting one "
+        "is not."),
+    "editor_widget.js:_deleteItemsInLaneWithinGesture:bulk_delete_items": (_FAIR,
+        "Carries durable clip/audio ids and a boolean. There is no prior row "
+        "state an `expected` would describe, and clip/audio are exactly the two "
+        "item types `_apply_bulk_delete_items` resolves by durable id."),
+    "editor_widget.js:_deleteSelectedItemsWithinGesture:bulk_delete_items": (_REASONED,
+        "`items` is an identifier the scan cannot see through, and the array DOES "
+        "carry per-item `expected` -- built by `_mutationItemFromSelection` -- "
+        "that the server validates for guide, prompt and reference. The residual "
+        "that made this a gap is closed: `_validate_selection_item_identity` now "
+        "runs ahead of `_item_ref_from_selection` on the apply_linked path, so a "
+        "guarded delete no longer becomes an unguarded one by being linked. Clip "
+        "and audio members carry no snapshot and need none -- they are addressed "
+        "by durable id."),
+    "editor_widget.js:_consolidateSelectedItemsToLaneWithinGesture:consolidate_items": (
+        _FAIR,
+        "Carries `target_lane` and durable `item_ids`. The lane index is rebased "
+        "through `rebaseLaneIndex`, and `_consolidate_media_items` range-checks it "
+        "and refuses an id it cannot resolve. The item ids are durable, so "
+        "nothing here is addressed by position without a check."),
+
+    # -- owned by an approved plan -------------------------------------------
+    "editor_widget.js:_splitClipAtFrameWithinGesture:split_clip": (_GAP,
+        "The Critical defect itself. split-optimistic-local-apply.md L1 adds the "
+        "`expected` bounds guard; not this phase's to take."),
+    "editor_widget.js:_splitClipAtFrameWithinGesture:split_audio_track": (_GAP,
+        "As `split_clip`; split-optimistic-local-apply.md L1 covers both."),
+}
+
+
+def test_every_unguarded_emission_has_a_site_disposition():
+    """Per site, not per operation. 47 emissions, 46 keys, one decision each."""
+    sites = _unguarded_payload_sites()
+    undecided = sorted(set(sites) - set(GUARD_SITE_DISPOSITIONS))
+    assert not undecided, (
+        "these emissions carry an operation-level reason but no decision about "
+        "this call site. Say whether the missing guard is fair here, reasoned "
+        f"here, or a gap here, and trace it: {undecided}")
+    gone = sorted(set(GUARD_SITE_DISPOSITIONS) - set(sites))
+    assert not gone, (
+        "these dispositions match no unguarded emission any more -- the site was "
+        f"guarded, renamed or removed -- so the decision should go with it: {gone}")
+    for key, (disposition, note) in sorted(GUARD_SITE_DISPOSITIONS.items()):
+        assert disposition in {_FAIR, _REASONED, _GAP}, f"{key}: {disposition!r}"
+        # A disposition is a claim about code, so it has to cite some -- a source
+        # file, a plan, or an identifier in backticks. A character count would be
+        # an arbitrary proxy whose cheapest repair is padding.
+        assert re.search(r"routes\.py|\w+\.(?:js|md)|`[A-Za-z_][\w.]*`",
+                         note), (
+            f"{key}: the disposition cites nothing checkable. Name the handler, "
+            "the helper, or the plan that owns it")
+
+
+def test_the_site_dispositions_agree_with_the_operation_reasons():
+    """The two catalogues must cover the same surface, keyed differently."""
+    per_site_ops = {key.rsplit(":", 1)[-1] for key in GUARD_SITE_DISPOSITIONS}
+    assert per_site_ops == set(GUARD_EXEMPT_REASONS), (
+        "the per-site and per-operation catalogues disagree about which "
+        "operations are exempted: "
+        f"{sorted(per_site_ops ^ set(GUARD_EXEMPT_REASONS))}")
+
+
+def test_no_catalogue_still_calls_a_decided_operation_unreviewed():
+    """Prose drifts silently; this is the one claim worth policing mechanically.
+
+    Four `GUARD_EXEMPT_REASONS` entries went on saying "unreviewed" after the
+    dict that held the unreviewed entries had been emptied, so two catalogues in
+    this file said opposite things about `create_guide` and nothing failed. The
+    word is a status claim about another dict, which makes it checkable.
+    """
+    stale = sorted(
+        op_type for op_type, reason in GUARD_EXEMPT_REASONS.items()
+        if re.search(r"\bunreviewed\b", reason, re.IGNORECASE)
+        and op_type not in REBASE_UNREVIEWED)
+    assert not stale, (
+        "these reasons call an operation unreviewed, but REBASE_UNREVIEWED no "
+        "longer holds it -- so the reason is describing a state that ended. "
+        f"Say what the review concluded: {stale}")
+
+    for name, entries in (("REBASE_EXEMPT", REBASE_EXEMPT),
+                          ("DELIBERATE_NO_PROJECTION", DELIBERATE_NO_PROJECTION)):
+        contradictory = sorted(
+            op_type for op_type, reason in entries.items()
+            if re.search(r"\bunreviewed\b", reason, re.IGNORECASE))
+        assert not contradictory, (
+            f"{name} explains these operations while calling them unreviewed: "
+            f"{contradictory}")
+
+
+def test_the_dispositions_hold_the_findings_the_trace_established():
+    """Not a count -- the specific conclusions, so reclassifying one fails.
+
+    An earlier version asserted only `>= 2` gaps and `>= 2` fair, which 25 of the
+    27 gaps could be reclassified without tripping. An exact total is no better:
+    its cheapest repair is to bump the number, the failure Phase A's audit found
+    repeatedly. What is worth pinning is what the trace CONCLUDED, per operation,
+    because each of these is a claim someone would have to re-refute to change.
+    """
+    by_op = {}
+    for key, (disposition, _note) in GUARD_SITE_DISPOSITIONS.items():
+        by_op.setdefault(key.rsplit(":", 1)[-1], set()).add(disposition)
+
+    # Every emission of these is a gap: the branch compares nothing and the
+    # payload names a row or a lane the client read from a view that can be stale.
+    for op_type in ("update_clip", "update_audio_track",
+                    "split_clip", "split_audio_track"):
+        assert by_op.get(op_type) == {_GAP}, (
+            f"{op_type} was traced as a gap at every site; it now reads as "
+            f"{sorted(by_op.get(op_type, ()))}. Re-refute the trace before "
+            "changing it")
+
+    # And these are fair at every site: additive, or a whole-value set where
+    # last-write-wins is the correct semantic.
+    for op_type in ("create_clip", "create_audio_track", "create_prompt_section",
+                    "create_prompt_semantic_unit", "consolidate_items",
+                    "import_prompt_context_dependencies"):
+        assert by_op.get(op_type) == {_FAIR}, (
+            f"{op_type} was traced as fair at every site; it now reads as "
+            f"{sorted(by_op.get(op_type, ()))}")
+
+    # `bulk_delete_items` is the one operation whose two sites still disagree,
+    # which is the whole reason this catalogue is per site rather than per
+    # operation. One carries durable ids and needs nothing; the other carries a
+    # per-item snapshot the linked path used to discard.
+    assert by_op.get("bulk_delete_items") == {_FAIR, _REASONED}, (
+        "bulk_delete_items' two sites used to disagree. If they now agree, "
+        "either the code changed or the distinction was lost")
+
+    assert _REASONED in {d for values in by_op.values() for d in values}, (
+        "no site reads as reasoned. The two `promptEditFields` sites are why the "
+        "class exists: their guard is built by a helper, so a lexical scan calls "
+        "the best-guarded writes in the tree unguarded")
+
+
+def test_the_guard_evidence_cites_code_that_exists():
+    """A traced reason has to be traceable.
+
+    The first pass of `GUARD_CONTRACTS` cited `routes.py:<line>` and sixteen of
+    those lines landed on the PREVIOUS branch's tail -- generated from an index
+    instead of read. A line number cannot be checked and rots under any edit
+    above it; a backticked identifier can be checked, so that is what the
+    evidence carries and this is the check.
+    """
+    known = _routes_identifiers()
+    anywhere = known | _client_identifiers()
+    unknown = []
+    for op_type, (_kind, _keys, evidence) in sorted(GUARD_CONTRACTS.items()):
+        for name in _cited_names(evidence):
+            # A leading underscore marks an identifier rather than prose. Field
+            # names and payload keys also ride in backticks and are not defined
+            # anywhere, which is why the rule keys on the underscore.
+            if name.startswith("_") and name not in anywhere:
+                unknown.append(f"{op_type}: `{name}`")
+    assert not unknown, (
+        "these evidence entries cite an identifier neither routes.py nor an "
+        "emitting module defines, so the trace points at nothing. Re-read the "
+        f"branch: {unknown}")
+
+    # And the citation must not be vacuous: every entry names at least one
+    # routes.py function, which is what "traced to the handler" means.
+    untraced = sorted(
+        op_type for op_type, (_k, _keys, evidence) in GUARD_CONTRACTS.items()
+        if not any(name in known and name.startswith("_")
+                   for name in _cited_names(evidence)))
+    assert not untraced, (
+        "these entries cite no routes.py function at all, so nothing anchors the "
+        f"claim to code: {untraced}")
+
+
+def test_the_transcribed_key_sets_match_what_routes_compares():
+    """Three key sets are copied out of routes.py; copies drift.
+
+    The unsafe direction is silent: if a key is REMOVED server-side the
+    transcription stays too wide, and an emission sending the now-discarded key
+    passes the tripwire. So the sets are re-read from routes.py here rather than
+    trusted, in the spirit of Phase A's reuse rule -- consume, never re-list.
+    """
+    assert _GUIDE_KEYS == _validator_key_set("_validate_guide_identity"), (
+        "_GUIDE_KEYS no longer matches the keys `_validate_guide_identity` "
+        f"compares: {sorted(_GUIDE_KEYS ^ _validator_key_set('_validate_guide_identity'))}")
+    assert _PROMPT_KEYS == _validator_key_set("_validate_prompt_identity"), (
+        "_PROMPT_KEYS no longer matches the keys `_validate_prompt_identity` "
+        f"compares: {sorted(_PROMPT_KEYS ^ _validator_key_set('_validate_prompt_identity'))}")
+    honoured = GUARD_CONTRACTS["update_scene_fields"][1]
+    assert honoured == _direct_global_prompt_fields(), (
+        "update_scene_fields' honoured set no longer matches "
+        "_DIRECT_GLOBAL_PROMPT_FIELDS: "
+        f"{sorted(honoured ^ _direct_global_prompt_fields())}")
+
+
+def test_the_two_depth_one_key_readers_agree():
+    """`_object_literal_keys` and `_payload_fingerprint` must read alike.
+
+    They are separate because they answer different questions -- one walks an
+    operation literal to depth 2 keyed on PAYLOAD_KEYS, the other reads one
+    nested object -- but they share a heuristic, and the copy has already drifted
+    once: a non-leading spread was invisible to it while the original degraded
+    correctly. This pins them together on the shapes both can see.
+    """
+    def fingerprint_keys(body):
+        literal = _scan_text(
+            'function g() { send({ type: "update_clip", fields: %s }); }\n' % body)
+        return tuple(sorted(
+            {path.split(".", 1)[1]
+             for path in _payload_fingerprint(literal[0]["extent"], literal[0]["mask"])
+             if path.startswith("fields.")}))
+
+    for body, expected in (
+            ("{ a: 1, b: 2 }", ("a", "b")),
+            ("{ a, b }", ("a", "b")),
+            ("{ a: { deep: 1 }, b: 2 }", ("a", "b")),
+            ("{ a: [1, 2], b: 2 }", ("a", "b")),
+            ("{ a: 1, ...rest }", ("<opaque>", "a")),
+    ):
+        assert _object_literal_keys(body) == expected, (
+            f"{body}: _object_literal_keys gave {_object_literal_keys(body)}")
+        assert fingerprint_keys(body) == expected, (
+            f"{body}: _payload_fingerprint gave {fingerprint_keys(body)}")
+
+    # One deliberate divergence, pinned rather than papered over. On a LEADING
+    # spread `_payload_fingerprint` stops descending and records `<opaque>`
+    # alone; its output is pinned in GUARD_EXEMPT_SITES, so widening it would
+    # rewrite fingerprints across the catalogue for no gain. The guard reader has
+    # no pinned output and reports both, which is strictly more information.
+    assert fingerprint_keys("{ ...rest, a: 1 }") == ("<opaque>",)
+    assert _object_literal_keys("{ ...rest, a: 1 }") == ("<opaque>", "a")
+
+
+def test_a_guard_the_branch_ignores_cannot_hide_behind_an_identifier():
+    """The drain the opacity skip used to allow, pinned shut.
+
+    `expected: priorClip` reads as guarded to the Phase 3 predicate -- so the
+    exemption entry must go -- while the server discards it whole. When opacity
+    was checked before the contract, that swap was free and silent.
+    """
+    opaque = _scan_text(
+        'function gesture() { send({ type: "update_clip", clip_id: id,'
+        ' fields: { timeline_start_frame: f }, expected: priorClip }); }\n')
+    assert _is_guarded(opaque[0]["extent"], opaque[0]["mask"])
+    paths = _guard_key_paths(opaque[0]["extent"], opaque[0]["mask"])
+    assert paths == (("", "expected", "<opaque>"),)
+    assert GUARD_CONTRACTS["update_clip"][0] == _NOTHING
+
+    # A spread that hides keys behind a readable one must not be certified by it.
+    mixed = _scan_text(
+        'function gesture() { send({ type: "update_scene_fields",'
+        ' fields: { prompt: next },'
+        ' expected: { prompt: prior, ...geometrySnapshot } }); }\n')
+    fields = _guard_key_paths(mixed[0]["extent"], mixed[0]["mask"])
+    assert ("", "expected", "prompt") in fields
+    assert ("", "expected", "<opaque>") in fields, (
+        "a trailing spread inside the guard hid its keys behind the readable one")
+
+
+# ---------------------------------------------------------------------------
+# Phase 5c -- a refusal the user cannot read is not a refusal
+# ---------------------------------------------------------------------------
+# `_queueProjectMutation` sets `error.code` only for `project_version_conflict`
+# (api_client.js), so an `identity_mismatch` falls to the generic
+# "... failed -- timeline restored." and the server's message is discarded. The
+# whole point of a guard is that it says WHAT moved, and the plan's L3b requires
+# it: "refuse with a message naming what moved". Every emission of a guarded
+# operation must therefore pass `failureMessage`, because the default drops the
+# only actionable thing the user gets.
+#
+# Scoped to operations whose guard can refuse a gesture the user just performed.
+# An operation with no guard has nothing specific to say.
+GUARDED_OPERATIONS_NEEDING_A_MESSAGE = frozenset({
+    "remove_lane", "create_guide", "move_guide",
+    "create_reference_item", "replace_prompt_sections", "bulk_delete_items",
+    "create_link_group", "unlink_items",
+})
+
+
+# Two named reasons a scope is judged by something other than its own body.
+# Both are properties of the call site, not of the operation, which is why they
+# are listed rather than computed -- a computed version would have to guess at
+# what a shared runner is.
+MESSAGE_OWNED_ELSEWHERE = {
+    "editor_reference_panel.js:createItem":
+        "Delegates its enqueue to `runItemOperation`, which owns the catch and "
+        "already notifies with `error?.message`. The scope itself never calls "
+        "`_runSceneMutation`, so its own body cannot show a message.",
+    "editor_widget.js:_deleteItemsInLaneWithinGesture":
+        "Its `items` are clip and audio ids with no snapshot -- "
+        "`_mutationItemFromSelection` builds one only for guide, prompt and "
+        "reference -- so no identity guard can refuse this emission and there is "
+        "no specific message for it to surface.",
+}
+
+
+def test_a_guarded_emission_surfaces_the_server_message():
+    """An emission whose server branch can 409 must not use the generic toast."""
+    silent = []
+    for item in sorted(_operation_literals(), key=lambda i: (i["module"], i["scope"])):
+        if item["op_type"] not in GUARDED_OPERATIONS_NEEDING_A_MESSAGE:
+            continue
+        if f"{item['module']}:{item['scope']}" in MESSAGE_OWNED_ELSEWHERE:
+            continue
+        scope_body = _code_only(_scope_body(item))
+        # Two mechanisms reach the user, and both are live in the tree:
+        # `failureMessage` on the enqueue, and a catch that notifies with the
+        # error's own message. `_commitItemMove` uses the second.
+        surfaced = ("failureMessage" in scope_body
+                    or re.search(r"notify\w*\(\s*\w+\?\.message", scope_body))
+        if not surfaced:
+            silent.append(f"{item['module']}:{item['scope']}:{item['op_type']} "
+                          f"(line {item['line']})")
+    assert not silent, (
+        "these emissions can be refused by a guard that names exactly what "
+        "moved, and pass no `failureMessage` -- so `_queueProjectMutation` "
+        "replaces the server's message with the generic \"... failed -- timeline "
+        "restored.\" and the user is told nothing. `error.message` carries it; "
+        "`_consolidateSelectedItemsToLaneWithinGesture` is the worked example. "
+        f"{silent}")
+
+    # The exemptions must be able to die with the sites they excuse.
+    scopes = {f"{item['module']}:{item['scope']}" for item in _operation_literals()}
+    gone = sorted(set(MESSAGE_OWNED_ELSEWHERE) - scopes)
+    assert not gone, f"these message exemptions name no emitting scope: {gone}"
+
+
+def _scope_body(item) -> str:
+    """The source of the named scope that owns one emission."""
+    source = (JS_DIR / item["module"]).read_text(encoding="utf-8")
+    for name, start, end in _scopes(source):
+        if name == item["scope"] and start <= item["offset"] <= end:
+            return source[start:end]
+    raise AssertionError(f"no scope body found for {item['scope']}")

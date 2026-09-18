@@ -1,11 +1,16 @@
+import json
 import shutil
+import sys
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 def _run_node(script: str) -> None:
@@ -892,3 +897,615 @@ def test_pending_export_cancel_retains_original_gesture(close_panel):
         assert.equal(starts().length, 2);
         assert.equal(w._exportStartDiagnostics, null);
     """)
+
+
+def test_only_the_head_of_a_coalesced_group_rolls_back_its_scene_edit():
+    """Umbrella Phase B / L2: the defect, driven through the real gestures.
+
+    Two same-key scene edits authored while the queue is busy collapse into one
+    request, and the queue settles both waiters from the survivor. Every
+    collapsed gesture's `catch` therefore runs, so a gesture that restores a
+    privately captured `previous` unconditionally leaves the client at the
+    *older* edit's optimistic result -- a state the server never held, and one
+    nothing refetches because these gestures run `refreshScenes: false`.
+
+    Asserting the exact intermediate matters: 100 (duration) and 1280x720
+    (resolution) are the values the unguarded rollback produced, and they are
+    the only values that prove the defect is back.
+    """
+    _run_gesture_node("""
+        // Both gestures warn on failure by design, and `_run_node` prefers stderr
+        // when it reports, so an un-silenced warn hides the assertion message --
+        // which is the whole product of a test like this.
+        console.warn = () => {};
+        const refuse = async () => {
+            throw Object.assign(new Error('refused'), { code: 'refused' });
+        };
+        const busy = (w) => {
+            let release; const blocked = new Promise((r) => { release = r; });
+            const done = w._projectMutationQueue.enqueue({
+                key: 'unrelated', coalesce: false, run: () => blocked });
+            return [done, release];
+        };
+
+        // --- duration -------------------------------------------------------
+        const d = makeWidget();
+        d.activeScene = { scene_id: 'scene', duration_frames: 50 };
+        d.totalFrames = 50;
+        Object.assign(d, {
+            _clampTimelineStateToDuration: () => {}, _refreshDurationInput: () => {},
+            _updateToolbar: () => {}, _updateTransportUI: () => {},
+            _runVersionedProjectMutation: refuse,
+        });
+        let [blocked, release] = busy(d);
+        let edits = [d._updateSceneDuration(100), d._updateSceneDuration(200)];
+        release();
+        await Promise.all([blocked, ...edits]);
+        assert.notEqual(d.activeScene.duration_frames, 100,
+            "restored the first edit's optimistic value: a superseded sibling rolled back");
+        assert.equal(d.activeScene.duration_frames, 50,
+            'the head of the coalesced group must restore the value the server still has');
+        assert.equal(d.totalFrames, 50);
+
+        // --- resolution -----------------------------------------------------
+        const r = makeWidget();
+        r.activeScene = { scene_id: 'scene', width: 640, height: 360 };
+        Object.assign(r, {
+            _syncSceneResolutionControls: () => {}, _updateViewportHeader: () => {},
+            _resizeViewportCanvas: () => {}, _runVersionedProjectMutation: refuse,
+        });
+        [blocked, release] = busy(r);
+        edits = [r._updateSceneResolution(1280, 720), r._updateSceneResolution(1920, 1080)];
+        release();
+        await Promise.all([blocked, ...edits]);
+        assert.notEqual(r.activeScene.width, 1280,
+            "restored the first edit's optimistic width: a superseded sibling rolled back");
+        assert.deepEqual([r.activeScene.width, r.activeScene.height], [640, 360],
+            'the head of the coalesced group must restore the value the server still has');
+
+        // A single uncoalesced failure still rolls back at once, with no refetch.
+        const s = makeWidget();
+        s.activeScene = { scene_id: 'scene', duration_frames: 50 };
+        s.totalFrames = 50;
+        Object.assign(s, {
+            _clampTimelineStateToDuration: () => {}, _refreshDurationInput: () => {},
+            _updateToolbar: () => {}, _updateTransportUI: () => {},
+            _fetchScenes: async () => { throw new Error('the rollback must not need the network'); },
+            _runVersionedProjectMutation: refuse,
+        });
+        await s._updateSceneDuration(400);
+        assert.equal(s.activeScene.duration_frames, 50);
+    """)
+
+
+def test_the_queue_resolves_every_coalesced_waiter_with_the_survivor_s_result():
+    """Why a private rollback is unsafe at all: losers cannot tell they lost.
+
+    The queue sends one payload and settles every collapsed waiter from it, so a
+    losing gesture's `catch`/`then` runs against an outcome that is not its own.
+    This is the mechanism behind the test above; pinning it here means a change
+    to the queue's settlement contract fails beside the gesture that relies on it.
+    """
+    _run_node("""
+        import assert from 'node:assert/strict';
+        const { ProjectMutationQueue } = await import(%r);
+        const q = new ProjectMutationQueue();
+        const sent = [];
+        let release; const blocked = new Promise((r) => { release = r; });
+        const blocker = q.enqueue({ key: 'other', coalesce: false, run: () => blocked });
+        const run = async (intent) => { sent.push(intent.n); return 'result-of-' + intent.n; };
+        const settled = [];
+        const a = q.enqueue({ key: 'same', coalesce: true, intent: { n: 1 }, run })
+            .then((r) => settled.push(r));
+        const b = q.enqueue({ key: 'same', coalesce: true, intent: { n: 2 }, run })
+            .then((r) => settled.push(r));
+        release();
+        await Promise.all([blocker, a, b]);
+
+        assert.deepEqual(sent, [2], 'the older intent was replaced, not merged');
+        assert.deepEqual(settled, ['result-of-2', 'result-of-2'],
+            'a losing waiter must be seen to settle from the survivor, which is why it '
+            + 'cannot use its own captured state to decide what to restore');
+    """ % ((ROOT / "web/js/project_mutation_queue.js").as_uri(),))
+
+
+def test_link_operations_rebase_their_positional_refs_like_bulk_delete():
+    """A queued link/unlink must follow a prompt row history reordered.
+
+    `_mutationItemFromSelection` addresses a prompt by LIST INDEX and a guide by
+    FRAME INDEX, and `_item_ref_from_selection` on the server resolves both
+    positionally. Before umbrella Phase B these two operations reached
+    `default: break`, so an Undo that reordered prompt sections while the gesture
+    was queued linked the row that inherited the index instead.
+    """
+    source = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
+    rebase = _method(source, "_historyExpectedProjection", "_queueProjectMutation")
+    _run_node(f"""
+        import assert from 'node:assert/strict';
+        class Harness {{
+        {rebase}
+        }}
+        const h = new Harness();
+        // History inserted a section ahead of the authored one, so the prompt the
+        // gesture meant is now at index 1, and the guide it meant moved to 40.
+        const ordered = {{
+            scene_id: 'scene', video_lane_count: 1, audio_lane_count: 1,
+            clips: [{{clip_id: 'c1'}}], audio_tracks: [],
+            guide_frames: [{{guide_id: 'g1', frame_index: 40}}],
+            prompt_sections: [
+                {{prompt_id: 'other', start_frame: 0, end_frame: 5}},
+                {{prompt_id: 'p1', start_frame: 10, end_frame: 20}},
+            ],
+            reference_items: [],
+        }};
+        const item = (type, id, expected) => ({{type, id, expected}});
+        for (const opType of ['create_link_group', 'unlink_items']) {{
+            const operations = [{{
+                type: opType,
+                items: [
+                    item('prompt', 0, {{prompt_id: 'p1', start_frame: 1, end_frame: 2}}),
+                    item('guide', 12, {{guide_id: 'g1', frame_index: 12, asset_id: ''}}),
+                    item('clip', 'c1', undefined),
+                ],
+            }}];
+            const rebased = h._rebaseSceneMutationIntentForHistory(
+                {{sceneId: 'scene', operations}}, ordered).operations[0];
+            assert.equal(rebased.items[0].id, 1, `${{opType}} prompt index`);
+            assert.equal(rebased.items[0].expected.start_frame, 10);
+            assert.equal(rebased.items[0].expected.end_frame, 20);
+            assert.equal(rebased.items[1].id, 40, `${{opType}} guide frame`);
+            // A durable member passes through untouched, and an absent guard is
+            // not invented: `_historyExpectedProjection` returns its input.
+            assert.equal(rebased.items[2].id, 'c1');
+            assert.equal(rebased.items[2].expected, undefined);
+            // The authored intent is never mutated in place.
+            assert.equal(operations[0].items[0].id, 0);
+        }}
+
+        // An unresolvable ref is left alone rather than throwing, so the change
+        // can only improve on the pass-through it replaced.
+        const orphan = h._rebaseSceneMutationIntentForHistory({{
+            sceneId: 'scene',
+            operations: [{{type: 'unlink_items', items: [
+                item('prompt', 3, {{prompt_id: 'gone', start_frame: 0, end_frame: 1}}),
+            ]}}],
+        }}, ordered).operations[0];
+        assert.equal(orphan.items[0].id, 3);
+    """)
+
+
+def _builder_keys(method_source: str, calls: str, extra_imports: str = "") -> set:
+    """Run a client guard builder and report the union of keys it can emit.
+
+    Derived, not asserted: the point is to compare the builder's real output
+    against `GUARD_CONTRACTS`, so nothing here may hardcode the key set. An
+    earlier version of this helper's callers asserted the same literals on both
+    sides, which meant a third key could be added to the server and the client
+    together and both halves would still pass.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        sink = (Path(directory) / "keys.json").as_posix()
+        _run_node(f"""
+            import assert from 'node:assert/strict';
+            import {{ writeFileSync }} from 'node:fs';
+            {extra_imports}
+            class Harness {{
+                constructor(scene) {{ this.activeScene = scene; }}
+            {method_source}
+            }}
+            const keys = new Set();
+            const collect = (guard) => {{
+                for (const key of Object.keys(guard)) keys.add(key);
+                return guard;
+            }};
+            {calls}
+            writeFileSync({sink!r}, JSON.stringify([...keys].sort()));
+        """)
+        return set(json.loads(Path(sink).read_text(encoding="utf-8")))
+
+
+def test_the_lane_removal_guard_matches_its_contract():
+    """The client builder and the server validator must name the same keys.
+
+    `_laneRemovalGuard` is one builder shared by four gestures, which is why
+    those four emissions read as `<opaque>`: there is no literal to scan. The
+    trade is only acceptable because this DERIVES the builder's key set and
+    compares it to `GUARD_CONTRACTS` — which is what the earlier version claimed
+    and did not do.
+    """
+    import test_scene_mutation_registration as registration
+
+    source = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
+    guard = _method(source, "_laneRemovalGuard", "_applyLocalRemoveLane")
+    registry_url = (ROOT / "web" / "js" / "lane_registry.js").as_uri()
+    scene = """
+        const scene = {
+            video_lane_count: 4, audio_lane_count: 2, reference_lane_count: 3,
+            video_lane_configs: [{ name: 'v0' }, { name: 'v1' },
+                                 { name: 'v2', locked: true }, {}],
+            audio_lane_configs: [{}, {}],
+            reference_lane_configs: [{}, {}, {}],
+            reference_lane_recipes: [
+                { lane_id: 'lane-a' }, { lane_id: 'lane-b' }, { lane_id: '' },
+            ],
+        };
+        const host = new Harness(scene);
+    """
+    keys = _builder_keys(
+        guard,
+        scene + """
+        collect(host._laneRemovalGuard('video', 2));
+        collect(host._laneRemovalGuard('audio', 0));
+        collect(host._laneRemovalGuard('reference', 1));
+        collect(host._laneRemovalGuard('reference', 2));
+        """,
+        extra_imports=f"const {{ descriptorForLaneType }} = await import({registry_url!r});")
+
+    kind, honoured, _evidence = registration.GUARD_CONTRACTS["remove_lane"]
+    assert kind == registration._FIXED
+    assert keys == set(honoured), (
+        "`_laneRemovalGuard` emits a different key set than the dispatch branch "
+        f"compares: builder={sorted(keys)} contract={sorted(honoured)}")
+
+    # Behaviour, now that the keys are known to line up.
+    _run_node(f"""
+        import assert from 'node:assert/strict';
+        const {{ descriptorForLaneType }} = await import({registry_url!r});
+        class Harness {{
+            constructor(scene) {{ this.activeScene = scene; }}
+        {guard}
+        }}
+        {scene}
+        // The config anchor is what survives a permutation that leaves the
+        // count unchanged, so it must carry the lane's real settings.
+        assert.deepEqual(host._laneRemovalGuard('video', 2), {{
+            lane_count: 4,
+            config: {{ name: 'v2', color: '', locked: true, hidden: false }},
+        }});
+        // An absent config reads as the default, not as undefined.
+        assert.deepEqual(host._laneRemovalGuard('audio', 0).config,
+            {{ name: '', color: '', locked: false, hidden: false }});
+        // Reference carries its durable id as well.
+        assert.equal(host._laneRemovalGuard('reference', 1).lane_id, 'lane-b');
+        // A blank stored id claims no identity rather than an empty one.
+        assert.ok(!('lane_id' in host._laneRemovalGuard('reference', 2)));
+        assert.ok(!('lane_id' in host._laneRemovalGuard('reference', 9)));
+        // Each removal in a descending batch states the floor IT will see.
+        assert.deepEqual(
+            [0, 1, 2].map((prior) => host._laneRemovalGuard('video', 3 - prior, prior).lane_count),
+            [4, 3, 2]);
+        // Looked up by LANE type: a track-type map would miss and degrade to 1.
+        assert.equal(host._laneRemovalGuard('video', 0).lane_count, 4);
+    """)
+
+
+def test_a_rebased_lane_removal_keeps_its_guard_true():
+    """Retargeting the index without the count would refuse every rebased removal.
+
+    `remove_lane` is one of the operations `_rebaseSceneMutationIntentForHistory`
+    retargets. The guard is authored against the pre-history count, so leaving it
+    alone turns a retarget that just succeeded into a 409 -- a self-inflicted
+    refusal on the exact path the rebase exists to rescue.
+    """
+    source = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
+    rebase = _method(source, "_historyExpectedProjection", "_queueProjectMutation")
+    _run_node(f"""
+        import assert from 'node:assert/strict';
+        class Harness {{
+        {rebase}
+        }}
+        const h = new Harness();
+        // Named configs on purpose: with a changed lane count `rebaseLaneIndex`
+        // falls through to the anchor, which refuses an ambiguous match. Blank
+        // configs would make every lane identical and throw before the guard is
+        // reached -- a real refusal, but not what this test is about.
+        const scene = (video) => ({{
+            scene_id: 'scene', video_lane_count: video, audio_lane_count: 1,
+            video_lane_configs: Array.from({{ length: video }},
+                (_value, index) => ({{ name: `v${{index}}` }})),
+            clips: [], audio_tracks: [], prompt_sections: [], guide_frames: [],
+            reference_items: [],
+        }});
+
+        // History restored two video lanes while the removal was queued.
+        const single = h._rebaseSceneMutationIntentForHistory({{
+            sceneId: 'scene',
+            operations: [{{ type: 'remove_lane', lane_type: 'video', lane_index: 1,
+                item_policy: 'require_empty', expected: {{ lane_count: 3 }} }}],
+        }}, scene(5), scene(3)).operations[0];
+        assert.equal(single.expected.lane_count, 5);
+
+        // A descending batch: each operation still expects one fewer than the last.
+        const batch = h._rebaseSceneMutationIntentForHistory({{
+            sceneId: 'scene',
+            operations: [
+                {{ type: 'remove_lane', lane_type: 'video', lane_index: 2,
+                   item_policy: 'delete_items', expected: {{ lane_count: 3 }} }},
+                {{ type: 'remove_lane', lane_type: 'video', lane_index: 0,
+                   item_policy: 'delete_items', expected: {{ lane_count: 2 }} }},
+            ],
+        }}, scene(5), scene(3)).operations;
+        assert.deepEqual(batch.map((op) => op.expected.lane_count), [5, 4]);
+
+        // A durable lane id is authored state and is NOT re-snapshotted: it is
+        // what proves the rebase landed on the lane the author meant.
+        const reference = h._rebaseSceneMutationIntentForHistory({{
+            sceneId: 'scene',
+            operations: [{{ type: 'remove_lane', lane_type: 'reference', lane_index: 1,
+                item_policy: 'require_empty',
+                expected: {{ lane_count: 2, lane_id: 'lane-b' }} }}],
+        }}, {{ ...scene(1), reference_lane_count: 3, reference_lane_configs: [{{}}, {{}}, {{}}],
+              reference_lane_recipes: [{{ lane_id: 'x' }}, {{ lane_id: 'lane-b' }}, {{ lane_id: 'y' }}] }},
+           {{ ...scene(1), reference_lane_count: 2, reference_lane_configs: [{{}}, {{}}],
+              reference_lane_recipes: [{{ lane_id: 'x' }}, {{ lane_id: 'lane-b' }}] }}).operations[0];
+        assert.equal(reference.expected.lane_id, 'lane-b');
+        assert.equal(reference.expected.lane_count, 3);
+    """)
+
+
+def test_the_guide_replacement_guard_reads_the_frame_before_the_local_apply():
+    """The builder must name the occupant, and both call sites must read it early.
+
+    `_applyLocalCreateGuide` removes the guide at the frame. Reading the guard
+    after it would always produce an empty claim, which is the one value that
+    passes on an empty frame and refuses on an occupied one -- a guard that
+    inverts itself silently. Order is the whole correctness argument, so it is
+    asserted against the source as well as the behaviour.
+    """
+    import test_scene_mutation_registration as registration
+
+    source = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
+    guard = _method(source, "_guideReplacementGuard", "_applyLocalCreateGuide")
+
+    # Derived, not asserted on both sides: the builder's real key set against
+    # the contract. Six emissions were moved into OPAQUE_GUARD_SITES on the
+    # strength of these parity checks, so they have to be real ones.
+    keys = _builder_keys(guard, """
+        const host = new Harness({ guide_frames: [
+            { guide_id: 'occupant', frame_index: 12 },
+        ] });
+        collect(host._guideReplacementGuard(12));
+        collect(host._guideReplacementGuard(99));
+    """)
+    kind, honoured, _evidence = registration.GUARD_CONTRACTS["create_guide"]
+    assert kind == registration._FIXED
+    assert keys == set(honoured), (
+        "`_guideReplacementGuard` emits a different key set than the dispatch "
+        f"branch compares: builder={sorted(keys)} contract={sorted(honoured)}")
+
+    _run_node(f"""
+        import assert from 'node:assert/strict';
+        class Harness {{
+            constructor(scene) {{ this.activeScene = scene; }}
+        {guard}
+        }}
+        const host = new Harness({{ guide_frames: [
+            {{ guide_id: 'occupant', frame_index: 12 }},
+            {{ guide_id: 'elsewhere', frame_index: 40 }},
+        ] }});
+        assert.deepEqual(host._guideReplacementGuard(12),
+            {{ replaces_guide_id: 'occupant' }});
+        // `move_guide` excludes the guide it is moving: a drag that ends on the
+        // frame it started from must not name itself as what it replaces.
+        assert.deepEqual(host._guideReplacementGuard(12, 'occupant'),
+            {{ replaces_guide_id: '' }});
+        assert.deepEqual(host._guideReplacementGuard(12, 'someone-else'),
+            {{ replaces_guide_id: 'occupant' }});
+        assert.deepEqual(host._guideReplacementGuard(13),
+            {{ replaces_guide_id: '' }});
+        // A string frame from a dataset attribute must not read as "no occupant".
+        assert.deepEqual(host._guideReplacementGuard('40'),
+            {{ replaces_guide_id: 'elsewhere' }});
+        // No scene at all is still a well-formed empty claim, not a crash.
+        assert.deepEqual(new Harness(null)._guideReplacementGuard(0),
+            {{ replaces_guide_id: '' }});
+    """)
+
+    for built, applied in _guide_guard_call_order(source):
+        assert built < applied, (
+            "a guide guard is built after the local apply has already removed "
+            "the occupant it is meant to name")
+
+
+def _guide_guard_call_order(source: str):
+    """Per `create_guide` emission: where its guard was built, and its local apply.
+
+    Anchored on the emission and scanned BACKWARDS, because not every
+    `_applyLocalCreateGuide` belongs to an emission -- the asset-drop path calls
+    it a third time to adopt the canonical guide out of the write's own response,
+    which needs no guard because nothing is being claimed about prior state.
+    Pairing the two lists positionally would have mistaken that reconciliation
+    for a missing guard.
+    """
+    def occurrences(needle):
+        return [index for index in range(len(source))
+                if source.startswith(needle, index)]
+
+    emissions = occurrences('type: "create_guide"')
+    assert len(emissions) == 2, f"expected two emissions, found {len(emissions)}"
+    builds = occurrences("this._guideReplacementGuard(")
+    applies = occurrences("this._applyLocalCreateGuide(")
+    # Two for `create_guide`, two more for `move_guide`'s destination claim.
+    assert len(builds) == 4, f"expected four guard call sites, found {len(builds)}"
+
+    pairs = []
+    for emission in emissions:
+        before_build = [index for index in builds if index < emission]
+        before_apply = [index for index in applies if index < emission]
+        assert before_build, "a create_guide emission builds no replacement guard"
+        assert before_apply, "a create_guide emission runs no local apply"
+        pairs.append((before_build[-1], before_apply[-1]))
+    return pairs
+
+
+def test_the_reference_and_prompt_guards_match_their_contracts():
+    """Both Phase 2b builders, derived and compared — not asserted twice."""
+    import test_scene_mutation_registration as registration
+
+    source = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
+
+    reference = _method(source, "_referenceCreationGuard",
+                        "_promptSectionsReplacementGuard")
+    keys = _builder_keys(reference, """
+        const host = new Harness({ reference_items: [
+            { reference_item_id: 'later', lane_index: 0, start_frame: 100 },
+            { reference_item_id: 'other-lane', lane_index: 1, start_frame: 20 },
+        ] });
+        collect(host._referenceCreationGuard(0, 10));
+        collect(host._referenceCreationGuard(0, 150));
+    """)
+    kind, honoured, _evidence = registration.GUARD_CONTRACTS["create_reference_item"]
+    assert kind == registration._FIXED
+    assert keys == set(honoured), (
+        "`_referenceCreationGuard` emits a different key set than the dispatch "
+        f"branch compares: builder={sorted(keys)} contract={sorted(honoured)}")
+
+    prompt = _method(source, "_promptSectionsReplacementGuard",
+                     "_applyLocalCreateGuide")
+    keys = _builder_keys(prompt, """
+        const host = new Harness({ prompt_sections: [
+            { prompt_id: 'p1', start_frame: 0, end_frame: 10 },
+        ] });
+        collect(host._promptSectionsReplacementGuard());
+    """)
+    kind, honoured, _evidence = registration.GUARD_CONTRACTS["replace_prompt_sections"]
+    assert kind == registration._FIXED
+    assert keys == set(honoured), (
+        "`_promptSectionsReplacementGuard` emits a different key set than the "
+        f"dispatch branch compares: builder={sorted(keys)} contract={sorted(honoured)}")
+
+    _run_node(f"""
+        import assert from 'node:assert/strict';
+        class Harness {{
+            constructor(scene) {{ this.activeScene = scene; }}
+        {reference}
+        {prompt}
+        }}
+        const host = new Harness({{
+            reference_items: [
+                {{ lane_index: 0, start_frame: 100 }},
+                {{ lane_index: 0, start_frame: 40 }},
+                {{ lane_index: 1, start_frame: 20 }},
+            ],
+            prompt_sections: [
+                {{ prompt_id: 'p1', start_frame: 0, end_frame: 10 }},
+                {{ prompt_id: 'p2', start_frame: 10, end_frame: 20 }},
+            ],
+        }});
+        // The NEXT start after 10 on lane 0 is 40, not 20 (other lane) and not
+        // 100 (further away). This is the value `end_frame` is derived from.
+        assert.deepEqual(host._referenceCreationGuard(0, 10),
+            {{ next_start_frame: 40 }});
+        // Strictly after: an item starting exactly at the new start is an
+        // overlap, which the server refuses on its own.
+        assert.deepEqual(host._referenceCreationGuard(0, 40),
+            {{ next_start_frame: 100 }});
+        // Nothing later reports the same -1 sentinel both emitters send for
+        // "runs to the end of the scene".
+        assert.deepEqual(host._referenceCreationGuard(0, 150),
+            {{ next_start_frame: -1 }});
+        assert.deepEqual(host._referenceCreationGuard(2, 0),
+            {{ next_start_frame: -1 }});
+
+        // The prompt guard names the collection being REPLACED, in order.
+        assert.deepEqual(host._promptSectionsReplacementGuard(), {{ sections: [
+            {{ prompt_id: 'p1', start_frame: 0, end_frame: 10 }},
+            {{ prompt_id: 'p2', start_frame: 10, end_frame: 20 }},
+        ] }});
+        // An empty scene still makes the claim rather than omitting it.
+        assert.deepEqual(new Harness({{}})._promptSectionsReplacementGuard(),
+            {{ sections: [] }});
+    """)
+
+
+def _js_guard_values(method_sources: str, scene_json: str, calls: str) -> list:
+    """Run a client guard builder over a scene fixture and return what it built.
+
+    Values, not key names. `test_the_reference_and_prompt_guards_match_their_contracts`
+    already pins the keys; this is the other half — the same fixture through both
+    languages, which `agent_workflow.md` requires of an intentional mirror and
+    which two guard builders in this landing are.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        sink = (Path(directory) / "values.json").as_posix()
+        _run_node(f"""
+            import {{ writeFileSync }} from 'node:fs';
+            class Harness {{
+                constructor(scene) {{ this.activeScene = scene; }}
+            {method_sources}
+            }}
+            const host = new Harness({scene_json});
+            const out = [];
+            {calls}
+            writeFileSync({sink!r}, JSON.stringify(out));
+        """)
+        return json.loads(Path(sink).read_text(encoding="utf-8"))
+
+
+def test_the_reference_next_start_scan_agrees_across_languages():
+    """`_next_reference_start_after` mirrors `_referenceCreationGuard`.
+
+    A guard is only worth anything if both sides compute it the same way: a
+    client that measures one thing and a server that measures another produces
+    either a permanent refusal or a guard that never fires, and both look like
+    "the feature is broken" rather than like a mirror that drifted.
+    """
+    import server.routes as routes
+    from server.timeline_state import ReferenceItem, Scene
+
+    source = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
+    guard = _method(source, "_referenceCreationGuard", "_promptSectionsReplacementGuard")
+
+    fixture = [
+        {"reference_item_id": "a", "lane_index": 0, "start_frame": 0},
+        {"reference_item_id": "b", "lane_index": 0, "start_frame": 40},
+        {"reference_item_id": "c", "lane_index": 0, "start_frame": 100},
+        {"reference_item_id": "d", "lane_index": 1, "start_frame": 20},
+    ]
+    probes = [(0, -5), (0, 0), (0, 10), (0, 40), (0, 99), (0, 100), (0, 500),
+              (1, 0), (1, 20), (2, 0)]
+
+    emitted = _js_guard_values(
+        guard, json.dumps({"reference_items": fixture}),
+        "".join(f"out.push(host._referenceCreationGuard({lane}, {start})"
+                f".next_start_frame);\n" for lane, start in probes))
+
+    scene = Scene(scene_id="scene")
+    scene.reference_items = [ReferenceItem(**value) for value in fixture]
+    expected = [routes._next_reference_start_after(scene, lane, start)
+                for lane, start in probes]
+
+    assert emitted == expected, (
+        "the client and server disagree about which item a new Reference item's "
+        f"extent is measured against: js={emitted} python={expected}")
+
+
+def test_the_prompt_section_structure_agrees_across_languages():
+    """`_prompt_section_structure` mirrors `_promptSectionsReplacementGuard`."""
+    import server.routes as routes
+    from server.timeline_state import PromptSection, Scene
+
+    source = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
+    guard = _method(source, "_promptSectionsReplacementGuard", "_applyLocalCreateGuide")
+
+    scene = Scene(scene_id="scene")
+    scene.prompt_sections = [PromptSection(start_frame=0, end_frame=10),
+                             PromptSection(start_frame=10, end_frame=25),
+                             PromptSection(start_frame=25, end_frame=30)]
+    for section, prompt_id in zip(scene.prompt_sections, ("p1", "p2", "p3")):
+        section.prompt_id = prompt_id
+    scene.prompt_sections[1].muted = True
+
+    fixture = [section.to_dict() for section in scene.prompt_sections]
+    emitted = _js_guard_values(
+        guard, json.dumps({"prompt_sections": fixture}),
+        "out.push(host._promptSectionsReplacementGuard().sections);\n")
+
+    assert emitted[0] == routes._prompt_section_structure(scene), (
+        "the client and server project a prompt section's structure "
+        f"differently: js={emitted[0]} python={routes._prompt_section_structure(scene)}")
+
+    # The empty scene is the case an Apply on a fresh project takes.
+    empty = _js_guard_values(guard, json.dumps({"prompt_sections": []}),
+                             "out.push(host._promptSectionsReplacementGuard().sections);\n")
+    assert empty[0] == routes._prompt_section_structure(Scene(scene_id="empty")) == []

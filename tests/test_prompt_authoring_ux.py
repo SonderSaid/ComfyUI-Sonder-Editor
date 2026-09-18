@@ -85,7 +85,12 @@ def test_inline_attachment_transactions_keep_every_prompt_bar_open():
     widget = _source("web/js/editor_widget.js")
     builder = _method(widget, "_buildChannelInputs", "_showPromptCreator")
     assert builder.count("onEnter?.({ close: false })") == 9
-    global_bar = _method(widget, "_showGlobalPromptEditor", "_updateScenePrompt")
+    # Delimiter only: `_updateScenePrompt` was deleted as dead code, so the
+    # slice now ends at the method that really follows the global bar. It is
+    # tighter than before — the old anchor reached past six later method
+    # declarations (264 lines, 7 methods) where this one is the global bar
+    # alone (112 lines, 1 method). Every assertion below still holds.
+    global_bar = _method(widget, "_showGlobalPromptEditor", "_updateSceneGlobalContext")
     assert "({ close = true } = {})" in global_bar
     assert "if (close) this._hidePromptEditor();" in global_bar
 
@@ -6145,8 +6150,16 @@ def test_image_asset_drop_uses_the_project_mutation_queue():
 const emit=console.log;console.log=()=>{{}};
 class Harness {{
   constructor(){{this.activeSceneId="scene";this.applied=[];this.sent=[];
+    this.activeScene={{guide_frames:[
+      {{guide_id:"occupant",frame_index:12,asset_id:"a0"}}]}};
     this.response={{payload:{{scene:{{guide_frames:[
       {{guide_id:"guide-1",frame_index:20,asset_id:"a1"}}]}}}}}};}}
+  _guideReplacementGuard(frameIndex){{
+    const frame=parseInt(frameIndex,10);
+    const occupant=(this.activeScene?.guide_frames||[]).find(
+      (guide)=>Number(guide?.frame_index)===frame);
+    return {{replaces_guide_id:String(occupant?.guide_id||"")}};
+  }}
   _seedFitDefaults(fields){{return {{...fields,fit_mode:"contain"}};}}
   _newLocalItemId(kind){{return `${{kind}}-1`;}}
   _defaultGuideStrength(){{return 0.5;}}
@@ -6177,6 +6190,11 @@ emit(JSON.stringify({{sent:h.sent,applied:h.applied,propagated}}));
             "guide_id": "guide-1", "frame_index": 12, "asset_id": "a1",
             "source": "asset", "strength": 0.5, "fit_mode": "contain",
         },
+        # The drop names the guide it replaces. Read before the local apply,
+        # which removes that guide -- reading it after would always claim an
+        # empty frame, and an empty claim passes on an empty frame while
+        # refusing on an occupied one, so the guard would invert silently.
+        "expected": {"replaces_guide_id": "occupant"},
     }]
     # The drop defers its own scenes refresh, and history ordering depends on it
     # not coalescing with a neighbouring drop.

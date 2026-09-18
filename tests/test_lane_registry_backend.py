@@ -185,6 +185,29 @@ def _scene_for_lane_removal(lane_type, state):
     return scene, descriptor, lane_index
 
 
+def _removal_guard(scene, lane_type, lane_index):
+    """The `expected` a real caller sends with `remove_lane`.
+
+    Built from the scene the caller can see, exactly as the client builds it:
+    the family's current lane count, plus the durable `lane_id` for the one
+    family that has one. Tests construct it here rather than inline so a change
+    to the guard's shape is one edit, not thirty.
+    """
+    descriptor = lane_registry.descriptor_for_lane_type(lane_type)
+    configs = routes._scene_lane_configs(scene, lane_type)
+    config = configs[lane_index] if 0 <= lane_index < len(configs) else None
+    guard = {
+        "lane_count": routes._scene_lane_count(scene, lane_type),
+        "config": routes._normalized_lane_config(config if config is not None else {}),
+    }
+    if descriptor is not None and descriptor.recipe_attr:
+        recipes = getattr(scene, descriptor.recipe_attr, None) or []
+        if 0 <= lane_index < len(recipes):
+            lane_id = str(getattr(recipes[lane_index], "lane_id", "") or "")
+            if lane_id:
+                guard["lane_id"] = lane_id
+    return guard
+
 @pytest.mark.parametrize("item_policy", ["require_empty", "move_items", "delete_items"])
 @pytest.mark.parametrize("lane_type", lane_registry.VARIABLE_LANE_TYPES)
 @pytest.mark.parametrize("state", ["empty", "occupied", "only_lane", "out_of_range", "locked"])
@@ -203,11 +226,15 @@ def test_remove_media_lane_policy_family_state_matrix(item_policy, lane_type, st
 
     if expected_error is not None:
         with pytest.raises(routes.ProjectMutationRequestError) as raised:
-            routes._remove_media_lane(scene, lane_type, lane_index, item_policy)
+            routes._remove_media_lane(
+                scene, lane_type, lane_index, item_policy,
+                expected=_removal_guard(scene, lane_type, lane_index))
         assert (raised.value.message, raised.value.status, raised.value.code) == expected_error
         return
 
-    routes._remove_media_lane(scene, lane_type, lane_index, item_policy)
+    routes._remove_media_lane(
+        scene, lane_type, lane_index, item_policy,
+        expected=_removal_guard(scene, lane_type, lane_index))
     assert getattr(scene, descriptor.count_attr) == 2
     assert [config.name for config in getattr(scene, descriptor.configs_attr)] == [
         f"{lane_type}-0",
@@ -232,7 +259,9 @@ def test_remove_driver_lane_move_revalidates_single_item_limit():
         )
     )
     with pytest.raises(routes.ProjectMutationRequestError) as raised:
-        routes._remove_media_lane(scene, "motion_driver", lane_index, "move_items", target_lane=0)
+        routes._remove_media_lane(
+            scene, "motion_driver", lane_index, "move_items", target_lane=0,
+            expected=_removal_guard(scene, "motion_driver", lane_index))
     assert (raised.value.status, raised.value.code) == (409, "driver_lane_occupied")
     assert raised.value.message.startswith("Only one driver clip is allowed per driver lane")
     assert {raised.value.details["item_id"], raised.value.details["other_item_id"]} == {"destination", "occupied"}

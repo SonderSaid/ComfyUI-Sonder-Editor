@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import server
 import server.routes as routes
 from server import prompt_context
-from server.timeline_state import Asset, AudioTrack, ClipReference, GenerationJob, GuideFrame, LaneConfig, PromptSection, ReferenceEntity, ReferenceMember, Scene, TimelineProject
+from server.timeline_state import Asset, AudioTrack, ClipReference, GenerationJob, GuideFrame, LaneConfig, PromptSection, ReferenceEntity, ReferenceItem, ReferenceLaneRecipe, ReferenceMember, Scene, TimelineProject
 
 
 class DummyRequest(dict):
@@ -909,6 +909,8 @@ def test_scene_mutation_remove_lane_is_single_save_and_reindexes(monkeypatch, tm
                 "lane_index": 1,
                 "item_policy": "move_items",
                 "target_lane": 0,
+                "expected": {"lane_count": 3, "config": {
+                    "name": "V1", "color": "", "locked": False, "hidden": False}},
             }],
         },
     )))
@@ -964,6 +966,7 @@ def test_scene_mutation_move_guide_replaces_destination_frame(monkeypatch, tmp_p
         GuideFrame(frame_index=5, asset_id="asset-a", strength=0.7),
         GuideFrame(frame_index=8, asset_id="asset-b", strength=0.4),
     ]
+    displaced = scene.guide_frames[1].guide_id
     project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
     saves = []
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
@@ -981,7 +984,10 @@ def test_scene_mutation_move_guide_replaces_destination_frame(monkeypatch, tmp_p
                 "type": "move_guide",
                 "from_frame_index": 5,
                 "to_frame_index": 8,
-                "expected": {"frame_index": 5, "asset_id": "asset-a"},
+                # Naming the guide at the destination is what makes this the
+                # DELIBERATE replacement rather than a blind one.
+                "expected": {"frame_index": 5, "asset_id": "asset-a",
+                             "replaces_guide_id": displaced},
                 "asset_id": "asset-a",
                 "source": "asset",
                 "strength": 0.7,
@@ -2188,6 +2194,7 @@ def test_scene_mutation_remove_lane_move_collision_never_deletes(monkeypatch, tm
         "lane_index": 1,
         "item_policy": "move_items",
         "target_lane": 0,
+        "expected": {"lane_count": 2, "config": {"name": "", "color": "", "locked": False, "hidden": False}},
     }], saves)
 
     assert response.status == 409
@@ -2228,6 +2235,7 @@ def test_scene_mutation_remove_lane_refuses_video_and_audio_collisions(monkeypat
             "lane_index": 1,
             "item_policy": "move_items",
             "target_lane": 0,
+            "expected": {"lane_count": 2, "config": {"name": "", "color": "", "locked": False, "hidden": False}},
         }], saves)
         assert response.status == 409
         assert _response_json(response)["code"] == "lane_collision"
@@ -2691,7 +2699,9 @@ def test_cross_project_template_imports_assetless_vocal_identity_with_sections(m
     response = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [
         {"type": "import_prompt_context_dependencies", "profiles": [],
          "semantic_units": [unit]},
-        {"type": "replace_prompt_sections", "sections": [{
+        {"type": "replace_prompt_sections",
+         "expected": {"sections": [s.to_dict() for s in scene.prompt_sections]},
+         "sections": [{
             "prompt_id": "p", "start_frame": 0, "end_frame": 24,
             "channels": {"visual": ""}, "attachments": [event],
         }]},
@@ -2796,7 +2806,10 @@ def test_multiple_ad_hoc_prompt_identities_and_sections_commit_in_one_mutation(m
                   "kind": "subject", "definition": ""}}
         for identity_id, name in (("other-1", "One"), ("other-2", "Two"))
     ]
-    operations.append({"type": "replace_prompt_sections", "sections": [{
+    operations.append({
+        "type": "replace_prompt_sections",
+        "expected": {"sections": [s.to_dict() for s in scene.prompt_sections]},
+        "sections": [{
         "prompt_id": "section-1", "start_frame": 0, "end_frame": 24,
         "channels": {"detailed_description": "A conversation."},
         "attachments": [{
@@ -3356,3 +3369,616 @@ def test_storage_failure_is_never_answered_as_a_bad_request(monkeypatch, family)
     assert reached == [entry_point]
     # The message keeps the path deliberately — it goes to the log, never the client.
     assert STORAGE_SENTINEL_PATH in str(caught.value)
+
+
+def test_remove_lane_refuses_when_the_lane_layout_moved_underneath(monkeypatch, tmp_path):
+    """The retrofit: a stale lane index no longer deletes the wrong lane.
+
+    A lane index is positional and this operation deletes, so the failure was
+    silent and unrecoverable except through Undo. The guard is the family's lane
+    count -- complete for `video`, `motion_driver` and `audio` because none of
+    them is `lane_movable`, so nothing but an add or a remove can change what
+    one of their indices means.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.video_lane_count = 3
+    scene.video_lane_configs = [LaneConfig(name="keep-0"), LaneConfig(name="keep-1"),
+                                LaneConfig(name="doomed-2")]
+    # On the lane a wrong-index removal would take, so the assertion below is
+    # about data surviving rather than about a clip that was never at risk.
+    scene.clips = [
+        ClipReference(clip_id="on-2", timeline_start_frame=0, timeline_end_frame=5,
+                      track_index=2),
+    ]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+
+    # The client read a four-lane scene; another writer has since removed one, so
+    # index 2 no longer names the lane it named.
+    saves = []
+    refused = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "remove_lane", "lane_type": "video", "lane_index": 2,
+        "item_policy": "delete_items",
+        "expected": {"lane_count": 4, "config": {
+            "name": "doomed-2", "color": "", "locked": False, "hidden": False}},
+    }], saves)
+    assert refused.status == 409
+    assert _response_json(refused)["code"] == "identity_mismatch"
+    assert saves == []
+    assert scene.video_lane_count == 3
+    assert [config.name for config in scene.video_lane_configs] == [
+        "keep-0", "keep-1", "doomed-2"]
+
+    # A guard that matches still removes the lane the caller meant.
+    accepted = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "remove_lane", "lane_type": "video", "lane_index": 2,
+        "item_policy": "delete_items",
+        "expected": {"lane_count": 3, "config": {
+            "name": "doomed-2", "color": "", "locked": False, "hidden": False}},
+    }], saves)
+    assert accepted.status == 200
+    assert scene.video_lane_count == 2
+    assert [config.name for config in scene.video_lane_configs] == ["keep-0", "keep-1"]
+    # The clip on the deleted lane goes with it; the refusal above is what kept
+    # it when the guard did not match.
+    assert scene.clips == []
+
+
+def test_remove_lane_requires_a_guard_rather_than_defaulting_to_none(monkeypatch, tmp_path):
+    """Absence is refused, not tolerated.
+
+    A caller that cannot send the guard -- a tab left open across a deploy -- is
+    exactly the caller whose lane indices are most likely to be stale, so
+    treating a missing guard as permission would exempt the worst case.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.video_lane_count = 2
+    scene.video_lane_configs = [LaneConfig(), LaneConfig()]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+
+    saves = []
+    blank = {"name": "", "color": "", "locked": False, "hidden": False}
+    for operation in ({"type": "remove_lane", "lane_type": "video", "lane_index": 1,
+                       "item_policy": "require_empty"},
+                      {"type": "remove_lane", "lane_type": "video", "lane_index": 1,
+                       "item_policy": "require_empty", "expected": {}},
+                      {"type": "remove_lane", "lane_type": "video", "lane_index": 1,
+                       "item_policy": "require_empty",
+                       "expected": {"lane_count": "2", "config": blank}},
+                      {"type": "remove_lane", "lane_type": "video", "lane_index": 1,
+                       "item_policy": "require_empty",
+                       "expected": {"lane_count": True, "config": blank}},
+                      # The config anchor is as mandatory as the count: without
+                      # it the guard cannot see a permutation at equal count.
+                      {"type": "remove_lane", "lane_type": "video", "lane_index": 1,
+                       "item_policy": "require_empty",
+                       "expected": {"lane_count": 2}}):
+        response = _apply_scene_operations(
+            route_module, monkeypatch, project, "scene-1", [operation], saves)
+        assert response.status == 400, operation
+        assert _response_json(response)["code"] == "missing_expected_identity"
+    assert saves == []
+    assert scene.video_lane_count == 2
+
+
+def test_remove_lane_guards_a_reference_lane_by_its_durable_id(monkeypatch, tmp_path):
+    """`reference` is the only movable family, so a count guard is not enough.
+
+    Two lanes swapped by `move_lane` leave the count identical while every index
+    means a different lane -- the case `durable_rules.md` names, and the reason
+    this family carries its `lane_id` as well.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.reference_lane_count = 2
+    scene.reference_lane_configs = [LaneConfig(), LaneConfig()]
+    scene.reference_lane_recipes = [ReferenceLaneRecipe(lane_id="lane-a"),
+                                    ReferenceLaneRecipe(lane_id="lane-b")]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    blank = {"name": "", "color": "", "locked": False, "hidden": False}
+
+    saves = []
+    swapped = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "remove_lane", "lane_type": "reference", "lane_index": 1,
+        "item_policy": "require_empty",
+        "expected": {"lane_count": 2, "config": blank, "lane_id": "lane-a"},
+    }], saves)
+    assert swapped.status == 409
+    assert _response_json(swapped)["code"] == "identity_mismatch"
+    assert saves == []
+    assert scene.reference_lane_count == 2
+
+    matched = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "remove_lane", "lane_type": "reference", "lane_index": 1,
+        "item_policy": "require_empty",
+        "expected": {"lane_count": 2, "config": blank, "lane_id": "lane-b"},
+    }], saves)
+    assert matched.status == 200
+    assert [recipe.lane_id for recipe in scene.reference_lane_recipes] == ["lane-a"]
+
+
+def test_remove_lane_tolerates_a_reference_lane_with_no_durable_id(monkeypatch, tmp_path):
+    """The bootstrap case `_apply_lane_config` already tolerates.
+
+    A lane whose recipe was never written has no id the caller could have read,
+    so demanding one would refuse a legitimate removal. The count still covers it.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.reference_lane_count = 2
+    scene.reference_lane_configs = [LaneConfig(), LaneConfig()]
+    scene.reference_lane_recipes = [ReferenceLaneRecipe(lane_id="lane-a")]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+
+    saves = []
+    response = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "remove_lane", "lane_type": "reference", "lane_index": 1,
+        "item_policy": "require_empty",
+        "expected": {"lane_count": 2, "config": {
+            "name": "", "color": "", "locked": False, "hidden": False}},
+    }], saves)
+    assert response.status == 200
+    assert scene.reference_lane_count == 1
+
+
+def test_consolidate_items_still_vacates_lanes_it_emptied(monkeypatch, tmp_path):
+    """The internal removal is server-derived and must not need a client guard.
+
+    `_consolidate_media_items` removes a lane it has just emptied, from state it
+    is already holding. Making `expected` mandatory without exempting this path
+    would have broken every consolidation that removes vacated lanes -- which is
+    what `LANE_INDEX_FROM_SERVER_STATE` exists to say out loud.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.video_lane_count = 3
+    scene.video_lane_configs = [LaneConfig(), LaneConfig(), LaneConfig()]
+    scene.clips = [
+        ClipReference(clip_id="a", timeline_start_frame=0, timeline_end_frame=5,
+                      track_index=0),
+        ClipReference(clip_id="b", timeline_start_frame=10, timeline_end_frame=15,
+                      track_index=2),
+    ]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+
+    saves = []
+    response = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "consolidate_items", "lane_type": "video",
+        "item_ids": ["a", "b"], "target_lane": 0, "remove_vacated_lanes": True,
+    }], saves)
+    assert response.status == 200, _response_json(response)
+    assert _response_json(response)["results"][0]["removed_lanes"] == [2]
+    assert scene.video_lane_count == 2
+    assert {clip.track_index for clip in scene.clips} == {0}
+
+
+def test_create_guide_refuses_replacing_a_guide_the_caller_never_saw(monkeypatch, tmp_path):
+    """The retrofit: replacement is deliberate, or it is refused.
+
+    `_apply_create_guide` drops every guide already at the frame. That is a
+    two-sided semantic the author can see — the client mirrors it — so the guard
+    names what is being replaced rather than demanding an empty frame. Only the
+    guide this client could not see is refused.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.guide_frames = [GuideFrame(guide_id="other-tab", frame_index=12,
+                                     asset_id="asset-a")]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+
+    # The client believed frame 12 was empty; another writer put a guide there.
+    saves = []
+    blind = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "create_guide",
+        "fields": {"guide_id": "mine", "frame_index": 12, "asset_id": "asset-b"},
+        "expected": {"replaces_guide_id": ""},
+    }], saves)
+    assert blind.status == 409
+    assert _response_json(blind)["code"] == "identity_mismatch"
+    assert saves == []
+    assert [guide.guide_id for guide in scene.guide_frames] == ["other-tab"]
+
+    # Naming the occupant is the deliberate replacement, and it still works.
+    deliberate = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "create_guide",
+        "fields": {"guide_id": "mine", "frame_index": 12, "asset_id": "asset-b"},
+        "expected": {"replaces_guide_id": "other-tab"},
+    }], saves)
+    assert deliberate.status == 200
+    assert [guide.guide_id for guide in scene.guide_frames] == ["mine"]
+
+    # And an empty frame accepts the empty claim.
+    fresh = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "create_guide",
+        "fields": {"guide_id": "second", "frame_index": 40, "asset_id": "asset-c"},
+        "expected": {"replaces_guide_id": ""},
+    }], saves)
+    assert fresh.status == 200
+    assert {guide.guide_id for guide in scene.guide_frames} == {"mine", "second"}
+
+
+def test_create_guide_requires_the_replacement_claim(monkeypatch, tmp_path):
+    """Absence is refused. A caller that cannot say is the one most likely stale."""
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+
+    saves = []
+    for operation in ({"type": "create_guide",
+                       "fields": {"frame_index": 3, "asset_id": "a"}},
+                      {"type": "create_guide",
+                       "fields": {"frame_index": 3, "asset_id": "a"},
+                       "expected": {}},
+                      {"type": "create_guide",
+                       "fields": {"frame_index": 3, "asset_id": "a"},
+                       "expected": {"guide_id": "x"}}):
+        response = _apply_scene_operations(
+            route_module, monkeypatch, project, "scene-1", [operation], saves)
+        assert response.status == 400, operation
+        assert _response_json(response)["code"] == "missing_expected_identity"
+    assert saves == []
+    assert scene.guide_frames == []
+
+
+def test_remove_lane_catches_a_permutation_that_leaves_the_count_unchanged(
+        monkeypatch, tmp_path):
+    """The counterexample that disproved the first version of this guard.
+
+    A remove plus an add restores the lane count while shifting every index
+    above the removal, so a count-equality guard accepted a stale removal and
+    destroyed a clip on a lane the caller never named. The config anchor --
+    the identity `durable_rules.md` names for families with no durable id, and
+    the one `findLaneByAnchor` already resolves by on the client -- is what
+    catches it.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.video_lane_count = 3
+    scene.video_lane_configs = [LaneConfig(name="v0"), LaneConfig(name="v1"),
+                                LaneConfig(name="v2")]
+    scene.clips = [
+        ClipReference(clip_id="on-0", timeline_start_frame=0, timeline_end_frame=5,
+                      track_index=0),
+        ClipReference(clip_id="on-2", timeline_start_frame=0, timeline_end_frame=5,
+                      track_index=2),
+    ]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    saves = []
+
+    # What client A captured while looking at a three-lane scene: it means the
+    # lane called "v1", which is at index 1.
+    authored = {"lane_count": 3, "config": {
+        "name": "v1", "color": "", "locked": False, "hidden": False}}
+
+    # Client B removes lane 0 and then adds a lane. Net zero on the count;
+    # every index above 0 has shifted down and a blank lane is appended.
+    assert _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "remove_lane", "lane_type": "video", "lane_index": 0,
+        "item_policy": "delete_items",
+        "expected": {"lane_count": 3, "config": {
+            "name": "v0", "color": "", "locked": False, "hidden": False}},
+    }], saves).status == 200
+    assert _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "set_lane_count", "lane_type": "video", "count": 3,
+    }], saves).status == 200
+    assert [config.name for config in scene.video_lane_configs] == ["v1", "v2", ""]
+    assert scene.video_lane_count == 3
+
+    # A's stale removal must not delete "v2" -- and must not take `on-2` with it.
+    saves.clear()
+    refused = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "remove_lane", "lane_type": "video", "lane_index": 1,
+        "item_policy": "delete_items", "expected": authored,
+    }], saves)
+    assert refused.status == 409
+    assert _response_json(refused)["code"] == "identity_mismatch"
+    assert saves == []
+    assert [config.name for config in scene.video_lane_configs] == ["v1", "v2", ""]
+    assert {clip.clip_id for clip in scene.clips} == {"on-2"}
+
+
+def test_remove_lane_accepts_a_concurrent_lane_ADD(monkeypatch, tmp_path):
+    """An append moves nothing, so refusing it would be a pure false refusal.
+
+    `_set_scene_lane_count` grows by appending and `remove_lane` deletes in
+    place, so a family that only grew cannot have moved this caller's lane. The
+    count is therefore compared as a floor, never for equality -- the first
+    version demanded equality and refused this, which costs the user an edit for
+    no protection at all.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.video_lane_count = 3
+    scene.video_lane_configs = [LaneConfig(name="v0"), LaneConfig(name="v1"),
+                                LaneConfig(name="v2")]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    saves = []
+
+    # Another writer appends a lane while this removal is in flight.
+    assert _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "set_lane_count", "lane_type": "video", "count": 4,
+    }], saves).status == 200
+
+    accepted = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "remove_lane", "lane_type": "video", "lane_index": 1,
+        "item_policy": "require_empty",
+        "expected": {"lane_count": 3, "config": {
+            "name": "v1", "color": "", "locked": False, "hidden": False}},
+    }], saves)
+    assert accepted.status == 200
+    assert [config.name for config in scene.video_lane_configs] == ["v0", "v2", ""]
+
+
+def test_create_guide_cannot_name_one_of_two_occupants(monkeypatch, tmp_path):
+    """`_apply_create_guide` deletes EVERY guide at the frame, so the claim must
+    cover every one of them.
+
+    Duplicates cannot be produced by `create_guide` or `move_guide` -- both
+    replace at the frame -- but deserialization does not dedupe, so a
+    hand-edited or imported document can hold them. Naming one of two would
+    authorize destroying the other with nothing compared.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.guide_frames = [GuideFrame(guide_id="first", frame_index=12),
+                          GuideFrame(guide_id="second", frame_index=12)]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+
+    saves = []
+    for claim in ("first", "second", ""):
+        response = _apply_scene_operations(
+            route_module, monkeypatch, project, "scene-1", [{
+                "type": "create_guide",
+                "fields": {"guide_id": "mine", "frame_index": 12},
+                "expected": {"replaces_guide_id": claim},
+            }], saves)
+        assert response.status == 409, claim
+        assert _response_json(response)["code"] == "identity_mismatch"
+    assert saves == []
+    assert {guide.guide_id for guide in scene.guide_frames} == {"first", "second"}
+
+
+def test_move_guide_refuses_a_destination_the_caller_never_saw(monkeypatch, tmp_path):
+    """The same blind-replacement defect `create_guide` was retrofitted for.
+
+    `_apply_move_guide` deletes whatever sits on the destination frame and
+    rewrites its link groups, and its `expected` only identified the guide being
+    MOVED. Found by an adversarial audit of the `create_guide` retrofit: guarding
+    one door of a two-door room.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.guide_frames = [GuideFrame(guide_id="mine", frame_index=5, asset_id="a"),
+                          GuideFrame(guide_id="other-tab", frame_index=8, asset_id="b")]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    saves = []
+
+    blind = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "move_guide", "from_frame_index": 5, "to_frame_index": 8,
+        "expected": {"frame_index": 5, "guide_id": "mine",
+                     "replaces_guide_id": ""},
+    }], saves)
+    assert blind.status == 409
+    assert _response_json(blind)["code"] == "identity_mismatch"
+    assert saves == []
+    assert {(guide.guide_id, guide.frame_index) for guide in scene.guide_frames} == {
+        ("mine", 5), ("other-tab", 8)}
+
+    # A drag that ends where it began: the guide being moved occupies its own
+    # destination, and naming itself as what it replaces would be nonsense.
+    same = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "move_guide", "from_frame_index": 5, "to_frame_index": 5,
+        "expected": {"frame_index": 5, "guide_id": "mine",
+                     "replaces_guide_id": ""},
+    }], saves)
+    assert same.status == 200, _response_json(same)
+
+    # And a guard with no destination claim at all is refused, not defaulted.
+    missing = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "move_guide", "from_frame_index": 5, "to_frame_index": 8,
+        "expected": {"frame_index": 5, "guide_id": "mine"},
+    }], saves)
+    assert missing.status == 400
+    assert _response_json(missing)["code"] == "missing_expected_identity"
+
+
+def test_create_reference_item_refuses_an_extent_measured_against_a_moved_lane(
+        monkeypatch, tmp_path):
+    """The half `_require_no_reference_overlap` does not cover.
+
+    Both emitters set `end_frame` to the start of the next item on the lane,
+    read out of their own copy. An item appearing EARLIER makes the extent
+    overlap and is already refused. An item being DELETED, or moved later,
+    leaves the new item shorter than it was drawn — no overlap, no refusal, and
+    a silently wrong extent.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.duration_frames = 200
+    scene.reference_lane_count = 1
+    scene.reference_lane_configs = [LaneConfig()]
+    scene.reference_lane_recipes = [ReferenceLaneRecipe(lane_id="lane-a")]
+    scene.reference_items = [ReferenceItem(reference_item_id="later", lane_index=0,
+                                           start_frame=100, end_frame=150)]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    # A Reference item needs at least one Library member to exist at all, so the
+    # accepted arm below has something real to stage.
+    project.references = [ReferenceEntity(
+        reference_id="ref", name="Subject",
+        members=[ReferenceMember(member_id="member", asset_id="asset",
+                                 handle="SUBJECT")])]
+    project.assets = [Asset(asset_id="asset", asset_type="image",
+                            path="media/subject.png")]
+    member = [{"entity_id": "ref", "member_id": "member"}]
+    saves = []
+
+    # The client drew a bar from 10 up to the item at 100. That item is then
+    # deleted, so the extent it measured no longer describes the lane.
+    scene.reference_items = []
+    stale = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "create_reference_item",
+        "expected": {"next_start_frame": 100},
+        "fields": {"lane_index": 0, "start_frame": 10, "end_frame": 100,
+                   "members": member},
+    }], saves)
+    assert stale.status == 409
+    assert _response_json(stale)["code"] == "identity_mismatch"
+    assert saves == []
+    assert scene.reference_items == []
+
+    # With a real later item present and named, the same create succeeds. The
+    # later item matters: an earlier version of this test emptied the lane
+    # first, so `_next_reference_start_after` was never consulted and a helper
+    # that always returned -1 would have passed every arm.
+    scene.reference_items = [ReferenceItem(reference_item_id="later", lane_index=0,
+                                           start_frame=100, end_frame=150)]
+    accepted = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "create_reference_item",
+        "expected": {"next_start_frame": 100},
+        "fields": {"lane_index": 0, "start_frame": 10, "end_frame": 100,
+                   "members": member},
+    }], saves)
+    assert accepted.status == 200, _response_json(accepted)
+    assert sorted(item.start_frame for item in scene.reference_items) == [10, 100]
+
+    # An item on ANOTHER lane must not be what the guard measures against.
+    scene.reference_lane_count = 2
+    scene.reference_lane_configs.append(LaneConfig())
+    scene.reference_lane_recipes.append(ReferenceLaneRecipe(lane_id="lane-b"))
+    other_lane = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "create_reference_item",
+        "expected": {"next_start_frame": -1},
+        "fields": {"lane_index": 1, "start_frame": 10, "end_frame": -1,
+                   "members": member},
+    }], saves)
+    assert other_lane.status == 200, _response_json(other_lane)
+
+    # And a missing claim is refused rather than defaulted.
+    missing = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "create_reference_item",
+        "fields": {"lane_index": 0, "start_frame": 200, "end_frame": -1,
+                   "members": member},
+    }], saves)
+    assert missing.status == 400
+    assert _response_json(missing)["code"] == "missing_expected_identity"
+
+
+def test_replace_prompt_sections_refuses_a_collection_that_moved(monkeypatch, tmp_path):
+    """A wholesale replace discards every concurrent edit without a word."""
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.prompt_sections = [PromptSection(start_frame=0, end_frame=10),
+                             PromptSection(start_frame=10, end_frame=20)]
+    scene.prompt_sections[0].prompt_id = "p1"
+    scene.prompt_sections[1].prompt_id = "p2"
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    saves = []
+
+    replacement = [{"prompt_id": "new", "start_frame": 0, "end_frame": 30}]
+
+    # Another writer split, removed or retimed a section meanwhile.
+    for stale in (
+            [{"prompt_id": "p1", "start_frame": 0, "end_frame": 10}],
+            [{"prompt_id": "p1", "start_frame": 0, "end_frame": 10},
+             {"prompt_id": "p2", "start_frame": 10, "end_frame": 25}],
+            [{"prompt_id": "p2", "start_frame": 10, "end_frame": 20},
+             {"prompt_id": "p1", "start_frame": 0, "end_frame": 10}],
+    ):
+        response = _apply_scene_operations(
+            route_module, monkeypatch, project, "scene-1", [{
+                "type": "replace_prompt_sections", "sections": replacement,
+                "expected": {"sections": stale},
+            }], saves)
+        assert response.status == 409, stale
+        assert _response_json(response)["code"] == "identity_mismatch"
+    assert saves == []
+    assert [section.prompt_id for section in scene.prompt_sections] == ["p1", "p2"]
+
+    # A missing claim is refused, not defaulted to permission.
+    missing = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "replace_prompt_sections", "sections": replacement,
+    }], saves)
+    assert missing.status == 400
+    assert _response_json(missing)["code"] == "missing_expected_identity"
+
+    # The collection as the caller saw it still applies.
+    accepted = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "replace_prompt_sections", "sections": replacement,
+        "expected": {"sections": [
+            {"prompt_id": "p1", "start_frame": 0, "end_frame": 10},
+            {"prompt_id": "p2", "start_frame": 10, "end_frame": 20},
+        ]},
+    }], saves)
+    assert accepted.status == 200, _response_json(accepted)
+    assert [section.prompt_id for section in scene.prompt_sections] == ["new"]
+
+
+def test_bulk_delete_honours_its_per_item_guard_on_the_linked_path(
+        monkeypatch, tmp_path):
+    """A guarded delete must not become an unguarded one by being linked.
+
+    `_item_ref_from_selection` resolves a prompt by LIST POSITION and reads no
+    `expected`, so on the `apply_linked` path the per-item snapshot the client
+    already builds was thrown away — and a stale index deleted whatever row had
+    inherited it.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.prompt_sections = [PromptSection(start_frame=0, end_frame=5),
+                             PromptSection(start_frame=5, end_frame=10)]
+    scene.prompt_sections[0].prompt_id = "inserted"
+    scene.prompt_sections[1].prompt_id = "mine"
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    saves = []
+
+    # The caller selected the section at index 0 when it was "mine"; another
+    # writer has since inserted a section ahead of it.
+    refused = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "bulk_delete_items", "apply_linked": True,
+        "items": [{"type": "prompt", "id": 0,
+                   "expected": {"prompt_id": "mine", "start_frame": 5,
+                                "end_frame": 10}}],
+    }], saves)
+    assert refused.status == 409
+    assert _response_json(refused)["code"] == "identity_mismatch"
+    assert saves == []
+    assert [section.prompt_id for section in scene.prompt_sections] == [
+        "inserted", "mine"]
+
+    # Naming the row that is really there deletes that row and no other.
+    accepted = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "bulk_delete_items", "apply_linked": True,
+        "items": [{"type": "prompt", "id": 1,
+                   "expected": {"prompt_id": "mine", "start_frame": 5,
+                                "end_frame": 10}}],
+    }], saves)
+    assert accepted.status == 200, _response_json(accepted)
+    assert [section.prompt_id for section in scene.prompt_sections] == ["inserted"]
+
+
+def test_bulk_delete_linked_still_accepts_durable_members_with_no_snapshot(
+        monkeypatch, tmp_path):
+    """Clip and audio members carry no `expected` and must not start needing one.
+
+    `_mutationItemFromSelection` builds a snapshot for guide, prompt and
+    reference items only — the other two are addressed by durable id, so there
+    is nothing to compare and demanding it would refuse every linked delete.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.clips = [ClipReference(clip_id="clip-a", timeline_start_frame=0,
+                                 timeline_end_frame=10, track_index=0)]
+    scene.audio_tracks = [AudioTrack(track_id="audio-a", timeline_start_frame=0,
+                                     timeline_end_frame=10, lane_index=0)]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    saves = []
+
+    response = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "bulk_delete_items", "apply_linked": True,
+        "items": [{"type": "clip", "id": "clip-a"},
+                  {"type": "audio", "id": "audio-a"}],
+    }], saves)
+    assert response.status == 200, _response_json(response)
+    assert scene.clips == []
+    assert scene.audio_tracks == []

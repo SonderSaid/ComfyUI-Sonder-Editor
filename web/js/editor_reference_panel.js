@@ -1528,16 +1528,17 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             render();
             return;
         }
-        const nextStart = items
-            .map((item) => item.start_frame || 0)
-            .filter((value) => value > start)
-            .sort((left, right) => left - right)[0];
+        // The host owns the scan, so this surface and the timeline drop cannot
+        // measure the lane differently. `end_frame` is read back off the guard
+        // rather than recomputed, for the same reason.
+        const guard = host._referenceCreationGuard(state.laneIndex, start);
         await runItemOperation({
             type: "create_reference_item",
+            expected: guard,
             fields: {
                 lane_index: state.laneIndex,
                 start_frame: start,
-                end_frame: Number.isFinite(nextStart) ? nextStart : -1,
+                end_frame: guard.next_start_frame,
                 members,
                 prompt_override: "",
                 strength: 1.0,

@@ -1331,27 +1331,57 @@ def _item_ref_from_selection(scene: Scene, item: dict) -> dict:
     if item_type not in LINK_ITEM_TYPES:
         _mutation_error(f"Unsupported linked item type: {item_type}", 400, "invalid_link_type")
     raw_id = item.get("id")
+    # The caller's own snapshot of the row it means, validated at each point a
+    # row is actually resolved. An earlier version checked it in a separate pass
+    # that re-derived the resolution beside this one, and the two could disagree:
+    # `{id: "mine", frame_index: 10}` had the guard read the guide at frame 10
+    # while this resolved `mine` at frame 40, so a satisfied guard deleted a row
+    # it never looked at. Validating here makes that impossible rather than
+    # unlikely -- there is only one resolution to disagree with.
+    expected = item.get("expected")
+    expected = expected if isinstance(expected, dict) else None
     if item_type == "guide" and not item.get("id") and "frame_index" in item:
         guide = _find_guide(scene, _mutation_int(item.get("frame_index"), "guide frame_index"))
+        _validate_guide_identity(guide, expected)
         return _link_ref("guide", getattr(guide, "guide_id", ""))
     if item_type == "prompt" and not item.get("id") and "index" in item:
         section = _find_prompt_section(scene, _mutation_int(item.get("index"), "prompt index"))
+        _validate_prompt_identity(section, expected)
         return _link_ref("prompt", getattr(section, "prompt_id", ""))
     if item_type == "prompt" and raw_id is not None:
         raw_id_str = str(raw_id)
         if raw_id_str.isdigit() and not any(getattr(p, "prompt_id", "") == raw_id_str for p in scene.prompt_sections):
             section = _find_prompt_section(scene, int(raw_id_str))
+            _validate_prompt_identity(section, expected)
             return _link_ref("prompt", getattr(section, "prompt_id", ""))
     if item_type == "guide" and raw_id is not None:
         raw_id_str = str(raw_id)
         if not any(getattr(g, "guide_id", "") == raw_id_str for g in scene.guide_frames):
             try:
                 guide = _find_guide(scene, int(raw_id_str))
-                return _link_ref("guide", getattr(guide, "guide_id", ""))
             except (TypeError, ValueError):
-                pass
+                guide = None
+            # A frame index that resolves is validated like any other; one that
+            # does not is a durable id this scene has never held, and falls
+            # through to `_resolve_link_ref` to say so.
+            if guide is not None:
+                _validate_guide_identity(guide, expected)
+                return _link_ref("guide", getattr(guide, "guide_id", ""))
     item_id = str(raw_id or "")
     _resolve_link_ref(scene, item_type, item_id)
+    # The durable-id path: whichever row this names is the row that is acted on,
+    # so validate that one rather than a positional re-derivation of it.
+    if expected is not None:
+        if item_type == "guide":
+            _validate_guide_identity(
+                next((value for value in scene.guide_frames
+                      if str(getattr(value, "guide_id", "")) == item_id), None),
+                expected)
+        elif item_type == "prompt":
+            _validate_prompt_identity(
+                next((value for value in scene.prompt_sections
+                      if str(getattr(value, "prompt_id", "")) == item_id), None),
+                expected)
     return _link_ref(item_type, item_id)
 
 
@@ -2436,7 +2466,8 @@ def _consolidate_media_items(scene: Scene, op: dict) -> dict:
         for source_lane in sorted(source_lanes - {target_lane}, reverse=True):
             if _media_lane_items(scene, lane_type, source_lane):
                 continue
-            _remove_media_lane(scene, lane_type, source_lane, "require_empty")
+            _remove_media_lane(scene, lane_type, source_lane, "require_empty",
+                               expected=LANE_INDEX_FROM_SERVER_STATE)
             removed_lanes.append(source_lane)
 
     final_target_lane = target_lane - sum(1 for lane_index in removed_lanes if lane_index < target_lane)
@@ -2449,12 +2480,126 @@ def _consolidate_media_items(scene: Scene, op: dict) -> dict:
     }
 
 
-def _remove_media_lane(scene: Scene, lane_type: str, lane_index: int, item_policy: str, target_lane: int | None = None) -> None:
+# A removal whose lane index the SERVER computed from the document it is already
+# holding -- `_consolidate_media_items` vacating a lane it has just emptied. There
+# is no read-write window for a guard to close, and no client index to be stale.
+# An object identity rather than a string or None, so nothing arriving in a JSON
+# body can ever spell it.
+LANE_INDEX_FROM_SERVER_STATE = object()
+
+
+def _normalized_lane_config(config) -> dict:
+    """A lane config reduced to the four fields that identify it.
+
+    Mirrors `normalizedLaneConfig` in `editor_widget.js`, which
+    `findLaneByAnchor` already uses to resolve a non-reference lane during a
+    history rebase. Same four fields, same coercions, so the two sides cannot
+    disagree about whether a lane is the one the caller saw.
+    """
+    getter = (config.get if isinstance(config, dict)
+              else lambda key, default=None: getattr(config, key, default))
+    return {
+        "name": str(getter("name", "") or ""),
+        "color": str(getter("color", "") or ""),
+        "locked": getter("locked", False) is True,
+        "hidden": getter("hidden", False) is True,
+    }
+
+
+def _validate_lane_removal_identity(scene: Scene, descriptor, lane_index: int,
+                                    current_count: int, expected) -> None:
+    """Refuse a removal whose lane index no longer names the lane it named.
+
+    A lane index is positional and `remove_lane` deletes, so a stale index does
+    not misfire quietly -- it destroys the wrong lane and everything on it. Two
+    pieces of evidence, because neither alone is enough and the first draft of
+    this guard shipped with only the weaker one:
+
+      * **The lane's normalized config**, which is the identity
+        `durable_rules.md` and `architecture.md` already name for families
+        without a durable id -- "one unique exact normalized-config match" -- and
+        which `findLaneByAnchor` already resolves by on the client. This is what
+        catches a permutation that leaves the count unchanged.
+      * **A lane-count floor.** A family that only GREW cannot have moved this
+        caller's lane: `_set_scene_lane_count` appends and `remove_lane` deletes
+        in place, so no existing index shifts when lanes are added. A family that
+        SHRANK has shifted every index above the removal. So the count is
+        compared as `current < wanted`, never for equality -- equality would
+        refuse a concurrent append in which nothing moved at all.
+
+      * `reference` additionally carries a durable `lane_id`. It is the only
+        `lane_movable` family, so it is the only one that can be permuted at
+        equal count *and* identical configs, and its id settles that outright.
+        Blank ids are tolerated exactly as `_apply_lane_config` tolerates them --
+        a lane minted earlier in this same batch has no id the caller could have
+        read -- and `_move_media_lane` refuses to swap a blank-id lane, so such a
+        lane cannot be reordered behind the caller's back.
+
+    **Known residual, stated rather than implied.** Two lanes of a non-reference
+    family with identical configs are indistinguishable to this guard: a removal
+    below them followed by an append restores the count and matches the config,
+    and the wrong lane is deleted. That is not closable from the request -- the
+    model holds no other lane identity -- and it is what a document version
+    precondition on `_apply_scene_mutations_sync` would close. The bug tracker
+    carries it against the execution-queue item that owns bare writes.
+
+    Deliberately NOT guarded on the items the lane holds. Membership is lane
+    content, not lane identity (`durable_rules.md`): an ordinary concurrent item
+    move would then refuse a removal that is perfectly valid.
+
+    `lane_count` is the count this operation expects at or below WHEN IT RUNS,
+    not when the batch was authored. `_deleteSelectedLanesAndItemsWithinGesture`
+    sends several removals of one family in descending index order, so each one
+    legitimately sees one fewer lane than the last.
+    """
+    if expected is LANE_INDEX_FROM_SERVER_STATE:
+        return
+    if not isinstance(expected, dict):
+        _mutation_error("remove_lane requires an expected lane identity", 400,
+                        "missing_expected_identity")
+    wanted_count = expected.get("lane_count")
+    if isinstance(wanted_count, bool) or not isinstance(wanted_count, int):
+        _mutation_error("remove_lane requires an expected lane count", 400,
+                        "missing_expected_identity")
+    if current_count < wanted_count:
+        _mutation_error(
+            "Lanes were removed elsewhere, so this lane number no longer refers "
+            "to the same lane.", 409, "identity_mismatch")
+
+    wanted_config = expected.get("config")
+    if not isinstance(wanted_config, dict):
+        _mutation_error("remove_lane requires the expected lane config", 400,
+                        "missing_expected_identity")
+    configs = _scene_lane_configs(scene, descriptor.lane_type)
+    actual_config = (_normalized_lane_config(configs[lane_index])
+                     if 0 <= lane_index < len(configs)
+                     else _normalized_lane_config({}))
+    if _normalized_lane_config(wanted_config) != actual_config:
+        _mutation_error(
+            "This lane changed elsewhere, so this lane number no longer refers "
+            "to the same lane.", 409, "identity_mismatch")
+
+    if not descriptor.recipe_attr:
+        return
+    recipes = getattr(scene, descriptor.recipe_attr, None) or []
+    stored = (str(getattr(recipes[lane_index], "lane_id", "") or "")
+              if 0 <= lane_index < len(recipes) else "")
+    if stored and str(expected.get("lane_id") or "") != stored:
+        _mutation_error("Reference lane identity mismatch", 409,
+                        "identity_mismatch")
+
+
+def _remove_media_lane(scene: Scene, lane_type: str, lane_index: int, item_policy: str, target_lane: int | None = None, *, expected) -> None:
     descriptor = variable_descriptor(lane_type)
     if descriptor is None or not descriptor.lane_removable:
         _mutation_error(f"Cannot remove lane type: {lane_type}", 400)
     lane_index = _mutation_int(lane_index, "lane_index")
     current_count = _scene_lane_count(scene, lane_type)
+    # Before "cannot remove the only lane": if a concurrent writer took the
+    # family down to one, the accurate answer is that the layout moved, not that
+    # this lane is the last one.
+    _validate_lane_removal_identity(
+        scene, descriptor, lane_index, current_count, expected)
     if current_count <= 1:
         _mutation_error("Cannot remove the only lane", 409, "invalid_lane_operation")
     if lane_index < 0 or lane_index >= current_count:
@@ -2821,6 +2966,9 @@ def _apply_bulk_delete_items(scene: Scene, items: list, preserve_lanes: bool = F
     if apply_linked:
         linked_items = [item for item in items if str(item.get("type", "")) != "reference"]
         if linked_items:
+            # `_item_ref_from_selection` validates each item's own `expected` as
+            # it resolves it, so a positional ref that has gone stale refuses
+            # here instead of deleting the row that inherited its index.
             refs = [_item_ref_from_selection(scene, item) for item in linked_items]
             _apply_delete_link_refs(scene, refs, preserve_lanes)
         items = [item for item in items if str(item.get("type", "")) == "reference"]
@@ -2955,6 +3103,7 @@ def _apply_move_guide(scene: Scene, op: dict) -> GuideFrame:
     new_frame = _mutation_int(op.get("to_frame_index"), "to_frame_index")
     guide = _find_guide(scene, old_frame)
     _validate_guide_identity(guide, op.get("expected"))
+    _validate_guide_destination(scene, new_frame, op.get("expected"), ignore=guide)
     next_guide = GuideFrame(
         guide_id=str(op.get("guide_id", getattr(guide, "guide_id", "")) or getattr(guide, "guide_id", "") or uuid.uuid4().hex[:8]),
         frame_index=new_frame,
@@ -3006,6 +3155,60 @@ def _apply_delete_guide(scene: Scene, frame_index: int, expected: dict | None = 
     _validate_guide_identity(guide, expected)
     scene.guide_frames = [current for current in scene.guide_frames if current.frame_index != frame_index]
     _rewrite_link_groups_for_deleted(scene, [_link_ref("guide", getattr(guide, "guide_id", ""))])
+
+
+def _validate_guide_destination(scene: Scene, frame_index: int, expected,
+                                *, ignore=None) -> None:
+    """Refuse a write whose destination frame holds a guide the caller never saw.
+
+    Shared by `create_guide` and `move_guide` because both REPLACE at the frame
+    they land on, and the question is the same for each: is the guide about to be
+    destroyed the one the caller could see? `move_guide` passes `ignore` for the
+    guide it is moving, which legitimately occupies the destination when a drag
+    ends where it began.
+    """
+    if not isinstance(expected, dict) or "replaces_guide_id" not in expected:
+        _mutation_error(
+            "This operation requires the id of the guide it replaces, or an "
+            "empty string for none", 400, "missing_expected_identity")
+    # Every occupant, not the first: both appliers delete them all, and a claim
+    # that names one of two would authorize destroying the other with nothing
+    # compared. Duplicates cannot be produced by either operation -- both replace
+    # at the frame -- but deserialization does not dedupe, so a hand-edited or
+    # imported document can hold them.
+    occupants = [str(getattr(guide, "guide_id", "") or "")
+                 for guide in scene.guide_frames
+                 if int(getattr(guide, "frame_index", 0)) == frame_index
+                 and guide is not ignore]
+    actual = occupants[0] if len(occupants) == 1 else ("" if not occupants else None)
+    if actual is None or str(expected.get("replaces_guide_id") or "") != actual:
+        _mutation_error(
+            "A guide at this frame changed elsewhere, so this would have "
+            "replaced a different one.", 409, "identity_mismatch")
+
+
+def _validate_guide_creation_identity(scene: Scene, fields: dict, expected) -> None:
+    """Refuse a create whose frame is occupied by a guide the caller never saw.
+
+    `_apply_create_guide` REPLACES: it drops every guide already at the frame and
+    rewrites their link groups. That is deliberate and two-sided -- the client's
+    `_applyLocalCreateGuide` filters the same frame -- so the author who drops a
+    second image on an occupied frame means to replace what is there.
+
+    What has no guard is a guide this client cannot see: one another tab placed,
+    or one a queued Undo restored inside the write window. So the guard is not
+    "is the frame empty" but "name what you are replacing", which lets deliberate
+    replacement through and refuses the blind one. An empty string is the
+    positive claim that the frame held nothing.
+
+    Deliberately scoped to the mutation dispatcher. `api_add_guide`, the legacy
+    `POST .../guides` route, calls `_apply_create_guide` with a bare body and no
+    client base version; it has no caller in this repository and stays as it was
+    rather than growing a contract nothing exercises.
+    """
+    _validate_guide_destination(
+        scene, _mutation_int(fields.get("frame_index", 0), "frame_index", 0),
+        expected)
 
 
 def _apply_create_guide(scene: Scene, fields: dict) -> GuideFrame:
@@ -3118,6 +3321,57 @@ def _apply_create_prompt_section(scene: Scene, fields: dict) -> PromptSection:
     scene.prompt_sections.append(section)
     scene.prompt_sections.sort(key=lambda s: s.start_frame)
     return section
+
+
+def _prompt_section_structure(scene: Scene) -> list[dict]:
+    """The structural shape of a scene's prompt sections, in order."""
+    return [{"prompt_id": str(getattr(section, "prompt_id", "") or ""),
+             "start_frame": int(getattr(section, "start_frame", 0) or 0),
+             "end_frame": int(getattr(section, "end_frame", 0) or 0)}
+            for section in getattr(scene, "prompt_sections", []) or []]
+
+
+def _validate_prompt_replacement_identity(scene: Scene, expected) -> None:
+    """Refuse a wholesale replacement of a collection that has since changed.
+
+    `replace_prompt_sections` assigns `scene.prompt_sections` outright, so every
+    concurrent edit inside the write window is discarded without a word. The
+    guard is the ordered structure it believes it is replacing -- prompt ids with
+    their bounds -- which is the same shape `reorder_members` guards with
+    `expected_member_ids`, and it catches an insert, a delete, a reorder or a
+    retime.
+
+    **Not covered, and stated rather than implied:** a concurrent edit to a
+    section's CONTENT that leaves its id and bounds alone. Catching that needs a
+    canonical content hash computed identically in Python and JavaScript, which
+    would be a new cross-language mirror and owes its own parity test; the
+    per-document `prompt_edit` guard covers ordinary prompt text editing on its
+    own surface. The bug tracker carries the remainder.
+    """
+    if not isinstance(expected, dict) or "sections" not in expected:
+        _mutation_error(
+            "replace_prompt_sections requires the sections it replaces",
+            400, "missing_expected_identity")
+    wanted = expected.get("sections")
+    if not isinstance(wanted, list):
+        _mutation_error(
+            "replace_prompt_sections requires a sections list to compare",
+            400, "missing_expected_identity")
+    # `_mutation_int`, never bare `int()`: a body is caller-supplied, and a raw
+    # ValueError escapes both the route's own handler and
+    # `_project_error_middleware`, so aiohttp answers outside the application --
+    # no editor security headers, no CSP, connection force-closed. That is the
+    # failure the storage-integrity policy exists to prevent.
+    normalized = [{"prompt_id": str((value or {}).get("prompt_id", "") or ""),
+                   "start_frame": _mutation_int(
+                       (value or {}).get("start_frame", 0), "start_frame", 0),
+                   "end_frame": _mutation_int(
+                       (value or {}).get("end_frame", 0), "end_frame", 0)}
+                  for value in wanted if isinstance(value, dict)]
+    if len(normalized) != len(wanted) or normalized != _prompt_section_structure(scene):
+        _mutation_error(
+            "The prompt sections changed elsewhere, so this would have replaced "
+            "a different set.", 409, "identity_mismatch")
 
 
 def _apply_replace_prompt_sections(scene: Scene, values) -> list[PromptSection]:
@@ -3815,6 +4069,63 @@ def _create_prompt_context_profile(project: TimelineProject, raw_create) -> list
     return [*project.prompt_context_profiles, value]
 
 
+def _next_reference_start_after(scene: Scene, lane_index: int, start_frame: int) -> int:
+    """First Reference item start strictly after `start_frame` on one lane, or -1.
+
+    Exactly what both emitters compute to decide the new item's `end_frame`, so
+    the guard compares like with like.
+    """
+    starts = sorted(
+        int(getattr(item, "start_frame", 0) or 0)
+        for item in getattr(scene, "reference_items", []) or []
+        if int(getattr(item, "lane_index", 0) or 0) == lane_index
+        and int(getattr(item, "start_frame", 0) or 0) > start_frame)
+    return starts[0] if starts else -1
+
+
+def _validate_reference_creation_identity(scene: Scene, lane_index: int,
+                                          start_frame: int, expected) -> None:
+    """Refuse a create whose extent was measured against a lane that has moved.
+
+    `create_reference_item` is additive in name only: both emitters set
+    `end_frame` to the start of the NEXT item on the lane, read out of the
+    client's own copy of `scene.reference_items`. That is a prior row, and this
+    guard is two-sided -- an earlier draft claimed the existing overlap check
+    already owned one direction, and an audit disproved it:
+
+      * An item DELETED, or moved LATER, leaves the extent too short. No
+        overlap, no refusal -- the item is created smaller than the author drew
+        it, silently.
+      * An item moved EARLIER often overlaps, and `_require_no_reference_overlap`
+        refuses that -- but not always. With `A[0,50)` and `B[300,400)` on the
+        lane, a client drawing `[100,300)` while `B` moves to `[51,99)` produces
+        no overlap at all. Only this guard refuses it.
+
+    A lane with no later item reports -1, which is also the sentinel both
+    emitters send for "runs to the end of the scene". The two cannot be
+    confused: a stored `start_frame` is clamped to >= 0 by
+    `_reference_item_bounds` and by `ReferenceItem.from_dict`, so -1 is never a
+    real start.
+
+    **Not covered:** a concurrent SCENE DURATION shrink produces the same harm
+    for an item drawn to the -1 sentinel, and nothing here sees it --
+    `_clamp_reference_items_to_scene` simply retimes what is stored.
+    """
+    if not isinstance(expected, dict) or "next_start_frame" not in expected:
+        _mutation_error(
+            "create_reference_item requires the next item start it measured "
+            "against, or -1 for none", 400, "missing_expected_identity")
+    wanted = expected.get("next_start_frame")
+    if isinstance(wanted, bool) or not isinstance(wanted, int):
+        _mutation_error(
+            "create_reference_item requires a numeric next item start",
+            400, "missing_expected_identity")
+    if wanted != _next_reference_start_after(scene, lane_index, start_frame):
+        _mutation_error(
+            "Another Reference item on this lane changed, so this one would not "
+            "cover the range it was drawn for.", 409, "identity_mismatch")
+
+
 def _apply_create_reference_item(project: TimelineProject, scene: Scene, fields: dict) -> ReferenceItem:
     if not isinstance(fields, dict):
         _mutation_error("create_reference_item requires fields", 400)
@@ -4271,6 +4582,7 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
             _mutation_int(op.get("lane_index"), "lane_index"),
             str(op.get("item_policy", "require_empty")),
             op.get("target_lane"),
+            expected=op.get("expected"),
         )
         return {"type": op_type}
     if op_type == "move_lane":
@@ -4384,7 +4696,14 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
         _delete_audio_track(scene, str(op.get("track_id", "")), bool(op.get("preserve_lane", False)))
         return {"type": op_type, "track_id": str(op.get("track_id", ""))}
     if op_type == "create_reference_item":
-        item = _apply_create_reference_item(project, scene, op.get("fields", {}))
+        creation_fields = op.get("fields", {})
+        if isinstance(creation_fields, dict):
+            _validate_reference_creation_identity(
+                scene,
+                _mutation_int(creation_fields.get("lane_index", 0), "lane_index", 0),
+                _mutation_int(creation_fields.get("start_frame", 0), "start_frame", 0),
+                op.get("expected"))
+        item = _apply_create_reference_item(project, scene, creation_fields)
         return {"type": op_type, "reference_item_id": item.reference_item_id}
     if op_type == "update_reference_item":
         item = _apply_update_reference_item(project, scene, op)
@@ -4422,6 +4741,9 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
         if op.get("apply_linked"):
             guide = _find_guide(scene, _mutation_int(op.get("from_frame_index"), "from_frame_index"))
             _validate_guide_identity(guide, op.get("expected"))
+            _validate_guide_destination(
+                scene, _mutation_int(op.get("to_frame_index"), "to_frame_index"),
+                op.get("expected"), ignore=guide)
             _apply_linked_bounds_update(
                 project,
                 scene,
@@ -4455,6 +4777,8 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
         _apply_delete_guide(scene, frame_index, op.get("expected"))
         return {"type": op_type, "frame_index": frame_index}
     if op_type == "create_guide":
+        _validate_guide_creation_identity(
+            scene, op.get("fields", {}), op.get("expected"))
         guide = _apply_create_guide(scene, op.get("fields", {}))
         return {"type": op_type, "frame_index": guide.frame_index}
     if op_type == "update_prompt_section":
@@ -4501,6 +4825,7 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
         section = _apply_create_prompt_section(scene, op.get("fields", {}))
         return {"type": op_type, "start_frame": section.start_frame, "end_frame": section.end_frame}
     if op_type == "replace_prompt_sections":
+        _validate_prompt_replacement_identity(scene, op.get("expected"))
         sections = _apply_replace_prompt_sections(scene, op.get("sections", []))
         return {"type": op_type, "count": len(sections)}
     if op_type == "import_prompt_context_dependencies":

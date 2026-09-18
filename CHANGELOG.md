@@ -21,6 +21,13 @@ a fresh `[Unreleased]` block.
 - The standalone `DELETE` routes for clips, guides, prompt sections and audio tracks. These operations are owned by the scene mutations endpoint, which accepts an identity snapshot of the target that the old routes could not send, and which rewrites the link groups they left behind.
 
 ### Fixed
+- Staging a Reference item is refused, instead of being created shorter than it was drawn, when another item on that lane was deleted or moved while the write was on its way.
+- Writing mode's Apply is refused, instead of silently discarding the change, when prompt sections were added, removed, reordered or retimed elsewhere first.
+- Deleting a linked selection now honours the identity check it already carried. Previously that check was discarded whenever the selection was linked, so a prompt section or guide that had moved could be deleted in place of the one selected.
+- Deleting a timeline lane is refused, instead of deleting a different lane, when that lane changed elsewhere while the delete was on its way. Adding a lane in another tab no longer interferes, because it moves nothing.
+- Adding a guide frame, or dragging one onto an occupied frame, is refused instead of silently destroying what was there, when another editor put a different guide on that frame first. Replacing a guide you can see still works as before.
+- Linking or unlinking timeline items now follows a prompt section or guide that an Undo moved while the action was still queued, instead of acting on whatever row inherited its position. A row the Undo removed outright is still sent as authored.
+- A scene duration or resolution edit that fails while a second edit of the same kind is still queued now returns the timeline to the value it started from, instead of the intermediate value the first edit had shown.
 - A failure to read the project's own stored data is now reported as a server error rather than a bad request, and no longer puts the server's folder path in the editor's error message, in a failed export, or in the saved project file. The cases that previously ended the request without a proper reply now answer with the editor's security headers and content policy like every other response.
 - Version-conflict responses now carry the editor's security headers and content policy, which they previously shipped without.
 - Emptying the trash, or permanently deleting assets, no longer removes the media before the change is saved. If the save cannot proceed, the files are put back and the assets stay in the trash; previously the media was already gone and the gallery was left pointing at missing files.

@@ -241,7 +241,12 @@ def test_reference_lane_removal_keeps_recipe_array_aligned():
         ReferenceLaneRecipe(recipe_id="b"),
         ReferenceLaneRecipe(recipe_id="c"),
     ]
-    routes._remove_media_lane(scene, "reference", 1, "require_empty")
+    routes._remove_media_lane(
+        scene, "reference", 1, "require_empty",
+        expected={"lane_count": 3,
+                  "config": routes._normalized_lane_config(
+                      scene.reference_lane_configs[1]),
+                  "lane_id": scene.reference_lane_recipes[1].lane_id})
     assert [recipe.recipe_id for recipe in scene.reference_lane_recipes] == ["a", "c"]
 
 
@@ -253,7 +258,12 @@ def test_reference_lane_removal_refuses_media_kind_change_and_overlap():
         members=[{"entity_id": "entity-1", "member_id": "member-1"}],
     )]
     with pytest.raises(routes.ProjectMutationRequestError) as media_mismatch:
-        routes._remove_media_lane(scene, "reference", 0, "move_items", 1)
+        routes._remove_media_lane(
+            scene, "reference", 0, "move_items", 1,
+            expected={"lane_count": routes._scene_lane_count(scene, "reference"),
+                      "config": routes._normalized_lane_config(
+                          scene.reference_lane_configs[0]),
+                      "lane_id": scene.reference_lane_recipes[0].lane_id})
     assert media_mismatch.value.code == "reference_media_kind_mismatch"
 
     scene.reference_lane_recipes[1] = ReferenceLaneRecipe(media_kind="image")
@@ -262,7 +272,12 @@ def test_reference_lane_removal_refuses_media_kind_change_and_overlap():
         members=[{"entity_id": "entity-1", "member_id": "member-1"}],
     ))
     with pytest.raises(routes.ProjectMutationRequestError) as collision:
-        routes._remove_media_lane(scene, "reference", 0, "move_items", 1)
+        routes._remove_media_lane(
+            scene, "reference", 0, "move_items", 1,
+            expected={"lane_count": routes._scene_lane_count(scene, "reference"),
+                      "config": routes._normalized_lane_config(
+                          scene.reference_lane_configs[0]),
+                      "lane_id": scene.reference_lane_recipes[0].lane_id})
     assert collision.value.code == "lane_collision"
 
 
