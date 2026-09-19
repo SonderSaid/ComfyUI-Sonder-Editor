@@ -394,6 +394,9 @@ import {
 } from "./lane_registry.js";
 import { deriveRetryOnConflict } from "./scene_mutation_addressing.js";
 import { coalesceSceneMutationIntents } from "./scene_mutation_coalescing.js";
+import {
+    splitClipGeometry, splitAudioGeometry, mintSplitHalfId, splitHalfIdKey,
+} from "./scene_split_geometry.js";
 import { createViewportSurface } from "./viewport_surface.js";
 import {
     EDITOR_COLORS as COLORS,
@@ -5203,6 +5206,58 @@ export class EditorWidget {
         }
         this._pruneLocalLinkedGroups();
         return true;
+    }
+
+    /** Paint a planned split into `activeScene`, before the server answers.
+     *
+     *  INTENTIONAL MIRROR of `_split_clip_object` / `_split_audio_object`. The
+     *  arithmetic lives in `scene_split_geometry.js` so that
+     *  `tests/test_split_geometry_parity.py` can drive it against the Python
+     *  under Node -- `editor_widget.js` cannot be imported there, so a mirror
+     *  living only in this file could not carry the parity test
+     *  `agent_workflow.md` requires of one. This method owns only placement.
+     *
+     *  HALF-GEOMETRY ONLY. The server's left/right link partition -- overlap
+     *  majority, ties left, then drop any side left with fewer than two members
+     *  -- is deliberately not reproduced, because it would be a second authority
+     *  over link-group ownership. **The right half is not a link-group member
+     *  until the canonical scene response lands**; the surviving group stays
+     *  valid throughout and `_reconcileActiveSceneFromMutation` adopts the
+     *  server's final groups, the same authority the media-drop path relies on.
+     *
+     *  Returns the refs it painted, so a failure can say what it created.
+     */
+    _applyLocalSplit(members = [], splitFrame = 0) {
+        if (!this.activeScene) return [];
+        // Halves painted by a write that has not settled. Scoped to exactly that
+        // window: the runner clears each entry when its gesture settles, at
+        // which point the canonical scene has the real groups and
+        // `_isLinkedItem` answers correctly on its own.
+        if (!this._optimisticSplitHalves) this._optimisticSplitHalves = new Set();
+        const painted = [];
+        for (const member of members) {
+            if (!member?.rightId) continue;
+            if (member.type === "clip") {
+                const clip = (this.activeScene.clips || [])
+                    .find((row) => String(row.clip_id) === String(member.id));
+                if (!clip) continue;
+                const halves = splitClipGeometry(clip, splitFrame, member.rightId);
+                Object.assign(clip, halves.left);
+                this.activeScene.clips.push(halves.right);
+                painted.push({ type: "clip", id: member.rightId });
+                this._optimisticSplitHalves.add(`clip:${member.rightId}`);
+            } else if (member.type === "audio") {
+                const track = (this.activeScene.audio_tracks || [])
+                    .find((row) => String(row.track_id) === String(member.id));
+                if (!track) continue;
+                const halves = splitAudioGeometry(track, splitFrame, member.rightId);
+                Object.assign(track, halves.left);
+                this.activeScene.audio_tracks.push(halves.right);
+                painted.push({ type: "audio", id: member.rightId });
+                this._optimisticSplitHalves.add(`audio:${member.rightId}`);
+            }
+        }
+        return painted;
     }
 
     _buildAssetItem(asset) {
@@ -16752,13 +16807,69 @@ export class EditorWidget {
         // types, and it is the same authority the context menu and drag paths
         // ask. Four inline lane-lock checks were a copy of it that could drift.
         if (this._isItemLocked(hit)) return refuse("lane_locked");
-        const applyLinked = this._isLinkedItem(hit);
+        // A half this gesture painted belongs to no group LOCALLY -- the
+        // partition is the server's and arrives with the canonical response --
+        // so `_isLinkedItem` says false for it, and a second cut on it would be
+        // sent with `apply_linked: false` and divide only that one row, leaving
+        // its linked audio partner uncut. Before this landing that second cut
+        // was refused `invalid_range` for aiming at stale geometry; a silently
+        // wrong durable result is worse than a loud refusal.
+        //
+        // Asking the server to apply to whatever group it holds is NOT a second
+        // authority -- the client states no membership, it declines to assert
+        // that there is none. `_expand_linked_refs` returns the single ref when
+        // there is no group, so the flag is harmless when the partition put the
+        // half on its own.
+        const applyLinked = this._isLinkedItem(hit)
+            || this._optimisticSplitHalves?.has(this._selectionItemKey(hit)) === true;
         const closure = applyLinked ? this._expandItemsWithLinked([hit]) : [hit];
         if (applyLinked && closure.some((item) => this._isItemLocked(item))) {
             return refuse("linked_locked");
         }
         if (closure.some((item) => item?.type === "clip" && this._isMotionDriverClip(item.data))) {
             return refuse("driver");
+        }
+        // The optimistic half-geometry, and the durable ids that name it.
+        //
+        // Minted for every clip and audio member of the closure, because
+        // `_apply_split_linked` splits them all and the client has to hold every
+        // half it paints under the name the server will give it -- otherwise the
+        // next edit authored against a painted half names a row the server does
+        // not have, which is the tracked `temp-clip-...` defect.
+        //
+        // CARVE-OUT, with its expiry stated: a closure containing a prompt ref
+        // gets NO local apply at all, not even for its clip members. The prompt
+        // half is built by `clone_for_split`, which mints attachment ids,
+        // rewrites document nodes and drops shot and timestamp markers --
+        // mirroring that in JS would be a second authority over prompt document
+        // semantics. Painting only the video half would leave the prompt lane
+        // disagreeing with the lanes above it for the whole in-flight window,
+        // which is worse than painting nothing. Retire this when a prompt split
+        // has a canonical client-side projection, or when the prompt lane learns
+        // to show a pending cut.
+        const closureHasPrompt = closure.some((item) => item?.type === "prompt");
+        // ONLY the members the frame actually falls inside. `_apply_split_linked`
+        // divides a member only when `start < split_frame < end` and files every
+        // other one on whichever side it lies -- a linked partner legitimately
+        // lying wholly left or right is ordinary authoring, not an error, and
+        // `_add_link_group` imposes no bounds constraint at all, so a clip
+        // linked to a longer music bed or to a partner of a different length is
+        // a normal scene. Painting such a member would rewrite its end to a
+        // frame outside it, producing an INVERTED row plus a phantom half with
+        // a negative source window -- on screen for the whole write window, hit
+        // tested by the next gesture, and durable as soon as any later
+        // `_pushUndo` snapshots the painted scene.
+        const crossesCut = (item) => {
+            const from = item?.data?.timeline_start_frame;
+            const to = item?.data?.timeline_end_frame;
+            return Number.isFinite(from) && Number.isFinite(to) && from < frame && frame < to;
+        };
+        const paintable = closureHasPrompt ? [] : closure.filter(
+            (item) => (item?.type === "clip" || item?.type === "audio") && crossesCut(item));
+        const optimistic = paintable.length > 0;
+        const rightIds = {};
+        for (const member of paintable) {
+            rightIds[splitHalfIdKey(member.type, member.id)] = mintSplitHalfId();
         }
         // Where the item STARTS, and which lane and role it holds. The server's
         // `_validate_clip_identity` / `_validate_audio_identity` compare exactly
@@ -16780,6 +16891,7 @@ export class EditorWidget {
                 clip_id: hit.id,
                 frame,
                 apply_linked: applyLinked,
+                right_ids: rightIds,
                 expected: {
                     clip_id: hit.id,
                     timeline_start_frame: hit.data?.timeline_start_frame,
@@ -16793,6 +16905,7 @@ export class EditorWidget {
                     track_id: hit.id,
                     frame,
                     apply_linked: applyLinked,
+                    right_ids: rightIds,
                     expected: {
                         track_id: hit.id,
                         timeline_start_frame: hit.data?.timeline_start_frame,
@@ -16839,6 +16952,15 @@ export class EditorWidget {
             // all because its anchor is always the item under the cursor.
             closureTypes: closure.map((item) => String(item?.type || "")),
             linked: applyLinked && closure.length > 1,
+            // What the local apply will paint, resolved here so the runner never
+            // re-decides it. `null` means this target stays non-optimistic.
+            optimistic: optimistic
+                ? paintable.map((item) => ({
+                    type: item.type,
+                    id: item.id,
+                    rightId: rightIds[splitHalfIdKey(item.type, item.id)],
+                }))
+                : null,
             operation,
         };
     }
@@ -16894,6 +17016,79 @@ export class EditorWidget {
      */
     _splitRefusalDurationMs(reason) {
         return reason === "outside_bounds" ? 4000 : 0;
+    }
+
+    /** Did the server actually cut what each operation asked it to?
+     *
+     *  The tracked Critical defect was a split that returned 200 with
+     *  `split_count: 0`, changed nothing and still paid a full document write.
+     *  The server has always reported that; the client read neither
+     *  `split_count` nor `right_items`, which is why a no-op cut was
+     *  indistinguishable from a real one.
+     *
+     *  This is a NET, not the fix -- the fix is the optimistic apply above,
+     *  which stops the stale cut being aimed in the first place. The roadmap is
+     *  explicit that reading `split_count` must not become a refusal pattern
+     *  that punishes a second cut, so the caller speaks only when EVERY
+     *  operation came back having cut nothing.
+     *
+     *  A minted id is the sharper check wherever one exists: it proves the
+     *  server built the half under the name the client is already painting.
+     *  Where the client minted nothing -- a prompt or Reference target, or a
+     *  closure carrying a prompt ref -- `split_count` is the only evidence
+     *  there is. `results` is a comprehension over `operations` in order, so the
+     *  index is a safe pairing.
+     */
+    _splitOutcomeShortfall(result, planned = []) {
+        const results = result?.payload?.results || [];
+        const shortfalls = [];
+        for (let index = 0; index < planned.length; index += 1) {
+            const outcome = results[index];
+            // A MISSING result is not evidence that nothing was cut -- it is
+            // evidence the response is not the shape this code expects, and the
+            // two must not be confused, because the caller turns a full
+            // shortfall into a sentence telling the author nothing happened.
+            // Claiming that from an absence would be a guess presented as a
+            // fact. `results` is a comprehension over `operations`, so absence
+            // should be unreachable; if it ever is not, the diagnostic is the
+            // honest report and silence is the honest UI.
+            if (!outcome || typeof outcome !== "object") continue;
+            // A branch that reports NEITHER field gives no evidence either way,
+            // and absence of evidence is not evidence of a no-op. The Reference
+            // split is exactly that branch -- `_apply_split_reference_item`
+            // returns `reference_item_id`, `right_reference_item_id`, `frame`
+            // and `bound_attachment_count`, and no `split_count` at all -- so
+            // reading its silence as "nothing was cut" made EVERY successful
+            // Reference cut raise a false warning, refetch the scene for no
+            // reason, and skip the chip-binding warning that is the one thing
+            // the author actually has to act on.
+            if (!("split_count" in outcome) && !("right_items" in outcome)) continue;
+            const cut = Number(outcome.split_count || 0) > 0;
+            const minted = (planned[index].optimistic || [])
+                .map((member) => String(member.rightId || ""))
+                .filter(Boolean);
+            if (minted.length) {
+                const arrived = new Set((outcome.right_items || [])
+                    .map((ref) => String(ref?.id ?? "")));
+                const missing = minted.filter((id) => !arrived.has(id));
+                // TWO different outcomes, and conflating them produces a false
+                // sentence. `split_count: 0` means nothing was divided. A cut
+                // that happened under a DIFFERENT name means the server ignored
+                // the minted id -- which is exactly what a server predating
+                // stage 2 L4 does, and that is a live configuration: the
+                // frontend reloads on a browser refresh while `routes.py` needs
+                // a ComfyUI restart, so a pack update leaves new JS talking to
+                // old Python until then. Telling that author "nothing was cut"
+                // would be plainly false; the canonical response heals the id,
+                // and the diagnostic is where it belongs.
+                if (missing.length) {
+                    shortfalls.push({ index, missing, kind: cut ? "renamed" : "no_cut" });
+                }
+                continue;
+            }
+            if (!cut) shortfalls.push({ index, missing: [], kind: "no_cut" });
+        }
+        return shortfalls;
     }
 
     /** Split every qualifying target at one frame, as one gesture.
@@ -16969,6 +17164,22 @@ export class EditorWidget {
         // runs once after the whole comprehension -- so one entry makes exactly
         // one claim and takes exactly one stamp.
         const historyEntry = this._pushUndo(label);
+
+        // PAINT BEFORE THE WRITE. This is the whole point of the landing: a cut
+        // used to leave the timeline showing pre-cut geometry for the entire
+        // 6-15 s write window, so the NEXT cut was hit-tested against a clip the
+        // server had already shortened and aimed at the wrong half. That is the
+        // measured root cause of the tracked Critical defect, where three cuts
+        // at frames the author could plainly see inside the clip did nothing at
+        // all. With the halves painted, the next cut aims at real geometry and
+        // the defect stops being reachable rather than being reported.
+        const painted = [];
+        for (const plan of planned) {
+            if (!plan.optimistic) continue;
+            painted.push(...this._applyLocalSplit(plan.optimistic, frame));
+        }
+        if (painted.length) this._renderSceneAfterLocalMutation();
+
         try {
             const result = await this._runSceneMutation(operations, {
                 key: `scene:${sceneId}:split:${Date.now()}`,
@@ -17005,6 +17216,46 @@ export class EditorWidget {
                         : reason;
                 },
             });
+            // The safety net, and only a net. The server already returns
+            // `split_count` and the ids it built; the client used to read
+            // neither, which is why a no-op cut was indistinguishable from a
+            // real one. A minted id arriving in `right_items` is the sharper
+            // evidence, because it proves the server built the half under the
+            // name already painted here.
+            const shortfall = this._splitOutcomeShortfall(result, planned);
+            if (shortfall.length) {
+                sessionDiagRecord("split_outcome_shortfall", {
+                    operations: operations.length,
+                    shortfall: shortfall.length,
+                    renamed: shortfall.filter((e) => e.kind === "renamed").length,
+                    // Field NAMES and counts only, never contents --
+                    // `durable_rules.md` binds any new diagnostic that
+                    // enumerates what was involved.
+                    missing_ids: shortfall.reduce(
+                        (total, entry) => total + entry.missing.length, 0),
+                });
+            }
+            // Speaks ONLY when every operation came back having cut nothing.
+            // The roadmap is explicit that this must not become a refusal
+            // pattern punishing a second cut -- that pattern is what the
+            // Critical undo entry exists to remove -- so a partial shortfall is
+            // a diagnostic and nothing else.
+            const reported = (result?.payload?.results || [])
+                .filter((outcome) => outcome && typeof outcome === "object").length;
+            // Only a wholly ineffective gesture speaks, and only when every
+            // shortfall really was a non-cut -- a renamed half is a cut.
+            const ineffective = shortfall.filter((entry) => entry.kind === "no_cut");
+            if (reported > 0 && ineffective.length === reported) {
+                notifyWarning(
+                    operations.length === 1
+                        ? "Nothing was cut: the timeline was already divided there."
+                        : `Nothing was cut: none of the ${operations.length} items `
+                            + "were divided at that frame.",
+                    { source: "timeline-split-no-effect", durationMs: 6000 });
+                await this._fetchScenes(
+                    { ignoreMutationGate: true, reason: "split_no_effect" });
+                return;
+            }
             if (types.has("reference")) {
                 this._buildTrackLayout();
                 this._warnOnSplitReferenceChipBindings(result);
@@ -17019,7 +17270,34 @@ export class EditorWidget {
             }
             this._renderTimeline();
         } catch (e) {
-            await this._fetchScenes({ ignoreMutationGate: true, reason: "split_item_error" });
+            // The refetch IS the rollback, and it has to happen here rather than
+            // be left to the queue: `_queueProjectMutation`'s failure branch
+            // toasts, discards the entry and DEFERS a refresh, which
+            // `_replayDeferredProjectBackedRefresh` holds while a drag is live
+            // or `_timelineMutationDepth > 0` -- so the optimistic halves would
+            // stay on screen. Inventing an inverse delta instead would be a
+            // second authority over what a split undoes.
+            this._discardUnstampableUndoEntry(historyEntry);
+            // The refetch is what DISCARDS the optimistic halves -- inventing an
+            // inverse delta would be a second authority over what a split
+            // undoes. It is called here rather than left to the queue, whose
+            // failure branch only DEFERS a refresh that
+            // `_replayDeferredProjectBackedRefresh` holds while a drag is live.
+            //
+            // But it is not a guarantee, and saying so would be false comfort:
+            // `_fetchScenes` returns `false` without adopting anything while a
+            // drag is in progress, while a history lifecycle owner is active,
+            // when the mutation-invalidation sequence has moved -- likely in a
+            // burst, since every enqueue bumps it -- or when the stale-version
+            // governor trips, and it never throws. The halves then stay painted
+            // until the queue drains or the drag ends. Record it rather than
+            // pretend otherwise; healing is the deferred refresh's job.
+            const healed = await this._fetchScenes(
+                { ignoreMutationGate: true, reason: "split_item_error" });
+            if (painted.length && healed === false) {
+                sessionDiagRecord("split_rollback_deferred", {
+                    painted: painted.length, operations: operations.length });
+            }
             if (types.has("reference") || types.has("prompt")) {
                 // Deliberately no toast here. The Reference branch used to raise
                 // its own because the enqueue passed no `failureMessage` and the
@@ -17032,6 +17310,15 @@ export class EditorWidget {
                 this._refreshPromptContextDependencyConsumers();
             }
             console.warn(`[Sonder] Failed to split ${[...types].join("+")}:`, e);
+        } finally {
+            // Released on BOTH paths. On success the canonical scene carries the
+            // server's groups, so `_isLinkedItem` is right again; on failure the
+            // halves are gone. Leaving an entry behind would make a later cut on
+            // an unrelated row claim linkage it does not have -- and the id is
+            // durable, so the entry would outlive the window it describes.
+            for (const ref of painted) {
+                this._optimisticSplitHalves?.delete(`${ref.type}:${ref.id}`);
+            }
         }
     }
 

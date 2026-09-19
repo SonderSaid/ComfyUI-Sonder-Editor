@@ -24,6 +24,7 @@ a fresh `[Unreleased]` block.
 - The standalone `DELETE` routes for clips, guides, prompt sections and audio tracks. These operations are owned by the scene mutations endpoint, which accepts an identity snapshot of the target that the old routes could not send, and which rewrites the link groups they left behind.
 
 ### Fixed
+- Splitting now applies to the timeline immediately instead of waiting for the project to save, so a second cut lands on the half the first one made. Cuts made in quick succession used to be aimed at the clip as it was before any of them, and did nothing at all — three rapid cuts on one clip now produce four pieces. A split that divided nothing says so; one that divided something no longer stays silent about a half it could not confirm.
 - A split that cannot happen now says why. Aiming a cut outside an item, at a locked lane, at a Driver clip, or at nothing at all used to do nothing and show nothing; each of those now names what it refused. Splitting a selection where only some items cross the cut splits those and names the rest.
 - Splitting a prompt section now refreshes the Prompt tool, which previously kept showing the sections as they were before the cut until it was refreshed by hand. This includes cutting a clip that is linked to a prompt section, where the section is split too.
 - A split that is refused now says that none of its cuts were applied, when it covered more than one item. Every cut in one split is saved together, so one refused item stops them all; previously the message named only the item that was refused.

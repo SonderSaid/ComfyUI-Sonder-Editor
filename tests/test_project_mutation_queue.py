@@ -2401,3 +2401,506 @@ def test_a_target_the_scene_no_longer_holds_refuses_instead_of_throwing():
         assert.equal(seen.length, 1);
         assert.match(seen[0].message, /no longer on the timeline/);
     """)
+
+
+# ── Split: the optimistic local apply (umbrella Phase C stage 2 L4/L5) ───────
+#
+# The tracked Critical defect is not that a stale cut was refused -- stage 2 L1
+# made it refuse. It is that the cut was AIMED at stale geometry, because the
+# timeline showed pre-cut bounds for the whole write window. These drive the
+# real gesture with a runner that never resolves, which is exactly the window
+# the defect lives in.
+
+_OPTIMISTIC_SETUP = _SPLIT_SETUP + """
+    function pendingWidget(scene) {
+        const w = splitWidget(scene);
+        w.released = [];
+        w._runSceneMutation = (operations, options) => {
+            w.sent.push({operations, options});
+            return new Promise((resolve, reject) => {
+                w.released.push({resolve, reject});
+            });
+        };
+        return w;
+    }
+"""
+
+
+def test_a_split_paints_both_halves_before_the_server_answers():
+    """The landing's whole purpose, and the write window is where it matters."""
+    _run_gesture_node(_OPTIMISTIC_SETUP + """
+        const scene = clipScene();
+        const w = pendingWidget(scene);
+        const pending = w._splitItemsAtFrame(
+            [{type: 'clip', id: 'c1', data: scene.clips[0]}], 40);
+        await new Promise((r) => setTimeout(r, 0));
+
+        assert.equal(w.sent.length, 1, 'the write is in flight');
+        assert.equal(scene.clips.length, 2, 'and both halves are already drawn');
+        const left = scene.clips.find((c) => c.clip_id === 'c1');
+        const right = scene.clips.find((c) => c.clip_id !== 'c1');
+        assert.deepEqual([left.timeline_start_frame, left.timeline_end_frame], [0, 40]);
+        assert.deepEqual([right.timeline_start_frame, right.timeline_end_frame], [40, 100]);
+        // The painted half carries the id the operation asked the server to use,
+        // or the next edit against it would name a row the server does not hold.
+        const minted = w.sent[0].operations[0].right_ids['clip:c1'];
+        assert.equal(right.clip_id, minted);
+        assert.match(minted, /^[a-f0-9]{8}$/, 'the same shape a server id has');
+
+        w.released[0].resolve({payload: {results: [
+            {type: 'split_item', split_count: 1,
+             right_items: [{type: 'clip', id: minted}]}]}});
+        await pending;
+    """)
+
+
+def test_the_second_cut_of_a_burst_aims_at_the_first_cut_s_geometry():
+    """The defect itself, stated as a test.
+
+    Measured 2026-09-05: a first cut split a clip to [0,48], and the next two
+    cuts -- queued while it was still saving -- were hit-tested against the
+    pre-cut bar and aimed at the same clip id, whose bounds the server had
+    already changed. Both fell through and did nothing. With the halves painted,
+    the second cut resolves against real geometry instead.
+    """
+    _run_gesture_node(_OPTIMISTIC_SETUP + """
+        const scene = clipScene();
+        const w = pendingWidget(scene);
+        const first = w._splitItemsAtFrame(
+            [{type: 'clip', id: 'c1', data: scene.clips[0]}], 40);
+        await new Promise((r) => setTimeout(r, 0));
+
+        // Nothing has been saved. A second cut at frame 70 now falls inside the
+        // RIGHT half, not inside the clip the author first clicked.
+        const right = scene.clips.find((c) => c.clip_id !== 'c1');
+        const second = w._splitItemsAtFrame(
+            [{type: 'clip', id: right.clip_id, data: right}], 70);
+        await new Promise((r) => setTimeout(r, 0));
+
+        assert.equal(w.sent.length, 2, 'both cuts were sent');
+        const op = w.sent[1].operations[0];
+        assert.equal(op.clip_id, right.clip_id,
+            'the second cut names the half it actually landed in');
+        assert.equal(op.expected.timeline_start_frame, 40,
+            'and guards against that half, not against the original clip');
+        assert.equal(scene.clips.length, 3, 'three halves painted, none lost');
+
+        for (const slot of w.released) {
+            slot.resolve({payload: {results: [{type: 'split_item', split_count: 1,
+                right_items: [{type: 'clip', id: 'anything'}]}]}});
+        }
+        await Promise.allSettled([first, second]);
+    """)
+
+
+def test_a_closure_holding_a_prompt_section_paints_nothing_at_all():
+    """The carve-out, and why it is the whole closure rather than the prompt.
+
+    `clone_for_split` mints attachment ids, rewrites document nodes and drops
+    shot and timestamp markers; mirroring it would be a second authority over
+    prompt document semantics. Painting only the video half would leave the
+    prompt lane disagreeing with the lanes above it for the whole window, which
+    is worse than painting nothing.
+    """
+    _run_gesture_node(_OPTIMISTIC_SETUP + """
+        const scene = clipScene();
+        scene.prompt_sections = [{prompt_id: 'p1', start_frame: 0, end_frame: 100}];
+        scene.linked_item_groups = [{group_id: 'g1', items: [
+            {type: 'clip', id: 'c1'}, {type: 'prompt', id: 'p1'}]}];
+        const w = pendingWidget(scene);
+        const pending = w._splitItemsAtFrame(
+            [{type: 'clip', id: 'c1', data: scene.clips[0]}], 40);
+        await new Promise((r) => setTimeout(r, 0));
+
+        assert.equal(w.sent.length, 1);
+        assert.equal(scene.clips.length, 1, 'nothing painted');
+        assert.equal(scene.clips[0].timeline_end_frame, 100, 'and nothing moved');
+        assert.deepEqual(w.sent[0].operations[0].right_ids, {},
+            'and no id was minted for a half that will not be drawn');
+
+        w.released[0].resolve({payload: {results: [
+            {type: 'split_linked_items', split_count: 2, right_items: []}]}});
+        await pending;
+    """)
+
+
+def test_a_failed_split_discards_its_entry_and_refetches():
+    """The refetch IS the rollback, and it cannot be left to the queue.
+
+    `_queueProjectMutation`'s failure branch toasts, discards the entry and
+    DEFERS a refresh, which `_replayDeferredProjectBackedRefresh` holds while a
+    drag is live or `_timelineMutationDepth > 0` -- so the optimistic halves
+    would stay on screen. Inventing an inverse delta instead would be a second
+    authority over what a split undoes.
+    """
+    _run_gesture_node(_OPTIMISTIC_SETUP + """
+        const scene = clipScene();
+        const w = pendingWidget(scene);
+        const refetches = [];
+        w._fetchScenes = async (options) => { refetches.push(options); };
+        const discarded = [];
+        w._discardUnstampableUndoEntry = (entry) => { discarded.push(entry); };
+
+        const pending = w._splitItemsAtFrame(
+            [{type: 'clip', id: 'c1', data: scene.clips[0]}], 40);
+        await new Promise((r) => setTimeout(r, 0));
+        assert.equal(scene.clips.length, 2, 'painted');
+
+        w.released[0].reject(new Error('refused'));
+        await pending;
+        assert.deepEqual(discarded, [w.undos[0]], 'the exact entry, by object');
+        assert.equal(refetches.length, 1);
+        assert.equal(refetches[0].ignoreMutationGate, true);
+        assert.equal(refetches[0].reason, 'split_item_error');
+    """)
+
+
+def test_a_split_that_cut_nothing_says_so_only_when_nothing_was_cut():
+    """The safety net, kept narrow on purpose.
+
+    The roadmap is explicit that reading `split_count` must not become a refusal
+    pattern that punishes a second cut -- that pattern is what the Critical undo
+    entry exists to remove. So a partial shortfall is a diagnostic and silence;
+    only a wholly ineffective gesture speaks.
+    """
+    _run_gesture_node(_OPTIMISTIC_SETUP + """
+        // Every operation came back having cut nothing.
+        const wholly = pendingWidget(clipScene());
+        const seen = captureNotes();
+        const p1 = wholly._splitItemsAtFrame(
+            [{type: 'clip', id: 'c1', data: wholly.activeScene.clips[0]}], 40);
+        await new Promise((r) => setTimeout(r, 0));
+        wholly.released[0].resolve({payload: {results: [
+            {type: 'split_item', split_count: 0, right_items: []}]}});
+        await p1;
+        assert.equal(seen.filter((v) => v.source === 'timeline-split-no-effect').length, 1);
+
+        // One of two cut nothing: a diagnostic, and NO toast.
+        const partial = pendingWidget(clipScene());
+        const before = seen.length;
+        const p2 = partial._splitItemsAtFrame([
+            {type: 'clip', id: 'c1', data: partial.activeScene.clips[0]},
+            {type: 'audio', id: 'a1', data: partial.activeScene.audio_tracks[0]},
+        ], 40);
+        await new Promise((r) => setTimeout(r, 0));
+        const ops = partial.sent[0].operations;
+        partial.released[0].resolve({payload: {results: [
+            {type: 'split_item', split_count: 1,
+             right_items: [{type: 'clip', id: ops[0].right_ids['clip:c1']}]},
+            {type: 'split_item', split_count: 0, right_items: []},
+        ]}});
+        await p2;
+        assert.equal(seen.slice(before)
+            .filter((v) => v.source === 'timeline-split-no-effect').length, 0,
+            'a partial shortfall must not punish the cut that landed');
+    """)
+
+
+def test_the_shortfall_check_prefers_the_minted_id_over_split_count():
+    """A minted id is the sharper evidence: it names the row.
+
+    `split_count` only says a cut happened somewhere in the closure. The id says
+    the server built the half the client is already painting, under that name --
+    which is the thing the next edit depends on.
+    """
+    _run_gesture_node(_OPTIMISTIC_SETUP + """
+        const w = splitWidget(clipScene());
+        const planned = [{optimistic: [{type: 'clip', id: 'c1', rightId: 'abc12345'}]}];
+
+        // `split_count` is happy, but the server built a DIFFERENT id.
+        const wrongId = w._splitOutcomeShortfall({payload: {results: [
+            {split_count: 1, right_items: [{type: 'clip', id: 'other999'}]}]}}, planned);
+        assert.equal(wrongId.length, 1);
+        assert.deepEqual(wrongId[0].missing, ['abc12345']);
+
+        const matched = w._splitOutcomeShortfall({payload: {results: [
+            {split_count: 1, right_items: [{type: 'clip', id: 'abc12345'}]}]}}, planned);
+        assert.deepEqual(matched, []);
+
+        // With nothing minted, `split_count` is the evidence -- WHERE THE BRANCH
+        // SENDS ONE. The prompt branch does. Hand-writing a `split_count` onto a
+        // fixture for a branch that omits it is how the Reference defect below
+        // survived the first version of this test, so these shapes are copied
+        // from the dispatcher rather than invented.
+        const coarse = [{optimistic: null}];
+        assert.equal(w._splitOutcomeShortfall(
+            {payload: {results: [{type: 'split_item', split_count: 0, right_items: []}]}},
+            coarse).length, 1);
+        assert.deepEqual(w._splitOutcomeShortfall(
+            {payload: {results: [{type: 'split_item', split_count: 1,
+                                  right_items: [{type: 'prompt', id: 'p2'}]}]}},
+            coarse), []);
+    """)
+
+
+def test_a_linked_split_paints_every_member_of_the_closure():
+    """`_apply_split_linked` divides them all, so the paint has to as well."""
+    _run_gesture_node(_OPTIMISTIC_SETUP + """
+        const scene = clipScene();
+        scene.linked_item_groups = [{group_id: 'g1', items: [
+            {type: 'clip', id: 'c1'}, {type: 'audio', id: 'a1'}]}];
+        const w = pendingWidget(scene);
+        const pending = w._splitItemsAtFrame(
+            [{type: 'clip', id: 'c1', data: scene.clips[0]}], 40);
+        await new Promise((r) => setTimeout(r, 0));
+
+        assert.equal(scene.clips.length, 2);
+        assert.equal(scene.audio_tracks.length, 2);
+        const ids = w.sent[0].operations[0].right_ids;
+        assert.deepEqual(Object.keys(ids).sort(), ['audio:a1', 'clip:c1']);
+        assert.equal(new Set(Object.values(ids)).size, 2, 'distinct ids');
+        assert.ok(scene.audio_tracks.some((t) => t.track_id === ids['audio:a1']));
+        // The right half is NOT a group member yet: the partition is the
+        // server's, and arrives with the canonical scene.
+        assert.deepEqual(scene.linked_item_groups[0].items,
+            [{type: 'clip', id: 'c1'}, {type: 'audio', id: 'a1'}]);
+
+        w.released[0].resolve({payload: {results: [
+            {type: 'split_linked_items', split_count: 2, right_items: [
+                {type: 'clip', id: ids['clip:c1']},
+                {type: 'audio', id: ids['audio:a1']}]}]}});
+        await pending;
+    """)
+
+
+def test_a_server_that_ignores_the_minted_id_is_not_reported_as_cutting_nothing():
+    """A live configuration, not a hypothetical.
+
+    `routes.py` needs a ComfyUI restart while `web/js` reloads on a browser
+    refresh, so a pack update leaves new frontend talking to old backend until
+    the server is restarted. A server predating stage 2 L4 ignores `right_ids`
+    and names the right half itself -- observed exactly that way against the
+    test install on 2026-09-19. Reading a missing minted id as "nothing was cut"
+    would tell that author something plainly false about a cut they can see on
+    the timeline; the canonical response heals the id by itself.
+    """
+    _run_gesture_node(_OPTIMISTIC_SETUP + """
+        const w = splitWidget(clipScene());
+        const planned = [{optimistic: [{type: 'clip', id: 'c1', rightId: 'mine1234'}]}];
+
+        // Cut happened, under a name the client did not choose.
+        const renamed = w._splitOutcomeShortfall({payload: {results: [
+            {split_count: 1, right_items: [{type: 'clip', id: 'theirs99'}]}]}}, planned);
+        assert.equal(renamed.length, 1, 'still a shortfall worth recording');
+        assert.equal(renamed[0].kind, 'renamed');
+
+        // Nothing cut at all is a different answer.
+        const nothing = w._splitOutcomeShortfall({payload: {results: [
+            {split_count: 0, right_items: []}]}}, planned);
+        assert.equal(nothing[0].kind, 'no_cut');
+    """)
+
+
+def test_only_an_uncut_gesture_raises_the_no_effect_message():
+    """The renamed case must stay silent end to end, not just in the classifier."""
+    _run_gesture_node(_OPTIMISTIC_SETUP + """
+        const w = pendingWidget(clipScene());
+        const seen = captureNotes();
+        const pending = w._splitItemsAtFrame(
+            [{type: 'clip', id: 'c1', data: w.activeScene.clips[0]}], 40);
+        await new Promise((r) => setTimeout(r, 0));
+        // The server cut, but named the half itself.
+        w.released[0].resolve({payload: {results: [
+            {type: 'split_item', split_count: 1,
+             right_items: [{type: 'clip', id: 'server01'}]}]}});
+        await pending;
+        assert.equal(
+            seen.filter((v) => v.source === 'timeline-split-no-effect').length, 0,
+            'a cut that happened must never be reported as no cut at all');
+    """)
+
+
+def test_a_reference_split_is_not_reported_as_having_cut_nothing():
+    """The regression an adversarial audit of this landing found.
+
+    `_apply_split_reference_item` returns `reference_item_id`,
+    `right_reference_item_id`, `frame` and `bound_attachment_count` -- and no
+    `split_count` at all. Reading that silence as a no-op made EVERY successful
+    Reference cut raise a false warning, refetch the scene for nothing, and
+    return before `_warnOnSplitReferenceChipBindings` -- which is the one thing
+    the author has to act on, because an unresolvable chip binding is appended
+    to compile ERRORS and every render over the right half is then refused.
+
+    The response literal below is copied from that branch, not invented.
+    """
+    _run_gesture_node(_OPTIMISTIC_SETUP + """
+        const scene = clipScene();
+        scene.reference_items = [{reference_item_id: 'r1', lane_index: 0,
+                                  start_frame: 0, end_frame: 100}];
+        const w = pendingWidget(scene);
+        w._findSceneItemBySelection = (type, id) => (type === 'reference'
+            ? {type, id: 'r1', data: scene.reference_items[0]} : null);
+        let warned = 0;
+        w._warnOnSplitReferenceChipBindings = () => { warned += 1; };
+        const seen = captureNotes();
+
+        const pending = w._splitItemsAtFrame(
+            [{type: 'reference', id: 'r1', data: scene.reference_items[0]}], 40);
+        await new Promise((r) => setTimeout(r, 0));
+        w.released[0].resolve({payload: {results: [{
+            type: 'split_reference_item', reference_item_id: 'r1',
+            right_reference_item_id: 'r2', frame: 40, bound_attachment_count: 2,
+        }]}});
+        await pending;
+
+        assert.equal(seen.filter((v) => v.source === 'timeline-split-no-effect').length, 0,
+            'a successful Reference cut must not report cutting nothing');
+        assert.equal(warned, 1, 'and the chip-binding warning must still run');
+        assert.equal(w.promptRefreshes, 1);
+    """)
+
+
+def test_a_linked_partner_that_does_not_span_the_cut_is_never_painted():
+    """The other regression that audit found, and the more dangerous one.
+
+    `_apply_split_linked` divides a member only when `start < split_frame < end`
+    and files every other one on whichever side it lies. `_add_link_group`
+    imposes no bounds constraint, so a clip linked to a longer music bed is an
+    ordinary scene. Painting such a partner rewrote its end to a frame outside
+    it -- an INVERTED row plus a phantom half with a negative source window,
+    which the next gesture hit-tests and which any later `_pushUndo` snapshots
+    into a history entry Undo writes back to disk.
+    """
+    _run_gesture_node(_OPTIMISTIC_SETUP + """
+        const scene = clipScene();
+        // The audio partner sits entirely to the right of the clip.
+        scene.audio_tracks[0].timeline_start_frame = 200;
+        scene.audio_tracks[0].timeline_end_frame = 300;
+        scene.linked_item_groups = [{group_id: 'g1', items: [
+            {type: 'clip', id: 'c1'}, {type: 'audio', id: 'a1'}]}];
+        const w = pendingWidget(scene);
+
+        const plan = w._planItemSplit({type: 'clip', id: 'c1', data: scene.clips[0]}, 40);
+        assert.deepEqual(Object.keys(plan.operation.right_ids), ['clip:c1'],
+            'no id is minted for a half the server will not build');
+        assert.deepEqual(plan.optimistic.map((m) => m.id), ['c1']);
+
+        const pending = w._splitItemsAtFrame(
+            [{type: 'clip', id: 'c1', data: scene.clips[0]}], 40);
+        await new Promise((r) => setTimeout(r, 0));
+        assert.equal(scene.clips.length, 2, 'the clip that crosses is painted');
+        assert.equal(scene.audio_tracks.length, 1,
+            'the partner that does not is untouched');
+        assert.deepEqual(
+            [scene.audio_tracks[0].timeline_start_frame,
+             scene.audio_tracks[0].timeline_end_frame], [200, 300]);
+        // `apply_linked` still goes to the server, which owns the partition.
+        assert.equal(plan.operation.apply_linked, true);
+
+        w.released[0].resolve({payload: {results: [{type: 'split_linked_items',
+            split_count: 1,
+            right_items: [{type: 'clip', id: plan.operation.right_ids['clip:c1']}]}]}});
+        await pending;
+    """)
+
+
+def test_a_closure_with_no_crossing_media_member_paints_nothing():
+    """The degenerate case of the same rule: the anchor is a Reference item.
+
+    A Reference item is not linkable, so its closure is itself and there is no
+    clip or audio member to paint. The gesture must stay non-optimistic rather
+    than mint an id for a row it will not draw -- an unmatched minted id would
+    read as a shortfall against a response that is perfectly correct.
+    """
+    _run_gesture_node(_OPTIMISTIC_SETUP + """
+        const scene = clipScene();
+        scene.reference_items = [{reference_item_id: 'r1', lane_index: 0,
+                                  start_frame: 0, end_frame: 100}];
+        const w = splitWidget(scene);
+        w._findSceneItemBySelection = (type, id) => (type === 'reference'
+            ? {type, id: 'r1', data: scene.reference_items[0]} : null);
+        const plan = w._planItemSplit(
+            {type: 'reference', id: 'r1', data: scene.reference_items[0]}, 40);
+        assert.equal(plan.optimistic, null);
+        assert.equal(plan.operation.type, 'split_reference_item');
+        assert.equal(plan.operation.right_ids, undefined,
+            'only the two media operations carry minted ids');
+    """)
+
+
+def test_the_minted_id_generator_terminates_and_looks_like_a_server_id():
+    """`Math.random()` may return exactly 0, whose hex slice is the empty string.
+
+    An unguarded accumulate-until-eight loop would then never grow and would
+    lock the tab. Vanishingly unlikely, and a hard lock when it happens.
+    """
+    _run_gesture_node(_OPTIMISTIC_SETUP + """
+        const mod = await import('./web/js/scene_split_geometry.js');
+        const saved = Math.random;
+        try {
+            Math.random = () => 0;
+            const id = mod.mintSplitHalfId();
+            assert.equal(id.length, 8, 'terminates on the degenerate stream');
+            assert.match(id, /^[a-f0-9]{8}$/);
+        } finally { Math.random = saved; }
+        for (let i = 0; i < 200; i += 1) {
+            assert.match(mod.mintSplitHalfId(), /^[a-f0-9]{8}$/);
+        }
+    """)
+
+
+def test_a_cut_on_a_half_this_gesture_painted_still_asks_about_linkage():
+    """The third regression the audit found, and the only one that loses data.
+
+    A painted right half belongs to no group locally, because the partition is
+    the server's. `_isLinkedItem` therefore says false for it, and a second cut
+    on that half would be sent `apply_linked: false` -- dividing the video and
+    leaving its linked audio partner whole, which then persists. Before this
+    landing that second cut was refused `invalid_range` for aiming at stale
+    geometry, so this would have been a silently wrong result replacing a loud
+    refusal.
+
+    The client asserts no membership; it declines to assert that there is none.
+    """
+    _run_gesture_node(_OPTIMISTIC_SETUP + """
+        const scene = clipScene();
+        scene.linked_item_groups = [{group_id: 'g1', items: [
+            {type: 'clip', id: 'c1'}, {type: 'audio', id: 'a1'}]}];
+        const w = pendingWidget(scene);
+
+        const first = w._splitItemsAtFrame(
+            [{type: 'clip', id: 'c1', data: scene.clips[0]}], 40);
+        await new Promise((r) => setTimeout(r, 0));
+        const half = scene.clips.find((c) => c.clip_id !== 'c1');
+        assert.ok(half, 'painted');
+        assert.equal(w._isLinkedItem({type: 'clip', id: half.clip_id, data: half}), false,
+            'and it is genuinely in no group locally -- that is the trap');
+
+        const second = w._splitItemsAtFrame(
+            [{type: 'clip', id: half.clip_id, data: half}], 70);
+        await new Promise((r) => setTimeout(r, 0));
+        assert.equal(w.sent.length, 2);
+        assert.equal(w.sent[1].operations[0].apply_linked, true,
+            'the server is asked to use whatever group it holds');
+
+        // Settling the first gesture releases its halves, so an UNRELATED row
+        // afterwards must not inherit the claim -- the id is durable and the
+        // entry would otherwise outlive the window it describes.
+        w.released[0].resolve({payload: {results: [{type: 'split_linked_items',
+            split_count: 2, right_items: []}]}});
+        await first;
+        assert.equal(w._optimisticSplitHalves.has(`clip:${half.clip_id}`), false,
+            'released when its gesture settled');
+
+        w.released[1].resolve({payload: {results: [{type: 'split_item',
+            split_count: 1, right_items: []}]}});
+        await second;
+        assert.equal(w._optimisticSplitHalves.size, 0);
+    """)
+
+
+def test_a_failed_split_also_releases_the_halves_it_claimed():
+    """The other half of the same lifecycle: `finally`, not the success path."""
+    _run_gesture_node(_OPTIMISTIC_SETUP + """
+        const w = pendingWidget(clipScene());
+        w._fetchScenes = async () => true;
+        w._discardUnstampableUndoEntry = () => {};
+        const pending = w._splitItemsAtFrame(
+            [{type: 'clip', id: 'c1', data: w.activeScene.clips[0]}], 40);
+        await new Promise((r) => setTimeout(r, 0));
+        assert.equal(w._optimisticSplitHalves.size, 1);
+        w.released[0].reject(new Error('refused'));
+        await pending;
+        assert.equal(w._optimisticSplitHalves.size, 0,
+            'a refused gesture must not leave a durable id claiming linkage');
+    """)

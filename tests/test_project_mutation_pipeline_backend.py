@@ -4504,3 +4504,193 @@ def test_one_refused_cut_in_a_batch_leaves_the_earlier_cut_unwritten(
     assert response.status == 400, _response_json(response)
     assert _response_json(response)["code"] == "invalid_range"
     assert saves == [], "a refused batch writes nothing, including its earlier cut"
+
+
+# ---------------------------------------------------------------------------
+# Client-minted right-half ids (umbrella Phase C stage 2 L4)
+# ---------------------------------------------------------------------------
+# The optimistic half painted on the client has to carry the name the server
+# will give it, or the next edit authored against that half names a row the
+# server does not hold -- the tracked `temp-clip-...` defect, reached from
+# another direction. So the client mints, and the server refuses rather than
+# re-mints when the id is unusable or taken.
+
+
+def _minted_split_op(clip_id, frame, *, start=0, lane=0, right_ids=None,
+                   apply_linked=False):
+    operation = {
+        "type": "split_clip", "clip_id": clip_id, "frame": frame,
+        "apply_linked": apply_linked,
+        "expected": {"clip_id": clip_id, "timeline_start_frame": start,
+                     "track_index": lane, "role": "render"},
+    }
+    if right_ids is not None:
+        operation["right_ids"] = right_ids
+    return operation
+
+
+def _scene_with_one_clip(tmp_path, **overrides):
+    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=200)
+    fields = {"clip_id": "clip-a", "source_path": "media/a.mp4",
+              "timeline_start_frame": 0, "timeline_end_frame": 100,
+              "source_in_frame": 0, "source_out_frame": 100,
+              "total_source_frames": 100, "track_index": 0}
+    fields.update(overrides)
+    scene.clips = [ClipReference(**fields)]
+    return scene, TimelineProject(project_dir=str(tmp_path), name="Project",
+                                  scenes=[scene])
+
+
+def test_a_split_uses_the_right_half_id_the_client_minted(monkeypatch, tmp_path):
+    """The whole reason L4 exists: the painted half and the saved half agree."""
+    route_module = _load_route_module(monkeypatch)
+    scene, project = _scene_with_one_clip(tmp_path)
+    saves = []
+    response = _apply_scene_operations(
+        route_module, monkeypatch, project, "scene-1",
+        [_minted_split_op("clip-a", 40, right_ids={"clip:clip-a": "0a1b2c3d"})],
+        saves)
+    assert response.status == 200, _response_json(response)
+    assert sorted(clip.clip_id for clip in scene.clips) == ["0a1b2c3d", "clip-a"]
+    right = next(clip for clip in scene.clips if clip.clip_id == "0a1b2c3d")
+    assert (right.timeline_start_frame, right.timeline_end_frame) == (40, 100)
+    # And the response names it, which is what the client asserts against.
+    [result] = _response_json(response)["results"]
+    assert result["right_items"] == [{"type": "clip", "id": "0a1b2c3d"}]
+
+
+def test_a_linked_split_names_each_half_the_client_minted(monkeypatch, tmp_path):
+    """Keyed by the LEFT ref, because a closure splits several rows at once.
+
+    Positional keying would break the moment `_expand_linked_refs` returned the
+    members in a different order than the client walked them.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene, project = _scene_with_one_clip(tmp_path)
+    scene.audio_tracks = [AudioTrack(
+        track_id="audio-a", source_path="media/a.wav", timeline_start_frame=0,
+        timeline_end_frame=100, source_in_frame=0, total_source_frames=100)]
+    scene.linked_item_groups = [{"group_id": "g1", "items": [
+        {"type": "clip", "id": "clip-a"}, {"type": "audio", "id": "audio-a"}]}]
+    saves = []
+    response = _apply_scene_operations(
+        route_module, monkeypatch, project, "scene-1",
+        [_minted_split_op("clip-a", 40, apply_linked=True, right_ids={
+            "clip:clip-a": "aaaa1111", "audio:audio-a": "bbbb2222"})],
+        saves)
+    assert response.status == 200, _response_json(response)
+    assert "aaaa1111" in {clip.clip_id for clip in scene.clips}
+    assert "bbbb2222" in {track.track_id for track in scene.audio_tracks}
+
+
+def test_a_member_with_no_minted_id_still_gets_a_server_one(monkeypatch, tmp_path):
+    """How a prompt member inside a mixed closure stays server-authoritative.
+
+    The client mints nothing for a prompt section -- its right half is built by
+    `clone_for_split` -- so the absence of an entry has to mean "you name it",
+    not "refuse".
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene, project = _scene_with_one_clip(tmp_path)
+    scene.audio_tracks = [AudioTrack(
+        track_id="audio-a", source_path="media/a.wav", timeline_start_frame=0,
+        timeline_end_frame=100, source_in_frame=0, total_source_frames=100)]
+    scene.linked_item_groups = [{"group_id": "g1", "items": [
+        {"type": "clip", "id": "clip-a"}, {"type": "audio", "id": "audio-a"}]}]
+    saves = []
+    response = _apply_scene_operations(
+        route_module, monkeypatch, project, "scene-1",
+        [_minted_split_op("clip-a", 40, apply_linked=True,
+                        right_ids={"clip:clip-a": "aaaa1111"})],
+        saves)
+    assert response.status == 200, _response_json(response)
+    new_track = next(track for track in scene.audio_tracks
+                     if track.track_id != "audio-a")
+    assert new_track.track_id and new_track.track_id != "aaaa1111"
+
+
+def test_a_colliding_split_half_id_is_refused_and_never_re_minted(
+        monkeypatch, tmp_path):
+    """The decision this landing takes, and it is NOT the existing precedent.
+
+    `_apply_create_reference_item` silently re-mints a colliding client id. Doing
+    that here would hand the caller back a row under a name its optimistic copy
+    does not carry, so the client would hold a half the server has never heard
+    of and every edit authored against it would 404. A 409 is recoverable.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene, project = _scene_with_one_clip(tmp_path)
+    scene.clips.append(ClipReference(
+        clip_id="taken111", source_path="media/b.mp4",
+        timeline_start_frame=150, timeline_end_frame=190, track_index=1))
+    saves = []
+    response = _apply_scene_operations(
+        route_module, monkeypatch, project, "scene-1",
+        [_minted_split_op("clip-a", 40, right_ids={"clip:clip-a": "taken111"})],
+        saves)
+    assert response.status == 409, _response_json(response)
+    assert _response_json(response)["code"] == "id_conflict"
+    assert saves == []
+    assert len(scene.clips) == 2, "the refused split wrote nothing"
+    assert scene.clips[0].timeline_end_frame == 100
+
+
+def test_two_halves_in_one_linked_split_cannot_share_an_id(monkeypatch, tmp_path):
+    """The collision the live scene cannot show, because both ids are new.
+
+    A set rebuilt per call would compare each minted id against the scene only,
+    and two members handed the same id inside one operation would both be
+    accepted -- leaving two rows the client cannot tell apart.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene, project = _scene_with_one_clip(tmp_path)
+    scene.audio_tracks = [AudioTrack(
+        track_id="audio-a", source_path="media/a.wav", timeline_start_frame=0,
+        timeline_end_frame=100, source_in_frame=0, total_source_frames=100)]
+    scene.linked_item_groups = [{"group_id": "g1", "items": [
+        {"type": "clip", "id": "clip-a"}, {"type": "audio", "id": "audio-a"}]}]
+    saves = []
+    response = _apply_scene_operations(
+        route_module, monkeypatch, project, "scene-1",
+        [_minted_split_op("clip-a", 40, apply_linked=True, right_ids={
+            "clip:clip-a": "samesame", "audio:audio-a": "samesame"})],
+        saves)
+    assert response.status == 409, _response_json(response)
+    assert _response_json(response)["code"] == "id_conflict"
+    assert saves == []
+
+
+@pytest.mark.parametrize("bad", [
+    "", "ab", "UPPERCASE", "has space", "has/slash", "x" * 64 + "y",
+    "-leading-dash", 12345,
+])
+def test_an_unusable_split_half_id_is_refused_rather_than_stored(
+        monkeypatch, tmp_path, bad):
+    """`clip_id` is an unvalidated `str` in the model, so this is the only gate.
+
+    Without it a client could write a durable id containing anything at all, and
+    it would travel into link refs, history entries and diagnostics.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene, project = _scene_with_one_clip(tmp_path)
+    saves = []
+    response = _apply_scene_operations(
+        route_module, monkeypatch, project, "scene-1",
+        [_minted_split_op("clip-a", 40, right_ids={"clip:clip-a": bad})], saves)
+    assert response.status == 400, _response_json(response)
+    assert _response_json(response)["code"] == "invalid_id"
+    assert saves == []
+    assert len(scene.clips) == 1
+
+
+def test_a_split_with_no_right_ids_at_all_still_works(monkeypatch, tmp_path):
+    """The two legacy REST split routes and any older client send none."""
+    route_module = _load_route_module(monkeypatch)
+    scene, project = _scene_with_one_clip(tmp_path)
+    saves = []
+    response = _apply_scene_operations(
+        route_module, monkeypatch, project, "scene-1",
+        [_minted_split_op("clip-a", 40)], saves)
+    assert response.status == 200, _response_json(response)
+    assert len(scene.clips) == 2
+    assert all(clip.clip_id for clip in scene.clips)

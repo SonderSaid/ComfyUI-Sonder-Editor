@@ -1764,7 +1764,59 @@ def _apply_linked_bounds_update(
                 fields["attachments"], scene=scene, exclude_section=section)
 
 
-def _split_clip_object(scene: Scene, clip: ClipReference, split_frame: int) -> ClipReference:
+_CLIENT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{3,63}$")
+
+
+def _client_split_half_id(right_ids, item_type: str, item_id: str,
+                          taken: "set[str]") -> str:
+    """A client-minted durable id for the right half of a split, or "".
+
+    Keyed by the LEFT ref rather than positionally, because under `apply_linked`
+    several rows split inside one operation and each needs its own id -- while a
+    member the client does not mint for, such as a prompt section whose right
+    half `clone_for_split` builds, simply has no entry and stays
+    server-authoritative.
+
+    A colliding id is REFUSED, not re-minted. `_apply_create_reference_item`
+    does the opposite (`item.reference_item_id = uuid.uuid4().hex` when a
+    supplied id is taken), and that is the behaviour this deliberately does not
+    copy: silently substituting an id hands the caller back a row under a name
+    its optimistic copy does not carry, so the client holds a half the server
+    has never heard of and every edit authored against it 404s. That is the
+    shape of the tracked `temp-clip-...` defect reached from another direction.
+    A 409 is recoverable; a silent substitution is not. New behaviour rather
+    than precedent -- neither `_apply_create_guide` nor
+    `_apply_create_prompt_section` validates a supplied id at all.
+
+    `taken` is passed in rather than re-derived per call, so two halves minted
+    inside ONE operation cannot collide with each other: they arrive together
+    and nothing else would compare them.
+    """
+    if not isinstance(right_ids, dict) or not right_ids:
+        return ""
+    raw_id = right_ids.get(f"{item_type}:{item_id}")
+    if raw_id is None:
+        return ""
+    # A string, not anything that stringifies. `str(12345)` would pass the
+    # pattern below and be stored as "12345", so the client would be holding a
+    # NUMBER where the server holds a string -- the exact mismatch between the
+    # painted half and the saved half this landing exists to remove, arriving
+    # through the type system instead of through the id. Nothing in the editor
+    # can produce a non-string here, so refusing is free and fails closed.
+    candidate = raw_id if isinstance(raw_id, str) else None
+    if candidate is None or not _CLIENT_ID_PATTERN.match(candidate):
+        _mutation_error(
+            f"Split half id for {item_type} {item_id} is not a usable id",
+            400, "invalid_id")
+    if candidate in taken:
+        _mutation_error(
+            f"Split half id {candidate} is already in use", 409, "id_conflict")
+    taken.add(candidate)
+    return candidate
+
+
+def _split_clip_object(scene: Scene, clip: ClipReference, split_frame: int,
+                       right_id: str = "") -> ClipReference:
     if getattr(clip, "role", "render") == "motion_driver":
         _mutation_error("Driver clips cannot be split", 409, "driver_clip_split_refused")
     if split_frame <= clip.timeline_start_frame or split_frame >= clip.timeline_end_frame:
@@ -1774,6 +1826,10 @@ def _split_clip_object(scene: Scene, clip: ClipReference, split_frame: int) -> C
     orig_source_out = clip.source_out_frame or clip.timeline_end_frame - clip.timeline_start_frame
     left_source_in = clip.source_in_frame or 0
     right = ClipReference(
+        # `_apply_create_guide`'s pattern: take the caller's id when it gave
+        # one, mint otherwise. Validated and collision-checked by
+        # `_client_split_half_id` before it reaches here.
+        clip_id=str(right_id or uuid.uuid4().hex[:8]),
         source_path=clip.source_path,
         timeline_start_frame=split_frame,
         timeline_end_frame=clip.timeline_end_frame,
@@ -1803,7 +1859,8 @@ def _split_clip_object(scene: Scene, clip: ClipReference, split_frame: int) -> C
     return right
 
 
-def _split_audio_object(scene: Scene, track: AudioTrack, split_frame: int) -> AudioTrack:
+def _split_audio_object(scene: Scene, track: AudioTrack, split_frame: int,
+                        right_id: str = "") -> AudioTrack:
     if split_frame <= track.timeline_start_frame or split_frame >= track.timeline_end_frame:
         _mutation_error("Split frame must be within track range", 400, "invalid_range")
     source_offset = split_frame - track.timeline_start_frame
@@ -1812,6 +1869,7 @@ def _split_audio_object(scene: Scene, track: AudioTrack, split_frame: int) -> Au
     right_duration = orig_end_frame - split_frame
     left_duration = split_frame - track.timeline_start_frame
     right = AudioTrack(
+        track_id=str(right_id or uuid.uuid4().hex[:8]),
         source_path=track.source_path,
         timeline_start_frame=split_frame,
         timeline_end_frame=orig_end_frame,
@@ -1850,7 +1908,8 @@ def _split_prompt_object(scene: Scene, section: PromptSection, split_frame: int)
     return right
 
 
-def _apply_split_linked(scene: Scene, anchor_ref: dict, split_frame: int, apply_linked: bool = True) -> dict:
+def _apply_split_linked(scene: Scene, anchor_ref: dict, split_frame: int,
+                        apply_linked: bool = True, right_ids=None) -> dict:
     refs = _expand_linked_refs(scene, [anchor_ref], apply_linked)
     _require_link_refs_unlocked(scene, refs)
     split_frame = _mutation_int(split_frame, "frame")
@@ -1894,19 +1953,28 @@ def _apply_split_linked(scene: Scene, anchor_ref: dict, split_frame: int, apply_
     left_refs = []
     right_refs = []
     split_results = {}
+    # Every durable id a client-minted right half must not land on. Built
+    # once, from live state, and then ADDED TO as each half is minted, so
+    # two halves inside one linked split cannot be given the same id either.
+    taken_ids = {str(getattr(item, "clip_id", "")) for item in scene.clips}
+    taken_ids |= {str(getattr(item, "track_id", "")) for item in scene.audio_tracks}
 
     for ref in refs:
         item_type, item_id = _link_ref_key(ref)
         start, end = _item_bounds(scene, ref)
         if start < split_frame < end:
             if item_type == "clip":
-                right = _split_clip_object(scene, _find_clip(scene, item_id), split_frame)
+                right = _split_clip_object(
+                    scene, _find_clip(scene, item_id), split_frame,
+                    _client_split_half_id(right_ids, "clip", item_id, taken_ids))
                 left_refs.append(ref)
                 right_ref = _link_ref("clip", right.clip_id)
                 right_refs.append(right_ref)
                 split_results[item_id] = {"left": ref, "right": right_ref}
             elif item_type == "audio":
-                right = _split_audio_object(scene, _find_audio_track(scene, item_id), split_frame)
+                right = _split_audio_object(
+                    scene, _find_audio_track(scene, item_id), split_frame,
+                    _client_split_half_id(right_ids, "audio", item_id, taken_ids))
                 left_refs.append(ref)
                 right_ref = _link_ref("audio", right.track_id)
                 right_refs.append(right_ref)
@@ -4854,6 +4922,7 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
             _link_ref("clip", clip.clip_id),
             op.get("frame", 0),
             bool(op.get("apply_linked", False)),
+            op.get("right_ids"),
         )
         return result
     if op_type == "split_audio_track":
@@ -4867,6 +4936,7 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
             _link_ref("audio", track.track_id),
             op.get("frame", 0),
             bool(op.get("apply_linked", False)),
+            op.get("right_ids"),
         )
         return result
     if op_type == "move_guide":
@@ -4951,6 +5021,13 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
             _link_ref("prompt", getattr(section, "prompt_id", "")),
             op.get("frame", 0),
             bool(op.get("apply_linked", False)),
+            # No client mints an id on this branch today: the optimistic
+            # local apply is skipped outright when a closure contains a
+            # prompt ref, so there is nothing to name. Threaded anyway so
+            # that if that carve-out is ever lifted, the clip and audio
+            # members of a prompt-anchored closure do not silently fall
+            # back to server ids the client is not holding.
+            op.get("right_ids"),
         )
         return result
     if op_type == "create_prompt_section":
