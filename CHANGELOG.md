@@ -12,6 +12,7 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Changed
+- Linking and unlinking timeline items now updates group badges immediately, with canonical Undo baselines and recovery for failed queued edits.
 - **⌇ Split Here** now acts only on the selection, and covers prompt sections as well as clips, audio and Reference items. It no longer falls back to cutting whatever happens to sit under the playhead when nothing is selected — it says so instead. Splitting several selected items at once is one undo step.
 - Durable components use shorter full-hash filenames (storage format 3); format-2 projects migrate automatically on their next version-bumping save. Newly migrated projects cannot be opened by 0.5.0 or earlier. Format-1 projects retain their format until a history edit, then migrate on the following save.
 - Project route reads and saves run off the event loop, including the first automatic component migration.

@@ -401,7 +401,7 @@ import {
     movedMediaBounds, movedMemberBounds, memberBounds, writeMemberBounds,
     linkedMoveRefusal,
 } from "./scene_move_geometry.js";
-import { LINK_ITEM_TYPES, pruneLinkedItemGroups } from "./scene_link_groups.js";
+import { LINK_ITEM_TYPES, pruneLinkedItemGroups, editedLinkGroups, rollbackLinkGroupPrediction } from "./scene_link_groups.js";
 import { createViewportSurface } from "./viewport_surface.js";
 import {
     EDITOR_COLORS as COLORS,
@@ -4229,8 +4229,28 @@ export class EditorWidget {
         // history action applies. Keep the exact history-order context with the
         // queue slot; later coalescing adopts the latest surviving gesture's
         // context along with its entry.
-        const capturedHistoryOrderContext = historyOrderContext === undefined
+        let capturedHistoryOrderContext = historyOrderContext === undefined
             ? (this._latestHistoryOrderContext || null) : historyOrderContext;
+        if (historyOrderContext === undefined
+                && intent?.operations?.some((op) => op.type === "create_link_group" || op.type === "unlink_items")) {
+            // Optimistic groups enter later gestures' Undo snapshots. Start an
+            // ordered baseline before this write, including any earlier split's
+            // server-only repartition. Reuse history's queue-position authority,
+            // but do NOT re-author guards: no Undo changed these intents.
+            if (!capturedHistoryOrderContext) {
+                capturedHistoryOrderContext = this._beginHistoryOrderContext("link optimism", 0);
+                capturedHistoryOrderContext.rebaseIntents = false;
+            }
+            const sceneId = String(intent.sceneId);
+            let hasBaseline = false;
+            for (let current = capturedHistoryOrderContext; current; current = current.parent) {
+                if (current.scenes?.has(sceneId) || current.ambiguousScenes?.has(sceneId)) {
+                    hasBaseline = true;
+                    break;
+                }
+            }
+            if (!hasBaseline) capturedHistoryOrderContext.scenes.set(sceneId, null);
+        }
         if (capturedHistoryEntry && capturedHistoryOrderContext) {
             capturedHistoryEntry._historyOrderContext = capturedHistoryOrderContext;
         }
@@ -4290,7 +4310,7 @@ export class EditorWidget {
                     if (orderedBefore && queuedHistoryEntry && !queuedHistoryEntry.kind) {
                         queuedHistoryEntry.snapshot = structuredClone(orderedBefore);
                     }
-                    const orderedIntent = orderedBefore
+                    const orderedIntent = orderedBefore && queuedValue?.historyOrderContext?.rebaseIntents !== false
                         ? (this._rebaseSceneMutationIntentForHistory?.(
                             queuedValue?.payload, orderedBefore,
                             authoredScene) || queuedValue?.payload)
@@ -9868,6 +9888,8 @@ export class EditorWidget {
                 }
                 if (hasLinkedSelection) {
                     menuItems.push({ label: "Select Linked Items", action: () => this._selectLinkedItemsForSelection() });
+                }
+                if (this.selectedItems.some((item) => this._shouldApplyLinked(item))) {
                     menuItems.push({ label: "Unlink Linked Items", action: () => this._unlinkSelectedItems() });
                 }
                 // Discoverable mirror of the M shortcut (linked-aware via
@@ -15961,28 +15983,50 @@ export class EditorWidget {
 
     async _createLinkGroupFromSelectionWithinGesture() {
         if (!this.activeScene || !this.projectDir) return;
-        const items = this._selectedLinkableItems()
-            .map((item) => this._mutationItemFromSelection(item))
-            .filter(Boolean);
-        if (items.length < 2) {
+        const selection = this._selectedLinkableItems();
+        // Capture guards before painting, and address guide/prompt rows by the
+        // same durable refs used for badges rather than their selection index.
+        const refs = selection.map((item) => this._linkRefForItem(item)).filter(Boolean);
+        const items = selection.map((item) => ({
+            ...this._mutationItemFromSelection(item), ...this._linkRefForItem(item),
+        }));
+        if (new Set(refs.map((ref) => this._linkRefKey(ref))).size < 2) {
             notifyWarning("Select at least two timeline items to link.", { source: "timeline-link" });
             return;
         }
-        this._pushUndo("link items");
+        const scene = this.activeScene;
+        const projectDir = this.projectDir;
+        const previous = scene.linked_item_groups;
+        const groupId = this._newLocalItemId("link");
+        const painted = editedLinkGroups(scene, refs, { groupId }, () => this._newLocalItemId("link"));
+        const historyEntry = this._pushUndo("link items");
+        if (painted) {
+            this._linkGroupPredictions ||= new WeakMap();
+            this._linkGroupPredictions.set(painted, { previous, failed: false });
+            scene.linked_item_groups = painted;
+        }
+        this._renderSceneAfterLocalMutation({ viewport: false });
         try {
             await this._runSceneMutation(
-                [{ type: "create_link_group", items }],
+                [{ type: "create_link_group", items, group_id: groupId }],
                 {
                     key: `scene:${this.activeSceneId}:link-items:${Date.now()}`,
                     label: "link items",
                     coalesce: false,
+                    historyEntry,
+                    failureMessage: (error) => error?.message || "Link operation was refused.",
                 }
             );
-            this._reconcileSelection();
-            this._renderTimeline();
-        } catch (e) {
-            notifyWarning(e?.message || "Link operation was refused.", { source: "timeline-link-refused" });
-            await this._fetchScenes({ ignoreMutationGate: true, reason: "link_items_error" });
+        } catch {
+            // Restore only while this gesture still owns this exact prediction.
+            // A later edit, canonical adoption or scene switch wins. The normal
+            // queue failure path schedules authoritative post-drain recovery.
+            const rollback = rollbackLinkGroupPrediction(this._linkGroupPredictions, painted);
+            if (this.projectDir === projectDir && this.activeScene === scene
+                    && painted && scene.linked_item_groups === painted) {
+                scene.linked_item_groups = rollback;
+                this._renderSceneAfterLocalMutation({ viewport: false });
+            }
         }
     }
 
@@ -15993,12 +16037,25 @@ export class EditorWidget {
 
     async _unlinkSelectedItemsWithinGesture() {
         if (!this.activeScene || !this.projectDir) return;
-        const items = this._selectedLinkableItems()
-            .filter((item) => this._isLinkedItem(item))
-            .map((item) => this._mutationItemFromSelection(item))
-            .filter(Boolean);
+        // A newly split half may already be grouped on the server. Absence of
+        // its canonical membership is not evidence that it needs no unlink.
+        const selection = this._selectedLinkableItems().filter((item) => this._shouldApplyLinked(item));
+        const refs = selection.map((item) => this._linkRefForItem(item)).filter(Boolean);
+        const items = selection.map((item) => ({
+            ...this._mutationItemFromSelection(item), ...this._linkRefForItem(item),
+        }));
         if (!items.length) return;
-        this._pushUndo("unlink items");
+        const scene = this.activeScene;
+        const projectDir = this.projectDir;
+        const previous = scene.linked_item_groups;
+        const painted = editedLinkGroups(scene, refs, { entireGroup: true }, () => this._newLocalItemId("link"));
+        const historyEntry = this._pushUndo("unlink items");
+        if (painted) {
+            this._linkGroupPredictions ||= new WeakMap();
+            this._linkGroupPredictions.set(painted, { previous, failed: false });
+            scene.linked_item_groups = painted;
+        }
+        this._renderSceneAfterLocalMutation({ viewport: false });
         try {
             await this._runSceneMutation(
                 [{ type: "unlink_items", items, entire_group: true }],
@@ -16006,13 +16063,17 @@ export class EditorWidget {
                     key: `scene:${this.activeSceneId}:unlink-items:${Date.now()}`,
                     label: "unlink items",
                     coalesce: false,
+                    historyEntry,
+                    failureMessage: (error) => error?.message || "Unlink operation was refused.",
                 }
             );
-            this._reconcileSelection();
-            this._renderTimeline();
-        } catch (e) {
-            notifyWarning(e?.message || "Unlink operation was refused.", { source: "timeline-unlink-refused" });
-            await this._fetchScenes({ ignoreMutationGate: true, reason: "unlink_items_error" });
+        } catch {
+            const rollback = rollbackLinkGroupPrediction(this._linkGroupPredictions, painted);
+            if (this.projectDir === projectDir && this.activeScene === scene
+                    && painted && scene.linked_item_groups === painted) {
+                scene.linked_item_groups = rollback;
+                this._renderSceneAfterLocalMutation({ viewport: false });
+            }
         }
     }
 

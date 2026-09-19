@@ -1248,7 +1248,7 @@ GUARD_EXEMPT_SITES = {
         ('clip_id', 'fields', 'fields.<opaque>', 'type'),
     ],
     "editor_widget.js:_createLinkGroupFromSelectionWithinGesture:create_link_group": [
-        ('items', 'items.<opaque>', 'type'),
+        ('group_id', 'items', 'items.<opaque>', 'type'),
     ],
     "editor_widget.js:_deleteItemsInLaneWithinGesture:bulk_delete_items": [
         ('items', 'items.<opaque>', 'preserve_lanes', 'type'),

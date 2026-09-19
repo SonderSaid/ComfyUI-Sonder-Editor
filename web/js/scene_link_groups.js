@@ -149,3 +149,55 @@ export function pruneLinkedItemGroups(scene, mintGroupId) {
     }
     return normalized;
 }
+
+
+/** Predict explicit link/unlink edits from durable refs. The server still owns
+ *  validation and persistence. Return null when a target cannot be represented
+ *  faithfully; never paint a partial group into a later Undo snapshot.
+ *  Mirrors `_unlink_refs`, `_expand_linked_refs`, and `_add_link_group`.
+ */
+export function editedLinkGroups(scene, refs, { groupId = null, entireGroup = false } = {}, mintGroupId) {
+    const existing = existingLinkIds(scene);
+    const selected = [];
+    const keys = new Set();
+    for (const ref of refs) {
+        if (!LINK_ITEM_TYPES.has(ref?.type) || !existing[ref.type].has(ref.id)) return null;
+        const key = `${ref.type}:${ref.id}`;
+        if (!keys.has(key)) selected.push({ type: ref.type, id: ref.id });
+        keys.add(key);
+    }
+    if (groupId !== null && selected.length < 2) return null;
+    // Entire-group unlink expands each originally selected ref once, just as
+    // the server does; it is not a transitive walk through malformed overlaps.
+    const groups = entireGroup ? pruneLinkedItemGroups(scene, mintGroupId)
+        : (scene.linked_item_groups || []);
+    if (entireGroup) {
+        for (const ref of selected) {
+            const group = groups.find((g) => g.items.some((r) => r.type === ref.type && r.id === ref.id));
+            for (const member of group?.items || []) keys.add(`${member.type}:${member.id}`);
+        }
+    }
+    const remaining = groups.map((g) => ({
+        group_id: g.group_id || mintGroupId(),
+        items: g.items.filter((r) => !keys.has(`${r.type}:${r.id}`)),
+    })).filter((g) => g.items.length >= 2);
+    if (groupId !== null) {
+        if (remaining.some((g) => g.group_id === groupId)) return null;
+        remaining.push({ group_id: groupId, items: selected });
+    }
+    return pruneLinkedItemGroups({ ...scene, linked_item_groups: remaining }, mintGroupId);
+}
+
+
+/** Display-only failure chain. The host owns the WeakMap; canonical history
+ *  baselines remain in the mutation queue. Skip failed predecessors so two
+ *  offline edits cannot restore the first edit's abandoned prediction.
+ */
+export function rollbackLinkGroupPrediction(predictions, painted) {
+    const record = painted && predictions?.get(painted);
+    if (!record) return undefined;
+    record.failed = true;
+    let previous = record.previous;
+    while (previous && predictions.get(previous)?.failed) previous = predictions.get(previous).previous;
+    return previous;
+}

@@ -3323,3 +3323,232 @@ def test_a_move_on_an_optimistic_split_half_still_asks_about_linkage():
         }
         await Promise.allSettled([split, move]);
     """)
+
+
+_LINK_SETUP = """
+    function linkWidget() {
+        const w = makeWidget();
+        w.activeScene = {scene_id: 'scene', clips: [{clip_id: 'c1'}, {clip_id: 'c2'}],
+            audio_tracks: [{track_id: 'a1'}], guide_frames: [], prompt_sections: [], linked_item_groups: []};
+        w.selectedItems = w.activeScene.clips.map(data => ({type: 'clip', id: data.clip_id, data}));
+        w._reconcileSelection = () => {};
+        w.paints = [];
+        w._renderSceneAfterLocalMutation = () => w.paints.push(structuredClone(w.activeScene.linked_item_groups));
+        w.undos = [];
+        w._pushUndo = label => {
+            const entry = {label, snapshot: structuredClone(w.activeScene)};
+            w.undos.push(entry); return entry;
+        };
+        w.sent = []; w.releases = [];
+        w._runSceneMutation = (operations, options) => {
+            w.sent.push({operations, options});
+            return new Promise((resolve, reject) => w.releases.push({resolve, reject}));
+        };
+        return w;
+    }
+"""
+
+
+def test_link_paints_durable_id_before_save_and_undo_captures_before():
+    _run_gesture_node(_LINK_SETUP + """
+        const w = linkWidget();
+        const pending = w._createLinkGroupFromSelectionWithinGesture();
+        assert.equal(w.paints.length, 1);
+        const group = w.activeScene.linked_item_groups[0];
+        assert.equal(group.items.length, 2);
+        assert.equal(group.group_id, w.sent[0].operations[0].group_id);
+        assert.deepEqual(w.undos[0].snapshot.linked_item_groups, []);
+        assert.equal(w.sent[0].options.historyEntry, w.undos[0]);
+        w.releases[0].resolve({}); await pending;
+    """)
+
+
+def test_link_then_unlink_before_either_response_has_immediate_badges():
+    _run_gesture_node(_LINK_SETUP + """
+        const w = linkWidget();
+        const link = w._createLinkGroupFromSelectionWithinGesture();
+        const group = structuredClone(w.activeScene.linked_item_groups);
+        w.selectedItems = [w.selectedItems[0]];
+        const unlink = w._unlinkSelectedItemsWithinGesture();
+        assert.deepEqual(w.activeScene.linked_item_groups, []);
+        assert.deepEqual(w.undos[1].snapshot.linked_item_groups, group);
+        assert.equal(w.sent[1].operations[0].entire_group, true);
+        w.releases[0].resolve({}); w.releases[1].resolve({});
+        await Promise.all([link, unlink]);
+    """)
+
+
+def test_link_uses_durable_prompt_and_guide_ids_with_prepaint_guards():
+    _run_gesture_node(_LINK_SETUP + """
+        const w = linkWidget();
+        const prompt = {prompt_id: 'prompt-later', start_frame: 20, end_frame: 40};
+        const guide = {guide_id: 'guide-later', frame_index: 30, asset_id: 'asset'};
+        w.activeScene.prompt_sections = [prompt]; w.activeScene.guide_frames = [guide];
+        w.selectedItems = [{type: 'prompt', id: 0, data: prompt}, {type: 'guide', id: 30, data: guide}];
+        const pending = w._createLinkGroupFromSelectionWithinGesture();
+        const op = w.sent[0].operations[0];
+        assert.deepEqual(op.items.map(i => i.id), ['prompt-later', 'guide-later']);
+        assert.equal(op.items[0].expected.start_frame, 20);
+        assert.equal(op.items[1].expected.frame_index, 30);
+        assert.deepEqual(w.activeScene.linked_item_groups[0].items,
+            [{type: 'prompt', id: 'prompt-later'}, {type: 'guide', id: 'guide-later'}]);
+        w.releases[0].resolve({}); await pending;
+    """)
+
+
+def test_failed_link_restores_groups_without_a_network_read():
+    _run_gesture_node(_LINK_SETUP + """
+        const w = linkWidget();
+        const previous = w.activeScene.linked_item_groups;
+        const pending = w._createLinkGroupFromSelectionWithinGesture();
+        w.releases[0].reject(new Error('offline')); await pending;
+        assert.equal(w.activeScene.linked_item_groups, previous);
+        assert.equal(w.paints.length, 2);
+    """)
+
+
+def test_failed_link_cannot_overwrite_a_newer_unlink_or_scene():
+    _run_gesture_node(_LINK_SETUP + """
+        for (const switchScene of [false, true]) {
+            const w = linkWidget();
+            const link = w._createLinkGroupFromSelectionWithinGesture();
+            const unlink = w._unlinkSelectedItemsWithinGesture();
+            if (switchScene) w.activeScene = {scene_id: 'other', linked_item_groups: [{group_id: 'other'}]};
+            const current = w.activeScene.linked_item_groups;
+            w.releases[0].reject(new Error('offline')); await link;
+            assert.equal(w.activeScene.linked_item_groups, current);
+            w.releases[1].resolve({}); await unlink;
+        }
+    """)
+
+
+def test_failed_unlink_restores_the_whole_group():
+    _run_gesture_node(_LINK_SETUP + """
+        const w = linkWidget();
+        w.activeScene.linked_item_groups = [{group_id: 'old', items:
+            [{type: 'clip', id: 'c1'}, {type: 'clip', id: 'c2'}, {type: 'audio', id: 'a1'}]}];
+        const previous = w.activeScene.linked_item_groups;
+        w.selectedItems = [w.selectedItems[0]];
+        const pending = w._unlinkSelectedItemsWithinGesture();
+        assert.deepEqual(w.activeScene.linked_item_groups, []);
+        w.releases[0].reject(new Error('offline')); await pending;
+        assert.equal(w.activeScene.linked_item_groups, previous);
+    """)
+
+
+def test_unlink_on_unreconciled_split_half_reaches_the_server():
+    _run_gesture_node(_LINK_SETUP + """
+        const w = linkWidget();
+        w.selectedItems = [w.selectedItems[0]];
+        w._optimisticSplitHalves = new Set(['clip:c1']);
+        const pending = w._unlinkSelectedItemsWithinGesture();
+        assert.equal(w.sent.length, 1);
+        assert.equal(w.sent[0].operations[0].entire_group, true);
+        w.releases[0].resolve({}); await pending;
+    """)
+
+
+@pytest.mark.parametrize("first_link", [True, False])
+def test_failed_group_edit_cannot_enter_the_next_edits_undo_target(first_link):
+    """Real queue/history: canonical pre-state replaces abandoned predictions.
+
+    Only transport and rendering are replaced. Both failure orientations matter:
+    Undo must neither resurrect a refused link nor delete a group whose unlink
+    failed. The original operation guards must remain authored values.
+    """
+    _run_gesture_node(_LINK_SETUP + f"const firstLink = {str(first_link).lower()};" + """
+        const w = linkWidget();
+        delete w._pushUndo; delete w._stampHistoryPostSnapshot; delete w._runSceneMutation;
+        w._undoStack = []; w._redoStack = []; w._maxUndoSteps = 100; w._historyStackRevision = 0;
+        w._replayDeferredHistoryWidgetStateIfIdle = () => {};
+        w._snapshotProjectMutationContext = () => ({projectId: 'project', sceneId: 'scene'});
+        if (!firstLink) w.activeScene.linked_item_groups = [{group_id:'old', items:
+            [{type:'clip', id:'c1'}, {type:'clip', id:'c2'}]}];
+        const server = structuredClone(w.activeScene);
+        const original = structuredClone(server.linked_item_groups);
+        let reads = 0;
+        globalThis.fetch = async () => {
+            reads++; return new Response(JSON.stringify(server), {status:200});
+        };
+        let rejectFirst, calls = 0;
+        w._runVersionedProjectMutation = async (_url, init) => {
+            calls++;
+            if (calls === 1) await new Promise((_resolve, reject) => { rejectFirst = reject; });
+            const op = JSON.parse(init.body).operations[0];
+            server.linked_item_groups = op.type === 'unlink_items' ? []
+                : [{group_id:op.group_id, items:op.items.map(({type,id}) => ({type,id}))}];
+            return {payload:{scene:structuredClone(server)}};
+        };
+        const first = firstLink ? w._createLinkGroupFromSelectionWithinGesture()
+            : w._unlinkSelectedItemsWithinGesture();
+        while (!rejectFirst) await new Promise(r => setTimeout(r, 1));
+        const second = firstLink ? w._unlinkSelectedItemsWithinGesture()
+            : w._createLinkGroupFromSelectionWithinGesture();
+        rejectFirst(new Error('refused'));
+        await Promise.all([first, second]);
+        assert.equal(calls, 2);
+        assert.equal(reads, 2, 'unknown failure outcome resolves before the next slot');
+        assert.equal(w._undoStack.length, 1);
+        assert.deepEqual(w._undoStack[0].snapshot.linked_item_groups, original);
+        assert.deepEqual(w._undoStack[0].postSnapshot.linked_item_groups, server.linked_item_groups);
+    """)
+
+
+def test_two_failed_group_predictions_return_to_the_pre_burst_groups():
+    _run_gesture_node(_LINK_SETUP + """
+        const w = linkWidget();
+        const before = w.activeScene.linked_item_groups;
+        const first = w._createLinkGroupFromSelectionWithinGesture();
+        const second = w._unlinkSelectedItemsWithinGesture();
+        w.releases[0].reject(new Error('offline')); await first;
+        w.releases[1].reject(new Error('offline')); await second;
+        assert.equal(w.activeScene.linked_item_groups, before);
+    """)
+
+
+def test_link_ordering_does_not_rewrite_authored_guards():
+    _run_gesture_node(_LINK_SETUP + """
+        const w = linkWidget();
+        delete w._pushUndo; delete w._stampHistoryPostSnapshot; delete w._runSceneMutation;
+        w._undoStack=[]; w._redoStack=[]; w._maxUndoSteps=100; w._historyStackRevision=0;
+        w._replayDeferredHistoryWidgetStateIfIdle=()=>{};
+        w._snapshotProjectMutationContext=()=>({projectId:'project',sceneId:'scene'});
+        const guide={guide_id:'g', frame_index:10, asset_id:'asset'};
+        w.activeScene.guide_frames=[guide];
+        w.selectedItems=[w.selectedItems[0],{type:'guide', id:10,data:guide}];
+        const server=structuredClone(w.activeScene); server.guide_frames[0].frame_index=99;
+        globalThis.fetch=async()=>new Response(JSON.stringify(server),{status:200});
+        w._runVersionedProjectMutation=async(_url,init)=>{
+            const op=JSON.parse(init.body).operations[0];
+            assert.equal(op.items[1].id,'g');
+            assert.equal(op.items[1].expected.frame_index,10,'must refuse drift, not authorize it');
+            return {payload:{scene:server}};
+        };
+        await w._createLinkGroupFromSelectionWithinGesture();
+        assert.equal(w._undoStack[0].snapshot.guide_frames[0].frame_index,99);
+    """)
+
+
+
+def test_unlink_history_reads_the_servers_unknown_split_partition():
+    _run_gesture_node(_LINK_SETUP + """
+        const w=linkWidget();
+        delete w._pushUndo; delete w._stampHistoryPostSnapshot; delete w._runSceneMutation;
+        w._undoStack=[]; w._redoStack=[]; w._maxUndoSteps=100; w._historyStackRevision=0;
+        w._replayDeferredHistoryWidgetStateIfIdle=()=>{};
+        w._snapshotProjectMutationContext=()=>({projectId:'project',sceneId:'scene'});
+        w._optimisticSplitHalves=new Set(['clip:c1']);
+        w.selectedItems=[w.selectedItems[0]];
+        const canonical=structuredClone(w.activeScene);
+        canonical.linked_item_groups=[{group_id:'server-right',items:
+            [{type:'clip',id:'c1'},{type:'clip',id:'c2'}]}];
+        // A context for another scene must not suppress this scene's first read.
+        w._latestHistoryOrderContext={rebaseIntents:false,scenes:new Map([['other',{scene_id:'other'}]])};
+        let reads=0;
+        globalThis.fetch=async()=>{reads++; return new Response(JSON.stringify(canonical),{status:200});};
+        w._runVersionedProjectMutation=async()=>({payload:{scene:{...canonical,linked_item_groups:[]}}});
+        await w._unlinkSelectedItemsWithinGesture();
+        assert.equal(reads,1);
+        assert.deepEqual(w._undoStack[0].snapshot.linked_item_groups,canonical.linked_item_groups);
+        assert.deepEqual(w._undoStack[0].postSnapshot.linked_item_groups,[]);
+    """)

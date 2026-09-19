@@ -359,3 +359,60 @@ def test_a_group_id_collision_is_resolved_the_same_way_in_both_languages(monkeyp
     [python] = _python_prunes(case, monkeypatch)
     assert [group["group_id"] for group in javascript] == ["same", "mint0001"]
     assert javascript == python
+
+
+@pytest.mark.parametrize("action", ["link", "unlink"])
+def test_explicit_group_edit_matches_server(action):
+    """Regroup survivors, whole-group unlink, durable guide/prompt refs, collision.
+
+    Drive the actual server mutation functions, not a second expected-value
+    implementation. Every case also checks that prediction leaves its input alone.
+    """
+    rows = {"clips": ["c1", "c2", "c3"], "audio": ["a1", "a2"],
+            "guides": [("g1", 20)], "prompts": ["p1"]}
+    groups = [
+        {"group_id": "old", "items": [{"type": "clip", "id": "c1"},
+         {"type": "audio", "id": "a1"}, {"type": "guide", "id": "g1"},
+         {"type": "prompt", "id": "p1"}]},
+        {"group_id": "keep", "items": [{"type": "clip", "id": "c2"}, {"type": "audio", "id": "a2"}]},
+    ]
+    selections = [
+        [{"type": "clip", "id": "c1"}, {"type": "clip", "id": "c2"}],
+        [{"type": "guide", "id": "g1"}, {"type": "prompt", "id": "p1"}],
+        [{"type": "clip", "id": "c2"}, {"type": "audio", "id": "a2"}],
+        [{"type": "clip", "id": "c3"}, {"type": "audio", "id": "a2"}],
+    ]
+    cases, expected = [], []
+    for refs in selections:
+        for group_id in ["fresh", "keep"]:
+            data = _scene_dict(rows, groups)
+            scene = Scene.from_dict({**data, "scene_id": "s", "duration_frames": 100})
+            try:
+                if action == "link":
+                    routes._add_link_group(scene, refs, group_id)
+                else:
+                    expanded = routes._expand_linked_refs(scene, refs, True)
+                    routes._unlink_refs(scene, expanded)
+                    routes._prune_linked_item_groups(scene)
+                expected.append(scene.linked_item_groups)
+            except routes.ProjectMutationRequestError as exc:
+                assert exc.code == "id_conflict"
+                expected.append(None)
+            cases.append({"scene": data, "refs": refs, "options":
+                {"groupId": group_id} if action == "link" else {"entireGroup": True}})
+    script = f"""
+        import assert from 'node:assert/strict';
+        import {{ editedLinkGroups }} from {json.dumps(MODULE_URL)};
+        const cases = {json.dumps(cases)};
+        const results = cases.map(c => {{
+            const before = JSON.stringify(c.scene);
+            const result = editedLinkGroups(c.scene, c.refs, c.options, () => 'mint0001');
+            assert.equal(JSON.stringify(c.scene), before);
+            return result;
+        }});
+        console.log(JSON.stringify(results));
+    """
+    result = subprocess.run([shutil.which("node"), "--input-type=module", "-e", script],
+                            capture_output=True, text=True, encoding="utf-8", timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == expected
