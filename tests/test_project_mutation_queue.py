@@ -384,6 +384,85 @@ def test_asset_drop_append_rebase_keeps_lane_count_and_create_target_aligned():
     """)
 
 
+def test_a_media_split_intent_survives_the_history_rebase_byte_identical():
+    """The half of the split guard that lives on the client.
+
+    `_historyExpectedProjection` overwrites every `expected` key the ordered
+    row also carries. Projecting a media split forward would therefore rewrite
+    the exact `timeline_start_frame` / `timeline_end_frame` the new server-side
+    guard compares, and it could never fire -- the guard would be checking the
+    rebase's own answer against itself. The two `case` labels added in umbrella
+    Phase C stage 2 L1 do nothing on purpose; this is what makes "does nothing"
+    a tested property rather than an accident of falling to `default`.
+
+    The prompt split is asserted alongside as the deliberate asymmetry: its
+    target is a positional index history can legitimately move, so it IS
+    rebased. A test that only proved the media splits pass through unchanged
+    would also pass against a switch that had stopped rebasing anything.
+    """
+    source = (ROOT / "web" / "js" / "editor_widget.js").read_text(
+        encoding="utf-8")
+    rebase = _method(source, "_historyExpectedProjection", "_queueProjectMutation")
+    _run_node(f"""
+        import assert from 'node:assert/strict';
+        class Harness {{
+        {rebase}
+        }}
+        const h = new Harness();
+        // The ordered scene disagrees with every authored value: a first cut
+        // already shortened the clip and the track, and moved the clip's lane.
+        const ordered = {{
+            scene_id: 'scene', video_lane_count: 2, audio_lane_count: 2,
+            clips: [{{clip_id: 'clip-1', timeline_start_frame: 0,
+                     timeline_end_frame: 8, track_index: 1, role: 'render'}}],
+            audio_tracks: [{{track_id: 'audio-1', timeline_start_frame: 0,
+                            timeline_end_frame: 8, lane_index: 1}}],
+            prompt_sections: [
+                {{prompt_id: 'p-early', start_frame: 0, end_frame: 5}},
+                {{prompt_id: 'p-1', start_frame: 5, end_frame: 20}},
+            ],
+            guide_frames: [], reference_items: [],
+        }};
+        const authored = {{
+            scene_id: 'scene', video_lane_count: 2, audio_lane_count: 2,
+            clips: [], audio_tracks: [],
+            prompt_sections: [{{prompt_id: 'p-1', start_frame: 0, end_frame: 20}}],
+            guide_frames: [], reference_items: [],
+        }};
+
+        const splits = [
+            {{type: 'split_clip', clip_id: 'clip-1', frame: 10,
+              apply_linked: false,
+              expected: {{clip_id: 'clip-1', timeline_start_frame: 0,
+                         timeline_end_frame: 20, track_index: 0,
+                         role: 'render'}}}},
+            {{type: 'split_audio_track', track_id: 'audio-1', frame: 10,
+              apply_linked: false,
+              expected: {{track_id: 'audio-1', timeline_start_frame: 0,
+                         timeline_end_frame: 20, lane_index: 0}}}},
+        ];
+        const before = JSON.stringify(splits);
+        const rebased = h._rebaseSceneMutationIntentForHistory(
+            {{sceneId: 'scene', operations: JSON.parse(before)}},
+            ordered, authored).operations;
+        assert.equal(JSON.stringify(rebased), before,
+            'a media split intent must reach the server exactly as authored');
+
+        // The asymmetry, asserted so this test cannot pass against an inert
+        // switch: the prompt split's positional index IS retargeted, from 0 to
+        // the ordered scene's index 1.
+        const promptIntent = {{sceneId: 'scene', operations: [{{
+            type: 'split_prompt_section', index: 0, frame: 10,
+            apply_linked: false,
+            expected: {{prompt_id: 'p-1', start_frame: 0, end_frame: 20}},
+        }}]}};
+        const prompt = h._rebaseSceneMutationIntentForHistory(
+            promptIntent, ordered, authored).operations[0];
+        assert.equal(prompt.index, 1);
+        assert.equal(prompt.expected.start_frame, 5);
+    """)
+
+
 def test_mutation_ids_are_unique_across_independent_module_contexts():
     api_url = (ROOT / "web" / "js" / "api_client.js").as_uri()
     widget_url = (ROOT / "web" / "js" / "editor_widget.js").as_uri()

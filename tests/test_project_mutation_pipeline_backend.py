@@ -1325,6 +1325,17 @@ def test_scene_mutation_linked_split_rejects_driver_clip_atomically(monkeypatch,
             "clip_id": "driver-1",
             "frame": 10,
             "apply_linked": True,
+            # Matching, so the identity guard passes and the Driver refusal is
+            # still what this test observes. `role` is in the guarded set
+            # precisely so a concurrent conversion refuses at the dispatch
+            # instead of 409-ing deeper in; here it agrees, so it does not.
+            "expected": {
+                "clip_id": "driver-1",
+                "timeline_start_frame": 0,
+                "timeline_end_frame": 20,
+                "track_index": 0,
+                "role": "motion_driver",
+            },
         }]},
     )))
 
@@ -1335,6 +1346,417 @@ def test_scene_mutation_linked_split_rejects_driver_clip_atomically(monkeypatch,
     assert len(scene.audio_tracks) == 1
     assert driver.timeline_end_frame == 20
     assert audio.timeline_end_frame == 20
+
+
+# ---------------------------------------------------------------------------
+# Media-split anchor guards (umbrella Phase C stage 2 L1)
+# ---------------------------------------------------------------------------
+# The tracked Critical defect is a cut aimed at a clip whose bounds the server
+# had already changed: it fell through `_apply_split_linked`'s `else` arm,
+# returned 200 with `split_count: 0`, changed nothing and still paid a full
+# document write. Two guards close it, and they answer different questions --
+# `expected` says "this is not the row you saw" (409) and the anchor bounds
+# check says "this frame was never inside it" (400). Neither may write.
+
+def _split_scene_project(monkeypatch, route_module, tmp_path, *, linked=False):
+    """One clip [0,20] on lane 0, one audio [0,20], optionally linked."""
+    clip = ClipReference(
+        clip_id="clip-1",
+        source_path="media/a.mp4",
+        timeline_start_frame=0,
+        timeline_end_frame=20,
+        source_in_frame=0,
+        source_out_frame=20,
+        total_source_frames=20,
+        track_index=0,
+    )
+    audio = AudioTrack(
+        track_id="audio-1",
+        source_path="media/a.wav",
+        timeline_start_frame=0,
+        timeline_end_frame=20,
+        source_in_frame=0,
+        total_source_frames=20,
+        lane_index=0,
+    )
+    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=40)
+    scene.clips = [clip]
+    scene.audio_tracks = [audio]
+    if linked:
+        scene.linked_item_groups = [{
+            "group_id": "group-1",
+            "items": [{"type": "clip", "id": "clip-1"},
+                      {"type": "audio", "id": "audio-1"}],
+        }]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project",
+                        lambda saved_project: saves.append(saved_project))
+    return scene, clip, audio, saves
+
+
+def _split_clip_op(frame, expected=None, **overrides):
+    guard = {
+        "clip_id": "clip-1",
+        "timeline_start_frame": 0,
+        "timeline_end_frame": 20,
+        "track_index": 0,
+        "role": "render",
+    }
+    guard.update(expected or {})
+    operation = {"type": "split_clip", "clip_id": "clip-1", "frame": frame,
+                 "apply_linked": False, "expected": guard}
+    operation.update(overrides)
+    return operation
+
+
+def _split_audio_op(frame, expected=None, **overrides):
+    guard = {
+        "track_id": "audio-1",
+        "timeline_start_frame": 0,
+        "timeline_end_frame": 20,
+        "lane_index": 0,
+    }
+    guard.update(expected or {})
+    operation = {"type": "split_audio_track", "track_id": "audio-1", "frame": frame,
+                 "apply_linked": False, "expected": guard}
+    operation.update(overrides)
+    return operation
+
+
+def _run_operations(route_module, operations):
+    return asyncio.run(_mutation_handler(route_module)(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={"operations": operations},
+    )))
+
+
+def test_split_clip_with_matching_expected_splits_normally(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene, clip, _audio, saves = _split_scene_project(monkeypatch, route_module, tmp_path)
+
+    response = _run_operations(route_module, [_split_clip_op(10)])
+
+    assert response.status == 200
+    assert len(scene.clips) == 2
+    assert clip.timeline_end_frame == 10
+    right = next(item for item in scene.clips if item.clip_id != "clip-1")
+    assert (right.timeline_start_frame, right.timeline_end_frame) == (10, 20)
+    assert len(saves) == 1
+
+
+def test_split_clip_without_expected_is_refused_before_any_write(monkeypatch, tmp_path):
+    """The legacy REST route may omit `expected`; a dispatcher operation may not."""
+    route_module = _load_route_module(monkeypatch)
+    scene, clip, _audio, saves = _split_scene_project(monkeypatch, route_module, tmp_path)
+
+    operation = _split_clip_op(10)
+    del operation["expected"]
+    response = _run_operations(route_module, [operation])
+
+    assert response.status == 400
+    assert _response_json(response)["code"] == "missing_expected_identity"
+    assert saves == []
+    assert len(scene.clips) == 1
+    assert clip.timeline_end_frame == 20
+
+
+def test_split_clip_refuses_a_partial_expected_rather_than_half_guarding(
+        monkeypatch, tmp_path):
+    """`_require_expected` is a key-SET check, so a subset never half-guards."""
+    route_module = _load_route_module(monkeypatch)
+    scene, _clip, _audio, saves = _split_scene_project(monkeypatch, route_module, tmp_path)
+
+    operation = _split_clip_op(10)
+    operation["expected"] = {"clip_id": "clip-1"}
+    response = _run_operations(route_module, [operation])
+
+    assert response.status == 400
+    assert _response_json(response)["code"] == "missing_expected_identity"
+    assert saves == []
+    assert len(scene.clips) == 1
+
+
+def test_split_clip_whose_start_moved_refuses_without_writing(monkeypatch, tmp_path):
+    """The staleness the guard exists for, and the one the bounds check cannot
+    see: a clip that MOVED still contains the frame, but the cut would land at
+    a different source offset than the author pointed at."""
+    route_module = _load_route_module(monkeypatch)
+    scene, clip, _audio, saves = _split_scene_project(monkeypatch, route_module, tmp_path)
+    clip.timeline_start_frame = 5
+    clip.timeline_end_frame = 25
+
+    response = _run_operations(route_module, [_split_clip_op(10)])
+
+    assert response.status == 409
+    assert _response_json(response)["code"] == "identity_mismatch"
+    assert "start frame" in _response_json(response)["error"], (
+        "a refusal must name what moved: " + _response_json(response)["error"])
+    assert saves == [], "a refused split must not pay a document write"
+    assert len(scene.clips) == 1
+    assert clip.timeline_start_frame == 5
+
+
+def test_a_cut_aimed_left_of_an_earlier_one_still_lands(monkeypatch, tmp_path):
+    """`timeline_end_frame` is deliberately NOT guarded, and this is why.
+
+    The end is the field the author's own previous cut rewrites. A clip [0,20]
+    cut at 12 leaves [0,12]; a second cut queued against the pre-cut view and
+    aimed at frame 8 is still inside that left half and split correctly before
+    the guard existed. Guarding the end would 409 it -- roughly half of every
+    rapid-cut burst, turned from working into refused. Probed on the live route
+    before this test was written.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene, clip, _audio, saves = _split_scene_project(monkeypatch, route_module, tmp_path)
+    clip.timeline_end_frame = 12      # an earlier cut in the same burst landed
+    clip.source_out_frame = 12
+
+    response = _run_operations(route_module, [_split_clip_op(8)])
+
+    assert response.status == 200, _response_json(response)
+    assert sorted((c.timeline_start_frame, c.timeline_end_frame)
+                  for c in scene.clips) == [(0, 8), (8, 12)]
+    assert len(saves) == 1
+
+
+def test_a_cut_aimed_past_a_shortened_end_refuses_loudly(monkeypatch, tmp_path):
+    """The complementary direction, and the tracked defect's exact shape.
+
+    Same burst, but the second cut is aimed RIGHT of the first, so the clip it
+    names no longer contains the frame. Before this landing that returned 200
+    with `split_count: 0` and still paid a full write. The anchor bounds check
+    is what catches it -- not the identity guard, which passes here.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene, clip, _audio, saves = _split_scene_project(monkeypatch, route_module, tmp_path)
+    clip.timeline_end_frame = 8
+    clip.source_out_frame = 8
+
+    response = _run_operations(route_module, [_split_clip_op(14)])
+
+    assert response.status == 400
+    assert _response_json(response)["code"] == "invalid_range"
+    assert saves == []
+    assert len(scene.clips) == 1
+    assert clip.timeline_end_frame == 8
+
+
+def test_split_clip_whose_lane_moved_refuses(monkeypatch, tmp_path):
+    """`track_index` is guarded because the lane is what the lock check read."""
+    route_module = _load_route_module(monkeypatch)
+    scene, clip, _audio, saves = _split_scene_project(monkeypatch, route_module, tmp_path)
+    clip.track_index = 2
+
+    response = _run_operations(route_module, [_split_clip_op(10)])
+
+    assert response.status == 409
+    assert _response_json(response)["code"] == "identity_mismatch"
+    assert saves == []
+    assert len(scene.clips) == 1
+
+
+def test_split_clip_whose_role_became_driver_refuses_at_the_guard(monkeypatch, tmp_path):
+    """`role` is in the set so a concurrent conversion refuses at the dispatch
+    rather than 409-ing deeper in with a message about a clip the author never
+    aimed at."""
+    route_module = _load_route_module(monkeypatch)
+    scene, clip, _audio, saves = _split_scene_project(monkeypatch, route_module, tmp_path)
+    clip.role = "motion_driver"
+
+    response = _run_operations(route_module, [_split_clip_op(10)])
+
+    assert response.status == 409
+    assert _response_json(response)["code"] == "identity_mismatch"
+    assert saves == []
+    assert len(scene.clips) == 1
+
+
+def test_split_clip_ignores_a_concurrent_source_trim(monkeypatch, tmp_path):
+    """The other half of the guard's scope. The set is deliberately narrow, so
+    an unrelated property edit must NOT refuse a cut the author could still
+    make -- over-guarding is its own defect."""
+    route_module = _load_route_module(monkeypatch)
+    scene, clip, _audio, saves = _split_scene_project(monkeypatch, route_module, tmp_path)
+    clip.total_source_frames = 999
+    clip.opacity = 0.5
+
+    response = _run_operations(route_module, [_split_clip_op(10)])
+
+    assert response.status == 200
+    assert len(scene.clips) == 2
+    assert len(saves) == 1
+
+
+def test_split_clip_outside_its_own_bounds_refuses_instead_of_no_op(monkeypatch, tmp_path):
+    """Guard 1, reached when `expected` agrees and the frame is simply wrong.
+
+    This is the arm that used to return 200, `split_count: 0` and a full write.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene, clip, _audio, saves = _split_scene_project(monkeypatch, route_module, tmp_path)
+
+    response = _run_operations(route_module, [_split_clip_op(30)])
+
+    assert response.status == 400
+    assert _response_json(response)["code"] == "invalid_range"
+    assert saves == []
+    assert len(scene.clips) == 1
+    assert clip.timeline_end_frame == 20
+
+
+def test_split_clip_on_a_boundary_frame_refuses(monkeypatch, tmp_path):
+    """`start < f < end` is strict at both ends, as `_split_clip_object` is."""
+    route_module = _load_route_module(monkeypatch)
+    scene, _clip, _audio, saves = _split_scene_project(monkeypatch, route_module, tmp_path)
+
+    for frame in (0, 20):
+        response = _run_operations(route_module, [_split_clip_op(frame)])
+        assert response.status == 400, frame
+        assert _response_json(response)["code"] == "invalid_range", frame
+    assert saves == []
+    assert len(scene.clips) == 1
+
+
+def test_linked_split_still_divides_every_member(monkeypatch, tmp_path):
+    """The anchor guard is anchor-SCOPED: partners keep their own behaviour."""
+    route_module = _load_route_module(monkeypatch)
+    scene, clip, audio, saves = _split_scene_project(
+        monkeypatch, route_module, tmp_path, linked=True)
+
+    response = _run_operations(route_module, [_split_clip_op(10, apply_linked=True)])
+
+    assert response.status == 200
+    assert clip.timeline_end_frame == 10
+    assert audio.timeline_end_frame == 10
+    assert len(scene.clips) == 2
+    assert len(scene.audio_tracks) == 2
+    assert len(saves) == 1
+
+
+def test_a_linked_partner_lying_wholly_past_the_cut_is_not_an_error(monkeypatch, tmp_path):
+    """`split_count == len(refs)` is never a valid assertion, so the anchor
+    guard must not quietly become one: a partner outside the cut is filed into
+    the right-hand group, not refused."""
+    route_module = _load_route_module(monkeypatch)
+    scene, clip, audio, saves = _split_scene_project(
+        monkeypatch, route_module, tmp_path, linked=True)
+    audio.timeline_start_frame = 14
+    audio.timeline_end_frame = 20
+
+    response = _run_operations(route_module, [_split_clip_op(10, apply_linked=True)])
+
+    assert response.status == 200
+    results = _response_json(response)["results"]
+    assert results[0]["split_count"] == 1
+    assert len(scene.audio_tracks) == 1, "the partner must not have been split"
+    assert audio.timeline_start_frame == 14
+    assert len(saves) == 1
+
+
+def test_split_audio_track_carries_the_same_guard(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene, _clip, audio, saves = _split_scene_project(monkeypatch, route_module, tmp_path)
+
+    response = _run_operations(route_module, [
+        _split_audio_op(10, expected={"timeline_start_frame": 3})])
+    assert response.status == 409
+    assert _response_json(response)["code"] == "identity_mismatch"
+    assert "audio track" in _response_json(response)["error"]
+    assert saves == []
+    assert len(scene.audio_tracks) == 1
+
+    response = _run_operations(route_module, [_split_audio_op(10)])
+    assert response.status == 200
+    assert audio.timeline_end_frame == 10
+    assert len(scene.audio_tracks) == 2
+    assert len(saves) == 1
+
+
+def test_split_audio_track_without_expected_is_refused(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene, _clip, _audio, saves = _split_scene_project(monkeypatch, route_module, tmp_path)
+
+    operation = _split_audio_op(10)
+    del operation["expected"]
+    response = _run_operations(route_module, [operation])
+
+    assert response.status == 400
+    assert _response_json(response)["code"] == "missing_expected_identity"
+    assert saves == []
+    assert len(scene.audio_tracks) == 1
+
+
+def test_a_refused_split_aborts_the_whole_batch(monkeypatch, tmp_path):
+    """One request, one save, so a refusal anywhere must leave nothing DURABLE.
+
+    Stated precisely, because the in-memory claim would be false: the earlier
+    `update_clip` does reach the model -- `_apply_scene_mutations_sync` applies
+    operations in order and the refusal unwinds by raising, not by rolling back.
+    What makes that harmless is that the write never happens and the next
+    request reloads from disk, so the assertion that carries the weight is
+    `saves == []`, not the model's state. Asserted both ways round so a future
+    change to either half is visible.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene, clip, _audio, saves = _split_scene_project(monkeypatch, route_module, tmp_path)
+
+    response = _run_operations(route_module, [
+        {"type": "update_clip", "clip_id": "clip-1", "fields": {"opacity": 0.25}},
+        _split_clip_op(10, expected={"timeline_start_frame": 999}),
+    ])
+
+    assert response.status == 409
+    assert saves == [], "nothing durable may survive a refused batch"
+    assert len(scene.clips) == 1
+    assert clip.opacity == 0.25, (
+        "the in-memory model IS mutated by the operations preceding the "
+        "refusal; only the absent write makes that harmless")
+
+
+def test_the_prompt_split_inherits_the_anchor_bounds_check(monkeypatch, tmp_path):
+    """The third anchor type, and the one nobody set out to change.
+
+    The bounds check lives in `_apply_split_linked`, which `split_prompt_section`
+    also calls, so the prompt split gained it too. That is reachable rather than
+    theoretical: `_rebaseSceneMutationIntentForHistory` DOES rebase this
+    operation -- it retargets `index` and re-snapshots `expected` onto the
+    ordered row, so the identity guard passes -- but it never rebases `frame`.
+    A prompt split queued behind an Undo that retimed its section therefore
+    arrives with a frame outside the section it names, and now refuses loudly
+    where it used to return 200 with `split_count: 0` and pay a full write.
+    """
+    route_module = _load_route_module(monkeypatch)
+    section = PromptSection(0, 10, channels={"visual": "text"})
+    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=40)
+    scene.prompt_sections = [section]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project",
+                        lambda saved_project: saves.append(saved_project))
+
+    def split(frame):
+        return asyncio.run(_mutation_handler(route_module)(DummyRequest(
+            match_info={"project_id": "proj", "scene_id": "scene-1"},
+            body={"operations": [{
+                "type": "split_prompt_section", "index": 0, "frame": frame,
+                "apply_linked": False,
+                "expected": {"prompt_id": section.prompt_id,
+                             "start_frame": 0, "end_frame": 10},
+            }]})))
+
+    response = split(25)
+    assert response.status == 400
+    assert _response_json(response)["code"] == "invalid_range"
+    assert saves == []
+    assert len(scene.prompt_sections) == 1
+
+    response = split(5)
+    assert response.status == 200
+    assert len(scene.prompt_sections) == 2
+    assert len(saves) == 1
 
 
 def test_scene_mutation_create_prompt_section_returns_reconciled_scene(monkeypatch, tmp_path):

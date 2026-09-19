@@ -23,6 +23,7 @@ a fresh `[Unreleased]` block.
 - The standalone `DELETE` routes for clips, guides, prompt sections and audio tracks. These operations are owned by the scene mutations endpoint, which accepts an identity snapshot of the target that the old routes could not send, and which rewrites the link groups they left behind.
 
 ### Fixed
+- A cut aimed at a clip, audio track or prompt section that no longer spans that frame is now refused and said so, instead of quietly doing nothing while still saving the whole project. This happened whenever a second cut was made before the first had finished saving.
 - Rapid mute toggles on one selection no longer queue a full project save each; they collapse the way lane-header clicks now do. Repeated clip-role conversions on one clip collapse too, though that gesture is reached through a context menu and rarely repeats fast enough to matter.
 - Rapid clicks on a lane header's hide control no longer queue one full project save each. A burst now costs one save per save already in flight, instead of one per click: six quick clicks were measured at 24.2 seconds of serialized saving, and a longer burst at over seven minutes. Clicks on different lanes are still saved separately, so each stays its own undo step.
 - Staging a Reference item is refused, instead of being created shorter than it was drawn, when another item on that lane was deleted or moved while the write was on its way.

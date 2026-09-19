@@ -3988,6 +3988,20 @@ export class EditorWidget {
                 // could never fire. A moved bound therefore refuses, and
                 // `_splitClipAtFrameWithinGesture` toasts the refusal.
                 break;
+            case "split_clip":
+            case "split_audio_track":
+                // Same decision, and present as an explicit empty case rather
+                // than left to `default` on purpose. `_historyExpectedProjection`
+                // overwrites every `expected` key the ordered row also carries,
+                // so projecting these forward would rewrite the very
+                // `timeline_start_frame`, lane and role the guard exists to
+                // compare, and it could never fire. Falling to `default`
+                // already does nothing; the label is what stops a future
+                // "rebase everything that carries an `expected`" change from
+                // silently reopening the defect. `split_prompt_section` IS
+                // rebased, because its target is a positional index history can
+                // legitimately move — that asymmetry is deliberate.
+                break;
             case "move_lane":
                 if (laneSpecs[operation.lane_type]) {
                     // Both endpoints rebase; the durable `expected` lane ids
@@ -16687,10 +16701,45 @@ export class EditorWidget {
 
         this._pushUndo(`split ${hit.type}`);
         const sceneId = this.activeSceneId;
+        // Where the item STARTS, and which lane and role it holds. The server's
+        // `_validate_clip_identity` / `_validate_audio_identity` compare exactly
+        // these and `_require_expected` makes every one of them mandatory, so
+        // the key set here and the key set there are one decision in two files;
+        // `tests/test_scene_mutation_registration.py` fails the suite if they
+        // drift apart in either direction.
+        //
+        // `timeline_end_frame` is deliberately absent, and the reason is written
+        // out in full beside the server guard: the end is the field the author's
+        // own previous cut rewrites, so guarding it turns roughly half of every
+        // rapid-cut burst -- any cut aimed left of an earlier one -- from a
+        // working gesture into a refusal. The stale case it would have caught is
+        // caught better by the server's anchor bounds check, which asks whether
+        // the frame is inside the item NOW.
         const operation = hit.type === "clip"
-            ? { type: "split_clip", clip_id: hit.id, frame, apply_linked: applyLinked }
+            ? {
+                type: "split_clip",
+                clip_id: hit.id,
+                frame,
+                apply_linked: applyLinked,
+                expected: {
+                    clip_id: hit.id,
+                    timeline_start_frame: hit.data?.timeline_start_frame,
+                    track_index: hit.data?.track_index || 0,
+                    role: hit.data?.role || "render",
+                },
+            }
             : hit.type === "audio"
-                ? { type: "split_audio_track", track_id: hit.id, frame, apply_linked: applyLinked }
+                ? {
+                    type: "split_audio_track",
+                    track_id: hit.id,
+                    frame,
+                    apply_linked: applyLinked,
+                    expected: {
+                        track_id: hit.id,
+                        timeline_start_frame: hit.data?.timeline_start_frame,
+                        lane_index: hit.data?.lane_index || 0,
+                    },
+                }
                 : hit.type === "reference"
                     ? {
                         type: "split_reference_item",
@@ -16720,6 +16769,13 @@ export class EditorWidget {
                 key: `scene:${sceneId}:split:${hit.type}:${hit.id}:${Date.now()}`,
                 label: `split ${hit.type}`,
                 coalesce: false,
+                // Clip and audio splits now carry a prior-identity guard whose
+                // refusal names the field that moved. The generic fallback would
+                // replace "This clip's start frame changed since the split was
+                // aimed…" with "split clip failed — timeline restored." and
+                // discard the only actionable part.
+                failureMessage: (error) => error?.message
+                    || `The ${hit.type} split was refused — timeline restored.`,
             });
             if (hit.type === "reference") {
                 this._buildTrackLayout();
@@ -16730,8 +16786,14 @@ export class EditorWidget {
         } catch (e) {
             await this._fetchScenes({ ignoreMutationGate: true, reason: "split_item_error" });
             if (hit.type === "reference") {
-                notifyWarning(e?.message || "The Reference split was refused — timeline restored.",
-                    { source: "reference-split-refused" });
+                // Deliberately no toast here. The Reference branch used to raise
+                // its own because the enqueue passed no `failureMessage` and the
+                // generic "split reference failed — timeline restored." dropped
+                // the server's wording; now that the enqueue surfaces
+                // `error.message` for every type, a second notify would show the
+                // SAME sentence twice rather than counting once —
+                // `editor_notifications.js` coalesces on `src:<source>`, and
+                // these two carried different sources so they could never merge.
                 this._refreshPromptContextDependencyConsumers();
             }
             console.warn(`[Sonder] Failed to split ${hit.type}:`, e);

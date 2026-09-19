@@ -2097,6 +2097,128 @@ def test_clip_split_rejects_motion_driver_atomically(tmp_path, monkeypatch):
     assert save_calls == []
 
 
+# The two legacy REST split routes have zero frontend callers and predate
+# prior-identity guards. Umbrella Phase C stage 2 L1 put the `expected`
+# requirement in the SCENE MUTATION dispatch branch rather than inside
+# `_apply_split_linked`, precisely so these keep working -- while still gaining
+# the anchor bounds check, which is what stops an out-of-range frame returning
+# 200 with nothing changed.
+
+def _legacy_split_scene(tmp_path, monkeypatch, route_module):
+    clip = ClipReference(
+        clip_id="clip-1",
+        source_path="media/a.mp4",
+        timeline_start_frame=0,
+        timeline_end_frame=20,
+        source_in_frame=0,
+        source_out_frame=20,
+        total_source_frames=20,
+        track_index=0,
+    )
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.clips = [clip]
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(exist_ok=True)
+    project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    save_calls = []
+    monkeypatch.setattr(route_module, "save_project",
+                        lambda saved: save_calls.append(saved))
+    handler = _route_handler(
+        route_module,
+        "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/clips/{clip_id}/split",
+    )
+    return scene, clip, save_calls, handler
+
+
+def test_legacy_clip_split_route_still_succeeds_without_expected(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    scene, clip, save_calls, handler = _legacy_split_scene(
+        tmp_path, monkeypatch, route_module)
+
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"scene_id": "scene-1", "clip_id": "clip-1"},
+        body={"frame": 10},
+    )))
+
+    assert response.status == 200
+    assert clip.timeline_end_frame == 10
+    assert len(scene.clips) == 2
+    assert len(save_calls) == 1
+
+
+def test_legacy_clip_split_route_refuses_an_out_of_bounds_frame(tmp_path, monkeypatch):
+    """Gained for free with the anchor bounds check. Before it, this returned
+    200 with an unchanged clip and still paid a document write."""
+    route_module = _load_route_module(monkeypatch)
+    scene, clip, save_calls, handler = _legacy_split_scene(
+        tmp_path, monkeypatch, route_module)
+
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"scene_id": "scene-1", "clip_id": "clip-1"},
+        body={"frame": 30},
+    )))
+
+    assert response.status == 400
+    assert _response_json(response)["code"] == "invalid_range"
+    assert len(scene.clips) == 1
+    assert clip.timeline_end_frame == 20
+    assert save_calls == []
+
+
+def test_legacy_audio_split_route_keeps_working_and_gains_the_bounds_check(
+        tmp_path, monkeypatch):
+    """The plan says "the two legacy REST routes keep working"; both are pinned.
+
+    The audio route is the one a reader is most likely to assume is covered by
+    the clip route's test. It is not -- they are separate handlers with separate
+    bodies, and only the shared `_apply_split_linked` makes their behaviour
+    agree.
+    """
+    route_module = _load_route_module(monkeypatch)
+    track = AudioTrack(
+        track_id="track-1",
+        source_path="media/a.wav",
+        timeline_start_frame=0,
+        timeline_end_frame=20,
+        source_in_frame=0,
+        total_source_frames=20,
+        lane_index=0,
+    )
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.audio_tracks = [track]
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(exist_ok=True)
+    project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    save_calls = []
+    monkeypatch.setattr(route_module, "save_project", lambda saved: save_calls.append(saved))
+    handler = _route_handler(
+        route_module,
+        "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/audio_tracks/{track_id}/split",
+    )
+
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"scene_id": "scene-1", "track_id": "track-1"},
+        body={"frame": 99},
+    )))
+    assert response.status == 400
+    assert _response_json(response)["code"] == "invalid_range"
+    assert len(scene.audio_tracks) == 1
+    assert save_calls == []
+
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"scene_id": "scene-1", "track_id": "track-1"},
+        body={"frame": 10},
+    )))
+    assert response.status == 200
+    assert track.timeline_end_frame == 10
+    assert len(scene.audio_tracks) == 2
+    assert len(save_calls) == 1
+
+
 def test_clear_queue_route_removes_only_completed_jobs(tmp_path, monkeypatch):
     route_module = _load_route_module(monkeypatch)
     project_dir = tmp_path / "project"

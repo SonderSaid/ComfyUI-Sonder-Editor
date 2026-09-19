@@ -176,9 +176,13 @@ export const SCENE_MUTATION_ADDRESSING = freeze({
             + "and is not a row guard — the decoy a widened pattern certified twice." }),
     split_clip: freeze({ addressing: DURABLE, ids: freeze(["clip_id"]),
         evidence: "`_apply_split_linked` takes a durable `clip_id` and a frame. "
-            + "The frame is a coordinate, not an address. Guard and `changed` "
-            + "reporting for this branch belong to split-optimistic-local-apply.md; "
-            + "retry policy is unchanged by that plan." }),
+            + "The frame is a coordinate, not an address. The dispatch branch "
+            + "additionally requires and compares an `expected` through "
+            + "`_validate_clip_identity`, which is what makes the replay honest: "
+            + "if the concurrent write that caused the conflict moved the clip's "
+            + "bounds or lane, the replay refuses instead of cutting a different "
+            + "shape at the same frame. `changed` reporting for this branch is "
+            + "still owned by umbrella Phase C stage 2." }),
     update_audio_track: freeze({ addressing: DURABLE, ids: freeze(["track_id"]),
         evidence: "`_apply_update_audio_track` / `_apply_linked_bounds_update` by "
             + "durable `track_id`; `fields.lane_index` degrades it, see "
@@ -190,7 +194,8 @@ export const SCENE_MUTATION_ADDRESSING = freeze({
         evidence: "`_apply_replace_audio_source`; the same `expected_type` decoy "
             + "as `replace_clip_source`." }),
     split_audio_track: freeze({ addressing: DURABLE, ids: freeze(["track_id"]),
-        evidence: "`_apply_split_linked` by durable `track_id`." }),
+        evidence: "`_apply_split_linked` by durable `track_id`, with the same "
+            + "dispatch-branch `_validate_audio_identity` guard as `split_clip`." }),
     update_reference_item: freeze({ addressing: DURABLE, ids: freeze(["reference_item_id"]),
         evidence: "`_apply_update_reference_item` calls `_find_reference_item` on "
             + "the durable id; `_reference_item_expected` then compares the written "

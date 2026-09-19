@@ -1135,6 +1135,92 @@ def _validate_guide_identity(guide: GuideFrame, expected: dict | None) -> None:
             _mutation_error("Guide identity mismatch", 409, "identity_mismatch")
 
 
+# The two media splits carry only what changes what the cut MEANS: where the
+# item starts, and which lane and role it holds. Guard scope was measured
+# against the live route, not reasoned about, because the obvious set is wrong.
+#
+# **`timeline_end_frame` is deliberately NOT guarded, and that is the whole
+# design.** The plan that specified this landing named it, and implementing it
+# showed why it cannot be there: the end is the field the author's OWN previous
+# cut rewrites. Probed on a clip `[0,300]` with a first cut at 200 already
+# landed, a queued second cut at frame 100 -- still inside the shortened
+# `[0,200]`, and a cut that split correctly before this landing -- returned 409.
+# Roughly half of every rapid-cut burst is that shape (any cut aimed left of an
+# earlier one), so guarding the end would convert a working gesture into a
+# refusal, which is a worse defect than the silent one being closed.
+#
+# Nothing is lost by dropping it, because the ANCHOR BOUNDS CHECK in
+# `_apply_split_linked` asks the better question against LIVE state: "is the
+# frame inside this item now". A stale cut aimed past the shortened end is
+# refused there with `invalid_range`, loudly, which is exactly the outcome the
+# tracked Critical entry asks for. `expected.timeline_end_frame` would only add
+# "the end is not what you saw", which after an unrelated concurrent right-trim
+# is over-guarding: the left half the author asked for is unchanged.
+#
+# `timeline_start_frame` IS load-bearing and the bounds check does not cover it.
+# A clip moved from `[0,300]` to `[50,350]` still contains frame 100, but the
+# cut would land 50 frames into different media than the author pointed at.
+#
+# Also deliberately excluded: `source_in_frame` / `source_out_frame` (a split is
+# a timeline-geometry operation), `total_source_frames` (it carries two
+# conflicting meanings once an item has been split once -- see the tracked entry
+# about items sitting past the end of their own media), every presentation
+# field, and link membership, which `apply_linked` rewrites as part of the split
+# itself. `role` is in the clip set because `_split_clip_object` refuses a Driver
+# clip: a concurrent conversion must refuse here rather than 409 deeper in.
+#
+# Permissive per key, like `_validate_guide_identity`: the dispatch decides which
+# keys are MANDATORY through `_require_expected`, so the two legacy REST split
+# routes, which send no `expected` at all, keep working unchanged.
+#
+# Values are compared RAW, as the guide and prompt validators do. An earlier
+# draft coerced with `int(... or 0)`, which would both mask a real difference on
+# a tolerantly-deserialized fractional bound and refuse an honest client
+# forever; `_expected_matches` already reconciles int against float.
+_SPLIT_IDENTITY_LABELS = {
+    "clip_id": "id", "track_id": "id", "role": "role",
+    "timeline_start_frame": "start frame",
+    "track_index": "lane", "lane_index": "lane",
+}
+
+
+def _refuse_split_identity(noun: str, key: str) -> None:
+    """Name the field that moved. A guard that only says "mismatch" makes the
+    user re-derive what happened from a timeline they can no longer trust."""
+    _mutation_error(
+        f"This {noun}'s {_SPLIT_IDENTITY_LABELS.get(key, key)} changed since the "
+        "split was aimed, so the cut was refused rather than applied somewhere "
+        "else",
+        409, "identity_mismatch")
+
+
+def _validate_clip_identity(clip: ClipReference, expected: dict | None) -> None:
+    if not isinstance(expected, dict):
+        return
+    checks = {
+        "clip_id": getattr(clip, "clip_id", ""),
+        "timeline_start_frame": getattr(clip, "timeline_start_frame", 0),
+        "track_index": getattr(clip, "track_index", 0),
+        "role": getattr(clip, "role", "render"),
+    }
+    for key, current in checks.items():
+        if key in expected and not _expected_matches(current, expected[key]):
+            _refuse_split_identity("clip", key)
+
+
+def _validate_audio_identity(track: AudioTrack, expected: dict | None) -> None:
+    if not isinstance(expected, dict):
+        return
+    checks = {
+        "track_id": getattr(track, "track_id", ""),
+        "timeline_start_frame": getattr(track, "timeline_start_frame", 0),
+        "lane_index": getattr(track, "lane_index", 0),
+    }
+    for key, current in checks.items():
+        if key in expected and not _expected_matches(current, expected[key]):
+            _refuse_split_identity("audio track", key)
+
+
 def _validate_prompt_identity(section: PromptSection, expected: dict | None) -> None:
     if not isinstance(expected, dict):
         return
@@ -1768,6 +1854,35 @@ def _apply_split_linked(scene: Scene, anchor_ref: dict, split_frame: int, apply_
     refs = _expand_linked_refs(scene, [anchor_ref], apply_linked)
     _require_link_refs_unlocked(scene, refs)
     split_frame = _mutation_int(split_frame, "frame")
+    # The anchor -- and only the anchor -- must actually contain the frame.
+    #
+    # Without this, an anchor whose bounds moved under the request falls into the
+    # `else` arm of the loop below, is filed as a left or right group member, and
+    # the whole call returns `split_count: 0` with HTTP 200: the tracked Critical
+    # defect, where a cut aimed at a clip the server had already shortened did
+    # nothing, said nothing, and still paid a full document write.
+    #
+    # Anchor-SCOPED because a linked partner legitimately lies wholly left or
+    # right of the cut -- `_item_bounds` gives a guide `[idx, idx + 1]`, so a
+    # linked guide can never satisfy the comparison. `split_count == 0` is not
+    # inherently an error and `split_count == len(refs)` is never a valid
+    # assertion; only the anchor's own emptiness is a refusal.
+    #
+    # 400 `invalid_range`, the code and wording `_split_clip_object` already uses
+    # for the same condition, and NOT 409, because this arm is the one an author
+    # reaches by aiming at a frame the item never spanned. The other staleness --
+    # the item is not the row you saw -- is answered earlier and separately by
+    # the dispatch branch's `expected` comparison, with 409 `identity_mismatch`.
+    # Note the two do not overlap: `timeline_end_frame` is deliberately outside
+    # that comparison, so a cut aimed past an end an earlier cut moved arrives
+    # here rather than there. That is the common case, and this is its answer.
+    anchor_type, _anchor_id = _link_ref_key(anchor_ref)
+    anchor_start, anchor_end = _item_bounds(scene, anchor_ref)
+    if not anchor_start < split_frame < anchor_end:
+        _mutation_error(
+            f"Split frame {split_frame} is outside the {anchor_type} being split "
+            f"({anchor_start}-{anchor_end})",
+            400, "invalid_range")
     for ref in refs:
         item_type, item_id = _link_ref_key(ref)
         if item_type != "clip":
@@ -4723,17 +4838,33 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
         )
         return {"type": op_type, "count": len(op.get("items", []) or [])}
     if op_type == "split_clip":
+        # Resolved, validated, and only then addressed -- the anchor ref is built
+        # from the row the guard just compared, so the guard and
+        # `_apply_split_linked`'s own resolution cannot name different clips.
+        # `_require_expected` makes the key set mandatory HERE rather than in
+        # `_validate_clip_identity`, so the legacy REST split route, which sends
+        # no `expected`, keeps working and still gains the anchor bounds check.
+        clip = _find_clip(scene, str(op.get("clip_id", "")))
+        _validate_clip_identity(clip, _require_expected(
+            op.get("expected"),
+            {"clip_id", "timeline_start_frame", "track_index", "role"},
+            "split_clip"))
         result = _apply_split_linked(
             scene,
-            _link_ref("clip", str(op.get("clip_id", ""))),
+            _link_ref("clip", clip.clip_id),
             op.get("frame", 0),
             bool(op.get("apply_linked", False)),
         )
         return result
     if op_type == "split_audio_track":
+        track = _find_audio_track(scene, str(op.get("track_id", "")))
+        _validate_audio_identity(track, _require_expected(
+            op.get("expected"),
+            {"track_id", "timeline_start_frame", "lane_index"},
+            "split_audio_track"))
         result = _apply_split_linked(
             scene,
-            _link_ref("audio", str(op.get("track_id", ""))),
+            _link_ref("audio", track.track_id),
             op.get("frame", 0),
             bool(op.get("apply_linked", False)),
         )
@@ -4857,9 +4988,15 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
 # runtime rather than trusting this comment, because an AST check cannot: the
 # handler legitimately receives `project`.
 #
-# Deliberately NOT here: `split_clip` / `split_audio_track`, whose no-op case and
-# `changed` reporting belong to `split-optimistic-local-apply.md` L1; and
-# `update_clip` / `update_audio_track`, handed to the guard-retrofit successor.
+# Deliberately NOT here: `split_clip` / `split_audio_track`, and the reason has
+# changed. It used to be that their no-op case was owned by an unlanded plan;
+# umbrella Phase C stage 2 L1 landed it, and the answer turned out to be that
+# they have no no-op case left to report. The anchor bounds check refuses a
+# frame the anchor does not contain, so every split that reaches the write has
+# divided something — there is no "all operations changed nothing" batch for
+# this allow-list to skip. Adding them would cost a scene comparison to prove a
+# property the guard already enforces. Also not here: `update_clip` /
+# `update_audio_track`, handed to the guard-retrofit successor.
 # Expiry: this set is an allow-list, so it needs no expiry — but every addition
 # owes the same runtime proof.
 _SCENE_ONLY_MUTATIONS = frozenset({
@@ -13462,6 +13599,10 @@ if routes is not None:
 
         if body.get("apply_linked"):
             return web.json_response({"scene": scene.to_dict(), **result})
+        # Reading `right_items[0]` is only correct because `_apply_split_linked`
+        # now refuses a frame the anchor does not contain. On the old no-op path
+        # the anchor itself was filed into one of the two groups, so this line
+        # could report the UNSPLIT clip as the "right" half.
         right_ref = result.get("right_items", [None])[0]
         right_clip = _find_clip(scene, right_ref["id"]) if right_ref else None
         return web.json_response({"left": clip.to_dict(), "right": right_clip.to_dict() if right_clip else None})

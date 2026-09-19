@@ -1134,10 +1134,7 @@ GUARD_EXEMPT_REASONS = {
                    "about items sitting past the end of their own media, and "
                    "says retrofitting the guard is a larger change than split.",
     "update_audio_track": "As update_clip; the same plan names both.",
-    "split_clip": "The Critical defect itself. split-optimistic-local-apply.md "
-                  "L1 adds the `expected` bounds guard; until it lands, this "
-                  "entry is the record that the gap is known and owned.",
-    "split_audio_track": "As split_clip; the same landing covers it.",
+
     "update_scene_fields": "Scene-level fields have no row to identify -- the "
                            "scene comes from the URL -- so what an `expected` "
                            "would protect is the field's prior value. Only four "
@@ -1293,12 +1290,7 @@ GUARD_EXEMPT_SITES = {
     "editor_widget.js:_saveNewPromptSectionWithinGesture:create_prompt_section": [
         ('fields', 'fields.<opaque>', 'type'),
     ],
-    "editor_widget.js:_splitClipAtFrameWithinGesture:split_audio_track": [
-        ('apply_linked', 'frame', 'track_id', 'type'),
-    ],
-    "editor_widget.js:_splitClipAtFrameWithinGesture:split_clip": [
-        ('apply_linked', 'clip_id', 'frame', 'type'),
-    ],
+
     "editor_widget.js:_toggleSelectedMuteWithinGesture:update_audio_track": [
         ('apply_linked', 'fields', 'fields.muted', 'track_id', 'type'),
     ],
@@ -1977,7 +1969,11 @@ def test_the_two_real_merges_are_read_as_effective():
 # deliberately FALSE `expected` on `update_clip`, and on
 # `update_scene_fields { width }`, both returned 200 and applied the write,
 # while the same shape on `update_scene_fields { global_channels }` returned
-# 409. 23 of the dispatcher's 38 branches ignore any `expected` sent.
+# 409. **15** of the dispatcher's 38 branches ignore any `expected` sent, down
+# from the 23 this comment recorded when the probe was run: umbrella Phase B
+# closed most of the gap and Phase C stage 2 L1 closed the two media splits.
+# Re-measure before citing it -- `_branches_reading_expected()` is the authority
+# and the count has moved twice.
 #
 # So `GUARD_EXEMPT_SITES` can be drained without protecting anything: add
 # `expected: { timeline_start_frame: x }` to an `update_clip` emission and the
@@ -2117,6 +2113,18 @@ _GUIDE_KEYS = frozenset({"guide_id", "frame_index", "asset_id", "source",
 _PROMPT_KEYS = frozenset({"prompt_id", "start_frame", "end_frame", "prompt",
                           "muted", "channels", "channel_docs", "attachments",
                           "global_channel_exceptions"})
+# The two media-split guards. Much narrower than their rows, and the omission
+# that matters is `timeline_end_frame`: the end is the field the author's own
+# previous cut rewrites, so guarding it refuses roughly half of every rapid-cut
+# burst. The full reasoning, and the probe that produced it, is beside
+# `_validate_clip_identity` in routes.py. Nothing about the source media is
+# guarded either, because an unrelated concurrent property edit must not refuse
+# a valid cut. `test_the_transcribed_key_sets_match_what_routes_compares`
+# re-reads both out of routes.py and
+# `test_an_emission_sends_every_key_its_branch_requires` re-reads the MANDATORY
+# set, so the client and the server cannot drift apart in either direction.
+_CLIP_KEYS = frozenset({"clip_id", "timeline_start_frame", "track_index", "role"})
+_AUDIO_KEYS = frozenset({"track_id", "timeline_start_frame", "lane_index"})
 
 GUARD_CONTRACTS = {
     # -- validates a closed key set -------------------------------------------
@@ -2167,6 +2175,16 @@ GUARD_CONTRACTS = {
     "split_prompt_section": (_FIXED, _PROMPT_KEYS,
         "`_validate_prompt_identity`, called in the branch before "
         "`_apply_split_linked`."),
+    "split_clip": (_FIXED, _CLIP_KEYS,
+        "`_validate_clip_identity`, called in the dispatch branch on the clip "
+        "`_find_clip` just resolved, with `_require_expected` making all five "
+        "keys mandatory. The anchor ref handed to `_apply_split_linked` is "
+        "built from that same validated object, so the guard and the split's "
+        "own resolution cannot name different clips. The branch is also where "
+        "the requirement lives rather than inside the validator, which keeps "
+        "the legacy REST split route -- no `expected` at all -- working."),
+    "split_audio_track": (_FIXED, _AUDIO_KEYS,
+        "`_validate_audio_identity`, the same shape as `split_clip`."),
     "swap_prompt_sections": (_FIXED, _PROMPT_KEYS,
         "`_apply_swap_prompt_sections` calls `_validate_prompt_identity` twice, "
         "under `expected_a` and `expected_b` rather than `expected`."),
@@ -2305,10 +2323,7 @@ GUARD_CONTRACTS.update({op: (_NOTHING, frozenset(), evidence) for op, evidence i
                            "`expected_type` decoy.",
     "set_lane_count": "`_set_scene_lane_count` takes a count; there is no row to "
                       "identify.",
-    "split_audio_track": "`_apply_split_linked` takes a ref and a frame; no "
-                         "bounds are compared.",
-    "split_clip": "`_apply_split_linked`; the Critical defect's enabling "
-                  "condition, and it is server-side.",
+
     "update_audio_track": "`_apply_update_audio_track` on the plain path and "
                           "`_apply_linked_bounds_update` on the linked one. "
                           "Neither reads expected.",
@@ -2744,6 +2759,135 @@ def test_no_emission_sends_a_guard_the_server_discards():
         + "; ".join(findings))
 
 
+def _required_expected_key_sets():
+    """`_require_expected(expected, {...}, "<op_type>")`, read out of routes.py.
+
+    Only calls whose LABEL is a dispatcher operation type are collected, which
+    is deliberate: the label is what ties a mandatory key set to the operation
+    a client emits, and using the op type as the label is the convention this
+    scan enforces by only being able to see branches that follow it. The older
+    `_require_expected` sites label themselves by prose ("update_reference",
+    "reference item mutation") and are out of scope for the same reason they
+    are out of scope for the emission scanner: their payloads are built
+    somewhere this file cannot follow.
+    """
+    tree = ast.parse(ROUTES.read_text(encoding="utf-8"))
+    op_types = _dispatcher_op_types()
+    required = {}
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_require_expected" and len(node.args) >= 3):
+            continue
+        keys, label = node.args[1], node.args[2]
+        if not (isinstance(label, ast.Constant) and label.value in op_types):
+            continue
+        if not (isinstance(keys, ast.Set) and all(
+                isinstance(element, ast.Constant) and isinstance(element.value, str)
+                for element in keys.elts)):
+            continue
+        required.setdefault(label.value, set()).update(
+            element.value for element in keys.elts)
+    return required
+
+
+def test_an_emission_sends_every_key_its_branch_requires():
+    """The direction the guard tripwire above cannot see, and the expensive one.
+
+    `test_no_emission_sends_a_guard_the_server_discards` checks *sent is a
+    subset of honoured* -- an extra key protects nothing and is caught. Nothing
+    checked the reverse, and `_require_expected` is a key-SET check that answers
+    a missing key with `400 missing_expected_identity`. So a refactor dropping
+    one key from a client payload makes **every** such gesture fail at runtime
+    while the whole suite stays green, because the backend tests build their own
+    payloads and the Node tests build their own intents.
+
+    That was harmless while the only `_require_expected` branches were Library
+    routes whose payloads this file cannot read. Umbrella Phase C stage 2 L1
+    made the media splits mandatory-guard operations on the timeline's most
+    frequent gesture, which is what makes the gap worth a scan.
+
+    Two directions, because they fail differently: an emission that sends SOME
+    of the required keys, and an emission that carries no `expected` at all --
+    the second is invisible to `_guarded_emissions` by construction.
+    """
+    required = _required_expected_key_sets()
+    assert required, (
+        "no dispatcher branch was read as requiring an `expected` key set. "
+        "Either the AST walk has stopped matching `_require_expected`, or the "
+        "labelling convention it depends on changed -- both make this tripwire "
+        "silently vacuous")
+
+    guarded = _guarded_emissions()
+    emissions = {}
+    for item in _operation_literals():
+        if item["op_type"] in required:
+            emissions.setdefault(
+                f"{item['module']}:{item['scope']}:{item['op_type']}", item)
+
+    findings = []
+    for key, item in sorted(emissions.items()):
+        needed = required[item["op_type"]]
+        site = guarded.get(key)
+        if not site:
+            findings.append(
+                f"{key} (line {item['line']}) sends no `expected` at all, but "
+                f"its dispatch branch requires {sorted(needed)} -- every one of "
+                "these gestures would 400 at runtime")
+            continue
+        sent = {field for container, guard, field in site["paths"]
+                if not container and guard == "expected"}
+        if "<opaque>" in sent:
+            continue  # OPAQUE_GUARD_SITES owns what a scan cannot read
+        missing = sorted(needed - sent)
+        if missing:
+            findings.append(
+                f"{key} (line {site['line']}) omits {missing}, which its "
+                f"dispatch branch requires -- this gesture would 400 at runtime")
+
+    assert not findings, (
+        "a mandatory `expected` key is missing from a client emission. This is "
+        "a hard runtime failure, not a weakened guard: `_require_expected` "
+        "refuses the whole batch with `400 missing_expected_identity` before "
+        "comparing anything. Add the key to the emission, or -- if the guard "
+        "genuinely should not require it -- narrow the set in the dispatch "
+        "branch, the validator's `checks` and the transcribed key set together: "
+        + "; ".join(findings))
+
+
+def test_the_required_key_scan_reads_the_branches_it_claims():
+    """Liveness. A scan that found nothing would pass the test above forever."""
+    required = _required_expected_key_sets()
+    assert required.get("split_clip") == {
+        "clip_id", "timeline_start_frame", "track_index", "role"}, (
+        f"split_clip's mandatory set reads as {sorted(required.get('split_clip', ()))}")
+    assert required.get("split_audio_track") == {
+        "track_id", "timeline_start_frame", "lane_index"}, (
+        "split_audio_track's mandatory set reads as "
+        f"{sorted(required.get('split_audio_track', ()))}")
+    # The MANDATORY set and the COMPARED set are two reads of two different
+    # pieces of code. They must agree, or one of them is decoration: a key
+    # required but not compared forces the client to send something nothing
+    # checks, and a key compared but not required is a guard the client can
+    # silently stop supplying.
+    assert required["split_clip"] == _CLIP_KEYS
+    assert required["split_audio_track"] == _AUDIO_KEYS
+
+
+def test_the_required_key_scan_would_catch_a_dropped_key():
+    """Drive the scan against a payload missing two mandatory keys."""
+    emission = _scan_text(
+        'function g() { this._runSceneMutation([{ type: "split_clip", '
+        'clip_id: id, frame, expected: { clip_id: id, timeline_start_frame: 0 } }]); }\n')
+    assert emission, "the harness emission did not parse"
+    sent = {field for container, guard, field
+            in _guard_key_paths(emission[0]["extent"], emission[0]["mask"])
+            if not container and guard == "expected"}
+    missing = _required_expected_key_sets()["split_clip"] - sent
+    assert missing == {"track_index", "role"}, (
+        f"the scan reads the shortened payload as missing {sorted(missing)}; it "
+        "must see exactly the two keys that were dropped")
+
+
 def test_an_opaque_guard_is_catalogued_rather_than_assumed_honoured():
     """Opaque is a named class. Silence would be the false-confidence test."""
     opaque = {key for key, site in _guarded_emissions().items()
@@ -3016,18 +3160,16 @@ GUARD_SITE_DISPOSITIONS = {
         "through `rebaseLaneIndex`, and `_consolidate_media_items` range-checks it "
         "and refuses an id it cannot resolve. The item ids are durable, so "
         "nothing here is addressed by position without a check."),
-
-    # -- owned by an approved plan -------------------------------------------
-    "editor_widget.js:_splitClipAtFrameWithinGesture:split_clip": (_GAP,
-        "The Critical defect itself. split-optimistic-local-apply.md L1 adds the "
-        "`expected` bounds guard; not this phase's to take."),
-    "editor_widget.js:_splitClipAtFrameWithinGesture:split_audio_track": (_GAP,
-        "As `split_clip`; split-optimistic-local-apply.md L1 covers both."),
 }
 
 
 def test_every_unguarded_emission_has_a_site_disposition():
-    """Per site, not per operation. 47 emissions, 46 keys, one decision each."""
+    """Per site, not per operation. 36 emissions, 35 keys, one decision each.
+
+    The count falls as guards land -- it was 47/46 before umbrella Phase B, and
+    Phase C stage 2 L1 took the two media splits out. Measured from
+    `_unguarded_payload_sites()`, never typed.
+    """
     sites = _unguarded_payload_sites()
     undecided = sorted(set(sites) - set(GUARD_SITE_DISPOSITIONS))
     assert not undecided, (
@@ -3100,8 +3242,10 @@ def test_the_dispositions_hold_the_findings_the_trace_established():
 
     # Every emission of these is a gap: the branch compares nothing and the
     # payload names a row or a lane the client read from a view that can be stale.
-    for op_type in ("update_clip", "update_audio_track",
-                    "split_clip", "split_audio_track"):
+    # `split_clip` and `split_audio_track` were here until umbrella Phase C
+    # stage 2 L1 gave both a dispatch-branch guard; they now carry a _FIXED
+    # contract instead, which is what drained their disposition entries.
+    for op_type in ("update_clip", "update_audio_track"):
         assert by_op.get(op_type) == {_GAP}, (
             f"{op_type} was traced as a gap at every site; it now reads as "
             f"{sorted(by_op.get(op_type, ()))}. Re-refute the trace before "
@@ -3179,6 +3323,12 @@ def test_the_transcribed_key_sets_match_what_routes_compares():
     assert _PROMPT_KEYS == _validator_key_set("_validate_prompt_identity"), (
         "_PROMPT_KEYS no longer matches the keys `_validate_prompt_identity` "
         f"compares: {sorted(_PROMPT_KEYS ^ _validator_key_set('_validate_prompt_identity'))}")
+    assert _CLIP_KEYS == _validator_key_set("_validate_clip_identity"), (
+        "_CLIP_KEYS no longer matches the keys `_validate_clip_identity` "
+        f"compares: {sorted(_CLIP_KEYS ^ _validator_key_set('_validate_clip_identity'))}")
+    assert _AUDIO_KEYS == _validator_key_set("_validate_audio_identity"), (
+        "_AUDIO_KEYS no longer matches the keys `_validate_audio_identity` "
+        f"compares: {sorted(_AUDIO_KEYS ^ _validator_key_set('_validate_audio_identity'))}")
     honoured = GUARD_CONTRACTS["update_scene_fields"][1]
     assert honoured == _direct_global_prompt_fields(), (
         "update_scene_fields' honoured set no longer matches "
@@ -3267,6 +3417,11 @@ GUARDED_OPERATIONS_NEEDING_A_MESSAGE = frozenset({
     "remove_lane", "create_guide", "move_guide",
     "create_reference_item", "replace_prompt_sections", "bulk_delete_items",
     "create_link_group", "unlink_items",
+    # Added by umbrella Phase C stage 2 L1. A stale cut used to be the quietest
+    # failure in the editor -- 200, `split_count: 0`, no change and no message.
+    # Now that the dispatch refuses it, the refusal has to reach the user, or
+    # the landing has replaced a silent no-op with a silent rollback.
+    "split_clip", "split_audio_track",
 })
 
 
