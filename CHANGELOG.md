@@ -12,6 +12,7 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Changed
+- **⌇ Split Here** now acts only on the selection, and covers prompt sections as well as clips, audio and Reference items. It no longer falls back to cutting whatever happens to sit under the playhead when nothing is selected — it says so instead. Splitting several selected items at once is one undo step.
 - Durable components use shorter full-hash filenames (storage format 3); format-2 projects migrate automatically on their next version-bumping save. Newly migrated projects cannot be opened by 0.5.0 or earlier. Format-1 projects retain their format until a history edit, then migrate on the following save.
 - Project route reads and saves run off the event loop, including the first automatic component migration.
 - Project reads and saves now use their own worker threads, so a long automatic migration no longer delays thumbnails, media probes or uploads waiting behind it.
@@ -23,6 +24,10 @@ a fresh `[Unreleased]` block.
 - The standalone `DELETE` routes for clips, guides, prompt sections and audio tracks. These operations are owned by the scene mutations endpoint, which accepts an identity snapshot of the target that the old routes could not send, and which rewrites the link groups they left behind.
 
 ### Fixed
+- A split that cannot happen now says why. Aiming a cut outside an item, at a locked lane, at a Driver clip, or at nothing at all used to do nothing and show nothing; each of those now names what it refused. Splitting a selection where only some items cross the cut splits those and names the rest.
+- Splitting a prompt section now refreshes the Prompt tool, which previously kept showing the sections as they were before the cut until it was refreshed by hand. This includes cutting a clip that is linked to a prompt section, where the section is split too.
+- A split that is refused now says that none of its cuts were applied, when it covered more than one item. Every cut in one split is saved together, so one refused item stops them all; previously the message named only the item that was refused.
+- Splitting two linked items that were both selected no longer sends two cuts for one group, where the second could not apply.
 - A cut aimed at a clip, audio track or prompt section that no longer spans that frame is now refused and said so, instead of quietly doing nothing while still saving the whole project. This happened whenever a second cut was made before the first had finished saving.
 - Rapid mute toggles on one selection no longer queue a full project save each; they collapse the way lane-header clicks now do. Repeated clip-role conversions on one clip collapse too, though that gesture is reached through a context menu and rarely repeats fast enough to matter.
 - Rapid clicks on a lane header's hide control no longer queue one full project save each. A burst now costs one save per save already in flight, instead of one per click: six quick clicks were measured at 24.2 seconds of serialized saving, and a longer burst at over seven minutes. Clicks on different lanes are still saved separately, so each stays its own undo step.

@@ -2010,3 +2010,394 @@ def test_a_selected_mute_burst_keeps_the_oldest_reference_guard():
         assert.equal(refs[0].expected.muted, true);
         assert.equal(refs[0].fields.muted, true);
     """)
+
+
+# ── Split: one path, one gesture (umbrella Phase C stage 2 L2/L3) ────────────
+#
+# The razor and "Split Here" share `_splitItemsAtFrameWithinGesture`, so these
+# drive the real method against a plain-object scene. What they pin is the part
+# a manual check cannot see reliably: how many operations one gesture emits, how
+# many undo entries it pushes, and whether a refusal reached the bus at all.
+
+_SPLIT_SETUP = """
+    const notes = await import('./web/js/editor_notifications.js');
+    function splitWidget(scene) {
+        const w = makeWidget();
+        w.activeScene = scene;
+        w.totalFrames = 1000;
+        w.undos = [];
+        w._pushUndo = (label) => { const e = {label}; w.undos.push(e); return e; };
+        w._isItemLocked = () => false;
+        w._isMotionDriverClip = () => false;
+        w._clipTrackType = () => 'video';
+        w._isLaneLocked = () => false;
+        w._isPromptTrackLocked = () => false;
+        // `_isLinkedItem`, `_expandItemsWithLinked`, `_selectionItemKey`,
+        // `_linkRefForItem`, `_linkRefKey`, `_linkGroupForItem` and
+        // `_findSceneItemForLinkRef` are all left REAL. The closure key is the
+        // thing these tests are about, so stubbing the helpers that build it
+        // would make the assertion supply its own answer.
+        w._buildTrackLayout = () => {};
+        w._refreshPromptContextDependencyConsumers = () => { w.promptRefreshes = (w.promptRefreshes || 0) + 1; };
+        w._warnOnSplitReferenceChipBindings = () => {};
+        w._findSceneItemBySelection = (type, id) => {
+            if (type === 'clip') {
+                const clip = (scene.clips || []).find((c) => String(c.clip_id) === String(id));
+                return clip ? {type, id: clip.clip_id, data: clip} : null;
+            }
+            if (type === 'audio') {
+                const track = (scene.audio_tracks || []).find((t) => String(t.track_id) === String(id));
+                return track ? {type, id: track.track_id, data: track} : null;
+            }
+            return null;
+        };
+        w._selectionItemKey = (item) => `${item?.type || ''}:${String(item?.id ?? '')}`;
+        w.sent = [];
+        w._runSceneMutation = (operations, options) => w._queueProjectMutation({
+            ...options, refreshScenes: false, intent: {operations},
+            run: async () => { w.sent.push({operations, options}); return {payload: {results: []}}; },
+        });
+        return w;
+    }
+    function captureNotes() {
+        notes._resetForTest();
+        const seen = [];
+        notes.subscribe((list) => { for (const item of list) {
+            if (!seen.some((v) => v.id === item.id)) seen.push(item);
+        } });
+        return seen;
+    }
+    const clipScene = () => ({
+        scene_id: 'scene',
+        clips: [{clip_id: 'c1', timeline_start_frame: 0, timeline_end_frame: 100,
+                 track_index: 0, role: 'render'}],
+        audio_tracks: [{track_id: 'a1', timeline_start_frame: 0, timeline_end_frame: 100,
+                        lane_index: 0}],
+        prompt_sections: [],
+    });
+"""
+
+
+def test_a_split_gesture_emits_one_operation_per_link_closure():
+    """Two selected members of ONE group are one cut, not two.
+
+    `_apply_split_linked` dissolves the group and moves the left half on its
+    first pass, so a second operation over the same closure finds an anchor
+    whose bounds it has already changed. Before stage 2 L1 that was silent; it
+    is now a 400 that refuses the WHOLE gesture, which is worse for the author
+    and exactly the shape the Critical entry describes.
+    """
+    _run_gesture_node(_SPLIT_SETUP + """
+        const scene = clipScene();
+        // A REAL link group. `_expandItemsWithLinked` resolves it through
+        // `_linkGroupForItem`, so both members must produce the same closure key
+        // for the dedupe to fire -- which is the property under test.
+        scene.linked_item_groups = [{group_id: 'g1', items: [
+            {type: 'clip', id: 'c1'}, {type: 'audio', id: 'a1'}]}];
+        const w = splitWidget(scene);
+        const keys = [
+            w._planItemSplit({type: 'clip', id: 'c1', data: scene.clips[0]}, 50).closureKey,
+            w._planItemSplit({type: 'audio', id: 'a1', data: scene.audio_tracks[0]}, 50).closureKey,
+        ];
+        assert.equal(keys[0], keys[1], 'both members name one closure');
+        assert.equal(keys[0], 'audio:a1|clip:c1', 'sorted, so selection order cannot change it');
+        await w._splitItemsAtFrame([
+            {type: 'clip', id: 'c1', data: scene.clips[0]},
+            {type: 'audio', id: 'a1', data: scene.audio_tracks[0]},
+        ], 50);
+        assert.equal(w.sent.length, 1, 'one write');
+        assert.equal(w.sent[0].operations.length, 1, 'one operation for one closure');
+        assert.equal(w.sent[0].operations[0].type, 'split_clip');
+        assert.equal(w.sent[0].operations[0].apply_linked, true);
+        assert.equal(w.undos.length, 1, 'one undo entry');
+        assert.equal(w.sent[0].options.historyEntry, w.undos[0],
+            'the entry is passed explicitly, not left to the capture candidate');
+        assert.equal(w.sent[0].options.coalesce, false);
+    """)
+
+
+def test_unlinked_targets_batch_into_one_gesture_with_one_undo_entry():
+    """Several independent cuts are one author action and one history step."""
+    _run_gesture_node(_SPLIT_SETUP + """
+        const scene = clipScene();
+        const w = splitWidget(scene);
+        await w._splitItemsAtFrame([
+            {type: 'clip', id: 'c1', data: scene.clips[0]},
+            {type: 'audio', id: 'a1', data: scene.audio_tracks[0]},
+        ], 50);
+        assert.equal(w.sent.length, 1);
+        assert.deepEqual(w.sent[0].operations.map((op) => op.type),
+            ['split_clip', 'split_audio_track']);
+        assert.equal(w.undos.length, 1);
+        assert.equal(w.undos[0].label, 'split 2 items');
+    """)
+
+
+def test_a_wholly_refused_split_is_history_neutral_and_says_why():
+    """Planning before `_pushUndo` is what keeps this true as targets multiply.
+
+    The old single-target path was already history-neutral -- it pushed its entry
+    after all five refusal checks -- so this is not a defect being fixed. What
+    changed is that a gesture now plans N targets and pushes ONE entry, and the
+    only ordering that stays neutral when SOME targets refuse is plan-everything
+    first. Pushing per target, or pushing before planning, would strand an entry
+    naming cuts that never happened. The message half IS new: most of those old
+    refusals returned in silence.
+    """
+    _run_gesture_node(_SPLIT_SETUP + """
+        const scene = clipScene();
+        const w = splitWidget(scene);
+        const seen = captureNotes();
+        // Frame 300 is past the clip's end and outside the audio track too.
+        await w._splitItemsAtFrame([
+            {type: 'clip', id: 'c1', data: scene.clips[0]},
+            {type: 'audio', id: 'a1', data: scene.audio_tracks[0]},
+        ], 300);
+        assert.equal(w.sent.length, 0, 'nothing written');
+        assert.equal(w.undos.length, 0, 'no history entry to strand');
+        assert.equal(seen.length, 1, 'one message, not one per target');
+        assert.match(seen[0].message, /do not cross the split frame/);
+        assert.equal(seen[0].tier, 'warning');
+    """)
+
+
+def test_a_partly_refused_split_cuts_what_qualifies_and_names_the_rest():
+    """Split the ones that cross; name the ones that did not."""
+    _run_gesture_node(_SPLIT_SETUP + """
+        const scene = clipScene();
+        scene.audio_tracks[0].timeline_end_frame = 20;
+        const w = splitWidget(scene);
+        const seen = captureNotes();
+        await w._splitItemsAtFrame([
+            {type: 'clip', id: 'c1', data: scene.clips[0]},
+            {type: 'audio', id: 'a1', data: scene.audio_tracks[0]},
+        ], 50);
+        assert.equal(w.sent.length, 1);
+        assert.deepEqual(w.sent[0].operations.map((op) => op.type), ['split_clip']);
+        assert.equal(seen.length, 1);
+        // The wording changes with the outcome: "left whole" is a report,
+        // "A cut has to fall inside an item" is a failure.
+        assert.match(seen[0].message, /left whole/);
+    """)
+
+
+def test_each_refusal_reason_gets_its_own_notification_source():
+    """`editor_notifications.js` coalesces on `src:<source>`.
+
+    A shared source would let two different sentences replace one another, so
+    the author would be told about one refusal and never the other.
+    """
+    _run_gesture_node(_SPLIT_SETUP + """
+        const scene = clipScene();
+        // The audio track still spans the cut, so it reaches the lock check;
+        // the clip does not, so it stops at the bounds check. Bounds is tested
+        // first -- as it was before this landing -- so a frame outside BOTH
+        // would collapse the two into one reason and prove nothing.
+        scene.audio_tracks[0].timeline_end_frame = 500;
+        const w = splitWidget(scene);
+        w._isItemLocked = (item) => item.type === 'audio';
+        const seen = captureNotes();
+        await w._splitItemsAtFrame([
+            {type: 'clip', id: 'c1', data: scene.clips[0]},
+            {type: 'audio', id: 'a1', data: scene.audio_tracks[0]},
+        ], 300);
+        assert.equal(w.sent.length, 0);
+        assert.equal(seen.length, 2, 'both refusals reached the bus');
+        assert.equal(new Set(seen.map((v) => v.source)).size, 2);
+        assert.ok(seen.some((v) => /locked lane/.test(v.message)));
+        assert.ok(seen.some((v) => /cross the split frame/.test(v.message)));
+    """)
+
+
+def test_split_here_with_nothing_selected_says_so_and_writes_nothing():
+    """The removed fallback's replacement.
+
+    "Split Here" used to cut whatever sat under the playhead when nothing was
+    selected, which made it a second razor with different rules -- it could
+    never reach a Reference item and silently ignored prompt sections.
+    """
+    _run_gesture_node(_SPLIT_SETUP + """
+        const w = splitWidget(clipScene());
+        const seen = captureNotes();
+        await w._splitItemsAtFrame([], 50);
+        assert.equal(w.sent.length, 0);
+        assert.equal(w.undos.length, 0);
+        assert.equal(seen.length, 1);
+        assert.match(seen[0].message, /Select a clip/);
+    """)
+
+
+def test_a_prompt_split_is_addressed_by_prompt_id_not_the_selection_index():
+    """`_split_prompt_object` re-sorts `prompt_sections` on every cut.
+
+    An index captured when the section was selected therefore names a different
+    row after any earlier cut, and the wire operation is index-addressed, so the
+    translation has nowhere to happen but here. The selection below claims index
+    0 while its `prompt_id` now sits at index 1.
+    """
+    _run_gesture_node(_SPLIT_SETUP + """
+        const scene = clipScene();
+        scene.prompt_sections = [
+            {prompt_id: 'p-early', start_frame: 0, end_frame: 40},
+            {prompt_id: 'p-late', start_frame: 40, end_frame: 100},
+        ];
+        const w = splitWidget(scene);
+        await w._splitItemsAtFrame([
+            {type: 'prompt', id: 0, data: {prompt_id: 'p-late', start_frame: 40, end_frame: 100}},
+        ], 60);
+        assert.equal(w.sent.length, 1);
+        const op = w.sent[0].operations[0];
+        assert.equal(op.type, 'split_prompt_section');
+        assert.equal(op.index, 1, 'the index `p-late` currently occupies');
+        assert.equal(op.expected.prompt_id, 'p-late');
+        // The Prompt panel holds no scene subscription, so a prompt split that
+        // does not call this leaves it showing the pre-cut sections.
+        assert.equal(w.promptRefreshes, 1);
+    """)
+
+
+def test_follow_up_work_reads_the_whole_closure_not_just_the_anchor():
+    """The defect an adversarial audit of this landing found.
+
+    `_apply_split_linked` splits every in-bounds member of the closure, so a cut
+    anchored on a CLIP that is linked to a prompt section splits the prompt
+    section too. Deriving the follow-up work from the anchor's type meant the
+    Prompt panel refresh depended on which member of the group the author
+    happened to click or select first -- and the razor, whose anchor is always
+    the item under the cursor, never refreshed at all. The panel holds no scene
+    subscription, so the author was left looking at the pre-cut sections: exactly
+    the defect this landing claims to close.
+
+    Both orders are driven here, because one order passed before the fix.
+    """
+    _run_gesture_node(_SPLIT_SETUP + """
+        function linkedClipAndPrompt() {
+            const scene = clipScene();
+            scene.prompt_sections = [{prompt_id: 'p1', start_frame: 0, end_frame: 100}];
+            scene.linked_item_groups = [{group_id: 'g1', items: [
+                {type: 'clip', id: 'c1'}, {type: 'prompt', id: 'p1'}]}];
+            return scene;
+        }
+        for (const anchorFirst of ['clip', 'prompt']) {
+            const scene = linkedClipAndPrompt();
+            const w = splitWidget(scene);
+            const clipHit = {type: 'clip', id: 'c1', data: scene.clips[0]};
+            const promptHit = {type: 'prompt', id: 0, data: scene.prompt_sections[0]};
+            const order = anchorFirst === 'clip' ? [clipHit, promptHit] : [promptHit, clipHit];
+            await w._splitItemsAtFrame(order, 50);
+            assert.equal(w.sent.length, 1, `${anchorFirst}: one closure, one operation`);
+            assert.equal(w.sent[0].operations.length, 1);
+            assert.equal(w.sent[0].operations[0].apply_linked, true);
+            // The server splits the prompt member either way, so the panel must
+            // be refreshed either way.
+            assert.equal(w.promptRefreshes, 1,
+                `${anchorFirst} anchor: the Prompt panel must be refreshed`);
+            // And the label says the cut covered a group rather than naming one
+            // member, which was previously order-dependent too.
+            assert.equal(w.undos[0].label, `split linked ${anchorFirst}`);
+        }
+
+        // The razor path: ONE hit, always the item under the cursor, linked.
+        const scene = linkedClipAndPrompt();
+        const w = splitWidget(scene);
+        await w._splitItemsAtFrame([{type: 'clip', id: 'c1', data: scene.clips[0]}], 50);
+        assert.equal(w.promptRefreshes, 1,
+            'a razor cut on a clip linked to a prompt section still splits it');
+    """)
+
+
+def test_a_multi_target_split_failure_says_no_cut_was_applied():
+    """One refused target abandons every other cut, and that has to be said.
+
+    The batch is all-or-nothing by design -- it is what makes one undo entry an
+    honest claim -- but the previous "Split Here" looped one gesture per target,
+    so the others DID land. A server message naming one stale clip would
+    otherwise read as though the rest succeeded.
+    """
+    _run_gesture_node(_SPLIT_SETUP + """
+        const scene = clipScene();
+        const w = splitWidget(scene);
+        w._runSceneMutation = (operations, options) => {
+            w.sent.push({operations, options});
+            return Promise.reject(new Error("This clip's start frame changed."));
+        };
+        await w._splitItemsAtFrame([
+            {type: 'clip', id: 'c1', data: scene.clips[0]},
+            {type: 'audio', id: 'a1', data: scene.audio_tracks[0]},
+        ], 50);
+        const message = w.sent[0].options.failureMessage(
+            new Error("This clip's start frame changed."));
+        assert.match(message, /start frame changed/, 'the server wording survives');
+        assert.match(message, /None of the 2 cuts/, 'and the batch outcome is disclosed');
+
+        // A single-target gesture says only what the server said -- there is no
+        // other cut to report on, and padding every refusal would be noise.
+        const solo = splitWidget(clipScene());
+        solo._runSceneMutation = (operations, options) => {
+            solo.sent.push({operations, options});
+            return Promise.reject(new Error('nope'));
+        };
+        await solo._splitItemsAtFrame(
+            [{type: 'clip', id: 'c1', data: solo.activeScene.clips[0]}], 50);
+        assert.equal(solo.sent[0].options.failureMessage(new Error('nope')), 'nope');
+    """)
+
+
+def test_a_boundary_miss_auto_dismisses_while_a_real_refusal_stays():
+    """Warnings are sticky and the toast stack has no cap.
+
+    In razor mode `_hitTestClip` matches inclusively at both edges and
+    `_xToFrame` rounds, so at high zoom a click within half a frame of an edge --
+    or on the seam between two abutting clips -- resolves to the boundary. That
+    is an aiming miss, and leaving a card the author must dismiss by hand for
+    every near-miss is a worse trade than the silence it replaced.
+    """
+    _run_gesture_node(_SPLIT_SETUP + """
+        const policy = splitWidget(clipScene());
+        // The policy itself. 0 is what `editor_notifications.js` reads as "no
+        // override", so these reasons keep the sticky default their tier gives
+        // them -- three of them were already sticky before this landing.
+        assert.ok(policy._splitRefusalDurationMs('outside_bounds') > 0);
+        for (const reason of ['lane_locked', 'linked_locked', 'driver', 'missing']) {
+            assert.equal(policy._splitRefusalDurationMs(reason), 0, reason);
+        }
+
+        // And the runner consults it for every refusal it raises, rather than
+        // the policy existing beside a call site that ignores it. The subscriber
+        // projection drops `_ttl`, so the wiring is not observable from the bus.
+        const scene = clipScene();
+        // The audio track still spans the cut so it reaches the lock check.
+        scene.audio_tracks[0].timeline_end_frame = 500;
+        const w = splitWidget(scene);
+        w._isItemLocked = (item) => item.type === 'audio';
+        const asked = [];
+        w._splitRefusalDurationMs = (reason) => { asked.push(reason); return 0; };
+        const seen = captureNotes();
+        // Frame 100 is exactly the clip's end -- `_hitTestClip` matches
+        // inclusively there, so razor mode really can produce it.
+        await w._splitItemsAtFrame([
+            {type: 'clip', id: 'c1', data: scene.clips[0]},
+            {type: 'audio', id: 'a1', data: scene.audio_tracks[0]},
+        ], 100);
+        assert.deepEqual(asked.sort(), ['lane_locked', 'outside_bounds']);
+        assert.equal(seen.filter((v) => /timeline-split-refused/.test(v.source)).length, 2);
+    """)
+
+
+def test_a_target_the_scene_no_longer_holds_refuses_instead_of_throwing():
+    """The one silent failure left after "every silent return now notifies".
+
+    A stale selection can name a row the scene no longer holds.
+    `_resolveSplitTarget` falls back to the raw hit, so the bounds read went
+    through `undefined` and threw a TypeError out of the gesture -- and the razor
+    does not await, so it became an unhandled rejection nobody ever saw.
+    """
+    _run_gesture_node(_SPLIT_SETUP + """
+        const w = splitWidget(clipScene());
+        const seen = captureNotes();
+        await w._splitItemsAtFrame([{type: 'clip', id: 'ghost'}], 50);
+        assert.equal(w.sent.length, 0);
+        assert.equal(w.undos.length, 0);
+        assert.equal(seen.length, 1);
+        assert.match(seen[0].message, /no longer on the timeline/);
+    """)

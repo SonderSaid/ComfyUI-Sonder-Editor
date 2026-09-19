@@ -478,36 +478,30 @@ export function buildEditorToolbar(widget) {
         widget._updateToolbar();
     });
 
-    const cutHereBtn = makeToolButton("\u2307 Split Here", "", "Split clip/audio/Reference at playhead", async () => {
-        // Reference items are selected through the same `selectedItems` path and
-        // divide the same way, so they belong in this filter. Their `-1` end
-        // means "follow scene end", which is the bar the user actually sees.
-        const splitSpan = (item) => (item.type === "reference"
-            ? [item.data.start_frame || 0,
-                item.data.end_frame === -1 ? widget.totalFrames : item.data.end_frame]
-            : [item.data.timeline_start_frame, item.data.timeline_end_frame]);
-        const selectedTargets = widget.selectedItems
-            .filter((item) => (item.type === "clip" || item.type === "audio"
-                    || item.type === "reference")
-                && widget.playhead > splitSpan(item)[0]
-                && widget.playhead < splitSpan(item)[1]);
-        if (selectedTargets.length) {
-            for (const hit of selectedTargets) {
-                await widget._splitClipAtFrame(hit, widget.playhead);
-            }
-            return;
-        }
-
-        const clip = widget._getClipAtFrame(widget.playhead) || widget._getMotionDriverClipAtFrame(widget.playhead);
-        if (clip) {
-            await widget._splitClipAtFrame({ type: "clip", id: clip.clip_id, data: clip }, widget.playhead);
-        }
-        const audio = widget._getAudioAtFrame(widget.playhead);
-        if (audio) {
-            await widget._splitClipAtFrame({ type: "audio", id: audio.track_id, data: audio }, widget.playhead);
-        }
+    // SELECTION-ONLY, deliberately. The button used to fall back to whatever sat
+    // under the playhead when nothing was selected, which made it a second,
+    // differently-behaved razor: it silently ignored prompt sections, could
+    // never reach a Reference item, and cut something the author had not named.
+    // Nothing selected now says so. The button is NOT greyed -- no top-chrome
+    // button is, and `setButtonDisabled` has no callers in this file.
+    //
+    // The playhead-crossing test is deliberately NOT applied here. `_planItemSplit`
+    // already refuses an item the frame falls outside and the runner names it, so
+    // filtering it out here would go back to splitting the ones that cross and
+    // saying nothing about the rest -- which is the silence this landing removes.
+    // The type filter stays: a guide or a global-prompt row is not a split target
+    // under any reading, and naming it every time would be noise, not disclosure.
+    const cutHereBtn = makeToolButton("\u2307 Split Here", "", "Split the selection at the playhead", async () => {
+        // A prompt section and a Reference item are both source-less half-open
+        // scopes selected through this same `selectedItems` path, and both divide
+        // the same way, so both belong here. Prompt was missing outright: the
+        // razor has always cut prompt sections and this button never could.
+        const selectedTargets = (widget.selectedItems || [])
+            .filter((item) => item && (item.type === "clip" || item.type === "audio"
+                || item.type === "reference" || item.type === "prompt"));
+        await widget._splitItemsAtFrame(selectedTargets, widget.playhead);
     });
-    cutHereBtn.title = "Split the selected clip, audio or Reference item at the current playhead position";
+    cutHereBtn.title = "Split the selected clips, audio, prompt sections or Reference items at the current playhead position";
 
     const frameLabel = document.createElement("span");
     frameLabel.style.cssText = labelCss({ marginLeft: "2px", fontSize: "9px" });

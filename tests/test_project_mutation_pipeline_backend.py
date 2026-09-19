@@ -4404,3 +4404,103 @@ def test_bulk_delete_linked_still_accepts_durable_members_with_no_snapshot(
     assert response.status == 200, _response_json(response)
     assert scene.clips == []
     assert scene.audio_tracks == []
+
+
+def test_a_multi_target_split_batch_applies_every_cut_in_one_save(
+        monkeypatch, tmp_path):
+    """Umbrella Phase C stage 2 L3's central claim, on the server side.
+
+    The client now emits ONE operations array for a whole gesture and pushes ONE
+    undo entry against it. That entry makes one claim -- "these cuts happened" --
+    so it is only honest if the batch is all-or-nothing and costs one write. It
+    is: `_load_project_from_request` reloads per request and `save_project` runs
+    once after the whole comprehension.
+
+    `split_count` and `left_items` / `right_items` had no coverage at all before
+    this, so the response shape is asserted here rather than assumed.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=200)
+    scene.clips = [ClipReference(clip_id="clip-a", source_path="media/a.mp4",
+                                 timeline_start_frame=0, timeline_end_frame=100,
+                                 source_in_frame=0, source_out_frame=100,
+                                 total_source_frames=100, track_index=0)]
+    scene.audio_tracks = [AudioTrack(track_id="audio-a", source_path="media/a.wav",
+                                     timeline_start_frame=0, timeline_end_frame=100,
+                                     source_in_frame=0, total_source_frames=100,
+                                     lane_index=0)]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    saves = []
+
+    response = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [
+        {"type": "split_clip", "clip_id": "clip-a", "frame": 40,
+         "apply_linked": False,
+         "expected": {"clip_id": "clip-a", "timeline_start_frame": 0,
+                      "track_index": 0, "role": "render"}},
+        {"type": "split_audio_track", "track_id": "audio-a", "frame": 60,
+         "apply_linked": False,
+         "expected": {"track_id": "audio-a", "timeline_start_frame": 0,
+                      "lane_index": 0}},
+    ], saves)
+
+    assert response.status == 200, _response_json(response)
+    # Not a property of split -- every batch through this route saves once --
+    # but it is the premise the single undo entry rests on, so it is stated
+    # where the batch is exercised rather than assumed from elsewhere.
+    assert len(saves) == 1, "one gesture, one document write"
+    assert sorted((clip.timeline_start_frame, clip.timeline_end_frame)
+                  for clip in scene.clips) == [(0, 40), (40, 100)]
+    assert sorted((track.timeline_start_frame, track.timeline_end_frame)
+                  for track in scene.audio_tracks) == [(0, 60), (60, 100)]
+
+    results = _response_json(response)["results"]
+    assert [item["type"] for item in results] == ["split_item", "split_item"]
+    assert [item["split_count"] for item in results] == [1, 1]
+    # The anchor is filed left and the new half right, which is what the client
+    # asserts its minted id against from stage 2 L4 onward.
+    assert results[0]["left_items"] == [{"type": "clip", "id": "clip-a"}]
+    assert len(results[0]["right_items"]) == 1
+    assert results[0]["right_items"][0]["type"] == "clip"
+    assert results[0]["right_items"][0]["id"] != "clip-a"
+
+
+def test_one_refused_cut_in_a_batch_leaves_the_earlier_cut_unwritten(
+        monkeypatch, tmp_path):
+    """The premise under "one undo entry for the whole gesture".
+
+    If a later operation could be refused while an earlier one had already been
+    committed, one entry would be a claim about a state that never existed and
+    its inverse would over-reverse. The first cut mutates the in-memory scene,
+    but nothing is saved, and the next request reloads from disk.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=200)
+    scene.clips = [
+        ClipReference(clip_id="clip-a", source_path="media/a.mp4",
+                      timeline_start_frame=0, timeline_end_frame=100,
+                      source_in_frame=0, source_out_frame=100,
+                      total_source_frames=100, track_index=0),
+        ClipReference(clip_id="clip-b", source_path="media/b.mp4",
+                      timeline_start_frame=0, timeline_end_frame=100,
+                      source_in_frame=0, source_out_frame=100,
+                      total_source_frames=100, track_index=1),
+    ]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    saves = []
+
+    response = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [
+        {"type": "split_clip", "clip_id": "clip-a", "frame": 40,
+         "apply_linked": False,
+         "expected": {"clip_id": "clip-a", "timeline_start_frame": 0,
+                      "track_index": 0, "role": "render"}},
+        # Aimed outside `clip-b`: the anchor bounds check refuses 400, and the
+        # whole request is abandoned before `save_project`.
+        {"type": "split_clip", "clip_id": "clip-b", "frame": 500,
+         "apply_linked": False,
+         "expected": {"clip_id": "clip-b", "timeline_start_frame": 0,
+                      "track_index": 1, "role": "render"}},
+    ], saves)
+
+    assert response.status == 400, _response_json(response)
+    assert _response_json(response)["code"] == "invalid_range"
+    assert saves == [], "a refused batch writes nothing, including its earlier cut"

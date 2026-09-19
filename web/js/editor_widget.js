@@ -3986,7 +3986,7 @@ export class EditorWidget {
                 // Re-snapshotting either value against the ordered scene would
                 // make that guard check the current state against itself and it
                 // could never fire. A moved bound therefore refuses, and
-                // `_splitClipAtFrameWithinGesture` toasts the refusal.
+                // `_splitItemsAtFrameWithinGesture` toasts the refusal.
                 break;
             case "split_clip":
             case "split_audio_track":
@@ -8739,7 +8739,7 @@ export class EditorWidget {
                     // Razor mode: split clip or audio at click position
                     const hit = this._hitTestItem(x, rawY);
                     if (hit && SPLITTABLE_ITEM_TYPES.has(hit.type)) {
-                        this._splitClipAtFrame(hit, frame);
+                        this._splitItemsAtFrame([hit], frame);
                     }
                     return;
                 } else {
@@ -16653,54 +16653,113 @@ export class EditorWidget {
      *  unresolvable in exactly the windows the original resolves.
      */
     _warnOnSplitReferenceChipBindings(result) {
-        const outcome = (result?.payload?.results || []).find(
-            (value) => value?.type === "split_reference_item");
-        const count = Number(outcome?.bound_attachment_count || 0);
-        if (!Number.isFinite(count) || count <= 0) return;
+        // SUMMED, not `find`ed: one gesture can now split several Reference
+        // items, and reading only the first result would under-report the
+        // bindings an author has to rebind before their next render.
+        let count = 0;
+        let items = 0;
+        for (const outcome of result?.payload?.results || []) {
+            if (outcome?.type !== "split_reference_item") continue;
+            const bound = Number(outcome.bound_attachment_count || 0);
+            if (Number.isFinite(bound) && bound > 0) { count += bound; items += 1; }
+        }
+        if (count <= 0) return;
+        // Both halves of the sentence count, and they count DIFFERENT things:
+        // one gesture can split several Reference items, so `items` decides
+        // "the item" versus "the items you split" while `count` is the total
+        // number of bindings. Saying "5 chips ... the item you split" when two
+        // items were cut names a relationship that does not exist and leaves
+        // the author no way to tell which halves need rebinding.
         notifyWarning(
-            `${count} Context chip${count === 1 ? " is" : "s are"} bound to the item you split. `
+            `${count} Context chip${count === 1 ? " is" : "s are"} bound to `
+            + `the item${items === 1 ? "" : "s"} you split. `
             + "A chip names one item, so it still resolves only on the left half; "
             + "rebind it, or a render over the right half will be refused.",
             { source: "reference-split-chip-binding" });
     }
 
-    /** Split a clip at the given frame (razor tool). */
-    async _splitClipAtFrame(...args) {
-        return this._withMutationGesture(
-            "splitItem", () => this._splitClipAtFrameWithinGesture(...args));
+    /** How a split refusal names one target. User-facing, singular. */
+    _splitTargetLabel(type) {
+        return type === "clip" ? "clip"
+            : type === "audio" ? "audio track"
+                : type === "reference" ? "Reference item"
+                    : type === "prompt" ? "prompt section" : "item";
     }
 
-    async _splitClipAtFrameWithinGesture(hit, frame) {
-        if (!this.projectDir || !this.activeScene) return;
-        if (!SPLITTABLE_ITEM_TYPES.has(hit.type)) return;
-        const sourceLess = hit.type === "prompt" || hit.type === "reference";
-        const start = sourceLess ? hit.data.start_frame : hit.data.timeline_start_frame;
+    /** Resolve a split target against the scene as it stands now.
+     *
+     *  Clip, audio and Reference hits carry a durable id, so the generic
+     *  selection resolver is exact for them. A prompt hit carries a LIST INDEX,
+     *  and `_split_prompt_object` re-sorts `prompt_sections` on every cut, so an
+     *  index captured when the section was selected can name a different section
+     *  by the time the gesture runs. Resolve that one by `prompt_id` -- the
+     *  durable identity the row already carries -- and report the index it
+     *  currently occupies, because the wire operation is index-addressed and the
+     *  translation has nowhere else to happen.
+     *
+     *  Falls back to the hit itself rather than refusing, so this changes what a
+     *  stale selection resolves to and never whether it resolves at all.
+     */
+    _resolveSplitTarget(hit) {
+        if (!hit) return null;
+        if (hit.type === "prompt") {
+            const sections = this.activeScene?.prompt_sections || [];
+            const promptId = String(hit.data?.prompt_id || "");
+            const index = promptId
+                ? sections.findIndex((section) => String(section.prompt_id || "") === promptId)
+                : -1;
+            if (index >= 0) return { type: "prompt", id: index, data: sections[index] };
+            return hit;
+        }
+        return this._findSceneItemBySelection(hit.type, hit.id) || hit;
+    }
+
+    /** Plan one target's split. PURE: no state, no history, no notification.
+     *
+     *  Purity is the point rather than a style preference. Planning every target
+     *  BEFORE `_pushUndo` makes a wholly refused gesture history-neutral by
+     *  construction rather than by cleanup, and it is what lets the razor and
+     *  "Split Here" share one path: the trigger decides only WHICH targets and
+     *  which frame, and nothing after target resolution differs.
+     *
+     *  Returns `{type, id, data, closureKey, operation}` on success, or
+     *  `{type, id, refusal}` naming a typed reason the caller renders.
+     */
+    _planItemSplit(rawHit, frame) {
+        const hit = this._resolveSplitTarget(rawHit);
+        const type = String(hit?.type || rawHit?.type || "");
+        const id = hit?.id ?? rawHit?.id;
+        const refuse = (refusal) => ({ type, id, refusal });
+        if (!hit || !SPLITTABLE_ITEM_TYPES.has(type)) return refuse("not_splittable");
+        // Optional-chained because a selection can name a row the scene no
+        // longer holds -- `_resolveSplitTarget` falls back to the raw hit rather
+        // than refusing, and a razor hit always carries `data` but a stale
+        // selection entry need not. Reading through it unguarded threw a
+        // TypeError that escaped the gesture entirely and, on the razor path
+        // which does not await, became an unhandled rejection the author never
+        // saw: the one silent failure this landing would otherwise have left.
+        const sourceLess = type === "prompt" || type === "reference";
+        const start = sourceLess ? hit.data?.start_frame : hit.data?.timeline_start_frame;
         // A Reference item's `-1` end means "follow scene end"; the razor drew
         // against the resolved bar, so the bounds check must use the same value
         // the user saw, and the server is told which one that was.
-        const resolvedEnd = hit.type === "reference" && hit.data.end_frame === -1
+        const resolvedEnd = type === "reference" && hit.data?.end_frame === -1
             ? this.totalFrames
-            : (sourceLess ? hit.data.end_frame : hit.data.timeline_end_frame);
-        const end = resolvedEnd;
-        if (frame <= start || frame >= end) return;
-        // Block split on locked lanes
-        if (hit.type === "clip" && this._isLaneLocked(this._clipTrackType(hit.data), hit.data.track_index || 0)) return;
-        if (hit.type === "audio" && this._isLaneLocked(TRACK_TYPE.AUDIO, hit.data.lane_index || 0)) return;
-        if (hit.type === "prompt" && this._isPromptTrackLocked()) return;
-        if (hit.type === "reference" && this._isLaneLocked(TRACK_TYPE.REFERENCE, hit.data.lane_index || 0)) return;
+            : (sourceLess ? hit.data?.end_frame : hit.data?.timeline_end_frame);
+        if (!Number.isFinite(start) || !Number.isFinite(resolvedEnd)) return refuse("missing");
+        if (!(frame > start && frame < resolvedEnd)) return refuse("outside_bounds");
+        // `_isItemLocked` already answers this per type, for all four splittable
+        // types, and it is the same authority the context menu and drag paths
+        // ask. Four inline lane-lock checks were a copy of it that could drift.
+        if (this._isItemLocked(hit)) return refuse("lane_locked");
         const applyLinked = this._isLinkedItem(hit);
-        if (applyLinked && this._expandItemsWithLinked([hit]).some((item) => this._isItemLocked(item))) {
-            notifyWarning("Split refused because one or more linked items are locked.", { source: "timeline-split-refused" });
-            return;
+        const closure = applyLinked ? this._expandItemsWithLinked([hit]) : [hit];
+        if (applyLinked && closure.some((item) => this._isItemLocked(item))) {
+            return refuse("linked_locked");
         }
-        const splitTargets = applyLinked ? this._expandItemsWithLinked([hit]) : [hit];
-        if (splitTargets.some((item) => item?.type === "clip" && this._isMotionDriverClip(item.data))) {
-            notifyWarning("Driver clips cannot be split.", { source: "timeline-split-refused" });
-            return;
+        if (closure.some((item) => item?.type === "clip" && this._isMotionDriverClip(item.data))) {
+            return refuse("driver");
         }
-
-        this._pushUndo(`split ${hit.type}`);
-        const sceneId = this.activeSceneId;
         // Where the item STARTS, and which lane and role it holds. The server's
         // `_validate_clip_identity` / `_validate_audio_identity` compare exactly
         // these and `_require_expected` makes every one of them mandatory, so
@@ -16715,7 +16774,7 @@ export class EditorWidget {
         // working gesture into a refusal. The stale case it would have caught is
         // caught better by the server's anchor bounds check, which asks whether
         // the frame is inside the item NOW.
-        const operation = hit.type === "clip"
+        const operation = type === "clip"
             ? {
                 type: "split_clip",
                 clip_id: hit.id,
@@ -16728,7 +16787,7 @@ export class EditorWidget {
                     role: hit.data?.role || "render",
                 },
             }
-            : hit.type === "audio"
+            : type === "audio"
                 ? {
                     type: "split_audio_track",
                     track_id: hit.id,
@@ -16740,7 +16799,7 @@ export class EditorWidget {
                         lane_index: hit.data?.lane_index || 0,
                     },
                 }
-                : hit.type === "reference"
+                : type === "reference"
                     ? {
                         type: "split_reference_item",
                         reference_item_id: hit.id,
@@ -16763,29 +16822,205 @@ export class EditorWidget {
                             prompt_id: hit.data?.prompt_id || "",
                         },
                     };
+        return {
+            type,
+            id: hit.id,
+            data: hit.data,
+            // Identifies the whole link closure, so two selected members of one
+            // group produce ONE operation. The set is order-independent.
+            closureKey: closure.map((item) => this._selectionItemKey(item)).sort().join("|"),
+            // Every type the SERVER will touch for this one operation, which is
+            // not the same as the anchor's type. `_apply_split_linked` splits
+            // every in-bounds member of the closure, so a cut anchored on a clip
+            // linked to a prompt section splits the prompt section too. Reading
+            // only the anchor made the follow-up work -- the Prompt panel
+            // refresh above all -- depend on which member of the group happened
+            // to be clicked or listed first, and the razor never refreshed at
+            // all because its anchor is always the item under the cursor.
+            closureTypes: closure.map((item) => String(item?.type || "")),
+            linked: applyLinked && closure.length > 1,
+            operation,
+        };
+    }
 
+    /** One sentence for one refusal reason, covering every target it names.
+     *
+     *  Shared so the razor and "Split Here" say the same thing about the same
+     *  condition. `anySplit` is what turns "nothing happened" into "the rest did
+     *  not qualify", which is the difference between a failure and a report.
+     */
+    _splitRefusalMessage(reason, refused, { anySplit = false } = {}) {
+        const types = new Set(refused.map((plan) => plan.type));
+        const plural = refused.length !== 1;
+        const named = refused.length === 1
+            ? `This ${this._splitTargetLabel(refused[0].type)}`
+            : (types.size === 1
+                ? `${refused.length} ${this._splitTargetLabel([...types][0])}s`
+                : `${refused.length} selected items`);
+        switch (reason) {
+            case "outside_bounds":
+                return anySplit
+                    ? `${named} ${plural ? "do" : "does"} not cross the split frame, `
+                        + `so ${plural ? "they were" : "it was"} left whole.`
+                    : `${named} ${plural ? "do" : "does"} not cross the split frame. `
+                        + "A cut has to fall inside an item, not on its edge.";
+            case "lane_locked":
+                return `${named} ${plural ? "are" : "is"} on a locked lane.`;
+            case "linked_locked":
+                return "Split refused because one or more linked items are locked.";
+            case "driver":
+                return "Driver clips cannot be split.";
+            case "missing":
+                return `${named} ${plural ? "are" : "is"} no longer on the timeline.`;
+            default:
+                return `${named} cannot be split.`;
+        }
+    }
+
+    /** How long a split refusal stays on screen.
+     *
+     *  Warnings are sticky by default and the toast stack has no cap, so a
+     *  refusal an author reaches by AIMING must not leave a card they have to
+     *  dismiss. In razor mode `_hitTestClip` matches inclusively at both edges
+     *  (`x >= x1 && x <= x2`) and `_xToFrame` ROUNDS, so at 40 px per frame a
+     *  click within half a frame of an edge -- or anywhere on the seam between
+     *  two abutting clips -- resolves to the boundary and is refused. That is a
+     *  miss, not a decision, and it is common precisely when the author is
+     *  zoomed in to place a cut exactly.
+     *
+     *  Every other reason stays sticky: a locked lane, a locked linked partner,
+     *  a Driver clip and an empty selection are all things the author chose and
+     *  must act on, and the last three were already sticky before this landing.
+     */
+    _splitRefusalDurationMs(reason) {
+        return reason === "outside_bounds" ? 4000 : 0;
+    }
+
+    /** Split every qualifying target at one frame, as one gesture.
+     *
+     *  Both triggers land here. The razor passes the item under the cursor;
+     *  "Split Here" passes the selection. Cardinality legitimately differs -- a
+     *  mouse is one point on one lane, a selection spans lanes -- and nothing
+     *  after target resolution does.
+     */
+    async _splitItemsAtFrame(...args) {
+        return this._withMutationGesture(
+            "splitItem", () => this._splitItemsAtFrameWithinGesture(...args));
+    }
+
+    async _splitItemsAtFrameWithinGesture(hits, frame) {
+        if (!this.projectDir || !this.activeScene) {
+            notifyWarning("No scene is open, so there is nothing to split.",
+                { source: "timeline-split-refused:no-scene" });
+            return;
+        }
+        const targets = (Array.isArray(hits) ? hits : [hits]).filter(Boolean);
+        if (!targets.length) {
+            notifyWarning("Select a clip, audio track, prompt section or Reference item "
+                + "to split at the playhead.",
+                { source: "timeline-split-refused:empty-selection" });
+            return;
+        }
+        const plans = targets.map((hit) => this._planItemSplit(hit, frame));
+
+        // One operation per link CLOSURE, not per target. `_apply_split_linked`
+        // dissolves the group and moves the left half on its first pass, so a
+        // second operation over the same closure finds an anchor whose bounds it
+        // has already changed -- the tracked Critical defect reappearing inside
+        // a single batch, where it would now surface as a 400 rather than as
+        // silence, and refuse the whole gesture.
+        const operations = [];
+        const planned = [];
+        const closures = new Set();
+        for (const plan of plans) {
+            if (plan.refusal || closures.has(plan.closureKey)) continue;
+            closures.add(plan.closureKey);
+            operations.push(plan.operation);
+            planned.push(plan);
+        }
+
+        const byReason = new Map();
+        for (const plan of plans) {
+            if (!plan.refusal) continue;
+            if (!byReason.has(plan.refusal)) byReason.set(plan.refusal, []);
+            byReason.get(plan.refusal).push(plan);
+        }
+        for (const [reason, refused] of byReason) {
+            notifyWarning(
+                this._splitRefusalMessage(reason, refused, { anySplit: operations.length > 0 }),
+                // One source per reason: `editor_notifications.js` coalesces on
+                // `src:<source>`, so a shared source would let two different
+                // sentences replace one another instead of both being said.
+                { source: `timeline-split-refused:${reason}`,
+                    durationMs: this._splitRefusalDurationMs(reason) });
+        }
+        // Every refusal has spoken and no history entry exists, so a wholly
+        // refused gesture is history-neutral by construction.
+        if (!operations.length) return;
+
+        const sceneId = this.activeSceneId;
+        // The union of every CLOSURE, not of the anchors -- see `closureTypes`.
+        const types = new Set(planned.flatMap((plan) => plan.closureTypes));
+        const label = planned.length > 1
+            ? `split ${planned.length} items`
+            : (planned[0].linked ? `split linked ${planned[0].type}` : `split ${planned[0].type}`);
+        // One entry for the whole gesture. A batch cannot partially apply --
+        // `_load_project_from_request` reloads per request and `save_project`
+        // runs once after the whole comprehension -- so one entry makes exactly
+        // one claim and takes exactly one stamp.
+        const historyEntry = this._pushUndo(label);
         try {
-            const result = await this._runSceneMutation([operation], {
-                key: `scene:${sceneId}:split:${hit.type}:${hit.id}:${Date.now()}`,
-                label: `split ${hit.type}`,
+            const result = await this._runSceneMutation(operations, {
+                key: `scene:${sceneId}:split:${Date.now()}`,
+                label,
+                // The key already uniquifies, so this states the decision rather
+                // than creating it: under a stable key the queue would REPLACE a
+                // pending cut and settle both waiters from the second result,
+                // dropping the first cut silently.
                 coalesce: false,
-                // Clip and audio splits now carry a prior-identity guard whose
+                // Passed explicitly rather than left to
+                // `_historyPostSnapshotCaptureCandidate`, which expires at a
+                // microtask boundary; the trim-commit and asset-drop paths
+                // already do this for the same reason.
+                historyEntry,
+                // Clip and audio splits carry a prior-identity guard whose
                 // refusal names the field that moved. The generic fallback would
                 // replace "This clip's start frame changed since the split was
-                // aimed…" with "split clip failed — timeline restored." and
+                // aimed..." with "split clip failed -- timeline restored." and
                 // discard the only actionable part.
-                failureMessage: (error) => error?.message
-                    || `The ${hit.type} split was refused — timeline restored.`,
+                // A batch cannot partially apply -- `_load_project_from_request`
+                // reloads per request and `save_project` runs once after the
+                // whole comprehension -- which is what makes ONE undo entry an
+                // honest claim, and also means one refused target abandons every
+                // other cut in the gesture. The author has to be told that, or a
+                // message naming one stale clip reads as though the other four
+                // landed. Before this landing "Split Here" looped one gesture per
+                // target and the rest did land, so this is a real change.
+                failureMessage: (error) => {
+                    const reason = error?.message
+                        || `The ${planned[0].type} split was refused — timeline restored.`;
+                    return operations.length > 1
+                        ? `${reason} None of the ${operations.length} cuts in this split were `
+                            + "applied, because they are saved together."
+                        : reason;
+                },
             });
-            if (hit.type === "reference") {
+            if (types.has("reference")) {
                 this._buildTrackLayout();
-                this._refreshPromptContextDependencyConsumers();
                 this._warnOnSplitReferenceChipBindings(result);
+            }
+            if (types.has("reference") || types.has("prompt")) {
+                // The Prompt panel holds no scene subscription, and neither
+                // `_fetchScenes` nor `_setActiveScene` refreshes it, so before
+                // this call a prompt split left the panel showing the pre-cut
+                // sections until the author refreshed by hand. The Reference
+                // branch already called this; the prompt branch never did.
+                this._refreshPromptContextDependencyConsumers();
             }
             this._renderTimeline();
         } catch (e) {
             await this._fetchScenes({ ignoreMutationGate: true, reason: "split_item_error" });
-            if (hit.type === "reference") {
+            if (types.has("reference") || types.has("prompt")) {
                 // Deliberately no toast here. The Reference branch used to raise
                 // its own because the enqueue passed no `failureMessage` and the
                 // generic "split reference failed — timeline restored." dropped
@@ -16796,7 +17031,7 @@ export class EditorWidget {
                 // these two carried different sources so they could never merge.
                 this._refreshPromptContextDependencyConsumers();
             }
-            console.warn(`[Sonder] Failed to split ${hit.type}:`, e);
+            console.warn(`[Sonder] Failed to split ${[...types].join("+")}:`, e);
         }
     }
 
@@ -23081,36 +23316,6 @@ export class EditorWidget {
         return true;
     }
 
-    _getClipAtFrame(frame) {
-        if (!this.activeScene?.clips) return null;
-        let best = null;
-        for (const clip of this.activeScene.clips) {
-            if (!this._isRenderClip(clip)) continue;
-            if (frame >= clip.timeline_start_frame && frame < clip.timeline_end_frame) {
-                if (this._isLaneHidden(TRACK_TYPE.VIDEO, clip.track_index || 0)) continue;
-                if (!best || (clip.track_index || 0) > (best.track_index || 0)) {
-                    best = clip;
-                }
-            }
-        }
-        return best;
-    }
-
-    _getMotionDriverClipAtFrame(frame) {
-        if (!this.activeScene?.clips) return null;
-        let best = null;
-        for (const clip of this.activeScene.clips) {
-            if (!this._isMotionDriverClip(clip)) continue;
-            if (frame >= clip.timeline_start_frame && frame < clip.timeline_end_frame) {
-                if (this._isLaneHidden(TRACK_TYPE.MOTION_DRIVER, clip.track_index || 0)) continue;
-                if (!best || (clip.track_index || 0) > (best.track_index || 0)) {
-                    best = clip;
-                }
-            }
-        }
-        return best;
-    }
-
     /** Get all non-hidden clips at a given frame, sorted bottom-up (lowest track_index first) */
     _getClipsAtFrame(frame) {
         if (!this.activeScene?.clips) return [];
@@ -23152,16 +23357,6 @@ export class EditorWidget {
             scrollIntoView: true,
             openInspector: true,
         });
-    }
-
-    _getAudioAtFrame(frame) {
-        if (!this.activeScene?.audio_tracks) return null;
-        for (const track of this.activeScene.audio_tracks) {
-            if (frame >= track.timeline_start_frame && frame < track.timeline_end_frame) {
-                return track;
-            }
-        }
-        return null;
     }
 
     _getAudioTracksAtFrame(frame) {

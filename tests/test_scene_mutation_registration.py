@@ -3434,6 +3434,14 @@ MESSAGE_OWNED_ELSEWHERE = {
         "Delegates its enqueue to `runItemOperation`, which owns the catch and "
         "already notifies with `error?.message`. The scope itself never calls "
         "`_runSceneMutation`, so its own body cannot show a message.",
+    "editor_widget.js:_planItemSplit":
+        "A PURE planner. It builds the operation and never enqueues, because "
+        "planning every target before `_pushUndo` is what makes a wholly "
+        "refused split gesture history-neutral by construction. The single "
+        "enqueue lives in `_splitItemsAtFrameWithinGesture` and passes the "
+        "`failureMessage` this test looks for; "
+        "`test_the_split_runner_surfaces_the_server_message` pins that, so "
+        "the exemption cannot outlive the thing it assumes.",
     "editor_widget.js:_deleteItemsInLaneWithinGesture":
         "Its `items` are clip and audio ids with no snapshot -- "
         "`_mutationItemFromSelection` builds one only for guide, prompt and "
@@ -3471,6 +3479,28 @@ def test_a_guarded_emission_surfaces_the_server_message():
     scopes = {f"{item['module']}:{item['scope']}" for item in _operation_literals()}
     gone = sorted(set(MESSAGE_OWNED_ELSEWHERE) - scopes)
     assert not gone, f"these message exemptions name no emitting scope: {gone}"
+
+
+def test_the_split_runner_surfaces_the_server_message():
+    """The pin under `_planItemSplit`'s MESSAGE_OWNED_ELSEWHERE exemption.
+
+    That exemption is a claim about a DIFFERENT method than the one being
+    excused, so the staleness check above -- which only asks whether the
+    exempted scope still emits -- cannot see it go wrong. A refactor that
+    dropped `failureMessage` from the runner would leave the planner exempt
+    and the guard refusals silent again, which is the exact regression stage 2
+    L1 landed the guards to prevent.
+    """
+    source = (JS_DIR / "editor_widget.js").read_text(encoding="utf-8")
+    body = next(source[start:end] for name, start, end in _scopes(source)
+                if name == "_splitItemsAtFrameWithinGesture")
+    assert "this._runSceneMutation(" in body, (
+        "the split runner no longer enqueues, so `_planItemSplit`'s message "
+        "exemption names an owner that does nothing")
+    assert "failureMessage" in body, (
+        "`_splitItemsAtFrameWithinGesture` passes no `failureMessage`, so the "
+        "409 naming the field that moved is replaced by the generic toast -- "
+        "and `_planItemSplit` is exempt from noticing")
 
 
 def _scope_body(item) -> str:
@@ -3777,8 +3807,6 @@ KEY_INTERPOLATIONS = {
     "laneIndex": (STABLE, "a lane's position"),
     "type": (STABLE, "an item type name"),
     "id": (STABLE, "an item's durable id or positional address"),
-    "hit.type": (STABLE, "the item type under the cursor"),
-    "hit.id": (STABLE, "the item id under the cursor"),
     "clipId": (STABLE, "a clip's durable id"),
     "clip.clip_id": (STABLE, "a clip's durable id"),
     "track.track_id": (STABLE, "an audio track's durable id"),
@@ -3978,12 +4006,14 @@ COALESCE_OPT_OUT_REVIEWED = {
         UNREACHABLE,
         "a trim commit has the same shape as a drag commit: one operation per "
         "trimmed item, a key that names no item."),
-    "editor_widget.js:_splitClipAtFrameWithinGesture:scene:${}:split:${}:${}:${}": (
+    "editor_widget.js:_splitItemsAtFrameWithinGesture:scene:${}:split:${}": (
         UNREACHABLE,
         "`_apply_split_linked` cuts at a frame inside the item's CURRENT "
-        "bounds, which the previous cut changed. Umbrella Phase C stage 2 L3 "
-        "adds the explicit `coalesce: false` this key already enforces, because "
-        "that landing batches several targets into one gesture."),
+        "bounds, which the previous cut changed, so two cuts are never one "
+        "write. Phase C stage 2 L3 batched every target of one gesture into "
+        "a single operations array, so the key no longer names an item -- it "
+        "names the gesture, and only the clock keeps two apart. The explicit "
+        "`coalesce: false` states that decision rather than creating it."),
     "editor_widget.js:_replaceClipSource:clip:${}:replace-source:${}": (
         UNREACHABLE,
         "`_apply_replace_clip_source` re-derives bounds from the new asset's "

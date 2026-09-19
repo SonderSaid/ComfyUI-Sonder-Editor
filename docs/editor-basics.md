@@ -182,9 +182,13 @@ lives in the right-click menu.
 - **Snapping** (`S` to toggle) pulls dragged edges to clip edges, guides, and
   the playhead, with a visible snap guide line. Threshold and per-type
   targets are in Settings ▸ Timeline Behavior.
-- **Razor mode** (`C`): click any clip to split it at that point.
-  **⌇ Split Here** splits the selected items — or whatever sits under the
-  playhead — at the playhead.
+- **Razor mode** (`C`): click a clip, audio track, prompt section or Reference
+  item to split it at that point. **⌇ Split Here** does the same to everything
+  selected, at the playhead. Both cover the same four item types, and both say
+  why when something cannot be cut — an item the frame falls outside, a locked
+  lane, or a Driver clip. Split Here acts only on the **selection**: with
+  nothing selected it tells you so rather than cutting whatever happens to sit
+  under the playhead. Splitting several items at once is one undo step.
 - **Muting** (`M`): mutes/unmutes the selected items. Mute is per-item render
   participation and composes with lane Hide.
 - **Deleting** (`Del`/`Backspace`): deleting the last item on a video/audio
