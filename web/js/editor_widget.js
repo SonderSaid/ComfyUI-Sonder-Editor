@@ -397,6 +397,10 @@ import { coalesceSceneMutationIntents } from "./scene_mutation_coalescing.js";
 import {
     splitClipGeometry, splitAudioGeometry, mintSplitHalfId, splitHalfIdKey,
 } from "./scene_split_geometry.js";
+import {
+    movedMediaBounds, movedMemberBounds, memberBounds, writeMemberBounds,
+    linkedMoveRefusal,
+} from "./scene_move_geometry.js";
 import { createViewportSurface } from "./viewport_surface.js";
 import {
     EDITOR_COLORS as COLORS,
@@ -5260,6 +5264,144 @@ export class EditorWidget {
         return painted;
     }
 
+    /** Paint a timeline move into `activeScene`, before the server answers.
+     *
+     *  INTENTIONAL MIRROR of the duration-preserving branch of
+     *  `_apply_update_clip` / `_apply_update_audio_track`, and of the
+     *  `pure_move` arm of `_apply_linked_bounds_update`. The arithmetic lives in
+     *  `scene_move_geometry.js` so `tests/test_move_geometry_parity.py` can
+     *  drive both languages over one table.
+     *
+     *  Reads its geometry from the OPERATION, not from the input box: the
+     *  operation is what the server will act on, and re-deriving the same number
+     *  from the control would be a second answer to one question.
+     *
+     *  Returns true when it painted anything, so the caller knows whether it has
+     *  something to roll back.
+     */
+    _applyLocalItemMove(hit, applyLinked, operation) {
+        if (!this.activeScene || !operation) return false;
+        const row = this._findSceneItemBySelection(hit.type, hit.id)?.data || hit.data;
+        if (!row) return false;
+
+        if (hit.type === "reference") {
+            // Already clamped and duration-preserved when the operation was
+            // built -- and the sentinel end is part of that answer, so it is
+            // copied rather than recomputed.
+            row.start_frame = operation.fields.start_frame;
+            row.end_frame = operation.fields.end_frame;
+            return true;
+        }
+
+        const bounds = memberBounds(hit.type, row);
+        if (!bounds) return false;
+        const next = movedMediaBounds(
+            bounds.start, bounds.end, operation.fields.timeline_start_frame);
+        const delta = next.start - bounds.start;
+        if (!delta) return false;
+
+        if (!applyLinked) {
+            writeMemberBounds(hit.type, row, next.start, next.end);
+            return true;
+        }
+        // A linked move is a WHOLE-GROUP delta, and the delta is the anchor's
+        // own -- clamping happens once, on the anchor, exactly as
+        // `_apply_linked_bounds_update` computes it from the anchor and then
+        // adds it to every member. Clamping each member independently would
+        // silently compress a group that straddles frame zero.
+        //
+        // Planned in full BEFORE anything is written, because the server refuses
+        // the whole move when the delta would carry any member below zero
+        // (`_apply_ref_bounds` raises `invalid_range`). Painting it would draw a
+        // negative bound the project will never hold -- and the split landing's
+        // audit established that such a paint is not merely transient: a later
+        // gesture's `_pushUndo` snapshots the scene verbatim and Undo writes
+        // that snapshot back. Mirror the guard that decides WHETHER, not only
+        // the arithmetic that decides what.
+        const moves = [];
+        const members = this._expandItemsWithLinked([hit]);
+        for (const member of members) {
+            const memberAt = memberBounds(member?.type, member?.data);
+            if (!memberAt) continue;
+            const moved = movedMemberBounds(memberAt.start, memberAt.end, delta);
+            moves.push({ member, moved });
+        }
+        // Every section the move does NOT carry, which is what the server
+        // compares a moved prompt against.
+        const carried = new Set(members
+            .filter((member) => member?.type === "prompt")
+            .map((member) => member.data));
+        const otherPromptRanges = (this.activeScene.prompt_sections || [])
+            .filter((section) => !carried.has(section))
+            .map((section) => [section.start_frame || 0, section.end_frame || 0]);
+        const refusal = linkedMoveRefusal(
+            moves.map(({ member, moved }) => ({
+                type: member.type, start: moved.start, end: moved.end,
+            })),
+            { sceneDuration: this.totalFrames, otherPromptRanges });
+        if (refusal) return false;
+        let painted = false;
+        let promptMoved = false;
+        for (const { member, moved } of moves) {
+            if (writeMemberBounds(member.type, member.data, moved.start, moved.end)) {
+                painted = true;
+                if (member.type === "prompt") promptMoved = true;
+            }
+        }
+        if (promptMoved) {
+            // `_apply_ref_bounds` re-sorts the sections after moving one, and
+            // every prompt consumer addresses a section by its LIST POSITION.
+            (this.activeScene.prompt_sections || []).sort(
+                (a, b) => (a.start_frame || 0) - (b.start_frame || 0));
+        }
+        return painted;
+    }
+
+    /** Move a selection onto one lane and compact the lanes it empties.
+     *
+     *  INTENTIONAL MIRROR of `_consolidate_media_items`, and named rather than
+     *  inlined because the ORDER is the whole difficulty. The server moves every
+     *  item first, then removes the vacated source lanes in DESCENDING index
+     *  order, and `_remove_media_lane` shifts every item above a removed lane
+     *  down by one. The destination therefore ends up at `final_target_lane` --
+     *  `target_lane` minus the number of removed lanes below it -- which the
+     *  server returns rather than the caller guessing.
+     *
+     *  Doing the same three steps in the same order makes the target follow by
+     *  itself, because the moved items are shifted along with everything else.
+     *  Computing the final index directly instead would be a second answer to a
+     *  question the sequence already answers, and would be wrong the first time
+     *  a source lane failed to empty.
+     */
+    _applyLocalConsolidateItems(laneType, itemIds, targetLane) {
+        if (!this.activeScene) return false;
+        const descriptor = descriptorFor(laneType);
+        const indexField = descriptor?.itemsSource?.indexField;
+        if (!indexField) return false;
+        const wanted = new Set(itemIds.map((value) => String(value)));
+        const rows = laneItemsForType(this.activeScene, descriptor.trackType, null)
+            .filter((item) => wanted.has(String(item.clip_id ?? item.track_id ?? "")));
+        // ALL of them or none. `_consolidate_media_items` resolves every id and
+        // 404s the whole operation on the first it cannot find, so painting a
+        // partial move would draw an arrangement the server will never produce.
+        // Not reachable today -- `_selectedConsolidationItems` resolves each
+        // item synchronously just above -- which is exactly why it is worth one
+        // line rather than a comment saying it cannot happen.
+        if (rows.length !== wanted.size) return false;
+
+        const sourceLanes = new Set(rows.map((item) => item[indexField] || 0));
+        for (const item of rows) item[indexField] = targetLane;
+
+        // Descending, and only lanes the move actually emptied --
+        // `_compactEmptyMediaLaneLocal` re-checks emptiness itself, exactly as
+        // the server's `if _media_lane_items(...): continue` does.
+        for (const lane of [...sourceLanes].filter((value) => value !== targetLane)
+            .sort((a, b) => b - a)) {
+            this._compactEmptyMediaLaneLocal(laneType, lane);
+        }
+        return true;
+    }
+
     _buildAssetItem(asset) {
         {
             const item = document.createElement("div");
@@ -6900,6 +7042,33 @@ export class EditorWidget {
 
     _isLinkedItem(item) {
         return !!this._linkGroupForItem(item);
+    }
+
+    /** Should this gesture ask the server to apply to the item's whole group?
+     *
+     *  NOT the same question as `_isLinkedItem`, and the difference is durable.
+     *  A half painted by an in-flight split belongs to no group LOCALLY --
+     *  `_apply_split_linked` regroups the right halves and that partition
+     *  arrives with the canonical response -- so `_isLinkedItem` answers false
+     *  for it. Sending `apply_linked: false` on that answer does not merely
+     *  decline a nicety: the server moves, trims or deletes the one row named
+     *  and leaves its partner behind, returns 200 because the request was
+     *  perfectly valid, and nothing refetches. The client and the disk then
+     *  agree on the wrong state.
+     *
+     *  `durable_rules.md` states the rule this implements: a gesture must not
+     *  assert a classification the server has not yet made. The client asserts
+     *  no membership here; it declines to assert that there is none, and
+     *  `_expand_linked_refs` returns the single ref when the server has no group
+     *  either, so the flag is harmless when the partition left the half alone.
+     *
+     *  Every emitter of `apply_linked` on a single anchor goes through this.
+     *  The split landing answered it inline for its own gesture first; keeping
+     *  four copies of the answer is how three of them would stay wrong.
+     */
+    _shouldApplyLinked(item) {
+        if (this._isLinkedItem(item)) return true;
+        return this._optimisticSplitHalves?.has(this._selectionItemKey(item)) === true;
     }
 
     /** Stable display label for a link group: A..Z, AA, AB... by group order. */
@@ -10919,34 +11088,66 @@ export class EditorWidget {
     async _moveItemToNewLaneWithinGesture(hit) {
         if (!this.activeScene || !this.projectDir) return;
         const sceneId = this.activeSceneId;
+
+        // Built BEFORE `_pushUndo` and before any local apply, so the lane count
+        // it names is the one the author saw. `variableLaneTypeFor` on the
+        // clip's own track type matters here: a Driver clip belongs to the
+        // `motion_driver` family, and appending to `video` would create a lane
+        // in the wrong family and move the clip onto a lane that cannot hold it.
+        const operations = [];
+        let localApply = null;
+        if (hit.type === "clip") {
+            const trackType = this._clipTrackType(hit.data);
+            const laneType = variableLaneTypeFor(trackType);
+            const newCount = laneCountFor(this.activeScene, trackType) + 1;
+            const newLane = newCount - 1;
+            operations.push({ type: "set_lane_count", lane_type: laneType, count: newCount });
+            operations.push({ type: "update_clip", clip_id: hit.id, fields: { track_index: newLane } });
+            localApply = { laneType, newCount, field: "track_index", newLane };
+        } else if (hit.type === "audio") {
+            const newCount = laneCountFor(this.activeScene, TRACK_TYPE.AUDIO) + 1;
+            const newLane = newCount - 1;
+            operations.push({ type: "set_lane_count", lane_type: "audio", count: newCount });
+            operations.push({ type: "update_audio_track", track_id: hit.id, fields: { lane_index: newLane } });
+            localApply = { laneType: "audio", newCount, field: "lane_index", newLane };
+        }
+        if (!operations.length) return;
+
         this._pushUndo("move to new lane");
+        // `_applyLocalSetLaneCount` already mirrors the append; the item's own
+        // lane field is the only thing left, and it is a single assignment, so
+        // it stays inline rather than earning a named helper.
+        const row = this._findSceneItemBySelection(hit.type, hit.id)?.data || hit.data;
+        this._applyLocalSetLaneCount(localApply.laneType, localApply.newCount);
+        if (row) row[localApply.field] = localApply.newLane;
+        this._renderSceneAfterLocalMutation();
 
         try {
-            const operations = [];
-            if (hit.type === "clip") {
-                const trackType = this._clipTrackType(hit.data);
-                const laneType = variableLaneTypeFor(trackType);
-                const currentCount = laneCountFor(this.activeScene, trackType);
-                const newCount = currentCount + 1;
-                const newLane = newCount - 1;
-                operations.push({ type: "set_lane_count", lane_type: laneType, count: newCount });
-                operations.push({ type: "update_clip", clip_id: hit.id, fields: { track_index: newLane } });
-            } else if (hit.type === "audio") {
-                const newCount = laneCountFor(this.activeScene, TRACK_TYPE.AUDIO) + 1;
-                const newLane = newCount - 1;
-                operations.push({ type: "set_lane_count", lane_type: "audio", count: newCount });
-                operations.push({ type: "update_audio_track", track_id: hit.id, fields: { lane_index: newLane } });
-            }
-            if (operations.length > 0) {
-                await this._runSceneMutation(operations, {
-                    key: `scene:${sceneId}:move-item-new-lane:${Date.now()}`,
-                    label: "move item to new lane",
-                    coalesce: false,
-                });
-            }
-            this._buildTrackLayout();
-            this._renderTimeline();
+            await this._runSceneMutation(operations, {
+                key: `scene:${sceneId}:move-item-new-lane:${Date.now()}`,
+                label: "move item to new lane",
+                coalesce: false,
+                // `fields.track_index` is a LANE DESTINATION, so
+                // `scene_mutation_addressing.js` denies this batch a retry: it
+                // is refused rather than replayed when a render or another
+                // editor moves the version underneath it. The local apply makes
+                // that refusal more visible, not more likely, and the author has
+                // to be told which of the lane checks refused it.
+                failureMessage: (error) => error?.message
+                    || "The move to a new lane was refused — timeline restored.",
+            });
+            this._renderSceneAfterLocalMutation();
         } catch (e) {
+            // Previously the repaint sat inside this `try` AFTER the await, so a
+            // failure left the timeline unrepainted and nothing was refetched at
+            // all. With an optimistic apply that would strand the item on a lane
+            // the project does not have.
+            const healed = await this._fetchScenes(
+                { ignoreMutationGate: true, reason: "move_new_lane_error" });
+            if (healed === false) {
+                sessionDiagRecord("move_rollback_deferred", { type: hit.type, lane: true });
+            }
+            this._renderSceneAfterLocalMutation();
             console.warn("[Sonder] Failed to move item to new lane:", e);
         }
     }
@@ -11530,6 +11731,12 @@ export class EditorWidget {
         const selectedItemSnapshot = this.selectedItem ? { type: this.selectedItem.type, id: this.selectedItem.id } : null;
         const undoLabel = "consolidate items";
         this._pushUndo(undoLabel);
+        // `_consolidationRefusal` above has already read every guard this
+        // gesture has, against the state the author saw, so the apply cannot
+        // make one compare the client's own answer against itself.
+        const painted = this._applyLocalConsolidateItems(
+            laneType, items.map((item) => String(item.id)), targetLane);
+        if (painted) this._renderSceneAfterLocalMutation();
         try {
             await this._runSceneMutation([{
                 type: "consolidate_items",
@@ -11554,7 +11761,17 @@ export class EditorWidget {
             this._renderTimeline();
             this._renderViewportFrame();
         } catch (error) {
-            // The mutation queue owns exact-entry failure cleanup.
+            // The mutation queue owns exact-entry failure cleanup -- but not the
+            // optimistic state, which it only defers a refresh for. A
+            // consolidation that painted has moved items between lanes and may
+            // have removed lanes, so leaving that on screen after a refusal is
+            // not a cosmetic delay.
+            if (painted) {
+                const healed = await this._fetchScenes(
+                    { ignoreMutationGate: true, reason: "consolidate_error" });
+                if (healed === false) sessionDiagRecord("consolidate_rollback_deferred", {});
+                this._renderSceneAfterLocalMutation();
+            }
         }
     }
 
@@ -15463,7 +15680,7 @@ export class EditorWidget {
     async _moveItemToFrameWithinGesture(type, id, data, newStart) {
         if (!this.activeScene || !this.projectDir) return;
         const hit = { type, id, data };
-        const applyLinked = this._isLinkedItem(hit);
+        const applyLinked = this._shouldApplyLinked(hit);
         if (applyLinked && this._expandItemsWithLinked([hit]).some((item) => this._isItemLocked(item))) {
             notifyWarning("Move refused because one or more linked items are locked.", { source: "timeline-move-refused" });
             return;
@@ -15492,16 +15709,45 @@ export class EditorWidget {
                 ? referenceMove
                 : { type: "update_audio_track", track_id: id, fields: { timeline_start_frame: newStart }, apply_linked: applyLinked };
 
+        // PAINTED AFTER the operation is built, never before. `expected` states
+        // what the author saw, and the Reference branch above reads
+        // `data.start_frame` / `data.end_frame` to build it -- applying first
+        // would make that guard compare the client's own answer against itself.
+        // The plan's contract names this rule first for a reason: the existing
+        // counter-example in this file, `_moveGuideToFrameWithinGesture`, reads
+        // its guard after the apply and is correct only by accident.
+        const painted = this._applyLocalItemMove(hit, applyLinked, operation);
+        if (painted) this._renderSceneAfterLocalMutation();
+
         try {
             await this._runSceneMutation([operation], {
                 key: `${type}:${id}:timeline`,
                 label: "move item",
                 coalesce: false,
+                // The lock and prompt-range checks stay on the server, so a
+                // refusal has to name which one refused rather than be replaced
+                // by the generic toast. NOT the lane-fit check: this operation
+                // does not send `validate_lane_collision`, which only the trim
+                // commit does, so the server accepts a move that overlaps
+                // another item and the optimistic paint agrees with it.
+                failureMessage: (error) => error?.message
+                    || "The move was refused — timeline restored.",
             });
             this._clearSelection();
             this._hideItemEditor();
             this._renderTimeline();
         } catch (e) {
+            // The refetch discards the optimistic position. It is called here
+            // rather than left to the queue, whose failure branch only DEFERS a
+            // refresh; see the split runner for the same reasoning and the same
+            // limits -- `_fetchScenes` can decline, and then the deferred
+            // refresh is what heals.
+            if (painted) {
+                const healed = await this._fetchScenes(
+                    { ignoreMutationGate: true, reason: "move_item_error" });
+                if (healed === false) sessionDiagRecord("move_rollback_deferred", { type });
+                this._renderSceneAfterLocalMutation();
+            }
             console.warn("[Sonder] Failed to move item:", e);
         }
     }
@@ -15519,7 +15765,7 @@ export class EditorWidget {
         let applyLinked = false;
         if (props && "muted" in props) {
             const anchor = this._findSceneItemBySelection(type, id);
-            if (anchor && this._isLinkedItem(anchor)) {
+            if (anchor && this._shouldApplyLinked(anchor)) {
                 const members = this._expandItemsWithLinked([anchor]);
                 if (members.some((item) => this._isItemLocked(item))) {
                     // Callers flip the anchor's local muted before calling; restore it.
@@ -16255,7 +16501,7 @@ export class EditorWidget {
             return;
         }
         const applyLinked = expanded.length > this.selectedItems.length
-            || this.selectedItems.some((item) => this._isLinkedItem(item));
+            || this.selectedItems.some((item) => this._shouldApplyLinked(item));
         const undoLabel = "delete items";
         this._pushUndo(undoLabel);
         const items = expanded.map((item) => this._mutationItemFromSelection(item)).filter(Boolean);
@@ -16613,7 +16859,7 @@ export class EditorWidget {
         if (!this.projectDir || !this.activeScene) return;
         const sceneId = this.activeSceneId;
         const { type, id, data, origStart, origEnd } = trimInfo;
-        const applyLinked = this._isLinkedItem(trimInfo);
+        const applyLinked = this._shouldApplyLinked(trimInfo);
 
         return this._withTimelineMutationCommit("trimEdge", async () => {
             try {
@@ -16820,8 +17066,7 @@ export class EditorWidget {
         // that there is none. `_expand_linked_refs` returns the single ref when
         // there is no group, so the flag is harmless when the partition put the
         // half on its own.
-        const applyLinked = this._isLinkedItem(hit)
-            || this._optimisticSplitHalves?.has(this._selectionItemKey(hit)) === true;
+        const applyLinked = this._shouldApplyLinked(hit);
         const closure = applyLinked ? this._expandItemsWithLinked([hit]) : [hit];
         if (applyLinked && closure.some((item) => this._isItemLocked(item))) {
             return refuse("linked_locked");

@@ -5888,6 +5888,13 @@ class Harness {{
     this._projectMutationQueue=new ProjectMutationQueue();}}
   _selectedConsolidationItems(){{return [];}}
   _consolidationRefusal(){{return "";}}
+  // This test is about which UNDO ENTRY survives a failed consolidation,
+  // not about what the timeline showed meanwhile. The optimistic apply and
+  // its rollback refetch are stubbed for the same reason the two above are:
+  // they are collaborators, not the subject.
+  _applyLocalConsolidateItems(){{return false;}}
+  _renderSceneAfterLocalMutation(){{}}
+  async _fetchScenes(){{return true;}}
   _pushUndo(label){{const entry={{label,sceneId:"scene",snapshot:this.activeScene}};
     this._undoStack.push(entry);this.candidate=entry;return entry;}}
   _claimHistoryPostSnapshotCapture(){{return this.candidate;}}

@@ -789,7 +789,6 @@ def test_clean_mute_gesture_captures_at_enqueue_and_ends_after_settlement():
         w._expandItemsWithLinked = items => items;
         w._isItemLocked = () => false;
         w._linkedGroupIdForItem = () => '';
-        w._applyLocalItemProperty = () => {};
         let release;
         w._runSceneMutation = (operations, options) => w._queueProjectMutation({
             ...options, refreshScenes:false, intent:{operations},
@@ -2903,4 +2902,424 @@ def test_a_failed_split_also_releases_the_halves_it_claimed():
         await pending;
         assert.equal(w._optimisticSplitHalves.size, 0,
             'a refused gesture must not leave a durable id claiming linkage');
+    """)
+
+
+# ── Class A: local applies for move and consolidate (stage 2 L6) ─────────────
+#
+# These three gestures changed rows that already existed and showed nothing
+# until the write returned. Each now paints first. The order that matters is the
+# same one the split landing needed: every guard is read BEFORE the apply, or it
+# compares the client's own answer against itself.
+
+_CLASS_A_SETUP = _SPLIT_SETUP + """
+    function moveWidget(scene) {
+        const w = splitWidget(scene);
+        w._clearSelection = () => {};
+        w._hideItemEditor = () => {};
+        w._parsePositionInput = (v) => parseInt(v, 10);
+        w.released = [];
+        w._runSceneMutation = (operations, options) => {
+            w.sent.push({operations, options});
+            return new Promise((resolve, reject) => {
+                w.released.push({resolve, reject});
+            });
+        };
+        return w;
+    }
+"""
+
+
+def test_moving_an_item_to_a_frame_paints_before_the_write():
+    """Duration preserved, start clamped, and the operation is the source."""
+    _run_gesture_node(_CLASS_A_SETUP + """
+        const scene = clipScene();
+        const w = moveWidget(scene);
+        const clip = scene.clips[0];            // [0, 100]
+        const pending = w._moveItemToFrame('clip', 'c1', clip, 250);
+        await new Promise((r) => setTimeout(r, 0));
+
+        assert.equal(w.sent.length, 1, 'the write is in flight');
+        assert.deepEqual(
+            [clip.timeline_start_frame, clip.timeline_end_frame], [250, 350],
+            'painted, with the duration preserved by the server rule');
+        assert.equal(w.sent[0].operations[0].fields.timeline_start_frame, 250);
+        assert.equal(w.sent[0].operations[0].fields.timeline_end_frame, undefined,
+            'no end is sent -- preserving the duration is the SERVER answer');
+        w.released[0].resolve({payload: {results: []}});
+        await pending;
+    """)
+
+
+def test_a_negative_move_target_clamps_the_way_the_server_does():
+    """`max(0, int(x))`, not `Math.floor`, and not the raw input."""
+    _run_gesture_node(_CLASS_A_SETUP + """
+        const scene = clipScene();
+        const w = moveWidget(scene);
+        scene.clips[0].timeline_start_frame = 40;
+        scene.clips[0].timeline_end_frame = 90;
+        const pending = w._moveItemToFrame('clip', 'c1', scene.clips[0], -7);
+        await new Promise((r) => setTimeout(r, 0));
+        assert.deepEqual(
+            [scene.clips[0].timeline_start_frame, scene.clips[0].timeline_end_frame],
+            [0, 50], 'clamped to zero, duration kept');
+        w.released[0].resolve({payload: {results: []}});
+        await pending;
+    """)
+
+
+def test_a_linked_move_shifts_every_member_by_the_anchor_s_delta():
+    """`_apply_linked_bounds_update`'s pure-move arm, including its clamping.
+
+    The delta is computed ONCE from the anchor and then added to every member.
+    Clamping each member independently would compress a group that straddles
+    frame zero -- the members would pile up rather than move together.
+    """
+    _run_gesture_node(_CLASS_A_SETUP + """
+        const scene = clipScene();
+        scene.audio_tracks[0].timeline_start_frame = 10;
+        scene.audio_tracks[0].timeline_end_frame = 60;
+        scene.prompt_sections = [{prompt_id: 'p1', start_frame: 20, end_frame: 70}];
+        scene.guide_frames = [{guide_id: 'g0', frame_index: 30}];
+        scene.clips[0].source_in_frame = 12;
+        scene.clips[0].source_out_frame = 112;
+        scene.linked_item_groups = [{group_id: 'g1', items: [
+            {type: 'clip', id: 'c1'}, {type: 'audio', id: 'a1'},
+            {type: 'prompt', id: 'p1'}, {type: 'guide', id: 'g0'}]}];
+        const w = moveWidget(scene);
+        w._findSceneItemForLinkRef = (ref) => {
+            if (ref.type === 'clip') return {type: 'clip', id: 'c1', data: scene.clips[0]};
+            if (ref.type === 'audio') return {type: 'audio', id: 'a1', data: scene.audio_tracks[0]};
+            if (ref.type === 'prompt') return {type: 'prompt', id: 0, data: scene.prompt_sections[0]};
+            if (ref.type === 'guide') return {type: 'guide', id: 30, data: scene.guide_frames[0]};
+            return null;
+        };
+        const pending = w._moveItemToFrame('clip', 'c1', scene.clips[0], 25);
+        await new Promise((r) => setTimeout(r, 0));
+
+        assert.equal(w.sent[0].operations[0].apply_linked, true);
+        assert.deepEqual([scene.clips[0].timeline_start_frame,
+                          scene.clips[0].timeline_end_frame], [25, 125]);
+        assert.deepEqual([scene.audio_tracks[0].timeline_start_frame,
+                          scene.audio_tracks[0].timeline_end_frame], [35, 85]);
+        assert.deepEqual([scene.prompt_sections[0].start_frame,
+                          scene.prompt_sections[0].end_frame], [45, 95]);
+        // A guide is a single frame: the server writes `frame_index` alone and
+        // derives its end, so a mirror must not invent an `end_frame` on it.
+        assert.equal(scene.guide_frames[0].frame_index, 55);
+        assert.equal('end_frame' in scene.guide_frames[0], false);
+        // Source windows are untouched: this is a move, not a trim.
+        // `_apply_ref_bounds` shifts them only when the move is NOT pure, so a
+        // mirror that adjusted them here would re-trim every linked member of
+        // an ordinary move.
+        assert.equal(scene.clips[0].source_in_frame, 12);
+        assert.equal(scene.clips[0].source_out_frame, 112);
+        w.released[0].resolve({payload: {results: []}});
+        await pending;
+    """)
+
+
+def test_a_refused_move_refetches_instead_of_leaving_the_item_where_it_was_drawn():
+    _run_gesture_node(_CLASS_A_SETUP + """
+        const scene = clipScene();
+        const w = moveWidget(scene);
+        const refetches = [];
+        w._fetchScenes = async (options) => { refetches.push(options); return true; };
+        const pending = w._moveItemToFrame('clip', 'c1', scene.clips[0], 250);
+        await new Promise((r) => setTimeout(r, 0));
+        assert.equal(scene.clips[0].timeline_start_frame, 250, 'painted');
+        // A refusal this operation really can produce. It does NOT send
+        // `validate_lane_collision` -- only the trim commit does -- so it can
+        // never be refused for overlapping; a locked destination lane is the
+        // refusal an author actually meets.
+        w.released[0].reject(new Error('Lane is locked'));
+        await pending;
+        assert.equal(refetches.length, 1);
+        assert.equal(refetches[0].reason, 'move_item_error');
+        // And the server's own wording survives rather than the generic toast.
+        assert.match(w.sent[0].options.failureMessage(new Error('Lane is locked')),
+            /Lane is locked/);
+    """)
+
+
+def test_moving_an_item_to_a_new_lane_paints_the_lane_and_the_item():
+    """`_applyLocalSetLaneCount` already mirrored the append; the lane field is
+    the only thing that was missing, and the repaint used to run only on
+    success."""
+    _run_gesture_node(_CLASS_A_SETUP + """
+        const scene = clipScene();
+        scene.video_lane_count = 2;
+        const w = moveWidget(scene);
+        w._clipTrackType = () => 'video';
+        const pending = w._moveItemToNewLane({type: 'clip', id: 'c1', data: scene.clips[0]});
+        await new Promise((r) => setTimeout(r, 0));
+
+        assert.equal(scene.video_lane_count, 3, 'the lane exists immediately');
+        assert.equal(scene.clips[0].track_index, 2, 'and the clip is on it');
+        assert.deepEqual(w.sent[0].operations.map((op) => op.type),
+            ['set_lane_count', 'update_clip']);
+        assert.equal(w.sent[0].operations[0].count, 3);
+        assert.equal(w.sent[0].operations[1].fields.track_index, 2);
+        w.released[0].resolve({payload: {results: []}});
+        await pending;
+    """)
+
+
+def test_a_driver_clip_moves_to_a_new_driver_lane_not_a_video_one():
+    """`variableLaneTypeFor(this._clipTrackType(...))`, not a hardcoded family.
+
+    Appending to `video` would create the lane in the wrong family and move the
+    Driver onto a lane that cannot hold it.
+    """
+    _run_gesture_node(_CLASS_A_SETUP + """
+        const scene = clipScene();
+        scene.clips[0].role = 'motion_driver';
+        scene.motion_driver_lane_count = 1;
+        const w = moveWidget(scene);
+        // The shared fixture pins `_clipTrackType` to 'video' for the ordinary
+        // cases. That is the very thing under test here, so drop the own
+        // property and let the prototype's real one read the clip's role.
+        delete w._clipTrackType;
+        const pending = w._moveItemToNewLane({type: 'clip', id: 'c1', data: scene.clips[0]});
+        await new Promise((r) => setTimeout(r, 0));
+        assert.equal(w.sent[0].operations[0].lane_type, 'motion_driver');
+        assert.equal(scene.motion_driver_lane_count, 2);
+        assert.equal(scene.clips[0].track_index, 1);
+        w.released[0].resolve({payload: {results: []}});
+        await pending;
+    """)
+
+
+def test_consolidating_moves_the_items_and_compacts_the_lanes_they_empty():
+    """The ORDER is the difficulty, and it is why this one is a named helper.
+
+    Move every item first, then remove the vacated lanes in DESCENDING order.
+    The destination then lands on the server's `final_target_lane` by itself,
+    because the moved items shift down with everything else above a removed
+    lane. Computing that index directly would be a second answer.
+    """
+    _run_gesture_node(_CLASS_A_SETUP + """
+        const scene = clipScene();
+        scene.video_lane_count = 4;
+        scene.clips = [
+            {clip_id: 'a', timeline_start_frame: 0, timeline_end_frame: 10, track_index: 0},
+            {clip_id: 'b', timeline_start_frame: 20, timeline_end_frame: 30, track_index: 1},
+            {clip_id: 'c', timeline_start_frame: 40, timeline_end_frame: 50, track_index: 3},
+        ];
+        const w = moveWidget(scene);
+        // Target lane 3; lanes 0 and 1 empty when their only items move.
+        const painted = w._applyLocalConsolidateItems('video', ['a', 'b'], 3);
+        assert.equal(painted, true);
+        assert.equal(scene.video_lane_count, 2, 'two vacated lanes removed');
+        // 3 - 2 removed below = 1, which is what `final_target_lane` reports.
+        assert.deepEqual(scene.clips.map((v) => [v.clip_id, v.track_index]),
+            [['a', 1], ['b', 1], ['c', 1]]);
+    """)
+
+
+def test_consolidating_leaves_a_source_lane_that_did_not_empty():
+    """`_compactEmptyMediaLaneLocal` re-checks emptiness, as the server does."""
+    _run_gesture_node(_CLASS_A_SETUP + """
+        const scene = clipScene();
+        scene.video_lane_count = 3;
+        scene.clips = [
+            {clip_id: 'a', timeline_start_frame: 0, timeline_end_frame: 10, track_index: 0},
+            {clip_id: 'stay', timeline_start_frame: 60, timeline_end_frame: 70, track_index: 0},
+            {clip_id: 'c', timeline_start_frame: 40, timeline_end_frame: 50, track_index: 2},
+        ];
+        const w = moveWidget(scene);
+        w._applyLocalConsolidateItems('video', ['a'], 2);
+        assert.equal(scene.video_lane_count, 3, 'lane 0 still holds an item');
+        assert.deepEqual(scene.clips.map((v) => [v.clip_id, v.track_index]),
+            [['a', 2], ['stay', 0], ['c', 2]]);
+    """)
+
+
+def test_a_linked_move_that_would_carry_a_member_negative_paints_nothing():
+    """The server refuses the whole move, so the honest paint is none.
+
+    The client cannot clamp its way out: the delta is the anchor's, and clamping
+    each member independently piles the group up at frame zero instead of moving
+    it together. `_apply_ref_bounds` raises `invalid_range` on the first member
+    that would land below zero, so painting would draw a row the project will
+    never hold -- and a later `_pushUndo` snapshots whatever is on screen.
+
+    Found by injecting the clamp into the mirror and watching the parity test
+    pass, which is what sent me looking for the case it could not reach.
+    """
+    _run_gesture_node(_CLASS_A_SETUP + """
+        const scene = clipScene();
+        scene.clips[0].timeline_start_frame = 100;
+        scene.clips[0].timeline_end_frame = 200;
+        // The partner starts BEFORE the anchor, so a delta that puts the anchor
+        // at zero puts this one below it.
+        scene.audio_tracks[0].timeline_start_frame = 50;
+        scene.audio_tracks[0].timeline_end_frame = 150;
+        scene.linked_item_groups = [{group_id: 'g1', items: [
+            {type: 'clip', id: 'c1'}, {type: 'audio', id: 'a1'}]}];
+        const w = moveWidget(scene);
+
+        const pending = w._moveItemToFrame('clip', 'c1', scene.clips[0], 0);
+        await new Promise((r) => setTimeout(r, 0));
+
+        assert.equal(w.sent.length, 1, 'the move is still SENT -- the server decides');
+        assert.equal(w.sent[0].operations[0].apply_linked, true);
+        // Nothing painted, including the anchor: a half-applied group on screen
+        // is worse than an unapplied one, and the server applies none of it.
+        assert.deepEqual([scene.clips[0].timeline_start_frame,
+                          scene.clips[0].timeline_end_frame], [100, 200]);
+        assert.deepEqual([scene.audio_tracks[0].timeline_start_frame,
+                          scene.audio_tracks[0].timeline_end_frame], [50, 150]);
+
+        w.released[0].reject(new Error('Clip range is invalid'));
+        await pending;
+    """)
+
+
+def test_a_linked_move_that_clears_frame_zero_still_paints():
+    """The boundary of the rule above: exactly at zero is allowed."""
+    _run_gesture_node(_CLASS_A_SETUP + """
+        const scene = clipScene();
+        scene.clips[0].timeline_start_frame = 100;
+        scene.clips[0].timeline_end_frame = 200;
+        scene.audio_tracks[0].timeline_start_frame = 100;
+        scene.audio_tracks[0].timeline_end_frame = 150;
+        scene.linked_item_groups = [{group_id: 'g1', items: [
+            {type: 'clip', id: 'c1'}, {type: 'audio', id: 'a1'}]}];
+        const w = moveWidget(scene);
+        const pending = w._moveItemToFrame('clip', 'c1', scene.clips[0], 0);
+        await new Promise((r) => setTimeout(r, 0));
+        assert.deepEqual([scene.clips[0].timeline_start_frame,
+                          scene.clips[0].timeline_end_frame], [0, 100]);
+        assert.deepEqual([scene.audio_tracks[0].timeline_start_frame,
+                          scene.audio_tracks[0].timeline_end_frame], [0, 50]);
+        w.released[0].resolve({payload: {results: []}});
+        await pending;
+    """)
+
+
+def test_a_refused_lane_move_repaints_and_refetches():
+    """The repaint used to sit inside the `try`, AFTER the await.
+
+    So a failure left the timeline unrepainted and refetched nothing at all --
+    tolerable when nothing had been drawn, and not tolerable now, because the
+    optimistic apply has already added a lane and moved the item onto it. The
+    batch is also non-retryable by construction (`fields.track_index` is a lane
+    destination), so this path is REACHED rather than replayed whenever a render
+    or another editor moves the version underneath it.
+    """
+    _run_gesture_node(_CLASS_A_SETUP + """
+        const scene = clipScene();
+        scene.video_lane_count = 2;
+        const w = moveWidget(scene);
+        w._clipTrackType = () => 'video';
+        const refetches = [];
+        w._fetchScenes = async (options) => { refetches.push(options); return true; };
+        let repaints = 0;
+        w._renderSceneAfterLocalMutation = () => { repaints += 1; };
+
+        const pending = w._moveItemToNewLane({type: 'clip', id: 'c1', data: scene.clips[0]});
+        await new Promise((r) => setTimeout(r, 0));
+        assert.equal(scene.video_lane_count, 3, 'painted');
+        const paintedAt = repaints;
+
+        w.released[0].reject(new Error('Lane is locked'));
+        await pending;
+        assert.equal(refetches.length, 1, 'the optimistic lane is discarded');
+        assert.equal(refetches[0].ignoreMutationGate, true);
+        assert.equal(refetches[0].reason, 'move_new_lane_error');
+        assert.ok(repaints > paintedAt, 'and the timeline is repainted on failure');
+    """)
+
+
+def test_a_refused_consolidation_refetches_what_it_painted():
+    """Consolidation moves items between lanes and can REMOVE one.
+
+    Leaving that on screen after a refusal is not a cosmetic delay: the lane is
+    gone from the client's scene and every item above it has been reindexed.
+    """
+    _run_gesture_node(_CLASS_A_SETUP + """
+        const scene = clipScene();
+        scene.video_lane_count = 3;
+        scene.clips = [
+            {clip_id: 'a', timeline_start_frame: 0, timeline_end_frame: 10, track_index: 0},
+            {clip_id: 'b', timeline_start_frame: 40, timeline_end_frame: 50, track_index: 2},
+        ];
+        const w = moveWidget(scene);
+        const refetches = [];
+        w._fetchScenes = async (options) => { refetches.push(options); return true; };
+        w._selectedConsolidationItems = () => ([
+            {type: 'clip', id: 'a', data: scene.clips[0]},
+            {type: 'clip', id: 'b', data: scene.clips[1]},
+        ]);
+        w._consolidationRefusal = () => '';
+        w._mediaItemsOverlap = () => false;
+        w._laneItemsForTrackType = () => [];
+
+        const pending = w._consolidateSelectedItemsToLane(
+            {type: 'clip', id: 'b', data: scene.clips[1]});
+        await new Promise((r) => setTimeout(r, 0));
+        assert.equal(scene.video_lane_count, 2, 'the vacated lane is gone already');
+        assert.deepEqual(scene.clips.map((c) => c.track_index), [1, 1]);
+
+        w.released[0].reject(new Error('Selected items overlap'));
+        await pending;
+        assert.equal(refetches.length, 1);
+        assert.equal(refetches[0].reason, 'consolidate_error');
+        assert.equal(refetches[0].ignoreMutationGate, true);
+    """)
+
+
+def test_consolidation_paints_nothing_when_an_id_is_not_on_the_timeline():
+    """`_consolidate_media_items` 404s the WHOLE operation on the first id it
+    cannot resolve, so a partial paint would draw an arrangement the server can
+    never produce. Unreachable through the live selection path, which is why it
+    is pinned rather than left to a comment."""
+    _run_gesture_node(_CLASS_A_SETUP + """
+        const scene = clipScene();
+        scene.video_lane_count = 3;
+        scene.clips = [
+            {clip_id: 'a', timeline_start_frame: 0, timeline_end_frame: 10, track_index: 0},
+        ];
+        const w = moveWidget(scene);
+        assert.equal(w._applyLocalConsolidateItems('video', ['a', 'ghost'], 2), false);
+        assert.equal(scene.clips[0].track_index, 0, 'nothing moved');
+        assert.equal(scene.video_lane_count, 3, 'and no lane was compacted');
+    """)
+
+
+def test_a_move_on_an_optimistic_split_half_still_asks_about_linkage():
+    """The defect an adversarial audit of this landing found.
+
+    A half painted by an in-flight split is in no group locally, so
+    `_isLinkedItem` says false. Sending `apply_linked: false` on that answer is
+    not a declined nicety: the server holds the regrouped halves, moves only the
+    row named, leaves its partner behind, and returns **200** -- so nothing
+    refetches and the client and the disk agree on the wrong state. Every
+    `apply_linked` emitter now goes through `_shouldApplyLinked`.
+    """
+    _run_gesture_node(_CLASS_A_SETUP + """
+        const scene = clipScene();
+        scene.linked_item_groups = [{group_id: 'g1', items: [
+            {type: 'clip', id: 'c1'}, {type: 'audio', id: 'a1'}]}];
+        const w = moveWidget(scene);
+
+        const split = w._splitItemsAtFrame(
+            [{type: 'clip', id: 'c1', data: scene.clips[0]}], 50);
+        await new Promise((r) => setTimeout(r, 0));
+        const half = scene.clips.find((c) => c.clip_id !== 'c1');
+        assert.equal(w._isLinkedItem({type: 'clip', id: half.clip_id, data: half}), false,
+            'genuinely ungrouped locally -- that is the trap');
+        assert.equal(w._shouldApplyLinked({type: 'clip', id: half.clip_id, data: half}), true);
+
+        const move = w._moveItemToFrame('clip', half.clip_id, half, 400);
+        await new Promise((r) => setTimeout(r, 0));
+        assert.equal(w.sent[1].operations[0].apply_linked, true,
+            'the server is asked to move whatever group it holds');
+
+        for (const slot of w.released) {
+            slot.resolve({payload: {results: [{type: 'split_linked_items',
+                split_count: 2, right_items: []}]}});
+        }
+        await Promise.allSettled([split, move]);
     """)
