@@ -4694,3 +4694,234 @@ def test_a_split_with_no_right_ids_at_all_still_works(monkeypatch, tmp_path):
     assert response.status == 200, _response_json(response)
     assert len(scene.clips) == 2
     assert all(clip.clip_id for clip in scene.clips)
+
+
+# ---------------------------------------------------------------------------
+# Client-minted link-group ids. The same contract as the split half ids above,
+# settled here because `_prune_linked_item_groups` did the OPPOSITE -- it
+# silently re-minted a colliding `group_id`, which is exactly the behaviour the
+# split landing refused to copy.
+# ---------------------------------------------------------------------------
+
+
+def _scene_for_linking(tmp_path):
+    scene, project = _scene_with_one_clip(tmp_path)
+    scene.audio_tracks = [AudioTrack(
+        track_id="audio-a", source_path="media/a.wav", timeline_start_frame=0,
+        timeline_end_frame=100, source_in_frame=0, total_source_frames=100)]
+    return scene, project
+
+
+def _link_op(group_id=None, items=None):
+    operation = {
+        "type": "create_link_group",
+        "items": items or [{"type": "clip", "id": "clip-a"},
+                           {"type": "audio", "id": "audio-a"}],
+    }
+    if group_id is not None:
+        operation["group_id"] = group_id
+    return operation
+
+
+def test_a_link_group_uses_the_group_id_the_client_minted(monkeypatch, tmp_path):
+    """So an optimistic link badge names the group the project actually holds."""
+    route_module = _load_route_module(monkeypatch)
+    scene, project = _scene_for_linking(tmp_path)
+    saves = []
+    response = _apply_scene_operations(
+        route_module, monkeypatch, project, "scene-1",
+        [_link_op("link-abc1")], saves)
+    assert response.status == 200, _response_json(response)
+    assert scene.linked_item_groups[0]["group_id"] == "link-abc1"
+    assert _response_json(response)["results"][0]["group_id"] == "link-abc1"
+
+
+def test_a_colliding_link_group_id_is_refused_and_never_re_minted(
+        monkeypatch, tmp_path):
+    """The contradiction this closes, stated as a test.
+
+    `_prune_linked_item_groups` re-mints a duplicate `group_id`, so before this
+    the client's optimistic badge could name a group the server had quietly
+    renamed -- the same shape as the `temp-clip-...` defect, reached through a
+    link instead of a split. Link groups do not diverge from split: 409.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene, project = _scene_for_linking(tmp_path)
+    scene.guide_frames = [GuideFrame(guide_id="guide-a", frame_index=10),
+                          GuideFrame(guide_id="guide-b", frame_index=20)]
+    scene.linked_item_groups = [{"group_id": "taken111", "items": [
+        {"type": "guide", "id": "guide-a"}, {"type": "guide", "id": "guide-b"}]}]
+    saves = []
+    response = _apply_scene_operations(
+        route_module, monkeypatch, project, "scene-1",
+        [_link_op("taken111")], saves)
+    assert response.status == 409, _response_json(response)
+    assert _response_json(response)["code"] == "id_conflict"
+    assert saves == []
+    assert len(scene.linked_item_groups) == 1, "the refused link wrote nothing"
+
+
+def test_an_id_this_very_operation_frees_does_not_refuse_the_link(
+        monkeypatch, tmp_path):
+    """Why the collision check runs AFTER `_unlink_refs`, not before.
+
+    `create_link_group` dissolves the selection's existing groups first. A check
+    read before that would refuse an id the operation itself is about to
+    release, which is the ordinary case of re-linking a pair that is already
+    linked -- a refusal with nothing to refuse.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene, project = _scene_for_linking(tmp_path)
+    scene.linked_item_groups = [{"group_id": "reused11", "items": [
+        {"type": "clip", "id": "clip-a"}, {"type": "audio", "id": "audio-a"}]}]
+    saves = []
+    response = _apply_scene_operations(
+        route_module, monkeypatch, project, "scene-1",
+        [_link_op("reused11")], saves)
+    assert response.status == 200, _response_json(response)
+    assert [group["group_id"] for group in scene.linked_item_groups] == ["reused11"]
+
+
+def test_an_id_held_by_a_group_that_survives_the_unlink_still_refuses(
+        monkeypatch, tmp_path):
+    """The other side of the ordering, so the rule is not read as 'never refuse'.
+
+    A group of three loses one member to the new link and keeps two, so it
+    survives and keeps its id. That id is still taken.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene, project = _scene_for_linking(tmp_path)
+    scene.guide_frames = [GuideFrame(guide_id="guide-a", frame_index=10),
+                          GuideFrame(guide_id="guide-b", frame_index=20)]
+    scene.linked_item_groups = [{"group_id": "survive1", "items": [
+        {"type": "clip", "id": "clip-a"},
+        {"type": "guide", "id": "guide-a"},
+        {"type": "guide", "id": "guide-b"}]}]
+    saves = []
+    response = _apply_scene_operations(
+        route_module, monkeypatch, project, "scene-1",
+        [_link_op("survive1")], saves)
+    assert response.status == 409, _response_json(response)
+    assert _response_json(response)["code"] == "id_conflict"
+    assert saves == []
+
+
+@pytest.mark.parametrize("bad", [
+    "ab", "UPPERCASE", "has space", "has/slash", "x" * 64 + "y",
+    "-leading-dash", 12345, True, ["link-abc1"],
+])
+def test_an_unusable_link_group_id_is_refused_rather_than_stored(
+        monkeypatch, tmp_path, bad):
+    """`group_id` is an unvalidated string in durable data, so this is the gate.
+
+    `True` is in the table because `isinstance(True, str)` is False but a bare
+    truthiness check would have let it through, and `str(True)` is `"True"` --
+    an id the caller does not hold, in a field nothing else validates.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene, project = _scene_for_linking(tmp_path)
+    saves = []
+    response = _apply_scene_operations(
+        route_module, monkeypatch, project, "scene-1", [_link_op(bad)], saves)
+    assert response.status == 400, _response_json(response)
+    assert _response_json(response)["code"] == "invalid_id"
+    assert saves == []
+    assert scene.linked_item_groups == []
+
+
+@pytest.mark.parametrize("absent", [None, ""])
+def test_a_link_group_with_no_client_id_is_still_named_by_the_server(
+        monkeypatch, tmp_path, absent):
+    """Every caller before this landing sent none, and a blank is not an error.
+
+    `None` is an operation with no `group_id` key at all; `""` is one that sent
+    the field empty, which is what a client reading a blank stored id would do.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene, project = _scene_for_linking(tmp_path)
+    saves = []
+    operation = _link_op() if absent is None else _link_op("")
+    response = _apply_scene_operations(
+        route_module, monkeypatch, project, "scene-1", [operation], saves)
+    assert response.status == 200, _response_json(response)
+    assert len(scene.linked_item_groups[0]["group_id"]) == 8
+
+
+def test_the_link_response_names_the_group_the_scene_actually_holds(
+        monkeypatch, tmp_path):
+    """The response is looked up by id after pruning, not read off the appended dict.
+
+    `_prune_linked_item_groups` rebuilds every group as a NEW dict, so the
+    object handed to it is not authoritative afterwards. The scene here carries
+    a pre-existing duplicate pair that prune DOES renumber, so the lookup walks
+    a list prune has genuinely rewritten.
+
+    This case alone does NOT separate the lookup from `return group`, and saying
+    so matters: both spellings answer identically whenever the new group
+    survives. The fixture that separates them is the one below, where it does
+    not.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene, project = _scene_for_linking(tmp_path)
+    scene.guide_frames = [GuideFrame(guide_id=f"guide-{n}", frame_index=n * 10)
+                          for n in range(1, 5)]
+    scene.linked_item_groups = [
+        {"group_id": "dup", "items": [{"type": "guide", "id": "guide-1"},
+                                      {"type": "guide", "id": "guide-2"}]},
+        {"group_id": "dup", "items": [{"type": "guide", "id": "guide-3"},
+                                      {"type": "guide", "id": "guide-4"}]},
+    ]
+    saves = []
+    response = _apply_scene_operations(
+        route_module, monkeypatch, project, "scene-1",
+        [_link_op("link-new1")], saves)
+    assert response.status == 200, _response_json(response)
+    reported = _response_json(response)["results"][0]["group_id"]
+    stored = [group["group_id"] for group in scene.linked_item_groups]
+    assert reported in stored, "the response named a group the scene does not hold"
+    assert stored.count(reported) == 1
+    assert len(set(stored)) == 3, "prune renumbered the pre-existing duplicate"
+
+
+@pytest.mark.parametrize("guide_id", [0, None, 5])
+@pytest.mark.parametrize("other_group", [False, True])
+def test_a_link_whose_refs_prune_discards_is_refused_rather_than_misreported(
+        monkeypatch, tmp_path, guide_id, other_group):
+    """"The ref resolved" and "prune can match the ref" are not the same test.
+
+    `_link_ref` coerces the row's id with `str(item_id or "")`, while
+    `_scene_existing_link_ids` indexes the row's id RAW and `GuideFrame.from_dict`
+    accepts one uncoerced. So a durable `guide_id` of `0`, `None` or `5`
+    resolves in `_item_ref_from_selection` and is discarded by the very next
+    prune, leaving the appended group with one ref and no place in the scene.
+
+    Two wrong answers were live here and both are pinned. Returning the appended
+    dict reported a group of two that the project does not hold. Returning the
+    LAST group instead -- which reads as the safe fix, since prune preserves
+    order -- returned an unrelated group under HTTP 200 when the scene held
+    another one, and raised `IndexError` into a 500 when it did not.
+
+    Unreachable from the editor, whose create paths coerce every durable id to
+    `str`; reachable from hand-edited, legacy or third-party `project.json`.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene, project = _scene_for_linking(tmp_path)
+    scene.guide_frames = [GuideFrame(guide_id=guide_id, frame_index=10),
+                          GuideFrame(guide_id="guide-b", frame_index=20)]
+    if other_group:
+        scene.guide_frames += [GuideFrame(guide_id="guide-c", frame_index=30),
+                               GuideFrame(guide_id="guide-d", frame_index=40)]
+        scene.linked_item_groups = [{"group_id": "other111", "items": [
+            {"type": "guide", "id": "guide-c"}, {"type": "guide", "id": "guide-d"}]}]
+    before = [group["group_id"] for group in scene.linked_item_groups]
+    saves = []
+    response = _apply_scene_operations(
+        route_module, monkeypatch, project, "scene-1",
+        # A guide addressed by FRAME INDEX, which is how the editor sends one.
+        [_link_op("mine-abc1", items=[{"type": "guide", "id": 10},
+                                      {"type": "guide", "id": "guide-b"}])],
+        saves)
+    assert response.status == 400, _response_json(response)
+    assert _response_json(response)["code"] == "invalid_link_group"
+    assert saves == []
+    assert [group["group_id"] for group in scene.linked_item_groups] == before

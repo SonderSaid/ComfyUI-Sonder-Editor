@@ -1533,7 +1533,7 @@ def _item_bounds(scene: Scene, ref: dict) -> tuple[int, int]:
     _mutation_error(f"Unsupported linked item type: {item_type}", 400, "invalid_link_type")
 
 
-def _add_link_group(scene: Scene, items: list[dict], group_id: str = "") -> dict:
+def _add_link_group(scene: Scene, items: list[dict], group_id=None) -> dict:
     refs = []
     seen = set()
     for item in items:
@@ -1545,10 +1545,45 @@ def _add_link_group(scene: Scene, items: list[dict], group_id: str = "") -> dict
     if len(refs) < 2:
         _mutation_error("A link group requires at least two existing items", 400, "invalid_link_group")
     _unlink_refs(scene, refs)
-    group = {"group_id": str(group_id or uuid.uuid4().hex[:8]), "items": refs}
-    scene.linked_item_groups.append(group)
+    # AFTER `_unlink_refs`, because that is the state the new group joins: a
+    # group this very operation dissolves has released its id and must not
+    # refuse the caller's.
+    if not isinstance(getattr(scene, "linked_item_groups", None), list):
+        scene.linked_item_groups = []
+    taken = {str(group.get("group_id", "") or "")
+             for group in scene.linked_item_groups if isinstance(group, dict)}
+    minted = _client_link_group_id(group_id, taken)
+    new_group_id = minted or uuid.uuid4().hex[:8]
+    scene.linked_item_groups.append({"group_id": new_group_id, "items": refs})
     _prune_linked_item_groups(scene)
-    return group
+    # Look the group up BY ID rather than returning the dict just appended.
+    # `_prune_linked_item_groups` rebuilds every group as a new dict, so the
+    # appended one is not what the scene holds afterwards, and reporting it
+    # could name a group the project does not carry -- the silent-substitution
+    # failure this branch's whole id policy exists to prevent, arriving through
+    # the return statement instead of through the id. The lookup is unambiguous:
+    # `taken` was compared against every group present at append time, so no
+    # earlier group holds `new_group_id` and prune cannot re-mint this one.
+    #
+    # A POSITIONAL walk was tried here and was wrong. Prune can drop the new
+    # group outright, because "the ref resolved" and "prune can match the ref"
+    # are not the same test: `_link_ref` coerces the row's id with
+    # `str(item_id or "")` while `_scene_existing_link_ids` indexes the row's id
+    # RAW, so a durable `guide_id` of `0`, `None` or `5` -- which
+    # `GuideFrame.from_dict` accepts uncoerced -- resolves here and is discarded
+    # one line later. `[-1]` then returned an unrelated group with HTTP 200, or
+    # raised `IndexError` into a 500 when the scene had no other group.
+    created = next((group for group in scene.linked_item_groups
+                    if str(group.get("group_id", "") or "") == new_group_id), None)
+    if created is None:
+        # Not reachable from the editor, whose create paths coerce every durable
+        # id to `str`; reachable from hand-edited or third-party `project.json`.
+        # Refusing is the honest outcome either way: fewer than two of the named
+        # rows can be addressed by a link ref, so the project holds no new link
+        # and a 200 would say one was made.
+        _mutation_error("A link group requires at least two existing items",
+                        400, "invalid_link_group")
+    return created
 
 
 def _unlink_refs(scene: Scene, refs: list[dict]) -> None:
@@ -1812,6 +1847,50 @@ def _client_split_half_id(right_ids, item_type: str, item_id: str,
         _mutation_error(
             f"Split half id {candidate} is already in use", 409, "id_conflict")
     taken.add(candidate)
+    return candidate
+
+
+def _client_link_group_id(raw_id, taken: "set[str]") -> str:
+    """A client-minted durable id for a new link group, or "".
+
+    The same contract as `_client_split_half_id` above, and deliberately so.
+    The question this settles is one the split landing raised and left open for
+    link groups: `_prune_linked_item_groups` SILENTLY RE-MINTS a colliding
+    `group_id`, which is exactly the behaviour split refused to copy. A client
+    that paints a link badge before the write has to be holding the name the
+    server will store, or the badge names a group the project does not have and
+    the next edit authored against it addresses nothing.
+
+    Link groups do not diverge from split on the POLICY. Three mechanical
+    differences, stated because "the same contract" would otherwise read as
+    "identical code":
+
+    * `taken` is compared, not accumulated. Split mints several halves inside
+      one operation and has to compare them against each other; a link group is
+      one row, compared against the groups the scene holds at the moment it is
+      appended.
+    * `""` is ABSENT here, where split treats it as invalid. `right_ids[key] = ""`
+      is a caller that built a key and filled nothing, which is a bug; this
+      field was previously read as `str(op.get("group_id", "") or "")`, so a
+      blank has always meant "not supplied" and refusing it now would break a
+      caller that never sent an id.
+    * No compatibility is owed for narrowing this field. `group_id` was
+      accepted and stored permissively before, so a non-editor caller could
+      name a group `"My Group 1"` and can no longer. It is REST surface, not
+      durable project data and not the published node contract, and existing
+      stored ids are never revalidated -- only newly supplied ones.
+    """
+    if raw_id is None or raw_id == "":
+        return ""
+    # A string, not anything that stringifies, for the reason
+    # `_client_split_half_id` states: `str(12345)` would pass the pattern and
+    # store a value whose TYPE the caller does not hold.
+    candidate = raw_id if isinstance(raw_id, str) else None
+    if candidate is None or not _CLIENT_ID_PATTERN.match(candidate):
+        _mutation_error("Link group id is not a usable id", 400, "invalid_id")
+    if candidate in taken:
+        _mutation_error(
+            f"Link group id {candidate} is already in use", 409, "id_conflict")
     return candidate
 
 
@@ -4800,7 +4879,9 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
             "audio_asset": audio_asset.to_dict() if audio_asset else None,
         }
     if op_type == "create_link_group":
-        group = _add_link_group(scene, op.get("items", []), str(op.get("group_id", "") or ""))
+        # The raw value, NOT `str(...)`: coercing here would defeat the type
+        # check `_client_link_group_id` makes, which is the whole point of it.
+        group = _add_link_group(scene, op.get("items", []), op.get("group_id"))
         return {"type": op_type, "group_id": group["group_id"], "count": len(group["items"])}
     if op_type == "unlink_items":
         refs = [_item_ref_from_selection(scene, item) for item in op.get("items", []) or []]

@@ -401,6 +401,7 @@ import {
     movedMediaBounds, movedMemberBounds, memberBounds, writeMemberBounds,
     linkedMoveRefusal,
 } from "./scene_move_geometry.js";
+import { LINK_ITEM_TYPES, pruneLinkedItemGroups } from "./scene_link_groups.js";
 import { createViewportSurface } from "./viewport_surface.js";
 import {
     EDITOR_COLORS as COLORS,
@@ -6981,8 +6982,9 @@ export class EditorWidget {
         return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
     }
 
+    /** The shared list, not a second copy — see `scene_link_groups.js`. */
     _linkableItemTypes() {
-        return new Set(["clip", "audio", "guide", "prompt"]);
+        return LINK_ITEM_TYPES;
     }
 
     _selectionItemKey(item) {
@@ -7185,26 +7187,17 @@ export class EditorWidget {
         return null;
     }
 
+    /** Normalize `activeScene.linked_item_groups` the way the server will.
+     *
+     *  An INTENTIONAL MIRROR, and the rule itself lives in
+     *  `web/js/scene_link_groups.js` so `tests/test_link_group_parity.py` can
+     *  drive it against `_prune_linked_item_groups` under node. This stays a
+     *  method because four local applies and a source-slicing test name it.
+     */
     _pruneLocalLinkedGroups() {
         if (!this.activeScene) return;
-        const groups = this.activeScene.linked_item_groups || [];
-        const next = [];
-        for (const group of groups) {
-            const items = [];
-            const seen = new Set();
-            for (const ref of group?.items || []) {
-                const hit = this._findSceneItemForLinkRef(ref);
-                if (!hit) continue;
-                const stableRef = this._linkRefForItem(hit);
-                if (!stableRef) continue;
-                const key = this._linkRefKey(stableRef);
-                if (seen.has(key)) continue;
-                items.push(stableRef);
-                seen.add(key);
-            }
-            if (items.length >= 2) next.push({ group_id: group.group_id || this._newLocalItemId("link"), items });
-        }
-        this.activeScene.linked_item_groups = next;
+        this.activeScene.linked_item_groups = pruneLinkedItemGroups(
+            this.activeScene, () => this._newLocalItemId("link"));
     }
 
     _laneRefForEntry(entry) {
