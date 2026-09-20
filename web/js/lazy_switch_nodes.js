@@ -291,7 +291,31 @@ const normalizeCounts = (node) => {
     return { branchCount, laneCount };
 };
 
+const sortInputSlots = (node, compare) => {
+    const inputs = node.inputs || [];
+    const sorted = inputs.slice().sort(compare);
+    const moves = inputs.flatMap((slot, index) => {
+        const target = sorted.indexOf(slot);
+        const link = getLinkById(node, slot.link);
+        return link && target !== index ? [{ link, target }] : [];
+    });
+    // Endpoint setters update ComfyUI's link store. Park moved inputs outside
+    // the live range first so swapping occupied positions cannot collide.
+    for (const [index, { link }] of moves.entries()) link.target_slot = inputs.length + index;
+    for (const link of node.graph?.floatingLinks?.values() || []) {
+        if (String(link.target_id) === String(node.id)) {
+            const target = sorted.indexOf(inputs[link.target_slot]);
+            if (target >= 0) link.target_slot = target;
+        }
+    }
+    node.inputs = sorted;
+    for (const { link, target } of moves) link.target_slot = target;
+};
+
 const ensureNodeShape = (node) => {
+    // During restore, ECS links still address transitional slot positions.
+    // Reconcile in afterConfigureGraph, once widgets and link endpoints agree.
+    if (app.configuringGraph) return;
     const state = getNodeState(node);
     const { branchCount, laneCount } = normalizeCounts(node);
 
@@ -332,7 +356,7 @@ const ensureNodeShape = (node) => {
 
     for (const name of removableInputs) removeInputSlot(node, name);
 
-    node.inputs = (node.inputs || []).slice().sort((left, right) => {
+    sortInputSlots(node, (left, right) => {
         const leftInfo = parseInputSlot(left);
         const rightInfo = parseInputSlot(right);
         if (!leftInfo && !rightInfo) return 0;
@@ -396,6 +420,16 @@ app.registerExtension({
     async nodeCreated(node) {
         if (!isTargetNode(node)) return;
         installNodeBehavior(node);
+    },
+
+    afterConfigureGraph() {
+        const root = app.rootGraph || app.graph;
+        const graphs = new Set([root, ...(root?.subgraphs?.values() || [])]);
+        for (const graph of graphs) {
+            for (const node of graph?._nodes || []) {
+                if (isTargetNode(node)) ensureNodeShape(node);
+            }
+        }
     },
 
     getNodeMenuItems(node) {
