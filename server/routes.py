@@ -3411,6 +3411,27 @@ def _apply_delete_link_refs(scene: Scene, refs: list[dict], preserve_lanes: bool
     _rewrite_link_groups_for_deleted(scene, refs)
 
 
+def _apply_swap_guides(scene: Scene, op: dict) -> tuple:
+    """Exchange two guide positions atomically, retaining identity and links."""
+    _require_lane_unlocked(scene, "guide")
+    frame_a = _mutation_int(op.get("frame_index_a"), "frame_index_a")
+    frame_b = _mutation_int(op.get("frame_index_b"), "frame_index_b")
+    if frame_a == frame_b:
+        _mutation_error("swap_guides requires two distinct guide frames", 400)
+    guide_a = _find_guide(scene, frame_a)
+    guide_b = _find_guide(scene, frame_b)
+    _validate_guide_identity(guide_a, op.get("expected_a"))
+    _validate_guide_identity(guide_b, op.get("expected_b"))
+    # Do not mint here: the authored Undo baseline would still have no identity.
+    # Retire this refusal when all supported stored guides have stable ids.
+    if not guide_a.guide_id or not guide_b.guide_id or guide_a.guide_id == guide_b.guide_id:
+        _mutation_error("These guides need distinct stable identities before they can be swapped.",
+                        409, "identity_mismatch")
+    guide_a.frame_index, guide_b.frame_index = frame_b, frame_a
+    scene.guide_frames.sort(key=lambda guide: guide.frame_index)
+    return guide_a, guide_b
+
+
 def _apply_move_guide(scene: Scene, op: dict) -> GuideFrame:
     _require_lane_unlocked(scene, "guide")
     old_frame = _mutation_int(op.get("from_frame_index"), "from_frame_index")
@@ -5120,6 +5141,9 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
             op.get("right_ids"),
         )
         return result
+    if op_type == "swap_guides":
+        guide_a, guide_b = _apply_swap_guides(scene, op)
+        return {"type": op_type, "guides": [guide_a.to_dict(), guide_b.to_dict()]}
     if op_type == "move_guide":
         if op.get("apply_linked"):
             guide = _find_guide(scene, _mutation_int(op.get("from_frame_index"), "from_frame_index"))
@@ -13692,48 +13716,9 @@ if routes is not None:
             },
         })
 
-    @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/guides/swap")
-    async def api_swap_guides(request: web.Request) -> web.Response:
-        try:
-            project = await run_project_io(_load_project_from_request, request)
-        except FileNotFoundError as e:
-            return _json_error(str(e), 404)
-
-        scene_id = request.match_info["scene_id"]
-        scene = project.get_scene(scene_id)
-        if not scene:
-            return _json_error(f"Scene not found: {scene_id}", 404)
-        if getattr(scene.guide_track_config, "locked", False):
-            return _json_error("Guide track is locked", 409)
-
-        try:
-            body = await request.json()
-        except json.JSONDecodeError:
-            return _json_error("Invalid JSON body", 400)
-
-        try:
-            frame_a = int(body.get("frame_a"))
-            frame_b = int(body.get("frame_b"))
-        except (TypeError, ValueError):
-            return _json_error("Invalid guide frame index", 400)
-
-        if frame_a == frame_b:
-            guide = next((g for g in scene.guide_frames if g.frame_index == frame_a), None)
-            if not guide:
-                return _json_error(f"No guide at frame {frame_a}", 404)
-            return web.json_response({"guides": [guide.to_dict()]})
-
-        guide_a = next((g for g in scene.guide_frames if g.frame_index == frame_a), None)
-        guide_b = next((g for g in scene.guide_frames if g.frame_index == frame_b), None)
-        if not guide_a:
-            return _json_error(f"No guide at frame {frame_a}", 404)
-        if not guide_b:
-            return _json_error(f"No guide at frame {frame_b}", 404)
-
-        guide_a.frame_index, guide_b.frame_index = frame_b, frame_a
-        scene.guide_frames.sort(key=lambda g: g.frame_index)
-        await run_project_io(save_project, project)
-        return web.json_response({"guides": [guide_a.to_dict(), guide_b.to_dict()]})
+    # Dedicated guide swap retired: it could not carry expected identities and
+    # its only client sent no If-Match. swap_guides now uses the shared mutation
+    # queue/response/history path. No published node or durable data contract.
 
     @routes.patch("/sonder-editor/project/{project_id}/scenes/{scene_id}/guides/{frame_index}")
     async def api_update_guide(request: web.Request) -> web.Response:

@@ -29,7 +29,8 @@ OBLIGATIONS = {
     "operation.model-helper": ("routes.py model helpers", ()),
     "operation.media-budget": ("_media_io_operation_count", (
         "test_mutation_authoring_contract.py::test_every_operation_has_a_media_budget_disposition",
-        "test_mutation_authoring_contract.py::test_media_budget_executes_its_counted_branches")),
+        "test_mutation_authoring_contract.py::test_media_budget_executes_its_counted_branches",
+        "test_mutation_authoring_contract.py::test_no_media_operations_cannot_reach_ffmpeg")),
     "operation.history-rebase": ("_rebaseSceneMutationIntentForHistory", (
         REG + "test_every_scene_operation_has_a_history_rebase_policy",
         REG + "test_rebase_policy_entries_are_not_stale")),
@@ -45,7 +46,8 @@ OBLIGATIONS = {
         "test_scene_mutation_no_op_writes.py::test_the_allow_list_only_holds_operations_the_dispatcher_accepts",
         "test_scene_mutation_no_op_writes.py::test_a_scene_only_operation_leaves_the_rest_of_the_project_alone")),
     "gesture.wrapper": ("_withMutationGesture", (
-        "test_mutation_gesture_coverage.py::test_editor_writer_boundary_inventory",)),
+        "test_mutation_gesture_coverage.py::test_editor_writer_boundary_inventory",
+        "test_mutation_gesture_coverage.py::test_editor_writer_exemptions_are_live",)),
     "gesture.guard-emission": ("operation literal expected*", (
         REG + "test_every_unguarded_client_payload_is_accounted_for",
         REG + "test_no_emission_sends_a_guard_the_server_discards",
@@ -106,6 +108,7 @@ NO_MEDIA = {
     "split_clip": "Splits timeline references, not media bytes.",
     "split_prompt_section": "Splits prompt ranges.",
     "split_reference_item": "Splits staged member ranges.",
+    "swap_guides": "Exchanges two timeline references.",
     "swap_prompt_sections": "Swaps prompt data.",
     "unlink_items": "Changes group membership.",
     "update_audio_track": "Changes timeline properties.",
@@ -221,6 +224,99 @@ def test_every_operation_has_a_media_budget_disposition():
     source = (ROOT / "server/routes.py").read_text(encoding="utf-8")
     _assert_media_partition(registration._dispatcher_op_types(), _counted_media_types(source))
 
+# Direct named calls through module-level routes helpers, not whole-program
+# reachability. Dynamic dispatch, aliases and calls into other modules remain
+# review work. Pin executable entry points, not today's extraction wrapper.
+MEDIA_ENTRY_POINTS = frozenset({"_get_ffmpeg", "get_ffmpeg_path", "get_ffprobe_path"})
+
+def _media_reachable_operations(source):
+    tree = ast.parse(source)
+    functions = {node.name: node for node in tree.body
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    def calls(node):
+        return {child.func.id for child in ast.walk(node)
+                if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)}
+    def reaches_media(names):
+        visited = set()
+        pending = list(names)
+        while pending:
+            name = pending.pop()
+            if name in MEDIA_ENTRY_POINTS:
+                return True
+            if name not in visited:
+                visited.add(name)
+                if name in functions:
+                    pending.extend(calls(functions[name]))
+        return False
+    dispatcher = functions["_apply_scene_mutation_operation"]
+    result = set()
+    branches = {}
+    for node in ast.walk(dispatcher):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if (isinstance(test, ast.Compare) and isinstance(test.left, ast.Name)
+                and test.left.id == "op_type"):
+            assert len(test.ops) == 1 and isinstance(test.ops[0], ast.Eq), "Review media dispatch shape"
+            value = test.comparators[0]
+            assert isinstance(value, ast.Constant) and isinstance(value.value, str)
+            branches[node] = value.value
+            branch = ast.Module(body=node.body, type_ignores=[])
+            if reaches_media(calls(branch)):
+                result.add(value.value)
+    # Calls outside operation branches run for every operation. Do not let a
+    # new common pre-pass silently evade the NO_MEDIA classification.
+    common_calls = set()
+    def visit_common(node):
+        if node in branches:
+            for child in node.orelse:
+                visit_common(child)
+            return
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            common_calls.add(node.func.id)
+        for child in ast.iter_child_nodes(node):
+            visit_common(child)
+    visit_common(dispatcher)
+    if reaches_media(common_calls):
+        result.update(branches.values())
+    return result
+
+def _assert_no_media_reachability(source):
+    bad = _media_reachable_operations(source) & NO_MEDIA.keys()
+    assert not bad, f"NO_MEDIA operations reach ffmpeg: {sorted(bad)}"
+
+def test_no_media_operations_cannot_reach_ffmpeg():
+    source = (ROOT / "server/routes.py").read_text(encoding="utf-8")
+    _assert_no_media_reachability(source)
+    assert _media_reachable_operations(source) == _counted_media_types(source), (
+        "Review media reachability or counted-operation drift")
+
+@pytest.mark.parametrize("entry", sorted(MEDIA_ENTRY_POINTS))
+def test_media_reachability_rejects_an_existing_no_media_operation(entry, monkeypatch):
+    source = (ROOT / "server/routes.py").read_text(encoding="utf-8")
+    # A new two-hop path, independent of _prepare_video_audio_asset.
+    source = source.replace('if op_type == "update_guide":',
+                            'if op_type == "update_guide":\n        _probe_media_path()')
+    source += f"\ndef _probe_media_path():\n    _probe_media_leaf()\ndef _probe_media_leaf():\n    {entry}()\n"
+    original = Path.read_text
+    monkeypatch.setattr(Path, "read_text", lambda path, *a, **kw:
+                        source if path == ROOT / "server/routes.py" else original(path, *a, **kw))
+    with pytest.raises(AssertionError, match="NO_MEDIA operations reach ffmpeg.*update_guide"):
+        test_no_media_operations_cannot_reach_ffmpeg()
+
+def test_media_reachability_checks_the_shared_dispatcher_path(monkeypatch):
+    source = (ROOT / "server/routes.py").read_text(encoding="utf-8")
+    dispatcher = _function(source, "_apply_scene_mutation_operation")
+    # Inject after the docstring; every operation now reaches this new chain.
+    lines = source.splitlines(keepends=True)
+    lines.insert(dispatcher.body[0].end_lineno, "    _probe_common_media()\n")
+    source = "".join(lines) + "\ndef _probe_common_media():\n    _get_ffmpeg()\n"
+    original = Path.read_text
+    monkeypatch.setattr(Path, "read_text", lambda path, *a, **kw:
+                        source if path == ROOT / "server/routes.py" else original(path, *a, **kw))
+    with pytest.raises(AssertionError, match="NO_MEDIA operations reach ffmpeg"):
+        test_no_media_operations_cannot_reach_ffmpeg()
+
 def test_media_budget_executes_its_counted_branches():
     # Execute the real, dependency-light function. The stub isolates counting
     # from the separately tested dual-drop predicate; it does not claim to prove it.
@@ -316,10 +412,6 @@ _MUTATION_HELPERS = {
 # scene candidate: posting is not stamping, and their intents lack sceneId.
 
 UNDO_CLAIM_EXEMPTIONS = {
-    ("swapGuides", "missing-mutation-helper"): (
-        "Existing raw /guides/swap fetch never claims the undo entry. Bug tracker "
-        "owns the defect; delete this exception when the gesture uses a stamping "
-        "mutation path and its regression is verified."),
     ("_toggleHeaderVisibility", "missing-mutation-helper"): (
         "Reserves and hands the entry to _applyHeaderVisibilityBulkWithinGesture "
         "as an argument, which this scan does not follow. The handoff is pinned "
@@ -1210,6 +1302,11 @@ def test_severing_any_single_claim_link_fails_the_contract(old, new, count, mess
 # Header form: // @server-mirror relative/python_file.py::symbol
 # Authority citations and test references prove existence, never semantic coverage.
 MIRRORED_MODULES = {
+    "scene_guide_geometry.js": {
+        "scope": "Guide-swap applicability and raw frame ordering for optimistic paint.",
+        "authorities": ("server/routes.py::_apply_swap_guides",),
+        "tests": ("test_guide_swap.py::test_guide_swap_geometry_matches_server",),
+    },
     "selection_constraints.js": {
         "scope": "Execution-window snapping, context and padding math.",
         "authorities": ("server/guide_collision.py::resolve_execution_window",),
@@ -1396,9 +1493,12 @@ def _assert_mirror_obligations(inventory, root):
         for ref in row["authorities"]:
             path, name = ref.split("::")
             body = tree(root / path).body
-            names = {node.name for node in body if isinstance(node, (ast.FunctionDef, ast.ClassDef))}
-            names.update(node.id for stmt in body if isinstance(stmt, (ast.Assign, ast.AnnAssign))
-                         for node in ast.walk(stmt) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store))
+            names = {node.name for node in body
+                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+            targets = [target for stmt in body if isinstance(stmt, (ast.Assign, ast.AnnAssign))
+                       for target in (stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target])]
+            names.update(node.id for target in targets for node in ast.walk(target)
+                         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store))
             assert name in names, f"Missing mirror authority: {ref}"
         for ref in row["tests"]:
             path, name = ref.split("::")
@@ -1415,6 +1515,20 @@ def test_declared_mirror_headers_match_the_inventory_both_ways():
 
 def test_every_declared_mirror_has_a_live_parity_disposition():
     _assert_mirror_obligations(MIRRORED_MODULES, ROOT)
+    assert sum(len(row["authorities"]) for row in MIRRORED_MODULES.values()) == 44
+
+@pytest.mark.parametrize("name, valid", [("TABLE", True), ("row", False), ("transform", True)])
+def test_mirror_authorities_are_module_declarations(tmp_path, name, valid):
+    (tmp_path / "probe.py").write_text(
+        "TABLE = [row for row in source]\nasync def transform():\n    pass\n", encoding="utf-8")
+    inventory = {"probe.js": {
+        "scope": "Declaration resolution fixture", "authorities": (f"probe.py::{name}",),
+        "tests": (), "exemption": {"reason": "Fixture", "owner": "test", "expiry": "Fixture only"}}}
+    if valid:
+        _assert_mirror_obligations(inventory, tmp_path)
+    else:
+        with pytest.raises(AssertionError, match="Missing mirror authority"):
+            _assert_mirror_obligations(inventory, tmp_path)
 
 
 @pytest.mark.parametrize("drift", ["unlisted", "unmarked", "late-marker", "duplicate", "malformed", "wrong-authority"])

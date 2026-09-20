@@ -65,7 +65,7 @@ EXPECTED_LITERAL_COUNTS = {
     # 82 -> 80 on 2026-09-17: `_updateSceneGlobalChannelsWithinGesture` and
     # `_updateScenePromptWithinGesture` were deleted as unreachable code (umbrella
     # Phase B / L1). They were the only patch-shaped `coalesce: true` emissions.
-    "editor_widget.js": 80,
+    "editor_widget.js": 81,
     "editor_prompt_panel.js": 4,
     "editor_reference_panel.js": 3,
     "prompt_context_chips.js": 1,
@@ -75,7 +75,7 @@ EXPECTED_LITERAL_COUNTS = {
 # Scene-mutation enqueue call sites, pinned for the same reason as the
 # literal counts above: a scan that quietly stops matching reports a clean
 # surface forever. Update deliberately when adding or removing an enqueue.
-EXPECTED_ENQUEUE_SITES = 56
+EXPECTED_ENQUEUE_SITES = 57
 
 # Geometry the client computed from what it could see. Matched with a trailing
 # `[:,}]` so ES6 shorthand counts — `split_clip` passes its frame that way, and a
@@ -84,7 +84,7 @@ EXPECTED_ENQUEUE_SITES = 56
 GEOMETRY_KEYS = (
     "frame", "start_frame", "end_frame", "timeline_start_frame",
     "timeline_end_frame", "track_index", "lane_index", "target_lane",
-    "index", "index_a", "index_b", "from_index", "to_index",
+    "index", "index_a", "index_b", "from_index", "to_index", "frame_index_a", "frame_index_b",
 )
 
 # Payloads the client assembled. Keying only on geometry under `fields` would
@@ -2190,6 +2190,8 @@ GUARD_CONTRACTS = {
         "the legacy REST split route -- no `expected` at all -- working."),
     "split_audio_track": (_FIXED, _AUDIO_KEYS,
         "`_validate_audio_identity`, the same shape as `split_clip`."),
+    "swap_guides": (_FIXED, _GUIDE_KEYS,
+        "`_apply_swap_guides` compares expected_a and expected_b through `_validate_guide_identity`."),
     "swap_prompt_sections": (_FIXED, _PROMPT_KEYS,
         "`_apply_swap_prompt_sections` calls `_validate_prompt_identity` twice, "
         "under `expected_a` and `expected_b` rather than `expected`."),
@@ -3419,7 +3421,7 @@ def test_a_guard_the_branch_ignores_cannot_hide_behind_an_identifier():
 # Scoped to operations whose guard can refuse a gesture the user just performed.
 # An operation with no guard has nothing specific to say.
 GUARDED_OPERATIONS_NEEDING_A_MESSAGE = frozenset({
-    "remove_lane", "create_guide", "move_guide",
+    "remove_lane", "create_guide", "move_guide", "swap_guides",
     "create_reference_item", "replace_prompt_sections", "bulk_delete_items",
     "create_link_group", "unlink_items",
     # Added by umbrella Phase C stage 2 L1. A stale cut used to be the quietest
@@ -3549,7 +3551,7 @@ def _scope_body(item) -> str:
 
 # Pinned rather than bounded: the split between the two spellings is the
 # finding that justified two tripwires instead of one.
-EXPECTED_STABLE_KEY_OPT_OUTS = 17
+EXPECTED_STABLE_KEY_OPT_OUTS = 18
 EXPECTED_UNIQUIFIED_KEY_OPT_OUTS = 29
 EXPECTED_CALLER_SUPPLIED_OPT_OUTS = 1
 
@@ -3952,6 +3954,11 @@ DEFAULT_KEY_REVIEWED: dict = {}
 # changes -- the key IS the dict key, so a reworded key kills the entry and the
 # staleness test reports it.
 COALESCE_OPT_OUT_REVIEWED = {
+    "editor_widget.js:_showGuideManagementPopup:guide:${}:swap": (
+        DECLINED,
+        "`_apply_swap_guides` changes the occupant at both frame indices; dropping "
+        "an earlier swap loses authored intent and its Undo step. Keep separate "
+        "until the gesture supplies an ordered-batch merge and history policy."),
 
     # -- the key cannot repeat -----------------------------------------------
 

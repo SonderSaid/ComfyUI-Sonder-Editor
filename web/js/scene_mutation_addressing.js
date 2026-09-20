@@ -302,6 +302,13 @@ export const SCENE_MUTATION_ADDRESSING = freeze({
         promotedBy: freeze([guard("expected", {
             identifying: ["prompt_id"], validator: "_validate_prompt_identity" })]),
         evidence: "List `index`, validated in the branch before `_apply_split_linked`." }),
+    swap_guides: freeze({ addressing: POSITIONAL,
+        promotedBy: freeze([
+            guard("expected_a", { identifying: ["guide_id"], validator: "_validate_guide_identity" }),
+            guard("expected_b", { identifying: ["guide_id"], validator: "_validate_guide_identity" }),
+        ]),
+        evidence: "Two frame indices; `_apply_swap_guides` validates BOTH identities. "
+            + "Replaying without either claim could exchange the wrong pair." }),
     swap_prompt_sections: freeze({ addressing: POSITIONAL,
         promotedBy: freeze([
             guard("expected_a", { identifying: ["prompt_id"], validator: "_validate_prompt_identity" }),

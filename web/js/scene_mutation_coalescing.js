@@ -400,6 +400,7 @@ export const SCENE_MUTATION_COALESCING = Object.freeze({
 
     move_guide: preserved(
         "addressed by `from_frame_index`, which the previous move changed."),
+    swap_guides: preserved("exchanges two guides by frame index, which a previous swap changed."),
     swap_prompt_sections: preserved("reorders two sections by list index."),
     import_prompt_context_dependencies: preserved(
         "`_apply_prompt_context_dependencies` imports a dependency set into the "

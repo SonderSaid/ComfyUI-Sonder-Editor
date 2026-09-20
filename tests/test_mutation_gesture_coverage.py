@@ -7,6 +7,8 @@ prefix of its callback. Behavioral tests exercise those boundaries separately.
 Raw mutating fetch sites and queue/versioned helper calls are included here.
 """
 import re
+
+import pytest
 from pathlib import Path
 
 from test_project_mutation_queue import _run_gesture_node
@@ -33,6 +35,21 @@ EXEMPT = {
     "_revealProjectFolder": "Opens a folder, not a project-data mutation.",
 }
 
+
+def _assert_live_writer_exemptions(source):
+    methods = {m[1] for m in re.finditer(
+        r"^    (?:async )?(\w+)\(.*?^    \}\n",
+        source[source.index("export class EditorWidget {"):], re.M | re.S)}
+    assert not EXEMPT.keys() - methods, f"Stale writer exemptions: {sorted(EXEMPT.keys() - methods)}"
+    assert all(reason.strip() for reason in EXEMPT.values())
+
+def test_editor_writer_exemptions_are_live():
+    _assert_live_writer_exemptions((ROOT / "web/js/editor_widget.js").read_text(encoding="utf-8"))
+
+def test_writer_exemption_ratchet_rejects_a_dead_entry(monkeypatch):
+    monkeypatch.setitem(EXEMPT, "_retiredWriter", "Fixture: remove with this probe.")
+    with pytest.raises(AssertionError, match="Stale writer exemptions.*_retiredWriter"):
+        test_editor_writer_exemptions_are_live()
 
 def test_editor_writer_boundary_inventory():
     source = (ROOT / "web/js/editor_widget.js").read_text(encoding="utf-8")

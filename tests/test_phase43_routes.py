@@ -2012,7 +2012,7 @@ def test_duplicate_scene_route_deep_copies_scene_and_regenerates_child_ids(tmp_p
     assert payload["audio_tracks"][0]["source_path"] == source.audio_tracks[0].source_path
 
 
-def test_guide_swap_route_swaps_frames_and_respects_lock(tmp_path, monkeypatch):
+def test_guide_swap_operation_swaps_frames_and_respects_lock(tmp_path, monkeypatch):
     route_module = _load_route_module(monkeypatch)
     project_dir = tmp_path / "project"
     project_dir.mkdir()
@@ -2029,28 +2029,21 @@ def test_guide_swap_route_swaps_frames_and_respects_lock(tmp_path, monkeypatch):
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
     monkeypatch.setattr(route_module, "save_project", lambda project: None)
 
-    swap_guides = _route_handler(
-        route_module,
-        "POST",
-        "/sonder-editor/project/{project_id}/scenes/{scene_id}/guides/swap",
-    )
-    response = asyncio.run(swap_guides(DummyRequest(
-        match_info={"scene_id": "scene-1"},
-        body={"frame_a": 10, "frame_b": 20},
-    )))
-
-    assert response.status == 200
+    operation = {"type": "swap_guides", "frame_index_a": 10, "frame_index_b": 20,
+                 "expected_a": {"guide_id": scene.guide_frames[0].guide_id},
+                 "expected_b": {"guide_id": scene.guide_frames[1].guide_id}}
+    result = route_module._apply_scene_mutation_operation(project, scene, operation)
+    assert result["type"] == "swap_guides"
     assert [(guide.frame_index, guide.asset_id) for guide in scene.guide_frames] == [
-        (10, "guide-b"),
-        (20, "guide-a"),
-    ]
-
+        (10, "guide-b"), (20, "guide-a")]
+    before = scene.to_dict()
     scene.guide_track_config = LaneConfig(locked=True)
-    locked = asyncio.run(swap_guides(DummyRequest(
-        match_info={"scene_id": "scene-1"},
-        body={"frame_a": 10, "frame_b": 20},
-    )))
-    assert locked.status == 409
+    with pytest.raises(route_module.ProjectMutationRequestError) as error:
+        route_module._apply_scene_mutation_operation(project, scene, operation)
+    assert error.value.status == 409
+    assert scene.to_dict()["guide_frames"] == before["guide_frames"]
+    assert not any(route.method == "POST" and route.path.endswith("/guides/swap")
+                   for route in route_module.routes)
 
 
 def test_clip_split_rejects_motion_driver_atomically(tmp_path, monkeypatch):

@@ -476,6 +476,7 @@ import { LINK_ITEM_TYPES, pruneLinkedItemGroups, editedLinkGroups, rollbackLinkG
 import {
     canonicalStagedMemberRefs, canonicalStoredMemberRefs, stagedReferenceItem,
 } from "./scene_reference_geometry.js";
+import { applyGuideSwap } from "./scene_guide_geometry.js";
 import { createViewportSurface } from "./viewport_surface.js";
 import {
     EDITOR_COLORS as COLORS,
@@ -3943,8 +3944,8 @@ export class EditorWidget {
             if (!Number.isInteger(index) || index < 0 || index >= prompts.length) return null;
             return { index, value: prompts[index] };
         };
-        const guideTarget = (operation, frameKey = "frame_index") => {
-            const guideId = String(operation?.expected?.guide_id || operation?.guide_id || "");
+        const guideTarget = (operation, frameKey = "frame_index", expectedKey = "expected") => {
+            const guideId = String(operation?.[expectedKey]?.guide_id || operation?.guide_id || "");
             const frame = Number(operation?.[frameKey]);
             return (guideId
                 ? guides.find((value) => String(value?.guide_id || "") === guideId)
@@ -3963,13 +3964,13 @@ export class EditorWidget {
             }
             this._rebasePromptEditExpectations(operation.fields, target.value);
         };
-        const rebaseGuideOperation = (operation, frameKey = "frame_index") => {
-            const target = guideTarget(operation, frameKey);
+        const rebaseGuideOperation = (operation, frameKey = "frame_index", expectedKey = "expected") => {
+            const target = guideTarget(operation, frameKey, expectedKey);
             if (!target) return;
             operation[frameKey] = Number(target.frame_index);
-            if (operation.expected) {
-                operation.expected = this._historyExpectedProjection(
-                    operation.expected, target);
+            if (operation[expectedKey]) {
+                operation[expectedKey] = this._historyExpectedProjection(
+                    operation[expectedKey], target);
             }
         };
         const rebaseBulkItem = (item) => {
@@ -4022,6 +4023,10 @@ export class EditorWidget {
             case "swap_prompt_sections":
                 rebasePromptOperation(operation, "expected_a", "index_a");
                 rebasePromptOperation(operation, "expected_b", "index_b");
+                break;
+            case "swap_guides":
+                rebaseGuideOperation(operation, "frame_index_a", "expected_a");
+                rebaseGuideOperation(operation, "frame_index_b", "expected_b");
                 break;
             case "move_guide":
                 rebaseGuideOperation(operation, "from_frame_index");
@@ -4763,6 +4768,10 @@ export class EditorWidget {
         const index = this._undoStack.lastIndexOf(target);
         if (index < 0) return false;
         this._undoStack.splice(index, 1);
+        // Exact-owner cancellation settles the detached reservation too: queued
+        // Undo/Redo retain object references in claimedPendingEntries. Leaving
+        // it pending would block a later history action after this write failed.
+        target.pending = false;
         this._replayDeferredHistoryWidgetStateIfIdle?.();
         return true;
     }
@@ -18313,21 +18322,37 @@ export class EditorWidget {
             swapBtn.addEventListener("click", (event) => this._withMutationGesture("swapGuides", async (diagnostics) => {
                 event.stopPropagation();
                 if (locked || !swapSelect.value) return;
-                this._pushUndo("swap guides");
-                const dirName = this._projectDirName();
+                const other = guides.find((value) => value.frame_index === Number(swapSelect.value));
+                if (!other) return;
+                const operation = {
+                    type: "swap_guides",
+                    frame_index_a: guide.frame_index,
+                    frame_index_b: other.frame_index,
+                    expected_a: { guide_id: guide.guide_id || "", frame_index: guide.frame_index,
+                        asset_id: guide.asset_id || "" },
+                    expected_b: { guide_id: other.guide_id || "", frame_index: other.frame_index,
+                        asset_id: other.asset_id || "" },
+                };
+                // Pending preserves prior Redo on refusal; successful canonical
+                // stamping commits the new edit and invalidates the old future.
+                const historyEntry = this._pushUndo("swap guides", { pending: true });
                 const sceneId = this.activeSceneId;
                 try {
-                    await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/guides/swap`), withEditorMutationDiagnostics({
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({
-                            frame_a: guide.frame_index,
-                            frame_b: Number(swapSelect.value),
-                        }),
-                    }, diagnostics));
-                    await refreshPanel();
-                } catch (e) {
-                    console.warn("[Sonder] Failed to swap guides:", e);
+                    if (applyGuideSwap(this.activeScene, operation)) {
+                        this._renderSceneAfterLocalMutation();
+                        this._showGuideManagementPopup(x, y);
+                    }
+                    await this._runSceneMutation([operation], {
+                        key: `guide:${sceneId}:swap`, label: "swap guides",
+                        coalesce: false, sceneId, historyEntry, diagnostics,
+                        refreshScenes: false,
+                        failureMessage: (error) => error?.message || "Swap guides failed — timeline restored.",
+                    });
+                    if (historyEntry?.postSnapshot) this._commitUndoEntry(historyEntry);
+                    else this._discardUnstampableUndoEntry(historyEntry);
+                } catch (error) {
+                    this._discardUnstampableUndoEntry(historyEntry);
+                    if (this.activeSceneId === sceneId) await refreshPanel();
                 }
             }));
             swapWrap.append(swapSelect, swapBtn);

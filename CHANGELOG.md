@@ -22,9 +22,11 @@ a fresh `[Unreleased]` block.
 - When a save collides with another editor or a running render, the editor now retries only the edits it can safely repeat — those that name what they change by an identity the server checks. An edit that names a lane, a section or a position by its place in the list is refused and the timeline restored, instead of being replayed onto a document it was never written against, where it could land on the wrong lane.
 
 ### Removed
+- The dedicated guide-swap route; swaps now use the guarded scene mutations endpoint.
 - The standalone `DELETE` routes for clips, guides, prompt sections and audio tracks. These operations are owned by the scene mutations endpoint, which accepts an identity snapshot of the target that the old routes could not send, and which rewrites the link groups they left behind.
 
 ### Fixed
+- Guide swaps now update immediately and support Undo/Redo; refused swaps preserve the previous Redo history and report the conflict.
 - Sonder Cluster preserves its saved lane and branch counts when loading or switching workflows in newer ComfyUI frontends, and keeps existing connections attached to their named sockets when its layout changes.
 - Dragging a second Library member onto a Reference item that was still saving no longer refuses it with an identity error and loses the drop. Staging now appears on the timeline immediately instead of waiting for the project to save, so the next drag is aimed at the bar that is really there: a drop onto it appends, where before it tried to create a second item in the same place and was refused for overlapping.
 - Moving an item to a typed frame, moving it to a new lane, and consolidating a selection onto one lane now update the timeline immediately instead of waiting for the project to save. A failed move restores the timeline and says why; moving to a new lane previously neither repainted nor restored anything when it failed.

@@ -770,6 +770,8 @@ CANONICAL_PAYLOAD = {
     "create_prompt_semantic_unit": {"unit": {"semantic_unit_id": "u1"}},
     "delete_prompt_semantic_unit_if_unreferenced": {"semantic_unit_id": "u1",
                                                     "expected": {}},
+    "swap_guides": {"frame_index_a": 1, "frame_index_b": 2,
+                    "expected_a": {"guide_id": "a"}, "expected_b": {"guide_id": "b"}},
     "swap_prompt_sections": {"index_a": 0, "index_b": 1,
                              "expected_a": {"prompt_id": "a"},
                              "expected_b": {"prompt_id": "b"}},
