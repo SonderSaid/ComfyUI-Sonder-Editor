@@ -412,7 +412,10 @@ def test_explicit_group_edit_matches_server(action):
         }});
         console.log(JSON.stringify(results));
     """
-    result = subprocess.run([shutil.which("node"), "--input-type=module", "-e", script],
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for link-group parity")
+    result = subprocess.run([node, "--input-type=module", "-e", script],
                             capture_output=True, text=True, encoding="utf-8", timeout=15)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == expected

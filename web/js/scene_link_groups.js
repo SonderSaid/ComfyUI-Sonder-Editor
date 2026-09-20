@@ -1,3 +1,8 @@
+// @server-mirror server/routes.py::_prune_linked_item_groups
+// @server-mirror server/routes.py::_unlink_refs
+// @server-mirror server/routes.py::_expand_linked_refs
+// @server-mirror server/routes.py::_add_link_group
+// Scope and parity disposition: tests/test_mutation_authoring_contract.py::MIRRORED_MODULES
 // Link-group normalization for an optimistically edited scene.
 //
 // Leaf module: DOM-free, host-free, no editor imports — the same shape and the

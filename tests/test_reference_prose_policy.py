@@ -1,5 +1,6 @@
 """Out-of-window Reference text: staging, policy and execution contracts."""
 import json
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +16,13 @@ from server.timeline_state import Scene, TimelineProject
 from test_minimax_h3_format_coverage import _identity_dormancy_fixture, _reference_chip
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _node_binary():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for the Reference JavaScript comparison")
+    return node
 
 
 def test_reference_verdict_python_js_parity():
@@ -43,7 +51,7 @@ const r = m.resolveReferenceVerdicts({{referenceItems: {json.dumps(items)},
 console.log(JSON.stringify({{verdicts:Object.fromEntries(r.verdicts),
  values:m.REFERENCE_VERDICT, labels:m.REFERENCE_VERDICT_LABEL}}));
 """
-    js = json.loads(subprocess.run(["node", "--input-type=module", "-e", script],
+    js = json.loads(subprocess.run([_node_binary(), "--input-type=module", "-e", script],
         capture_output=True, text=True, check=True).stdout)
     assert {str(k): v for k, v in actual["verdicts"].items()} == js["verdicts"]
     assert list(actual["verdicts"].values()) == [
@@ -308,7 +316,7 @@ def test_aggregated_diagnostics_mark_each_chip_without_inflating_count():
 const m = await import({json.dumps(uri)});
 console.log(JSON.stringify(m.buildPromptContextDiagnostics({json.dumps(payload)})));
 """
-    result = json.loads(subprocess.run(["node", "--input-type=module", "-e", script],
+    result = json.loads(subprocess.run([_node_binary(), "--input-type=module", "-e", script],
         capture_output=True, text=True, check=True).stdout)
     assert result["warningCount"] == 1
     assert set(result["byAttachment"]) == {"a", "b"}

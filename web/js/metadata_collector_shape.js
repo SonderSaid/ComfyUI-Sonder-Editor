@@ -1,3 +1,7 @@
+// @server-mirror nodes/metadata_collector.py::collect_metadata
+// @server-mirror nodes/metadata_collector.py::SonderMetadataCollector
+// @server-mirror nodes/metadata_collector_v3.py::SonderMetadataCollectorV3
+// Scope and parity disposition: tests/test_mutation_authoring_contract.py::MIRRORED_MODULES
 const VALUE_SLOT_PATTERN = /^(?:values\.)?value_(\d+)$/;
 const LABEL_WIDGET_PATTERN = /^label_(\d+)$/;
 

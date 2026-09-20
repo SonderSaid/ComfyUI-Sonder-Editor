@@ -1,3 +1,9 @@
+// @server-mirror server/prompt_tokens.py::_HANDLE_RE
+// @server-mirror server/prompt_tokens.py::_TOKEN_RE
+// @server-mirror server/prompt_tokens.py::_declarations
+// @server-mirror server/prompt_context.py::SHOT_ORDINAL_KEY
+// @server-mirror server/prompt_payload.py::SHOT_LABEL_TEMPLATE
+// Scope and parity disposition: tests/test_mutation_authoring_contract.py::MIRRORED_MODULES
 // Authored prompt tokens store stable ids; provider ordinals are preview-only.
 
 export const PROMPT_TOKEN_KINDS = Object.freeze({

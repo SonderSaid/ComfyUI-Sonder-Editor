@@ -1,3 +1,8 @@
+// @server-mirror server/reference_resolution.py::resolve_reference_verdicts
+// @server-mirror server/reference_resolution.py::reference_live_outputs
+// @server-mirror nodes/reference_core.py::_assemble_prompt
+// @server-mirror nodes/reference_core.py::member_prompt_fragment
+// Scope and parity disposition: tests/test_mutation_authoring_contract.py::MIRRORED_MODULES
 // Type-homogeneous Bridge output groups. Mirrored in
 // server/reference_resolution.py.
 export const REFERENCE_OUTPUT_NAMES = [

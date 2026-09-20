@@ -1,3 +1,7 @@
+// @server-mirror server/routes.py::_reference_item_bounds
+// @server-mirror server/routes.py::_canonical_reference_member_refs
+// @server-mirror server/routes.py::_apply_create_reference_item
+// Scope and parity disposition: tests/test_mutation_authoring_contract.py::MIRRORED_MODULES
 // Bounds and member arithmetic for an optimistic Reference staging paint.
 //
 // Leaf module: DOM-free, host-free, no editor imports — the same shape and the

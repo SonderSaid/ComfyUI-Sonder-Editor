@@ -1,3 +1,5 @@
+// @server-mirror server/lane_registry.py::LANE_DESCRIPTORS
+// Scope and parity disposition: tests/test_mutation_authoring_contract.py::MIRRORED_MODULES
 import { TRACK_TYPE } from "./editor_timeline_constants.js";
 
 export { TRACK_TYPE } from "./editor_timeline_constants.js";

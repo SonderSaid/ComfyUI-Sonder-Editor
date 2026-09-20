@@ -1,3 +1,8 @@
+// @server-mirror server/routes.py::_apply_update_clip
+// @server-mirror server/routes.py::_apply_update_audio_track
+// @server-mirror server/routes.py::_apply_linked_bounds_update
+// @server-mirror server/routes.py::_apply_ref_bounds
+// Scope and parity disposition: tests/test_mutation_authoring_contract.py::MIRRORED_MODULES
 // Bounds arithmetic for an optimistic timeline move, mirroring the server.
 //
 // Leaf module: DOM-free, host-free, no editor imports — the same shape and the

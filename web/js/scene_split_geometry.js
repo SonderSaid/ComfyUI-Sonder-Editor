@@ -1,3 +1,6 @@
+// @server-mirror server/routes.py::_split_clip_object
+// @server-mirror server/routes.py::_split_audio_object
+// Scope and parity disposition: tests/test_mutation_authoring_contract.py::MIRRORED_MODULES
 // Half-geometry for an optimistic split, mirroring the server exactly.
 //
 // Leaf module: DOM-free, host-free, no editor imports — the same shape as

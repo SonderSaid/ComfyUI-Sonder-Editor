@@ -1,3 +1,7 @@
+// @server-mirror server/timeline_state.py::default_reference_class
+// @server-mirror server/timeline_state.py::normalize_reference_tags
+// @server-mirror server/routes.py::_validated_reference_tags
+// Scope and parity disposition: tests/test_mutation_authoring_contract.py::MIRRORED_MODULES
 const RESERVED_TAG_PREFIX = "sonder:";
 const VALID_KINDS = new Set(["character", "location", "prop", "outfit"]);
 const VALID_CLASSES = new Set(["subject", "context"]);

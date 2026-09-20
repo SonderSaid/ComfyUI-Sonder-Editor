@@ -1,3 +1,5 @@
+// @server-mirror server/guide_collision.py::resolve_execution_window
+// Scope and parity disposition: tests/test_mutation_authoring_contract.py::MIRRORED_MODULES
 // Pure frontend mirror of server/guide_collision.py execution-window math.
 // Selection endpoints are scene coordinates; model frame constraints apply to
 // the resolved tensor length, never to either absolute endpoint.

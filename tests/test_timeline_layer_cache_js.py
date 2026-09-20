@@ -3,11 +3,16 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def run(script):
-    p = subprocess.run([shutil.which('node'), '--input-type=module', '-e', script], capture_output=True, text=True)
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for the JavaScript behavior probe")
+    p = subprocess.run([node, '--input-type=module', '-e', script], capture_output=True, text=True)
     assert p.returncode == 0, p.stderr
 
 

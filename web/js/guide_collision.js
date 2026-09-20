@@ -1,3 +1,5 @@
+// @server-mirror server/guide_collision.py::resolve_guide_collisions
+// Scope and parity disposition: tests/test_mutation_authoring_contract.py::MIRRORED_MODULES
 // Pure display/parity mirror of server/guide_collision.py. Backend queue
 // prediction remains authoritative for user warnings.
 

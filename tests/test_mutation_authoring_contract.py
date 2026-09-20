@@ -606,3 +606,260 @@ def test_deferred_handoff_tripwire_rejects_severed_storage_and_bindings():
     assert source.count(old) == 1
     with pytest.raises(AssertionError, match="Move lost retained entry binding"):
         _assert_deferred_undo_claims(source.replace(old, "const historyEntry = null;", 1))
+
+
+# Declared DOM/host-free leaf mirrors, not discovery of all duplicated logic.
+# Each scope names the reproduced transform, not every export in the JS module.
+# Embedded UI transforms (e.g. prompt_context_chips.normalizePromptDocument)
+# still owe parity under the workflow, but are outside this leaf inventory.
+# Coalescing has dispatcher-equivalence tests, not a server coalescer twin;
+# addressing has no server twin yet. Neither belongs in this list.
+# Header form: // @server-mirror relative/python_file.py::symbol
+# Authority citations and test references prove existence, never semantic coverage.
+MIRRORED_MODULES = {
+    "selection_constraints.js": {
+        "scope": "Execution-window snapping, context and padding math.",
+        "authorities": ("server/guide_collision.py::resolve_execution_window",),
+        "tests": ("test_selection_constraints_js.py::test_frontend_execution_window_matches_backend_fixtures",),
+    },
+    "guide_collision.js": {
+        "scope": "Guide/driver collision display decisions.",
+        "authorities": ("server/guide_collision.py::resolve_guide_collisions",),
+        "tests": (),
+        "exemption": {
+            "reason": "test_guide_collision_js uses hand-synced expected literals, not the Python decision.",
+            "owner": "Guide/driver collision maintainer (server/guide_collision.py)",
+            "expiry": "Remove when one fixture corpus compares JS and Python collision decisions directly.",
+        },
+    },
+    "metadata_collector_shape.js": {
+        "scope": "Legacy value_N, V3 values.value_N and label_N slot naming only, not capacity policy.",
+        "authorities": ("nodes/metadata_collector.py::collect_metadata",
+                        "nodes/metadata_collector.py::SonderMetadataCollector",
+                        "nodes/metadata_collector_v3.py::SonderMetadataCollectorV3"),
+        "tests": (),
+        "exemption": {
+            "reason": "Widget visibility tests cover literal slot examples without comparing the backend schema/grammar.",
+            "owner": "Metadata collector maintainer (nodes/metadata_collector.py)",
+            "expiry": "Remove when generated V1/V3 slot names and rejection cases are compared with the JS parser.",
+        },
+    },
+    "lane_registry.js": {
+        "scope": "Shared lane descriptor fields, with frontend-only fields classified separately.",
+        "authorities": ("server/lane_registry.py::LANE_DESCRIPTORS",),
+        "tests": ("test_lane_registry_parity.py::test_frontend_backend_descriptor_parity_and_classified_fields",),
+    },
+    "prompt_channel_templates.js": {
+        "scope": "Preset catalog, custom normalization, resolution, label/global policy and timecodes.",
+        "authorities": ("server/prompt_channel_templates.py::PROMPT_CHANNEL_TEMPLATE_PRESETS",
+                        "server/prompt_channel_templates.py::normalize_channel_template",
+                        "server/prompt_channel_templates.py::resolve_channel_template",
+                        "server/prompt_channel_templates.py::template_labels_on",
+                        "server/prompt_channel_templates.py::format_shot_timecode"),
+        "tests": tuple("test_prompt_channel_templates_js.py::" + name for name in (
+            "test_preset_catalog_matches_between_python_and_javascript",
+            "test_global_channel_flag_matches_between_python_and_javascript",
+            "test_template_resolution_matches_between_python_and_javascript",
+            "test_label_policy_matches_between_python_and_javascript",
+            "test_custom_template_normalization_matches_between_python_and_javascript",
+            "test_timecode_matches_between_python_and_javascript")),
+    },
+    "prompt_composition.js": {
+        "scope": "Channel normalization, header split/collapse, and compose-only display/join rules; no server gap-fill resolver.",
+        "authorities": tuple("server/prompt_payload.py::" + name for name in (
+            "normalize_channels", "split_channel_headers", "collapse_channels_for_template",
+            "join_channel_headers", "compose_range_prompt")),
+        "tests": (
+            "test_prompt_channel_templates_js.py::test_channel_normalizer_matches_between_python_and_javascript",
+            "test_prompt_channel_collapse.py::test_split_matches_between_python_and_javascript",
+            "test_prompt_channel_collapse.py::test_collapse_matches_between_python_and_javascript"),
+        "exemption": {
+            "reason": "Direct normalizer/split/collapse comparisons do not pin all composition and join rules independently.",
+            "owner": "Prompt composition maintainer (server/prompt_payload.py)",
+            "expiry": "Remove when compose-only display and join decisions have direct cross-language fixtures.",
+        },
+    },
+    "prompt_tokens.js": {
+        "scope": "Token/handle grammar and declared vocabulary, including compiler-owned shot tokens.",
+        "authorities": ("server/prompt_tokens.py::_HANDLE_RE", "server/prompt_tokens.py::_TOKEN_RE",
+                        "server/prompt_tokens.py::_declarations", "server/prompt_context.py::SHOT_ORDINAL_KEY",
+                        "server/prompt_payload.py::SHOT_LABEL_TEMPLATE"),
+        "tests": tuple("test_prompt_tokens.py::" + name for name in (
+            "test_python_and_javascript_handle_grammars_match",
+            "test_python_and_javascript_token_vocabularies_match",
+            "test_format_declared_token_kind_has_python_javascript_parity",
+            "test_declared_token_grammar_matches_between_python_and_javascript")),
+    },
+    "reference_library_model.js": {
+        "scope": "Default Reference class and tag normalization/preset-asset compatibility intent; input tolerance and case handling are not certified equivalent.",
+        "authorities": ("server/timeline_state.py::default_reference_class",
+                        "server/timeline_state.py::normalize_reference_tags",
+                        "server/routes.py::_validated_reference_tags"),
+        "tests": (),
+        "exemption": {
+            "reason": "Reference Library JS tests assert literals, not backend decisions; normalization/case/input boundaries also need comparison.",
+            "owner": "Reference Library maintainer (server/routes.py::_validated_reference_tags)",
+            "expiry": "Remove when direct class/tag/asset decision comparisons pin intended equivalence and explain deliberate input-tolerance differences.",
+        },
+    },
+    "reference_lane_identity.js": {
+        "scope": "Lane population and member-population compatibility decisions.",
+        "authorities": ("server/minimax_h3.py::lane_population", "server/routes.py::member_population_compatible"),
+        "tests": (
+            "test_reference_timeline.py::test_lane_population_matches_between_python_and_the_browser",
+            "test_reference_timeline.py::test_member_population_compatibility_matches_between_python_and_the_browser"),
+    },
+    "reference_resolution.js": {
+        "scope": "Winner/threshold/prose verdicts, output liveness and derived member prompt text.",
+        "authorities": ("server/reference_resolution.py::resolve_reference_verdicts",
+                        "server/reference_resolution.py::reference_live_outputs",
+                        "nodes/reference_core.py::_assemble_prompt",
+                        "nodes/reference_core.py::member_prompt_fragment"),
+        "tests": (
+            "test_reference_timeline.py::test_python_and_browser_reference_resolvers_share_most_specific_semantics",
+            "test_reference_timeline.py::test_recipe_output_liveness_mirrors_across_backend_and_frontend",
+            "test_reference_panel_js.py::test_derived_prompt_matches_between_python_and_javascript",
+            "test_reference_panel_js.py::test_reference_threshold_matches_between_python_and_javascript",
+            "test_reference_subject_registry.py::test_member_prompt_fragment_matches_between_python_and_javascript",
+            "test_reference_subject_registry.py::test_token_vocabulary_matches_between_python_and_javascript",
+            "test_reference_prose_policy.py::test_reference_verdict_python_js_parity"),
+    },
+    "scene_link_groups.js": {
+        "scope": "Route link pruning, explicit link/unlink editing and id-collision refusal.",
+        "authorities": tuple("server/routes.py::" + name for name in (
+            "_prune_linked_item_groups", "_unlink_refs", "_expand_linked_refs", "_add_link_group")),
+        "tests": tuple("test_link_group_parity.py::" + name for name in (
+            "test_link_group_normalization_is_identical_in_both_languages",
+            "test_a_group_id_collision_is_resolved_the_same_way_in_both_languages",
+            "test_explicit_group_edit_matches_server")),
+    },
+    "scene_move_geometry.js": {
+        "scope": "Start-only duration-preserving moves and linked pure-move bounds/refusals, not whole update handlers.",
+        "authorities": tuple("server/routes.py::" + name for name in (
+            "_apply_update_clip", "_apply_update_audio_track", "_apply_linked_bounds_update", "_apply_ref_bounds")),
+        "tests": tuple("test_move_geometry_parity.py::" + name for name in (
+            "test_a_clip_move_preserves_its_duration_identically_in_both_languages",
+            "test_an_audio_move_preserves_its_duration_identically_in_both_languages",
+            "test_a_linked_move_adds_one_delta_to_every_member",
+            "test_the_client_declines_exactly_the_linked_moves_the_server_refuses")),
+    },
+    "scene_reference_geometry.js": {
+        "scope": "Reference bounds, canonical member-ref record shape and staged-row defaults, not all route applicability.",
+        "authorities": tuple("server/routes.py::" + name for name in (
+            "_reference_item_bounds", "_canonical_reference_member_refs", "_apply_create_reference_item")),
+        "tests": tuple("test_reference_geometry_parity.py::" + name for name in (
+            "test_reference_bounds_agree_in_both_languages",
+            "test_an_inverted_range_is_refused_on_both_sides_rather_than_repaired",
+            "test_the_painted_member_record_is_the_record_the_route_stores",
+            "test_the_painted_row_matches_the_stored_row_field_for_field",
+            "test_a_stored_member_round_trips_through_an_append_unchanged")),
+    },
+    "scene_split_geometry.js": {
+        "scope": "Clip/audio split-half geometry and source-duration sentinel semantics, not link repartition.",
+        "authorities": ("server/routes.py::_split_clip_object", "server/routes.py::_split_audio_object"),
+        "tests": tuple("test_split_geometry_parity.py::" + name for name in (
+            "test_clip_split_halves_match_field_for_field", "test_audio_split_halves_match_field_for_field",
+            "test_the_split_mirror_reproduces_the_two_meanings_of_total_source_frames")),
+    },
+}
+
+
+def _mirror_header(source):
+    """Only leading comments declare a mirror; imports/code end the header."""
+    return re.match(r"\s*(?:(?://[^\n]*(?:\n|$)|/\*[\s\S]*?\*/)\s*)*", source).group()
+
+
+def _assert_mirror_markers(sources, inventory):
+    marked = {}
+    for filename, source in sources.items():
+        header = _mirror_header(source)
+        if "@server-mirror" not in header:
+            continue
+        markers = re.findall(r"^// @server-mirror ([\w/]+\.py::\w+)$", header, re.MULTILINE)
+        assert len(markers) == header.count("@server-mirror"), f"Malformed mirror marker: {filename}"
+        assert len(markers) == len(set(markers)), f"Duplicate mirror marker: {filename}"
+        marked[filename] = set(markers)
+    assert set(marked) == set(inventory), (
+        f"Mirror inventory drift: unlisted {sorted(set(marked) - set(inventory))}; "
+        f"unmarked {sorted(set(inventory) - set(marked))}")
+    for filename, row in inventory.items():
+        assert marked[filename] == set(row["authorities"]), f"Mirror authority drift: {filename}"
+
+
+def _assert_mirror_obligations(inventory, root):
+    trees = {}
+    def tree(path):
+        assert path.is_file(), f"Missing mirror contract file: {path}"
+        if path not in trees:
+            trees[path] = ast.parse(path.read_text(encoding="utf-8"))
+        return trees[path]
+    for filename, row in inventory.items():
+        assert row["scope"].strip(), f"Missing mirror scope: {filename}"
+        assert row["authorities"], f"Missing mirror authority: {filename}"
+        assert row["tests"] or row.get("exemption"), f"No parity disposition: {filename}"
+        if "exemption" in row:
+            for field in ("reason", "owner", "expiry"):
+                assert row["exemption"].get(field, "").strip(), f"Missing exemption {field}: {filename}"
+        for ref in row["authorities"]:
+            path, name = ref.split("::")
+            body = tree(root / path).body
+            names = {node.name for node in body if isinstance(node, (ast.FunctionDef, ast.ClassDef))}
+            names.update(node.id for stmt in body if isinstance(stmt, (ast.Assign, ast.AnnAssign))
+                         for node in ast.walk(stmt) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store))
+            assert name in names, f"Missing mirror authority: {ref}"
+        for ref in row["tests"]:
+            path, name = ref.split("::")
+            assert name.startswith("test_") and any(
+                isinstance(node, ast.FunctionDef) and node.name == name
+                for node in tree(root / "tests" / path).body), f"Missing parity test: {ref}"
+
+
+def test_declared_mirror_headers_match_the_inventory_both_ways():
+    sources = {path.relative_to(ROOT / "web/js").as_posix(): path.read_text(encoding="utf-8")
+               for path in (ROOT / "web/js").rglob("*.js")}
+    _assert_mirror_markers(sources, MIRRORED_MODULES)
+
+
+def test_every_declared_mirror_has_a_live_parity_disposition():
+    _assert_mirror_obligations(MIRRORED_MODULES, ROOT)
+
+
+@pytest.mark.parametrize("drift", ["unlisted", "unmarked", "late-marker", "duplicate", "malformed", "wrong-authority"])
+def test_mirror_marker_ratchet_rejects_injected_drift(drift):
+    source = "// @server-mirror server/guide_collision.py::resolve_execution_window\nexport const x = 1;"
+    sources = {"selection_constraints.js": source}
+    inventory = {"selection_constraints.js": MIRRORED_MODULES["selection_constraints.js"]}
+    if drift == "unlisted":
+        sources["new_mirror.js"] = source
+    elif drift == "unmarked":
+        sources["selection_constraints.js"] = "export const x = 1;"
+    elif drift == "late-marker":
+        sources["selection_constraints.js"] = "export const x = 1;\n" + source
+    elif drift == "duplicate":
+        sources["selection_constraints.js"] = source.splitlines()[0] + "\n" + source
+    elif drift == "malformed":
+        sources["selection_constraints.js"] = source.replace("server/", "./server/")
+    else:
+        sources["selection_constraints.js"] = source.replace("resolve_execution_window", "wrong")
+    with pytest.raises(AssertionError, match="mirror|Mirror"):
+        _assert_mirror_markers(sources, inventory)
+
+
+@pytest.mark.parametrize("drift", ["no-disposition", "missing-test-file", "missing-test", "missing-authority",
+                                  "missing-reason", "missing-owner", "missing-expiry"])
+def test_mirror_disposition_ratchet_rejects_injected_drift(drift):
+    row = copy.deepcopy(MIRRORED_MODULES["selection_constraints.js"])
+    if drift == "no-disposition":
+        row["tests"] = ()
+    elif drift == "missing-test-file":
+        row["tests"] = ("test_nonexistent_mirror.py::test_comparison",)
+    elif drift == "missing-test":
+        row["tests"] = ("test_selection_constraints_js.py::test_nonexistent_comparison",)
+    elif drift == "missing-authority":
+        row["authorities"] = ("server/guide_collision.py::nonexistent_transform",)
+    else:
+        row["tests"] = ()
+        row["exemption"] = dict(MIRRORED_MODULES["guide_collision.js"]["exemption"])
+        row["exemption"][drift.removeprefix("missing-")] = " "
+    with pytest.raises(AssertionError, match="parity|Parity|mirror|Mirror|exemption"):
+        _assert_mirror_obligations({"new_mirror.js": row}, ROOT)

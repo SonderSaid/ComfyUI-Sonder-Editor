@@ -1,3 +1,6 @@
+// @server-mirror server/minimax_h3.py::lane_population
+// @server-mirror server/routes.py::member_population_compatible
+// Scope and parity disposition: tests/test_mutation_authoring_contract.py::MIRRORED_MODULES
 /** Pure Reference-lane identity rules shared by the panel and node tests. */
 
 export function preserveLaneRecipeIdentity(currentRecipe, nextRecipe, fallbackLaneId = "") {

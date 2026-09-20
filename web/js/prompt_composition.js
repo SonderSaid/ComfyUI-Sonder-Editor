@@ -1,3 +1,9 @@
+// @server-mirror server/prompt_payload.py::normalize_channels
+// @server-mirror server/prompt_payload.py::split_channel_headers
+// @server-mirror server/prompt_payload.py::collapse_channels_for_template
+// @server-mirror server/prompt_payload.py::join_channel_headers
+// @server-mirror server/prompt_payload.py::compose_range_prompt
+// Scope and parity disposition: tests/test_mutation_authoring_contract.py::MIRRORED_MODULES
 // Prompt composition mirror — compose-only DISPLAY twin of
 // server/prompt_payload.py. Keep the channel normalizer and join rules in
 // lockstep with the backend module; the channel SET itself now comes from

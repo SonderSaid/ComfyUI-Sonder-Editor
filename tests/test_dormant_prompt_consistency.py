@@ -1,4 +1,4 @@
-"""Parity and freeze contracts for candidate, execution, Relay, and dormant prompt views."""
+"""Python view consistency and freeze contracts for candidate, execution, Relay, and dormant prompt views."""
 
 from server import prompt_context
 from server.routes import (

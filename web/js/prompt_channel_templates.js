@@ -1,3 +1,9 @@
+// @server-mirror server/prompt_channel_templates.py::PROMPT_CHANNEL_TEMPLATE_PRESETS
+// @server-mirror server/prompt_channel_templates.py::normalize_channel_template
+// @server-mirror server/prompt_channel_templates.py::resolve_channel_template
+// @server-mirror server/prompt_channel_templates.py::template_labels_on
+// @server-mirror server/prompt_channel_templates.py::format_shot_timecode
+// Scope and parity disposition: tests/test_mutation_authoring_contract.py::MIRRORED_MODULES
 // Prompt channel templates — mirror of server/prompt_channel_templates.py.
 // Keep the preset ids, channel keys, labels, separators and policies in
 // lockstep with the backend module; tests/test_prompt_channel_templates_js.py
