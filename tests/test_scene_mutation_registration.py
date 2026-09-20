@@ -1492,7 +1492,7 @@ _FORWARDING_SCOPES = frozenset({
 
 # A receiver is required. `_queueProjectMutation({` -- the declaration itself --
 # otherwise matches, and reads as a call site with no enclosing scope.
-_ENQUEUE_RE = re.compile(r"\.\s*_(?:runSceneMutation|queueProjectMutation)\s*\(")
+_ENQUEUE_RE = re.compile(r"\.\s*(_runSceneMutation|_queueProjectMutation)\s*\(")
 _ARROW_MERGE_RE = re.compile(r"\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*=>")
 _FUNCTION_MERGE_RE = re.compile(r"\bfunction\s*\w*\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)")
 _IMPORT_RE = re.compile(r"\bimport\s*\{([^}]*)\}\s*from\s*[\"']([^\"']+)[\"']")
@@ -1748,6 +1748,11 @@ def _scan_enqueue_sites(sources: tuple) -> tuple:
             sites.append({
                 "module": module,
                 "scope": scope,
+                # Which helper: the two do NOT share a key policy.
+                # `_runSceneMutation` substitutes a scene-wide default for a
+                # falsy key; `_queueProjectMutation` has no default and the
+                # queue rejects a keyless enqueue outright.
+                "helper": match.group(1),
                 "line": source.count("\n", 0, match.start()) + 1,
                 "key_shape": key_shape,
                 "key_interpolations": key_interpolations,
@@ -3875,6 +3880,59 @@ def _coalescing_opt_out_findings(sites=None) -> dict:
     return findings
 
 
+def _default_key_findings(sites=None) -> dict:
+    """Every enqueue that takes `_runSceneMutation`'s default key by omission.
+
+    Deliberately NOT one of the opt-out classes above, and not filed in their
+    dict. Those ask why a site will not coalesce; this asks what a site
+    acquired by saying nothing, which is the opposite failure. Filing it there
+    would make one reviewed-entry dict mean two incompatible things and put a
+    class that is not a spelling of "will not coalesce" under a test that
+    checks exactly that.
+
+    The default is `scene:<id>:mutation` with `coalesce: true` and `merge: null`
+    (`editor_widget.js::_runSceneMutation`), so an omitted key collapses into
+    every other default-key gesture on the same scene, wholesale. Coalescing
+    settles each collapsed loser from the survivor's result, so an intent the
+    survivor does not subsume is discarded while its author is told it
+    succeeded. `durable_rules.md` forbids acquiring a policy by omission and
+    the same method already refuses it for `retryOnConflict`; the key and its
+    merge are the pair that can still be taken by silence.
+    """
+    findings = {}
+    for site in (sites if sites is not None else _enqueue_call_sites()):
+        if site["scope"] in _FORWARDING_SCOPES:
+            continue
+        # An empty literal key is the SAME acquisition as omitting it, because
+        # `_runSceneMutation` substitutes on `key || <template>`. Reading only
+        # the omitted spelling would let `key: ""` walk past both tripwires:
+        # the opt-out scan sees a non-interpolating key and calls it repeating.
+        if site["key_shape"] not in (_KEY_DEFAULT, ""):
+            continue
+        # The two helpers do not fail the same way, so they must not be told
+        # the same thing. A keyless `_queueProjectMutation` coalesces with
+        # nothing -- the queue rejects it -- and a reviewed entry explaining
+        # what it shares a scene-wide key with would describe a call that
+        # throws on every invocation.
+        findings[f"{site['module']}:{site['scope']}:{site['line']}"] = (
+            "takes the scene-wide default key with no `merge`, so it coalesces "
+            "with every other default-key gesture on the scene"
+            if site["helper"] == "_runSceneMutation" else
+            "passes no key to `_queueProjectMutation`, which has no default; "
+            "the queue rejects a keyless enqueue, so this call always throws")
+    return findings
+
+
+# Enqueues reviewed as safe on the default key, and the aim is to keep this
+# empty: naming a key costs one line and removes the question entirely.
+#
+# An entry must say what the site shares its scene-wide key with and why losing
+# an intent to that collapse is acceptable -- not merely that it looked fine.
+#
+# Expiry: an entry leaves when its site names a key.
+DEFAULT_KEY_REVIEWED: dict = {}
+
+
 # Every enqueue that will not coalesce, with the traced reason it owes.
 #
 # `UNREACHABLE` -- the key cannot repeat, so the `coalesce: false` beside it is
@@ -4202,6 +4260,35 @@ def test_every_key_interpolation_is_classified():
         f"documentation of nothing: {dead}")
 
 
+def test_no_enqueue_acquires_the_default_key_by_omission():
+    """The third spelling, and the one no tripwire covered.
+
+    A site that names no key is not opting out of coalescing -- it is opting
+    into the broadest possible key without saying so. Every shipped enqueue
+    names one today, which is what makes this cheap to hold.
+    """
+    findings = _default_key_findings()
+    unreviewed = {key: why for key, why in findings.items()
+                  if key not in DEFAULT_KEY_REVIEWED}
+    assert not unreviewed, (
+        "these enqueues take `_runSceneMutation`'s scene-wide default key with "
+        "no `merge`, so they collapse into every other default-key gesture on "
+        "the scene and each collapsed loser is settled from the survivor's "
+        "result -- an intent the survivor does not subsume is discarded while "
+        "its author is told it succeeded. Name a key that scopes what this "
+        "gesture actually edits, or add an entry to DEFAULT_KEY_REVIEWED "
+        "saying what it shares the scene-wide key with: "
+        + "; ".join(f"{key} -- {why}" for key, why in sorted(unreviewed.items())))
+
+
+def test_default_key_review_entries_are_not_stale():
+    """An entry must be able to die, or it is documentation of a gap."""
+    gone = sorted(set(DEFAULT_KEY_REVIEWED) - set(_default_key_findings()))
+    assert not gone, (
+        "these sites no longer take the default key, so the entry is dead and "
+        f"should go with it: {gone}")
+
+
 def test_every_enqueue_that_cannot_coalesce_says_why():
     """The tripwire this landing exists for, in both its spellings.
 
@@ -4356,6 +4443,71 @@ def test_a_coalescing_site_is_not_reported_as_an_opt_out():
         "spelling of `will not coalesce` is unwatched again")
 
 
+def test_the_default_key_tripwire_fires_on_an_omitted_key():
+    """Drives the predicate over fixtures, with exact findings.
+
+    Without this the real modules decide whether the tripwire has ever been
+    exercised, and the assertion above is satisfied today by a predicate that
+    returns `{}` for every input -- no shipped enqueue omits its key.
+    """
+    def findings(js):
+        return _default_key_findings(_scan_enqueue_sites((("fixture.js", js),)))
+
+    omitted = findings(
+        'async function gesture() {\n'
+        '  await host._runSceneMutation(ops, { label: "no key" });\n}\n')
+    assert list(omitted) == ["fixture.js:gesture:2"]
+
+    assert findings(
+        'async function gesture() {\n  await host._runSceneMutation(ops);\n}\n'), (
+        "no options object at all is the same acquisition as an options object "
+        "with no key, and is the likelier spelling for a newly added gesture")
+
+    for spelling in ('key: ""', "key: ``"):
+        assert findings(
+            'async function gesture() {\n'
+            '  await host._runSceneMutation(ops, { ' + spelling + ' });\n}\n'), (
+            "`key || <template>` makes an empty literal key the same "
+            f"acquisition as omitting it, so {spelling} must not walk past")
+
+    assert not findings(
+        'async function gesture() {\n'
+        '  await host._runSceneMutation(ops, { key: `scene:${sceneId}:x` });\n}\n'), (
+        "a named key is the whole remedy; naming one must clear the finding")
+
+    queued = findings(
+        'async function gesture() {\n'
+        '  await host._queueProjectMutation({ label: "no key" });\n}\n')
+    assert "rejects a keyless enqueue" in next(iter(queued.values())), (
+        "`_queueProjectMutation` has no key default and the queue refuses a "
+        "keyless call, so it must not be told it coalesces scene-wide")
+
+    two = findings(
+        'async function gesture() {\n'
+        '  host._runSceneMutation(a, { label: "x" });\n'
+        '  host._runSceneMutation(b, { label: "y" });\n}\n')
+    assert len(two) == 2, (
+        "two default-key enqueues in one scope must be two findings, or one "
+        "reviewed entry silently covers a site nobody looked at")
+
+
+def test_the_default_key_ratchet_fails_when_a_site_takes_the_default(monkeypatch):
+    """Drives the SHIPPED assertion, not a local restatement of it.
+
+    Asserting that `assert not <non-empty dict>` raises proves only that Python
+    works. The tripwire is only enforcement if the shipped test body fails when
+    the predicate reports something, and its own message is what says so.
+    """
+    monkeypatch.setitem(
+        globals(), "_default_key_findings",
+        lambda sites=None: {"editor_widget.js:_probeWithinGesture:1": "takes the default key"})
+    with pytest.raises(AssertionError, match="scene-wide default key"):
+        test_no_enqueue_acquires_the_default_key_by_omission()
+    monkeypatch.setitem(globals(), "DEFAULT_KEY_REVIEWED", {"gone:0": "stale"})
+    with pytest.raises(AssertionError, match="no longer take the default key"):
+        test_default_key_review_entries_are_not_stale()
+
+
 def test_the_opt_out_tripwires_produce_the_findings_they_claim():
     """Drives both predicates over fixtures, with exact findings.
 
@@ -4388,6 +4540,11 @@ def test_the_opt_out_tripwires_produce_the_findings_they_claim():
         '  await host._runSceneMutation(ops, { key: `scene:${sceneId}:x` });\n}\n'), (
         "a coalescing gesture on a repeating key is not an opt-out")
 
+    # Still true, and not a contradiction of the default-key tripwire:
+    # an absent key is the most COALESCIBLE key in the file, so it is not an
+    # opt-out and must not be read as unresolved here. That it is too broad to
+    # take by silence is the opposite failure, and
+    # `test_no_enqueue_acquires_the_default_key_by_omission` owns it.
     assert not findings(
         'async function gesture() {\n'
         '  await host._runSceneMutation(ops, { label: "no key" });\n}\n'), (
