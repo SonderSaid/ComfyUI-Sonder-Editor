@@ -52,7 +52,8 @@ OBLIGATIONS = {
         REG + "test_an_emission_sends_every_key_its_branch_requires")),
     "gesture.coalescing": ("key / coalesce / merge", (
         REG + "test_a_coalescing_gesture_declares_a_merge_or_sends_a_whole_value_payload",
-        REG + "test_every_enqueue_that_cannot_coalesce_says_why")),
+        REG + "test_every_enqueue_that_cannot_coalesce_says_why",
+        REG + "test_no_enqueue_acquires_the_default_key_by_omission")),
     "gesture.undo": ("_pushUndo and its microtask claim", (
         "test_mutation_authoring_contract.py::test_gesture_undo_claims_reach_a_mutation_helper_before_expiry",
         "test_mutation_authoring_contract.py::test_deferred_undo_claims_keep_their_explicit_handoff")),
@@ -296,8 +297,12 @@ def test_a_class_method_cannot_hide_behind_a_represented_top_level_test():
 # follow calls into other methods, implicit promise continuations, or arbitrary
 # aliases. Existing scanner masking also excludes template interpolations and
 # does not tokenize regex literals. Behavioral history tests own runtime claims.
-# Nested functions containing relevant events fail for review rather than being
-# credited as synchronous work in their outer callback.
+# A nested function body is masked out of the outer synchronous path rather than
+# abandoning the callback, because an await inside an unrelated closure is not an
+# outer suspension. What the closure CONTAINS is still reported: a reservation or
+# a write inside one is deferred work no lexical scan can attribute. A concise
+# arrow has no brace to mask, so it is reviewed only when its body could hide one
+# of those three events.
 _MUTATION_HELPERS = {
     "_runSceneMutation": 1,
     "_queueProjectMutation": 0,
@@ -315,20 +320,106 @@ UNDO_CLAIM_EXEMPTIONS = {
         "Existing raw /guides/swap fetch never claims the undo entry. Bug tracker "
         "owns the defect; delete this exception when the gesture uses a stamping "
         "mutation path and its regression is verified."),
+    ("_toggleHeaderVisibility", "missing-mutation-helper"): (
+        "Reserves and hands the entry to _applyHeaderVisibilityBulkWithinGesture "
+        "as an argument, which this scan does not follow. The handoff is pinned "
+        "instead by DEFERRED_UNDO_CLAIMS['toggle track visibility (header "
+        "control)'], link by link. Delete this exception when the scan resolves "
+        "argument handoffs, or when the dormant method is deleted."),
+    ("assetDrop", "multiple-reservations-review"): (
+        "Two reservations, because one drop can write a clip, its extracted "
+        "audio and a driver as separate ordered writes. Each is forwarded "
+        "explicitly through the local queueDropMutation helper, pinned by "
+        "DEFERRED_UNDO_CLAIMS['asset drop']. Delete this exception when the "
+        "drop submits one batch carrying one entry."),
+    # The three below hold reservations inside event-handler closures, so the
+    # outer synchronous path has none to follow. Their value is not today's
+    # verdict: a reservation added at the TOP level of any of them changes the
+    # finding and fails this catalogue, which is what the exemption buys.
+    ("_setupTimelineEvents", "reservation-only-in-nested"): (
+        "Every reservation here is inside a pointer or context-menu handler. "
+        "Trim and move items are pinned by DEFERRED_UNDO_CLAIMS; the lane menu's "
+        "visibility toggle is pinned as 'toggle track visibility (context "
+        "menu)'. Delete this exception when the handlers become named methods."),
+    ("_showItemEditor", "reservation-only-in-nested"): (
+        "Reservations sit in the editor panel's control handlers, each writing "
+        "through _updateItemProperty in the same synchronous turn. Delete this "
+        "exception when the panel's handlers become named methods."),
+    ("_showGuideManagementPopup", "reservation-only-in-nested"): (
+        "Reservations sit in the popup's per-guide button handlers. Delete this "
+        "exception when the popup's handlers become named methods."),
 }
 
+# Reservations that travel out of the scope that made them. Three TRANSPORT
+# FORMS, named rather than blurred, because they fail differently:
+#
+#   member-storage -- the entry is parked on `this` at pointer-down and read at
+#       pointer-up. Genuinely deferred across an asynchronous lifecycle.
+#   argument -- the entry is handed to another method in the same synchronous
+#       turn. Not deferred in time, but it does cross a scope boundary, so no
+#       callback-scoped scan can see both halves.
+#   local-helper -- the entry is passed to a closure declared in the SAME
+#       method, which forwards it. Producer and consumer are one scope.
+#
+# What every form owes is identical and is checked for all three: the reserved
+# object reaches a mutation helper as an explicit `historyEntry`, because the
+# implicit `_historyPostSnapshotCaptureCandidate` expires at a microtask.
 DEFERRED_UNDO_CLAIMS = {
     "trim": {
+        "form": "member-storage",
         "producer": "_setupTimelineEvents", "consumer": "_commitTrim",
         "storage": "_trimItem", "entry": "trimInfo.historyEntry",
         "reason": "Pointer-down reserves history; pointer-up forwards that exact entry.",
         "expiry": "Remove when trim reserves and queues in one synchronous callback.",
     },
     "move items": {
+        "form": "member-storage",
         "producer": "_setupTimelineEvents", "consumer": "_commitItemMove",
         "storage": "_dragHistoryEntry", "entry": "historyEntry",
         "reason": "Pointer-down reserves history; move commit forwards the retained entry.",
         "expiry": "Remove when move reserves and queues in one synchronous callback.",
+    },
+    "toggle track visibility (context menu)": {
+        "form": "argument",
+        "producer": "_setupTimelineEvents",
+        "consumer": "_applyHeaderVisibilityBulkWithinGesture",
+        "label": "toggle track visibility", "binding": "undoEntry",
+        "entrypoint": "_applyHeaderVisibilityBulk",
+        "parameter": "undoEntry", "entry": "undoEntry",
+        "reason": "The lane menu reserves, then hands the entry down rather than "
+                  "letting the gesture look it up: a label or top-of-stack match "
+                  "can delete a NEWER gesture's entry once the queue interleaves, "
+                  "which coalescing on this key makes likelier, not less.",
+        "expiry": "Remove when the bulk apply reserves its own entry inside the gesture.",
+    },
+    "toggle track visibility (header control)": {
+        "form": "argument",
+        "producer": "_toggleHeaderVisibility",
+        "consumer": "_applyHeaderVisibilityBulkWithinGesture",
+        "label": "toggle track visibility", "binding": "undoEntry",
+        "entrypoint": "_applyHeaderVisibilityBulk",
+        "parameter": "undoEntry", "entry": "undoEntry",
+        # This path is DORMANT: `_toggleHeaderVisibility` has no caller, and
+        # only `tests/test_animatic_visibility_js.py` names it, as a slice
+        # anchor. It is pinned because its own comment asks for exactly that --
+        # reviving it must not silently reintroduce a label-matched discard --
+        # so a severance probe here is not evidence of a live hole.
+        "reason": "Dormant single-lane entry point, kept reserving and handing "
+                  "down its own entry so a revival cannot reintroduce the "
+                  "label-matched discard this surface removed.",
+        "expiry": "Remove when a single-lane control calls it, or when the "
+                  "method is deleted with its test anchor.",
+    },
+    "asset drop": {
+        "form": "local-helper",
+        "producer": "_handleAssetDropWithinGesture",
+        "consumer": "_handleAssetDropWithinGesture",
+        "helper": "queueDropMutation", "parameter": "historyEntry",
+        "bindings": ("driverUndoEntry", "assetUndoEntry"), "entry": "historyEntry",
+        "reason": "One drop can create a clip, its extracted audio and a driver "
+                  "in separate ordered writes; each carries the reservation its "
+                  "own branch made so the composite gesture stamps the right one.",
+        "expiry": "Remove when the drop submits one batch that carries one entry.",
     },
 }
 
@@ -362,26 +453,111 @@ def _js_arguments(source, opener, mask=None):
     return args, end
 
 
+# The codebase's dominant gesture shape: the wrapper's callback does nothing
+# but delegate to a `*WithinGesture` method, which is where the reservation and
+# the write actually live. Resolving ONE level of that forwarding is what takes
+# the scan from the handful of inline callbacks to the bodies that hold most of
+# the reservations. It is one level by design: a callee that itself delegates is
+# not followed, and says so as a finding rather than passing quietly.
+_FORWARD_RE = re.compile(r"\bthis\.(_[\w$]*WithinGesture)\s*\(")
+
+# Methods that reserve undo without a gesture wrapper above them. Scanned under
+# their own name because there is no gesture name to attribute to.
+UNWRAPPED_RESERVING_SCOPES = (
+    "_setupTimelineEvents", "_showItemEditor", "_toggleHeaderVisibility",
+    "_showGuideManagementPopup",
+)
+
+# Deliberately not scanned. Each reason is checked by
+# `test_the_unscanned_scopes_are_still_the_shapes_their_reasons_describe`, so an
+# exclusion cannot outlive the condition that justified it.
+UNSCANNED_SCOPES = {
+    "_showGuideManagementPopupLegacy":
+        "Dead: declared once and called from nowhere in web/. Scanning it would "
+        "buy a permanent exemption for code whose fix is deletion. This entry "
+        "goes when it gains a caller, and the liveness check fails first.",
+    "commitStrength":
+        "A local const arrow declared TWICE in this file -- the legacy popup's "
+        "does not reserve, the current one does -- so a name-keyed lookup "
+        "cannot address either. This entry goes when they become one scope.",
+}
+
+
+# Every unit the scan reserves undo in, pinned so a shrinking scan cannot read
+# as full coverage. One entry per scanned UNIT, not per reservation: `assetDrop`
+# holds two reservations and appears once, while `deleteGuide` appears twice
+# because two separate popup surfaces each wrap their own gesture of that name.
+SCANNED_RESERVING_UNITS = (
+    "_setupTimelineEvents", "_showGuideManagementPopup", "_showItemEditor",
+    "_toggleHeaderVisibility", "addClipFrameToGuides", "addLane",
+    "appendReferenceMembers", "applyPromptSetup", "assetDrop",
+    "consolidateSelectedItemsToLane", "convertClipRole", "deleteGuide",
+    "deleteGuide", "deleteItemsInLane", "deletePromptSection",
+    "deleteSelectedItems", "deleteSelectedLanesAndItems", "linkItems",
+    "moveGuideToFrame", "moveItemToFrame", "moveItemToNewLane",
+    "moveReferenceLane", "placeReferencePayload", "removeLane",
+    "removeLaneDeletingItems", "removeLaneWithItems", "renameScene",
+    "replaceAudioSource", "replaceClipSource", "replaceGuideImage",
+    "saveNewPromptSection", "splitItem", "swapGuides", "toggleMute",
+    "unlinkItems", "updateLinkedPromptAttachment", "updatePromptSection",
+    "updateSceneDuration", "updateSceneGlobalContext",
+)
+
+
+def _scope_body(source, scopes, name):
+    matches = [(start, end) for scope, start, end in scopes if scope == name]
+    return source[matches[0][0]:matches[0][1] + 1] if len(matches) == 1 else None
+
+
 def _gesture_undo_callbacks(source):
     mask = registration._code_mask(source)
     code = "".join(char if mask[index] else " " for index, char in enumerate(source))
-    callbacks = []
+    scopes = registration._scopes(source, mask)
+    callbacks, claimed = [], {}
     for match in re.finditer(r"\bthis\._withMutationGesture\s*\(", code):
         args, end = _js_arguments(source, match.end() - 1, mask)
-        # A forwarding callback can call a WithinGesture method; this lexical
-        # scan deliberately does not claim to inspect those callee bodies.
-        if len(args) < 2 or not re.search(r"\bthis\._pushUndo\s*\(", _js_code(args[1])):
+        if len(args) < 2:
+            continue
+        callback, reserves = args[1], re.search(r"\bthis\._pushUndo\s*\(", _js_code(args[1]))
+        # Resolved from the MASKED callback. A delegation reachable only from
+        # inside a closure does not run in the gesture's synchronous turn, and
+        # entering the callee would certify a reservation that happens after
+        # the turn has ended. Those are collected separately as findings.
+        masked_callback, _ = _mask_nested_functions(callback)
+        callees = sorted({one[1] for one in _FORWARD_RE.finditer(masked_callback)})
+        forwarded = [one for one in callees
+                     if re.search(r"\bthis\._pushUndo\s*\(",
+                                  _js_code(_scope_body(source, scopes, one) or ""))]
+        if not reserves and not forwarded:
             continue
         name = re.fullmatch(r'''(["'])([\w.-]+)\1''', args[0])
-        assert name, "Undo claim scan: a callback reserving undo needs a literal gesture name"
-        callback = args[1]
-        cb_code = _js_code(callback)
-        head = re.match(r"\s*(?:async\s+)?(?:\([^)]*\)|[\w$]+)\s*=>\s*\{", cb_code)
-        assert head, f"Undo claim scan: review unsupported callback shape for {name[2]}"
-        brace = head.end() - 1
-        close = registration._match_delimiter(callback, brace, "{", "}")
-        assert close >= 0 and not cb_code[close + 1:].strip(), "Undo claim scan: incomplete callback"
-        callbacks.append((name[2], callback[brace + 1:close]))
+        # A computed gesture name has nothing to attribute a finding to. Two
+        # sites pass a variable and neither reserves; that must stay true.
+        assert name, ("Undo claim scan: a gesture that reserves undo, directly "
+                      "or through a WithinGesture callee, needs a literal name")
+        if reserves:
+            cb_code = _js_code(callback)
+            head = re.match(r"\s*(?:async\s+)?(?:\([^)]*\)|[\w$]+)\s*=>\s*\{", cb_code)
+            assert head, f"Undo claim scan: review unsupported callback shape for {name[2]}"
+            brace = head.end() - 1
+            close = registration._match_delimiter(callback, brace, "{", "}")
+            assert close >= 0 and not cb_code[close + 1:].strip(), "Undo claim scan: incomplete callback"
+            callbacks.append((name[2], callback[brace + 1:close]))
+        for callee in forwarded:
+            # One callee reached from two gestures would have its findings
+            # attributed to whichever was scanned first. Refuse instead.
+            assert claimed.setdefault(callee, name[2]) == name[2], (
+                f"Undo claim scan: {callee} reserves undo and is reached from "
+                f"both {claimed[callee]} and {name[2]}; one level of forwarding "
+                "cannot attribute its findings")
+            callbacks.append((name[2], _scope_body(source, scopes, callee)))
+    for scope in UNWRAPPED_RESERVING_SCOPES:
+        # Absent in a synthetic fixture, which is the normal case for the
+        # parametrized probes. `SCANNED_RESERVING_UNITS` is what fails if one
+        # of these disappears from the real widget.
+        body = _scope_body(source, scopes, scope)
+        if body is not None and re.search(r"\bthis\._pushUndo\s*\(", _js_code(body)):
+            callbacks.append((scope, body))
     return callbacks
 
 
@@ -442,23 +618,186 @@ def _queue_has_scene_claim(call_args):
     return len(ids) == 1 and ids[0] not in {"", "null", "undefined", "false", "0", '""', "''"}
 
 
-def _undo_claim_findings(source):
+_PUSH_RE = re.compile(r"\bthis\._pushUndo\s*\(")
+_HELPER_RE = re.compile(r"\bthis\.(" + "|".join(_MUTATION_HELPERS) + r")\s*\(")
+_ARROW_HEAD_RE = re.compile(r"=>\s*\{")
+# A `function` body is the brace after ITS OWN parameter list. Bounding the head
+# this way is load-bearing, not tidiness: `_code_mask` deliberately does not
+# tokenize regex literals, so a bare `\bfunction\b` also matches inside
+# `/function/` and would then adopt the next `if (...) {` in real code as its
+# body -- masking a block that actually runs, and with it any await gap in it.
+_FUNCTION_HEAD_RE = re.compile(r"\bfunction\b\s*\*?\s*([\w$]*)\s*\(")
+# Object-literal shorthand methods, class methods, getters and setters. Filtered
+# through `registration._NOT_A_SCOPE`, the same keyword list `_scopes` uses to
+# tell a scope head from a call, so `if (...) {` is not read as a closure. An
+# unrecognised closure is worse than a missed one: its body stays on the outer
+# synchronous path and is credited to it.
+_METHOD_HEAD_RE = re.compile(r"(?:\b(?:get|set|async)\s+)?\*?\s*\b([\w$]+)\s*\(")
+
+
+def _nested_function_spans(code, source, mask):
+    """Every brace-bodied nested function as (brace, close), outermost only.
+
+    `close` is -1 when the body cannot be read. Heads inside an already-covered
+    span are skipped, so one outer closure is masked once rather than per
+    nested shape that also matches inside it.
+    """
+    heads = set()
+    for match in _ARROW_HEAD_RE.finditer(code):
+        heads.add((match.start(), code.index("{", match.start())))
+    for pattern in (_FUNCTION_HEAD_RE, _METHOD_HEAD_RE):
+        for match in pattern.finditer(code):
+            if match.group(1) in registration._NOT_A_SCOPE:
+                continue
+            paren = registration._match_delimiter(source, match.end() - 1, "(", ")", mask)
+            if paren < 0:
+                continue
+            brace = paren + 1
+            while brace < len(code) and code[brace].isspace():
+                brace += 1
+            if code[brace:brace + 1] == "{":
+                heads.add((match.start(), brace))
+    spans, covered = [], -1
+    for head, brace in sorted(heads):
+        if head <= covered:
+            continue
+        close = registration._match_delimiter(source, brace, "{", "}", mask)
+        spans.append((brace, close))
+        if close >= 0:
+            covered = close
+    return spans
+
+
+def _mask_nested_functions(source):
+    """Blank brace-bodied nested function bodies; report what they contained.
+
+    An await inside an unrelated closure is not an outer suspension, so the
+    closure is removed from the outer synchronous path rather than abandoning
+    the whole callback. A reservation or a write INSIDE one is deferred work and
+    is reported, never silently dropped. The returned text is the same LENGTH as
+    the input, because callers index the unmasked source with offsets taken from
+    the masked code.
+    """
+    mask = registration._code_mask(source)
+    code = "".join(char if mask[index] else " " for index, char in enumerate(source))
+    masked, events = list(code), set()
+    for brace, close in _nested_function_spans(code, source, mask):
+        if close < 0:
+            events.add("unreadable-nested")
+            continue
+        inner = code[brace + 1:close]
+        if _PUSH_RE.search(inner):
+            events.add("push-in-nested")
+        if _HELPER_RE.search(inner):
+            events.add("helper-in-nested")
+        for position in range(brace + 1, close):
+            masked[position] = " "
+    return "".join(masked), events
+
+
+def _concise_arrow_risk(code):
+    """What a brace-less arrow body could hide: a write, or a reservation/await.
+
+    A concise arrow has no body to mask, so its expression stays in the scanned
+    text and reads as the outer synchronous path. The helper term is
+    load-bearing, not decoration: without it
+    `const later = () => this._runSceneMutation(ops); await x(); later();`
+    reports nothing, because the write still lexically precedes the await.
+
+    The lookahead spans the whitespace deliberately. `=>\\s*(?!\\{)` backtracks
+    to zero width and matches a brace arrow too, which would only be harmless
+    while masking happens to have blanked that body first.
+    """
+    for match in re.finditer(r"=>(?!\s*\{)", code):
+        depth, index = 0, match.end()
+        while index < len(code):
+            char = code[index]
+            if char in "([{":
+                depth += 1
+            elif char in ")]}":
+                if depth == 0:
+                    break
+                depth -= 1
+            elif char in ";," and depth == 0:
+                break
+            index += 1
+        span = code[match.end():index]
+        if _HELPER_RE.search(span):
+            # Same defect as a write held in a braced closure, so same name:
+            # the fix is to reach the helper on the synchronous path, and the
+            # arrow's brace style is not what a developer has to change.
+            return "deferred-write-review"
+        if re.search(r"\bawait\b", span) or _PUSH_RE.search(span):
+            return "concise-arrow-review"
+    return None
+
+
+def _unresolved_forward_findings(source):
+    """Delegations this scan sees but deliberately does not follow.
+
+    Two shapes, both reported rather than passed over: a callee reached only
+    from inside a closure (it does not run in the gesture's turn), and a callee
+    that itself delegates (one level is all this resolver claims).
+    """
+    mask = registration._code_mask(source)
+    code = "".join(char if mask[index] else " " for index, char in enumerate(source))
+    scopes = registration._scopes(source, mask)
     findings = []
-    helper_re = re.compile(r"\bthis\.(" + "|".join(_MUTATION_HELPERS) + r")\s*\(")
+    for match in re.finditer(r"\bthis\._withMutationGesture\s*\(", code):
+        args, _ = _js_arguments(source, match.end() - 1, mask)
+        if len(args) < 2:
+            continue
+        name = re.fullmatch(r'''(["'])([\w.-]+)\1''', args[0])
+        if not name:
+            continue
+        masked_callback, _ = _mask_nested_functions(args[1])
+        synchronous = {one[1] for one in _FORWARD_RE.finditer(masked_callback)}
+        deferred = {one[1] for one in _FORWARD_RE.finditer(_js_code(args[1]))} - synchronous
+        for callee in sorted(deferred):
+            body = _scope_body(source, scopes, callee) or ""
+            if re.search(r"\bthis\._pushUndo\s*\(", _js_code(body)):
+                findings.append((name[2], "forward-only-in-nested"))
+        for callee in sorted(synchronous):
+            body = _scope_body(source, scopes, callee) or ""
+            if not re.search(r"\bthis\._pushUndo\s*\(", _js_code(body)):
+                continue
+            onward, _ = _mask_nested_functions(body)
+            if {one[1] for one in _FORWARD_RE.finditer(onward)} - {callee}:
+                findings.append((name[2], "forward-not-followed"))
+    return findings
+
+
+def _undo_claim_findings(source):
+    findings = list(_unresolved_forward_findings(source))
     for gesture, body in _gesture_undo_callbacks(source):
-        code = _js_code(body)
-        pushes = list(re.finditer(r"\bthis\._pushUndo\s*\(", code))
+        # Masking runs HERE, after selection. `_gesture_undo_callbacks` finds a
+        # callback by the reservation in it; masking first would hide a callback
+        # whose only reservation sits in a closure instead of reporting it.
+        code, nested = _mask_nested_functions(body)
+        pushes = list(_PUSH_RE.finditer(code))
+        if not pushes:
+            # Selection saw a reservation and the outer path does not hold it.
+            findings.append((gesture, "reservation-only-in-nested"))
+            continue
         if len(pushes) > 1:
             # A second push replaces the first candidate. Reviewing the whole
             # callback is safer than assigning one later helper to both pushes.
             findings.append((gesture, "multiple-reservations-review"))
             continue
-        # Conservative around closures: even an await inside an unrelated arrow
-        # is not an outer suspension. Force review instead of reasoning across it.
-        if re.search(r"=>|\bfunction\b", code):
+        if "unreadable-nested" in nested:
             findings.append((gesture, "nested-function-review"))
             continue
-        calls = list(helper_re.finditer(code))
+        concise = _concise_arrow_risk(code)
+        if concise:
+            findings.append((gesture, concise))
+            continue
+        if "push-in-nested" in nested:
+            findings.append((gesture, "reservation-in-nested-review"))
+            continue
+        if "helper-in-nested" in nested:
+            findings.append((gesture, "deferred-write-review"))
+            continue
+        calls = list(_HELPER_RE.finditer(code))
         for push in pushes:
             _, push_end = _js_arguments(body, push.end() - 1)
             subsequent = [call for call in calls if call.start() > push_end]
@@ -498,8 +837,82 @@ def test_gesture_undo_claims_reach_a_mutation_helper_before_expiry():
     source = (ROOT / "web/js/editor_widget.js").read_text(encoding="utf-8")
     callbacks = _gesture_undo_callbacks(source)
     # A parser that sees nothing must not pass on an empty exception catalogue.
-    assert {name for name, _ in callbacks} >= {"replaceGuideImage", "swapGuides"}
+    # Pinned as a MULTISET, not a set of names: `deleteGuide` reserves undo on
+    # two separate popup surfaces, so a set cannot see one of them stop doing
+    # it, and a name floor would report full coverage of a shrinking scan.
+    assert sorted(name for name, _ in callbacks) == sorted(SCANNED_RESERVING_UNITS), (
+        "the set of scanned units reserving undo moved. If a gesture "
+        "legitimately gained or lost its reservation, update "
+        "SCANNED_RESERVING_UNITS deliberately; if the scan simply stopped "
+        "seeing one, the exception catalogue no longer covers it. Found: "
+        f"{sorted(name for name, _ in callbacks)}")
     _assert_undo_claim_findings(_undo_claim_findings(source))
+
+
+def test_the_unscanned_scopes_are_still_the_shapes_their_reasons_describe():
+    """An exclusion must not outlive the condition that justified it."""
+    source = (ROOT / "web/js/editor_widget.js").read_text(encoding="utf-8")
+    assert all(reason.strip() for reason in UNSCANNED_SCOPES.values())
+    scopes = registration._scopes(source)
+    legacy = "_showGuideManagementPopupLegacy"
+    # Counted, not pattern-matched for a call: `this?.x()`, `this['x']()`,
+    # `.call(this)` and a stored reference all revive it without matching a
+    # call shape, and this codebase uses optional chaining heavily. Exactly one
+    # occurrence is the declaration; anything else is a revival or a second
+    # declaration, and both end the exclusion.
+    occurrences = sum(path.read_text(encoding="utf-8").count(legacy)
+                      for path in (ROOT / "web/js").rglob("*.js"))
+    assert occurrences == 1, (
+        f"{legacy} occurs {occurrences} times in web/js, so it is no longer "
+        "dead and excluding it from the undo scan is no longer free")
+    assert len([one for one in scopes if one[0] == "commitStrength"]) == 2, (
+        "commitStrength no longer resolves to two scopes, so the name-keyed "
+        "lookup that this exclusion works around may now be possible")
+
+
+def test_a_reservation_inside_a_closure_is_reported_rather_than_unseen():
+    """Selection must precede masking, and this is what pins the order.
+
+    `_gesture_undo_callbacks` finds a callback by the reservation in it. Masking
+    nested bodies before selection would make a callback whose only reservation
+    sits in a closure disappear from the scan entirely, which reads as a pass.
+    """
+    fixture = _claim_fixture(
+        'handler(() => { this._pushUndo("edit"); });\nawait this._runSceneMutation([]);')
+    assert [name for name, _ in _gesture_undo_callbacks(fixture)] == ["probe"]
+    assert _undo_claim_findings(fixture) == [("probe", "reservation-only-in-nested")]
+    # Mask the CALLBACK, the way `_undo_claim_findings` does. Masking the whole
+    # fixture would blank the gesture's own `async () => {` body on the first
+    # span and satisfy this with no inner closure present at all.
+    body = _gesture_undo_callbacks(fixture)[0][1]
+    masked, events = _mask_nested_functions(body)
+    assert "push-in-nested" in events and not _PUSH_RE.search(masked)
+    plain = _claim_fixture('this._pushUndo("edit"); await this._runSceneMutation([]);')
+    _, without = _mask_nested_functions(_gesture_undo_callbacks(plain)[0][1])
+    assert "push-in-nested" not in without, (
+        "the assertion above must depend on the closure, not on the gesture's "
+        "own callback body being a brace arrow")
+
+
+def test_the_masker_preserves_offsets_and_reports_an_unreadable_closure():
+    """Two properties every caller depends on and no fixture above proves.
+
+    Offsets: `_undo_claim_findings` takes positions from the masked code and
+    indexes the UNMASKED body with them, so the two must stay the same length.
+    """
+    body = 'this._pushUndo("e"); const f = () => { await x(); }; await this._runSceneMutation([]);'
+    masked, _ = _mask_nested_functions(body)
+    assert len(masked) == len(body)
+    assert "await x()" not in masked and "this._runSceneMutation" in masked
+    # `unreadable-nested` is covered here rather than through a callback
+    # fixture, and deliberately: a callback only reaches the scan once
+    # `_gesture_undo_callbacks` has brace-matched it, so an unterminated nested
+    # body inside a balanced callback cannot be constructed. The cascade branch
+    # that turns this event into `nested-function-review` is defensive, and
+    # malformed input fails earlier and louder in the selection parser.
+    truncated = 'const f = () => { this._pushUndo("e");'
+    unreadable, events = _mask_nested_functions(truncated)
+    assert events == {"unreadable-nested"} and len(unreadable) == len(truncated)
 
 
 def _claim_fixture(body, name="probe"):
@@ -521,8 +934,51 @@ def _claim_fixture(body, name="probe"):
     ('let e = this._pushUndo("edit"); await prepare(); e = other; this._runSceneMutation([], {historyEntry: e});', ["await-before-claim"]),
     ('const e = this._pushUndo("edit"); await prepare(); this._runSceneMutation([], {historyEntry: e, ...options});', ["await-before-claim"]),
     ('const e = this._pushUndo("edit"); await prepare(); this._updateItemProperty("guide", 1, {}, {historyEntry: e});', ["await-before-claim"]),
-    ('this._pushUndo("edit"); const later = () => this._runSceneMutation([]);', ["nested-function-review"]),
-    ('this._pushUndo("edit"); function later() { this._runSceneMutation([]); }', ["nested-function-review"]),
+    ('this._pushUndo("edit"); const later = () => this._runSceneMutation([]);', ["deferred-write-review"]),
+    ('this._pushUndo("edit"); function later() { this._runSceneMutation([]); }', ["deferred-write-review"]),
+    # An unrecognised closure would be credited to the outer path, so the
+    # shorthand, class-method and accessor forms are masked like the others.
+    ('this._pushUndo("edit"); const h = { onDone() { this._runSceneMutation([]); } };'
+     ' await fetch("/raw");', ["deferred-write-review"]),
+    ('this._pushUndo("edit"); const h = { get later() { this._runSceneMutation([]); } };'
+     ' await fetch("/raw");', ["deferred-write-review"]),
+    # `_code_mask` does not tokenize regex literals, so an unbounded `function`
+    # search would adopt the `if (...)` block below as its body and mask away a
+    # real suspension. The head must belong to its own parameter list.
+    ('this._pushUndo("edit"); const re = /function/;'
+     ' if (stale) { await this._reloadScene(); } await this._runSceneMutation([]);',
+     ["await-before-claim"]),
+    # Control-flow blocks are not closures; `registration._NOT_A_SCOPE` is what
+    # keeps them on the scanned path.
+    ('this._pushUndo("edit"); if (ready) { this._runSceneMutation([]); }', []),
+    ('this._pushUndo("edit"); for (const one of many) { this._runSceneMutation([]); }', []),
+    # A closure is masked out of the outer path, not a reason to abandon it.
+    ('this._pushUndo("edit"); void [1].map((n) => n); await this._runSceneMutation([]);', []),
+    ('this._pushUndo("edit"); const opts = {onSupersededByCoalescing: () => { isHead = false; }};'
+     ' await this._runSceneMutation([], opts);', []),
+    ('this._pushUndo("edit"); const f = async () => { await prepare(); };'
+     ' await this._runSceneMutation([]);', []),
+    ('this._pushUndo("edit"); sorted.sort((a, b) => a.frame - b.frame);'
+     ' await this._runSceneMutation([]);', []),
+    # A `function` body is the brace after its parameter list, so a default
+    # value holding an object literal cannot be masked as the body.
+    ('this._pushUndo("edit"); function later(a = {x: 1}) { return a; }'
+     ' await this._runSceneMutation([]);', []),
+    # The helper term in the concise-arrow rule is load-bearing: the write reads
+    # as preceding the await, so dropping it would report nothing here.
+    ('this._pushUndo("edit"); const later = () => this._runSceneMutation([]); await x(); later();',
+     ["deferred-write-review"]),
+    ('this._pushUndo("edit"); const ready = () => await probe(); await this._runSceneMutation([]);',
+     ["concise-arrow-review"]),
+    # A concise arrow keeps its expression on the scanned path, so a deferred
+    # reservation reads as a second one. Either way the callback is reviewed.
+    ('this._pushUndo("edit"); const later = () => this._pushUndo("second"); await x();',
+     ["multiple-reservations-review"]),
+    # Deferred work inside a closure is reported, never credited to the outer path.
+    ('handler(() => { this._pushUndo("edit"); }); await this._runSceneMutation([]);',
+     ["reservation-only-in-nested"]),
+    ('this._pushUndo("edit"); handler(() => { this._pushUndo("second"); });'
+     ' await this._runSceneMutation([]);', ["reservation-in-nested-review"]),
     ('this._pushUndo("edit"); const note = "await ghost(); this._runSceneMutation([])"; /* this._runSceneMutation([]); */ await fetch("/raw");', ["missing-mutation-helper"]),
     ('this._pushUndo("edit"); this._runSceneMutation([]); await repaint();', []),
     ('this._pushUndo("first"); this._pushUndo("second"); this._runSceneMutation([]);', ["multiple-reservations-review"]),
@@ -543,11 +999,30 @@ def test_undo_claim_scanner_distinguishes_suspension_from_awaiting_the_write(bod
 def test_undo_claim_tripwire_rejects_injected_raw_and_awaiting_gestures():
     source = (ROOT / "web/js/editor_widget.js").read_text(encoding="utf-8")
     findings = _undo_claim_findings(source)
-    assert findings == [("swapGuides", "missing-mutation-helper")]
+    # Exactly the reviewed set, compared against the catalogue rather than a
+    # second hardcoded copy of it that could drift from the one being enforced.
+    assert sorted(findings) == sorted(UNDO_CLAIM_EXEMPTIONS)
     for body in ('this._pushUndo("probe"); await fetch("/raw");',
                  'this._pushUndo("probe"); await prepare(); this._runSceneMutation([]);'):
         with pytest.raises(AssertionError, match="probe"):
             _assert_undo_claim_findings(_undo_claim_findings(source + _claim_fixture(body)))
+    # The expansion's own proof: a defect in a `*WithinGesture` CALLEE, which
+    # the scan could not see before, reported under its gesture's name.
+    marker = "    _isLaneVisibilityControlDisabled(entry) {"
+    assert source.count(marker) == 1, "the callee-injection anchor moved"
+    injected = (
+        '    async _auditProbe() {\n'
+        '        return this._withMutationGesture("auditProbe",\n'
+        '            () => this._auditProbeWithinGesture());\n'
+        '    }\n\n'
+        '    async _auditProbeWithinGesture() {\n'
+        '        this._pushUndo("probe");\n'
+        '        await this._reloadScene();\n'
+        '        await this._runSceneMutation([]);\n'
+        '    }\n\n')
+    with pytest.raises(AssertionError, match="auditProbe.*await-before-claim"):
+        _assert_undo_claim_findings(_undo_claim_findings(
+            source.replace(marker, injected + marker, 1)))
     with pytest.raises(AssertionError, match="stale exceptions"):
         _assert_undo_claim_findings([])
     with pytest.raises(AssertionError, match="second site"):
@@ -559,17 +1034,96 @@ def test_deferred_undo_claims_keep_their_explicit_handoff():
     _assert_deferred_undo_claims(source)
 
 
+def _forwards_explicit_entry(scope_source, entry):
+    """Whether this scope hands `entry` to a helper that transports it.
+
+    Only the helpers whose options argument actually carries `historyEntry`
+    count. `_updateItemProperty` is reachable but drops the option, so spelling
+    it there would certify a handoff that never happens.
+    """
+    code = _js_code(scope_source)
+    for helper, position in _MUTATION_HELPERS.items():
+        if position is None:
+            continue
+        for call in re.finditer(r"this\." + re.escape(helper) + r"\s*\(", code):
+            args, _ = _js_arguments(scope_source, call.end() - 1)
+            if _explicit_history_entry(args, helper, entry):
+                return True
+    return False
+
+
 def _assert_deferred_undo_claims(source):
     scopes = registration._scopes(source)
     for label, contract in DEFERRED_UNDO_CLAIMS.items():
         assert contract["reason"] and contract["expiry"]
-        def body(name):
+        assert contract["form"] in {"member-storage", "argument", "local-helper"}
+        def span(name):
             matches = [(start, end) for scope, start, end in scopes if scope == name]
             assert len(matches) == 1, f"Deferred undo claim lost method {name}"
-            start, end = matches[0]
+            return matches[0]
+        def body(name):
+            start, end = span(name)
             return source[start:end + 1]
+        def signature(name):
+            # `_scopes` spans start at the body brace, so a destructured
+            # parameter lives BEFORE the span and has to be sliced back to.
+            start, _ = span(name)
+            return source[source.rindex(name, 0, start):start]
         producer, consumer = body(contract["producer"]), body(contract["consumer"])
-        if label == "trim":
+        if contract["form"] == "argument":
+            # Three links, because severing any one of them loses the claim
+            # while the other two still read as intact.
+            binding, parameter = contract["binding"], contract["parameter"]
+            # Searched RAW, not through `_js_code`: the gesture label is a
+            # string literal and the code mask blanks its contents, so a masked
+            # search would match any reservation in the method.
+            assert re.search(r"const\s+" + re.escape(binding) + r'\s*=\s*this\._pushUndo\("'
+                             + re.escape(contract["label"]) + r'"\)', producer), (
+                f"Deferred undo claim lost the reserved binding for {label}")
+            # Tied to the CALL, not merely present in the method: an object
+            # literal spelling `{ undoEntry }` somewhere in the body proves
+            # nothing, and a refactor that moves it rather than deleting it
+            # would leave the handoff severed while this still read as intact.
+            handed = False
+            for call in re.finditer(r"this\." + re.escape(contract["entrypoint"])
+                                    + r"\s*\(", _js_code(producer)):
+                arguments, _ = _js_arguments(producer, call.end() - 1)
+                for argument in arguments:
+                    members = _object_members(argument)
+                    handed |= bool(members) and any(
+                        key == parameter and _js_code(value).strip() == binding
+                        for key, value in members)
+            assert handed, (
+                f"Deferred undo claim stopped handing the entry to "
+                f"{contract['entrypoint']} for {label}")
+            assert re.search(r"\{\s*" + re.escape(parameter) + r"\s*[,}=]",
+                             signature(contract["consumer"])), (
+                f"Deferred undo claim lost the receiving parameter for {label} "
+                f"in {contract['consumer']}")
+        elif contract["form"] == "local-helper":
+            helper, parameter = contract["helper"], contract["parameter"]
+            declaration = re.search(r"const\s+" + re.escape(helper) + r"\s*=\s*\(\s*\{",
+                                    _js_code(producer))
+            assert declaration, f"Deferred undo claim lost the local helper for {label}"
+            start = declaration.end() - 1
+            end = registration._match_delimiter(producer, start, "{", "}")
+            assert end >= 0, f"Deferred undo claim: unreadable helper parameters for {label}"
+            # Read as a destructuring PARAMETER list, not through
+            # `_object_members`: that parses object literals, and a parameter
+            # carrying a default (`historyEntry = null`) is not one, so it
+            # would return None and the check would pass on unreadability.
+            parameters = _js_code(producer[start:end + 1])
+            assert re.search(r"[{,]\s*" + re.escape(parameter)
+                             + r"\s*(?:=[^,}]*)?\s*[,}]", parameters), (
+                f"Deferred undo claim lost the helper's entry parameter for {label}")
+            for reserved in contract["bindings"]:
+                assert re.search(r"const\s+" + re.escape(reserved)
+                                 + r"\s*=\s*this\._pushUndo\(", _js_code(producer)), (
+                    f"Deferred undo claim lost the {reserved} reservation for {label}")
+                assert re.search(re.escape(parameter) + r"\s*:\s*" + re.escape(reserved)
+                                 + r"\b", _js_code(producer)), (
+                    f"Deferred undo claim stopped forwarding {reserved} for {label}")
+        elif label == "trim":
             assert re.search(r'const\s+historyEntry\s*=\s*this\._pushUndo\("trim"\)', producer), "Trim lost reserved entry binding"
             code = _js_code(producer)
             starts = list(re.finditer(r"this\._trimItem\s*=\s*\{", code))
@@ -584,11 +1138,10 @@ def _assert_deferred_undo_claims(source):
         else:
             assert re.search(r'this\._dragHistoryEntry\s*=\s*this\._pushUndo\("move items"\)', producer), "Move lost reserved entry storage"
             assert re.search(r"const\s+historyEntry\s*=\s*this\._dragHistoryEntry\s*;", _js_code(consumer)), "Move lost retained entry binding"
-        forwarded = False
-        for call in re.finditer(r"this\._runSceneMutation\s*\(", _js_code(consumer)):
-            args, _ = _js_arguments(consumer, call.end() - 1)
-            forwarded |= _explicit_history_entry(args, "_runSceneMutation", contract["entry"])
-        assert forwarded, f"Deferred undo claim lost explicit historyEntry for {label}"
+        # The one obligation every form shares: whatever the transport, the
+        # reserved object must reach a helper that actually carries it.
+        assert _forwards_explicit_entry(consumer, contract["entry"]), (
+            f"Deferred undo claim lost explicit historyEntry for {label}")
     # This is a lexical handoff pin, not a proof of drag cancellation or runtime
     # entry identity. No source scan reaches across those asynchronous lifecycles.
 
@@ -606,6 +1159,46 @@ def test_deferred_handoff_tripwire_rejects_severed_storage_and_bindings():
     assert source.count(old) == 1
     with pytest.raises(AssertionError, match="Move lost retained entry binding"):
         _assert_deferred_undo_claims(source.replace(old, "const historyEntry = null;", 1))
+
+
+# Each argument- and helper-form link, severed on its own. A pin nobody has
+# watched fail is documentation; these are the shapes a refactor would produce.
+_SEVERANCE_CASES = [
+    ('const undoEntry = this._pushUndo("toggle track visibility");',
+     'this._pushUndo("toggle track visibility");', 2, "lost the reserved binding"),
+    ("{ undoEntry }", "{}", 2, "stopped handing the entry to _applyHeaderVisibilityBulk"),
+    ("{ undoEntry = null } = {}", "{} = {}", 1, "lost the receiving parameter"),
+    ("historyEntry: undoEntry,", "", 1, "lost explicit historyEntry"),
+    ("operation, historyEntry = null,", "operation,", 1,
+     "lost the helper's entry parameter"),
+    ("historyEntry: driverUndoEntry,", "", 1, "stopped forwarding driverUndoEntry"),
+    ("historyEntry: assetUndoEntry,", "", 2, "stopped forwarding assetUndoEntry"),
+]
+
+
+def test_an_orphaned_entry_object_does_not_read_as_a_handoff():
+    """The severance a text-deletion fixture cannot express.
+
+    A refactor that MOVES the `{ undoEntry }` literal off the call rather than
+    deleting it leaves the text present and the handoff gone. Checking the
+    literal's existence would pass; checking the call's arguments does not.
+    """
+    source = (ROOT / "web/js/editor_widget.js").read_text(encoding="utf-8")
+    orphaned = source.replace("{ undoEntry }", "{}").replace(
+        'const undoEntry = this._pushUndo("toggle track visibility");',
+        'const undoEntry = this._pushUndo("toggle track visibility");'
+        "\n        const orphan = { undoEntry };")
+    with pytest.raises(AssertionError, match="stopped handing the entry to"):
+        _assert_deferred_undo_claims(orphaned)
+
+
+@pytest.mark.parametrize("old, new, count, message", _SEVERANCE_CASES)
+def test_severing_any_single_claim_link_fails_the_contract(old, new, count, message):
+    source = (ROOT / "web/js/editor_widget.js").read_text(encoding="utf-8")
+    assert source.count(old) == count, (
+        f"the severance fixture no longer describes the source: {old!r}")
+    with pytest.raises(AssertionError, match=re.escape(message)):
+        _assert_deferred_undo_claims(source.replace(old, new))
 
 
 # Declared DOM/host-free leaf mirrors, not discovery of all duplicated logic.

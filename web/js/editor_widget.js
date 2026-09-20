@@ -39,9 +39,16 @@
  *    Stamp only from that write's exact response, never a later refresh. Cleanup
  *    uses _discardUnstampableUndoEntry with the exact object and respects the
  *    caller-owned pending/ambiguous lifecycle; a matching label is not ownership.
- *    tests/test_mutation_authoring_contract.py scans inline gesture callbacks for
- *    missing helpers and await gaps, with one tracked raw-fetch defect. It pins
- *    explicit trim/move handoffs separately, not arbitrary callee control flow.
+ *    tests/test_mutation_authoring_contract.py scans inline gesture callbacks,
+ *    one level of WithinGesture forwarding, and the named scopes that reserve
+ *    without a wrapper; nested function bodies are masked off the synchronous
+ *    path and what they hold is reported separately. Reviewed exceptions each
+ *    carry a removal condition. Deferred handoffs are pinned link by link in
+ *    three transport forms: parked on this, handed down as an argument, or
+ *    passed to a local helper that forwards it. It is not control-flow proof --
+ *    a callee that itself delegates, a delegation reachable only from inside a
+ *    closure, and a reservation inside an event handler are reported, not
+ *    resolved. This prose is not pinned by a test; refresh it with the scan.
  *    Retire this microtask-specific rule when every undo reservation is explicit
  *    queue-owned state and the implicit capture candidate is removed.
  * 5. Classify a new Scene field for server-side three-way history merge; do not
