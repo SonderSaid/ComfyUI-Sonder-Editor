@@ -402,6 +402,9 @@ import {
     linkedMoveRefusal,
 } from "./scene_move_geometry.js";
 import { LINK_ITEM_TYPES, pruneLinkedItemGroups, editedLinkGroups, rollbackLinkGroupPrediction } from "./scene_link_groups.js";
+import {
+    canonicalStagedMemberRefs, canonicalStoredMemberRefs, stagedReferenceItem,
+} from "./scene_reference_geometry.js";
 import { createViewportSurface } from "./viewport_surface.js";
 import {
     EDITOR_COLORS as COLORS,
@@ -5114,6 +5117,150 @@ export class EditorWidget {
         this.activeScene.guide_frames.sort((a, b) => (a.frame_index || 0) - (b.frame_index || 0));
         this._pruneLocalLinkedGroups();
         return guide;
+    }
+
+    /** The reference id every member of `refs` belongs to, the route's way.
+     *
+     *  `_canonical_reference_member_refs` re-derives `entity_id` from its
+     *  `by_member_id` index rather than trusting the payload's, so the paint
+     *  does the same. A drag payload whose `entity_id` is stale — a member moved
+     *  between References since the Library last loaded — would otherwise paint
+     *  a record the server silently corrects, and the divergence would surface
+     *  as the NEXT append's `identity_mismatch` rather than here.
+     */
+    _stagedMemberRefs(rawMembers) {
+        return canonicalStagedMemberRefs(rawMembers, (memberId) =>
+            this._referenceMemberForRef({ member_id: memberId })?.reference?.reference_id || "");
+    }
+
+    /** The same, for members this client read back from the route.
+     *
+     *  A stored member may carry `visual_intent`, `audio_intent` or `role`,
+     *  which the staged form refuses because it cannot validate them. It does
+     *  not have to: an append passes `legacy_members`, so the route returns a
+     *  stored record unchanged. Using the staged form for priors would make
+     *  every bar with a member role silently lose its optimistic paint.
+     */
+    _storedMemberRefs(rawMembers) {
+        return canonicalStoredMemberRefs(rawMembers, (memberId) =>
+            this._referenceMemberForRef({ member_id: memberId })?.reference?.reference_id || "");
+    }
+
+    /** Plan, then paint, a newly staged Reference bar.
+     *
+     *  This pair mirrors `_apply_create_reference_item`:
+     *  `_plannedReferenceItemRow` decides and builds the row, and
+     *  `_applyLocalCreateReferenceItem` below is the two lines that commit it.
+     *
+     *  Returns the planned row, or null when the server would refuse — in which
+     *  case the caller still sends the operation and lets the response speak.
+     *  Painting nothing is the honest answer to a write that will be rejected;
+     *  painting optimistically and rolling back would flash a bar that never
+     *  existed.
+     *
+     *  The lane this lands on, its recipe, and the member canonicalization are
+     *  NOT this method's business. The lane arrives through
+     *  `_applyLocalSetLaneCount` in the same gesture, and members are
+     *  server-authoritative beyond the record shape — see
+     *  `scene_reference_geometry.js` for why the shape alone is safe to mirror.
+     *
+     *  Split in two so the gesture can ask whether a row is paintable BEFORE it
+     *  paints the lane and recipe that row needs. A `create_reference_item`
+     *  arrives in one ordered batch with its `set_lane_count` and
+     *  `update_lane_config`, and the paint has to be equally all-or-nothing:
+     *  committing the lane and then finding the row unpaintable would leave an
+     *  empty Reference lane on the timeline that the project never accepted.
+     *
+     *  How often the planner actually declines, stated rather than implied,
+     *  because a guard whose reachability is unknown gets deleted by the next
+     *  reader. From `_placeReferencePayload` there is exactly ONE live case: a
+     *  payload naming one member twice. `resolveReferenceDropVerdict` compares a
+     *  drag against the members of the bar it would append to, never against
+     *  itself, so that payload passes every drop rule and the route answers 400.
+     *  Every other decline — an unresolvable member, a missing asset, an
+     *  inverted range — is already refused before the gesture builds an
+     *  operation. The Library cannot currently emit a self-duplicating payload
+     *  either, so this is defence in depth, not a repair.
+     */
+    _plannedReferenceItemRow(fields = {}) {
+        const scene = this.activeScene;
+        if (!scene) return null;
+        const members = this._stagedMemberRefs(fields.members);
+        if (!members) return null;
+        return stagedReferenceItem({
+            referenceItemId: fields.reference_item_id,
+            laneIndex: fields.lane_index,
+            startFrame: fields.start_frame,
+            endFrame: fields.end_frame,
+            durationFrames: scene.duration_frames,
+            members,
+        });
+    }
+
+    _applyLocalCreateReferenceItem(row) {
+        const scene = this.activeScene;
+        if (!scene || !row) return null;
+        if (!Array.isArray(scene.reference_items)) scene.reference_items = [];
+        scene.reference_items.push(row);
+        return row;
+    }
+
+    /** Paint an append onto an already-staged bar.
+     *
+     *  This is the half Phase C §3 decided to leave out, and the probe that
+     *  reversed that decision is written up in `scene_reference_geometry.js`.
+     *  The short version: the second drop into one in-flight window is refused
+     *  TODAY, because `priorMembers` is read from a scene the first drop never
+     *  updated, and painting is what makes that guard describe reality.
+     *
+     *  `_referenceDropResolver`'s `duplicate_member` and `covering` tests read
+     *  the same list, so the paint also decides create-vs-append correctly for
+     *  the rest of the window — which is the point of the exercise, not the bar
+     *  redrawing sooner.
+     */
+    _applyLocalAppendReferenceMembers(referenceItemId, members) {
+        const scene = this.activeScene;
+        const item = (scene?.reference_items || []).find(
+            (candidate) => candidate.reference_item_id === referenceItemId);
+        if (!item || !Array.isArray(members) || !members.length) return null;
+        item.members = members.map((member) => ({ ...member }));
+        return item.members;
+    }
+
+    /** Report a staged bar that came back under a name the client did not mint.
+     *
+     *  `durable_rules.md`: a minted id that does not come back is NOT the same
+     *  finding as nothing having been written. A server predating this landing
+     *  ignores `fields.reference_item_id` and substitutes its own, and that is a
+     *  live configuration rather than a hypothetical -- `web/js` reloads on a
+     *  browser refresh while `server/routes.py` needs a ComfyUI restart, so a
+     *  pack update leaves new JS talking to old Python until then.
+     *
+     *  It is deliberately silent to the author. The bar IS on their timeline, so
+     *  saying "staging failed" would be plainly false, and that is the confusion
+     *  this rule exists to prevent.
+     *
+     *  Note what it does NOT claim. The reconcile on the next line heals the id
+     *  only when it actually runs: `_reconcileActiveSceneFromMutation` is called
+     *  without `ignoreMutationGate`, so during a burst — where `_pump` has
+     *  already made the next drop active — it defers instead, and the client id
+     *  survives until the queue drains. That is exactly the window in which a
+     *  substituted id matters, which is why this is a diagnostic rather than a
+     *  comment asserting the problem cannot persist.
+     */
+    _reportStagedReferenceIdShortfall(result, mintedId) {
+        if (!mintedId) return;
+        const results = result?.payload?.results || [];
+        // Absence is not evidence. A branch that reports no `reference_item_id`
+        // gives no information about whether the id survived, and reading
+        // silence as a substitution would manufacture a finding.
+        const outcome = results.find((entry) => entry && typeof entry === "object"
+            && entry.type === "create_reference_item");
+        if (!outcome || !("reference_item_id" in outcome)) return;
+        const stored = String(outcome.reference_item_id || "");
+        if (!stored || stored === mintedId) return;
+        // Names and counts only, never contents, per the diagnostic rule.
+        sessionDiagRecord("reference_stage_id_substituted", { operations: results.length });
     }
 
     _applyLocalPromptCreate(fields = {}) {
@@ -10273,11 +10420,31 @@ export class EditorWidget {
         const item = (scene?.reference_items || []).find(
             (candidate) => candidate.reference_item_id === referenceItemId);
         if (!item) return;
+        // Read BEFORE the local apply, per the cross-cutting rule: `expected`
+        // states what the author saw, and a guard read after the paint compares
+        // the client's own answer against itself.
         const priorMembers = (item.members || []).map((value) => ({ ...value }));
-        const members = [
-            ...priorMembers,
-            ...(payload.members || []).map((value) => ({ ...value })),
-        ];
+        // The canonical record, not the payload's copy of it, so the painted
+        // list and the stored list cannot differ. `null` means the route would
+        // refuse -- an unresolvable member, one named twice, or a stored field
+        // this client cannot reproduce -- in which case nothing is painted and
+        // the raw payload is sent so the server's own message reaches the author
+        // instead of a local guess.
+        //
+        // The PRIORS are re-resolved too, and that is not belt and braces.
+        // `_apply_update_reference_item` re-canonicalizes the whole list, while
+        // `resolveReferenceDropVerdict` only ever looked at the dragged members
+        // -- so a bar holding a member whose asset was trashed since it was
+        // staged is refused for a row the drop rules never examined. Painting
+        // over that refusal would put the new member on a bar the save is about
+        // to reject outright.
+        const stagedPriors = priorMembers.length
+            ? this._storedMemberRefs(priorMembers) : [];
+        const stagedAdditions = this._stagedMemberRefs(payload.members);
+        const staged = stagedPriors && stagedAdditions
+            ? [...stagedPriors, ...stagedAdditions] : null;
+        const members = staged
+            || [...priorMembers, ...(payload.members || []).map((value) => ({ ...value }))];
         const laneIndex = item.lane_index || 0;
         // The cap is HARD — `nodes/reference_core.py` raises when a lane's
         // reserved span exceeds `hard.max_members` — but the append still
@@ -10290,7 +10457,18 @@ export class EditorWidget {
         const cap = Number(this._referenceLaneRecipe(laneIndex)?.recipe?.hard?.max_members);
         const overCap = Number.isFinite(cap) && cap >= 0 && members.length > cap;
 
-        this._pushUndo("add reference member");
+        // Pushed before the paint, so the entry restores the pre-drop scene.
+        // The entry itself is held, not just its label, so a refused write can
+        // drop the one it created rather than leaving an unstampable entry --
+        // the shape of the tracked Undo-wedge defect, and the convention every
+        // other optimistic writer here already follows.
+        const undoEntry = this._pushUndo("add reference member");
+        if (staged) {
+            // `staged` is the already-canonical list, so this does not resolve
+            // the members a second time.
+            this._applyLocalAppendReferenceMembers(referenceItemId, staged);
+            this._renderSceneAfterLocalMutation({ viewport: false });
+        }
         try {
             const result = await this._runSceneMutation([{
                 type: "update_reference_item",
@@ -10318,7 +10496,19 @@ export class EditorWidget {
             }
         } catch (error) {
             notifyWarning(error?.message || "Reference member was not added.", { source: "reference-stage-refused" });
-            await this._fetchScenes({ ignoreMutationGate: true, reason: "reference_append_error" });
+            // The refetch is what discards the painted members, and the repaint
+            // is what makes the discard visible -- this catch used to refetch
+            // and draw nothing, which was harmless while there was no optimistic
+            // state and is not now. `_fetchScenes` can still decline, and then
+            // the queue's deferred refresh is what heals; the diagnostic records
+            // that it happened rather than leaving it silent.
+            const healed = await this._fetchScenes(
+                { ignoreMutationGate: true, reason: "reference_append_error" });
+            this._discardUnstampableUndoEntry(undoEntry);
+            if (staged) {
+                if (healed === false) sessionDiagRecord("reference_append_rollback_deferred", {});
+                this._renderSceneAfterLocalMutation({ viewport: false });
+            }
             this._refreshPromptContextDependencyConsumers();
         }
     }
@@ -10390,37 +10580,81 @@ export class EditorWidget {
             laneIndex = entry.laneIndex || 0;
         }
         const existingRecipe = this._referenceLaneRecipe(laneIndex);
+        let stagedRecipe = null;
+        let stagedRecipeLaneId = "";
         if (existingRecipe.media_kind !== mediaKind || !entry) {
             const laneId = String(scene.reference_lane_recipes?.[laneIndex]?.lane_id || "").trim();
+            stagedRecipe = this._defaultReferenceLaneRecipe({ media_kind: mediaKind });
+            stagedRecipeLaneId = laneId;
             operations.push({
                 type: "update_lane_config",
                 lane_type: "reference",
                 lane_index: laneIndex,
-                fields: { reference_recipe: this._defaultReferenceLaneRecipe({ media_kind: mediaKind }) },
+                fields: { reference_recipe: stagedRecipe },
                 ...(laneId ? { expected: { lane_id: laneId } } : {}),
             });
         }
-        // One scan: `end_frame` is derived from the value the guard names, so
-        // the two cannot describe different measurements. Two copies with
-        // slightly different coercions is exactly how a guard ends up asserting
-        // something the payload was not built from.
+        // One scan, and it happens BEFORE the local apply. `end_frame` is
+        // derived from the value the guard names, so the two cannot describe
+        // different measurements -- two copies with slightly different coercions
+        // is exactly how a guard ends up asserting something the payload was not
+        // built from. And `next_start_frame` measures the neighbour this bar
+        // sizes itself against, while the paint inserts a bar of its own, so a
+        // guard read afterwards would compare the client's answer with itself.
         const referenceGuard = this._referenceCreationGuard(laneIndex, startFrame);
+        // Named by the client so the painted bar carries the id the project will
+        // store. The very next gesture over this bar is an APPEND addressed by
+        // `reference_item_id`, so a server-substituted id would send it to a row
+        // that does not exist -- the tracked `temp-clip-...` shape.
+        // `_client_reference_item_id` refuses a collision with 409 rather than
+        // re-minting, which is what makes painting the id safe at all.
+        const referenceItemId = this._newLocalItemId("ref");
+        const stagedFields = {
+            reference_item_id: referenceItemId,
+            lane_index: laneIndex,
+            start_frame: startFrame,
+            end_frame: referenceGuard.next_start_frame,
+            members: payload.members,
+            prompt_override: "",
+            strength: 1.0,
+            sequence_frames: 0,
+            muted: false,
+        };
         operations.push({
             type: "create_reference_item",
             expected: referenceGuard,
-            fields: {
-                lane_index: laneIndex,
-                start_frame: startFrame,
-                end_frame: referenceGuard.next_start_frame,
-                members: payload.members,
-                prompt_override: "",
-                strength: 1.0,
-                sequence_frames: 0,
-                muted: false,
-            },
+            fields: stagedFields,
         });
 
-        this._pushUndo("add reference item");
+        // Held rather than labelled, so a refused stage drops the entry it
+        // created instead of leaving one with no post-snapshot behind.
+        const undoEntry = this._pushUndo("add reference item");
+        // The lane, its recipe and the bar are one ordered batch, so the paint
+        // is the same sequence in the same order -- and equally all-or-nothing:
+        // a row that cannot be painted must not leave its lane and recipe
+        // painted behind it. `_applyLocalSetLaneCount` seeds a blank `lane_id`
+        // deliberately; the server mints that identity, and a local draft would
+        // become a false `expected.lane_id` on a config edit queued before
+        // creation.
+        const painted = this._plannedReferenceItemRow(stagedFields);
+        if (painted) {
+            if (!entry) this._applyLocalSetLaneCount(TRACK_TYPE.REFERENCE, laneIndex + 1);
+            if (stagedRecipe) {
+                const recipes = Array.isArray(scene.reference_lane_recipes)
+                    ? scene.reference_lane_recipes : [];
+                while (recipes.length <= laneIndex) {
+                    recipes.push({ ...this._defaultReferenceLaneRecipe(), lane_id: "" });
+                }
+                // Only an identity already read from the scene is known durable,
+                // matching `_saveLaneConfigWithinGesture`'s rule for the same write.
+                recipes[laneIndex] = { ...stagedRecipe, lane_id: stagedRecipeLaneId };
+                scene.reference_lane_recipes = recipes;
+            }
+            this._applyLocalCreateReferenceItem(painted);
+            // A Reference bar is timeline-only, so the viewport does not change
+            // -- matching every other lane and Reference paint in this file.
+            this._renderSceneAfterLocalMutation({ viewport: false });
+        }
         try {
             const result = await this._runSceneMutation(operations, {
                 key: `scene:${this.activeSceneId}:reference-stage:${Date.now()}`,
@@ -10428,12 +10662,22 @@ export class EditorWidget {
                 coalesce: false,
                 refreshScenes: false,
             });
+            this._reportStagedReferenceIdShortfall(result, painted ? referenceItemId : "");
             this._reconcileActiveSceneFromMutation(result, { reason: "reference_stage", ignoreTimelineGate: true });
             this._buildTrackLayout();
             this._renderTimeline();
         } catch (error) {
             notifyWarning(error?.message || "Reference placement was refused.", { source: "reference-stage-refused" });
-            await this._fetchScenes({ ignoreMutationGate: true, reason: "reference_stage_error" });
+            // Discards the painted bar AND the lane and recipe painted with it:
+            // the three were one ordered batch, so they roll back together or
+            // the timeline keeps an empty lane the project never accepted.
+            const healed = await this._fetchScenes(
+                { ignoreMutationGate: true, reason: "reference_stage_error" });
+            this._discardUnstampableUndoEntry(undoEntry);
+            if (painted) {
+                if (healed === false) sessionDiagRecord("reference_stage_rollback_deferred", {});
+                this._renderSceneAfterLocalMutation({ viewport: false });
+            }
             // Staging changes what the Prompt tool resolves, so a refusal has
             // to reach its Reference Prompting rows too.
             this._refreshPromptContextDependencyConsumers();

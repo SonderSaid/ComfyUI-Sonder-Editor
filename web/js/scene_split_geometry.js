@@ -134,12 +134,13 @@ export function splitAudioGeometry(track, splitFrame, rightId = "") {
 //
 // Uniqueness is NOT guaranteed here and deliberately is not attempted: the
 // client cannot see rows another editor added, so the server refuses a colliding
-// id with 409 rather than silently re-minting it the way
-// `_apply_create_reference_item` does. Re-minting would hand back an id the
-// optimistic half does not carry, and the client would then hold a half the
-// server has never heard of. At 32 bits against a scene's worth of clips the
-// refusal is vanishingly rare, and a refusal is recoverable where a silent
-// substitution is not.
+// id with 409 rather than silently re-minting it — which is what
+// `_apply_create_reference_item` used to do, until Reference staging began
+// painting optimistically and adopted the same refusal. Re-minting would hand
+// back an id the optimistic half does not carry, and the client would then hold
+// a half the server has never heard of. At 32 bits against a scene's worth of
+// clips the refusal is vanishingly rare, and a refusal is recoverable where a
+// silent substitution is not.
 export function mintSplitHalfId(randomHex = null) {
     if (typeof randomHex === "function") return randomHex();
     let out = "";

@@ -4611,10 +4611,12 @@ def test_a_member_with_no_minted_id_still_gets_a_server_one(monkeypatch, tmp_pat
 
 def test_a_colliding_split_half_id_is_refused_and_never_re_minted(
         monkeypatch, tmp_path):
-    """The decision this landing takes, and it is NOT the existing precedent.
+    """The decision this landing takes, and it was NOT the existing precedent.
 
-    `_apply_create_reference_item` silently re-mints a colliding client id. Doing
-    that here would hand the caller back a row under a name its optimistic copy
+    `_apply_create_reference_item` silently re-minted a colliding client id when
+    this was written; it adopted this refusal once Reference staging began
+    painting optimistically, so all three client-minted ids now agree. Re-minting
+    would hand the caller back a row under a name its optimistic copy
     does not carry, so the client would hold a half the server has never heard
     of and every edit authored against it would 404. A 409 is recoverable.
     """
@@ -4925,3 +4927,133 @@ def test_a_link_whose_refs_prune_discards_is_refused_rather_than_misreported(
     assert _response_json(response)["code"] == "invalid_link_group"
     assert saves == []
     assert [group["group_id"] for group in scene.linked_item_groups] == before
+def _scene_for_reference_staging(tmp_path):
+    scene, project = _scene_with_one_clip(tmp_path)
+    scene.reference_lane_count = 1
+    scene.reference_lane_configs = [LaneConfig()]
+    scene.reference_lane_recipes = [ReferenceLaneRecipe(media_kind="image")]
+    project.assets = [Asset(asset_id="asset-a", name="A", asset_type="image",
+                            path="media/a.png")]
+    project.references = [ReferenceEntity(
+        reference_id="entity-1", name="Subject",
+        members=[ReferenceMember(member_id="member-a", asset_id="asset-a")])]
+    return scene, project
+
+
+def _stage_op(reference_item_id=None, start_frame=0):
+    operation = {
+        "type": "create_reference_item",
+        "expected": {"next_start_frame": -1},
+        "fields": {
+            "lane_index": 0,
+            "start_frame": start_frame,
+            "end_frame": -1,
+            "members": [{"entity_id": "entity-1", "member_id": "member-a"}],
+        },
+    }
+    if reference_item_id is not None:
+        operation["fields"]["reference_item_id"] = reference_item_id
+    return operation
+
+
+def test_a_staged_reference_uses_the_item_id_the_client_minted(monkeypatch, tmp_path):
+    """So the painted bar and the stored bar answer to the same name.
+
+    The next gesture over a freshly staged bar is an APPEND addressed by
+    `reference_item_id`; a substituted id would send it to a row the project does
+    not hold.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene, project = _scene_for_reference_staging(tmp_path)
+    saves = []
+    response = _apply_scene_operations(
+        route_module, monkeypatch, project, "scene-1",
+        [_stage_op("ref-abc123")], saves)
+    assert response.status == 200, _response_json(response)
+    assert [item.reference_item_id for item in scene.reference_items] == ["ref-abc123"]
+
+
+def test_a_colliding_reference_item_id_refuses_instead_of_re_minting(
+        monkeypatch, tmp_path):
+    """The last route surface that silently substituted a client-supplied id.
+
+    `_client_split_half_id` and `_client_link_group_id` both cite this branch as
+    the behaviour they refused to copy. It now refuses too, so all three agree
+    and the `durable_rules.md` entry has no remaining exception.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene, project = _scene_for_reference_staging(tmp_path)
+    scene.reference_items = [ReferenceItem(
+        reference_item_id="ref-taken1", lane_index=0, start_frame=150,
+        end_frame=180, members=[{"entity_id": "entity-1", "member_id": "member-a"}])]
+    saves = []
+    # Staged AFTER the occupant, so `_validate_reference_creation_identity`
+    # passes and the id is the only thing left to refuse on.
+    response = _apply_scene_operations(
+        route_module, monkeypatch, project, "scene-1",
+        [_stage_op("ref-taken1", start_frame=190)], saves)
+    assert response.status == 409, _response_json(response)
+    assert _response_json(response)["code"] == "id_conflict"
+    assert saves == []
+    assert len(scene.reference_items) == 1, "the refused stage wrote nothing"
+
+
+def test_the_creation_guard_is_read_before_the_minted_id_is_consumed(
+        monkeypatch, tmp_path):
+    """The ordering `durable_rules.md` requires of every client-minted id.
+
+    A minted id may only be consumed behind a guard that refuses a replay first,
+    or a re-sent request could write a second row under an id the caller already
+    used. Here the same request carries BOTH a stale `next_start_frame` and a
+    taken id; the guard's `identity_mismatch` is what must come back, because it
+    is the check that runs first.
+    """
+    route_module = _load_route_module(monkeypatch)
+    scene, project = _scene_for_reference_staging(tmp_path)
+    scene.reference_items = [ReferenceItem(
+        reference_item_id="ref-taken1", lane_index=0, start_frame=150,
+        end_frame=180, members=[{"entity_id": "entity-1", "member_id": "member-a"}])]
+    saves = []
+    response = _apply_scene_operations(
+        route_module, monkeypatch, project, "scene-1",
+        [_stage_op("ref-taken1", start_frame=0)], saves)
+    assert response.status == 409, _response_json(response)
+    assert _response_json(response)["code"] == "identity_mismatch"
+    assert len(scene.reference_items) == 1
+
+
+def test_an_unusable_reference_item_id_is_refused_by_shape(monkeypatch, tmp_path):
+    """A value that stringifies is not a string.
+
+    `str(12345)` would pass the pattern and be stored as `"12345"`, so the client
+    would hold a NUMBER where the project holds a string -- the same mismatch the
+    id exists to remove, arriving through the type system instead.
+    """
+    route_module = _load_route_module(monkeypatch)
+    for candidate in (12345, "no", "Not Lower Case", "x" * 65):
+        scene, project = _scene_for_reference_staging(tmp_path)
+        saves = []
+        response = _apply_scene_operations(
+            route_module, monkeypatch, project, "scene-1",
+            [_stage_op(candidate)], saves)
+        assert response.status == 400, (candidate, _response_json(response))
+        assert _response_json(response)["code"] == "invalid_id", candidate
+        assert scene.reference_items == []
+
+
+def test_a_stage_without_an_id_still_gets_a_server_minted_one(monkeypatch, tmp_path):
+    """`""` and absent both mean "not supplied", as they always have.
+
+    `str(fields.get("reference_item_id", "") or uuid4().hex)` read a blank that
+    way long before anything minted client-side, so refusing one now would break
+    a caller that never sent an id.
+    """
+    route_module = _load_route_module(monkeypatch)
+    for candidate in (None, ""):
+        scene, project = _scene_for_reference_staging(tmp_path)
+        saves = []
+        response = _apply_scene_operations(
+            route_module, monkeypatch, project, "scene-1",
+            [_stage_op(candidate)], saves)
+        assert response.status == 200, (candidate, _response_json(response))
+        assert len(scene.reference_items[0].reference_item_id) == 32, candidate

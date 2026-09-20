@@ -1812,13 +1812,16 @@ def _client_split_half_id(right_ids, item_type: str, item_id: str,
     half `clone_for_split` builds, simply has no entry and stays
     server-authoritative.
 
-    A colliding id is REFUSED, not re-minted. `_apply_create_reference_item`
-    does the opposite (`item.reference_item_id = uuid.uuid4().hex` when a
-    supplied id is taken), and that is the behaviour this deliberately does not
-    copy: silently substituting an id hands the caller back a row under a name
-    its optimistic copy does not carry, so the client holds a half the server
-    has never heard of and every edit authored against it 404s. That is the
-    shape of the tracked `temp-clip-...` defect reached from another direction.
+    A colliding id is REFUSED, not re-minted. The behaviour deliberately not
+    copied is `_apply_create_reference_item`'s: it substituted
+    `uuid.uuid4().hex` for a supplied id that was taken, and was the
+    counter-example this docstring was written against. It adopted the refusal
+    when Reference staging started painting optimistically, so all three
+    client-minted ids now agree and the example below is historical. Silently
+    substituting an id hands the caller back a row under a name its optimistic
+    copy does not carry, so the client holds a half the server has never heard
+    of and every edit authored against it 404s. That is the shape of the tracked
+    `temp-clip-...` defect reached from another direction.
     A 409 is recoverable; a silent substitution is not. New behaviour rather
     than precedent -- neither `_apply_create_guide` nor
     `_apply_create_prompt_section` validates a supplied id at all.
@@ -1856,10 +1859,12 @@ def _client_link_group_id(raw_id, taken: "set[str]") -> str:
     The same contract as `_client_split_half_id` above, and deliberately so.
     The question this settles is one the split landing raised and left open for
     link groups: `_prune_linked_item_groups` SILENTLY RE-MINTS a colliding
-    `group_id`, which is exactly the behaviour split refused to copy. A client
-    that paints a link badge before the write has to be holding the name the
-    server will store, or the badge names a group the project does not have and
-    the next edit authored against it addresses nothing.
+    `group_id`, which is exactly the behaviour split refused to copy -- and
+    which the branch `_client_reference_item_id` below guards was the last route
+    surface to still do. A client that paints a link badge before the write has
+    to be holding the name the server will store, or the badge names a group the
+    project does not have and the next edit authored against it addresses
+    nothing.
 
     Link groups do not diverge from split on the POLICY. Three mechanical
     differences, stated because "the same contract" would otherwise read as
@@ -1891,6 +1896,52 @@ def _client_link_group_id(raw_id, taken: "set[str]") -> str:
     if candidate in taken:
         _mutation_error(
             f"Link group id {candidate} is already in use", 409, "id_conflict")
+    return candidate
+
+
+def _client_reference_item_id(raw_id, taken: "set[str]") -> str:
+    """A client-minted durable id for a newly staged Reference item, or "".
+
+    The third and last site of the contract `_client_split_half_id` states and
+    `_client_link_group_id` adopted, and the one both of those comments name as
+    the counter-example: this branch used to substitute `uuid4().hex` for a
+    colliding id without telling anyone. That is now gone, so the reference in
+    those two docstrings is historical -- they say what the rule is, this says
+    where the last violation of it was.
+
+    The reason it had to close here is narrower than "consistency". A staged
+    Reference bar is addressed by `reference_item_id` for the rest of its life,
+    and the very next gesture over it is an APPEND -- `update_reference_item`
+    resolved through `_find_reference_item`. A painted bar carrying an id the
+    server replaced would take that append to a row that does not exist, so the
+    author's second drop would 404 while their first one sits on the timeline.
+    That is the tracked `temp-clip-...` defect, reached from a third direction.
+
+    Mechanically this is `_client_link_group_id`, including its two deliberate
+    differences from the split minter -- `taken` is compared rather than
+    accumulated, because one create appends one row, and `""` means ABSENT
+    rather than invalid, because `str(fields.get("reference_item_id", "") or ...)`
+    read a blank as "not supplied" long before anything minted client-side.
+
+    No compatibility is owed for narrowing the field: it is REST surface, not
+    durable project data and not the published node contract, and stored ids are
+    never revalidated. `uuid4().hex` satisfies the pattern, so every id this
+    route has ever minted would still be accepted if a caller sent it back.
+
+    Retire with the other two, per the `durable_rules.md` entry: when every
+    optimistic create mints client-side behind a guard, the rule is the norm.
+    """
+    if raw_id is None or raw_id == "":
+        return ""
+    # A string, not anything that stringifies, for the reason
+    # `_client_split_half_id` states: `str(12345)` would pass the pattern and
+    # store a value whose TYPE the caller does not hold.
+    candidate = raw_id if isinstance(raw_id, str) else None
+    if candidate is None or not _CLIENT_ID_PATTERN.match(candidate):
+        _mutation_error("Reference item id is not a usable id", 400, "invalid_id")
+    if candidate in taken:
+        _mutation_error(
+            f"Reference item id {candidate} is already in use", 409, "id_conflict")
     return candidate
 
 
@@ -4405,8 +4456,17 @@ def _apply_create_reference_item(project: TimelineProject, scene: Scene, fields:
         project, fields.get("members"), recipe.media_kind, recipe.recipe,
         _scene_prompt_context_profile_key(project, scene))
     _require_no_reference_overlap(scene, lane_index, start_frame, end_frame)
+    # Compared at APPEND time, for the reason `_add_link_group` states: the ids
+    # the scene holds now are the ones the new row has to be distinct from, and
+    # nothing earlier in this handler adds or removes a Reference item. The raw
+    # value, NOT `str(...)`, so the type check inside survives the call.
+    minted = _client_reference_item_id(
+        fields.get("reference_item_id"),
+        {str(getattr(existing, "reference_item_id", "") or "")
+         for existing in scene.reference_items},
+    )
     item = ReferenceItem(
-        reference_item_id=str(fields.get("reference_item_id", "") or uuid.uuid4().hex),
+        reference_item_id=minted or uuid.uuid4().hex,
         lane_index=lane_index,
         start_frame=start_frame,
         end_frame=end_frame,
@@ -4416,8 +4476,6 @@ def _apply_create_reference_item(project: TimelineProject, scene: Scene, fields:
         sequence_frames=max(0, min(4096, _mutation_int(fields.get("sequence_frames", 0), "sequence_frames", 0))),
         muted=bool(fields.get("muted", False)),
     )
-    if any(existing.reference_item_id == item.reference_item_id for existing in scene.reference_items):
-        item.reference_item_id = uuid.uuid4().hex
     scene.reference_items.append(item)
     return item
 

@@ -3552,3 +3552,322 @@ def test_unlink_history_reads_the_servers_unknown_split_partition():
         assert.deepEqual(w._undoStack[0].snapshot.linked_item_groups,canonical.linked_item_groups);
         assert.deepEqual(w._undoStack[0].postSnapshot.linked_item_groups,[]);
     """)
+# -- Class C: Reference staging (stage 2 L7) ---------------------------------
+#
+# Phase C section 3 specified a GEOMETRY-ONLY apply here, to avoid a 409 it
+# believed painting `item.members` would create. Probed against the route, the
+# opposite holds: the canonical record for a Library drop is byte-identical to
+# what `dragPayload` sends, and NOT painting is what loses a drop, because
+# `_appendReferenceMembersWithinGesture` reads `priorMembers` before its await.
+# `tests/test_reference_geometry_parity.py` holds the route half of that; these
+# hold the gesture half.
+
+_CLASS_C_SETUP = _SPLIT_SETUP + """
+    function referenceWidget(scene) {
+        const w = splitWidget(scene);
+        w.projectDir = 'project';
+        w.activeSceneId = 'scene';
+        w._references = [{reference_id: 'entity-1', name: 'Subject', members: [
+            {member_id: 'member-a', asset_id: 'asset-a'},
+            {member_id: 'member-b', asset_id: 'asset-b'},
+            {member_id: 'member-c', asset_id: 'asset-c'}]}];
+        w._findAssetById = (id) => ({asset_id: id, asset_type: 'image', has_audio: false});
+        w._referenceLaneRecipe = () => ({media_kind: 'image', recipe: {}});
+        w._defaultReferenceLaneRecipe = (o = {}) => ({media_kind: 'image', recipe: {}, ...o});
+        w._timelineRulerHeight = () => 0;
+        w._layoutIndexFromRawY = () => -1;
+        w._trackLayout = [{type: 'reference', laneIndex: 0, collapsed: false}];
+        w.paints = 0;
+        w._renderSceneAfterLocalMutation = () => { w.paints += 1; };
+        w._reconcileActiveSceneFromMutation = () => {};
+        w._fetchScenes = async () => {};
+        w.released = [];
+        w._runSceneMutation = (operations, options) => {
+            w.sent.push({operations, options});
+            return new Promise((resolve, reject) => {
+                w.released.push({resolve, reject});
+            });
+        };
+        return w;
+    }
+    const referenceScene = () => ({
+        scene_id: 'scene',
+        duration_frames: 1000,
+        clips: [], audio_tracks: [], prompt_sections: [],
+        reference_lane_count: 1,
+        reference_lane_configs: [{}],
+        reference_lane_recipes: [{media_kind: 'image', recipe: {}, lane_id: 'lane-a'}],
+        reference_items: [],
+    });
+    const drag = (id) => ({entity_id: 'entity-1', member_id: id});
+"""
+
+
+def test_staging_a_reference_paints_the_bar_before_the_write():
+    """The bar, its members and the id the project will store, all at once."""
+    _run_gesture_node(_CLASS_C_SETUP + """
+        const scene = referenceScene();
+        const w = referenceWidget(scene);
+        const pending = w._placeReferencePayload({members: [drag('member-a')]}, 40);
+        await new Promise((r) => setTimeout(r, 0));
+
+        assert.equal(w.sent.length, 1, 'the write is in flight');
+        assert.equal(scene.reference_items.length, 1, 'and the bar is already drawn');
+        const painted = scene.reference_items[0];
+        assert.equal(painted.start_frame, 40);
+        assert.equal(painted.end_frame, -1, 'the run-to-scene-end sentinel is kept');
+        assert.deepEqual(painted.members, [drag('member-a')],
+            'the canonical record, not a client-only shape');
+        const create = w.sent[0].operations.find((op) => op.type === 'create_reference_item');
+        assert.equal(create.fields.reference_item_id, painted.reference_item_id,
+            'the painted bar answers to the name the operation asks for');
+        assert.ok(w.paints > 0);
+        w.released[0].resolve({payload: {results: []}});
+        await pending;
+    """)
+
+
+def test_a_second_drop_in_the_same_window_appends_to_the_painted_bar():
+    """The whole point of painting: the drop resolver now sees real geometry.
+
+    Without the paint the bar is not in `activeScene` yet, so the second drop
+    resolves `create` at an occupied frame and the route refuses it for
+    overlapping. With it, the drop resolves `append` against the bar that is
+    genuinely there.
+    """
+    _run_gesture_node(_CLASS_C_SETUP + """
+        const scene = referenceScene();
+        const w = referenceWidget(scene);
+        const first = w._placeReferencePayload({members: [drag('member-a')]}, 40);
+        await new Promise((r) => setTimeout(r, 0));
+        const staged = scene.reference_items[0];
+
+        // The pointer is over the bar this gesture just painted.
+        w._layoutIndexFromRawY = () => 0;
+        const second = w._placeReferencePayload({members: [drag('member-b')]}, 50, 10);
+        await new Promise((r) => setTimeout(r, 0));
+
+        assert.equal(w.sent.length, 2, 'a second write, not a refusal');
+        const update = w.sent[1].operations.find((op) => op.type === 'update_reference_item');
+        assert.ok(update, 'the second drop became an append');
+        assert.equal(update.reference_item_id, staged.reference_item_id);
+        assert.deepEqual(update.expected.members, [drag('member-a')],
+            'guarded on what the author saw, which the paint made true');
+        assert.deepEqual(update.fields.members, [drag('member-a'), drag('member-b')]);
+        assert.deepEqual(staged.members, [drag('member-a'), drag('member-b')],
+            'and the bar shows both before either write returns');
+        w.released[0].resolve({payload: {results: []}});
+        w.released[1].resolve({payload: {results: []}});
+        await Promise.all([first, second]);
+    """)
+
+
+def test_an_append_reads_its_guard_before_the_paint():
+    """`expected` states what the author saw, not what this gesture just drew."""
+    _run_gesture_node(_CLASS_C_SETUP + """
+        const scene = referenceScene();
+        scene.reference_items = [{reference_item_id: 'ref-1', lane_index: 0,
+            start_frame: 40, end_frame: -1, members: [drag('member-a')],
+            prompt_override: '', strength: 1.0, sequence_frames: 0, muted: false}];
+        const w = referenceWidget(scene);
+        const pending = w._appendReferenceMembers('ref-1', {members: [drag('member-b')]});
+        await new Promise((r) => setTimeout(r, 0));
+
+        const update = w.sent[0].operations[0];
+        assert.deepEqual(update.expected.members, [drag('member-a')],
+            'the guard is the PRE-paint list');
+        assert.deepEqual(scene.reference_items[0].members,
+            [drag('member-a'), drag('member-b')], 'and the paint already happened');
+        assert.equal(w.undos.length, 1, 'one undo entry, pushed before the paint');
+        w.released[0].resolve({payload: {results: []}});
+        await pending;
+    """)
+
+
+def test_an_unpaintable_member_sends_the_payload_and_paints_nothing():
+    """A member the project cannot resolve is the route's refusal to make.
+
+    Painting the resolvable part of a batch the server will reject wholesale
+    would put members on the bar that the save is about to remove, and
+    `_pushUndo` can carry that to disk in between.
+    """
+    _run_gesture_node(_CLASS_C_SETUP + """
+        const scene = referenceScene();
+        scene.reference_items = [{reference_item_id: 'ref-1', lane_index: 0,
+            start_frame: 40, end_frame: -1, members: [drag('member-a')],
+            prompt_override: '', strength: 1.0, sequence_frames: 0, muted: false}];
+        const w = referenceWidget(scene);
+        const pending = w._appendReferenceMembers(
+            'ref-1', {members: [{entity_id: 'entity-1', member_id: 'member-gone'}]});
+        await new Promise((r) => setTimeout(r, 0));
+
+        assert.equal(w.sent.length, 1, 'the write still goes, so the route speaks');
+        assert.deepEqual(scene.reference_items[0].members, [drag('member-a')],
+            'but nothing was painted');
+        w.released[0].reject(new Error('Reference member not found: member-gone'));
+        await pending;
+    """)
+def test_the_painted_bar_carries_the_canonical_record_not_the_payload():
+    """A stale `entity_id` is the case where the two can be told apart.
+
+    The first staging test cannot distinguish them: a fresh Library drag already
+    sends the canonical shape, so pushing the raw payload passes it. `entity_id`
+    is re-derived on the route from the member lookup, so a payload naming a
+    reference the member does not belong to is silently corrected there -- and a
+    paint that trusted it would differ from the stored row, which is how a
+    divergence reaches disk through `_pushUndo`.
+    """
+    _run_gesture_node(_CLASS_C_SETUP + """
+        const scene = referenceScene();
+        const w = referenceWidget(scene);
+        const pending = w._placeReferencePayload(
+            {members: [{entity_id: 'entity-stale', member_id: 'member-a'}]}, 40);
+        await new Promise((r) => setTimeout(r, 0));
+
+        assert.deepEqual(scene.reference_items[0].members, [drag('member-a')],
+            'entity_id re-derived from the reference that owns the member');
+        w.released[0].resolve({payload: {results: []}});
+        await pending;
+    """)
+
+
+def test_an_unpaintable_row_leaves_no_lane_or_recipe_painted_behind_it():
+    """The batch is all-or-nothing, so the paint is too.
+
+    `create_reference_item` travels with its `set_lane_count` and
+    `update_lane_config`. Painting the lane and then finding the row unpaintable
+    would leave an empty Reference lane the project never accepted -- visible,
+    selectable, and gone again the moment anything refetches.
+
+    The case used here is the only one that reaches the planner at all: one
+    member named twice in a single payload. `resolveReferenceDropVerdict`
+    compares a drag against the members of the bar it would append to, not
+    against itself, so a self-duplicating payload passes it and the route
+    answers 400. Every OTHER way the planner can decline -- an unresolvable
+    member, a missing asset, an inverted range -- is already refused before the
+    gesture builds an operation, so the guard is defence rather than a live
+    path, and that is worth knowing when reading it.
+    """
+    _run_gesture_node(_CLASS_C_SETUP + """
+        const scene = referenceScene();
+        const w = referenceWidget(scene);
+        const lanesBefore = scene.reference_lane_count;
+        // The ruler zone, so the gesture takes the NEW-LANE branch: this is the
+        // arm where a lane would be painted ahead of the row.
+        w._timelineRulerHeight = () => 40;
+        const pending = w._placeReferencePayload(
+            {members: [drag('member-a'), drag('member-a')]}, 40, 10);
+        await new Promise((r) => setTimeout(r, 0));
+
+        assert.equal(w.sent.length, 1, 'the write still goes, so the route speaks');
+        assert.ok(w.sent[0].operations.some((op) => op.type === 'set_lane_count'),
+            'and it really is the new-lane branch');
+        assert.equal(scene.reference_items.length, 0, 'no bar');
+        assert.equal(scene.reference_lane_count, lanesBefore, 'and no lane');
+        assert.equal(w.paints, 0, 'nothing was repainted');
+        w.released[0].reject(new Error('Reference item members must be unique'));
+        await pending;
+    """)
+
+
+def test_a_refused_stage_repaints_after_discarding_the_optimistic_bar():
+    """The refetch discards the paint; the repaint is what makes it visible.
+
+    Both Reference catches used to refetch and draw nothing, which was harmless
+    while there was no optimistic state to discard.
+    """
+    _run_gesture_node(_CLASS_C_SETUP + """
+        const scene = referenceScene();
+        const w = referenceWidget(scene);
+        let refetched = 0;
+        w._fetchScenes = async () => {
+            refetched += 1;
+            scene.reference_items = [];      // what the server actually holds
+            return true;
+        };
+        const pending = w._placeReferencePayload({members: [drag('member-a')]}, 40);
+        await new Promise((r) => setTimeout(r, 0));
+        assert.equal(scene.reference_items.length, 1, 'painted');
+        const paintsBefore = w.paints;
+
+        w.released[0].reject(new Error('Reference placement was refused.'));
+        await pending;
+        assert.equal(refetched, 1);
+        assert.equal(scene.reference_items.length, 0, 'the paint was discarded');
+        assert.ok(w.paints > paintsBefore, 'and the discard was drawn');
+    """)
+def test_an_append_whose_PRIOR_member_cannot_be_resolved_paints_nothing():
+    """The refusal the drop resolver structurally cannot see.
+
+    `_apply_update_reference_item` re-canonicalizes the WHOLE list, priors
+    included, while `resolveReferenceDropVerdict` only ever examines the dragged
+    members. A bar holding a member whose asset was trashed since it was staged
+    is therefore refused for a row the drop rules never looked at -- so painting
+    the new member would put it on a bar the save is about to reject outright.
+    """
+    _run_gesture_node(_CLASS_C_SETUP + """
+        const scene = referenceScene();
+        scene.reference_items = [{reference_item_id: 'ref-1', lane_index: 0,
+            start_frame: 40, end_frame: -1,
+            members: [{entity_id: 'entity-1', member_id: 'member-gone'}],
+            prompt_override: '', strength: 1.0, sequence_frames: 0, muted: false}];
+        const w = referenceWidget(scene);
+        const pending = w._appendReferenceMembers('ref-1', {members: [drag('member-b')]});
+        await new Promise((r) => setTimeout(r, 0));
+
+        assert.equal(w.sent.length, 1, 'the write still goes, so the route speaks');
+        assert.deepEqual(scene.reference_items[0].members.map((m) => m.member_id),
+            ['member-gone'], 'and the addition was not painted');
+        w.released[0].reject(new Error('Reference member asset not found'));
+        await pending;
+    """)
+
+
+def test_an_append_paints_over_a_prior_that_carries_a_member_role():
+    """A stored role must not cost the bar its optimistic paint.
+
+    The staged form refuses those three fields because it cannot validate them;
+    the stored form carries them, because the route's `legacy_members` leniency
+    returns them unchanged. Using the strict form for priors would silently
+    disable this paint for every bar the author has assigned roles on.
+    """
+    _run_gesture_node(_CLASS_C_SETUP + """
+        const scene = referenceScene();
+        const prior = {entity_id: 'entity-1', member_id: 'member-a',
+                       visual_intent: 'preserve'};
+        scene.reference_items = [{reference_item_id: 'ref-1', lane_index: 0,
+            start_frame: 40, end_frame: -1, members: [prior],
+            prompt_override: '', strength: 1.0, sequence_frames: 0, muted: false}];
+        const w = referenceWidget(scene);
+        const pending = w._appendReferenceMembers('ref-1', {members: [drag('member-b')]});
+        await new Promise((r) => setTimeout(r, 0));
+
+        assert.deepEqual(scene.reference_items[0].members,
+            [prior, drag('member-b')], 'painted, with the role carried verbatim');
+        assert.deepEqual(w.sent[0].operations[0].expected.members, [prior],
+            'and the guard still describes the pre-paint list');
+        w.released[0].resolve({payload: {results: []}});
+        await pending;
+    """)
+
+
+def test_a_refused_stage_drops_the_undo_entry_it_created():
+    """An entry with no post-snapshot is what wedges Undo.
+
+    `_pushUndo` also clears the Redo stack, so leaving the entry behind costs the
+    author their Redo as well as leaving a step that cannot be stamped.
+    """
+    _run_gesture_node(_CLASS_C_SETUP + """
+        const scene = referenceScene();
+        const w = referenceWidget(scene);
+        const discarded = [];
+        w._discardUnstampableUndoEntry = (entry) => { discarded.push(entry); };
+        const pending = w._placeReferencePayload({members: [drag('member-a')]}, 40);
+        await new Promise((r) => setTimeout(r, 0));
+        assert.equal(w.undos.length, 1);
+
+        w.released[0].reject(new Error('Reference placement was refused.'));
+        await pending;
+        assert.deepEqual(discarded, [w.undos[0]],
+            'the entry this gesture pushed, by identity');
+    """)

@@ -3933,14 +3933,17 @@ COALESCE_OPT_OUT_REVIEWED = {
     "editor_widget.js:_appendReferenceMembersWithinGesture:scene:${}:reference-append:${}:${}": (
         UNREACHABLE,
         "each append sends the WHOLE new member list as `fields.members`, guarded by "
-        "`expected: { members: priorMembers }` read from the reconciled scene. "
-        "The gesture has no local apply and does not touch `item.members`, so "
-        "the two appends chain through the server round trip rather than "
-        "through local state -- which is exactly what the uniquified key "
-        "preserves. Two appends are two additions and neither may be dropped. "
-        "(Umbrella Phase C §3 Class C keeps it that way: its Reference local "
-        "apply is geometry-only precisely so that lengthening `item.members` "
-        "optimistically cannot turn the second append into a 409.)"),
+        "`expected: { members: priorMembers }`. Two appends are two additions and "
+        "neither may be dropped, which is what the uniquified key preserves. "
+        "The gesture DOES have a local apply, and that is what makes the second "
+        "append work: `priorMembers` is read before the await, so without the "
+        "paint the second drop in one in-flight window guards against state the "
+        "server has already left and is refused `identity_mismatch`. Phase C "
+        "§3 Class C specified the opposite -- a geometry-only apply, to stop a "
+        "409 it believed painting would create -- and a probe against the route "
+        "reversed it in both halves: the canonical record for a Library drop is "
+        "byte-identical to what `dragPayload` sends, and NOT painting is what "
+        "loses the drop. See `web/js/scene_reference_geometry.js`."),
     "editor_widget.js:_placeReferencePayloadWithinGesture:scene:${}:reference-stage:${}": (
         UNREACHABLE,
         "`create_reference_item` creates a row, alongside the lane it needs. "
