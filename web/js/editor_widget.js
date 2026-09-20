@@ -1,9 +1,58 @@
+/**
+ * Sonder Editor Widget -- timeline and gallery host, embedded with addDOMWidget.
+ *
+ * Scene Mutation Authoring
+ * The host owns gesture, queue and reconciliation lifecycle; the server owns
+ * validation and durable state. Leaf modules own their declared transforms or DOM
+ * and cleanup. A new mutation must review each obligation below, including the
+ * operation-keyed JavaScript tables and the separate Scene-field history decision.
+ * The canonical list and header markers are pinned by
+ * tests/test_mutation_authoring_contract.py; enforcing tests are named there.
+ * The external architecture.md#scene-mutation-authoring map is a readable projection,
+ * not a tested source. Refresh it when changing this contract.
+ *
+ * 1. Attribute the actual writing callback with _withMutationGesture; wrapping a
+ *    picker builder leaves its later callback unattributed. The lexical boundary
+ *    inventory in tests/test_mutation_gesture_coverage.py pins reviewed sites,
+ *    not asynchronous control flow. Thread diagnostics across awaits.
+ * 2. Read expected guards from the authored state before painting, and send only
+ *    guards the server compares. A guard the branch discards protects nothing.
+ *    tests/test_scene_mutation_registration.py pins emission and server contracts;
+ *    runtime validity and optimistic applicability still need behavior tests.
+ * 3. Derive retry from operation addressing and make coalescing a gesture decision.
+ *    A durable item id does not guard its destination lane. A repeating queue key
+ *    with no lossless merge can report a discarded intent as successful.
+ *    tests/test_scene_mutation_retry_policy.py and
+ *    tests/test_scene_mutation_coalescing_policy.py pin those classifications;
+ *    tests/test_scene_mutation_registration.py reviews the key and merge sites.
+ * 4. Reserve undo before writing and capture post-state from that write's canonical
+ *    response, never a later refresh. Review the _pushUndo microtask claim and
+ *    explicit historyEntry ownership when introducing an asynchronous gap.
+ *    Claim-gap enforcement is not yet part of this contract's tests.
+ * 5. Classify a new Scene field for server-side three-way history merge; do not
+ *    hand-write an inverse operation. tests/test_scene_history_merge.py pins the
+ *    field classifications. Optimistic local apply and shortcut exposure remain
+ *    review obligations here; operation coverage cannot prove either correct.
+ *
+ * Obligations (markers pin membership, not the surrounding prose):
+ * @mutation-obligation operation.dispatch -- _apply_scene_mutation_operation
+ * @mutation-obligation operation.model-helper -- routes.py model helpers
+ * @mutation-obligation operation.media-budget -- _media_io_operation_count
+ * @mutation-obligation operation.history-rebase -- _rebaseSceneMutationIntentForHistory
+ * @mutation-obligation operation.guard -- GUARD_CONTRACTS
+ * @mutation-obligation operation.addressing -- SCENE_MUTATION_ADDRESSING
+ * @mutation-obligation operation.collapse -- SCENE_MUTATION_COALESCING
+ * @mutation-obligation operation.scene-only -- _SCENE_ONLY_MUTATIONS (listed operations only)
+ * @mutation-obligation gesture.wrapper -- _withMutationGesture
+ * @mutation-obligation gesture.guard-emission -- operation literal expected*
+ * @mutation-obligation gesture.coalescing -- key / coalesce / merge
+ * @mutation-obligation gesture.undo -- _pushUndo and its microtask claim
+ * @mutation-obligation gesture.optimistic-apply -- _applyLocal* / _renderSceneAfterLocalMutation
+ * @mutation-obligation gesture.surface -- user surface / shortcut overlay
+ * @mutation-obligation field.history-write-set -- MERGED_WRITE_FIELDS and Scene field classification
+ */
 import { shouldJoinSweep } from "./render_cache_activation.js";
 import { promptEditFields, promptDraftKey, updatePromptDraft, savePromptDraft, rebasePromptDraft } from "./prompt_edit_intent.js";
-/**
- * Sonder Editor Widget — Timeline + Asset Gallery embedded in a ComfyUI node.
- * Uses addDOMWidget pattern (same as VHS/KJNodes).
- */
 
 const { api } = window.comfyAPI.api;
 

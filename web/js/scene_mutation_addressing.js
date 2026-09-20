@@ -38,9 +38,9 @@ import { descriptorForLaneType } from "./lane_registry.js";
  * commits. So "no retry" is the safe direction only where replaying would be
  * wrong; granting it by omission is what this table exists to stop.
  *
- * Deliberately NOT a mutation registry. `mutation-surface-correctness.md` §8:
- * *"a registry that split mutation authority would be worse than none."* This
- * declares one property of one policy. The server-side twin — teaching
+ * Deliberately NOT a mutation registry. The decision in
+ * `architecture.md#scene-mutation-authoring` retains each policy's ownership;
+ * this module declares one property of one policy. The server-side twin — teaching
  * `_apply_scene_mutations_sync` the `addressing="identity"|"positional"` shape
  * `_apply_project_versioned_sync` already has — is the roadmap execution-queue
  * item for bare project writes, and it consumes this table under a parity test

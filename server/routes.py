@@ -4868,6 +4868,48 @@ def _media_io_operation_count(project: TimelineProject, operations: list) -> int
 
 
 def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: dict) -> dict:
+    """Apply one scene operation; this branch owns validation and mutation.
+
+    Scene Mutation Authoring: review operation, gesture and Scene-field duties
+    below when extending this dispatcher. The canonical list and these markers
+    are pinned by tests/test_mutation_authoring_contract.py. The external
+    architecture.md#scene-mutation-authoring map is an unratcheted projection.
+
+    1. Register the operation's rebase, guard, addressing, collapse and media
+       budget decisions. A new branch alone leaves silent defaults elsewhere;
+       the named enforcing tests live beside the canonical obligation list.
+    2. Validate at the resolver that returns the row to mutate. Comparing one
+       lookup then mutating another is not a guard. Registration tests check
+       declared guard coverage, not all runtime row-resolution behavior.
+    3. Review _SCENE_ONLY_MUTATIONS against every project-level side effect.
+       Incorrect membership can skip a necessary save; no-op-write tests probe
+       listed members, but do not decide whether a new operation belongs.
+    4. Keep batch persistence, CAS, version headers and canonical responses in
+       the existing route pipeline. Media extraction consumes the batch budget;
+       a client-only change that batches two extracting creates can exceed it.
+    5. History merges fields, not inverse operations. Classify new Scene fields
+       through test_scene_history_merge.py; a new dispatch branch is not a new
+       field and cannot substitute for that review.
+
+    Reference Library, prompt project writes and queue writes are separate
+    surfaces; this dispatcher is not their registration authority.
+
+    @mutation-obligation operation.dispatch -- _apply_scene_mutation_operation
+    @mutation-obligation operation.model-helper -- routes.py model helpers
+    @mutation-obligation operation.media-budget -- _media_io_operation_count
+    @mutation-obligation operation.history-rebase -- _rebaseSceneMutationIntentForHistory
+    @mutation-obligation operation.guard -- GUARD_CONTRACTS
+    @mutation-obligation operation.addressing -- SCENE_MUTATION_ADDRESSING
+    @mutation-obligation operation.collapse -- SCENE_MUTATION_COALESCING
+    @mutation-obligation operation.scene-only -- _SCENE_ONLY_MUTATIONS (listed operations only)
+    @mutation-obligation gesture.wrapper -- _withMutationGesture
+    @mutation-obligation gesture.guard-emission -- operation literal expected*
+    @mutation-obligation gesture.coalescing -- key / coalesce / merge
+    @mutation-obligation gesture.undo -- _pushUndo and its microtask claim
+    @mutation-obligation gesture.optimistic-apply -- _applyLocal* / _renderSceneAfterLocalMutation
+    @mutation-obligation gesture.surface -- user surface / shortcut overlay
+    @mutation-obligation field.history-write-set -- MERGED_WRITE_FIELDS and Scene field classification
+    """
     if not isinstance(op, dict):
         _mutation_error("Mutation operation must be an object", 400)
     op_type = str(op.get("type", ""))

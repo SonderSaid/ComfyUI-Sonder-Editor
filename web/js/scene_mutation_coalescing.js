@@ -105,8 +105,8 @@
  * **Whether a gesture coalesces.** `_runSceneMutation` keeps ownership. This
  * module answers "what would a collapse lose", the same way
  * `scene_mutation_addressing.js` answers "may this be replayed" without taking
- * the retry decision. `mutation-surface-correctness.md` §8: *"a registry that
- * split mutation authority would be worse than none."*
+ * the retry decision. `architecture.md#scene-mutation-authoring` records why
+ * those decisions remain with their existing owners rather than a new registry.
  *
  * **Rollback.** A gesture that restores local state on failure needs
  * `onSupersededByCoalescing`, because the queue settles every collapsed waiter
