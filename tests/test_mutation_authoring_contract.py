@@ -53,7 +53,9 @@ OBLIGATIONS = {
     "gesture.coalescing": ("key / coalesce / merge", (
         REG + "test_a_coalescing_gesture_declares_a_merge_or_sends_a_whole_value_payload",
         REG + "test_every_enqueue_that_cannot_coalesce_says_why")),
-    "gesture.undo": ("_pushUndo and its microtask claim", ()),
+    "gesture.undo": ("_pushUndo and its microtask claim", (
+        "test_mutation_authoring_contract.py::test_gesture_undo_claims_reach_a_mutation_helper_before_expiry",
+        "test_mutation_authoring_contract.py::test_deferred_undo_claims_keep_their_explicit_handoff")),
     "gesture.optimistic-apply": ("_applyLocal* / _renderSceneAfterLocalMutation", ()),
     "gesture.surface": ("user surface / shortcut overlay", ()),
     "field.history-write-set": ("MERGED_WRITE_FIELDS and Scene field classification", (
@@ -286,3 +288,321 @@ def test_a_class_method_cannot_hide_behind_a_represented_top_level_test():
         "test_scene_mutation_retry_policy.py::TestAdditionalPolicy.test_every_dispatcher_operation_is_classified"}
     with pytest.raises(AssertionError, match="TestAdditionalPolicy"):
         _assert_consumers(found)
+
+
+# Undo claims are gesture-callback scoped, not method scoped: a picker builder
+# and its eventual writer have different synchronous lifetimes. This is a lexical
+# tripwire, not a JavaScript interpreter or a proof of control flow. It does not
+# follow calls into other methods, implicit promise continuations, or arbitrary
+# aliases. Existing scanner masking also excludes template interpolations and
+# does not tokenize regex literals. Behavioral history tests own runtime claims.
+# Nested functions containing relevant events fail for review rather than being
+# credited as synchronous work in their outer callback.
+_MUTATION_HELPERS = {
+    "_runSceneMutation": 1,
+    "_queueProjectMutation": 0,
+    "_updateItemProperty": None,
+}
+# Values are the inline options argument that actually forwards historyEntry.
+# None means the helper is reachable, NOT that it can transport an explicit claim.
+# In particular _updateItemProperty supports a synchronous claim but discards a
+# historyEntry option today. Never certify an async gap merely by spelling it.
+# Versioned HTTP, Reference, queue and prompt-project helpers do not claim a
+# scene candidate: posting is not stamping, and their intents lack sceneId.
+
+UNDO_CLAIM_EXEMPTIONS = {
+    ("swapGuides", "missing-mutation-helper"): (
+        "Existing raw /guides/swap fetch never claims the undo entry. Bug tracker "
+        "owns the defect; delete this exception when the gesture uses a stamping "
+        "mutation path and its regression is verified."),
+}
+
+DEFERRED_UNDO_CLAIMS = {
+    "trim": {
+        "producer": "_setupTimelineEvents", "consumer": "_commitTrim",
+        "storage": "_trimItem", "entry": "trimInfo.historyEntry",
+        "reason": "Pointer-down reserves history; pointer-up forwards that exact entry.",
+        "expiry": "Remove when trim reserves and queues in one synchronous callback.",
+    },
+    "move items": {
+        "producer": "_setupTimelineEvents", "consumer": "_commitItemMove",
+        "storage": "_dragHistoryEntry", "entry": "historyEntry",
+        "reason": "Pointer-down reserves history; move commit forwards the retained entry.",
+        "expiry": "Remove when move reserves and queues in one synchronous callback.",
+    },
+}
+
+
+def _js_code(source):
+    mask = registration._code_mask(source)
+    return "".join(char if mask[index] else " " for index, char in enumerate(source))
+
+
+def _js_arguments(source, opener, mask=None):
+    """Top-level call arguments, preserving text for a literal gesture name."""
+    if mask is None:
+        mask = registration._code_mask(source)
+    end = registration._match_delimiter(source, opener, "(", ")", mask)
+    assert end >= 0, "Undo claim scan: unterminated call"
+    args, start, stack = [], opener + 1, []
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    for index in range(start, end):
+        if not mask[index]:
+            continue
+        char = source[index]
+        if char in pairs:
+            stack.append(pairs[char])
+        elif char in ")]}":
+            assert stack and stack.pop() == char, "Undo claim scan: unmatched delimiter"
+        elif char == "," and not stack:
+            args.append(source[start:index].strip())
+            start = index + 1
+    assert not stack, "Undo claim scan: unclosed argument"
+    args.append(source[start:end].strip())
+    return args, end
+
+
+def _gesture_undo_callbacks(source):
+    mask = registration._code_mask(source)
+    code = "".join(char if mask[index] else " " for index, char in enumerate(source))
+    callbacks = []
+    for match in re.finditer(r"\bthis\._withMutationGesture\s*\(", code):
+        args, end = _js_arguments(source, match.end() - 1, mask)
+        # A forwarding callback can call a WithinGesture method; this lexical
+        # scan deliberately does not claim to inspect those callee bodies.
+        if len(args) < 2 or not re.search(r"\bthis\._pushUndo\s*\(", _js_code(args[1])):
+            continue
+        name = re.fullmatch(r'''(["'])([\w.-]+)\1''', args[0])
+        assert name, "Undo claim scan: a callback reserving undo needs a literal gesture name"
+        callback = args[1]
+        cb_code = _js_code(callback)
+        head = re.match(r"\s*(?:async\s+)?(?:\([^)]*\)|[\w$]+)\s*=>\s*\{", cb_code)
+        assert head, f"Undo claim scan: review unsupported callback shape for {name[2]}"
+        brace = head.end() - 1
+        close = registration._match_delimiter(callback, brace, "{", "}")
+        assert close >= 0 and not cb_code[close + 1:].strip(), "Undo claim scan: incomplete callback"
+        callbacks.append((name[2], callback[brace + 1:close]))
+    return callbacks
+
+
+def _object_members(options, allowed_spreads=()):
+    """Readable own members, or None if a computed key/spread can overwrite them."""
+    code = _js_code(options)
+    if not code.startswith("{") or not code.endswith("}"):
+        return None
+    # Reuse the delimiter-aware argument splitter as an object-member splitter.
+    members, _ = _js_arguments("(" + options[1:-1] + ")", 0)
+    found = []
+    for member in members:
+        text = _js_code(member).strip()
+        if not text:
+            continue
+        if text in {"..." + name for name in allowed_spreads}:
+            continue
+        if re.fullmatch(r"[\w$]+", text):
+            found.append((text, text))
+            continue
+        named = re.match(r"\s*([\w$]+)\s*:", _js_code(member))
+        quoted = re.match(r'''\s*(["'])([\w$]+)\1\s*:''', member)
+        if named:
+            found.append((named[1], member[named.end():].strip()))
+        elif quoted:
+            found.append((quoted[2], member[quoted.end():].strip()))
+        else:
+            # Includes computed keys, accessor/method keys, escaped quoted keys
+            # and opaque spreads. Their effect on historyEntry needs review.
+            return None
+    return found
+
+
+def _explicit_history_entry(call_args, helper, entry):
+    position = _MUTATION_HELPERS[helper]
+    if entry is None or position is None or len(call_args) <= position:
+        return False
+    members = _object_members(call_args[position])
+    if members is None:
+        return False
+    return [_js_code(value).strip() for key, value in members if key == "historyEntry"] == [entry]
+
+
+def _queue_has_scene_claim(call_args):
+    if not call_args:
+        return False
+    members = _object_members(call_args[0])
+    if members is None or any(key == "historyEntry" for key, _ in members):
+        return False  # an explicit override must be checked against its binding
+    intents = [value for key, value in members if key == "intent"]
+    if len(intents) != 1:
+        return False
+    fields = _object_members(intents[0])
+    if fields is None:
+        return False
+    ids = [value.strip() for key, value in fields if key == "sceneId"]
+    # An identifier is a lexical witness, not proof it is populated at runtime.
+    return len(ids) == 1 and ids[0] not in {"", "null", "undefined", "false", "0", '""', "''"}
+
+
+def _undo_claim_findings(source):
+    findings = []
+    helper_re = re.compile(r"\bthis\.(" + "|".join(_MUTATION_HELPERS) + r")\s*\(")
+    for gesture, body in _gesture_undo_callbacks(source):
+        code = _js_code(body)
+        pushes = list(re.finditer(r"\bthis\._pushUndo\s*\(", code))
+        if len(pushes) > 1:
+            # A second push replaces the first candidate. Reviewing the whole
+            # callback is safer than assigning one later helper to both pushes.
+            findings.append((gesture, "multiple-reservations-review"))
+            continue
+        # Conservative around closures: even an await inside an unrelated arrow
+        # is not an outer suspension. Force review instead of reasoning across it.
+        if re.search(r"=>|\bfunction\b", code):
+            findings.append((gesture, "nested-function-review"))
+            continue
+        calls = list(helper_re.finditer(code))
+        for push in pushes:
+            _, push_end = _js_arguments(body, push.end() - 1)
+            subsequent = [call for call in calls if call.start() > push_end]
+            if not subsequent:
+                findings.append((gesture, "missing-mutation-helper"))
+                continue
+            call = subsequent[0]
+            args, call_end = _js_arguments(body, call.end() - 1)
+            # `await this._runSceneMutation(...)` calls before suspending. A
+            # preceding await, or an await while evaluating its arguments, does
+            # suspend first. Parenthesized/chained variations require review.
+            prefix = code[push_end + 1:call.start()]
+            prefix = re.sub(r"\bawait\s*$", "", prefix)
+            gap = re.search(r"\bawait\b", prefix + code[call.end():call_end])
+            assignment = re.search(r"\b(?:const|let)\s+([\w$]+)\s*=\s*$", code[:push.start()])
+            entry = assignment[1] if assignment else None
+            # A reassignment of the captured binding is not the reserved object.
+            reassigned = entry and re.search(r"\b" + re.escape(entry) + r"\s*=(?!=|>)", code[push_end + 1:call_end])
+            explicit = not reassigned and _explicit_history_entry(args, call[1], entry)
+            if gap and not explicit:
+                findings.append((gesture, "await-before-claim"))
+            elif call[1] == "_queueProjectMutation" and not explicit and not _queue_has_scene_claim(args):
+                findings.append((gesture, "queue-scene-claim-review"))
+    return findings
+
+
+def _assert_undo_claim_findings(findings):
+    assert set(findings) == set(UNDO_CLAIM_EXEMPTIONS), (
+        "Scene Mutation Authoring undo claim: new findings "
+        f"{sorted(set(findings) - UNDO_CLAIM_EXEMPTIONS.keys())}; "
+        f"stale exceptions {sorted(UNDO_CLAIM_EXEMPTIONS.keys() - set(findings))}")
+    assert len(findings) == len(set(findings)), "An existing undo exception hides a second site"
+    assert all(reason.strip() for reason in UNDO_CLAIM_EXEMPTIONS.values())
+
+
+def test_gesture_undo_claims_reach_a_mutation_helper_before_expiry():
+    source = (ROOT / "web/js/editor_widget.js").read_text(encoding="utf-8")
+    callbacks = _gesture_undo_callbacks(source)
+    # A parser that sees nothing must not pass on an empty exception catalogue.
+    assert {name for name, _ in callbacks} >= {"replaceGuideImage", "swapGuides"}
+    _assert_undo_claim_findings(_undo_claim_findings(source))
+
+
+def _claim_fixture(body, name="probe"):
+    return f'this._withMutationGesture("{name}", async () => {{\n{body}\n}});'
+
+
+@pytest.mark.parametrize("body, expected", [
+    ('this._pushUndo("edit"); await this._runSceneMutation([]);', []),
+    ('await prepare(); this._pushUndo("edit"); await this._runSceneMutation([]);', []),
+    ('this._pushUndo("edit"); await this._updateItemProperty("guide", 1, {});', []),
+    ('this._pushUndo("edit"); await fetch("/raw");', ["missing-mutation-helper"]),
+    ('this._pushUndo("edit"); await prepare(); await this._runSceneMutation([]);', ["await-before-claim"]),
+    ('this._pushUndo("edit"); await this._runSceneMutation(await prepare());', ["await-before-claim"]),
+    ('const e = this._pushUndo("edit"); await prepare(); await this._runSceneMutation([], {historyEntry: e});', []),
+    ('const historyEntry = this._pushUndo("edit"); await prepare(); this._runSceneMutation([], {historyEntry});', []),
+    ('const e = this._pushUndo("edit"); await prepare(); this._queueProjectMutation({historyEntry: e});', []),
+    ('const e = this._pushUndo("edit"); await prepare(); this._runSceneMutation([{historyEntry: e}]);', ["await-before-claim"]),
+    ('const e = this._pushUndo("edit"); await prepare(); this._runSceneMutation([], {historyEntry: other});', ["await-before-claim"]),
+    ('let e = this._pushUndo("edit"); await prepare(); e = other; this._runSceneMutation([], {historyEntry: e});', ["await-before-claim"]),
+    ('const e = this._pushUndo("edit"); await prepare(); this._runSceneMutation([], {historyEntry: e, ...options});', ["await-before-claim"]),
+    ('const e = this._pushUndo("edit"); await prepare(); this._updateItemProperty("guide", 1, {}, {historyEntry: e});', ["await-before-claim"]),
+    ('this._pushUndo("edit"); const later = () => this._runSceneMutation([]);', ["nested-function-review"]),
+    ('this._pushUndo("edit"); function later() { this._runSceneMutation([]); }', ["nested-function-review"]),
+    ('this._pushUndo("edit"); const note = "await ghost(); this._runSceneMutation([])"; /* this._runSceneMutation([]); */ await fetch("/raw");', ["missing-mutation-helper"]),
+    ('this._pushUndo("edit"); this._runSceneMutation([]); await repaint();', []),
+    ('this._pushUndo("first"); this._pushUndo("second"); this._runSceneMutation([]);', ["multiple-reservations-review"]),
+    ('const e=this._pushUndo("edit"); await prepare(); this._runSceneMutation([], {historyEntry:e, "historyEntry":other});', ["await-before-claim"]),
+    ('const e=this._pushUndo("edit"); await prepare(); this._runSceneMutation([], {historyEntry:e, ["historyEntry"]:other});', ["await-before-claim"]),
+    ('const e=this._pushUndo("edit"); await prepare(); this._runSceneMutation([], {historyEntry:e, [key]:other});', ["await-before-claim"]),
+    ('const e=this._pushUndo("edit"); await prepare(); this._runSceneMutation([], {"historyEntry":e});', []),
+    ('this._pushUndo("edit"); this._queueProjectMutation({run});', ["queue-scene-claim-review"]),
+    ('this._pushUndo("edit"); this._queueProjectMutation({intent:{sceneId}, run});', []),
+    ('this._pushUndo("edit"); this._queueProjectMutation({intent:{sceneId:""}, run});', ["queue-scene-claim-review"]),
+    *[(f'this._pushUndo("edit"); await this.{helper}([]);', ["missing-mutation-helper"])
+      for helper in ("_runVersionedProjectMutation", "_runQueueMutation", "_queuePromptProjectWrite", "_mutateReferences")],
+])
+def test_undo_claim_scanner_distinguishes_suspension_from_awaiting_the_write(body, expected):
+    assert _undo_claim_findings(_claim_fixture(body)) == [("probe", reason) for reason in expected]
+
+
+def test_undo_claim_tripwire_rejects_injected_raw_and_awaiting_gestures():
+    source = (ROOT / "web/js/editor_widget.js").read_text(encoding="utf-8")
+    findings = _undo_claim_findings(source)
+    assert findings == [("swapGuides", "missing-mutation-helper")]
+    for body in ('this._pushUndo("probe"); await fetch("/raw");',
+                 'this._pushUndo("probe"); await prepare(); this._runSceneMutation([]);'):
+        with pytest.raises(AssertionError, match="probe"):
+            _assert_undo_claim_findings(_undo_claim_findings(source + _claim_fixture(body)))
+    with pytest.raises(AssertionError, match="stale exceptions"):
+        _assert_undo_claim_findings([])
+    with pytest.raises(AssertionError, match="second site"):
+        _assert_undo_claim_findings(findings + findings)
+
+
+def test_deferred_undo_claims_keep_their_explicit_handoff():
+    source = (ROOT / "web/js/editor_widget.js").read_text(encoding="utf-8")
+    _assert_deferred_undo_claims(source)
+
+
+def _assert_deferred_undo_claims(source):
+    scopes = registration._scopes(source)
+    for label, contract in DEFERRED_UNDO_CLAIMS.items():
+        assert contract["reason"] and contract["expiry"]
+        def body(name):
+            matches = [(start, end) for scope, start, end in scopes if scope == name]
+            assert len(matches) == 1, f"Deferred undo claim lost method {name}"
+            start, end = matches[0]
+            return source[start:end + 1]
+        producer, consumer = body(contract["producer"]), body(contract["consumer"])
+        if label == "trim":
+            assert re.search(r'const\s+historyEntry\s*=\s*this\._pushUndo\("trim"\)', producer), "Trim lost reserved entry binding"
+            code = _js_code(producer)
+            starts = list(re.finditer(r"this\._trimItem\s*=\s*\{", code))
+            assert len(starts) == 1, "Review trim storage assignments"
+            start = starts[0].end() - 1
+            end = registration._match_delimiter(producer, start, "{", "}")
+            assert end >= 0
+            fields = _object_members(producer[start:end + 1], allowed_spreads=("edgeHit", "trimLimits"))
+            assert fields is not None, "Review changed trim storage shape"
+            assert [value for key, value in fields if key == "historyEntry"] == ["historyEntry"], "Trim lost stored entry"
+            assert "this._commitTrim(this._trimItem)" in _js_code(producer)
+        else:
+            assert re.search(r'this\._dragHistoryEntry\s*=\s*this\._pushUndo\("move items"\)', producer), "Move lost reserved entry storage"
+            assert re.search(r"const\s+historyEntry\s*=\s*this\._dragHistoryEntry\s*;", _js_code(consumer)), "Move lost retained entry binding"
+        forwarded = False
+        for call in re.finditer(r"this\._runSceneMutation\s*\(", _js_code(consumer)):
+            args, _ = _js_arguments(consumer, call.end() - 1)
+            forwarded |= _explicit_history_entry(args, "_runSceneMutation", contract["entry"])
+        assert forwarded, f"Deferred undo claim lost explicit historyEntry for {label}"
+    # This is a lexical handoff pin, not a proof of drag cancellation or runtime
+    # entry identity. No source scan reaches across those asynchronous lifecycles.
+
+
+def test_deferred_handoff_tripwire_rejects_severed_storage_and_bindings():
+    source = (ROOT / "web/js/editor_widget.js").read_text(encoding="utf-8")
+    trim = source.index("this._trimItem = {")
+    end = registration._match_delimiter(source, source.index("{", trim), "{", "}")
+    storage = source[trim:end + 1]
+    assert "historyEntry," in storage
+    broken = source[:trim] + storage.replace("historyEntry,", "", 1) + source[end + 1:]
+    with pytest.raises(AssertionError, match="Trim lost stored entry"):
+        _assert_deferred_undo_claims(broken)
+    old = "const historyEntry = this._dragHistoryEntry;"
+    assert source.count(old) == 1
+    with pytest.raises(AssertionError, match="Move lost retained entry binding"):
+        _assert_deferred_undo_claims(source.replace(old, "const historyEntry = null;", 1))

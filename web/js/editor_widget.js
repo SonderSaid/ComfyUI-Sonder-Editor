@@ -25,10 +25,25 @@
  *    tests/test_scene_mutation_retry_policy.py and
  *    tests/test_scene_mutation_coalescing_policy.py pin those classifications;
  *    tests/test_scene_mutation_registration.py reviews the key and merge sites.
- * 4. Reserve undo before writing and capture post-state from that write's canonical
- *    response, never a later refresh. Review the _pushUndo microtask claim and
- *    explicit historyEntry ownership when introducing an asynchronous gap.
- *    Claim-gap enforcement is not yet part of this contract's tests.
+ * 4. Reserve undo before writing; the next synchronous enqueue can claim the
+ *    _pushUndo entry only until its queued microtask expires. Awaiting the write
+ *    itself calls it before yielding; awaiting preparation first loses the claim.
+ *    Across that gap, retain the returned object and pass historyEntry to a
+ *    helper that forwards it (_runSceneMutation or _queueProjectMutation).
+ *    _updateItemProperty supports the synchronous path, not explicit forwarding.
+ *    A direct queue call needs intent.sceneId or the explicit entry; a versioned
+ *    HTTP call alone and Reference/queue/prompt-project writers do not claim it.
+ *    Explicit historyEntry bypasses the claim's kind, postSnapshot, already-claimed,
+ *    stack-membership and scene-id checks. The caller owns that identity and its
+ *    lifecycle; stamping still validates the entry and the canonical scene.
+ *    Stamp only from that write's exact response, never a later refresh. Cleanup
+ *    uses _discardUnstampableUndoEntry with the exact object and respects the
+ *    caller-owned pending/ambiguous lifecycle; a matching label is not ownership.
+ *    tests/test_mutation_authoring_contract.py scans inline gesture callbacks for
+ *    missing helpers and await gaps, with one tracked raw-fetch defect. It pins
+ *    explicit trim/move handoffs separately, not arbitrary callee control flow.
+ *    Retire this microtask-specific rule when every undo reservation is explicit
+ *    queue-owned state and the implicit capture candidate is removed.
  * 5. Classify a new Scene field for server-side three-way history merge; do not
  *    hand-write an inverse operation. tests/test_scene_history_merge.py pins the
  *    field classifications. Optimistic local apply and shortcut exposure remain
