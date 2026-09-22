@@ -26,6 +26,7 @@ a fresh `[Unreleased]` block.
 - The standalone `DELETE` routes for clips, guides, prompt sections and audio tracks. These operations are owned by the scene mutations endpoint, which accepts an identity snapshot of the target that the old routes could not send, and which rewrites the link groups they left behind.
 
 ### Fixed
+- Fullscreen editor undo/redo stays in the editor after button clicks and cannot advance ComfyUI graph history, including editors inside subgraphs.
 - Guide swaps now update immediately and support Undo/Redo; refused swaps preserve the previous Redo history and report the conflict.
 - Sonder Cluster preserves its saved lane and branch counts when loading or switching workflows in newer ComfyUI frontends, and keeps existing connections attached to their named sockets when its layout changes.
 - Dragging a second Library member onto a Reference item that was still saving no longer refuses it with an identity error and loses the drop. Staging now appears on the timeline immediately instead of waiting for the project to save, so the next drag is aimed at the bar that is really there: a drop onto it appends, where before it tried to create a second item in the same place and was refused for overlapping.

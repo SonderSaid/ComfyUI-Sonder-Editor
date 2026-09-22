@@ -4341,13 +4341,12 @@ class Harness {{
     this._editorFocused=false;this.restores=[];this._historyStackRevision=0;
     this._historyOperationSeq=0;this._queuedHistoryOperationCount=0;
     this._queuedHistoryNotification=null;this._sceneMutationInvalidationSeq=0;
-    this._projectMutationQueue=new ProjectMutationQueue();this.suppressions=[]; }}
+    this._projectMutationQueue=new ProjectMutationQueue(); }}
   _keyboardDebug() {{}}
   _hasPendingProjectMutations() {{return this._projectMutationQueue.isBusy();}}
   async _restoreScene(_sceneId,target) {{this.restores.push(target.value);return target;}}
   async _applyPromptIdentityChange() {{}}
   async _applyReferenceHistoryOperations() {{}}
-  _activateGraphUndoSuppression(reason){{this.suppressions.push(reason);}}
   _schedulePostMutationSceneRefresh(){{}}
 }}
 const results=[];
@@ -4359,21 +4358,20 @@ for (const operation of ["undo","redo"]) {{
   const call=operation === "undo" ? h._undo() : h._redo();await Promise.resolve();
   const source=operation === "undo" ? h._undoStack : h._redoStack;
   const during={{claimed:Boolean(source[0]?.claimedBy),restores:[...h.restores],
-    suppressions:[...h.suppressions],
     queued:h._projectMutationQueue.hasPending()}};
   release();await blocker;await call;
-  results.push({{operation,during,restores:h.restores,suppressions:h.suppressions,
+  results.push({{operation,during,restores:h.restores,
     undo:h._undoStack.length,redo:h._redoStack.length}});
 }}
 console.log(JSON.stringify({{results,notices}}));
 """)
     assert result["results"] == [
         {"operation": "undo", "during": {"claimed": True, "restores": [],
-         "suppressions": [], "queued": True}, "restores": [1],
-         "suppressions": ["editor-undo-apply"], "undo": 0, "redo": 1},
+         "queued": True}, "restores": [1],
+         "undo": 0, "redo": 1},
         {"operation": "redo", "during": {"claimed": True, "restores": [],
-         "suppressions": [], "queued": True}, "restores": [3],
-         "suppressions": ["editor-redo-apply"], "undo": 1, "redo": 0},
+         "queued": True}, "restores": [3],
+         "undo": 1, "redo": 0},
     ]
     assert result["notices"] == []
 
@@ -4679,7 +4677,6 @@ class Harness {{
       sceneId:"scene",label:"failed",snapshot:{{scene_id:"scene"}}}});}}
   _projectDirName(){{return "project";}}
   _keyboardDebug(){{}}
-  _activateGraphUndoSuppression(){{}}
   _schedulePostMutationSceneRefresh(){{}}
   _deferProjectBackedRefresh(){{}}
   _trimUndoStack(){{}}
@@ -6126,7 +6123,6 @@ class Harness {{
   _discardAmbiguousHistoryReservation(){{}} _trimUndoStack(){{}}
   _hasPendingProjectMutations(){{return this._projectMutationQueue.isBusy();}}
   async _resolveHistoryOrderContextScene(){{this.events.push("resolve");return {{scene_id:"scene"}};}}
-  _activateGraphUndoSuppression(){{this.events.push("suppress");}}
   async _runUndoWithinGesture(){{this.events.push("run");}}
   async _runRedoWithinGesture(){{this.events.push("run");}}
   _schedulePostMutationSceneRefresh(){{}} _finishHistoryOperation(){{}}
@@ -6143,11 +6139,11 @@ console.log(JSON.stringify({{dominance,undo,redo,undoClean}}));
 """)
     assert result == {
         "dominance": {"scene": None, "needs": True},
-        "undo": ["resolve", "suppress", "run"],
-        "redo": ["resolve", "suppress", "run"],
+        "undo": ["resolve", "run"],
+        "redo": ["resolve", "run"],
         # The gate is the production one now, so a clean ancestor skips the wait
         # instead of the test asserting that a stub it forced to true was called.
-        "undoClean": ["suppress", "run"],
+        "undoClean": ["run"],
     }
 
 
@@ -7693,7 +7689,7 @@ catch(error) {{ body=error.message; }}
     }
 
 
-def test_scene_restore_rearms_graph_suppression_at_direct_and_reconciled_adoption():
+def test_scene_restore_adopts_direct_and_reconciled_results_once():
     widget = _source("web/js/editor_widget.js")
     restore = _method(widget, "_restoreScene", "_setWidgetValue")
     result = _run_node(f"""
@@ -7704,7 +7700,6 @@ class Harness {{
   constructor(){{this.projectDir="project";this.activeSceneId="scene";
     this.activeScene={{scene_id:"scene"}};this.scenes=[];this.events=[];}}
   _keyboardDebug(){{}}
-  _activateGraphUndoSuppression(reason){{this.events.push(["suppress",reason]);}}
   _setActiveScene(scene){{this.events.push(["set",scene.value]);this.activeScene=scene;}}
   _renderTimeline(){{}} _renderViewportFrame(){{}}
 }}
@@ -7725,8 +7720,8 @@ await h._restoreScene("scene",{{scene_id:"scene",value:"reconciled"}},
 console.log(JSON.stringify(h.events));
 """)
     assert result == [
-        ["suppress", "editor-history-adopt"], ["set", "direct"],
-        ["suppress", "editor-history-adopt"], ["set", "reconciled"],
+        ["set", "direct"],
+        ["set", "reconciled"],
     ]
 
 

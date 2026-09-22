@@ -219,10 +219,8 @@ async function openWorkflowJson(workflow, name = "Sonder Source Workflow") {
         return false;
     }
     notifySourceWorkflow("Opening workflow will replace current canvas", "info");
-    return await withGraphLoadBypass(async () => {
-        await app.loadGraphData(workflow);
-        return true;
-    });
+    await app.loadGraphData(workflow);
+    return true;
 }
 
 async function openSourceWorkflowForAsset(projectDir, asset) {
@@ -661,124 +659,49 @@ function sonderKeyboardDebug(message, details) {
     console.log("[Sonder][UndoGuard]", message, details);
 }
 
+// Controller state owns fullscreen lifetime, including editors inside subgraphs.
+// Keep this traversal local: other getActiveEditorNodes callers are root-scoped.
 function shouldSuppressComfyGraphUndo() {
-    return getActiveEditorNodes().some((node) => node._sonderController?.state?.isFullscreenOpen);
-}
-
-function isPromptTextEditorFocused() {
-    if (typeof document === "undefined") return false;
-    const active = document.activeElement;
-    return !!(active?.closest?.("[data-sonder-prompt-box='1']")
-        || active?.isContentEditable
-        || active?.closest?.("[contenteditable]:not([contenteditable='false'])")
-        || active?.closest?.("input, textarea, select"));
-}
-
-const sonderGraphUndoSuppression = {
-    untilMs: 0,
-    reason: "",
-    nodeIds: [],
-};
-let sonderGraphLoadBypassDepth = 0;
-
-function nowMs() {
-    if (typeof performance !== "undefined" && typeof performance.now === "function") {
-        return performance.now();
-    }
-    return Date.now();
-}
-
-function isGraphUndoSuppressed() {
-    return sonderGraphUndoSuppression.untilMs > nowMs();
-}
-
-function activateGraphUndoSuppression(reason = "unknown", nodeIds = []) {
-    sonderGraphUndoSuppression.untilMs = nowMs() + 1000;
-    sonderGraphUndoSuppression.reason = String(reason || "unknown");
-    sonderGraphUndoSuppression.nodeIds = Array.isArray(nodeIds) ? nodeIds.slice() : [];
-    sonderKeyboardDebug("activated graph undo suppression", {
-        reason: sonderGraphUndoSuppression.reason,
-        nodeIds: sonderGraphUndoSuppression.nodeIds,
-        untilMs: sonderGraphUndoSuppression.untilMs,
-    });
-}
-
-async function withGraphLoadBypass(callback) {
-    sonderGraphLoadBypassDepth += 1;
-    try {
-        return await callback();
-    } finally {
-        sonderGraphLoadBypassDepth = Math.max(0, sonderGraphLoadBypassDepth - 1);
-    }
-}
-
-function installGraphLoadGuard() {
-    if (!app || app._sonderGraphLoadGuardInstalled) return;
-
-    const originalLoadGraphData = typeof app.loadGraphData === "function" ? app.loadGraphData.bind(app) : null;
-    if (!originalLoadGraphData) return;
-
-    app.loadGraphData = async function (...args) {
-        // ComfyUI's window-capture undo listener is registered before custom
-        // extensions. It can therefore start loadGraphData before our higher-
-        // level KeyboardOwnership consumer sees Ctrl/Cmd-Z. A focused prompt
-        // document is an authoritative text-editing boundary: graph history
-        // must not replace the mounted node while that editor owns the key.
-        const promptTextEditing = isPromptTextEditorFocused();
-        if (sonderGraphLoadBypassDepth <= 0 && shouldSuppressComfyGraphUndo()
-                && (isGraphUndoSuppressed() || promptTextEditing)) {
-            sonderKeyboardDebug("blocked app.loadGraphData during fullscreen editor undo window", {
-                reason: promptTextEditing ? "prompt-text-editor" : sonderGraphUndoSuppression.reason,
-                nodeIds: sonderGraphUndoSuppression.nodeIds,
-            });
-            return false;
+    const pending = [app?.rootGraph || app?.graph];
+    const visited = new Set();
+    while (pending.length) {
+        const graph = pending.pop();
+        if (!graph || visited.has(graph)) continue;
+        visited.add(graph);
+        for (const node of graph._nodes || graph.nodes || []) {
+            const controller = node?._sonderController;
+            if (node?.type === "SonderEditor" && !controller?._destroyed
+                    && controller?.state?.isFullscreenOpen) return true;
         }
-        return await originalLoadGraphData(...args);
-    };
-
-    app._sonderGraphLoadGuardInstalled = true;
-    if (typeof window !== "undefined") {
-        window.__SONDER_SUPPRESS_COMFY_GRAPH_UNDO__ = activateGraphUndoSuppression;
-        window.__SONDER_GRAPH_UNDO_GUARD__ = {
-            isSuppressed: () => isGraphUndoSuppressed(),
-            getState: () => ({
-                untilMs: sonderGraphUndoSuppression.untilMs,
-                reason: sonderGraphUndoSuppression.reason,
-                nodeIds: sonderGraphUndoSuppression.nodeIds.slice(),
-            }),
-            withBypass: async (callback) => await withGraphLoadBypass(callback),
-        };
+        for (const subgraph of graph.subgraphs?.values?.() || []) pending.push(subgraph);
     }
-    sonderKeyboardDebug("installed graph load guard");
+    return false;
 }
 
 function installComfyGraphUndoGuard() {
-    const changeTracker = app?.changeTracker;
-    if (!changeTracker || changeTracker._sonderUndoGuardInstalled) return;
+    const prototype = window.comfyAPI?.changeTracker?.ChangeTracker?.prototype;
+    if (!prototype || prototype._sonderUndoGuardInstalled) return;
 
-    const wrap = (methodName) => {
-        const original = changeTracker[methodName];
-        if (typeof original !== "function") return;
-        changeTracker[methodName] = function (...args) {
+    // ComfyUI queues undo in an earlier window-capture listener. Consuming the
+    // DOM event cannot cancel that callback. Guard before updateState pops/pushes
+    // history; blocking loadGraphData is too late and corrupts tracker state.
+    // This internal frontend seam can be retired when ComfyUI provides an
+    // equivalent history-ownership hook before either stack is mutated.
+    for (const methodName of ["undo", "redo"]) {
+        if (typeof prototype[methodName] !== "function") return;
+    }
+    for (const methodName of ["undo", "redo"]) {
+        const original = prototype[methodName];
+        prototype[methodName] = function (...args) {
             if (shouldSuppressComfyGraphUndo()) {
-                sonderKeyboardDebug(`blocked changeTracker.${methodName}`, {
-                    fullscreenEditorNodeIds: getActiveEditorNodes()
-                        .filter((node) => node._sonderController?.state?.isFullscreenOpen)
-                        .map((node) => node.id),
-                });
+                sonderKeyboardDebug(`blocked ChangeTracker.${methodName} during fullscreen`);
                 return;
             }
             return original.apply(this, args);
         };
-    };
-
-    wrap("undoRedo");
-    wrap("undo");
-    wrap("redo");
-    changeTracker._sonderUndoGuardInstalled = true;
-    sonderKeyboardDebug("installed graph undo guard", {
-        wrapped: ["undoRedo", "undo", "redo"].filter((name) => typeof changeTracker[name] === "function"),
-    });
+    }
+    Object.defineProperty(prototype, "_sonderUndoGuardInstalled", { value: true });
+    sonderKeyboardDebug("installed graph undo guard");
 }
 
 function getNodeById(nodeId) {
@@ -1443,7 +1366,6 @@ app.registerExtension({
     },
 
     setup() {
-        installGraphLoadGuard();
         installComfyGraphUndoGuard();
         // Page-level notification toast stack (canvas page). Mounted once for the
         // page lifetime — visible whether the editor is dormant or fullscreen,

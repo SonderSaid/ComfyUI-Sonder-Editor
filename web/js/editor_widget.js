@@ -1811,13 +1811,6 @@ export class EditorWidget {
                 { source: "scene-switch-history-pending" });
             return false;
         }
-        if (!optimisticHistory && this._deferredHistoryAdoption) {
-            const pending = this._deferredHistoryAdoption;
-            this._deferredHistoryAdoption = null;
-            if (pending.projectDir === this.projectDir && pending.sceneId === scene.scene_id) {
-                this._activateGraphUndoSuppression?.("editor-history-deferred-adopt");
-            }
-        }
         const pendingHistorySelection = this._pendingHistorySelection;
         const historySelection = pendingHistorySelection?.projectDir === this.projectDir
             && pendingHistorySelection?.sceneId === scene.scene_id ? pendingHistorySelection : null;
@@ -18473,7 +18466,7 @@ export class EditorWidget {
             this._shortcutSection("Edit", [
                 ["Double-click item", "Open inline editor (isolates a linked member)"],
                 ["Del / Backspace", "Delete selected items"],
-                ["Ctrl+Z", "Undo"],
+                ["Ctrl+Z", "Undo (including after button clicks)"],
                 ["Ctrl+Y", "Redo"],
                 ["Ctrl+Shift+Z", "Redo"],
                 ["Ctrl+V", "Paste"],
@@ -19738,7 +19731,7 @@ export class EditorWidget {
             const ctrl = e.ctrlKey || e.metaKey;
             const shift = e.shiftKey;
 
-            // Guard: don't fire when typing in inputs (except Ctrl+Z/Y for undo/redo)
+            // Text fields own editing history; ordinary buttons may route undo/redo.
             const activeTarget = e.target instanceof Element ? e.target : document.activeElement;
             const activeElement = document.activeElement;
             const tag = activeTarget?.tagName || activeElement?.tagName;
@@ -19750,7 +19743,8 @@ export class EditorWidget {
             const isPromptPanelInput = !!(activeTarget?.closest?.("[data-sonder-prompt-box='1']")
                 || activeElement?.closest?.("[data-sonder-prompt-box='1']"));
             const isContentEditor = !!(activeTarget?.isContentEditable || activeElement?.isContentEditable);
-            const isOrdinaryField = ["INPUT", "TEXTAREA", "SELECT", "BUTTON"].includes(tag);
+            const isOrdinaryField = ["INPUT", "TEXTAREA", "SELECT"].includes(tag)
+                || (tag === "BUTTON" && !isUndo);
             const debugUndoRouting = (message, extra = {}) => {
                 if (!ctrl || (normalizedKey !== "z" && normalizedKey !== "y")) return;
                 this._keyboardDebug(message, this._keyboardDebugSnapshot(e, extra));
@@ -19781,7 +19775,6 @@ export class EditorWidget {
             // ── Undo / Redo ──
             if (ctrl && normalizedKey === "z" && !shift) {
                 debugUndoRouting("consume undo", { branch: "undo" });
-                this._activateGraphUndoSuppression("editor-undo");
                 void this._undo();
                 return true;
             }
@@ -19789,9 +19782,6 @@ export class EditorWidget {
                 debugUndoRouting("consume redo", {
                     branch: normalizedKey === "y" ? "redo-y" : "redo-shift-z",
                 });
-                this._activateGraphUndoSuppression(
-                    normalizedKey === "y" ? "editor-redo-y" : "editor-redo-shift-z"
-                );
                 void this._redo();
                 return true;
             }
@@ -19968,19 +19958,6 @@ export class EditorWidget {
             return;
         }
         console.debug(`[Sonder][EditorKeyboard][${this._keyboardConsumerId("editor")}] ${message}`, details);
-    }
-
-    _activateGraphUndoSuppression(reason) {
-        const suppress = typeof window !== "undefined"
-            ? window.__SONDER_SUPPRESS_COMFY_GRAPH_UNDO__
-            : null;
-        if (typeof suppress !== "function") return;
-        const nodeId = this.widgetHost?.getNodeId?.() ?? this.node?.id;
-        suppress(reason, nodeId == null ? [] : [nodeId]);
-        this._keyboardDebug("requested graph undo suppression", {
-            reason,
-            nodeId: nodeId ?? null,
-        });
     }
 
     /** Called whenever the playhead changes position (arrow keys, etc.). */
@@ -22366,7 +22343,6 @@ export class EditorWidget {
                 await this._resolveHistoryOrderContextScene(
                     historyOrderContext, sceneId, ownerToken);
             }
-            this._activateGraphUndoSuppression?.("editor-undo-apply");
             return this._runUndoWithinGesture(
                 queuedDiagnostics, entry, claimId, ownerToken,
                 oppositeReservation, historyOrderContext);
@@ -22899,7 +22875,6 @@ export class EditorWidget {
                 await this._resolveHistoryOrderContextScene(
                     historyOrderContext, sceneId, ownerToken);
             }
-            this._activateGraphUndoSuppression?.("editor-redo-apply");
             return this._runRedoWithinGesture(
                 queuedDiagnostics, entry, claimId, ownerToken,
                 oppositeReservation, historyOrderContext);
@@ -23425,7 +23400,6 @@ export class EditorWidget {
         state.selectionBefore = (this.selectedItems || []).map(({ type, id }) => ({ type, id }));
         state.primarySelectionBefore = this.selectedItem && { type: this.selectedItem.type, id: this.selectedItem.id };
         state.inspectorBefore = !!this._itemEditorEl;
-        this._activateGraphUndoSuppression?.("editor-history-optimistic");
         const scene = structuredClone(entry.snapshot);
         this._replaceSceneInList(scene);
         this._setActiveScene(scene, { optimisticHistory: true });
@@ -23485,12 +23459,10 @@ export class EditorWidget {
             // Mouse-up drains a canonical refresh after the drag's own commit;
             // replacing objects here would orphan drag/trim data references.
             this._pendingScenesRefresh = true;
-            this._deferredHistoryAdoption = { projectDir: this.projectDir, sceneId: state.sceneId };
             state.restoreSelectionOnAdopt = true;
             return;
         }
         try {
-            this._activateGraphUndoSuppression?.("editor-history-rollback");
             const scene = structuredClone(state.sceneBefore);
             this._replaceSceneInList(scene);
             const selectionOwned = this.selectedItems === state.selectionAfter
@@ -23554,15 +23526,10 @@ export class EditorWidget {
             if (!scene || String(scene.scene_id || "") !== String(sceneId || "")) {
                 throw new Error("Scene restore returned an invalid scene.");
             }
-            // Restore requests can outlive the graph suppression lease by many
-            // seconds. Re-arm at the graph-affecting adoption point for both
-            // the direct response and receipt-reconciliation paths.
-            this._activateGraphUndoSuppression?.("editor-history-adopt");
             if (this.isDragging || this._timelineMutationDepth) {
                 // Canonical settlement also replaces the object graph. Keep
                 // the dragged objects alive until mouse-up/queue drain.
                 this._pendingScenesRefresh = true;
-                this._deferredHistoryAdoption = { projectDir: this.projectDir, sceneId };
                 return scene;
             }
             if (this.activeSceneId !== sceneId) this.activeSceneId = sceneId;

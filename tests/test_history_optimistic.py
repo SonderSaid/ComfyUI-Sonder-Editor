@@ -19,7 +19,6 @@ def _run_history_node(body):
                 activeScene:structuredClone(entry().postSnapshot),
                 _keyboardDebug:()=>{}, _recordHistoryRefusal:()=>{},
                 _historyObservedProjectVersion:()=> 'v1',
-                _activateGraphUndoSuppression:()=>{},
                 _replaceSceneInList:()=>{},
                 _setActiveScene(scene, options={}) { this.activeScene=scene; if(!options.optimisticHistory) this._authoritativeSceneSeq++; },
             });
@@ -85,10 +84,9 @@ def test_restore_stamp_survives_newer_get_during_response_body():
     """)
 
 
-def test_paint_clones_snapshot_and_rollback_rearms_graph_suppression():
+def test_paint_and_rollback_clone_their_snapshots():
     _run_history_node("""
-        const w=makeHistoryWidget(), e=entry(), state={entry:e}, arms=[];
-        w._activateGraphUndoSuppression=reason=>arms.push(reason);
+        const w=makeHistoryWidget(), e=entry(), state={entry:e};
         w._paintHistoryOptimistically(state);
         assert.notEqual(w.activeScene,e.snapshot);
         w.activeScene.name='local mutation';
@@ -96,7 +94,6 @@ def test_paint_clones_snapshot_and_rollback_rearms_graph_suppression():
         w._rollbackHistoryOptimisticPaint(state);
         assert.equal(w.activeScene.name,'after');
         assert.notEqual(w.activeScene,e.postSnapshot);
-        assert.deepEqual(arms,['editor-history-optimistic','editor-history-rollback']);
     """)
 
 

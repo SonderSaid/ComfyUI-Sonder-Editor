@@ -1,7 +1,7 @@
 /**
  * KeyboardOwnership — single window-capture root for keydown, keyup and paste
- * that beats LiteGraph's document-capture handlers regardless of registration
- * order.
+ * that precedes LiteGraph's document-capture handlers. Earlier window-capture
+ * listeners still run first; queued ComfyUI history needs its own method guard.
  *
  * Consumers register with a priority. On each event, consumers are dispatched
  * highest priority first; same priority dispatches LIFO (last-registered wins).
