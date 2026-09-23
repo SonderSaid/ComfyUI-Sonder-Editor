@@ -200,7 +200,9 @@ def test_streaming_preserves_extension_after_long_filename_sanitization(tmp_path
 
 def test_streaming_rejects_oversized_aggregate_text_and_cleans_stage(tmp_path, monkeypatch):
     monkeypatch.setattr(upload_streaming, "UPLOAD_DISK_RESERVE_BYTES", 0)
-    monkeypatch.setattr(upload_streaming, "UPLOAD_TEXT_BYTES", 8)
+    # The read size is this limit + 1, and newer aiohttp (3.14.3 in ComfyUI)
+    # refuses a multipart chunk smaller than its boundary + 2.
+    monkeypatch.setattr(upload_streaming, "UPLOAD_TEXT_BYTES", 256)
     destination = tmp_path / "media"
     destination.mkdir()
 
@@ -224,7 +226,7 @@ def test_streaming_rejects_oversized_aggregate_text_and_cleans_stage(tmp_path, m
         try:
             form = FormData()
             form.add_field("file", b"video", filename="clip.mp4")
-            form.add_field("folder", "0123456789")
+            form.add_field("folder", "0123456789" * 30)
             response = await client.post("/upload", data=form)
             assert response.status == 413
         finally:

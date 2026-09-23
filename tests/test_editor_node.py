@@ -3555,7 +3555,9 @@ def test_load_scene_audio_caps_track_to_timeline_trim(tmp_path, monkeypatch):
 
     sample_rate = 44100
     fps = 44100.0
-    waveform = (torch.arange(200, dtype=torch.float32) / 1000.0).unsqueeze(0)
+    # 0.1 s: without mutagen the probe falls back to ffmpeg, whose centisecond
+    # duration reads a sub-10 ms file as zero and refuses it.
+    waveform = (torch.arange(4410, dtype=torch.float32) / 10000.0).unsqueeze(0)
     stereo_samples = editor_node.np.vstack([waveform.numpy(), waveform.numpy()])
 
     from scipy.io import wavfile
