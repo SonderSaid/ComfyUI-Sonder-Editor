@@ -902,8 +902,10 @@ def test_prompt_editors_claim_keyboard_and_compact_channels_without_flattening()
         encoding="utf-8")
     assert "PRESERVE_DEFAULT" in keyboard and "TEXT_EDITOR: 75" in keyboard
     assert 'id: "sonder-prompt-text-editor"' in chips
-    assert "isPromptTextEditorFocused" in extension
-    assert 'reason: promptTextEditing ? "prompt-text-editor"' in extension
+    assert "function installComfyGraphUndoGuard()" in extension
+    assert "if (shouldSuppressComfyGraphUndo())" in extension
+    setup_body = extension[extension.index("    setup() {"):]
+    assert "installComfyGraphUndoGuard();" in setup_body[:setup_body.index("\n    },")]
     assert "selection: selectionBookmark()" in chips
     assert "render(previous.selection)" in chips
     assert "render(next.selection)" in chips
