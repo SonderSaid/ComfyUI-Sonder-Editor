@@ -978,6 +978,12 @@ export function mountPromptManagementPanel(host) {
     // `durable_rules.md` calls "the consumer that regressed is rarely the one
     // the payload is named after".
     let dormancyRefreshers = [];
+    // One check per drawn text surface: is the scene's text for it neither what
+    // it last saved nor what it shows? That is an Undo (or another writer)
+    // having replaced it; the panel's own saves are always one or the other.
+    let textStaleChecks = [];
+    const sameChannelText = (left, right, keys) => keys.every((key) =>
+        String(left?.[key] ?? "").trim() === String(right?.[key] ?? "").trim());
     const identityRefreshGate = createModalRefreshGate(() => renderNow());
     const render = () => identityRefreshGate.request();
     // Esc/blur-commit guard (audit F1): the OVERLAY consumer fires on the
@@ -3670,14 +3676,23 @@ Server value: ${serverValue}` : ""}`;
         dormancyRefreshers = [];
         if (!mounted) return;
         renderDraftRecovery();
+        // A rebuild would take the caret, the typed value and a chip editor's
+        // undo history with it. Any control holding input defers — a range
+        // field as much as a chip box, since a range save's own re-render used
+        // to erase what was being typed into the next field — and the host
+        // replays the render once the author leaves the panel.
         if (renderedDraftScene === draftSceneIdentity()
-                && body.contains(document.activeElement)
-                && document.activeElement?.closest?.("[data-sonder-prompt-box='1']")) {
+                && (host._managementPanelBusy?.(body, { selects: false })
+                    || (body.contains(document.activeElement)
+                        && document.activeElement?.closest?.("[data-sonder-prompt-box='1']")))) {
             deferredDraftRender = true;
+            host._deferManagementPanelRender?.("prompt");
             return;
         }
         deferredDraftRender = false;
         renderedDraftScene = draftSceneIdentity();
+        textStaleChecks = [];
+        host._stampManagementPanel?.("prompt");
         identityPanelCleanup();
         identityPanelCleanup = () => {};
         for (const editor of body.querySelectorAll("[data-sonder-prompt-box='1']")) {
@@ -3732,6 +3747,16 @@ Server value: ${serverValue}` : ""}`;
             ])),
         });
         const globalInputs = {};
+        textStaleChecks.push(() => {
+            const current = host.activeScene;
+            if (!current || current !== scene && current.scene_id !== scene.scene_id) return false;
+            const now = normalizeChannels(current.global_channels, current.prompt, globalKeys);
+            const base = normalizeChannels(globalBase.global_channels, globalBase.prompt, globalKeys);
+            const shown = Object.fromEntries(globalKeys.map((key) =>
+                [key, globalInputs[key]?.value ?? ""]));
+            return !sameChannelText(now, base, globalKeys)
+                && !sameChannelText(now, shown, globalKeys);
+        });
         const globalRow = document.createElement("div");
         globalRow.dataset.sonderPromptOrigin = "global";
         globalRow.style.cssText = `
@@ -4272,6 +4297,19 @@ Server value: ${serverValue}` : ""}`;
                 channelRow.appendChild(column);
             }
 
+            if (section.prompt_id) textStaleChecks.push(() => {
+                const row = (host.activeScene?.prompt_sections || []).find((value) =>
+                    value.prompt_id === section.prompt_id);
+                // A section that is gone or new is structural: the host's
+                // signature already covers it.
+                if (!row) return false;
+                const now = normalizeChannels(row.channels, row.prompt, channelKeys);
+                const base = normalizeChannels(sectionBase.channels, sectionBase.prompt, channelKeys);
+                const shown = Object.fromEntries(channelKeys.map((key) =>
+                    [key, channelInputs[key]?.value ?? ""]));
+                return !sameChannelText(now, base, channelKeys)
+                    && !sameChannelText(now, shown, channelKeys);
+            });
             const commitRange = async () => {
                 if (guard.suppressBlurCommit) return;
                 const start = parseInt(startInput.value, 10);
@@ -4728,6 +4766,9 @@ Server value: ${serverValue}` : ""}`;
     const handle = {
         element: backdrop,
         refresh: render,
+        isTextStale: () => mounted && textStaleChecks.some((check) => {
+            try { return check(); } catch (_error) { return false; }
+        }),
         refreshDiagnostics: renderDiagnostics,
         // Projections ONLY. The scene-wide payload lands here, and it must not
         // reach diagnostics (blockers stay windowed-only) or `applyCandidate`

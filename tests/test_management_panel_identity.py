@@ -379,7 +379,9 @@ _POPUP_DOM = """
         }
         const all = (n, out = []) => { out.push(n); n.children.forEach((c) => all(c, out)); return out; };
         globalThis.document = { createElement: (t) => new N(t), body: new N("body"),
-            activeElement: null, addEventListener() {}, removeEventListener() {} };
+            activeElement: null, listeners: {},
+            addEventListener(t, h) { (this.listeners[t] ||= []).push(h); },
+            removeEventListener() {} };
         globalThis.Element = N;
         window.addEventListener = () => {}; window.removeEventListener = () => {};
 """
@@ -403,7 +405,8 @@ def test_the_guide_popup_refuses_a_stale_strength_before_undo_or_write():
         w.activeScene.guide_frames = [{ guide_id: 'g2', frame_index: 10, asset_id: 'a2', strength: 1 }];
         staleInput.value = '0.5';
         staleInput.fire('change');
-        await new Promise((resolve) => setTimeout(resolve, 0));
+        // The popup repaints through the gated scheduler (next frame, or 50 ms).
+        await new Promise((resolve) => setTimeout(resolve, 80));
         assert.equal(undos, 0);
         assert.equal(sent.length, 0);
         assert.equal(fetches, 1);
@@ -531,3 +534,204 @@ console.log(JSON.stringify({staleSaves,followed,fresh,
     assert result == {"staleSaves": 0, "followed": 0,
                       "fresh": {"laneIndex": 0, "expectedLaneId": "B"},
                       "blankSaves": 0, "blankClosed": True}
+
+
+# -- L3B: panels repaint after the scene is replaced, gated by what they show
+# and by whether the author is working in them.
+
+_REPAINT_HOST = """
+        const node = (tag, type = '') => ({ tagName: tag, type, isContentEditable: false });
+        const root = { members: new Set(), contains(n) { return this.members.has(n); } };
+        globalThis.document = { activeElement: null, listeners: {},
+            addEventListener(t, h) { (this.listeners[t] ||= []).push(h); },
+            removeEventListener() {} };
+        const w = makeWidget();
+        let refreshes = 0;
+        w._channelTemplate = () => ({ id: 'standard' });
+        w._isPromptTrackLocked = () => false; w._isGlobalPromptTrackLocked = () => false;
+        w._promptPanelHandle = { isMounted: () => true, element: root,
+            refresh: () => { refreshes += 1; w._stampManagementPanel('prompt'); } };
+        w.activeScene = { scene_id: 'scene', prompt_sections: [
+            { prompt_id: 'a', start_frame: 0, end_frame: 10, channels: { visual: 'x' } }] };
+        w._stampManagementPanel('prompt');
+"""
+
+
+def test_a_panel_repaints_only_when_what_it_projects_changed():
+    _run_gesture_node(_REPAINT_HOST + """
+        w._runManagementPanelRefresh();
+        assert.equal(refreshes, 0);
+        // The panel's own channel save: text is not what the panel stamps, so
+        // the mounted editors survive it.
+        w.activeScene.prompt_sections[0].channels.visual = 'saved';
+        w._runManagementPanelRefresh();
+        assert.equal(refreshes, 0);
+        // An Undo that restores a section is a structural change.
+        w.activeScene.prompt_sections.push({ prompt_id: 'b', start_frame: 10, end_frame: 20 });
+        w._runManagementPanelRefresh();
+        assert.equal(refreshes, 1);
+        w._runManagementPanelRefresh();
+        assert.equal(refreshes, 1);
+    """)
+
+
+def test_a_repaint_waits_for_typed_input_and_a_pressed_pointer_then_replays():
+    _run_gesture_node(_REPAINT_HOST + """
+        const field = node('INPUT', 'text');
+        root.members.add(field);
+        document.activeElement = field;
+        w.activeScene.prompt_sections.push({ prompt_id: 'b', start_frame: 10, end_frame: 20 });
+        w._runManagementPanelRefresh();
+        assert.equal(refreshes, 0);
+        assert.equal(w._managementPanelsPending, true);
+        // Focus leaves for a button inside the panel, but the pointer that
+        // moved it is still down on that button: still deferred.
+        const button = node('BUTTON');
+        root.members.add(button);
+        document.activeElement = button;
+        w._managementPointerTarget = button;
+        w._runManagementPanelRefresh();
+        assert.equal(refreshes, 0);
+        // Pointer up; a focused button holds no input.
+        w._managementPointerTarget = null;
+        w._runManagementPanelRefresh();
+        assert.equal(refreshes, 1);
+        assert.equal(w._managementPanelsPending, false);
+    """)
+
+
+def test_leaving_the_panel_replays_a_deferred_repaint():
+    _run_gesture_node(_REPAINT_HOST + """
+        let frames = [];
+        globalThis.requestAnimationFrame = (callback) => { frames.push(callback); return 1; };
+        const field = node('TEXTAREA');
+        root.members.add(field);
+        document.activeElement = field;
+        w.activeScene.prompt_sections[0].end_frame = 12;
+        w._refreshOpenManagementPanels('scene');
+        frames.shift()();
+        assert.equal(refreshes, 0);
+        // The author tabs out of the panel: the focus event schedules the
+        // replay after its own task, then the next frame repaints.
+        document.activeElement = null;
+        for (const handler of document.listeners.focusout || []) handler({});
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        frames.shift()();
+        assert.equal(refreshes, 1);
+    """)
+
+
+def test_a_deferred_panel_render_replays_even_without_a_scene_change():
+    _run_gesture_node(_REPAINT_HOST + """
+        w._deferManagementPanelRender('prompt');
+        assert.equal(w._managementPanelsPending, true);
+        w._runManagementPanelRefresh();
+        assert.equal(refreshes, 1);
+    """)
+
+
+def test_a_reference_lane_swap_repaints_the_reference_panel():
+    _run_gesture_node("""
+        globalThis.document = { activeElement: null, addEventListener() {}, removeEventListener() {} };
+        const w = makeWidget();
+        let refreshes = 0;
+        w.activeScene = { scene_id: 'scene',
+            reference_lane_recipes: [{ lane_id: 'A' }, { lane_id: 'B' }],
+            reference_lane_configs: [{}, {}], reference_items: [] };
+        w._referencePanelHandle = { laneIndex: 1, element: { contains: () => false },
+            refresh: () => { refreshes += 1; } };
+        w._stampManagementPanel('reference', { laneIndex: 1 });
+        w._runManagementPanelRefresh();
+        assert.equal(refreshes, 0);
+        w.activeScene.reference_lane_recipes.reverse();
+        w._runManagementPanelRefresh();
+        assert.equal(refreshes, 1);
+    """)
+
+
+def test_scene_replacement_and_local_paint_both_reach_the_repaint_hook():
+    source = (ROOT / "web/js/editor_widget.js").read_text(encoding="utf-8")
+    for method, marker in (("_setActiveScene(scene,", '_refreshOpenManagementPanels("scene")'),
+                           ("_renderSceneAfterLocalMutation({",
+                            '_refreshOpenManagementPanels("local-mutation")')):
+        start = source.index(f"    {method}")
+        end = source.index("\n    }\n", start) if "\n    }\n" in source[start:] else \
+            source.index("\n    }\r\n", start)
+        assert marker in source[start:end], method
+    panel = (ROOT / "web/js/editor_prompt_panel.js").read_text(encoding="utf-8")
+    assert 'host._stampManagementPanel?.("prompt")' in panel
+    assert 'host._deferManagementPanelRender?.("prompt")' in panel
+    reference = (ROOT / "web/js/editor_reference_panel.js").read_text(encoding="utf-8")
+    assert 'host._stampManagementPanel?.("reference", { laneIndex: state.laneIndex })' in reference
+
+
+def test_a_press_in_the_popup_is_tracked_from_the_moment_it_opens():
+    # The tracker used to be installed by the first scene change, so on a fresh
+    # page the first press in a panel went unseen and a repaint scheduled by
+    # that press's own blur-commit rebuilt the row before its click landed.
+    _run_gesture_node(_POPUP_DOM + """
+        const w = makeWidget();
+        w._isGuideTrackLocked = () => false; w._isGuideTrackHidden = () => false;
+        w._getGuideAsset = () => null; w.totalFrames = 100;
+        w.activeScene = { scene_id: 'scene',
+            guide_frames: [{ guide_id: 'g1', frame_index: 10, asset_id: 'a1', strength: 1 }] };
+        w._showGuideManagementPopup(0, 0);
+        const popup = w._guideManagerEl;
+        const button = all(popup).find((n) => n.tagName === 'BUTTON' && n.textContent === 'Hide');
+        popup.contains = (n) => all(popup).includes(n);
+        for (const h of document.listeners.pointerdown || []) h({ target: button, button: 0 });
+        w.activeScene.guide_frames[0].strength = 0.5;
+        w._runManagementPanelRefresh();
+        assert.equal(w._guideManagerEl, popup);
+        assert.equal(w._managementPanelsPending, true);
+        // A right-button press does not hold it.
+        for (const h of document.listeners.pointerup || []) h({});
+        for (const h of document.listeners.pointerdown || []) h({ target: button, button: 2 });
+        w._runManagementPanelRefresh();
+        assert.notEqual(w._guideManagerEl, popup);
+    """)
+
+
+def test_an_undone_text_edit_repaints_through_the_panels_own_staleness_check():
+    _run_gesture_node(_REPAINT_HOST + """
+        let textStale = false;
+        w._promptPanelHandle.isTextStale = () => textStale;
+        w._runManagementPanelRefresh();
+        assert.equal(refreshes, 0);
+        textStale = true;
+        w._runManagementPanelRefresh();
+        assert.equal(refreshes, 1);
+    """)
+
+
+def test_an_open_attachment_dialog_holds_the_prompt_panel():
+    _run_gesture_node(_REPAINT_HOST + """
+        let dialog = true;
+        // Editors keep their menus mounted and hidden; only a visible one holds.
+        document.querySelectorAll = () => [{ getClientRects: () => [] },
+            { getClientRects: () => (dialog ? [{}] : []) }];
+        w.activeScene.prompt_sections.push({ prompt_id: 'b', start_frame: 10, end_frame: 20 });
+        w._runManagementPanelRefresh();
+        assert.equal(refreshes, 0);
+        assert.equal(w._managementPanelsPending, true);
+        dialog = false;
+        w._runManagementPanelRefresh();
+        assert.equal(refreshes, 1);
+    """)
+
+
+def test_a_deferral_raised_inside_a_run_survives_it():
+    _run_gesture_node(_REPAINT_HOST + """
+        w._promptPanelHandle.refresh = () => { refreshes += 1; w._deferManagementPanelRender('prompt'); };
+        w.activeScene.prompt_sections.push({ prompt_id: 'b', start_frame: 10, end_frame: 20 });
+        w._runManagementPanelRefresh();
+        assert.equal(refreshes, 1);
+        assert.equal(w._managementPanelsPending, true);
+    """)
+
+
+def test_the_prompt_panel_reports_text_staleness_against_its_baseline_and_view():
+    source = (ROOT / "web/js/editor_prompt_panel.js").read_text(encoding="utf-8")
+    assert "return !sameChannelText(now, base, channelKeys)\n                    && !sameChannelText(now, shown, channelKeys);" in source
+    assert "isTextStale: () => mounted && textStaleChecks.some(" in source
+    assert "host._managementPanelBusy?.(body, { selects: false })" in source

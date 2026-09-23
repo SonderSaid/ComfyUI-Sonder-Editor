@@ -1927,6 +1927,9 @@ export class EditorWidget {
             if (ownsHistorySelection) this._restoreHistorySelection(historySelection);
             if (this._pendingHistorySelection === historySelection) this._pendingHistorySelection = null;
         }
+        // Every replacement — fetch, reconcile, history paint, rollback and
+        // adoption, create, duplicate, switch — passes through here.
+        this._refreshOpenManagementPanels("scene");
     }
 
     _refreshDurationInput() {
@@ -4817,6 +4820,200 @@ export class EditorWidget {
         this._buildTrackLayout();
         this._renderTimeline();
         if (viewport) this._renderViewportFrame();
+        this._refreshOpenManagementPanels("local-mutation");
+    }
+
+    // ── Management panel repaint ────────────────────────────────────────
+    //
+    // The Prompt panel, Guide popup and Reference Lane panel draw from the
+    // scene once and were never told when it was replaced beneath them — an
+    // Undo, a refetch, another writer — so they kept showing, and acting on,
+    // what was no longer there. Every scene replacement and local paint now
+    // asks them to repaint, under two gates:
+    //
+    //  * Signature: each panel stamps the scene fields it projects when it
+    //    renders, and is repainted only when they differ. The panel's own
+    //    acknowledged writes are already on screen, so they change nothing —
+    //    which is also what keeps the Prompt panel's chip editors (and their
+    //    undo histories) mounted across a channel save — and a 1 MB scene is
+    //    not rebuilt on every unrelated paint.
+    //  * Activity: a panel holding typed input, or under a pressed pointer, is
+    //    marked pending and repainted once the author leaves it. Never on
+    //    `focusout` itself: a mousedown on another row's button would rebuild
+    //    that row before its click landed.
+
+    /** The scene fields a management panel projects, as a comparable string. */
+    _managementPanelSignature(kind, {
+        laneIndex = this._referencePanelHandle?.laneIndex ?? 0,
+    } = {}) {
+        const scene = this.activeScene;
+        if (!scene) return "";
+        if (kind === "prompt") {
+            // Structure, not channel text: text belongs to mounted editors that
+            // must survive the panel's own saves.
+            return JSON.stringify([scene.scene_id, this._channelTemplate?.()?.id || "",
+                scene.prompt_context_profile_id || "",
+                this._isPromptTrackLocked(), this._isGlobalPromptTrackLocked(),
+                (scene.prompt_sections || []).map((section) => [section.prompt_id || "",
+                    section.start_frame, section.end_frame, !!section.muted,
+                    normalizeChannelExceptions(section.global_channel_exceptions)])]);
+        }
+        if (kind === "guide") {
+            return JSON.stringify([scene.scene_id, this.totalFrames,
+                this._isGuideTrackLocked(), this._isGuideTrackHidden(),
+                (scene.guide_frames || []).map((guide) => [guide.guide_id || "",
+                    guide.frame_index, guide.asset_id || "", guide.source || "",
+                    guide.strength ?? 1, !!guide.muted])]);
+        }
+        if (kind === "reference") {
+            return JSON.stringify([scene.scene_id, laneIndex,
+                (scene.reference_lane_recipes || []).map((recipe) => recipe?.lane_id || ""),
+                scene.reference_lane_recipes?.[laneIndex] || null,
+                // Every lane's config, not only the drawn one: the tabs show
+                // their names and an Undo of a rename must reach them.
+                scene.reference_lane_configs || [],
+                (scene.reference_items || []).filter((item) =>
+                    (item.lane_index || 0) === laneIndex)]);
+        }
+        return "";
+    }
+
+    /** Called by each panel when it has rendered from the current scene. The
+     *  Reference panel passes its lane: while it mounts, its handle is not yet
+     *  the host's. */
+    _stampManagementPanel(kind, options = {}) {
+        (this._managementPanelStamps ||= {})[kind] = this._managementPanelSignature(kind, options);
+    }
+
+    /**
+     * Whether a panel must not be rebuilt right now: a pointer is pressed inside
+     * it, or it holds a control with typed or chosen input. A focused button
+     * holds nothing, so it does not block — otherwise focus left on a button
+     * would defer the repaint indefinitely.
+     */
+    _managementPanelBusy(root, { selects = true } = {}) {
+        if (!root) return false;
+        const pressed = this._managementPointerTarget;
+        if (pressed && root.contains?.(pressed)) return true;
+        const active = document.activeElement;
+        if (!active || !root.contains?.(active)) return false;
+        if (active.isContentEditable) return true;
+        if (active.tagName === "TEXTAREA" || (selects && active.tagName === "SELECT")) return true;
+        return active.tagName === "INPUT" && !["checkbox", "radio", "button", "submit",
+            "reset", "range", "color", "file"].includes(String(active.type || "").toLowerCase());
+    }
+
+    /** A panel deferred one of its own renders while busy: forget its stamp so
+     *  the replay treats it as stale whatever caused the render. */
+    _deferManagementPanelRender(kind) {
+        if (this._managementPanelStamps) delete this._managementPanelStamps[kind];
+        this._managementPanelsPending = true;
+        this._installManagementPanelActivity();
+    }
+
+    /** Ask every open management panel to repaint, at most once per frame. */
+    _refreshOpenManagementPanels(reason = "") {
+        if (!this._managementModalMounted?.()) {
+            this._managementPanelsPending = false;
+            return;
+        }
+        this._installManagementPanelActivity();
+        if (this._managementRefreshScheduled) return;
+        this._managementRefreshScheduled = true;
+        // The next frame, or a short timer when frames are not being produced
+        // (a hidden tab or pane pauses requestAnimationFrame), whichever comes
+        // first; the first one runs the refresh and the other finds nothing to do.
+        let ran = false;
+        const run = () => {
+            if (ran) return;
+            ran = true;
+            this._managementRefreshScheduled = false;
+            this._runManagementPanelRefresh(reason);
+        };
+        if (typeof requestAnimationFrame === "function") requestAnimationFrame(run);
+        setTimeout(run, 50);
+    }
+
+    _runManagementPanelRefresh(_reason = "") {
+        const stamps = this._managementPanelStamps ||= {};
+        // A panel's own refresh inside this run may defer and mark pending;
+        // that must survive the run's own verdict below.
+        this._managementPanelsPending = false;
+        let pending = false;
+        const panels = [
+            ["prompt", this._promptPanelHandle?.isMounted?.() ? this._promptPanelHandle : null,
+                () => this._promptPanelHandle?.element],
+            ["guide", this._guideManagerEl?.isConnected ? this._guideManagerEl : null,
+                () => this._guideManagerEl],
+            ["reference", this._referencePanelHandle, () => this._referencePanelHandle?.element],
+        ];
+        for (const [kind, open, root] of panels) {
+            if (!open) continue;
+            // Channel text is not in the prompt signature -- the panel's own
+            // saves must not rebuild its editors -- so the panel itself says
+            // when a section's text is neither what it last saved nor what it
+            // shows, which is what an Undo of a text edit leaves behind.
+            const stale = this._managementPanelSignature(kind) !== stamps[kind]
+                || (kind === "prompt" && !!this._promptPanelHandle?.isTextStale?.());
+            if (!stale) continue;
+            // An attachment dialog or insert menu opened from the Prompt panel
+            // lives outside it and writes into one of its editors when it
+            // closes. Each editor keeps its menu mounted and hidden, so only a
+            // visible one counts.
+            const dialogOpen = kind === "prompt" && typeof document !== "undefined"
+                && [...(document.querySelectorAll?.(
+                    "[data-sonder-prompt-context-modal='1'],[data-sonder-prompt-context-menu='1']")
+                    || [])].some((element) => (element.getClientRects?.().length ?? 0) > 0);
+            if (dialogOpen || this._managementPanelBusy(root())) {
+                pending = true;
+                continue;
+            }
+            if (kind === "prompt") this._promptPanelHandle.refresh();
+            else if (kind === "reference") this._referencePanelHandle.refresh();
+            else this._rebuildGuideManagementPopup();
+        }
+        this._managementPanelsPending = pending || this._managementPanelsPending;
+    }
+
+    /** Pointer and focus tracking that lets a deferred repaint replay. */
+    _installManagementPanelActivity() {
+        if (this._managementActivityOff || typeof document === "undefined"
+                || typeof document.addEventListener !== "function") return;
+        const replaySoon = () => {
+            if (!this._managementPanelsPending) return;
+            // After the event's own task, so a click that ends this press or a
+            // focus move has landed before anything is rebuilt.
+            setTimeout(() => this._refreshOpenManagementPanels("deferred"), 0);
+        };
+        // Primary presses only: a context-menu press may never deliver its
+        // pointerup to the page, and would then hold the panel busy.
+        const onDown = (event) => {
+            if (Number(event.button) > 0) return;
+            this._managementPointerTarget = event.target || null;
+        };
+        const onUp = () => { this._managementPointerTarget = null; replaySoon(); };
+        const listeners = [["pointerdown", onDown], ["pointerup", onUp],
+            ["pointercancel", onUp], ["focusin", replaySoon], ["focusout", replaySoon],
+            ["visibilitychange", onUp]];
+        for (const [type, handler] of listeners) document.addEventListener(type, handler, true);
+        // Leaving the window mid-press (a native dialog, an app switch) ends it.
+        globalThis.window?.addEventListener?.("blur", onUp);
+        this._managementActivityOff = () => {
+            for (const [type, handler] of listeners) document.removeEventListener(type, handler, true);
+            globalThis.window?.removeEventListener?.("blur", onUp);
+            this._managementActivityOff = null;
+            this._managementPointerTarget = null;
+        };
+    }
+
+    /** Rebuild the guide popup in place, keeping where it was scrolled to. */
+    _rebuildGuideManagementPopup() {
+        const anchor = this._guideManagerAnchor || { x: 0, y: 0 };
+        const scroller = this._guideManagerEl?.firstChild;
+        const scrollTop = scroller?.scrollTop || 0;
+        this._showGuideManagementPopup(anchor.x, anchor.y);
+        const next = this._guideManagerEl?.firstChild;
+        if (next && scrollTop) next.scrollTop = scrollTop;
     }
 
     _buildPlaybackWarmSceneSignature() {
@@ -13795,6 +13992,9 @@ export class EditorWidget {
 
     /** Open (or refresh) the Prompt Management panel. */
     _showPromptManagementPanel() {
+        // Track presses from the moment a panel is open: the first click in it
+        // must count as busy before any scene change schedules a repaint.
+        this._installManagementPanelActivity();
         this._fetchReferences({ force: true, reason: "prompt_context" })
             .then(() => this._promptPanelHandle?.refresh?.())
             .catch(() => {});
@@ -18135,7 +18335,13 @@ export class EditorWidget {
             this._renderTimeline();
             this._renderViewportFrame();
             // Closed while the write was in flight: settle, but do not reopen.
-            if (this._guideManagerEl?.isConnected) this._showGuideManagementPopup(x, y);
+            // Open, it repaints through the same gate as a scene change -- a
+            // press or typed input in the popup is not rebuilt under the
+            // author, and the scroll position is kept -- whether or not the
+            // action changed the scene (a refusal still resets the row).
+            if (!this._guideManagerEl?.isConnected) return;
+            this._deferManagementPanelRender("guide");
+            this._refreshOpenManagementPanels("guide-action");
         };
 
         if (!guides.length) {
@@ -18326,7 +18532,7 @@ export class EditorWidget {
                 try {
                     if (applyGuideSwap(this.activeScene, operation)) {
                         this._renderSceneAfterLocalMutation();
-                        this._showGuideManagementPopup(x, y);
+                        this._rebuildGuideManagementPopup();
                     }
                     await this._runSceneMutation([operation], {
                         key: `guide:${sceneId}:swap`, label: "swap guides",
@@ -18362,7 +18568,7 @@ export class EditorWidget {
                     expected,
                 }]);
                 this._renderSceneAfterLocalMutation();
-                this._showGuideManagementPopup(x, y);
+                this._rebuildGuideManagementPopup();
                 try {
                     await this._runSceneMutation(
                         [{
@@ -18395,6 +18601,9 @@ export class EditorWidget {
         document.body.appendChild(backdrop);
         this._guideManagerEl = backdrop;
         this._guideManagerMouseOff = null;
+        this._guideManagerAnchor = { x, y };
+        this._stampManagementPanel("guide");
+        this._installManagementPanelActivity();
         // Escape through the registry, like every overlay over the timeline:
         // unowned, it reached the editor consumer, which left fullscreen with
         // the popup still on the page. Registered once per open popup.
@@ -24002,6 +24211,7 @@ export class EditorWidget {
         if (!entry || entry.type !== TRACK_TYPE.REFERENCE) return;
         if (!this._referencesLoaded) await this._fetchReferences({ force: true, reason: "reference_lane_panel" });
         this._referencePanelHandle?.close?.();
+        this._installManagementPanelActivity();
         this._referencePanelHandle = mountReferenceLanePanel(this, { laneIndex: entry.laneIndex || 0 });
     }
 
@@ -25233,6 +25443,8 @@ export class EditorWidget {
         this._hideGuideHoverPreview();
         this._hidePromptHoverPreview();
         if (this._promptPanelHandle) { this._promptPanelHandle.cleanup(); this._promptPanelHandle = null; }
+        this._referencePanelHandle?.close?.();
+        this._managementActivityOff?.();
         if (this._contextMenuMouseOff) { this._contextMenuMouseOff(); this._contextMenuMouseOff = null; }
         if (this._focusHandler) {
             document.removeEventListener("mousedown", this._focusHandler, true);

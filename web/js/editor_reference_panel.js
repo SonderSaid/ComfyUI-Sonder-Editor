@@ -1640,6 +1640,9 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             state.laneIndex = entries[0].laneIndex || 0;
         }
         drawLane(state.laneIndex);
+        // What this render projects, so the host's scene-change repaint can
+        // tell a real change from this panel's own acknowledged write.
+        host._stampManagementPanel?.("reference", { laneIndex: state.laneIndex });
         subtitle.textContent = laneLocked()
             ? "Lane locked — unlock it on the timeline header to edit"
             : "Recipe values, staged items and their Library members";
@@ -1729,6 +1732,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
     document.body.appendChild(backdrop);
 
     const handle = {
+        element: backdrop,
         close,
         /** Repaint from the current scene, staying on the lane that was shown —
          *  by its durable id, since an Undo can move it to another index — and
