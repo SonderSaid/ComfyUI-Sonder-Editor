@@ -264,7 +264,7 @@ ComfyUI.
   system ffmpeg takes precedence over the bundled one, so an older system
   install must be updated or removed from `PATH`.
 - `torch` is provided by ComfyUI and is **not** installed by this pack (see
-  [Troubleshooting](#troubleshooting)).
+  [Troubleshooting](docs/troubleshooting.md)).
 
 ## Installation
 
@@ -333,6 +333,8 @@ latent noise masks so a window can be regenerated in place.
   tracked metadata, inspect/compare, timeline export, and audio fidelity.
 - **[References](docs/references.md)** — the Reference Library, Reference
   lanes and recipes, derived prompts, and the Reference nodes.
+- **[Troubleshooting](docs/troubleshooting.md)** — installation and
+  environment problems, project storage and Windows path limits, and playback.
 
 ## Example projects
 
@@ -362,63 +364,8 @@ It includes four scenes with their media, prompts, guides, and generated takes.
 
 ## Troubleshooting
 
-**An older Sonder version refuses a project saved by a newer one.**
-This version stores durable components under shorter full-hash filenames.
-Format-2 projects migrate automatically on their next version-bumping save;
-reading a project does not migrate it. Once migrated to storage format 3,
-the project requires this version or newer. Keep the complete project folder, including
-`state/`, when moving it. Shorter paths prevent future path-length failures;
-they cannot repair a project that already fails to open at its current location.
-Use a shallower folder to open and migrate such a project first.
-
-**Video does not play in the editor when ComfyUI runs with `--disable-api-nodes`.**
-That option makes ComfyUI replace the editor's content security policy with one
-that blocks the video the editor loads for playback. Start ComfyUI without it.
-
-**The Editor is blank or shows raw controls after installing through Manager.**
-After Manager finishes restarting ComfyUI, refresh the browser page as well
-(`F5` or `Ctrl+R`). A backend restart can leave the open page without the
-newly installed frontend extensions initialized. Refreshing the page loads
-the Editor interface.
-
-**`torch` / `torchaudio` got reinstalled and GPU stopped working.**
-ComfyUI ships a torch build matched to your GPU/CUDA. This pack intentionally
-does **not** list `torch`/`torchaudio` in its requirements so an automatic
-`pip install` can't overwrite that build with a mismatched (often CPU-only)
-wheel. Sonder's audio decode, mixing and export use FFmpeg. An optional waveform
-thumbnail fallback can use ComfyUI's existing `torchaudio` installation.
-
-**`cv2` import errors after installing another custom node.**
-This pack uses `opencv-python-headless` (no GUI dependencies, correct for a
-server). Some other custom nodes install the full `opencv-python` package, and
-the two conflict — whichever was installed last wins, and the other's `cv2` can
-break. If you hit this, pick one variant for your whole environment (headless is
-the safe choice for ComfyUI) and reinstall it so it's the only OpenCV present.
-
-**`ffmpeg` not found / export or decode fails.**
-Install FFmpeg **7.0 or newer** and make sure it's on your `PATH`, then restart ComfyUI.
-Audio preparation checks the selected binary; an older system installation takes
-precedence over the bundled binary and must be updated or removed from `PATH`. The
-bundled `imageio-ffmpeg` binary is used as a fallback, but a system ffmpeg is
-more capable across formats.
-
-**An export says the files were saved but registration could not be confirmed.**
-The exported video and audio are finished and safe — the message names their
-paths inside the project. Only the project bookkeeping failed, so press
-**Refresh** in the gallery and the files are registered as basic assets; their
-generation details and automatic take placement are not recovered. On Windows
-this is usually the 260-character path limit, which the message calls out when
-it can detect it: move or rename the project so its folder path is shorter, or
-enable Long Path support in Windows, then export again.
-
-**I can't link a project on another drive or a UNC share.**
-Enable **Allow External Project Links** in Editor Settings first, then use
-**Link project folder...** from the project menu and paste the server-visible
-path. Local Windows drives use a junction without elevated privileges; UNC
-paths need a true symlink, which requires Windows Developer Mode or an elevated
-ComfyUI process. Do not toggle the setting while a render or Save Bridge job is
-in flight; its finalization safely remains pending until the matching path is
-trusted again.
+Installation, project storage and playback fixes are in
+[Troubleshooting](docs/troubleshooting.md).
 
 ## License
 
