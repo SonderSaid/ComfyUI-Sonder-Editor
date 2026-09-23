@@ -3343,7 +3343,14 @@ def test_fps_change_is_not_recorded_until_scene_history_is_timebase_aware():
     assert "_discardLastUndo" not in update_fps
 
 
-def test_coalesced_scene_mutation_stamps_only_its_latest_correlated_undo_entry():
+def test_coalesced_scene_mutation_stamps_only_its_oldest_undo_entry():
+    """A merged slot owns one entry, the oldest, even with no caller `merge`.
+
+    The newer member's before-snapshot already holds the older member's paint,
+    so only the oldest reverses the whole write. With no `merge` the queue once
+    replaced the queued value wholesale, entry included, so the entry it kept
+    was the one the gesture had just discarded -- Undo then dropped the burst.
+    """
     widget = _source("web/js/editor_widget.js")
     queue_method = _method(widget, "_queueProjectMutation", "_runSceneMutation")
     history_methods = _method(widget, "_pushUndo", "_commitUndoEntry")
@@ -3381,17 +3388,21 @@ await h._queueProjectMutation({{key:"scene:later",label:"later",
   run:async(intent)=>({{payload:{{scene:{{scene_id:"scene",value:intent.value}}}}}})}});
 console.log(JSON.stringify({{
   firstClaimed:first._postSnapshotCaptureClaimed===true,
-  firstStamped:Object.hasOwn(first,"postSnapshot"),
+  firstSnapshot:first.snapshot.value,
+  firstPost:first.postSnapshot,
   firstPresent:h._undoStack.includes(first),
-  secondPost:second.postSnapshot,
+  secondStamped:Object.hasOwn(second,"postSnapshot"),
+  secondPresent:h._undoStack.includes(second),
   orphanStamped:Object.hasOwn(orphan,"postSnapshot"),
 }}));
 """)
     assert result == {
         "firstClaimed": True,
-        "firstStamped": False,
-        "firstPresent": False,
-        "secondPost": {"scene_id": "scene", "value": 2},
+        "firstSnapshot": 0,
+        "firstPost": {"scene_id": "scene", "value": 2},
+        "firstPresent": True,
+        "secondStamped": False,
+        "secondPresent": False,
         "orphanStamped": False,
     }
 
@@ -4714,7 +4725,7 @@ class QueueHarness {{
 {queue_mutation}
   constructor(){{this._sceneMutationInvalidationSeq=0;this._queueFetchSeq=0;
     this._projectMutationQueue=new ProjectMutationQueue();
-    this._pendingHistoryEntryByMutationKey=new Map();this._undoStack=[stamped];}}
+    this._undoStack=[stamped];}}
   _claimHistoryPostSnapshotCapture(){{return null;}}
   _historyOrderedSceneForContext(){{return null;}}
   _recordHistoryOrderedScene(){{}} _stampHistoryPostSnapshot(){{}}
@@ -5016,7 +5027,7 @@ class Harness {{
 {rebase}
 {queue_mutation}
   constructor(){{this._sceneMutationInvalidationSeq=0;this._queueFetchSeq=0;
-    this._projectMutationQueue=new ProjectMutationQueue();this._pendingHistoryEntryByMutationKey=new Map();}}
+    this._projectMutationQueue=new ProjectMutationQueue();}}
   _claimHistoryPostSnapshotCapture(){{return null;}}
   _stampHistoryPostSnapshot(){{}}
   _historyOrderedSceneForContext(context,sceneId){{return context?.scenes?.get(sceneId)||null;}}
@@ -5090,7 +5101,7 @@ class Harness {{
 {queue_mutation}
   constructor(){{this._sceneMutationInvalidationSeq=0;this._queueFetchSeq=0;
     this._projectMutationQueue=new ProjectMutationQueue();
-    this._pendingHistoryEntryByMutationKey=new Map();}}
+    }}
   _claimHistoryPostSnapshotCapture(){{return null;}}
   _stampHistoryPostSnapshot(){{}}
   _historyOrderedSceneForContext(context,sceneId){{return context?.scenes?.get(sceneId)||null;}}
@@ -5146,7 +5157,7 @@ class Harness {{
 {queue_mutation}
   constructor(){{this._sceneMutationInvalidationSeq=0;this._queueFetchSeq=0;
     this._projectMutationQueue=new ProjectMutationQueue();
-    this._pendingHistoryEntryByMutationKey=new Map();}}
+    }}
   _claimHistoryPostSnapshotCapture(){{return null;}}
   _stampHistoryPostSnapshot(){{}}
   _historyOrderedSceneForContext(context,sceneId){{return context?.scenes?.get(sceneId)||null;}}
@@ -5383,7 +5394,7 @@ class Harness {{
 {queue_mutation}
   constructor(){{this._sceneMutationInvalidationSeq=0;this._queueFetchSeq=0;
     this._projectMutationQueue=new ProjectMutationQueue();
-    this._pendingHistoryEntryByMutationKey=new Map();this.stamps=[];
+    this.stamps=[];
     this._latestHistoryOrderContext={{scenes:new Map([["scene",before]])}};}}
   _snapshotProjectMutationContext(){{return {{projectId:"project",sceneId:"scene"}};}}
   _claimHistoryPostSnapshotCapture(){{return null;}}
@@ -5797,7 +5808,7 @@ class Harness {{
 {queue_mutation}
   constructor(){{this._sceneMutationInvalidationSeq=0;this._queueFetchSeq=0;
     this._projectMutationQueue=new ProjectMutationQueue();
-    this._pendingHistoryEntryByMutationKey=new Map();}}
+    }}
   _claimHistoryPostSnapshotCapture(){{return null;}}
   _stampHistoryPostSnapshot(){{}}
   _historyOrderedSceneForContext(context,sceneId){{return context?.scenes?.get(sceneId)||null;}}
@@ -5840,7 +5851,7 @@ class Harness {{
 {queue_mutation}
   constructor(){{this._sceneMutationInvalidationSeq=0;this._queueFetchSeq=0;
     this._projectMutationQueue=new ProjectMutationQueue();
-    this._pendingHistoryEntryByMutationKey=new Map();this._undoStack=[failed,newer];}}
+    this._undoStack=[failed,newer];}}
   _claimHistoryPostSnapshotCapture(){{return null;}}
   _historyOrderedSceneForContext(){{return null;}}
   _recordHistoryOrderedScene(){{}}
@@ -6232,7 +6243,7 @@ globalThis.notifyError=()=>{{}};globalThis.notifyWarning=()=>{{}};
 class Harness {{
 {queue_mutation}
   constructor(){{this._sceneMutationInvalidationSeq=0;this._queueFetchSeq=0;
-    this._projectMutationQueue=new ProjectMutationQueue();this._pendingHistoryEntryByMutationKey=new Map();}}
+    this._projectMutationQueue=new ProjectMutationQueue();}}
   _claimHistoryPostSnapshotCapture(){{return null;}}
   _stampHistoryPostSnapshot(){{}}
   _historyOrderedSceneForContext(){{return null;}}

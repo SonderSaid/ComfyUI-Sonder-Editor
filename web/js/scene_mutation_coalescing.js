@@ -569,8 +569,9 @@ export function coalesceSceneMutationOperations(olderOperations, newerOperations
  * Reads its FIRST argument, which is what makes it an effective merge by the
  * tripwire's definition and by the queue's: `merge(existing.intent, intent)`.
  * Everything outside `operations` is taken from the newer intent, because the
- * surviving request is the newer gesture's — it carries that gesture's scene and
- * project identity, and the queue has already adopted its history entry.
+ * surviving request carries the newer gesture's scene and project identity.
+ * History is not decided here: `_queueProjectMutation` wraps this merge and
+ * keeps the slot's OLDEST undo entry with it.
  */
 export function coalesceSceneMutationIntents(olderIntent, newerIntent) {
     if (!olderIntent?.operations) return newerIntent;

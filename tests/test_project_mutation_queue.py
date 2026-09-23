@@ -191,6 +191,49 @@ def test_history_barrier_seals_same_key_coalescing_order():
     """)
 
 
+def test_only_the_tail_slot_coalesces_and_coalesce_target_agrees_with_enqueue():
+    """A, X, A behind an active write is three slots; A, A is one.
+
+    `coalesceTarget` is the question the widget asks before it enqueues, so it
+    must answer exactly as `enqueue` then acts -- including null for a refused
+    merge, a sealing write and an inline owner-token write.
+    """
+    queue_url = (ROOT / "web" / "js" / "project_mutation_queue.js").as_uri()
+    _run_node(f"""
+        import assert from 'node:assert/strict';
+        import {{ ProjectMutationQueue }} from {queue_url!r};
+
+        const queue = new ProjectMutationQueue();
+        const calls = [];
+        let releaseActive, ownerToken;
+        const active = queue.enqueue({{
+            key: 'active',
+            run: async (_intent, _diagnostics, token) => {{
+                ownerToken = token;
+                await new Promise((resolve) => {{ releaseActive = resolve; }});
+            }},
+        }});
+        await Promise.resolve();
+        const run = async (intent) => calls.push(intent);
+        const writes = [queue.enqueue({{ key: 'A', intent: 'a1', run }})];
+        assert.equal(queue.coalesceTarget('A')?.intent, 'a1');
+        assert.equal(queue.coalesceTarget('A', {{ coalesce: false }}), null);
+        assert.equal(queue.coalesceTarget('A', {{ sealCoalescing: true }}), null);
+        assert.equal(queue.coalesceTarget('A', {{ ownerToken }}), null,
+            'an inline write never merges');
+        writes.push(queue.enqueue({{ key: 'X', intent: 'x', run }}));
+        assert.equal(queue.coalesceTarget('A'), null,
+            'a pending A that is not the tail is not a merge target');
+        writes.push(queue.enqueue({{ key: 'A', intent: 'a2', run }}));
+        assert.equal(queue.coalesceTarget('A')?.intent, 'a2');
+        writes.push(queue.enqueue({{ key: 'A', intent: 'a3', run }}));
+        releaseActive();
+        await Promise.all([active, ...writes]);
+        assert.deepEqual(calls, ['a1', 'x', 'a3'],
+            'A, X, A is three writes in authoring order; the tail A absorbs a3');
+    """)
+
+
 def test_owner_token_reentrancy_is_identity_scoped_and_missing_token_deadlocks():
     queue_url = (ROOT / "web" / "js" / "project_mutation_queue.js").as_uri()
     _run_node(f"""
@@ -1613,10 +1656,18 @@ def _header_visibility_burst(clicks: int) -> str:
         w._reconcileSelection = () => {};
         w._buildTrackLayout = () => {};
         w._updateToolbar = () => {};
-        // Real entry objects, so `historyEntry`, `_pendingHistoryEntryByMutationKey`
-        // and the `willCoalesce` discard are all live rather than inert.
+        // Real entry objects, so `historyEntry`, the slot's surviving entry
+        // and the joiner's discard are all live rather than inert.
+        // On a stack, as in the widget: a slot is joined only while its entry
+        // is on the undo stack with nothing but the joiner's own above it.
         const discarded = [];
-        w._discardUndoEntry = (target) => { discarded.push(target); return true; };
+        w._undoStack = [];
+        w._discardUndoEntry = (target) => {
+            discarded.push(target);
+            const at = w._undoStack.indexOf(target);
+            if (at >= 0) w._undoStack.splice(at, 1);
+            return true;
+        };
         const fetches = [];
         w._fetchScenes = async (options) => { fetches.push(options || {}); };
         const entries = [];
@@ -1643,6 +1694,7 @@ def _header_visibility_burst(clicks: int) -> str:
             const index = pending.length;
             const undoEntry = { label: 'toggle track visibility', index };
             entries.push(undoEntry);
+            w._undoStack.push(undoEntry);
             pending.push(w._applyHeaderVisibilityBulkWithinGesture([entry], hidden,
                 { undoEntry }).then(() => settled.push(index)));
         };
@@ -1721,15 +1773,11 @@ def test_two_lanes_do_not_share_a_visibility_write():
     """Two clicks on DIFFERENT lane headers are two edits, not one.
 
     The key names the lanes, not just the scene. Merging across lanes would
-    collapse two undo entries into one, and `_queueProjectMutation`'s merge
-    keeps the NEWEST entry -- whose before-state was captured after the first
-    click already painted. The survivor's reverse delta would then cover only
-    the last lane, and because `video_lane_family` is an atomic bundle in
-    `server/scene_history_merge.py` the stranded lane makes the NEXT entry's
-    restore raise `SceneMergeConflict` rather than merely not reverse it.
+    collapse two undo entries into one: a merged slot keeps only its oldest
+    entry, so one Ctrl+Z would revert both lanes.
 
     So the assertion is two writes, and it is a regression guard rather than a
-    performance one: the cost of getting this wrong is a blocked Ctrl+Z.
+    performance one: the cost of getting this wrong is a lost Undo step.
     """
     _run_gesture_node("""
         const w = makeWidget(), sent = [];
@@ -1839,16 +1887,26 @@ def test_a_coalesced_burst_discards_each_superseded_entry_by_exact_object():
     match to get: `_discardLastUndo("toggle track visibility")` would pop
     whatever happened to be on top, which after queue interleaving can be a
     newer gesture's entry entirely.
+
+    The survivor is the pending slot's OLDEST entry, click 2: its before-state
+    is the only one taken before any member of the slot painted, so it alone
+    reverses the whole merged write. It is also the one stamped from that write.
     """
-    _run_gesture_node(_header_visibility_burst(6) + """
+    _run_gesture_node(_header_visibility_burst(6).replace(
+        "const discarded = [];",
+        "const discarded = [], stamped = [];\n"
+        "        w._stampHistoryPostSnapshot = (entry) => { if (entry) stamped.push(entry); };") + """
         assert.equal(discarded.length, 4,
             `expected four superseded entries, got ${discarded.length}`);
-        assert.deepEqual(discarded.map((one) => one.index), [1, 2, 3, 4],
-            'the discarded entries must be clicks 2-5 -- click 1 was already '
-            + 'dispatched and click 6 is the survivor');
+        assert.deepEqual(discarded.map((one) => one.index), [2, 3, 4, 5],
+            'the discarded entries must be clicks 3-6 -- click 1 was already '
+            + 'dispatched and click 2 opened the pending slot, so it survives');
         // By identity, not by label: every discarded object is the exact entry
         // that gesture authored.
-        assert.ok(discarded.every((one, at) => one === entries[at + 1]));
+        assert.ok(discarded.every((one, at) => one === entries[at + 2]));
+        assert.deepEqual(stamped.map((one) => one.index), [0, 1],
+            'each write stamps exactly its own slot entry: click 1, then click 2 '
+            + 'from the merged write');
     """)
 
 
@@ -1871,6 +1929,459 @@ def test_a_failed_coalesced_burst_refetches_once():
         assert.equal(fetches[0].reason, 'header_visibility_error');
         assert.deepEqual(settled.slice().sort((a, b) => a - b), [0, 1, 2, 3, 4, 5],
             'every gesture must settle even though the write failed');
+    """)
+
+
+# The widget's own undo stack, claim and stamp, so which entry a merged slot
+# keeps -- and what it is stamped with -- is the shipped behaviour.
+_REAL_HISTORY = """
+        Object.assign(w, {
+            _pushUndo: EditorWidget.prototype._pushUndo,
+            _claimHistoryPostSnapshotCapture:
+                EditorWidget.prototype._claimHistoryPostSnapshotCapture,
+            _stampHistoryPostSnapshot: EditorWidget.prototype._stampHistoryPostSnapshot,
+            _undoStack: [], _redoStack: [], _maxUndoSteps: 50, _historyStackRevision: 0,
+            _trimUndoStack() {}, _clearRedoForNewEdit() {},
+            _replayDeferredHistoryWidgetStateIfIdle() {},
+        });
+"""
+
+
+def _lane_config_burst(body: str) -> str:
+    """Lane lock and rename through the real save, behind one in-flight write.
+
+    The server applies each `update_lane_config` in order and answers with the
+    whole scene, so every entry is stamped from the write that carried it.
+    `assertChain` is the property the wedge broke: each surviving entry's
+    before-state is the previous one's after-state, and the last one's
+    after-state is what the server holds. Then every Undo reverses exactly its
+    own write, and none restores a lane state the server never held -- which is
+    what a phantom entry does, and what makes the Undo after it refuse.
+    """
+    return """
+        const w = makeWidget();
+    """ + _REAL_HISTORY + """
+        const blank = () => ({name:'', color:'', locked:false, hidden:false});
+        w.activeScene = {scene_id:'scene', video_lane_count:3,
+            video_lane_configs:[blank(), blank(), blank()]};
+        w._laneTypeForEntry = () => 'video';
+        w._defaultLaneConfig = blank;
+        const server = structuredClone(w.activeScene);
+        const sent = [];
+        let release = null;
+        w._runSceneMutation = (operations, options) => w._queueProjectMutation({
+            ...options, refreshScenes:false, intent:{sceneId:'scene', operations},
+            run: async (intent) => {
+                sent.push({key: options.key, operations: intent.operations});
+                if (sent.length === 1) await new Promise(r => { release = r; });
+                for (const op of intent.operations) {
+                    server.video_lane_configs[op.lane_index] = {
+                        ...server.video_lane_configs[op.lane_index], ...op.fields};
+                }
+                return {payload:{scene: structuredClone(server)}};
+            },
+        });
+        const lanes = [0, 1, 2].map((laneIndex) => ({
+            type:'video', laneIndex, customName:'', color:'', locked:false, hidden:false}));
+        const pending = [];
+        // The header's lock case: push, flip, save -- synchronously, so the
+        // save claims the entry the way the canvas handler's does.
+        const lock = (...targets) => {
+            w._pushUndo('toggle track lock');
+            const next = !targets[0].locked;
+            for (const target of targets) target.locked = next;
+            pending.push(w._saveLaneConfigWithinGesture(targets));
+        };
+        // A rename owns no undo entry.
+        const rename = (target, name) => {
+            target.customName = name;
+            pending.push(w._saveLaneConfigWithinGesture([target]));
+        };
+        const tick = () => new Promise(r => setTimeout(r, 0));
+        const settle = async () => {
+            await tick();
+            release();
+            await Promise.all(pending);
+            await tick();
+        };
+        const configs = (scene) => scene.video_lane_configs.map(
+            (config) => [config.name || '', !!config.locked]);
+        const assertChain = () => {
+            const entries = w._undoStack;
+            assert.ok(entries.length > 0);
+            assert.ok(entries.every((entry) => entry.postSnapshot),
+                'every surviving entry must be stamped');
+            for (let at = 1; at < entries.length; at += 1) {
+                assert.deepEqual(configs(entries[at].snapshot),
+                    configs(entries[at - 1].postSnapshot),
+                    `entry ${at} must begin where entry ${at - 1} ended`);
+            }
+            assert.deepEqual(configs(entries.at(-1).postSnapshot), configs(server),
+                'the newest entry must end where the server is');
+        };
+    """ + body
+
+
+def test_three_lanes_locked_behind_a_write_keep_three_undo_steps():
+    """The measured wedge: one scene-wide key merged the locks of two lanes.
+
+    The merged write kept the NEWEST entry, whose before-state already held the
+    older lock's paint, so the older lane was changed with no entry naming it
+    and the next Undo was refused. Per-lane keys give each lane its own slot.
+    """
+    _run_gesture_node(_lane_config_burst("""
+        lock(lanes[0]);
+        await tick();
+        lock(lanes[1]);
+        lock(lanes[2]);
+        await settle();
+        assert.equal(sent.length, 3, 'one write per lane');
+        assert.deepEqual(sent.map((write) => write.operations.map((op) => op.lane_index)),
+            [[0], [1], [2]]);
+        assert.equal(new Set(sent.map((write) => write.key)).size, 3,
+            'each lane enqueues under its own key');
+        assert.equal(w._undoStack.length, 3, 'one Undo step per lane');
+        assertChain();
+    """))
+
+
+def test_an_even_count_lock_burst_on_one_lane_leaves_no_phantom_entry():
+    """Lock/unlock one lane four times behind a write.
+
+    Four toggles are one slot and one entry. Kept newest, that entry's
+    before-state was the lane LOCKED by the third toggle's paint -- a state the
+    server never held -- so its Undo would lock the lane. Kept oldest, it begins
+    where the in-flight write ends.
+    """
+    _run_gesture_node(_lane_config_burst("""
+        lock(lanes[0]);
+        await tick();
+        for (let toggle = 0; toggle < 4; toggle += 1) lock(lanes[1]);
+        await settle();
+        assert.equal(sent.length, 2, 'the four toggles collapse into one write');
+        assert.equal(sent[1].operations[0].fields.locked, false,
+            'the merged write carries the last toggle');
+        assert.equal(w._undoStack.length, 2);
+        assertChain();
+    """))
+
+
+def test_a_rename_then_a_lock_on_one_lane_keep_the_locks_undo_step():
+    """An entry-less rename opens the slot; the lock that joins it owns it."""
+    _run_gesture_node(_lane_config_burst("""
+        lock(lanes[0]);
+        await tick();
+        rename(lanes[1], 'Hero');
+        lock(lanes[1]);
+        await settle();
+        assert.equal(sent.length, 2);
+        assert.equal(w._undoStack.length, 2,
+            'the lock that joined the rename slot must keep its entry');
+        const entry = w._undoStack[1];
+        assert.equal(entry.label, 'toggle track lock');
+        assert.deepEqual(configs(entry.postSnapshot)[1], ['Hero', true]);
+        assert.deepEqual(configs(entry.snapshot)[1], ['Hero', false],
+            'the rename is not history, so the entry reverses only the lock');
+    """))
+
+
+def test_a_lock_then_a_rename_on_one_lane_keep_the_locks_undo_step():
+    """The lock opens the slot; the entry-less rename that joins it takes nothing.
+
+    The old per-key map discarded the lock's entry when the rename joined, and
+    the rename brought none, so the lock had no Undo at all. The lock's entry now
+    covers the rename as well, so its Undo reverts both -- deliberately: kept
+    out of the slot, the rename would be a lane write no entry reverses, which
+    strands the lane family and refuses every earlier lane Undo.
+    """
+    _run_gesture_node(_lane_config_burst("""
+        lock(lanes[0]);
+        await tick();
+        lock(lanes[1]);
+        rename(lanes[1], 'Hero');
+        await settle();
+        assert.equal(sent.length, 2);
+        assert.equal(w._undoStack.length, 2);
+        const entry = w._undoStack[1];
+        assert.equal(entry.label, 'toggle track lock');
+        assert.deepEqual(configs(entry.snapshot)[1], ['', false]);
+        assert.deepEqual(configs(entry.postSnapshot)[1], ['Hero', true],
+            'the entry covers the rename that joined its slot');
+        assertChain();
+    """))
+
+
+def _stack_order_burst(body: str) -> str:
+    """Same-key writes through the real queue and history, first write held."""
+    return """
+        const w = makeWidget();
+    """ + _REAL_HISTORY + """
+        w.activeScene = {scene_id:'scene', value:0, other:0};
+        const server = {scene_id:'scene', value:0, other:0};
+        const sent = [];
+        let release = null;
+        const write = (key, field, value) => {
+            w.activeScene[field] = value;
+            return w._queueProjectMutation({key, refreshScenes:false,
+                intent:{sceneId:'scene', field, value},
+                run: async (intent) => {
+                    sent.push([intent.payload?.field ?? intent.field,
+                        intent.payload?.value ?? intent.value]);
+                    if (sent.length === 1) await new Promise(r => { release = r; });
+                    server[intent.field] = intent.value;
+                    return {payload:{scene: structuredClone(server)}};
+                }});
+        };
+        const tick = () => new Promise(r => setTimeout(r, 0));
+    """ + body
+
+
+def test_a_slot_is_not_joined_past_another_gestures_undo_entry():
+    """Oldest on the undo STACK, not first enqueued.
+
+    A drag pushes its entry at mousedown and enqueues at mouseup. A same-key
+    edit made during the drag must not join the slot opened before it: the
+    merged write would land ahead of the drag's, the drag's entry would be
+    stamped after that edit, and Undo of the drag would revert it too -- then
+    the slot's own entry would reverse nothing.
+    """
+    _run_gesture_node(_stack_order_burst("""
+        const pending = [];
+        w._pushUndo('in flight'); pending.push(write('scene:other', 'other', 1));
+        await tick();
+        w._pushUndo('first'); pending.push(write('scene:value', 'value', 1));
+        const drag = w._pushUndo('drag');          // mousedown: entry, no write yet
+        w.activeScene.other = 2;                   // the drag paints
+        w._pushUndo('second'); pending.push(write('scene:value', 'value', 2));
+        // mouseup: the drag's own write, claiming its entry explicitly
+        pending.push(w._queueProjectMutation({key:'scene:drag', historyEntry: drag,
+            refreshScenes:false, intent:{sceneId:'scene', field:'other', value:2},
+            run: async (intent) => {
+                sent.push([intent.field, intent.value]);
+                server.other = 2;
+                return {payload:{scene: structuredClone(server)}};
+            }}));
+        release();
+        await Promise.all(pending);
+        assert.deepEqual(w._undoStack.map((entry) => entry.label),
+            ['in flight', 'first', 'drag', 'second'],
+            'the edit made during the drag keeps its own entry');
+        assert.equal(sent.length, 4, 'and its own write');
+        assert.ok(w._undoStack.every((entry) => entry.postSnapshot));
+        assert.deepEqual(w._undoStack[1].postSnapshot.value, 1,
+            "the first edit's entry reverses only the first edit");
+    """))
+
+
+def test_a_slot_whose_entry_left_the_stack_is_not_joined():
+    """A scene switch clears the stack; a joiner must keep its live entry.
+
+    Discarding it in favour of the slot's dead entry would leave the joiner's
+    change with no Undo at all.
+    """
+    _run_gesture_node(_stack_order_burst("""
+        const pending = [];
+        w._pushUndo('in flight'); pending.push(write('scene:other', 'other', 1));
+        await tick();
+        w._pushUndo('first'); pending.push(write('scene:value', 'value', 1));
+        w._undoStack.length = 0;                   // e.g. the scene was switched
+        const live = w._pushUndo('second'); pending.push(write('scene:value', 'value', 2));
+        release();
+        await Promise.all(pending);
+        assert.deepEqual(w._undoStack, [live]);
+        assert.equal(live.postSnapshot?.value, 2, 'the joiner keeps and stamps its entry');
+    """))
+
+
+def test_a_different_key_between_two_members_keeps_authoring_order():
+    """Tail-only: A, X, A is three writes in that order, never A+A then X.
+
+    Merging the second A into the first slot sent it ahead of X, which was
+    authored before it. X's entry was then stamped after the second A's change
+    and its Undo reverted that change too, and the Undo after X's refused.
+    """
+    _run_gesture_node(_lane_config_burst("""
+        lock(lanes[0]);
+        await tick();
+        lock(lanes[1]);
+        lock(lanes[2]);
+        lock(lanes[1]);
+        await settle();
+        assert.deepEqual(sent.map((write) => write.operations[0].lane_index),
+            [0, 1, 2, 1], 'physical write order must equal authoring order');
+        assert.equal(w._undoStack.length, 4);
+        assertChain();
+    """))
+
+
+def test_a_failed_merged_write_discards_only_its_slots_entry():
+    """The slot's entry goes with its write; entries of other slots stay."""
+    _run_gesture_node(_lane_config_burst("""
+        w._fetchScenes = async () => {};
+        w._buildTrackLayout = () => {};
+        const run = w._runSceneMutation;
+        w._runSceneMutation = (operations, options) => {
+            if (operations[0].lane_index !== 1) return run(operations, options);
+            return w._queueProjectMutation({...options, refreshScenes:false,
+                intent:{sceneId:'scene', operations},
+                run: async () => { throw new Error('refused'); }});
+        };
+        lock(lanes[0]);
+        await tick();
+        lock(lanes[1]);
+        lock(lanes[1]);
+        lock(lanes[2]);
+        await settle();
+        assert.deepEqual(w._undoStack.map((entry) => entry.snapshot.video_lane_configs
+            .map((config) => !!config.locked)), [
+                [false, false, false],
+                [true, false, false],
+            ], 'lane 0 and lane 2 keep their entries; lane 1 keeps none');
+        assert.ok(w._undoStack.every((entry) => entry.postSnapshot));
+    """))
+
+
+def test_the_inline_owner_token_path_never_discards_a_pending_entry():
+    """A nested write owned by the running slot runs inline and merges nothing.
+
+    A pending slot under the same key is not its target. Asking only "is this
+    key pending" discarded that slot's entry and told its gesture it had lost
+    headship, for a write that never joined it.
+    """
+    _run_gesture_node("""
+        const w = makeWidget();
+    """ + _REAL_HISTORY + """
+        w.activeScene = {scene_id:'scene', value:0};
+        let release = null, superseded = 0;
+        let inline = null;
+        const outer = w._queueProjectMutation({key:'scene:outer', refreshScenes:false,
+            intent:{sceneId:'scene'},
+            run: async (_intent, _diagnostics, ownerToken) => {
+                await new Promise(r => { release = r; });
+                inline = w._queueProjectMutation({key:'scene:value', ownerToken,
+                    refreshScenes:false, intent:{sceneId:'scene'},
+                    onSupersededByCoalescing: () => { superseded += 1; },
+                    run: async () => ({payload:{scene:{scene_id:'scene', value:'inline'}}})});
+                await inline;
+                return {payload:{scene:{scene_id:'scene', value:'outer'}}};
+            }});
+        await new Promise(r => setTimeout(r, 0));
+        const queued = w._pushUndo('queued edit');
+        const pendingWrite = w._queueProjectMutation({key:'scene:value', refreshScenes:false,
+            intent:{sceneId:'scene'},
+            run: async () => ({payload:{scene:{scene_id:'scene', value:'queued'}}})});
+        release();
+        await Promise.all([outer, pendingWrite]);
+        assert.equal(superseded, 0, 'the inline write joined nothing');
+        assert.ok(w._undoStack.includes(queued), 'the pending slot keeps its entry');
+        assert.equal(queued.postSnapshot.value, 'queued');
+    """)
+
+
+def test_a_duration_burst_behind_a_write_undoes_to_the_original_in_one_step():
+    """A coalescer with no `merge` still keeps and stamps its oldest entry.
+
+    Without the always-wrapped merge the queue replaced the queued value
+    wholesale -- the entry with it -- so the slot kept the newest member's
+    entry, which the gesture had just discarded. Undo then dropped the burst as
+    unstampable and the duration could not be undone at all.
+    """
+    _run_gesture_node("""
+        const w = makeWidget();
+    """ + _REAL_HISTORY + """
+        w.activeScene = {scene_id:'scene', duration_frames:100};
+        w.totalFrames = 100;
+        for (const name of ['_clampTimelineStateToDuration', '_refreshDurationInput',
+                '_updateToolbar', '_updateTransportUI']) w[name] = () => {};
+        const server = {scene_id:'scene', duration_frames:100};
+        const sent = [];
+        let release = null;
+        w._runSceneMutation = (operations, options) => w._queueProjectMutation({
+            ...options, refreshScenes:false, intent:{sceneId:'scene', operations},
+            run: async (intent) => {
+                sent.push(intent.operations);
+                if (sent.length === 1) await new Promise(r => { release = r; });
+                Object.assign(server, intent.operations[0].fields);
+                return {payload:{scene: structuredClone(server)}};
+            },
+        });
+        const pending = [w._updateSceneDurationWithinGesture(120)];
+        await new Promise(r => setTimeout(r, 0));
+        pending.push(w._updateSceneDurationWithinGesture(140));
+        pending.push(w._updateSceneDurationWithinGesture(160));
+        release();
+        await Promise.all(pending);
+        assert.equal(sent.length, 2);
+        assert.deepEqual(w._undoStack.map((entry) => [entry.snapshot.duration_frames,
+            entry.postSnapshot?.duration_frames]), [[100, 120], [120, 160]],
+            'the burst is one step from 120 to 160, stamped from the merged write');
+    """)
+
+
+def test_a_clip_role_burst_behind_a_queued_undo_keeps_every_authored_lane():
+    """render -> driver -> render -> driver, then render, behind a queued Undo.
+
+    The conversions share one key and one slot, and the slot keeps each
+    member's `set_lane_count`. History rebases each absolute count as a delta
+    from the slot entry's before-snapshot. That snapshot is the oldest member's,
+    taken before any of the burst painted, so both lanes the burst appended land
+    on top of the lane the Undo restored. Measured from the newest member's
+    snapshot instead -- the old survivor -- the first appended lane read as
+    already present, the count came out one short, and the clip was left on the
+    lane the Undo had brought back.
+    """
+    _run_gesture_node("""
+        const w = makeWidget();
+    """ + _REAL_HISTORY + """
+        w.activeScene = {scene_id:'scene', video_lane_count:1, motion_driver_lane_count:1,
+            video_lane_configs:[{}], motion_driver_lane_configs:[{}],
+            clips:[{clip_id:'c1', role:'render', track_index:0, strength:1.0}]};
+        w._defaultLaneConfig = () => ({});
+        w._clearSelection = () => {}; w._hideItemEditor = () => {};
+        w._defaultMotionDriverStrength = () => 0.5;
+        w._firstEmptyUnlockedDriverLane = () => 0;
+        w._getAssetForSourcePath = () => ({asset_type:'video'});
+        // What the queued Undo leaves: one more video lane than the author saw.
+        const ordered = structuredClone(w.activeScene);
+        ordered.video_lane_count = 2;
+        ordered.video_lane_configs = [{}, {name:'restored'}];
+        let server = null;
+        const context = w._beginHistoryOrderContext('undo', 1);
+        let releaseUndo = null;
+        const undo = w._projectMutationQueue.enqueue({key:'history:undo', coalesce:false,
+            sealCoalescing:true, run: async () => {
+                await new Promise(r => { releaseUndo = r; });
+                server = structuredClone(ordered);
+                context.scenes.set('scene', structuredClone(ordered));
+            }});
+        await new Promise(r => setTimeout(r, 0));
+        const sent = [];
+        w._runSceneMutation = (operations, options) => w._queueProjectMutation({
+            ...options, refreshScenes:false, intent:{sceneId:'scene', operations},
+            run: async (intent) => {
+                sent.push(intent.operations);
+                for (const op of intent.operations) {
+                    if (op.type === 'set_lane_count') server[`${op.lane_type}_lane_count`] = op.count;
+                    if (op.type === 'update_clip') Object.assign(server.clips[0], op.fields);
+                }
+                return {payload:{scene: structuredClone(server)}};
+            },
+        });
+        const pending = [];
+        for (const role of ['motion_driver', 'render', 'motion_driver', 'render']) {
+            pending.push(w._convertClipRoleWithinGesture('c1', role));
+        }
+        assert.equal(w.activeScene.video_lane_count, 3, 'the burst painted two new lanes');
+        releaseUndo();
+        await Promise.all([undo, ...pending]);
+        assert.equal(sent.length, 1, 'the four conversions are one write');
+        assert.equal(server.video_lane_count, 4,
+            'the lane the Undo restored plus both lanes the burst appended');
+        assert.equal(server.clips[0].role, 'render');
+        assert.equal(server.clips[0].track_index, 3,
+            'the clip lands on the last lane the burst appended');
+        assert.equal(w._undoStack.length, 1, 'one slot, one Undo step');
+        assert.equal(w._undoStack[0].postSnapshot.video_lane_count, 4);
     """)
 
 

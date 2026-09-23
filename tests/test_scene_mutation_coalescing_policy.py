@@ -858,7 +858,15 @@ def _inline_merge(name: str) -> str:
     brace = body.index("{", body.index("=>", at))
     close = _match_delimiter(body, brace, "{", "}", mask[brace:] and mask)
     assert close > 0, f"{name}'s merge body is unterminated"
-    return body[at:close + 1] + ";"
+    # A helper the merge shares with the gesture's coalescing key travels with
+    # it, so the merge is compared as it runs rather than without its row key.
+    helpers = ""
+    helper_at = body.find("const laneConfigKey = ")
+    if helper_at >= 0:
+        stop = next(index for index in range(helper_at, len(body))
+                    if mask[index] and body[index] == ";")
+        helpers = body[helper_at:stop + 1] + "\n"
+    return helpers + body[at:close + 1] + ";"
 
 
 @pytest.mark.parametrize("gesture,intents", [

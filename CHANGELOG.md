@@ -28,6 +28,7 @@ a fresh `[Unreleased]` block.
 ### Fixed
 - The Prompt, Guides and Reference Lane panels now update as soon as Undo, Redo or another save changes what they show, and never while you are typing in them.
 - The Prompt, Guides and Reference Lane panels no longer act on a different item after Undo. An action on something that has changed since the panel was drawn is refused with a message and changes nothing.
+- Undo no longer gets stuck after locking several lanes in quick succession, or after toggling one setting several times while a save is running. Each lane's lock is its own Undo step, like hiding a lane, and repeated edits to one thing made while an earlier save is still running undo together in one step.
 - While a Prompt, Guides or Reference Lane panel is open, only Undo and Redo reach the timeline, so Delete, Space and other shortcuts can't edit the timeline hidden behind it. Escape closes the Guides panel instead of leaving fullscreen.
 - Enter and Shift+Enter in the prompt editors now insert a line break exactly where the caret is. In the Writing draft they no longer lose the break, move the caret, or turn a prompt link into plain text. Deleting the last line's text no longer leaves an extra blank line.
 - Fullscreen editor undo/redo stays in the editor after button clicks and cannot advance ComfyUI graph history, including editors inside subgraphs.

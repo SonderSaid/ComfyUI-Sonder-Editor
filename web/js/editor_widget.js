@@ -4142,12 +4142,16 @@ export class EditorWidget {
                     // Valid only while both of these hold - both are verified
                     // facts today, not assumptions. Every emitter sends
                     // `current + n` (`_addLane`, `_convertClipRole`,
-                    // `_moveItemToNewLane`, the reference-stage drop), and every
-                    // one is `coalesce: false`. A genuinely absolute emitter
-                    // would be silently retargeted. A coalescing one would merge
-                    // two clicks into one payload while keeping only the newer
-                    // entry's snapshot, computing +1 for an intended +2 and
-                    // losing a lane. Re-verify both before adding an emitter.
+                    // `_moveItemToNewLane`, the reference-stage drop); a
+                    // genuinely absolute emitter would be silently retargeted.
+                    // And `authoredScene` predates every count in the payload:
+                    // `_convertClipRole` coalesces, keeping each member's
+                    // `set_lane_count` in order, and a merged slot keeps its
+                    // OLDEST entry, so each count's delta is measured from the
+                    // pre-burst scene and the last one lands the burst's total.
+                    // Keeping the newest entry's snapshot instead measured from
+                    // after the older members' paint and lost their lanes.
+                    // Re-verify both before adding an emitter.
                     const delta = Number(operation.count) - laneCount(authoredScene, laneType);
                     // Unlike its sibling lane operations this clamps instead of
                     // refusing: a lane count carries no identity to be ambiguous
@@ -4260,31 +4264,67 @@ export class EditorWidget {
         const capturedHistoryEntry = historyEntry
             || this._claimHistoryPostSnapshotCapture(intent?.sceneId);
         if (capturedHistoryEntry) capturedHistoryEntry._postSnapshotCaptureClaimed = true;
-        this._pendingHistoryEntryByMutationKey ||= new Map();
         // Config edits authored on opposite sides of a lane move belong to
         // different physical queue positions, even when their keys match.
         const sealsLaneOrder = intent?.operations?.some((op) => op.type === "move_lane") === true;
-        const willCoalesce = !sealsLaneOrder && coalesce !== false
-            && this._projectMutationQueue.hasPendingKey?.(
-                key, { currentEpochOnly: true }) === true;
-        if (willCoalesce) {
-            const supersededEntry = this._pendingHistoryEntryByMutationKey.get(key);
-            if (supersededEntry) this._discardUndoEntry(supersededEntry);
-            this._pendingHistoryEntryByMutationKey.delete(key);
+        // The queue's own decision, asked before enqueueing: the pending slot
+        // this write will merge into, or null. Null too on the inline
+        // owner-token path, which never merges and so must never discard.
+        let coalesceSlot = this._projectMutationQueue.coalesceTarget(key, {
+            coalesce, ownerToken, sealCoalescing: sealsLaneOrder,
+        });
+        // The SLOT owns one undo entry, and the oldest wins. Its before-snapshot
+        // predates every member that brought an entry, so it is the only one
+        // whose reverse delta covers the whole merged write. A newer member's
+        // snapshot already holds the older members' paint: kept instead, two
+        // lanes locked in one burst left the first lane changed with no entry
+        // naming it, and the next Undo was refused and stayed on top.
+        //
+        // Entry-less members are covered by that entry in both directions. A
+        // slot opened by one (a lane rename, a recipe save) adopts the first
+        // entry that joins it, whose snapshot then already holds the opener's
+        // paint; one that joins an entry-owning slot is reverted by that
+        // entry's Undo along with it. Not merging instead would leave it a
+        // lane write no entry reverses, which strands the lane family.
+        //
+        // "Oldest" must mean oldest on the undo stack, not first enqueued: a
+        // drag pushes its entry at mousedown and enqueues at mouseup, so a
+        // member joining after it would be folded into a write that lands
+        // BEFORE the drag's, and the drag's Undo would revert that member too.
+        // So a slot is joined only while its entry is still on the stack with
+        // nothing above it but the joiner's own. A scene switch or a trim that
+        // dropped the entry, or any other gesture's entry since, starts a slot
+        // of its own instead.
+        let mergeCoalesce = coalesce;
+        const survivor = coalesceSlot?.intent?.historyEntry || null;
+        if (survivor) {
+            const at = this._undoStack?.lastIndexOf(survivor) ?? -1;
+            const onTop = at >= 0 && this._undoStack.slice(at + 1)
+                .every((entry) => entry === capturedHistoryEntry);
+            if (!onTop) {
+                coalesceSlot = null;
+                mergeCoalesce = false;
+            }
+        }
+        let slotHistoryEntry = capturedHistoryEntry;
+        if (coalesceSlot) {
+            if (survivor) {
+                if (capturedHistoryEntry && capturedHistoryEntry !== survivor) {
+                    this._discardUndoEntry(capturedHistoryEntry);
+                }
+                slotHistoryEntry = survivor;
+            }
             // This enqueue is joining a pending entry, so it is NOT the head of
             // its coalesced group. A gesture that keeps a local rollback needs to
             // know that: the queue settles every collapsed waiter from the
             // survivor's single result, so on failure every one's `catch` runs and
             // each would restore its own captured `previous`. Only the head's is
             // the state the server still holds; a later sibling's is an earlier
-            // sibling's optimistic result. Derived from the same `willCoalesce` as
-            // the undo discard above, so the two cannot disagree about which entry
-            // was superseded.
+            // sibling's optimistic result. Derived from the same queue decision
+            // as the undo discard above, so the two cannot disagree.
             onSupersededByCoalescing?.();
         }
-        if (capturedHistoryEntry) {
-            this._pendingHistoryEntryByMutationKey.set(key, capturedHistoryEntry);
-        }
+        const ownsSlotEntry = !!capturedHistoryEntry && slotHistoryEntry === capturedHistoryEntry;
         // Capture at enqueue. The queue may not send this request until a much
         // later gesture is active, and coalescing deliberately replaces this
         // object with the last surviving gesture's closure.
@@ -4303,8 +4343,7 @@ export class EditorWidget {
         // before-snapshot from the state produced at its physical queue
         // position, not from the optimistic UI state visible before that
         // history action applies. Keep the exact history-order context with the
-        // queue slot; later coalescing adopts the latest surviving gesture's
-        // context along with its entry.
+        // queue slot; coalescing keeps it with the slot's surviving entry.
         let capturedHistoryOrderContext = historyOrderContext === undefined
             ? (this._latestHistoryOrderContext || null) : historyOrderContext;
         if (historyOrderContext === undefined
@@ -4327,32 +4366,46 @@ export class EditorWidget {
             }
             if (!hasBaseline) capturedHistoryOrderContext.scenes.set(sceneId, null);
         }
-        if (capturedHistoryEntry && capturedHistoryOrderContext) {
+        if (ownsSlotEntry && capturedHistoryOrderContext) {
             capturedHistoryEntry._historyOrderContext = capturedHistoryOrderContext;
         }
         const queuedIntent = {
             payload: intent,
-            historyEntry: capturedHistoryEntry,
+            // A discarded entry never rides in the queue.
+            historyEntry: ownsSlotEntry ? capturedHistoryEntry : null,
             historyOrderContext: capturedHistoryOrderContext,
             stampHistory,
             historyFailureOwnedByCaller,
         };
-        const wrappedMerge = typeof merge === "function"
-            ? (oldValue, nextValue) => ({
-                payload: merge(oldValue?.payload, nextValue?.payload),
-                // A coalesced request has only the latest mutation's durable
-                // result. Never stamp an older entry from that later state.
-                historyEntry: nextValue?.historyEntry || null,
-                historyOrderContext: nextValue?.historyOrderContext || null,
-                stampHistory: nextValue?.stampHistory !== false,
-                historyFailureOwnedByCaller: nextValue?.historyFailureOwnedByCaller === true,
-            })
-            : null;
+        // Always wrapped, with or without a caller `merge`. Without one the
+        // queue used to replace the whole queued value, entry included, so a
+        // no-merge coalescer (duration, scene rename) would lose the slot's
+        // entry to a newer member that had just been discarded above -- and
+        // Undo would then drop the burst as unstampable.
+        //
+        // The history fields travel with the slot's surviving entry: the oldest
+        // member that brought one. It is stamped from the merged write's
+        // canonical result, which is exactly the post-state of everything its
+        // before-snapshot predates.
+        const wrappedMerge = (oldValue, nextValue) => {
+            const owner = oldValue?.historyEntry ? oldValue : nextValue;
+            return {
+                payload: typeof merge === "function"
+                    ? merge(oldValue?.payload, nextValue?.payload)
+                    : nextValue?.payload,
+                historyEntry: owner?.historyEntry || null,
+                historyOrderContext: owner?.historyOrderContext || null,
+                stampHistory: owner?.stampHistory !== false,
+                historyFailureOwnedByCaller: owner?.historyFailureOwnedByCaller === true,
+            };
+        };
         const promise = this._projectMutationQueue.enqueue({
             sealCoalescing: sealsLaneOrder,
             key,
             label,
-            coalesce,
+            // The same decision as `coalesceSlot`: a slot refused above is not
+            // merged into here either.
+            coalesce: mergeCoalesce,
             merge: wrappedMerge,
             intent: queuedIntent,
             diagnostics: mutationDiagnostics,
@@ -4426,13 +4479,7 @@ export class EditorWidget {
                 }
             },
         });
-        const clearPendingHistoryEntry = () => {
-            if (this._pendingHistoryEntryByMutationKey.get(key) === capturedHistoryEntry) {
-                this._pendingHistoryEntryByMutationKey.delete(key);
-            }
-        };
-        promise.then(clearPendingHistoryEntry, () => {
-            clearPendingHistoryEntry();
+        promise.catch(() => {
             // Enqueue itself can reject without entering run (for example an
             // invalid nested owner). Apply the same exact-entry rule there.
             if (!historyFailureOwnedByCaller
@@ -11849,13 +11896,9 @@ export class EditorWidget {
         if (!targets.length) return;
         // The coalescing key names the LANES this gesture touches, not just the
         // scene. Two clicks on one lane's hide control are one edit and should
-        // cost one write; two clicks on DIFFERENT lanes are two edits, and
-        // merging them would collapse two undo entries into one whose
-        // before-state was captured after the first click already painted. The
-        // survivor's reverse delta would then cover only the last lane, and
-        // because `video_lane_family` is an atomic bundle in
-        // `server/scene_history_merge.py`, the stranded lane does not merely
-        // fail to reverse -- it makes the next entry's restore conflict.
+        // cost one write; two clicks on DIFFERENT lanes are two edits, and each
+        // owes its own Ctrl+Z. A merged slot keeps only its oldest undo entry,
+        // so merging them would fold both lanes into one step.
         const laneKey = targets
             .map((target) => `${this._laneTypeForEntry(target) || target.type}:${target.laneIndex || 0}`)
             .sort()
@@ -12143,21 +12186,28 @@ export class EditorWidget {
             }
         }
         if (!operations.length) return;
-        // Latest config wins per durable lane; positional families and lanes
-        // without a known id retain their index key. Distinct lanes that occupy
-        // the same index across a reorder must not erase each other's edits.
+        // A lane's durable id where one is known; positional families and lanes
+        // without a known id keep their index. Distinct lanes that occupy the
+        // same index across a reorder must not erase each other's edits.
+        const laneConfigKey = (op) => (op.expected?.lane_id
+            ? `${op.lane_type}:lane:${op.expected.lane_id}`
+            : `${op.lane_type}:index:${op.lane_index || 0}`);
+        // The coalescing key names the LANE SET, as header visibility does:
+        // each lane (or bulk selection) is its own write and its own Ctrl+Z,
+        // at the cost of one document write per lane in a burst. A scene-wide
+        // key folded locks on three different lanes into one Undo step.
+        const laneSetKey = [...new Set(operations.map(laneConfigKey))].sort().join(",");
+        // Latest config wins per lane.
         const merge = (oldIntent, nextIntent) => {
             const byLane = new Map();
             for (const op of [...(oldIntent?.operations || []), ...(nextIntent?.operations || [])]) {
-                const laneKey = op.expected?.lane_id
-                    ? `lane:${op.expected.lane_id}` : `index:${op.lane_index || 0}`;
-                byLane.set(`${op.lane_type}:${laneKey}`, op);
+                byLane.set(laneConfigKey(op), op);
             }
             return { ...nextIntent, operations: [...byLane.values()] };
         };
         try {
             await this._runSceneMutation(operations, {
-                key: `scene:${sceneId}:lane-config`,
+                key: `scene:${sceneId}:lane-config:${laneSetKey}`,
                 label: "lane config",
                 coalesce: true,
                 merge,
@@ -16529,10 +16579,9 @@ export class EditorWidget {
         // The key names the SELECTION, for the same reason the lane-header key
         // names its lanes: two toggles over the same selection are one edit and
         // should cost one write, while two toggles over different selections are
-        // two edits and must keep two undo entries. Merging those would leave
-        // the first selection changed with no entry that reverses it, because
-        // `willCoalesce` discards the older entry and the survivor's
-        // before-state was captured after the first toggle already painted.
+        // two edits and must keep two undo entries. A merged slot keeps only its
+        // oldest entry, so merging those would fold two authored edits into one
+        // Ctrl+Z.
         const selectionKey = targets
             .map((item) => `${item.type}:${item.id}`)
             .sort()

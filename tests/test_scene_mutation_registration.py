@@ -3850,6 +3850,13 @@ KEY_INTERPOLATIONS = {
                         "the same lane -- which is one edit -- and differs for "
                         "two lanes, which are two edits and must keep two undo "
                         "entries"),
+    "laneSetKey": (STABLE, "the sorted lane set a lane-config save writes, each "
+                           "lane named `<type>:lane:<lane_id>` or "
+                           "`<type>:index:<n>`. Repeats for two edits of the same "
+                           "lane -- one edit, one Undo step -- and differs for "
+                           "two lanes, which must keep two -- the granularity of "
+                           "the header-visibility `laneKey`, which names lanes by "
+                           "index only"),
     "fieldNames[0]": (STABLE, "the single field name a property write sets"),
     "fieldNames.join(\"-\")": (STABLE, "the sorted field names a property write sets"),
     "operations.map((op) => `${op.lane_type}:${op.lane_index}`).join(\",\")":
@@ -4180,9 +4187,10 @@ COALESCE_OPT_OUT_REVIEWED = {
     "editor_widget.js:_addLaneWithinGesture:scene:${}:${}-lane-count": (
         DECLINED,
         "`set_lane_count` carries an absolute, and two authored lane additions "
-        "would also collapse into ONE undo entry -- `willCoalesce` discards the "
-        "superseded gesture's entry in `_queueProjectMutation`. One Ctrl+Z per "
-        "authored gesture is the reason to decline here, not the payload."),
+        "would also collapse into ONE undo entry -- a merged slot keeps only its "
+        "oldest entry and `_queueProjectMutation` discards the joiner's. One "
+        "Ctrl+Z per authored gesture is the reason to decline here, not the "
+        "payload."),
     "editor_widget.js:_removeLaneWithinGesture:scene:${}:${}-remove-lane:${}": (
         DECLINED,
         "`_remove_media_lane` shifts every lane above the one it removes, so a "
@@ -4231,9 +4239,10 @@ COALESCE_OPT_OUT_REVIEWED = {
         "key."),
     "editor_widget.js:_deletePromptSectionWithinGesture:prompt:${}:${}:delete": (
         DECLINED,
-        "`_apply_delete_prompt_section` is addressed by list index, and a "
-        "delete is consumed once: a second delete of the same section "
-        "describes a row the first one removed."),
+        "a delete is consumed once: a second delete of the same section "
+        "describes a row the first one removed. The key names the section by "
+        "its `prompt_id` (or `index-<n>` for an id-less legacy one), so the "
+        "flag is what refuses the merge."),
     "editor_widget.js:_updateLinkedPromptAttachmentWithinGesture:prompt:${}:linked:${}": (
         DECLINED,
         "carries `retryOnConflict: false` as a stated caller override, and "
