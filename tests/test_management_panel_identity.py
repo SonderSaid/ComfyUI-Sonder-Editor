@@ -502,7 +502,8 @@ const makeHost=(ids)=>({
   _referenceAssetPreviewUrl:()=>null,_referenceLaneAdvisories:()=>[],
   _isLaneLocked:()=>false,_channelTemplate:()=>({}),
   saves:[],_saveLaneConfig:async function(entries,options){this.saves.push({
-    laneIndex:entries[0].laneIndex,expectedLaneId:options?.expectedLaneId});},
+    laneIndex:entries[0].laneIndex,expectedLaneId:options?.expectedLaneId,
+    undoLabel:options?.undoLabel});},
 });
 const templateSelect=()=>walk(document.body.children.at(-1)).find((n)=>n.tagName==="SELECT");
 const change=async(select)=>{for(const h of select._handlers.change||[])h({});
@@ -532,7 +533,8 @@ console.log(JSON.stringify({staleSaves,followed,fresh,
         [node, "--input-type=module", "-e", script], capture_output=True,
         text=True, encoding="utf-8", check=True).stdout)
     assert result == {"staleSaves": 0, "followed": 0,
-                      "fresh": {"laneIndex": 0, "expectedLaneId": "B"},
+                      "fresh": {"laneIndex": 0, "expectedLaneId": "B",
+                                "undoLabel": "change lane recipe"},
                       "blankSaves": 0, "blankClosed": True}
 
 

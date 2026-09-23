@@ -12,7 +12,8 @@
 //   _referenceLaneAdvisories(entry, definition), _defaultReferenceLaneRecipe(),
 //   _findAssetById(id), _referenceAssetPreviewUrl(asset),
 //   _openReferenceMediaEditor({ asset, draft, readOnly }),
-//   _isLaneLocked(type, laneIndex), _saveLaneConfig(entries),
+//   _isLaneLocked(type, laneIndex),
+//   _saveLaneConfig(entries, { expectedLaneId, undoLabel }),
 //   _runSceneMutation(ops, opts), _mutateReferences(ops),
 //   _fetchReferences(opts), _fetchScenes(opts), _buildTrackLayout(),
 //   _renderTimeline(), _pushUndo(label), _discardLastUndo(label)
@@ -309,7 +310,9 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         state.busy = true;
         entry.referenceRecipe = nextRecipe;
         try {
-            await host._saveLaneConfig([entry], { expectedLaneId });
+            // Its own Undo step: a recipe is part of the lane family, and a
+            // lane write no entry reverses blocks every earlier lane Undo.
+            await host._saveLaneConfig([entry], { expectedLaneId, undoLabel: "change lane recipe" });
         } finally {
             state.busy = false;
         }

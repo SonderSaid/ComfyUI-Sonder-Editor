@@ -1992,8 +1992,14 @@ def _lane_config_burst(body: str) -> str:
             for (const target of targets) target.locked = next;
             pending.push(w._saveLaneConfigWithinGesture(targets));
         };
-        // A rename owns no undo entry.
+        // A lane rename, as `_startLaneRename` saves it: its own Undo step.
         const rename = (target, name) => {
+            target.customName = name;
+            pending.push(w._saveLaneConfigWithinGesture([target], {undoLabel: 'rename lane'}));
+        };
+        // A lane-config save that owns no Undo step. No gesture does this since
+        // L4c; the queue's handling of one is still pinned below.
+        const saveWithoutEntry = (target, name) => {
             target.customName = name;
             pending.push(w._saveLaneConfigWithinGesture([target]));
         };
@@ -2066,12 +2072,12 @@ def test_an_even_count_lock_burst_on_one_lane_leaves_no_phantom_entry():
     """))
 
 
-def test_a_rename_then_a_lock_on_one_lane_keep_the_locks_undo_step():
-    """An entry-less rename opens the slot; the lock that joins it owns it."""
+def test_an_entryless_save_then_a_lock_on_one_lane_keep_the_locks_undo_step():
+    """An entry-less save opens the slot; the lock that joins it owns it."""
     _run_gesture_node(_lane_config_burst("""
         lock(lanes[0]);
         await tick();
-        rename(lanes[1], 'Hero');
+        saveWithoutEntry(lanes[1], 'Hero');
         lock(lanes[1]);
         await settle();
         assert.equal(sent.length, 2);
@@ -2081,24 +2087,24 @@ def test_a_rename_then_a_lock_on_one_lane_keep_the_locks_undo_step():
         assert.equal(entry.label, 'toggle track lock');
         assert.deepEqual(configs(entry.postSnapshot)[1], ['Hero', true]);
         assert.deepEqual(configs(entry.snapshot)[1], ['Hero', false],
-            'the rename is not history, so the entry reverses only the lock');
+            'the save is not history, so the entry reverses only the lock');
     """))
 
 
-def test_a_lock_then_a_rename_on_one_lane_keep_the_locks_undo_step():
-    """The lock opens the slot; the entry-less rename that joins it takes nothing.
+def test_a_lock_then_an_entryless_save_on_one_lane_keep_the_locks_undo_step():
+    """The lock opens the slot; the entry-less save that joins it takes nothing.
 
-    The old per-key map discarded the lock's entry when the rename joined, and
-    the rename brought none, so the lock had no Undo at all. The lock's entry now
-    covers the rename as well, so its Undo reverts both -- deliberately: kept
-    out of the slot, the rename would be a lane write no entry reverses, which
-    strands the lane family and refuses every earlier lane Undo.
+    The old per-key map discarded the lock's entry when the save joined, and
+    the save brought none, so the lock had no Undo at all. The lock's entry now
+    covers the save as well, so its Undo reverts both -- deliberately: kept out
+    of the slot, the save would be a lane write no entry reverses, which strands
+    the lane family and refuses every earlier lane Undo.
     """
     _run_gesture_node(_lane_config_burst("""
         lock(lanes[0]);
         await tick();
         lock(lanes[1]);
-        rename(lanes[1], 'Hero');
+        saveWithoutEntry(lanes[1], 'Hero');
         await settle();
         assert.equal(sent.length, 2);
         assert.equal(w._undoStack.length, 2);
@@ -2106,8 +2112,190 @@ def test_a_lock_then_a_rename_on_one_lane_keep_the_locks_undo_step():
         assert.equal(entry.label, 'toggle track lock');
         assert.deepEqual(configs(entry.snapshot)[1], ['', false]);
         assert.deepEqual(configs(entry.postSnapshot)[1], ['Hero', true],
-            'the entry covers the rename that joined its slot');
+            'the entry covers the save that joined its slot');
         assertChain();
+    """))
+
+
+def test_a_lane_rename_owns_an_undo_step_so_an_earlier_lane_undo_still_restores():
+    """The wedge found live in Phase 4, with no burst at all.
+
+    Lock one lane and let it land, rename another, and the rename's write
+    changed the lane-family bundle with no entry reversing it; the lock's Undo
+    was then refused `scene_merge_conflict` and stayed on top. With the rename
+    owning its step, the chain is unbroken.
+    """
+    _run_gesture_node(_lane_config_burst("""
+        lock(lanes[0]);
+        await settle();
+        rename(lanes[1], 'Hero');
+        await Promise.all(pending);
+        assert.deepEqual(w._undoStack.map((entry) => entry.label),
+            ['toggle track lock', 'rename lane']);
+        assertChain();
+        assert.deepEqual(configs(w._undoStack[1].snapshot)[1], ['', false],
+            'the rename entry reverses only the rename');
+    """))
+
+
+def test_a_rename_then_a_lock_on_one_lane_are_one_undo_step():
+    """Both edits of one lane inside one in-flight window: one write, one step.
+
+    The rename opens the slot with its own entry, and the lock's joins it and
+    is discarded, so one Ctrl+Z returns the lane to where it started.
+    """
+    _run_gesture_node(_lane_config_burst("""
+        lock(lanes[0]);
+        await tick();
+        rename(lanes[1], 'Hero');
+        lock(lanes[1]);
+        await settle();
+        assert.equal(sent.length, 2);
+        assert.deepEqual(w._undoStack.map((entry) => entry.label),
+            ['toggle track lock', 'rename lane']);
+        assert.deepEqual(configs(w._undoStack[1].snapshot)[1], ['', false]);
+        assert.deepEqual(configs(w._undoStack[1].postSnapshot)[1], ['Hero', true]);
+        assertChain();
+    """))
+
+
+def test_a_lane_config_save_with_nothing_to_write_leaves_no_undo_entry():
+    """The entry is pushed only after the early exits, and dropped on the last."""
+    _run_gesture_node(_lane_config_burst("""
+        w._laneTypeForEntry = () => '';
+        await w._saveLaneConfigWithinGesture([lanes[1]], {undoLabel: 'rename lane'});
+        await w._saveLaneConfigWithinGesture([], {undoLabel: 'rename lane'});
+        assert.equal(w._undoStack.length, 0);
+        assert.equal(sent.length, 0);
+    """))
+
+
+def _lane_rename_input(script: str) -> str:
+    """`_startLaneRename` against a stub DOM input, recording saves."""
+    return """
+        const w = makeWidget();
+        const listeners = {};
+        let removed = 0;
+        const input = {style: {}, value: '', placeholder: '',
+            addEventListener: (type, handler) => { listeners[type] = handler; },
+            focus() {}, select() {},
+            remove() { removed += 1; listeners.blur?.(); }};
+        globalThis.document = {createElement: () => input, body: {appendChild() {}}};
+        w.timelineCanvas = {getBoundingClientRect: () => ({left: 0, top: 0})};
+        Object.defineProperty(w, '_labelW', {value: 100});
+        w._scaleTrackHeaders = 1; w.scrollY = 0;
+        w._trackY = () => 0; w._trackH = () => 20;
+        const lane = {type:'video', laneIndex:0, customName:'Old', label:'Old'};
+        w._trackLayout = [lane];
+        w.activeScene = {scene_id:'scene', video_lane_count:1,
+            video_lane_configs:[{name:'Old'}]};
+        const saves = [];
+        w._saveLaneConfig = (entries, options) => { saves.push([entries[0].customName, options]); };
+        w._startLaneRename(0);
+        const key = (name) => listeners.keydown({key: name, preventDefault() {},
+            stopPropagation() {}});
+    """ + script
+
+
+def test_a_lane_rename_on_enter_saves_once_with_its_own_undo_step():
+    """Enter removed the input, and its blur finished the rename a second time."""
+    _run_gesture_node(_lane_rename_input("""
+        input.value = 'New';
+        key('Enter');
+        listeners.blur();
+        assert.deepEqual(saves, [['New', {undoLabel: 'rename lane'}]]);
+        assert.equal(removed, 1, 'the input is removed once');
+    """))
+
+
+def test_a_lane_rename_escape_saves_nothing():
+    """Escape used to save through the blur its own removal fired."""
+    _run_gesture_node(_lane_rename_input("""
+        input.value = 'New';
+        key('Escape');
+        assert.deepEqual(saves, []);
+        assert.equal(lane.customName, 'Old');
+    """))
+
+
+def test_clearing_a_lane_name_still_saves():
+    """An empty name is a change back to the default label, not a no-op."""
+    _run_gesture_node(_lane_rename_input("""
+        input.value = '';
+        key('Enter');
+        assert.deepEqual(saves, [['', {undoLabel: 'rename lane'}]]);
+    """))
+
+
+def test_a_refused_stale_recipe_save_leaves_no_undo_entry():
+    """The Reference panel's stale path: no paint, a 409, and no entry left.
+
+    The panel names the lane it drew; when the lane at that index now has
+    another id the save paints nothing and the server refuses it. The entry
+    the save pushed must go with the refusal, or Undo meets an unstampable
+    entry.
+    """
+    _run_gesture_node("""
+        const w = makeWidget();
+    """ + _REAL_HISTORY + """
+        w.activeScene = {scene_id:'scene', reference_lane_count:1,
+            reference_lane_configs:[{}],
+            reference_lane_recipes:[{lane_id:'now', recipe_id:'old'}]};
+        w._laneTypeForEntry = () => 'reference';
+        w._defaultLaneConfig = () => ({});
+        w._defaultReferenceLaneRecipe = () => ({lane_id:'', recipe_id:''});
+        w._buildTrackLayout = () => {};
+        const sent = [];
+        w._runSceneMutation = (operations, options) => w._queueProjectMutation({
+            ...options, refreshScenes:false, intent:{sceneId:'scene', operations},
+            run: async (intent) => {
+                sent.push(intent.operations);
+                const error = new Error('identity_mismatch');
+                error.status = 409;
+                throw error;
+            },
+        });
+        const entry = {type:'reference', laneIndex:0, customName:'', color:'',
+            locked:false, hidden:false, referenceRecipe:{lane_id:'drawn', recipe_id:'new'}};
+        await w._saveLaneConfigWithinGesture([entry],
+            {expectedLaneId:'drawn', undoLabel:'change lane recipe'});
+        await new Promise(r => setTimeout(r, 0));
+        assert.equal(sent.length, 1);
+        assert.equal(sent[0][0].expected.lane_id, 'drawn',
+            'the save names the lane the panel drew');
+        assert.equal(w.activeScene.reference_lane_recipes[0].recipe_id, 'old',
+            'a stale save paints nothing');
+        assert.equal(w._undoStack.length, 0, 'and leaves no entry behind');
+    """)
+
+
+def test_a_click_without_drag_discards_its_own_undo_entry_not_the_top_one():
+    """Mousedown on an item pushes "move items"; a click that moves nothing
+    must remove THAT entry.
+
+    It popped the top instead. Finishing a lane rename by clicking an item runs
+    the rename's blur after mousedown, so the rename's entry was on top and was
+    the one popped: the rename was left with no Undo step, which strands the
+    lane family, and the move entry was left unstamped. The canvas handler is
+    inline in `_setupTimelineEvents`, so this pins the shape lexically.
+    """
+    source = (ROOT / "web/js/editor_widget.js").read_text(encoding="utf-8")
+    start = source.index("    _setupTimelineEvents(")
+    body = source[start:source.index("\n    }\n", start)]
+    assert "this._undoStack.pop()" not in body, (
+        "the timeline's canvas handlers must remove undo entries by object")
+    no_move = body[body.index("// Click without drag"):]
+    no_move = no_move[:no_move.index("if (this.selectedItems.length === 1)")]
+    assert "this._discardUnstampableUndoEntry(this._dragHistoryEntry)" in no_move
+    assert "this._dragHistoryEntry = null" in no_move
+
+
+def test_an_unchanged_lane_name_writes_nothing():
+    """No write, so no Undo step that reverses nothing."""
+    _run_gesture_node(_lane_rename_input("""
+        input.value = '  Old ';
+        key('Enter');
+        assert.deepEqual(saves, []);
     """))
 
 

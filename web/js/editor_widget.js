@@ -4281,8 +4281,9 @@ export class EditorWidget {
         // naming it, and the next Undo was refused and stayed on top.
         //
         // Entry-less members are covered by that entry in both directions. A
-        // slot opened by one (a lane rename, a recipe save) adopts the first
-        // entry that joins it, whose snapshot then already holds the opener's
+        // slot opened by one (no gesture does this since 0.6.0 L4c gave lane
+        // renames and recipe saves their own entries) adopts the first entry
+        // that joins it, whose snapshot then already holds the opener's
         // paint; one that joins an entry-owning slot is reverted by that
         // entry's Undo along with it. Not merging instead would leave it a
         // lane write no entry reverses, which strands the lane family.
@@ -10050,9 +10051,13 @@ export class EditorWidget {
                 if (frameDelta !== 0 || this._dragLaneChanged || this._dragSwapTarget || this._dragPromptSwap) {
                     commitPromise = this._commitItemMove(frameDelta);
                 } else {
-                    // Click without drag = show properties editor (single item only)
-                    // Remove the undo entry since nothing changed
-                    if (this._undoStack.length > 0) this._undoStack.pop();
+                    // Click without drag = show properties editor (single item only).
+                    // Remove THIS gesture's undo entry, by object: popping the
+                    // top removed a newer one instead -- a lane rename finished
+                    // by this very click (its blur) pushes after mousedown, and
+                    // lost its entry, which re-opened the lane-family Undo wedge.
+                    this._discardUnstampableUndoEntry(this._dragHistoryEntry);
+                    this._dragHistoryEntry = null;
                     if (this.selectedItems.length === 1) {
                         if (this.selectedItem?.type === "prompt") {
                             // Single click only SELECTS a prompt section —
@@ -12082,15 +12087,26 @@ export class EditorWidget {
             box-sizing: border-box;
         `;
 
+        // Once only. Removing the focused input fires its blur, which called
+        // `finish(true)` a second time: Enter wrote twice (and would now push two
+        // Undo steps), and Escape saved through that blur.
+        let finished = false;
         const finish = (save) => {
-            if (save) {
+            if (finished) return;
+            finished = true;
+            try {
                 const newName = input.value.trim();
-                entry.customName = newName;
-                entry.label = laneLabel(this.activeScene, entry.type, entry.laneIndex, newName);
-                this._saveLaneConfig([entry]);
-                this._renderTimeline();
+                if (save && newName !== (entry.customName || "")) {
+                    entry.customName = newName;
+                    entry.label = laneLabel(this.activeScene, entry.type, entry.laneIndex, newName);
+                    this._saveLaneConfig([entry], { undoLabel: "rename lane" });
+                    this._renderTimeline();
+                }
+            } finally {
+                // Even if the save throws: the guard above would otherwise
+                // leave a dead input on the page that no key can close.
+                input.remove();
             }
-            input.remove();
         };
 
         input.addEventListener("keydown", (e) => {
@@ -12127,13 +12143,25 @@ export class EditorWidget {
      * lane now sits at `laneIndex`, which always agrees with itself; with it, a
      * panel left pointing at a moved lane is refused by the server instead of
      * rewriting the lane that took its place, and nothing is painted locally.
+     *
+     * `undoLabel` makes this save own its Undo step, pushed here -- after the
+     * early exits and before the optimistic paint, so its snapshot is the state
+     * the save changes. Every lane-family write needs one: a lane family is one
+     * atomic bundle in `server/scene_history_merge.py`, so a write no entry
+     * reverses leaves every earlier lane entry unrestorable, and the next Undo
+     * is refused and stays on top. The lock toggle pushes its own entry before
+     * calling, so it passes none.
      */
-    async _saveLaneConfigWithinGesture(changedEntries, { expectedLaneId = "" } = {}) {
+    async _saveLaneConfigWithinGesture(changedEntries, { expectedLaneId = "", undoLabel = "" } = {}) {
         if (!this.activeScene || !this.projectDir) return;
-        const entries = (Array.isArray(changedEntries) ? changedEntries : [changedEntries]).filter(Boolean);
+        // Only entries that write: pushing an entry clears Redo and can trim the
+        // oldest step, which discarding it afterwards would not give back.
+        const entries = (Array.isArray(changedEntries) ? changedEntries : [changedEntries])
+            .filter((entry) => entry && this._laneTypeForEntry(entry));
         if (!entries.length) return;
         const sceneId = this.activeSceneId;
         const sceneRef = this.activeScene;
+        if (undoLabel) this._pushUndo(undoLabel);
         const operations = [];
         for (const e of entries) {
             const laneType = this._laneTypeForEntry(e);

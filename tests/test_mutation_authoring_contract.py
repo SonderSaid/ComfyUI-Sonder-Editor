@@ -569,7 +569,10 @@ SCANNED_RESERVING_UNITS = (
     "appendReferenceMembers", "applyPromptSetup", "assetDrop",
     "consolidateSelectedItemsToLane", "convertClipRole", "deleteGuide",
     "deleteItemsInLane", "deletePromptSection",
-    "deleteSelectedItems", "deleteSelectedLanesAndItems", "linkItems",
+    "deleteSelectedItems", "deleteSelectedLanesAndItems",
+    # 0.6.0 L4c: a lane rename and a recipe save own their Undo step, pushed by
+    # `_saveLaneConfigWithinGesture` itself when given `undoLabel`.
+    "laneConfig", "linkItems",
     "moveGuideToFrame", "moveItemToFrame", "moveItemToNewLane",
     "moveReferenceLane", "placeReferencePayload", "removeLane",
     "removeLaneDeletingItems", "removeLaneWithItems", "renameScene",
