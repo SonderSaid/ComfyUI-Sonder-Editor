@@ -102,6 +102,36 @@ def test_raw_link_refusal_names_group_and_missing_member(monkeypatch):
     assert exc.value.details["other_item_id"] == "broken"
 
 
+def test_scene_restore_of_a_lane_lock_keeps_a_take_lane_appended_since(tmp_path, monkeypatch):
+    """0.6.0 L4d, through the real route and the real lane appender.
+
+    A take placed on a new lane (`ensure_lane_index`, what timeline export's
+    Place as take and generated takes call) used to make the lock's Undo refuse
+    `video_lane_family` and stay on top.
+    """
+    from server.lane_registry import ensure_lane_index
+    from server.timeline_state import ClipReference, LaneConfig
+
+    base_scene = Scene(scene_id="scene-1", duration_frames=24, video_lane_count=2,
+                       video_lane_configs=[LaneConfig(locked=True), LaneConfig()])
+    base = base_scene.to_dict()
+    target = copy.deepcopy(base)
+    target["video_lane_configs"][0]["locked"] = False
+    stored_scene = Scene.from_dict(copy.deepcopy(base))
+    ensure_lane_index(stored_scene, "video", 2, LaneConfig)
+    stored_scene.clips.append(ClipReference(
+        clip_id="take", timeline_start_frame=0, timeline_end_frame=8, track_index=2))
+
+    status, payload, _ = restore_case(monkeypatch, tmp_path, base, target,
+                                      stored_scene.to_dict())
+
+    assert status == 200, payload
+    scene = payload["scene"]
+    assert scene["video_lane_count"] == 3
+    assert [config["locked"] for config in scene["video_lane_configs"]] == [False, False, False]
+    assert [(clip["clip_id"], clip["track_index"]) for clip in scene["clips"]] == [("take", 2)]
+
+
 def test_scene_restore_accepts_a_clip_stranded_by_a_merged_duration_shrink(tmp_path, monkeypatch):
     """Accepted: concurrent clip remains visible/editable beyond the shortened
     scene, but renders nothing there. History preserves work instead of clamping.

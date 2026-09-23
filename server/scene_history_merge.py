@@ -127,6 +127,56 @@ def _same_bundle(left: dict, right: dict) -> bool:
     return all(_same(left[key], right[key]) for key in left)
 
 
+def _append_tolerant_bundle(keys: tuple[str, ...], base_value: dict,
+                            target_value: dict, stored_value: dict) -> dict | None:
+    """The lane family to write when lanes were only APPENDED since ``base``.
+
+    Take placement (timeline export's Place as take, generated takes) raises a
+    lane count and pads the index-parallel lists at the end, outside history.
+    Compared as one value, that made every earlier lane step's Undo and Redo
+    refuse and stay on top. When the step keeps the lane count and stored is
+    exactly ``base`` plus lanes at the end, no existing lane moved, so the step
+    is written over the existing lanes and the appended ones are kept. Any
+    other shape returns None and still refuses: a step that adds or removes a
+    lane, and a concurrent removal, move or edit of an existing lane.
+
+    Retire with the per-lane history merge the roadmap owns.
+    """
+    count_key, *list_keys = keys
+    counts = [value[count_key] for value in (base_value, target_value, stored_value)]
+    if any(isinstance(count, bool) or not isinstance(count, int) for count in counts):
+        return None
+    base_count, target_count, stored_count = counts
+    if base_count != target_count or stored_count <= base_count:
+        return None
+    lists = []
+    for key in list_keys:
+        base_list, target_list, stored_list = (
+            base_value[key], target_value[key], stored_value[key])
+        if base_list is _MISSING and target_list is _MISSING and stored_list is _MISSING:
+            continue
+        if not all(isinstance(value, list) for value in (base_list, target_list, stored_list)):
+            return None
+        if len(target_list) != len(base_list) or len(stored_list) < len(base_list):
+            return None
+        lists.append((key, base_list, target_list, stored_list))
+    # The existing lanes read as `base` (the step still to apply) or, on a
+    # retry whose first attempt committed, already as `target` -- a no-op, as
+    # the plain merge treats stored == target. A mix of the two is a conflict.
+    if all(_same(stored_list[:len(base_list)], base_list)
+           for _, base_list, _, stored_list in lists):
+        merged = {count_key: stored_count}
+        for key in list_keys:
+            merged[key] = stored_value[key]
+        for key, base_list, target_list, stored_list in lists:
+            merged[key] = [*target_list, *stored_list[len(base_list):]]
+        return merged
+    if all(_same(stored_list[:len(target_list)], target_list)
+           for _, _, target_list, stored_list in lists):
+        return dict(stored_value)
+    return None
+
+
 def _merge_bundle(result: dict, keys: tuple[str, ...], base: dict, target: dict,
                   stored: dict, conflicts: list[dict], path: str) -> None:
     base_value = _bundle(base, keys)
@@ -142,6 +192,11 @@ def _merge_bundle(result: dict, keys: tuple[str, ...], base: dict, target: dict,
     if _same_bundle(stored_value, base_value):
         for key in keys:
             _apply_value(result, key, target_value[key])
+        return
+    appended = _append_tolerant_bundle(keys, base_value, target_value, stored_value)
+    if appended is not None:
+        for key in keys:
+            _apply_value(result, key, appended[key])
         return
     _conflict(conflicts, path, base_value, target_value, stored_value)
 

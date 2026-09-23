@@ -350,6 +350,137 @@ def test_each_lane_family_uses_one_atomic_conflict_unit(path, keys):
     assert exc.value.conflicts[0]["path"] == path
 
 
+# -- 0.6.0 L4d: lanes appended outside history (take placement) -------------
+
+def _lock_step(count_field, configs_field, *, count=2, lane=0):
+    """(target, base): a step that locked one lane and kept the count."""
+    configs = [{"name": f"lane {index}", "locked": False} for index in range(count)]
+    target = _scene(**{count_field: count, configs_field: configs})
+    locked = copy.deepcopy(configs)
+    locked[lane]["locked"] = True
+    base = _scene(**{count_field: count, configs_field: locked})
+    return target, base
+
+
+def _append_lane(scene, count_field, configs_field, extra=None):
+    """What `ensure_lane_index` / `_append_generated_lanes` do: count + 1 and a
+    default config padded at the end, plus the take's item on the new lane."""
+    appended = copy.deepcopy(scene)
+    appended[count_field] += 1
+    appended[configs_field].append({})
+    for key, value in (extra or {}).items():
+        appended[key] = appended.get(key, []) + [value]
+    return appended
+
+
+@pytest.mark.parametrize(("count_field", "configs_field", "item"), [
+    ("video_lane_count", "video_lane_configs",
+     ("clips", {"clip_id": "take", "track_index": 2})),
+    ("audio_lane_count", "audio_lane_configs",
+     ("audio_tracks", {"track_id": "take", "lane_index": 2})),
+    ("motion_driver_lane_count", "motion_driver_lane_configs", None),
+])
+def test_undo_of_a_lane_step_keeps_a_lane_appended_since(count_field, configs_field, item):
+    """The measured wedge: a take landed on a new lane after a lane lock, and
+    the lock's Undo was refused `video_lane_family` and stuck on top."""
+    target, base = _lock_step(count_field, configs_field)
+    stored = _append_lane(base, count_field, configs_field,
+                          dict([item]) if item else None)
+
+    merged = merge_scene_history(base, target, stored)
+
+    assert merged[count_field] == 3, "the appended lane is kept"
+    assert merged[configs_field] == [*target[configs_field], {}], (
+        "the step is reverted on the existing lanes only")
+    if item:
+        assert merged[item[0]] == [item[1]], "the take on the new lane is kept"
+
+
+def test_redo_of_a_lane_step_keeps_a_lane_appended_since():
+    target, base = _lock_step("video_lane_count", "video_lane_configs")
+    # Redo applies the step forward: base is the pre-step scene, target the post.
+    stored = _append_lane(target, "video_lane_count", "video_lane_configs")
+
+    merged = merge_scene_history(target, base, stored)
+
+    assert merged["video_lane_count"] == 3
+    assert merged["video_lane_configs"] == [*base["video_lane_configs"], {}]
+
+
+def test_a_reference_recipe_step_keeps_an_appended_reference_lane():
+    target = _scene(reference_lane_count=1, reference_lane_configs=[{}],
+                    reference_lane_recipes=[{"lane_id": "a", "recipe_id": "old"}])
+    base = _scene(reference_lane_count=1, reference_lane_configs=[{}],
+                  reference_lane_recipes=[{"lane_id": "a", "recipe_id": "new"}])
+    stored = copy.deepcopy(base)
+    stored["reference_lane_count"] = 2
+    stored["reference_lane_configs"].append({})
+    stored["reference_lane_recipes"].append({"lane_id": "b", "recipe_id": ""})
+
+    merged = merge_scene_history(base, target, stored)
+
+    assert merged["reference_lane_count"] == 2
+    assert merged["reference_lane_recipes"] == [
+        {"lane_id": "a", "recipe_id": "old"}, {"lane_id": "b", "recipe_id": ""}]
+
+
+def test_a_retry_after_an_append_finds_the_step_already_applied():
+    """A lost-receipt retry: the first attempt committed, then a lane landed."""
+    target, base = _lock_step("video_lane_count", "video_lane_configs")
+    stored = _append_lane(target, "video_lane_count", "video_lane_configs")
+
+    assert merge_scene_history(base, target, stored) == stored
+
+
+@pytest.mark.parametrize("change", [
+    "existing_lane_edited", "step_changed_the_count", "lane_removed_then_added",
+    "stored_shorter"])
+def test_an_append_does_not_excuse_any_other_lane_change(change):
+    """Everything but a pure tail append still refuses as one unit -- for lanes
+    whose configs tell them apart. `_lock_step` names every lane; with default
+    configs the older by-value shortcut can alias instead (see the xfail below).
+    """
+    target, base = _lock_step("video_lane_count", "video_lane_configs", count=3)
+    stored = _append_lane(base, "video_lane_count", "video_lane_configs")
+    if change == "existing_lane_edited":
+        stored["video_lane_configs"][1]["hidden"] = True
+    elif change == "step_changed_the_count":
+        # Undo of "add lane" after a take landed: removing the step's lane
+        # would shift the take's lane under its clip.
+        target = copy.deepcopy(base)
+        target["video_lane_count"] = 2
+        target["video_lane_configs"] = target["video_lane_configs"][:2]
+    elif change == "lane_removed_then_added":
+        del stored["video_lane_configs"][1]
+        stored["video_lane_configs"].append({"name": "new"})
+    elif change == "stored_shorter":
+        stored["video_lane_configs"] = stored["video_lane_configs"][:2]
+
+    with pytest.raises(SceneMergeConflict) as exc:
+        merge_scene_history(base, target, stored)
+
+    assert exc.value.conflicts[0]["path"] == "video_lane_family"
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "pre-existing, bug tracker: with default lane configs, undoing a step that "
+    "removed a lane after a take was appended at the same index finds the "
+    "family equal to target BY VALUE, takes the no-op shortcut, and restores "
+    "the clip onto the take's lane. Flips to a failure when that is fixed."))
+def test_undo_of_a_lane_removal_after_a_take_refuses_instead_of_aliasing():
+    default = {}
+    # The step: deleting the lone clip on lane 1 compacted that lane away.
+    target = _scene(video_lane_count=2, video_lane_configs=[default, default],
+                    clips=[{"clip_id": "c", "track_index": 1}])
+    base = _scene(video_lane_count=1, video_lane_configs=[default])
+    # Then a take landed on a new lane -- index 1 again.
+    stored = _scene(video_lane_count=2, video_lane_configs=[default, default],
+                    clips=[{"clip_id": "take", "track_index": 1}])
+
+    with pytest.raises(SceneMergeConflict):
+        merge_scene_history(base, target, stored)
+
+
 def test_restore_receipts_are_count_bounded_and_ttl_prunes_every_entry(monkeypatch):
     clock = {"now": 100.0}
     monkeypatch.setattr("server.scene_history_merge.time.monotonic",
