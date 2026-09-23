@@ -1627,6 +1627,20 @@ export function createPromptDocumentEditor({
     editor.setAttribute("aria-multiline", "true");
     editor.style.cssText = editorCss(compact);
 
+    // The zero-width text node `paintTextSpan` appends after the LAST model
+    // node when it ends in `\n`. Without it a caret after a final line break
+    // has no line box to sit on and is not drawn at all. Only the last node:
+    // anywhere else the next node already supplies that line, and a sentinel
+    // there adds a blank line before a block decoration and a dead keypress
+    // to arrow keys and Delete. Every reader already strips `\u200b`, so the
+    // sentinel never reaches the model; the set only lets the caret, Backspace
+    // and Delete paths tell it apart from the empty-span placeholder.
+    const ZERO_WIDTH = String.fromCharCode(0x200b);
+    const trailingBreakSentinels = new WeakSet();
+    // One live test for every entry point that mutates the document. The
+    // construction option alone would keep refusing edits after a host
+    // unlocks the editor.
+    const isEditable = () => editor.contentEditable !== "false";
     const directNodeFor = (container) => {
         const element = container?.nodeType === Node.TEXT_NODE
             ? container.parentElement : container;
@@ -1677,7 +1691,8 @@ export function createPromptDocumentEditor({
         const nodes = spanTextNodes(host);
         if (!nodes.length) return { container: host, offset: 0 };
         let remaining = Math.max(0, Number(wanted) || 0);
-        for (const textNode of nodes) {
+        for (let index = 0; index < nodes.length; index += 1) {
+            const textNode = nodes[index];
             const value = String(textNode.nodeValue || "");
             let logical = 0;
             let raw = 0;
@@ -1685,7 +1700,18 @@ export function createPromptDocumentEditor({
                 if (value[raw] !== "\u200b") logical += 1;
                 raw += 1;
             }
-            if (logical >= remaining) return { container: textNode, offset: raw };
+            if (logical >= remaining) {
+                // A caret at the end of a text node that ends in a line break
+                // has no client rect, so it is invisible; the same logical
+                // position at the start of the sentinel painted after the
+                // break renders on the new line.
+                const following = nodes[index + 1];
+                if (raw === value.length && value.endsWith("\n")
+                        && trailingBreakSentinels.has(following)) {
+                    return { container: following, offset: 0 };
+                }
+                return { container: textNode, offset: raw };
+            }
             remaining -= logical;
         }
         const last = nodes[nodes.length - 1];
@@ -1868,7 +1894,7 @@ export function createPromptDocumentEditor({
         .map((node) => node.type !== "text" ? "" : promptHandleMentions(
             node.text).map((run) => run.handle).join(","))
         .join("|");
-    const paintTextSpan = (span, text) => {
+    const paintTextSpan = (span, text, { last = false } = {}) => {
         // Every run is an explicit Text node, including the unmarked ones and
         // including the no-handles case. Assigning `textContent` would be
         // shorter, but it leaves the span's characters in a place the offset
@@ -1894,6 +1920,11 @@ export function createPromptDocumentEditor({
         }
         if (cursor < text.length || !runs.length) {
             span.appendChild(document.createTextNode(text.slice(cursor)));
+        }
+        if (last && text.endsWith("\n")) {
+            const sentinel = document.createTextNode(ZERO_WIDTH);
+            trailingBreakSentinels.add(sentinel);
+            span.appendChild(sentinel);
         }
     };
     let decorationPlan = [];
@@ -1942,7 +1973,8 @@ export function createPromptDocumentEditor({
                 span.dataset.modelIndex = String(nodeIndex);
                 // A zero-width character keeps an empty stable text node
                 // addressable without entering the normalized projection.
-                paintTextSpan(span, node.text || "\u200b");
+                paintTextSpan(span, node.text || "\u200b",
+                    { last: nodeIndex === model.nodes.length - 1 });
                 editor.appendChild(span);
                 paintDecorations(nodeIndex);
                 return;
@@ -2110,16 +2142,62 @@ export function createPromptDocumentEditor({
         return String(clone.innerText || clone.textContent || "")
             .replaceAll("\u200b", "");
     };
+    // Ids the last `readDom` minted for bare top-level text nodes — the ones a
+    // browser leaves beside a chip, which no span id can name — so a caret
+    // inside one can be carried into the model that read produced.
+    let bareTextNodeIds = new WeakMap();
+    const isBareTextNode = (container) => container?.nodeType === Node.TEXT_NODE
+        && container.parentElement === editor;
+    /** `selectionBoundary`, plus a caret in a bare text node the last read named. */
+    const boundaryAcrossBareNodes = (container, offset) => {
+        if (!isBareTextNode(container)) return selectionBoundary(container, offset);
+        const nodeId = bareTextNodeIds.get(container);
+        if (nodeId) {
+            return { node_id: nodeId, offset: String(container.nodeValue || "")
+                .slice(0, Math.max(0, Number(offset) || 0))
+                .split(ZERO_WIDTH).join("").length };
+        }
+        // A bare node holding only zero-width characters never becomes a model
+        // node; resolve it by position, as a caret on the editor itself is.
+        const index = [...editor.childNodes].indexOf(container);
+        return index < 0 ? null : selectionBoundary(editor, index);
+    };
+    /** Valid only between a `readDom` and the next render. */
+    const bookmarkAcrossBareNodes = () => {
+        const range = selectionPoint(editor);
+        if (!range) return null;
+        const start = boundaryAcrossBareNodes(range.startContainer, range.startOffset);
+        const end = boundaryAcrossBareNodes(range.endContainer, range.endOffset);
+        return start && end ? { start, end } : null;
+    };
+    /**
+     * The last model node ends in `\n` but its span carries no sentinel — a
+     * native edit (deleting the last line's text) left the caret after a final
+     * break with nothing to draw it on.
+     */
+    const trailingSentinelMissing = () => {
+        const last = model.nodes[model.nodes.length - 1];
+        if (last?.type !== "text" || !last.text.endsWith("\n")) return false;
+        const span = [...editor.childNodes].find((child) =>
+            child?.dataset?.nodeId === last.node_id);
+        const textNodes = span ? spanTextNodes(span) : [];
+        return !trailingBreakSentinels.has(textNodes[textNodes.length - 1]);
+    };
     const readDom = () => {
         if (rendering || composing) return;
         const previouslyAnchored = new Set(model.nodes
             .filter((node) => node.type === "attachment")
             .map((node) => node.attachment_id));
         const next = [];
+        bareTextNodeIds = new WeakMap();
         for (const child of [...editor.childNodes]) {
             if (child.nodeType === Node.TEXT_NODE) {
                 const value = String(child.nodeValue || "").replaceAll("\u200b", "");
-                if (value) next.push({ type: "text", node_id: uid(), text: value });
+                if (value) {
+                    const nodeId = uid();
+                    bareTextNodeIds.set(child, nodeId);
+                    next.push({ type: "text", node_id: nodeId, text: value });
+                }
                 continue;
             }
             if (!(child instanceof HTMLElement)) continue;
@@ -2133,8 +2211,17 @@ export function createPromptDocumentEditor({
                 if (child.dataset.capabilityId) node.capability_id = child.dataset.capabilityId;
                 next.push(node);
             } else {
-                next.push({ type: "text", node_id: child.dataset.nodeId || uid(),
-                    text: textWithoutDecorations(child) });
+                let text = textWithoutDecorations(child);
+                // Chromium keeps an emptied last line alive with a placeholder
+                // `<br>`, which `innerText` reads as a second `\n`: deleting a
+                // final line's text stored a phantom newline. A `<br>` after
+                // text that already ends in a break is that placeholder, never
+                // content — the trailing-break sentinel stands in for it.
+                const tail = child.childNodes?.[child.childNodes.length - 1];
+                if ((tail?.nodeName || tail?.tagName) === "BR" && text.endsWith("\n\n")) {
+                    text = text.slice(0, -1);
+                }
+                next.push({ type: "text", node_id: child.dataset.nodeId || uid(), text });
             }
         }
         model = normalizePromptDocument({ nodes: next });
@@ -2153,8 +2240,16 @@ export function createPromptDocumentEditor({
         // silently stopped telling the author which words are live. Comparing
         // signatures keeps the render to the keystroke that completes or breaks
         // a handle rather than every one.
+        //
+        // A bare text node is a new model node, so it always changes the
+        // signature and this is also the render that absorbs one. The caret is
+        // measured through the ids just minted: `render()`'s own bookmark
+        // cannot name a bare node, dropped the caret, and the next keystroke
+        // landed at the start of the document.
         const signature = handlePaintSignature();
-        if (signature !== paintedHandleSignature) render();
+        if (signature !== paintedHandleSignature || trailingSentinelMissing()) {
+            render(bookmarkAcrossBareNodes());
+        }
     };
 
     editor.addEventListener("compositionstart", () => {
@@ -2176,8 +2271,97 @@ export function createPromptDocumentEditor({
         snapPromptCaretAtAtomicBoundary(
             editor, event.clientX, event.clientY, range);
     });
+    /**
+     * Rebuild the DOM from the model when a selection end sits in a bare
+     * top-level text node, so it becomes a model bookmark. `readDom` normally
+     * absorbs such a node on the `input` that created it; this covers one that
+     * is still there when the next `beforeinput` arrives.
+     *
+     * `{ rebuilt }` says whether the DOM was replaced: after that the browser's
+     * own selection may point at detached nodes, so a caller must not hand the
+     * event back to the browser even when no bookmark resulted.
+     */
+    const canonicalSelection = () => {
+        const range = selectionPoint(editor);
+        if (!range || !(isBareTextNode(range.startContainer)
+                || isBareTextNode(range.endContainer))) {
+            return { bookmark: null, rebuilt: false };
+        }
+        readDom();
+        const current = selectionPoint(editor);
+        if (current && (isBareTextNode(current.startContainer)
+                || isBareTextNode(current.endContainer))) {
+            // Only a zero-width bare node survives the read unrendered.
+            const bookmark = bookmarkAcrossBareNodes();
+            if (bookmark) {
+                render(bookmark);
+                restoreSelection(bookmark);
+            }
+        }
+        return { bookmark: selectionBookmark(), rebuilt: true };
+    };
+    /** Scroll every scrolling ancestor, nearest first, until the caret shows. */
+    const revealCaret = () => {
+        const caretRect = () => {
+            const range = selectionPoint(editor);
+            const rect = range?.getClientRects?.()?.[0] || range?.getBoundingClientRect?.();
+            return rect && (rect.height > 0 || rect.top !== 0) ? rect : null;
+        };
+        for (let scroller = editor; scroller && scroller !== document.body;
+            scroller = scroller.parentElement) {
+            const rect = caretRect();
+            if (!rect) return;
+            if (!(scroller.scrollHeight > scroller.clientHeight)) continue;
+            const overflow = globalThis.getComputedStyle?.(scroller)?.overflowY || "";
+            if (!["auto", "scroll"].includes(overflow)) continue;
+            const box = scroller.getBoundingClientRect();
+            if (rect.bottom > box.bottom) scroller.scrollTop += rect.bottom - box.bottom + 4;
+            else if (rect.top < box.top) scroller.scrollTop -= box.top - rect.top + 4;
+        }
+    };
+    /**
+     * The text a line-break input should insert, or null for any other input.
+     * Real keyboards send `insertParagraph`/`insertLineBreak`; automation, some
+     * virtual keyboards and IMEs send `insertText` whose data carries the break.
+     */
+    const lineBreakInputText = (event) => {
+        const type = String(event.inputType || "");
+        if (type === "insertParagraph" || type === "insertLineBreak") return "\n";
+        const data = String(event.data ?? "");
+        return type === "insertText" && /[\r\n]/.test(data)
+            ? data.replace(/\r\n?/g, "\n") : null;
+    };
     editor.addEventListener("beforeinput", (event) => {
-        if (!composing && !String(event.inputType || "").startsWith("history")) pushHistory();
+        // A host capture guard cancelling the input (the panel does during a
+        // template change) means nothing will be edited: no history, no break.
+        if (event.defaultPrevented) return;
+        if (composing || event.isComposing === true) return;
+        // Enter/Shift+Enter go through the model, never Chromium's paragraph
+        // insertion: that restructures a DOM `render()` rebuilds from the
+        // model, and the result was a lost newline and a jumped caret inside
+        // text, a caret in front of the break after a chip, and a chip read
+        // back as literal label text with its record deleted before one.
+        // The native path survives only where the event is not cancelable;
+        // remove that fallback once every supported browser reports these
+        // input types as cancelable.
+        const breakText = lineBreakInputText(event);
+        if (breakText !== null && event.cancelable !== false && isEditable()) {
+            let bookmark = selectionBookmark();
+            let rebuilt = false;
+            if (!bookmark) ({ bookmark, rebuilt } = canonicalSelection());
+            const resolvable = bookmark && modelPositionFor(bookmark.start)
+                && modelPositionFor(bookmark.end);
+            // Never fall through to `insertText`'s append-at-end branch. A caret
+            // that still cannot be named is left to the browser — unless the
+            // DOM was just rebuilt under it, where the browser's selection may
+            // name detached nodes and the keystroke is dropped instead.
+            if (resolvable || rebuilt) {
+                event.preventDefault();
+                if (resolvable) editor.insertText(breakText, { replaceSelection: true });
+                return;
+            }
+        }
+        if (!String(event.inputType || "").startsWith("history")) pushHistory();
     });
     editor.addEventListener("input", readDom);
     editor.addEventListener("paste", (event) => {
@@ -2190,6 +2374,25 @@ export function createPromptDocumentEditor({
         const plain = event.clipboardData?.getData("text/plain") || "";
         editor.insertText(plain, { replaceSelection: true });
     });
+    // A native copy carries the trailing-break sentinel into other fields and
+    // other apps. Only a selection that actually contains a zero-width
+    // character is taken over; every other copy and cut stays native.
+    const copyWithoutSentinel = (event, cut) => {
+        const range = selectionPoint(editor);
+        if (!range || range.collapsed || !event.clipboardData) return;
+        const text = String(globalThis.getSelection?.()?.toString?.() ?? "");
+        if (!text.includes(ZERO_WIDTH)) return;
+        event.preventDefault();
+        event.clipboardData.setData("text/plain", text.split(ZERO_WIDTH).join(""));
+        if (!cut || !isEditable()) return;
+        // The same deletion the Backspace-over-chips path uses; `readDom`
+        // prunes any chip record the cut removed.
+        pushHistory();
+        range.deleteContents();
+        readDom();
+    };
+    editor.addEventListener("copy", (event) => copyWithoutSentinel(event, false));
+    editor.addEventListener("cut", (event) => copyWithoutSentinel(event, true));
     const ownedKeyHandlers = [];
     const handleOwnedKeydown = (event) => {
         // While an IME composition is open, Enter/Escape/Backspace belong to the
@@ -2254,6 +2457,32 @@ export function createPromptDocumentEditor({
                     return true;
                 }
             }
+            // A caret beside the trailing-break sentinel, with nothing but the
+            // sentinel on its side of the key, would have the browser delete
+            // the sentinel: a keypress that changes nothing and still costs an
+            // undo entry. Backspace deletes the break the author can see; Delete
+            // has nothing after the last node's final break to remove.
+            if (range?.collapsed && isEditable()
+                    && trailingBreakSentinels.has(range.startContainer)) {
+                const raw = String(range.startContainer.nodeValue || "");
+                const side = event.key === "Backspace"
+                    ? raw.slice(0, range.startOffset) : raw.slice(range.startOffset);
+                const host = directNodeFor(range.startContainer);
+                const node = model.nodes.find((value) =>
+                    value.node_id === host?.dataset?.nodeId);
+                if (!side.split(ZERO_WIDTH).join("")
+                        && node?.type === "text" && node.text.endsWith("\n")) {
+                    event.preventDefault();
+                    if (event.key === "Delete") return true;
+                    pushHistory();
+                    node.text = node.text.slice(0, -1);
+                    const caret = { node_id: node.node_id, offset: node.text.length };
+                    render();
+                    restoreSelection({ start: caret, end: caret });
+                    emit("document");
+                    return true;
+                }
+            }
             let chip = event.target?.dataset?.nodeType === "attachment" ? event.target : null;
             if (!chip && range?.collapsed) {
                 // `directNodeFor` CLIMBS to the node span. Reading
@@ -2312,7 +2541,7 @@ export function createPromptDocumentEditor({
 
     /** Insert a configured contribution chip at the active caret. */
     const insertAttachment = (rawAttachment, capabilityId = "") => {
-        if (disabled) return null;
+        if (!isEditable()) return null;
         pushHistory();
         const attachment = normalizePromptAttachment(rawAttachment);
         attachments = [...attachments.filter((value) => value.attachment_id !== attachment.attachment_id), attachment];
@@ -2489,11 +2718,19 @@ export function createPromptDocumentEditor({
                 removedIds.push(node.attachment_id);
             }
         }
+        // A chip the span only TOUCHES — the selection starts just after it or
+        // ends just before it — is outside the span and stays. Splicing it
+        // out with the covered range removed the chip while the loop above,
+        // correctly, kept its record, stranding an unanchored attachment.
+        const keepHead = head?.type === "attachment" && from.offset > 0;
+        const keepTail = tail?.type === "attachment" && to.offset === 0
+            && to.index > from.index;
         const headText = head?.type === "text" ? head.text.slice(0, from.offset) : "";
         const tailText = tail?.type === "text" ? tail.text.slice(to.offset) : "";
         const merged = { type: "text", node_id: head?.type === "text" ? head.node_id : uid(),
             text: headText + tailText };
-        model.nodes.splice(from.index, to.index - from.index + 1, merged);
+        model.nodes.splice(from.index, to.index - from.index + 1,
+            ...(keepHead ? [head] : []), merged, ...(keepTail ? [tail] : []));
         if (removedIds.length) {
             const stillAnchored = new Set(model.nodes
                 .filter((node) => node.type === "attachment")
@@ -2502,7 +2739,7 @@ export function createPromptDocumentEditor({
                 stillAnchored.has(value.attachment_id)
                 || !removedIds.includes(value.attachment_id));
         }
-        return { index: from.index, offset: headText.length,
+        return { index: from.index + (keepHead ? 1 : 0), offset: headText.length,
             removedAttachment: removedIds.length > 0 };
     };
 
@@ -2535,8 +2772,10 @@ export function createPromptDocumentEditor({
      */
     editor.insertText = (rawText, { replaceSelection = false, asOwnNode = false,
         replaceTextRange = null } = {}) => {
-        if (disabled) return;
-        const value = String(rawText ?? "");
+        if (!isEditable()) return;
+        // The trailing-break sentinel is the one zero-width character this
+        // editor paints, and a native copy carries it; it is never content.
+        const value = String(rawText ?? "").split(ZERO_WIDTH).join("");
         if (!value) return;
         editor.focus();
         const bookmark = selectionBookmark();
@@ -2593,6 +2832,9 @@ export function createPromptDocumentEditor({
         model = normalizePromptDocument(model);
         render();
         restoreSelection({ start: caret, end: caret });
+        // The restore is `preventScroll`, so an insertion at the bottom of a
+        // scrolled box — a line break, a paste — left the caret off-screen.
+        revealCaret();
         emit(removedAttachment ? "attachment" : "document");
     };
     // Lets a host that mutates the document through `promptState` still

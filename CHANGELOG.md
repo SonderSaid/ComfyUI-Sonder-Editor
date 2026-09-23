@@ -26,6 +26,7 @@ a fresh `[Unreleased]` block.
 - The standalone `DELETE` routes for clips, guides, prompt sections and audio tracks. These operations are owned by the scene mutations endpoint, which accepts an identity snapshot of the target that the old routes could not send, and which rewrites the link groups they left behind.
 
 ### Fixed
+- Enter and Shift+Enter in the prompt editors now insert a line break exactly where the caret is. In the Writing draft they no longer lose the break, move the caret, or turn a prompt link into plain text. Deleting the last line's text no longer leaves an extra blank line.
 - Fullscreen editor undo/redo stays in the editor after button clicks and cannot advance ComfyUI graph history, including editors inside subgraphs.
 - Guide swaps now update immediately and support Undo/Redo; refused swaps preserve the previous Redo history and report the conflict.
 - Sonder Cluster preserves its saved lane and branch counts when loading or switching workflows in newer ComfyUI frontends, and keeps existing connections attached to their named sockets when its layout changes.
