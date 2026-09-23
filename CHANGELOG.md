@@ -26,6 +26,8 @@ a fresh `[Unreleased]` block.
 - The standalone `DELETE` routes for clips, guides, prompt sections and audio tracks. These operations are owned by the scene mutations endpoint, which accepts an identity snapshot of the target that the old routes could not send, and which rewrites the link groups they left behind.
 
 ### Fixed
+- The Prompt, Guides and Reference Lane panels no longer act on a different item after Undo. An action on something that has changed since the panel was drawn is refused with a message and changes nothing.
+- While a Prompt, Guides or Reference Lane panel is open, only Undo and Redo reach the timeline, so Delete, Space and other shortcuts can't edit the timeline hidden behind it. Escape closes the Guides panel instead of leaving fullscreen.
 - Enter and Shift+Enter in the prompt editors now insert a line break exactly where the caret is. In the Writing draft they no longer lose the break, move the caret, or turn a prompt link into plain text. Deleting the last line's text no longer leaves an extra blank line.
 - Fullscreen editor undo/redo stays in the editor after button clicks and cannot advance ComfyUI graph history, including editors inside subgraphs.
 - Guide swaps now update immediately and support Undo/Redo; refused swaps preserve the previous Redo history and report the conflict.

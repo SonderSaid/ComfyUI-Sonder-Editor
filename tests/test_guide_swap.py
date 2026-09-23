@@ -62,6 +62,45 @@ def test_guide_swap_geometry_matches_server(case, monkeypatch):
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {"applied": applied, "scene": scene.to_dict()}
 
+_IDENTITY_CASES = [
+    ("same", {"guide_id": "a", "frame_index": 10, "asset_id": "asset-a"}),
+    ("empty_snapshot", {}),
+    ("no_id_key", {"frame_index": 10, "asset_id": "asset-a"}),
+    ("other_id", {"guide_id": "b", "frame_index": 10, "asset_id": "asset-a"}),
+    ("moved", {"guide_id": "a", "frame_index": 20}),
+    ("other_asset", {"guide_id": "a", "asset_id": "asset-b"}),
+    ("blank_id_vs_stored", {"guide_id": "", "frame_index": 10}),
+    ("strength_close", {"guide_id": "a", "strength": 0.4 + 1e-12}),
+    ("muted", {"guide_id": "a", "muted": True}),
+]
+
+
+@pytest.mark.parametrize("case, expected", _IDENTITY_CASES)
+def test_guide_identity_match_matches_server(case, expected, monkeypatch):
+    """The host's local applies gate on the same decision the server's guard makes.
+
+    A local apply that disagrees paints a guide the server then refuses to
+    touch, or skips one the server writes.
+    """
+    routes = _load_route_module(monkeypatch)
+    guide = _scene().guide_frames[0]
+    try:
+        routes._validate_guide_identity(guide, expected)
+        server = True
+    except routes.ProjectMutationRequestError:
+        server = False
+    node = shutil.which("node")
+    if not node: pytest.skip("node is required for identity parity")
+    url = (ROOT / "web/js/scene_guide_geometry.js").as_uri()
+    code = (f"import {{guideIdentityMatches}} from {json.dumps(url)};"
+            f"console.log(JSON.stringify(guideIdentityMatches("
+            f"{json.dumps(guide.to_dict())}, {json.dumps(expected)})));")
+    result = subprocess.run([node, "--input-type=module", "-e", code], capture_output=True,
+                            text=True, encoding="utf-8", timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) is server, case
+
+
 def test_swap_round_trip_restores_identity_fields_and_links(monkeypatch):
     routes = _load_route_module(monkeypatch)
     from server.scene_history_merge import merge_scene_history

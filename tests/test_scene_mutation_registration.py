@@ -65,7 +65,10 @@ EXPECTED_LITERAL_COUNTS = {
     # 82 -> 80 on 2026-09-17: `_updateSceneGlobalChannelsWithinGesture` and
     # `_updateScenePromptWithinGesture` were deleted as unreachable code (umbrella
     # Phase B / L1). They were the only patch-shaped `coalesce: true` emissions.
-    "editor_widget.js": 81,
+    # 81 -> 80 on 2026-09-22: `_showGuideManagementPopupLegacy`, dead since the
+    # current popup replaced it, was deleted with its `delete_guide` emission
+    # (0.6.0 release blockers, L3).
+    "editor_widget.js": 80,
     "editor_prompt_panel.js": 4,
     "editor_reference_panel.js": 3,
     "prompt_context_chips.js": 1,
@@ -75,7 +78,8 @@ EXPECTED_LITERAL_COUNTS = {
 # Scene-mutation enqueue call sites, pinned for the same reason as the
 # literal counts above: a scan that quietly stops matching reports a clean
 # surface forever. Update deliberately when adding or removing an enqueue.
-EXPECTED_ENQUEUE_SITES = 57
+# 57 -> 56 on 2026-09-22: the dead legacy guide popup's delete enqueue went with it.
+EXPECTED_ENQUEUE_SITES = 56
 
 # Geometry the client computed from what it could see. Matched with a trailing
 # `[:,}]` so ES6 shorthand counts — `split_clip` passes its frame that way, and a
@@ -2363,9 +2367,15 @@ OPAQUE_GUARD_SITES = {
         "identifier. Half-opaque, and listed because the half that is readable "
         "must not certify the half that is not.",
     "editor_widget.js:_deletePromptSectionWithinGesture:delete_prompt_section":
-        "`expected` is an identifier built from the section being deleted.",
+        "`expected` is an identifier: `{prompt_id}` from the section a panel "
+        "drew, or the current row's id and range for a timeline caller.",
     "editor_widget.js:_updateItemPropertyWithinGesture:update_guide":
-        "`expected` is a computed Object.fromEntries over the changed keys.",
+        "`expected` is the caller's snapshot identity when one is passed "
+        "(`_guideSnapshotIdentity`), otherwise read from the current row.",
+    "editor_widget.js:_showGuideManagementPopup:delete_guide":
+        "`expected` is `_guideIdentityForAction(guide)`: the popup row's "
+        "`guide_id` / `frame_index` / `asset_id` with empty keys omitted, "
+        "checked against the current occupant before the undo entry.",
     "editor_widget.js:_updateItemPropertyWithinGesture:update_reference_item":
         "As above; the same computed guard serves both operations.",
     "editor_widget.js:_updatePromptSectionWithinGesture:update_prompt_section":
@@ -3551,7 +3561,8 @@ def _scope_body(item) -> str:
 
 # Pinned rather than bounded: the split between the two spellings is the
 # finding that justified two tripwires instead of one.
-EXPECTED_STABLE_KEY_OPT_OUTS = 18
+# 18 -> 17 on 2026-09-22: the legacy guide popup's declined delete was deleted.
+EXPECTED_STABLE_KEY_OPT_OUTS = 17
 EXPECTED_UNIQUIFIED_KEY_OPT_OUTS = 29
 EXPECTED_CALLER_SUPPLIED_OPT_OUTS = 1
 
@@ -3825,7 +3836,8 @@ KEY_INTERPOLATIONS = {
     "guide.frame_index": (STABLE, "a guide's frame, which is its address"),
     "this.playhead": (STABLE, "the playhead frame; two gestures at one frame "
                               "address the same target"),
-    "idx": (STABLE, "a prompt section's list index"),
+    "keyId": (STABLE, "a prompt section's durable id, or `index-<n>` for an "
+                      "id-less legacy section"),
     "oldIdx": (STABLE, "the guide frame a move starts from"),
     "keySuffix": (STABLE, "a literal discriminator -- \"clip\", \"audio\", "
                           "\"driver\" -- passed by `_handleAssetDrop`"),
@@ -4210,10 +4222,6 @@ COALESCE_OPT_OUT_REVIEWED = {
         "`_apply_delete_guide` is consumed once and carries an identity "
         "`expected` including `guide_id`, so a second delete at the same frame "
         "describes a guide the first one removed."),
-    "editor_widget.js:_showGuideManagementPopupLegacy:guide:${}:${}:delete": (
-        DECLINED,
-        "the legacy popup's copy of the same delete; same reasoning, and the "
-        "matching key shape is why the scope is part of the entry key."),
     "editor_widget.js:_updatePromptSectionWithinGesture:prompt:${}:${}:fields": (
         DECLINED,
         "`_apply_update_prompt_section` is addressed by LIST INDEX, and "
@@ -4223,8 +4231,9 @@ COALESCE_OPT_OUT_REVIEWED = {
         "key."),
     "editor_widget.js:_deletePromptSectionWithinGesture:prompt:${}:${}:delete": (
         DECLINED,
-        "`_apply_delete_prompt_section` is addressed by list index and the key "
-        "carries that index, which the first deletion renumbers."),
+        "`_apply_delete_prompt_section` is addressed by list index, and a "
+        "delete is consumed once: a second delete of the same section "
+        "describes a row the first one removed."),
     "editor_widget.js:_updateLinkedPromptAttachmentWithinGesture:prompt:${}:linked:${}": (
         DECLINED,
         "carries `retryOnConflict: false` as a stated caller override, and "

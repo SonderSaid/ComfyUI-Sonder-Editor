@@ -57,6 +57,7 @@ class Editor {
  constructor(){this.isFullscreen=true;this._editorFocused=false;this.undos=0;this.redos=0;this.empty=false;this._setupKeyboardEvents();}
  _undo(){if(!this.empty)this.undos++;} _redo(){if(!this.empty)this.redos++;}
  _keyboardConsumerId(){return 'test-editor';} _keyboardDebug(){} _keyboardDebugSnapshot(){return {};}
+ _managementModalMounted(){return false;}
 }
 function event(tag='BODY',key='z',extra={},kind=''){
  const target=new Element(tag,kind);document.activeElement=target;

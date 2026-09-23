@@ -560,31 +560,15 @@ UNWRAPPED_RESERVING_SCOPES = (
     "_showGuideManagementPopup",
 )
 
-# Deliberately not scanned. Each reason is checked by
-# `test_the_unscanned_scopes_are_still_the_shapes_their_reasons_describe`, so an
-# exclusion cannot outlive the condition that justified it.
-UNSCANNED_SCOPES = {
-    "_showGuideManagementPopupLegacy":
-        "Dead: declared once and called from nowhere in web/. Scanning it would "
-        "buy a permanent exemption for code whose fix is deletion. This entry "
-        "goes when it gains a caller, and the liveness check fails first.",
-    "commitStrength":
-        "A local const arrow declared TWICE in this file -- the legacy popup's "
-        "does not reserve, the current one does -- so a name-keyed lookup "
-        "cannot address either. This entry goes when they become one scope.",
-}
-
-
 # Every unit the scan reserves undo in, pinned so a shrinking scan cannot read
 # as full coverage. One entry per scanned UNIT, not per reservation: `assetDrop`
-# holds two reservations and appears once, while `deleteGuide` appears twice
-# because two separate popup surfaces each wrap their own gesture of that name.
+# holds two reservations and appears once.
 SCANNED_RESERVING_UNITS = (
     "_setupTimelineEvents", "_showGuideManagementPopup", "_showItemEditor",
     "_toggleHeaderVisibility", "addClipFrameToGuides", "addLane",
     "appendReferenceMembers", "applyPromptSetup", "assetDrop",
     "consolidateSelectedItemsToLane", "convertClipRole", "deleteGuide",
-    "deleteGuide", "deleteItemsInLane", "deletePromptSection",
+    "deleteItemsInLane", "deletePromptSection",
     "deleteSelectedItems", "deleteSelectedLanesAndItems", "linkItems",
     "moveGuideToFrame", "moveItemToFrame", "moveItemToNewLane",
     "moveReferenceLane", "placeReferencePayload", "removeLane",
@@ -941,27 +925,6 @@ def test_gesture_undo_claims_reach_a_mutation_helper_before_expiry():
     _assert_undo_claim_findings(_undo_claim_findings(source))
 
 
-def test_the_unscanned_scopes_are_still_the_shapes_their_reasons_describe():
-    """An exclusion must not outlive the condition that justified it."""
-    source = (ROOT / "web/js/editor_widget.js").read_text(encoding="utf-8")
-    assert all(reason.strip() for reason in UNSCANNED_SCOPES.values())
-    scopes = registration._scopes(source)
-    legacy = "_showGuideManagementPopupLegacy"
-    # Counted, not pattern-matched for a call: `this?.x()`, `this['x']()`,
-    # `.call(this)` and a stored reference all revive it without matching a
-    # call shape, and this codebase uses optional chaining heavily. Exactly one
-    # occurrence is the declaration; anything else is a revival or a second
-    # declaration, and both end the exclusion.
-    occurrences = sum(path.read_text(encoding="utf-8").count(legacy)
-                      for path in (ROOT / "web/js").rglob("*.js"))
-    assert occurrences == 1, (
-        f"{legacy} occurs {occurrences} times in web/js, so it is no longer "
-        "dead and excluding it from the undo scan is no longer free")
-    assert len([one for one in scopes if one[0] == "commitStrength"]) == 2, (
-        "commitStrength no longer resolves to two scopes, so the name-keyed "
-        "lookup that this exclusion works around may now be possible")
-
-
 def test_a_reservation_inside_a_closure_is_reported_rather_than_unseen():
     """Selection must precede masking, and this is what pins the order.
 
@@ -1303,9 +1266,12 @@ def test_severing_any_single_claim_link_fails_the_contract(old, new, count, mess
 # Authority citations and test references prove existence, never semantic coverage.
 MIRRORED_MODULES = {
     "scene_guide_geometry.js": {
-        "scope": "Guide-swap applicability and raw frame ordering for optimistic paint.",
-        "authorities": ("server/routes.py::_apply_swap_guides",),
-        "tests": ("test_guide_swap.py::test_guide_swap_geometry_matches_server",),
+        "scope": ("Guide-swap applicability, raw frame ordering, and the guide "
+                  "identity comparison host local applies gate on."),
+        "authorities": ("server/routes.py::_apply_swap_guides",
+                        "server/routes.py::_validate_guide_identity"),
+        "tests": ("test_guide_swap.py::test_guide_swap_geometry_matches_server",
+                  "test_guide_swap.py::test_guide_identity_match_matches_server"),
     },
     "selection_constraints.js": {
         "scope": "Execution-window snapping, context and padding math.",
@@ -1515,7 +1481,7 @@ def test_declared_mirror_headers_match_the_inventory_both_ways():
 
 def test_every_declared_mirror_has_a_live_parity_disposition():
     _assert_mirror_obligations(MIRRORED_MODULES, ROOT)
-    assert sum(len(row["authorities"]) for row in MIRRORED_MODULES.values()) == 44
+    assert sum(len(row["authorities"]) for row in MIRRORED_MODULES.values()) == 45
 
 @pytest.mark.parametrize("name, valid", [("TABLE", True), ("row", False), ("transform", True)])
 def test_mirror_authorities_are_module_declarations(tmp_path, name, valid):

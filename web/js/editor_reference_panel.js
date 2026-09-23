@@ -178,6 +178,49 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         pickerItemId: "",
         pickerQuery: "",
         busy: false,
+        // The durable id of the lane the panel last drew (null before the first
+        // render). Lanes reorder, and an Undo can shift them under an open
+        // panel, so the index alone can name another lane by the time anything
+        // renders or writes; every render follows this id instead.
+        renderedLaneId: null,
+        // A lane with no durable id yet has no identity to follow; the lane
+        // count is the only evidence left that its index moved.
+        renderedLaneCount: 0,
+    };
+    const storedLaneId = (index = state.laneIndex) => String(
+        host.activeScene?.reference_lane_recipes?.[index]?.lane_id || "").trim();
+    const referenceLaneCount = () => Number(host.activeScene?.reference_lane_count
+        ?? (host.activeScene?.reference_lane_recipes || []).length) || 0;
+    const drawnLaneMoved = () => {
+        if (state.renderedLaneId === null) return false;
+        if (state.renderedLaneId) return storedLaneId() !== state.renderedLaneId;
+        return referenceLaneCount() !== state.renderedLaneCount;
+    };
+    /** Point the panel back at the lane it drew, or close with a notice when
+     *  that lane is gone (or, for an id-less lane, cannot be told apart).
+     *  Returns whether the panel is still open. */
+    const resyncDrawnLane = () => {
+        if (!drawnLaneMoved()) return true;
+        const wanted = state.renderedLaneId;
+        const index = wanted ? (host.activeScene?.reference_lane_recipes || [])
+            .findIndex((recipe) => String(recipe?.lane_id || "").trim() === wanted) : -1;
+        if (index >= 0) {
+            state.laneIndex = index;
+            state.pickerItemId = "";
+            state.pickerQuery = "";
+            return true;
+        }
+        notifyWarning(wanted ? "The Reference lane this panel showed no longer exists."
+            : "The Reference lanes changed since this panel was drawn.",
+            { source: "reference-panel-lane-gone" });
+        close();
+        return false;
+    };
+    /** A deliberate lane switch (a tab, `followLane`) re-points what is drawn. */
+    const drawLane = (index) => {
+        state.laneIndex = index;
+        state.renderedLaneId = storedLaneId(index);
+        state.renderedLaneCount = referenceLaneCount();
     };
     // Keyed on the lane's DURABLE id, not its index. Lane order is now
     // user-controlled, so an index-keyed memory would hand a moved lane the
@@ -241,8 +284,22 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
 
     // ── Durable writes ─────────────────────────────────────────────────────
     const writeRecipe = async (recipe) => {
+        // A references refresh can close the panel under an open custom-recipe
+        // flow; nothing may be written from a closed one.
+        if (!mounted) return;
+        if (drawnLaneMoved()) {
+            // An Undo or a refetch moved the lanes under an unrepainted panel:
+            // the index now names another lane, whose recipe this would replace.
+            render();
+            if (mounted) {
+                notifyWarning("This Reference lane moved since the panel was drawn.",
+                    { source: "reference-panel-stale" });
+            }
+            return;
+        }
         const entry = currentEntry();
         if (!entry || state.busy) return;
+        const expectedLaneId = state.renderedLaneId || "";
         const current = laneRecipe();
         const nextRecipe = preserveLaneRecipeIdentity(
             current,
@@ -252,7 +309,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         state.busy = true;
         entry.referenceRecipe = nextRecipe;
         try {
-            await host._saveLaneConfig([entry]);
+            await host._saveLaneConfig([entry], { expectedLaneId });
         } finally {
             state.busy = false;
         }
@@ -1577,10 +1634,12 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
 
     const render = () => {
         if (!mounted) return;
+        if (!resyncDrawnLane()) return;
         const entries = laneEntries();
         if (entries.length && !entries.some((entry) => (entry.laneIndex || 0) === state.laneIndex)) {
             state.laneIndex = entries[0].laneIndex || 0;
         }
+        drawLane(state.laneIndex);
         subtitle.textContent = laneLocked()
             ? "Lane locked — unlock it on the timeline header to edit"
             : "Recipe values, staged items and their Library members";
@@ -1592,7 +1651,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             const tab = button(entry.customName || `Reference ${index + 1}`, "", active ? "primary" : "subtle");
             tab.addEventListener("click", () => {
                 if (index === state.laneIndex) return;
-                state.laneIndex = index;
+                drawLane(index);
                 state.pickerItemId = "";
                 state.pickerQuery = "";
                 render();
@@ -1637,35 +1696,46 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         renderRecipe(body);
     };
 
+    /** Re-point this overlay at one lane by its DURABLE id.
+     *
+     *  Every accessor above reads `state.laneIndex`, so after a lane move a
+     *  stale index shows another lane's recipe, items and lock state with no
+     *  sign anything is wrong. The host calls this instead of poking the
+     *  index, which is why the index stays read-only on the handle.
+     */
+    function followLane(laneId) {
+        const wanted = String(laneId || "").trim();
+        if (!mounted || !wanted) return false;
+        const recipes = host.activeScene?.reference_lane_recipes || [];
+        const index = recipes.findIndex(
+            (recipe) => String(recipe?.lane_id || "").trim() === wanted);
+        if (index < 0) return false;
+        if (index !== state.laneIndex) {
+            state.pickerItemId = "";
+            state.pickerQuery = "";
+        }
+        drawLane(index);
+        render();
+        return true;
+    }
+    /** `render` itself follows the drawn lane; this reports whether the
+     *  panel survived doing so. */
+    function refreshFollowingLane() {
+        render();
+        return mounted;
+    }
+
     render();
     document.body.appendChild(backdrop);
 
     const handle = {
         close,
-        refresh: render,
+        /** Repaint from the current scene, staying on the lane that was shown —
+         *  by its durable id, since an Undo can move it to another index — and
+         *  closing with a notice when that lane no longer exists. */
+        refresh: () => refreshFollowingLane(),
         get laneIndex() { return state.laneIndex; },
-        /** Re-point this overlay at one lane by its DURABLE id.
-         *
-         *  Every accessor above reads `state.laneIndex`, so after a lane move a
-         *  stale index shows another lane's recipe, items and lock state with no
-         *  sign anything is wrong. The host calls this instead of poking the
-         *  index, which is why the index stays read-only on this handle.
-         */
-        followLane(laneId) {
-            const wanted = String(laneId || "").trim();
-            if (!mounted || !wanted) return false;
-            const recipes = host.activeScene?.reference_lane_recipes || [];
-            const index = recipes.findIndex(
-                (recipe) => String(recipe?.lane_id || "").trim() === wanted);
-            if (index < 0) return false;
-            if (index !== state.laneIndex) {
-                state.laneIndex = index;
-                state.pickerItemId = "";
-                state.pickerQuery = "";
-            }
-            render();
-            return true;
-        },
+        followLane,
     };
     host._referencePanelHandle = handle;
     return handle;

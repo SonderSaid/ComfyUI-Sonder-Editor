@@ -9534,6 +9534,8 @@ def test_real_prompt_save_preserves_remote_sibling_and_revision_owned_undo(globa
     widget = _source("web/js/editor_widget.js")
     method = _method(widget, "_updateSceneGlobalContext", "_setSectionGlobalInherit") if global_scope else _method(widget, "_updatePromptSection", "_updateLinkedPromptAttachment")
     take = _method(widget, "_takePromptIdentityCreateIntents", "_adoptPromptIdentitiesFromMutation")
+    # The section save resolves its row through the panel-identity helper.
+    resolve = _method(widget, "_resolvePanelPromptSection", "_deletePromptSectionWithinGesture")
     intent_url = (ROOT / "web/js/prompt_edit_intent.js").as_uri()
     composition_url = (ROOT / "web/js/prompt_composition.js").as_uri()
     template_url = (ROOT / "web/js/prompt_channel_templates.js").as_uri()
@@ -9547,6 +9549,7 @@ const baseline={{prompt_id:"stable",start_frame:0,end_frame:24,[docsKey]:{{visua
 class Host {{
  {method}
  {take}
+ {resolve}
  constructor() {{this.projectDir="p";this.activeSceneId="s";this.row=structuredClone(baseline);this.row[docsKey].speech.text="REMOTE";this.row[channelsKey].speech="REMOTE";this.activeScene=globalScope?this.row:{{prompt_sections:[this.row]}};this.history=[];this.calls=[];}}
  _projectDirName(){{return "p";}} _channelTemplate(){{return getChannelTemplate("sonder");}}
  _isGlobalPromptTrackLocked(){{return false;}} _isPromptTrackLocked(){{return false;}}

@@ -476,7 +476,7 @@ import { LINK_ITEM_TYPES, pruneLinkedItemGroups, editedLinkGroups, rollbackLinkG
 import {
     canonicalStagedMemberRefs, canonicalStoredMemberRefs, stagedReferenceItem,
 } from "./scene_reference_geometry.js";
-import { applyGuideSwap } from "./scene_guide_geometry.js";
+import { applyGuideSwap, guideIdentityMatches } from "./scene_guide_geometry.js";
 import { createViewportSurface } from "./viewport_surface.js";
 import {
     EDITOR_COLORS as COLORS,
@@ -500,6 +500,7 @@ import {
     isKeyboardDebugEnabled,
     register as registerKeyboardConsumer,
     PRIORITY as KEY_PRIORITY,
+    PRESERVE_DEFAULT,
 } from "./keyboard_ownership.js";
 import {
     ASPECT_RATIO_PRESETS,
@@ -5127,6 +5128,49 @@ export class EditorWidget {
     }
 
     /**
+     * The identity of a guide AS ITS CALLER SAW IT — the guide popup's row,
+     * the timeline's hit — for `expected` and for gating local applies.
+     *
+     * Built from the caller's object, never by re-looking-up the frame: a
+     * guard read from the row about to be written always matches, and a stale
+     * popup once muted a different guide with its own guard agreeing
+     * (`durable_rules.md`, "Build `expected` from what the caller saw"). Empty
+     * keys are omitted, so an id-less legacy guide is not refused against an
+     * id the server minted since.
+     */
+    _guideSnapshotIdentity(guide) {
+        const identity = {};
+        if (guide?.guide_id) identity.guide_id = String(guide.guide_id);
+        if (Number.isFinite(Number(guide?.frame_index))) {
+            identity.frame_index = Number(guide.frame_index);
+        }
+        if (guide?.asset_id) identity.asset_id = String(guide.asset_id);
+        return identity;
+    }
+
+    /**
+     * The caller's identity for `guide`, or null — after one warning — when the
+     * guide it shows is no longer the one at its frame. Checked before any undo
+     * entry or write, so a stale popup action costs neither; the identity it
+     * returns still travels as `expected` for the race after this check.
+     */
+    _guideIdentityForAction(guide) {
+        const identity = this._guideSnapshotIdentity(guide);
+        if (this._guideMatchingIdentity(guide?.frame_index, identity)) return identity;
+        notifyWarning("This guide changed since the panel was drawn.",
+            { source: "guide-panel-stale" });
+        return null;
+    }
+
+    /** The guide now at `frameIndex`, if it is the one `identity` names. */
+    _guideMatchingIdentity(frameIndex, identity) {
+        const frame = parseInt(frameIndex, 10);
+        const occupant = (this.activeScene?.guide_frames || []).find(
+            (guide) => parseInt(guide?.frame_index, 10) === frame);
+        return occupant && guideIdentityMatches(occupant, identity) ? occupant : null;
+    }
+
+    /**
      * The `expected` a `create_reference_item` must carry.
      *
      * Both emitters set the new item's `end_frame` to the start of the next item
@@ -5415,7 +5459,15 @@ export class EditorWidget {
                 if (!preserveLane) audioLanes.push(parseInt(track.lane_index, 10) || 0);
             } else if (item.type === "guide") {
                 const frameIndex = parseInt(item.id, 10);
-                if (Number.isFinite(frameIndex)) guideFrames.add(frameIndex);
+                if (!Number.isFinite(frameIndex)) continue;
+                // A guide is addressed by its frame, so a stale caller names
+                // whichever guide now sits there. With the caller's identity,
+                // paint only the guide it saw; a mismatch is left for the
+                // server's `identity_mismatch` to refuse.
+                if (item.expected && !this._guideMatchingIdentity(frameIndex, item.expected)) {
+                    continue;
+                }
+                guideFrames.add(frameIndex);
             } else if (item.type === "prompt") {
                 const idx = parseInt(item.id, 10);
                 if (Number.isFinite(idx)) promptIndexes.push(idx);
@@ -11829,7 +11881,14 @@ export class EditorWidget {
             "laneConfig", () => this._saveLaneConfigWithinGesture(...args));
     }
 
-    async _saveLaneConfigWithinGesture(changedEntries) {
+    /**
+     * `expectedLaneId` is the durable id of the Reference lane the caller drew
+     * (the Reference Lane panel). Without it the guard is read from whatever
+     * lane now sits at `laneIndex`, which always agrees with itself; with it, a
+     * panel left pointing at a moved lane is refused by the server instead of
+     * rewriting the lane that took its place, and nothing is painted locally.
+     */
+    async _saveLaneConfigWithinGesture(changedEntries, { expectedLaneId = "" } = {}) {
         if (!this.activeScene || !this.projectDir) return;
         const entries = (Array.isArray(changedEntries) ? changedEntries : [changedEntries]).filter(Boolean);
         if (!entries.length) return;
@@ -11847,10 +11906,16 @@ export class EditorWidget {
                     || sceneRef?.[descriptor.recipeAttr]?.[laneIndex]
                     || this._defaultReferenceLaneRecipe();
             }
-            const laneId = String(sceneRef?.[descriptorFor(laneType)?.recipeAttr]?.[laneIndex]?.lane_id || "").trim();
+            const storedLaneId = String(sceneRef?.[descriptorFor(laneType)?.recipeAttr]?.[laneIndex]?.lane_id || "").trim();
+            // One caller identity names one lane: a multi-entry call cannot say
+            // which of its entries the id belongs to, so it gets none.
+            const callerLaneId = descriptor?.recipeAttr && entries.length === 1
+                ? String(expectedLaneId || "").trim() : "";
+            const laneId = callerLaneId || storedLaneId;
             operations.push({ type: "update_lane_config", lane_type: laneType, lane_index: laneIndex, fields,
                 ...(laneId ? { expected: { lane_id: laneId } } : {}),
             });
+            if (callerLaneId && callerLaneId !== storedLaneId) continue;
             // Optimistic per-lane scene write (icon-flicker fix, now scoped):
             // _buildTrackLayout re-derives icon state from scene configs, so any
             // rebuild during the in-flight window must already see the new value.
@@ -13705,7 +13770,11 @@ export class EditorWidget {
      *  default is inherit-everything and a channel added to the template later
      *  needs no per-section write. Routed through `_updatePromptSection` so it
      *  shares the section's identity check, undo entry and coalescing. */
-    async _setSectionGlobalInherit(idx, key, inherits) {
+    async _setSectionGlobalInherit(idx, key, inherits, { promptId = "" } = {}) {
+        // Current, next and the no-op test all read the row the id resolves
+        // to: computing them from the index would write an exception set
+        // derived from whichever section now sits there.
+        idx = this._resolvePanelPromptSection(idx, promptId);
         const section = (this.activeScene?.prompt_sections || [])[idx];
         if (!section) return;
         const current = new Set(normalizeChannelExceptions(section.global_channel_exceptions));
@@ -13714,7 +13783,8 @@ export class EditorWidget {
         const next = [...current].sort();
         if (next.join("\u0000") === normalizeChannelExceptions(
             section.global_channel_exceptions).join("\u0000")) return;
-        await this._updatePromptSection(idx, { global_channel_exceptions: next });
+        await this._updatePromptSection(idx, { global_channel_exceptions: next },
+            { promptId });
     }
 
     /** Global channel keys for the active template — every channel, or just the
@@ -14909,10 +14979,13 @@ export class EditorWidget {
 
     /** Insert an empty section directly after the given one, filling the gap
      *  to the next section / scene end (min 1 frame; warns when no room). */
-    async _addPromptSectionAfter(index) {
+    async _addPromptSectionAfter(index, { promptId = "" } = {}) {
         const scene = this.activeScene;
         if (!scene || this._isPromptTrackLocked()) return false;
         const sections = scene.prompt_sections || [];
+        // The anchor is the section the panel drew; its neighbour is whatever
+        // follows it NOW, which is where the gap actually is.
+        index = this._resolvePanelPromptSection(index, promptId);
         const section = sections[index];
         if (!section) return false;
         const duration = scene.duration_frames || this.totalFrames || 0;
@@ -15438,14 +15511,21 @@ export class EditorWidget {
             "updatePromptSection", () => this._updatePromptSectionWithinGesture(...args));
     }
 
+    /**
+     * `baseline` is a draft's full snapshot: identity AND before-values come
+     * from it. `promptId` is identity only — the section the panel drew —
+     * with before-values read from the current optimistic row, so the
+     * panel's own unrefreshed writes (a Start then an End commit) do not
+     * refuse each other.
+     */
     async _updatePromptSectionWithinGesture(idx, updates, {
-        baseline = null, projectId = this._projectDirName(), sceneId = this.activeSceneId,
+        baseline = null, promptId = "", projectId = this._projectDirName(),
+        sceneId = this.activeSceneId,
         template = projectTemplateValue(this._channelTemplate()),
     } = {}) {
         if (!this.activeScene || !this.projectDir || this._isPromptTrackLocked()
                 || projectId !== this._projectDirName() || sceneId !== this.activeSceneId) return false;
-        if (baseline?.prompt_id) idx = (this.activeScene.prompt_sections || [])
-            .findIndex((row) => row.prompt_id === baseline.prompt_id);
+        idx = this._resolvePanelPromptSection(idx, baseline?.prompt_id || promptId);
         const section = (this.activeScene.prompt_sections || [])[idx];
         if (!section) return false;
         const previous = structuredClone(section);
@@ -15607,12 +15687,51 @@ export class EditorWidget {
             "deletePromptSection", () => this._deletePromptSectionWithinGesture(...args));
     }
 
-    async _deletePromptSectionWithinGesture(idx) {
-        if (!this.activeScene || !this.projectDir) return;
-        if (this._isPromptTrackLocked()) return;
+    /**
+     * Where the section a management panel drew now sits, by its durable id.
+     *
+     * A panel that is not repainted after Undo or a refetch keeps the list
+     * index it rendered, and that index can name a different section by the
+     * time the action runs — panel Delete once removed the very section Undo
+     * had just restored, with a 200 and no message. Identity comes from what
+     * the panel showed (`durable_rules.md`, "Build `expected` from what the
+     * caller saw"). An id-less legacy section, or a caller that passes none
+     * (the timeline selection), keeps the index it was given.
+     *
+     * Returns -1 after telling the author and repainting the panel.
+     */
+    _resolvePanelPromptSection(idx, promptId = "") {
+        const sections = this.activeScene?.prompt_sections || [];
+        if (!promptId) return sections[idx] ? idx : -1;
+        const index = sections.findIndex((row) => row.prompt_id === promptId);
+        if (index < 0) {
+            // Worded for any surface: the timeline prompt bar resolves its
+            // draft baseline through here too, with no panel open.
+            notifyWarning("This prompt section changed or was removed since it was shown.",
+                { source: "prompt-panel-stale" });
+            this._promptPanelHandle?.refresh?.();
+        }
+        return index;
+    }
+
+    async _deletePromptSectionWithinGesture(idx, { promptId = "" } = {}) {
+        if (!this.activeScene || !this.projectDir) return false;
+        if (this._isPromptTrackLocked()) return false;
+        // Resolved BEFORE the undo entry: a refused target owes no entry, and
+        // an entry pushed first would strand one for a write never sent.
+        idx = this._resolvePanelPromptSection(idx, promptId);
+        const section = (this.activeScene.prompt_sections || [])[idx];
+        if (!section) return false;
         const undoLabel = "delete prompt";
         this._pushUndo(undoLabel);
-        const section = (this.activeScene.prompt_sections || [])[idx];
+        // The panel's own unrefreshed range edits move start/end, so a panel
+        // delete guards on the id alone; the id is what says which section.
+        const expected = promptId ? { prompt_id: promptId } : {
+            prompt_id: section.prompt_id || "",
+            start_frame: section.start_frame,
+            end_frame: section.end_frame,
+        };
+        const keyId = section.prompt_id || `index-${idx}`;
         this._applyLocalPromptDelete(idx);
         this._selectedPromptIdx = null;
         // Discard any pending inline edit: it targets a section that is gone,
@@ -15625,22 +15744,20 @@ export class EditorWidget {
                 [{
                     type: "delete_prompt_section",
                     index: idx,
-                    expected: section ? {
-                        prompt_id: section.prompt_id || "",
-                        start_frame: section.start_frame,
-                        end_frame: section.end_frame,
-                    } : undefined,
+                    expected,
                 }],
                 {
-                    key: `prompt:${this.activeSceneId}:${idx}:delete`,
+                    key: `prompt:${this.activeSceneId}:${keyId}:delete`,
                     label: "delete prompt",
                     coalesce: false,
                 }
             );
+            return true;
         } catch (e) {
             notifyWarning(e?.message || "Prompt delete was refused.", { source: "prompt-delete-refused" });
             await this._fetchScenes({ ignoreMutationGate: true, reason: "delete_prompt_error" });
             console.warn("[Sonder] Failed to delete prompt section:", e);
+            return false;
         }
     }
 
@@ -16089,13 +16206,24 @@ export class EditorWidget {
             "updateItemProperty", () => this._updateItemPropertyWithinGesture(...args));
     }
 
-    async _updateItemPropertyWithinGesture(type, id, props, { refresh = true, coalesce = true } = {}) {
+    /**
+     * `expected`, for a guide, is the identity its caller saw
+     * (`_guideSnapshotIdentity`). A guide is addressed by frame, so without it
+     * the guard below is read from whichever guide now occupies that frame and
+     * always agrees; with it, a stale popup's write is refused and nothing is
+     * painted onto a guide the caller never showed.
+     */
+    async _updateItemPropertyWithinGesture(type, id, props, {
+        refresh = true, coalesce = true, expected = null,
+    } = {}) {
         if (!this.activeScene || !this.projectDir) return;
+        const guideCaller = type === "guide" && expected && typeof expected === "object";
+        const guideMatches = !guideCaller || !!this._guideMatchingIdentity(id, expected);
         // Linked mute propagation (manual-test #7): muting one linked member mutes
         // the whole group atomically. Only `muted` propagates through links —
         // opacity/volume/strength and other per-item fields stay per-item.
         let applyLinked = false;
-        if (props && "muted" in props) {
+        if (props && "muted" in props && guideMatches) {
             const anchor = this._findSceneItemBySelection(type, id);
             if (anchor && this._shouldApplyLinked(anchor)) {
                 const members = this._expandItemsWithLinked([anchor]);
@@ -16131,7 +16259,9 @@ export class EditorWidget {
             operation = {
                 type: "update_guide",
                 frame_index: frameIndex,
-                expected: guide ? {
+                // Callers without a snapshot (the item editor, which edits the
+                // live selection) keep the current-row guard.
+                expected: guideCaller ? { ...expected } : guide ? {
                     frame_index: guide.frame_index,
                     asset_id: guide.asset_id || "",
                     guide_id: guide.guide_id || "",
@@ -16428,7 +16558,13 @@ export class EditorWidget {
         // existing guide's values rather than rejecting an empty string.
         if (guideData.fit_mode != null) fields.fit_mode = guideData.fit_mode;
         if (guideData.crop_position != null) fields.crop_position = guideData.crop_position;
-        this._applyLocalMoveGuide(oldIdx, newIdx, guideData, fields);
+        // `_applyLocalMoveGuide` removes whatever guide sits on `oldIdx`. A stale
+        // caller's guide may no longer be the one there, so paint only when the
+        // occupant is the guide the caller showed; otherwise the server's
+        // identity guard refuses and the failure refetch settles the timeline.
+        if (this._guideMatchingIdentity(oldIdx, this._guideSnapshotIdentity(guideData))) {
+            this._applyLocalMoveGuide(oldIdx, newIdx, guideData, fields);
+        }
         this._clearSelection();
         this._hideItemEditor();
         this._renderSceneAfterLocalMutation();
@@ -17939,171 +18075,11 @@ export class EditorWidget {
     }
 
     // ── Context Menu ──────────────────────────────────────────────────
-    _showGuideManagementPopupLegacy(x, y) {
-        this._hideGuideManagementPopup();
-        const popup = document.createElement("div");
-        popup.style.cssText = `
-            position: fixed; left: ${x}px; top: ${y}px; z-index: 10000;
-            min-width: 320px; max-width: 420px; max-height: 360px; overflow: auto;
-            background: ${COLORS.panel}; border: 1px solid ${COLORS.borderStrong};
-            border-radius: 6px; box-shadow: 0 12px 28px rgba(0,0,0,0.45);
-            padding: 8px; color: ${COLORS.text}; font-size: 11px;
-        `;
-        const title = document.createElement("div");
-        title.textContent = "Guides";
-        title.style.cssText = `font-weight: 700; color: ${COLORS.guideSelected}; margin-bottom: 6px;`;
-        popup.appendChild(title);
-
-        const guides = (this.activeScene?.guide_frames || [])
-            .slice()
-            .sort((a, b) => {
-                const af = a.frame_index === -1 ? this.totalFrames - 1 : a.frame_index;
-                const bf = b.frame_index === -1 ? this.totalFrames - 1 : b.frame_index;
-                return af - bf;
-            });
-        if (!guides.length) {
-            const empty = document.createElement("div");
-            empty.textContent = "No guides in this scene.";
-            empty.style.cssText = `color:${COLORS.textMuted}; padding:4px 0;`;
-            popup.appendChild(empty);
-        }
-        for (const guide of guides) {
-            const frame = guide.frame_index === -1 ? this.totalFrames - 1 : guide.frame_index;
-            const asset = this._getGuideAsset(guide);
-            const row = document.createElement("div");
-            row.style.cssText = "display:flex;align-items:center;gap:6px;padding:4px 0;border-top:1px solid rgba(255,255,255,0.06);";
-
-            // Thumbnail (cached only)
-            const thumbUrl = asset && !asset.missing && asset.path ? this._buildViewURL(asset.path) : null;
-            const thumb = document.createElement("div");
-            thumb.style.cssText = "width:36px;height:22px;flex-shrink:0;border-radius:3px;border:1px solid rgba(255,255,255,0.18);background:#000;overflow:hidden;";
-            if (thumbUrl) {
-                const img = document.createElement("img");
-                img.src = thumbUrl;
-                img.alt = "";
-                img.style.cssText = "width:100%;height:100%;object-fit:contain;display:block;";
-                img.title = asset?.name || asset?.path || "Guide asset";
-                thumb.appendChild(img);
-            }
-
-            // Frame index input
-            const frameInput = document.createElement("input");
-            frameInput.type = "text";
-            frameInput.inputMode = "decimal";
-            frameInput.min = "0";
-            frameInput.max = this._timecodeMode === "timecode"
-                ? this._framesToSeconds(Math.max(0, this.totalFrames - 1)).toFixed(2)
-                : String(Math.max(0, this.totalFrames - 1));
-            frameInput.value = this._formatPositionInput(frame);
-            frameInput.title = "Guide frame index (re-keys on commit)";
-            frameInput.style.cssText = `width:54px;${chromeInputCss({ fontSize: "10px", padding: "2px 4px" })}`;
-            const commitFrameInput = () => {
-                const newIdx = this._parsePositionInput(frameInput.value);
-                const nextFrame = Math.round(newIdx);
-                if (!Number.isFinite(nextFrame) || nextFrame === frame) return;
-                const clamped = Math.max(0, Math.min(this.totalFrames - 1, nextFrame));
-                this._moveGuideToFrame(guide, clamped, guide.strength);
-                this._hideGuideManagementPopup();
-            };
-            frameInput.addEventListener("change", commitFrameInput);
-            frameInput.addEventListener("keydown", (e) => {
-                if (e.key === "Enter") { commitFrameInput(); e.preventDefault(); }
-                e.stopPropagation();
-            });
-
-            // Strength input
-            const strengthInput = document.createElement("input");
-            strengthInput.type = "number";
-            strengthInput.min = "0";
-            strengthInput.max = "1";
-            strengthInput.step = "0.05";
-            strengthInput.value = (Number(guide.strength ?? 1.0)).toFixed(2);
-            strengthInput.title = "Guide strength (0.0-1.0)";
-            strengthInput.style.cssText = `width:50px;${chromeInputCss({ fontSize: "10px", padding: "2px 4px" })}`;
-            const commitStrength = () => {
-                const next = Math.max(0, Math.min(1, parseFloat(strengthInput.value)));
-                if (!Number.isFinite(next) || next === guide.strength) return;
-                guide.strength = next;
-                this._updateItemProperty("guide", guide.frame_index, { strength: next });
-            };
-            strengthInput.addEventListener("change", commitStrength);
-            strengthInput.addEventListener("keydown", (e) => {
-                if (e.key === "Enter") { commitStrength(); e.preventDefault(); }
-                e.stopPropagation();
-            });
-
-            // Asset name label (truncated)
-            const label = document.createElement("div");
-            label.style.cssText = "flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
-            const name = asset?.name || asset?.path?.split(/[/\\]/).pop() || guide.asset_id || "Guide";
-            label.textContent = name;
-            label.title = name;
-
-            const muteBtn = this._makeBtn(guide.muted ? "Hidden" : "Visible", "Toggle guide visibility");
-            muteBtn.addEventListener("click", async (event) => {
-                event.stopPropagation();
-                this._pushUndo("toggle guide mute");
-                guide.muted = !guide.muted;
-                await this._updateItemProperty("guide", guide.frame_index, { muted: guide.muted });
-                this._showGuideManagementPopup(x, y);
-            });
-
-            const deleteBtn = this._makeBtn("✕", "Delete guide");
-            deleteBtn.style.color = COLORS.dangerText;
-            deleteBtn.addEventListener("click", (event) => this._withMutationGesture("deleteGuide", async (diagnostics) => {
-                event.stopPropagation();
-                const undoLabel = "delete guide";
-                this._pushUndo(undoLabel);
-                this._applyLocalBulkDeleteItems([{
-                    type: "guide",
-                    id: guide.frame_index,
-                    expected: {
-                        frame_index: guide.frame_index,
-                        asset_id: guide.asset_id || "",
-                        guide_id: guide.guide_id || "",
-                    },
-                }]);
-                this._renderSceneAfterLocalMutation();
-                this._showGuideManagementPopup(x, y);
-                try {
-                    await this._runSceneMutation(
-                        [{
-                            type: "delete_guide",
-                            frame_index: guide.frame_index,
-                            expected: {
-                                frame_index: guide.frame_index,
-                                asset_id: guide.asset_id || "",
-                                guide_id: guide.guide_id || "",
-                            },
-                        }],
-                        {
-                            key: `guide:${this.activeSceneId}:${guide.frame_index}:delete`,
-                            label: "delete guide",
-                            coalesce: false,
-                            refreshScenes: false,
-                        }
-                    );
-                } catch (e) {
-                    await this._fetchScenes({ ignoreMutationGate: true, reason: "delete_guide_error" });
-                    this._showGuideManagementPopup(x, y);
-                    console.warn("[Sonder] Failed to delete guide:", e);
-                }
-            }));
-
-            row.append(thumb, frameInput, strengthInput, label, muteBtn, deleteBtn);
-            popup.appendChild(row);
-        }
-
-        document.body.appendChild(popup);
-        this._guideManagerEl = popup;
-        this._guideManagerMouseOff = (event) => {
-            if (!popup.contains(event.target)) this._hideGuideManagementPopup();
-        };
-        window.setTimeout(() => document.addEventListener("mousedown", this._guideManagerMouseOff, true), 0);
-    }
-
     _showGuideManagementPopup(x, y) {
-        this._hideGuideManagementPopup();
+        // A rebuild, not a close: the Escape registration survives it, so a
+        // picker opened from this popup stays the newer overlay and keeps
+        // Escape for itself.
+        this._removeGuideManagementPopupDom();
         this._hideGuideHoverPreview();
 
         const backdrop = document.createElement("div");
@@ -18158,7 +18134,8 @@ export class EditorWidget {
             await this._fetchScenes();
             this._renderTimeline();
             this._renderViewportFrame();
-            this._showGuideManagementPopup(x, y);
+            // Closed while the write was in flight: settle, but do not reopen.
+            if (this._guideManagerEl?.isConnected) this._showGuideManagementPopup(x, y);
         };
 
         if (!guides.length) {
@@ -18233,6 +18210,10 @@ export class EditorWidget {
                 const nextFrame = Math.round(newIdx);
                 if (!Number.isFinite(nextFrame) || nextFrame === frame) return;
                 const clamped = Math.max(0, Math.min(this.totalFrames - 1, nextFrame));
+                if (!this._guideIdentityForAction(guide)) {
+                    await refreshPanel();
+                    return;
+                }
                 await this._moveGuideToFrame(guide, clamped, guide.strength);
                 await refreshPanel();
             };
@@ -18255,9 +18236,15 @@ export class EditorWidget {
                 if (locked) return;
                 const next = Math.max(0, Math.min(1, parseFloat(strengthInput.value)));
                 if (!Number.isFinite(next) || next === guide.strength) return;
+                const expected = this._guideIdentityForAction(guide);
+                if (!expected) {
+                    await refreshPanel();
+                    return;
+                }
                 this._pushUndo("change guide strength");
                 guide.strength = next;
-                await this._updateItemProperty("guide", guide.frame_index, { strength: next }, { refresh: false });
+                await this._updateItemProperty("guide", guide.frame_index, { strength: next },
+                    { refresh: false, expected });
                 await refreshPanel();
             };
             strengthInput.addEventListener("change", commitStrength);
@@ -18283,9 +18270,15 @@ export class EditorWidget {
             muteBtn.addEventListener("click", async (event) => {
                 event.stopPropagation();
                 if (locked) return;
+                const expected = this._guideIdentityForAction(guide);
+                if (!expected) {
+                    await refreshPanel();
+                    return;
+                }
                 this._pushUndo("toggle guide mute");
                 guide.muted = !guide.muted;
-                await this._updateItemProperty("guide", guide.frame_index, { muted: guide.muted }, { refresh: false });
+                await this._updateItemProperty("guide", guide.frame_index, { muted: guide.muted },
+                    { refresh: false, expected });
                 await refreshPanel();
             });
 
@@ -18356,16 +18349,17 @@ export class EditorWidget {
             deleteBtn.addEventListener("click", (event) => this._withMutationGesture("deleteGuide", async (diagnostics) => {
                 event.stopPropagation();
                 if (locked) return;
+                const expected = this._guideIdentityForAction(guide);
+                if (!expected) {
+                    await refreshPanel();
+                    return;
+                }
                 const undoLabel = "delete guide";
                 this._pushUndo(undoLabel);
                 this._applyLocalBulkDeleteItems([{
                     type: "guide",
                     id: guide.frame_index,
-                    expected: {
-                        frame_index: guide.frame_index,
-                        asset_id: guide.asset_id || "",
-                        guide_id: guide.guide_id || "",
-                    },
+                    expected,
                 }]);
                 this._renderSceneAfterLocalMutation();
                 this._showGuideManagementPopup(x, y);
@@ -18374,11 +18368,7 @@ export class EditorWidget {
                         [{
                             type: "delete_guide",
                             frame_index: guide.frame_index,
-                            expected: {
-                                frame_index: guide.frame_index,
-                                asset_id: guide.asset_id || "",
-                                guide_id: guide.guide_id || "",
-                            },
+                            expected,
                         }],
                         {
                             key: `guide:${this.activeSceneId}:${guide.frame_index}:delete`,
@@ -18405,10 +18395,41 @@ export class EditorWidget {
         document.body.appendChild(backdrop);
         this._guideManagerEl = backdrop;
         this._guideManagerMouseOff = null;
+        // Escape through the registry, like every overlay over the timeline:
+        // unowned, it reached the editor consumer, which left fullscreen with
+        // the popup still on the page. Registered once per open popup.
+        this._guideManagerReleaseEscape ||= registerKeyboardConsumer({
+            id: `sonder-guide-popup-${Date.now().toString(36)}`,
+            priority: KEY_PRIORITY.OVERLAY,
+            keydown: (event) => {
+                // An open composition owns Escape (it cancels the reading).
+                if (event.isComposing === true || event.keyCode === 229) return false;
+                if (event.key !== "Escape") return false;
+                this._hideGuideManagementPopup();
+                return true;
+            },
+        });
+    }
+
+    /**
+     * A management modal is open over the timeline: the Prompt panel, the
+     * Guide popup or the Reference Lane panel. The editor key consumer lets only
+     * Undo/Redo through while one is.
+     */
+    _managementModalMounted() {
+        return !!(this._promptPanelHandle?.isMounted?.()
+            || this._guideManagerEl?.isConnected
+            || this._referencePanelHandle);
     }
 
     _hideGuideManagementPopup() {
         this._hideGuideHoverPreview();
+        this._guideManagerReleaseEscape?.();
+        this._guideManagerReleaseEscape = null;
+        this._removeGuideManagementPopupDom();
+    }
+
+    _removeGuideManagementPopupDom() {
         if (this._guideManagerEl) {
             this._guideManagerEl.remove();
             this._guideManagerEl = null;
@@ -18470,11 +18491,13 @@ export class EditorWidget {
                 ["Ctrl+Y", "Redo"],
                 ["Ctrl+Shift+Z", "Redo"],
                 ["Ctrl+V", "Paste"],
+                ["Panel open", "Prompt, Guide or Reference Lane panel: only Undo / Redo reach the timeline"],
             ]) +
             this._shortcutSection("Prompt", [
                 ["Right-click prompt", "Open the insert menu where you clicked"],
                 ["Shift+F10 / Menu", "Open the insert menu at the cursor"],
                 ["Arrow keys / Enter", "Move through the menu and choose"],
+                ["Shift+Enter", "Line break (Enter commits a single-field box; a line break in the Writing draft)"],
             ]) +
             this._shortcutSection("Asset Gallery", [
                 ["Arrow keys", "Move asset focus / selection"],
@@ -18701,13 +18724,20 @@ export class EditorWidget {
             currentAssetId: guide.asset_id || "",
             onPick: (assetId) => this._withMutationGesture("replaceGuideImage", async () => {
                 if (!assetId || assetId === guide.asset_id) return;
+                // The picker stays open for as long as the author browses, so
+                // the guide it was opened for can have moved or been replaced.
+                const expected = this._guideIdentityForAction(guide);
+                if (!expected) {
+                    if (onDone) await onDone();
+                    return;
+                }
                 this._pushUndo("replace guide");
                 try {
                     await this._updateItemProperty(
                         "guide",
                         guide.frame_index,
                         { asset_id: assetId, source: "asset" },
-                        { refresh },
+                        { refresh, expected },
                     );
                     if (onDone) await onDone();
                 } catch (e) {
@@ -19757,6 +19787,21 @@ export class EditorWidget {
             if (!this.isFullscreen && !this._editorFocused) {
                 debugUndoRouting("skip undo routing: editor not focused");
                 return false;
+            }
+
+            // A management modal sits over a timeline it hides. Undo/Redo still
+            // reach it — the open panel repaints from their result — but every
+            // other shortcut (Delete, split, mute, play…) would edit the hidden
+            // timeline beneath the modal, so none of them runs. PRESERVE_DEFAULT,
+            // not `true`: LiteGraph must not see Delete either, while the
+            // browser's own default (Tab between the modal's controls) survives.
+            // A Ctrl/Meta chord is the exception: the timeline consumed those
+            // (Ctrl+S, Ctrl+O, Ctrl+±), so letting their default through would
+            // open the browser's save or file dialog, or zoom the page. Copy,
+            // cut and paste keep their native default.
+            if (this._managementModalMounted() && !isUndo) {
+                return ctrl && !["c", "x", "v"].includes(normalizedKey)
+                    ? true : PRESERVE_DEFAULT;
             }
 
             // ── Escape ──

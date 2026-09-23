@@ -4281,7 +4281,12 @@ Server value: ${serverValue}` : ""}`;
                     return;
                 }
                 if (start === section.start_frame && end === section.end_frame) return;
-                await host._updatePromptSection(idx, { start_frame: start, end_frame: end });
+                // Identity from the section this card drew; the host reads the
+                // before-range from the current row, so a Start commit and an
+                // End commit made before the panel repaints do not refuse each
+                // other.
+                await host._updatePromptSection(idx, { start_frame: start, end_frame: end },
+                    { promptId: sectionBase.prompt_id || "" });
                 render(); // indices may have re-sorted — rebuild rows
             };
             const commitChannels = async () => {
@@ -4417,13 +4422,18 @@ Server value: ${serverValue}` : ""}`;
                         }
                         const nextAttachments = sectionAttachments.filter((value) =>
                             value.attachment_id !== attachment.attachment_id);
+                        // Identity from the card, before-values from the current
+                        // row — like a range commit, NOT the draft baseline: the
+                        // card's own range save or an in-flight channel save
+                        // leaves `sectionBase` behind until the next repaint,
+                        // and a baseline would then refuse against them.
                         await host._updatePromptSection(idx, {
                             channel_docs: nextDocuments,
                             channels: Object.fromEntries(channelKeys.map((channelKey) => [
                                 channelKey, promptDocumentText(nextDocuments[channelKey]).trim(),
                             ])),
                             attachments: nextAttachments,
-                        });
+                        }, { promptId: sectionBase.prompt_id || "" });
                         render();
                     },
                     onRemove: async (attachment) => {
@@ -4473,7 +4483,8 @@ Server value: ${serverValue}` : ""}`;
                 "secondary", "Add prompt section after this section");
             addAfterBtn.addEventListener("click", async () => {
                 if (sectionsLocked) return;
-                const created = await host._addPromptSectionAfter(idx).catch(() => false);
+                const created = await host._addPromptSectionAfter(idx,
+                    { promptId: sectionBase.prompt_id || "" }).catch(() => false);
                 if (created) render();
             });
             const deleteBtn = makeBtn("✕", "Delete this section", "danger",
@@ -4488,7 +4499,7 @@ Server value: ${serverValue}` : ""}`;
             deleteBtn.addEventListener("click", async () => {
                 if (sectionsLocked) return;
                 if (!confirm("Delete this prompt section?")) return;
-                await host._deletePromptSection(idx);
+                await host._deletePromptSection(idx, { promptId: sectionBase.prompt_id || "" });
                 render();
             });
 
@@ -4529,7 +4540,8 @@ Server value: ${serverValue}` : ""}`;
                     box.disabled = sectionsLocked;
                     box.addEventListener("keydown", (e) => e.stopPropagation());
                     box.addEventListener("change", () => {
-                        host._setSectionGlobalInherit(idx, key, box.checked)
+                        host._setSectionGlobalInherit(idx, key, box.checked,
+                            { promptId: sectionBase.prompt_id || "" })
                             .then(() => render())
                             .catch(() => render());
                     });

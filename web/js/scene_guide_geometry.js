@@ -1,10 +1,16 @@
 // @server-mirror server/routes.py::_apply_swap_guides
+// @server-mirror server/routes.py::_validate_guide_identity
 // Scope/parity: tests/test_mutation_authoring_contract.py::MIRRORED_MODULES.
 // The host owns undo, queuing, reconciliation and popup lifecycle. This leaf
 // owns only the in-place optimistic exchange and its applicability. Raw frame
 // order is canonical: the -1 sentinel sorts first, unlike popup display order.
 
-function identityMatches(guide, expected) {
+/**
+ * `_validate_guide_identity`'s decision: every key the caller's snapshot
+ * carries must match. Exported so a host local apply acts only on the guide
+ * its caller saw, with the same answer the server's compare will give.
+ */
+export function guideIdentityMatches(guide, expected) {
     if (!expected || typeof expected !== "object" || Array.isArray(expected)) return true;
     // Preserve explicit nulls: Python getattr defaults only missing fields.
     const values = { guide_id: guide.guide_id === undefined ? "" : guide.guide_id,
@@ -28,8 +34,8 @@ export function applyGuideSwap(scene, operation) {
     const guides = scene.guide_frames || [];
     const first = guides.find((guide) => guide.frame_index === a);
     const second = guides.find((guide) => guide.frame_index === b);
-    if (!first || !second || !identityMatches(first, operation.expected_a)
-            || !identityMatches(second, operation.expected_b)) return false;
+    if (!first || !second || !guideIdentityMatches(first, operation.expected_a)
+            || !guideIdentityMatches(second, operation.expected_b)) return false;
     if (!first.guide_id || !second.guide_id || first.guide_id === second.guide_id) return false;
     first.frame_index = b;
     second.frame_index = a;
