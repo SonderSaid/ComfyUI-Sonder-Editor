@@ -226,7 +226,7 @@ ComfyUI.
 | **Sonder Save Video** | Encodes an IMAGE tensor to a project video asset, optionally muxing audio; previews the first frame. Auto-corrects accumulated VAE color drift against the render's protected context frames (`color_drift_correction`, on by default). |
 | **Sonder Save Bridge** | Creates a prompt-isolated output target in the project cache — external save nodes write there, then the bridge registers the results into the Sonder asset system after the prompt settles. |
 | **Sonder Preview Video** | Encodes frames to a temporary video for in-UI preview playback. |
-| **Sonder Metadata Collector** / **Sonder Metadata Collector Nodes 2.0** | Both collect explicitly wired upstream widget values into a generated asset's tracked metadata. The established collector keeps manually shaped workflow sockets; the Nodes 2.0 entry uses native heterogeneous V3 Autogrow sockets when the installed ComfyUI supports them. |
+| **Sonder Metadata Collector** / **Sonder Metadata Collector Nodes 2.0** | Both collect explicitly wired upstream widget values into a generated asset's tracked metadata. Wiring a subgraph output records the subgraph by name with its interface values. The established collector keeps manually shaped workflow sockets; the Nodes 2.0 entry uses native heterogeneous V3 Autogrow sockets when the installed ComfyUI supports them. |
 
 ### Routing & logic — `Sonder/Logic`
 

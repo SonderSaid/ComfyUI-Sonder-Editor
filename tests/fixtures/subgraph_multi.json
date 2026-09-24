@@ -1,0 +1,831 @@
+{
+ "prompt": {
+  "1": {
+   "inputs": {
+    "project": "+ Create New",
+    "project_name": "My Project",
+    "fps": 24,
+    "width": 1280,
+    "height": 720,
+    "scene_id": "",
+    "selection_start": 0,
+    "selection_end": 0,
+    "pre_context_frames": 0,
+    "post_context_frames": 0,
+    "mask_pre_offset": 0,
+    "mask_post_offset": 0,
+    "take_placement_mode": "trimmed",
+    "take_placement_linked": true,
+    "take_placement_muted": false,
+    "render_cache_max_bytes": 0,
+    "render_queue_active": true,
+    "take_fit_mode": "pad_edge",
+    "take_crop_position": "center"
+   },
+   "class_type": "SonderEditor",
+   "_meta": {
+    "title": "Sonder Editor"
+   }
+  },
+  "2": {
+   "inputs": {
+    "label_0": "",
+    "label_1": "",
+    "label_2": "",
+    "label_3": "",
+    "label_4": "",
+    "label_5": "",
+    "label_6": "",
+    "label_7": "",
+    "label_8": "",
+    "label_9": "",
+    "label_10": "",
+    "label_11": "",
+    "project": [
+     "1",
+     0
+    ],
+    "value_0": [
+     "15:5",
+     0
+    ],
+    "value_1": [
+     "16:8",
+     0
+    ],
+    "value_2": [
+     "17:11",
+     0
+    ]
+   },
+   "class_type": "SonderMetadataCollector",
+   "_meta": {
+    "title": "Sonder Metadata Collector"
+   }
+  },
+  "14": {
+   "inputs": {
+    "seed": 0,
+    "steps": 20,
+    "cfg": 8,
+    "sampler_name": "euler",
+    "scheduler": "simple",
+    "denoise": 1,
+    "model": [
+     "17:13",
+     0
+    ]
+   },
+   "class_type": "KSampler",
+   "_meta": {
+    "title": "KSampler"
+   }
+  },
+  "15:4": {
+   "inputs": {
+    "value": "a quiet harbor at dawn"
+   },
+   "class_type": "PrimitiveStringMultiline",
+   "_meta": {
+    "title": "Caption Text"
+   }
+  },
+  "15:5": {
+   "inputs": {
+    "string_a": [
+     "15:4",
+     0
+    ],
+    "string_b": "wide lens",
+    "delimiter": ", "
+   },
+   "class_type": "StringConcatenate",
+   "_meta": {
+    "title": "Concatenate Text"
+   }
+  },
+  "16:7": {
+   "inputs": {
+    "value": "a quiet harbor at dawn"
+   },
+   "class_type": "PrimitiveStringMultiline",
+   "_meta": {
+    "title": "Caption Text"
+   }
+  },
+  "16:8": {
+   "inputs": {
+    "string_a": [
+     "16:7",
+     0
+    ],
+    "string_b": "close up",
+    "delimiter": ", "
+   },
+   "class_type": "StringConcatenate",
+   "_meta": {
+    "title": "Concatenate Text"
+   }
+  },
+  "17:9": {
+   "inputs": {
+    "unet_name": "KREA2turbo-int8-convrot-simple.safetensors",
+    "weight_dtype": "default"
+   },
+   "class_type": "UNETLoader",
+   "_meta": {
+    "title": "Load Diffusion Model"
+   }
+  },
+  "17:10": {
+   "inputs": {
+    "PowerLoraLoaderHeaderWidget": {
+     "type": "PowerLoraLoaderHeaderWidget"
+    },
+    "➕ Add Lora": "",
+    "model": [
+     "17:9",
+     0
+    ],
+    "lora_1": {
+     "on": true,
+     "lora": "film_grain.safetensors",
+     "strength": 0.8
+    },
+    "lora_2": {
+     "on": false,
+     "lora": "sketch.safetensors",
+     "strength": 1.0
+    }
+   },
+   "class_type": "Power Lora Loader (rgthree)",
+   "_meta": {
+    "title": "Style LoRAs"
+   }
+  },
+  "17:11": {
+   "inputs": {
+    "shift": 1.73,
+    "sampling": "flow",
+    "model": [
+     "17:10",
+     0
+    ]
+   },
+   "class_type": "ModelSamplingAuraFlow",
+   "_meta": {
+    "title": "ModelSamplingAuraFlow"
+   }
+  },
+  "17:12": {
+   "inputs": {
+    "unet_name": "KREA2turbo-int8-convrot-simple.safetensors",
+    "weight_dtype": "default"
+   },
+   "class_type": "UNETLoader",
+   "_meta": {
+    "title": "Load Diffusion Model"
+   }
+  },
+  "17:13": {
+   "inputs": {
+    "PowerLoraLoaderHeaderWidget": {
+     "type": "PowerLoraLoaderHeaderWidget"
+    },
+    "➕ Add Lora": "",
+    "model": [
+     "17:12",
+     0
+    ],
+    "lora_1": {
+     "on": true,
+     "lora": "unused_branch.safetensors",
+     "strength": 1.0
+    }
+   },
+   "class_type": "Power Lora Loader (rgthree)",
+   "_meta": {
+    "title": "Unused LoRAs"
+   }
+  }
+ },
+ "workflow": {
+  "nodes": [
+   {
+    "id": 1,
+    "type": "SonderEditor",
+    "inputs": [],
+    "outputs": [
+     {
+      "name": "project",
+      "type": "SONDER_PROJECT",
+      "links": [
+       1
+      ]
+     },
+     {
+      "name": "rendered_frames",
+      "type": "IMAGE",
+      "links": []
+     },
+     {
+      "name": "guide_images",
+      "type": "IMAGE",
+      "links": []
+     },
+     {
+      "name": "guide_idx",
+      "type": "STRING",
+      "links": []
+     },
+     {
+      "name": "guide_strengths",
+      "type": "STRING",
+      "links": []
+     },
+     {
+      "name": "prompt",
+      "type": "STRING",
+      "links": []
+     },
+     {
+      "name": "frame_count",
+      "type": "INT",
+      "links": []
+     },
+     {
+      "name": "fps",
+      "type": "FLOAT",
+      "links": []
+     },
+     {
+      "name": "width",
+      "type": "INT",
+      "links": []
+     },
+     {
+      "name": "height",
+      "type": "INT",
+      "links": []
+     },
+     {
+      "name": "audio",
+      "type": "AUDIO",
+      "links": []
+     },
+     {
+      "name": "mask_start_time",
+      "type": "FLOAT",
+      "links": []
+     },
+     {
+      "name": "mask_end_time",
+      "type": "FLOAT",
+      "links": []
+     }
+    ]
+   },
+   {
+    "id": 2,
+    "type": "SonderMetadataCollector",
+    "inputs": [
+     {
+      "name": "project",
+      "type": "SONDER_PROJECT",
+      "link": 1
+     },
+     {
+      "name": "value_0",
+      "label": "TEXT",
+      "type": "*",
+      "link": 14
+     },
+     {
+      "name": "value_1",
+      "label": "TEXT",
+      "type": "*",
+      "link": 16
+     },
+     {
+      "name": "value_2",
+      "label": "MODEL",
+      "type": "*",
+      "link": 17
+     },
+     {
+      "name": "value_3",
+      "label": "value_3",
+      "type": "*",
+      "link": null
+     }
+    ],
+    "outputs": [
+     {
+      "name": "project",
+      "type": "SONDER_PROJECT",
+      "links": []
+     }
+    ]
+   },
+   {
+    "id": 14,
+    "type": "KSampler",
+    "inputs": [
+     {
+      "name": "model",
+      "type": "MODEL",
+      "link": 18
+     },
+     {
+      "name": "positive",
+      "type": "CONDITIONING",
+      "link": null
+     },
+     {
+      "name": "negative",
+      "type": "CONDITIONING",
+      "link": null
+     },
+     {
+      "name": "latent_image",
+      "type": "LATENT",
+      "link": null
+     }
+    ],
+    "outputs": [
+     {
+      "name": "LATENT",
+      "type": "LATENT",
+      "links": []
+     }
+    ]
+   },
+   {
+    "id": 15,
+    "type": "068bfabb-9e51-4043-8f6a-db6badb067f3",
+    "title": "Shot A",
+    "inputs": [],
+    "outputs": [
+     {
+      "name": "STRING",
+      "type": "STRING",
+      "links": [
+       14
+      ]
+     }
+    ]
+   },
+   {
+    "id": 16,
+    "type": "e76e45ee-c30c-4fd9-8e73-25529f2c81bd",
+    "title": "Shot B",
+    "inputs": [],
+    "outputs": [
+     {
+      "name": "STRING",
+      "type": "STRING",
+      "links": [
+       16
+      ]
+     }
+    ]
+   },
+   {
+    "id": 17,
+    "type": "e31376aa-9535-469c-895d-a22df92f9bd6",
+    "title": "LoRA Stack",
+    "inputs": [],
+    "outputs": [
+     {
+      "name": "MODEL",
+      "type": "MODEL",
+      "links": [
+       17
+      ]
+     },
+     {
+      "name": "MODEL_1",
+      "type": "MODEL",
+      "links": [
+       18
+      ]
+     }
+    ]
+   }
+  ],
+  "links": [
+   [
+    1,
+    1,
+    0,
+    2,
+    0,
+    "SONDER_PROJECT"
+   ],
+   [
+    14,
+    15,
+    0,
+    2,
+    1,
+    "STRING"
+   ],
+   [
+    16,
+    16,
+    0,
+    2,
+    2,
+    "STRING"
+   ],
+   [
+    17,
+    17,
+    0,
+    2,
+    3,
+    "MODEL"
+   ],
+   [
+    18,
+    17,
+    1,
+    14,
+    0,
+    "MODEL"
+   ]
+  ],
+  "definitions": {
+   "subgraphs": [
+    {
+     "id": "068bfabb-9e51-4043-8f6a-db6badb067f3",
+     "name": "New Subgraph",
+     "inputs": [
+      {
+       "name": "string_b",
+       "type": "STRING",
+       "linkIds": [
+        3
+       ]
+      }
+     ],
+     "outputs": [
+      {
+       "name": "STRING",
+       "type": "STRING",
+       "linkIds": [
+        4
+       ]
+      }
+     ],
+     "nodes": [
+      {
+       "id": 4,
+       "type": "PrimitiveStringMultiline",
+       "title": "Caption Text",
+       "inputs": [],
+       "outputs": [
+        {
+         "name": "STRING",
+         "type": "STRING",
+         "links": [
+          2
+         ]
+        }
+       ]
+      },
+      {
+       "id": 5,
+       "type": "StringConcatenate",
+       "inputs": [
+        {
+         "name": "string_a",
+         "type": "STRING",
+         "link": 2,
+         "widget": {
+          "name": "string_a"
+         }
+        },
+        {
+         "name": "string_b",
+         "type": "STRING",
+         "link": 3,
+         "widget": {
+          "name": "string_b"
+         }
+        }
+       ],
+       "outputs": [
+        {
+         "name": "STRING",
+         "type": "STRING",
+         "links": [
+          4
+         ]
+        }
+       ]
+      }
+     ],
+     "links": [
+      {
+       "id": 2,
+       "origin_id": 4,
+       "origin_slot": 0,
+       "target_id": 5,
+       "target_slot": 0,
+       "type": "STRING"
+      },
+      {
+       "id": 3,
+       "origin_id": -10,
+       "origin_slot": 0,
+       "target_id": 5,
+       "target_slot": 1,
+       "type": "STRING"
+      },
+      {
+       "id": 4,
+       "origin_id": 5,
+       "origin_slot": 0,
+       "target_id": -20,
+       "target_slot": 0,
+       "type": "STRING"
+      }
+     ]
+    },
+    {
+     "id": "e76e45ee-c30c-4fd9-8e73-25529f2c81bd",
+     "name": "New Subgraph",
+     "inputs": [
+      {
+       "name": "string_b",
+       "type": "STRING",
+       "linkIds": [
+        6
+       ]
+      }
+     ],
+     "outputs": [
+      {
+       "name": "STRING",
+       "type": "STRING",
+       "linkIds": [
+        7
+       ]
+      }
+     ],
+     "nodes": [
+      {
+       "id": 7,
+       "type": "PrimitiveStringMultiline",
+       "title": "Caption Text",
+       "inputs": [],
+       "outputs": [
+        {
+         "name": "STRING",
+         "type": "STRING",
+         "links": [
+          5
+         ]
+        }
+       ]
+      },
+      {
+       "id": 8,
+       "type": "StringConcatenate",
+       "inputs": [
+        {
+         "name": "string_a",
+         "type": "STRING",
+         "link": 5,
+         "widget": {
+          "name": "string_a"
+         }
+        },
+        {
+         "name": "string_b",
+         "type": "STRING",
+         "link": 6,
+         "widget": {
+          "name": "string_b"
+         }
+        }
+       ],
+       "outputs": [
+        {
+         "name": "STRING",
+         "type": "STRING",
+         "links": [
+          7
+         ]
+        }
+       ]
+      }
+     ],
+     "links": [
+      {
+       "id": 5,
+       "origin_id": 7,
+       "origin_slot": 0,
+       "target_id": 8,
+       "target_slot": 0,
+       "type": "STRING"
+      },
+      {
+       "id": 6,
+       "origin_id": -10,
+       "origin_slot": 0,
+       "target_id": 8,
+       "target_slot": 1,
+       "type": "STRING"
+      },
+      {
+       "id": 7,
+       "origin_id": 8,
+       "origin_slot": 0,
+       "target_id": -20,
+       "target_slot": 0,
+       "type": "STRING"
+      }
+     ]
+    },
+    {
+     "id": "e31376aa-9535-469c-895d-a22df92f9bd6",
+     "name": "New Subgraph",
+     "inputs": [],
+     "outputs": [
+      {
+       "name": "MODEL",
+       "type": "MODEL",
+       "linkIds": [
+        12
+       ]
+      },
+      {
+       "name": "MODEL_1",
+       "type": "MODEL",
+       "linkIds": [
+        11
+       ]
+      }
+     ],
+     "nodes": [
+      {
+       "id": 9,
+       "type": "UNETLoader",
+       "inputs": [],
+       "outputs": [
+        {
+         "name": "MODEL",
+         "type": "MODEL",
+         "links": [
+          8
+         ]
+        }
+       ]
+      },
+      {
+       "id": 10,
+       "type": "Power Lora Loader (rgthree)",
+       "title": "Style LoRAs",
+       "inputs": [
+        {
+         "name": "model",
+         "type": "MODEL",
+         "link": 8
+        },
+        {
+         "name": "clip",
+         "type": "CLIP",
+         "link": null
+        }
+       ],
+       "outputs": [
+        {
+         "name": "MODEL",
+         "type": "MODEL",
+         "links": [
+          9
+         ]
+        },
+        {
+         "name": "CLIP",
+         "type": "CLIP",
+         "links": []
+        }
+       ]
+      },
+      {
+       "id": 11,
+       "type": "ModelSamplingAuraFlow",
+       "inputs": [
+        {
+         "name": "model",
+         "type": "MODEL",
+         "link": 9
+        }
+       ],
+       "outputs": [
+        {
+         "name": "MODEL",
+         "type": "MODEL",
+         "links": [
+          12
+         ]
+        }
+       ]
+      },
+      {
+       "id": 12,
+       "type": "UNETLoader",
+       "inputs": [],
+       "outputs": [
+        {
+         "name": "MODEL",
+         "type": "MODEL",
+         "links": [
+          10
+         ]
+        }
+       ]
+      },
+      {
+       "id": 13,
+       "type": "Power Lora Loader (rgthree)",
+       "title": "Unused LoRAs",
+       "inputs": [
+        {
+         "name": "model",
+         "type": "MODEL",
+         "link": 10
+        },
+        {
+         "name": "clip",
+         "type": "CLIP",
+         "link": null
+        }
+       ],
+       "outputs": [
+        {
+         "name": "MODEL",
+         "type": "MODEL",
+         "links": [
+          11
+         ]
+        },
+        {
+         "name": "CLIP",
+         "type": "CLIP",
+         "links": []
+        }
+       ]
+      }
+     ],
+     "links": [
+      {
+       "id": 8,
+       "origin_id": 9,
+       "origin_slot": 0,
+       "target_id": 10,
+       "target_slot": 0,
+       "type": "MODEL"
+      },
+      {
+       "id": 9,
+       "origin_id": 10,
+       "origin_slot": 0,
+       "target_id": 11,
+       "target_slot": 0,
+       "type": "MODEL"
+      },
+      {
+       "id": 10,
+       "origin_id": 12,
+       "origin_slot": 0,
+       "target_id": 13,
+       "target_slot": 0,
+       "type": "MODEL"
+      },
+      {
+       "id": 12,
+       "origin_id": 11,
+       "origin_slot": 0,
+       "target_id": -20,
+       "target_slot": 0,
+       "type": "MODEL"
+      },
+      {
+       "id": 11,
+       "origin_id": 13,
+       "origin_slot": 0,
+       "target_id": -20,
+       "target_slot": 1,
+       "type": "MODEL"
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "collector": "2"
+}

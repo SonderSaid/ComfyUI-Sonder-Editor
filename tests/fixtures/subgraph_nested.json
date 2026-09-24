@@ -1,0 +1,541 @@
+{
+ "prompt": {
+  "1": {
+   "inputs": {
+    "project": "+ Create New",
+    "project_name": "My Project",
+    "fps": 24,
+    "width": 1280,
+    "height": 720,
+    "scene_id": "",
+    "selection_start": 0,
+    "selection_end": 0,
+    "pre_context_frames": 0,
+    "post_context_frames": 0,
+    "mask_pre_offset": 0,
+    "mask_post_offset": 0,
+    "take_placement_mode": "trimmed",
+    "take_placement_linked": true,
+    "take_placement_muted": false,
+    "render_cache_max_bytes": 0,
+    "render_queue_active": true,
+    "take_fit_mode": "pad_edge",
+    "take_crop_position": "center"
+   },
+   "class_type": "SonderEditor",
+   "_meta": {
+    "title": "Sonder Editor"
+   }
+  },
+  "2": {
+   "inputs": {
+    "label_0": "",
+    "label_1": "",
+    "label_2": "",
+    "label_3": "",
+    "label_4": "",
+    "label_5": "",
+    "label_6": "",
+    "label_7": "",
+    "label_8": "",
+    "label_9": "",
+    "label_10": "",
+    "label_11": "",
+    "project": [
+     "1",
+     0
+    ],
+    "value_0": [
+     "7:6",
+     0
+    ]
+   },
+   "class_type": "SonderMetadataCollector",
+   "_meta": {
+    "title": "Sonder Metadata Collector"
+   }
+  },
+  "3": {
+   "inputs": {
+    "value": "outer text"
+   },
+   "class_type": "PrimitiveStringMultiline",
+   "_meta": {
+    "title": "Text (Multiline)"
+   }
+  },
+  "7:6": {
+   "inputs": {
+    "string_a": [
+     "7:8:5",
+     0
+    ],
+    "string_b": "",
+    "delimiter": " | "
+   },
+   "class_type": "StringConcatenate",
+   "_meta": {
+    "title": "Concatenate Text"
+   }
+  },
+  "7:8:4": {
+   "inputs": {
+    "value": "inner text"
+   },
+   "class_type": "PrimitiveStringMultiline",
+   "_meta": {
+    "title": "Text (Multiline)"
+   }
+  },
+  "7:8:5": {
+   "inputs": {
+    "string_a": [
+     "7:8:4",
+     0
+    ],
+    "string_b": [
+     "3",
+     0
+    ],
+    "delimiter": " + "
+   },
+   "class_type": "StringConcatenate",
+   "_meta": {
+    "title": "Concatenate Text"
+   }
+  },
+  "7:9": {
+   "inputs": {
+    "label_0": "",
+    "label_1": "",
+    "label_2": "",
+    "label_3": "",
+    "label_4": "",
+    "label_5": "",
+    "label_6": "",
+    "label_7": "",
+    "label_8": "",
+    "label_9": "",
+    "label_10": "",
+    "label_11": "",
+    "value_0": [
+     "7:8:5",
+     0
+    ]
+   },
+   "class_type": "SonderMetadataCollector",
+   "_meta": {
+    "title": "Sonder Metadata Collector"
+   }
+  }
+ },
+ "workflow": {
+  "nodes": [
+   {
+    "id": 1,
+    "type": "SonderEditor",
+    "inputs": [],
+    "outputs": [
+     {
+      "name": "project",
+      "type": "SONDER_PROJECT",
+      "links": [
+       4
+      ]
+     },
+     {
+      "name": "rendered_frames",
+      "type": "IMAGE",
+      "links": []
+     },
+     {
+      "name": "guide_images",
+      "type": "IMAGE",
+      "links": []
+     },
+     {
+      "name": "guide_idx",
+      "type": "STRING",
+      "links": []
+     },
+     {
+      "name": "guide_strengths",
+      "type": "STRING",
+      "links": []
+     },
+     {
+      "name": "prompt",
+      "type": "STRING",
+      "links": []
+     },
+     {
+      "name": "frame_count",
+      "type": "INT",
+      "links": []
+     },
+     {
+      "name": "fps",
+      "type": "FLOAT",
+      "links": []
+     },
+     {
+      "name": "width",
+      "type": "INT",
+      "links": []
+     },
+     {
+      "name": "height",
+      "type": "INT",
+      "links": []
+     },
+     {
+      "name": "audio",
+      "type": "AUDIO",
+      "links": []
+     },
+     {
+      "name": "mask_start_time",
+      "type": "FLOAT",
+      "links": []
+     },
+     {
+      "name": "mask_end_time",
+      "type": "FLOAT",
+      "links": []
+     }
+    ]
+   },
+   {
+    "id": 2,
+    "type": "SonderMetadataCollector",
+    "inputs": [
+     {
+      "name": "project",
+      "type": "SONDER_PROJECT",
+      "link": 4
+     },
+     {
+      "name": "value_0",
+      "label": "TEXT",
+      "type": "*",
+      "link": 7
+     },
+     {
+      "name": "value_1",
+      "label": "value_1",
+      "type": "*",
+      "link": null
+     }
+    ],
+    "outputs": [
+     {
+      "name": "project",
+      "type": "SONDER_PROJECT",
+      "links": []
+     }
+    ]
+   },
+   {
+    "id": 3,
+    "type": "PrimitiveStringMultiline",
+    "inputs": [],
+    "outputs": [
+     {
+      "name": "STRING",
+      "type": "STRING",
+      "links": [
+       6
+      ]
+     }
+    ]
+   },
+   {
+    "id": 7,
+    "type": "3cf88f68-ab8c-4392-999f-793571e79983",
+    "title": "Prompt Builder",
+    "inputs": [
+     {
+      "name": "string_b",
+      "type": "STRING",
+      "link": 6,
+      "widget": {
+       "name": "string_b"
+      }
+     }
+    ],
+    "outputs": [
+     {
+      "name": "STRING",
+      "type": "STRING",
+      "links": [
+       7
+      ]
+     }
+    ]
+   }
+  ],
+  "links": [
+   [
+    4,
+    1,
+    0,
+    2,
+    0,
+    "SONDER_PROJECT"
+   ],
+   [
+    6,
+    3,
+    0,
+    7,
+    0,
+    "STRING"
+   ],
+   [
+    7,
+    7,
+    0,
+    2,
+    1,
+    "STRING"
+   ]
+  ],
+  "definitions": {
+   "subgraphs": [
+    {
+     "id": "3cf88f68-ab8c-4392-999f-793571e79983",
+     "name": "New Subgraph",
+     "inputs": [
+      {
+       "name": "string_b",
+       "type": "STRING",
+       "linkIds": [
+        8
+       ]
+      }
+     ],
+     "outputs": [
+      {
+       "name": "STRING",
+       "type": "STRING",
+       "linkIds": [
+        5
+       ]
+      }
+     ],
+     "nodes": [
+      {
+       "id": 6,
+       "type": "StringConcatenate",
+       "inputs": [
+        {
+         "name": "string_a",
+         "type": "STRING",
+         "link": 9,
+         "widget": {
+          "name": "string_a"
+         }
+        }
+       ],
+       "outputs": [
+        {
+         "name": "STRING",
+         "type": "STRING",
+         "links": [
+          5
+         ]
+        }
+       ]
+      },
+      {
+       "id": 8,
+       "type": "4a46b800-65a2-4acd-8504-e003eb733369",
+       "title": "Inner Builder",
+       "inputs": [
+        {
+         "name": "string_b",
+         "type": "STRING",
+         "link": 8,
+         "widget": {
+          "name": "string_b"
+         }
+        }
+       ],
+       "outputs": [
+        {
+         "name": "STRING",
+         "type": "STRING",
+         "links": [
+          9,
+          10
+         ]
+        }
+       ]
+      },
+      {
+       "id": 9,
+       "type": "SonderMetadataCollector",
+       "inputs": [
+        {
+         "name": "project",
+         "type": "SONDER_PROJECT",
+         "link": null
+        },
+        {
+         "name": "value_0",
+         "label": "TEXT",
+         "type": "*",
+         "link": 10
+        },
+        {
+         "name": "value_1",
+         "label": "value_1",
+         "type": "*",
+         "link": null
+        }
+       ],
+       "outputs": [
+        {
+         "name": "project",
+         "type": "SONDER_PROJECT",
+         "links": []
+        }
+       ]
+      }
+     ],
+     "links": [
+      {
+       "id": 5,
+       "origin_id": 6,
+       "origin_slot": 0,
+       "target_id": -20,
+       "target_slot": 0,
+       "type": "STRING"
+      },
+      {
+       "id": 8,
+       "origin_id": -10,
+       "origin_slot": 0,
+       "target_id": 8,
+       "target_slot": 0,
+       "type": "STRING"
+      },
+      {
+       "id": 9,
+       "origin_id": 8,
+       "origin_slot": 0,
+       "target_id": 6,
+       "target_slot": 0,
+       "type": "STRING"
+      },
+      {
+       "id": 10,
+       "origin_id": 8,
+       "origin_slot": 0,
+       "target_id": 9,
+       "target_slot": 1,
+       "type": "STRING"
+      }
+     ]
+    },
+    {
+     "id": "4a46b800-65a2-4acd-8504-e003eb733369",
+     "name": "New Subgraph",
+     "inputs": [
+      {
+       "name": "string_b",
+       "type": "STRING",
+       "linkIds": [
+        2
+       ]
+      }
+     ],
+     "outputs": [
+      {
+       "name": "STRING",
+       "type": "STRING",
+       "linkIds": [
+        3
+       ]
+      }
+     ],
+     "nodes": [
+      {
+       "id": 4,
+       "type": "PrimitiveStringMultiline",
+       "inputs": [],
+       "outputs": [
+        {
+         "name": "STRING",
+         "type": "STRING",
+         "links": [
+          1
+         ]
+        }
+       ]
+      },
+      {
+       "id": 5,
+       "type": "StringConcatenate",
+       "inputs": [
+        {
+         "name": "string_a",
+         "type": "STRING",
+         "link": 1,
+         "widget": {
+          "name": "string_a"
+         }
+        },
+        {
+         "name": "string_b",
+         "type": "STRING",
+         "link": 2,
+         "widget": {
+          "name": "string_b"
+         }
+        }
+       ],
+       "outputs": [
+        {
+         "name": "STRING",
+         "type": "STRING",
+         "links": [
+          3
+         ]
+        }
+       ]
+      }
+     ],
+     "links": [
+      {
+       "id": 1,
+       "origin_id": 4,
+       "origin_slot": 0,
+       "target_id": 5,
+       "target_slot": 0,
+       "type": "STRING"
+      },
+      {
+       "id": 2,
+       "origin_id": -10,
+       "origin_slot": 0,
+       "target_id": 5,
+       "target_slot": 1,
+       "type": "STRING"
+      },
+      {
+       "id": 3,
+       "origin_id": 5,
+       "origin_slot": 0,
+       "target_id": -20,
+       "target_slot": 0,
+       "type": "STRING"
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "collector": "2",
+ "innerCollector": "7:9"
+}

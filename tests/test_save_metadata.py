@@ -1,4 +1,5 @@
 import importlib
+import json
 import sys
 import types
 from pathlib import Path
@@ -165,6 +166,28 @@ def test_save_video_preserves_collector_copy_span_without_full_prompt_duplicate(
     start, end = saved["raw_field_spans"]["prompt"]
     assert saved["raw_widget_text"][start:end] == full_prompt
     assert "full_fields" not in saved
+
+
+def test_save_video_persists_a_collected_subgraph_section(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    collector = importlib.import_module(f"{TEST_PACKAGE}.nodes.metadata_collector")
+    torch = importlib.import_module("torch")
+    _patch_save_deps(io_nodes, monkeypatch, [])
+    project = _project(tmp_path)
+    fixture = json.loads((ROOT / "tests" / "fixtures" / "subgraph_qwen_edit_2509.json").read_text(encoding="utf-8"))
+    collector.collect_metadata(
+        project, prompt=fixture["prompt"], extra_pnginfo={"workflow": fixture["workflow"]},
+        unique_id=fixture["collector"], values={"value_0": object()}, labels={}, capacity=12)
+    collected = project._execution_context[collector.TRACKED_METADATA_CONTEXT_KEY][fixture["collector"]]
+    prompt = {"S": {"class_type": "SonderSaveVideo", "inputs": {"project": [fixture["collector"], 0]}}}
+
+    io_nodes.SonderSaveVideo().save_video(
+        project, torch.zeros(1, 2, 2, 3), embed_metadata=False, prompt=prompt, unique_id="S")
+
+    saved = project.assets[0].generation_params["editor_export"]["tracked_metadata"]
+    assert saved == collected
+    assert saved[0]["display_type"] == "subgraph"
+    assert saved[0]["subgraph"]["output_names"] == ["IMAGE"]
 
 
 def test_save_video_display_type_propagates(tmp_path, monkeypatch):

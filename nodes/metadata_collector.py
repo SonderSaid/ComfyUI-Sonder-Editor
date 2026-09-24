@@ -7,6 +7,15 @@ import os
 import re
 from typing import Any
 
+from .subgraph_provenance import (
+    checked_workflow_node,
+    find_workflow_node,
+    is_link,
+    prompt_title,
+    resolve_subgraph_origin,
+    upstream_keys,
+)
+
 
 class _AnyType(str):
     def __ne__(self, other):  # noqa: D401 - make any type comparison succeed
@@ -42,61 +51,8 @@ def _as_id(value: Any) -> str:
     return str(value or "")
 
 
-def _workflow_nodes(workflow: dict | None) -> list[dict]:
-    nodes = workflow.get("nodes") if isinstance(workflow, dict) else None
-    return [node for node in nodes if isinstance(node, dict)] if isinstance(nodes, list) else []
-
-
-def _workflow_subgraphs(workflow: dict | None) -> list[dict]:
-    if not isinstance(workflow, dict):
-        return []
-    definitions = workflow.get("definitions")
-    if isinstance(definitions, dict) and isinstance(definitions.get("subgraphs"), list):
-        return [item for item in definitions["subgraphs"] if isinstance(item, dict)]
-    if isinstance(workflow.get("subgraphs"), list):
-        return [item for item in workflow["subgraphs"] if isinstance(item, dict)]
-    return []
-
-
-def _node_id(node: dict | None) -> str:
-    return _as_id((node or {}).get("id"))
-
-
-def _find_node_by_id(nodes: list[dict], node_id: str) -> dict | None:
-    for node in nodes:
-        if _node_id(node) == node_id:
-            return node
-    return None
-
-
-def _subgraph_type_keys(subgraph: dict) -> list[str]:
-    keys = []
-    for key in ("id", "type", "name"):
-        value = subgraph.get(key)
-        if value is not None:
-            keys.append(_as_id(value))
-    return keys
-
-
 def _find_collector_workflow_node(workflow: dict | None, unique_id: str) -> dict | None:
-    unique = _as_id(unique_id)
-    if not unique:
-        return None
-    main_nodes = _workflow_nodes(workflow)
-    if ":" not in unique:
-        return _find_node_by_id(main_nodes, unique)
-
-    parent_id, child_id = unique.split(":", 1)
-    parent_node = _find_node_by_id(main_nodes, parent_id)
-    parent_type = _as_id((parent_node or {}).get("type") or (parent_node or {}).get("class_type"))
-    for subgraph in _workflow_subgraphs(workflow):
-        keys = set(_subgraph_type_keys(subgraph))
-        if parent_type and parent_type not in keys:
-            continue
-        found = _find_node_by_id(_workflow_nodes(subgraph), child_id)
-        if found:
-            return found
-    return None
+    return find_workflow_node(workflow, _as_id(unique_id))
 
 
 def _prompt_node(prompt: dict | None, prompt_key: str) -> tuple[str, dict | None]:
@@ -287,7 +243,6 @@ def _section_from_origin(prompt_key: str, prompt_entry: dict, workflow_node: dic
     title = _workflow_title(workflow_node)
     section_label = str(label or "").strip() or title or class_type or prompt_key
 
-    raw_widget_text, input_spans = _raw_widget_text_and_spans(inputs)
     handler = _resolve_compat_handler(class_type)
     source_fields: dict | None = None
     display_type: str | None = None
@@ -302,28 +257,41 @@ def _section_from_origin(prompt_key: str, prompt_entry: dict, workflow_node: dic
     if source_fields is None:
         source_fields = inputs
 
+    return _assemble_section(
+        {
+            "label": section_label,
+            "source_node_id": prompt_key,
+            "source_node_class": class_type,
+            "source_node_title": title,
+        },
+        inputs,
+        source_fields,
+        display_type,
+        structured=display_type is not None,
+    )
+
+
+def _assemble_section(header: dict, raw_inputs: dict, source_fields: dict, display_type, *, structured: bool) -> dict:
+    raw_widget_text, input_spans = _raw_widget_text_and_spans(raw_inputs)
     fields: dict = {}
     has_capped_scalar = False
     full_fields: dict = {}
     for key, value in source_fields.items():
         field_key = str(key)
         safe = _json_safe(value)
-        capped = _cap_field_value(safe, structured=display_type is not None)
+        capped = _cap_field_value(safe, structured=structured)
         fields[field_key] = capped
         if capped != safe:
             # Generic scalars already exist verbatim in raw_widget_text. Spans
             # avoid repeating a long prompt in every asset/take provenance copy.
-            if display_type is None and not isinstance(safe, (dict, list, tuple)) and field_key in input_spans:
+            if not structured and not isinstance(safe, (dict, list, tuple)) and field_key in input_spans:
                 has_capped_scalar = True
             else:
                 # Transformed rows and containers need their JSON shape for Copy.
                 full_fields[field_key] = safe
 
     section = {
-        "label": section_label,
-        "source_node_id": prompt_key,
-        "source_node_class": class_type,
-        "source_node_title": title,
+        **header,
         "raw_widget_text": raw_widget_text,
         "fields": fields,
         "display_type": display_type,
@@ -335,6 +303,109 @@ def _section_from_origin(prompt_key: str, prompt_entry: dict, workflow_node: dic
     if full_fields:
         section["full_fields"] = full_fields
     return section
+
+
+def _has_literal_input(prompt_entry: Any) -> bool:
+    inputs = prompt_entry.get("inputs") if isinstance(prompt_entry, dict) else None
+    return isinstance(inputs, dict) and any(not is_link(value) for value in inputs.values())
+
+
+def _subgraph_sections(collector_key: str, origin_ref, prompt: dict | None, workflow: dict | None,
+                       label: str, emitted: dict) -> list[dict] | None:
+    """Sections for an origin inside a subgraph instance, or None to use the inner node.
+
+    The subgraph's interface becomes one section per instance (every tapped
+    output is recorded on it). The producing node keeps its own values, minus
+    those the interface already shows, as a sibling, and compat-handled
+    ancestors on the tapped branch follow. `emitted` spans one collector run:
+    an origin whose sections were all emitted by an earlier input returns [],
+    which is resolved, not a fallback.
+    """
+    try:
+        origin = resolve_subgraph_origin(collector_key, origin_ref, prompt, workflow)
+        if origin is None:
+            return None
+        return _subgraph_origin_sections(origin, prompt, workflow, label, emitted)
+    except Exception:
+        # Workflow JSON is user-controlled; malformed shapes must never fail a run.
+        return None
+
+
+def _subgraph_origin_sections(origin: dict, prompt: dict, workflow, label: str, emitted: dict) -> list[dict] | None:
+    keys: set = emitted.setdefault("keys", set())
+    units: dict = emitted.setdefault("units", {})
+    labels: set = emitted.setdefault("labels", set())
+    sections: list[dict] = []
+    resolved = False
+
+    instance_key = origin["instance_key"]
+    unit_label = str(label or "").strip() or origin["instance_title"] or origin["definition_name"]
+    if instance_key not in units and unit_label.lower() in labels:
+        # Untitled instances of one definition would share a label and pin key.
+        unit_label = f"{unit_label} [{instance_key}]"
+    fields = origin["fields"]
+    if fields:
+        resolved = True
+        existing = units.get(instance_key)
+        if existing is not None:
+            names = existing["subgraph"]["output_names"]
+            if origin["output_name"] and origin["output_name"] not in names:
+                names.append(origin["output_name"])
+            unit_label = existing["label"]
+        else:
+            section = _assemble_section(
+                {
+                    "label": unit_label,
+                    "source_node_id": instance_key,
+                    "source_node_class": origin["definition_name"],
+                    "source_node_title": origin["instance_title"],
+                },
+                fields,
+                fields,
+                "subgraph",
+                structured=False,
+            )
+            section["subgraph"] = {
+                "definition_id": origin["definition_id"],
+                "definition_name": origin["definition_name"],
+                "instance_key": instance_key,
+                "output_names": [origin["output_name"]] if origin["output_name"] else [],
+                "producer_node_id": origin["producer_key"],
+            }
+            units[instance_key] = section
+            labels.add(unit_label.lower())
+            sections.append(section)
+
+    producer_key = origin["producer_key"]
+    producer_entry = prompt.get(producer_key)
+    shown = {name for key, name in origin["interface_targets"] if key == producer_key}
+    producer_inputs = producer_entry.get("inputs") if isinstance(producer_entry, dict) else None
+    remaining = {
+        name: value for name, value in (producer_inputs if isinstance(producer_inputs, dict) else {}).items()
+        if name not in shown
+    }
+    remaining_entry = {**producer_entry, "inputs": remaining} if isinstance(producer_entry, dict) else None
+    if _has_literal_input(remaining_entry):
+        resolved = True
+        if ("node", producer_key) not in keys:
+            keys.add(("node", producer_key))
+            producer_label = _workflow_title(origin["producer_node"]) or prompt_title(prompt, producer_key)
+            sections.append(_section_from_origin(
+                producer_key, remaining_entry, origin["producer_node"], f"{unit_label} \u203a {producer_label}",
+            ))
+
+    for ancestor_key in upstream_keys(prompt, producer_key, origin["prefix"]):
+        entry = prompt.get(ancestor_key)
+        if not isinstance(entry, dict) or _resolve_compat_handler(str(entry.get("class_type") or "")) is None:
+            continue
+        resolved = True
+        if ("node", ancestor_key) in keys:
+            continue
+        keys.add(("node", ancestor_key))
+        node = checked_workflow_node(workflow, prompt, ancestor_key)
+        ancestor_label = _workflow_title(node) or prompt_title(prompt, ancestor_key)
+        sections.append(_section_from_origin(ancestor_key, entry, node, f"{unit_label} \u203a {ancestor_label}"))
+    return sections if resolved else None
 
 
 def _project_input_origin_id(inputs: dict | None) -> str:
@@ -446,6 +517,7 @@ def collect_metadata(
     own_chain = list(chains.get(parent_key, [])) if parent_key else []
     value_names = _normalized_value_names(values)
     label_values = labels if isinstance(labels, dict) else {}
+    emitted: dict = {}
 
     for index in range(max(0, int(capacity))):
         value_name = f"value_{index}"
@@ -457,15 +529,14 @@ def collect_metadata(
         resolved_key, prompt_entry = _prompt_node(prompt, _as_id(origin_ref[0]))
         if not prompt_entry:
             continue
+        label = label_values.get(f"label_{index}", "")
+        if resolved_key == _as_id(origin_ref[0]):
+            subgraph_sections = _subgraph_sections(owner_key, origin_ref, prompt, workflow, label, emitted)
+            if subgraph_sections is not None:
+                own_chain.extend(subgraph_sections)
+                continue
         origin_workflow_node = _find_collector_workflow_node(workflow, resolved_key)
-        own_chain.append(
-            _section_from_origin(
-                resolved_key,
-                prompt_entry,
-                origin_workflow_node,
-                label_values.get(f"label_{index}", ""),
-            )
-        )
+        own_chain.append(_section_from_origin(resolved_key, prompt_entry, origin_workflow_node, label))
 
     chains[owner_key] = own_chain
     return project

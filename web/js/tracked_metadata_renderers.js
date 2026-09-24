@@ -278,3 +278,21 @@ registerTrackedRenderer("power_loras", {
     render: renderPowerLoraBody,
     matchField: matchPowerLoraField,
 });
+
+// A subgraph section's fields are its interface values, keyed by input label.
+// The body only says which outputs were tapped; every field stays in the generic
+// grid, so pins, Copy and field search work unchanged.
+function renderSubgraphBody(entry, ctx) {
+    const names = Array.isArray(entry?.subgraph?.output_names) ? entry.subgraph.output_names : [];
+    const outputs = names.map((name) => String(name || "").trim()).filter(Boolean);
+    const { style, CHROME } = ctx;
+    const line = style(document.createElement("div"), `color:${CHROME.textDim};font-size:10px;`);
+    line.textContent = outputs.length
+        ? `Subgraph · ${outputs.join(", ")} output${outputs.length > 1 ? "s" : ""}`
+        : "Subgraph";
+    return { dom: line, consumedFields: [] };
+}
+
+registerTrackedRenderer("subgraph", {
+    render: renderSubgraphBody,
+});

@@ -38,7 +38,9 @@ function rawSpanText(entry, key) {
     const raw = entry?.raw_widget_text;
     const fields = entry?.fields;
     const spans = entry?.raw_field_spans;
-    if (entry?.display_type || typeof raw !== "string" || !fields || typeof fields !== "object"
+    // Subgraph interface sections cap like generic ones: raw text is their fields.
+    const spanned = !entry?.display_type || entry.display_type === "subgraph";
+    if (!spanned || typeof raw !== "string" || !fields || typeof fields !== "object"
             || !spans || typeof spans !== "object") return null;
     const keys = Object.keys(fields);
     if (!keys.includes(key) || Object.keys(spans).length !== keys.length

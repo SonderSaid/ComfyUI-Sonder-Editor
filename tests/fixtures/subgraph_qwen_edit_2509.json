@@ -1,0 +1,1712 @@
+{
+ "prompt": {
+  "78": {
+   "inputs": {
+    "image": "image_qwen_image_edit_2509_input_image.png"
+   },
+   "class_type": "LoadImage",
+   "_meta": {
+    "title": "Load Image"
+   }
+  },
+  "469": {
+   "inputs": {
+    "filename_prefix": "Qwen_Image_2509",
+    "format": "png",
+    "format.bit_depth": "8-bit",
+    "format.input_color_space": "sRGB",
+    "images": [
+     "433:8",
+     0
+    ]
+   },
+   "class_type": "SaveImageAdvanced",
+   "_meta": {
+    "title": "Save Image (Advanced)"
+   }
+  },
+  "470": {
+   "inputs": {
+    "project": "+ Create New",
+    "project_name": "My Project",
+    "fps": 24,
+    "width": 1280,
+    "height": 720,
+    "scene_id": "",
+    "selection_start": 0,
+    "selection_end": 0,
+    "pre_context_frames": 0,
+    "post_context_frames": 0,
+    "mask_pre_offset": 0,
+    "mask_post_offset": 0,
+    "take_placement_mode": "trimmed",
+    "take_placement_linked": true,
+    "take_placement_muted": false,
+    "render_cache_max_bytes": 0,
+    "render_queue_active": true,
+    "take_fit_mode": "pad_edge",
+    "take_crop_position": "center"
+   },
+   "class_type": "SonderEditor",
+   "_meta": {
+    "title": "Sonder Editor"
+   }
+  },
+  "471": {
+   "inputs": {
+    "label_0": "",
+    "label_1": "",
+    "label_2": "",
+    "label_3": "",
+    "label_4": "",
+    "label_5": "",
+    "label_6": "",
+    "label_7": "",
+    "label_8": "",
+    "label_9": "",
+    "label_10": "",
+    "label_11": "",
+    "project": [
+     "470",
+     0
+    ],
+    "value_0": [
+     "433:8",
+     0
+    ]
+   },
+   "class_type": "SonderMetadataCollector",
+   "_meta": {
+    "title": "Sonder Metadata Collector"
+   }
+  },
+  "433:75": {
+   "inputs": {
+    "strength": 1,
+    "pre_cfg": false,
+    "model": [
+     "433:66",
+     0
+    ]
+   },
+   "class_type": "CFGNorm",
+   "_meta": {
+    "title": "CFGNorm"
+   }
+  },
+  "433:39": {
+   "inputs": {
+    "vae_name": "qwen_image_vae.safetensors"
+   },
+   "class_type": "VAELoader",
+   "_meta": {
+    "title": "Load VAE"
+   }
+  },
+  "433:38": {
+   "inputs": {
+    "clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+    "type": "qwen_image",
+    "device": "default"
+   },
+   "class_type": "CLIPLoader",
+   "_meta": {
+    "title": "Load CLIP"
+   }
+  },
+  "433:37": {
+   "inputs": {
+    "unet_name": "qwen_image_edit_2509_fp8_e4m3fn.safetensors",
+    "weight_dtype": "default"
+   },
+   "class_type": "UNETLoader",
+   "_meta": {
+    "title": "Load Diffusion Model"
+   }
+  },
+  "433:110": {
+   "inputs": {
+    "prompt": "",
+    "clip": [
+     "433:38",
+     0
+    ],
+    "vae": [
+     "433:39",
+     0
+    ],
+    "image1": [
+     "433:117",
+     0
+    ]
+   },
+   "class_type": "TextEncodeQwenImageEditPlus",
+   "_meta": {
+    "title": "Text Encode Qwen Image Edit Plus"
+   }
+  },
+  "433:66": {
+   "inputs": {
+    "shift": 3,
+    "sampling": "flow",
+    "model": [
+     "433:440",
+     0
+    ]
+   },
+   "class_type": "ModelSamplingAuraFlow",
+   "_meta": {
+    "title": "ModelSamplingAuraFlow"
+   }
+  },
+  "433:111": {
+   "inputs": {
+    "prompt": "Replace the cat with a dalmatian, keeping the environment and scene consistent",
+    "clip": [
+     "433:38",
+     0
+    ],
+    "vae": [
+     "433:39",
+     0
+    ],
+    "image1": [
+     "433:117",
+     0
+    ]
+   },
+   "class_type": "TextEncodeQwenImageEditPlus",
+   "_meta": {
+    "title": "Text Encode Qwen Image Edit Plus"
+   }
+  },
+  "433:88": {
+   "inputs": {
+    "pixels": [
+     "433:117",
+     0
+    ],
+    "vae": [
+     "433:39",
+     0
+    ]
+   },
+   "class_type": "VAEEncode",
+   "_meta": {
+    "title": "VAE Encode"
+   }
+  },
+  "433:8": {
+   "inputs": {
+    "samples": [
+     "433:3",
+     0
+    ],
+    "vae": [
+     "433:39",
+     0
+    ]
+   },
+   "class_type": "VAEDecode",
+   "_meta": {
+    "title": "VAE Decode"
+   }
+  },
+  "433:89": {
+   "inputs": {
+    "lora_name": "Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors",
+    "strength_model": 1,
+    "model": [
+     "433:37",
+     0
+    ]
+   },
+   "class_type": "LoraLoaderModelOnly",
+   "_meta": {
+    "title": "Load LoRA"
+   }
+  },
+  "433:117": {
+   "inputs": {
+    "image": [
+     "78",
+     0
+    ]
+   },
+   "class_type": "FluxKontextImageScale",
+   "_meta": {
+    "title": "FluxKontextImageScale"
+   }
+  },
+  "433:3": {
+   "inputs": {
+    "seed": 362225868152841,
+    "steps": [
+     "433:441",
+     0
+    ],
+    "cfg": [
+     "433:442",
+     0
+    ],
+    "sampler_name": "euler",
+    "scheduler": "simple",
+    "denoise": 1,
+    "model": [
+     "433:75",
+     0
+    ],
+    "positive": [
+     "433:111",
+     0
+    ],
+    "negative": [
+     "433:110",
+     0
+    ],
+    "latent_image": [
+     "433:88",
+     0
+    ]
+   },
+   "class_type": "KSampler",
+   "_meta": {
+    "title": "KSampler"
+   }
+  },
+  "433:436": {
+   "inputs": {
+    "value": 4
+   },
+   "class_type": "PrimitiveInt",
+   "_meta": {
+    "title": "Stpes"
+   }
+  },
+  "433:437": {
+   "inputs": {
+    "value": 1
+   },
+   "class_type": "PrimitiveFloat",
+   "_meta": {
+    "title": "CFG"
+   }
+  },
+  "433:438": {
+   "inputs": {
+    "value": 20
+   },
+   "class_type": "PrimitiveInt",
+   "_meta": {
+    "title": "Steps"
+   }
+  },
+  "433:439": {
+   "inputs": {
+    "value": 4
+   },
+   "class_type": "PrimitiveFloat",
+   "_meta": {
+    "title": "CFG"
+   }
+  },
+  "433:440": {
+   "inputs": {
+    "switch": [
+     "433:443",
+     0
+    ],
+    "on_false": [
+     "433:37",
+     0
+    ],
+    "on_true": [
+     "433:89",
+     0
+    ]
+   },
+   "class_type": "ComfySwitchNode",
+   "_meta": {
+    "title": "Switch (Model)"
+   }
+  },
+  "433:441": {
+   "inputs": {
+    "switch": [
+     "433:443",
+     0
+    ],
+    "on_false": [
+     "433:438",
+     0
+    ],
+    "on_true": [
+     "433:436",
+     0
+    ]
+   },
+   "class_type": "ComfySwitchNode",
+   "_meta": {
+    "title": "Switch (Steps)"
+   }
+  },
+  "433:442": {
+   "inputs": {
+    "switch": [
+     "433:443",
+     0
+    ],
+    "on_false": [
+     "433:439",
+     0
+    ],
+    "on_true": [
+     "433:437",
+     0
+    ]
+   },
+   "class_type": "ComfySwitchNode",
+   "_meta": {
+    "title": "Switch (CFG)"
+   }
+  },
+  "433:443": {
+   "inputs": {
+    "value": true
+   },
+   "class_type": "PrimitiveBoolean",
+   "_meta": {
+    "title": "Enable Lightning LoRA"
+   }
+  }
+ },
+ "workflow": {
+  "nodes": [
+   {
+    "id": 99,
+    "type": "MarkdownNote",
+    "title": "Model links",
+    "inputs": [],
+    "outputs": []
+   },
+   {
+    "id": 78,
+    "type": "LoadImage",
+    "inputs": [],
+    "outputs": [
+     {
+      "name": "IMAGE",
+      "type": "IMAGE",
+      "links": [
+       695
+      ]
+     },
+     {
+      "name": "MASK",
+      "type": "MASK",
+      "links": []
+     }
+    ]
+   },
+   {
+    "id": 433,
+    "type": "eba40a3a-f6c5-48ac-b58e-55525d06b373",
+    "inputs": [
+     {
+      "name": "image",
+      "label": "image",
+      "type": "IMAGE",
+      "link": 695
+     },
+     {
+      "name": "image2",
+      "label": "image2 (optional)",
+      "type": "IMAGE",
+      "link": null
+     },
+     {
+      "name": "image3",
+      "label": "image3 (optional)",
+      "type": "IMAGE",
+      "link": null
+     },
+     {
+      "name": "prompt",
+      "label": "positive_prompt",
+      "type": "STRING",
+      "link": null,
+      "widget": {
+       "name": "prompt"
+      }
+     },
+     {
+      "name": "lora_name",
+      "type": "COMBO",
+      "link": null
+     },
+     {
+      "name": "prompt_1",
+      "label": "negative_prompt",
+      "type": "STRING",
+      "link": null,
+      "widget": {
+       "name": "prompt_1"
+      }
+     },
+     {
+      "name": "seed_1",
+      "label": "seed",
+      "type": "INT",
+      "link": null,
+      "widget": {
+       "name": "seed_1"
+      }
+     },
+     {
+      "name": "unet_name_1",
+      "label": "unet_name",
+      "type": "COMBO",
+      "link": null,
+      "widget": {
+       "name": "unet_name_1"
+      }
+     },
+     {
+      "name": "clip_name_1",
+      "label": "clip_name",
+      "type": "COMBO",
+      "link": null,
+      "widget": {
+       "name": "clip_name_1"
+      }
+     },
+     {
+      "name": "vae_name_1",
+      "label": "vae_name",
+      "type": "COMBO",
+      "link": null,
+      "widget": {
+       "name": "vae_name_1"
+      }
+     },
+     {
+      "name": "value",
+      "label": "enable_turbo_mode",
+      "type": "BOOLEAN",
+      "link": null,
+      "widget": {
+       "name": "value"
+      }
+     },
+     {
+      "name": "lora_name_1",
+      "label": "lightning_lora",
+      "type": "COMBO",
+      "link": null,
+      "widget": {
+       "name": "lora_name_1"
+      }
+     }
+    ],
+    "outputs": [
+     {
+      "name": "IMAGE",
+      "type": "IMAGE",
+      "links": [
+       743,
+       745
+      ]
+     }
+    ],
+    "properties": {
+     "proxyWidgetErrorQuarantine": [
+      {
+       "originalEntry": [
+        "3",
+        "control_after_generate"
+       ],
+       "reason": "missingSubgraphInput",
+       "attemptedAtVersion": 1
+      }
+     ]
+    }
+   },
+   {
+    "id": 469,
+    "type": "SaveImageAdvanced",
+    "inputs": [
+     {
+      "name": "images",
+      "type": "IMAGE",
+      "link": 743
+     }
+    ],
+    "outputs": [
+     {
+      "name": "images",
+      "type": "IMAGE",
+      "links": []
+     }
+    ]
+   },
+   {
+    "id": 470,
+    "type": "SonderEditor",
+    "inputs": [],
+    "outputs": [
+     {
+      "name": "project",
+      "type": "SONDER_PROJECT",
+      "links": [
+       744
+      ]
+     },
+     {
+      "name": "rendered_frames",
+      "type": "IMAGE",
+      "links": []
+     },
+     {
+      "name": "guide_images",
+      "type": "IMAGE",
+      "links": []
+     },
+     {
+      "name": "guide_idx",
+      "type": "STRING",
+      "links": []
+     },
+     {
+      "name": "guide_strengths",
+      "type": "STRING",
+      "links": []
+     },
+     {
+      "name": "prompt",
+      "type": "STRING",
+      "links": []
+     },
+     {
+      "name": "frame_count",
+      "type": "INT",
+      "links": []
+     },
+     {
+      "name": "fps",
+      "type": "FLOAT",
+      "links": []
+     },
+     {
+      "name": "width",
+      "type": "INT",
+      "links": []
+     },
+     {
+      "name": "height",
+      "type": "INT",
+      "links": []
+     },
+     {
+      "name": "audio",
+      "type": "AUDIO",
+      "links": []
+     },
+     {
+      "name": "mask_start_time",
+      "type": "FLOAT",
+      "links": []
+     },
+     {
+      "name": "mask_end_time",
+      "type": "FLOAT",
+      "links": []
+     }
+    ]
+   },
+   {
+    "id": 471,
+    "type": "SonderMetadataCollector",
+    "inputs": [
+     {
+      "name": "project",
+      "type": "SONDER_PROJECT",
+      "link": 744
+     },
+     {
+      "name": "value_0",
+      "label": "IMAGE",
+      "type": "*",
+      "link": 745
+     },
+     {
+      "name": "value_1",
+      "label": "value_1",
+      "type": "*",
+      "link": null
+     }
+    ],
+    "outputs": [
+     {
+      "name": "project",
+      "type": "SONDER_PROJECT",
+      "links": []
+     }
+    ]
+   }
+  ],
+  "links": [
+   [
+    695,
+    78,
+    0,
+    433,
+    0,
+    "IMAGE"
+   ],
+   [
+    743,
+    433,
+    0,
+    469,
+    0,
+    "IMAGE"
+   ],
+   [
+    744,
+    470,
+    0,
+    471,
+    0,
+    "SONDER_PROJECT"
+   ],
+   [
+    745,
+    433,
+    0,
+    471,
+    1,
+    "IMAGE"
+   ]
+  ],
+  "definitions": {
+   "subgraphs": [
+    {
+     "id": "eba40a3a-f6c5-48ac-b58e-55525d06b373",
+     "name": "Image Edit (Qwen 2509)",
+     "inputs": [
+      {
+       "name": "image",
+       "label": "image",
+       "type": "IMAGE",
+       "linkIds": [
+        248
+       ]
+      },
+      {
+       "name": "image2",
+       "label": "image2 (optional)",
+       "type": "IMAGE",
+       "linkIds": [
+        235,
+        236
+       ]
+      },
+      {
+       "name": "image3",
+       "label": "image3 (optional)",
+       "type": "IMAGE",
+       "linkIds": [
+        237,
+        238
+       ]
+      },
+      {
+       "name": "prompt",
+       "label": "positive_prompt",
+       "type": "STRING",
+       "linkIds": [
+        244
+       ]
+      },
+      {
+       "name": "lora_name",
+       "type": "COMBO",
+       "linkIds": []
+      },
+      {
+       "name": "prompt_1",
+       "label": "negative_prompt",
+       "type": "STRING",
+       "linkIds": [
+        735
+       ]
+      },
+      {
+       "name": "seed_1",
+       "label": "seed",
+       "type": "INT",
+       "linkIds": [
+        736
+       ]
+      },
+      {
+       "name": "unet_name_1",
+       "label": "unet_name",
+       "type": "COMBO",
+       "linkIds": [
+        737
+       ]
+      },
+      {
+       "name": "clip_name_1",
+       "label": "clip_name",
+       "type": "COMBO",
+       "linkIds": [
+        738
+       ]
+      },
+      {
+       "name": "vae_name_1",
+       "label": "vae_name",
+       "type": "COMBO",
+       "linkIds": [
+        739
+       ]
+      },
+      {
+       "name": "value",
+       "label": "enable_turbo_mode",
+       "type": "BOOLEAN",
+       "linkIds": [
+        740
+       ]
+      },
+      {
+       "name": "lora_name_1",
+       "label": "lightning_lora",
+       "type": "COMBO",
+       "linkIds": [
+        742
+       ]
+      }
+     ],
+     "outputs": [
+      {
+       "name": "IMAGE",
+       "type": "IMAGE",
+       "linkIds": [
+        110
+       ]
+      }
+     ],
+     "nodes": [
+      {
+       "id": 75,
+       "type": "CFGNorm",
+       "inputs": [
+        {
+         "name": "model",
+         "type": "MODEL",
+         "link": 141
+        }
+       ],
+       "outputs": [
+        {
+         "name": "patched_model",
+         "type": "MODEL",
+         "links": [
+          186
+         ]
+        }
+       ]
+      },
+      {
+       "id": 39,
+       "type": "VAELoader",
+       "inputs": [
+        {
+         "name": "vae_name",
+         "type": "COMBO",
+         "link": 739,
+         "widget": {
+          "name": "vae_name"
+         }
+        }
+       ],
+       "outputs": [
+        {
+         "name": "VAE",
+         "type": "VAE",
+         "links": [
+          76,
+          168,
+          206,
+          207
+         ]
+        }
+       ]
+      },
+      {
+       "id": 38,
+       "type": "CLIPLoader",
+       "inputs": [
+        {
+         "name": "clip_name",
+         "type": "COMBO",
+         "link": 738,
+         "widget": {
+          "name": "clip_name"
+         }
+        }
+       ],
+       "outputs": [
+        {
+         "name": "CLIP",
+         "type": "CLIP",
+         "links": [
+          204,
+          205
+         ]
+        }
+       ]
+      },
+      {
+       "id": 37,
+       "type": "UNETLoader",
+       "inputs": [
+        {
+         "name": "unet_name",
+         "type": "COMBO",
+         "link": 737,
+         "widget": {
+          "name": "unet_name"
+         }
+        }
+       ],
+       "outputs": [
+        {
+         "name": "MODEL",
+         "type": "MODEL",
+         "links": [
+          184,
+          710
+         ]
+        }
+       ]
+      },
+      {
+       "id": 110,
+       "type": "TextEncodeQwenImageEditPlus",
+       "inputs": [
+        {
+         "name": "clip",
+         "type": "CLIP",
+         "link": 204
+        },
+        {
+         "name": "vae",
+         "type": "VAE",
+         "link": 206
+        },
+        {
+         "name": "image1",
+         "type": "IMAGE",
+         "link": 251
+        },
+        {
+         "name": "image2",
+         "type": "IMAGE",
+         "link": 236
+        },
+        {
+         "name": "image3",
+         "type": "IMAGE",
+         "link": 238
+        },
+        {
+         "name": "prompt",
+         "type": "STRING",
+         "link": 735,
+         "widget": {
+          "name": "prompt"
+         }
+        }
+       ],
+       "outputs": [
+        {
+         "name": "CONDITIONING",
+         "type": "CONDITIONING",
+         "links": [
+          210
+         ]
+        }
+       ]
+      },
+      {
+       "id": 66,
+       "type": "ModelSamplingAuraFlow",
+       "inputs": [
+        {
+         "name": "model",
+         "type": "MODEL",
+         "link": 708
+        }
+       ],
+       "outputs": [
+        {
+         "name": "MODEL",
+         "type": "MODEL",
+         "links": [
+          141
+         ]
+        }
+       ]
+      },
+      {
+       "id": 111,
+       "type": "TextEncodeQwenImageEditPlus",
+       "inputs": [
+        {
+         "name": "clip",
+         "type": "CLIP",
+         "link": 205
+        },
+        {
+         "name": "vae",
+         "type": "VAE",
+         "link": 207
+        },
+        {
+         "name": "image1",
+         "type": "IMAGE",
+         "link": 250
+        },
+        {
+         "name": "image2",
+         "type": "IMAGE",
+         "link": 235
+        },
+        {
+         "name": "image3",
+         "type": "IMAGE",
+         "link": 237
+        },
+        {
+         "name": "prompt",
+         "type": "STRING",
+         "link": 244,
+         "widget": {
+          "name": "prompt"
+         }
+        }
+       ],
+       "outputs": [
+        {
+         "name": "CONDITIONING",
+         "type": "CONDITIONING",
+         "links": [
+          211
+         ]
+        }
+       ]
+      },
+      {
+       "id": 88,
+       "type": "VAEEncode",
+       "inputs": [
+        {
+         "name": "pixels",
+         "type": "IMAGE",
+         "link": 249
+        },
+        {
+         "name": "vae",
+         "type": "VAE",
+         "link": 168
+        }
+       ],
+       "outputs": [
+        {
+         "name": "LATENT",
+         "type": "LATENT",
+         "links": [
+          246
+         ]
+        }
+       ]
+      },
+      {
+       "id": 8,
+       "type": "VAEDecode",
+       "inputs": [
+        {
+         "name": "samples",
+         "type": "LATENT",
+         "link": 128
+        },
+        {
+         "name": "vae",
+         "type": "VAE",
+         "link": 76
+        }
+       ],
+       "outputs": [
+        {
+         "name": "IMAGE",
+         "type": "IMAGE",
+         "links": [
+          110
+         ]
+        }
+       ]
+      },
+      {
+       "id": 89,
+       "type": "LoraLoaderModelOnly",
+       "inputs": [
+        {
+         "name": "model",
+         "type": "MODEL",
+         "link": 184
+        },
+        {
+         "name": "lora_name",
+         "type": "COMBO",
+         "link": 742,
+         "widget": {
+          "name": "lora_name"
+         }
+        }
+       ],
+       "outputs": [
+        {
+         "name": "MODEL",
+         "type": "MODEL",
+         "links": [
+          709
+         ]
+        }
+       ]
+      },
+      {
+       "id": 117,
+       "type": "FluxKontextImageScale",
+       "inputs": [
+        {
+         "name": "image",
+         "type": "IMAGE",
+         "link": 248
+        }
+       ],
+       "outputs": [
+        {
+         "name": "IMAGE",
+         "type": "IMAGE",
+         "links": [
+          249,
+          250,
+          251
+         ]
+        }
+       ]
+      },
+      {
+       "id": 3,
+       "type": "KSampler",
+       "inputs": [
+        {
+         "name": "model",
+         "type": "MODEL",
+         "link": 186
+        },
+        {
+         "name": "positive",
+         "type": "CONDITIONING",
+         "link": 211
+        },
+        {
+         "name": "negative",
+         "type": "CONDITIONING",
+         "link": 210
+        },
+        {
+         "name": "latent_image",
+         "type": "LATENT",
+         "link": 246
+        },
+        {
+         "name": "seed",
+         "type": "INT",
+         "link": 736,
+         "widget": {
+          "name": "seed"
+         }
+        },
+        {
+         "name": "steps",
+         "type": "INT",
+         "link": 707,
+         "widget": {
+          "name": "steps"
+         }
+        },
+        {
+         "name": "cfg",
+         "type": "FLOAT",
+         "link": 706,
+         "widget": {
+          "name": "cfg"
+         }
+        }
+       ],
+       "outputs": [
+        {
+         "name": "LATENT",
+         "type": "LATENT",
+         "links": [
+          128
+         ]
+        }
+       ]
+      },
+      {
+       "id": 436,
+       "type": "PrimitiveInt",
+       "title": "Stpes",
+       "inputs": [],
+       "outputs": [
+        {
+         "name": "INT",
+         "type": "INT",
+         "links": [
+          713
+         ]
+        }
+       ]
+      },
+      {
+       "id": 437,
+       "type": "PrimitiveFloat",
+       "title": "CFG",
+       "inputs": [],
+       "outputs": [
+        {
+         "name": "FLOAT",
+         "type": "FLOAT",
+         "links": [
+          714
+         ]
+        }
+       ]
+      },
+      {
+       "id": 438,
+       "type": "PrimitiveInt",
+       "title": "Steps",
+       "inputs": [],
+       "outputs": [
+        {
+         "name": "INT",
+         "type": "INT",
+         "links": [
+          711
+         ]
+        }
+       ]
+      },
+      {
+       "id": 439,
+       "type": "PrimitiveFloat",
+       "title": "CFG",
+       "inputs": [],
+       "outputs": [
+        {
+         "name": "FLOAT",
+         "type": "FLOAT",
+         "links": [
+          712
+         ]
+        }
+       ]
+      },
+      {
+       "id": 440,
+       "type": "ComfySwitchNode",
+       "title": "Switch (Model)",
+       "inputs": [
+        {
+         "name": "on_false",
+         "type": "MODEL",
+         "link": 710
+        },
+        {
+         "name": "on_true",
+         "type": "MODEL",
+         "link": 709
+        },
+        {
+         "name": "switch",
+         "type": "BOOLEAN",
+         "link": 715,
+         "widget": {
+          "name": "switch"
+         }
+        }
+       ],
+       "outputs": [
+        {
+         "name": "output",
+         "type": "MODEL",
+         "links": [
+          708
+         ]
+        }
+       ]
+      },
+      {
+       "id": 441,
+       "type": "ComfySwitchNode",
+       "title": "Switch (Steps)",
+       "inputs": [
+        {
+         "name": "on_false",
+         "type": "INT",
+         "link": 711
+        },
+        {
+         "name": "on_true",
+         "type": "INT",
+         "link": 713
+        },
+        {
+         "name": "switch",
+         "type": "BOOLEAN",
+         "link": 716,
+         "widget": {
+          "name": "switch"
+         }
+        }
+       ],
+       "outputs": [
+        {
+         "name": "output",
+         "type": "INT",
+         "links": [
+          707
+         ]
+        }
+       ]
+      },
+      {
+       "id": 442,
+       "type": "ComfySwitchNode",
+       "title": "Switch (CFG)",
+       "inputs": [
+        {
+         "name": "on_false",
+         "type": "FLOAT",
+         "link": 712
+        },
+        {
+         "name": "on_true",
+         "type": "FLOAT",
+         "link": 714
+        },
+        {
+         "name": "switch",
+         "type": "BOOLEAN",
+         "link": 717,
+         "widget": {
+          "name": "switch"
+         }
+        }
+       ],
+       "outputs": [
+        {
+         "name": "output",
+         "type": "FLOAT",
+         "links": [
+          706
+         ]
+        }
+       ]
+      },
+      {
+       "id": 443,
+       "type": "PrimitiveBoolean",
+       "title": "Enable Lightning LoRA",
+       "inputs": [
+        {
+         "name": "value",
+         "type": "BOOLEAN",
+         "link": 740,
+         "widget": {
+          "name": "value"
+         }
+        }
+       ],
+       "outputs": [
+        {
+         "name": "BOOLEAN",
+         "type": "BOOLEAN",
+         "links": [
+          715,
+          716,
+          717
+         ]
+        }
+       ]
+      },
+      {
+       "id": 444,
+       "type": "MarkdownNote",
+       "title": "Note: KSampler settings",
+       "inputs": [],
+       "outputs": []
+      }
+     ],
+     "links": [
+      {
+       "id": 141,
+       "origin_id": 66,
+       "origin_slot": 0,
+       "target_id": 75,
+       "target_slot": 0,
+       "type": "MODEL"
+      },
+      {
+       "id": 128,
+       "origin_id": 3,
+       "origin_slot": 0,
+       "target_id": 8,
+       "target_slot": 0,
+       "type": "LATENT"
+      },
+      {
+       "id": 76,
+       "origin_id": 39,
+       "origin_slot": 0,
+       "target_id": 8,
+       "target_slot": 1,
+       "type": "VAE"
+      },
+      {
+       "id": 184,
+       "origin_id": 37,
+       "origin_slot": 0,
+       "target_id": 89,
+       "target_slot": 0,
+       "type": "MODEL"
+      },
+      {
+       "id": 186,
+       "origin_id": 75,
+       "origin_slot": 0,
+       "target_id": 3,
+       "target_slot": 0,
+       "type": "MODEL"
+      },
+      {
+       "id": 211,
+       "origin_id": 111,
+       "origin_slot": 0,
+       "target_id": 3,
+       "target_slot": 1,
+       "type": "CONDITIONING"
+      },
+      {
+       "id": 210,
+       "origin_id": 110,
+       "origin_slot": 0,
+       "target_id": 3,
+       "target_slot": 2,
+       "type": "CONDITIONING"
+      },
+      {
+       "id": 168,
+       "origin_id": 39,
+       "origin_slot": 0,
+       "target_id": 88,
+       "target_slot": 1,
+       "type": "VAE"
+      },
+      {
+       "id": 204,
+       "origin_id": 38,
+       "origin_slot": 0,
+       "target_id": 110,
+       "target_slot": 0,
+       "type": "CLIP"
+      },
+      {
+       "id": 206,
+       "origin_id": 39,
+       "origin_slot": 0,
+       "target_id": 110,
+       "target_slot": 1,
+       "type": "VAE"
+      },
+      {
+       "id": 205,
+       "origin_id": 38,
+       "origin_slot": 0,
+       "target_id": 111,
+       "target_slot": 0,
+       "type": "CLIP"
+      },
+      {
+       "id": 207,
+       "origin_id": 39,
+       "origin_slot": 0,
+       "target_id": 111,
+       "target_slot": 1,
+       "type": "VAE"
+      },
+      {
+       "id": 110,
+       "origin_id": 8,
+       "origin_slot": 0,
+       "target_id": -20,
+       "target_slot": 0,
+       "type": "IMAGE"
+      },
+      {
+       "id": 235,
+       "origin_id": -10,
+       "origin_slot": 1,
+       "target_id": 111,
+       "target_slot": 3,
+       "type": "IMAGE"
+      },
+      {
+       "id": 236,
+       "origin_id": -10,
+       "origin_slot": 1,
+       "target_id": 110,
+       "target_slot": 3,
+       "type": "IMAGE"
+      },
+      {
+       "id": 237,
+       "origin_id": -10,
+       "origin_slot": 2,
+       "target_id": 111,
+       "target_slot": 4,
+       "type": "IMAGE"
+      },
+      {
+       "id": 238,
+       "origin_id": -10,
+       "origin_slot": 2,
+       "target_id": 110,
+       "target_slot": 4,
+       "type": "IMAGE"
+      },
+      {
+       "id": 244,
+       "origin_id": -10,
+       "origin_slot": 3,
+       "target_id": 111,
+       "target_slot": 5,
+       "type": "STRING"
+      },
+      {
+       "id": 246,
+       "origin_id": 88,
+       "origin_slot": 0,
+       "target_id": 3,
+       "target_slot": 3,
+       "type": "LATENT"
+      },
+      {
+       "id": 248,
+       "origin_id": -10,
+       "origin_slot": 0,
+       "target_id": 117,
+       "target_slot": 0,
+       "type": "IMAGE"
+      },
+      {
+       "id": 249,
+       "origin_id": 117,
+       "origin_slot": 0,
+       "target_id": 88,
+       "target_slot": 0,
+       "type": "IMAGE"
+      },
+      {
+       "id": 250,
+       "origin_id": 117,
+       "origin_slot": 0,
+       "target_id": 111,
+       "target_slot": 2,
+       "type": "IMAGE"
+      },
+      {
+       "id": 251,
+       "origin_id": 117,
+       "origin_slot": 0,
+       "target_id": 110,
+       "target_slot": 2,
+       "type": "IMAGE"
+      },
+      {
+       "id": 706,
+       "origin_id": 442,
+       "origin_slot": 0,
+       "target_id": 3,
+       "target_slot": 6,
+       "type": "FLOAT"
+      },
+      {
+       "id": 707,
+       "origin_id": 441,
+       "origin_slot": 0,
+       "target_id": 3,
+       "target_slot": 5,
+       "type": "INT"
+      },
+      {
+       "id": 708,
+       "origin_id": 440,
+       "origin_slot": 0,
+       "target_id": 66,
+       "target_slot": 0,
+       "type": "MODEL"
+      },
+      {
+       "id": 709,
+       "origin_id": 89,
+       "origin_slot": 0,
+       "target_id": 440,
+       "target_slot": 1,
+       "type": "MODEL"
+      },
+      {
+       "id": 710,
+       "origin_id": 37,
+       "origin_slot": 0,
+       "target_id": 440,
+       "target_slot": 0,
+       "type": "MODEL"
+      },
+      {
+       "id": 711,
+       "origin_id": 438,
+       "origin_slot": 0,
+       "target_id": 441,
+       "target_slot": 0,
+       "type": "INT"
+      },
+      {
+       "id": 712,
+       "origin_id": 439,
+       "origin_slot": 0,
+       "target_id": 442,
+       "target_slot": 0,
+       "type": "FLOAT"
+      },
+      {
+       "id": 713,
+       "origin_id": 436,
+       "origin_slot": 0,
+       "target_id": 441,
+       "target_slot": 1,
+       "type": "INT"
+      },
+      {
+       "id": 714,
+       "origin_id": 437,
+       "origin_slot": 0,
+       "target_id": 442,
+       "target_slot": 1,
+       "type": "FLOAT"
+      },
+      {
+       "id": 715,
+       "origin_id": 443,
+       "origin_slot": 0,
+       "target_id": 440,
+       "target_slot": 2,
+       "type": "BOOLEAN"
+      },
+      {
+       "id": 716,
+       "origin_id": 443,
+       "origin_slot": 0,
+       "target_id": 441,
+       "target_slot": 2,
+       "type": "BOOLEAN"
+      },
+      {
+       "id": 717,
+       "origin_id": 443,
+       "origin_slot": 0,
+       "target_id": 442,
+       "target_slot": 2,
+       "type": "BOOLEAN"
+      },
+      {
+       "id": 735,
+       "origin_id": -10,
+       "origin_slot": 5,
+       "target_id": 110,
+       "target_slot": 5,
+       "type": "STRING"
+      },
+      {
+       "id": 736,
+       "origin_id": -10,
+       "origin_slot": 6,
+       "target_id": 3,
+       "target_slot": 4,
+       "type": "INT"
+      },
+      {
+       "id": 737,
+       "origin_id": -10,
+       "origin_slot": 7,
+       "target_id": 37,
+       "target_slot": 0,
+       "type": "COMBO"
+      },
+      {
+       "id": 738,
+       "origin_id": -10,
+       "origin_slot": 8,
+       "target_id": 38,
+       "target_slot": 0,
+       "type": "COMBO"
+      },
+      {
+       "id": 739,
+       "origin_id": -10,
+       "origin_slot": 9,
+       "target_id": 39,
+       "target_slot": 0,
+       "type": "COMBO"
+      },
+      {
+       "id": 740,
+       "origin_id": -10,
+       "origin_slot": 10,
+       "target_id": 443,
+       "target_slot": 0,
+       "type": "BOOLEAN"
+      },
+      {
+       "id": 742,
+       "origin_id": -10,
+       "origin_slot": 11,
+       "target_id": 89,
+       "target_slot": 1,
+       "type": "COMBO"
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "collector": "471",
+ "subgraph": "433"
+}
