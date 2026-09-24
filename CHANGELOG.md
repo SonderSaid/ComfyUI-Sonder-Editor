@@ -11,6 +11,12 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Added
+- Asset Gallery details now offer Copy on read-only fields, prompts, names, paths, raw metadata, and Where Used information, with keyboard access and Power LoRA row JSON.
+
+### Fixed
+- Copying a capped tracked-metadata field now uses its complete saved value when available and identifies whole-section raw text when an older asset cannot isolate the field.
+
 ## [0.6.0] - 2026-09-24
 
 **Project format change: a project saved by this version can no longer be opened by 0.5.0 or earlier.**

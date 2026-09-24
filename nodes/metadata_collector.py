@@ -146,8 +146,32 @@ def _cap_structured(value: Any) -> Any:
     return value
 
 
+def _utf16_units(text: str) -> int:
+    """Count JavaScript string indices, including surrogate pairs."""
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2
+
+
+def _raw_widget_text_and_spans(inputs: dict) -> tuple[str, dict[str, list[int]]]:
+    parts: list[str] = []
+    spans: dict[str, list[int]] = {}
+    offset = 0
+    for key, value in inputs.items():
+        if parts:
+            parts.append(", ")
+            offset += 2
+        key_text = str(key)
+        prefix = f"{key_text}: "
+        value_text = str(value)
+        parts.extend((prefix, value_text))
+        offset += _utf16_units(prefix)
+        start = offset
+        offset += _utf16_units(value_text)
+        spans[key_text] = [start, offset]
+    return "".join(parts), spans
+
+
 def _raw_widget_text(inputs: dict) -> str:
-    return ", ".join(f"{key}: {value}" for key, value in inputs.items())
+    return _raw_widget_text_and_spans(inputs)[0]
 
 
 def _workflow_title(workflow_node: dict | None) -> str:
@@ -225,7 +249,7 @@ def _power_lora_transform(inputs: dict) -> dict | None:
     if not summary:
         return None
     return {
-        "power_loras": _cap_field_value(summary, structured=True),
+        "power_loras": summary,
         "enabled_lora_count": sum(1 for row in summary if row.get("enabled") is not False),
         "total_lora_count": len(summary),
     }
@@ -263,8 +287,9 @@ def _section_from_origin(prompt_key: str, prompt_entry: dict, workflow_node: dic
     title = _workflow_title(workflow_node)
     section_label = str(label or "").strip() or title or class_type or prompt_key
 
+    raw_widget_text, input_spans = _raw_widget_text_and_spans(inputs)
     handler = _resolve_compat_handler(class_type)
-    fields: dict | None = None
+    source_fields: dict | None = None
     display_type: str | None = None
     if handler is not None:
         try:
@@ -272,19 +297,44 @@ def _section_from_origin(prompt_key: str, prompt_entry: dict, workflow_node: dic
         except Exception:
             transformed = None
         if transformed:
-            fields = transformed
+            source_fields = transformed
             display_type = handler["display_type"]
-    if fields is None:
-        fields = {str(key): _cap_field_value(value) for key, value in inputs.items()}
-    return {
+    if source_fields is None:
+        source_fields = inputs
+
+    fields: dict = {}
+    has_capped_scalar = False
+    full_fields: dict = {}
+    for key, value in source_fields.items():
+        field_key = str(key)
+        safe = _json_safe(value)
+        capped = _cap_field_value(safe, structured=display_type is not None)
+        fields[field_key] = capped
+        if capped != safe:
+            # Generic scalars already exist verbatim in raw_widget_text. Spans
+            # avoid repeating a long prompt in every asset/take provenance copy.
+            if display_type is None and not isinstance(safe, (dict, list, tuple)) and field_key in input_spans:
+                has_capped_scalar = True
+            else:
+                # Transformed rows and containers need their JSON shape for Copy.
+                full_fields[field_key] = safe
+
+    section = {
         "label": section_label,
         "source_node_id": prompt_key,
         "source_node_class": class_type,
         "source_node_title": title,
-        "raw_widget_text": _raw_widget_text(inputs),
+        "raw_widget_text": raw_widget_text,
         "fields": fields,
         "display_type": display_type,
     }
+    if has_capped_scalar:
+        # The complete ordered partition lets the gallery validate a capped
+        # field's boundaries even when another raw value contains ", key: ".
+        section["raw_field_spans"] = input_spans
+    if full_fields:
+        section["full_fields"] = full_fields
+    return section
 
 
 def _project_input_origin_id(inputs: dict | None) -> str:

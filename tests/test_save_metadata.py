@@ -145,6 +145,28 @@ def test_save_video_tracked_metadata_propagates(tmp_path, monkeypatch):
     assert tracked == [{"label": "Sampler", "fields": {"cfg": 7}}]
 
 
+def test_save_video_preserves_collector_copy_span_without_full_prompt_duplicate(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    collector = importlib.import_module(f"{TEST_PACKAGE}.nodes.metadata_collector")
+    torch = importlib.import_module("torch")
+    calls = []
+    _patch_save_deps(io_nodes, monkeypatch, calls)
+    project = _project(tmp_path)
+    full_prompt = "P" * 3000
+    section = collector._section_from_origin(
+        "10", {"class_type": "Prompt Node", "inputs": {"prompt": full_prompt}}, None, "Prompt Node")
+    project._execution_context = {io_nodes.TRACKED_METADATA_CONTEXT_KEY: {"C": [section]}}
+    prompt = {"S": {"class_type": "SonderSaveVideo", "inputs": {"project": ["C", 0]}}}
+
+    io_nodes.SonderSaveVideo().save_video(
+        project, torch.zeros(1, 2, 2, 3), embed_metadata=False, prompt=prompt, unique_id="S")
+
+    saved = project.assets[0].generation_params["editor_export"]["tracked_metadata"][0]
+    start, end = saved["raw_field_spans"]["prompt"]
+    assert saved["raw_widget_text"][start:end] == full_prompt
+    assert "full_fields" not in saved
+
+
 def test_save_video_display_type_propagates(tmp_path, monkeypatch):
     io_nodes = _import_io_nodes(tmp_path, monkeypatch)
     torch = importlib.import_module("torch")

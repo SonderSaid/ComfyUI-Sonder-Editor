@@ -40,6 +40,7 @@ import { mountMediaScrubBar } from "./media_scrub_bar.js";
 import { openContextMenu } from "./editor_context_menu.js";
 import { cancelProjectAssetDetails, requestProjectAssetDetails } from "./asset_refresh_coordinator.js";
 import { createDetailLoader, createSearchProjection } from "./asset_provenance_details.js";
+import { resolveTrackedFieldCopy, resolvePowerLoraRowCopies, resolvePowerLoraNamesCopy } from "./gallery_copy_values.js";
 
 const DEFAULT_SORT_MODE = DEFAULT_EDITOR_SETTINGS.gallery.sortMode;
 const DEFAULT_GALLERY_TAB = DEFAULT_EDITOR_SETTINGS.gallery.activeTab;
@@ -708,32 +709,6 @@ function dataTransferHasType(dataTransfer, type) {
 
 // Distinguishes gallery instances that share a host owner id in detail-lane ownership.
 let galleryInstanceSequence = 0;
-
-function makeMetaCell(label, value) {
-    const displayValue = String(value ?? "-");
-    const cell = style(document.createElement("div"), `padding:6px;border-radius:6px;background:rgba(255,255,255,0.03);border:1px solid transparent;min-width:0;`);
-    const title = style(document.createElement("div"), `color:#7f8b96;margin-bottom:2px;font-size:10px;`);
-    title.textContent = label;
-    const content = style(document.createElement("div"), `color:#ececec;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
-    content.textContent = displayValue;
-    cell.addEventListener("mouseenter", () => {
-        if (content.scrollWidth <= content.clientWidth) return;
-        content.style.whiteSpace = "normal";
-        content.style.wordBreak = "break-word";
-        content.style.maxHeight = "140px";
-        content.style.overflow = "auto";
-        content.style.textOverflow = "clip";
-    });
-    cell.addEventListener("mouseleave", () => {
-        content.style.whiteSpace = "nowrap";
-        content.style.wordBreak = "";
-        content.style.maxHeight = "";
-        content.style.overflow = "hidden";
-        content.style.textOverflow = "ellipsis";
-    });
-    cell.append(title, content);
-    return cell;
-}
 
 function makeSectionTitle(label) {
     const title = style(document.createElement("div"), `color:#a9b8c4;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;`);
@@ -1915,32 +1890,128 @@ export function mountSharedAssetGallery(container, options = {}) {
         showContextMenu(event.clientX, event.clientY, items);
     }
 
-    function copyToClipboardSafe(text) {
+    function showCopyMenu(event, copy) {
+        event.preventDefault();
+        event.stopPropagation();
+        showContextMenu(event.clientX, event.clientY, [copyMenuItem(copy)]);
+    }
+
+    function attachCopyToElement(host, copy, label, onContextMenu = null) {
+        host.style.position = "relative";
+        host.style.paddingRight = "42px";
+        const button = style(document.createElement("button"),
+            "appearance:none;position:absolute;right:4px;top:4px;z-index:1;" +
+            "padding:2px 4px;border-radius:4px;border:1px solid rgba(143,192,240,0.4);" +
+            "background:#1d2b38;color:#dce8f2;font-size:9px;cursor:pointer;" +
+            "opacity:0;pointer-events:none;transition:opacity 120ms;");
+        button.type = "button";
+        button.textContent = "Copy";
+        button.title = copy.label;
+        button.setAttribute("aria-label", copy.kind === "raw"
+            ? "Copy raw widget text for " + label : "Copy " + label + " value");
+        button.disabled = copy.kind === "unavailable";
+        button.addEventListener("mousedown", (event) => event.stopPropagation());
+        button.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            if (!button.disabled) copyToClipboardSafe(copy.text);
+        });
+        button.addEventListener("contextmenu", (event) => {
+            if (onContextMenu) onContextMenu(event);
+            else showCopyMenu(event, copy);
+        });
+        host.appendChild(button);
+        let hovered = false;
+        const syncReveal = () => {
+            const visible = hovered || host.contains(document.activeElement);
+            button.style.opacity = visible ? "1" : "0";
+            button.style.pointerEvents = visible ? "auto" : "none";
+        };
+        host.addEventListener("mouseenter", () => { hovered = true; syncReveal(); });
+        host.addEventListener("mouseleave", () => { hovered = false; syncReveal(); });
+        host.addEventListener("focusin", syncReveal);
+        host.addEventListener("focusout", () => queueMicrotask(syncReveal));
+        host.addEventListener("contextmenu", (event) => {
+            if (onContextMenu) onContextMenu(event);
+            else showCopyMenu(event, copy);
+        });
+        return host;
+    }
+
+    function makeMetaCell(label, value, options = {}) {
+        const displayValue = String(value ?? "-");
+        const cell = style(document.createElement("div"),
+            "padding:6px;border-radius:6px;background:rgba(255,255,255,0.03);" +
+            "border:1px solid transparent;min-width:0;");
+        const title = style(document.createElement("div"),
+            "color:#7f8b96;margin-bottom:2px;font-size:10px;");
+        title.textContent = label;
+        const content = style(document.createElement("div"),
+            "color:#ececec;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;");
+        content.textContent = displayValue;
+        cell.addEventListener("mouseenter", () => {
+            if (content.scrollWidth <= content.clientWidth) return;
+            content.style.whiteSpace = "normal";
+            content.style.wordBreak = "break-word";
+            content.style.maxHeight = "140px";
+            content.style.overflow = "auto";
+            content.style.textOverflow = "clip";
+        });
+        cell.addEventListener("mouseleave", () => {
+            content.style.whiteSpace = "nowrap";
+            content.style.wordBreak = "";
+            content.style.maxHeight = "";
+            content.style.overflow = "hidden";
+            content.style.textOverflow = "ellipsis";
+        });
+        cell.append(title, content);
+        const copy = options.copy || { kind: "value", label: "Copy value", text: displayValue };
+        return attachCopyToElement(cell, copy, label, options.onContextMenu);
+    }
+
+    async function copyToClipboardSafe(text) {
         const value = String(text == null ? "" : text);
         try {
             if (navigator.clipboard && navigator.clipboard.writeText) {
-                navigator.clipboard.writeText(value).catch(() => fallbackCopy(value));
-            } else {
-                fallbackCopy(value);
+                await navigator.clipboard.writeText(value);
+                return true;
             }
-        } catch {
-            fallbackCopy(value);
+        } catch (err) {
+            console.warn("[gallery] clipboard API failed", err);
         }
+        if (fallbackCopy(value)) return true;
+        notifyError("Could not copy to clipboard");
+        return false;
     }
 
     function fallbackCopy(value) {
+        let ta = null;
+        const previousFocus = document.activeElement;
         try {
-            const ta = document.createElement("textarea");
+            ta = document.createElement("textarea");
             ta.value = value;
             ta.style.position = "fixed";
             ta.style.left = "-9999px";
             document.body.appendChild(ta);
             ta.select();
-            document.execCommand("copy");
-            ta.remove();
+            return document.execCommand("copy") === true;
         } catch (err) {
             console.warn("[gallery] copy fallback failed", err);
+            return false;
+        } finally {
+            ta?.remove();
+            if (previousFocus?.isConnected) {
+                try { previousFocus.focus({ preventScroll: true }); } catch { /* focus may have moved */ }
+            }
         }
+    }
+
+    function copyMenuItem(copy) {
+        return {
+            label: copy.label,
+            disabled: copy.kind === "unavailable",
+            action: () => copyToClipboardSafe(copy.text),
+        };
     }
 
     function trackedFieldContextMenuItems(info, surface, token) {
@@ -1948,15 +2019,14 @@ export function mountSharedAssetGallery(container, options = {}) {
         const fieldKey = info.fieldKey;
         const pinned = isFieldPinned(entry, fieldKey, surface);
         const tokenActive = searchHasToken(token);
-        let copyText = String(info.value == null ? "" : info.value);
-        if (info.displayKind === "power_lora_row" && info.rowMeta) {
-            copyText = String(info.rowMeta.name || info.rowMeta.lora || copyText);
-        }
+        const copies = info.displayKind === "power_lora_row"
+            ? resolvePowerLoraRowCopies(entry, info.rowIndex)
+            : null;
+        const copyItems = copies
+            ? [copyMenuItem(copies.name), copyMenuItem(copies.row)]
+            : [copyMenuItem(resolveTrackedFieldCopy(entry, fieldKey))];
         return [
-            {
-                label: "Copy as text",
-                action: () => copyToClipboardSafe(copyText),
-            },
+            ...copyItems,
             {
                 label: pinned ? "Unpin from top" : "Pin to top",
                 action: () => togglePinField(entry, fieldKey, surface),
@@ -1972,19 +2042,11 @@ export function mountSharedAssetGallery(container, options = {}) {
         const pinned = isSectionPinned(entry, surface);
         const items = [];
         if (kind === "raw") {
-            items.push({
-                label: "Copy raw widget text",
-                action: () => copyToClipboardSafe(entry.raw_widget_text || ""),
-            });
+            items.push(copyMenuItem({ kind: "value", label: "Copy raw widget text", text: entry.raw_widget_text || "" }));
         } else {
             // Section header: copy a useful summary depending on display_type.
             if (entry.display_type === "power_loras") {
-                const rows = Array.isArray(entry.fields?.power_loras) ? entry.fields.power_loras : [];
-                const text = rows.map((row) => row && (row.name || row.lora || "")).filter(Boolean).join("\n");
-                items.push({
-                    label: "Copy LoRA names",
-                    action: () => copyToClipboardSafe(text),
-                });
+                items.push(copyMenuItem(resolvePowerLoraNamesCopy(entry)));
             } else {
                 items.push({
                     label: "Copy raw widget text",
@@ -2883,6 +2945,8 @@ export function mountSharedAssetGallery(container, options = {}) {
             tokenActiveB: (token) => compareModeActive() && compareSearchHasToken("B", token),
             onFieldClick: (event, info) => handleTrackedFieldClick(event, info, surface),
             onFieldContextMenu: (event, info) => handleTrackedFieldContextMenu(event, info, surface),
+            rowCopy: (entry, rowIndex) => resolvePowerLoraRowCopies(entry, rowIndex).row,
+            onFieldCopy: (copy) => { if (copy.kind !== "unavailable") copyToClipboardSafe(copy.text); },
         };
     }
 
@@ -3056,7 +3120,11 @@ export function mountSharedAssetGallery(container, options = {}) {
                     const value = entry.fields[key];
                     const rendered = formatGenerationValue(value);
                     const token = fieldSearchToken(key, rendered);
-                    const cell = makeMetaCell(key, rendered);
+                    const cellInfo = { entry, fieldKey: key, value: rendered, displayKind: "generic" };
+                    const cell = makeMetaCell(key, rendered, {
+                        copy: resolveTrackedFieldCopy(entry, key),
+                        onContextMenu: (event) => handleTrackedFieldContextMenu(event, cellInfo, surface),
+                    });
                     cell.style.cursor = "pointer";
                     applyFieldCellActiveStyle(cell, surface, entry, key, token);
                     const titleEl = cell.firstChild;
@@ -3066,14 +3134,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                         titleEl.prepend(cellPin);
                     }
                     cell.title = "Pinned to top — right-click to unpin";
-                    const cellInfo = {
-                        entry,
-                        fieldKey: key,
-                        value: rendered,
-                        displayKind: "generic",
-                    };
                     cell.addEventListener("click", (event) => handleTrackedFieldClick(event, cellInfo, surface));
-                    cell.addEventListener("contextmenu", (event) => handleTrackedFieldContextMenu(event, cellInfo, surface));
                     grid.appendChild(cell);
                 }
                 subCard.appendChild(grid);
@@ -3123,6 +3184,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             });
             const raw = style(document.createElement("pre"), `margin:6px 0 0 0;white-space:pre-wrap;word-break:break-word;color:#d9e0e6;background:rgba(0,0,0,0.18);border-radius:6px;padding:6px;`);
             raw.textContent = String(entry.raw_widget_text || "");
+            attachCopyToElement(raw, { kind: "value", label: "Copy raw widget text", text: String(entry.raw_widget_text) }, "raw widget text");
             details.append(summary, raw);
             section.appendChild(details);
         }
@@ -3170,7 +3232,11 @@ export function mountSharedAssetGallery(container, options = {}) {
         for (const [key, value] of orderedFieldEntries) {
             const rendered = formatGenerationValue(value);
             const token = fieldSearchToken(key, rendered);
-            const cell = makeMetaCell(key, rendered);
+            const cellInfo = { entry, fieldKey: String(key), value: rendered, displayKind: "generic" };
+            const cell = makeMetaCell(key, rendered, {
+                copy: resolveTrackedFieldCopy(entry, key),
+                onContextMenu: (event) => handleTrackedFieldContextMenu(event, cellInfo, surface),
+            });
             cell.style.cursor = "pointer";
             applyFieldCellActiveStyle(cell, surface, entry, key, token);
             if (isFieldPinned(entry, key, surface)) {
@@ -3182,14 +3248,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                 }
                 cell.title = "Pinned to top — right-click to unpin";
             }
-            const cellInfo = {
-                entry,
-                fieldKey: String(key),
-                value: rendered,
-                displayKind: "generic",
-            };
             cell.addEventListener("click", (event) => handleTrackedFieldClick(event, cellInfo, surface));
-            cell.addEventListener("contextmenu", (event) => handleTrackedFieldContextMenu(event, cellInfo, surface));
             grid.appendChild(cell);
         }
         return grid;
@@ -3225,6 +3284,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             wrap.appendChild(makeSectionTitle("Prompt"));
             const promptBox = style(document.createElement("div"), `padding:8px;border-radius:8px;background:rgba(255,255,255,0.03);border:1px solid ${CHROME.borderSoft};color:#d9e0e6;font-size:10px;line-height:1.45;white-space:pre-wrap;`);
             promptBox.textContent = asset.prompt;
+            attachCopyToElement(promptBox, { kind: "value", label: "Copy prompt", text: asset.prompt }, "prompt");
             wrap.appendChild(promptBox);
         }
         const generationEntries = Object.entries(generationParams);
@@ -3286,6 +3346,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                 const title = style(document.createElement("div"), `color:#dce8f2;font-size:11px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
                 title.textContent = assetDisplayName(item);
                 title.title = assetDisplayName(item);
+                attachCopyToElement(title, { kind: "value", label: "Copy asset name", text: assetDisplayName(item) }, "asset name");
                 section.appendChild(title);
             }
             const quick = style(document.createElement("div"), `display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;`);
@@ -5329,6 +5390,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         const title = style(document.createElement("div"), `color:#f1f5f8;font-size:15px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
         title.textContent = assetDisplayName(asset);
         const counter = style(document.createElement("div"), `color:${CHROME.textDim};font-size:11px;`);
+        attachCopyToElement(title, { kind: "value", label: "Copy asset name", text: assetDisplayName(asset) }, "asset name");
         const assets = overlayAssets();
         const assetIndex = Math.max(0, assets.findIndex((entry) => entry.asset_id === asset.asset_id));
         counter.textContent = `${assetIndex + 1} / ${Math.max(assets.length, 1)}`;
@@ -5479,6 +5541,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         title.textContent = "Where Used";
         const subtitle = style(document.createElement("div"), `color:${CHROME.textDim};font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
         subtitle.textContent = assetDisplayName(asset);
+        attachCopyToElement(subtitle, { kind: "value", label: "Copy asset name", text: assetDisplayName(asset) }, "asset name");
         headingWrap.append(title, subtitle);
 
         const backBtn = makeActionButton();
@@ -5493,6 +5556,7 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         const pathLine = style(document.createElement("div"), `color:${CHROME.textDim};font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
         pathLine.textContent = asset.path || "-";
+        attachCopyToElement(pathLine, { kind: "value", label: "Copy stored path", text: asset.path || "-" }, "stored path");
         detailPane.appendChild(pathLine);
 
         if (state.usageLoading) {
@@ -5534,14 +5598,18 @@ export function mountSharedAssetGallery(container, options = {}) {
         }
 
         for (const group of groupUsagesByScene(usage.usages || [])) {
-            detailPane.appendChild(makeSectionTitle(group.sceneName));
+            const sceneTitle = makeSectionTitle(group.sceneName);
+            attachCopyToElement(sceneTitle, { kind: "value", label: "Copy scene", text: group.sceneName }, "scene");
+            detailPane.appendChild(sceneTitle);
             const list = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;`);
             for (const item of group.items) {
                 const row = style(document.createElement("div"), `padding:8px;border-radius:6px;background:rgba(255,255,255,0.03);border:1px solid #343434;display:flex;flex-direction:column;gap:4px;`);
                 const typeLine = style(document.createElement("div"), `color:#ececec;font-size:10px;font-weight:600;`);
                 typeLine.textContent = usageTypeLabel(item.type);
+                attachCopyToElement(typeLine, { kind: "value", label: "Copy usage type", text: usageTypeLabel(item.type) }, "usage type");
                 const posLine = style(document.createElement("div"), `color:#8ea0af;font-size:10px;line-height:1.4;`);
                 posLine.textContent = usagePositionLabel(item);
+                attachCopyToElement(posLine, { kind: "value", label: "Copy usage position", text: usagePositionLabel(item) }, "usage position");
                 row.append(typeLine, posLine);
                 list.appendChild(row);
             }
@@ -5676,6 +5744,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         const titleRow = style(document.createElement("div"), `display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0;`);
         const title = style(document.createElement("div"), `color:${CHROME.text};font-size:11px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
         title.textContent = assetDisplayName(asset);
+        attachCopyToElement(title, { kind: "value", label: "Copy asset name", text: assetDisplayName(asset) }, "asset name");
         const badges = style(document.createElement("div"), `display:flex;align-items:center;gap:6px;flex:0 0 auto;`);
         const kind = style(document.createElement("div"), `padding:3px 6px;border-radius:999px;background:${THEME.accent}1f;border:1px solid ${THEME.accent}47;color:${THEME.accentHi};font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;white-space:nowrap;`);
         kind.textContent = assetKindLabel(asset.asset_type);
@@ -5706,6 +5775,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         titleRow.append(title, badges);
         const pathLine = style(document.createElement("div"), `color:${assetIsMissing(asset) ? THEME.statusFailed : THEME.fg2};font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
         pathLine.textContent = asset.path || "-";
+        attachCopyToElement(pathLine, { kind: "value", label: "Copy stored path", text: asset.path || "-" }, "stored path");
 
         const previewSurface = style(document.createElement("div"), `min-height:140px;border-radius:8px;border:1px solid ${CHROME.border};background:${CHROME.panelMuted};overflow:hidden;display:flex;align-items:center;justify-content:center;position:relative;`);
         const previewExtras = [];

@@ -1,4 +1,5 @@
 import importlib
+import json
 import sys
 import types
 from pathlib import Path
@@ -334,6 +335,94 @@ def test_collector_field_size_cap(tmp_path):
     section = _chain(project, module)[0]
     assert module.TRUNCATED_MARKER in section["fields"]["prompt"]
     assert long_value in section["raw_widget_text"]
+
+
+def _utf16_span_text(text, span):
+    encoded = text.encode("utf-16-le", "surrogatepass")
+    return encoded[span[0] * 2:span[1] * 2].decode("utf-16-le", "surrogatepass")
+
+
+def test_collector_capped_scalars_copy_from_raw_spans_without_duplicate_full_fields(tmp_path):
+    module = _import_collector()
+    project = _project(tmp_path)
+    # Explicit surrogate pair and astral emoji exercise Python/JS string-index parity.
+    lead = "before\\ud83d\\ude00".encode("ascii").decode("unicode_escape")
+    first = "😀, cfg: " + "x" * 3000
+    second = "second, prompt: " + "y" * 2600
+    inputs = {"lead": lead, "prompt": first, "negative": second}
+    prompt = _collector_prompt(values={0: ["10", 0]}, upstreams={"10": _origin("Node", inputs)})
+
+    _run(module, project, prompt, value_0="connected")
+
+    section = json.loads(json.dumps(_chain(project, module)[0]))
+    assert set(section["raw_field_spans"]) == {"lead", "prompt", "negative"}
+    assert "full_fields" not in section
+    for key, value in (("prompt", first), ("negative", second)):
+        assert module.TRUNCATED_MARKER in section["fields"][key]
+        assert _utf16_span_text(section["raw_widget_text"], section["raw_field_spans"][key]) == value
+    assert len(json.dumps(section)) - len(section["raw_widget_text"]) < 2 * module.FIELD_VALUE_LIMIT + 1000
+
+
+def test_collector_capped_container_keeps_full_json_value(tmp_path):
+    module = _import_collector()
+    project = _project(tmp_path)
+    payload = {"prompt": "z" * 3000, "enabled": True, "options": [None, 2]}
+    tuple_value = ("t" * 3000, 2)
+    prompt = _collector_prompt(values={0: ["10", 0]},
+                               upstreams={"10": _origin("Node", {"payload": payload, "tuple": tuple_value})})
+
+    _run(module, project, prompt, value_0="connected")
+
+    section = _chain(project, module)[0]
+    assert module.TRUNCATED_MARKER in section["fields"]["payload"]
+    assert section["full_fields"]["payload"] == payload
+    assert section["full_fields"]["tuple"] == tuple_value
+    assert json.loads(json.dumps(section))["full_fields"]["tuple"] == list(tuple_value)
+    assert "raw_field_spans" not in section
+
+
+def test_collector_copy_sources_survive_asset_provenance_disk_round_trip(tmp_path):
+    module = _import_collector()
+    timeline_state = _import_timeline_state()
+    project_manager = importlib.import_module(f"{TEST_PACKAGE}.server.project_manager")
+    project_storage = importlib.import_module(f"{TEST_PACKAGE}.server.project_storage")
+    project = _project(tmp_path)
+    full_prompt = "😀" + "p" * 3000
+    payload = {"text": "q" * 3000, "enabled": True}
+    section = module._section_from_origin(
+        "10", {"class_type": "Node", "inputs": {"prompt": full_prompt, "payload": payload}},
+        None, "Node")
+    asset = timeline_state.Asset(
+        asset_id="copy-source",
+        generation_params={"editor_export": {"tracked_metadata": [section]}})
+    project.assets.append(asset)
+
+    project_manager.save_project(project)
+    params = project_storage.read_asset_provenance(str(tmp_path), "copy-source")["generation_params"]
+    stored = params["editor_export"]["tracked_metadata"][0]
+    raw = stored["raw_widget_text"]
+    assert _utf16_span_text(raw, stored["raw_field_spans"]["prompt"]) == full_prompt
+    assert stored["full_fields"]["payload"] == payload
+    assert "prompt" not in stored["full_fields"]
+
+
+def test_power_lora_capped_name_keeps_full_row_by_original_index(tmp_path):
+    module = _import_collector()
+    project = _project(tmp_path)
+    name = "L" * 3000 + ".safetensors"
+    inputs = {"lora_1": name, "strength_1": 0.75, "on_1": True}
+    prompt = _collector_prompt(values={0: ["10", 0]},
+                               upstreams={"10": _origin("Power Lora Loader (rgthree)", inputs)})
+
+    _run(module, project, prompt, value_0="connected")
+
+    section = _chain(project, module)[0]
+    preview = section["fields"]["power_loras"][0]
+    full = section["full_fields"]["power_loras"][0]
+    assert module.TRUNCATED_MARKER in preview["name"]
+    assert full["name"] == name
+    assert full["strength"] == 0.75
+    assert "raw_field_spans" not in section
 
 
 def test_collector_missing_upstream(tmp_path):

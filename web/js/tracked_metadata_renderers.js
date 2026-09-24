@@ -131,19 +131,20 @@ function parsePowerLoraFilterValue(value) {
 
 function renderPowerLoraBody(entry, ctx) {
     const rows = Array.isArray(entry?.fields?.power_loras)
-        ? entry.fields.power_loras.filter((row) => row && typeof row === "object")
+        ? entry.fields.power_loras.map((row, index) => ({ row, index }))
+            .filter(({ row }) => row && typeof row === "object")
         : [];
     if (!rows.length) return null;
 
     const { style, CHROME, formatGenerationValue, fieldSearchToken,
-        tokenActiveA, tokenActiveB, onFieldClick, onFieldContextMenu } = ctx;
+        tokenActiveA, tokenActiveB, onFieldClick, onFieldContextMenu, rowCopy, onFieldCopy } = ctx;
 
     const wrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:5px;min-width:0;`);
     const label = style(document.createElement("div"), `color:#8fa4b6;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;`);
     label.textContent = "Power LoRAs";
     wrap.appendChild(label);
 
-    for (const row of rows) {
+    for (const { row, index } of rows) {
         const name = powerLoraRowName(row);
         const filterValue = encodePowerLoraFilterValue(row);
         const token = fieldSearchToken("power_loras", filterValue);
@@ -170,7 +171,7 @@ function renderPowerLoraBody(entry, ctx) {
         const line = style(document.createElement("button"), `
             appearance:none;text-align:left;width:100%;min-width:0;
             display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;
-            padding:7px 8px;border-radius:6px;border:1px solid ${border};
+            padding:7px 48px 7px 8px;border-radius:6px;border:1px solid ${border};
             background:${bg};
             color:${enabled ? "#e4edf4" : "#9ca8b2"};cursor:pointer;
             box-shadow:${shadow};
@@ -199,10 +200,39 @@ function renderPowerLoraBody(entry, ctx) {
             value: filterValue,
             displayKind: "power_lora_row",
             rowMeta: row,
+            rowIndex: index,
         };
         line.addEventListener("click", (event) => onFieldClick?.(event, cellInfo));
         line.addEventListener("contextmenu", (event) => onFieldContextMenu?.(event, cellInfo));
-        wrap.appendChild(line);
+        const rowWrap = style(document.createElement("div"), `position:relative;min-width:0;`);
+        const copy = rowCopy?.(entry, index);
+        const copyButton = style(document.createElement("button"), `appearance:none;position:absolute;right:6px;top:7px;padding:2px 4px;border-radius:4px;border:1px solid rgba(143,192,240,0.4);background:#1d2b38;color:#dce8f2;font-size:9px;cursor:pointer;opacity:0;pointer-events:none;transition:opacity 120ms;`);
+        copyButton.type = "button";
+        copyButton.textContent = "Copy";
+        copyButton.title = copy?.label || "Copy row JSON";
+        copyButton.setAttribute("aria-label", copy?.kind === "raw" ? "Copy whole raw widget text" : "Copy LoRA row JSON");
+        copyButton.disabled = !copy || copy.kind === "unavailable";
+        copyButton.addEventListener("mousedown", (event) => event.stopPropagation());
+        copyButton.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            onFieldCopy?.(copy);
+        });
+        copyButton.addEventListener("contextmenu", (event) => {
+            onFieldContextMenu?.(event, cellInfo);
+        });
+        let hovered = false;
+        const syncCopy = () => {
+            const visible = hovered || rowWrap.contains(document.activeElement);
+            copyButton.style.opacity = visible ? "1" : "0";
+            copyButton.style.pointerEvents = visible ? "auto" : "none";
+        };
+        rowWrap.addEventListener("mouseenter", () => { hovered = true; syncCopy(); });
+        rowWrap.addEventListener("mouseleave", () => { hovered = false; syncCopy(); });
+        rowWrap.addEventListener("focusin", syncCopy);
+        rowWrap.addEventListener("focusout", () => queueMicrotask(syncCopy));
+        rowWrap.append(line, copyButton);
+        wrap.appendChild(rowWrap);
     }
     // Tell the gallery we consumed only the structured `power_loras` list; let the generic
     // grid render any sibling count fields (enabled_lora_count, total_lora_count, etc.) so
