@@ -7497,8 +7497,13 @@ def _asset_payload(
     media_snapshot: dict[str, dict] | None = None,
     thumbnail_snapshot: dict[str, dict] | None = None,
 ) -> dict:
-    from .project_storage import generation_summary, INLINE_GENERATION_PARAM_KEYS, provenance_revision
+    from .project_storage import (
+        generation_summary, has_generation_provenance, INLINE_GENERATION_PARAM_KEYS, provenance_revision,
+    )
     payload = asset.to_dict(include_provenance=not lean)
+    # Lets the gallery skip a detail request for an asset with nothing to show. Reads the
+    # descriptor and backing value only, so a lean list still never hydrates.
+    payload["has_provenance"] = has_generation_provenance(asset)
     params = payload.pop("generation_params", {})
     if not lean:
         payload["generation_params"] = params
@@ -11217,18 +11222,34 @@ if routes is not None:
     # Asset management
     # -----------------------------------------------------------------------
 
-    @routes.get("/sonder-editor/project/{project_id}/assets/provenance")
-    async def api_asset_provenance_batch(request: web.Request) -> web.Response:
-        from .project_storage import read_asset_provenance_batch
+    async def _asset_detail_batch_response(request: web.Request, reader) -> web.Response:
+        """One bound and one error policy for the gallery's two detail batch reads.
+
+        At most 64 ids, so one request never holds the project lock for a whole large
+        project's worth of component reads. The 404 is a fixed sentence: the reader's own
+        `FileNotFoundError` can name the absolute `project.json` path when the folder
+        vanishes between resolution and read.
+        """
         ids = request.query.getall("asset_id", [])
         if not ids or len(ids) > 64:
             return _json_error("Request between 1 and 64 asset ids", 400)
         try:
             def read_batch():
-                return read_asset_provenance_batch(_project_dir_without_model(request), ids)
+                return reader(_project_dir_without_model(request), ids)
             return web.json_response(await run_project_io(read_batch))
-        except FileNotFoundError as exc:
-            return _json_error(str(exc), 404)
+        except FileNotFoundError:
+            return _json_error("Project not found", 404)
+
+    @routes.get("/sonder-editor/project/{project_id}/assets/provenance")
+    async def api_asset_provenance_batch(request: web.Request) -> web.Response:
+        from .project_storage import read_asset_provenance_batch
+        return await _asset_detail_batch_response(request, read_asset_provenance_batch)
+
+    @routes.get("/sonder-editor/project/{project_id}/assets/search-metadata")
+    async def api_asset_search_metadata_batch(request: web.Request) -> web.Response:
+        """Tracked-metadata projection for complete `tracked:`/`field:` search."""
+        from .project_storage import read_asset_search_metadata_batch
+        return await _asset_detail_batch_response(request, read_asset_search_metadata_batch)
 
     @routes.get("/sonder-editor/project/{project_id}/assets/{asset_id}/provenance")
     async def api_asset_provenance(request: web.Request) -> web.Response:

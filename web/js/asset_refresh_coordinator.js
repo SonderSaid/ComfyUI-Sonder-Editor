@@ -136,7 +136,6 @@ function emit(state, demand, kind, details = {}) {
 }
 
 function demandCanJoin(active, incoming) {
-    if (!(incoming.provenanceIds || []).every((id) => (active.provenanceIds || []).includes(id))) return false;
     if (active.waveId !== incoming.waveId) return false;
     if (active.epoch !== incoming.epoch) return false;
     if (MODE_RANK[active.mode] < MODE_RANK[incoming.mode]) return false;
@@ -147,7 +146,6 @@ function demandCanJoin(active, incoming) {
 
 function mergeDemand(target, incoming) {
     if (!target) return incoming;
-    target.provenanceIds = [...new Set([...(target.provenanceIds || []), ...(incoming.provenanceIds || [])])];
     target.waveId = incoming.waveId;
     target.unknownVersion = incoming.unknownVersion;
     target.requiredVersion = maxVersion(target.requiredVersion, incoming.requiredVersion);
@@ -169,7 +167,6 @@ function mergeDemand(target, incoming) {
 
 function resultSatisfiesDemand(result, demand, state) {
     if (!result || result.error) return false;
-    if (!(demand.provenanceIds || []).every((id) => (result.provenanceIds || []).includes(id))) return false;
     if (result.epoch < demand.epoch || result.epoch < state.mutationEpoch) return false;
     if (MODE_RANK[result.mode] < MODE_RANK[demand.mode]) return false;
     if (demand.mode === "sync" && result.policySignature !== demand.policySignature) return false;
@@ -207,30 +204,44 @@ async function defaultRequest(demand) {
             { projectId: demand.projectId },
         )
         : await fetchProjectJson(url, {}, { projectId: demand.projectId });
-    const provenance = {};
-    const listed = new Map((result.payload?.assets || []).map((asset) => [asset.asset_id, asset.provenance_revision]));
-    // Bounded sequential requests share this pass's mutation epoch and follow-up
-    // ownership. Never run a separate provenance coordinator beside assets.
-    const ids = (demand.provenanceIds || []).filter((id) => listed.has(id));
-    for (let offset = 0; offset < ids.length; offset += 64) {
-        const batch = ids.slice(offset, offset + 64);
-        const query = new URLSearchParams();
-        for (const id of batch) query.append("asset_id", id);
-        const detail = await fetchProjectJson(api.apiURL(
-            `/sonder-editor/project/${encodeURIComponent(demand.projectId)}/assets/provenance?${query}`),
-            {}, { projectId: demand.projectId });
-        if (!batch.every((id) => detail.payload.revisions?.[id] === listed.get(id))) {
-            const error = new Error("Assets changed while loading provenance; retry the refresh.");
-            error.code = "asset_provenance_changed";
-            throw error;
-        }
-        Object.assign(provenance, detail.payload.provenance);
-    }
-    return { ...result, payload: { ...result.payload, provenance } };
+    return result;
+}
+
+// Detail-only transport. Never returns or implies a list: a detail response carries
+// per-asset revisions and the version it was read at, nothing a list consumer could adopt.
+const DETAIL_ROUTES = { provenance: "provenance", search: "search-metadata" };
+
+async function defaultDetailRequest({ projectId, kind, assetIds }) {
+    const api = window.comfyAPI.api.api;
+    const query = new URLSearchParams();
+    for (const id of assetIds) query.append("asset_id", id);
+    const { payload } = await fetchProjectJson(api.apiURL(
+        `/sonder-editor/project/${encodeURIComponent(projectId)}/assets/${DETAIL_ROUTES[kind]}?${query}`),
+        {}, { projectId });
+    return {
+        modifiedAt: String(payload?.modified_at || ""),
+        revisions: payload?.revisions || {},
+        values: (kind === "search" ? payload?.tracked_metadata : payload?.provenance) || {},
+    };
+}
+
+// Lower rank dispatches first. A batch holds one kind and one rank, so a selected asset
+// is never made to wait for a preload window's component reads in the same request.
+export const ASSET_DETAIL_PRIORITY = Object.freeze({ selected: 0, search: 1, prefetch: 2, background: 3 });
+export const ASSET_DETAIL_BATCH_LIMIT = 64;
+const DETAIL_PRIORITY_NAMES = Object.keys(ASSET_DETAIL_PRIORITY)
+    .sort((a, b) => ASSET_DETAIL_PRIORITY[a] - ASSET_DETAIL_PRIORITY[b]);
+const DETAIL_SUPERSEDE_REQUEUE_LIMIT = 2;
+
+function detailRank(priority) {
+    return Object.prototype.hasOwnProperty.call(ASSET_DETAIL_PRIORITY, priority)
+        ? ASSET_DETAIL_PRIORITY[priority]
+        : ASSET_DETAIL_PRIORITY.background;
 }
 
 export function createAssetRefreshCoordinator({
     request = defaultRequest,
+    detailRequest = defaultDetailRequest,
     getLiveVersion = getProjectVersion,
     resetVersion = resetProjectVersion,
     retryDelaysMs = RETRY_DELAYS_MS,
@@ -347,7 +358,6 @@ export function createAssetRefreshCoordinator({
             }
 
             const result = {
-                provenanceIds: demand.provenanceIds || [],
                 payload,
                 response,
                 projectId: state.projectId,
@@ -434,7 +444,6 @@ export function createAssetRefreshCoordinator({
         const waiter = deferred();
         const policy = policyFromInput(input.policy);
         const demand = {
-            provenanceIds: [...new Set((input.provenanceIds || []).map(String))],
             projectId,
             mode,
             waveId,
@@ -488,7 +497,6 @@ export function createAssetRefreshCoordinator({
         mutationEpochs.set(normalized, state.mutationEpoch);
         if (state.active) {
             const followup = {
-                provenanceIds: [...(state.active.provenanceIds || []), ...(state.pending?.provenanceIds || [])],
                 projectId: normalized,
                 mode: "read",
                 waveId: allocateAssetRefreshWave(`mutation-${state.mutationEpoch}`),
@@ -515,8 +523,291 @@ export function createAssetRefreshCoordinator({
         return state.mutationEpoch;
     };
 
+    // ---- Detail lane -------------------------------------------------------------
+    // Kept in its own map: list/sync `states` entries are deleted when that lane goes
+    // idle, and a detail lane parked on a deleted state would run beside a second one.
+    // It shares only the mutation epoch, which is the gate both lanes must honour.
+    const detailStates = new Map();
+
+    const detailStateFor = (projectId) => {
+        let state = detailStates.get(projectId);
+        if (!state) {
+            state = { projectId, queue: new Map(), active: null, pumpScheduled: false };
+            detailStates.set(projectId, state);
+        }
+        return state;
+    };
+
+    const liveEpoch = (projectId) => states.get(projectId)?.mutationEpoch || mutationEpochs.get(projectId) || 0;
+
+    const detailKey = (kind, assetId) => `${kind}:${assetId}`;
+
+    const settleDetailWaiter = (waiter, assetId, result) => {
+        if (waiter.settled) return;
+        waiter.settled = true;
+        waiter.onSettle(assetId, result);
+    };
+
+    const nextDetailBatch = (state) => {
+        let best = null;
+        for (const entry of state.queue.values()) {
+            if (!best || entry.rank < best.rank) best = entry;
+        }
+        if (!best) return null;
+        // An entry isolated after a failed batch is read alone, so one unreadable asset
+        // cannot fail the healthy ones it was batched with a second time.
+        if (best.isolated) return [best];
+        const batch = [];
+        for (const entry of state.queue.values()) {
+            if (entry.kind !== best.kind || entry.rank !== best.rank || entry.isolated) continue;
+            batch.push(entry);
+            if (batch.length >= ASSET_DETAIL_BATCH_LIMIT) break;
+        }
+        return batch;
+    };
+
+    const releaseIdleDetailState = (state) => {
+        if (!state.active && !state.queue.size && !state.pumpScheduled
+            && detailStates.get(state.projectId) === state) {
+            detailStates.delete(state.projectId);
+        }
+    };
+
+    // Batches form one microtask after a demand, so demands made in the same turn are
+    // ranked together: a selection requested just after its own preload window still
+    // dispatches first.
+    const scheduleDetailPump = (state) => {
+        if (state.pumpScheduled) return;
+        state.pumpScheduled = true;
+        queueMicrotask(() => {
+            state.pumpScheduled = false;
+            pumpDetails(state);
+        });
+    };
+
+    const pumpDetails = (state) => {
+        if (state.active) return;
+        const batch = nextDetailBatch(state);
+        if (!batch) {
+            releaseIdleDetailState(state);
+            return;
+        }
+        for (const entry of batch) state.queue.delete(detailKey(entry.kind, entry.assetId));
+        const kind = batch[0].kind;
+        const epoch = liveEpoch(state.projectId);
+        const active = {
+            kind,
+            epoch,
+            requestId: `asset-detail-${++requestSequence}`,
+            entries: new Map(batch.map((entry) => [entry.assetId, entry])),
+        };
+        state.active = active;
+        // Read live, so a demand that joins after dispatch still sees this read's outcome.
+        const diag = {
+            requestId: active.requestId,
+            mode: `detail:${kind}`,
+            epoch,
+            get recorders() {
+                return new Set([...active.entries.values()].flatMap((entry) => [...entry.recorders]));
+            },
+            reason: `detail:${DETAIL_PRIORITY_NAMES[batch[0].rank] || "background"}`,
+        };
+        const startedAt = performance.now();
+        emit(state, diag, "asset_detail_request", { asset_count: batch.length });
+        // The lane is released BEFORE any waiter hears the outcome: a consumer that asks
+        // again from inside its callback must queue a fresh read, never join this finished
+        // one, whose waiters will never be settled again.
+        const release = () => {
+            if (state.active === active) state.active = null;
+        };
+        let run;
+        try {
+            run = Promise.resolve(detailRequest({ projectId: state.projectId, kind, assetIds: [...active.entries.keys()] }));
+        } catch (error) {
+            run = Promise.reject(error);
+        }
+        run
+            .then((response) => {
+                release();
+                const live = liveEpoch(state.projectId);
+                emit(state, diag, "asset_detail_response", {
+                    served_version: response.modifiedAt,
+                    duration_ms: performance.now() - startedAt,
+                    live_epoch: live,
+                });
+                if (live !== epoch) {
+                    // An asset write landed while this read was in flight. Nothing from it
+                    // may populate a gallery; re-read at the new epoch, boundedly.
+                    const exhausted = [];
+                    for (const entry of active.entries.values()) {
+                        entry.requeues += 1;
+                        if (entry.requeues > DETAIL_SUPERSEDE_REQUEUE_LIMIT) exhausted.push(entry);
+                        else enqueueDetailEntry(state, entry);
+                    }
+                    emit(state, diag, "asset_detail_supersede", { live_epoch: live, exhausted_count: exhausted.length });
+                    const error = new Error("Assets kept changing while loading details.");
+                    error.code = "asset_detail_superseded";
+                    for (const entry of exhausted) {
+                        for (const waiter of [...entry.waiters]) {
+                            settleDetailWaiter(waiter, entry.assetId, { status: "error", error, epoch });
+                        }
+                    }
+                    return;
+                }
+                for (const entry of active.entries.values()) {
+                    const listed = Object.prototype.hasOwnProperty.call(response.revisions, entry.assetId);
+                    const result = listed
+                        ? { status: "ok", revision: String(response.revisions[entry.assetId] || ""),
+                            value: response.values[entry.assetId], modifiedAt: response.modifiedAt, epoch }
+                        : { status: "missing", modifiedAt: response.modifiedAt, epoch };
+                    for (const waiter of [...entry.waiters]) settleDetailWaiter(waiter, entry.assetId, result);
+                }
+            })
+            .catch((error) => {
+                release();
+                emit(state, diag, "asset_detail_error", {
+                    status: Number(error?.status) || 0,
+                    error_code: String(error?.code || error?.name || "error"),
+                    duration_ms: performance.now() - startedAt,
+                });
+                // A server error on a shared batch may belong to one asset (an unreadable
+                // component fails the whole read): errors belong to their own asset, so each
+                // id is read once more on its own before any of them is reported.
+                if (Number(error?.status) >= 500 && active.entries.size > 1) {
+                    for (const entry of active.entries.values()) {
+                        entry.isolated = true;
+                        enqueueDetailEntry(state, entry);
+                    }
+                    return;
+                }
+                for (const entry of active.entries.values()) {
+                    for (const waiter of [...entry.waiters]) {
+                        settleDetailWaiter(waiter, entry.assetId, { status: "error", error, epoch });
+                    }
+                }
+            })
+            .finally(() => {
+                release();
+                scheduleDetailPump(state);
+            });
+    };
+
+    // Re-queue keeps the entry's waiters and highest priority; a same-key entry already
+    // queued absorbs it rather than duplicating the read.
+    const enqueueDetailEntry = (state, entry) => {
+        const key = detailKey(entry.kind, entry.assetId);
+        const existing = state.queue.get(key);
+        if (!existing) {
+            state.queue.set(key, entry);
+            return;
+        }
+        existing.rank = Math.min(existing.rank, entry.rank);
+        // The supersede budget is per asset read, not per entry object: absorbing must not
+        // reset it.
+        existing.requeues = Math.max(existing.requeues, entry.requeues);
+        existing.isolated = existing.isolated || !!entry.isolated;
+        existing.waiters.push(...entry.waiters);
+        for (const recorder of entry.recorders) existing.recorders.add(recorder);
+    };
+
+    const requestDetails = (input = {}) => {
+        const projectId = normalizedProjectId(input.projectId);
+        const kind = input.kind === "search" ? "search" : "provenance";
+        const assetIds = [...new Set((input.assetIds || []).map(String).filter(Boolean))];
+        const results = new Map();
+        if (!projectId || !assetIds.length) {
+            return { promise: Promise.resolve(results), cancel() {} };
+        }
+        const state = detailStateFor(projectId);
+        const rank = detailRank(input.priority);
+        const owner = String(input.ownerId || "");
+        const recorder = typeof input.diagnosticRecorder === "function" ? input.diagnosticRecorder : null;
+        const done = deferred();
+        let remaining = assetIds.length;
+        const waiters = [];
+        const onSettle = (assetId, result) => {
+            results.set(assetId, result);
+            try { input.onResult?.(assetId, result); } catch (error) {
+                console.warn("[Sonder] Asset detail consumer failed:", error);
+            }
+            remaining -= 1;
+            if (remaining === 0) done.resolve(results);
+        };
+        for (const assetId of assetIds) {
+            const waiter = { owner, rank, settled: false, onSettle };
+            waiters.push({ assetId, waiter });
+            // Shared in-flight read: join it rather than queue a duplicate. It finishes
+            // normally even if a newer selection outranks what is queued behind it. Only a
+            // read of the same kind dispatched at the live mutation epoch can be joined; one
+            // an asset write has already overtaken would only be superseded. No other
+            // generation boundary is needed here: a detail is valid for exactly the revision
+            // it reports, and every consumer checks that against the list it shows.
+            const active = state.active;
+            const inFlight = active?.kind === kind && active.epoch === liveEpoch(projectId)
+                ? active.entries.get(assetId)
+                : null;
+            if (inFlight) {
+                inFlight.waiters.push(waiter);
+                // A joining selection raises the read's priority in case it must be redone.
+                inFlight.rank = Math.min(inFlight.rank, rank);
+                if (recorder) inFlight.recorders.add(recorder);
+                continue;
+            }
+            enqueueDetailEntry(state, {
+                kind,
+                assetId,
+                rank,
+                requeues: 0,
+                waiters: [waiter],
+                recorders: new Set(recorder ? [recorder] : []),
+            });
+        }
+        scheduleDetailPump(state);
+        return {
+            promise: done.promise,
+            // Withdraws this call's not-yet-dispatched ids only; dispatched ones finish.
+            cancel() {
+                const own = new Set(waiters.map((item) => item.waiter));
+                cancelQueuedWaiters(state, (waiter) => own.has(waiter));
+            },
+        };
+    };
+
+    const cancelQueuedWaiters = (state, predicate) => {
+        const cancelled = { status: "cancelled" };
+        // Iterate a snapshot: a consumer that asks again from inside its cancellation
+        // callback queues new work this pass must not visit.
+        for (const [key, entry] of [...state.queue.entries()]) {
+            if (state.queue.get(key) !== entry) continue;
+            const kept = [];
+            for (const waiter of entry.waiters) {
+                if (predicate(waiter, entry)) settleDetailWaiter(waiter, entry.assetId, cancelled);
+                else kept.push(waiter);
+            }
+            entry.waiters = kept;
+            if (!kept.length) state.queue.delete(key);
+            else entry.rank = Math.min(...kept.map((waiter) => waiter.rank));
+        }
+        releaseIdleDetailState(state);
+    };
+
+    // New selections outrank unstarted preload work: an owner withdraws its queued waiters
+    // at the given priorities before requesting the new window.
+    const cancelDetails = ({ projectId, ownerId, priorities = null } = {}) => {
+        const state = detailStates.get(normalizedProjectId(projectId));
+        if (!state) return;
+        const owner = String(ownerId || "");
+        // Unknown names select nothing rather than falling back to background.
+        const ranks = priorities
+            ? new Set(priorities.filter((name) => DETAIL_PRIORITY_NAMES.includes(name)).map(detailRank))
+            : null;
+        cancelQueuedWaiters(state, (waiter) => waiter.owner === owner && (!ranks || ranks.has(waiter.rank)));
+    };
+
     return {
         request: requestRefresh,
+        requestDetails,
+        cancelDetails,
         markMutation,
         getMutationEpoch(projectId) {
             const normalized = normalizedProjectId(projectId);
@@ -524,6 +815,9 @@ export function createAssetRefreshCoordinator({
         },
         _debugState(projectId) {
             return states.get(normalizedProjectId(projectId)) || null;
+        },
+        _debugDetailState(projectId) {
+            return detailStates.get(normalizedProjectId(projectId)) || null;
         },
     };
 }
@@ -537,6 +831,17 @@ const pageCoordinator = createAssetRefreshCoordinator();
 
 export function requestProjectAssetRefresh(options) {
     return pageCoordinator.request(options);
+}
+
+// Detail-only demand (provenance or tracked-metadata search projection). Resolves to a
+// Map of asset id -> {status: ok|missing|error|cancelled, ...}; it never rejects and
+// never satisfies, joins or replaces a list/sync request.
+export function requestProjectAssetDetails(options) {
+    return pageCoordinator.requestDetails(options);
+}
+
+export function cancelProjectAssetDetails(options) {
+    return pageCoordinator.cancelDetails(options);
 }
 
 export function markProjectAssetMutation(projectId, reason) {

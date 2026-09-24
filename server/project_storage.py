@@ -433,6 +433,30 @@ def read_asset_provenance_batch(project_dir, asset_ids):
         return {"modified_at": data.get("modified_at", ""), "provenance": values, "revisions": revisions}
 
 
+def tracked_metadata_value(params):
+    """The raw `editor_export.tracked_metadata` value, unfiltered.
+
+    Deliberately not a projection of entries: the gallery's `trackedMetadataEntries`
+    (`web/js/shared_asset_gallery.js`) is the one authority for which values count as
+    entries, and its registered matchers may read any field of one.
+    """
+    export = params.get("editor_export") if isinstance(params, dict) else None
+    return export.get("tracked_metadata") if isinstance(export, dict) else None
+
+
+def read_asset_search_metadata_batch(project_dir, asset_ids):
+    """Tracked-metadata search projection for one bounded batch of assets.
+
+    Same read, lock and integrity behaviour as `read_asset_provenance_batch`, returning
+    only what `tracked:`/`field:` search matches against. An id the document no longer
+    holds is absent from `revisions`, which a caller treats as a snapshot mismatch.
+    """
+    result = read_asset_provenance_batch(project_dir, asset_ids)
+    return {"modified_at": result["modified_at"], "revisions": result["revisions"],
+            "tracked_metadata": {asset_id: tracked_metadata_value(params)
+                                 for asset_id, params in result["provenance"].items()}}
+
+
 def stage_prompt_history(project, history):
     storage = storage_of(project._raw_data)
     base = storage["components"].get("prompt_history") if storage else None

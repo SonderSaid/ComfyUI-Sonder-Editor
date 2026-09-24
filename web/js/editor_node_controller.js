@@ -2521,6 +2521,8 @@ export class EditorNodeController {
             };
         this.moduleCache.assets = {
             ...normalized,
+            // Which list the gallery holds; detail reads are checked against it.
+            listVersion: Array.isArray(result.payload) ? "" : String(result.payload?.modified_at || ""),
             currentSceneAssetIds: deriveCurrentSceneAssetIds(
                 this.state.dormantSummary?.active_scene,
                 normalized.assets,
@@ -3511,6 +3513,7 @@ export class EditorNodeController {
         this._rememberAssetIds(normalized, projectDir);
         return {
             ...normalized,
+            listVersion: Array.isArray(payload) ? "" : String(payload.modified_at || ""),
             currentSceneAssetIds: deriveCurrentSceneAssetIds(scene, normalized.assets),
         };
     }
@@ -3690,6 +3693,9 @@ export class EditorNodeController {
                 this.card.syncModuleContainerHeight?.();
             },
             onRequestResize: () => this.card.syncModuleContainerHeight?.(),
+            // A detail or search read found the gallery's list older than the asset.
+            onRequestAssetListRefresh: async ({ requiredVersion = "", reason = "gallery_detail_mismatch" } = {}) =>
+                await this._refreshAssets({ mode: "read", requiredVersion, reason }),
         });
         this._activeDormantAssetGallery = gallery;
         return () => {

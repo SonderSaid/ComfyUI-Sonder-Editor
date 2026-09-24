@@ -284,7 +284,8 @@ import ast
 LOCK_LEAVES = {
     "load_project", "save_project", "list_projects", "create_project",
     "hydrate_job", "hydrate_asset", "read_component", "read_prompt_history",
-    "read_asset_provenance_batch", "collect_unreferenced_components",
+    "read_asset_provenance_batch", "read_asset_search_metadata_batch",
+    "collect_unreferenced_components",
     "_project_write_lock", "generation_params",
 }
 

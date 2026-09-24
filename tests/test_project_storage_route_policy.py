@@ -78,6 +78,8 @@ def _read_the_same_component(project_dir, route):
         return ps.read_prompt_history(project_dir)
     if route == "provenance_batch":
         return ps.read_asset_provenance_batch(project_dir, [ASSET_ID])
+    if route == "search_metadata":
+        return ps.read_asset_search_metadata_batch(project_dir, [ASSET_ID])
     return ps.read_asset_provenance(project_dir, ASSET_ID)
 
 
@@ -142,7 +144,7 @@ def test_empty_trash_reports_unreadable_storage_as_a_shaped_server_error(tmp_pat
 # just the history panel.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("route", ["history", "provenance_batch", "provenance_single"])
+@pytest.mark.parametrize("route", ["history", "provenance_batch", "provenance_single", "search_metadata"])
 def test_storage_reads_that_returned_409_now_return_the_shaped_500(tmp_path, monkeypatch, route):
     module = _load_route_module(monkeypatch)
     project_dir = _project_with_frozen_storage(tmp_path)
@@ -158,6 +160,9 @@ def test_storage_reads_that_returned_409_now_return_the_shaped_500(tmp_path, mon
         leaked_path = _delete_component(project_dir, "provenance_")
         if route == "provenance_batch":
             path = "/sonder-editor/project/{project_id}/assets/provenance"
+            query = f"?asset_id={ASSET_ID}"
+        elif route == "search_metadata":
+            path = "/sonder-editor/project/{project_id}/assets/search-metadata"
             query = f"?asset_id={ASSET_ID}"
         else:
             path = "/sonder-editor/project/{project_id}/assets/{asset_id}/provenance"
@@ -203,7 +208,7 @@ STORAGE_LEAVES = {
     "load_project", "save_project", "create_project", "list_projects",
     "save_generated_project", "hydrate_job", "hydrate_asset", "resolve_queue_job",
     "read_component", "read_prompt_history", "read_asset_provenance",
-    "read_asset_provenance_batch", "storage_of", "descriptor_path",
+    "read_asset_provenance_batch", "read_asset_search_metadata_batch", "storage_of", "descriptor_path",
     "generation_params", "to_dict", "_load_project_from_request", "_asset_payload",
     "_asset_payloads",
 }

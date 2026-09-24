@@ -38,7 +38,8 @@ import {
 import { resolveInspectOverlayScope } from "./inspect_overlay_scope.js";
 import { mountMediaScrubBar } from "./media_scrub_bar.js";
 import { openContextMenu } from "./editor_context_menu.js";
-import { requestProjectAssetRefresh, getProjectAssetMutationEpoch } from "./asset_refresh_coordinator.js";
+import { cancelProjectAssetDetails, requestProjectAssetDetails } from "./asset_refresh_coordinator.js";
+import { createDetailLoader, createSearchProjection } from "./asset_provenance_details.js";
 
 const DEFAULT_SORT_MODE = DEFAULT_EDITOR_SETTINGS.gallery.sortMode;
 const DEFAULT_GALLERY_TAB = DEFAULT_EDITOR_SETTINGS.gallery.activeTab;
@@ -537,13 +538,31 @@ function parseAssetSearchQuery(rawQuery) {
     return result;
 }
 
-function trackedMetadataEntries(asset) {
-    const entries = asset?.generation_params?.editor_export?.tracked_metadata;
-    return Array.isArray(entries) ? entries.filter((entry) => entry && typeof entry === "object") : [];
+// The one authority for which `tracked_metadata` values count as entries. The search
+// route deliberately returns the raw value so this filter is never mirrored server-side.
+// Memoized by the stored value's identity: search runs the matchers over every listed
+// asset several times per render, and details are never mutated in place once held.
+const trackedEntriesMemo = new WeakMap();
+const trackedBlobMemo = new WeakMap();
+
+function trackedEntriesFromValue(value) {
+    if (!Array.isArray(value)) return [];
+    let entries = trackedEntriesMemo.get(value);
+    if (!entries) {
+        entries = value.filter((entry) => entry && typeof entry === "object");
+        trackedEntriesMemo.set(value, entries);
+    }
+    return entries;
 }
 
-function trackedMetadataBlob(asset) {
-    return trackedMetadataEntries(asset).map((entry) => {
+function trackedEntriesFromParams(params) {
+    return trackedEntriesFromValue(params?.editor_export?.tracked_metadata);
+}
+
+function trackedMetadataBlob(entries) {
+    const memo = trackedBlobMemo.get(entries);
+    if (memo !== undefined) return memo;
+    const blob = entries.map((entry) => {
         try {
             return JSON.stringify({
                 label: entry.label || "",
@@ -554,10 +573,12 @@ function trackedMetadataBlob(asset) {
             return `${entry.label || ""} ${entry.raw_widget_text || ""}`;
         }
     }).join(" ").toLowerCase();
+    trackedBlobMemo.set(entries, blob);
+    return blob;
 }
 
-function trackedFieldMatches(asset, name, value) {
-    for (const entry of trackedMetadataEntries(asset)) {
+function trackedFieldMatches(entries, name, value) {
+    for (const entry of entries) {
         const registryDecision = trackedFieldMatchForEntry(entry, name, value);
         if (registryDecision === true) return true;
         if (registryDecision === false) continue; // registered matcher had a definitive "no" for this entry
@@ -685,6 +706,9 @@ function dataTransferHasType(dataTransfer, type) {
     return Array.from(types).includes(type);
 }
 
+// Distinguishes gallery instances that share a host owner id in detail-lane ownership.
+let galleryInstanceSequence = 0;
+
 function makeMetaCell(label, value) {
     const displayValue = String(value ?? "-");
     const cell = style(document.createElement("div"), `padding:6px;border-radius:6px;background:rgba(255,255,255,0.03);border:1px solid transparent;min-width:0;`);
@@ -718,63 +742,88 @@ function makeSectionTitle(label) {
 }
 
 export function mountSharedAssetGallery(container, options = {}) {
-    let provenancePending = null;
-    let provenanceGeneration = 0;
-    let provenanceProjectDir = null;
     let dataProjectDir = null;
-    let provenanceError = "";
-    const provenanceErrors = new Map();
-    const provenanceKey = (asset) => `${asset?.asset_id}:${asset?.provenance_revision}`;
+    // List snapshot version from the host: which list this gallery shows, independent of
+    // the project version any other response may have advanced.
+    let dataListVersion = "";
+    // Provenance details and the tracked-search projection are ephemeral per-instance
+    // data, resolved through these two objects and never attached to lean list records.
+    const detailOwnerBase = `${options.ownerId || "sonder-gallery"}#${++galleryInstanceSequence}`;
+    const detailLoader = createDetailLoader({
+        ownerId: `${detailOwnerBase}:details`,
+        requestDetails: requestProjectAssetDetails,
+        cancelDetails: cancelProjectAssetDetails,
+        requestListRefresh: (request) => options.onRequestAssetListRefresh?.(request),
+        onChange: (assetIds) => handleDetailArrivals(assetIds),
+        settings: getEditorSettings().gallery || {},
+    });
+    const searchProjection = createSearchProjection({
+        ownerId: `${detailOwnerBase}:search`,
+        requestDetails: requestProjectAssetDetails,
+        cancelDetails: cancelProjectAssetDetails,
+        requestListRefresh: (request) => options.onRequestAssetListRefresh?.(request),
+        onChange: () => handleSearchProjectionChange(),
+        peekDetail: (assetId, revision) => detailLoader.peek(assetId, revision),
+    });
 
-    function syncProvenanceProject() {
-        const projectDir = currentProjectDir();
-        if (provenanceProjectDir !== projectDir) {
-            provenanceProjectDir = projectDir;
-            provenanceGeneration++;
-            provenancePending = null;
-            provenanceErrors.clear();
-            provenanceError = "";
+    function detailProjectId() {
+        return projectIdFromDir(currentProjectDir()) || "";
+    }
+
+    // Full provenance for one asset: {status: ready|loading|error, params, message}.
+    function assetDetail(asset) {
+        return detailLoader.resolve(asset);
+    }
+
+    function trackedEntriesFor(asset) {
+        const detail = assetDetail(asset);
+        return detail.status === "ready" ? trackedEntriesFromParams(detail.params) : [];
+    }
+
+    // Search reads the projection, never the detail cache. An asset that needs no fetch
+    // (no provenance, or a record already carrying it) answers from itself.
+    function searchEntriesFor(asset) {
+        const value = searchProjection.valueFor(asset);
+        if (value !== undefined) return trackedEntriesFromValue(value);
+        const params = asset?.generation_params;
+        return params && typeof params === "object" ? trackedEntriesFromParams(params) : [];
+    }
+
+    function queryHasMetadataTerms(query) {
+        return !!(query?.trackedTerms?.length || query?.fieldTerms?.length);
+    }
+
+    // Compare pickers hold their own queries; they count only while compare is showing them.
+    function comparePickerHasMetadataQuery() {
+        const overlay = state.overlayState;
+        return !!(overlay.open && overlay.compareMode
+            && [overlay.comparePickerQuery, overlay.comparePickerQueryB]
+                .some((query) => queryHasMetadataTerms(parseAssetSearchQuery(query || ""))));
+    }
+
+    // Loading or error in place of results, in every view: a folders view would otherwise
+    // show its empty folders, which reads as "nothing matched".
+    function renderMetadataSearchStatus(status) {
+        const wrap = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px;border-radius:6px;background:${THEME.bg2};color:${THEME.fg2};font-size:10px;`);
+        const message = document.createElement("span");
+        message.textContent = status === "error" ? searchProjection.message : "Loading metadata for search…";
+        wrap.appendChild(message);
+        if (status === "error") {
+            const retry = makeActionButton("subtle");
+            retry.textContent = "Retry";
+            retry.title = "Load metadata for search again";
+            retry.addEventListener("click", () => searchProjection.retry());
+            wrap.appendChild(retry);
         }
-        return projectDir;
+        return wrap;
     }
 
-    function ensureProvenance(assets) {
-        const projectDir = syncProvenanceProject();
-        const needed = (assets || []).filter((asset) => asset?.provenance_revision && !asset.generation_params
-            && !provenanceErrors.has(provenanceKey(asset)));
-        if (!needed.length || provenancePending || state.destroyed) return;
-        const projectId = projectIdFromDir(projectDir);
-        if (!projectId) return;
-        const generation = ++provenanceGeneration;
-        const isCurrent = () => !state.destroyed && currentProjectDir() === projectDir
-            && provenanceGeneration === generation;
-        const ids = needed.map((asset) => asset.asset_id);
-        provenancePending = requestProjectAssetRefresh({ projectId, provenanceIds: ids,
-            reason: "gallery-provenance" });
-        provenancePending.then((result) => {
-            if (!isCurrent()
-                || result.epoch !== getProjectAssetMutationEpoch(projectId)) return;
-            for (const asset of result.payload.assets || []) {
-                if (Object.prototype.hasOwnProperty.call(result.payload.provenance || {}, asset.asset_id)) {
-                    asset.generation_params = result.payload.provenance[asset.asset_id];
-                }
-            }
-            provenanceError = "";
-            setData(result.payload);
-        }).catch((error) => {
-            if (!isCurrent()) return;
-            provenanceError = error.message || String(error);
-            for (const asset of needed) provenanceErrors.set(provenanceKey(asset), provenanceError);
-            notifyError(`Metadata unavailable: ${provenanceError}`);
-        }).finally(() => {
-            if (!isCurrent()) return;
-            provenancePending = null;
-            if (!state.destroyed) {
-                render();
-                if (state.overlayState.open) renderInspectOverlay();
-            }
-        });
+    // Starts or reuses the complete projection for a metadata query; returns its status.
+    function prepareMetadataSearch(query) {
+        if (!queryHasMetadataTerms(query)) return "ready";
+        return searchProjection.ensure({ projectId: detailProjectId(), assets: data.assets, version: dataListVersion });
     }
+
     const initialSettings = getEditorSettings();
     const initialInspectorSettings = initialSettings.inspector || DEFAULT_INSPECTOR_SETTINGS;
     const ownerId = typeof options.ownerId === "string" && options.ownerId
@@ -822,6 +871,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         // Hook stored when the inspect overlay mounts its metadata panel, so token toggles
         // can refresh just that panel without tearing the media element.
         overlayMetadataRefresh: null,
+        detailMetadataRefresh: null,
         // Hook stored when the compare overlay mounts its A/B choosers, so compare-mode
         // metadata-cell L/R clicks can refresh both picker lists without tearing media.
         overlayCompareChoosersRefresh: null,
@@ -1444,7 +1494,9 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     const unsubscribeSettings = subscribeEditorSettings((settings) => {
+        const demandChanged = detailLoader.applySettings(settings?.gallery || {});
         applyGallerySettings(settings);
+        if (demandChanged) syncDetailDemand();
     });
 
     function setBusyButton(btn, isBusy, busyLabel, idleLabel) {
@@ -1611,12 +1663,18 @@ export function mountSharedAssetGallery(container, options = {}) {
             const ext = assetExtension(asset);
             if (!query.extTerms.every((term) => ext === term)) return false;
         }
-        if (query.trackedTerms.length) {
-            const blob = trackedMetadataBlob(asset);
-            if (!query.trackedTerms.every((term) => blob.includes(term))) return false;
-        }
-        if (query.fieldTerms.length) {
-            if (!query.fieldTerms.every((term) => trackedFieldMatches(asset, term.name, term.value))) return false;
+        if (queryHasMetadataTerms(query)) {
+            // Never a partial answer: until the projection covers every listed asset,
+            // nothing matches and the surface says it is loading.
+            if (searchProjection.status !== "ready") return false;
+            const entries = searchEntriesFor(asset);
+            if (query.trackedTerms.length) {
+                const blob = trackedMetadataBlob(entries);
+                if (!query.trackedTerms.every((term) => blob.includes(term))) return false;
+            }
+            if (query.fieldTerms.length) {
+                if (!query.fieldTerms.every((term) => trackedFieldMatches(entries, term.name, term.value))) return false;
+            }
         }
         if (!query.nameTerms.length) return true;
         const name = assetDisplayName(asset).toLowerCase();
@@ -1749,6 +1807,77 @@ export function mountSharedAssetGallery(container, options = {}) {
         const refresh = state.overlayMetadataRefresh;
         if (typeof refresh === "function") {
             try { refresh(); } catch (err) { console.warn("[gallery] overlay metadata refresh failed", err); }
+        }
+    }
+
+    // ---------- Provenance detail demand ----------
+
+    // One demand for the whole gallery: every asset whose metadata is on screen, plus the
+    // preload window of the surface the user is moving through. The overlay's order wins
+    // while it is open; the list's order otherwise.
+    // `listOrder` lets render() pass the navigation list it already computed; filtering a
+    // large list against an active metadata query is the expensive part of a render.
+    function syncDetailDemand(listOrder = null) {
+        if (state.destroyed) return;
+        const displayed = [];
+        let order = [];
+        let currentId = "";
+        let wrap = false;
+        const overlay = state.overlayState;
+        const current = overlay.open ? currentOverlayAsset() : null;
+        if (current) {
+            if (overlay.compareMode && sameTypeOverlayAssets(current).length >= 2) {
+                const side = overlay.compareCycleSide === "A" ? "A" : "B";
+                const byId = (id) => data.assets.find((entry) => entry.asset_id === id) || null;
+                // A side whose asset is gone falls back to `current` in the panels.
+                displayed.push(byId(overlay.compareLeftAssetId) || current, byId(overlay.compareRightAssetId) || current);
+                prepareMetadataSearch(parseAssetSearchQuery(overlay[compareQueryRef(side)] || ""));
+                order = compareFilteredCandidates(side);
+                currentId = side === "A" ? overlay.compareLeftAssetId : overlay.compareRightAssetId;
+            } else {
+                displayed.push(current);
+                order = overlayAssets();
+                currentId = current.asset_id;
+            }
+            wrap = true;
+        }
+        const inspected = !state.inspectorCollapsed && selectedAssetIdsList().length <= 1 ? selectedAsset() : null;
+        if (inspected) displayed.push(inspected);
+        if (!current) {
+            order = listOrder || navigableAssets();
+            currentId = state.selectedAssetId || "";
+        }
+        detailLoader.sync({ projectId: detailProjectId(), displayed: displayed.filter(Boolean), order, currentId, wrap });
+    }
+
+    // Details arrived (or failed): repaint only the metadata that shows those assets, once.
+    function handleDetailArrivals(assetIds) {
+        if (state.destroyed) return;
+        const ids = new Set(assetIds);
+        const inspector = state.detailMetadataRefresh;
+        if (inspector?.slot?.isConnected && ids.has(inspector.assetId)) {
+            try { inspector.build(); } catch (err) { console.warn("[gallery] inspector metadata refresh failed", err); }
+        }
+        const overlay = state.overlayState;
+        if (overlay.open && overlay.showMetadata) {
+            // Degraded compare draws one panel for the current asset, so all three count.
+            const shown = [overlay.assetId, overlay.compareLeftAssetId, overlay.compareRightAssetId];
+            if (shown.some((id) => id && ids.has(id))) invalidateOverlayMetadata();
+        }
+        syncDetailDemand();
+    }
+
+    // The search projection settled (ready, error, or restarting on a newer list).
+    function handleSearchProjectionChange() {
+        if (state.destroyed) return;
+        if (queryHasMetadataTerms(parseAssetSearchQuery(state.query))) render();
+        const overlay = state.overlayState;
+        if (overlay.open && overlay.compareMode
+            && [overlay.comparePickerQuery, overlay.comparePickerQueryB]
+                .some((query) => queryHasMetadataTerms(parseAssetSearchQuery(query)))) {
+            if (typeof state.overlayCompareChoosersRefresh === "function") {
+                try { state.overlayCompareChoosersRefresh(); } catch (err) { console.warn("[gallery] compare choosers refresh failed", err); }
+            }
         }
     }
 
@@ -2786,15 +2915,29 @@ export function mountSharedAssetGallery(container, options = {}) {
         return { pinned, unpinned };
     }
 
-    function renderTrackedMetadataSection(asset, options = {}) {
-        if (asset?.provenance_revision && !asset.generation_params) {
-            ensureProvenance([asset]);
-            const message = document.createElement("div");
-            const error = provenanceErrors.get(provenanceKey(asset));
-            message.textContent = error ? `Metadata unavailable: ${error}` : "Loading metadata…";
-            return message;
+    // One placeholder per asset while its details are not ready; the generation section
+    // shows it and the tracked section stays absent, so a loading asset reads once.
+    function renderDetailStatus(asset, detail) {
+        const wrap = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;flex-wrap:wrap;color:${CHROME.textDim};font-size:10px;`);
+        const message = document.createElement("span");
+        message.textContent = detail.status === "error" ? `Metadata unavailable: ${detail.message}` : "Loading metadata…";
+        wrap.appendChild(message);
+        if (detail.status === "error") {
+            const retry = makeActionButton("subtle");
+            retry.textContent = "Retry";
+            retry.title = "Load this asset's generation details again";
+            retry.addEventListener("click", (event) => {
+                event.stopPropagation();
+                detailLoader.retry(asset);
+            });
+            wrap.appendChild(retry);
         }
-        const entries = trackedMetadataEntries(asset);
+        return wrap;
+    }
+
+    function renderTrackedMetadataSection(asset, options = {}) {
+        if (assetDetail(asset).status !== "ready") return null;
+        const entries = trackedEntriesFor(asset);
         if (!entries.length) return null;
         const surface = options.surface || "fullscreen";
         const wrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:8px;`);
@@ -3074,13 +3217,9 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     function renderGenerationSection(asset) {
-        if (asset?.provenance_revision && !asset.generation_params) {
-            ensureProvenance([asset]);
-            const message = document.createElement("div");
-            const error = provenanceErrors.get(provenanceKey(asset));
-            message.textContent = error ? `Metadata unavailable: ${error}` : "Loading metadata…";
-            return message;
-        }
+        const detail = assetDetail(asset);
+        if (detail.status !== "ready") return renderDetailStatus(asset, detail);
+        const generationParams = detail.params || {};
         const wrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;`);
         if (asset.prompt) {
             wrap.appendChild(makeSectionTitle("Prompt"));
@@ -3088,7 +3227,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             promptBox.textContent = asset.prompt;
             wrap.appendChild(promptBox);
         }
-        const generationEntries = Object.entries(asset.generation_params || {});
+        const generationEntries = Object.entries(generationParams);
         if (generationEntries.length) {
             wrap.appendChild(makeSectionTitle("Generation"));
             const grid = style(document.createElement("div"), `display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;min-width:0;`);
@@ -3721,6 +3860,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         if (!state.destroyed && !state.inspectorCollapsed) {
             renderDetail(selectedAsset());
         }
+        syncDetailDemand();
     }
 
     function attachZoomPan(surface, targets, options = {}) {
@@ -4282,6 +4422,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         if (!compareModeActive()) return;
         const side = state.overlayState.compareCycleSide === "A" ? "A" : "B";
         const slotKey = side === "B" ? "compareRightAssetId" : "compareLeftAssetId";
+        prepareMetadataSearch(parseAssetSearchQuery(state.overlayState[compareQueryRef(side)] || ""));
         const list = compareFilteredCandidates(side);
         if (!list.length) return;
         const currentIndex = list.findIndex((entry) => entry.asset_id === state.overlayState[slotKey]);
@@ -4633,9 +4774,13 @@ export function mountSharedAssetGallery(container, options = {}) {
                 : DEFAULT_SORT_MODE;
             const selectionGroupEl = renderSelectionGroup(buildSelectionGroup());
             if (selectionGroupEl) list.appendChild(selectionGroupEl);
+            const chooserQuery = parseAssetSearchQuery(state.overlayState[queryRef] || "");
+            const searchStatus = prepareMetadataSearch(chooserQuery);
             const naturalRows = buildOrderedNatural();
             for (const item of naturalRows) list.appendChild(renderRow(item));
-            if (!list.children.length) {
+            if (queryHasMetadataTerms(chooserQuery) && searchStatus !== "ready") {
+                list.appendChild(renderMetadataSearchStatus(searchStatus));
+            } else if (!naturalRows.length) {
                 const empty = style(document.createElement("div"), `color:${CHROME.textDim};font-size:11px;padding:8px;`);
                 empty.textContent = "No matching assets.";
                 list.appendChild(empty);
@@ -5314,11 +5459,13 @@ export function mountSharedAssetGallery(container, options = {}) {
                 };
             }
         }
+        syncDetailDemand();
     }
 
     function renderUsagesDetail(asset) {
         destroyLiveMedia();
         detailPane.innerHTML = "";
+        state.detailMetadataRefresh = null;
 
         if (!asset || state.showingUsagesFor !== asset.asset_id) {
             clearUsageView();
@@ -5406,6 +5553,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     function renderMultiDetail(assetIds) {
         destroyLiveMedia();
         detailPane.innerHTML = "";
+        state.detailMetadataRefresh = null;
 
         const assets = assetIds
             .map((assetId) => data.assets.find((asset) => asset.asset_id === assetId))
@@ -5481,7 +5629,21 @@ export function mountSharedAssetGallery(container, options = {}) {
         queueResize();
     }
 
+    // Tracked + generation metadata for the inspector, in a slot that arriving details can
+    // replace on their own: the preview media above it is never rebuilt for metadata.
+    function renderDetailMetadataSlot(asset) {
+        const slot = style(document.createElement("div"), `display:flex;flex-direction:column;gap:8px;min-width:0;`);
+        const build = () => {
+            const tracked = renderTrackedMetadataSection(asset);
+            slot.replaceChildren(...(tracked ? [tracked] : []), renderGenerationSection(asset));
+        };
+        build();
+        state.detailMetadataRefresh = { assetId: asset.asset_id, slot, build };
+        return slot;
+    }
+
     function renderDetail(asset) {
+        state.detailMetadataRefresh = null;
         const selectedIds = selectedAssetIdsList();
         if (selectedIds.length > 1) {
             renderMultiDetail(selectedIds);
@@ -5675,14 +5837,10 @@ export function mountSharedAssetGallery(container, options = {}) {
             });
             detailSections.push(artifactToggle);
             if (state.artifactInspectorExpanded) {
-                const tracked = renderTrackedMetadataSection(asset);
-                if (tracked) detailSections.push(tracked);
-                detailSections.push(renderGenerationSection(asset));
+                detailSections.push(renderDetailMetadataSlot(asset));
             }
         } else {
-            const tracked = renderTrackedMetadataSection(asset);
-            if (tracked) detailSections.push(tracked);
-            detailSections.push(renderGenerationSection(asset));
+            detailSections.push(renderDetailMetadataSlot(asset));
         }
         if (isTrashed(asset)) {
             const trashedNote = style(document.createElement("div"), `padding:8px;border-radius:6px;background:${THEME.bg2};border:1px solid ${THEME.statusPending}55;color:${THEME.fg1};font-size:10px;line-height:1.45;`);
@@ -6557,9 +6715,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     function render() {
         if (state.destroyed) return;
         const metadataQuery = parseAssetSearchQuery(state.query);
-        if (metadataQuery.trackedTerms.length || metadataQuery.fieldTerms.length) {
-            ensureProvenance(data.assets);
-        }
+        const metadataSearchStatus = prepareMetadataSearch(metadataQuery);
         ensureProjectPrefs();
         refreshCurrentSceneAssetIdsFromHost();
         updateControlState();
@@ -6576,8 +6732,13 @@ export function mountSharedAssetGallery(container, options = {}) {
         const selected = selectedAsset();
         const folders = allFolders();
         let renderedAnything = false;
+        const metadataSearch = queryHasMetadataTerms(metadataQuery);
+        if (!metadataSearch && !comparePickerHasMetadataQuery()) searchProjection.idle();
 
-        if (state.viewMode === "flat") {
+        if (metadataSearch && metadataSearchStatus !== "ready") {
+            renderedAnything = true;
+            listScroller.appendChild(renderMetadataSearchStatus(metadataSearchStatus));
+        } else if (state.viewMode === "flat") {
             if (assets.length) {
                 renderedAnything = true;
                 for (const asset of assets) {
@@ -6801,21 +6962,20 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         if (!renderedAnything) {
             const empty = style(document.createElement("div"), `padding:10px;border-radius:6px;background:${THEME.bg2};color:${THEME.fg2};font-size:10px;`);
-            const metadataSearch = metadataQuery.trackedTerms.length || metadataQuery.fieldTerms.length;
-            empty.textContent = metadataSearch && provenanceError ? `Metadata search unavailable: ${provenanceError}`
-                : metadataSearch && provenancePending ? "Loading metadata for search…"
-                : data.assets.length ? "No assets match the current filter." : "No assets in this project yet. Drag files here or use Import.";
+            empty.textContent = data.assets.length ? "No assets match the current filter." : "No assets in this project yet. Drag files here or use Import.";
             listScroller.appendChild(empty);
         }
 
         if (state.inspectorCollapsed) {
             destroyLiveMedia();
             detailPane.innerHTML = "";
+            state.detailMetadataRefresh = null;
         } else {
             renderDetail(selected);
         }
         refreshThumbnailRepairObservation(state.inspectorCollapsed ? null : selected);
         queueResize();
+        syncDetailDemand(visibleAssets);
     }
 
     async function handleDrop(event) {
@@ -6885,8 +7045,6 @@ export function mountSharedAssetGallery(container, options = {}) {
         render();
     });
     searchInput.addEventListener("input", () => {
-        provenanceError = "";
-        provenanceErrors.clear();
         state.query = searchInput.value || "";
         state.allowAutoFocus = true;
         render();
@@ -7196,7 +7354,6 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     function setData(nextData) {
-        syncProvenanceProject();
         const payload = Array.isArray(nextData) ? { assets: nextData, folders: [] } : (nextData || {});
         if (Object.prototype.hasOwnProperty.call(payload, "currentSceneAssetIds")) {
             state.currentSceneAssetIds = normalizeAssetIdSet(payload.currentSceneAssetIds);
@@ -7206,12 +7363,10 @@ export function mountSharedAssetGallery(container, options = {}) {
         const previousAssets = sameProject ? data.assets : [];
         const previousFolders = sameProject ? data.folders : [];
         const nextAssets = Array.isArray(payload.assets) ? [...payload.assets] : [];
-        for (const asset of nextAssets) {
-            const previous = previousAssets.find((entry) => entry.asset_id === asset.asset_id);
-            if (!asset.generation_params && asset.provenance_revision && previous?.provenance_revision === asset.provenance_revision
-                && previous.generation_params) asset.generation_params = previous.generation_params;
-        }
-        provenanceError = "";
+        // A list without its snapshot version (a host's placeholder seed) is shown but is
+        // not a loaded list: it cannot make the next real list's assets look like arrivals.
+        dataListVersion = sameProject && !payload.listVersion ? dataListVersion : String(payload.listVersion || "");
+        detailLoader.listChanged({ projectId: detailProjectId(), assets: nextAssets, version: String(payload.listVersion || "") });
         const nextFolders = Array.isArray(payload.folders) ? payload.folders.map(normalizeFolderName).filter(Boolean) : [];
         const additiveAssets = additiveRefreshAssets(previousAssets, nextAssets, previousFolders, nextFolders);
         data.assets = nextAssets;
@@ -7231,10 +7386,16 @@ export function mountSharedAssetGallery(container, options = {}) {
             clearUsageView();
         }
         state.allowAutoFocus = true;
-        if (!tryRenderAdditiveData(additiveAssets, previousAssets)) {
+        // An active metadata search must re-ensure its projection over the new list, which
+        // only a full render does; additive insertion would test new rows against the old one.
+        if (queryHasMetadataTerms(parseAssetSearchQuery(state.query)) || !tryRenderAdditiveData(additiveAssets, previousAssets)) {
             render();
         } else {
+            if (comparePickerHasMetadataQuery() && typeof state.overlayCompareChoosersRefresh === "function") {
+                try { state.overlayCompareChoosersRefresh(); } catch (err) { console.warn("[gallery] compare choosers refresh failed", err); }
+            }
             refreshThumbnailRepairObservation(selectedAsset());
+            syncDetailDemand();
         }
     }
 
@@ -7253,6 +7414,9 @@ export function mountSharedAssetGallery(container, options = {}) {
         clearOverlayMediaCache();
         hideContextMenu();
         destroyLiveMedia();
+        detailLoader.destroy();
+        searchProjection.destroy();
+        state.detailMetadataRefresh = null;
     }
 
     setData(options.initialData || { assets: [], folders: [] });

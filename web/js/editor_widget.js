@@ -1562,6 +1562,9 @@ export class EditorWidget {
             onDeleteFolder: async (folderName, force, diagnostics) => await this._deleteAssetFolder(folderName, force, diagnostics),
             onReplaceAsset: async (assetId, file) => await this._replaceAsset(assetId, file),
             onSetSceneAspectRatio: (width, height) => this._setSceneAspectRatioFromDimensions(width, height),
+            // A detail or search read found the gallery's list older than the asset.
+            onRequestAssetListRefresh: async ({ requiredVersion = "", reason = "gallery_detail_mismatch" } = {}) =>
+                await this._fetchAssets({ mode: "read", requiredVersion, reason }),
             onOpenSourceWorkflow: async (asset) => {
                 const handled = await window.__SONDER_OPEN_SOURCE_WORKFLOW__?.(this.projectDir, asset);
                 if (!handled) this._showToast?.("Source workflow unavailable");
@@ -2399,6 +2402,8 @@ export class EditorWidget {
         this._assetGallery?.setData({
             assets: data?.assets || [],
             folders: data?.folders || [],
+            // Which list the gallery holds; detail reads are checked against it.
+            listVersion: String(data?.modified_at || ""),
             currentSceneAssetIds: this._currentSceneAssetIdsForGallery(),
         });
         // Reference entities are unchanged by an asset-only refresh, but their

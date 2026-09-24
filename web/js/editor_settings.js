@@ -434,6 +434,15 @@ export const DEFAULT_EDITOR_SETTINGS = {
         thumbnailSize: "small",
         artifactInspectorExpanded: false,
         stickyFolderHeaders: true,
+        // Provenance details fetched ahead of the selection in each inspection surface's
+        // navigation order. 0 disables; 63 keeps the selection plus its window in one
+        // 64-id route batch.
+        preloadFollowingAssets: 50,
+        // Background detail fetch for assets that appear while a gallery is mounted.
+        preloadNewAssets: true,
+        // Reusable provenance details kept per gallery instance; 0 is unlimited.
+        // Details on screen are held outside this cap.
+        maxCachedProvenanceDetails: 0,
     },
     inspector: {
         compareLayout: "divider",
@@ -450,6 +459,8 @@ const VALID_THUMBNAIL_SIZES = new Set(GALLERY_THUMBNAIL_SIZE_OPTIONS.map((entry)
 const VALID_GALLERY_TABS = new Set(GALLERY_TAB_OPTIONS.map((entry) => entry.value));
 const VALID_GALLERY_SCOPES = new Set(GALLERY_SCOPE_OPTIONS.map((entry) => entry.value));
 const VALID_GALLERY_VIEWS = new Set(GALLERY_VIEW_OPTIONS.map((entry) => entry.value));
+export const GALLERY_PRELOAD_FOLLOWING_MAX = 63;
+export const GALLERY_PROVENANCE_CACHE_MAX = 100000;
 const VALID_PLAYBACK_RESOLUTIONS = new Set(PLAYBACK_RESOLUTION_OPTIONS.map((entry) => entry.value));
 const VALID_STREAMING_MODES = new Set(INTERNAL_STREAMING_MODE_OPTIONS.map((entry) => entry.value));
 const VALID_CLIP_LABEL_MODES = new Set(CLIP_LABEL_MODE_OPTIONS.map((entry) => entry.value));
@@ -1506,6 +1517,23 @@ export function normalizeEditorSettings(source = null) {
             stickyFolderHeaders: stored?.gallery?.stickyFolderHeaders == null
                 ? defaults.gallery.stickyFolderHeaders
                 : !!stored.gallery.stickyFolderHeaders,
+            preloadFollowingAssets: clampNumber(
+                stored?.gallery?.preloadFollowingAssets,
+                0,
+                GALLERY_PRELOAD_FOLLOWING_MAX,
+                defaults.gallery.preloadFollowingAssets,
+                true,
+            ),
+            preloadNewAssets: stored?.gallery?.preloadNewAssets == null
+                ? defaults.gallery.preloadNewAssets
+                : !!stored.gallery.preloadNewAssets,
+            maxCachedProvenanceDetails: clampNumber(
+                stored?.gallery?.maxCachedProvenanceDetails,
+                0,
+                GALLERY_PROVENANCE_CACHE_MAX,
+                defaults.gallery.maxCachedProvenanceDetails,
+                true,
+            ),
         },
         inspector: {
             compareLayout: VALID_COMPARE_LAYOUTS.has(stored?.inspector?.compareLayout)

@@ -15,6 +15,8 @@ import {
     DEFAULT_EDITOR_SETTINGS,
     DEFAULT_SAVE_PRESET,
     FIT_MODE_OPTIONS,
+    GALLERY_PRELOAD_FOLLOWING_MAX,
+    GALLERY_PROVENANCE_CACHE_MAX,
     GALLERY_SORT_OPTIONS,
     GALLERY_THUMBNAIL_SIZE_OPTIONS,
     PLAYBACK_RESOLUTION_OPTIONS,
@@ -282,6 +284,9 @@ function syncSettingsPanelControls() {
     }
     if (controls.trashRetentionDays) controls.trashRetentionDays.value = String(this._trashRetentionDays());
     if (controls.galleryStickyFolderHeaders) controls.galleryStickyFolderHeaders.checked = this._settings.gallery?.stickyFolderHeaders !== false;
+    if (controls.galleryPreloadFollowingAssets) controls.galleryPreloadFollowingAssets.value = String(this._settings.gallery.preloadFollowingAssets);
+    if (controls.galleryPreloadNewAssets) controls.galleryPreloadNewAssets.checked = this._settings.gallery.preloadNewAssets !== false;
+    if (controls.galleryMaxCachedProvenanceDetails) controls.galleryMaxCachedProvenanceDetails.value = String(this._settings.gallery.maxCachedProvenanceDetails);
     if (controls.batchRenderMaxFramesPerChunk) controls.batchRenderMaxFramesPerChunk.value = String(this._settings.batchRender.maxFramesPerChunk);
     if (controls.defaultProjectFps) controls.defaultProjectFps.value = String(this._settings.projectDefaults.fps);
     if (controls.defaultProjectWidth) controls.defaultProjectWidth.value = String(this._settings.projectDefaults.width);
@@ -2127,6 +2132,42 @@ function showSettingsPanel() {
     );
     createNumberInput(
         gallerySection,
+        "galleryPreloadFollowingAssets",
+        "Preload Following Assets",
+        `Load generation details for this many assets after the one you are inspecting, in the order you move through them. 0 turns preloading off; at most ${GALLERY_PRELOAD_FOLLOWING_MAX}.`,
+        {
+            min: 0,
+            max: GALLERY_PRELOAD_FOLLOWING_MAX,
+            step: 1,
+            getter: () => this._settings.gallery.preloadFollowingAssets,
+            onChange: (value) => updateCategory("gallery", "preloadFollowingAssets",
+                Math.min(GALLERY_PRELOAD_FOLLOWING_MAX, Math.max(0, Math.round(value)))),
+        }
+    );
+    createCheckbox(
+        gallerySection,
+        "galleryPreloadNewAssets",
+        "Preload New Assets",
+        "Load generation details for takes and other assets as they arrive, so they are ready when you inspect them.",
+        () => this._settings.gallery.preloadNewAssets !== false,
+        (checked) => updateCategory("gallery", "preloadNewAssets", checked)
+    );
+    createNumberInput(
+        gallerySection,
+        "galleryMaxCachedProvenanceDetails",
+        "Max Cached Provenance Details",
+        "How many loaded generation details each gallery keeps for reuse. 0 keeps all of them. Details on screen are always kept.",
+        {
+            min: 0,
+            max: GALLERY_PROVENANCE_CACHE_MAX,
+            step: 1,
+            getter: () => this._settings.gallery.maxCachedProvenanceDetails,
+            onChange: (value) => updateCategory("gallery", "maxCachedProvenanceDetails",
+                Math.min(GALLERY_PROVENANCE_CACHE_MAX, Math.max(0, Math.round(value)))),
+        }
+    );
+    createNumberInput(
+        gallerySection,
         "trashRetentionDays",
         "Trash Retention Days",
         "Hard-delete trashed assets after this many days during asset refresh/open sync.",
@@ -2175,7 +2216,7 @@ function showSettingsPanel() {
     addSectionReset(
         gallerySection,
         "Reset Gallery Section",
-        "Restore gallery sort, scope, view, thumbnail, inspector, sticky-header, and trash-cleanup defaults.",
+        "Restore gallery sort, scope, view, thumbnail, inspector, sticky-header, preloading, detail-cache, and trash-cleanup defaults.",
         () => this._updateSettings({
             gallery: DEFAULT_EDITOR_SETTINGS.gallery,
             render: {
