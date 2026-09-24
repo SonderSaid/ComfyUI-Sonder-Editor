@@ -6,7 +6,9 @@ import { CHROME_DIM_PLACEHOLDER_CLASS, EDITOR_COLORS as COLORS, chromeInputCss,
     installChromePlaceholderStyles, setButtonDisabled,
     setButtonVariant } from "./editor_theme.js";
 import { createReferenceOverrideFieldset,
-    normalizePromptAttachment } from "./prompt_context_chips.js";
+    normalizePromptAttachment, referencePromptDefaults } from "./prompt_context_chips.js";
+import { TASK_TYPE_PREVIEW_LABEL, captureTaskTypePreview,
+    createTaskTypeChoiceControl } from "./prompt_task_type_choices.js";
 import { createDisclosureMemory } from "./disclosure_memory.js";
 import { createModalDraftGuard } from "./modal_draft_guard.js";
 import {
@@ -339,8 +341,10 @@ function intentValues(profile, field, { includeInherited = false } = {}) {
         : values;
 }
 
-function fieldRow(label, input, { help = "", required = false } = {}) {
-    const row = document.createElement("label");
+function fieldRow(label, input, { help = "", required = false, group = false } = {}) {
+    // A control holding several inputs sits in a `div`: a `<label>` activates
+    // its first labelable descendant, so its caption would press a button.
+    const row = document.createElement(group ? "div" : "label");
     row.style.cssText = "display:grid;grid-template-columns:130px minmax(0,1fr);gap:7px;align-items:center;";
     const caption = document.createElement("span");
     caption.textContent = `${label}${required ? " *" : ""}`;
@@ -375,27 +379,6 @@ function disclosureGroup({ title, description = "", open = false,
     details.addEventListener("toggle", () => memory?.remember(key, details.open));
     details.append(summary, body);
     return { details, summary, body };
-}
-
-function makeMultiSelect(values, selected = []) {
-    const saved = new Set((Array.isArray(selected) ? selected : [])
-        .map(String).filter(Boolean));
-    const options = [...(values || [])];
-    for (const value of saved) {
-        if (!options.some(([known]) => String(known) === value)) {
-            options.push([value, `Unsupported saved value: ${value}`]);
-        }
-    }
-    const select = makeSelect(options, "");
-    select.multiple = true;
-    select.size = Math.min(6, Math.max(2, options.length));
-    [...select.options].forEach((option) => {
-        option.selected = saved.has(String(option.value));
-    });
-    if ([...saved].some((value) => !values.some(([known]) => String(known) === value))) {
-        select.dataset.sonderInvalid = "1";
-    }
-    return select;
 }
 
 export function identityRoutingProjection(profile = {}, placementPhases = []) {
@@ -551,7 +534,7 @@ export function promptReferenceAttachment(owner, profile = {}) {
 
 function openAttachmentTargetPicker({ scene, owner, onAttach, onClose, onError,
     profile = {}, references = [], semanticUnits = [], setupManifest = {},
-    disclosureMemory = null, confirmDismiss = null }) {
+    candidate = null, disclosureMemory = null, confirmDismiss = null }) {
     const opener = document.activeElement;
     const backdrop = document.createElement("div");
     backdrop.dataset.promptAttachmentTarget = "1";
@@ -590,6 +573,9 @@ function openAttachmentTargetPicker({ scene, owner, onAttach, onClose, onError,
     const fieldset = createReferenceOverrideFieldset({
         profile, references, semanticUnits, setupManifest,
         overrides: {}, selected: selection,
+        // Captured at open; unsaved choices here never move this preview.
+        taskTypePreview: captureTaskTypePreview(candidate),
+        showScenePreview: true,
         disclosureMemory, disclosureKey: "attach_overrides",
     });
     const fieldsetHost = document.createElement("div");
@@ -625,6 +611,7 @@ function openAttachmentTargetPicker({ scene, owner, onAttach, onClose, onError,
         if (event.target === backdrop && draftGuard.confirmDismiss()) close();
     });
     attach.addEventListener("click", async () => {
+        if (fieldset.validate()) return;
         setButtonDisabled(attach, true);
         const sectionMatch = String(target.value || "").match(/^section:(\d+)$/);
         try {
@@ -661,7 +648,7 @@ function openAttachmentTargetPicker({ scene, owner, onAttach, onClose, onError,
 
 function openIdentityEditor({ identity = null, seedSource = null, profile, references,
     semanticUnits, assets, disclosureMemory = null, placementPhases = [],
-    attachmentCount = 0,
+    attachmentCount = 0, candidate = null,
     confirmDismiss = null, onSave, onDelete, onClose, onError }) {
     const opener = document.activeElement;
     const backdrop = document.createElement("div");
@@ -766,9 +753,6 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
     }
     const taskDeclaration = referenceFieldDeclaration(
         profile, "summary", "task_types");
-    const taskTypesDefault = makeMultiSelect(
-        declaredFieldChoices(taskDeclaration).map((value) => [value.value, value.label]),
-        attachmentDefaults.task_types || []);
     const sourceMap = new Map((identity?.sources || []).map((source) => [
         `${source.entity_id}:${source.member_id}`, source,
     ]));
@@ -877,6 +861,50 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
     sourceSearch.addEventListener("input", filterSources);
     sourceRows.forEach((row) => row.enabled.addEventListener("change", filterSources));
     filterSources();
+    // Sparse like the chip: an identity with no stored list follows its
+    // members or the format, else staged roles, and saving it untouched keeps
+    // it that way. The automatic checks are the CURRENT scene's staged roles,
+    // since an identity is project-wide and roles are staged per window.
+    const taskTypeChoices = taskDeclaration ? createTaskTypeChoiceControl({
+        declaration: taskDeclaration,
+        label: String(taskDeclaration.label || "Summary task types"),
+        local: Object.hasOwn(attachmentDefaults, "task_types")
+            ? { present: true, value: attachmentDefaults.task_types }
+            : { present: false },
+        preview: captureTaskTypePreview(candidate),
+        automaticLabel: TASK_TYPE_PREVIEW_LABEL,
+        localLabel: "this identity",
+        inherited: () => {
+            // The tier below the identity: its contributing members, then
+            // the format. Resolved through the same browser mirror the chip
+            // uses, with this identity's own stored list set aside.
+            // Sources are the ones ticked in THIS dialog, so "Following" and
+            // "Returns to" track an unsaved source edit, and a new identity
+            // seeded from a member already inherits from it.
+            const unitId = String(identity?.semantic_unit_id || "draft-identity");
+            const below = [{
+                ...(identity || {}),
+                semantic_unit_id: unitId,
+                attachment_defaults: Object.fromEntries(Object.entries(
+                    attachmentDefaults).filter(([field]) => field !== "task_types")),
+                sources: sourceRows.filter((row) => row.enabled.checked)
+                    .map((row) => ({ entity_id: row.reference.reference_id,
+                        member_id: row.member.member_id })),
+            }];
+            const inherited = referencePromptDefaults(unitId, {
+                references, semanticUnits: below, profile,
+                capabilityKind: "summary",
+            });
+            return {
+                value: inherited.values?.task_types,
+                label: String(inherited.fieldSources?.task_types?.label
+                    || inherited.formatSource || ""),
+            };
+        },
+    }) : null;
+    const taskTypesDefault = taskTypeChoices?.element || null;
+    sourceRows.forEach((row) => row.enabled.addEventListener("change",
+        () => taskTypeChoices?.refresh()));
     // Temporary repair UI for project data authored before voice became a
     // normal physical source. Remove with the server tolerance after this
     // batch has been in use and this affordance stops appearing.
@@ -930,6 +958,14 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
             return false;
         }
         requiredNotice.style.display = "none";
+        const taskTypeRefusal = taskTypeChoices?.validate() || "";
+        taskTypeChoices?.showError(taskTypeRefusal);
+        if (taskTypeRefusal) {
+            // The group lives in a collapsed disclosure by default; a refusal
+            // the author cannot see reads as a Save button that does nothing.
+            advancedGroup.details.open = true;
+            return false;
+        }
         const nextAttachmentDefaults = { ...attachmentDefaults };
         if (derivedDeclarations.summary) {
             nextAttachmentDefaults.summary = summaryDefault.value;
@@ -942,10 +978,14 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
         if (derivedDeclarations.definitions) {
             nextAttachmentDefaults.audio_definition = audioDefinitionDefault.value;
         }
-        if (taskDeclaration) {
-            nextAttachmentDefaults.task_types = [
-                ...(taskTypesDefault.selectedOptions || []),
-            ].map((option) => option.value).filter(Boolean);
+        // Untouched, the stored key stays exactly as loaded — absent, empty or
+        // holding unsupported values — via the spread above.
+        if (taskTypeChoices?.isTouched()) {
+            if (taskTypeChoices.hasLocal()) {
+                nextAttachmentDefaults.task_types = taskTypeChoices.value();
+            } else {
+                delete nextAttachmentDefaults.task_types;
+            }
         }
         const next = {
             ...(identity || {}),
@@ -1090,11 +1130,12 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
         "Audio definition default", audioDefinitionDefault,
         { help: declarationGuidance(derivedDeclarations.definitions,
             "Inherited voice/audio definition for chips with no local override.") }));
-    if (taskDeclaration) {
+    if (taskTypesDefault) {
         advancedGroup.body.append(fieldRow(
             taskDeclaration.label || "Summary task types", taskTypesDefault, {
                 help: declarationGuidance(taskDeclaration,
                     "Format-declared Summary categories inherited by new chips."),
+                group: true,
             }));
     }
     const ownedDefaultFields = new Set([
@@ -1233,6 +1274,7 @@ export function mountPromptIdentityPanel(container, options = {}) {
         options.onModalStateChange?.(true);
         modalCleanup = openIdentityEditor({ identity, seedSource, profile,
             references, semanticUnits, assets, disclosureMemory,
+            candidate: options.currentCandidate?.() || candidate,
             placementPhases: options.catalog?.placement_phases || [],
             // How many attachments actually follow these defaults. The count is
             // what turns an abstract "defaults" group into a statement about
@@ -1250,10 +1292,14 @@ export function mountPromptIdentityPanel(container, options = {}) {
     const openAttach = (owner) => {
         modalCleanup?.();
         options.onModalStateChange?.(true);
+        // One snapshot for the whole dialog: the staged setup its fields
+        // inherit from and the task-type preview must describe one compile.
+        const openCandidate = options.currentCandidate?.() || candidate;
         modalCleanup = openAttachmentTargetPicker({
             scene: options.scene, owner,
             profile, references, semanticUnits,
-            setupManifest: candidate?.setup_manifest || {},
+            setupManifest: openCandidate?.setup_manifest || {},
+            candidate: openCandidate,
             disclosureMemory,
             confirmDismiss: options.confirm,
             onAttach: options.attachReference,

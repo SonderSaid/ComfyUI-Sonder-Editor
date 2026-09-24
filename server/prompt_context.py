@@ -5112,6 +5112,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             blocked_reference_attachments.update(new_blockers)
 
     prevalidated_prompt_token_diagnostics = set()
+    h3_task_type_preview = None
     if is_h3_reference_profile:
         # Only the Summary prefix is a singleton; prose belongs to each group.
         # Collect explicit selections after genuine attachment/source/config
@@ -5152,6 +5153,29 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         if has_explicit_summary_task_types:
             context["h3_summary_task_types"] = _minimax_task_types(
                 context, explicit_summary_task_types, resolved_profile)
+        # What the authoring surfaces show as automatic checks, from the SAME
+        # derivation and contributor walk the prefix uses, so a panel never
+        # re-derives roles on its own. `role_derived` ignores every explicit
+        # selection; `scene_effective` is what a live Summary prefix prints.
+        # Response-only: named in the freeze denylist and outside content_hash.
+        role_derived = _minimax_task_types(
+            {"setup_manifest": context.get("setup_manifest") or {}},
+            (), resolved_profile)
+        # "explicit" only when an explicit value survives the declared
+        # vocabulary: a chip holding nothing but unsupported values still
+        # leaves the prefix to staged roles, and must not be credited with it.
+        declared_task_types = {
+            choice["value"] for choice in declared_field_choices(
+                declared_reference_field(resolved_profile, "summary", "task_types"))}
+        explicit_decides = any(
+            value.lower() in declared_task_types
+            for value in explicit_summary_task_types)
+        h3_task_type_preview = {
+            "role_derived": role_derived,
+            "scene_effective": list(context.get(
+                "h3_summary_task_types", role_derived)),
+            "scene_source": "explicit" if explicit_decides else "roles",
+        }
         preflight_global_reference_render_blockers()
         candidate_keys = {(origin, attachment["attachment_id"])
                           for attachment, origin, *_ in dormant_candidates}
@@ -6586,6 +6610,11 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                      {"lines": [], "frozen_static": [], "frozen_ordinal": [],
                       "refused": "That capability is not staged in this scene."})
 
+    if h3_task_type_preview is not None and not any(h3_summary_prefixes.values()):
+        # No live Summary in this window, so no prefix printed: say so rather
+        # than advertise task types the prompt never carried.
+        h3_task_type_preview["scene_effective"] = []
+        h3_task_type_preview["scene_source"] = "none"
     result = {
         "format": FORMAT_VERSION,
         "prompt": final_prompt,
@@ -6630,6 +6659,10 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         # named in the freeze DENYLIST in `routes.py`, which excludes rather
         # than allows -- silence there puts a key in every frozen envelope.
         "section_window_states": section_window_states,
+        # Response-only authoring preview of H3 Summary task types; absent for
+        # every other format. Denylisted from the freeze beside the key above.
+        **({"h3_task_type_preview": h3_task_type_preview}
+           if h3_task_type_preview is not None else {}),
         # This is the compiler's effective-window speaker domain after section
         # holding, overlap resolution, clipping and boundary threshold. The UI
         # consumes it rather than approximating eligibility from authored bars.

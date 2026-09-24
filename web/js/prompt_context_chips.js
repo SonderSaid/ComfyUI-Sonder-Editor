@@ -21,6 +21,8 @@ import {
     referenceSelectionPopulation,
 } from "./prompt_profile_declarations.js";
 import { promptCandidateVisuallyStale } from "./prompt_context_diagnostics.js";
+import { captureTaskTypePreview,
+    createTaskTypeChoiceControl } from "./prompt_task_type_choices.js";
 
 /**
  * Context-chip role identity: the violet that marks an authored chip as a chip
@@ -1148,6 +1150,7 @@ export function resolveInheritedCapabilityEnabled(capabilityId, {
 export function referenceCapabilityInputProjection(capabilityKind, {
     selected = "", profile = {}, references = [], semanticUnits = [],
     overrides = {}, capabilityConfig = {}, setupManifest = {},
+    choiceDisplays = {},
 } = {}) {
     const kind = String(capabilityKind || "");
     const inherited = referencePromptDefaults(selected, {
@@ -1155,6 +1158,22 @@ export function referenceCapabilityInputProjection(capabilityKind, {
     });
     return referenceCapabilityValueFields(profile, kind).map((field) => {
         const declaration = referenceFieldDeclaration(profile, kind, field) || {};
+        // When staged roles decide, the raw tiers below hold nothing (or a
+        // stored empty list) and printed "(empty)" beside checks naming the
+        // automatic choice. Only that mode is restated; an authored or
+        // inherited value is already accurate here. A declared derivation is a
+        // format default, so it keeps the format rung.
+        const shown = choiceDisplays?.[field];
+        if (shown?.mode === "automatic") {
+            return {
+                field,
+                label: String(declaration?.label || REFERENCE_VALUE_LABELS[field] || field),
+                value: [...shown.values],
+                source: String(shown.label || ""),
+                tier: "format",
+                authored_empty: false,
+            };
+        }
         const capabilityOwns = Object.hasOwn(capabilityConfig || {}, field);
         const chipOwns = Object.hasOwn(overrides || {}, field);
         const source = capabilityOwns || chipOwns
@@ -3901,6 +3920,23 @@ function fieldRow(label, control, help = "", { visibleHelp = false } = {}) {
     return row;
 }
 
+/** `fieldRow`'s layout for a control that groups several inputs. */
+function groupRow(label, control, help = "") {
+    const row = document.createElement("div");
+    row.style.cssText = `display:grid;grid-template-columns:130px minmax(0,1fr);gap:8px;align-items:start;font:11px system-ui;color:${COLORS.text};`;
+    const title = document.createElement("span");
+    title.textContent = label;
+    if (help) title.title = help;
+    row.append(title, control);
+    if (help) {
+        const description = document.createElement("span");
+        description.textContent = help;
+        description.style.cssText = `grid-column:2;font:9px/1.35 system-ui;color:${COLORS.textDim};margin-top:-4px;`;
+        row.appendChild(description);
+    }
+    return row;
+}
+
 function textField(value = "", multiline = false) {
     const control = document.createElement(multiline ? "textarea" : "input");
     control.value = String(value ?? "");
@@ -4000,10 +4036,23 @@ export function createReferenceOverrideFieldset({
     profile = {}, references = [], semanticUnits = [], setupManifest = {},
     overrides = {}, selected = "", onOverrideChange = null,
     disclosureMemory = null, disclosureKey = "reference_overrides",
+    capabilityValues = {}, taskTypePreview = null, showScenePreview = false,
 } = {}) {
     const working = overrides && typeof overrides === "object"
         ? structuredClone(overrides) : {};
     const overriddenFields = new Set(Object.keys(working));
+    // Multi-choice fields render as checkboxes with their own automatic /
+    // customized state (`prompt_task_type_choices.js`). `capabilityValues`
+    // carries a legacy value stored on the capability record itself, which
+    // outranks the chip override: untouched it stays authoritative and
+    // unwritten; once edited it moves to the override, and the host deletes
+    // the capability key named by `clearedCapabilityFields()`.
+    const legacyCapabilityValues = capabilityValues && typeof capabilityValues === "object"
+        ? capabilityValues : {};
+    const choiceControls = new Map();
+    for (const field of Object.keys(legacyCapabilityValues)) {
+        overriddenFields.add(field);
+    }
     let currentSelection = String(selected || "");
     const populationForSelection = () =>
         referenceSelectionPopulation(profile, currentSelection);
@@ -4043,6 +4092,8 @@ export function createReferenceOverrideFieldset({
         return Object.hasOwn(values, field) ? values[field] : fallback;
     };
     const setControlValue = (field, control, value) => {
+        // A choice control resolves its own display from the tiers below.
+        if (choiceControls.has(field)) return;
         if (control.multiple) {
             const chosen = new Set((Array.isArray(value) ? value : [])
                 .map(String));
@@ -4053,36 +4104,66 @@ export function createReferenceOverrideFieldset({
         }
         control.value = String(value ?? "");
     };
-    const readControlValue = (field, control) => (control.multiple
-        ? [...(control.selectedOptions || [])]
-            .map((option) => option.value).filter(Boolean)
-        : control.value);
+    const readControlValue = (field, control) => {
+        if (choiceControls.has(field)) return choiceControls.get(field).value();
+        return control.multiple
+            ? [...(control.selectedOptions || [])]
+                .map((option) => option.value).filter(Boolean)
+            : control.value;
+    };
+
+    const buildChoiceControl = (field, declaration, label) => {
+        const legacy = Object.hasOwn(legacyCapabilityValues, field);
+        const local = legacy
+            ? { present: true, value: legacyCapabilityValues[field] }
+            : (Object.hasOwn(working, field)
+                ? { present: true, value: working[field] } : { present: false });
+        // The compiler previews Summary task types only; another multi-choice
+        // field gets checkboxes without a task-type preview or scene line.
+        const isTaskTypes = field === "task_types";
+        const choice = createTaskTypeChoiceControl({
+            declaration, local, label, localLabel: "this attachment",
+            preview: isTaskTypes ? taskTypePreview : null,
+            showScenePreview: isTaskTypes && showScenePreview,
+            inherited: () => {
+                const inherited = inheritedFor(field);
+                const source = inherited.fieldSources?.[field]
+                    || authoritySource(inherited.formatSource, "format");
+                return { value: inherited.values?.[field], label: source.label };
+            },
+            onChange: ({ reset = false } = {}) => {
+                if (choice.hasLocal()) overriddenFields.add(field);
+                else overriddenFields.delete(field);
+                applyDisclosure();
+                // A collapsed fieldset hides a row that stopped overriding,
+                // taking the focused Reset/Customize with it.
+                if (reset && rows.get(field)?.style.display === "none") {
+                    summaryToggle.focus?.();
+                }
+                onOverrideChange?.(field);
+            },
+        });
+        choiceControls.set(field, choice);
+        return choice.element;
+    };
 
     const buildControl = (field, declaration) => {
         if (REFERENCE_ENUM_FIELDS.has(field)) {
             if (!declaration) return null;
+            if (declaration.type === "enum_multi") {
+                return buildChoiceControl(field, declaration, String(
+                    declaration?.label || REFERENCE_VALUE_LABELS[field] || field));
+            }
             const inheritLabel = REFERENCE_INHERIT_CHOICE_FIELDS.has(field)
                 ? "Inherit staged/entity default" : "";
-            const selectedValue = effectiveValue(field,
-                declaration.type === "enum_multi" ? [] : "");
+            const selectedValue = String(effectiveValue(field, "") ?? "");
             const choices = declaredFieldChoices(declaration)
                 .map((entry) => [entry.value, entry.label]);
-            const saved = new Set((Array.isArray(selectedValue)
-                ? selectedValue : [selectedValue]).map(String).filter(Boolean));
-            for (const value of saved) {
-                if (!choices.some(([known]) => known === value)) {
-                    choices.push([value, `Unsupported saved value: ${value}`]);
-                }
+            if (selectedValue && !choices.some(([known]) => known === selectedValue)) {
+                choices.push([selectedValue, `Unsupported saved value: ${selectedValue}`]);
             }
             if (inheritLabel) choices.unshift(["", inheritLabel]);
-            const control = selectField(choices,
-                Array.isArray(selectedValue) ? "" : selectedValue);
-            if (declaration.type === "enum_multi") {
-                control.multiple = true;
-                control.size = Math.min(6, Math.max(2, choices.length));
-                setControlValue(field, control, selectedValue);
-            }
-            return control;
+            return selectField(choices, selectedValue);
         }
         return textField(effectiveValue(field),
             REFERENCE_MULTILINE_FIELDS.has(field));
@@ -4149,6 +4230,16 @@ export function createReferenceOverrideFieldset({
             const help = String(declaration?.help
                 || capabilityDeclaration?.help || "");
 
+            if (choiceControls.has(field)) {
+                // The control carries its own state line, Customize and Reset,
+                // so it takes none of the generic row chrome. A `div`, not the
+                // `<label>` of `fieldRow`: a label activates its first
+                // labelable descendant, so clicking the title would press
+                // Customize or toggle the first checkbox.
+                rows.set(field, groupRow(label, control, help));
+                continue;
+            }
+
             const wrapper = document.createElement("div");
             wrapper.style.cssText = "display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px;align-items:start;";
             const reset = document.createElement("button");
@@ -4205,7 +4296,16 @@ export function createReferenceOverrideFieldset({
     summaryText.style.cssText = `font:9px/1.35 system-ui;color:${COLORS.textSecondary};min-width:0;`;
     const summaryToggle = chipButton("", "", { padding: "3px 7px" });
     summaryToggle.style.flex = "0 0 auto";
-    summaryRow.append(summaryText, summaryToggle);
+    // Task types decide the Summary prefix for the whole scene, so a collapsed
+    // fieldset still states them in one line instead of folding them into the
+    // count of following fields.
+    const summaryBody = document.createElement("div");
+    summaryBody.style.cssText = "display:flex;flex-direction:column;gap:2px;min-width:0;";
+    const compactChoices = document.createElement("span");
+    compactChoices.dataset.sonderCompactTaskTypes = "1";
+    compactChoices.style.cssText = `font:9px/1.35 system-ui;color:${COLORS.textSecondary};min-width:0;overflow-wrap:anywhere;`;
+    summaryBody.append(summaryText, compactChoices);
+    summaryRow.append(summaryBody, summaryToggle);
 
     const inheritingFields = () => fields.filter((field) =>
         fieldApplicability(field).applicable && !overriddenFields.has(field));
@@ -4257,6 +4357,12 @@ export function createReferenceOverrideFieldset({
         summaryToggle.title = expanded
             ? "Collapse the fields that are following their default."
             : "Show every declared field so one can be overridden.";
+        const collapsedChoices = [...choiceControls].filter(([field]) =>
+            rows.get(field)?.style.display === "none"
+            && fieldApplicability(field).applicable);
+        compactChoices.textContent = collapsedChoices
+            .map(([, choice]) => choice.compactSummary()).join("\n");
+        compactChoices.style.display = collapsedChoices.length ? "block" : "none";
         summaryRow.style.display = following.length ? "flex" : "none";
     };
     summaryToggle.addEventListener("click", () => {
@@ -4265,6 +4371,17 @@ export function createReferenceOverrideFieldset({
         applyDisclosure();
     });
     applyDisclosure();
+
+    // An UNTOUCHED choice writes nothing, so the stored override — present,
+    // absent, empty, or holding unsupported values — survives byte for byte,
+    // and a legacy capability-level value is never copied down into it.
+    const applyChoiceDrafts = (target) => {
+        for (const [field, choice] of choiceControls) {
+            if (!choice.isTouched()) continue;
+            if (choice.hasLocal()) target[field] = choice.value();
+            else delete target[field];
+        }
+    };
 
     return {
         fields,
@@ -4283,22 +4400,42 @@ export function createReferenceOverrideFieldset({
             return Boolean(row);
         },
         isOverridden: (field) => overriddenFields.has(field),
+        /**
+         * What a choice control currently shows, so a second readout of the
+         * same field (the routing block's input lines) cannot contradict it.
+         */
+        choiceDisplay: (field) => {
+            const choice = choiceControls.get(field);
+            if (!choice) return null;
+            return { values: choice.displayedValues(), label: choice.modeLabel(),
+                mode: choice.mode() };
+        },
         /** Current authored-or-inherited value, for live effective projections. */
-        draftValue: (field) => (controls.has(field)
-            ? readControlValue(field, controls.get(field))
-            : working[field]),
+        draftValue: (field) => {
+            if (choiceControls.has(field)) {
+                return choiceControls.get(field).displayedValues();
+            }
+            return controls.has(field)
+                ? readControlValue(field, controls.get(field))
+                : working[field];
+        },
         draftOverrides: () => {
             const draft = { ...working };
             for (const field of overriddenFields) {
-                if (controls.has(field)) {
+                if (controls.has(field) && !choiceControls.has(field)) {
                     draft[field] = readControlValue(field, controls.get(field));
                 }
             }
+            applyChoiceDrafts(draft);
             return draft;
         },
         refresh: (nextSelected = currentSelection) => {
             currentSelection = String(nextSelected || "");
             for (const [field, control] of controls) {
+                if (choiceControls.has(field)) {
+                    choiceControls.get(field).refresh();
+                    continue;
+                }
                 if (!overriddenFields.has(field)) {
                     setControlValue(field, control, effectiveValue(field,
                         control.multiple ? [] : ""));
@@ -4308,18 +4445,37 @@ export function createReferenceOverrideFieldset({
             applyDisclosure();
         },
         /**
+         * Capability-level keys the save must delete: a legacy value the author
+         * edited (it moved to the override) or reset.
+         */
+        clearedCapabilityFields: () => [...choiceControls]
+            .filter(([field, choice]) => choice.isTouched()
+                && Object.hasOwn(legacyCapabilityValues, field))
+            .map(([field]) => field),
+        /** `[field, message]` for the first control refusing its draft, or null. */
+        validate: () => {
+            for (const [field, choice] of choiceControls) {
+                const message = choice.validate();
+                choice.showError(message);
+                if (message) return [field, message];
+            }
+            return null;
+        },
+        /**
          * Sparse overrides for the save. Derived from the SAME control map the
          * rows came from — reading a fixed field list here is what let a
          * declaration-gated control be dereferenced when absent.
          */
         collect: () => {
             for (const field of REFERENCE_OVERRIDE_FIELDS) {
+                if (choiceControls.has(field)) continue;
                 if (overriddenFields.has(field) && controls.has(field)) {
                     working[field] = readControlValue(field, controls.get(field));
                 } else if (!overriddenFields.has(field)) {
                     delete working[field];
                 }
             }
+            applyChoiceDrafts(working);
             return working;
         },
     };
@@ -4810,10 +4966,22 @@ export function configurePromptAttachment(rawAttachment, {
                     controls.reference.options[index].disabled = value[2] === false;
                 }
             });
+            // A task-type list stored on the Summary capability record predates
+            // chip overrides and outranks them; the fieldset keeps it
+            // authoritative until the author edits or resets it.
+            const legacySummaryTaskTypes = (attachment.capabilities || []).find(
+                (value) => String(value?.kind || value?.capability_id || "")
+                    === "summary")?.config?.task_types;
             const referenceFieldset = createReferenceOverrideFieldset({
                 profile: resolvedProfile, references, semanticUnits,
                 setupManifest: candidate?.setup_manifest || {},
                 overrides: attachment.config.overrides,
+                capabilityValues: Array.isArray(legacySummaryTaskTypes)
+                    ? { task_types: legacySummaryTaskTypes } : {},
+                // Captured once, at open: the automatic checks and the
+                // scene-wide line describe the last compile, never this draft.
+                taskTypePreview: captureTaskTypePreview(candidate),
+                showScenePreview: true,
                 selected: controls.reference.value,
                 onOverrideChange: () => refreshCapabilityEffectiveValues(),
                 // Browser-local presentation state, like every other disclosure
@@ -5224,12 +5392,20 @@ export function configurePromptAttachment(rawAttachment, {
                         compiledLine.append(compiledLabel, compiledValue, compiledSource);
                         effective.appendChild(compiledLine);
                         const draftOverrides = referenceFieldset.draftOverrides();
+                        const draftCapabilityConfig = { ...(current.config || {}) };
+                        for (const field of referenceFieldset.clearedCapabilityFields()) {
+                            delete draftCapabilityConfig[field];
+                        }
                         const values = referenceCapabilityInputProjection(
                             capabilityId, {
                                 selected: controls.reference.value,
                                 profile: resolvedProfile, references, semanticUnits,
                                 overrides: draftOverrides,
-                                capabilityConfig: current.config || {},
+                                capabilityConfig: draftCapabilityConfig,
+                                choiceDisplays: Object.fromEntries(
+                                    ["task_types"].map((field) => [field,
+                                        referenceFieldset.choiceDisplay(field)])
+                                        .filter(([, shown]) => shown)),
                                 setupManifest: candidate?.setup_manifest || {},
                             });
                         if (!values.length) {
@@ -5433,6 +5609,7 @@ export function configurePromptAttachment(rawAttachment, {
                 attachment.source.subject_ids = distinctSubjectIds;
             } else if (attachment.kind === "reference") {
                 if (!controls.reference.value) return;
+                if (controls.referenceFieldset.validate()) return;
                 // Eligibility gates new bindings, not edits to a saved chip.
                 // Inactive References still need editable prose policy; source
                 // deletion/format errors remain the compiler's responsibility.
@@ -5466,8 +5643,24 @@ export function configurePromptAttachment(rawAttachment, {
                 // declaration gate had legitimately never created, throwing
                 // inside this handler and losing the chip with no message.
                 attachment.config.overrides = controls.referenceFieldset.collect();
+                const clearedCapabilityFields =
+                    controls.referenceFieldset.clearedCapabilityFields();
+                // Only the edited key leaves the capability record; the rest of
+                // its config is the author's and stays.
+                const withoutClearedFields = (current) => {
+                    if (!clearedCapabilityFields.length
+                            || String(current?.kind || current?.capability_id || "")
+                                !== "summary"
+                            || !current?.config || typeof current.config !== "object") {
+                        return current;
+                    }
+                    const config = { ...current.config };
+                    for (const field of clearedCapabilityFields) delete config[field];
+                    return { ...current, config };
+                };
                 attachment.capabilities = [...(controls.capabilityRows?.entries() || [])]
-                    .map(([capabilityId, row]) => sparseCapabilityRecord(row.current, {
+                    .map(([capabilityId, row]) => sparseCapabilityRecord(
+                        withoutClearedFields(row.current), {
                         capabilityId,
                         enabled: row.checkbox.checked,
                         inheritedEnabled: row.inheritedEnabled,

@@ -3645,6 +3645,9 @@ Server value: ${serverValue}` : ""}`;
         };
         identityPanelCleanup = mountPromptIdentityPanel(card, {
             candidate,
+            // Read when a modal OPENS: the task-type preview must describe the
+            // latest compile, not the one this panel happened to mount with.
+            currentCandidate: () => currentCandidatePayload() || candidate,
             scene,
             profile: identityProfile,
             catalog: host._promptContextCatalog || {},

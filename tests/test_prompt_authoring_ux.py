@@ -490,8 +490,9 @@ const after=sourceRows.map((row)=>row.style.display || "");
 const routing=nodes.filter((n)=>n.dataset.sonderIdentityRoutingKind).map((n)=>({
   kind:n.dataset.sonderIdentityRoutingKind, text:text(n).replace(/\s+/g," ").trim(),
 }));
-const taskSelect=nodes.find((n)=>n.tagName==="SELECT" && n.multiple);
-const taskLabels=taskSelect.options.map((option)=>option.textContent);
+const taskGroup=nodes.find((n)=>n.dataset.sonderTaskTypeChoices);
+const taskLabels=walk(taskGroup).filter((n)=>n.tagName==="LABEL")
+  .map((n)=>n.children[1]?.textContent || "");
 const routingTitles=nodes.filter((n)=>n.dataset.sonderIdentityRoutingKind)
   .map((n)=>n.title || "");
 const definitionControl=nodes.find((n)=>n.tagName==="TEXTAREA"
@@ -500,9 +501,15 @@ const save=nodes.find((n)=>n.tagName==="BUTTON" && n.textContent==="Save identit
 await save._handlers.click[0]();
 const required=nodes.find((n)=>n.dataset.sonderIdentityRequired);
 const requiredFailure={display:required.style.display,text:required.textContent};
+// Read HERE: Customize below legitimately moves focus to the first checkbox.
+const requiredFocus=globalThis.document.activeElement?.placeholder || "";
 const name=nodes.find((n)=>n.tagName==="INPUT" && n.placeholder==="Identity name");
 name.value="Edited subject";
-taskSelect.options.find((option)=>option.value==="video editing").selected=true;
+walk(taskGroup).find((n)=>n.tagName==="BUTTON"
+  && n.textContent==="Customize")._handlers.click[0]();
+const videoBox=walk(taskGroup).find((n)=>n.tagName==="INPUT"
+  && n.value==="video editing");
+videoBox.checked=true; videoBox._handlers.change[0]();
 await save._handlers.click[0]();
 const baseRoot=new N("div"); let baseUnits=[];
 mod.mountPromptIdentityPanel(baseRoot, {
@@ -534,13 +541,13 @@ const escapeEvent={key:"Escape",isComposing:false,keyCode:27,
 windowHandlers.keydown[0](escapeEvent);
 console.log(JSON.stringify({details,kindHelp,before,after,routing,taskLabels,saves,
   routingTitles,definitionTitle:definitionControl.title || "",
-  taskTitle:taskSelect.title || "",
+  taskTitle:taskGroup.title || "",
   requiredFailure,savedTaskTypes:savedUnits[0]?.attachment_defaults?.task_types || [],
   baseLabels,baseDefaults:baseIdentity.attachment_defaults || {},
   baseHasVisual:Object.hasOwn(baseIdentity,"visual_intent"),
   baseHasAudio:Object.hasOwn(baseIdentity,"audio_intent"),
   dialogAttrs,escapeClosed:!globalThis.document.body.children.includes(escapeModal),
-  focused:globalThis.document.activeElement?.placeholder || ""}));
+  focused:requiredFocus}));
 """.replace("__MODULE__", json.dumps(module_url)).replace(
         "__PROFILE__", json.dumps(profile))
     result = json.loads(subprocess.run(

@@ -1164,9 +1164,11 @@ def test_reference_chip_save_preserves_task_types_without_or_beyond_vocabulary()
                 scene: sceneFor(profileId, attachment.capabilities[0].kind),
                 profileId, profile, placementPhases: phases,
             });
-            const unsupported = document.body.querySelectorAll("option")
-                .filter((option) => option.textContent.startsWith("Unsupported saved value:"))
-                .map((option) => option.textContent);
+            // Task types render as checkboxes; a saved value outside the
+            // declared vocabulary is a checked row naming itself unsupported.
+            const unsupported = document.body.querySelectorAll("span")
+                .filter((span) => span.textContent.startsWith("Unsupported saved value:"))
+                .map((span) => span.textContent);
             const attach = document.body.querySelectorAll("button")
                 .find((button) => button.textContent === "Attach");
             attach._handlers.click[0]();

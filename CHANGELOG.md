@@ -18,6 +18,7 @@ version-bumping save. Format-1 projects keep their format until a history edit, 
 following save.
 
 ### Changed
+- MiniMax H3 Summary task types are now checkboxes in the identity editor, the Attach dialog and the chip editor, and they show the choices currently in effect. A choice inherited from an identity or member, or derived from staged Roles, appears checked and labelled with where it comes from; opening and saving a dialog no longer turns it into a stored choice that stops following the roles. **Customize** makes the checks editable and **Reset to inherited** returns to the automatic choice. The Attach dialog and the chip editor also show the scene-wide task types from the last compile, and a collapsed attachment still states its task types in one line.
 - Inspecting an asset no longer reloads the whole asset list first. Its generation details load on their own, and the next 50 assets in the order you are moving through them — the gallery list, the inspector, or the active compare side — load in the background, so stepping through a large gallery shows metadata without waiting. Assets that arrive while a gallery is open, such as a finished take, have their details loaded as they appear. Three new Asset Gallery settings control this: **Preload Following Assets**, **Preload New Assets** and **Max Cached Provenance Details**.
 - `tracked:` and `field:` searches, in the gallery and in both compare pickers, no longer reload the asset list, skip assets that have no generation details, and reuse whatever is already loaded. On a large project the first such search is noticeably faster, and a repeated one makes no requests at all.
 - Linking and unlinking timeline items now updates group badges immediately, with canonical Undo baselines and recovery for failed queued edits.
@@ -33,6 +34,7 @@ following save.
 - The standalone `DELETE` routes for clips, guides, prompt sections and audio tracks. These operations are owned by the scene mutations endpoint, which accepts an identity snapshot of the target that the old routes could not send, and which rewrites the link groups they left behind.
 
 ### Fixed
+- Saving a prompt identity no longer stores an empty Summary task-type list when none was chosen. The empty list made the identity's attachments ignore task types set on its physical References. An identity saved that way by an earlier version keeps its list until you press **Reset to inherited** in its Summary task types.
 - A `tracked:` or `field:` search no longer shows a partial list while metadata is still loading. It says it is loading until every asset can be searched, in the folder view as well, and offers Retry if loading fails.
 - Metadata that fails to load for an asset now offers Retry, and one unreadable asset no longer stops the details of the assets loaded alongside it.
 - The Prompt, Guides and Reference Lane panels now update as soon as Undo, Redo or another save changes what they show, and never while you are typing in them.

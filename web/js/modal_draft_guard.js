@@ -25,6 +25,12 @@
 export function readDraftSnapshot(controls) {
     return (Array.isArray(controls) ? controls : []).map((control) => {
         if (!control) return "";
+        // A composite control states its own draft, when its authored state is
+        // more than its visible values (the task-type checkboxes' automatic vs
+        // customized mode).
+        if (typeof control.draftSignature === "function") {
+            return control.draftSignature();
+        }
         if (control.type === "checkbox") return control.checked ? "1" : "0";
         if (Array.isArray(control.selectedOptions)) {
             return control.selectedOptions.map((option) => option.value).join("\u0000");
