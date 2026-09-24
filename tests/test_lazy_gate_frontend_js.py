@@ -1,6 +1,7 @@
 """Sonder Gate frontend shape and advisories; live ECS behavior is a manual row."""
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -136,43 +137,67 @@ for (const [id, link] of graph.links) {
     if (link.origin_id === gate.id) assert.ok(gate.outputs[link.origin_slot].links.includes(id));
 }
 
-// 5. Paste order: the host configures a saved shape with links detached, then
-//    reconnects one link at a time outside configuringGraph, possibly with
-//    queued work running in between. Nothing may trim before a later connect.
+// The host's configure merges saved slots into the full schema (it never
+// restores the trimmed shape) and copies properties. One frame later it
+// refreshes MatchType inputs, firing link-less connected=false events.
+const hostConfigure = (n, saved) => {
+    n.inputs = fullInputs();
+    n.outputs = fullOutputs();
+    n.properties = {...(saved.properties || {})};
+    n.onConfigure?.(saved);
+};
+const hostFrameRefresh = (n) => {
+    for (const [index, slot] of n.inputs.entries()) {
+        if (slot.name.startsWith('value_')) n.onConnectionsChange?.(1, index, slot.link != null, undefined, slot);
+    }
+};
+assert.equal(gate.properties.sonderGateLanes, 3, 'the shown lane count is saved');
+
+// 5. Paste: configure restores 16 lanes, links replay one at a time with
+//    queued work and frame refreshes running in between. No lane below the
+//    saved floor may disappear before its link returns.
 const pasted = makeGate(2);
 extension.nodeCreated(pasted);
-pasted.inputs = pasted.inputs.slice(0, 10);   // saved shape: lanes A..E
-pasted.outputs = pasted.outputs.slice(0, 5);
-pasted.onConfigure?.({});
-flush();
-assert.equal(pasted.outputs.length, 5, 'a configured node never trims without a disconnect');
+hostConfigure(pasted, {properties: {sonderGateLanes: 5}});
 const sources = [20, 21, 22, 23].map((id) => makeNode(id, 'ImageScale', ['image'], ['IMAGE']));
-const inputIndexBefore = names(pasted.inputs);
 for (const [lane, src] of [[3, sources[3]], [0, sources[0]], [2, sources[2]], [1, sources[1]]]) {
-    connect(src, 'IMAGE', pasted, `value_${L(lane)}`);
+    hostFrameRefresh(pasted);
     flush();
+    assert.ok(pasted.outputs.length >= 5, 'never below the saved floor mid-replay');
+    connect(src, 'IMAGE', pasted, `value_${L(lane)}`);
 }
-assert.deepEqual(names(pasted.inputs), inputIndexBefore);
+hostFrameRefresh(pasted);
+flush();
+assert.deepEqual(names(pasted.outputs), ['A', 'B', 'C', 'D', 'E']);
 for (const [lane, src] of [[0, sources[0]], [1, sources[1]], [2, sources[2]], [3, sources[3]]]) {
     const link = graph.links.get(src.outputs[0].links[0]);
     assert.equal(pasted.inputs[link.target_slot].name, `value_${L(lane)}`);
 }
 
-// 6. A saved graph restores untouched while configuringGraph is set, then only
-//    relabels; afterConfigureGraph walks subgraphs too.
+// 6. Reload: nothing reshapes while configuringGraph is set; afterConfigureGraph
+//    trims the host's 16 lanes back to the saved floor and relabels. Link-less
+//    frame refreshes never lower the floor; a real disconnect does.
 const restored = makeGate(3);
 extension.nodeCreated(restored);
-restored.inputs = restored.inputs.slice(0, 6);
-restored.outputs = restored.outputs.slice(0, 3);
 app.configuringGraph = true;
-restored.onConfigure?.({});
+hostConfigure(restored, {properties: {sonderGateLanes: 3}});
 connect(sources[0], 'IMAGE', restored, 'value_B');
-assert.equal(restored.outputs[1].label, undefined, 'no reshape while configuring');
+flush();
+assert.equal(restored.outputs.length, 16, 'no reshape while configuring');
 app.configuringGraph = false;
 extension.afterConfigureGraph();
-flush();
 assert.deepEqual(names(restored.outputs), ['A', 'B', 'C']);
 assert.equal(outLabel(restored, 'B'), 'B: IMAGE (no condition)');
+hostFrameRefresh(restored);
+flush();
+assert.deepEqual(names(restored.outputs), ['A', 'B', 'C']);
+connect(sources[1], 'IMAGE', restored, 'value_C');
+flush();
+assert.deepEqual(names(restored.outputs), ['A', 'B', 'C', 'D']);
+disconnect(restored, 'value_C');
+flush();
+assert.deepEqual(names(restored.outputs), ['A', 'B', 'C']);
+assert.equal(restored.properties.sonderGateLanes, 3);
 console.log('ok');
 """
 
@@ -192,3 +217,19 @@ def test_gate_shape_advisories_and_paste_order(in_subgraph):
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "ok"
+
+
+def test_gate_lane_limit_matches_backend():
+    python_source = (ROOT / "nodes/lazy_switches.py").read_text(encoding="utf-8")
+    js_source = (ROOT / "web/js/lazy_switch_nodes.js").read_text(encoding="utf-8")
+    lanes = int(re.search(r"^MAX_GATE_LANES = (\d+)$", python_source, re.M).group(1))
+
+    assert int(re.search(r"^const MAX_GATE_LANES = (\d+);$", js_source, re.M).group(1)) == lanes
+    last_letter = chr(ord("A") + lanes - 1)
+    assert f"/^(when|value)_([A-{last_letter}])$/" in js_source
+
+
+def test_consumer_requirement_module_stays_free_of_host_imports():
+    source = (ROOT / "web/js/consumer_input_requirements.js").read_text(encoding="utf-8")
+    assert not re.search(r"^import ", source, re.M)
+    assert not re.search(r"\b(document|window)\.", source)

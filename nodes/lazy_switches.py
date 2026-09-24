@@ -12,7 +12,7 @@ try:
 except ImportError as exc:  # pragma: no cover - depends on installed ComfyUI version
     # Only a missing versioned API falls back; an unrelated broken import inside
     # ComfyUI must surface instead of being masked by the fallback.
-    if exc.name not in {"comfy_api.v0_0_2", "comfy_api"}:
+    if exc.name not in {"comfy_api.v0_0_2", "comfy_api.latest", "comfy_api"}:
         raise
     from comfy_api.latest import io
 
@@ -358,14 +358,17 @@ _UNWIRED = object()
 def _gate_open(condition: Any = _UNWIRED) -> bool:
     """Whether a Gate lane passes its value.
 
-    Unwired, None, False and a zero number close the lane. Anything else opens
-    it; tensors and containers are presence, so bool() never touches them.
+    Unwired, None, False and a zero number close the lane, including a numpy
+    or tensor scalar. Anything else opens it: strings, containers and
+    multi-element tensors are presence, so bool() never touches them.
     """
     if condition is _UNWIRED or condition is None:
         return False
+    if getattr(condition, "ndim", None) == 0 and callable(getattr(condition, "item", None)):
+        condition = condition.item()
     if isinstance(condition, bool):
         return condition
-    if isinstance(condition, numbers.Real):
+    if isinstance(condition, numbers.Number):
         return condition != 0
     return True
 
@@ -386,7 +389,8 @@ class SonderGate(io.ComfyNode):
                     cls._when_name(lane_idx),
                     optional=True,
                     tooltip=(
-                        "Lane condition. Unwired, None, false or 0 closes the lane; anything else opens it. "
+                        "Lane condition. Unwired, None, false or a zero number closes the lane; anything else, "
+                        "including any string or image, opens it. "
                         "Wire the source (a Reference Bridge slot set to 'nothing', or has_reference), "
                         "never the chain feeding 'value' — that would run the chain first."
                     ),

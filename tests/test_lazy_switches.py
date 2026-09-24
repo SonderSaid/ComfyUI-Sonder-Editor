@@ -3,6 +3,7 @@
 import importlib
 import sys
 import types
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -106,10 +107,21 @@ def test_gate_condition_rule():
     gate_open = lazy._gate_open
 
     assert gate_open() is False  # unwired
-    for closed in (None, False, 0, 0.0):
+    for closed in (None, False, 0, 0.0, Decimal(0), 0j):
         assert gate_open(closed) is False, closed
-    for opened in (True, 1, -1, 0.5, "", "text", [], {}, {"waveform": 1}, _TensorLike()):
+    for opened in (True, 1, -1, 0.5, "", "false", "0", [], {}, {"waveform": 1}, _TensorLike()):
         assert gate_open(opened) is True, opened
+
+
+def test_gate_condition_unwraps_numpy_and_tensor_scalars():
+    lazy = _import_lazy_switches()
+    np = pytest.importorskip("numpy")
+    torch = pytest.importorskip("torch")
+
+    for closed in (np.bool_(False), np.int64(0), np.float32(0), torch.tensor(False), torch.tensor(0)):
+        assert lazy._gate_open(closed) is False, closed
+    for opened in (np.bool_(True), np.int64(2), torch.tensor(1.5), torch.zeros(2, 2), np.zeros(3)):
+        assert lazy._gate_open(opened) is True, opened
 
 
 def test_gate_schema_declares_paired_lanes_and_outputs():

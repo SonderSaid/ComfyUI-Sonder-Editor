@@ -420,14 +420,21 @@ const installNodeBehavior = (node) => {
 //
 // The backend tuple is fixed. Lanes auto-extend to the highest connected lane
 // plus one spare, and only the canonical tail is ever removed, so no surviving
-// slot index shifts (the host resolves links by index). Removal happens only
-// for a fresh node or after an explicit disconnect settles: paste, duplicate
-// and subgraph convert reconnect links one at a time outside configuringGraph,
-// and trimming between those connects would drop links aimed at later lanes.
+// slot index shifts (the host resolves links by index).
+//
+// Restore does not carry the trimmed shape: the host's configure merges saved
+// slots into the full 16-lane schema, and paste, duplicate and subgraph convert
+// then reconnect links one at a time outside configuringGraph. So the shown
+// lane count is saved as a workflow property. A settle trims to that floor
+// (never below it), which cannot strand a link still being replayed, and only
+// a real disconnect (one carrying its link) lowers the floor. The host also
+// emits link-less "disconnected" events for unwired MatchType inputs on the
+// next frame; those are not user disconnects and are ignored.
 
 const TARGET_GATE = "SonderGate";
 const MAX_GATE_LANES = 16;
 const GATE_STATE = Symbol("sonderGateState");
+const GATE_FLOOR_PROPERTY = "sonderGateLanes";
 const GATE_REQUIRED_SUFFIX = " (feeds required input)";
 const GATE_NO_CONDITION_SUFFIX = " (no condition)";
 
@@ -464,8 +471,7 @@ const getGateState = (node) => {
         node[GATE_STATE] = {
             meta,
             initialized: false,
-            configured: false,
-            shrinkPending: false,
+            userDisconnected: false,
             settleQueued: false,
         };
     }
@@ -561,18 +567,28 @@ const labelGateSlots = (node) => {
     return changed;
 };
 
-const gateTargetLanes = ({ shown, ceiling, mayShrink }) => {
-    const desired = Math.min(MAX_GATE_LANES, Math.max(1, ceiling + 2));
-    return mayShrink ? desired : Math.max(shown, desired);
+const clampLanes = (value) => Math.min(MAX_GATE_LANES, Math.max(1, Math.trunc(Number(value)) || 1));
+
+const readGateFloor = (node) => clampLanes(node.properties?.[GATE_FLOOR_PROPERTY] ?? 1);
+
+const writeGateFloor = (node, lanes) => {
+    node.properties = node.properties || {};
+    if (node.properties[GATE_FLOOR_PROPERTY] !== lanes) node.properties[GATE_FLOOR_PROPERTY] = lanes;
 };
 
 const ensureGateShape = (node, { settle = false } = {}) => {
     if (app.configuringGraph) return;
     const state = getGateState(node);
-    const shown = gateShownLanes(node);
-    const mayShrink = settle && (!state.configured || state.shrinkPending);
-    if (settle) state.shrinkPending = false;
-    const target = gateTargetLanes({ shown, ceiling: gateConnectedCeiling(node), mayShrink });
+    const desired = clampLanes(gateConnectedCeiling(node) + 2);
+    if (settle && state.userDisconnected) {
+        state.userDisconnected = false;
+        writeGateFloor(node, 1);
+    }
+    const floor = Math.max(readGateFloor(node), desired);
+    // Between settles only grow: a replay may still be reconnecting, and the
+    // host may have restored lanes above the floor that a settle will trim.
+    const target = settle ? floor : Math.max(gateShownLanes(node), desired);
+    writeGateFloor(node, floor);
     let changed = false;
 
     // Grow in canonical order: appended slots land at the tail, after every
@@ -604,7 +620,9 @@ const ensureGateShape = (node, { settle = false } = {}) => {
 
     if (!changed) return;
     if (typeof node.computeSize === "function" && typeof node.setSize === "function") {
-        node.setSize(node.computeSize());
+        const [width, height] = node.computeSize();
+        // Keep a user's wider node; the height follows the lane count.
+        node.setSize([Math.max(width, Number(node.size?.[0]) || 0), height]);
     }
     node.setDirtyCanvas?.(true, true);
 };
@@ -624,18 +642,12 @@ const installGateBehavior = (node) => {
     if (state.initialized) return;
     state.initialized = true;
 
-    const originalOnConfigure = node.onConfigure;
-    node.onConfigure = function (...args) {
-        // A configured node carries a saved or pasted shape; only an explicit
-        // disconnect may shrink it from now on.
-        state.configured = true;
-        return originalOnConfigure?.apply(this, args);
-    };
-
     const originalOnConnectionsChange = node.onConnectionsChange;
     node.onConnectionsChange = function (...args) {
         const result = originalOnConnectionsChange?.apply(this, args);
-        if (args[2] === false) state.shrinkPending = true;
+        // (type, slot, connected, linkInfo): only a removal naming its link is
+        // a real disconnect; the host's per-frame type refresh passes none.
+        if (args[2] === false && args[3] != null) state.userDisconnected = true;
         ensureGateShape(this);
         queueGateSettle(this);
         return result;
@@ -666,7 +678,7 @@ app.registerExtension({
         for (const graph of graphs) {
             for (const node of graph?._nodes || []) {
                 if (isTargetNode(node)) ensureNodeShape(node);
-                if (isGateNode(node)) ensureGateShape(node);
+                if (isGateNode(node)) ensureGateShape(node, { settle: true });
             }
         }
     },
