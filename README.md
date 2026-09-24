@@ -1,6 +1,6 @@
 # ComfyUI-Sonder-Editor
 
-**Version 0.5.0** — see the [CHANGELOG](CHANGELOG.md) for release notes.
+**Version 0.6.0** — see the [CHANGELOG](CHANGELOG.md) for release notes.
 
 Sonder Editor is a timeline-based video editor for ComfyUI, built for iterative
 long-form generation. Arrange scenes, clips, audio, guide frames and prompts on
@@ -59,8 +59,8 @@ and viewport preview.</em></p>
 
 Three techniques from the same project, run through the same workflow. Each clip
 shows the timeline alongside the result it produced. You can explore those scenes
-in **Project-Sample**, listed under **Project Sample — LTX 2.3** on
-[Hugging Face](https://huggingface.co/datasets/SonderSaid/Sonder-Editor-Projects),
+in **Project-Sample**, listed under
+[**Project Sample — LTX 2.3**](https://huggingface.co/datasets/SonderSaid/Sonder-Editor-Projects#project-sample--ltx-23) on Hugging Face,
 using the [LTX 2.3 Playground](#example-workflows) below.
 
 ### Prompt Relay
@@ -251,8 +251,8 @@ ComfyUI.
 
 ## Requirements
 
-- **ComfyUI** — 0.5.0 was validated on ComfyUI **0.34.0** with frontend
-  **1.51.10**. That is what this release was tested against, not a minimum;
+- **ComfyUI** — 0.6.0 was validated on ComfyUI **0.37.0** with frontend
+  **1.53.6**. That is what this release was tested against, not a minimum;
   other versions are expected to work. The V3 nodes noted above load only on
   builds that provide `comfy_api`, and the complete V1 set loads otherwise.
 - **Python 3.10+** (matching your ComfyUI environment; validated on 3.12).
@@ -309,14 +309,17 @@ Two ready-wired generation graphs. Drop either onto the ComfyUI canvas.
 
 **[Sonder LTX 2.3 Playground](example_workflows/sonder_ltx_2_3_playground.json)** —
 prompt relay, multi-pass upscaling, image guides, and driver-controlled generation.
-Its matching project is **Project-Sample**, listed under **Project Sample — LTX 2.3**
-on [Hugging Face](https://huggingface.co/datasets/SonderSaid/Sonder-Editor-Projects).
+Its matching project is **Project-Sample**, listed under
+[**Project Sample — LTX 2.3**](https://huggingface.co/datasets/SonderSaid/Sonder-Editor-Projects#project-sample--ltx-23) on Hugging Face.
 
 **[Sonder MiniMax H3 References](example_workflows/sonder_minimax_h3_references.json)** —
 References driving MiniMax H3: Reference lanes reaching the model through the
 Reference Selector and the Image and Audio bridges, first- and last-frame guides
 through the Guides Bridge, separated AV latents, and the Masks Bridge writing
 latent noise masks so a window can be regenerated in place.
+Its matching project is
+[**Project Sample: MiniMax H3 References**](https://huggingface.co/datasets/SonderSaid/Sonder-Editor-Projects#project-sample-minimax-h3-references)
+on Hugging Face, and needs Sonder Editor 0.6.0 or newer.
 
 ## Documentation
 
@@ -343,8 +346,11 @@ Explore complete Sonder Editor projects on
 Each project entry includes its matching workflow, showcase video, tested editor
 version, and opening instructions.
 
-Start with **Project-Sample**, listed under **Project Sample — LTX 2.3**.
+Start with **Project-Sample**, listed under
+[**Project Sample — LTX 2.3**](https://huggingface.co/datasets/SonderSaid/Sonder-Editor-Projects#project-sample--ltx-23).
 It includes four scenes with their media, prompts, guides, and generated takes.
+[**Project Sample: MiniMax H3 References**](https://huggingface.co/datasets/SonderSaid/Sonder-Editor-Projects#project-sample-minimax-h3-references) is the project behind the western
+showcase, with its reference assets staged on the timeline; it needs 0.6.0 or newer.
 
 ## Security & metadata
 

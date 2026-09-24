@@ -22,8 +22,8 @@ Click **Open Editor** to enter the fullscreen editing surface.
 ![The Sonder Editor node card with a project loaded and its Preview module expanded](images/node-card.webp)
 
 > **Prefer to explore a finished project first?**
-> Open [Sonder Editor Projects on Hugging Face](https://huggingface.co/datasets/SonderSaid/Sonder-Editor-Projects)
-> and find **Project Sample — LTX 2.3**. Its **Project-Sample** folder includes
+> Open [**Project Sample — LTX 2.3**](https://huggingface.co/datasets/SonderSaid/Sonder-Editor-Projects#project-sample--ltx-23)
+> on Hugging Face. Its **Project-Sample** folder includes
 > four scenes with media, prompts, guides, and generated takes. The project entry
 > includes the matching workflow and opening instructions.
 
