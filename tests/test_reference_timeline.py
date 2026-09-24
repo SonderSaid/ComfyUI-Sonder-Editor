@@ -882,8 +882,9 @@ def test_reference_bridge_shape_tracks_project_writes_and_recipe_liveness():
     assert 'origin: "project_ready"' in bridge
     assert "Refresh reference slots" in bridge
     assert "beforeRegisterNodeDef(_nodeType, nodeData)" in bridge
-    assert "INPUT_DEFINITIONS.set(name, distillInputDefinition(nodeData))" in bridge
-    assert "inputRequirement(definition, targetInput?.name) === \"required\"" in bridge
+    assert "captureInputDefinition(nodeData);" in bridge
+    assert "requiredConsumerOutputNames(node, {" in bridge
+    assert "include: (output) => SLOT_NAME_RE.test(" in bridge
     assert "requiredConsumerSlots: requiredConsumerSlotNames(node)" in bridge
     assert "...shape," in bridge, "node-local advisory data must not mutate shared FULL_SHAPE"
     policy_callback = bridge.split(

@@ -29,10 +29,12 @@ def test_lazy_node_mappings_and_ids():
     assert set(lazy.LAZY_NODE_CLASS_MAPPINGS) == {
         "SonderLazySwitch",
         "SonderLazyCluster",
+        "SonderGate",
         "SonderLazyDebugSleep",
     }
     assert lazy.SonderLazySwitch.GET_SCHEMA().node_id == "SonderLazySwitch"
     assert lazy.SonderLazyCluster.GET_SCHEMA().node_id == "SonderLazyCluster"
+    assert lazy.SonderGate.GET_SCHEMA().node_id == "SonderGate"
 
 
 def test_lazy_switch_requests_only_selected_branch():
@@ -90,3 +92,69 @@ def test_lazy_cluster_validate_defers_when_control_linked():
     assert lazy.SonderLazyCluster.validate_inputs(select=None) is True
     assert lazy.SonderLazyCluster.validate_inputs(select=0, branches=None) is True
     assert lazy.SonderLazyCluster.validate_inputs(select=0, lanes=None) is True
+
+
+class _TensorLike:
+    """Truth-testing a real tensor raises; the gate must never ask."""
+
+    def __bool__(self):
+        raise RuntimeError("Boolean value of Tensor with more than one value is ambiguous")
+
+
+def test_gate_condition_rule():
+    lazy = _import_lazy_switches()
+    gate_open = lazy._gate_open
+
+    assert gate_open() is False  # unwired
+    for closed in (None, False, 0, 0.0):
+        assert gate_open(closed) is False, closed
+    for opened in (True, 1, -1, 0.5, "", "text", [], {}, {"waveform": 1}, _TensorLike()):
+        assert gate_open(opened) is True, opened
+
+
+def test_gate_schema_declares_paired_lanes_and_outputs():
+    lazy = _import_lazy_switches()
+    schema = lazy.SonderGate.GET_SCHEMA()
+    names = [item.id for item in schema.inputs]
+
+    assert names[:4] == ["when_A", "value_A", "when_B", "value_B"]
+    assert len(names) == 2 * lazy.MAX_GATE_LANES
+    assert [item.display_name for item in schema.outputs][:3] == ["A", "B", "C"]
+    assert len(schema.outputs) == lazy.MAX_GATE_LANES
+    by_name = {item.id: item for item in schema.inputs}
+    assert by_name["value_A"].lazy is True and by_name["value_A"].optional is True
+    assert not by_name["when_A"].lazy and by_name["when_A"].optional is True
+
+
+def test_gate_requests_only_open_unevaluated_lanes():
+    lazy = _import_lazy_switches()
+    image = _TensorLike()
+
+    needed = lazy.SonderGate.check_lazy_status(
+        when_A=image, value_A=None,        # present slot: open
+        when_B=None, value_B=None,         # 'nothing' slot: closed
+        when_C=1, value_C=None,            # has_reference = 1: open
+        when_D=0, value_D=None,            # has_reference = 0: closed
+        value_E=None,                      # unwired condition: closed
+        when_F=True, value_F="ready",      # already evaluated
+        when_G=True,                       # open with no value wired
+    )
+
+    assert needed == ["value_A", "value_C"]
+
+
+def test_gate_execute_emits_value_or_nothing_per_lane():
+    lazy = _import_lazy_switches()
+    image = _TensorLike()
+
+    result = lazy.SonderGate.execute(
+        when_A=image, value_A="a",
+        when_B=None, value_B="b",
+        when_C=True,
+        value_D="d",
+    )
+    outputs = result.result
+
+    assert len(outputs) == lazy.MAX_GATE_LANES
+    assert outputs[:4] == ("a", None, None, None)
+    assert set(outputs[4:]) == {None}

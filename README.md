@@ -235,8 +235,9 @@ ComfyUI.
 | **Sonder Selector** | Selects one label from a newline-delimited list and outputs its text plus zero-based index. |
 | **Sonder Switch** | Routes any one data type across N branches and evaluates only the selected branch (lazy). |
 | **Sonder Cluster** | Routes a shared branch selection across multiple lanes, each lane carrying its own type (lazy). |
+| **Sonder Gate** | Per-lane lazy gate: each lane's condition decides whether its value is evaluated and passed on or skipped entirely, emitting nothing. Place it directly in front of an optional input — for example after a resize fed by a Reference Bridge slot set to `nothing`. |
 
-> **Sonder Switch**, **Sonder Cluster**, **Sonder Reference Selector**, the three
+> **Sonder Switch**, **Sonder Cluster**, **Sonder Gate**, **Sonder Reference Selector**, the three
 > **Sonder Reference Bridges**, and
 > **Sonder Metadata Collector Nodes 2.0** use ComfyUI's
 > newer V3 node API and load only on recent ComfyUI builds.

@@ -230,6 +230,7 @@ export const resolveProjectSource = () => ({
         "./keyboard_ownership.js": (tmp_path / "keyboard.mjs").as_uri(),
         "./project_source_resolver.js": (tmp_path / "resolver.mjs").as_uri(),
         "./reference_bridge_shape.js": (ROOT / "web/js/reference_bridge_shape.js").as_uri(),
+        "./consumer_input_requirements.js": (ROOT / "web" / "js" / "consumer_input_requirements.js").as_uri(),
         "./bridge_read_coordinator.js": (
             ROOT / "web/js/bridge_read_coordinator.js"
         ).as_uri(),

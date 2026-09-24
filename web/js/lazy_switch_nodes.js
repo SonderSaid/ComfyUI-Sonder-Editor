@@ -1,4 +1,5 @@
 import { app } from "/scripts/app.js";
+import { captureInputDefinition, requiredConsumerOutputNames } from "./consumer_input_requirements.js";
 
 const EXT_NAME = "sonder.lazy_cluster";
 const TARGET_CLUSTER = "SonderLazyCluster";
@@ -75,7 +76,7 @@ const normalizeTypeString = (value) => {
 
     let cleaned = value.trim();
     if (!cleaned || cleaned === "*" || cleaned === "0") return null;
-    if (/^SONDER_cluster_lane_\d+$/i.test(cleaned)) return null;
+    if (/^SONDER_(cluster|gate)_lane_\d+$/i.test(cleaned)) return null;
 
     const pathParts = cleaned.split(/[\\/]/).filter(Boolean);
     cleaned = pathParts.length > 0 ? pathParts[pathParts.length - 1] : cleaned;
@@ -414,10 +415,247 @@ const installNodeBehavior = (node) => {
     }, 0);
 };
 
+// ---------------------------------------------------------------------------
+// Sonder Gate: lanes of (when_X, value_X) -> output X, A..P.
+//
+// The backend tuple is fixed. Lanes auto-extend to the highest connected lane
+// plus one spare, and only the canonical tail is ever removed, so no surviving
+// slot index shifts (the host resolves links by index). Removal happens only
+// for a fresh node or after an explicit disconnect settles: paste, duplicate
+// and subgraph convert reconnect links one at a time outside configuringGraph,
+// and trimming between those connects would drop links aimed at later lanes.
+
+const TARGET_GATE = "SonderGate";
+const MAX_GATE_LANES = 16;
+const GATE_STATE = Symbol("sonderGateState");
+const GATE_REQUIRED_SUFFIX = " (feeds required input)";
+const GATE_NO_CONDITION_SUFFIX = " (no condition)";
+
+const isGateNode = (node) => node?.comfyClass === TARGET_GATE;
+const gateWhenName = (lane) => `when_${laneFallbackLabel(lane)}`;
+const gateValueName = (lane) => `value_${laneFallbackLabel(lane)}`;
+
+const parseGateInput = (slot) => {
+    const match = /^(when|value)_([A-P])$/.exec(String(slot?.name || ""));
+    return match ? { kind: match[1], lane: match[2].charCodeAt(0) - 65 } : null;
+};
+
+const parseGateOutput = (slot) => {
+    const info = parseOutputSlot(slot);
+    return info && info.lane < MAX_GATE_LANES ? info : null;
+};
+
+const gateInputRank = (slot) => {
+    const info = parseGateInput(slot);
+    return info ? info.lane * 2 + (info.kind === "value" ? 1 : 0) : -1;
+};
+
+const getGateState = (node) => {
+    if (!node[GATE_STATE]) {
+        // Capture the full schema shape at creation so a regrown slot keeps its
+        // declared type and tooltip, whatever a saved node later trims to.
+        const meta = new Map();
+        for (const slot of node.inputs || []) {
+            if (parseGateInput(slot)) meta.set(`in:${slot.name}`, { type: slot.type, tooltip: slot.tooltip || "" });
+        }
+        for (const slot of node.outputs || []) {
+            if (parseGateOutput(slot)) meta.set(`out:${slot.name}`, { type: slot.type, tooltip: slot.tooltip || "" });
+        }
+        node[GATE_STATE] = {
+            meta,
+            initialized: false,
+            configured: false,
+            shrinkPending: false,
+            settleQueued: false,
+        };
+    }
+    return node[GATE_STATE];
+};
+
+const gateConnectedCeiling = (node) => {
+    let ceiling = -1;
+    for (const slot of node.inputs || []) {
+        const info = parseGateInput(slot);
+        if (info && slot.link != null) ceiling = Math.max(ceiling, info.lane);
+    }
+    for (const slot of node.outputs || []) {
+        const info = parseGateOutput(slot);
+        if (info && slotHasOutputLinks(slot)) ceiling = Math.max(ceiling, info.lane);
+    }
+    return ceiling;
+};
+
+const gateShownLanes = (node) => {
+    let shown = 0;
+    for (const slot of node.inputs || []) {
+        const info = parseGateInput(slot);
+        if (info) shown = Math.max(shown, info.lane + 1);
+    }
+    for (const slot of node.outputs || []) {
+        const info = parseGateOutput(slot);
+        if (info) shown = Math.max(shown, info.lane + 1);
+    }
+    return shown;
+};
+
+const addGateInput = (node, name, state) => {
+    if (getInputByName(node, name)) return;
+    const meta = state.meta.get(`in:${name}`) || { type: "*", tooltip: "" };
+    node.addInput(name, meta.type, { tooltip: meta.tooltip });
+};
+
+const addGateOutput = (node, name, state) => {
+    if (getOutputByName(node, name)) return;
+    const meta = state.meta.get(`out:${name}`) || { type: "*", tooltip: "" };
+    node.addOutput(name, meta.type, { tooltip: meta.tooltip });
+};
+
+const gateLaneTypeLabel = (node, lane) => {
+    // The lane's type is its value's type; `when` accepts anything.
+    const value = getInputByName(node, gateValueName(lane));
+    const fromValue = value?.link != null ? getInputLaneTypeLabel(node, value) : null;
+    if (fromValue) return fromValue;
+    const output = getOutputByName(node, outputName(lane));
+    return output && slotHasOutputLinks(output) ? getOutputLaneTypeLabel(node, output) : null;
+};
+
+const setSlotLabel = (slot, label) => {
+    // Legacy LiteGraph draws `label`; Nodes 2.0 reads `localized_name`.
+    if (slot.label === label && slot.localized_name === label) return false;
+    slot.label = label;
+    slot.localized_name = label;
+    return true;
+};
+
+const gateOutputAdvisory = ({ whenWired, laneUsed, feedsRequired }) => {
+    if (laneUsed && !whenWired) return GATE_NO_CONDITION_SUFFIX;
+    if (feedsRequired) return GATE_REQUIRED_SUFFIX;
+    return "";
+};
+
+const labelGateSlots = (node) => {
+    const required = new Set(requiredConsumerOutputNames(node, {
+        getLink: (linkId) => getLinkById(node, linkId),
+        getNode: (nodeId) => getGraphNodeById(node, nodeId),
+        include: (output) => parseGateOutput(output) !== null,
+    }));
+    let changed = false;
+    for (const slot of node.inputs || []) {
+        const info = parseGateInput(slot);
+        if (!info) continue;
+        const letter = laneFallbackLabel(info.lane);
+        const type = info.kind === "value" ? gateLaneTypeLabel(node, info.lane) : null;
+        const label = info.kind === "when" ? `when ${letter}` : (type ? `${letter}: ${type}` : letter);
+        changed = setSlotLabel(slot, label) || changed;
+    }
+    for (const slot of node.outputs || []) {
+        const info = parseGateOutput(slot);
+        if (!info) continue;
+        const letter = laneFallbackLabel(info.lane);
+        const type = gateLaneTypeLabel(node, info.lane);
+        const whenWired = getInputByName(node, gateWhenName(info.lane))?.link != null;
+        const laneUsed = getInputByName(node, gateValueName(info.lane))?.link != null || slotHasOutputLinks(slot);
+        const suffix = gateOutputAdvisory({ whenWired, laneUsed, feedsRequired: required.has(slot.name) });
+        changed = setSlotLabel(slot, `${type ? `${letter}: ${type}` : letter}${suffix}`) || changed;
+    }
+    return changed;
+};
+
+const gateTargetLanes = ({ shown, ceiling, mayShrink }) => {
+    const desired = Math.min(MAX_GATE_LANES, Math.max(1, ceiling + 2));
+    return mayShrink ? desired : Math.max(shown, desired);
+};
+
+const ensureGateShape = (node, { settle = false } = {}) => {
+    if (app.configuringGraph) return;
+    const state = getGateState(node);
+    const shown = gateShownLanes(node);
+    const mayShrink = settle && (!state.configured || state.shrinkPending);
+    if (settle) state.shrinkPending = false;
+    const target = gateTargetLanes({ shown, ceiling: gateConnectedCeiling(node), mayShrink });
+    let changed = false;
+
+    // Grow in canonical order: appended slots land at the tail, after every
+    // lane below them, so no existing index moves.
+    for (let lane = 0; lane < target; lane += 1) {
+        const before = (node.inputs?.length || 0) + (node.outputs?.length || 0);
+        addGateInput(node, gateWhenName(lane), state);
+        addGateInput(node, gateValueName(lane), state);
+        addGateOutput(node, outputName(lane), state);
+        changed = changed || before !== (node.inputs?.length || 0) + (node.outputs?.length || 0);
+    }
+    // Shrink the true tail only, high to low. Every lane at or above the target
+    // is unconnected, because the target always exceeds the connected ceiling.
+    for (let lane = MAX_GATE_LANES - 1; lane >= target; lane -= 1) {
+        const output = getOutputByName(node, outputName(lane));
+        if (output && !slotHasOutputLinks(output)) { removeOutputSlot(node, output.name); changed = true; }
+        for (const name of [gateValueName(lane), gateWhenName(lane)]) {
+            const input = getInputByName(node, name);
+            if (input && input.link == null) { removeInputSlot(node, name); changed = true; }
+        }
+    }
+    const ordered = (node.inputs || []).every((slot, index, inputs) =>
+        index === 0 || gateInputRank(inputs[index - 1]) <= gateInputRank(slot));
+    if (!ordered) {
+        sortInputSlots(node, (left, right) => gateInputRank(left) - gateInputRank(right));
+        changed = true;
+    }
+    changed = labelGateSlots(node) || changed;
+
+    if (!changed) return;
+    if (typeof node.computeSize === "function" && typeof node.setSize === "function") {
+        node.setSize(node.computeSize());
+    }
+    node.setDirtyCanvas?.(true, true);
+};
+
+const queueGateSettle = (node) => {
+    const state = getGateState(node);
+    if (state.settleQueued) return;
+    state.settleQueued = true;
+    window.setTimeout(() => {
+        state.settleQueued = false;
+        if (isGateNode(node)) ensureGateShape(node, { settle: true });
+    }, 0);
+};
+
+const installGateBehavior = (node) => {
+    const state = getGateState(node);
+    if (state.initialized) return;
+    state.initialized = true;
+
+    const originalOnConfigure = node.onConfigure;
+    node.onConfigure = function (...args) {
+        // A configured node carries a saved or pasted shape; only an explicit
+        // disconnect may shrink it from now on.
+        state.configured = true;
+        return originalOnConfigure?.apply(this, args);
+    };
+
+    const originalOnConnectionsChange = node.onConnectionsChange;
+    node.onConnectionsChange = function (...args) {
+        const result = originalOnConnectionsChange?.apply(this, args);
+        if (args[2] === false) state.shrinkPending = true;
+        ensureGateShape(this);
+        queueGateSettle(this);
+        return result;
+    };
+
+    queueGateSettle(node);
+};
+
 app.registerExtension({
     name: EXT_NAME,
 
+    beforeRegisterNodeDef(_nodeType, nodeData) {
+        captureInputDefinition(nodeData);
+    },
+
     async nodeCreated(node) {
+        if (isGateNode(node)) {
+            installGateBehavior(node);
+            return;
+        }
         if (!isTargetNode(node)) return;
         installNodeBehavior(node);
     },
@@ -428,6 +666,7 @@ app.registerExtension({
         for (const graph of graphs) {
             for (const node of graph?._nodes || []) {
                 if (isTargetNode(node)) ensureNodeShape(node);
+                if (isGateNode(node)) ensureGateShape(node);
             }
         }
     },

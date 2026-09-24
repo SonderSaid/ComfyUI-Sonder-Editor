@@ -24,13 +24,12 @@ import {
     MAX_REFERENCE_SLOTS,
     SLOT_NAME_RE,
     canonicalOutputOrder,
-    distillInputDefinition,
-    inputRequirement,
     mergedBridgeShape,
     parseLaneSelection,
     resolveBridgeOutputs,
     selectorPanelView,
 } from "./reference_bridge_shape.js";
+import { captureInputDefinition, requiredConsumerOutputNames } from "./consumer_input_requirements.js";
 
 const EXT_NAME = "sonder.reference_bridge";
 const SELECTOR = "SonderReferenceSelector";
@@ -41,7 +40,6 @@ const BRIDGES = new Set([
 ]);
 const STATE = Symbol("sonderReferenceBridgeState");
 const SELECTOR_STATE = Symbol("sonderReferenceSelectorState");
-const INPUT_DEFINITIONS = new Map();
 
 const nodeType = (node) => String(node?.comfyClass || node?.type || "");
 const findWidget = (node, name) => (node?.widgets || []).find((widget) => widget?.name === name) || null;
@@ -110,25 +108,11 @@ export function applyReferenceBridgeShape(node, shape = {}) {
 function requiredConsumerSlotNames(node) {
     if (!findWidget(node, "unused_slots")) return [];
     const graph = node?.graph || app.graph;
-    const required = new Set();
-    for (const output of node?.outputs || []) {
-        const slotName = String(output?.name || "");
-        if (!SLOT_NAME_RE.test(slotName)) continue;
-        const linkIds = Array.isArray(output?.links)
-            ? output.links
-            : (output?.link != null ? [output.link] : []);
-        for (const linkId of linkIds) {
-            const link = getGraphLink(graph, linkId);
-            const target = getGraphNode(graph, link?.target_id);
-            const targetInput = target?.inputs?.[Number(link?.target_slot)];
-            const definition = INPUT_DEFINITIONS.get(nodeType(target));
-            if (inputRequirement(definition, targetInput?.name) === "required") {
-                required.add(slotName);
-                break;
-            }
-        }
-    }
-    return [...required];
+    return requiredConsumerOutputNames(node, {
+        getLink: (linkId) => getGraphLink(graph, linkId),
+        getNode: (nodeId) => getGraphNode(graph, nodeId),
+        include: (output) => SLOT_NAME_RE.test(String(output?.name || "")),
+    });
 }
 
 function upstreamSelector(node) {
@@ -644,8 +628,7 @@ function install(node) {
 app.registerExtension({
     name: EXT_NAME,
     beforeRegisterNodeDef(_nodeType, nodeData) {
-        const name = String(nodeData?.name || "");
-        if (name) INPUT_DEFINITIONS.set(name, distillInputDefinition(nodeData));
+        captureInputDefinition(nodeData);
     },
     setup() {
         onProjectVersionChanged(refreshAllBridges);

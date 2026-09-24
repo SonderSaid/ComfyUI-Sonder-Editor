@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import numbers
 import os
 import time
 from typing import Any
 
 try:
     from comfy_api.v0_0_2 import io
-except ImportError:  # pragma: no cover - depends on installed ComfyUI version
+except ImportError as exc:  # pragma: no cover - depends on installed ComfyUI version
+    # Only a missing versioned API falls back; an unrelated broken import inside
+    # ComfyUI must surface instead of being masked by the fallback.
+    if exc.name not in {"comfy_api.v0_0_2", "comfy_api"}:
+        raise
     from comfy_api.latest import io
 
 
@@ -346,6 +351,107 @@ class SonderLazyCluster(io.ComfyNode, _LazySelectionMixin):
         return io.NodeOutput(*outputs)
 
 
+MAX_GATE_LANES = 16
+_UNWIRED = object()
+
+
+def _gate_open(condition: Any = _UNWIRED) -> bool:
+    """Whether a Gate lane passes its value.
+
+    Unwired, None, False and a zero number close the lane. Anything else opens
+    it; tensors and containers are presence, so bool() never touches them.
+    """
+    if condition is _UNWIRED or condition is None:
+        return False
+    if isinstance(condition, bool):
+        return condition
+    if isinstance(condition, numbers.Real):
+        return condition != 0
+    return True
+
+
+class SonderGate(io.ComfyNode):
+    """Per-lane lazy gate: an open lane evaluates and passes its value, a closed one emits nothing."""
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        lane_templates = [
+            io.MatchType.Template(f"{PACK_PREFIX}_gate_lane_{lane_idx}")
+            for lane_idx in range(MAX_GATE_LANES)
+        ]
+        lane_inputs: list[io.Input] = []
+        for lane_idx, template in enumerate(lane_templates):
+            lane_inputs.append(
+                io.AnyType.Input(
+                    cls._when_name(lane_idx),
+                    optional=True,
+                    tooltip=(
+                        "Lane condition. Unwired, None, false or 0 closes the lane; anything else opens it. "
+                        "Wire the source (a Reference Bridge slot set to 'nothing', or has_reference), "
+                        "never the chain feeding 'value' — that would run the chain first."
+                    ),
+                )
+            )
+            lane_inputs.append(
+                io.MatchType.Input(
+                    cls._value_name(lane_idx),
+                    template=template,
+                    optional=True,
+                    lazy=True,
+                    tooltip="Evaluated only while this lane is open. Everything feeding it is skipped when closed.",
+                )
+            )
+
+        return io.Schema(
+            node_id="SonderGate",
+            display_name="Sonder Gate",
+            category=CATEGORY,
+            description=(
+                "Per-lane lazy gate. An open lane evaluates its value and passes it on; a closed lane "
+                "skips everything feeding its value and emits nothing, so an optional input ignores it. "
+                "Place the gate directly in front of the optional input: nodes after it still run, and "
+                "fail if they need a value. Pair with Reference Bridge unused_slots = 'nothing'. Lanes "
+                "share one node, so a list-valued or blocked lane affects them all; use one gate per "
+                "consumer when lanes come from unrelated sources."
+            ),
+            inputs=lane_inputs,
+            outputs=[
+                io.MatchType.Output(template=template, display_name=_lane_label(lane_idx))
+                for lane_idx, template in enumerate(lane_templates)
+            ],
+        )
+
+    @classmethod
+    def _when_name(cls, lane_idx: int) -> str:
+        return f"when_{_lane_label(lane_idx)}"
+
+    @classmethod
+    def _value_name(cls, lane_idx: int) -> str:
+        return f"value_{_lane_label(lane_idx)}"
+
+    @classmethod
+    def _lane_open(cls, lane_idx: int, kwargs: dict[str, Any]) -> bool:
+        return _gate_open(kwargs.get(cls._when_name(lane_idx), _UNWIRED))
+
+    @classmethod
+    def check_lazy_status(cls, **kwargs) -> list[str]:
+        # 'when' is non-lazy, so it is already evaluated here: its None is a real
+        # None. A connected lazy value that has not run yet arrives as None.
+        needed: list[str] = []
+        for lane_idx in range(MAX_GATE_LANES):
+            key = cls._value_name(lane_idx)
+            if key in kwargs and kwargs[key] is None and cls._lane_open(lane_idx, kwargs):
+                needed.append(key)
+        return needed
+
+    @classmethod
+    def execute(cls, **kwargs) -> io.NodeOutput:
+        return io.NodeOutput(*(
+            kwargs.get(cls._value_name(lane_idx)) if cls._lane_open(lane_idx, kwargs) else None
+            for lane_idx in range(MAX_GATE_LANES)
+        ))
+
+
 class SonderLazyDebugSleep(io.ComfyNode):
     """Sleeps for N seconds then passes the value through."""
 
@@ -388,11 +494,13 @@ class SonderLazyDebugSleep(io.ComfyNode):
 LAZY_NODE_CLASS_MAPPINGS = {
     "SonderLazySwitch": SonderLazySwitch,
     "SonderLazyCluster": SonderLazyCluster,
+    "SonderGate": SonderGate,
     "SonderLazyDebugSleep": SonderLazyDebugSleep,
 }
 
 LAZY_NODE_DISPLAY_NAME_MAPPINGS = {
     "SonderLazySwitch": "Sonder Switch",
     "SonderLazyCluster": "Sonder Cluster",
+    "SonderGate": "Sonder Gate",
     "SonderLazyDebugSleep": "Sonder Lazy Debug Sleep",
 }

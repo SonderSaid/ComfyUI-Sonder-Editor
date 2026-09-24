@@ -26,8 +26,10 @@ const graph = {_nodes: [], links: new Map(), getNodeById() { return null; }};
 const root = IN_SUBGRAPH ? {_nodes: [], subgraphs: new Map([['child', graph]])} : graph;
 const app = {graph: root, rootGraph: root, configuringGraph: true,
     registerExtension(e) { extension = e; }};
-const source = fs.readFileSync(SOURCE_PATH, 'utf8').replace(/^import .*;\r?\n/, '');
-vm.runInNewContext(source, {app, window: {setTimeout(fn) { timers.push(fn); }}});
+const source = fs.readFileSync(SOURCE_PATH, 'utf8').replace(/^import .*;\r?\n/gm, '');
+// Imports are stripped for vm; the Cluster never consults consumer definitions.
+vm.runInNewContext(source, {app, window: {setTimeout(fn) { timers.push(fn); }},
+    captureInputDefinition() {}, requiredConsumerOutputNames() { return []; }});
 let originalCalls = 0;
 let resizeCalls = 0;
 const n = {comfyClass: 'SonderLazyCluster', graph,

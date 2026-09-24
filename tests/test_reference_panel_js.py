@@ -1225,6 +1225,7 @@ export const resolveProjectSource = () => ({ status: 'unresolved' });
         "./editor_render_window_events.js": (tmp_path / "events.mjs").as_uri(),
         "./keyboard_ownership.js": (tmp_path / "keyboard.mjs").as_uri(),
         "./reference_bridge_shape.js": shape_url,
+        "./consumer_input_requirements.js": (ROOT / "web" / "js" / "consumer_input_requirements.js").as_uri(),
         "./bridge_read_coordinator.js": coordinator_url,
     }
     for old, new in replacements.items():
@@ -1417,6 +1418,7 @@ export const resolveProjectSource = () => ({
         "./editor_render_window_events.js": (tmp_path / "events.mjs").as_uri(),
         "./keyboard_ownership.js": (tmp_path / "keyboard.mjs").as_uri(),
         "./reference_bridge_shape.js": shape_url,
+        "./consumer_input_requirements.js": (ROOT / "web" / "js" / "consumer_input_requirements.js").as_uri(),
         "./bridge_read_coordinator.js": coordinator_url,
     }
     for old, new in replacements.items():

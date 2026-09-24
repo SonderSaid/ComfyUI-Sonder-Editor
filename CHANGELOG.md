@@ -12,6 +12,7 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Added
+- **Sonder Gate** skips an optional input's whole upstream chain per lane: a closed lane never evaluates its value and emits nothing, so a Reference Bridge set to `nothing` now works with a resize or other node in between. Lanes grow as you connect them, and the canvas flags a lane with no condition or one feeding a required input.
 - Asset Gallery details now offer Copy on read-only fields, prompts, names, paths, raw metadata, and Where Used information, with keyboard access and Power LoRA row JSON.
 
 ### Fixed

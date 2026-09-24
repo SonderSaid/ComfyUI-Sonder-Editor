@@ -56,75 +56,9 @@ export function connectedSlotCeiling(node, prefix = null) {
         .map(slotNumber));
 }
 
-const namedEntries = (value) => (
-    value && typeof value === "object" && !Array.isArray(value) ? Object.entries(value) : []
-);
-
-/** Reduce one /object_info node definition to the input facts this module models. */
-export function distillInputDefinition(nodeData = {}) {
-    const input = nodeData?.input && typeof nodeData.input === "object" ? nodeData.input : {};
-    const requiredEntries = namedEntries(input.required);
-    const optionalEntries = namedEntries(input.optional);
-    const autogrow = [];
-    for (const [, value] of [...requiredEntries, ...optionalEntries]) {
-        const options = Array.isArray(value) && value[1] && typeof value[1] === "object" ? value[1] : null;
-        const template = options?.template;
-        if (!template || typeof template !== "object") continue;
-
-        let templateRequired = null;
-        for (const [category, entries] of namedEntries(template.input)) {
-            if (!entries || typeof entries !== "object" || !Object.keys(entries).length) continue;
-            templateRequired = category === "required";
-            break;
-        }
-        // An Autogrow shape with no readable template input is unknown. Failing
-        // quiet is safer than labelling a valid graph as broken.
-        if (templateRequired === null) continue;
-
-        const names = Array.isArray(template.names)
-            ? template.names.map((name) => String(name))
-            : null;
-        const prefix = typeof template.prefix === "string" ? template.prefix : null;
-        if (!names && prefix === null) continue;
-        const parsedMin = Number(template.min);
-        const parsedMax = Number(template.max);
-        autogrow.push({
-            prefix,
-            names,
-            min: Number.isInteger(parsedMin) && parsedMin >= 0 ? parsedMin : 0,
-            max: names
-                ? names.length
-                : (Number.isInteger(parsedMax) && parsedMax >= 1 ? parsedMax : 0),
-            required: templateRequired,
-        });
-    }
-    return {
-        required: new Set(requiredEntries.map(([name]) => name)),
-        optional: new Set(optionalEntries.map(([name]) => name)),
-        autogrow,
-    };
-}
-
-/** Return required/optional only when the captured input shape proves it. */
-export function inputRequirement(definition, inputName) {
-    const name = String(inputName || "");
-    if (!definition || !name) return "unknown";
-    if (definition.required instanceof Set && definition.required.has(name)) return "required";
-    if (definition.optional instanceof Set && definition.optional.has(name)) return "optional";
-    for (const template of Array.isArray(definition.autogrow) ? definition.autogrow : []) {
-        let index = -1;
-        if (Array.isArray(template?.names)) {
-            index = template.names.indexOf(name);
-        } else if (typeof template?.prefix === "string" && name.startsWith(template.prefix)) {
-            const suffix = name.slice(template.prefix.length);
-            if (/^\d+$/.test(suffix)) index = Number(suffix);
-            if (!Number.isInteger(index) || index < 0 || index >= Number(template.max)) index = -1;
-        }
-        if (index < 0) continue;
-        return template.required && index < Number(template.min) ? "required" : "optional";
-    }
-    return "unknown";
-}
+// Input-requirement facts live in the shared consumer module, which the Sonder
+// Gate uses too; re-exported so this module's importers keep one entry point.
+export { distillInputDefinition, inputRequirement } from "./consumer_input_requirements.js";
 
 /** Canonical tuple order for one homogeneous bridge. */
 export function canonicalOutputOrder(bridgeType = "SonderReferenceImageBridge") {
