@@ -193,6 +193,7 @@ const style = (element) => element;
 const copied = [], menus = [];
 const copyToClipboardSafe = (value) => copied.push(value);
 const showCopyMenu = () => menus.push('copy');
+const compareModeActive = () => false;
 {helper}
 const host = new Element('div');
 let filters = 0, contextFilters = 0;
@@ -226,3 +227,73 @@ console.log(JSON.stringify({{ copied, filters, contextFilters, menus, loraFilter
         "filters": 1, "contextFilters": 1, "menus": [],
         "loraFilter": 1, "loraContext": 1, "sibling": True, "rowIndex": True,
     }
+
+def test_copy_reveals_on_hover_only_in_compare_and_on_focus_everywhere():
+    source = GALLERY.read_text(encoding="utf-8")
+    helper = "function attachCopyToElement(host, copy, label, onContextMenu = null) {" + source.split(
+        "function attachCopyToElement(host, copy, label, onContextMenu = null) {", 1)[1].split(
+            "    function makeMetaCell(label, value, options = {})", 1)[0]
+    script = f"""
+import {{ renderTrackedSectionBody }} from {json.dumps(RENDERERS.as_uri())};
+class Element {{
+  constructor(tag) {{ this.tag = tag; this.style = {{}}; this.children = []; this.handlers = {{}}; this.parent = null; }}
+  append(...nodes) {{ for (const node of nodes) {{ node.parent = this; this.children.push(node); }} }}
+  appendChild(node) {{ this.append(node); }}
+  addEventListener(type, fn) {{ (this.handlers[type] ||= []).push(fn); }}
+  setAttribute(name, value) {{ this[name] = value; }}
+  contains(node) {{ for (let cur = node; cur; cur = cur.parent) if (cur === this) return true; return false; }}
+  fire(type) {{ for (const fn of this.handlers[type] || []) fn({{ type }}); }}
+}}
+globalThis.document = {{ createElement: (tag) => new Element(tag), activeElement: null }};
+globalThis.queueMicrotask = (fn) => fn();
+const style = (element) => element;
+const copyToClipboardSafe = () => {{}};
+const showCopyMenu = () => {{}};
+let compare = false;
+const compareModeActive = () => compare;
+{helper}
+const state = (host) => {{
+  const button = host.children[0];
+  return {{ opacity: button.style.opacity, clickable: button.style.pointerEvents }};
+}};
+const make = () => attachCopyToElement(new Element('div'), {{ kind: 'value', label: 'Copy value', text: 'x' }}, 'seed');
+const inspector = make();
+inspector.fire('mouseenter');
+const inspectorHover = state(inspector);
+document.activeElement = inspector.children[0];
+inspector.fire('focusin');
+const inspectorFocus = state(inspector);
+document.activeElement = null;
+inspector.fire('focusout');
+compare = true;
+const compared = make();
+compared.fire('mouseenter');
+const compareHover = state(compared);
+compared.fire('mouseleave');
+const compareLeave = state(compared);
+
+const loraRow = (onHover) => {{
+  const entry = {{ display_type: 'power_loras', fields: {{ power_loras: [{{ name: 'a' }}] }} }};
+  const body = renderTrackedSectionBody(entry, {{ style, CHROME: {{ borderSoft: '#555' }},
+    formatGenerationValue: String, fieldSearchToken: () => 'token',
+    rowCopy: () => ({{ kind: 'value', label: 'Copy row JSON', text: '{{}}' }}),
+    copyOnHover: () => onHover }});
+  const rowWrap = body.dom.children[1];
+  rowWrap.fire('mouseenter');
+  return rowWrap.children[1].style.opacity;
+}};
+console.log(JSON.stringify({{
+  inspectorHover, inspectorFocus, compareHover, compareLeave,
+  inspectorPadding: inspector.style.paddingRight ?? null, comparePadding: compared.style.paddingRight,
+  loraInspector: loraRow(false), loraCompare: loraRow(true),
+}}));
+"""
+    result = _run(script)
+    assert result["inspectorHover"] == {"opacity": "0", "clickable": "none"}
+    assert result["inspectorFocus"] == {"opacity": "1", "clickable": "auto"}
+    assert result["compareHover"] == {"opacity": "1", "clickable": "auto"}
+    assert result["compareLeave"] == {"opacity": "0", "clickable": "none"}
+    assert result["inspectorPadding"] is None
+    assert result["comparePadding"] == "42px"
+    assert (result["loraInspector"], result["loraCompare"]) == ("0", "1")
+

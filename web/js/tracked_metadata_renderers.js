@@ -137,7 +137,7 @@ function renderPowerLoraBody(entry, ctx) {
     if (!rows.length) return null;
 
     const { style, CHROME, formatGenerationValue, fieldSearchToken,
-        tokenActiveA, tokenActiveB, onFieldClick, onFieldContextMenu, rowCopy, onFieldCopy } = ctx;
+        tokenActiveA, tokenActiveB, onFieldClick, onFieldContextMenu, rowCopy, onFieldCopy, copyOnHover } = ctx;
 
     const wrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:5px;min-width:0;`);
     const label = style(document.createElement("div"), `color:#8fa4b6;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;`);
@@ -223,7 +223,8 @@ function renderPowerLoraBody(entry, ctx) {
         });
         let hovered = false;
         const syncCopy = () => {
-            const visible = hovered || rowWrap.contains(document.activeElement);
+            // Hover reveals the row's Copy only in Compare; right-click copies elsewhere.
+            const visible = (hovered && !!copyOnHover?.()) || rowWrap.contains(document.activeElement);
             copyButton.style.opacity = visible ? "1" : "0";
             copyButton.style.pointerEvents = visible ? "auto" : "none";
         };

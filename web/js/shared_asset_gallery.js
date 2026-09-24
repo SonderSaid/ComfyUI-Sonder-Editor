@@ -1898,7 +1898,11 @@ export function mountSharedAssetGallery(container, options = {}) {
 
     function attachCopyToElement(host, copy, label, onContextMenu = null) {
         host.style.position = "relative";
-        host.style.paddingRight = "42px";
+        // Hover reveals Copy only in Compare, where right-click is the B filter and
+        // the button is the only copy path. Elsewhere right-click already offers
+        // Copy value, and a button flashing on every hovered card is noise; keyboard
+        // focus still reveals it on every surface.
+        if (compareModeActive()) host.style.paddingRight = "42px";
         const button = style(document.createElement("button"),
             "appearance:none;position:absolute;right:4px;top:4px;z-index:1;" +
             "padding:2px 4px;border-radius:4px;border:1px solid rgba(143,192,240,0.4);" +
@@ -1923,7 +1927,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         host.appendChild(button);
         let hovered = false;
         const syncReveal = () => {
-            const visible = hovered || host.contains(document.activeElement);
+            const visible = (hovered && compareModeActive()) || host.contains(document.activeElement);
             button.style.opacity = visible ? "1" : "0";
             button.style.pointerEvents = visible ? "auto" : "none";
         };
@@ -2946,6 +2950,8 @@ export function mountSharedAssetGallery(container, options = {}) {
             onFieldClick: (event, info) => handleTrackedFieldClick(event, info, surface),
             onFieldContextMenu: (event, info) => handleTrackedFieldContextMenu(event, info, surface),
             rowCopy: (entry, rowIndex) => resolvePowerLoraRowCopies(entry, rowIndex).row,
+            // Same rule as attachCopyToElement: hover shows Copy only in Compare.
+            copyOnHover: () => compareModeActive(),
             onFieldCopy: (copy) => { if (copy.kind !== "unavailable") copyToClipboardSafe(copy.text); },
         };
     }
