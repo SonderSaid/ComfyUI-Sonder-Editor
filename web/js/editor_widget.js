@@ -12156,8 +12156,15 @@ export class EditorWidget {
      * reverses leaves every earlier lane entry unrestorable, and the next Undo
      * is refused and stays on top. The lock toggle pushes its own entry before
      * calling, so it passes none.
+     *
+     * `rollbackRecipe` (the Reference Lane panel's recipe writes) restores the
+     * painted recipe locally when the write fails, so a dead server cannot
+     * leave a recipe on screen that the project never accepted. See
+     * `_trackLaneRecipeWrite` for which value it restores and when.
      */
-    async _saveLaneConfigWithinGesture(changedEntries, { expectedLaneId = "", undoLabel = "" } = {}) {
+    async _saveLaneConfigWithinGesture(changedEntries, {
+        expectedLaneId = "", undoLabel = "", rollbackRecipe = false,
+    } = {}) {
         if (!this.activeScene || !this.projectDir) return;
         // Only entries that write: pushing an entry clears Redo and can trim the
         // oldest step, which discarding it afterwards would not give back.
@@ -12167,7 +12174,15 @@ export class EditorWidget {
         const sceneId = this.activeSceneId;
         const sceneRef = this.activeScene;
         if (undoLabel) this._pushUndo(undoLabel);
+        // A lane's durable id where one is known; positional families and lanes
+        // without a known id keep their index. Distinct lanes that occupy the
+        // same index across a reorder must not erase each other's edits.
+        const laneConfigKey = (op) => (op.expected?.lane_id
+            ? `${op.lane_type}:lane:${op.expected.lane_id}`
+            : `${op.lane_type}:index:${op.lane_index || 0}`);
         const operations = [];
+        // The recipe chains this save painted into (see `_trackLaneRecipeWrite`).
+        const recipeChains = [];
         for (const e of entries) {
             const laneType = this._laneTypeForEntry(e);
             if (!laneType) continue;
@@ -12208,23 +12223,22 @@ export class EditorWidget {
                     list[laneIndex] = { ...(list[laneIndex] || {}), ...cfg };
                     sceneRef[listKey] = list;
                     if (descriptor?.recipeAttr && fields.reference_recipe) {
+                        const chain = this._trackLaneRecipeWrite(
+                            sceneId, laneConfigKey(operations.at(-1)), sceneRef,
+                            descriptor.recipeAttr, laneIndex, laneId, rollbackRecipe);
+                        recipeChains.push(chain);
                         const recipes = Array.isArray(sceneRef[descriptor.recipeAttr]) ? sceneRef[descriptor.recipeAttr] : [];
                         while (recipes.length <= laneIndex) recipes.push({ ...this._defaultReferenceLaneRecipe(), lane_id: "" });
                         // Only an identity already read from the scene is known
                         // durable. A panel draft cannot mint it optimistically.
                         recipes[laneIndex] = { ...fields.reference_recipe, lane_id: laneId };
                         sceneRef[descriptor.recipeAttr] = recipes;
+                        chain.lastPainted = recipes[laneIndex];
                     }
                 }
             }
         }
         if (!operations.length) return;
-        // A lane's durable id where one is known; positional families and lanes
-        // without a known id keep their index. Distinct lanes that occupy the
-        // same index across a reorder must not erase each other's edits.
-        const laneConfigKey = (op) => (op.expected?.lane_id
-            ? `${op.lane_type}:lane:${op.expected.lane_id}`
-            : `${op.lane_type}:index:${op.lane_index || 0}`);
         // The coalescing key names the LANE SET, as header visibility does:
         // each lane (or bulk selection) is its own write and its own Ctrl+Z,
         // at the cost of one document write per lane in a burst. A scene-wide
@@ -12238,8 +12252,12 @@ export class EditorWidget {
             }
             return { ...nextIntent, operations: [...byLane.values()] };
         };
+        // Whether this save opened its own queue slot or folded into a pending
+        // one: only a slot's head settles the recipe chains it painted into.
+        let joinedPendingSlot = false;
+        let saving;
         try {
-            await this._runSceneMutation(operations, {
+            saving = this._runSceneMutation(operations, {
                 key: `scene:${sceneId}:lane-config:${laneSetKey}`,
                 label: "lane config",
                 coalesce: true,
@@ -12247,13 +12265,142 @@ export class EditorWidget {
                 // Adopt server-minted bootstrap ids through the normal guarded
                 // scene reconciler; pending newer edits defer to the idle refresh.
                 refreshScenes: true,
+                onSupersededByCoalescing: () => { joinedPendingSlot = true; },
             });
         } catch (e) {
+            saving = Promise.reject(e);
+        }
+        if (!joinedPendingSlot) {
+            for (const chain of recipeChains) chain.open += 1;
+        }
+        try {
+            const result = await saving;
+            if (!joinedPendingSlot) {
+                for (const chain of recipeChains) this._settleLaneRecipeWrite(chain, result);
+            }
+        } catch (e) {
             console.warn("[Sonder] Failed to save lane config:", e);
-            await this._fetchScenes({ ignoreMutationGate: true, reason: "lane_config_error" });
+            let rolledBack = false;
+            if (!joinedPendingSlot) {
+                for (const chain of recipeChains) {
+                    rolledBack = this._settleLaneRecipeWrite(chain, null, { failed: true })
+                        || rolledBack;
+                }
+            }
+            if (rolledBack) this._renderSceneAfterLocalMutation({ viewport: false });
+            // An ungated GET dispatched while a later write is still queued
+            // would replace that write's paint with a scene that lacks it, and
+            // the next edit would read -- and whole-value re-send -- the scene
+            // without it. The queue's own failure handler has already deferred
+            // a scenes refresh, which runs once the queue drains.
+            if (this._hasPendingProjectMutations()) {
+                this._buildTrackLayout();
+                this._renderTimeline();
+                return;
+            }
+            const healed = await this._fetchScenes({ ignoreMutationGate: true, reason: "lane_config_error" });
+            // The heal is the only rollback lock/rename/hide have, and it fails
+            // for the same reason the write did when the server is unreachable.
+            if (healed === false && recipeChains.length && !joinedPendingSlot) {
+                sessionDiagRecord("lane_config_rollback_deferred", {
+                    recipe_rolled_back: rolledBack,
+                });
+            }
             this._buildTrackLayout();
             this._renderTimeline();
         }
+    }
+
+    /**
+     * A Reference lane's unsettled recipe writes, one chain per lane, so a
+     * failed recipe write can be rolled back from local state -- without the
+     * network that just failed (`durable_rules.md`: a local optimistic apply
+     * owes a rollback that works without the network).
+     *
+     * The chain restores the ACKNOWLEDGED recipe -- the value before its first
+     * unsettled write, advanced by each write the server accepts -- never a
+     * snapshot one gesture captured for itself. Two writes A then B, both
+     * failing: B's own snapshot is A's paint, which the server never held.
+     * Every lane-config write that carries the lane's recipe joins the chain
+     * (a lock or rename re-sends the recipe too), but only a chain some write
+     * opted into with `rollbackRecipe` restores it; lock/rename/hide keep the
+     * refetch heal alone.
+     */
+    _trackLaneRecipeWrite(sceneId, laneKey, sceneRef, recipeAttr, laneIndex, laneId, rollbackRecipe) {
+        const chains = this._laneRecipeWriteChains ||= new Map();
+        const key = `${sceneId}|${laneKey}`;
+        let chain = chains.get(key);
+        // Every enqueued head opens a slot in the same synchronous turn it
+        // painted, and the last settle deletes the chain, so a chain with no
+        // open slot here was left by a save that threw before enqueueing: its
+        // acknowledged value is stale, and it starts over.
+        if (!chain || chain.open === 0) {
+            const prior = sceneRef?.[recipeAttr]?.[laneIndex];
+            chain = {
+                key,
+                recipeAttr,
+                // null: unknown, so nothing is restored.
+                acknowledged: prior ? structuredClone(prior) : null,
+                open: 0,
+                rollback: false,
+            };
+            chains.set(key, chain);
+        }
+        // Where the newest paint went. A scene object replaced after it came
+        // from the server, and is already the truth a rollback would restore.
+        chain.sceneRef = sceneRef;
+        chain.laneIndex = laneIndex;
+        chain.laneId = String(laneId || "");
+        chain.laneCount = Array.isArray(sceneRef?.[recipeAttr]) ? sceneRef[recipeAttr].length : 0;
+        if (rollbackRecipe) chain.rollback = true;
+        return chain;
+    }
+
+    /** One settled queue slot of a recipe chain. Returns whether it restored
+     *  the acknowledged recipe locally (the caller renders). */
+    _settleLaneRecipeWrite(chain, result, { failed = false } = {}) {
+        chain.open = Math.max(0, chain.open - 1);
+        if (!failed) {
+            const recipes = result?.payload?.scene?.[chain.recipeAttr];
+            const accepted = Array.isArray(recipes)
+                ? (chain.laneId
+                    ? recipes.find((recipe) => String(recipe?.lane_id || "").trim() === chain.laneId)
+                    : recipes[chain.laneIndex])
+                : null;
+            chain.acknowledged = accepted ? structuredClone(accepted) : null;
+            if (!chain.open) this._laneRecipeWriteChains?.delete(chain.key);
+            return false;
+        }
+        if (!chain.rollback) {
+            if (!chain.open) this._laneRecipeWriteChains?.delete(chain.key);
+            return false;
+        }
+        if (chain.open) {
+            // A newer write for this lane is still queued. It carries what the
+            // author last saw and settles the chain itself: restoring now would
+            // flash a value that write is about to re-commit.
+            sessionDiagRecord("recipe_rollback_skipped", { reason: "newer_write_queued" });
+            return false;
+        }
+        this._laneRecipeWriteChains?.delete(chain.key);
+        const scene = this.activeScene;
+        const recipes = scene?.[chain.recipeAttr];
+        const current = Array.isArray(recipes) ? recipes[chain.laneIndex] : null;
+        // Restore only over this chain's own last paint: anything else there
+        // (a Reference stage painting the lane's recipe, a canonical scene) is
+        // newer than the value the chain would put back.
+        const reason = !chain.acknowledged ? "unknown_acknowledged_recipe"
+            : scene !== chain.sceneRef ? "scene_replaced"
+                : !current || String(current.lane_id || "").trim() !== chain.laneId
+                    || (!chain.laneId && recipes.length !== chain.laneCount)
+                    ? "lane_moved"
+                    : current !== chain.lastPainted ? "repainted_elsewhere" : "";
+        if (reason) {
+            sessionDiagRecord("recipe_rollback_skipped", { reason });
+            return false;
+        }
+        recipes[chain.laneIndex] = structuredClone(chain.acknowledged);
+        return true;
     }
 
     async _addLane(...args) {

@@ -253,8 +253,13 @@ def test_panel_honours_the_overlay_and_mutation_contracts():
     assert "expected: { ...item }" in panel
     assert "expected: expectedRecipe(definition)" in panel
 
-    # A built-in recipe is never edited in place.
+    # A built-in recipe is never edited in place. `state.busy` now belongs to
+    # item operations only: a recipe save never drops, or waits behind, the
+    # next recipe edit (the Critical silent-drop bug).
     assert "const locked = builtIn || laneLocked() || state.busy;" in panel
+    write_recipe = panel.split("const writeRecipe =", 1)[1].split("\n    };", 1)[0]
+    assert "state.busy" not in write_recipe
+    assert "rollbackRecipe: true" in write_recipe
     assert 'button("Edit as custom"' in panel
 
     # The host owns mount and teardown.
@@ -263,6 +268,548 @@ def test_panel_honours_the_overlay_and_mutation_contracts():
     assert "this._referencePanelHandle?.close?.();" in widget
     assert "this._referencePanelHandle?.refresh?.();" in widget
     assert "_showReferenceLaneMenu" not in widget
+
+
+_RECIPE_SCHEMA = [
+    {"key": "assembly", "section": "hard", "group": "Model input", "label": "Assembly",
+     "type": "enum", "values": ["batch", "sheet"], "default": "batch",
+     "applies_to": [], "requires": "", "requires_value": "", "help": "h"},
+    {"key": "layout", "section": "hard", "group": "Model input", "label": "Layout",
+     "type": "enum", "values": ["strip", "grid"], "default": "strip",
+     "applies_to": ["sheet"], "requires": "", "requires_value": "", "help": "h"},
+    {"key": "max_members", "section": "hard", "group": "Members", "label": "Maximum members",
+     "type": "int", "default": 4, "applies_to": [], "requires": "", "requires_value": "",
+     "help": "h"},
+    {"key": "frame_step", "section": "hard", "group": "Members", "label": "Frame step",
+     "type": "int", "default": 8, "applies_to": [], "requires": "", "requires_value": "",
+     "help": "h"},
+    {"key": "prompt_prefix", "section": "soft", "group": "Prompt", "label": "Prompt prefix",
+     "type": "string", "default": "", "applies_to": [], "requires": "", "requires_value": "",
+     "help": "h"},
+    {"key": "suggested_tags", "section": "soft", "group": "Prompt", "label": "Suggested tags",
+     "type": "string_list", "default": [], "applies_to": [], "requires": "",
+     "requires_value": "", "help": "h"},
+    {"key": "live_outputs", "section": "hard", "group": "Outputs", "label": "Live outputs",
+     "type": "output_list", "values": ["image", "mask", "slots"], "default": None,
+     "applies_to": [], "requires": "", "requires_value": "", "help": "h"},
+]
+
+
+def _run_recipe_panel(body: str) -> dict:
+    """The mounted Reference Lane panel on a real `EditorWidget`.
+
+    The lane-config save, the project-mutation queue, the coalescing decision
+    and the undo stack are the shipped ones (`durable_rules.md`: a paint test
+    drives the real path). Only the transport is a stub: `server` applies
+    `update_lane_config` the way the route does and answers with the whole
+    scene, and `hold()` parks the next write until the test releases or fails
+    it. The body returns a JSON-able value.
+    """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for the mounted recipe-panel harness")
+    script = """
+import assert from 'node:assert/strict';
+class N {
+  constructor(tag) { this.tagName=String(tag).toUpperCase(); this.children=[];
+    this.options=[]; this.style={cssText:""}; this.dataset={}; this.attributes={};
+    this.value=""; this.textContent=""; this.title=""; this.disabled=false;
+    this.checked=false; this.open=false; this._handlers={}; }
+  get selectedOptions() { return this.options.filter((o) => o.value === this.value); }
+  // As in the DOM, assigning text replaces the children; a render clears its
+  // body this way.
+  get textContent() { return this._text; }
+  set textContent(v) { this._text = String(v ?? ""); this.children = []; this.options = []; }
+  appendChild(c) { if(!c?.tagName) return c; this.children.push(c); c.parentElement=this;
+    if(c.tagName==="OPTION") this.options.push(c); return c; }
+  append(...cs) { cs.forEach((c)=>this.appendChild(c)); }
+  insertBefore(c, ref) { this.appendChild(c); this.children.pop();
+    const at = this.children.indexOf(ref);
+    this.children.splice(at < 0 ? this.children.length : at, 0, c); return c; }
+  addEventListener(t,h) { (this._handlers[t] ||= []).push(h); }
+  removeEventListener() {}
+  dispatch(t, extra = {}) { (this._handlers[t] || []).forEach((h) => h({ target: this,
+    preventDefault() {}, stopPropagation() {}, ...extra })); }
+  setAttribute(k,v) { this.attributes[k]=String(v); }
+  getAttribute(k) { return this.attributes[k] ?? null; }
+  querySelectorAll(sel) { const tags=String(sel).split(",").map((v)=>v.trim().toUpperCase());
+    const out=[]; const walk=(n)=>n.children.forEach((c)=>{
+      if(tags.includes(c.tagName)) out.push(c); walk(c); }); walk(this); return out; }
+  querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
+  contains() { return false; }
+  focus() {}
+  remove() { if(this.parentElement) this.parentElement.children=
+    this.parentElement.children.filter((c)=>c!==this); }
+}
+globalThis.document={createElement:(t)=>new N(t),body:new N("body"),activeElement:null};
+globalThis.window={addEventListener(){},removeEventListener(){},localStorage:null,
+  comfyAPI:{api:{api:{apiURL:(path)=>path}}},SONDER_DEBUG_SESSION:true,
+  prompt:()=>globalThis.__promptAnswer};
+globalThis.localStorage={getItem(){return null;},setItem(){}};
+globalThis.location={href:'http://test/'};
+globalThis.requestAnimationFrame=()=>0;
+const { EditorWidget } = await import(__WIDGET__);
+const { ProjectMutationQueue } = await import(__QUEUE__);
+const panelModule = await import(__PANEL__);
+const schema = __SCHEMA__;
+const baseRecipe = () => ({lane_id:'lane-a', recipe_id:'', media_kind:'image',
+  recipe:{name:'Mine', hard:{assembly:'batch', max_members:4, frame_step:8,
+    frame_grid_source:'custom'}, soft:{prompt_prefix:''}}});
+const w = Object.create(EditorWidget.prototype);
+const localRenders = [];
+const fetches = [];
+let fetchApplies = false;
+let server = null;
+Object.assign(w, {
+  projectDir:'project', projectId:'project', activeSceneId:'scene',
+  activeScene:{scene_id:'scene', reference_lane_count:1, duration_frames:20,
+    reference_lane_configs:[{name:'', color:'', locked:false, hidden:false}],
+    reference_lane_recipes:[baseRecipe()], reference_items:[]},
+  _activeMutationGesture:null, _timelineMutationDepth:0, _sceneMutationInvalidationSeq:0,
+  _projectMutationQueue:new ProjectMutationQueue(),
+  _undoStack:[], _redoStack:[], _maxUndoSteps:50, _historyStackRevision:0,
+  _trimUndoStack(){}, _clearRedoForNewEdit(){}, _replayDeferredHistoryWidgetStateIfIdle(){},
+  _reconcileActiveSceneFromMutation:()=>true, _schedulePostMutationSceneRefresh(){},
+  _deferProjectBackedRefresh(){},
+  // The ungated heal refetch. Offline by default; a test may make it apply
+  // the server's scene, as the real one does when the server answers.
+  _fetchScenes:async(options)=>{ fetches.push(options?.reason || '');
+    if (!fetchApplies) return false;
+    w.activeScene = structuredClone(server); return true; },
+  _renderTimeline(){}, _renderViewportFrame(){},
+  _renderSceneAfterLocalMutation(){ localRenders.push(structuredClone(
+    w.activeScene.reference_lane_recipes[0].recipe)); },
+  _buildTrackLayout(){ w._trackLayout=[{type:'reference', laneIndex:0, customName:'',
+    color:'', locked:false, hidden:false}]; },
+  _referenceRecipePresets:[{id:'preset:sheet', name:'Sheet preset', builtIn:true,
+    media_kind:'image', hard:{assembly:'sheet', layout:'grid'}, soft:{}}],
+  _customReferenceRecipes:[], _referenceRecipeFieldSchema:schema,
+  _promptContextProfiles:[], _promptContextCatalog:{},
+  _defaultReferenceLaneRecipe:()=>({lane_id:'', recipe_id:'', media_kind:'image',
+    recipe:{hard:{}, soft:{}}}),
+  _referenceMemberForRef:()=>null, _findAssetById:()=>null,
+  _referenceAssetPreviewUrl:()=>null, _referenceLaneAdvisories:()=>[],
+  _isLaneLocked:()=>false, _channelTemplate:()=>({}),
+});
+w._buildTrackLayout();
+server = structuredClone(w.activeScene);
+const sent = [];
+const held = [];
+let holdNext = 0;
+const hold = (count = 1) => { holdNext += count; };
+w._runSceneMutation = (operations, options) => w._queueProjectMutation({
+  ...options, refreshScenes:false, intent:{sceneId:'scene', operations},
+  run: async (intent) => {
+    sent.push(structuredClone(intent.operations));
+    if (holdNext > 0) {
+      holdNext -= 1;
+      await new Promise((resolve, reject) => held.push({resolve, reject}));
+    }
+    for (const op of intent.operations) {
+      if (op.type !== 'update_lane_config') continue;
+      const stored = server.reference_lane_recipes[op.lane_index];
+      server.reference_lane_recipes[op.lane_index] = {
+        ...op.fields.reference_recipe, lane_id: stored?.lane_id || ''};
+    }
+    return {payload:{scene: structuredClone(server)}};
+  },
+});
+const tick = () => new Promise((r) => setTimeout(r, 0));
+// The queue dispatches a write on a later turn, so wait for it to be held.
+const nextHeld = async () => {
+  for (let i = 0; i < 20 && !held.length; i += 1) await tick();
+  assert.ok(held.length, 'no write is held');
+  return held.shift();
+};
+const release = async () => { (await nextHeld()).resolve(); await tick(); await tick(); };
+const fail = async () => { (await nextHeld()).reject(Object.assign(new Error('offline'),
+  {status:0})); await tick(); await tick(); };
+// Release every held write, including ones the queue dispatches meanwhile.
+const drain = async () => { for (let i = 0; i < 5; i += 1) { await tick();
+  while (held.length) await release(); } };
+const walk = (n, out=[]) => { out.push(n); n.children.forEach((c) => walk(c, out)); return out; };
+const handle = panelModule.mountReferenceLanePanel(w, {laneIndex:0});
+const nodes = () => walk(handle.element);
+const control = (label) => {
+  const tag = nodes().find((n) => n.tagName === 'DIV' && n.textContent === label);
+  assert.ok(tag, `no control labelled ${label}`);
+  const found = tag.parentElement.children[1];
+  return found.tagName === 'DIV' ? found.children[0] : found;
+};
+const edit = (label, value) => { const input = control(label); input.value = String(value);
+  input.dispatch('change'); };
+const clickButton = (text) => { const b = nodes().find((n) => n.tagName === 'BUTTON'
+  && n.textContent.startsWith(text)); assert.ok(b, `no button ${text}`); b.dispatch('click'); };
+const recipe = () => w.activeScene.reference_lane_recipes[0].recipe;
+const recipeEntries = () => w._undoStack.filter((entry) => entry.label === 'change lane recipe');
+const recipeWrites = () => sent.filter((ops) => ops.some((op) => op.type === 'update_lane_config'));
+const diag = (kind) => (window.__SONDER_CANVAS_DIAG?.events || []).filter((e) => e.kind === kind);
+const result = await (async () => {
+__BODY__
+})();
+console.log(JSON.stringify(result ?? null));
+"""
+    script = (script
+              .replace("__WIDGET__", json.dumps((ROOT / "web/js/editor_widget.js").as_uri()))
+              .replace("__QUEUE__", json.dumps((ROOT / "web/js/project_mutation_queue.js").as_uri()))
+              .replace("__PANEL__", json.dumps((ROOT / "web/js/editor_reference_panel.js").as_uri()))
+              .replace("__SCHEMA__", json.dumps(_RECIPE_SCHEMA))
+              .replace("__BODY__", body))
+    completed = subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        capture_output=True, text=True, encoding="utf-8")
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+    return json.loads(completed.stdout.strip().splitlines()[-1])
+
+
+def test_a_recipe_edit_made_while_the_previous_save_runs_is_sent_not_dropped():
+    """The Critical silent drop: a second edit during a running save.
+
+    It used to hit `state.busy` and vanish. Now it reads the scene the first
+    edit painted, opens its own queue slot (a running write cannot be merged
+    into) and its own Undo step, and the second write carries both fields.
+    """
+    result = _run_recipe_panel("""
+    hold();
+    edit('Maximum members', 5);
+    await tick();
+    edit('Frame step', 9);
+    const shownBeforeAnyAck = structuredClone(recipe().hard);
+    await release();
+    await tick();
+    return {shownBeforeAnyAck, writes: recipeWrites().map((ops) =>
+      ops[0].fields.reference_recipe.recipe.hard), entries: recipeEntries().length,
+      stamped: recipeEntries().every((entry) => entry.postSnapshot),
+      server: server.reference_lane_recipes[0].recipe.hard};
+    """)
+    assert result["shownBeforeAnyAck"]["max_members"] == 5
+    assert result["shownBeforeAnyAck"]["frame_step"] == 9
+    assert len(result["writes"]) == 2
+    assert result["writes"][1]["max_members"] == 5 and result["writes"][1]["frame_step"] == 9
+    assert result["entries"] == 2 and result["stamped"]
+    assert result["server"]["max_members"] == 5 and result["server"]["frame_step"] == 9
+
+
+def test_recipe_edits_behind_a_pending_save_fold_into_one_write_and_one_undo_step():
+    """Edits that meet a still-pending recipe write fold into it.
+
+    A blocker holds the queue, so the first recipe edit's slot is pending when
+    the second and third arrive: one merged write, one Undo step, all three
+    fields present.
+    """
+    result = _run_recipe_panel("""
+    hold();
+    w._runSceneMutation([{type:'blocker'}], {key:'blocker', coalesce:false});
+    await tick();
+    edit('Maximum members', 5);
+    edit('Frame step', 9);
+    edit('Prompt prefix', 'hello');
+    await release();
+    await tick();
+    return {writes: recipeWrites().map((ops) => ops[0].fields.reference_recipe.recipe),
+      entries: recipeEntries().length};
+    """)
+    assert len(result["writes"]) == 1
+    merged = result["writes"][0]
+    assert merged["hard"]["max_members"] == 5 and merged["hard"]["frame_step"] == 9
+    assert merged["soft"]["prompt_prefix"] == "hello"
+    assert result["entries"] == 1
+
+
+def test_save_as_custom_right_after_a_field_change_keeps_the_field():
+    """The buttons read the lane when clicked, never the recipe a render drew.
+
+    The busy gate used to hide this by dropping the field edit; without it, a
+    draw-time copy would write the old value straight back over the field.
+    """
+    result = _run_recipe_panel("""
+    const created = [];
+    w._mutateReferences = async (operations) => {
+      created.push(structuredClone(operations[0].fields));
+      w._customReferenceRecipes.push({id:'custom:new', name:'Kept', builtIn:false,
+        media_kind:'image', ...operations[0].fields});
+      return {payload:{results:[{type:'create_recipe', recipe_id:'custom:new'}]}};
+    };
+    globalThis.__promptAnswer = 'Kept';
+    edit('Maximum members', 6);
+    clickButton('Save as custom');
+    for (let i = 0; i < 6; i += 1) await tick();
+    return {created: created[0]?.hard, lane: w.activeScene.reference_lane_recipes[0],
+      server: server.reference_lane_recipes[0]};
+    """)
+    assert result["created"]["max_members"] == 6
+    assert result["lane"]["recipe_id"] == "custom:new"
+    assert result["lane"]["recipe"]["hard"]["max_members"] == 6
+    assert result["server"]["recipe"]["hard"]["max_members"] == 6
+    assert result["lane"]["lane_id"] == "lane-a"
+
+
+def test_a_structural_recipe_edit_repaints_at_once_and_a_plain_one_waits_for_the_gate():
+    """A value that reshapes the form repaints now; a plain value does not.
+
+    Assembly `sheet` reveals Layout, so the panel must show it before the save
+    returns. A number edit leaves the rebuild to the host's gated refresh, so
+    the field the author tabbed into is not rebuilt under them.
+    """
+    result = _run_recipe_panel("""
+    hold(2);
+    const firstInput = control('Maximum members');
+    edit('Maximum members', 5);
+    const sameInputAfterPlainEdit = control('Maximum members') === firstInput;
+    const gatedRepaints = localRenders.length;
+    edit('Assembly', 'sheet');
+    const layoutShown = nodes().some((n) => n.tagName === 'DIV' && n.textContent === 'Layout');
+    const rebuilt = control('Maximum members') !== firstInput;
+    await drain();
+    return {sameInputAfterPlainEdit, gatedRepaints, layoutShown, rebuilt};
+    """)
+    assert result == {"sameInputAfterPlainEdit": True, "gatedRepaints": 1,
+                      "layoutShown": True, "rebuilt": True}
+
+
+def test_a_template_switch_shows_the_new_template_at_once():
+    """The select keeps focus, so the gated refresh would wait: repaint directly."""
+    result = _run_recipe_panel("""
+    hold();
+    const select = nodes().find((n) => n.tagName === 'SELECT'
+      && n.options.some((o) => o.value === 'preset:sheet'));
+    select.value = 'preset:sheet';
+    select.dispatch('change');
+    const shown = {editAsCustom: nodes().some((n) => n.tagName === 'BUTTON'
+      && n.textContent === 'Edit as custom'),
+      layout: nodes().some((n) => n.tagName === 'DIV' && n.textContent === 'Layout')};
+    await release();
+    return shown;
+    """)
+    assert result == {"editAsCustom": True, "layout": True}
+
+
+def test_a_failed_recipe_write_restores_the_acknowledged_recipe_locally():
+    """Server unreachable: the heal refetch fails too, so roll back locally.
+
+    `durable_rules.md`: a local optimistic apply owes a rollback that works
+    without the network. The failed write's Undo step goes with it, and the
+    deferred heal is recorded.
+    """
+    result = _run_recipe_panel("""
+    hold();
+    edit('Maximum members', 7);
+    const painted = recipe().hard.max_members;
+    await fail();
+    await tick();
+    return {painted, after: recipe().hard.max_members,
+      laneId: w.activeScene.reference_lane_recipes[0].lane_id,
+      repaintedAfterRollback: localRenders.at(-1)?.hard?.max_members,
+      entries: recipeEntries().length,
+      deferred: diag('lane_config_rollback_deferred').length};
+    """)
+    assert result["painted"] == 7
+    assert result["after"] == 4
+    assert result["laneId"] == "lane-a"
+    assert result["repaintedAfterRollback"] == 4
+    assert result["entries"] == 0
+    assert result["deferred"] >= 1
+
+
+def test_a_failed_coalesced_burst_restores_what_the_server_holds_not_a_sibling_paint():
+    """Every folded gesture sees the failure; the restore is the pre-burst value.
+
+    A joiner's own snapshot is an earlier sibling's paint, which the server
+    never held (`durable_rules.md`, the head-of-a-coalesced-group rule).
+    """
+    result = _run_recipe_panel("""
+    hold(2);
+    w._runSceneMutation([{type:'blocker'}], {key:'blocker', coalesce:false}).catch(() => {});
+    await tick();
+    edit('Maximum members', 5);
+    edit('Frame step', 9);
+    await release();
+    await fail();
+    await tick();
+    return {hard: recipe().hard, writes: recipeWrites().length};
+    """)
+    assert result["writes"] == 1
+    assert result["hard"]["max_members"] == 4 and result["hard"]["frame_step"] == 8
+
+
+def test_a_failed_recipe_write_with_a_newer_write_queued_does_not_flash_back():
+    """The newer queued write carries what the author last saw; it decides."""
+    result = _run_recipe_panel("""
+    hold(2);
+    edit('Maximum members', 5);
+    await tick();
+    edit('Frame step', 9);
+    await fail();
+    const whileNewerQueued = structuredClone(recipe().hard);
+    const skipped = diag('recipe_rollback_skipped').map((e) => e.reason
+      ?? e.payload?.reason ?? e.data?.reason);
+    await release();
+    await tick();
+    return {whileNewerQueued, skipped, final: recipe().hard,
+      server: server.reference_lane_recipes[0].recipe.hard};
+    """)
+    assert result["whileNewerQueued"]["max_members"] == 5
+    assert result["whileNewerQueued"]["frame_step"] == 9
+    assert len(result["skipped"]) == 1
+    # Residual logged on the Bug Tracker: the newer whole-value write
+    # re-commits the failed field, because it is what the author last saw.
+    assert result["server"]["max_members"] == 5 and result["server"]["frame_step"] == 9
+
+
+def test_two_failed_recipe_writes_restore_the_value_before_both():
+    """B's own snapshot is A's paint; the chain restores what the server holds."""
+    result = _run_recipe_panel("""
+    hold(2);
+    edit('Maximum members', 5);
+    await tick();
+    edit('Frame step', 9);
+    await fail();
+    await fail();
+    await tick();
+    return recipe().hard;
+    """)
+    assert result["max_members"] == 4 and result["frame_step"] == 8
+
+
+def test_a_failed_recipe_write_after_an_accepted_one_restores_the_accepted_value():
+    result = _run_recipe_panel("""
+    hold(2);
+    edit('Maximum members', 5);
+    await tick();
+    edit('Frame step', 9);
+    await release();
+    await fail();
+    await tick();
+    return recipe().hard;
+    """)
+    assert result["max_members"] == 5 and result["frame_step"] == 8
+
+
+_ROW = """
+const rowOf = (label) => nodes().find((n) => n.tagName === 'DIV' && n.textContent === label)
+  .parentElement;
+const inRow = (label, predicate) => walk(rowOf(label)).filter(predicate);
+"""
+
+
+def test_two_tags_entered_in_a_row_are_both_kept():
+    """The tag input keeps focus, so the panel does not repaint between tags.
+
+    The second commit used to build on the draw-time list and drop the first,
+    and the blur after Enter committed the same tag again.
+    """
+    result = _run_recipe_panel(_ROW + """
+    hold(2);
+    const input = inRow('Suggested tags', (n) => n.tagName === 'INPUT')[0];
+    input.value = 'A'; input.dispatch('keydown', {key:'Enter'});
+    input.value = 'B'; input.dispatch('keydown', {key:'Enter'});
+    input.dispatch('change');
+    await drain();
+    await tick();
+    return {local: recipe().soft.suggested_tags, server: server.reference_lane_recipes[0]
+      .recipe.soft.suggested_tags, cleared: input.value,
+      chips: inRow('Suggested tags', (n) => n.tagName === 'SPAN' && ['A', 'B']
+        .includes(n.textContent)).map((n) => n.textContent),
+      writes: recipeWrites().length};
+    """)
+    assert result["local"] == ["A", "B"]
+    assert result["server"] == ["A", "B"]
+    assert result["cleared"] == ""
+    assert result["chips"] == ["A", "B"], "each committed tag shows at once"
+    assert result["writes"] <= 2, "the blur after Enter commits nothing more"
+
+
+def test_two_output_toggles_before_a_repaint_are_both_kept():
+    result = _run_recipe_panel(_ROW + """
+    hold(2);
+    const boxes = inRow('Live outputs', (n) => n.tagName === 'INPUT');
+    boxes[0].checked = false; boxes[0].dispatch('change');
+    boxes[1].checked = false; boxes[1].dispatch('change');
+    await drain();
+    return recipe().hard.live_outputs;
+    """)
+    assert result == ["slots"]
+
+
+def test_a_failed_write_does_not_refetch_over_a_newer_queued_write():
+    """An ungated GET while B is queued would replace B's paint.
+
+    The server answers here (a refusal, not an outage), so the heal would
+    apply. It must wait for the queue's deferred refresh instead, or the next
+    edit reads a scene without B and re-sends it whole.
+    """
+    result = _run_recipe_panel("""
+    fetchApplies = true;
+    hold(2);
+    edit('Maximum members', 5);
+    await tick();
+    edit('Frame step', 9);
+    await fail();
+    const fetchedWhileQueued = fetches.length;
+    const shown = structuredClone(recipe().hard);
+    await release();
+    return {fetchedWhileQueued, shown, server: server.reference_lane_recipes[0].recipe.hard};
+    """)
+    assert result["fetchedWhileQueued"] == 0
+    assert result["shown"]["frame_step"] == 9
+    assert result["server"]["frame_step"] == 9
+
+
+def test_a_rollback_never_overwrites_a_recipe_painted_by_something_else():
+    """A Reference stage paints the lane's recipe outside the chain."""
+    result = _run_recipe_panel("""
+    hold();
+    edit('Maximum members', 7);
+    const staged = {...structuredClone(w.activeScene.reference_lane_recipes[0]), recipe_id:'staged'};
+    w.activeScene.reference_lane_recipes[0] = staged;
+    await fail();
+    return {recipeId: w.activeScene.reference_lane_recipes[0].recipe_id,
+      reasons: diag('recipe_rollback_skipped').map((e) => JSON.stringify(e))};
+    """)
+    assert result["recipeId"] == "staged"
+    assert any("repainted_elsewhere" in reason for reason in result["reasons"])
+
+
+def test_an_edit_on_a_lane_locked_since_the_form_was_drawn_is_refused():
+    result = _run_recipe_panel("""
+    w._isLaneLocked = () => true;
+    edit('Maximum members', 7);
+    await tick();
+    return {writes: recipeWrites().length, local: recipe().hard.max_members};
+    """)
+    assert result == {"writes": 0, "local": 4}
+
+
+def test_a_recipe_created_while_the_lane_switched_template_is_not_attached():
+    result = _run_recipe_panel("""
+    let answer;
+    w._mutateReferences = () => new Promise((resolve) => { answer = resolve; });
+    globalThis.__promptAnswer = 'Late';
+    clickButton('Save as custom');
+    w.activeScene.reference_lane_recipes[0] = {...w.activeScene.reference_lane_recipes[0],
+      recipe_id:'preset:sheet'};
+    answer({payload:{results:[{type:'create_recipe', recipe_id:'custom:late'}]}});
+    for (let i = 0; i < 4; i += 1) await tick();
+    return {recipeId: w.activeScene.reference_lane_recipes[0].recipe_id,
+      writes: recipeWrites().length};
+    """)
+    assert result == {"recipeId": "preset:sheet", "writes": 0}
+
+
+def test_a_failed_lane_write_without_the_rollback_opt_in_keeps_the_heal_only():
+    """Lock/rename/hide keep today's refetch-only heal (out of Phase 1 scope)."""
+    result = _run_recipe_panel("""
+    hold();
+    const entry = {...w._trackLayout[0], referenceRecipe: {...recipe().__wrapper,
+      ...structuredClone(w.activeScene.reference_lane_recipes[0]),
+      recipe: {...recipe(), hard: {...recipe().hard, max_members: 9}}}};
+    const saving = w._saveLaneConfigWithinGesture([entry], {expectedLaneId:'lane-a',
+      undoLabel:'change lane recipe'});
+    await fail();
+    await saving;
+    return recipe().hard.max_members;
+    """)
+    assert result == 9
 
 
 def test_panel_uses_catalog_controls_and_progressive_disclosure():

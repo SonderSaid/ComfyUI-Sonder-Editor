@@ -187,6 +187,8 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         // A lane with no durable id yet has no identity to follow; the lane
         // count is the only evidence left that its index moved.
         renderedLaneCount: 0,
+        // `recipeFormShape` of the recipe form as last drawn.
+        drawnFormShape: "",
     };
     const storedLaneId = (index = state.laneIndex) => String(
         host.activeScene?.reference_lane_recipes?.[index]?.lane_id || "").trim();
@@ -284,7 +286,21 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
     const laneLocked = () => host._isLaneLocked?.(TRACK_TYPE.REFERENCE, state.laneIndex) || false;
 
     // ── Durable writes ─────────────────────────────────────────────────────
-    const writeRecipe = async (recipe) => {
+    //
+    // A recipe write paints and returns to the author at once; it never waits
+    // for, or is dropped behind, an earlier recipe save. The host's lane-config
+    // queue orders the writes and folds edits that meet a still-pending one
+    // into it, so a second edit reads the scene the first one painted. Every
+    // recipe action therefore reads `laneRecipe()` when the author acts, never
+    // the recipe a render drew: the draw-time copy is exactly the stale value a
+    // quick "change a field, then click Save as custom" would write back.
+    //
+    // `structural` repaints the panel directly: a template, media kind or
+    // custom-recipe switch changes which fields exist, and the gated refresh
+    // would leave the old form under a focused select. A plain field edit
+    // leaves the repaint to that gate, so the field the author tabbed into is
+    // never rebuilt under them.
+    const writeRecipe = async (recipe, { structural = true, evenIfLocked = false } = {}) => {
         // A references refresh can close the panel under an open custom-recipe
         // flow; nothing may be written from a closed one.
         if (!mounted) return;
@@ -299,7 +315,18 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             return;
         }
         const entry = currentEntry();
-        if (!entry || state.busy) return;
+        if (!entry) return;
+        if (laneLocked() && !evenIfLocked) {
+            // Locked since the form was drawn (an Undo, the header toggle)
+            // while its repaint waited on the author. The server does not
+            // gate lane-config writes on the lock, so the panel must.
+            render();
+            if (mounted) {
+                notifyWarning("This Reference lane is locked. Unlock it on the timeline header to edit.",
+                    { source: "reference-panel-locked" });
+            }
+            return;
+        }
         const expectedLaneId = state.renderedLaneId || "";
         const current = laneRecipe();
         const nextRecipe = preserveLaneRecipeIdentity(
@@ -307,18 +334,23 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             recipe,
             host._defaultReferenceLaneRecipe().lane_id,
         );
-        state.busy = true;
         entry.referenceRecipe = nextRecipe;
-        try {
-            // Its own Undo step: a recipe is part of the lane family, and a
-            // lane write no entry reverses blocks every earlier lane Undo.
-            await host._saveLaneConfig([entry], { expectedLaneId, undoLabel: "change lane recipe" });
-        } finally {
-            state.busy = false;
+        // Its own Undo step: a recipe is part of the lane family, and a lane
+        // write no entry reverses blocks every earlier lane Undo. The save's
+        // synchronous part pushes that step and paints the scene; a failed
+        // write restores the acknowledged recipe locally (`rollbackRecipe`).
+        const saving = host._saveLaneConfig([entry], {
+            expectedLaneId, undoLabel: "change lane recipe", rollbackRecipe: true });
+        if (structural) {
+            host._buildTrackLayout?.();
+            host._renderTimeline?.();
+            render();
+        } else {
+            host._renderSceneAfterLocalMutation?.({ viewport: false });
         }
-        host._buildTrackLayout?.();
-        host._renderTimeline?.();
-        render();
+        // No repaint after the save: its canonical reconcile, or a rollback,
+        // repaints through the host's gated panel refresh.
+        await saving;
     };
 
     const writeItem = async (item, fields, label) => {
@@ -400,7 +432,41 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         if (peg) next[peg] = "custom";
         materialized[section] = next;
         recipe.recipe = materialized;
-        void writeRecipe(recipe);
+        // A value that shows, hides, un-pegs or re-validates other controls
+        // reshapes the form, which must repaint now; any other value is already
+        // on screen. Compared with what the panel DREW, so a scene change whose
+        // repaint was deferred also counts.
+        void writeRecipe(recipe, { structural: recipeFormShape(recipe) !== state.drawnFormShape });
+    };
+
+    /** A saved value the control cannot offer, which the form flags in red. */
+    const fieldIsUnsupported = (recipe, field) => {
+        const value = readField(recipe, field);
+        if (field.type === "enum") {
+            const known = new Set((field.values || []).map(String));
+            const selected = String(value ?? field.default ?? "");
+            return !!selected && !known.has(selected);
+        }
+        if (!["compatible_profiles", "exposed_capabilities", "role_fields"].includes(field.key)) return false;
+        if (["compatible_profiles", "exposed_capabilities"].includes(field.key)
+                && !promptCatalogState().ready) return false;
+        const known = new Set(promptContextChoices(field).map((entry) => entry.value));
+        return (Array.isArray(value) ? value : []).some((entry) => !known.has(String(entry)));
+    };
+
+    /** What the recipe form draws beyond each control's own value: which
+     *  controls exist, which are pegged, which are flagged unsupported, and
+     *  the profiles the capability choices are derived from. */
+    const recipeFormShape = (recipe) => {
+        const hard = recipe.recipe?.hard || {};
+        const soft = recipe.recipe?.soft || {};
+        return JSON.stringify([soft.compatible_profiles || [],
+            visibleRecipeFields(host._referenceRecipeFieldSchema || [], hard, soft)
+                .map((field) => {
+                    const pegSource = PEG_SOURCE_FIELD[field.key];
+                    return [field.key, !!pegSource && String(hard[pegSource] || "custom") !== "custom",
+                        fieldIsUnsupported(recipe, field)];
+                })]);
     };
 
     /**
@@ -478,9 +544,19 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         return label && label !== tag ? `${tag} · ${label}` : String(tag);
     };
 
+    /** A list field's value when the author acts. A plain edit no longer
+     *  rebuilds the form, so a list captured at draw time would drop every
+     *  entry committed since: the second tag added in a row replaced the first. */
+    const currentList = (field) => {
+        const value = readField(laneRecipe(), field);
+        return Array.isArray(value) ? value.map(String) : [];
+    };
+
     const tagChipEditor = (field, tags, locked) => {
         const wrap = el("div", "", "display:flex;flex-wrap:wrap;align-items:center;gap:4px;flex:1;");
-        for (const tag of tags) {
+        // Chips are added and removed in place: the tag input keeps focus while
+        // the author enters several, so the panel's gated repaint waits.
+        const chipFor = (tag) => {
             const chip = el("span", "", `
                 display:inline-flex;align-items:center;gap:4px;font-size:10px;padding:2px 4px 2px 6px;
                 border:1px solid ${COLORS.border};border-radius:10px;color:${COLORS.text};
@@ -489,11 +565,15 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             if (!locked) {
                 const drop = el("button", "×", chromeButtonCss({ variant: "tertiary", padding: "0 3px", fontSize: "10px", radius: "8px" }));
                 drop.title = `Remove ${tag}`;
-                drop.addEventListener("click", () => applyField(field, tags.filter((entry) => entry !== tag)));
+                drop.addEventListener("click", () => {
+                    chip.remove();
+                    applyField(field, currentList(field).filter((entry) => entry !== tag));
+                });
                 chip.appendChild(drop);
             }
-            wrap.appendChild(chip);
-        }
+            return chip;
+        };
+        for (const tag of tags) wrap.appendChild(chipFor(tag));
         if (locked) return wrap;
 
         const input = el("input", "", chromeInputCss({ padding: "3px 6px", fontSize: "11px" }) + "width:150px;");
@@ -501,12 +581,18 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         const completionFor = (typed) => {
             const needle = typed.trim().toLowerCase();
             if (!needle) return "";
-            return tagCatalog().find((tag) => tag.toLowerCase().startsWith(needle) && !tags.includes(tag)) || "";
+            const present = currentList(field);
+            return tagCatalog().find((tag) => tag.toLowerCase().startsWith(needle) && !present.includes(tag)) || "";
         };
         const commit = (value) => {
             const tag = String(value || "").trim();
-            if (!tag || tags.includes(tag)) return;
-            applyField(field, [...tags, tag]);
+            const present = currentList(field);
+            // Cleared either way, so the blur after an Enter commits nothing.
+            input.value = "";
+            hint.textContent = "";
+            if (!tag || present.includes(tag)) return;
+            wrap.insertBefore(chipFor(tag), input);
+            applyField(field, [...present, tag]);
         };
         input.addEventListener("keydown", (event) => {
             event.stopPropagation();
@@ -595,9 +681,10 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             box.checked = selected.includes(entry.value);
             box.disabled = locked;
             box.addEventListener("change", () => {
+                const present = currentList(field);
                 const next = box.checked
-                    ? [...selected, entry.value]
-                    : selected.filter((value) => value !== entry.value);
+                    ? [...present, entry.value]
+                    : present.filter((value) => value !== entry.value);
                 applyField(field, [...new Set(next)]);
             });
             label.append(box, el("span", entry.label));
@@ -615,7 +702,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                 const remove = button("Remove", `Remove unsupported value ${value}`, "danger");
                 remove.style.padding = "0 4px";
                 remove.addEventListener("click", () => applyField(
-                    field, selected.filter((entry) => entry !== value)));
+                    field, currentList(field).filter((entry) => entry !== value)));
                 unsupported.appendChild(remove);
             }
             wrap.appendChild(unsupported);
@@ -687,7 +774,8 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                 // What this socket carries, and what it emits when unchecked.
                 label.title = field.value_help?.[name] || "";
                 box.addEventListener("change", () => {
-                    const base = declared || [...(field.values || [])];
+                    const now = readField(laneRecipe(), field);
+                    const base = Array.isArray(now) ? now : [...(field.values || [])];
                     const next = box.checked
                         ? [...new Set([...base, name])]
                         : base.filter((entry) => entry !== name);
@@ -754,6 +842,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
 
     const renderRecipe = (body) => {
         const recipe = laneRecipe();
+        state.drawnFormShape = recipeFormShape(recipe);
         const definition = definitionFor(recipe.recipe_id);
         const builtIn = isBuiltIn(recipe.recipe_id);
         const locked = builtIn || laneLocked() || state.busy;
@@ -776,11 +865,12 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         select.disabled = laneLocked() || state.busy;
         select.addEventListener("change", () => {
             const chosen = definitionFor(select.value);
+            const actingRecipe = laneRecipe();
             if (!chosen) {
-                void writeRecipe({ ...host._defaultReferenceLaneRecipe({ media_kind: recipe.media_kind }) });
+                void writeRecipe({ ...host._defaultReferenceLaneRecipe({ media_kind: actingRecipe.media_kind }) });
                 return;
             }
-            if (occupied && chosen.media_kind !== recipe.media_kind) {
+            if (laneItems().length > 0 && chosen.media_kind !== actingRecipe.media_kind) {
                 notifyWarning("Clear the Reference lane before switching its model input kind.", { source: "reference-panel-refused" });
                 render();
                 return;
@@ -802,7 +892,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         if (mediaBtn.disabled) mediaBtn.style.opacity = "0.5";
         mediaBtn.addEventListener("click", () => {
             void writeRecipe(host._defaultReferenceLaneRecipe({
-                media_kind: recipe.media_kind === "audio" ? "image" : "audio",
+                media_kind: laneRecipe().media_kind === "audio" ? "image" : "audio",
             }));
         });
         templateRow.appendChild(mediaBtn);
@@ -810,7 +900,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         if (builtIn) {
             const fork = button("Edit as custom", "Copy these values into a project recipe you can edit", "primary");
             fork.disabled = laneLocked() || state.busy;
-            fork.addEventListener("click", () => void forkToCustom(recipe, definition));
+            fork.addEventListener("click", () => void forkToCustom());
             templateRow.appendChild(fork);
         }
         body.appendChild(templateRow);
@@ -832,19 +922,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                 padding:8px 10px;font-size:11px;font-weight:700;color:${COLORS.text};
                 cursor:pointer;user-select:none;
             `);
-            const invalidFields = fields.filter((field) => {
-                const value = readField(recipe, field);
-                if (field.type === "enum") {
-                    const known = new Set((field.values || []).map(String));
-                    const selected = String(value ?? field.default ?? "");
-                    return !!selected && !known.has(selected);
-                }
-                if (!["compatible_profiles", "exposed_capabilities", "role_fields"].includes(field.key)) return false;
-                if (["compatible_profiles", "exposed_capabilities"].includes(field.key)
-                        && !promptCatalogState().ready) return false;
-                const known = new Set(promptContextChoices(field).map((entry) => entry.value));
-                return (Array.isArray(value) ? value : []).some((entry) => !known.has(String(entry)));
-            });
+            const invalidFields = fields.filter((field) => fieldIsUnsupported(recipe, field));
             block.open = invalidFields.length > 0 || disclosureOpen("recipe", group);
             block.addEventListener("toggle", () => rememberDisclosure("recipe", group, block.open));
             if (invalidFields.length) {
@@ -882,12 +960,12 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         const actions = el("div", "", "display:flex;gap:6px;flex-wrap:wrap;margin-top:2px;");
         const saveAs = button("Save as custom…", "Create a project recipe from this lane's current values");
         saveAs.disabled = state.busy;
-        saveAs.addEventListener("click", () => void saveAsCustom(recipe));
+        saveAs.addEventListener("click", () => void saveAsCustom());
         actions.appendChild(saveAs);
         if (definition && !definition.builtIn) {
             const update = button(`Update “${definition.name}”`, "Push this lane's values back into the project recipe");
             update.disabled = state.busy;
-            update.addEventListener("click", () => void updateCustom(recipe, definition));
+            update.addEventListener("click", () => void updateCustom());
             const rename = button("Rename", "Rename this project recipe");
             rename.addEventListener("click", () => void renameCustom(definition));
             const remove = button("Delete", "Delete this project recipe", "danger");
@@ -937,27 +1015,36 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         (result?.payload?.results || []).find((row) => row?.type === "create_recipe")?.recipe_id || "",
     );
 
-    const forkToCustom = async (recipe, definition) => {
-        const name = `${definition?.name || "Reference recipe"} (custom)`;
-        const result = await host._mutateReferences?.([{ type: "create_recipe", fields: recipePayload(recipe, name) }]);
+    // Each action reads the lane when the author acts, and again after the
+    // Library round trip: the lane's values may have been edited meanwhile, and
+    // the lane keeps what the author last set rather than the click-time copy.
+    // A lane that switched recipe during the round trip keeps its new recipe:
+    // the created one would name values it was never made from. It stays in
+    // the Library, where the author can pick or delete it.
+    const attachCreatedRecipe = async (result, clickedRecipeId, name) => {
         const recipeId = createdRecipeId(result);
-        if (!recipeId) {
+        const now = laneRecipe();
+        if (!recipeId || String(now.recipe_id || "") !== clickedRecipeId) {
             render();
             return;
         }
-        await writeRecipe({ ...recipe, recipe_id: recipeId, recipe: { ...(recipe.recipe || {}), name } });
+        await writeRecipe({ ...now, recipe_id: recipeId, recipe: { ...(now.recipe || {}), name } });
     };
 
-    const saveAsCustom = async (recipe) => {
+    const forkToCustom = async () => {
+        const recipe = laneRecipe();
+        const definition = definitionFor(recipe.recipe_id);
+        const name = `${definition?.name || "Reference recipe"} (custom)`;
+        const result = await host._mutateReferences?.([{ type: "create_recipe", fields: recipePayload(recipe, name) }]);
+        await attachCreatedRecipe(result, String(recipe.recipe_id || ""), name);
+    };
+
+    const saveAsCustom = async () => {
+        const recipe = laneRecipe();
         const name = window.prompt("Custom recipe name:", recipe.recipe?.name || "Custom Reference Recipe");
         if (!name?.trim()) return;
         const result = await host._mutateReferences?.([{ type: "create_recipe", fields: recipePayload(recipe, name.trim()) }]);
-        const recipeId = createdRecipeId(result);
-        if (recipeId) {
-            await writeRecipe({ ...recipe, recipe_id: recipeId, recipe: { ...(recipe.recipe || {}), name: name.trim() } });
-            return;
-        }
-        render();
+        await attachCreatedRecipe(result, String(recipe.recipe_id || ""), name.trim());
     };
 
     const expectedRecipe = (definition) => ({
@@ -968,7 +1055,13 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         soft: { ...(definition.soft || {}) },
     });
 
-    const updateCustom = async (recipe, definition) => {
+    const updateCustom = async () => {
+        const recipe = laneRecipe();
+        const definition = definitionFor(recipe.recipe_id);
+        if (!definition || definition.builtIn) {
+            render();
+            return;
+        }
         await host._mutateReferences?.([{
             type: "update_recipe",
             recipe_id: definition.id,
@@ -999,7 +1092,9 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         // The lane keeps its materialized values and falls back to Detached.
         const recipe = laneRecipe();
         if (recipe.recipe_id === definition.id) {
-            await writeRecipe({ ...recipe, recipe_id: "" });
+            // Not an edit of the lane's values: the recipe it named is gone, so
+            // it detaches whatever the lock says, as it always has.
+            await writeRecipe({ ...recipe, recipe_id: "" }, { evenIfLocked: true });
             return;
         }
         render();

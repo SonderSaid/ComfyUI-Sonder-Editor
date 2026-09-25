@@ -11,6 +11,9 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Fixed
+- A Reference lane recipe edit made while the previous one was still saving is no longer silently discarded. Recipe fields now update at once, and a change that cannot be saved returns to the saved value with a message, even when the server is unreachable.
+
 ## [0.7.0] - 2026-09-25
 
 ### Added
