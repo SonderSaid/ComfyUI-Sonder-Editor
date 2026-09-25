@@ -858,6 +858,8 @@ export function mountSharedAssetGallery(container, options = {}) {
             panX: 0,
             panY: 0,
             overlayEl: null,
+            // The single-view <img> currently on screen, carried under the next render's.
+            stageImage: null,
             cleanupFns: [],
             compareMode: false,
             showMetadata: false,
@@ -1301,14 +1303,26 @@ export function mountSharedAssetGallery(container, options = {}) {
         };
     }
 
-    function revealImageAfterDecode(img, onReveal = null) {
+    const IMAGE_REVEAL_FADE_MS = 140;
+
+    function revealImageAfterDecode(img, onReveal = null, onError = null) {
         let cancelled = false;
         let loadHandler = null;
         let errorHandler = null;
+        let placeholderTimer = null;
         const reveal = ({ clearPlaceholder = true } = {}) => {
-            if (!cancelled && img.isConnected) {
-                img.style.opacity = "1";
-                if (clearPlaceholder) onReveal?.();
+            if (cancelled || !img.isConnected) return;
+            img.style.opacity = "1";
+            if (!clearPlaceholder) {
+                onError?.();
+                return;
+            }
+            // Whatever sits under the image stays through the fade: cleared as it starts,
+            // the surface background shows through the half-transparent image as a blink.
+            if (onReveal) {
+                placeholderTimer = setTimeout(() => {
+                    if (!cancelled && img.isConnected) onReveal();
+                }, IMAGE_REVEAL_FADE_MS + 20);
             }
         };
         const decodeAndReveal = () => {
@@ -1328,18 +1342,23 @@ export function mountSharedAssetGallery(container, options = {}) {
         }
         return () => {
             cancelled = true;
+            clearTimeout(placeholderTimer);
             if (loadHandler) img.removeEventListener("load", loadHandler);
             if (errorHandler) img.removeEventListener("error", errorHandler);
         };
     }
 
-    function configureDecodedImage(img, asset, { highPriority = false, placeholderSurface = null } = {}) {
+    // `onShown` runs once the image has fully faded in, `onFailed` when it cannot load.
+    function configureDecodedImage(img, asset, { highPriority = false, placeholderSurface = null, onShown = null, onFailed = null } = {}) {
         img.decoding = "async";
         if (highPriority) img.fetchPriority = "high";
         img.style.opacity = "0";
-        img.style.transition = "opacity 140ms ease";
+        img.style.transition = `opacity ${IMAGE_REVEAL_FADE_MS}ms ease`;
         img.src = buildAssetViewUrl(currentProjectDir(), asset.path);
-        return revealImageAfterDecode(img, () => clearThumbnailPlaceholder(placeholderSurface));
+        return revealImageAfterDecode(img, () => {
+            clearThumbnailPlaceholder(placeholderSurface);
+            onShown?.();
+        }, onFailed);
     }
 
     function storageKey(suffix) {
@@ -3895,6 +3914,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     function closeInspectOverlay() {
         if (!state.overlayState.open) return;
         clearOverlayRuntime();
+        state.overlayState.stageImage = null;
         state.overlayState.open = false;
         state.overlayState.assetId = "";
         state.overlayState.origin = "gallery";
@@ -4541,7 +4561,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         return true;
     }
 
-    function renderSingleOverlay(asset, host) {
+    function renderSingleOverlay(asset, host, carriedImage = null) {
         const projectDir = currentProjectDir();
         const content = style(document.createElement("div"), `display:flex;flex-direction:column;gap:12px;flex:1 1 auto;min-height:0;`);
         host.appendChild(content);
@@ -4555,11 +4575,34 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         if (asset.asset_type === "image") {
             const stage = style(document.createElement("div"), `position:relative;flex:1 1 auto;min-height:0;border-radius:12px;background:#020507;border:1px solid #24323e;display:flex;align-items:center;justify-content:center;overflow:hidden;`);
-            applyThumbnailPlaceholder(stage, asset);
-            const img = style(document.createElement("img"), `max-width:100%;max-height:100%;display:block;user-select:none;pointer-events:none;`);
+            // The image on screen before this rebuild holds the stage until the new one has
+            // faded in. The stage is rebuilt on every step, and a placeholder for an asset
+            // whose row thumbnail never loaded arrives no sooner than the image itself.
+            const underlay = carriedImage?.complete && carriedImage.naturalWidth > 0 ? carriedImage : null;
+            if (underlay) {
+                underlay.decoding = "sync";
+                Object.assign(underlay.style, { position: "absolute", inset: "0", margin: "auto", transition: "none", opacity: "1" });
+                stage.appendChild(underlay);
+            } else {
+                applyThumbnailPlaceholder(stage, asset);
+            }
+            state.overlayState.stageImage = underlay;
+            const img = style(document.createElement("img"), `position:relative;max-width:100%;max-height:100%;display:block;user-select:none;pointer-events:none;`);
             img.draggable = false;
             img.alt = assetDisplayName(asset);
-            const imageRevealCleanup = configureDecodedImage(img, asset, { highPriority: true, placeholderSurface: stage });
+            const imageRevealCleanup = configureDecodedImage(img, asset, {
+                highPriority: true,
+                placeholderSurface: stage,
+                onShown: () => {
+                    underlay?.remove();
+                    state.overlayState.stageImage = img;
+                },
+                // Never leave the previous asset standing in for one that failed to load.
+                onFailed: () => {
+                    underlay?.remove();
+                    state.overlayState.stageImage = null;
+                },
+            });
             stage.appendChild(img);
             state.overlayState.cleanupFns.push(imageRevealCleanup, attachZoomPan(stage, img));
             content.appendChild(stage);
@@ -5228,6 +5271,9 @@ export function mountSharedAssetGallery(container, options = {}) {
         const carriedMediaState = (typeof overlay.captureMediaState === "function")
             ? overlay.captureMediaState()
             : null;
+        // The image on screen before this rebuild; only a single-image render takes it.
+        const carriedImage = overlay.stageImage;
+        overlay.stageImage = null;
         clearOverlayRuntime();
         // Drop any prior re-render hooks tied to torn-down overlay sub-trees.
         // renderCompareOverlay / metadata panel mount will reinstall them as needed.
@@ -5477,7 +5523,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             const signature = `s:${asset.asset_id}`;
             overlay.carriedMediaState = (carriedMediaState && overlay.mediaSignature === signature) ? carriedMediaState : null;
             overlay.mediaSignature = signature;
-            renderSingleOverlay(asset, mediaWrap);
+            renderSingleOverlay(asset, mediaWrap, carriedImage);
         }
         // The active renderer has consumed the carried scrub state (or there was none).
         overlay.carriedMediaState = null;

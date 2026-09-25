@@ -19,6 +19,7 @@ a fresh `[Unreleased]` block.
 ### Fixed
 - Copying a capped tracked-metadata field now uses its complete saved value when available and identifies whole-section raw text when an older asset cannot isolate the field.
 - The Asset Gallery inspector no longer blinks while an image preview loads, and its metadata panel stays in place when you select the next or previous asset instead of drifting up or down.
+- Stepping through images in the full-screen Inspect view no longer flashes black between assets: the previous image stays on screen until the next one has faded in.
 
 ## [0.6.0] - 2026-09-24
 
