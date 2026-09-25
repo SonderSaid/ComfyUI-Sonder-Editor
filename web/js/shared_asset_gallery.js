@@ -5708,6 +5708,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     function renderDetailMetadataSlot(asset) {
         const slot = style(document.createElement("div"), `display:flex;flex-direction:column;gap:8px;min-width:0;`);
         const build = () => {
+            slot.style.minHeight = "";
             const tracked = renderTrackedMetadataSection(asset);
             slot.replaceChildren(...(tracked ? [tracked] : []), renderGenerationSection(asset));
         };
@@ -5736,6 +5737,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         }
 
         destroyLiveMedia();
+        const heldScrollTop = detailPane.scrollTop;
         detailPane.innerHTML = "";
         if (!asset) {
             const emptyTitle = style(document.createElement("div"), `color:${CHROME.text};font-size:11px;font-weight:700;`);
@@ -5799,10 +5801,16 @@ export function mountSharedAssetGallery(container, options = {}) {
             // detail grid cell; otherwise overflow:hidden clips the centered image
             // top/bottom and the preview stops respecting aspect ratio (it should
             // letterbox like the thumbnails). The video branch below does the same.
+            // The height is fixed, not sized to the image: a surface that sizes to
+            // its image collapses to min-height until the new one loads, and its
+            // regrowth above the metadata lets scroll anchoring drift the pane on
+            // every selection change.
+            previewSurface.style.height = "220px";
             previewSurface.style.flex = "0 0 auto";
-            const img = style(document.createElement("img"), `max-width:100%;max-height:220px;width:auto;height:auto;object-fit:contain;display:block;`);
-            img.src = buildAssetViewUrl(projectDir, asset.path);
+            applyThumbnailPlaceholder(previewSurface, asset);
+            const img = style(document.createElement("img"), `max-width:100%;max-height:100%;width:auto;height:auto;object-fit:contain;display:block;`);
             img.alt = assetDisplayName(asset);
+            state.liveMediaCleanup = configureDecodedImage(img, asset, { highPriority: true, placeholderSurface: previewSurface });
             previewSurface.appendChild(img);
         } else if (asset.asset_type === "video" && shouldSkipVideoLoad(asset)) {
             // Mirrors the Missing-asset block above: explain instead of rendering
@@ -5988,7 +5996,19 @@ export function mountSharedAssetGallery(container, options = {}) {
         }
 
         detailPane.append(...detailSections);
+        holdDetailScrollWhileLoading(asset, heldScrollTop);
         queueResize();
+    }
+
+    // A selection whose details are still loading shows a short metadata slot, which
+    // clamps the pane's scrollTop; the metadata then arrives under a scroll position the
+    // user never chose. Reserve the room the old position needs until the slot rebuilds.
+    function holdDetailScrollWhileLoading(asset, scrollTop) {
+        const slot = state.detailMetadataRefresh?.slot;
+        if (!slot || scrollTop <= 0 || assetDetail(asset).status !== "loading") return;
+        const deficit = scrollTop + detailPane.clientHeight - detailPane.scrollHeight;
+        if (deficit > 0) slot.style.minHeight = `${slot.offsetHeight + deficit}px`;
+        detailPane.scrollTop = scrollTop;
     }
 
     async function promptCreateFolder(parentFolder = "") {
