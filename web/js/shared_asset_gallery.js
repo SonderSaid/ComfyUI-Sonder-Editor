@@ -14,7 +14,7 @@ import {
 import { register as registerKeyboardConsumer, PRIORITY as KEY_PRIORITY } from "./keyboard_ownership.js";
 import { resolveEffectiveStreamingMode } from "./media_streaming.js";
 import { shouldSkipVideoLoad, videoTrackFailedToDecode } from "./media_preview_support.js";
-import { notifyError, notifyInfo, notifySuccess } from "./editor_notifications.js";
+import { notifyError, notifyInfo, notifySuccess, notifyWarning } from "./editor_notifications.js";
 import {
     cancelAutomaticThumbnailRepairs,
     enqueueAutomaticThumbnailRepair,
@@ -2397,6 +2397,227 @@ export function mountSharedAssetGallery(container, options = {}) {
         state.allowAutoFocus = true;
     }
 
+    // ── Paint-first asset writes ─────────────────────────────────────────
+    //
+    // Favorite, rename, folder, trash and restore paint at once and save in the
+    // background. The list the host last delivered stays the only authority:
+    // the gallery shows it plus its own pending patches, in the order they were
+    // made. A patch leaves when its write settles. An accepted write folds the
+    // server's values into the acknowledged baseline; a failed one is simply
+    // dropped, so a rollback needs no network and can only land on a value the
+    // server acknowledged -- even when an earlier write in the same burst failed
+    // too. Hosts and every other consumer never see the patches.
+    const assetPatches = new Map();      // asset_id -> [{ gen, fields }]
+    const assetAckedFields = new Map();  // asset_id -> acknowledged values of patched keys
+    let assetPatchGen = 0;
+    // Every gallery-originated metadata, folder and trash write runs through
+    // one serial chain. The fetch patch stamps `If-Match` from the last version
+    // this page saw, so two overlapping writes would refuse each other; in
+    // order, each carries the version the previous one produced. Imports and
+    // replacements stay outside it: their uploads are exempt from `If-Match`.
+    let assetWriteChain = Promise.resolve();
+
+    function skippedAssetWrite(message) {
+        const error = new Error(message);
+        error.code = "asset_write_skipped";
+        return error;
+    }
+
+    function enqueueAssetWrite(task) {
+        const projectDir = currentProjectDir();
+        const run = assetWriteChain.then(() => {
+            // Queued behind a write that outlived its project: never send it to
+            // whichever project the host holds now. A gallery torn down mid-chain
+            // still sends -- the author's paint was their intent.
+            if (currentProjectDir() !== projectDir) {
+                throw skippedAssetWrite("The project changed before the change was saved.");
+            }
+            return task();
+        });
+        assetWriteChain = run.catch(() => {});
+        return run;
+    }
+
+    /**
+     * What the server holds for this asset: the list's record with each
+     * pending key at its acknowledged value. When a queued write's turn comes,
+     * every write ahead of it has settled, so this is the state that write
+     * really lands on -- not what an earlier paint promised.
+     */
+    function acknowledgedAsset(assetId) {
+        const record = shownAsset(assetId);
+        return record ? { ...record, ...assetAckedFields.get(assetId) } : null;
+    }
+
+    /** Permanent deletion only reaches assets the server holds in Trash: the
+     *  trash a delete was confirmed after may itself have failed since. */
+    function requireAcknowledgedTrash(assetIds) {
+        if (assetIds.some((assetId) => !isTrashed(acknowledgedAsset(assetId)))) {
+            throw skippedAssetWrite("Nothing was deleted: an asset was no longer in Trash.");
+        }
+    }
+
+    function shownAsset(assetId) {
+        return data.assets.find((entry) => entry.asset_id === assetId) || null;
+    }
+
+    function patchedAsset(record) {
+        const patches = assetPatches.get(record?.asset_id);
+        if (!patches?.length) return record;
+        let shown = { ...record, ...assetAckedFields.get(record.asset_id) };
+        for (const patch of patches) shown = { ...shown, ...patch.fields };
+        return shown;
+    }
+
+    function showAssetAt(index, asset) {
+        data.assets[index] = asset;
+        const folder = normalizeFolderName(asset.folder || "");
+        if (folder && !data.folders.includes(folder)) {
+            data.folders = [...data.folders, folder].sort(compareStrings);
+        }
+    }
+
+    /** Paint `fields` onto an asset; the patch's id, or null when it is not listed. */
+    function paintAssetPatch(assetId, fields) {
+        const index = data.assets.findIndex((entry) => entry.asset_id === assetId);
+        if (index < 0) return null;
+        const record = data.assets[index];
+        // A key's acknowledged value is what it shows before its first pending
+        // patch; a key already patched keeps the baseline it has.
+        const acked = assetAckedFields.get(assetId) || {};
+        for (const key of Object.keys(fields)) {
+            if (!Object.prototype.hasOwnProperty.call(acked, key)) acked[key] = record[key];
+        }
+        assetAckedFields.set(assetId, acked);
+        const gen = ++assetPatchGen;
+        const patches = assetPatches.get(assetId) || [];
+        patches.push({ gen, fields: { ...fields } });
+        assetPatches.set(assetId, patches);
+        const folder = normalizeFolderName(fields.folder || "");
+        const addedFolder = !!folder && !data.folders.includes(folder);
+        patches[patches.length - 1].addedFolder = addedFolder ? folder : "";
+        showAssetAt(index, patchedAsset(record));
+        // No mutation-epoch mark here: a list that lands mid-chain is painted
+        // over (`overlayPendingAssetPatches`), and the host marks at send and at
+        // acknowledgement. A third mark per edit only superseded detail reads.
+        return gen;
+    }
+
+    /**
+     * Settle one patch. `accepted` is the server's values for its keys (a key
+     * it omits is taken as written), or null to drop the patch. Returns whether
+     * what the asset shows changed.
+     */
+    function settleAssetPatch(assetId, gen, accepted) {
+        const patches = assetPatches.get(assetId);
+        const at = patches ? patches.findIndex((patch) => patch.gen === gen) : -1;
+        if (at < 0) return false;
+        const [patch] = patches.splice(at, 1);
+        const acked = assetAckedFields.get(assetId) || {};
+        if (accepted) {
+            for (const key of Object.keys(patch.fields)) {
+                acked[key] = accepted[key] !== undefined ? accepted[key] : patch.fields[key];
+            }
+        }
+        if (!patches.length) {
+            assetPatches.delete(assetId);
+            assetAckedFields.delete(assetId);
+        }
+        const index = data.assets.findIndex((entry) => entry.asset_id === assetId);
+        if (index < 0) return false;
+        const before = data.assets[index];
+        const next = patches.length ? patchedAsset(before) : { ...before, ...acked };
+        showAssetAt(index, next);
+        // A folder only this dropped paint created goes with it.
+        if (!accepted && patch.addedFolder && !data.assets.some((entry) =>
+                !isTrashed(entry) && normalizeFolderName(entry.folder || "") === patch.addedFolder)) {
+            data.folders = data.folders.filter((folder) => folder !== patch.addedFolder);
+        }
+        // The server's trash time differs from the painted one by milliseconds;
+        // that alone is not worth a second full rebuild.
+        return Object.keys(acked).some((key) => before[key] !== next[key]
+            && !(key === "trashed_at" && before[key] && next[key]));
+    }
+
+    function settleAssetPatches(gens, acceptedFor = null) {
+        let changed = false;
+        for (const [assetId, gen] of gens) {
+            changed = settleAssetPatch(assetId, gen, acceptedFor ? acceptedFor(assetId) || {} : null) || changed;
+        }
+        return changed;
+    }
+
+    /** A list from the host is newer truth: it becomes the baseline, and every
+     *  pending patch is painted over it again, so a refresh landing mid-burst
+     *  cannot flip a star back. */
+    function overlayPendingAssetPatches() {
+        for (const assetId of assetPatches.keys()) {
+            const index = data.assets.findIndex((entry) => entry.asset_id === assetId);
+            if (index < 0) continue;
+            const record = data.assets[index];
+            const acked = assetAckedFields.get(assetId) || {};
+            for (const key of Object.keys(acked)) acked[key] = record[key];
+            showAssetAt(index, patchedAsset(record));
+        }
+    }
+
+    function pickDefined(source, keys) {
+        const picked = {};
+        for (const key of keys) {
+            if (source && source[key] !== undefined) picked[key] = source[key];
+        }
+        return picked;
+    }
+
+    // Mirrors `_trash_project_asset` / `_restore_project_asset` for the paint;
+    // the server's answer replaces these values when it arrives.
+    function trashedAssetFields(asset) {
+        return {
+            folder: "",
+            trashed_at: new Date().toISOString(),
+            trash_previous_folder: isTrashed(asset)
+                ? (asset.trash_previous_folder || "") : normalizeFolderName(asset.folder),
+        };
+    }
+
+    function restoredAssetFields(asset) {
+        return {
+            folder: normalizeFolderName(asset.trash_previous_folder || ""),
+            trashed_at: "",
+            trash_previous_folder: "",
+        };
+    }
+
+    function renderAfterAssetPaint(assetIds = []) {
+        if (state.destroyed) return;
+        render();
+        const overlay = state.overlayState;
+        if (overlay.open && !overlay.compareMode && assetIds.includes(overlay.assetId)) {
+            renderInspectOverlay();
+        }
+    }
+
+    /**
+     * "It failed" and "it could not be confirmed" are different claims. A
+     * failure without an HTTP status never delivered its answer: the change may
+     * be saved. The patch is dropped either way; that case says so and lets a
+     * fresh list decide.
+     */
+    function reportAssetWriteFailure(error, message) {
+        if (error?.code === "asset_write_skipped") {
+            notifyWarning(error.message, { source: "gallery-asset-skipped" });
+            return;
+        }
+        console.warn("[Sonder] Asset write failed:", error);
+        if (!Number.isInteger(error?.status)) {
+            notifyWarning("The change could not be confirmed. Reloading the asset list.",
+                { source: "gallery-asset-unconfirmed", detail: error?.message || null });
+            void options.onRequestAssetListRefresh?.({ reason: "gallery_write_unconfirmed" });
+            return;
+        }
+        notifyError(message, { source: "gallery-asset-write", detail: error?.message || null });
+    }
+
     function folderContainsPath(folderName, candidate) {
         const normalizedFolder = normalizeFolderName(folderName);
         const normalizedCandidate = normalizeFolderName(candidate);
@@ -2545,33 +2766,60 @@ export function mountSharedAssetGallery(container, options = {}) {
         });
     }
 
-    async function applyAssetUpdate(asset, updates) {
-        if (!asset?.asset_id) return;
+    /** Favorite, rename and folder: paint, save in order, then settle. */
+    async function applyAssetUpdate(asset, updates, {
+        successMessage = "", successSource = "gallery-asset-update",
+        failureMessage = "Failed to update the asset.",
+    } = {}) {
+        if (!asset?.asset_id || !options.onUpdateAsset) return false;
         const normalizedUpdates = { ...updates };
         if (Object.prototype.hasOwnProperty.call(normalizedUpdates, "folder")) {
             normalizedUpdates.folder = normalizeFolderName(normalizedUpdates.folder);
         }
-        const updated = await options.onUpdateAsset?.(asset.asset_id, normalizedUpdates);
-        updateAsset({ ...asset, ...normalizedUpdates, ...(updated || {}) });
+        if (Object.prototype.hasOwnProperty.call(normalizedUpdates, "name")) {
+            // The server keeps the old name for a blank one; paint what it keeps.
+            const name = String(normalizedUpdates.name ?? "").trim();
+            normalizedUpdates.name = name || shownAsset(asset.asset_id)?.name || asset.name || "";
+        }
+        // The gesture, and its diagnostics, start at the paint -- not when the
+        // queued write is finally sent.
+        const run = (diagnostics) => applyAssetUpdateWithinGesture(
+            asset.asset_id, normalizedUpdates, diagnostics,
+            { successMessage, successSource, failureMessage });
+        return options.withMutationGesture
+            ? options.withMutationGesture("asset_metadata", run) : run(null);
+    }
+
+    async function applyAssetUpdateWithinGesture(assetId, updates, diagnostics, messages) {
+        const gen = paintAssetPatch(assetId, updates);
+        if (gen === null) return false;
         clearUsageView();
-        render();
+        renderAfterAssetPaint([assetId]);
+        try {
+            const updated = await enqueueAssetWrite(
+                () => options.onUpdateAsset(assetId, updates, diagnostics));
+            if (settleAssetPatch(assetId, gen, updated || {})) renderAfterAssetPaint([assetId]);
+            // One source per kind, so a burst reads as one counted toast.
+            if (messages.successMessage) notifySuccess(messages.successMessage, { source: messages.successSource });
+            return true;
+        } catch (error) {
+            if (settleAssetPatch(assetId, gen, null)) renderAfterAssetPaint([assetId]);
+            reportAssetWriteFailure(error, messages.failureMessage);
+            return false;
+        }
     }
 
     async function handleToggleFavorite(asset, nextFavorite = null) {
         if (!asset?.asset_id || !options.onUpdateAsset) return false;
-        const desired = typeof nextFavorite === "boolean" ? nextFavorite : !asset.favorite;
-        try {
-            await applyAssetUpdate(asset, { favorite: desired });
-            notifySuccess(desired ? "Added to Favorites" : "Removed from Favorites");
-            if (state.overlayState.open && state.overlayState.assetId === asset.asset_id && !state.overlayState.compareMode) {
-                renderInspectOverlay();
-            }
-            return true;
-        } catch (error) {
-            console.warn("[Sonder] Failed to update favorite:", error);
-            notifyError(error?.message || "Failed to update favorite.");
-            return false;
-        }
+        // What the gallery shows, not the caller's copy: a second S before the
+        // first save returns toggles back.
+        const shown = shownAsset(asset.asset_id) || asset;
+        const desired = typeof nextFavorite === "boolean" ? nextFavorite : !shown.favorite;
+        return await applyAssetUpdate(shown, { favorite: desired }, {
+            successMessage: desired ? "Added to Favorites" : "Removed from Favorites",
+            successSource: "gallery-favorite",
+            failureMessage: "Failed to update favorite.",
+        });
     }
 
     function summarizeAssetTypes(assets) {
@@ -2614,12 +2862,11 @@ export function mountSharedAssetGallery(container, options = {}) {
         const currentFolder = commonFolderForAssets(assets);
         showFolderPicker(event, currentFolder, async (folder) => {
             try {
-                await options.onBulkMoveAssets(ids, folder);
+                await enqueueAssetWrite(() => options.onBulkMoveAssets(ids, folder));
                 clearUsageView();
                 await options.onRefresh?.();
             } catch (error) {
-                console.warn("[Sonder] Failed to move selected assets:", error);
-                notifyError(error?.message || "Failed to move selected assets.");
+                reportAssetWriteFailure(error, "Failed to move selected assets.");
             }
         });
     }
@@ -2642,84 +2889,151 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     async function handleBulkDeleteWithinGesture(ids, diagnostics) {
-        const nextAssetId = successorAssetIdAfterRemoval(ids);
-        try {
-            const assets = ids.map((assetId) => data.assets.find((entry) => entry.asset_id === assetId)).filter(Boolean);
-            let force = await resolveTrashForceDecision(assets);
-            if (force === null) return false;
-            let result = await options.onBulkDeleteAssets(ids, force === true, diagnostics);
-            if (result?.status === "conflict") {
-                force = confirmTrashProtection(assets, result);
-                if (force !== true) return false;
-                result = await options.onBulkDeleteAssets(ids, true, diagnostics);
-                if (result?.status === "conflict") {
-                    throw new Error(result?.error || "Bulk trash still reported a conflict.");
-                }
-            }
+        const assets = ids.map(shownAsset).filter(Boolean);
+        return await trashAssetsWithinGesture(assets, {
+            send: (force) => options.onBulkDeleteAssets(ids, force, diagnostics),
+            done: `Moved ${ids.length} assets to Trash`,
+            failureMessage: "Failed to move selected assets to Trash.",
+        });
+    }
 
-            for (const assetId of ids) {
-                const asset = data.assets.find((entry) => entry.asset_id === assetId);
-                if (!asset) continue;
-                updateAsset({
-                    ...asset,
-                    folder: "",
-                    trashed_at: result?.trashed_at || new Date().toISOString(),
-                    trash_previous_folder: asset.trash_previous_folder || normalizeFolderName(asset.folder),
-                });
+    /**
+     * Trash, single or bulk. Usage and favorite protection is confirmed BEFORE
+     * anything moves, so a protected asset never flickers into Trash and back.
+     * Then the assets leave the list at once (with the selection moving on and
+     * `onPainted` telling the Inspect view), and the write follows in the
+     * chain. A protection that appeared since the preflight brings them back
+     * and asks again.
+     */
+    async function trashAssetsWithinGesture(assets, {
+        send, done, failureMessage, onPainted = null, onUnpainted = null,
+    }) {
+        const assetIds = assets.map((asset) => asset.asset_id);
+        if (!assetIds.length) return false;
+        let force;
+        try {
+            force = await resolveTrashForceDecision(assets);
+        } catch (error) {
+            console.warn("[Sonder] Trash usage check failed:", error);
+            notifyError(failureMessage, { source: "gallery-asset-write", detail: error?.message || null });
+            return false;
+        }
+        if (force === null) return false;
+        let paintedSelection = "";
+        const paint = () => {
+            const nextAssetId = successorAssetIdAfterRemoval(assetIds);
+            paintedSelection = nextAssetId;
+            const gens = new Map();
+            for (const assetId of assetIds) {
+                const shown = shownAsset(assetId);
+                const gen = shown ? paintAssetPatch(assetId, trashedAssetFields(shown)) : null;
+                if (gen !== null) gens.set(assetId, gen);
             }
             clearUsageView();
             applySelectionState(nextAssetId ? [nextAssetId] : [], nextAssetId);
-            render();
+            // Before the repaint, so an Inspect view on the asset moves on
+            // rather than redrawing what is leaving.
+            onPainted?.();
+            renderAfterAssetPaint(assetIds);
             if (nextAssetId) scrollAssetIntoView(nextAssetId);
-            notifyInfo(`Moved ${ids.length} assets to Trash`);
+            return gens;
+        };
+        const unpaint = (gens) => {
+            settleAssetPatches(gens, null);
+            // Give the selection back only if the author has not moved it since.
+            if ((state.selectedAssetId || "") === paintedSelection) {
+                applySelectionState(assetIds, assetIds[assetIds.length - 1]);
+            }
+            onUnpainted?.();
+            renderAfterAssetPaint(assetIds);
+        };
+        let gens = paint();
+        try {
+            let result = await enqueueAssetWrite(() => send(force === true));
+            if (result?.status === "conflict") {
+                unpaint(gens);
+                gens = new Map();
+                force = confirmTrashProtection(assets.map((asset) => shownAsset(asset.asset_id) || asset), result);
+                if (force === false) {
+                    // Refused, yet nothing to confirm: say so instead of
+                    // quietly putting the asset back.
+                    notifyError(failureMessage, { source: "gallery-asset-write", detail: result?.error || null });
+                    return false;
+                }
+                if (force !== true) return false;
+                gens = paint();
+                result = await enqueueAssetWrite(() => send(true));
+                if (result?.status === "conflict") {
+                    const error = new Error(result?.error || "Trash still reported a conflict.");
+                    error.status = 409;
+                    throw error;
+                }
+            }
+            const accepted = pickDefined(result, ["trashed_at", "trash_previous_folder"]);
+            if (settleAssetPatches(gens, () => accepted)) renderAfterAssetPaint(assetIds);
+            notifyInfo(done, { source: "gallery-trash" });
             return true;
         } catch (error) {
-            console.warn("[Sonder] Failed to trash selected assets:", error);
-            notifyError(error?.message || "Failed to move selected assets to Trash.");
+            if (gens.size) unpaint(gens);
+            reportAssetWriteFailure(error, failureMessage);
             return false;
         }
     }
 
     async function handleAssetRestore(asset) {
-        if (!asset?.asset_id || !options.onRestoreAsset) return;
-        try {
-            const result = await options.onRestoreAsset(asset.asset_id);
-            updateAsset({
-                ...asset,
-                ...(result?.asset || {}),
-                trashed_at: "",
-                trash_previous_folder: "",
-                folder: normalizeFolderName(result?.asset?.folder ?? asset.trash_previous_folder ?? ""),
-            });
-            clearUsageView();
-            render();
-        } catch (error) {
-            console.warn("[Sonder] Failed to restore asset:", error);
-            notifyError(error?.message || "Failed to restore asset.");
-        }
+        if (!asset?.asset_id || !options.onRestoreAsset) return false;
+        const assetId = asset.asset_id;
+        return await restoreAssetsWithGesture([assetId], "asset_restore", {
+            send: (diagnostics) => options.onRestoreAsset(assetId, diagnostics),
+            acceptedFor: (result) => () => pickDefined(result?.asset,
+                ["folder", "trashed_at", "trash_previous_folder"]),
+            failureMessage: "Failed to restore asset.",
+        });
     }
 
     async function handleBulkRestore(assetIds = selectedAssetIdsList()) {
         const ids = normalizeSelection(assetIds, state.selectedAssetId).ids.filter((assetId) => isTrashed(data.assets.find((entry) => entry.asset_id === assetId)));
-        if (!ids.length || !options.onBulkRestoreAssets) return;
-        try {
-            await options.onBulkRestoreAssets(ids);
-            for (const assetId of ids) {
-                const asset = data.assets.find((entry) => entry.asset_id === assetId);
-                if (!asset) continue;
-                updateAsset({
-                    ...asset,
-                    folder: normalizeFolderName(asset.trash_previous_folder || ""),
-                    trashed_at: "",
-                    trash_previous_folder: "",
-                });
+        if (!ids.length || !options.onBulkRestoreAssets) return false;
+        return await restoreAssetsWithGesture(ids, "asset_bulk_restore", {
+            send: (diagnostics) => options.onBulkRestoreAssets(ids, diagnostics),
+            acceptedFor: () => null,
+            failureMessage: "Failed to restore selected assets.",
+        });
+    }
+
+    /** Restore, single or bulk: back to its folder at once, then the write. */
+    async function restoreAssetsWithGesture(assetIds, kind, { send, acceptedFor, failureMessage }) {
+        const run = async (diagnostics) => {
+            const gens = new Map();
+            for (const assetId of assetIds) {
+                const shown = shownAsset(assetId);
+                const gen = shown ? paintAssetPatch(assetId, restoredAssetFields(shown)) : null;
+                if (gen !== null) gens.set(assetId, gen);
             }
+            if (!gens.size) return false;
             clearUsageView();
-            render();
-        } catch (error) {
-            console.warn("[Sonder] Failed to restore selected assets:", error);
-            notifyError(error?.message || "Failed to restore selected assets.");
-        }
+            renderAfterAssetPaint(assetIds);
+            try {
+                const result = await enqueueAssetWrite(() => {
+                    // The trash this restore undoes may itself have failed. The
+                    // server would then "restore" a live asset into its empty
+                    // previous folder, so refuse rather than send.
+                    if (assetIds.some((assetId) => !isTrashed(acknowledgedAsset(assetId)))) {
+                        throw skippedAssetWrite("Not restored: the asset was no longer in Trash.");
+                    }
+                    return send(diagnostics);
+                });
+                if (settleAssetPatches(gens, acceptedFor(result) || (() => ({})))) {
+                    renderAfterAssetPaint(assetIds);
+                }
+                return true;
+            } catch (error) {
+                if (settleAssetPatches(gens, null)) renderAfterAssetPaint(assetIds);
+                reportAssetWriteFailure(error, failureMessage);
+                return false;
+            }
+        };
+        return options.withMutationGesture ? options.withMutationGesture(kind, run) : run(null);
     }
 
     async function getBulkUsagePayload(assetIds) {
@@ -2817,16 +3131,19 @@ export function mountSharedAssetGallery(container, options = {}) {
                 : `Permanently delete "${assetDisplayName(asset)}"? This cannot be undone.`;
             if (!confirm(message)) return;
 
-            const result = await options.onPermanentDeleteAsset(asset.asset_id, usage?.usage_count > 0);
+            const result = await enqueueAssetWrite(() => {
+                requireAcknowledgedTrash([asset.asset_id]);
+                return options.onPermanentDeleteAsset(asset.asset_id, usage?.usage_count > 0);
+            });
             if (result?.status === "conflict") {
-                throw new Error("Permanent delete unexpectedly reported a usage conflict.");
+                throw Object.assign(new Error("Permanent delete unexpectedly reported a usage conflict."),
+                    { status: 409 });
             }
             removeAssetsByIds([asset.asset_id]);
             clearUsageView();
             render();
         } catch (error) {
-            console.warn("[Sonder] Failed to permanently delete asset:", error);
-            notifyError(error?.message || "Failed to permanently delete asset.");
+            reportAssetWriteFailure(error, "Failed to permanently delete asset.");
         }
     }
 
@@ -2858,16 +3175,19 @@ export function mountSharedAssetGallery(container, options = {}) {
                 : `Permanently delete ${ids.length} selected asset(s)? This cannot be undone.`;
             if (!confirm(message)) return;
 
-            const result = await options.onBulkPermanentDeleteAssets(ids, usage?.usage_count > 0);
+            const result = await enqueueAssetWrite(() => {
+                requireAcknowledgedTrash(ids);
+                return options.onBulkPermanentDeleteAssets(ids, usage?.usage_count > 0);
+            });
             if (result?.status === "conflict") {
-                throw new Error("Bulk permanent delete unexpectedly reported a usage conflict.");
+                throw Object.assign(new Error("Bulk permanent delete unexpectedly reported a usage conflict."),
+                    { status: 409 });
             }
             removeAssetsByIds(ids);
             clearUsageView();
             render();
         } catch (error) {
-            console.warn("[Sonder] Failed to permanently delete selected assets:", error);
-            notifyError(error?.message || "Failed to permanently delete selected assets.");
+            reportAssetWriteFailure(error, "Failed to permanently delete selected assets.");
         }
     }
 
@@ -2877,13 +3197,22 @@ export function mountSharedAssetGallery(container, options = {}) {
         if (!ids.length) return;
         if (!confirm(`Permanently delete all ${ids.length} asset(s) in Trash? This cannot be undone.`)) return;
         try {
-            await options.onEmptyTrash();
+            await enqueueAssetWrite(() => {
+                // The route empties whatever the server holds in Trash, so the
+                // set confirmed must still be exactly that set -- a restore or
+                // trash painted before the confirm may since have failed.
+                const held = data.assets.filter((entry) => isTrashed(acknowledgedAsset(entry.asset_id)))
+                    .map((entry) => entry.asset_id);
+                if (held.length !== ids.length || held.some((assetId) => !ids.includes(assetId))) {
+                    throw skippedAssetWrite("Trash changed before it was emptied, so nothing was deleted.");
+                }
+                return options.onEmptyTrash();
+            });
             removeAssetsByIds(ids);
             clearUsageView();
             render();
         } catch (error) {
-            console.warn("[Sonder] Failed to empty trash:", error);
-            notifyError(error?.message || "Failed to empty trash.");
+            reportAssetWriteFailure(error, "Failed to empty trash.");
         }
     }
 
@@ -6064,7 +6393,8 @@ export function mountSharedAssetGallery(container, options = {}) {
         const normalized = normalizeFolderName(parentFolder ? `${parentFolder}/${folderName.trim()}` : folderName.trim());
         if (!normalized) return;
         try {
-            const nextFolders = await options.onCreateFolder?.(normalized);
+            const nextFolders = options.onCreateFolder
+                ? await enqueueAssetWrite(() => options.onCreateFolder(normalized)) : undefined;
             if (Array.isArray(nextFolders)) {
                 data.folders = nextFolders.map(normalizeFolderName).filter(Boolean);
             } else if (!data.folders.includes(normalized)) {
@@ -6119,52 +6449,40 @@ export function mountSharedAssetGallery(container, options = {}) {
         replaceInput.click();
     }
 
-    async function handleAssetDelete(asset) {
+    async function handleAssetDelete(asset, { onPainted = null, onUnpainted = null } = {}) {
         // The fullscreen host owns diagnostics. Dormant hosts omit this hook.
-        const run = (diagnostics) => handleAssetDeleteWithinGesture(asset, diagnostics);
+        const run = (diagnostics) => handleAssetDeleteWithinGesture(asset, diagnostics,
+            { onPainted, onUnpainted });
         return options.withMutationGesture
             ? options.withMutationGesture("asset_trash", run) : run(null);
     }
 
-    async function handleAssetDeleteWithinGesture(asset, diagnostics) {
+    async function handleAssetDeleteWithinGesture(asset, diagnostics, { onPainted = null, onUnpainted = null } = {}) {
         if (!asset?.asset_id || !options.onDeleteAsset) return false;
-        const nextAssetId = successorAssetIdAfterRemoval([asset.asset_id]);
-        try {
-            let force = await resolveTrashForceDecision([asset]);
-            if (force === null) return false;
-            let result = await options.onDeleteAsset(asset.asset_id, force === true, diagnostics);
-            if (result?.status === "conflict") {
-                force = confirmTrashProtection([asset], result);
-                if (force !== true) return false;
-                result = await options.onDeleteAsset(asset.asset_id, true, diagnostics);
-                if (result?.status === "conflict") {
-                    throw new Error(result?.error || "Asset trash still reported a conflict.");
-                }
-            }
-
-            updateAsset({
-                ...asset,
-                folder: "",
-                trashed_at: result?.trashed_at || new Date().toISOString(),
-                trash_previous_folder: asset.trash_previous_folder || normalizeFolderName(asset.folder),
-            });
-            clearUsageView();
-            applySelectionState(nextAssetId ? [nextAssetId] : [], nextAssetId);
-            render();
-            if (nextAssetId) scrollAssetIntoView(nextAssetId);
-            notifyInfo("Moved to Trash");
-            return true;
-        } catch (error) {
-            console.warn("[Sonder] Failed to trash asset:", error);
-            notifyError(error?.message || "Failed to move asset to Trash.");
-            return false;
-        }
+        const assetId = asset.asset_id;
+        return await trashAssetsWithinGesture([shownAsset(assetId) || asset], {
+            send: (force) => options.onDeleteAsset(assetId, force, diagnostics),
+            done: "Moved to Trash",
+            failureMessage: "Failed to move asset to Trash.",
+            onPainted,
+            onUnpainted,
+        });
     }
 
     async function handleOverlayAssetDelete(asset) {
         if (state.overlayState.compareMode) return false;
-        const trashed = await handleAssetDelete(asset);
-        if (trashed) {
+        // The Inspect view moves on when the asset leaves the list, not when
+        // the save returns -- and back, if the trash is undone while it still
+        // shows where it moved to.
+        let advancedTo = null;
+        const comeBack = () => {
+            const overlay = state.overlayState;
+            if (!advancedTo || !overlay.open || overlay.assetId !== advancedTo) return;
+            overlay.assetId = asset.asset_id;
+            resetOverlayTransform();
+            renderInspectOverlay();
+        };
+        const advance = () => {
             const nextAsset = selectedAsset();
             if (nextAsset && !isTrashed(nextAsset)) {
                 state.overlayState.assetId = nextAsset.asset_id;
@@ -6172,11 +6490,12 @@ export function mountSharedAssetGallery(container, options = {}) {
                 state.overlayState.showWaveform = false;
                 resetOverlayTransform();
                 renderInspectOverlay();
+                advancedTo = nextAsset.asset_id;
             } else {
                 closeInspectOverlay();
             }
-        }
-        return trashed;
+        };
+        return await handleAssetDelete(asset, { onPainted: advance, onUnpainted: comeBack });
     }
 
     async function promptRenameFolder(folderName) {
@@ -6188,7 +6507,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         const nextFolder = normalizeFolderName([...parentParts, nextLeaf.trim()].join("/"));
         if (!nextFolder || nextFolder === normalizeFolderName(folderName)) return;
         try {
-            const payload = await options.onRenameFolder(folderName, nextFolder);
+            const payload = await enqueueAssetWrite(() => options.onRenameFolder(folderName, nextFolder));
             renameFolderLocally(folderName, nextFolder, Array.isArray(payload) ? payload : payload?.folders);
             render();
         } catch (error) {
@@ -6222,11 +6541,11 @@ export function mountSharedAssetGallery(container, options = {}) {
                 if (!confirm(message)) return;
             }
 
-            let result = await options.onDeleteFolder(folderName, force, diagnostics);
+            let result = await enqueueAssetWrite(() => options.onDeleteFolder(folderName, force, diagnostics));
             if (result?.status === "conflict") {
                 force = confirmTrashProtection(containedAssets, result, { folderName });
                 if (force !== true) return;
-                result = await options.onDeleteFolder(folderName, true, diagnostics);
+                result = await enqueueAssetWrite(() => options.onDeleteFolder(folderName, true, diagnostics));
                 if (result?.status === "conflict") {
                     throw new Error(result?.error || "Folder trash still reported a conflict.");
                 }
@@ -6484,7 +6803,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                 const assetIds = Array.isArray(payload?.assetIds) ? payload.assetIds : [];
                 const primaryAssetId = typeof payload?.primaryAssetId === "string" ? payload.primaryAssetId : (assetIds[assetIds.length - 1] || "");
                 if (!assetIds.length) return;
-                await options.onBulkMoveAssets(assetIds, normalized);
+                await enqueueAssetWrite(() => options.onBulkMoveAssets(assetIds, normalized));
                 applySelectionState(assetIds, primaryAssetId);
                 clearUsageView();
                 await options.onRefresh?.();
@@ -7510,9 +7829,19 @@ export function mountSharedAssetGallery(container, options = {}) {
         dataListVersion = sameProject && !payload.listVersion ? dataListVersion : String(payload.listVersion || "");
         detailLoader.listChanged({ projectId: detailProjectId(), assets: nextAssets, version: String(payload.listVersion || "") });
         const nextFolders = Array.isArray(payload.folders) ? payload.folders.map(normalizeFolderName).filter(Boolean) : [];
-        const additiveAssets = additiveRefreshAssets(previousAssets, nextAssets, previousFolders, nextFolders);
         data.assets = nextAssets;
         data.folders = nextFolders;
+        if (sameProject) {
+            overlayPendingAssetPatches();
+        } else {
+            // Their writes settle into nothing: a skipped or settling write
+            // finds no patch to fold.
+            assetPatches.clear();
+            assetAckedFields.clear();
+        }
+        // Compared as shown, pending paints included, so a refresh that only
+        // confirms them stays additive.
+        const additiveAssets = additiveRefreshAssets(previousAssets, data.assets, previousFolders, data.folders);
         const preservedSelection = selectedAssetIdsList();
         const fallbackId = data.assets.some((asset) => asset.asset_id === state.selectedAssetId)
             ? state.selectedAssetId

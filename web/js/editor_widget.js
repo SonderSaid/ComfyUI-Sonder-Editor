@@ -1545,15 +1545,17 @@ export class EditorWidget {
             onImportFiles: async (files, folder) => {
                 await this._importFilesWithProgress(Array.from(files || []), folder);
             },
-            onUpdateAsset: async (assetId, updates) => await this._updateAssetMetadata(assetId, updates),
+            onUpdateAsset: async (assetId, updates, diagnostics) =>
+                await this._updateAssetMetadata(assetId, updates, diagnostics),
             onGetAssetUsages: async (assetId) => await this._getAssetUsages(assetId),
             onGetBulkAssetUsages: async (assetIds) => await this._getBulkAssetUsages(assetIds),
             withMutationGesture: (kind, callback) => this._withMutationGesture(kind, callback),
             onDeleteAsset: async (assetId, force, diagnostics) => await this._deleteAsset(assetId, force, diagnostics),
             onBulkMoveAssets: async (assetIds, folder) => await this._bulkMoveAssets(assetIds, folder),
             onBulkDeleteAssets: async (assetIds, force, diagnostics) => await this._bulkDeleteAssets(assetIds, force, diagnostics),
-            onRestoreAsset: async (assetId) => await this._restoreAsset(assetId),
-            onBulkRestoreAssets: async (assetIds) => await this._bulkRestoreAssets(assetIds),
+            onRestoreAsset: async (assetId, diagnostics) => await this._restoreAsset(assetId, diagnostics),
+            onBulkRestoreAssets: async (assetIds, diagnostics) =>
+                await this._bulkRestoreAssets(assetIds, diagnostics),
             onPermanentDeleteAsset: async (assetId, force) => await this._permanentDeleteAsset(assetId, force),
             onBulkPermanentDeleteAssets: async (assetIds, force) => await this._bulkPermanentDeleteAssets(assetIds, force),
             onEmptyTrash: async () => await this._emptyTrash(),
@@ -3163,26 +3165,93 @@ export class EditorWidget {
         }
     }
 
-    async _updateAssetMetadata(...args) {
-        return this._withMutationGesture(
-            "asset_metadata", (diagnostics) => this._updateAssetMetadataWithinGesture(diagnostics, ...args));
+    async _updateAssetMetadata(assetId, updates, diagnostics = null) {
+        if (diagnostics) return this._updateAssetMetadataWithinGesture(diagnostics, assetId, updates);
+        return this._withMutationGesture("asset_metadata", (gesture) =>
+            this._updateAssetMetadataWithinGesture(gesture, assetId, updates));
     }
 
     async _updateAssetMetadataWithinGesture(diagnostics, assetId, updates) {
         if (!this.projectDir || !assetId) return null;
-        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const projectDir = this.projectDir;
+        const dirName = this._projectDirName();
         markProjectAssetMutation(dirName, "asset_metadata");
-        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/${assetId}`), withEditorMutationDiagnostics({
-            method: "PUT",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(updates),
-        }, diagnostics));
-        if (!resp.ok) {
-            throw new Error(`Asset update failed: ${resp.status}`);
+        const updatedAsset = await this._runGalleryAssetWrite(dirName,
+            `/assets/${encodeURIComponent(assetId)}`, "PUT", updates, diagnostics);
+        if (this.projectDir === projectDir) {
+            const fields = {};
+            for (const key of Object.keys(updates || {})) {
+                if (updatedAsset?.[key] !== undefined) fields[key] = updatedAsset[key];
+            }
+            this._acknowledgeGalleryAssets({ [assetId]: fields }, "asset_metadata_complete");
         }
-        const updatedAsset = await resp.json();
-        await this._fetchAssets();
         return updatedAsset;
+    }
+
+    /**
+     * A gallery asset write: versioned through the shared helper, with its 409s
+     * told apart. A version conflict is retried once -- safe, because favorite,
+     * name and folder are absolute values addressed by `asset_id`, trash and
+     * restore are identity-addressed, and a version-conflict 409 wrote nothing.
+     * A usage/favorite protection refusal (a 409 with no `code`) resolves to
+     * `{ status: "conflict", ...payload }` for the gallery to confirm and force.
+     * Anything else throws, including `queued_reference_input`: an asset frozen
+     * by a pending generation cannot be forced, so it must not reach the
+     * confirm-then-force path. Resolves to the response body.
+     */
+    async _runGalleryAssetWrite(dirName, path, method, body, diagnostics) {
+        try {
+            const { payload } = await this._runVersionedProjectMutation(
+                `/sonder-editor/project/${encodeURIComponent(dirName)}${path}`,
+                { method, headers: { "Content-Type": "application/json",
+                    ...this._mutationDiagnosticHeaders(diagnostics) },
+                    body: JSON.stringify(body) },
+                { projectId: dirName, retryOnConflict: true, maxAttempts: 2 });
+            return payload && typeof payload === "object" ? payload : {};
+        } catch (error) {
+            const payload = error?.payload;
+            if (error?.status === 409 && payload && typeof payload === "object" && !payload.code) {
+                return { status: "conflict", ...payload };
+            }
+            throw error;
+        }
+    }
+
+    /**
+     * Fold acknowledged asset fields into the host's own copies, without a list
+     * reload and without `setData`: the gallery has already painted them, and
+     * a reload cost a full `GET /assets` plus two complete gallery rebuilds per
+     * edit. Marking the mutation epoch again makes a list read that was already
+     * in flight re-read rather than land data older than this write.
+     */
+    _acknowledgeGalleryAssets(fieldsById, reason) {
+        const ids = new Set(Object.keys(fieldsById || {}));
+        if (!ids.size) return;
+        for (const list of Object.values(this.assets || {})) {
+            if (!Array.isArray(list)) continue;
+            for (let index = 0; index < list.length; index += 1) {
+                const asset = list[index];
+                if (!ids.has(asset?.asset_id)) continue;
+                const next = { ...asset, ...fieldsById[asset.asset_id] };
+                list[index] = next;
+                if (next.path) this._pathToAsset[next.path] = next;
+            }
+        }
+        markProjectAssetMutation(this._projectDirName(), reason);
+        // Library names, thumbnails and Trashed badges are asset-backed.
+        this._referenceLibraryHandle?.render?.();
+        // Clip and audio labels read the asset's name through `_pathToAsset`.
+        if (Object.values(fieldsById).some((fields) => fields && "name" in fields)) {
+            this._renderTimeline();
+        }
+    }
+
+    _hostAssetRecord(assetId) {
+        for (const list of Object.values(this.assets || {})) {
+            const asset = Array.isArray(list) ? list.find((entry) => entry?.asset_id === assetId) : null;
+            if (asset) return asset;
+        }
+        return null;
     }
 
     async _getAssetUsages(assetId) {
@@ -3239,26 +3308,18 @@ export class EditorWidget {
 
     async _deleteAssetWithinGesture(diagnostics, assetId, force = false) {
         if (!this.projectDir || !assetId) return { status: "noop" };
-        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const projectDir = this.projectDir;
+        const dirName = this._projectDirName();
         markProjectAssetMutation(dirName, "asset_trash");
-        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/${assetId}`), withEditorMutationDiagnostics({
-            method: "DELETE",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ force: !!force }),
-        }, diagnostics));
-        if (resp.status === 409) {
-            const payload = await resp.json();
-            return { status: "conflict", ...(payload || {}) };
+        const payload = await this._runGalleryAssetWrite(dirName,
+            `/assets/${encodeURIComponent(assetId)}`, "DELETE", { force: !!force }, diagnostics);
+        if (payload.status === "conflict") return payload;
+        if (this.projectDir === projectDir) {
+            this._acknowledgeGalleryAssets({ [assetId]: this._trashedHostFields(assetId, payload) },
+                "asset_trash_complete");
+            void this._fetchRenderQueue();
         }
-        if (!resp.ok) {
-            throw new Error(`Asset delete failed: ${resp.status}`);
-        }
-        const payload = await resp.json();
-        await Promise.all([
-            this._fetchAssets(),
-            this._fetchRenderQueue(),
-        ]);
-        return { status: "trashed", ...(payload || {}) };
+        return { status: "trashed", ...payload };
     }
 
     async _bulkDeleteAssets(assetIds, force = false, diagnostics = null) {
@@ -3269,76 +3330,81 @@ export class EditorWidget {
 
     async _bulkDeleteAssetsWithinGesture(diagnostics, assetIds, force = false) {
         if (!this.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { status: "noop" };
-        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const projectDir = this.projectDir;
+        const dirName = this._projectDirName();
         markProjectAssetMutation(dirName, "asset_bulk_trash");
-        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/bulk-delete`), withEditorMutationDiagnostics({
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ asset_ids: assetIds, force: !!force }),
-        }, diagnostics));
-        if (resp.status === 409) {
-            const payload = await resp.json();
-            return { status: "conflict", ...(payload || {}) };
+        const payload = await this._runGalleryAssetWrite(dirName, "/assets/bulk-delete", "POST",
+            { asset_ids: assetIds, force: !!force }, diagnostics);
+        if (payload.status === "conflict") return payload;
+        if (this.projectDir === projectDir) {
+            // The bulk route answers with ids only.
+            const trashed = Array.isArray(payload.trashed) ? payload.trashed : assetIds;
+            this._acknowledgeGalleryAssets(Object.fromEntries(trashed.map((assetId) =>
+                [assetId, this._trashedHostFields(assetId, {})])), "asset_bulk_trash_complete");
+            void this._fetchRenderQueue();
         }
-        if (!resp.ok) {
-            throw new Error(`Bulk asset delete failed: ${resp.status}`);
-        }
-        const payload = await resp.json();
-        await Promise.all([
-            this._fetchAssets(),
-            this._fetchRenderQueue(),
-        ]);
-        return { status: "trashed", ...(payload || {}) };
+        return { status: "trashed", ...payload };
     }
 
-    async _restoreAsset(...args) {
-        return this._withMutationGesture(
-            "asset_restore", (diagnostics) => this._restoreAssetWithinGesture(diagnostics, ...args));
+    /** `_trash_project_asset`'s fields for the host's copy of `assetId`,
+     *  preferring what the response states. */
+    _trashedHostFields(assetId, payload = {}) {
+        const record = this._hostAssetRecord(assetId);
+        return {
+            folder: "",
+            trashed_at: payload.trashed_at || new Date().toISOString(),
+            trash_previous_folder: payload.trash_previous_folder ?? (record?.trashed_at
+                ? (record.trash_previous_folder || "") : (record?.folder || "")),
+        };
+    }
+
+    async _restoreAsset(assetId, diagnostics = null) {
+        if (diagnostics) return this._restoreAssetWithinGesture(diagnostics, assetId);
+        return this._withMutationGesture("asset_restore", (gesture) =>
+            this._restoreAssetWithinGesture(gesture, assetId));
     }
 
     async _restoreAssetWithinGesture(diagnostics, assetId) {
         if (!this.projectDir || !assetId) return { status: "noop" };
-        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const projectDir = this.projectDir;
+        const dirName = this._projectDirName();
         markProjectAssetMutation(dirName, "asset_restore");
-        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/restore`), withEditorMutationDiagnostics({
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ asset_id: assetId }),
-        }, diagnostics));
-        if (!resp.ok) {
-            throw new Error(`Asset restore failed: ${resp.status}`);
+        const payload = await this._runGalleryAssetWrite(dirName, "/assets/restore", "POST",
+            { asset_id: assetId }, diagnostics);
+        if (this.projectDir === projectDir) {
+            this._acknowledgeGalleryAssets({ [assetId]: {
+                folder: payload.asset?.folder ?? payload.folder ?? "",
+                trashed_at: "",
+                trash_previous_folder: "",
+            } }, "asset_restore_complete");
+            void this._fetchRenderQueue();
         }
-        const payload = await resp.json();
-        await Promise.all([
-            this._fetchAssets(),
-            this._fetchRenderQueue(),
-        ]);
-        return { status: "restored", ...(payload || {}) };
+        return { status: "restored", ...payload };
     }
 
-    async _bulkRestoreAssets(...args) {
-        return this._withMutationGesture(
-            "asset_bulk_restore", (diagnostics) => this._bulkRestoreAssetsWithinGesture(diagnostics, ...args));
+    async _bulkRestoreAssets(assetIds, diagnostics = null) {
+        if (diagnostics) return this._bulkRestoreAssetsWithinGesture(diagnostics, assetIds);
+        return this._withMutationGesture("asset_bulk_restore", (gesture) =>
+            this._bulkRestoreAssetsWithinGesture(gesture, assetIds));
     }
 
     async _bulkRestoreAssetsWithinGesture(diagnostics, assetIds) {
         if (!this.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { status: "noop" };
-        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const projectDir = this.projectDir;
+        const dirName = this._projectDirName();
         markProjectAssetMutation(dirName, "asset_bulk_restore");
-        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/bulk-restore`), withEditorMutationDiagnostics({
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ asset_ids: assetIds }),
-        }, diagnostics));
-        if (!resp.ok) {
-            throw new Error(`Bulk asset restore failed: ${resp.status}`);
+        const payload = await this._runGalleryAssetWrite(dirName, "/assets/bulk-restore", "POST",
+            { asset_ids: assetIds }, diagnostics);
+        if (this.projectDir === projectDir) {
+            const restored = Array.isArray(payload.restored) ? payload.restored : assetIds;
+            this._acknowledgeGalleryAssets(Object.fromEntries(restored.map((assetId) => [assetId, {
+                folder: this._hostAssetRecord(assetId)?.trash_previous_folder || "",
+                trashed_at: "",
+                trash_previous_folder: "",
+            }])), "asset_bulk_restore_complete");
+            void this._fetchRenderQueue();
         }
-        const payload = await resp.json();
-        await Promise.all([
-            this._fetchAssets(),
-            this._fetchRenderQueue(),
-        ]);
-        return { status: "restored", ...(payload || {}) };
+        return { status: "restored", ...payload };
     }
 
     async _permanentDeleteAsset(...args) {

@@ -12,6 +12,7 @@ import pytest
 from pathlib import Path
 
 from test_project_mutation_queue import _run_gesture_node
+from test_gallery_paint_first_js import GALLERY_HARNESS, gallery_write_source
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -33,6 +34,7 @@ EXEMPT = {
     "_maybeHealFrameConstraint": "Background metadata healing, deliberately unscoped.",
     "_maybeHealDimensionConstraint": "Background metadata healing, deliberately unscoped.",
     "_revealProjectFolder": "Opens a folder, not a project-data mutation.",
+    "_runGalleryAssetWrite": "Sends the caller's diagnostics; its callers are checked as writers.",
 }
 
 
@@ -57,7 +59,8 @@ def test_editor_writer_boundary_inventory():
         r"^    (?:async )?(\w+)\(.*?^    \}\n", source[source.index("export class EditorWidget {"):], re.M | re.S)}
     helper_write = re.compile(r"this\.(?:_runSceneMutation|_runQueueMutation|"
                               r"_queueProjectMutation|_queuePromptProjectWrite|"
-                              r"_mutateReferences|_runVersionedProjectMutation)\(")
+                              r"_mutateReferences|_runVersionedProjectMutation|"
+                              r"_runGalleryAssetWrite)\(")
     uncovered = []
     for name, body in methods.items():
         raw_write = "fetch(api.apiURL(" in body and re.search(
@@ -78,13 +81,11 @@ def test_editor_writer_boundary_inventory():
 
 
 def test_gallery_trash_retry_preserves_host_gesture_with_fresh_request_ids():
-    source = (ROOT / "web/js/shared_asset_gallery.js").read_text(encoding="utf-8")
-    functions = "\n".join(re.search(
-        r"    async function " + name + r"\(.*?^    \}\n", source, re.M | re.S)[0]
-        for name in ("handleAssetDelete", "handleAssetDeleteWithinGesture",
-                     "handleFolderDelete", "handleFolderDeleteWithinGesture",
-                     "handleBulkDelete", "handleBulkDeleteWithinGesture"))
-    _run_gesture_node(functions + """
+    # The gallery's own trash functions (sliced, see test_gallery_paint_first_js)
+    # against the real fullscreen host methods: one gesture per trash, a fresh
+    # physical request id for the forced retry, and a code-less 409 read as
+    # protection that the author confirms.
+    _run_gesture_node(gallery_write_source() + GALLERY_HARNESS + """
         const w = makeWidget(), requests = [];
         w._fetchRenderQueue = async () => {};
         let count = 0;
@@ -98,21 +99,13 @@ def test_gallery_trash_retry_preserves_host_gesture_with_fresh_request_ids():
             onDeleteFolder: (...args) => w._deleteAssetFolder(...args),
             onBulkDeleteAssets: (...args) => w._bulkDeleteAssets(...args),
         };
-        const successorAssetIdAfterRemoval = () => '';
-        const resolveTrashForceDecision = async () => { await Promise.resolve(); return false; };
-        const confirmTrashProtection = () => true, confirm = () => true;
-        const normalizeFolderName = value => value || '';
-        const updateAsset = () => {}, clearUsageView = () => {}, applySelectionState = () => {};
-        const render = () => {}, scrollAssetIntoView = () => {}, notifyInfo = () => {}, notifyError = () => {};
-        const folderAssetsRecursive = () => [], isTrashed = () => false;
-        const removeFolderLocally = () => {};
-        await handleAssetDelete({asset_id:'a'});
+        data.assets = [asset('a'), asset('b')];
+        assert.equal(await handleAssetDelete(shown('a')), true);
         await handleFolderDelete('folder');
-        const state = {selectedAssetId:'a'}, data = {assets:[{asset_id:'a'},{asset_id:'b'}]};
-        const normalizeSelection = ids => ({ids});
-        await handleBulkDelete(['a','b']);
+        assert.equal(await handleBulkDelete(['a','b']), true);
         assert.equal(requests.length, 6);
         assert.equal(starts().length, 3);
+        assert.equal(confirms, 3);
         for (const offset of [0,2,4]) {
             const first = requests[offset], second = requests[offset+1];
             assert.ok(first.headers.get('X-Sonder-Gesture-Id'));
@@ -125,6 +118,7 @@ def test_gallery_trash_retry_preserves_host_gesture_with_fresh_request_ids():
         delete options.withMutationGesture;
         let dormantCalls = 0;
         options.onDeleteAsset = async () => { dormantCalls++; return {status:'trashed'}; };
-        await handleAssetDelete({asset_id:'dormant'});
+        data.assets.push(asset('dormant'));
+        await handleAssetDelete(shown('dormant'));
         assert.equal(dormantCalls, 1); assert.equal(starts().length, 3);
     """)

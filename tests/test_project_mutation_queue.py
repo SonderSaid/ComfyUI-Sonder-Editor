@@ -17,10 +17,14 @@ def _run_node(script: str) -> None:
     node = shutil.which("node")
     if not node:
         pytest.skip("node is not available")
+    # On stdin, not `-e`: a script sliced from a large module can pass the
+    # Windows command-line limit (WinError 206). UTF-8 both ways, because the
+    # locale default (cp1252) would mangle non-ASCII source on the way in.
     result = subprocess.run(
-        [node, "--input-type=module", "-e", script],
+        [node, "--input-type=module"],
+        input=script,
         cwd=ROOT,
-        text=True,
+        encoding="utf-8",
         capture_output=True,
         timeout=15,
     )

@@ -1211,7 +1211,19 @@ class DormantNodeCard {
             this._mountedModuleLoading !== loading ||
             this._mountedModuleError !== error;
 
-        if (!shouldRemount) {
+        // Only the data object changed: a module that can take new data in
+        // place keeps its instance. The asset gallery must -- its pending
+        // paints and serial write chain live on the instance, and every asset
+        // write replaces the cached list object before this runs.
+        const dataOnly = shouldRemount
+            && this._mountedModuleId === moduleId && !loading && !error
+            && !this._mountedModuleLoading && !this._mountedModuleError
+            && !!this._mountedModuleData && !!moduleData;
+        if (dataOnly && this.controller.modules[moduleId]?.update?.(moduleData, this.controller) === true) {
+            this._mountedModuleData = moduleData;
+        }
+
+        if (!shouldRemount || this._mountedModuleData === moduleData) {
             if (shouldAutoResizeNode) {
                 this.controller.queueResize();
             } else {
@@ -1272,6 +1284,14 @@ class DormantNodeCard {
         this._mountedModuleError = "";
         this._moduleContainerEl.innerHTML = "";
     }
+}
+
+// The shared gallery tells a refused write (an HTTP status) from one whose
+// answer never arrived (none), so a gallery write error carries its status.
+function assetWriteError(message, response) {
+    const error = new Error(message);
+    error.status = response?.status;
+    return error;
 }
 
 export class EditorNodeController {
@@ -1653,6 +1673,7 @@ export class EditorNodeController {
                 resourceTier: "light",
                 load: async (controller, signal) => await controller._loadDormantAssets(signal),
                 mount: (container, data, controller) => controller._mountAssetsModule(container, data),
+                update: (data, controller) => controller._updateAssetsModule(data),
                 collapseCleanup: () => {},
                 invalidate: (keys) => keys.some(key => key === "project" || key === "assets" || key === "scene"),
             },
@@ -2529,7 +2550,10 @@ export class EditorNodeController {
             ),
         };
         this._rememberAssetIds(normalized, projectDir);
-        this._activeDormantAssetGallery?.setData(this.moduleCache.assets);
+        if (this._activeDormantAssetGallery) {
+            this._activeDormantAssetGallery.setData(this.moduleCache.assets);
+            this._dormantAssetGalleryData = this.moduleCache.assets;
+        }
         this._recordDiagEvent("asset_refresh_apply", {
             request_id: result.requestId,
             mutation_epoch: result.epoch,
@@ -2627,9 +2651,10 @@ export class EditorNodeController {
         }
     }
 
-    _invalidateModules(keys) {
+    _invalidateModules(keys, { keepModuleIds = [] } = {}) {
+        const keep = new Set(keepModuleIds);
         for (const [moduleId, moduleDef] of Object.entries(this.modules)) {
-            if (moduleDef.invalidate(keys)) {
+            if (!keep.has(moduleId) && moduleDef.invalidate(keys)) {
                 this._abortModuleLoad(moduleId);
                 delete this.moduleCache[moduleId];
                 this.moduleStatus[moduleId].error = "";
@@ -3203,6 +3228,12 @@ export class EditorNodeController {
         return importedAny;
     }
 
+    // The dormant gallery's asset writes keep their raw fetch and the awaited
+    // refresh after each one; the shared gallery paints first and keeps its
+    // pending paints across that refresh, so it shows no flicker. Expiry: when
+    // these move to the shared versioned helper under the roadmap's "Converge
+    // remaining raw-fetch project writes", acknowledge like the fullscreen host
+    // (`_acknowledgeGalleryAssets`) and drop the awaited refreshes.
     async _updateAssetMetadata(assetId, updates) {
         if (!this.state.projectDir || !assetId) return null;
         markProjectAssetMutation(projectIdFromDir(this.state.projectDir), "asset_metadata");
@@ -3213,7 +3244,7 @@ export class EditorNodeController {
             body: JSON.stringify(updates),
         });
         if (!resp.ok) {
-            throw new Error(`Asset update failed: ${resp.status}`);
+            throw assetWriteError(`Asset update failed: ${resp.status}`, resp);
         }
 
         const updatedAsset = await resp.json();
@@ -3267,7 +3298,7 @@ export class EditorNodeController {
             body: JSON.stringify({ asset_ids: assetIds, folder }),
         });
         if (!resp.ok) {
-            throw new Error(`Bulk asset move failed: ${resp.status}`);
+            throw assetWriteError(`Bulk asset move failed: ${resp.status}`, resp);
         }
         const payload = await resp.json();
         await this._refreshAfterAssetMutation("asset_folder_move_complete", ["assets"]);
@@ -3285,14 +3316,19 @@ export class EditorNodeController {
         });
         if (resp.status === 409) {
             const payload = await resp.json();
+            // Only a code-less 409 is a usage/favorite protection the author can
+            // confirm; a stale version or a frozen input is a refusal.
+            if (payload?.code) throw assetWriteError(payload.error || `Asset delete failed: ${resp.status}`, resp);
             return { status: "conflict", ...(payload || {}) };
         }
         if (!resp.ok) {
-            throw new Error(`Asset delete failed: ${resp.status}`);
+            throw assetWriteError(`Asset delete failed: ${resp.status}`, resp);
         }
 
         const payload = await resp.json();
-        this._invalidateModules(["assets"]);
+        // The Assets module keeps its list until the refresh below replaces it:
+        // dropping it remounted the gallery mid-write (see `_updateAssetsModule`).
+        this._invalidateModules(["assets"], { keepModuleIds: ["assets"] });
         this._reloadExpandedModuleIfNeeded(["assets"], { skipModuleIds: ["assets"] });
         await this._refreshAfterAssetMutation("asset_trash_complete");
         return { status: "trashed", ...(payload || {}) };
@@ -3308,11 +3344,11 @@ export class EditorNodeController {
             body: JSON.stringify({ asset_id: assetId }),
         });
         if (!resp.ok) {
-            throw new Error(`Asset restore failed: ${resp.status}`);
+            throw assetWriteError(`Asset restore failed: ${resp.status}`, resp);
         }
 
         const payload = await resp.json();
-        this._invalidateModules(["assets"]);
+        this._invalidateModules(["assets"], { keepModuleIds: ["assets"] });
         this._reloadExpandedModuleIfNeeded(["assets"], { skipModuleIds: ["assets"] });
         await this._refreshAfterAssetMutation("asset_restore_complete");
         return { status: "restored", ...(payload || {}) };
@@ -3327,11 +3363,11 @@ export class EditorNodeController {
             body: JSON.stringify({ asset_ids: assetIds }),
         });
         if (!resp.ok) {
-            throw new Error(`Bulk asset restore failed: ${resp.status}`);
+            throw assetWriteError(`Bulk asset restore failed: ${resp.status}`, resp);
         }
 
         const payload = await resp.json();
-        this._invalidateModules(["assets"]);
+        this._invalidateModules(["assets"], { keepModuleIds: ["assets"] });
         this._reloadExpandedModuleIfNeeded(["assets"], { skipModuleIds: ["assets"] });
         await this._refreshAfterAssetMutation("asset_bulk_restore_complete");
         return { status: "restored", ...(payload || {}) };
@@ -3347,14 +3383,17 @@ export class EditorNodeController {
         });
         if (resp.status === 409) {
             const payload = await resp.json();
+            // Only a code-less 409 is a usage/favorite protection the author can
+            // confirm; a stale version or a frozen input is a refusal.
+            if (payload?.code) throw assetWriteError(payload.error || `Bulk asset delete failed: ${resp.status}`, resp);
             return { status: "conflict", ...(payload || {}) };
         }
         if (!resp.ok) {
-            throw new Error(`Bulk asset delete failed: ${resp.status}`);
+            throw assetWriteError(`Bulk asset delete failed: ${resp.status}`, resp);
         }
 
         const payload = await resp.json();
-        this._invalidateModules(["assets"]);
+        this._invalidateModules(["assets"], { keepModuleIds: ["assets"] });
         this._reloadExpandedModuleIfNeeded(["assets"], { skipModuleIds: ["assets"] });
         await this._refreshAfterAssetMutation("asset_bulk_trash_complete");
         return { status: "trashed", ...(payload || {}) };
@@ -3698,12 +3737,23 @@ export class EditorNodeController {
                 await this._refreshAssets({ mode: "read", requiredVersion, reason }),
         });
         this._activeDormantAssetGallery = gallery;
+        this._dormantAssetGalleryData = data;
         return () => {
             if (this._activeDormantAssetGallery === gallery) {
                 this._activeDormantAssetGallery = null;
             }
             gallery.destroy();
         };
+    }
+
+    /** New asset data for the mounted gallery, in place; false when none is mounted. */
+    _updateAssetsModule(data) {
+        const gallery = this._activeDormantAssetGallery;
+        if (!gallery) return false;
+        // `_seedAssetRefreshResult` has usually handed this exact object over already.
+        if (this._dormantAssetGalleryData !== data) gallery.setData(data);
+        this._dormantAssetGalleryData = data;
+        return true;
     }
 
     _mountPreviewModule(container, data) {
