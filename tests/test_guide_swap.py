@@ -150,7 +150,7 @@ def test_swap_gesture_paints_stamps_and_preserves_redo_on_refusal(refused, queue
         let paints=0, popups=0, refreshes=0, release;
         w._renderSceneAfterLocalMutation=()=>{paints++;};
         w._showGuideManagementPopup=()=>{popups++;};
-        const guides=[...w.activeScene.guide_frames], guide=guides[0];
+        const guides=[...w.activeScene.guide_frames], guide=guides[0], rowGuide=guide;
         const locked=false, swapSelect={value:'20'}, x=1, y=2, event={stopPropagation(){}};
         const refreshPanel=async()=>{refreshes++;w.activeScene=structuredClone(before);};
         globalThis.fetch=async(url, init)=>{

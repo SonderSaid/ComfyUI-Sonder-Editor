@@ -11,6 +11,9 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Changed
+- The Guides popup responds at once: a strength change, Hide/Show or frame change shows on the timeline and in the popup immediately and saves in the background, instead of waiting for the save and a full scene reload. A change that cannot be saved returns to the saved value with a message, and a strength or Hide right after moving the same guide's frame is no longer refused as stale.
+
 ### Fixed
 - A Reference lane recipe edit made while the previous one was still saving is no longer silently discarded. Recipe fields now update at once, and a change that cannot be saved returns to the saved value with a message, even when the server is unreachable.
 

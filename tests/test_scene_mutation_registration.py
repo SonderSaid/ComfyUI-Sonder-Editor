@@ -3833,7 +3833,7 @@ KEY_INTERPOLATIONS = {
     "before.prompt_id": (STABLE, "a prompt section's durable id"),
     "groupId": (STABLE, "a link group's durable id"),
     "fromLaneId": (STABLE, "a Reference lane's durable id"),
-    "guide.frame_index": (STABLE, "a guide's frame, which is its address"),
+    "target.frame_index": (STABLE, "a guide's frame, which is its address"),
     "this.playhead": (STABLE, "the playhead frame; two gestures at one frame "
                               "address the same target"),
     "keyId": (STABLE, "a prompt section's durable id, or `index-<n>` for an "

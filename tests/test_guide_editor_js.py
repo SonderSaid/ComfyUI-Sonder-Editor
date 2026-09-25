@@ -9,14 +9,18 @@ def _guide_manager_source() -> str:
     return widget[start:end]
 
 
-def test_frame_change_refreshes_guide_manager_instead_of_closing_it():
+def test_frame_change_keeps_the_guide_manager_open_and_moves_the_live_guide():
     manager = _guide_manager_source()
     commit_start = manager.index("            const commitFrameInput = async () => {")
     commit_end = manager.index("            frameInput.addEventListener", commit_start)
     commit = manager[commit_start:commit_end]
 
-    assert "await this._moveGuideToFrame(guide, clamped, guide.strength);" in commit
-    assert "await refreshPanel();" in commit
+    # The move paints, reconciles and heals itself, and the gated repaint
+    # re-sorts the row; a trailing refetch only delayed that. The refusal
+    # branch still refetches, because nothing was written.
+    assert "this._moveGuideToFrame(origin, clamped, origin.strength);" in commit
+    assert commit.count("await refreshPanel();") == 1
+    assert commit.index("await refreshPanel();") < commit.index("this._moveGuideToFrame(")
     assert "this._hideGuideManagementPopup();" not in commit
 
 

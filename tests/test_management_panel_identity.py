@@ -420,6 +420,299 @@ def test_the_guide_popup_refuses_a_stale_strength_before_undo_or_write():
     """)
 
 
+_PAINT_FIRST_POPUP = _POPUP_DOM + """
+        const w = makeWidget(), sent = [], releases = [];
+        let fetches = 0, paints = 0, fail = false;
+        // Each write settles when the test releases it, in send order; `fail`
+        // is read at release time.
+        w._runSceneMutation = (operations, options) => {
+            sent.push({ operations: structuredClone(operations), options });
+            return new Promise((resolve, reject) => {
+                releases.push(() => fail ? reject(new Error('refused')) : resolve({ payload: {} }));
+            });
+        };
+        const release = () => releases.shift()();
+        w._fetchScenes = async () => { fetches += 1; };
+        w._renderSceneAfterLocalMutation = () => { paints += 1; };
+        w._isGuideTrackLocked = () => false; w._isGuideTrackHidden = () => false;
+        w._getGuideAsset = () => null; w.totalFrames = 100; w._timecodeMode = "frames";
+        w._shouldApplyLinked = () => false;
+        const g1 = { guide_id: 'g1', frame_index: 10, asset_id: 'a1', strength: 1, muted: false };
+        w.activeScene = { scene_id: 'scene', guide_frames: [g1] };
+        w._showGuideManagementPopup(0, 0);
+        const control = (title) => all(w._guideManagerEl).find((n) => n.title === title);
+        const hideButton = () => all(w._guideManagerEl).find((n) => n.tagName === 'BUTTON'
+            && (n.textContent === 'Hide' || n.textContent === 'Show'));
+        const settle = async () => { for (let i = 0; i < 6; i += 1) await new Promise((r) => setTimeout(r, 0)); };
+        const setStrength = (input, value) => { input.value = String(value); input.fire('change'); };
+"""
+
+
+def test_a_guide_popup_strength_edit_paints_before_the_write_and_refetches_nothing():
+    _run_gesture_node(_PAINT_FIRST_POPUP + """
+        setStrength(control('Guide strength'), 0.5);
+        // Painted and sent in the same turn, before the write resolves.
+        assert.equal(g1.strength, 0.5);
+        assert.equal(paints, 1);
+        assert.equal(sent.length, 1);
+        assert.deepEqual(sent[0].operations[0].fields, { strength: 0.5 });
+        assert.deepEqual(sent[0].operations[0].expected,
+            { guide_id: 'g1', frame_index: 10, asset_id: 'a1' });
+        // The timeline mute contract: a success reconciles from the response.
+        assert.equal(sent[0].options.refreshScenes, true);
+        release();
+        await settle();
+        assert.equal(fetches, 0);
+        assert.equal(g1.strength, 0.5);
+    """)
+
+
+def test_a_guide_popup_hide_flips_at_once_and_toggles_back_from_the_live_state():
+    _run_gesture_node(_PAINT_FIRST_POPUP + """
+        const button = hideButton();
+        button.fire('click');
+        assert.equal(g1.muted, true);
+        assert.equal(paints, 1);
+        release(); await settle();
+        // The same drawn button, not rebuilt: it reads what the guide now is.
+        button.fire('click');
+        assert.equal(g1.muted, false);
+        assert.deepEqual(sent.map((s) => s.operations[0].fields.muted), [true, false]);
+        release(); await settle();
+        assert.equal(fetches, 0);
+    """)
+
+
+def test_a_guide_popup_edit_after_a_canonical_reconcile_paints_the_live_guide():
+    _run_gesture_node(_PAINT_FIRST_POPUP + """
+        // A reconcile replaces the scene's guide objects with equal ones, so
+        // the popup's projection is unchanged and it is not rebuilt.
+        const canonical = structuredClone(g1);
+        w.activeScene.guide_frames = [canonical];
+        setStrength(control('Guide strength'), 0.25);
+        assert.equal(canonical.strength, 0.25);
+        assert.equal(g1.strength, 1);
+        assert.equal(sent.length, 1);
+        release(); await settle();
+    """)
+
+
+def test_a_failed_guide_popup_write_rolls_back_locally_without_a_refetch():
+    _run_gesture_node(_PAINT_FIRST_POPUP + """
+        fail = true;
+        const drawn = w._guideManagerEl;
+        setStrength(control('Guide strength'), 0.5);
+        assert.equal(g1.strength, 0.5);
+        // An honest message; the machine string goes to `detail`.
+        assert.equal(sent[0].options.failureMessage, 'The guide change could not be saved.');
+        release();
+        await settle();
+        // Restored from local state, with no network: the popup itself
+        // fetches nothing, and the rebuilt row shows the saved value.
+        assert.equal(g1.strength, 1);
+        assert.equal(fetches, 0);
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        assert.notEqual(w._guideManagerEl, drawn);
+        assert.equal(control('Guide strength').value, '1.00');
+    """)
+
+
+def test_two_failed_guide_writes_restore_the_acknowledged_value_not_the_first_paint():
+    _run_gesture_node(_PAINT_FIRST_POPUP + """
+        const input = control('Guide strength');
+        setStrength(input, 0.5);
+        setStrength(input, 0.4);
+        assert.equal(g1.strength, 0.4);
+        fail = true;
+        // The first failure leaves the newer paint: its write is still queued.
+        release(); await settle();
+        assert.equal(g1.strength, 0.4);
+        // The chain's last failure restores what the server last accepted --
+        // the value before the chain, never the first write's paint.
+        release(); await settle();
+        assert.equal(g1.strength, 1);
+    """)
+
+
+def test_a_guide_write_failing_after_an_accepted_one_restores_the_accepted_value():
+    _run_gesture_node(_PAINT_FIRST_POPUP + """
+        const input = control('Guide strength');
+        setStrength(input, 0.5);
+        setStrength(input, 0.4);
+        release(); await settle();       // 0.5 accepted
+        fail = true;
+        release(); await settle();       // 0.4 fails
+        assert.equal(g1.strength, 0.5);
+        // And a newer write after an older failure keeps its own paint.
+        fail = false;
+        setStrength(input, 0.3);
+        setStrength(input, 0.2);
+        fail = true; release(); await settle();
+        assert.equal(g1.strength, 0.2);
+        fail = false; release(); await settle();
+        assert.equal(g1.strength, 0.2);
+    """)
+
+
+def test_a_locked_linked_guide_mute_is_refused_before_any_undo_entry():
+    _run_gesture_node(_PAINT_FIRST_POPUP + """
+        const proto = Object.getPrototypeOf(w);
+        const redo = { label: 'redo' };
+        Object.assign(w, { _undoStack: [], _redoStack: [redo], _maxUndoSteps: 50,
+            _historyStackRevision: 0, _pushUndo: proto._pushUndo });
+        w._shouldApplyLinked = () => true;
+        const partner = { type: 'clip', id: 'c1', data: { muted: false } };
+        w._findSceneItemBySelection = () => ({ type: 'guide', id: 10, data: w.activeScene.guide_frames[0] });
+        w._expandItemsWithLinked = (items) => [...items, partner];
+        w._isItemLocked = (item) => item === partner;
+        const drawn = w._guideManagerEl;
+        hideButton().fire('click');
+        assert.equal(g1.muted, false);
+        assert.equal(partner.data.muted, false);
+        assert.equal(sent.length, 0);
+        // No entry pushed, so Redo survives a gesture that changed nothing.
+        assert.equal(w._undoStack.length, 0);
+        assert.deepEqual(w._redoStack, [redo]);
+        await settle();
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        assert.notEqual(w._guideManagerEl, drawn);
+    """)
+
+
+def test_an_item_editor_linked_mute_refusal_discards_its_pushed_entry():
+    # The item editor pushes before calling, so the helper's own refusal owns
+    # the discard of the entry it would have claimed.
+    _run_gesture_node(_PAINT_FIRST_POPUP + """
+        const proto = Object.getPrototypeOf(w);
+        Object.assign(w, { _undoStack: [], _redoStack: [], _maxUndoSteps: 50,
+            _historyStackRevision: 0, _pushUndo: proto._pushUndo });
+        w._shouldApplyLinked = () => true;
+        const partner = { type: 'clip', id: 'c1', data: { muted: false } };
+        w._findSceneItemBySelection = () => ({ type: 'guide', id: 10, data: g1 });
+        w._expandItemsWithLinked = (items) => [...items, partner];
+        w._isItemLocked = (item) => item === partner;
+        w._pushUndo('toggle guide mute');
+        g1.muted = true;
+        const outcome = await w._updateItemProperty('guide', 10, { muted: true });
+        assert.equal(outcome, 'refused');
+        assert.equal(g1.muted, false);
+        assert.equal(w._undoStack.length, 0);
+    """)
+
+
+def test_popup_strength_writes_claim_merge_and_discard_through_the_real_queue():
+    # The real `_pushUndo`, claim, queue, coalescing and stamping: only the
+    # network call is stubbed. An `await` slipped in before the enqueue would
+    # let the claim candidate expire and fail this test.
+    _run_gesture_node(_PAINT_FIRST_POPUP + """
+        const proto = Object.getPrototypeOf(w);
+        Object.assign(w, { _undoStack: [], _redoStack: [], _maxUndoSteps: 50,
+            _historyStackRevision: 0, _pushUndo: proto._pushUndo,
+            _claimHistoryPostSnapshotCapture: proto._claimHistoryPostSnapshotCapture,
+            _stampHistoryPostSnapshot: proto._stampHistoryPostSnapshot,
+            _runSceneMutation: proto._runSceneMutation });
+        const posted = [];
+        w._runVersionedProjectMutation = (url, init) => {
+            posted.push(JSON.parse(init.body).operations[0].fields);
+            return new Promise((resolve, reject) => releases.push(() => fail
+                ? reject(new Error('refused'))
+                : resolve({ payload: { scene: structuredClone(w.activeScene) },
+                    response: { headers: { get: () => null } } })));
+        };
+        const input = control('Guide strength');
+        setStrength(input, 0.5);                   // S1: sent at once
+        const s1 = w._undoStack[0];
+        assert.equal(s1._postSnapshotCaptureClaimed, true);
+        await settle();
+        setStrength(input, 0.4);                   // S2: own slot, S1 is running
+        setStrength(input, 0.3);                   // S3: joins S2's pending slot
+        assert.equal(w._undoStack.length, 2);      // S3's entry discarded
+        const s2 = w._undoStack[1];
+        release(); await settle();
+        assert.ok(s1.postSnapshot);
+        release(); await settle();
+        assert.ok(s2.postSnapshot);
+        assert.deepEqual(posted, [{ strength: 0.5 }, { strength: 0.3 }]);
+        // A failed write loses its entry and rolls the field back.
+        fail = true;
+        setStrength(input, 0.2);
+        assert.equal(w._undoStack.length, 3);
+        await settle(); release(); await settle();
+        assert.equal(w._undoStack.length, 2);
+        assert.equal(g1.strength, 0.3);
+    """)
+
+
+def test_a_guide_popup_frame_commit_moves_once_and_does_not_refetch():
+    _run_gesture_node(_PAINT_FIRST_POPUP + """
+        let moves = 0;
+        w._moveGuideToFrame = async (guide, to, strength) => {
+            moves += 1;
+            assert.equal(guide, w.activeScene.guide_frames[0]);
+            assert.equal(to, 30);
+            // A strength edited on this row since it was drawn travels with it.
+            assert.equal(strength, 0.5);
+            // Like the real move, paint synchronously onto a new object.
+            w.activeScene.guide_frames = [{ ...guide, frame_index: to }];
+        };
+        w.activeScene.guide_frames = [{ ...g1, strength: 0.5 }];
+        const input = control('Guide frame index');
+        input.value = '30';
+        input.fire('keydown', { key: 'Enter' });
+        // Blur then fires the change the Enter already committed.
+        input.fire('change');
+        await settle();
+        assert.equal(moves, 1);
+        assert.equal(fetches, 0);
+    """)
+
+
+def test_a_row_follows_its_own_frame_move_for_the_next_action():
+    # Real move: it replaces the guide object at the new frame, and the row is
+    # not rebuilt while focus stays in it. "Set frame, Tab, set strength".
+    _run_gesture_node(_PAINT_FIRST_POPUP + """
+        w._clearSelection = () => {}; w._hideItemEditor = () => {};
+        w._remapSelectedItem = () => {}; w._pruneLocalLinkedGroups = () => {};
+        const frameInput = control('Guide frame index');
+        frameInput.value = '30';
+        frameInput.fire('keydown', { key: 'Enter' });
+        assert.deepEqual(w.activeScene.guide_frames.map((g) => [g.guide_id, g.frame_index]),
+            [['g1', 30]]);
+        setStrength(control('Guide strength'), 0.5);
+        assert.equal(sent.length, 2);
+        assert.equal(sent[1].operations[0].type, 'update_guide');
+        assert.deepEqual(sent[1].operations[0].expected,
+            { guide_id: 'g1', frame_index: 30, asset_id: 'a1' });
+        assert.equal(w.activeScene.guide_frames[0].strength, 0.5);
+        release(); release(); await settle();
+    """)
+
+
+def test_a_refused_move_lets_the_row_follow_the_guide_back_and_retry():
+    _run_gesture_node(_PAINT_FIRST_POPUP + """
+        w._clearSelection = () => {}; w._hideItemEditor = () => {};
+        w._remapSelectedItem = () => {}; w._pruneLocalLinkedGroups = () => {};
+        // The failure heal puts the guide back where the server holds it.
+        w._fetchScenes = async () => {
+            fetches += 1;
+            w.activeScene.guide_frames = [structuredClone(g1)];
+            return true;
+        };
+        fail = true;
+        const frameInput = control('Guide frame index');
+        frameInput.value = '30';
+        frameInput.fire('keydown', { key: 'Enter' });
+        release(); await settle();
+        assert.equal(w.activeScene.guide_frames[0].frame_index, 10);
+        // Enter on the same value again is a retry, not a silent no-op.
+        fail = false;
+        frameInput.fire('keydown', { key: 'Enter' });
+        assert.equal(sent.length, 2);
+        assert.equal(sent[1].operations[0].from_frame_index, 10);
+        release(); await settle();
+    """)
+
+
 def test_the_guide_popup_keeps_one_escape_registration_across_rebuilds():
     _run_gesture_node(_POPUP_DOM + """
         const w = makeWidget();

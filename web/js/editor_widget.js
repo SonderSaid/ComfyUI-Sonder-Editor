@@ -5420,6 +5420,102 @@ export class EditorWidget {
         return occupant && guideIdentityMatches(occupant, identity) ? occupant : null;
     }
 
+    /** Whether muting this item would reach a locked linked member, which
+     *  refuses the whole linked mute. Ask before pushing an Undo entry: a
+     *  push clears Redo, and a refused gesture must not. */
+    _linkedMuteBlocked(type, id) {
+        const anchor = this._findSceneItemBySelection(type, id);
+        if (!anchor || !this._shouldApplyLinked(anchor)) return false;
+        return this._expandItemsWithLinked([anchor]).some((item) => this._isItemLocked(item));
+    }
+
+    /**
+     * The Guides popup's paint-first write of a guide field (strength, muted).
+     *
+     * The field goes onto `live` and the save starts without being awaited --
+     * its synchronous part claims the Undo entry -- then the timeline repaints.
+     * A success reconciles from the canonical scene (`refresh: true`).
+     *
+     * A failure rolls back locally, because the refetch heal fails exactly when
+     * the server is unreachable (`durable_rules.md`: a local optimistic apply
+     * owes a rollback that works without the network). It restores the field's
+     * last ACKNOWLEDGED value, never this gesture's own snapshot: with a second
+     * write queued behind a running one, the second's snapshot is the first's
+     * paint, which the server never held. So each guide field keeps one chain
+     * of unsettled writes: its acknowledged value is the value before the
+     * chain's first write, advanced by each accepted one (the queue sends them
+     * in order, so the newest accepted is what the server holds), and only the
+     * chain's last write to settle may roll back -- and only while the field
+     * still shows the chain's newest paint on the same scene object. An earlier
+     * failure with a newer write still queued leaves the newer paint, which
+     * carries what the author last chose.
+     *
+     * Resolves to the `_updateItemProperty` outcome.
+     */
+    async _writeGuideFieldFromPanel(live, expected, props, undoLabel) {
+        const scene = this.activeScene;
+        if (!scene || !live) return "refused";
+        if ("muted" in props && this._linkedMuteBlocked("guide", live.frame_index)) {
+            notifyWarning("Linked mute refused because one or more linked items are locked.",
+                { source: "timeline-mute-refused" });
+            return "refused";
+        }
+        const chains = (this._guideFieldWriteChains ||= new Map());
+        const guideKey = live.guide_id ? `id:${live.guide_id}` : `frame:${live.frame_index}`;
+        const links = Object.keys(props).map((field) => {
+            const key = `${scene.scene_id}:${guideKey}:${field}`;
+            let chain = chains.get(key);
+            if (!chain) {
+                chain = { acked: live[field], ackedSeq: 0, seq: 0, pending: 0, painted: undefined };
+                chains.set(key, chain);
+            }
+            chain.seq += 1;
+            chain.pending += 1;
+            chain.painted = props[field];
+            return { key, chain, field, seq: chain.seq, value: props[field], prior: live[field] };
+        });
+        const entry = this._pushUndo(undoLabel);
+        Object.assign(live, props);
+        const pending = this._updateItemProperty("guide", live.frame_index, props, {
+            refresh: true, expected,
+            failureMessage: "The guide change could not be saved.",
+            failureDetail: (error) => error?.message || null,
+        });
+        this._renderSceneAfterLocalMutation({ viewport: true });
+        const outcome = await pending;
+        const deferred = [];
+        let restored = false;
+        for (const link of links) {
+            const { chain, field } = link;
+            chain.pending -= 1;
+            if (outcome === "ok" && link.seq > chain.ackedSeq) {
+                chain.acked = link.value;
+                chain.ackedSeq = link.seq;
+            }
+            // Nothing was sent: undo this gesture's own paint, unless a newer
+            // paint has already replaced it.
+            if (outcome === "refused" && live[field] === link.value) {
+                live[field] = link.prior;
+                restored = true;
+            }
+            if (chain.pending > 0) continue;
+            if (chains.get(link.key) === chain) chains.delete(link.key);
+            if (outcome !== "failed") continue;
+            if (this.activeScene === scene && scene.guide_frames?.includes(live)
+                    && live[field] === chain.painted) {
+                live[field] = chain.acked;
+                restored = true;
+            } else {
+                deferred.push(field);
+            }
+        }
+        if (outcome === "refused") this._discardUnstampableUndoEntry(entry);
+        // Field names only, never values (`durable_rules.md`, diagnostics).
+        if (deferred.length) sessionDiagRecord("guide_field_rollback_deferred", { fields: deferred });
+        if (restored) this._renderSceneAfterLocalMutation({ viewport: true });
+        return outcome;
+    }
+
     /**
      * The `expected` a `create_reference_item` must carry.
      *
@@ -16642,11 +16738,16 @@ export class EditorWidget {
      * the guard below is read from whichever guide now occupies that frame and
      * always agrees; with it, a stale popup's write is refused and nothing is
      * painted onto a guide the caller never showed.
+     *
+     * Resolves to `"ok"`, `"refused"` (nothing was sent) or `"failed"` (the
+     * write was sent and did not succeed; the queue has already notified).
+     * Callers that paint before awaiting use it to repaint from server truth.
      */
     async _updateItemPropertyWithinGesture(type, id, props, {
         refresh = true, coalesce = true, expected = null,
+        failureMessage = null, failureDetail = null,
     } = {}) {
-        if (!this.activeScene || !this.projectDir) return;
+        if (!this.activeScene || !this.projectDir) return "refused";
         const guideCaller = type === "guide" && expected && typeof expected === "object";
         const guideMatches = !guideCaller || !!this._guideMatchingIdentity(id, expected);
         // Linked mute propagation (manual-test #7): muting one linked member mutes
@@ -16657,14 +16758,20 @@ export class EditorWidget {
             const anchor = this._findSceneItemBySelection(type, id);
             if (anchor && this._shouldApplyLinked(anchor)) {
                 const members = this._expandItemsWithLinked([anchor]);
-                if (members.some((item) => this._isItemLocked(item))) {
+                if (this._linkedMuteBlocked(type, id)) {
                     // Callers flip the anchor's local muted before calling; restore it.
                     if (anchor.data && "muted" in anchor.data) anchor.data.muted = !props.muted;
+                    // Every mute caller pushes its entry in the same synchronous
+                    // turn, for this write to claim. None is sent, so the entry
+                    // would stay on the stack reverting nothing. Being still
+                    // the unclaimed capture candidate is what makes it exactly
+                    // that entry.
+                    this._discardUnstampableUndoEntry(this._historyPostSnapshotCaptureCandidate);
                     notifyWarning("Linked mute refused because one or more linked items are locked.", { source: "timeline-mute-refused" });
                     if (this._itemEditorEl && this.selectedItem) this._showItemEditor();
                     this._renderTimeline();
                     this._renderViewportFrame();
-                    return;
+                    return "refused";
                 }
                 applyLinked = true;
                 for (const member of members) {
@@ -16725,19 +16832,25 @@ export class EditorWidget {
         };
 
         try {
-            await this._runSceneMutation([operation], {
+            const result = await this._runSceneMutation([operation], {
                 key,
                 label: "item property",
                 coalesce,
                 merge,
                 refreshScenes: refresh,
+                failureMessage,
+                failureDetail,
             });
+            // No project mutation context: nothing was enqueued.
+            if (result === null) return "refused";
             if (refresh) {
                 this._renderTimeline();
                 this._renderViewportFrame();
             }
+            return "ok";
         } catch (e) {
             console.warn("[Sonder] Failed to update item property:", e);
+            return "failed";
         }
     }
 
@@ -18573,6 +18686,30 @@ export class EditorWidget {
             this._refreshOpenManagementPanels("guide-action");
         };
 
+        // A row closes over the guide object it was drawn with, but a canonical
+        // reconcile replaces the scene's guide objects without changing what the
+        // popup projects, so the popup is not rebuilt and a write to the drawn
+        // object would paint nothing -- or, for a move, carry fields another row
+        // action has since changed. Every row action therefore resolves the live
+        // guide by the identity the row holds; a miss is the stale refusal.
+        const liveGuideFor = (target) => {
+            const expected = this._guideSnapshotIdentity(target);
+            const live = this._guideMatchingIdentity(target?.frame_index, expected);
+            if (live) return { live, expected };
+            this._guideIdentityForAction(target); // the stale-row warning
+            return null;
+        };
+
+        // Paints at once and rolls back locally on failure
+        // (`_writeGuideFieldFromPanel`). A refusal or failure also repaints the
+        // row from the scene once the author leaves it.
+        const writeGuideField = async (live, expected, props, undoLabel) => {
+            const outcome = await this._writeGuideFieldFromPanel(live, expected, props, undoLabel);
+            if (outcome === "ok" || !this._guideManagerEl?.isConnected) return;
+            this._deferManagementPanelRender("guide");
+            this._refreshOpenManagementPanels("guide-action");
+        };
+
         if (!guides.length) {
             const empty = document.createElement("div");
             empty.textContent = "No guides in this scene.";
@@ -18639,18 +18776,40 @@ export class EditorWidget {
             frameInput.title = "Guide frame index";
             frameInput.disabled = locked;
             frameInput.style.cssText = `${chromeInputCss({ width: "66px", fontSize: "11px", padding: "5px 7px" })}`;
+            // The guide this row acts on. The row is not rebuilt while one of
+            // its inputs holds focus, so after the author's own frame move the
+            // drawn guide names a frame the guide has left: "set frame, Tab,
+            // set strength" would be refused as stale, and the `change` that
+            // follows an Enter-commit on blur would move it a second time. The
+            // row follows its own move instead, and back if the move heals.
+            let rowGuide = guide;
+            const shownFrame = () => (rowGuide.frame_index === -1
+                ? this.totalFrames - 1 : rowGuide.frame_index);
             const commitFrameInput = async () => {
                 if (locked) return;
-                const newIdx = this._parsePositionInput(frameInput.value);
-                const nextFrame = Math.round(newIdx);
-                if (!Number.isFinite(nextFrame) || nextFrame === frame) return;
+                const nextFrame = Math.round(this._parsePositionInput(frameInput.value));
+                if (!Number.isFinite(nextFrame)) return;
                 const clamped = Math.max(0, Math.min(this.totalFrames - 1, nextFrame));
-                if (!this._guideIdentityForAction(guide)) {
+                if (clamped === shownFrame()) return;
+                const resolved = liveGuideFor(rowGuide);
+                if (!resolved) {
                     await refreshPanel();
                     return;
                 }
-                await this._moveGuideToFrame(guide, clamped, guide.strength);
-                await refreshPanel();
+                const origin = resolved.live;
+                // Paints synchronously, then reconciles or heals itself; the
+                // row re-sorts through the gated repaint once focus leaves.
+                const moving = this._moveGuideToFrame(origin, clamped, origin.strength);
+                const moved = this._guideMatchingIdentity(clamped,
+                    { ...this._guideSnapshotIdentity(origin), frame_index: clamped });
+                if (moved) rowGuide = moved;
+                await moving;
+                if (!this._guideMatchingIdentity(rowGuide.frame_index,
+                        this._guideSnapshotIdentity(rowGuide))) {
+                    const back = this._guideMatchingIdentity(origin.frame_index,
+                        this._guideSnapshotIdentity(origin));
+                    if (back) rowGuide = back;
+                }
             };
             frameInput.addEventListener("change", commitFrameInput);
             frameInput.addEventListener("keydown", (event) => {
@@ -18670,17 +18829,18 @@ export class EditorWidget {
             const commitStrength = async () => {
                 if (locked) return;
                 const next = Math.max(0, Math.min(1, parseFloat(strengthInput.value)));
-                if (!Number.isFinite(next) || next === guide.strength) return;
-                const expected = this._guideIdentityForAction(guide);
-                if (!expected) {
+                if (!Number.isFinite(next)) return;
+                // A no-op stays silent even on a stale row.
+                const shown = this._guideMatchingIdentity(rowGuide.frame_index,
+                    this._guideSnapshotIdentity(rowGuide));
+                if (shown && next === Number(shown.strength ?? 1.0)) return;
+                const resolved = liveGuideFor(rowGuide);
+                if (!resolved) {
                     await refreshPanel();
                     return;
                 }
-                this._pushUndo("change guide strength");
-                guide.strength = next;
-                await this._updateItemProperty("guide", guide.frame_index, { strength: next },
-                    { refresh: false, expected });
-                await refreshPanel();
+                await writeGuideField(resolved.live, resolved.expected, { strength: next },
+                    "change guide strength");
             };
             strengthInput.addEventListener("change", commitStrength);
             strengthInput.addEventListener("keydown", (event) => {
@@ -18705,16 +18865,13 @@ export class EditorWidget {
             muteBtn.addEventListener("click", async (event) => {
                 event.stopPropagation();
                 if (locked) return;
-                const expected = this._guideIdentityForAction(guide);
-                if (!expected) {
+                const resolved = liveGuideFor(rowGuide);
+                if (!resolved) {
                     await refreshPanel();
                     return;
                 }
-                this._pushUndo("toggle guide mute");
-                guide.muted = !guide.muted;
-                await this._updateItemProperty("guide", guide.frame_index, { muted: guide.muted },
-                    { refresh: false, expected });
-                await refreshPanel();
+                await writeGuideField(resolved.live, resolved.expected,
+                    { muted: !resolved.live.muted }, "toggle guide mute");
             });
 
             const replaceBtn = this._makeBtn("Replace", "Replace this guide's image with another project image");
@@ -18722,7 +18879,7 @@ export class EditorWidget {
             replaceBtn.addEventListener("click", (event) => {
                 event.stopPropagation();
                 if (locked) return;
-                this._replaceGuideImage(guide, { refresh: false, onDone: refreshPanel });
+                this._replaceGuideImage(rowGuide, { refresh: false, onDone: refreshPanel });
             });
 
             const swapWrap = document.createElement("div");
@@ -18747,10 +18904,10 @@ export class EditorWidget {
                 if (!other) return;
                 const operation = {
                     type: "swap_guides",
-                    frame_index_a: guide.frame_index,
+                    frame_index_a: rowGuide.frame_index,
                     frame_index_b: other.frame_index,
-                    expected_a: { guide_id: guide.guide_id || "", frame_index: guide.frame_index,
-                        asset_id: guide.asset_id || "" },
+                    expected_a: { guide_id: rowGuide.guide_id || "", frame_index: rowGuide.frame_index,
+                        asset_id: rowGuide.asset_id || "" },
                     expected_b: { guide_id: other.guide_id || "", frame_index: other.frame_index,
                         asset_id: other.asset_id || "" },
                 };
@@ -18784,7 +18941,8 @@ export class EditorWidget {
             deleteBtn.addEventListener("click", (event) => this._withMutationGesture("deleteGuide", async (diagnostics) => {
                 event.stopPropagation();
                 if (locked) return;
-                const expected = this._guideIdentityForAction(guide);
+                const target = rowGuide;
+                const expected = this._guideIdentityForAction(target);
                 if (!expected) {
                     await refreshPanel();
                     return;
@@ -18793,7 +18951,7 @@ export class EditorWidget {
                 this._pushUndo(undoLabel);
                 this._applyLocalBulkDeleteItems([{
                     type: "guide",
-                    id: guide.frame_index,
+                    id: target.frame_index,
                     expected,
                 }]);
                 this._renderSceneAfterLocalMutation();
@@ -18802,11 +18960,11 @@ export class EditorWidget {
                     await this._runSceneMutation(
                         [{
                             type: "delete_guide",
-                            frame_index: guide.frame_index,
+                            frame_index: target.frame_index,
                             expected,
                         }],
                         {
-                            key: `guide:${this.activeSceneId}:${guide.frame_index}:delete`,
+                            key: `guide:${this.activeSceneId}:${target.frame_index}:delete`,
                             label: "delete guide",
                             coalesce: false,
                             refreshScenes: false,
