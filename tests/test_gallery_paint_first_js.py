@@ -18,6 +18,7 @@ GALLERY = ROOT / "web" / "js" / "shared_asset_gallery.js"
 # Gallery functions the write paths use, beyond the paint-first block itself.
 _WRITE_FUNCTIONS = (
     "applyAssetUpdate", "applyAssetUpdateWithinGesture", "handleToggleFavorite",
+    "planFavoriteRemovalInOverlay", "runPlacementHook",
     "handleAssetDelete", "handleAssetDeleteWithinGesture", "trashAssetsWithinGesture",
     "handleBulkDelete", "handleBulkDeleteWithinGesture",
     "handleAssetRestore", "handleBulkRestore", "restoreAssetsWithGesture",

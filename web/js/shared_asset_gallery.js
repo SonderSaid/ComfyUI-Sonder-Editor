@@ -36,7 +36,7 @@ import {
     setButtonDisabled,
     statusPillCss,
 } from "./editor_theme.js";
-import { resolveCompareSlots, resolveInspectOverlayScope } from "./inspect_overlay_scope.js";
+import { planCompareRemoval, resolveCompareSlots, resolveInspectOverlayScope } from "./inspect_overlay_scope.js";
 import { mountMediaScrubBar } from "./media_scrub_bar.js";
 import { openContextMenu } from "./editor_context_menu.js";
 import { cancelProjectAssetDetails, requestProjectAssetDetails } from "./asset_refresh_coordinator.js";
@@ -67,6 +67,10 @@ const OVERLAY_MEDIA_CACHE_LIMIT = 8;
 // for status: favorites have always worn it, the maintainer kept it when
 // compare gained stars, and one constant keeps any later hue a one-line edit.
 const FAVORITE_STAR_COLOR = THEME.statusPending;
+// How long an Inspect star ignores clicks after an elimination put a new asset
+// under it (a compare side, or the single view moving on): the second click of
+// a double-click would land on the newcomer. Windows' default double-click time.
+const OVERLAY_REPLACED_CLICK_GUARD_MS = 500;
 const THUMBNAIL_SIZE_CONFIG = {
     small: { thumbWidth: 60, thumbHeight: 44, gap: 6, padding: 5, nameFont: 10, metaFont: 9 },
     medium: { thumbWidth: 72, thumbHeight: 54, gap: 8, padding: 6, nameFont: 11, metaFont: 10 },
@@ -876,6 +880,9 @@ export function mountSharedAssetGallery(container, options = {}) {
         overlayCompareFavoriteRefresh: null,
         // What the compare lists last drew (`compareListSignature`).
         overlayCompareListSignature: "",
+        // Bumped each time Inspect opens, so a placement made for one viewing
+        // is never undone into the next.
+        overlaySession: 0,
         overlayState: {
             open: false,
             assetId: "",
@@ -925,6 +932,9 @@ export function mountSharedAssetGallery(container, options = {}) {
             carriedMediaState: null,
             // Identity of the media shown in the last render; the carry gate compares against it.
             mediaSignature: "",
+            // When an elimination last put a new asset on each compare side or
+            // moved the single view on (the click guard).
+            replacedAt: { A: 0, B: 0, single: 0 },
             sideBySideTransforms: {
                 a: { zoomLevel: 1, panX: 0, panY: 0 },
                 b: { zoomLevel: 1, panX: 0, panY: 0 },
@@ -1774,11 +1784,36 @@ export function mountSharedAssetGallery(container, options = {}) {
         return !!state.overlayState.open && String(state.overlayState.mediaSignature || "").startsWith("c:");
     }
 
+    // The media identity a compare render stamps, so a sync can ask whether
+    // the pair it would draw is the pair on screen.
+    function compareStageSignature(assetType, leftId, rightId) {
+        return `c:${assetType}:${leftId}:${rightId}`;
+    }
+
     // The pair the compare stage draws for the current slots and candidates.
     function resolvedCompareSlots() {
         const overlay = state.overlayState;
         const ids = sameTypeOverlayAssets(currentOverlayAsset()).map((entry) => entry.asset_id);
         return resolveCompareSlots(ids, overlay.assetId, overlay.compareLeftAssetId, overlay.compareRightAssetId);
+    }
+
+    // Whether an elimination put a new asset in `place` ("A", "B" or "single")
+    // within the click guard before `at` (an event time), so the second click
+    // of a double-click does not also unfavorite the newcomer.
+    function overlayPlaceJustReplaced(place, at) {
+        const replacedAt = state.overlayState.replacedAt?.[place] || 0;
+        return !!replacedAt && at - replacedAt < OVERLAY_REPLACED_CLICK_GUARD_MS;
+    }
+
+    // A compare side's star was clicked. The event's own time, not now: a
+    // click queued behind the rebuild an elimination caused is still the
+    // second click of that pair.
+    function handleCompareStarClick(side, event) {
+        if (overlayPlaceJustReplaced(side, event.timeStamp)) return false;
+        const target = compareSideAsset(side);
+        if (!target) return false;
+        void handleToggleFavorite(target);
+        return true;
     }
 
     // The asset a compare side shows. The render writes the resolved slots
@@ -1833,7 +1868,8 @@ export function mountSharedAssetGallery(container, options = {}) {
      * `assetIds` or a new list. What is drawn decides. A compare stage that
      * would draw the same pair repaints only its lists and stars, so neither
      * side's media reloads; a new pair, or a switch between the stage and the
-     * single view, rebuilds it. A single view rebuilds for its own asset.
+     * single view, rebuilds it. A single view rebuilds for its own asset, or
+     * when the asset it should show has moved (an elimination moving on).
      * A new list whose anchor asset is gone leaves the view as it is.
      */
     function syncOverlayWithAssets(assetIds = [], { listArrival = false } = {}) {
@@ -1843,8 +1879,8 @@ export function mountSharedAssetGallery(container, options = {}) {
         if (compareStageDrawn()) {
             const resolved = resolvedCompareSlots();
             if (!compareStageShown()
-                || resolved.leftId !== overlay.compareLeftAssetId
-                || resolved.rightId !== overlay.compareRightAssetId) {
+                || compareStageSignature(currentOverlayAsset().asset_type, resolved.leftId, resolved.rightId)
+                    !== overlay.mediaSignature) {
                 renderInspectOverlay();
             } else if (!listArrival || comparePickerHasMetadataQuery()
                 || compareListSignature() !== state.overlayCompareListSignature) {
@@ -1852,7 +1888,10 @@ export function mountSharedAssetGallery(container, options = {}) {
             }
             return;
         }
-        if (compareStageShown() || assetIds.includes(overlay.assetId)) renderInspectOverlay();
+        if (compareStageShown() || assetIds.includes(overlay.assetId)
+            || overlay.mediaSignature !== `s:${overlay.assetId}`) {
+            renderInspectOverlay();
+        }
     }
 
     function compareQueryRef(side) {
@@ -2896,6 +2935,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     async function applyAssetUpdate(asset, updates, {
         successMessage = "", successSource = "gallery-asset-update",
         failureMessage = "Failed to update the asset.",
+        onPainted = null, onUnpainted = null,
     } = {}) {
         if (!asset?.asset_id || !options.onUpdateAsset) return false;
         const normalizedUpdates = { ...updates };
@@ -2911,15 +2951,34 @@ export function mountSharedAssetGallery(container, options = {}) {
         // queued write is finally sent.
         const run = (diagnostics) => applyAssetUpdateWithinGesture(
             asset.asset_id, normalizedUpdates, diagnostics,
-            { successMessage, successSource, failureMessage });
+            { successMessage, successSource, failureMessage }, { onPainted, onUnpainted });
         return options.withMutationGesture
             ? options.withMutationGesture("asset_metadata", run) : run(null);
     }
 
-    async function applyAssetUpdateWithinGesture(assetId, updates, diagnostics, messages) {
+    // An Inspect placement that throws must not strand the paint unsent or
+    // skip a failure's report and repaint.
+    function runPlacementHook(hook) {
+        try {
+            return hook?.();
+        } catch (error) {
+            console.warn("[Sonder] Inspect placement failed:", error);
+            return false;
+        }
+    }
+
+    /**
+     * `onPainted` runs after the paint and before the repaint, as Trash's does,
+     * so an Inspect view on an asset that left moves on rather than redrawing
+     * it. `onUnpainted` runs after a failed write's rollback and returns
+     * whether it moved the view.
+     */
+    async function applyAssetUpdateWithinGesture(assetId, updates, diagnostics, messages,
+        { onPainted = null, onUnpainted = null } = {}) {
         const gen = paintAssetPatch(assetId, updates);
         if (gen === null) return false;
         clearUsageView();
+        runPlacementHook(onPainted);
         renderAfterAssetPaint([assetId]);
         try {
             const updated = await enqueueAssetWrite(
@@ -2929,10 +2988,123 @@ export function mountSharedAssetGallery(container, options = {}) {
             if (messages.successMessage) notifySuccess(messages.successMessage, { source: messages.successSource });
             return true;
         } catch (error) {
-            if (settleAssetPatch(assetId, gen, null)) renderAfterAssetPaint([assetId]);
+            const changed = settleAssetPatch(assetId, gen, null);
+            const moved = !!runPlacementHook(onUnpainted);
+            if (changed || moved) renderAfterAssetPaint([assetId]);
             reportAssetWriteFailure(error, messages.failureMessage);
             return false;
         }
+    }
+
+    /**
+     * An unfavorite in the Favorites view takes its asset out of Inspect's
+     * view. Planned before the paint, from the lists as they stand:
+     * - on a drawn compare stage the vacated side takes the next contender in
+     *   its own list, as ↓ would (`planCompareRemoval`), and below two
+     *   same-type candidates the view drops to single on the survivor;
+     * - a single view moves on like Trash, next else previous across types,
+     *   and closes after the last.
+     * `onPainted` places, and only if the asset really left. `onUnpainted`
+     * (the write failed and the asset is back) returns each place that still
+     * shows what was put there, within the same Inspect session. Null when
+     * Inspect is closed or the asset is not in its view.
+     */
+    function planFavoriteRemovalInOverlay(removedId) {
+        const overlay = state.overlayState;
+        if (!overlay.open) return null;
+        const viewBefore = overlayAssets();
+        const inView = (assetId) => overlayAssets().some((entry) => entry.asset_id === assetId);
+        if (!viewBefore.some((entry) => entry.asset_id === removedId)) return null;
+        const session = state.overlaySession;
+        const before = {
+            assetId: overlay.assetId, compareMode: overlay.compareMode,
+            leftId: overlay.compareLeftAssetId, rightId: overlay.compareRightAssetId,
+        };
+        const stageDrawn = compareStageDrawn();
+        // A side's list is ready only once its metadata search covers every
+        // asset. Read only for a side the removal vacates.
+        const sideList = (side) => {
+            const query = parseAssetSearchQuery(overlay[compareQueryRef(side)] || "");
+            if (prepareMetadataSearch(query) !== "ready") return null;
+            return compareFilteredCandidates(side).map((entry) => entry.asset_id);
+        };
+        const sideLists = {
+            A: stageDrawn && before.leftId === removedId ? sideList("A") : null,
+            B: stageDrawn && before.rightId === removedId ? sideList("B") : null,
+        };
+        // The removed asset's own type, not the anchor's: a stage kept after
+        // its anchor left has no anchor to ask.
+        const removedType = shownAsset(removedId)?.asset_type;
+        const sameTypeIds = stageDrawn
+            ? viewBefore.filter((entry) => entry.asset_type === removedType).map((entry) => entry.asset_id)
+            : [];
+        let placed = null;
+        const showSingle = (assetId) => {
+            overlay.assetId = assetId;
+            overlay.compareMode = false;
+            overlay.showWaveform = false;
+            resetOverlayTransform();
+            overlay.replacedAt.single = performance.now();
+            placed = { compare: false, assetId };
+        };
+        const onPainted = () => {
+            if (!overlay.open || state.overlaySession !== session || inView(removedId)) return;
+            if (stageDrawn) {
+                const plan = planCompareRemoval({
+                    sideLists, sameTypeIds, leftId: before.leftId, rightId: before.rightId, removedId,
+                });
+                if (plan.compare) {
+                    overlay.compareLeftAssetId = plan.leftId;
+                    overlay.compareRightAssetId = plan.rightId;
+                    // The anchor stays a candidate: one that left moves to A.
+                    if (overlay.assetId === removedId || !inView(overlay.assetId)) overlay.assetId = plan.leftId;
+                    const now = performance.now();
+                    if (plan.leftId !== before.leftId) overlay.replacedAt.A = now;
+                    if (plan.rightId !== before.rightId) overlay.replacedAt.B = now;
+                    placed = { compare: true, assetId: overlay.assetId, leftId: plan.leftId, rightId: plan.rightId };
+                    return;
+                }
+                if (plan.survivorId) {
+                    showSingle(plan.survivorId);
+                    return;
+                }
+            } else if (before.assetId !== removedId) {
+                return;
+            }
+            const nextId = successorAssetIdAfterRemoval([removedId], viewBefore, removedId);
+            if (nextId) showSingle(nextId);
+            else closeInspectOverlay();
+        };
+        const onUnpainted = () => {
+            const placement = placed;
+            placed = null;
+            if (!placement || !overlay.open || state.overlaySession !== session || !inView(removedId)) return false;
+            let moved = false;
+            if (placement.compare) {
+                if (!overlay.compareMode) return false;
+                if (overlay.compareLeftAssetId === placement.leftId && placement.leftId !== before.leftId) {
+                    overlay.compareLeftAssetId = before.leftId;
+                    moved = true;
+                }
+                if (overlay.compareRightAssetId === placement.rightId && placement.rightId !== before.rightId) {
+                    overlay.compareRightAssetId = before.rightId;
+                    moved = true;
+                }
+                if (overlay.assetId === placement.assetId && placement.assetId !== before.assetId) {
+                    overlay.assetId = before.assetId;
+                    moved = true;
+                }
+                return moved;
+            }
+            if (overlay.compareMode || overlay.assetId !== placement.assetId) return false;
+            Object.assign(overlay, {
+                assetId: before.assetId, compareMode: before.compareMode,
+                compareLeftAssetId: before.leftId, compareRightAssetId: before.rightId,
+            });
+            resetOverlayTransform();
+            return true;
+        };
+        return { onPainted, onUnpainted };
     }
 
     async function handleToggleFavorite(asset, nextFavorite = null) {
@@ -2941,10 +3113,13 @@ export function mountSharedAssetGallery(container, options = {}) {
         // first save returns toggles back.
         const shown = shownAsset(asset.asset_id) || asset;
         const desired = typeof nextFavorite === "boolean" ? nextFavorite : !shown.favorite;
+        // Before the paint: the plan reads the view the asset may be leaving.
+        const removal = desired ? null : planFavoriteRemovalInOverlay(shown.asset_id);
         return await applyAssetUpdate(shown, { favorite: desired }, {
             successMessage: desired ? "Added to Favorites" : "Removed from Favorites",
             successSource: "gallery-favorite",
             failureMessage: "Failed to update favorite.",
+            onPainted: removal?.onPainted, onUnpainted: removal?.onUnpainted,
         });
     }
 
@@ -4993,6 +5168,8 @@ export function mountSharedAssetGallery(container, options = {}) {
             state.overlayState.mediaSignature = "";
         }
         state.overlayState.open = true;
+        state.overlaySession += 1;
+        state.overlayState.replacedAt = { A: 0, B: 0, single: 0 };
         state.overlayState.assetId = asset.asset_id;
         state.overlayState.origin = origin === "direct" ? "direct" : "gallery";
         state.overlayState.compareMode = false;
@@ -5421,8 +5598,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         star.addEventListener("click", (event) => {
             event.preventDefault();
             event.stopPropagation();
-            const target = compareSideAsset(side);
-            if (target && !star.disabled) void handleToggleFavorite(target);
+            if (!star.disabled) handleCompareStarClick(side, event);
         });
         star.addEventListener("mouseenter", () => { starHovered = true; refresh(); });
         star.addEventListener("mouseleave", () => { starHovered = false; refresh(); });
@@ -6012,7 +6188,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         // The compare stage carries a star per side; any single view, including
         // compare left with one candidate, keeps the toolbar star.
         if (!stageShown) {
-            toolbarActions.appendChild(makeFavoriteButton(asset));
+            toolbarActions.appendChild(makeFavoriteButton(asset, { overlay: true }));
         }
         if (!overlay.compareMode) {
             const trashBtn = makeActionButton("danger");
@@ -6084,7 +6260,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             // Resolved compare slots form the signature; a metadata/layout/monitor/cycle-side
             // toggle keeps both slots, so the captured scrub state carries — but cycling either
             // slot or switching mode changes the signature and starts the new media fresh.
-            const signature = `c:${asset.asset_type}:${overlay.compareLeftAssetId}:${overlay.compareRightAssetId}`;
+            const signature = compareStageSignature(asset.asset_type, overlay.compareLeftAssetId, overlay.compareRightAssetId);
             overlay.carriedMediaState = (carriedMediaState && overlay.mediaSignature === signature) ? carriedMediaState : null;
             overlay.mediaSignature = signature;
             renderCompareOverlay(asset, mediaWrap);
@@ -7148,7 +7324,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         return state.manageMode ? `24px ${base}` : base;
     }
 
-    function makeFavoriteButton(asset, { row = false } = {}) {
+    function makeFavoriteButton(asset, { row = false, overlay = false } = {}) {
         const favorite = !!asset?.favorite;
         const btn = style(document.createElement("button"), row ? `
             width:18px;
@@ -7190,6 +7366,8 @@ export function mountSharedAssetGallery(container, options = {}) {
         btn.addEventListener("click", async (event) => {
             event.preventDefault();
             event.stopPropagation();
+            // Inspect's toolbar star: the view may just have moved on under it.
+            if (overlay && overlayPlaceJustReplaced("single", event.timeStamp)) return;
             selectAsset(asset.asset_id, { focusList: true });
             await handleToggleFavorite(asset);
         });

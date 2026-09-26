@@ -1,9 +1,11 @@
-"""Favoriting inside the Inspect view's compare stage.
+"""Favoriting inside the Inspect view's compare stage, and the elimination it
+drives in the Favorites view.
 
-The slot resolver runs as imported. The gallery's overlay functions are sliced
-from its source onto the paint-first harness, so a favorite goes through the
-real paint, write chain and repaint decision; only the DOM-building renderers
-are stubs.
+The slot resolver and the removal planner run as imported. The gallery's overlay
+functions are sliced from its source onto the paint-first harness, with the real
+scope filter and successor rule, so a favorite goes through the real paint,
+write chain, placement and repaint decision; only the DOM-building renderers
+and the per-side search are stubs.
 """
 import re
 
@@ -13,10 +15,12 @@ from test_project_mutation_queue import _run_gesture_node
 SCOPE_URL = (GALLERY.parent / "inspect_overlay_scope.js").as_uri()
 
 _OVERLAY_FUNCTIONS = (
-    "compareModeActive", "compareStageShown", "compareStageDrawn", "resolvedCompareSlots",
-    "compareSideAsset", "overlayFavoriteTarget", "handleOverlayFavoriteKey", "refreshCompareInPlace",
-    "compareListSignature", "syncOverlayWithAssets",
+    "compareModeActive", "compareStageShown", "compareStageDrawn", "compareStageSignature",
+    "resolvedCompareSlots", "compareSideAsset", "overlayFavoriteTarget", "handleOverlayFavoriteKey",
+    "refreshCompareInPlace", "compareListSignature", "syncOverlayWithAssets",
     "overlayAssets", "currentOverlayAsset", "sameTypeOverlayAssets",
+    "compareQueryRef", "compareFilteredCandidates", "assetMatchesCurrentScope",
+    "successorAssetIdAfterRemoval", "overlayPlaceJustReplaced", "handleCompareStarClick",
 )
 
 
@@ -26,33 +30,54 @@ def _gallery_function(source: str, name: str) -> str:
 
 def _overlay_source() -> str:
     source = GALLERY.read_text(encoding="utf-8")
-    return "\n".join(_gallery_function(source, name) for name in _OVERLAY_FUNCTIONS)
+    guard = re.search(r"^const OVERLAY_REPLACED_CLICK_GUARD_MS = \d+;$", source, re.M)[0]
+    return "\n".join([guard] + [_gallery_function(source, name) for name in _OVERLAY_FUNCTIONS])
 
 
-# The overlay's inputs: the gallery view (All, or Favorites) and an open
-# compare stage whose list and star hooks count their repaints. The render stub
-# draws what the real one would: it closes without an anchor, and otherwise
-# writes the resolved slots back and stamps the signature of the view it drew,
-# so a sequence of rebuilds runs on states the real overlay can reach.
+# The overlay's inputs: the gallery scope (All, or Favorites, through the real
+# scope filter) and an open compare stage whose list and star hooks count their
+# repaints. The render stub draws what the real one would: it closes without an
+# anchor, and otherwise writes the resolved slots back and stamps the signature
+# of the view it drew, so a sequence of rebuilds runs on states the real overlay
+# can reach. A side's search matches names containing it; `tracked:` stays
+# "not ready" until `metadataReady` is set.
 _OVERLAY_HARNESS = """
-        const { resolveCompareSlots, resolveInspectOverlayScope } = await import('__SCOPE_URL__');
+        const { planCompareRemoval, resolveCompareSlots, resolveInspectOverlayScope } = await import('__SCOPE_URL__');
+        Object.assign(state, { scopeMode: 'all', overlaySession: 1 });
+        state.overlayState.replacedAt = { A: 0, B: 0, single: 0 };
         let favoritesView = false;
-        const activeNavigableAssets = () => data.assets.filter((entry) =>
-            !isTrashed(entry) && (!favoritesView || entry.favorite));
+        const assetInCurrentScene = () => false;
+        const activeNavigableAssets = () => {
+            state.scopeMode = favoritesView ? 'favorites' : 'all';
+            return data.assets.filter((entry) => !isTrashed(entry) && assetMatchesCurrentScope(entry));
+        };
         const sortAssets = (assets) => [...assets];
+        const DEFAULT_SORT_MODE = 'newest';
+        const sortAssetsByMode = (assets) => assets;
+        const parseAssetSearchQuery = (query) => String(query || '');
+        const queryHasMetadataTerms = (query) => query.startsWith('tracked:');
+        let metadataReady = false;
+        const prepareMetadataSearch = (query) => !queryHasMetadataTerms(query) || metadataReady ? 'ready' : 'loading';
+        const assetMatchesParsedQuery = (entry, query) => !query || queryHasMetadataTerms(query)
+            || entry.name.includes(query);
         const comparePickerHasMetadataQuery = () => false;
+        const closeInspectOverlay = () => {
+            Object.assign(state.overlayState, { open: false, assetId: '', compareMode: false,
+                compareLeftAssetId: '', compareRightAssetId: '', mediaSignature: '' });
+        };
         const renderInspectOverlay = () => {
             overlayRenders += 1;
             const overlay = state.overlayState;
             if (!overlay.open || !currentOverlayAsset()) {
-                Object.assign(overlay, { open: false, mediaSignature: '' });
+                closeInspectOverlay();
                 return;
             }
             if (compareStageShown()) {
                 const resolved = resolvedCompareSlots();
                 overlay.compareLeftAssetId = resolved.leftId;
                 overlay.compareRightAssetId = resolved.rightId;
-                overlay.mediaSignature = `c:video:${resolved.leftId}:${resolved.rightId}`;
+                overlay.mediaSignature = compareStageSignature(currentOverlayAsset().asset_type,
+                    resolved.leftId, resolved.rightId);
                 state.overlayCompareListSignature = compareListSignature();
             } else {
                 overlay.mediaSignature = `s:${overlay.assetId}`;
@@ -62,20 +87,36 @@ _OVERLAY_HARNESS = """
         const openCompare = (anchor, left, right, extra = {}) => {
             Object.assign(state.overlayState, { open: true, origin: 'gallery', compareMode: true,
                 assetId: anchor, compareLeftAssetId: left, compareRightAssetId: right,
+                comparePickerQuery: '', comparePickerQueryB: '',
                 compareCycleSide: 'B', mediaSignature: `c:video:${left}:${right}`, ...extra });
             state.overlayCompareChoosersRefresh = () => { choosersRefreshes += 1; };
             state.overlayCompareFavoriteRefresh = () => { starRefreshes += 1; };
             state.overlayCompareListSignature = compareListSignature();
         };
+        const openSingle = (assetId) => {
+            Object.assign(state.overlayState, { open: true, origin: 'gallery', compareMode: false,
+                assetId, compareLeftAssetId: assetId, compareRightAssetId: '', mediaSignature: `s:${assetId}` });
+        };
         const video = (id, extra = {}) => asset(id, { asset_type: 'video', path: `${id}.mp4`, ...extra });
+        const image = (id, extra = {}) => asset(id, { asset_type: 'image', path: `${id}.png`, ...extra });
+        const fav = (make, ...ids) => ids.map((id) => make(id, { favorite: true }));
+        const drawn = () => {
+            const o = state.overlayState;
+            return o.open ? [o.mediaSignature, o.assetId] : ['closed', ''];
+        };
 """.replace("__SCOPE_URL__", SCOPE_URL)
 
 
-# The paint-first harness's render stub and single-view sync give way to the
-# drawing stub below and the real sync.
+# The paint-first harness's render stub, single-view sync, close stub and
+# successor stub give way to the drawing stubs above and the real functions.
 _HARNESS = re.sub(r"        const renderInspectOverlay = .*?(?=        const clearUsageView)", "",
                   GALLERY_HARNESS, count=1, flags=re.S)
-assert "syncOverlayWithAssets" not in _HARNESS and "renderInspectOverlay" not in _HARNESS
+_HARNESS = re.sub(r"        const successorAssetIdAfterRemoval = .*?\n.*?\n", "", _HARNESS, count=1)
+_HARNESS = _HARNESS.replace(
+    "        const closeInspectOverlay = () => { state.overlayState.open = false; };\n", "")
+for _stubbed in ("syncOverlayWithAssets", "renderInspectOverlay", "successorAssetIdAfterRemoval",
+                 "closeInspectOverlay"):
+    assert _stubbed not in _HARNESS, _stubbed
 
 
 def _run(body: str) -> None:
@@ -282,7 +323,295 @@ def test_the_render_writes_the_resolved_slots_back_before_the_media_signature():
     body = _gallery_function(source, "renderInspectOverlay")
     write_back = body.index("overlay.compareLeftAssetId = resolved.leftId;")
     assert body.index("const resolved = resolvedCompareSlots();") < write_back
-    assert write_back < body.index("const signature = `c:")
+    assert write_back < body.index("const signature = compareStageSignature(asset.asset_type,")
     assert "overlay.compareRightAssetId = resolved.rightId;" in body
     # S goes through the named, tested handler in every overlay mode.
     assert 'if (event.key === "s" || event.key === "S") return handleOverlayFavoriteKey(event);' in body
+
+
+# ── Elimination in the Favorites view ──────────────────────────────────────
+
+
+def test_the_removal_planner_steps_in_the_next_contender_per_side():
+    _run("""
+        const plan = (args) => planCompareRemoval({ sideLists: {}, ...args });
+        const all = ['v1', 'v2', 'v3', 'v4'];
+        // B leaves: its next contender, as the down arrow would.
+        assert.deepEqual(plan({ sameTypeIds: all, leftId: 'v1', rightId: 'v2', removedId: 'v2',
+            sideLists: { A: all, B: all } }), { compare: true, leftId: 'v1', rightId: 'v3' });
+        // Wrapping at the end skips the other side's asset.
+        assert.deepEqual(plan({ sameTypeIds: all, leftId: 'v1', rightId: 'v4', removedId: 'v4',
+            sideLists: { A: all, B: all } }), { compare: true, leftId: 'v1', rightId: 'v2' });
+        // A leaves: A resolves first, never onto B.
+        assert.deepEqual(plan({ sameTypeIds: all, leftId: 'v1', rightId: 'v2', removedId: 'v1',
+            sideLists: { A: all, B: all } }), { compare: true, leftId: 'v3', rightId: 'v2' });
+        // Each side walks its own filtered list.
+        assert.deepEqual(plan({ sameTypeIds: all, leftId: 'v1', rightId: 'v2', removedId: 'v2',
+            sideLists: { A: all, B: ['v2', 'v4'] } }), { compare: true, leftId: 'v1', rightId: 'v4' });
+        // A side list that is not ready, empty, lacks the asset or has nothing
+        // else falls back to every same-type candidate.
+        for (const B of [null, [], ['v3', 'v4'], ['v2', 'v1']]) {
+            assert.deepEqual(plan({ sameTypeIds: all, leftId: 'v1', rightId: 'v2', removedId: 'v2',
+                sideLists: { A: all, B } }), { compare: true, leftId: 'v1', rightId: 'v3' }, JSON.stringify(B));
+        }
+        // A == B: both sides move, and not onto each other.
+        assert.deepEqual(plan({ sameTypeIds: all, leftId: 'v2', rightId: 'v2', removedId: 'v2' }),
+            { compare: true, leftId: 'v3', rightId: 'v4' });
+        // Below two candidates, compare ends on the survivor.
+        assert.deepEqual(plan({ sameTypeIds: ['v1', 'v2'], leftId: 'v1', rightId: 'v2', removedId: 'v2' }),
+            { compare: false, survivorId: 'v1' });
+        assert.deepEqual(plan({ sameTypeIds: ['v2'], leftId: 'v2', rightId: 'v2', removedId: 'v2' }),
+            { compare: false, survivorId: '' });
+    """)
+
+
+def test_elimination_steps_the_next_contender_into_the_side_that_lost():
+    _run("""
+        favoritesView = true;
+        data.assets = [...fav(video, 'v1', 'v2', 'v3', 'v4'), ...fav(image, 'i1')];
+        openCompare('v1', 'v1', 'v2');
+        handleToggleFavorite(shown('v2'));
+        assert.deepEqual(drawn(), ['c:video:v1:v3', 'v1']);
+        assert.equal(overlayRenders, 1);
+        handleToggleFavorite(shown('v3'));
+        assert.deepEqual(drawn(), ['c:video:v1:v4', 'v1']);
+        // Unfavoriting A, the overlay's own asset: A takes its next contender
+        // and the overlay follows it, instead of closing.
+        handleToggleFavorite(shown('v1'));
+        // One video left: single Inspect on the true favorite.
+        assert.deepEqual(drawn(), ['s:v4', 'v4']);
+        assert.equal(state.overlayState.compareMode, false);
+        // The last video goes: the next favorite of any type, then closed.
+        handleToggleFavorite(shown('v4'));
+        assert.deepEqual(drawn(), ['s:i1', 'i1']);
+        handleToggleFavorite(shown('i1'));
+        assert.deepEqual(drawn(), ['closed', '']);
+        await settleTurns();
+        for (let i = 0; i < 5; i += 1) await answer({ favorite: false });
+        assert.deepEqual(calls.map((c) => c.args[0]), ['v2', 'v3', 'v1', 'v4', 'i1']);
+    """)
+
+
+def test_unfavoriting_a_moves_a_to_its_next_contender_and_keeps_b():
+    _run("""
+        favoritesView = true;
+        data.assets = fav(video, 'v1', 'v2', 'v3');
+        openCompare('v1', 'v1', 'v2', { compareCycleSide: 'A' });
+        handleOverlayFavoriteKey({ repeat: false });
+        assert.deepEqual([state.overlayState.compareLeftAssetId, state.overlayState.compareRightAssetId],
+            ['v3', 'v2']);
+        assert.equal(state.overlayState.assetId, 'v3');
+    """)
+
+
+def test_a_side_filtered_by_search_walks_its_own_list_and_waits_for_metadata():
+    _run("""
+        favoritesView = true;
+        data.assets = fav(video, 'v1', 'take2', 'v3', 'take4');
+        openCompare('v1', 'v1', 'take2', { comparePickerQueryB: 'take' });
+        handleToggleFavorite(shown('take2'));
+        assert.equal(state.overlayState.compareRightAssetId, 'take4');
+        // A metadata search still loading: every same-type candidate stands in.
+        data.assets = fav(video, 'v1', 'take2', 'v3', 'take4');
+        openCompare('v1', 'v1', 'take2', { comparePickerQueryB: 'tracked:seed' });
+        handleToggleFavorite(shown('take2'));
+        assert.equal(state.overlayState.compareRightAssetId, 'v3');
+    """)
+
+
+def test_unfavoriting_in_the_all_view_moves_nothing():
+    _run("""
+        data.assets = fav(video, 'v1', 'v2', 'v3');
+        openCompare('v1', 'v1', 'v2');
+        handleToggleFavorite(shown('v2'));
+        assert.deepEqual(drawn(), ['c:video:v1:v2', 'v1']);
+        assert.equal(overlayRenders, 0);
+        assert.equal(state.overlayState.replacedAt.B, 0);
+    """)
+
+
+def test_single_inspect_moves_on_like_trash_instead_of_closing():
+    _run("""
+        favoritesView = true;
+        data.assets = fav(video, 'v1', 'v2', 'v3');
+        openSingle('v2');
+        handleOverlayFavoriteKey({ repeat: false });
+        assert.deepEqual(drawn(), ['s:v3', 'v3']);
+        // At the end of the list: the previous one.
+        handleOverlayFavoriteKey({ repeat: false });
+        assert.deepEqual(drawn(), ['s:v1', 'v1']);
+        handleOverlayFavoriteKey({ repeat: false });
+        assert.deepEqual(drawn(), ['closed', '']);
+    """)
+
+
+def test_a_failed_removal_puts_back_only_what_still_shows_its_placement():
+    _run("""
+        favoritesView = true;
+        data.assets = fav(video, 'v1', 'v2', 'v3', 'v4');
+        openCompare('v1', 'v1', 'v2');
+        handleToggleFavorite(shown('v2'));
+        assert.equal(state.overlayState.compareRightAssetId, 'v3');
+        await settleTurns();
+        await fail(httpError(500));
+        // B still showed the contender the removal put there: v2 is back on B.
+        assert.deepEqual(drawn(), ['c:video:v1:v2', 'v1']);
+
+        // The author moved B on before the failure: B stays where they put it.
+        handleToggleFavorite(shown('v2'));
+        state.overlayState.compareRightAssetId = 'v4';
+        renderInspectOverlay();
+        await settleTurns();
+        await fail(httpError(500));
+        assert.deepEqual(drawn(), ['c:video:v1:v4', 'v1']);
+    """)
+
+
+def test_a_failed_drop_to_single_returns_to_the_old_pair():
+    _run("""
+        favoritesView = true;
+        data.assets = fav(video, 'v1', 'v2');
+        openCompare('v1', 'v1', 'v2');
+        handleToggleFavorite(shown('v1'));
+        assert.deepEqual(drawn(), ['s:v2', 'v2']);
+        await settleTurns();
+        await fail(httpError(500));
+        assert.deepEqual(drawn(), ['c:video:v1:v2', 'v1']);
+        assert.equal(state.overlayState.compareMode, true);
+    """)
+
+
+def test_a_failed_single_view_removal_comes_back_unless_the_author_moved():
+    _run("""
+        favoritesView = true;
+        data.assets = fav(video, 'v1', 'v2', 'v3');
+        openSingle('v2');
+        handleOverlayFavoriteKey({ repeat: false });
+        await settleTurns();
+        await fail(httpError(500));
+        assert.deepEqual(drawn(), ['s:v2', 'v2']);
+        handleOverlayFavoriteKey({ repeat: false });
+        openSingle('v1');
+        await settleTurns();
+        await fail(httpError(500));
+        assert.deepEqual(drawn(), ['s:v1', 'v1']);
+    """)
+
+
+def test_a_failed_removal_still_hidden_by_newer_state_puts_nothing_back():
+    _run("""
+        favoritesView = true;
+        data.assets = fav(video, 'v1', 'v2', 'v3');
+        openCompare('v1', 'v1', 'v2');
+        handleToggleFavorite(shown('v2'));
+        // A list from another window says v2 is no longer a favorite.
+        data.assets = [video('v1', { favorite: true }), video('v2'), video('v3', { favorite: true })];
+        overlayPendingAssetPatches();
+        await settleTurns();
+        await fail(httpError(500));
+        assert.equal(shown('v2').favorite, false);
+        assert.deepEqual(drawn(), ['c:video:v1:v3', 'v1']);
+    """)
+
+
+def test_a_failed_removal_puts_nothing_back_into_a_later_inspect_session():
+    _run("""
+        favoritesView = true;
+        data.assets = fav(video, 'v1', 'v2', 'v3');
+        openCompare('v1', 'v1', 'v2');
+        handleToggleFavorite(shown('v2'));
+        closeInspectOverlay();
+        state.overlaySession += 1;
+        openCompare('v1', 'v1', 'v3');
+        await settleTurns();
+        await fail(httpError(500));
+        assert.deepEqual([state.overlayState.compareLeftAssetId, state.overlayState.compareRightAssetId],
+            ['v1', 'v3']);
+    """)
+
+
+def test_a_star_ignores_the_second_click_of_a_double_click_on_a_newcomer():
+    _run("""
+        favoritesView = true;
+        data.assets = fav(video, 'v1', 'v2', 'v3', 'v4');
+        openCompare('v1', 'v1', 'v2');
+        const firstClick = performance.now();
+        assert.equal(handleCompareStarClick('B', { timeStamp: firstClick }), true);
+        assert.equal(state.overlayState.compareRightAssetId, 'v3');
+        // The second click, even one queued behind the rebuild, finds the newcomer.
+        assert.equal(handleCompareStarClick('B', { timeStamp: firstClick + 150 }), false);
+        assert.equal(handleCompareStarClick('B', { timeStamp: firstClick - 5 }), false);
+        assert.equal(shown('v3').favorite, true);
+        // The other side, and a click after the guard, still act.
+        assert.equal(overlayPlaceJustReplaced('A', firstClick + 150), false);
+        assert.equal(handleCompareStarClick('B', { timeStamp: performance.now() + 600 }), true);
+        assert.equal(shown('v3').favorite, false);
+    """)
+
+
+def test_single_inspect_moving_on_guards_its_toolbar_star():
+    _run("""
+        favoritesView = true;
+        data.assets = fav(video, 'v1', 'v2', 'v3');
+        openSingle('v1');
+        const firstClick = performance.now();
+        handleOverlayFavoriteKey({ repeat: false });
+        assert.deepEqual(drawn(), ['s:v2', 'v2']);
+        assert.equal(overlayPlaceJustReplaced('single', firstClick + 150), true);
+        assert.equal(overlayPlaceJustReplaced('single', performance.now() + 600), false);
+    """)
+    source = GALLERY.read_text(encoding="utf-8")
+    button = _gallery_function(source, "makeFavoriteButton")
+    guard = 'if (overlay && overlayPlaceJustReplaced("single", event.timeStamp)) return;'
+    assert button.index(guard) < button.index("await handleToggleFavorite(asset);")
+    render = _gallery_function(source, "renderInspectOverlay")
+    assert "makeFavoriteButton(asset, { overlay: true })" in render
+
+
+def test_the_compare_star_goes_through_the_guarded_handler():
+    source = GALLERY.read_text(encoding="utf-8")
+    chip = _gallery_function(source, "makeCompareSideChip")
+    assert "if (!star.disabled) handleCompareStarClick(side, event);" in chip
+    assert "handleToggleFavorite" not in chip
+
+
+def test_each_inspect_opening_is_a_new_session_with_no_guard_carried_over():
+    source = GALLERY.read_text(encoding="utf-8")
+    body = _gallery_function(source, "openInspectOverlay")
+    opened = body.index("state.overlayState.open = true;")
+    assert opened < body.index("state.overlaySession += 1;")
+    assert opened < body.index("state.overlayState.replacedAt = { A: 0, B: 0, single: 0 };")
+
+
+def test_a_stage_kept_after_its_anchor_left_still_eliminates_within_the_type():
+    _run("""
+        favoritesView = true;
+        data.assets = fav(video, 'v1', 'v2', 'v3', 'v4');
+        openCompare('v1', 'v1', 'v2');
+        // Another window unfavorited the anchor; the stage stays as drawn.
+        data.assets = [video('v1'), ...fav(video, 'v2', 'v3', 'v4')];
+        syncOverlayWithAssets([], { listArrival: true });
+        handleToggleFavorite(shown('v2'));
+        // The departed anchor's A was stale too: both sides take contenders,
+        // and the overlay follows A instead of closing.
+        assert.deepEqual(drawn(), ['c:video:v3:v4', 'v3']);
+    """)
+
+
+def test_a_throwing_placement_still_sends_the_write():
+    _run("""
+        favoritesView = true;
+        data.assets = fav(video, 'v1', 'v2', 'v3');
+        openCompare('v1', 'v1', 'v2');
+        console.warn = () => {};
+        const done = applyAssetUpdate(shown('v3'), { favorite: false }, {
+            onPainted: () => { throw new Error('boom'); },
+            onUnpainted: () => { throw new Error('boom'); },
+        });
+        await settleTurns();
+        assert.equal(calls.length, 1);
+        await fail(httpError(500));
+        assert.equal(await done, false);
+        assert.equal(shown('v3').favorite, true);
+        assert.ok(toasts.some((t) => t.tier === 'error'));
+    """)
