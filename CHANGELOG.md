@@ -11,6 +11,9 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Changed
+- In the full editor, a timeline edit that doesn't change which assets the scene uses (moving, trimming, cutting or muting a clip, locking or renaming a lane, and their Undo/Redo) pauses the editor for much less time, and no longer stops a video playing in the asset gallery's inspector.
+
 ## [0.7.1] - 2026-09-26
 
 ### Changed

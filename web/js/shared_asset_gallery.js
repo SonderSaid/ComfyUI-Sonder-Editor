@@ -456,6 +456,14 @@ function normalizeAssetIdSet(value) {
     return new Set();
 }
 
+function sameAssetIdSet(a, b) {
+    if (!(a instanceof Set) || !(b instanceof Set) || a.size !== b.size) return false;
+    for (const id of a) {
+        if (!b.has(id)) return false;
+    }
+    return true;
+}
+
 function formatGenerationValue(value) {
     if (value == null || value === "") return "-";
     if (typeof value === "number" || typeof value === "boolean") return String(value);
@@ -830,6 +838,12 @@ export function mountSharedAssetGallery(container, options = {}) {
         thumbnailSize: initialSettings.gallery.thumbnailSize || DEFAULT_EDITOR_SETTINGS.gallery.thumbnailSize,
         stickyFolderHeaders: initialSettings.gallery.stickyFolderHeaders !== false,
         currentSceneAssetIds: normalizeAssetIdSet(options.initialData?.currentSceneAssetIds),
+        // The scene set the rows on screen were painted from, or null when
+        // unknown. Only a completed full render() sets it; anything else may
+        // only clear it. Any path that paints rows or scope membership from
+        // the set either is a full render() or clears this, or
+        // refreshCurrentScene() skips a repaint the screen needs.
+        paintedSceneAssetIds: null,
         storageProjectId: "",
         contextMenuEl: null,
         contextMenuCleanup: null,
@@ -1626,6 +1640,14 @@ export function mountSharedAssetGallery(container, options = {}) {
 
     function currentSceneAssetIdSet() {
         return state.currentSceneAssetIds;
+    }
+
+    // Rows painted outside render() come from the live set, so once it differs
+    // from the stamp the stamp no longer describes every row on screen.
+    function forgetPaintedSceneIfChanged() {
+        if (!sameAssetIdSet(state.paintedSceneAssetIds, state.currentSceneAssetIds)) {
+            state.paintedSceneAssetIds = null;
+        }
     }
 
     function assetInCurrentScene(asset) {
@@ -7001,6 +7023,10 @@ export function mountSharedAssetGallery(container, options = {}) {
         return text;
     }
 
+    // Paints the Scene badge and scope membership from the live set. Callers
+    // are render() and the additive insert, whose setData clears the
+    // painted-scene stamp first; a new caller must do one or the other (see
+    // paintedSceneAssetIds).
     function renderActiveAssetRow(asset, visibleAssets, thumbConfig) {
         const isSelected = state.selectedAssetIds.has(asset.asset_id);
         const isPrimary = state.selectedAssetId === asset.asset_id;
@@ -7175,10 +7201,13 @@ export function mountSharedAssetGallery(container, options = {}) {
 
     function render() {
         if (state.destroyed) return;
+        // Unknown until the paint completes: a render that throws part-way
+        // leaves null, so the next refreshCurrentScene() repaints.
+        state.paintedSceneAssetIds = null;
         const metadataQuery = parseAssetSearchQuery(state.query);
         const metadataSearchStatus = prepareMetadataSearch(metadataQuery);
         ensureProjectPrefs();
-        refreshCurrentSceneAssetIdsFromHost();
+        const paintedSceneAssetIds = new Set(refreshCurrentSceneAssetIdsFromHost());
         updateControlState();
         updateLayout();
         updateFolderOptions();
@@ -7437,6 +7466,18 @@ export function mountSharedAssetGallery(container, options = {}) {
         refreshThumbnailRepairObservation(state.inspectorCollapsed ? null : selected);
         queueResize();
         syncDetailDemand(visibleAssets);
+        state.paintedSceneAssetIds = paintedSceneAssetIds;
+    }
+
+    function refreshCurrentScene() {
+        if (state.destroyed) return;
+        refreshCurrentSceneAssetIdsFromHost();
+        // The scene reaches the gallery only through this set (Scene badge,
+        // Current Scene scope); the project decides prefs and thumbnail URLs.
+        // A null stamp means rows may disagree with the set: repaint.
+        if (state.storageProjectId === currentProjectId()
+                && sameAssetIdSet(state.paintedSceneAssetIds, state.currentSceneAssetIds)) return;
+        render();
     }
 
     async function handleDrop(event) {
@@ -7819,6 +7860,10 @@ export function mountSharedAssetGallery(container, options = {}) {
         if (Object.prototype.hasOwnProperty.call(payload, "currentSceneAssetIds")) {
             state.currentSceneAssetIds = normalizeAssetIdSet(payload.currentSceneAssetIds);
         }
+        // Before any painting: an additive insert builds rows from this set,
+        // and one that throws part-way must not leave a stamp that still
+        // matches. A full render restamps anyway.
+        forgetPaintedSceneIfChanged();
         const sameProject = dataProjectDir === currentProjectDir();
         dataProjectDir = currentProjectDir();
         const previousAssets = sameProject ? data.assets : [];
@@ -7901,10 +7946,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         },
         isInspectOverlayOpen: () => !!state.overlayState.open,
         hasSelectionOwnership,
-        refreshCurrentScene: () => {
-            refreshCurrentSceneAssetIdsFromHost();
-            render();
-        },
+        refreshCurrentScene,
         inspectAsset,
         revealAsset,
     };
