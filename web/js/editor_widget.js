@@ -964,6 +964,13 @@ export class EditorWidget {
         this._referenceOverlaySeq = 0;
         this._referenceUnconfirmedRetryTimer = null;
         this._referenceUnconfirmedRetryAttempt = 0;
+        // The server's history merge lists, from the last restore-token answer
+        // (ephemeral; cleared on project change). With them a scene Undo/Redo
+        // paints before its token round trip instead of after it. Expiry: remove
+        // when the lists are served before the first Undo (for example on editor
+        // open), or when the token route stops loading the project and so stops
+        // costing the ≈0.3–0.6 s this saves.
+        this._historyMergeCapabilities = null;
         this._referenceLibraryEl = null;
         this._referenceLibraryHandle = null;
         this._referenceMediaEditorHandle = null;
@@ -24229,7 +24236,12 @@ export class EditorWidget {
         return dirName ? (getProjectVersion(dirName) || null) : null;
     }
 
-    _historyOptimisticEligibility(entry, capabilities) {
+    /** The options narrow the question for a prediction already on screen.
+     *  `ignoreGestures` drops "is it safe to paint now" (a drag or timeline
+     *  gesture answers that, not whether the scene is right); `ignoreVersion`
+     *  drops "has the project moved since this entry's base". Either would
+     *  otherwise mask the write-set reason the predicate ranks after it. */
+    _historyOptimisticEligibility(entry, capabilities, { ignoreGestures = false, ignoreVersion = false } = {}) {
         // `skip_detail` names the fields responsible, never their values: this
         // object is spread into `sessionDiagRecord` and reaches the
         // Ctrl+Alt+Shift+D bundle a user sends in, so an authored value here
@@ -24249,9 +24261,10 @@ export class EditorWidget {
                 || entry?.promptIdentityCreateIntents?.length) return skip("auxiliary_operations");
         if (!entry?.snapshot || entry.snapshot.scene_id !== entry.sceneId) return skip("scene_mismatch");
         if (entry.postSnapshotProjectVersion == null) return skip("no_authoritative_base");
-        if (entry.postSnapshotProjectVersion !== this._historyObservedProjectVersion()) return skip("version_mismatch");
-        if (this.isDragging) return skip("dragging");
-        if (this._timelineMutationDepth) return skip("timeline_mutation");
+        if (!ignoreVersion
+                && entry.postSnapshotProjectVersion !== this._historyObservedProjectVersion()) return skip("version_mismatch");
+        if (!ignoreGestures && this.isDragging) return skip("dragging");
+        if (!ignoreGestures && this._timelineMutationDepth) return skip("timeline_mutation");
         if (!entry.postSnapshot) return skip("missing_post_snapshot");
         if (!Array.isArray(capabilities?.merged_write_fields)
                 || !Array.isArray(capabilities?.merged_derived_fields)) return skip("missing_merge_capabilities");
@@ -24326,6 +24339,9 @@ export class EditorWidget {
     }
 
     _paintHistoryOptimistically(state) {
+        // One paint per action. A second call would overwrite `sceneBefore`
+        // with the prediction itself, and rollback would then restore it.
+        if (state.painted) return;
         const entry = state.entry;
         if (entry.snapshot?.scene_id !== entry.sceneId) {
             throw new Error("History paint target does not match its scene.");
@@ -24491,9 +24507,41 @@ export class EditorWidget {
 
         let restoreToken = String(existingRestoreToken || "");
         let mergeCapabilities = null;
-        if (!restoreToken) {
-            const tokenResponse = await fetch(
-                api.apiURL(tokenUrl), diagnosticInit({ method: "POST" }));
+        const recordPaintDecision = (eligibility, stage, extra = {}) => {
+            sessionDiagRecord("history_optimistic_paint", {
+                ...eligibility, ...extra, stage, scene_id: sceneId,
+                version_source: historyPaint.entry.postSnapshotVersionSource || "unknown",
+            });
+        };
+        // Pre-token paint. The token round trip is a full, lock-serialized
+        // project load (≈0.3–0.6 s) and answers only two things the paint
+        // needs: the merge lists, which are the same for every action on this
+        // server, and a freshly observed project version. With the lists cached
+        // from an earlier action, the prediction is made now against the version
+        // this client last observed, and checked again once the token answers.
+        // Still inside the serial queue slot and the caller's try/catch: a
+        // token failure reaches the same rollback as a restore failure. Only a
+        // fresh action pre-paints; one retried with its restore token (or
+        // re-entered after that token expired) keeps today's behaviour.
+        //
+        // The token request is sent first so its round trip overlaps the paint's
+        // clones and render. A paint that throws still reaches the caller's catch;
+        // the token promise is then orphaned, and handled so it cannot surface as
+        // an unhandled rejection.
+        const tokenFetched = !restoreToken;
+        const tokenRequest = tokenFetched
+            ? fetch(api.apiURL(tokenUrl), diagnosticInit({ method: "POST" }))
+            : null;
+        tokenRequest?.catch(() => {});
+        if (historyPaint?.entry && tokenFetched && !historyPaint.noPrePaint
+                && this._historyMergeCapabilities) {
+            const eligibility = this._historyOptimisticEligibility(
+                historyPaint.entry, this._historyMergeCapabilities);
+            recordPaintDecision(eligibility, "pre_token");
+            if (eligibility.would_paint) this._paintHistoryOptimistically(historyPaint);
+        }
+        if (tokenRequest) {
+            const tokenResponse = await tokenRequest;
             if (typeof rememberProjectVersionFromResponse === "function") {
                 rememberProjectVersionFromResponse(tokenResponse, dirName);
             }
@@ -24503,6 +24551,14 @@ export class EditorWidget {
             }
             const tokenPayload = await tokenResponse.json();
             mergeCapabilities = tokenPayload;
+            if (Array.isArray(tokenPayload?.merged_write_fields)
+                    && Array.isArray(tokenPayload?.merged_derived_fields)
+                    && this.projectDir?.split(/[/\\]/).pop() === dirName) {
+                this._historyMergeCapabilities = {
+                    merged_write_fields: [...tokenPayload.merged_write_fields],
+                    merged_derived_fields: [...tokenPayload.merged_derived_fields],
+                };
+            }
             restoreToken = String(tokenPayload?.restore_token || "");
             if (!restoreToken) throw new Error("Scene history token was not returned.");
         }
@@ -24556,22 +24612,41 @@ export class EditorWidget {
             }
         };
 
-        // Inside the serial queue slot and caller's try/catch, after the
-        // existing token round trip. Do not hoist paint to claim time: the serial
-        // slot and caller catch must own every paint and failure exit.
+        // Post-token decision, inside the serial queue slot and the caller's
+        // try/catch. Do not hoist either paint to claim time: the serial slot and
+        // caller catch must own every paint and failure exit.
+        //
+        // With fresh lists and the version the token response just reported:
+        // paint now if nothing was painted, keep a prediction that still holds,
+        // and roll back one the fresh lists disprove before PUT restore.
+        //
+        // A project that moved elsewhere does NOT retract (maintainer decision
+        // 2026-09-25, audit #1). The version is project-wide, so a gallery
+        // favorite, a Library save or a queue change during the token call would
+        // take back a prediction that is closer to the final scene than the
+        // rollback target: both lack the other writer's change, only the
+        // prediction has this Undo. The canonical scene on adopt brings the other
+        // change in; a refused restore still rolls back in the caller's catch.
+        // Neither may a drag or timeline gesture begun since the paint: it makes
+        // painting unsafe, not the painted scene wrong, and adopt defers for it.
         if (historyPaint?.entry) {
             const eligibility = this._historyOptimisticEligibility(historyPaint.entry, mergeCapabilities);
-            sessionDiagRecord("history_optimistic_paint", {
-                ...eligibility, scene_id: sceneId,
-                version_source: historyPaint.entry.postSnapshotVersionSource || "unknown",
-            });
+            const prePainted = !!historyPaint.painted;
+            const retract = prePainted && !this._historyOptimisticEligibility(
+                historyPaint.entry, mergeCapabilities,
+                { ignoreGestures: true, ignoreVersion: true }).would_paint;
+            recordPaintDecision(eligibility, "post_token", prePainted
+                ? { pre_painted: true, retracted: retract } : {});
             // Warn from here rather than inside the predicate, so the predicate
             // stays a pure probe that tests can call without spraying stderr.
             // Production output would be identical either way -- there is one
             // production caller and the dedup is module-level -- so this is
             // about keeping the predicate side-effect free, nothing more.
-            this._warnHistoryOptimisticSkip(eligibility);
-            if (eligibility.would_paint) this._paintHistoryOptimistically(historyPaint);
+            // Only for a token this call asked for: a retry holding its token
+            // has no fresh lists by design, which is not a contract breach.
+            if (tokenFetched) this._warnHistoryOptimisticSkip(eligibility);
+            if (retract) this._rollbackHistoryOptimisticPaint(historyPaint);
+            else if (eligibility.would_paint) this._paintHistoryOptimistically(historyPaint);
         }
         let restoreResponse;
         try {
@@ -24614,6 +24689,8 @@ export class EditorWidget {
             const error = await responseError(
                 restoreResponse, `Scene restore failed (${restoreResponse.status}).`);
             if (error.code === "scene_restore_token_expired" && existingRestoreToken) {
+                // Still the retry of an action that already held a token.
+                if (historyPaint) historyPaint.noPrePaint = true;
                 return this._restoreScene(
                     sceneId, targetSnapshot, baseSnapshot, "", restoreDiagnostics, historyPaint);
             }
@@ -24776,6 +24853,7 @@ export class EditorWidget {
         // check the project before touching these.
         this._referenceOverlays = [];
         this._clearUnconfirmedReferenceRetry();
+        this._historyMergeCapabilities = null;
         this._referenceLibraryHandle?.reset?.();
         this._referencePanelHandle?.close?.();
         this._queueBatchExpanded = {};

@@ -39,21 +39,306 @@ def test_plain_history_failure_tombstones_order_context(operation):
     ''')
 
 
-def test_paint_occurs_after_token_before_restore():
+def test_without_cached_lists_paint_occurs_after_token_before_restore():
+    # The first history action of a session (or after a project switch) has no
+    # merge lists yet, so it keeps the post-token paint.
     _run_history_node('''
         const w=makeHistoryWidget(), e=entry(); let calls=0, adopted=0;
         w._setActiveScene=()=>{adopted++;};
         globalThis.fetch=async(url,init)=>{
             calls++;
-            if(calls===1) return new Response(JSON.stringify({restore_token:'token',...capabilities}));
+            if(calls===1) {
+                assert.equal(adopted,0,'nothing painted before the token');
+                return new Response(JSON.stringify({restore_token:'token',...capabilities}));
+            }
             assert.equal(adopted,1);
             const diagnostics=window.__SONDER_CANVAS_DIAG.events.filter(e=>e.kind==='history_optimistic_paint');
-            assert.equal(diagnostics.length,1);
-            assert.equal(diagnostics[0].would_paint,true);
+            assert.deepEqual(diagnostics.map(d=>[d.stage,d.would_paint]),[['post_token',true]]);
             return new Response(JSON.stringify({scene:e.snapshot}));
         };
         await w._restoreScene(e.sceneId,e.snapshot,e.postSnapshot,'',null,{entry:e});
         assert.equal(adopted,2);
+        // The token's lists are kept for the next action.
+        assert.deepEqual(w._historyMergeCapabilities,capabilities);
+    ''')
+
+
+# Paint counting: the optimistic `_setActiveScene` calls, which are the paints
+# and rollbacks, in order.
+_COUNTING = '''
+        const shown=[];
+        const later=(fn)=>new Promise(r=>setTimeout(()=>r(fn()),0));
+        const set=w._setActiveScene.bind(w);
+        w._setActiveScene=(scene,options={})=>{shown.push([options.optimisticHistory?'optimistic':'canonical',scene.name]);set(scene,options);};
+        const paints=()=>window.__SONDER_CANVAS_DIAG.events.filter(d=>d.kind==='history_optimistic_paint')
+            .map(d=>[d.stage,d.would_paint,!!d.pre_painted,!!d.retracted]);
+'''
+
+
+def test_with_cached_lists_the_undo_paints_before_the_token_round_trip():
+    _run_history_node('''
+        const w=makeHistoryWidget(), e=entry();
+        w._historyMergeCapabilities=structuredClone(capabilities);
+    ''' + _COUNTING + '''
+        globalThis.fetch=async(url,init)=>{
+            // Sent first so its round trip overlaps the paint; by the time it
+            // answers the prediction is on screen.
+            if(url.endsWith('/restore-token')) return later(()=>{
+                assert.equal(w.activeScene.name,'before','painted before the token answers');
+                return new Response(JSON.stringify({restore_token:'token',...capabilities}));
+            });
+            assert.equal(w.activeScene.name,'before');
+            return new Response(JSON.stringify({scene:{...e.snapshot}}));
+        };
+        const state={entry:e};
+        await w._restoreScene(e.sceneId,e.snapshot,e.postSnapshot,'',null,state);
+        // Painted once, kept by the recheck, then the canonical scene.
+        assert.deepEqual(shown,[['optimistic','before'],['canonical','before']]);
+        assert.deepEqual(paints(),[['pre_token',true,false,false],['post_token',true,true,false]]);
+    ''')
+
+
+def test_a_project_change_elsewhere_keeps_the_prediction():
+    # Maintainer decision 2026-09-25 (audit #1): the version is project-wide, so a
+    # write elsewhere during the token call (a take landing, a gallery favorite)
+    # does not take the prediction back. Canonical adopt brings the other change in.
+    _run_history_node('''
+        const w=makeHistoryWidget(), e=entry();
+        w._historyMergeCapabilities=structuredClone(capabilities);
+    ''' + _COUNTING + '''
+        globalThis.fetch=async(url,init)=>later(()=>{
+            if(url.endsWith('/restore-token')) {
+                w._historyObservedProjectVersion=()=> 'v2';
+                return new Response(JSON.stringify({restore_token:'token',...capabilities}));
+            }
+            assert.equal(w.activeScene.name,'before','the prediction stands through the restore');
+            return new Response(JSON.stringify({scene:{...e.snapshot,name:'merged'}}));
+        });
+        const state={entry:e};
+        await w._restoreScene(e.sceneId,e.snapshot,e.postSnapshot,'',null,state);
+        assert.deepEqual(shown,[['optimistic','before'],['canonical','merged']]);
+        assert.deepEqual(paints(),[['pre_token',true,false,false],['post_token',false,true,false]]);
+    ''')
+
+
+def test_fresh_lists_that_disprove_the_prediction_roll_it_back_before_restore():
+    # The server no longer restores a field the prediction changed: retract,
+    # even though the project also moved (the version check ranks first).
+    _run_history_node('''
+        const w=makeHistoryWidget(), e=entry();
+        w._historyMergeCapabilities=structuredClone(capabilities);
+    ''' + _COUNTING + '''
+        globalThis.fetch=async(url,init)=>later(()=>{
+            if(url.endsWith('/restore-token')) {
+                w._historyObservedProjectVersion=()=> 'v2';
+                return new Response(JSON.stringify({restore_token:'token',...capabilities,
+                    merged_write_fields:['clips','global_channel_docs']}));
+            }
+            assert.equal(init.method,'PUT');
+            assert.equal(w.activeScene.name,'after','rolled back before the restore is sent');
+            return new Response(JSON.stringify({scene:{...e.snapshot,name:'merged'}}));
+        });
+        const state={entry:e};
+        await w._restoreScene(e.sceneId,e.snapshot,e.postSnapshot,'',null,state);
+        assert.deepEqual(shown,[['optimistic','before'],['optimistic','after'],['canonical','merged']]);
+        assert.deepEqual(paints(),[['pre_token',true,false,false],['post_token',false,true,true]]);
+        assert.equal(state.painted,false);
+    ''')
+
+
+def test_a_gesture_begun_after_the_prediction_does_not_retract_it():
+    _run_history_node('''
+        const w=makeHistoryWidget(), e=entry();
+        w._historyMergeCapabilities=structuredClone(capabilities);
+    ''' + _COUNTING + '''
+        globalThis.fetch=async(url,init)=>{
+            if(url.endsWith('/restore-token')) return later(()=>{
+                w.isDragging=true;
+                return new Response(JSON.stringify({restore_token:'token',...capabilities}));
+            });
+            assert.equal(w.activeScene.name,'before','the prediction stands');
+            return new Response(JSON.stringify({scene:{...e.snapshot}}));
+        };
+        await w._restoreScene(e.sceneId,e.snapshot,e.postSnapshot,'',null,{entry:e});
+        assert.deepEqual(paints().at(-1),['post_token',false,true,false]);
+        // Adopt defers during the drag, as it always has.
+        assert.deepEqual(shown,[['optimistic','before']]);
+        assert.equal(w._pendingScenesRefresh,true);
+    ''')
+
+
+@pytest.mark.parametrize('operation', ['Undo', 'Redo'])
+def test_a_failed_token_after_a_prediction_rolls_back(operation):
+    _run_history_node("""
+        const w=makeHistoryWidget(), e=entry(), context={scenes:new Map()};
+        w._historyMergeCapabilities=structuredClone(capabilities);
+        w._""" + operation.lower() + """Stack.push(e);
+        let painted=false;
+        globalThis.fetch=(url)=>new Promise(r=>setTimeout(()=>{
+            painted=w.activeScene.name==='before';
+            r(new Response(JSON.stringify({error:'gone'}),{status:404}));
+        },0));
+        await w._run""" + operation + """WithinGesture(null,null,null,null,null,context);
+        assert.equal(painted,true);
+        assert.equal(w.activeScene.name,'after','rolled back by the caller');
+    """)
+
+
+def test_a_retried_or_re_entered_restore_never_pre_paints():
+    _run_history_node('''
+        const w=makeHistoryWidget(), e=entry();
+        w._historyMergeCapabilities=structuredClone(capabilities);
+    ''' + _COUNTING + '''
+        let puts=0;
+        globalThis.fetch=async(url,init)=>{
+            if(url.endsWith('/restore-token')) {
+                assert.equal(shown.length,0,'the re-entry after an expired token did not pre-paint');
+                return new Response(JSON.stringify({restore_token:'fresh',...capabilities}));
+            }
+            if(++puts===1) {
+                assert.equal(shown.length,0,'a retry with its token did not pre-paint');
+                return new Response(JSON.stringify({error:'expired',code:'scene_restore_token_expired'}),{status:409});
+            }
+            return new Response(JSON.stringify({scene:{...e.snapshot}}));
+        };
+        await w._restoreScene(e.sceneId,e.snapshot,e.postSnapshot,'old-token',null,{entry:e});
+        assert.deepEqual(paints().map(p=>p[0]),['post_token','post_token']);
+        assert.deepEqual(shown,[['optimistic','before'],['canonical','before']]);
+    ''')
+
+
+def test_the_cached_lists_come_from_the_token_and_leave_with_the_project():
+    _run_history_node('''
+        const w=makeHistoryWidget(), e=entry();
+        globalThis.fetch=async(url)=>url.endsWith('/restore-token')
+            ? new Response(JSON.stringify({restore_token:'token',merged_write_fields:['name']}))
+            : new Response(JSON.stringify({scene:{...e.snapshot}}));
+        await w._restoreScene(e.sceneId,e.snapshot,e.postSnapshot,'',null,{entry:e});
+        assert.equal(w._historyMergeCapabilities,undefined,'an incomplete answer is not cached');
+        globalThis.fetch=async(url)=>url.endsWith('/restore-token')
+            ? new Response(JSON.stringify({restore_token:'token',...capabilities}))
+            : new Response(JSON.stringify({scene:{...e.snapshot}}));
+        await w._restoreScene(e.sceneId,e.snapshot,e.postSnapshot,'',null,{entry:e});
+        assert.deepEqual(w._historyMergeCapabilities,capabilities);
+        for (const name of ['_clearStaleReplayState','_updateSceneIdentity','_updateProjectIdentity',
+            '_stopPlayback','_clearVideoCache','_sweepRenderCache','_fetchProjectSettings',
+            '_renderQueuePanel','_fetchReferences','_clearUnconfirmedReferenceRetry']) w[name]=()=>{};
+        w._fetchAssets=()=>Promise.resolve();
+        w.updateProject('other project');
+        assert.equal(w._historyMergeCapabilities,null);
+    ''')
+
+
+API_CLIENT = __import__('pathlib').Path(__file__).resolve().parents[1] / 'web' / 'js' / 'api_client.js'
+
+
+def test_the_token_response_header_is_what_retracts_a_prediction():
+    # The real version map, moved only by the token answer's own header.
+    _run_history_node('''
+        const apiClient=await import(%r);
+        const w=makeHistoryWidget(), e=entry();
+        w.projectDir='project';
+        w._historyObservedProjectVersion=EditorWidget.prototype._historyObservedProjectVersion;
+        apiClient.rememberProjectVersion('project','2026-01-01T00:00:01');
+        e.postSnapshotProjectVersion='2026-01-01T00:00:01';
+        w._historyMergeCapabilities=structuredClone(capabilities);
+    ''' % API_CLIENT.as_uri() + _COUNTING + '''
+        globalThis.fetch=(url,init)=>later(()=>url.endsWith('/restore-token')
+            ? new Response(JSON.stringify({restore_token:'token',...capabilities}),
+                {headers:{'X-Sonder-Project-Modified-At':'2026-01-01T00:00:02'}})
+            : new Response(JSON.stringify({scene:{...e.snapshot}})));
+        await w._restoreScene(e.sceneId,e.snapshot,e.postSnapshot,'',null,{entry:e});
+        const post=window.__SONDER_CANVAS_DIAG.events.filter(d=>d.kind==='history_optimistic_paint').at(-1);
+        assert.equal(post.skip_reason,'version_mismatch','the header moved the observed version');
+        assert.equal(post.retracted,false,'and a project change elsewhere keeps the prediction');
+    ''')
+
+
+@pytest.mark.parametrize('change', ['version', 'write_set'])
+def test_a_drag_does_not_mask_a_write_set_change_at_the_recheck(change):
+    # The predicate ranks `dragging` and `version_mismatch` before the write-set
+    # check; retraction asks with both set aside so neither can hide it.
+    _run_history_node('''
+        const w=makeHistoryWidget(), e=entry();
+        w._historyMergeCapabilities=structuredClone(capabilities);
+        const change=%r;
+    ''' % change + _COUNTING + '''
+        globalThis.fetch=(url,init)=>later(()=>{
+            if(url.endsWith('/restore-token')) {
+                w.isDragging=true;
+                if(change==='version') w._historyObservedProjectVersion=()=> 'v2';
+                const fresh=change==='write_set'
+                    ? {...capabilities,merged_write_fields:['clips','global_channel_docs']} : capabilities;
+                return new Response(JSON.stringify({restore_token:'token',...fresh}));
+            }
+            return new Response(JSON.stringify({scene:{...e.snapshot}}));
+        });
+        const state={entry:e};
+        await w._restoreScene(e.sceneId,e.snapshot,e.postSnapshot,'',null,state);
+        // A version change keeps the prediction either way; a write-set change
+        // retracts it even under a drag (the rollback then waits for mouse-up).
+        assert.deepEqual(paints().at(-1),['post_token',false,true,change==='write_set']);
+        assert.equal(w._pendingScenesRefresh,true);
+    ''')
+
+
+def test_a_project_switch_while_the_token_is_out_caches_nothing():
+    _run_history_node('''
+        const w=makeHistoryWidget(), e=entry();
+        w.projectDir='project';
+        globalThis.fetch=(url)=>later(()=>{
+            if(url.endsWith('/restore-token')) {
+                w.projectDir='other project';
+                return new Response(JSON.stringify({restore_token:'token',...capabilities}));
+            }
+            return new Response(JSON.stringify({scene:{...e.snapshot}}));
+        });
+        const later=(fn)=>new Promise(r=>setTimeout(()=>r(fn()),0));
+        await w._restoreScene(e.sceneId,e.snapshot,e.postSnapshot,'',null,{entry:e});
+        assert.equal(w._historyMergeCapabilities,undefined);
+    ''')
+
+
+def test_a_retry_holding_its_token_does_not_warn_about_missing_lists():
+    _run_history_node('''
+        const w=makeHistoryWidget(), e=entry();
+        const warnings=[]; const warn=console.warn;
+        console.warn=(...args)=>{warnings.push(args.join(' '));};
+        globalThis.fetch=async()=>new Response(JSON.stringify({scene:{...e.snapshot}}));
+        await w._restoreScene(e.sceneId,e.snapshot,e.postSnapshot,'held-token',null,{entry:e});
+        console.warn=warn;
+        assert.deepEqual(warnings.filter(w=>w.includes('missing_merge_capabilities')),[]);
+    ''')
+
+
+def test_the_token_is_sent_before_the_prediction_is_painted():
+    # Its round trip overlaps the paint's clones and render.
+    _run_history_node('''
+        const w=makeHistoryWidget(), e=entry();
+        w._historyMergeCapabilities=structuredClone(capabilities);
+    ''' + _COUNTING + '''
+        const order=[];
+        const paint=w._paintHistoryOptimistically.bind(w);
+        w._paintHistoryOptimistically=(state)=>{order.push('paint');paint(state);};
+        globalThis.fetch=(url)=>{
+            order.push(url.endsWith('/restore-token')?'token':'restore');
+            return later(()=>url.endsWith('/restore-token')
+                ? new Response(JSON.stringify({restore_token:'token',...capabilities}))
+                : new Response(JSON.stringify({scene:{...e.snapshot}})));
+        };
+        await w._restoreScene(e.sceneId,e.snapshot,e.postSnapshot,'',null,{entry:e});
+        assert.deepEqual(order.slice(0,2),['token','paint']);
+    ''')
+
+
+def test_a_second_paint_of_the_same_action_is_refused():
+    _run_history_node('''
+        const w=makeHistoryWidget(), e=entry(), state={entry:e};
+        w._paintHistoryOptimistically(state);
+        w.activeScene.name='changed after paint';
+        w._paintHistoryOptimistically(state);
+        w._rollbackHistoryOptimisticPaint(state);
+        assert.equal(w.activeScene.name,'after','rollback restores the scene from before the first paint');
     ''')
 
 
