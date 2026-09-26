@@ -9,6 +9,24 @@ export function isDirectInspectAssetUsable(asset) {
         && !!asset.path;
 }
 
+/**
+ * What each compare side shows, as ids. `candidateIds` are the same-type
+ * assets compare may show, in order; `anchorId` is the overlay's own asset,
+ * always one of them. A slot keeps its asset while it is a candidate. A
+ * missing A falls back to the anchor, and B never repeats A: a missing or
+ * equal B takes the first other candidate. Only with a single candidate do
+ * both sides name the same asset.
+ */
+export function resolveCompareSlots(candidateIds = [], anchorId = "", leftId = "", rightId = "") {
+    const ids = (candidateIds || []).filter(Boolean);
+    const has = (id) => !!id && ids.includes(id);
+    const left = has(leftId) ? leftId : (has(anchorId) ? anchorId : (ids[0] || ""));
+    const right = has(rightId) && rightId !== left
+        ? rightId
+        : (ids.find((id) => id !== left) || left);
+    return { leftId: left, rightId: right };
+}
+
 export function resolveInspectOverlayScope({
     origin = "gallery",
     requestedAssetId = "",

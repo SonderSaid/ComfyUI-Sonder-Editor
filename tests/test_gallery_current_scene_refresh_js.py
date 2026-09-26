@@ -87,7 +87,8 @@ HARNESS = """
         const clearUsageView = () => {};
         const parseAssetSearchQuery = () => ({});
         const queryHasMetadataTerms = () => false;
-        const comparePickerHasMetadataQuery = () => false;
+        const overlaySyncs = [];
+        const syncOverlayWithAssets = (ids, opts) => { overlaySyncs.push([ids, opts]); };
         let additiveInsert = () => additive;
         const tryRenderAdditiveData = (...args) => additiveInsert(...args);
         const refreshThumbnailRepairObservation = () => {};
@@ -366,3 +367,16 @@ def test_set_data_forgets_before_it_paints_and_the_api_exposes_the_gate():
     widget = WIDGET.read_text(encoding="utf-8")
     set_active = re.search(r"^    _setActiveScene\(.*?^    \}\n", widget, re.M | re.S)[0]
     assert "this._assetGallery?.refreshCurrentScene?.();" in set_active
+
+
+def test_a_new_list_keeps_the_inspect_view_in_step_on_either_path():
+    # A favorite changed elsewhere arrives with a list; the Inspect view follows
+    # it (its decision is tested in test_gallery_compare_favorites_js), whether
+    # the list inserts or fully renders.
+    _run("""
+        additive = true;
+        setData({ assets: [{ asset_id: 'a' }], folders: [] });
+        additive = false;
+        setData({ assets: [{ asset_id: 'a' }, { asset_id: 'b' }], folders: [] });
+        assert.deepEqual(overlaySyncs, [[[], { listArrival: true }], [[], { listArrival: true }]]);
+    """)

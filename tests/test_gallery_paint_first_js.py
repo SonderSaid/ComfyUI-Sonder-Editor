@@ -44,7 +44,7 @@ GALLERY_HARNESS = """
         const toasts = [], marks = [], refreshes = [];
         let renders = 0, overlayRenders = 0;
         const state = { destroyed: false, selectedAssetId: '',
-            overlayState: { open: false, compareMode: false, assetId: '' } };
+            overlayState: { open: false, compareMode: false, assetId: '', mediaSignature: '' } };
         const data = { assets: [], folders: [] };
         let projectDir = 'project';
         const currentProjectDir = () => projectDir, detailProjectId = () => projectDir;
@@ -54,6 +54,12 @@ GALLERY_HARNESS = """
         const isTrashed = (asset) => !!asset?.trashed_at;
         const render = () => { renders += 1; };
         const renderInspectOverlay = () => { overlayRenders += 1; };
+        // The single-view half of the real sync; test_gallery_compare_favorites_js
+        // runs the real function, compare stage included.
+        const syncOverlayWithAssets = (ids) => {
+            const overlay = state.overlayState;
+            if (overlay.open && !overlay.compareMode && ids.includes(overlay.assetId)) renderInspectOverlay();
+        };
         const clearUsageView = () => {}, scrollAssetIntoView = () => {};
         let selection = [];
         const applySelectionState = (ids, primary) => { selection = [...ids]; state.selectedAssetId = primary; };
@@ -283,7 +289,7 @@ def test_the_inspect_view_moves_on_when_the_asset_leaves_the_list():
     _run("""
         data.assets = [asset('a'), asset('b')];
         state.selectedAssetId = 'a';
-        state.overlayState = { open: true, compareMode: false, assetId: 'a' };
+        state.overlayState = { open: true, compareMode: false, assetId: 'a', mediaSignature: 's:a' };
         const done = handleOverlayAssetDelete(shown('a'));
         await settleTurns();
         // Before the host has answered.
@@ -426,7 +432,7 @@ def test_a_declined_late_conflict_brings_the_inspect_view_back():
     _run("""
         data.assets = [asset('a'), asset('b')];
         state.selectedAssetId = 'a';
-        state.overlayState = { open: true, compareMode: false, assetId: 'a' };
+        state.overlayState = { open: true, compareMode: false, assetId: 'a', mediaSignature: 's:a' };
         const done = handleOverlayAssetDelete(shown('a'));
         await settleTurns();
         assert.equal(state.overlayState.assetId, 'b');

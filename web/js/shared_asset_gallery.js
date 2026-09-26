@@ -33,9 +33,10 @@ import {
     THEME,
     chromeScrollbarCss,
     installChromeScrollbarStyles,
+    setButtonDisabled,
     statusPillCss,
 } from "./editor_theme.js";
-import { resolveInspectOverlayScope } from "./inspect_overlay_scope.js";
+import { resolveCompareSlots, resolveInspectOverlayScope } from "./inspect_overlay_scope.js";
 import { mountMediaScrubBar } from "./media_scrub_bar.js";
 import { openContextMenu } from "./editor_context_menu.js";
 import { cancelProjectAssetDetails, requestProjectAssetDetails } from "./asset_refresh_coordinator.js";
@@ -60,6 +61,12 @@ const COMPARE_SORT_OPTIONS = GALLERY_SORT_OPTIONS.filter((entry) => entry.value 
 const AUDIO_DUCK_VOLUME = Math.pow(10, -3 / 20);
 const LIST_NAV_KEYS = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"]);
 const OVERLAY_MEDIA_CACHE_LIMIT = 8;
+// The favorite star's amber, on every surface that shows one: the row and
+// toolbar buttons, the compare canvas stars and the compare list marks.
+// Deliberately `statusPending` although the theme rule keeps pending/orange
+// for status: favorites have always worn it, the maintainer kept it when
+// compare gained stars, and one constant keeps any later hue a one-line edit.
+const FAVORITE_STAR_COLOR = THEME.statusPending;
 const THUMBNAIL_SIZE_CONFIG = {
     small: { thumbWidth: 60, thumbHeight: 44, gap: 6, padding: 5, nameFont: 10, metaFont: 9 },
     medium: { thumbWidth: 72, thumbHeight: 54, gap: 8, padding: 6, nameFont: 11, metaFont: 10 },
@@ -76,7 +83,7 @@ export const INSPECT_OVERLAY_SHORTCUTS = Object.freeze([
     ["1 / 2 / 3 / 0", "Monitor A / B / Both / Mute in audio compare"],
     ["Shift hold", "Temporarily flip A/B monitor in audio compare"],
     ["C", "Toggle Compare"],
-    ["S", "Favorite / Unfavorite"],
+    ["S", "Favorite / Unfavorite (Compare: the ↑/↓ side)"],
     ["Delete", "Move asset to Trash"],
     ["F / 0", "Fit"],
     ["+ / -", "Zoom"],
@@ -864,6 +871,11 @@ export function mountSharedAssetGallery(container, options = {}) {
         // Hook stored when the compare overlay mounts its A/B choosers, so compare-mode
         // metadata-cell L/R clicks can refresh both picker lists without tearing media.
         overlayCompareChoosersRefresh: null,
+        // Hook stored when the compare stage mounts its A/B stars, so a favorite
+        // change repaints them without reloading either side's media.
+        overlayCompareFavoriteRefresh: null,
+        // What the compare lists last drew (`compareListSignature`).
+        overlayCompareListSignature: "",
         overlayState: {
             open: false,
             assetId: "",
@@ -1748,6 +1760,101 @@ export function mountSharedAssetGallery(container, options = {}) {
         return !!(state.overlayState && state.overlayState.open && state.overlayState.compareMode);
     }
 
+    // Compare is on AND the A/B stage is what the overlay draws. With fewer than
+    // two same-type candidates the overlay draws the single view while
+    // `compareMode` stays on; `compareModeActive()` alone does not say which.
+    function compareStageShown() {
+        return compareModeActive() && sameTypeOverlayAssets(currentOverlayAsset()).length >= 2;
+    }
+
+    // The compare stage is what the overlay last drew. Anything aimed at what
+    // the author sees (S, the in-place repaints) asks this, not the live
+    // candidates, which a paint or a list can move before the next render.
+    function compareStageDrawn() {
+        return !!state.overlayState.open && String(state.overlayState.mediaSignature || "").startsWith("c:");
+    }
+
+    // The pair the compare stage draws for the current slots and candidates.
+    function resolvedCompareSlots() {
+        const overlay = state.overlayState;
+        const ids = sameTypeOverlayAssets(currentOverlayAsset()).map((entry) => entry.asset_id);
+        return resolveCompareSlots(ids, overlay.assetId, overlay.compareLeftAssetId, overlay.compareRightAssetId);
+    }
+
+    // The asset a compare side shows. The render writes the resolved slots
+    // back, so a slot id always names what is on screen.
+    function compareSideAsset(side) {
+        const overlay = state.overlayState;
+        return shownAsset(side === "B" ? overlay.compareRightAssetId : overlay.compareLeftAssetId);
+    }
+
+    // What the overlay's S favorites: the ↑/↓ side on a drawn compare stage,
+    // otherwise the single asset on screen.
+    function overlayFavoriteTarget() {
+        if (compareStageDrawn()) {
+            return compareSideAsset(state.overlayState.compareCycleSide === "A" ? "A" : "B");
+        }
+        return currentOverlayAsset();
+    }
+
+    // The overlay's S. A held key toggles once: auto-repeat would flip the
+    // star back and forth.
+    function handleOverlayFavoriteKey(event) {
+        if (!event.repeat) {
+            const target = overlayFavoriteTarget();
+            if (target) void handleToggleFavorite(target);
+        }
+        return true;
+    }
+
+    // Repaint the compare lists and stars from what the gallery shows, leaving
+    // both sides' media playing.
+    function refreshCompareInPlace() {
+        for (const hook of [state.overlayCompareChoosersRefresh, state.overlayCompareFavoriteRefresh]) {
+            if (typeof hook !== "function") continue;
+            try { hook(); } catch (err) { console.warn("[gallery] compare refresh failed", err); }
+        }
+    }
+
+    // What the compare lists draw from the gallery's data: each candidate's
+    // row content in order, and the slots behind the L/R badges. A new list
+    // that leaves it unchanged has nothing for the lists to repaint.
+    function compareListSignature() {
+        const overlay = state.overlayState;
+        const rows = sameTypeOverlayAssets(currentOverlayAsset()).map((entry) => [
+            entry.asset_id, entry.favorite ? 1 : 0, assetDisplayName(entry),
+            entry.has_thumbnail ? 1 : 0, entry.duration_sec ?? "", entry.frame_count ?? "",
+        ].join("\u0001"));
+        return [...rows, overlay.compareLeftAssetId, overlay.compareRightAssetId].join("\u0002");
+    }
+
+    /**
+     * Keep the Inspect view in step with the assets it shows, after a paint of
+     * `assetIds` or a new list. What is drawn decides. A compare stage that
+     * would draw the same pair repaints only its lists and stars, so neither
+     * side's media reloads; a new pair, or a switch between the stage and the
+     * single view, rebuilds it. A single view rebuilds for its own asset.
+     * A new list whose anchor asset is gone leaves the view as it is.
+     */
+    function syncOverlayWithAssets(assetIds = [], { listArrival = false } = {}) {
+        const overlay = state.overlayState;
+        if (!overlay.open) return;
+        if (listArrival && !currentOverlayAsset()) return;
+        if (compareStageDrawn()) {
+            const resolved = resolvedCompareSlots();
+            if (!compareStageShown()
+                || resolved.leftId !== overlay.compareLeftAssetId
+                || resolved.rightId !== overlay.compareRightAssetId) {
+                renderInspectOverlay();
+            } else if (!listArrival || comparePickerHasMetadataQuery()
+                || compareListSignature() !== state.overlayCompareListSignature) {
+                refreshCompareInPlace();
+            }
+            return;
+        }
+        if (compareStageShown() || assetIds.includes(overlay.assetId)) renderInspectOverlay();
+    }
+
     function compareQueryRef(side) {
         return side === "B" ? "comparePickerQueryB" : "comparePickerQuery";
     }
@@ -1842,7 +1949,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         const overlay = state.overlayState;
         const current = overlay.open ? currentOverlayAsset() : null;
         if (current) {
-            if (overlay.compareMode && sameTypeOverlayAssets(current).length >= 2) {
+            if (compareStageShown()) {
                 const side = overlay.compareCycleSide === "A" ? "A" : "B";
                 const byId = (id) => data.assets.find((entry) => entry.asset_id === id) || null;
                 // A side whose asset is gone falls back to `current` in the panels.
@@ -2613,10 +2720,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     function renderAfterAssetPaint(assetIds = []) {
         if (state.destroyed) return;
         render();
-        const overlay = state.overlayState;
-        if (overlay.open && !overlay.compareMode && assetIds.includes(overlay.assetId)) {
-            renderInspectOverlay();
-        }
+        syncOverlayWithAssets(assetIds);
     }
 
     /**
@@ -4281,6 +4385,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         state.overlayState.metadataScrollTopB = 0;
         state.overlayMetadataRefresh = null;
         state.overlayCompareChoosersRefresh = null;
+        state.overlayCompareFavoriteRefresh = null;
         state.overlayState.showWaveform = false;
         state.overlayState.audioFocus = "none";
         state.overlayState.audioTempFlip = false;
@@ -5104,7 +5209,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         }
     }
 
-    function renderCompareChooser(assets, slotLabel, selectedId, onAssign, requestRefresh = () => {}, side = "A") {
+    function renderCompareChooser(slotLabel, selectedId, onAssign, requestRefresh = () => {}, side = "A") {
         const queryRef = side === "B" ? "comparePickerQueryB" : "comparePickerQuery";
         const scrollKey = side === "B" ? "compareChooserScrollB" : "compareChooserScrollA";
         const sideAccent = side === "B" ? "#e8b86d" : "#7fc0ff";
@@ -5154,7 +5259,9 @@ export function mountSharedAssetGallery(container, options = {}) {
             if (rightId && rightId !== leftId) ids.push({ id: rightId, side: "R" });
             const items = [];
             for (const { id, side } of ids) {
-                const asset = assets.find((entry) => entry.asset_id === id);
+                // Live, not the candidates captured at mount: a refresh after a
+                // favorite change must show the new star.
+                const asset = shownAsset(id);
                 if (asset) items.push({ asset, role: "top", forcedSide: side });
             }
             return items;
@@ -5199,6 +5306,14 @@ export function mountSharedAssetGallery(container, options = {}) {
             const nameLabel = style(document.createElement("span"), `overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;`);
             nameLabel.textContent = assetDisplayName(asset);
             name.appendChild(nameLabel);
+            if (asset.favorite) {
+                // A mark, not a control: the row's clicks stay A and B.
+                const favoriteMark = style(document.createElement("span"), `color:${FAVORITE_STAR_COLOR};font-size:11px;line-height:1;flex:0 0 auto;`);
+                favoriteMark.textContent = "★";
+                favoriteMark.title = "Favorite";
+                favoriteMark.setAttribute("aria-label", "Favorite");
+                name.appendChild(favoriteMark);
+            }
             const meta = style(document.createElement("div"), `color:#8ea0af;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
             meta.textContent = `${assetKindLabel(asset.asset_type)} | ${formatDuration(asset)}`;
             text.append(name, meta);
@@ -5262,10 +5377,79 @@ export function mountSharedAssetGallery(container, options = {}) {
         return { el: wrap, refresh: renderRows };
     }
 
+    /**
+     * One side's label on the compare stage: its letter and a star for the
+     * asset that side shows. The star is faint until its stage is hovered and
+     * full on its own hover; a favorite always shows full. It never takes
+     * focus and keeps its gestures from the stage under it, so a click cannot
+     * pan, zoom, scrub or open a menu. `refresh` repaints it in place.
+     */
+    function makeCompareSideChip(side, hoverHost, placement = "left:10px;top:10px;") {
+        const chip = style(document.createElement("div"), `position:absolute;${placement}z-index:4;display:flex;align-items:center;gap:5px;padding:3px 6px;border-radius:5px;background:rgba(0,0,0,0.58);color:${CHROME.text};font-size:10px;pointer-events:none;`);
+        const letter = document.createElement("span");
+        letter.textContent = side;
+        const star = style(document.createElement("button"), `appearance:none;border:none;background:none;margin:0;padding:0 1px;font-size:12px;line-height:1;cursor:pointer;pointer-events:auto;transition:opacity 120ms;`);
+        star.type = "button";
+        star.tabIndex = -1;
+        if (!options.onUpdateAsset) setButtonDisabled(star, true);
+        let hostHovered = false;
+        let starHovered = false;
+        const refresh = () => {
+            const favorite = !!compareSideAsset(side)?.favorite;
+            star.textContent = favorite ? "★" : "☆";
+            star.style.color = favorite ? FAVORITE_STAR_COLOR : CHROME.text;
+            const cycleSide = state.overlayState.compareCycleSide === "A" ? "A" : "B";
+            if (star.disabled) {
+                star.title = "Favorites cannot be changed in this gallery";
+            } else {
+                star.style.opacity = favorite || starHovered ? "1" : (hostHovered ? "0.7" : "0.35");
+                star.title = `${favorite ? `Remove ${side} from` : `Add ${side} to`} Favorites${side === cycleSide ? " (S)" : ""}`;
+            }
+            star.setAttribute("aria-label", star.title);
+            star.setAttribute("aria-pressed", favorite ? "true" : "false");
+        };
+        star.addEventListener("mousedown", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+        });
+        star.addEventListener("wheel", (event) => event.stopPropagation());
+        star.addEventListener("dblclick", (event) => event.stopPropagation());
+        star.addEventListener("contextmenu", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+        });
+        star.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            const target = compareSideAsset(side);
+            if (target && !star.disabled) void handleToggleFavorite(target);
+        });
+        star.addEventListener("mouseenter", () => { starHovered = true; refresh(); });
+        star.addEventListener("mouseleave", () => { starHovered = false; refresh(); });
+        hoverHost.addEventListener("mouseenter", () => { hostHovered = true; refresh(); });
+        hoverHost.addEventListener("mouseleave", () => { hostHovered = false; refresh(); });
+        chip.append(letter, star);
+        refresh();
+        // A stage rebuilt under a resting pointer gets no mouseenter until it
+        // moves, so read the hover once the chip is mounted.
+        requestAnimationFrame(() => {
+            if (!chip.isConnected) return;
+            hostHovered = !!hoverHost.matches?.(":hover");
+            starHovered = !!star.matches?.(":hover");
+            refresh();
+        });
+        return { el: chip, refresh };
+    }
+
     function renderCompareOverlay(asset, host) {
         const candidates = sameTypeOverlayAssets(asset);
+        // renderInspectOverlay resolved both slots and wrote them back.
         const compareA = candidates.find((entry) => entry.asset_id === state.overlayState.compareLeftAssetId) || asset;
-        const compareB = candidates.find((entry) => entry.asset_id === state.overlayState.compareRightAssetId) || candidates.find((entry) => entry.asset_id !== compareA.asset_id) || compareA;
+        const compareB = candidates.find((entry) => entry.asset_id === state.overlayState.compareRightAssetId) || compareA;
+        const sideChips = [];
+        state.overlayCompareFavoriteRefresh = () => {
+            for (const chip of sideChips) chip.refresh();
+        };
 
         // Lock chooser column widths so they DO NOT shrink when the metadata panels mount.
         // Toggling Metadata on absorbs its cost from the central media area, not from the
@@ -5280,12 +5464,14 @@ export function mountSharedAssetGallery(container, options = {}) {
             renderInspectOverlay();
         };
         let refreshCompareChoosers = () => {};
-        const chooserA = renderCompareChooser(candidates, "Gallery A", compareA.asset_id, assignSlot, () => refreshCompareChoosers(), "A");
-        const chooserB = renderCompareChooser(candidates, "Gallery B", compareB.asset_id, assignSlot, () => refreshCompareChoosers(), "B");
+        const chooserA = renderCompareChooser("Gallery A", compareA.asset_id, assignSlot, () => refreshCompareChoosers(), "A");
+        const chooserB = renderCompareChooser("Gallery B", compareB.asset_id, assignSlot, () => refreshCompareChoosers(), "B");
         refreshCompareChoosers = () => {
             chooserA.refresh();
             chooserB.refresh();
+            state.overlayCompareListSignature = compareListSignature();
         };
+        state.overlayCompareListSignature = compareListSignature();
         // Expose the chooser refresh so setCompareQuery (driven by metadata-cell L/R clicks)
         // can keep both picker lists in sync without redrawing the whole overlay.
         state.overlayCompareChoosersRefresh = refreshCompareChoosers;
@@ -5393,7 +5579,24 @@ export function mountSharedAssetGallery(container, options = {}) {
                 restoreOverlayTransportPlayback(transport, audioA, state.overlayState.carriedMediaState),
                 () => { audioA.pause(); audioB.pause(); },
             );
-            center.append(controls, waveform.el);
+            // The waveform is shared with single audio, so the stars sit on a box
+            // around it, placed from the waveform's geometry: its canvas starts
+            // 27px down and 9px in, and Stacked splits it into two lanes 8px apart
+            // (`rowForDataset`), each labelled at its top-left. Stacked puts each
+            // star at its own lane's top-right, clear of the label; Overlay has no
+            // labels, so A takes the left corner and B the right.
+            const waveformBox = style(document.createElement("div"), `position:relative;display:flex;flex-direction:column;flex:1 1 auto;min-height:0;`);
+            waveformBox.appendChild(waveform.el);
+            const stacked = state.overlayState.audioCompareWaveformLayout === "stacked";
+            const audioPlacements = stacked
+                ? { A: "right:15px;top:33px;", B: "right:15px;top:calc(50% + 19px);" }
+                : { A: "left:15px;top:33px;", B: "right:15px;top:33px;" };
+            for (const side of ["A", "B"]) {
+                const chip = makeCompareSideChip(side, waveformBox, audioPlacements[side]);
+                sideChips.push(chip);
+                waveformBox.appendChild(chip.el);
+            }
+            center.append(controls, waveformBox);
         } else {
             const controls = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;flex-wrap:wrap;`);
             controls.append(
@@ -5482,9 +5685,9 @@ export function mountSharedAssetGallery(container, options = {}) {
                 const stage = style(document.createElement("div"), `display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px;flex:1 1 auto;min-height:0;`);
                 const makePane = (label, group, slot) => {
                     const pane = style(document.createElement("div"), `position:relative;min-width:0;min-height:0;border-radius:12px;background:#020507;border:1px solid #24323e;overflow:hidden;display:flex;align-items:center;justify-content:center;`);
-                    const badge = style(document.createElement("div"), `position:absolute;left:10px;top:10px;z-index:2;padding:3px 6px;border-radius:5px;background:rgba(0,0,0,0.58);color:${CHROME.text};font-size:10px;pointer-events:none;`);
-                    badge.textContent = label;
-                    pane.append(group, badge);
+                    const chip = makeCompareSideChip(label, pane);
+                    sideChips.push(chip);
+                    pane.append(group, chip.el);
                     if (asset.asset_type === "video") {
                         state.overlayState.cleanupFns.push(attachRightClickVideoScrub(pane, transport, [layerA, layerB], { fps: assetFps(compareA) }));
                     }
@@ -5515,6 +5718,12 @@ export function mountSharedAssetGallery(container, options = {}) {
                 stage.appendChild(contentGroupA);
                 stage.appendChild(clipWrapperB);
                 stage.appendChild(divider);
+                // Each side's star on the half it shows, above the divider.
+                for (const [side, placement] of [["A", "left:10px;top:10px;"], ["B", "right:10px;top:10px;"]]) {
+                    const chip = makeCompareSideChip(side, stage, placement);
+                    sideChips.push(chip);
+                    stage.appendChild(chip.el);
+                }
                 const applyDivider = () => {
                     const ratio = clamp(state.overlayState.dividerRatio, 0, 1);
                     const leftPct = `${ratio * 100}%`;
@@ -5630,6 +5839,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         // renderCompareOverlay / metadata panel mount will reinstall them as needed.
         state.overlayMetadataRefresh = null;
         state.overlayCompareChoosersRefresh = null;
+        state.overlayCompareFavoriteRefresh = null;
         let overlayEl = overlay.overlayEl;
         if (!overlayEl) {
             overlayEl = style(document.createElement("div"), `position:fixed;inset:0;z-index:99999;background:rgba(7,10,14,0.86);display:flex;align-items:stretch;justify-content:center;padding:20px;box-sizing:border-box;`);
@@ -5713,10 +5923,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                 }
             }
             if (event.ctrlKey || event.metaKey || event.altKey) return shouldCaptureOverlayShortcut(event);
-            if (!overlay.compareMode && (event.key === "s" || event.key === "S")) {
-                void handleToggleFavorite(activeAsset);
-                return true;
-            }
+            if (event.key === "s" || event.key === "S") return handleOverlayFavoriteKey(event);
             if (!overlay.compareMode && event.key === "Delete") {
                 void handleOverlayAssetDelete(activeAsset);
                 return true;
@@ -5801,8 +6008,13 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         const toolbarActions = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end;`);
         const compareCandidates = sameTypeOverlayAssets(asset);
-        if (!overlay.compareMode) {
+        const stageShown = compareStageShown();
+        // The compare stage carries a star per side; any single view, including
+        // compare left with one candidate, keeps the toolbar star.
+        if (!stageShown) {
             toolbarActions.appendChild(makeFavoriteButton(asset));
+        }
+        if (!overlay.compareMode) {
             const trashBtn = makeActionButton("danger");
             trashBtn.textContent = "Trash";
             trashBtn.title = "Move to Trash (Delete)";
@@ -5861,8 +6073,14 @@ export function mountSharedAssetGallery(container, options = {}) {
         shell.append(toolbar, contentWrap);
         overlayEl.appendChild(shell);
 
-        if (overlay.compareMode && compareCandidates.length >= 2) {
+        if (stageShown) {
             ensureCompareDefaults(asset);
+            // The slots always name what the stage shows: a slot whose asset left
+            // the candidates takes its stand-in here, so the L/R badges, the
+            // metadata panels, the stars and S agree with the stage.
+            const resolved = resolvedCompareSlots();
+            overlay.compareLeftAssetId = resolved.leftId;
+            overlay.compareRightAssetId = resolved.rightId;
             // Resolved compare slots form the signature; a metadata/layout/monitor/cycle-side
             // toggle keeps both slots, so the captured scrub state carries — but cycling either
             // slot or switching mode changes the signature and starts the new media fresh.
@@ -5882,7 +6100,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         // so closing/reopening Metadata leaves no stale callback firing into a detached node.
         state.overlayMetadataRefresh = null;
         if (overlay.showMetadata) {
-            if (overlay.compareMode && compareCandidates.length >= 2) {
+            if (stageShown) {
                 // Lift the shell's centered-1600px cap and slim its padding so the metadata
                 // panels move into the previously-empty edge real estate. Choosers + media
                 // keep their toggled-off widths almost entirely; only a small residual
@@ -6936,9 +7154,9 @@ export function mountSharedAssetGallery(container, options = {}) {
             width:18px;
             height:18px;
             border-radius:5px;
-            border:1px solid ${favorite ? `${THEME.statusPending}aa` : CHROME.border};
-            background:${favorite ? `${THEME.statusPending}24` : CHROME.panelRaised};
-            color:${favorite ? THEME.statusPending : CHROME.textDim};
+            border:1px solid ${favorite ? `${FAVORITE_STAR_COLOR}aa` : CHROME.border};
+            background:${favorite ? `${FAVORITE_STAR_COLOR}24` : CHROME.panelRaised};
+            color:${favorite ? FAVORITE_STAR_COLOR : CHROME.textDim};
             cursor:${options.onUpdateAsset ? "pointer" : "default"};
             font-size:12px;
             line-height:1;
@@ -6950,9 +7168,9 @@ export function mountSharedAssetGallery(container, options = {}) {
             width:22px;
             height:22px;
             border-radius:5px;
-            border:1px solid ${favorite ? `${THEME.statusPending}aa` : CHROME.border};
-            background:${favorite ? `${THEME.statusPending}24` : CHROME.panelRaised};
-            color:${favorite ? THEME.statusPending : CHROME.textDim};
+            border:1px solid ${favorite ? `${FAVORITE_STAR_COLOR}aa` : CHROME.border};
+            background:${favorite ? `${FAVORITE_STAR_COLOR}24` : CHROME.panelRaised};
+            color:${favorite ? FAVORITE_STAR_COLOR : CHROME.textDim};
             cursor:${options.onUpdateAsset ? "pointer" : "default"};
             font-size:14px;
             line-height:1;
@@ -7907,12 +8125,12 @@ export function mountSharedAssetGallery(container, options = {}) {
         if (queryHasMetadataTerms(parseAssetSearchQuery(state.query)) || !tryRenderAdditiveData(additiveAssets, previousAssets)) {
             render();
         } else {
-            if (comparePickerHasMetadataQuery() && typeof state.overlayCompareChoosersRefresh === "function") {
-                try { state.overlayCompareChoosersRefresh(); } catch (err) { console.warn("[gallery] compare choosers refresh failed", err); }
-            }
             refreshThumbnailRepairObservation(selectedAsset());
             syncDetailDemand();
         }
+        // Either way the compare lists and stars follow the new list (a favorite
+        // may arrive with it); the stage's media stays as it is.
+        syncOverlayWithAssets([], { listArrival: true });
     }
 
     function destroy() {
