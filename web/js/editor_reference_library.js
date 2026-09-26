@@ -15,6 +15,7 @@ import {
     validateReferenceDraft,
 } from "./reference_library_model.js";
 import { openContextMenu } from "./editor_context_menu.js";
+import { THEME, setButtonDisabled } from "./editor_theme.js";
 
 const css = {
     input: "width:100%;box-sizing:border-box;background:#151a20;border:1px solid #38414b;border-radius:6px;color:#e6ebf0;padding:6px 8px;font:11px 'Segoe UI',sans-serif;",
@@ -123,6 +124,12 @@ export function mountReferenceLibrary(container, host) {
         manage: false,
         memberNotice: "",
         error: "",
+        // The server's own words for a refusal, shown under the written
+        // sentence rather than as it.
+        errorDetail: "",
+        // One-shot: the next list render scrolls to the end, where a new
+        // Reference's pending card was appended.
+        revealEnd: false,
         destroyed: false,
     };
     const scrollSnapshots = new Map();
@@ -147,10 +154,17 @@ export function mountReferenceLibrary(container, host) {
     };
     container.style.cssText = "display:flex;flex-direction:column;min-height:0;overflow:hidden;height:100%;background:#11161b;color:#e6ebf0;";
 
+    // A pending row has a temporary id no request can name, so it is never
+    // staged, dragged or offered to the timeline until the server settles it.
+    const settledMembers = (reference) => (reference?.members || [])
+        .filter((member) => !member?.pendingStatus);
+    const pendingLabel = (status) => status === "unconfirmed" ? "Not confirmed — checking…" : "Saving…";
+    const WAIT_FOR_MEMBER = "Wait for the new member to finish saving.";
+
     const dragPayload = (reference, member = null) => ({
         reference_id: reference.reference_id,
         reference_name: reference.name,
-        members: (member ? [member] : (reference.members || [])).map((entry) => ({
+        members: (member ? [member] : settledMembers(reference)).map((entry) => ({
             entity_id: reference.reference_id,
             member_id: entry.member_id,
         })),
@@ -199,11 +213,64 @@ export function mountReferenceLibrary(container, host) {
         state.manage = false;
         state.memberNotice = "";
         state.error = "";
+        state.errorDetail = "";
+        state.revealEnd = false;
         render();
     };
 
-    const perform = async (operations) => {
+    const UNCONFIRMED = "The change could not be confirmed. The Library is refreshing to show whether it was saved.";
+
+    /** `paintFirst`: the host paints the change now and the form, if any, closes
+     *  at submit — which is also what stops a second Save from creating a
+     *  duplicate. A refusal the server answered drops the paint (the host's
+     *  rollback) and `onRefused` hands the draft back. A lost response does not,
+     *  because the write may have landed and a re-save would duplicate it; the
+     *  draft comes back only once a later read shows it did not land. */
+    const perform = async (operations, {
+        paintFirst = false, closeForm = false, revealEnd = false, onRefused = null,
+    } = {}) => {
         state.error = "";
+        state.errorDetail = "";
+        if (paintFirst && typeof host.mutatePaintFirst === "function") {
+            const projectKey = String(host.getData().projectKey || "");
+            const current = () => !state.destroyed
+                && String(host.getData().projectKey || "") === projectKey;
+            if (closeForm) {
+                state.entityDraft = null;
+                state.memberDraft = null;
+                state.memberMode = "";
+                state.memberNotice = "";
+            }
+            if (revealEnd) state.revealEnd = true;
+            const pending = host.mutatePaintFirst(operations, {
+                onUnconfirmedResolved: (saved) => {
+                    if (!current()) return;
+                    if (saved) {
+                        if (state.error === UNCONFIRMED) state.error = "";
+                    } else {
+                        state.error = "The change was not saved. Its form is back so you can save it again.";
+                        state.errorDetail = "";
+                        onRefused?.();
+                    }
+                    render();
+                },
+            });
+            render();
+            try {
+                await pending;
+            } catch (error) {
+                if (!current()) return;
+                if (Number.isInteger(error?.status)) {
+                    state.error = "The change was not saved.";
+                    state.errorDetail = String(error?.message || "");
+                    onRefused?.();
+                } else {
+                    state.error = UNCONFIRMED;
+                }
+                render();
+            }
+            return;
+        }
         try {
             await host.mutate(operations);
             state.entityDraft = null;
@@ -299,7 +366,16 @@ export function mountReferenceLibrary(container, host) {
                 if (!Object.keys(fields).length) { state.entityDraft = null; render(); return; }
                 void perform([{ type: "update_reference", reference_id: reference.reference_id, fields, expected }]);
             } else {
-                void perform([{ type: "create_reference", fields: values }]);
+                void perform([{ type: "create_reference", fields: values }], {
+                    paintFirst: true,
+                    closeForm: true,
+                    revealEnd: true,
+                    // Only into an empty slot: another form opened since is
+                    // the author's newer work.
+                    onRefused: () => {
+                        if (!state.entityDraft && !state.memberDraft) state.entityDraft = draft;
+                    },
+                });
             }
         });
         cancel.addEventListener("click", () => { state.entityDraft = null; render(); });
@@ -475,7 +551,18 @@ export function mountReferenceLibrary(container, host) {
                 if (!Object.keys(fields).length) { state.memberDraft = null; render(); return; }
                 void perform([{ type: "update_member", reference_id: reference.reference_id, member_id: member.member_id, fields, expected: member }]);
             } else {
-                void perform([{ type: "create_member", reference_id: reference.reference_id, fields: values }]);
+                void perform([{ type: "create_member", reference_id: reference.reference_id, fields: values }], {
+                    paintFirst: true,
+                    closeForm: true,
+                    onRefused: () => {
+                        const stillThere = (host.getData().references || []).some((entry) =>
+                            entry.reference_id === reference.reference_id);
+                        if (!stillThere || state.entityDraft || state.memberDraft) return;
+                        state.selectedReferenceId = reference.reference_id;
+                        state.memberDraft = draft;
+                        state.memberMode = "create";
+                    },
+                });
             }
         });
         cancel.addEventListener("click", () => { state.memberDraft = null; state.memberMode = ""; render(); });
@@ -484,8 +571,30 @@ export function mountReferenceLibrary(container, host) {
         body.appendChild(editor);
     };
 
+    /** Every host-driven render rebuilds the tree, and a save settling while the
+     *  author types in the next form would otherwise take the field out from
+     *  under them. Put focus and caret back on the same field by its label. */
     const render = () => {
         if (state.destroyed) return;
+        const active = globalThis.document?.activeElement;
+        const focusKey = active && container.contains?.(active)
+            ? (active.getAttribute?.("aria-label") || "") : "";
+        const selection = focusKey && typeof active.selectionStart === "number"
+            ? [active.selectionStart, active.selectionEnd] : null;
+        renderTree();
+        if (!focusKey) return;
+        const next = [...(container.querySelectorAll?.("input") || []),
+            ...(container.querySelectorAll?.("textarea") || []),
+            ...(container.querySelectorAll?.("select") || [])]
+            .find((node) => node.getAttribute?.("aria-label") === focusKey);
+        if (!next || next === globalThis.document?.activeElement) return;
+        next.focus?.();
+        if (selection) {
+            try { next.setSelectionRange?.(selection[0], selection[1]); } catch (_) { /* not a text field */ }
+        }
+    };
+
+    const renderTree = () => {
         const data = host.getData();
         const visible = containerIsVisible();
         const draftMode = state.entityDraft
@@ -526,9 +635,12 @@ export function mountReferenceLibrary(container, host) {
         const body = el("div", "", "flex:1;min-height:0;overflow:auto;padding:8px;box-sizing:border-box;");
         body.dataset.referenceLibraryBody = "true";
         container.appendChild(body);
-        if (data.loading) { body.appendChild(el("div", "Loading references…", "color:#98a5b2;padding:18px;text-align:center;font-size:11px;")); return; }
+        // A refresh keeps the last Library on screen, pending rows included;
+        // the placeholder is only for a project with nothing loaded yet.
+        if (data.loading && !data.loaded) { body.appendChild(el("div", "Loading references…", "color:#98a5b2;padding:18px;text-align:center;font-size:11px;")); return; }
         if (data.error) body.appendChild(el("div", data.error, "color:#e39a9a;margin-bottom:8px;font-size:11px;"));
         if (state.error) body.appendChild(el("div", state.error, "color:#e39a9a;margin-bottom:8px;font-size:11px;"));
+        if (state.error && state.errorDetail) body.appendChild(el("div", state.errorDetail, "color:#98a5b2;margin:-5px 0 8px;font-size:10px;"));
         if (state.entityDraft) {
             // An entity editor is a different tree. Do not carry a list offset
             // through it and later apply that offset to a newly rebuilt list.
@@ -546,14 +658,19 @@ export function mountReferenceLibrary(container, host) {
         const references = filterReferences(data.references, state.query, allAssets, data.catalog, data.tagFamilies);
         if (!references.length) body.appendChild(el("div", data.references.length ? "No references match." : "No references yet.", "color:#788692;padding:18px;text-align:center;font-size:11px;"));
         for (const reference of references) {
-            const card = el("section", "", "border:1px solid #303841;border-radius:8px;background:#171d23;margin-bottom:8px;overflow:hidden;");
-            const header = el("div", "", "display:flex;flex-direction:column;gap:5px;padding:8px;cursor:pointer;");
-            header.draggable = (reference.members || []).length > 0;
-            header.addEventListener("dragstart", (event) => beginReferenceDrag(
-                event, dragPayload(reference),
-                { assets: allAssets, members: reference.members || [] }));
-            header.addEventListener("dragend", endReferenceDrag);
-            header.addEventListener("contextmenu", (event) => openTimelineMenu(event, dragPayload(reference)));
+            const pendingEntity = reference.pendingStatus || "";
+            const memberPending = (reference.members || []).some((member) => member?.pendingStatus);
+            const card = el("section", "", `border:1px solid #303841;border-radius:8px;background:#171d23;margin-bottom:8px;overflow:hidden;${pendingEntity ? "opacity:.6;" : ""}`);
+            const header = el("div", "", `display:flex;flex-direction:column;gap:5px;padding:8px;cursor:${pendingEntity ? "default" : "pointer"};`);
+            if (pendingEntity) header.title = "Saving this Reference. It can be opened and used once saved.";
+            header.draggable = !pendingEntity && settledMembers(reference).length > 0;
+            if (!pendingEntity) {
+                header.addEventListener("dragstart", (event) => beginReferenceDrag(
+                    event, dragPayload(reference),
+                    { assets: allAssets, members: settledMembers(reference) }));
+                header.addEventListener("dragend", endReferenceDrag);
+                header.addEventListener("contextmenu", (event) => openTimelineMenu(event, dragPayload(reference)));
+            }
             const memberAssets = (reference.members || []).map((member) => allAssets.find((asset) => asset.asset_id === member.asset_id));
             const unresolved = memberAssets.filter((asset) => !asset).length;
             const trashed = memberAssets.filter((asset) => asset && (asset.trashed || asset.trashed_at)).length;
@@ -561,8 +678,10 @@ export function mountReferenceLibrary(container, host) {
             const topLine = el("div", "", "display:flex;align-items:center;gap:6px;min-width:0;");
             const title = el("div", reference.name, "flex:1;min-width:0;font-size:12px;font-weight:600;overflow:hidden;text-overflow:ellipsis;");
             const count = el("span", `${reference.members?.length || 0}`, `font-size:9px;color:${unresolved || trashed || missingFiles ? "#e2ab68" : "#82909c"};`);
-            topLine.append(title, count);
-            if (state.manage) {
+            topLine.append(title, pendingEntity
+                ? el("span", pendingLabel(pendingEntity), `font-size:9px;color:${THEME.statusPending};`)
+                : count);
+            if (state.manage && !pendingEntity) {
                 const edit = el("button", "Edit", `${css.button}padding:3px 6px;font-size:9px;`);
                 const remove = el("button", "Delete", `${css.button}padding:3px 6px;font-size:9px;`);
                 edit.addEventListener("click", (event) => { event.stopPropagation(); state.entityDraft = createReferenceDraft(reference); render(); });
@@ -593,6 +712,12 @@ export function mountReferenceLibrary(container, host) {
                     if (!host.confirm(`Delete “${reference.name}” and its ${reference.members?.length || 0} member(s)?${usage}`)) return;
                     void perform([{ type: "delete_reference", reference_id: reference.reference_id, expected: { name: reference.name, kind: reference.kind, reference_class: reference.reference_class, description: reference.description || "", visual_intent: reference.visual_intent || "preserve", audio_intent: reference.audio_intent || "reference_characteristics", member_ids: (reference.members || []).map((member) => member.member_id) } }]);
                 });
+                // Its exact member list is part of the delete's guard, and a
+                // member still being added is not in the server's list yet.
+                if (memberPending) {
+                    setButtonDisabled(remove, true);
+                    remove.title = WAIT_FOR_MEMBER;
+                }
                 topLine.append(edit, remove);
             }
             header.appendChild(topLine);
@@ -607,7 +732,7 @@ export function mountReferenceLibrary(container, host) {
             if (missingFiles) statuses.push(`${missingFiles} missing file${missingFiles === 1 ? "" : "s"}`);
             if (trashed) statuses.push(`${trashed} trashed`);
             if (statuses.length) header.appendChild(el("div", statuses.join(" · "), "font-size:9px;color:#e2ab68;"));
-            header.addEventListener("click", () => { state.selectedReferenceId = state.selectedReferenceId === reference.reference_id ? "" : reference.reference_id; state.memberDraft = null; render(); });
+            if (!pendingEntity) header.addEventListener("click", () => { state.selectedReferenceId = state.selectedReferenceId === reference.reference_id ? "" : reference.reference_id; state.memberDraft = null; render(); });
             card.appendChild(header);
             if (state.selectedReferenceId === reference.reference_id) {
                 const detail = el("div", "", "padding:0 8px 8px;border-top:1px solid #293039;");
@@ -615,7 +740,7 @@ export function mountReferenceLibrary(container, host) {
                 const addMember = el("button", "+ Member", css.button);
                 addMember.addEventListener("click", () => { state.memberDraft = createMemberDraft(); state.memberNotice = ""; state.memberMode = "create"; render(); });
                 const addTimeline = el("button", "Add to timeline", css.button);
-                addTimeline.disabled = !(reference.members || []).length;
+                setButtonDisabled(addTimeline, !settledMembers(reference).length);
                 addTimeline.addEventListener("click", () => host.addToTimeline?.(dragPayload(reference)));
                 actions.append(addMember, addTimeline);
                 detail.appendChild(actions);
@@ -625,13 +750,16 @@ export function mountReferenceLibrary(container, host) {
                 } else {
                     for (const member of reference.members || []) {
                         const asset = allAssets.find((entry) => entry.asset_id === member.asset_id);
-                        const row = el("div", "", "display:grid;grid-template-columns:40px minmax(0,1fr);gap:7px;padding:7px 0;border-top:1px solid #293039;");
-                        row.draggable = true;
-                        row.addEventListener("dragstart", (event) => beginReferenceDrag(
-                            event, dragPayload(reference, member),
-                            { assets: allAssets, members: [member] }));
-                        row.addEventListener("dragend", endReferenceDrag);
-                        row.addEventListener("contextmenu", (event) => openTimelineMenu(event, dragPayload(reference, member)));
+                        const pendingMember = member.pendingStatus || "";
+                        const row = el("div", "", `display:grid;grid-template-columns:40px minmax(0,1fr);gap:7px;padding:7px 0;border-top:1px solid #293039;${pendingMember ? "opacity:.6;" : ""}`);
+                        row.draggable = !pendingMember;
+                        if (!pendingMember) {
+                            row.addEventListener("dragstart", (event) => beginReferenceDrag(
+                                event, dragPayload(reference, member),
+                                { assets: allAssets, members: [member] }));
+                            row.addEventListener("dragend", endReferenceDrag);
+                            row.addEventListener("contextmenu", (event) => openTimelineMenu(event, dragPayload(reference, member)));
+                        }
                         const preview = el("button", asset?.asset_type === "audio" ? "Audio" : (asset?.asset_type === "video" ? "Video" : ""), "width:40px;height:34px;padding:0;background:#0b0e12;border:1px solid #333b44;border-radius:5px;display:flex;align-items:center;justify-content:center;font-size:8px;color:#8995a0;overflow:hidden;cursor:pointer;");
                         preview.type = "button";
                         preview.title = "Inspect Reference member";
@@ -650,6 +778,19 @@ export function mountReferenceLibrary(container, host) {
                             previewDraft.has_audio = asset?.has_audio === true;
                             host.previewMemberMedia?.({ asset, draft: previewDraft, readOnly: true });
                         };
+                        if (pendingMember) {
+                            // Inert until saved: nothing here may name its temporary id.
+                            for (const target of [preview, nameLine]) {
+                                target.style.cursor = "default";
+                                target.title = "Saving this member.";
+                            }
+                            info.appendChild(nameLine);
+                            info.appendChild(el("div", pendingLabel(pendingMember),
+                                `font-size:9px;color:${THEME.statusPending};margin-top:2px;`));
+                            row.append(preview, info);
+                            detail.appendChild(row);
+                            continue;
+                        }
                         preview.addEventListener("click", inspectMember);
                         nameLine.addEventListener("click", inspectMember);
                         info.appendChild(nameLine);
@@ -689,7 +830,18 @@ export function mountReferenceLibrary(container, host) {
                                 }
                             }],
                             ["Up", () => reorder(reference, member, -1)], ["Down", () => reorder(reference, member, 1)],
-                        ]) { const button = el("button", label, `${css.button}padding:2px 5px;font-size:9px;`); button.addEventListener("click", handler); controls.appendChild(button); }
+                        ]) {
+                            const button = el("button", label, `${css.button}padding:2px 5px;font-size:9px;`);
+                            button.addEventListener("click", handler);
+                            // Reorder names the exact member set and Remove's guard
+                            // carries the densified order; a member still being
+                            // added belongs to neither yet.
+                            if (memberPending && label !== "Edit") {
+                                setButtonDisabled(button, true);
+                                button.title = WAIT_FOR_MEMBER;
+                            }
+                            controls.appendChild(button);
+                        }
                         info.appendChild(controls);
                         row.append(preview, info);
                         detail.appendChild(row);
@@ -701,15 +853,27 @@ export function mountReferenceLibrary(container, host) {
         }
         if (visible) {
             restoreScroll();
+            if (state.revealEnd) {
+                state.revealEnd = false;
+                body.scrollTop = body.scrollHeight;
+            }
             rememberScroll(scrollKey, body.scrollTop);
         }
     };
 
-    const reorder = (reference, member, direction) => {
-        const desired = moveMember(reference.members, member.member_id, direction).map((entry) => entry.member_id);
-        const expected = reference.members.map((entry) => entry.member_id);
+    // Read at act time from the displayed Library, pending reorders included.
+    // The queue sends writes in order, so the server checks this one after the
+    // previous has landed and Up, Up both apply.
+    const reorder = (drawnReference, member, direction) => {
+        const reference = (host.getData().references || []).find((entry) =>
+            entry.reference_id === drawnReference.reference_id);
+        const members = reference?.members || [];
+        if (!reference || members.some((entry) => entry?.pendingStatus)) return;
+        const desired = moveMember(members, member.member_id, direction).map((entry) => entry.member_id);
+        const expected = members.map((entry) => entry.member_id);
         if (JSON.stringify(expected) !== JSON.stringify(desired)) {
-            void perform([{ type: "reorder_members", reference_id: reference.reference_id, expected_member_ids: expected, member_ids: desired }]);
+            void perform([{ type: "reorder_members", reference_id: reference.reference_id, expected_member_ids: expected, member_ids: desired }],
+                { paintFirst: true });
         }
     };
 

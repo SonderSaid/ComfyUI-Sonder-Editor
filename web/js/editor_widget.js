@@ -366,7 +366,13 @@ function sessionDiagEndLoad(kind, markerId, payload) {
 import { INSPECT_OVERLAY_SHORTCUTS, mountSharedAssetGallery, getActiveDragAsset } from "./shared_asset_gallery.js";
 import { getActiveReferenceDrag, mountReferenceLibrary, referenceMemberMediaKind, SONDER_REFERENCE_MIME } from "./editor_reference_library.js";
 import { openReferenceMediaEditor, REFERENCE_MEDIA_EDITOR_SHORTCUTS } from "./reference_media_editor.js";
-import { formatReferenceTag, shouldApplyReferenceResponse } from "./reference_library_model.js";
+import {
+    applyPendingReferenceOverlays,
+    formatReferenceTag,
+    referenceOverlayFromOperation,
+    referenceOverlayReflected,
+    shouldApplyReferenceResponse,
+} from "./reference_library_model.js";
 import { mountReferenceLanePanel } from "./editor_reference_panel.js";
 import { referenceConfigurationAdvisories, resolveReferenceDropVerdict } from "./reference_lane_identity.js";
 import { REFERENCE_LANE_CAUSE, classifyReferenceChunks } from "./reference_resolution.js";
@@ -947,6 +953,17 @@ export class EditorWidget {
         this._referencesError = "";
         this._referenceFetchSeq = 0;
         this._referenceMutationSeq = 0;
+        // Which kind of request holds `_referenceFetchSeq`. A mutation whose
+        // payload lost the generation gate to a FETCH must ask for a refresh:
+        // that fetch may have been sent before the write committed (Finding L).
+        // Lost to a later mutation it need not — that one runs after it.
+        this._referenceSeqSource = "fetch";
+        // Paint-first Library overlays (ephemeral, view-only). Each is owned by
+        // its own mutation; see `_mutateReferencesPaintFirst`.
+        this._referenceOverlays = [];
+        this._referenceOverlaySeq = 0;
+        this._referenceUnconfirmedRetryTimer = null;
+        this._referenceUnconfirmedRetryAttempt = 0;
         this._referenceLibraryEl = null;
         this._referenceLibraryHandle = null;
         this._referenceMediaEditorHandle = null;
@@ -2473,7 +2490,10 @@ export class EditorWidget {
     _referenceLibraryData() {
         return {
             projectKey: this._projectDirName(),
-            references: this._references,
+            // The only reader of overlays. Staging, Attach and pickers read
+            // `_references`, so a row the server has not acknowledged is never
+            // offered to them.
+            references: applyPendingReferenceOverlays(this._references, this._referenceOverlays),
             catalog: this._referenceTagPresets,
             tagFamilies: this._referenceTagFamilies,
             recipePresets: this._referenceRecipePresets,
@@ -2482,6 +2502,7 @@ export class EditorWidget {
             scenes: this.scenes || [],
             semanticUnits: this._promptSemanticUnits || [],
             loading: this._referencesLoading,
+            loaded: this._referencesLoaded,
             error: this._referencesError,
         };
     }
@@ -2787,7 +2808,12 @@ export class EditorWidget {
         }
     }
 
-    _applyReferencePayload(payload, { projectDir = this.projectDir, requestSeq = this._referenceFetchSeq } = {}) {
+    _applyReferencePayload(payload, {
+        projectDir = this.projectDir,
+        requestSeq = this._referenceFetchSeq,
+        source = "fetch",
+        ownOverlays = null,
+    } = {}) {
         if (!shouldApplyReferenceResponse({
             requestedProject: projectDir,
             currentProject: this.projectDir,
@@ -2795,6 +2821,8 @@ export class EditorWidget {
             currentGeneration: this._referenceFetchSeq,
         })) return false;
         this._references = Array.isArray(payload?.references) ? payload.references : [];
+        this._pruneReferenceOverlays({ source, requestSeq, ownOverlays });
+        this._referenceUnconfirmedRetryAttempt = 0;
         this._referenceTagPresets = Array.isArray(payload?.tag_presets) ? payload.tag_presets : [];
         this._referenceTagFamilies = payload?.tag_families && typeof payload.tag_families === "object"
             ? payload.tag_families : {};
@@ -2880,6 +2908,7 @@ export class EditorWidget {
         const projectDir = this.projectDir;
         const dirName = this._projectDirName();
         const requestSeq = ++this._referenceFetchSeq;
+        this._referenceSeqSource = "fetch";
         this._referencesLoading = true;
         this._referencesError = "";
         this._referenceLibraryHandle?.render?.();
@@ -2900,6 +2929,7 @@ export class EditorWidget {
                 this._referencesError = error?.message || "Failed to load references.";
                 this._referenceLibraryHandle?.render?.();
                 this._refreshPromptContextDependencyConsumers();
+                this._scheduleUnconfirmedReferenceRetry();
             }
             return null;
         }
@@ -2907,12 +2937,14 @@ export class EditorWidget {
 
     _mutateReferences(
         operations, label = "Reference Library change", diagnostics = null,
-        ownerToken = null, historyOrderContext = undefined) {
+        ownerToken = null, historyOrderContext = undefined, { overlays = null } = {}) {
         if (!this.projectDir || !Array.isArray(operations) || !operations.length) return Promise.resolve(null);
         const projectDir = this.projectDir;
         const dirName = this._projectDirName();
         const requestSeq = ++this._referenceFetchSeq;
-        return this._queueProjectMutation({
+        this._referenceSeqSource = "mutation";
+        const ownOverlays = Array.isArray(overlays) && overlays.length ? overlays : null;
+        const promise = this._queueProjectMutation({
             key: `references:${++this._referenceMutationSeq}`,
             label,
             coalesce: false,
@@ -2922,9 +2954,15 @@ export class EditorWidget {
             historyOrderContext,
             refreshScenes: false,
             refreshKeysOnError: ["references"],
-            failureMessage: (error) => error?.code === "identity_mismatch"
+            // `fetchProjectJson` lifts only `project_version_conflict` onto
+            // `error.code`; every other route code stays on the payload.
+            failureMessage: (error) => (error?.code || error?.payload?.code) === "identity_mismatch"
                 ? "Reference changed elsewhere — Library refreshed."
-                : "Reference Library change failed.",
+                // No status: the write may have committed. A failure claim
+                // would invite a re-save that duplicates it.
+                : (!Number.isInteger(error?.status)
+                    ? "Reference Library change could not be confirmed — refreshing the Library."
+                    : "Reference Library change failed."),
             run: async (queuedOperations, diagnostics) => {
                 const result = await this._runVersionedProjectMutation(
                     `/sonder-editor/project/${encodeURIComponent(dirName)}/references/mutations`,
@@ -2936,12 +2974,207 @@ export class EditorWidget {
                     },
                     { projectId: dirName, retryOnConflict: true, maxAttempts: 2 },
                 );
-                if (projectDir === this.projectDir) {
-                    this._applyReferencePayload(result?.payload || {}, { projectDir, requestSeq });
+                if (projectDir !== this.projectDir) return result;
+                const applied = this._applyReferencePayload(result?.payload || {}, {
+                    projectDir, requestSeq, source: "mutation", ownOverlays });
+                // Settled inside `run`, before the queue can send the next write,
+                // so that write's payload finds these overlays acknowledged.
+                if (!applied) this._acknowledgeReferenceOverlays(ownOverlays, result?.payload);
+                if (!applied && this._referenceSeqSource !== "mutation") {
+                    // Finding L: a fetch took the generation after this write was
+                    // queued and may carry pre-commit state, so this canonical
+                    // payload was discarded and nothing would show the change.
+                    // Deferred behind the queue, so a burst asks once.
+                    sessionDiagRecord("reference_mutation_payload_superseded", {
+                        request_seq: requestSeq,
+                        current_seq: this._referenceFetchSeq,
+                    });
+                    void this._fetchReferences({ force: true, reason: "reference_mutation_superseded" });
                 }
                 return result;
             },
         });
+        promise.catch((error) => {
+            if (projectDir !== this.projectDir) return;
+            const answered = Number.isInteger(error?.status);
+            if (!answered) {
+                // Lost response: only a read sent after this settle can say
+                // whether it committed, and the message promises that read.
+                // Joins the queue's own error refresh as one read, forced,
+                // because that refresh alone skips a Library the sidebar is
+                // not showing.
+                this._deferredReferencesForce = true;
+                this._deferProjectBackedRefresh(["references"], "reference_unconfirmed");
+            }
+            if (!ownOverlays) return;
+            if (answered) {
+                // The server answered and refused: it holds none of this, so
+                // dropping the overlay IS the rollback, with no network.
+                this._dropReferenceOverlays(ownOverlays);
+            } else {
+                // Keep the row as unconfirmed. What the Library already holds
+                // is recorded so the deciding read can tell a row this write
+                // added from one that was there before.
+                for (const overlay of ownOverlays) {
+                    overlay.status = "unconfirmed";
+                    overlay.knownIds = this._referenceOverlayKnownIds(overlay);
+                }
+                this._acknowledgeReferenceOverlays(ownOverlays, null);
+            }
+            this._referenceLibraryHandle?.render?.();
+        });
+        return promise;
+    }
+
+    /** Paint a Library create/add/reorder now and send it through the queue.
+     *
+     *  Acknowledged References stay the only authority: the overlays are drawn
+     *  on top of them by `_referenceLibraryData` and read by nothing else. Each
+     *  overlay is owned by its own mutation and leaves only when that mutation
+     *  settles — never because a fetch landed, since a fetch sent while the write
+     *  was queued describes the Library without it (Finding L).
+     */
+    _mutateReferencesPaintFirst(operations, { onUnconfirmedResolved = null } = {}) {
+        const overlays = (Array.isArray(operations) ? operations : [])
+            .map((operation) => referenceOverlayFromOperation(
+                operation, `pending:${++this._referenceOverlaySeq}`))
+            .filter(Boolean)
+            .map((overlay) => ({ ...overlay, state: "pending", clearAfterSeq: 0, onUnconfirmedResolved }));
+        if (this.projectDir && overlays.length) {
+            this._referenceOverlays.push(...overlays);
+            this._referenceLibraryHandle?.render?.();
+        }
+        return this._withMutationGesture("referenceLibrary", () => this._mutateReferences(
+            operations, undefined, null, null, undefined, { overlays }));
+    }
+
+    /** A settled write whose own payload did not apply: keep its rows until a
+     *  payload known to postdate the write lands, unless acknowledged data
+     *  already shows them. Called with the write's payload for its committed ids. */
+    _acknowledgeReferenceOverlays(overlays, payload) {
+        if (!overlays?.length) return;
+        const results = Array.isArray(payload?.results) ? payload.results : [];
+        // One route result per operation, in operation order; each overlay
+        // claims the first unclaimed result of its own kind and target.
+        const claimed = new Set();
+        for (const overlay of overlays) {
+            const result = results.find((entry, index) => !claimed.has(index)
+                && entry?.type === overlay.type
+                && (overlay.type === "create_reference"
+                    || String(entry?.reference_id || "") === overlay.reference_id));
+            if (result) {
+                claimed.add(results.indexOf(result));
+                overlay.committedId = String(
+                    overlay.type === "create_member" ? result.member_id || "" : result.reference_id || "");
+            }
+            overlay.state = "acknowledged";
+            overlay.clearAfterSeq = this._referenceFetchSeq;
+        }
+        this._referenceOverlays = this._referenceOverlays.filter((overlay) =>
+            !(overlays.includes(overlay) && referenceOverlayReflected(this._references, overlay)));
+        this._referenceLibraryHandle?.render?.();
+    }
+
+    /** Keep re-reading while a settled write's row still waits for a read and
+     *  the read keeps failing — a server that dropped the write is often still
+     *  unreachable, and no other path would read the Library again. That covers
+     *  an unconfirmed write and an acknowledged one whose payload lost the gate
+     *  (Finding L): both hold their row, and an acknowledged add holds its
+     *  Reference's order controls, until a read lands. Backs off to 30 s and
+     *  gives up after ten tries (≈4 min); a later read of any kind still
+     *  settles the rows. Stops early once no such row remains, the project
+     *  changes or the editor closes. */
+    _scheduleUnconfirmedReferenceRetry() {
+        if (this._destroyed || this._referenceUnconfirmedRetryTimer
+                || (this._referenceUnconfirmedRetryAttempt || 0) >= 10
+                || !this._referenceOverlays.some((overlay) => overlay.state === "acknowledged")) return;
+        this._referenceUnconfirmedRetryAttempt = (this._referenceUnconfirmedRetryAttempt || 0) + 1;
+        const projectDir = this.projectDir;
+        this._referenceUnconfirmedRetryTimer = setTimeout(() => {
+            this._referenceUnconfirmedRetryTimer = null;
+            if (this._destroyed || this.projectDir !== projectDir) return;
+            void this._fetchReferences({ force: true, reason: "reference_unconfirmed_retry" });
+        }, Math.min(30000, 2000 * 2 ** (this._referenceUnconfirmedRetryAttempt - 1)));
+    }
+
+    _clearUnconfirmedReferenceRetry() {
+        clearTimeout(this._referenceUnconfirmedRetryTimer);
+        this._referenceUnconfirmedRetryTimer = null;
+        this._referenceUnconfirmedRetryAttempt = 0;
+    }
+
+    /** Ids the Library held when an unconfirmed write settled, in the scope
+     *  the write adds to: References for a create, the target's members for
+     *  an add. */
+    _referenceOverlayKnownIds(overlay) {
+        if (overlay?.type === "create_reference") {
+            return new Set((this._references || []).map((entry) => String(entry?.reference_id || "")));
+        }
+        const target = (this._references || []).find((entry) =>
+            String(entry?.reference_id || "") === overlay?.reference_id);
+        return new Set((target?.members || []).map((entry) => String(entry?.member_id || "")));
+    }
+
+    /** Whether data read after an unconfirmed write shows it. Without a
+     *  committed id this is a match on what the write carried, among rows the
+     *  Library did not hold when the write settled. */
+    _unconfirmedReferenceOverlaySaved(overlay) {
+        const known = overlay?.knownIds instanceof Set ? overlay.knownIds : new Set();
+        if (overlay?.type === "create_reference") {
+            return (this._references || []).some((entry) =>
+                !known.has(String(entry?.reference_id || ""))
+                && String(entry?.name || "") === String(overlay.fields?.name || ""));
+        }
+        const target = (this._references || []).find((entry) =>
+            String(entry?.reference_id || "") === overlay?.reference_id);
+        const memberIds = (target?.members || []).map((entry) => String(entry?.member_id || ""));
+        if (overlay?.type === "create_member") {
+            return (target?.members || []).some((entry) =>
+                !known.has(String(entry?.member_id || ""))
+                && String(entry?.asset_id || "") === String(overlay.fields?.asset_id || ""));
+        }
+        return JSON.stringify(memberIds) === JSON.stringify(overlay?.member_ids || []);
+    }
+
+    _dropReferenceOverlays(overlays) {
+        if (!overlays?.length) return;
+        this._referenceOverlays = this._referenceOverlays.filter((overlay) => !overlays.includes(overlay));
+    }
+
+    /** Called for every applied References payload, before anything renders.
+     *
+     *  A pending overlay is never removed here: its mutation owns it. An
+     *  acknowledged one leaves once a payload postdating its write applies —
+     *  any mutation's (the queue is serial, so a later write's payload includes
+     *  it) or a fetch sent after it settled — or once the data shows it anyway.
+     */
+    _pruneReferenceOverlays({ source = "fetch", requestSeq = 0, ownOverlays = null } = {}) {
+        if (!this._referenceOverlays.length) return;
+        const resolved = [];
+        this._referenceOverlays = this._referenceOverlays.filter((overlay) => {
+            if (ownOverlays?.includes(overlay)) return false;
+            if (overlay.state !== "acknowledged") return true;
+            if (source === "mutation" || requestSeq > overlay.clearAfterSeq) {
+                if (overlay.status === "unconfirmed") resolved.push(overlay);
+                return false;
+            }
+            return !referenceOverlayReflected(this._references, overlay);
+        });
+        // An unconfirmed write is decided now. Say so when it did not land —
+        // otherwise its row just vanishes — and let the Library hand the draft
+        // back. After the payload has fully applied, so the Library renders it.
+        for (const overlay of resolved) {
+            const saved = this._unconfirmedReferenceOverlaySaved(overlay);
+            if (!saved) {
+                notifyWarning("A Reference Library change was not saved.", {
+                    source: "reference-library-unconfirmed",
+                    detail: "Its answer never arrived, and the Library read afterwards does not contain it.",
+                });
+            }
+            if (typeof overlay.onUnconfirmedResolved === "function") {
+                queueMicrotask(() => overlay.onUnconfirmedResolved(saved));
+            }
+        }
     }
 
     async _materializeReferenceMemberHandle(...args) {
@@ -3076,6 +3309,9 @@ export class EditorWidget {
             getData: () => this._referenceLibraryData(),
             mutate: (operations) => this._withMutationGesture(
                 "referenceLibrary", () => this._mutateReferences(operations)),
+            // Create identity, add member and reorder paint before the server
+            // answers; every other Library write stays server-first.
+            mutatePaintFirst: (operations, options) => this._mutateReferencesPaintFirst(operations, options),
             confirm: (message) => window.confirm(message),
             pickAsset: ({ assetType, currentAssetId, onPick }) => this._showImagePicker({
                 title: `Choose ${assetType} reference`,
@@ -24536,6 +24772,10 @@ export class EditorWidget {
         this._referencesError = "";
         this._referenceMediaEditorHandle?.destroy?.();
         this._referenceMediaEditorHandle = null;
+        // Overlays belong to the old project's writes; their settle handlers
+        // check the project before touching these.
+        this._referenceOverlays = [];
+        this._clearUnconfirmedReferenceRetry();
         this._referenceLibraryHandle?.reset?.();
         this._referencePanelHandle?.close?.();
         this._queueBatchExpanded = {};
@@ -25960,6 +26200,7 @@ export class EditorWidget {
             this._referenceLibraryHandle = null;
             this._referenceLibraryEl = null;
         }
+        this._clearUnconfirmedReferenceRetry();
         if (this._referenceMediaEditorHandle) {
             this._referenceMediaEditorHandle.destroy();
             this._referenceMediaEditorHandle = null;

@@ -452,6 +452,120 @@ export function filterReferences(references = [], query = "", assets = [], catal
     });
 }
 
+/** Library writes that paint before the server answers. Update/delete stay
+ *  server-first: their exact-prior-value guards read what the author saw, and
+ *  an overlay over a row the server may still refuse would be read as that. */
+export const PAINT_FIRST_REFERENCE_OPERATIONS = Object.freeze(new Set([
+    "create_reference", "create_member", "reorder_members"]));
+
+/** Describe one paint-first operation as a display overlay, or null.
+ *
+ *  `key` doubles as the temporary id of the row a create paints (`pending:<n>`);
+ *  it never reaches the server and no request can name it, which is why every
+ *  pending row is inert.
+ */
+export function referenceOverlayFromOperation(operation, key) {
+    const type = String(operation?.type || "");
+    if (!PAINT_FIRST_REFERENCE_OPERATIONS.has(type)) return null;
+    return {
+        key: String(key),
+        type,
+        reference_id: String(operation?.reference_id || ""),
+        fields: operation?.fields && typeof operation.fields === "object"
+            ? structuredClone(operation.fields) : {},
+        member_ids: Array.isArray(operation?.member_ids)
+            ? operation.member_ids.map(String) : [],
+        status: "saving",
+        committedId: "",
+    };
+}
+
+/** The Library as displayed: acknowledged References plus pending overlays.
+ *
+ *  Pure and view-only. Nothing is written back into `references`; the host
+ *  keeps the server's payload as the only authority and every other consumer
+ *  (staging, Attach, pickers, prompt compilation) reads that, never this.
+ *  Rolling a failed write back is therefore just dropping its overlay.
+ *
+ *  Overlays apply in authoring order, which is the queue's send order, so the
+ *  displayed order is what the server will hold once they all land. Painted
+ *  rows carry `pendingStatus`; untouched References keep their identity.
+ */
+export function applyPendingReferenceOverlays(references = [], overlays = []) {
+    const result = Array.isArray(references) ? [...references] : [];
+    for (const overlay of Array.isArray(overlays) ? overlays : []) {
+        if (overlay?.type === "create_reference") {
+            const kind = VALID_KINDS.has(overlay.fields?.kind) ? overlay.fields.kind : "character";
+            result.push({
+                description: "",
+                visual_intent: "preserve",
+                audio_intent: "reference_characteristics",
+                reference_class: defaultReferenceClass(kind),
+                ...overlay.fields,
+                kind,
+                reference_id: overlay.key,
+                members: [],
+                pendingStatus: overlay.status || "saving",
+            });
+            continue;
+        }
+        const index = result.findIndex((reference) =>
+            String(reference?.reference_id || "") === overlay?.reference_id);
+        // The target is gone from acknowledged data (deleted elsewhere): the
+        // write will be refused, so there is nothing truthful to paint.
+        if (index < 0) continue;
+        const reference = result[index];
+        const members = Array.isArray(reference.members) ? reference.members : [];
+        if (overlay.type === "create_member") {
+            // `order = len(members)`, as `_apply_create_reference_member` assigns.
+            result[index] = {
+                ...reference,
+                members: [...members, {
+                    tags: [], prompt: "", crop: null, source_start_sec: 0, source_end_sec: null,
+                    ...overlay.fields,
+                    member_id: overlay.key,
+                    order: members.length,
+                    pendingStatus: overlay.status || "saving",
+                }],
+            };
+        } else if (overlay.type === "reorder_members") {
+            const byId = new Map(members.map((member) => [String(member?.member_id || ""), member]));
+            const desired = overlay.member_ids.filter((id) => byId.has(id));
+            const placed = new Set(desired);
+            const ordered = [
+                ...desired.map((id) => byId.get(id)),
+                ...members.filter((member) => !placed.has(String(member?.member_id || ""))),
+            ];
+            // Dense `order`, as the route rewrites it: a Remove authored against
+            // this order is checked by the server after the reorder has landed.
+            result[index] = { ...reference, members: denseMemberOrder(ordered) };
+        }
+    }
+    return result;
+}
+
+/** True once acknowledged References already show what this create painted.
+ *
+ *  Only a committed id the server returned counts. A reorder never qualifies:
+ *  an order can match by coincidence — Up then Down restores it — so a later
+ *  reorder would leave ahead of an earlier one and the display would show an
+ *  order the server does not hold. It waits for a payload that postdates it.
+ */
+export function referenceOverlayReflected(references = [], overlay = null) {
+    const list = Array.isArray(references) ? references : [];
+    if (overlay?.type === "create_reference") {
+        return !!overlay.committedId && list.some((reference) =>
+            String(reference?.reference_id || "") === overlay.committedId);
+    }
+    const reference = list.find((entry) =>
+        String(entry?.reference_id || "") === overlay?.reference_id);
+    const memberIds = (reference?.members || []).map((member) => String(member?.member_id || ""));
+    if (overlay?.type === "create_member") {
+        return !!overlay.committedId && memberIds.includes(overlay.committedId);
+    }
+    return false;
+}
+
 export function shouldApplyReferenceResponse({ requestedProject, currentProject, requestGeneration, currentGeneration }) {
     return !!requestedProject
         && requestedProject === currentProject

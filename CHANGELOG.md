@@ -14,8 +14,10 @@ a fresh `[Unreleased]` block.
 ### Changed
 - The Guides popup responds at once: a strength change, Hide/Show or frame change shows on the timeline and in the popup immediately and saves in the background, instead of waiting for the save and a full scene reload. A change that cannot be saved returns to the saved value with a message, and a strength or Hide right after moving the same guide's frame is no longer refused as stale.
 - The asset gallery responds at once: favorite (S), rename, move to folder, Move to Trash and Restore, single or bulk, show immediately instead of after a save and a full asset-list reload. Trash still asks first when an asset is in use or a favorite. A change that cannot be saved returns to the saved value; one whose answer never arrives says it could not be confirmed and reloads the list.
+- The Reference Library responds at once: a new Reference, a new member and Up/Down show immediately, marked "Saving…" until saved, and the create form closes on Save. A change that is refused disappears again and hands the form back with its text; one whose answer never arrives stays marked "Not confirmed" until the Library can be read again. Pressing Up or Down several times in a row now applies every press instead of refusing the second, and the Library no longer blanks to "Loading references…" while it refreshes.
 
 ### Fixed
+- A Reference Library change could stay hidden after it had saved when another Library read was in flight at the same moment; it now shows once saved.
 - A Reference lane recipe edit made while the previous one was still saving is no longer silently discarded. Recipe fields now update at once, and a change that cannot be saved returns to the saved value with a message, even when the server is unreachable.
 
 ## [0.7.0] - 2026-09-25

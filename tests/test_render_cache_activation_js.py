@@ -193,6 +193,7 @@ class Host {{
   _fetchScenes() {{}}
   _fetchReferences() {{}}
   _renderTimeline() {{}}
+  _clearUnconfirmedReferenceRetry() {{}}
   {methods}
   {update_project}
 }}
