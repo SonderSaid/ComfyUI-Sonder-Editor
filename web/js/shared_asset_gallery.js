@@ -893,6 +893,9 @@ export function mountSharedAssetGallery(container, options = {}) {
             overlayEl: null,
             // The single-view <img> currently on screen, carried under the next render's.
             stageImage: null,
+            // Each compare side's media on screen ({ A, B }: an <img>, or a <video>
+            // on its current frame), carried under the next compare render's.
+            compareStageMedia: null,
             cleanupFns: [],
             compareMode: false,
             showMetadata: false,
@@ -1340,6 +1343,47 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     const IMAGE_REVEAL_FADE_MS = 140;
+    // The longest a new compare video stays hidden over its side's previous frame.
+    const VIDEO_UNDERLAY_MAX_MS = 3000;
+
+    /**
+     * A new <video> stays invisible over `underlay` (the side's previous video,
+     * paused on its frame) until it can paint a frame of its own and any
+     * restore seek has landed; then the underlay leaves and `onShown` runs.
+     * Its own black background would otherwise cover the underlay while it
+     * loads. An error, or VIDEO_UNDERLAY_MAX_MS, ends the hold, so a stale
+     * frame never outlives the load. Returns a cleanup that leaves the DOM
+     * alone: a rebuild discards both elements' parent anyway.
+     */
+    function holdVideoOverUnderlay(layer, underlay, onShown = null) {
+        if (!underlay) return () => {};
+        layer.style.opacity = "0";
+        let done = false;
+        const events = ["loadeddata", "canplay", "seeked", "error"];
+        const detach = () => {
+            clearTimeout(timer);
+            for (const name of events) layer.removeEventListener(name, check);
+        };
+        const finish = () => {
+            if (done) return;
+            done = true;
+            detach();
+            layer.style.opacity = "";
+            underlay.remove();
+            onShown?.();
+        };
+        function check(event) {
+            if (event?.type === "error" || (layer.readyState >= 2 && !layer.seeking)) finish();
+        }
+        const timer = setTimeout(finish, VIDEO_UNDERLAY_MAX_MS);
+        for (const name of events) layer.addEventListener(name, check);
+        check();
+        return () => {
+            if (done) return;
+            done = true;
+            detach();
+        };
+    }
 
     function revealImageAfterDecode(img, onReveal = null, onError = null) {
         let cancelled = false;
@@ -4659,6 +4703,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         if (!state.overlayState.open) return;
         clearOverlayRuntime();
         state.overlayState.stageImage = null;
+        state.overlayState.compareStageMedia = null;
         state.overlayState.open = false;
         state.overlayState.assetId = "";
         state.overlayState.origin = "gallery";
@@ -5731,7 +5776,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         return { el: chip, refresh };
     }
 
-    function renderCompareOverlay(asset, host) {
+    function renderCompareOverlay(asset, host, carriedMedia = null) {
         const candidates = sameTypeOverlayAssets(asset);
         // renderInspectOverlay resolved both slots and wrote them back.
         const compareA = candidates.find((entry) => entry.asset_id === state.overlayState.compareLeftAssetId) || asset;
@@ -5910,6 +5955,9 @@ export function mountSharedAssetGallery(container, options = {}) {
             layerB.style.cssText = mediaStyle;
             layerA.draggable = false;
             layerB.draggable = false;
+            // What each side shows; the next compare render carries it.
+            const shownMedia = { A: null, B: null };
+            state.overlayState.compareStageMedia = shownMedia;
             if (asset.asset_type === "image") {
                 layerA.alt = assetDisplayName(compareA);
                 layerB.alt = assetDisplayName(compareB);
@@ -5930,27 +5978,70 @@ export function mountSharedAssetGallery(container, options = {}) {
             const contentGroupA = style(document.createElement("div"), groupStyle);
             const contentGroupB = style(document.createElement("div"), groupStyle);
             if (asset.asset_type === "image") {
-                applyThumbnailPlaceholder(contentGroupA, compareA);
-                applyThumbnailPlaceholder(contentGroupB, compareB);
-                state.overlayState.cleanupFns.push(
-                    configureDecodedImage(layerA, compareA, { highPriority: true, placeholderSurface: contentGroupA }),
-                    configureDecodedImage(layerB, compareB, { highPriority: true, placeholderSurface: contentGroupB }),
-                );
+                // Every compare rebuild (a pick, an arrow, a star that changes the
+                // pair) makes new layers. The image each side showed holds its box
+                // until the new one has faded in over it, as the single view does:
+                // a side that kept its asset shows no change, and neither side
+                // drops to its thumbnail, whose rounded aspect draws a hair
+                // smaller or larger than the image.
+                for (const [side, sideAsset, layer, group] of [["A", compareA, layerA, contentGroupA],
+                                                               ["B", compareB, layerB, contentGroupB]]) {
+                    const carried = carriedMedia?.[side];
+                    const underlay = carried?.tagName === "IMG" && carried.complete && carried.naturalWidth > 0
+                        ? carried : null;
+                    if (underlay) {
+                        underlay.decoding = "sync";
+                        underlay.style.cssText = mediaStyle;
+                        Object.assign(underlay.style, { transition: "none", opacity: "1" });
+                        group.appendChild(underlay);
+                    } else {
+                        applyThumbnailPlaceholder(group, sideAsset);
+                    }
+                    shownMedia[side] = underlay;
+                    state.overlayState.cleanupFns.push(configureDecodedImage(layer, sideAsset, {
+                        highPriority: true,
+                        placeholderSurface: group,
+                        onShown: () => {
+                            underlay?.remove();
+                            shownMedia[side] = layer;
+                        },
+                        // Never leave the previous asset standing in for one that failed to load.
+                        onFailed: () => {
+                            underlay?.remove();
+                            shownMedia[side] = null;
+                        },
+                    }));
+                }
             } else {
                 // Per side: an undecodable layer shows its server still instead of a
                 // black rectangle. The placeholder sits on the content group, so the
                 // divider/side-by-side geometry is untouched.
-                for (const [sideAsset, layer, group] of [[compareA, layerA, contentGroupA],
-                                                         [compareB, layerB, contentGroupB]]) {
+                for (const [side, sideAsset, layer, group] of [["A", compareA, layerA, contentGroupA],
+                                                               ["B", compareB, layerB, contentGroupB]]) {
                     if (shouldSkipVideoLoad(sideAsset)) {
                         applyThumbnailPlaceholder(group, sideAsset);
                         layer.style.display = "none";
                     } else {
-                        state.overlayState.cleanupFns.push(watchVideoDecodeFailure(layer, () => {
-                            layer.pause();
-                            layer.style.display = "none";
-                            applyThumbnailPlaceholder(group, sideAsset);
-                        }));
+                        // The side's previous video holds its box on its frame (paused
+                        // and muted by the teardown) until the new one can show one.
+                        const carried = carriedMedia?.[side];
+                        const underlay = carried?.tagName === "VIDEO" && carried.readyState >= 2 && carried.videoWidth > 0
+                            ? carried : null;
+                        if (underlay) {
+                            underlay.muted = true;
+                            underlay.style.cssText = mediaStyle;
+                            group.appendChild(underlay);
+                        }
+                        shownMedia[side] = underlay || layer;
+                        state.overlayState.cleanupFns.push(
+                            holdVideoOverUnderlay(layer, underlay, () => { shownMedia[side] = layer; }),
+                            watchVideoDecodeFailure(layer, () => {
+                                layer.pause();
+                                layer.style.display = "none";
+                                underlay?.remove();
+                                applyThumbnailPlaceholder(group, sideAsset);
+                            }),
+                        );
                     }
                 }
             }
@@ -6121,9 +6212,12 @@ export function mountSharedAssetGallery(container, options = {}) {
         const carriedMediaState = (typeof overlay.captureMediaState === "function")
             ? overlay.captureMediaState()
             : null;
-        // The image on screen before this rebuild; only a single-image render takes it.
+        // The image on screen before this rebuild; only a single-image render takes it,
+        // and each compare side's, which only an image compare render takes.
         const carriedImage = overlay.stageImage;
         overlay.stageImage = null;
+        const carriedCompareMedia = overlay.compareStageMedia;
+        overlay.compareStageMedia = null;
         clearOverlayRuntime();
         // Drop any prior re-render hooks tied to torn-down overlay sub-trees.
         // renderCompareOverlay / metadata panel mount will reinstall them as needed.
@@ -6377,7 +6471,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             const signature = compareStageSignature(asset.asset_type, overlay.compareLeftAssetId, overlay.compareRightAssetId);
             overlay.carriedMediaState = (carriedMediaState && overlay.mediaSignature === signature) ? carriedMediaState : null;
             overlay.mediaSignature = signature;
-            renderCompareOverlay(asset, mediaWrap);
+            renderCompareOverlay(asset, mediaWrap, carriedCompareMedia);
         } else {
             const signature = `s:${asset.asset_id}`;
             overlay.carriedMediaState = (carriedMediaState && overlay.mediaSignature === signature) ? carriedMediaState : null;

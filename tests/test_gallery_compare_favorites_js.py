@@ -859,3 +859,57 @@ def test_a_failure_a_later_write_answers_stays_quiet_and_the_last_one_speaks():
         await fail(httpError(500));
         assert.ok(toasts.some((t) => t.tier === 'error' && t.message === 'Failed to update favorite.'));
     """)
+
+
+# ── Compare rebuilds carry each side's media ──────────────────────────────
+
+
+def test_a_new_compare_video_stays_hidden_over_the_old_frame_until_it_has_its_own():
+    source = GALLERY.read_text(encoding="utf-8")
+    cap = re.search(r"^    const VIDEO_UNDERLAY_MAX_MS = \d+;$", source, re.M)[0]
+    helper = _gallery_function(source, "holdVideoOverUnderlay")
+    _run_gesture_node(cap + "\n" + helper + """
+        const video = () => Object.assign(new EventTarget(), { readyState: 0, seeking: false, style: {} });
+        const under = () => ({ removed: false, remove() { this.removed = true; } });
+        // Waits for a frame, and for a restore seek to land.
+        let layer = video(), old = under(), shown = 0;
+        holdVideoOverUnderlay(layer, old, () => { shown += 1; });
+        assert.equal(layer.style.opacity, '0');
+        layer.readyState = 1;
+        layer.dispatchEvent(new Event('canplay'));
+        assert.equal(old.removed, false);
+        layer.readyState = 4; layer.seeking = true;
+        layer.dispatchEvent(new Event('loadeddata'));
+        assert.equal(old.removed, false);
+        layer.seeking = false;
+        layer.dispatchEvent(new Event('seeked'));
+        assert.deepEqual([old.removed, layer.style.opacity, shown], [true, '', 1]);
+        layer.dispatchEvent(new Event('seeked'));
+        assert.equal(shown, 1);
+        // A load error ends the hold rather than leaving the old frame.
+        layer = video(); old = under();
+        holdVideoOverUnderlay(layer, old);
+        layer.dispatchEvent(new Event('error'));
+        assert.equal(old.removed, true);
+        // A rebuild's cleanup stops listening without touching the DOM.
+        layer = video(); old = under();
+        const stop = holdVideoOverUnderlay(layer, old);
+        stop();
+        layer.readyState = 4;
+        layer.dispatchEvent(new Event('loadeddata'));
+        assert.deepEqual([old.removed, layer.style.opacity], [false, '0']);
+        // Nothing to hold: the new video shows as it loads.
+        layer = video();
+        holdVideoOverUnderlay(layer, null);
+        assert.equal(layer.style.opacity, undefined);
+    """)
+
+
+def test_each_compare_render_hands_its_on_screen_media_to_the_next():
+    source = GALLERY.read_text(encoding="utf-8")
+    render = _gallery_function(source, "renderInspectOverlay")
+    assert render.index("const carriedCompareMedia = overlay.compareStageMedia;") \
+        < render.index("clearOverlayRuntime();")
+    assert "renderCompareOverlay(asset, mediaWrap, carriedCompareMedia);" in render
+    close = _gallery_function(source, "closeInspectOverlay")
+    assert "state.overlayState.compareStageMedia = null;" in close
