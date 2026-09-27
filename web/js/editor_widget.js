@@ -19396,7 +19396,6 @@ export class EditorWidget {
                 ["Ctrl+Y", "Redo"],
                 ["Ctrl+Shift+Z", "Redo"],
                 ["Ctrl+V", "Paste"],
-                ["Panel open", "Prompt, Guide or Reference Lane panel: only Undo / Redo reach the timeline"],
             ]) +
             this._shortcutSection("Prompt", [
                 ["Right-click prompt", "Open the insert menu where you clicked"],
