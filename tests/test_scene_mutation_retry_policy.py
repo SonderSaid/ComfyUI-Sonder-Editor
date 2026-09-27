@@ -644,7 +644,8 @@ def _run_widget_node(body: str) -> None:
                 _renderSceneAfterLocalMutation: () => {{}},
                 _renderTimeline: () => {{}}, _renderViewportFrame: () => {{}},
                 _runVersionedProjectMutation: async (path, init, options) => {{
-                    sent.push({{ operations: JSON.parse(init.body).operations, options }});
+                    sent.push({{ operations: JSON.parse(init.body).operations, options,
+                        headers: init.headers || {{}} }});
                     return {{ payload: {{ status: 'ok' }} }};
                 }},
             }});

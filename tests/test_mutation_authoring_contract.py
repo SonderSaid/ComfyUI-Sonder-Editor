@@ -39,7 +39,8 @@ OBLIGATIONS = {
         REG + "test_the_guard_contracts_still_match_the_code")),
     "operation.addressing": ("SCENE_MUTATION_ADDRESSING", (
         "test_scene_mutation_retry_policy.py::test_every_dispatcher_operation_is_classified",
-        "test_scene_mutation_retry_policy.py::test_the_retryable_set_under_a_best_case_payload_is_pinned")),
+        "test_scene_mutation_retry_policy.py::test_the_retryable_set_under_a_best_case_payload_is_pinned",
+        "test_scene_mutation_addressing_parity.py::test_both_tables_classify_exactly_the_dispatcher_operations")),
     "operation.collapse": ("SCENE_MUTATION_COALESCING", (
         "test_scene_mutation_coalescing_policy.py::test_every_dispatcher_operation_carries_a_decision",)),
     "operation.scene-only": ("_SCENE_ONLY_MUTATIONS (listed operations only)", (
@@ -1263,8 +1264,9 @@ def test_severing_any_single_claim_link_fails_the_contract(old, new, count, mess
 # Each scope names the reproduced transform, not every export in the JS module.
 # Embedded UI transforms (e.g. prompt_context_chips.normalizePromptDocument)
 # still owe parity under the workflow, but are outside this leaf inventory.
-# Coalescing has dispatcher-equivalence tests, not a server coalescer twin;
-# addressing has no server twin yet. Neither belongs in this list.
+# Coalescing has dispatcher-equivalence tests, not a server coalescer twin, so
+# it does not belong in this list. Addressing gained its server twin with the
+# scene-mutation commit (cut-read-fanout Phase 1) and is listed below.
 # Header form: // @server-mirror relative/python_file.py::symbol
 # Authority citations and test references prove existence, never semantic coverage.
 MIRRORED_MODULES = {
@@ -1413,6 +1415,16 @@ MIRRORED_MODULES = {
             "test_the_painted_row_matches_the_stored_row_field_for_field",
             "test_a_stored_member_round_trips_through_an_append_unchanged")),
     },
+    "scene_mutation_addressing.js": {
+        "scope": ("Per-operation addressing class, promotion guards, payload refinements "
+                  "and the batch re-application policy, not the traced evidence prose."),
+        "authorities": tuple("server/scene_mutation_addressing.py::" + name for name in (
+            "SCENE_MUTATION_ADDRESSING", "scene_mutation_retry_evidence", "derive_batch_addressing")),
+        "tests": tuple("test_scene_mutation_addressing_parity.py::" + name for name in (
+            "test_the_tables_agree_entry_by_entry", "test_the_shared_constants_agree",
+            "test_every_decision_agrees_across_the_battery",
+            "test_batch_addressing_matches_the_browser_batch_policy")),
+    },
     "scene_split_geometry.js": {
         "scope": "Clip/audio split-half geometry and source-duration sentinel semantics, not link repartition.",
         "authorities": ("server/routes.py::_split_clip_object", "server/routes.py::_split_audio_object"),
@@ -1484,7 +1496,7 @@ def test_declared_mirror_headers_match_the_inventory_both_ways():
 
 def test_every_declared_mirror_has_a_live_parity_disposition():
     _assert_mirror_obligations(MIRRORED_MODULES, ROOT)
-    assert sum(len(row["authorities"]) for row in MIRRORED_MODULES.values()) == 45
+    assert sum(len(row["authorities"]) for row in MIRRORED_MODULES.values()) == 48
 
 @pytest.mark.parametrize("name, valid", [("TABLE", True), ("row", False), ("transform", True)])
 def test_mirror_authorities_are_module_declarations(tmp_path, name, valid):

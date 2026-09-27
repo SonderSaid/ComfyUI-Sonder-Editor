@@ -1,3 +1,7 @@
+// @server-mirror server/scene_mutation_addressing.py::SCENE_MUTATION_ADDRESSING
+// @server-mirror server/scene_mutation_addressing.py::scene_mutation_retry_evidence
+// @server-mirror server/scene_mutation_addressing.py::derive_batch_addressing
+// Scope and parity disposition: tests/test_mutation_authoring_contract.py::MIRRORED_MODULES
 import { descriptorForLaneType } from "./lane_registry.js";
 
 /**
@@ -40,12 +44,26 @@ import { descriptorForLaneType } from "./lane_registry.js";
  *
  * Deliberately NOT a mutation registry. The decision in
  * `architecture.md#scene-mutation-authoring` retains each policy's ownership;
- * this module declares one property of one policy. The server-side twin — teaching
- * `_apply_scene_mutations_sync` the `addressing="identity"|"positional"` shape
- * `_apply_project_versioned_sync` already has — is the roadmap execution-queue
- * item for bare project writes, and it consumes this table under a parity test
- * written at that landing.
+ * this module declares one property of one policy. Its server twin,
+ * `server/scene_mutation_addressing.py`, decides the `addressing=` the scene
+ * mutation route commits under, so the server re-applies a batch after a lost
+ * save race exactly when this table would let the browser re-send it.
+ * `tests/test_scene_mutation_addressing_parity.py` holds the two to one table of
+ * payloads; the traced evidence below stays here, where its citations are
+ * checked. Change both sides together.
  */
+
+/**
+ * A caller may DECLINE a replay the addressing would grant, for a reason the
+ * addressing cannot see (a whole-array payload built to be replanned rather than
+ * re-applied). `_runSceneMutation` sends this header with this value whenever it
+ * will not re-send the batch itself, so the server does not re-apply it either.
+ * It can only demote: the server derives its own policy from the operations and
+ * ignores the header for any other value. Mirrored in
+ * `server/scene_mutation_addressing.py`.
+ */
+export const REPLAY_DECLINED_HEADER = "X-Sonder-Mutation-Replay";
+export const REPLAY_DECLINED_VALUE = "declined";
 
 /** The row a request names is the same row in any version. */
 export const DURABLE = "durable";
@@ -496,7 +514,11 @@ function perItemEvidence(operation) {
             reason: "no items to decide on" };
     }
     for (const item of items) {
-        const identity = PER_ITEM_IDENTITY[String(item?.type || "")];
+        // Own properties only: `constructor` or `__proto__` would otherwise
+        // resolve an inherited Object.prototype member and throw below.
+        const memberType = String(item?.type || "");
+        const identity = Object.hasOwn(PER_ITEM_IDENTITY, memberType)
+            ? PER_ITEM_IDENTITY[memberType] : null;
         if (!identity) {
             return { addressing: PER_ITEM, retryable: false,
                 reason: `member type "${String(item?.type || "")}" is not classified` };
@@ -531,7 +553,8 @@ function perItemEvidence(operation) {
  */
 export function sceneMutationRetryEvidence(operation) {
     const type = String(operation?.type || "");
-    const entry = SCENE_MUTATION_ADDRESSING[type];
+    const entry = Object.hasOwn(SCENE_MUTATION_ADDRESSING, type)
+        ? SCENE_MUTATION_ADDRESSING[type] : null;
     if (!entry) {
         return { type, addressing: "", retryable: false,
             reason: "operation type is not classified" };

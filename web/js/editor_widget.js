@@ -469,7 +469,9 @@ import {
     trackTypeForClip,
     variableLaneTypeFor,
 } from "./lane_registry.js";
-import { deriveRetryOnConflict } from "./scene_mutation_addressing.js";
+import {
+    deriveRetryOnConflict, REPLAY_DECLINED_HEADER, REPLAY_DECLINED_VALUE,
+} from "./scene_mutation_addressing.js";
 import { coalesceSceneMutationIntents } from "./scene_mutation_coalescing.js";
 import {
     splitClipGeometry, splitAudioGeometry, mintSplitHalfId, splitHalfIdKey,
@@ -4930,6 +4932,10 @@ export class EditorWidget {
                         method: "POST",
                         headers: { "Content-Type": "application/json",
                             ...this._mutationDiagnosticHeaders(diagnostics),
+                            // A batch this client will not re-send must not be
+                            // re-applied by the server either; the header can
+                            // only demote the server's own derivation.
+                            ...(retry ? {} : { [REPLAY_DECLINED_HEADER]: REPLAY_DECLINED_VALUE }),
                             ...(expectedModifiedAt
                                 ? { "If-Match": expectedModifiedAt } : {}) },
                         body: JSON.stringify({ operations: queuedIntent.operations }),

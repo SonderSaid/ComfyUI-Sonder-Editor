@@ -173,7 +173,7 @@ def test_add_clip_dual_drop_and_audio_route_match_effective_scene_fps(tmp_path, 
     project = TimelineProject(project_dir=str(tmp_path), fps=24.0, scenes=[scene], assets=[video, derived_audio])
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda _request: project)
     monkeypatch.setattr(route_module, "_prepare_video_audio_asset", lambda *_args: derived_audio)
-    monkeypatch.setattr(route_module, "save_project", lambda _project: None)
+    monkeypatch.setattr(route_module, "save_project", lambda _project, **_kwargs: None)
 
     handler = _route_handler(
         route_module, "POST",
@@ -202,7 +202,7 @@ def test_add_audio_track_route_uses_scene_override(tmp_path, monkeypatch):
     audio = Asset(asset_id="audio", asset_type="audio", path="media/audio.wav", duration_sec=23.0)
     project = TimelineProject(project_dir=str(tmp_path), fps=24.0, scenes=[scene], assets=[audio])
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda _request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda _project: None)
+    monkeypatch.setattr(route_module, "save_project", lambda _project, **_kwargs: None)
     handler = _route_handler(
         route_module, "POST",
         "/sonder-editor/project/{project_id}/scenes/{scene_id}/mutations")
@@ -313,7 +313,7 @@ def test_legacy_scene_put_retimes_and_returns_queue_refusal(tmp_path, monkeypatc
     scene.clips = [ClipReference(timeline_start_frame=300, timeline_end_frame=600, source_out_frame=300, total_source_frames=300)]
     project = TimelineProject(project_dir=str(tmp_path), fps=24.0, scenes=[scene])
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda _request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda _project: None)
+    monkeypatch.setattr(route_module, "save_project", lambda _project, **_kwargs: None)
     handler = _route_handler(route_module, "PUT", "/sonder-editor/project/{project_id}/scenes/{scene_id}")
 
     response = asyncio.run(handler(DummyRequest(match_info={"scene_id": "scene"}, body={"fps": 24.0})))

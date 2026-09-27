@@ -439,7 +439,13 @@ def test_prompt_context_candidate_create_and_compile_share_requested_template(mo
 
 def _apply_scene_operations(route_module, monkeypatch, project, scene_id, operations, saves):
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+    # The route commits through `_apply_project_versioned_sync`, which states
+    # the loaded version on every save and verifies it on a no-op. This project
+    # never touches disk, so both stand in for a commit nobody raced.
+    monkeypatch.setattr(route_module, "save_project",
+                        lambda saved_project, **_kwargs: saves.append(saved_project))
+    monkeypatch.setattr(route_module, "verify_project_version",
+                        lambda _project, **_kwargs: None)
     handler = _route_handler(
         route_module,
         "POST",
@@ -893,7 +899,7 @@ def test_scene_mutation_remove_lane_is_single_save_and_reindexes(monkeypatch, tm
     project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
     saves = []
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **_kwargs: saves.append(saved_project))
 
     handler = _route_handler(
         route_module,
@@ -933,7 +939,7 @@ def test_scene_mutation_guide_identity_mismatch_rejects_before_save(monkeypatch,
     project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
     saves = []
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **_kwargs: saves.append(saved_project))
 
     handler = _route_handler(
         route_module,
@@ -970,7 +976,7 @@ def test_scene_mutation_move_guide_replaces_destination_frame(monkeypatch, tmp_p
     project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
     saves = []
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **_kwargs: saves.append(saved_project))
 
     handler = _route_handler(
         route_module,
@@ -1025,7 +1031,7 @@ def test_scene_mutation_linked_move_propagates_to_mixed_items(monkeypatch, tmp_p
     project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
     saves = []
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **_kwargs: saves.append(saved_project))
 
     handler = _mutation_handler(route_module)
     response = asyncio.run(handler(DummyRequest(
@@ -1076,7 +1082,7 @@ def test_scene_mutation_linked_move_rejects_locked_member(monkeypatch, tmp_path)
     project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
     saves = []
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **_kwargs: saves.append(saved_project))
 
     handler = _mutation_handler(route_module)
     response = asyncio.run(handler(DummyRequest(
@@ -1124,7 +1130,7 @@ def test_scene_mutation_replace_clip_source_clamps_and_clears_generated_provenan
     ]
     saves = []
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **_kwargs: saves.append(saved_project))
 
     response = asyncio.run(_mutation_handler(route_module)(DummyRequest(
         match_info={"project_id": "proj", "scene_id": "scene-1"},
@@ -1178,7 +1184,7 @@ def test_scene_mutation_replace_audio_source_clamps_and_preserves_track_edits(mo
     ]
     saves = []
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **_kwargs: saves.append(saved_project))
 
     response = asyncio.run(_mutation_handler(route_module)(DummyRequest(
         match_info={"project_id": "proj", "scene_id": "scene-1"},
@@ -1217,7 +1223,7 @@ def test_scene_mutation_replace_source_rejects_invalid_replacement_assets(monkey
     ]
     saves = []
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **_kwargs: saves.append(saved_project))
     handler = _mutation_handler(route_module)
 
     wrong_type = asyncio.run(handler(DummyRequest(
@@ -1267,7 +1273,7 @@ def test_scene_mutation_update_clip_rejects_driver_lane_collision_atomically(mon
     project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
     saves = []
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **_kwargs: saves.append(saved_project))
 
     response = asyncio.run(_mutation_handler(route_module)(DummyRequest(
         match_info={"project_id": "proj", "scene_id": "scene-1"},
@@ -1316,7 +1322,7 @@ def test_scene_mutation_linked_split_rejects_driver_clip_atomically(monkeypatch,
     project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
     saves = []
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **_kwargs: saves.append(saved_project))
 
     response = asyncio.run(_mutation_handler(route_module)(DummyRequest(
         match_info={"project_id": "proj", "scene_id": "scene-1"},
@@ -1392,7 +1398,7 @@ def _split_scene_project(monkeypatch, route_module, tmp_path, *, linked=False):
     saves = []
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
     monkeypatch.setattr(route_module, "save_project",
-                        lambda saved_project: saves.append(saved_project))
+                        lambda saved_project, **_kwargs: saves.append(saved_project))
     return scene, clip, audio, saves
 
 
@@ -1735,7 +1741,7 @@ def test_the_prompt_split_inherits_the_anchor_bounds_check(monkeypatch, tmp_path
     saves = []
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
     monkeypatch.setattr(route_module, "save_project",
-                        lambda saved_project: saves.append(saved_project))
+                        lambda saved_project, **_kwargs: saves.append(saved_project))
 
     def split(frame):
         return asyncio.run(_mutation_handler(route_module)(DummyRequest(
@@ -1765,7 +1771,7 @@ def test_scene_mutation_create_prompt_section_returns_reconciled_scene(monkeypat
     project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
     saves = []
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **_kwargs: saves.append(saved_project))
 
     handler = _route_handler(
         route_module,
@@ -1811,7 +1817,7 @@ def _prompt_scene_project(monkeypatch, route_module, tmp_path, sections):
     project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
     saves = []
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **_kwargs: saves.append(saved_project))
     return scene, project, saves
 
 
@@ -2754,7 +2760,7 @@ def test_scene_mutation_update_lane_config_partial_fields(monkeypatch, tmp_path)
     project, scene = _lane_config_project(tmp_path)
     saves = []
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **_kwargs: saves.append(saved_project))
 
     response = asyncio.run(_mutations_handler(route_module)(DummyRequest(
         match_info={"project_id": "proj", "scene_id": "scene-1"},
@@ -2781,7 +2787,7 @@ def test_scene_mutation_update_lane_config_pads_short_config_list(monkeypatch, t
     project, scene = _lane_config_project(tmp_path)
     saves = []
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **_kwargs: saves.append(saved_project))
 
     # lane_count is 3 but the config list only has one entry: index 2 is a
     # legal lane whose config must be padded into existence.
@@ -2806,7 +2812,7 @@ def test_scene_mutation_update_lane_config_index_beyond_count_rejects(monkeypatc
     project, scene = _lane_config_project(tmp_path)
     saves = []
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **_kwargs: saves.append(saved_project))
 
     response = asyncio.run(_mutations_handler(route_module)(DummyRequest(
         match_info={"project_id": "proj", "scene_id": "scene-1"},
@@ -2828,7 +2834,7 @@ def test_scene_mutation_update_lane_config_fixed_tracks(monkeypatch, tmp_path):
     project, scene = _lane_config_project(tmp_path)
     saves = []
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **_kwargs: saves.append(saved_project))
 
     response = asyncio.run(_mutations_handler(route_module)(DummyRequest(
         match_info={"project_id": "proj", "scene_id": "scene-1"},
@@ -2849,7 +2855,7 @@ def test_scene_mutation_update_lane_config_unlocks_locked_lane(monkeypatch, tmp_
     project, scene = _lane_config_project(tmp_path)
     saves = []
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **_kwargs: saves.append(saved_project))
 
     # No lock gate: toggling `locked` itself must work on a locked lane.
     response = asyncio.run(_mutations_handler(route_module)(DummyRequest(
@@ -2871,7 +2877,7 @@ def test_scene_mutation_update_lane_config_unknown_lane_type_rejects(monkeypatch
     project, scene = _lane_config_project(tmp_path)
     saves = []
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **_kwargs: saves.append(saved_project))
 
     response = asyncio.run(_mutations_handler(route_module)(DummyRequest(
         match_info={"project_id": "proj", "scene_id": "scene-1"},
@@ -2892,7 +2898,7 @@ def test_scene_mutation_update_lane_config_multi_op_single_save(monkeypatch, tmp
     project, scene = _lane_config_project(tmp_path)
     saves = []
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **_kwargs: saves.append(saved_project))
 
     # Bulk header apply: several lanes toggled in ONE mutation batch/save.
     response = asyncio.run(_mutations_handler(route_module)(DummyRequest(

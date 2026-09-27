@@ -442,27 +442,31 @@ def _write_from_another_process(project_dir, name):
 
 
 @pytest.mark.parametrize("operations,label", [
-    ([{"type": "update_scene_fields", "fields": {"width": 640}}],
+    # `update_lane_config` on a recipe-less variable family is positional
+    # (`scene_mutation_addressing`), so the batch gets exactly one attempt.
+    ([{"type": "update_lane_config", "lane_type": "video", "lane_index": 0,
+       "fields": {"name": "", "color": "", "locked": False, "hidden": False}}],
      "the skip path"),
-    ([{"type": "update_scene_fields", "fields": {"width": 640}},
+    ([{"type": "update_lane_config", "lane_type": "video", "lane_index": 0,
+       "fields": {"name": "", "color": "", "locked": False, "hidden": False}},
       {"type": "delete_link_group", "group_id": "none"}],
      "the save path"),
 ])
-def test_a_concurrent_write_inside_the_window_is_refused_either_way(
+def test_a_concurrent_write_inside_the_window_refuses_a_positional_batch(
         project_fixture, monkeypatch, operations, label):
     """The regression this landing introduced before it was caught, pinned.
 
     `_load_project_from_request` releases the project write lock before the
-    handler body runs, so `save_project`'s in-lock version re-check is the only
+    handler body runs, so the in-lock version re-check is the only
     compare-and-swap this route has. Dropping the write to save a no-op also
     dropped that check, and the probe was unambiguous: 200, `committed: false`,
     and a response scene still named `Scene` while the document said `Writer B`.
     `_reconcileActiveSceneFromMutation` adopts that with no version gate of its
     own and clears any deferred refresh, so nothing would have healed it.
 
-    Both paths are parametrised deliberately. The save path has always refused
-    here; the point of the test is that the skip path is indistinguishable from
-    it, now and after whatever changes next.
+    Both paths are parametrised deliberately: a positional batch has no retry,
+    so the skip path must refuse exactly as the save path does. The identity
+    branch re-applies instead; see the test below.
     """
     version = project_fixture.stored()["modified_at"]
     original = project_fixture.routes._batch_changes_only_the_scene
@@ -486,14 +490,24 @@ def test_a_concurrent_write_inside_the_window_is_refused_either_way(
         "the competing write must survive")
 
 
-def test_an_unguarded_no_op_no_longer_clobbers_a_concurrent_write(
-        project_fixture, monkeypatch):
-    """The half of the same window that L6 genuinely fixes.
+@pytest.mark.parametrize("if_match", [True, False], ids=["If-Match", "header-less"])
+@pytest.mark.parametrize("operations,label", [
+    ([{"type": "update_scene_fields", "fields": {"width": 640}}], "the skip path"),
+    ([{"type": "update_scene_fields", "fields": {"width": 640}},
+      {"type": "delete_link_group", "group_id": "none"}], "the save path"),
+])
+def test_a_concurrent_write_inside_the_window_re_applies_an_identity_batch(
+        project_fixture, monkeypatch, operations, label, if_match):
+    """An identity-addressed batch loses the race and is re-applied, not refused.
 
-    Without an `If-Match` there is no precondition to keep, so the skip is
-    unguarded either way -- but before L6 the no-op still rewrote the whole
-    document from a stale in-memory model and destroyed the competing write.
+    `update_scene_fields` names no row and `delete_link_group` a durable id, so
+    re-applying either to the reloaded document writes what the caller meant.
+    What must hold on both paths, with or without a header: the competing write
+    survives, and the response scene is the one the next reader loads -- never
+    the stale `Scene` the first attempt held. Before the batch went through the
+    versioned helper, the header-less no-op had no precondition at all.
     """
+    version = project_fixture.stored()["modified_at"]
     original = project_fixture.routes._batch_changes_only_the_scene
     fired = []
 
@@ -507,8 +521,10 @@ def test_an_unguarded_no_op_no_longer_clobbers_a_concurrent_write(
                         "_batch_changes_only_the_scene", hooked)
 
     status, payload = project_fixture.post(
-        [{"type": "update_scene_fields", "fields": {"width": 640}}])
-    assert status == 200
-    assert payload["committed"] is False
+        operations, if_match=version if if_match else "")
+    assert status == 200, label
+    assert len(fired) == 1
+    assert payload["scene"]["name"] == "Writer B", (
+        "the retry must answer from the reloaded document")
     assert load_project(
         project_fixture.project_dir).scenes[0].name == "Writer B"

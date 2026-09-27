@@ -47,7 +47,9 @@ def _run_node(script: str):
         # lifts their retry derivation with them: both post scene mutations
         # and derive the policy from the operations they are about to send.
         addressing = (ROOT / "web/js/scene_mutation_addressing.js").as_uri()
-        script = ("import { deriveRetryOnConflict } from "
+        # `_runSceneMutation` also stamps the demote-only replay header.
+        script = ("import { deriveRetryOnConflict, REPLAY_DECLINED_HEADER, "
+                  "REPLAY_DECLINED_VALUE } from "
                   + json.dumps(addressing) + ";" + chr(10)) + script
     if "projectErrorMessage(" in script:
         widget = _source("web/js/editor_widget.js")

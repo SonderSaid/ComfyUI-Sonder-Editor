@@ -322,12 +322,17 @@ def test_a_project_without_a_version_is_refused_rather_than_saved_unguarded(tmp_
     saves = []
     monkeypatch.setattr(routes, "save_project", lambda saved, **kwargs: saves.append(kwargs))
 
-    with pytest.raises(RuntimeError, match="modified_at"):
+    with pytest.raises(routes.ProjectMutationRequestError) as raised:
         routes._apply_project_versioned_sync(
             DummyRequest(match_info={"project_id": Path(project_dir).name}, method="POST"),
             lambda loaded: (True, {}), addressing="identity")
 
     assert saves == [], "an unguarded save must never be reached"
+    # A shaped refusal the route's own handler renders, carrying no path.
+    assert raised.value.code == "project_version_missing"
+    assert raised.value.status == 500
+    assert str(tmp_path) not in raised.value.message
+    assert Path(project_dir).name not in raised.value.message
 
 
 def test_a_version_conflict_409_carries_the_editor_security_headers(tmp_path, monkeypatch):

@@ -151,6 +151,7 @@ from . import prompt_context
 from . import frozen_prompt
 from . import minimax_h3
 from . import prompt_payload
+from . import scene_mutation_addressing
 from .guide_collision import resolve_execution_window, resolve_guide_collisions
 
 logger = logging.getLogger("sonder_editor")
@@ -2853,9 +2854,12 @@ def _validate_lane_removal_identity(scene: Scene, descriptor, lane_index: int,
     family with identical configs are indistinguishable to this guard: a removal
     below them followed by an append restores the count and matches the config,
     and the wrong lane is deleted. That is not closable from the request -- the
-    model holds no other lane identity -- and it is what a document version
-    precondition on `_apply_scene_mutations_sync` would close. The bug tracker
-    carries it against the execution-queue item that owns bare writes.
+    model holds no other lane identity. `_apply_scene_mutations_sync` now
+    commits against the version it loaded, which refuses a removal whose
+    document moved between that load and the commit; it does not close this,
+    because the lane the author meant is only pinned when the client's
+    `If-Match` is the version its document was read at. The bug tracker carries
+    the rest.
 
     Deliberately NOT guarded on the items the lane holds. Membership is lane
     content, not lane identity (`durable_rules.md`): an ordinary concurrent item
@@ -5296,7 +5300,41 @@ def _batch_changes_only_the_scene(operations: list) -> bool:
 
 
 def _apply_scene_mutations_sync(request: web.Request, scene_id: str, operations: list) -> tuple[TimelineProject, dict]:
-    project = _load_project_from_request(request)
+    """Apply one scene mutation batch under a compare-and-swap commit.
+
+    Every batch commits against the version THIS request loaded, whether or not
+    the client sent `If-Match`. A header-less caller, or one whose version map is
+    keyed by the other project-id spelling, used to reach a bare `save_project`
+    and could silently overwrite a concurrent writer's commit (measured 8/8 on a
+    306-asset project for the sibling `PUT /project`). Whether a lost save race
+    is re-applied follows the evidence in the operations themselves --
+    `scene_mutation_addressing.derive_batch_addressing`, the server twin of the
+    client's table -- never a flag passed beside them. A positional batch, which
+    includes every batch that can invoke media extraction, gets one attempt. A
+    caller that declined its own replay says so in a demote-only header, and the
+    server then declines too; the header cannot acquire one.
+    """
+    headers = getattr(request, "headers", None) or {}
+    replay_declined = str(
+        headers.get(scene_mutation_addressing.REPLAY_DECLINED_HEADER, "") or ""
+    ).strip().lower() == scene_mutation_addressing.REPLAY_DECLINED_VALUE
+    return _apply_project_versioned_sync(
+        request,
+        lambda project: _apply_scene_mutation_batch(project, scene_id, operations),
+        addressing=scene_mutation_addressing.derive_batch_addressing(
+            operations, replay_declined=replay_declined),
+        verify_unchanged=True,
+    )
+
+
+def _apply_scene_mutation_batch(project: TimelineProject, scene_id: str,
+                                operations: list) -> tuple[bool, dict]:
+    """Pure in-memory application of one batch to one loaded document.
+
+    Runs once per commit attempt, so everything it decides -- validation, the
+    no-op comparison, the response -- is recomputed against each reloaded
+    document rather than carried over from a document that lost the race.
+    """
     scene = project.get_scene(scene_id)
     if not scene:
         _mutation_error(f"Scene not found: {scene_id}", 404, "item_not_found")
@@ -5341,20 +5379,12 @@ def _apply_scene_mutations_sync(request: web.Request, scene_id: str, operations:
     _validate_single_driver_per_lane(scene)
 
     committed = scene_before is None or scene.to_dict() != scene_before
-    if committed:
-        save_project(project)
-    else:
-        # Not writing is not the same as having nothing to check. `save_project`
-        # re-compares the stored version inside the write lock, and that is the
-        # ONLY compare-and-swap this route has -- `_load_project_from_request`
-        # releases the lock before the handler body runs, so a second tab, the
-        # prompt worker or the generated-take merge lands in that window
-        # routinely. Dropping the write without keeping the check turned a
-        # detected 409 into a 200 carrying a scene the document never held,
-        # which `_reconcileActiveSceneFromMutation` adopts with no version gate
-        # and which also clears any deferred refresh that would have healed it.
-        # Probed end to end before this line existed.
-        verify_project_version(project)
+    # Not writing is not the same as having nothing to check: a skipped write
+    # still verifies the loaded version inside the write lock
+    # (`verify_unchanged`). `_load_project_from_request` releases the lock before
+    # this runs, so a second tab, the prompt worker or the generated-take merge
+    # lands in that window routinely, and dropping the check turned a detected
+    # 409 into a 200 carrying a scene the document never held.
     payload = {
         "status": "ok",
         "scene_id": scene_id,
@@ -5376,7 +5406,7 @@ def _apply_scene_mutations_sync(request: web.Request, scene_id: str, operations:
             dict(value) for value in project.prompt_context_profiles]
         payload["prompt_semantic_units"] = [
             dict(value) for value in project.prompt_semantic_units]
-    return project, payload
+    return committed, payload
 
 
 def _queue_job_from_body(body: dict) -> GenerationJob:
@@ -6027,6 +6057,7 @@ def _apply_project_versioned_sync(
     *,
     addressing: str = "positional",
     rebase_stale_precondition: bool = False,
+    verify_unchanged: bool = False,
 ):
     """Load, apply and commit one project mutation as a compare-and-swap.
 
@@ -6053,6 +6084,12 @@ def _apply_project_versioned_sync(
     is a deliberate tolerance for callers whose version legitimately lags through no
     fault of their own — see `_apply_queue_versioned_sync`, the only place it is set,
     for the reason and its limits.
+
+    `verify_unchanged` makes a no-op (`changed` false) re-check the loaded version
+    under the write lock instead of returning unchecked, and treats a mismatch as
+    the same conflict a save would raise, including the identity retry. The scene
+    mutation route sets it: its response hands the client a canonical scene, and
+    one from a document disk has already left is adopted with no gate of its own.
     """
     if addressing not in ("identity", "positional"):
         raise ValueError(f"addressing must be 'identity' or 'positional', got {addressing!r}")
@@ -6072,15 +6109,25 @@ def _apply_project_versioned_sync(
             # `save_project` only compares when this is truthy, so an empty version
             # would quietly downgrade this call to an unguarded write and make
             # `addressing` meaningless. Fail loudly instead: a project with no
-            # version cannot be committed under a precondition at all.
-            raise RuntimeError(
-                f"Project at {getattr(project, 'project_dir', '')!r} has no modified_at; "
-                "refusing to commit a versioned mutation without a precondition")
+            # version cannot be committed under a precondition at all. The path
+            # goes to the log only (`durable_rules.md`: never render a path).
+            logger.error("Project at %r has no modified_at; refusing to commit a "
+                         "versioned mutation without a precondition",
+                         getattr(project, "project_dir", ""))
+            _mutation_error("This project has no saved version, so the change cannot "
+                            "be committed safely.", 500, "project_version_missing")
         changed, payload = apply_fn(project)
-        if not changed:
-            _remember_request_project(request, project)
-            return project, payload
         try:
+            if not changed:
+                # A write skipped because nothing changed still owes its caller the
+                # precondition it would have been written under (`durable_rules.md`):
+                # the payload describes THIS loaded document, and a concurrent
+                # writer may have moved disk past it since the load. Opt-in, because
+                # the queue callers' tolerance of a stale version is deliberate.
+                if verify_unchanged:
+                    verify_project_version(project, expected_modified_at=base_modified_at)
+                _remember_request_project(request, project)
+                return project, payload
             save_project(project, expected_modified_at=base_modified_at)
             # A CAS retry replaces the object the request first remembered. The
             # version-header middleware must stamp the one that actually committed,
@@ -6090,6 +6137,19 @@ def _apply_project_versioned_sync(
         except ProjectVersionConflict as exc:
             if attempt >= max_attempts - 1:
                 raise
+            # A conflict the server absorbs never reaches the client's 409
+            # diagnostics, so the re-application is recorded here instead.
+            try:
+                record_diag_event(
+                    "project_versioned_reapply",
+                    project_id=str(getattr(project, "project_id", "") or ""),
+                    path=str(getattr(request, "path", "") or ""),
+                    attempt=attempt + 1,
+                    expected_modified_at=str(exc.expected_modified_at or ""),
+                    actual_modified_at=str(exc.actual_modified_at or ""),
+                )
+            except Exception:
+                logger.debug("versioned re-apply diag event failed", exc_info=True)
             project = _load_project_after_queue_conflict(exc, project)
     raise RuntimeError("Project mutation retry loop exhausted")
 

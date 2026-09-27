@@ -111,7 +111,7 @@ def test_saved_selection_routes_preserve_mask_offsets(tmp_path, monkeypatch):
     project = TimelineProject(project_dir=str(tmp_path / "project"), name="Project", scenes=[scene])
     saved_projects = []
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saved_projects.append(saved_project))
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **_kwargs: saved_projects.append(saved_project))
 
     post_handler = _route_handler(
         route_module,
@@ -443,7 +443,7 @@ def test_clip_put_round_trips_cross_lane_swap(tmp_path, monkeypatch):
     project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
 
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+    monkeypatch.setattr(route_module, "save_project", lambda project, **_kwargs: None)
 
     update_clip = _route_handler(
         route_module,
@@ -491,7 +491,7 @@ def test_clip_right_trim_extends_when_split_ceiling_allows(tmp_path, monkeypatch
     project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
 
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+    monkeypatch.setattr(route_module, "save_project", lambda project, **_kwargs: None)
 
     update_clip = _route_handler(
         route_module,
@@ -528,7 +528,7 @@ def test_dual_drop_skips_audio_when_video_asset_has_no_audio(tmp_path, monkeypat
     project.assets = [video_asset]
 
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+    monkeypatch.setattr(route_module, "save_project", lambda project, **_kwargs: None)
     monkeypatch.setattr(
         route_module,
         "_extract_audio_from_video",
@@ -573,7 +573,7 @@ def test_clip_post_rejects_video_asset_with_invalid_duration_metadata(tmp_path, 
     save_calls = []
 
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: save_calls.append(saved_project))
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **_kwargs: save_calls.append(saved_project))
 
     add_clip = _route_handler(
         route_module,
@@ -613,7 +613,7 @@ def test_audio_track_post_rejects_audio_asset_with_invalid_duration(tmp_path, mo
     save_calls = []
 
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: save_calls.append(saved_project))
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **_kwargs: save_calls.append(saved_project))
 
     add_audio = _route_handler(
         route_module,
@@ -704,7 +704,7 @@ def test_dual_drop_uses_target_audio_lane_lock_only(tmp_path, monkeypatch):
         return True
 
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+    monkeypatch.setattr(route_module, "save_project", lambda project, **_kwargs: None)
     monkeypatch.setattr(route_module, "_extract_audio_from_video", fake_extract)
     monkeypatch.setattr(route_module, "_get_audio_duration", lambda *_args, **_kwargs: 1.0)
     monkeypatch.setattr(route_module, "ensure_thumbnail", lambda *args, **kwargs: None)
@@ -759,7 +759,7 @@ def test_dual_drop_rejects_locked_target_audio_lane_before_clip_creation(tmp_pat
     save_calls = []
 
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda project: save_calls.append(project))
+    monkeypatch.setattr(route_module, "save_project", lambda project, **_kwargs: save_calls.append(project))
     monkeypatch.setattr(
         route_module,
         "_extract_audio_from_video",
@@ -812,7 +812,7 @@ def test_dual_drop_rejects_partial_audio_extraction(tmp_path, monkeypatch):
         return True
 
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+    monkeypatch.setattr(route_module, "save_project", lambda project, **_kwargs: None)
     monkeypatch.setattr(route_module, "_extract_audio_from_video", fake_extract)
     monkeypatch.setattr(
         route_module,
@@ -849,7 +849,7 @@ def test_scene_put_accepts_motion_driver_lane_config(tmp_path, monkeypatch):
     project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
 
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+    monkeypatch.setattr(route_module, "save_project", lambda project, **_kwargs: None)
 
     update_scene = _route_handler(
         route_module,
@@ -910,7 +910,7 @@ def test_scene_put_rejects_duplicate_driver_lane_state(tmp_path, monkeypatch):
     save_calls = []
 
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda project: save_calls.append(project))
+    monkeypatch.setattr(route_module, "save_project", lambda project, **_kwargs: save_calls.append(project))
 
     update_scene = _route_handler(
         route_module,
@@ -1175,7 +1175,7 @@ def test_scene_put_preserves_omitted_reference_lane_id_and_setup_binding(tmp_pat
         }], 'active_minimax_h3_setup_id': "setup"})
     project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+    monkeypatch.setattr(route_module, "save_project", lambda project, **_kwargs: None)
     update_scene = _route_handler(
         route_module, "PUT",
         "/sonder-editor/project/{project_id}/scenes/{scene_id}")
@@ -1218,7 +1218,7 @@ def test_scene_put_count_only_shrink_drops_removed_h3_population_lane(tmp_path, 
     )
     project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+    monkeypatch.setattr(route_module, "save_project", lambda project, **_kwargs: None)
     update_scene = _route_handler(
         route_module, "PUT",
         "/sonder-editor/project/{project_id}/scenes/{scene_id}")
@@ -2027,7 +2027,7 @@ def test_guide_swap_operation_swaps_frames_and_respects_lock(tmp_path, monkeypat
     project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
 
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+    monkeypatch.setattr(route_module, "save_project", lambda project, **_kwargs: None)
 
     operation = {"type": "swap_guides", "frame_index_a": 10, "frame_index_b": 20,
                  "expected_a": {"guide_id": scene.guide_frames[0].guide_id},
@@ -2068,7 +2068,7 @@ def test_clip_split_rejects_motion_driver_atomically(tmp_path, monkeypatch):
 
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
     save_calls = []
-    monkeypatch.setattr(route_module, "save_project", lambda project: save_calls.append(project))
+    monkeypatch.setattr(route_module, "save_project", lambda project, **_kwargs: save_calls.append(project))
 
     split_clip = _route_handler(
         route_module,
@@ -2116,7 +2116,7 @@ def _legacy_split_scene(tmp_path, monkeypatch, route_module):
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
     save_calls = []
     monkeypatch.setattr(route_module, "save_project",
-                        lambda saved: save_calls.append(saved))
+                        lambda saved, **_kwargs: save_calls.append(saved))
     handler = _route_handler(
         route_module,
         "POST",
@@ -2186,7 +2186,7 @@ def test_legacy_audio_split_route_keeps_working_and_gains_the_bounds_check(
     project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
     save_calls = []
-    monkeypatch.setattr(route_module, "save_project", lambda saved: save_calls.append(saved))
+    monkeypatch.setattr(route_module, "save_project", lambda saved, **_kwargs: save_calls.append(saved))
     handler = _route_handler(
         route_module,
         "POST",
@@ -2293,7 +2293,7 @@ def test_delete_last_clip_compacts_empty_video_lane(tmp_path, monkeypatch):
     project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
 
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+    monkeypatch.setattr(route_module, "save_project", lambda project, **_kwargs: None)
 
     # Clip deletion moved to the scene mutations pipeline in 0.6.0 and the
     # standalone DELETE route was retired; lane compaction is what is under test.
@@ -2327,7 +2327,7 @@ def test_delete_clip_preserve_lane_keeps_empty_video_lane(tmp_path, monkeypatch)
     project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
 
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+    monkeypatch.setattr(route_module, "save_project", lambda project, **_kwargs: None)
 
     response = asyncio.run(_mutations_handler(route_module)(DummyRequest(
         match_info={"project_id": "proj", "scene_id": "scene-1"},
@@ -2370,7 +2370,7 @@ def test_delete_last_audio_track_compacts_empty_audio_lane(tmp_path, monkeypatch
     project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
 
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+    monkeypatch.setattr(route_module, "save_project", lambda project, **_kwargs: None)
 
     response = asyncio.run(_mutations_handler(route_module)(DummyRequest(
         match_info={"project_id": "proj", "scene_id": "scene-1"},
