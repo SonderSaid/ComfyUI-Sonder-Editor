@@ -125,14 +125,15 @@ built for take review.
   until you hover; click it to favorite that side. `S` favorites the side the
   arrow keys cycle, and the pickers mark favorites with ★. Opened from the
   **Favorites** scope, compare becomes an elimination round: unfavorite the
-  weaker take and the next one in that side's list steps in, until one
-  favorite is left in single view. Single Inspect in the Favorites scope moves
-  on to the next favorite instead of closing.
+  weaker take and the next one in that side's list steps in, until the last
+  favorite of that type is left, shown in single view. Single Inspect in the
+  Favorites scope moves on to the next favorite instead of closing.
 - **Undo** — whenever an unfavorite takes an asset out of what you are looking
   at (the Favorites scope, in the list or in Inspect), the notice that confirms
-  it offers **Undo**. It makes the asset a favorite again and, while its
-  replacement is still showing, puts it back on its side; a viewer that closed
-  stays closed. Only the latest removal keeps its notice.
+  it offers **Undo**. It makes the asset a favorite again and puts it back on
+  its side, as long as the take that replaced it is still on screen; a viewer
+  that closed stays closed. Only the latest removal keeps its notice. It stays up for a few
+  seconds, and hovering over it holds it open.
 
 ![Compare mode in Divider layout: one shared stage split by a vertical divider, with the Gallery A and Gallery B pickers either side](images/compare-divider.webp)
 

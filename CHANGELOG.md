@@ -12,14 +12,15 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Added
-- Compare mode can favorite: each side has a star on the stage, `S` favorites the side the arrow keys cycle, and the pickers mark favorites. In the Favorites view, unfavoriting a take steps the next one from that side's list in, down to the last favorite. Single Inspect in the Favorites view now moves on to the next favorite instead of closing.
-- Unfavoriting an asset in the Favorites view, in the gallery list or in Inspect, shows a "Removed from Favorites" notice with Undo, which makes it a favorite again and returns it to where it was while its replacement is still showing.
-
-### Fixed
-- Picking or cycling an asset in Compare no longer blinks either side: each side keeps showing its image or video frame until the new one is ready, and an image no longer jumps slightly in size while it loads.
+- Compare mode can favorite: each side has a star on the stage, `S` favorites the side the arrow keys cycle, and the pickers mark favorites.
+- In the Favorites view, Compare becomes an elimination round: unfavoriting a take brings in the next one from that side's list, down to the last favorite. Single Inspect moves on to the next favorite instead of closing.
+- Unfavoriting an asset in the Favorites view, in the gallery list or in Inspect, shows a "Removed from Favorites" notice with Undo. Undo makes it a favorite again and puts it back where it was, as long as the take that replaced it is still on screen.
 
 ### Changed
 - In the full editor, a timeline edit that doesn't change which assets the scene uses (moving, trimming, cutting or muting a clip, locking or renaming a lane, and their Undo/Redo) pauses the editor for much less time, and no longer stops a video playing in the asset gallery's inspector.
+
+### Fixed
+- Picking or cycling an asset in Compare no longer blinks either side: each side keeps showing its image or video frame until the new one is ready, and an image no longer jumps slightly in size while it loads.
 
 ## [0.7.1] - 2026-09-26
 
