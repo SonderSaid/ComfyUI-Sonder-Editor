@@ -11,6 +11,8 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-09-27
+
 ### Added
 - Compare mode can favorite: each side has a star on the stage, `S` favorites the side the arrow keys cycle, and the pickers mark favorites.
 - In the Favorites view, Compare becomes an elimination round: unfavoriting a take brings in the next one from that side's list, down to the last favorite. Single Inspect moves on to the next favorite instead of closing.
