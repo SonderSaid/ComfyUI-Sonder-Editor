@@ -2584,6 +2584,11 @@ export function mountSharedAssetGallery(container, options = {}) {
     // order, each carries the version the previous one produced. Imports and
     // replacements stay outside it: their uploads are exempt from `If-Match`.
     let assetWriteChain = Promise.resolve();
+    // The one "Removed from Favorites" notice with Undo this gallery shows: a
+    // newer removal replaces it, and a failed write, a project change and
+    // teardown take it down.
+    let favoriteRemovalNotice = null;
+    let favoriteRemovalSeq = 0;
 
     function skippedAssetWrite(message) {
         const error = new Error(message);
@@ -2935,7 +2940,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     async function applyAssetUpdate(asset, updates, {
         successMessage = "", successSource = "gallery-asset-update",
         failureMessage = "Failed to update the asset.",
-        onPainted = null, onUnpainted = null,
+        hooks = {},
     } = {}) {
         if (!asset?.asset_id || !options.onUpdateAsset) return false;
         const normalizedUpdates = { ...updates };
@@ -2951,47 +2956,65 @@ export function mountSharedAssetGallery(container, options = {}) {
         // queued write is finally sent.
         const run = (diagnostics) => applyAssetUpdateWithinGesture(
             asset.asset_id, normalizedUpdates, diagnostics,
-            { successMessage, successSource, failureMessage }, { onPainted, onUnpainted });
+            { successMessage, successSource, failureMessage }, hooks);
         return options.withMutationGesture
             ? options.withMutationGesture("asset_metadata", run) : run(null);
     }
 
-    // An Inspect placement that throws must not strand the paint unsent or
-    // skip a failure's report and repaint.
-    function runPlacementHook(hook) {
+    // A write hook that throws must not strand the paint unsent or skip a
+    // failure's report and repaint.
+    function runWriteHook(hook) {
         try {
             return hook?.();
         } catch (error) {
-            console.warn("[Sonder] Inspect placement failed:", error);
+            console.warn("[Sonder] Asset write hook failed:", error);
             return false;
         }
     }
 
     /**
-     * `onPainted` runs after the paint and before the repaint, as Trash's does,
-     * so an Inspect view on an asset that left moves on rather than redrawing
-     * it. `onUnpainted` runs after a failed write's rollback and returns
-     * whether it moved the view.
+     * Hooks, all optional:
+     * - `onPainted` runs after the paint and before the repaint, as Trash's
+     *   does, so an Inspect view on an asset that left moves on rather than
+     *   redrawing it.
+     * - `beforeUnpaint` runs on failure while the paint still shows, and may
+     *   return a function run once it is rolled back (a placement that must
+     *   read the view the asset is about to leave), returning whether it
+     *   moved the view.
+     * - `onUnpainted` runs after a failed write's rollback and returns whether
+     *   it moved the view.
+     * - `silenceSuccess` returns true when the gesture already told the author.
      */
     async function applyAssetUpdateWithinGesture(assetId, updates, diagnostics, messages,
-        { onPainted = null, onUnpainted = null } = {}) {
+        { onPainted = null, beforeUnpaint = null, onUnpainted = null, silenceSuccess = null } = {}) {
         const gen = paintAssetPatch(assetId, updates);
         if (gen === null) return false;
         clearUsageView();
-        runPlacementHook(onPainted);
+        runWriteHook(onPainted);
         renderAfterAssetPaint([assetId]);
         try {
             const updated = await enqueueAssetWrite(
                 () => options.onUpdateAsset(assetId, updates, diagnostics));
             if (settleAssetPatch(assetId, gen, updated || {})) renderAfterAssetPaint([assetId]);
             // One source per kind, so a burst reads as one counted toast.
-            if (messages.successMessage) notifySuccess(messages.successMessage, { source: messages.successSource });
+            if (messages.successMessage && !runWriteHook(silenceSuccess)) {
+                notifySuccess(messages.successMessage, { source: messages.successSource });
+            }
             return true;
         } catch (error) {
+            const afterUnpaint = runWriteHook(beforeUnpaint);
             const changed = settleAssetPatch(assetId, gen, null);
-            const moved = !!runPlacementHook(onUnpainted);
+            let moved = !!runWriteHook(onUnpainted);
+            if (typeof afterUnpaint === "function") moved = !!runWriteHook(afterUnpaint) || moved;
             if (changed || moved) renderAfterAssetPaint([assetId]);
-            reportAssetWriteFailure(error, messages.failureMessage);
+            // A later paint of the same field is still waiting to be sent (an
+            // Undo, a second S): its write reports the outcome the author sees.
+            // A skipped or unconfirmed write still says so.
+            const superseded = Number.isInteger(error?.status)
+                && (assetPatches.get(assetId) || []).some((patch) =>
+                    Object.keys(updates).some((key) => Object.prototype.hasOwnProperty.call(patch.fields, key)));
+            if (superseded) console.warn("[Sonder] Asset write failed; a later write to it is queued:", error);
+            else reportAssetWriteFailure(error, messages.failureMessage);
             return false;
         }
     }
@@ -3004,10 +3027,11 @@ export function mountSharedAssetGallery(container, options = {}) {
      *   same-type candidates the view drops to single on the survivor;
      * - a single view moves on like Trash, next else previous across types,
      *   and closes after the last.
-     * `onPainted` places, and only if the asset really left. `onUnpainted`
-     * (the write failed and the asset is back) returns each place that still
-     * shows what was put there, within the same Inspect session. Null when
-     * Inspect is closed or the asset is not in its view.
+     * `onPainted` places, and only if the asset really left. `restore` (the
+     * write failed, or Undo brought the asset back) returns each place that
+     * still shows what was put there, within the same Inspect session, once;
+     * it says whether it moved the view. Null when Inspect is closed or the
+     * asset is not in its view.
      */
     function planFavoriteRemovalInOverlay(removedId) {
         const overlay = state.overlayState;
@@ -3047,8 +3071,9 @@ export function mountSharedAssetGallery(container, options = {}) {
             overlay.replacedAt.single = performance.now();
             placed = { compare: false, assetId };
         };
+        // Places, and says whether it moved the view.
         const onPainted = () => {
-            if (!overlay.open || state.overlaySession !== session || inView(removedId)) return;
+            if (!overlay.open || state.overlaySession !== session || inView(removedId)) return false;
             if (stageDrawn) {
                 const plan = planCompareRemoval({
                     sideLists, sameTypeIds, leftId: before.leftId, rightId: before.rightId, removedId,
@@ -3062,20 +3087,21 @@ export function mountSharedAssetGallery(container, options = {}) {
                     if (plan.leftId !== before.leftId) overlay.replacedAt.A = now;
                     if (plan.rightId !== before.rightId) overlay.replacedAt.B = now;
                     placed = { compare: true, assetId: overlay.assetId, leftId: plan.leftId, rightId: plan.rightId };
-                    return;
+                    return true;
                 }
                 if (plan.survivorId) {
                     showSingle(plan.survivorId);
-                    return;
+                    return true;
                 }
             } else if (before.assetId !== removedId) {
-                return;
+                return false;
             }
             const nextId = successorAssetIdAfterRemoval([removedId], viewBefore, removedId);
             if (nextId) showSingle(nextId);
             else closeInspectOverlay();
+            return true;
         };
-        const onUnpainted = () => {
+        const restore = () => {
             const placement = placed;
             placed = null;
             if (!placement || !overlay.open || state.overlaySession !== session || !inView(removedId)) return false;
@@ -3104,7 +3130,100 @@ export function mountSharedAssetGallery(container, options = {}) {
             resetOverlayTransform();
             return true;
         };
-        return { onPainted, onUnpainted };
+        return { onPainted, restore };
+    }
+
+    function dismissFavoriteRemovalNotice(handle = favoriteRemovalNotice) {
+        if (!handle || handle !== favoriteRemovalNotice) return;
+        favoriteRemovalNotice = null;
+        try { handle.dismiss?.(); } catch (error) { console.warn("[Sonder] Notice dismiss failed:", error); }
+    }
+
+    /**
+     * An unfavorite that takes its asset out of the view the author is
+     * looking at (Inspect's while it is open, else the gallery's), planned
+     * before the paint. At the paint, Inspect is re-placed and one notice
+     * offers Undo in place of the write's own "Removed from Favorites"; it
+     * replaces the previous removal's notice. A failed write takes the notice
+     * down and puts the asset back where it still can. Null when the asset is
+     * not in the view, so an unfavorite that cannot hide anything is unchanged.
+     */
+    function planFavoriteRemoval(asset) {
+        const removedId = asset.asset_id;
+        const inspecting = !!state.overlayState.open;
+        const inView = () => (inspecting ? overlayAssets() : activeNavigableAssets())
+            .some((entry) => entry.asset_id === removedId);
+        if (!inView()) return null;
+        const placement = planFavoriteRemovalInOverlay(removedId);
+        const projectDir = currentProjectDir();
+        let notice = null;
+        return {
+            onPainted: () => {
+                if (inView()) return;
+                runWriteHook(placement?.onPainted);
+                notice = raiseFavoriteRemovalNotice(asset, { projectDir, restore: placement?.restore });
+            },
+            onUnpainted: () => {
+                dismissFavoriteRemovalNotice(notice);
+                return !!placement?.restore();
+            },
+            silenceSuccess: () => !!notice,
+        };
+    }
+
+    function raiseFavoriteRemovalNotice(asset, { projectDir, restore = null }) {
+        dismissFavoriteRemovalNotice();
+        const assetId = asset.asset_id;
+        favoriteRemovalSeq += 1;
+        // The sentence is the title and the name the body, so a long name
+        // cannot truncate "from Favorites" away.
+        const handle = notifySuccess(assetDisplayName(asset), {
+            verb: "Removed from Favorites",
+            // Unique per gallery instance and removal, so no two notices merge.
+            source: `gallery-favorite-removal:${detailOwnerBase}:${favoriteRemovalSeq}`,
+            actions: [{
+                label: "Undo",
+                variant: "active",
+                fn: () => undoFavoriteRemoval(assetId, { projectDir, restore }),
+            }],
+        }) || null;
+        favoriteRemovalNotice = handle;
+        return handle;
+    }
+
+    /**
+     * Undo on a removal notice: favorite the asset again, behind any write
+     * still queued, and put it back where it was if that place still shows
+     * its replacement, in the same Inspect session. Inert once the gallery is
+     * torn down or its project changed. If the re-favorite fails, its
+     * rollback is a removal again, placed from the view it is leaving.
+     */
+    function undoFavoriteRemoval(assetId, { projectDir, restore = null }) {
+        try {
+            if (state.destroyed || currentProjectDir() !== projectDir) return false;
+            const shown = shownAsset(assetId);
+            // Already a favorite again (a second click on the leaving notice),
+            // or trashed since: nothing to undo.
+            if (!shown || shown.favorite || isTrashed(shown)) return false;
+            void writeFavorite(shown, true, {
+                onPainted: () => restore?.(),
+                beforeUnpaint: () => planFavoriteRemovalInOverlay(assetId)?.onPainted || null,
+                silenceSuccess: () => true,
+            });
+            return true;
+        } catch (error) {
+            console.warn("[Sonder] Favorite Undo failed:", error);
+            return false;
+        }
+    }
+
+    function writeFavorite(asset, desired, hooks = {}) {
+        return applyAssetUpdate(asset, { favorite: desired }, {
+            successMessage: desired ? "Added to Favorites" : "Removed from Favorites",
+            successSource: "gallery-favorite",
+            failureMessage: "Failed to update favorite.",
+            hooks,
+        });
     }
 
     async function handleToggleFavorite(asset, nextFavorite = null) {
@@ -3114,13 +3233,8 @@ export function mountSharedAssetGallery(container, options = {}) {
         const shown = shownAsset(asset.asset_id) || asset;
         const desired = typeof nextFavorite === "boolean" ? nextFavorite : !shown.favorite;
         // Before the paint: the plan reads the view the asset may be leaving.
-        const removal = desired ? null : planFavoriteRemovalInOverlay(shown.asset_id);
-        return await applyAssetUpdate(shown, { favorite: desired }, {
-            successMessage: desired ? "Added to Favorites" : "Removed from Favorites",
-            successSource: "gallery-favorite",
-            failureMessage: "Failed to update favorite.",
-            onPainted: removal?.onPainted, onUnpainted: removal?.onUnpainted,
-        });
+        const hooks = desired ? {} : (planFavoriteRemoval(shown) || {});
+        return await writeFavorite(shown, desired, hooks);
     }
 
     function summarizeAssetTypes(assets) {
@@ -8279,6 +8393,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             // finds no patch to fold.
             assetPatches.clear();
             assetAckedFields.clear();
+            dismissFavoriteRemovalNotice();
         }
         // Compared as shown, pending paints included, so a refresh that only
         // confirms them stays additive.
@@ -8324,6 +8439,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         resizeObserver?.disconnect();
         closeInspectOverlay();
         clearOverlayMediaCache();
+        dismissFavoriteRemovalNotice();
         hideContextMenu();
         destroyLiveMedia();
         detailLoader.destroy();

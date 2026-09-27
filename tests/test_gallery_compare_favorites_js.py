@@ -112,10 +112,11 @@ _OVERLAY_HARNESS = """
 _HARNESS = re.sub(r"        const renderInspectOverlay = .*?(?=        const clearUsageView)", "",
                   GALLERY_HARNESS, count=1, flags=re.S)
 _HARNESS = re.sub(r"        const successorAssetIdAfterRemoval = .*?\n.*?\n", "", _HARNESS, count=1)
+_HARNESS = re.sub(r"        const activeNavigableAssets = .*?\n", "", _HARNESS, count=1)
 _HARNESS = _HARNESS.replace(
     "        const closeInspectOverlay = () => { state.overlayState.open = false; };\n", "")
 for _stubbed in ("syncOverlayWithAssets", "renderInspectOverlay", "successorAssetIdAfterRemoval",
-                 "closeInspectOverlay"):
+                 "closeInspectOverlay", "activeNavigableAssets"):
     assert _stubbed not in _HARNESS, _stubbed
 
 
@@ -604,14 +605,257 @@ def test_a_throwing_placement_still_sends_the_write():
         data.assets = fav(video, 'v1', 'v2', 'v3');
         openCompare('v1', 'v1', 'v2');
         console.warn = () => {};
-        const done = applyAssetUpdate(shown('v3'), { favorite: false }, {
+        const done = applyAssetUpdate(shown('v3'), { favorite: false }, { hooks: {
             onPainted: () => { throw new Error('boom'); },
             onUnpainted: () => { throw new Error('boom'); },
-        });
+        } });
         await settleTurns();
         assert.equal(calls.length, 1);
         await fail(httpError(500));
         assert.equal(await done, false);
         assert.equal(shown('v3').favorite, true);
         assert.ok(toasts.some((t) => t.tier === 'error'));
+    """)
+
+
+# ── Undo on the removal notice ─────────────────────────────────────────────
+
+
+_REMOVAL = """
+        const removals = () => toasts.filter((t) => t.source?.startsWith('gallery-favorite-removal:'));
+        const undo = (notice) => notice.actions.find((a) => a.label === 'Undo').fn();
+"""
+
+
+def test_a_removal_raises_one_undo_notice_at_the_paint_and_no_success_toast():
+    _run(_REMOVAL + """
+        favoritesView = true;
+        data.assets = fav(video, 'v1', 'v2', 'v3', 'v4');
+        openCompare('v1', 'v1', 'v2');
+        handleToggleFavorite(shown('v2'));
+        // Raised before the host answers, naming the asset.
+        assert.equal(calls.length, 0);
+        assert.equal(removals().length, 1);
+        assert.equal(removals()[0].verb, 'Removed from Favorites');
+        assert.equal(removals()[0].message, 'v2');
+        assert.deepEqual(removals()[0].actions.map((a) => a.label), ['Undo']);
+        await settleTurns();
+        await answer({ favorite: false });
+        assert.equal(toasts.some((t) => t.message === 'Removed from Favorites'), false);
+        // The next removal replaces the notice rather than stacking or counting.
+        handleToggleFavorite(shown('v3'));
+        assert.equal(removals().length, 2);
+        assert.equal(removals()[0].dismissed, true);
+        assert.equal(removals()[1].dismissed, false);
+        assert.notEqual(removals()[0].source, removals()[1].source);
+    """)
+
+
+def test_an_unfavorite_that_stays_in_view_keeps_the_ordinary_toast():
+    _run(_REMOVAL + """
+        data.assets = fav(video, 'v1', 'v2');
+        openCompare('v1', 'v1', 'v2');
+        handleToggleFavorite(shown('v2'));
+        await settleTurns();
+        await answer({ favorite: false });
+        assert.equal(removals().length, 0);
+        assert.ok(toasts.some((t) => t.message === 'Removed from Favorites'));
+    """)
+
+
+def test_undo_favorites_again_and_puts_the_asset_back_on_its_side():
+    _run(_REMOVAL + """
+        favoritesView = true;
+        data.assets = fav(video, 'v1', 'v2', 'v3', 'v4');
+        openCompare('v1', 'v1', 'v2');
+        handleToggleFavorite(shown('v2'));
+        await settleTurns();
+        await answer({ favorite: false });
+        assert.deepEqual(drawn(), ['c:video:v1:v3', 'v1']);
+        assert.equal(undo(removals()[0]), true);
+        assert.equal(shown('v2').favorite, true);
+        assert.deepEqual(drawn(), ['c:video:v1:v2', 'v1']);
+        await settleTurns();
+        await answer({ favorite: true });
+        assert.deepEqual(calls.map((c) => c.args[1].favorite), [false, true]);
+        assert.equal(toasts.some((t) => t.message === 'Added to Favorites'), false);
+    """)
+
+
+def test_undo_while_the_removal_is_still_queued_writes_behind_it():
+    _run(_REMOVAL + """
+        favoritesView = true;
+        data.assets = fav(video, 'v1', 'v2', 'v3');
+        openCompare('v1', 'v1', 'v2');
+        handleToggleFavorite(shown('v2'));
+        undo(removals()[0]);
+        assert.deepEqual(drawn(), ['c:video:v1:v2', 'v1']);
+        await settleTurns();
+        await answer({ favorite: false });
+        await answer({ favorite: true });
+        assert.deepEqual(calls.map((c) => c.args[1].favorite), [false, true]);
+        assert.equal(shown('v2').favorite, true);
+    """)
+
+
+def test_undo_after_the_author_moved_on_favorites_without_moving_the_view():
+    _run(_REMOVAL + """
+        favoritesView = true;
+        data.assets = fav(video, 'v1', 'v2', 'v3', 'v4');
+        openCompare('v1', 'v1', 'v2');
+        handleToggleFavorite(shown('v2'));
+        state.overlayState.compareRightAssetId = 'v4';
+        renderInspectOverlay();
+        undo(removals()[0]);
+        assert.equal(shown('v2').favorite, true);
+        assert.deepEqual(drawn(), ['c:video:v1:v4', 'v1']);
+    """)
+
+
+def test_undo_brings_single_inspect_back_and_a_closed_viewer_stays_closed():
+    _run(_REMOVAL + """
+        favoritesView = true;
+        data.assets = fav(video, 'v1', 'v2');
+        openSingle('v1');
+        handleOverlayFavoriteKey({ repeat: false });
+        assert.deepEqual(drawn(), ['s:v2', 'v2']);
+        undo(removals()[0]);
+        assert.deepEqual(drawn(), ['s:v1', 'v1']);
+        // The last favorite closes the viewer; Undo favorites it without reopening.
+        handleOverlayFavoriteKey({ repeat: false });
+        handleOverlayFavoriteKey({ repeat: false });
+        assert.deepEqual(drawn(), ['closed', '']);
+        undo(removals()[removals().length - 1]);
+        assert.equal(shown('v2').favorite, true);
+        assert.deepEqual(drawn(), ['closed', '']);
+    """)
+
+
+def test_a_failed_removal_takes_its_notice_down_and_the_failure_stands():
+    _run(_REMOVAL + """
+        favoritesView = true;
+        data.assets = fav(video, 'v1', 'v2', 'v3');
+        openCompare('v1', 'v1', 'v2');
+        handleToggleFavorite(shown('v2'));
+        await settleTurns();
+        await fail(httpError(500));
+        assert.equal(removals()[0].dismissed, true);
+        assert.ok(toasts.some((t) => t.tier === 'error' && t.message === 'Failed to update favorite.'));
+        assert.deepEqual(drawn(), ['c:video:v1:v2', 'v1']);
+    """)
+
+
+def test_a_failed_undo_leaves_again_like_a_removal_instead_of_closing():
+    _run(_REMOVAL + """
+        favoritesView = true;
+        data.assets = fav(video, 'v1', 'v2', 'v3');
+        openCompare('v1', 'v1', 'v2', { compareCycleSide: 'A' });
+        handleOverlayFavoriteKey({ repeat: false });
+        assert.deepEqual(drawn(), ['c:video:v3:v2', 'v3']);
+        await settleTurns();
+        await answer({ favorite: false });
+        undo(removals()[0]);
+        assert.deepEqual(drawn(), ['c:video:v1:v2', 'v1']);
+        await settleTurns();
+        await fail(httpError(500));
+        // v1 left again: A takes a contender and the viewer stays open.
+        assert.equal(shown('v1').favorite, false);
+        assert.deepEqual(drawn(), ['c:video:v3:v2', 'v3']);
+    """)
+
+
+def test_undo_is_inert_after_teardown_or_a_project_change_and_never_throws():
+    _run(_REMOVAL + """
+        favoritesView = true;
+        data.assets = fav(video, 'v1', 'v2', 'v3');
+        openCompare('v1', 'v1', 'v2');
+        handleToggleFavorite(shown('v2'));
+        const notice = removals()[0];
+        projectDir = 'other';
+        assert.equal(undo(notice), false);
+        projectDir = 'project';
+        state.destroyed = true;
+        assert.equal(undo(notice), false);
+        state.destroyed = false;
+        console.warn = () => {};
+        Object.defineProperty(state, 'destroyed', { get() { throw new Error('boom'); }, configurable: true });
+        assert.equal(undo(notice), false);
+        await settleTurns();
+        assert.equal(calls.length, 1);
+    """)
+
+
+def test_a_removal_in_the_gallery_list_offers_undo_too():
+    _run(_REMOVAL + """
+        favoritesView = true;
+        data.assets = fav(video, 'v1', 'v2');
+        handleToggleFavorite(shown('v1'));
+        assert.equal(removals().length, 1);
+        undo(removals()[0]);
+        assert.equal(shown('v1').favorite, true);
+        await settleTurns();
+        await answer({ favorite: false });
+        await answer({ favorite: true });
+        assert.deepEqual(calls.map((c) => c.args[1].favorite), [false, true]);
+    """)
+
+
+def test_teardown_takes_the_notice_down():
+    # destroy() tears down DOM and observers, so its call is pinned by source;
+    # setData's project switch is run for real in test_gallery_current_scene_refresh_js.
+    source = GALLERY.read_text(encoding="utf-8")
+    destroy = _gallery_function(source, "destroy")
+    assert "dismissFavoriteRemovalNotice();" in destroy
+
+
+def test_an_older_failure_leaves_the_newer_notice_the_one_that_is_tracked():
+    _run(_REMOVAL + """
+        favoritesView = true;
+        data.assets = fav(video, 'v1', 'v2', 'v3', 'v4', 'v5');
+        openCompare('v1', 'v1', 'v2');
+        handleToggleFavorite(shown('v2'));
+        handleToggleFavorite(shown('v3'));
+        await settleTurns();
+        await fail(httpError(500));
+        // v2's failure took down only its own notice, long gone; v3's stays.
+        assert.equal(removals()[1].dismissed, false);
+        handleToggleFavorite(shown('v4'));
+        assert.equal(removals()[1].dismissed, true);
+        assert.equal(removals().filter((t) => !t.dismissed).length, 1);
+    """)
+
+
+def test_a_second_undo_click_sends_nothing_and_undo_never_favorites_a_trashed_asset():
+    _run(_REMOVAL + """
+        favoritesView = true;
+        data.assets = fav(video, 'v1', 'v2', 'v3');
+        openCompare('v1', 'v1', 'v2');
+        handleToggleFavorite(shown('v2'));
+        const notice = removals()[0];
+        assert.equal(undo(notice), true);
+        assert.equal(undo(notice), false);
+        await settleTurns();
+        await answer({ favorite: false });
+        await answer({ favorite: true });
+        assert.equal(calls.length, 2);
+        handleToggleFavorite(shown('v3'));
+        const shownIndex = data.assets.findIndex((entry) => entry.asset_id === 'v3');
+        data.assets[shownIndex] = { ...data.assets[shownIndex], trashed_at: 'now' };
+        assert.equal(undo(removals()[1]), false);
+    """)
+
+
+def test_a_failure_a_later_write_answers_stays_quiet_and_the_last_one_speaks():
+    _run(_REMOVAL + """
+        favoritesView = true;
+        data.assets = fav(video, 'v1', 'v2', 'v3');
+        openCompare('v1', 'v1', 'v2');
+        handleToggleFavorite(shown('v2'));
+        undo(removals()[0]);
+        await settleTurns();
+        await fail(httpError(500));
+        // The removal failed, but the Undo already asked for the same value.
+        assert.equal(toasts.some((t) => t.tier === 'error'), false);
+        await fail(httpError(500));
+        assert.ok(toasts.some((t) => t.tier === 'error' && t.message === 'Failed to update favorite.'));
     """)

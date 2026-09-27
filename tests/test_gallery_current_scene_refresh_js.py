@@ -88,6 +88,8 @@ HARNESS = """
         const parseAssetSearchQuery = () => ({});
         const queryHasMetadataTerms = () => false;
         const overlaySyncs = [];
+        let noticeDismissals = 0;
+        const dismissFavoriteRemovalNotice = () => { noticeDismissals += 1; };
         const syncOverlayWithAssets = (ids, opts) => { overlaySyncs.push([ids, opts]); };
         let additiveInsert = () => additive;
         const tryRenderAdditiveData = (...args) => additiveInsert(...args);
@@ -379,4 +381,17 @@ def test_a_new_list_keeps_the_inspect_view_in_step_on_either_path():
         additive = false;
         setData({ assets: [{ asset_id: 'a' }, { asset_id: 'b' }], folders: [] });
         assert.deepEqual(overlaySyncs, [[[], { listArrival: true }], [[], { listArrival: true }]]);
+    """)
+
+
+def test_only_a_project_switch_takes_the_favorite_undo_notice_down():
+    # A same-project list lands after every write; the Undo notice must outlive it.
+    _run("""
+        setData({ assets: [{ asset_id: 'a' }], folders: [] });
+        additive = false;
+        setData({ assets: [{ asset_id: 'a' }, { asset_id: 'b' }], folders: [] });
+        assert.equal(noticeDismissals, 0);
+        projectDir = 'projects/two';
+        setData({ assets: [{ asset_id: 'c' }], folders: [] });
+        assert.equal(noticeDismissals, 1);
     """)

@@ -121,6 +121,18 @@ built for take review.
 - **Metadata** — panels flank the media (A left, B right). Left-click a
   tracked field to filter the **A** picker, right-click to filter **B** —
   compare takes against their own generation parameters.
+- **Favorites** — each side carries a star in its corner of the stage, faint
+  until you hover; click it to favorite that side. `S` favorites the side the
+  arrow keys cycle, and the pickers mark favorites with ★. Opened from the
+  **Favorites** scope, compare becomes an elimination round: unfavorite the
+  weaker take and the next one in that side's list steps in, until one
+  favorite is left in single view. Single Inspect in the Favorites scope moves
+  on to the next favorite instead of closing.
+- **Undo** — whenever an unfavorite takes an asset out of what you are looking
+  at (the Favorites scope, in the list or in Inspect), the notice that confirms
+  it offers **Undo**. It makes the asset a favorite again and, while its
+  replacement is still showing, puts it back on its side; a viewer that closed
+  stays closed. Only the latest removal keeps its notice.
 
 ![Compare mode in Divider layout: one shared stage split by a vertical divider, with the Gallery A and Gallery B pickers either side](images/compare-divider.webp)
 
@@ -208,7 +220,7 @@ scheduling and device output can differ from an offline render.
 | 1 / 2 / 3 / 0 | Audio compare monitor: A / B / Both / Mute |
 | Shift (hold) | Temporarily flip the A/B monitor |
 | C | Toggle Compare |
-| S | Favorite / unfavorite |
+| S | Favorite / unfavorite (compare: the side ↑ / ↓ cycles) |
 | Delete | Move to Trash |
 | F | Fit |
 | + / − | Zoom |

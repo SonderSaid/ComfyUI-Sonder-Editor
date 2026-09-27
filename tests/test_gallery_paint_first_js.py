@@ -18,7 +18,8 @@ GALLERY = ROOT / "web" / "js" / "shared_asset_gallery.js"
 # Gallery functions the write paths use, beyond the paint-first block itself.
 _WRITE_FUNCTIONS = (
     "applyAssetUpdate", "applyAssetUpdateWithinGesture", "handleToggleFavorite",
-    "planFavoriteRemovalInOverlay", "runPlacementHook",
+    "planFavoriteRemovalInOverlay", "runWriteHook", "planFavoriteRemoval",
+    "dismissFavoriteRemovalNotice", "raiseFavoriteRemovalNotice", "undoFavoriteRemoval", "writeFavorite",
     "handleAssetDelete", "handleAssetDeleteWithinGesture", "trashAssetsWithinGesture",
     "handleBulkDelete", "handleBulkDeleteWithinGesture",
     "handleAssetRestore", "handleBulkRestore", "restoreAssetsWithGesture",
@@ -66,10 +67,16 @@ GALLERY_HARNESS = """
         const applySelectionState = (ids, primary) => { selection = [...ids]; state.selectedAssetId = primary; };
         const successorAssetIdAfterRemoval = (ids) => data.assets.find((entry) =>
             !ids.includes(entry.asset_id) && !isTrashed(entry))?.asset_id || '';
+        const activeNavigableAssets = () => data.assets.filter((entry) => !isTrashed(entry));
+        const detailOwnerBase = 'gallery-test#1';
         let preflight = async () => false, confirmAnswer = true, confirms = 0;
         const resolveTrashForceDecision = (assets) => preflight(assets);
         const confirmTrashProtection = () => { confirms += 1; return confirmAnswer; };
-        const toast = (tier) => (message, opts = {}) => { toasts.push({ tier, message, ...opts }); };
+        const toast = (tier) => (message, opts = {}) => {
+            const entry = { tier, message, ...opts, dismissed: false };
+            toasts.push(entry);
+            return { dismiss: () => { entry.dismissed = true; } };
+        };
         const notifySuccess = toast('success'), notifyInfo = toast('info');
         const notifyWarning = toast('warning'), notifyError = toast('error');
         const normalizeSelection = (ids) => ({ ids });
