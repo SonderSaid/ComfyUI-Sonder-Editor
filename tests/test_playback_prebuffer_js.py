@@ -709,7 +709,9 @@ console.log(JSON.stringify({{
     assert captured["beforeClear"] > 0
     assert captured["sameRun"] is True
     assert captured["stop"]["boundaryStaleDraws"] == 0
-    assert captured["stop"]["staleDraws"] == 8
+    # Only the eight draws after the clear are counted. Their frozen samples
+    # are older than the age limit by then, so they are unverified, not stale.
+    assert captured["stop"]["verifiedDraws"] + captured["stop"]["unverifiedDraws"] == 8
     result = _run_node(script)
     assert result == {
         "sameRun": True,
@@ -944,6 +946,10 @@ console.log(JSON.stringify({{
 def _presentation_harness(sampled=True, clear=False, abort=False, audio=False):
     script = _SURFACE_LOADER + r"""
 // Observe the actual closure; do not replace its state transitions.
+// performance.now follows the synthetic refresh clock from a fixed origin, so
+// wall-time allowances and sample ages elapse with the frames the loop
+// presents, identically on every run.
+let clock=1000;Object.defineProperty(globalThis,'performance',{value:{now:()=>clock,timeOrigin:0},configurable:true,writable:true});
 const {createViewportSurface}=await loadSurface(__MODULE_URL__,'_state: state, _sourceCache: sourceCache, _drain: drainPendingReleases, _abortPreRolls: abortPreRolls,');
 let fetches=0;globalThis.fetch=async()=>{fetches++;return {ok:true,blob:async()=>new Blob([new Uint8Array(100)])};};
 const drawnSourceFrames=[];const events = [], raf = [], videos = [], draws = [], frames=[];
@@ -954,7 +960,7 @@ class Video extends EventTarget {
  set src(v){this._src=v;this.readyState=4;}
  get currentTime(){return this._time;}
  set currentTime(v){this._time=v;queueMicrotask(()=>this.dispatchEvent(new Event('seeked')));}
- play(){this.paused=false;this.startupTicks=1;return Promise.resolve();}
+ play(){this.paused=false;this.startupTicks=1;this.decodeStarted=false;return Promise.resolve();}
  pause(){this.paused=true;}
  load(){}
  removeAttribute(k){if(k==="src"){delete this._src;this.readyState=0;}else delete this[k];}
@@ -977,7 +983,10 @@ if (__AUDIO__) { scene.audio_tracks=[{track_id:'audio-a',source_path:'audio-a.wa
 const base=performance.now();
 for(let i=0;i<20;i++){
 if (__ABORT__ && i===6) {const e=[...surface._state.prebufferCache.values()].find(e=>e.preRollPhase==='rolling');surface._abortPreRolls('test-rebuffer');await settle();abortRestored=!!e && e.preRollPhase==='target' && e.video.paused && Math.abs(e.video.currentTime-e.targetTime)<1e-6;}
-if (__CLEAR__ && i===12){beforeClear=events.filter(e=>e.kind==="playback_presentation_mismatch").length;for(const clear of window.__SONDER_DIAG_CLEARERS)clear();}for(const v of videos)if(!v.paused){if(v.startupTicks)v.startupTicks--;else v._time+=1/24;}for(const cb of raf.splice(0))cb(base+i*1000/24+0.1);await settle();}
+if (__CLEAR__ && i===12){beforeClear=events.filter(e=>e.kind==="playback_presentation_mismatch").length;for(const clear of window.__SONDER_DIAG_CLEARERS)clear();}clock=base+i*1000/24+0.1;for(const v of videos)if(!v.paused){if(v.startupTicks)v.startupTicks--;else{v._time+=1/24;
+// Sampled videos report the first frame their decoder produces after play(),
+// then freeze: the claim gate needs the first, the counters judge the rest.
+if(__SAMPLED__&&!v.decodeStarted){v.decodeStarted=true;v.present(Math.floor(v._time*24+1e-6)/24);}}}for(const cb of raf.splice(0))cb(clock);await settle();}
 const releasedPassed=!surface._state.videoCache.a && !videos[0].src;
 const idleBeforeStop=surface._sourceCache.snapshot().idleEntries;
 const fetchesBeforeStop=fetches;
@@ -1005,7 +1014,9 @@ def test_presentation_counters_detect_frozen_and_unsampled_boundary_draws():
     frozen = _presentation_harness()
     assert frozen["claims"] == 1
     assert frozen["stop"]["staleDraws"] > 0
-    assert frozen["stop"]["boundaryStaleDraws"] == 3
+    # The sample freezes on the roll's first decoded frame, behind its target,
+    # so every boundary draw (claim frame + 0..3) is judged stale.
+    assert frozen["stop"]["boundaryStaleDraws"] == 4
     assert frozen["stop"]["boundaryUnsampledDraws"] == 0
     missing = _presentation_harness(sampled=False)
     assert missing["claims"] == 1
@@ -1133,7 +1144,7 @@ def test_live_preview_does_not_cull_for_alpha_images_or_wrong_decoded_dimensions
 def test_preroll_planner_horizons_budgets_discontinuities_and_one_sided_claim():
     module_url = (ROOT / "web/js/viewport_surface.js").as_uri()
     result = _run_node(f"""
-const {{_planPlaybackPreRoll:plan,_rollingPrebufferAtTarget:claim}}=await import({json.dumps(module_url)});
+const {{_planPlaybackPreRoll:plan}}=await import({json.dumps(module_url)});
 const a={{fps:24,currentFrame:90,targetFrame:100,targetSourceFrame:56,sourceInFrame:56,clipLengthFrames:68,rebuffering:false,decodeConcurrency:8,activePreRolls:0,phase:'target'}};
 console.log(JSON.stringify({{
  leads:[24,30,60,12].map(fps=>plan({{...a,fps}}).leadInFrames),
@@ -1145,13 +1156,58 @@ console.log(JSON.stringify({{
  single:plan({{...a,currentFrame:94,decodeConcurrency:1}}).reason,
  abort:[{{rebuffering:true,currentFrame:98}},{{currentFrame:101}},{{currentFrame:94}}].map(v=>plan({{...a,phase:'rolling',...v}}).action),
  hold:plan({{...a,phase:'rolling',currentFrame:100}}).action,
- claim:[claim(2-1/24,2,1/24),claim(2,2,1/24),claim(2+2/24,2,1/24)],
 }}));
 """)
     assert result == {"leads": [3,4,6,2], "horizon": ["hold","park-lead-in","skip","skip"],
         "start":"start-roll", "noRoom":["no-room","no-room"], "short":"no-room",
         "budget":"budget", "single":"budget", "abort":["abort","abort","abort"],
-        "hold":"hold", "claim":[False,True,False]}
+        "hold":"hold"}
+
+
+def test_rolling_claim_gate_needs_a_running_decoder_inside_a_one_frame_window():
+    module_url = (ROOT / "web/js/viewport_surface.js").as_uri()
+    result = _run_node(f"""
+const {{_rollingClaimDecision:decide}}=await import({json.dumps(module_url)});
+const running={{decoderRunning:true,targetFrame:56}};
+console.log(JSON.stringify({{
+ idle:[55,56,57,58].map(currentFrame=>decide({{targetFrame:56,currentFrame}})),
+ running:[55,56,57,58].map(currentFrame=>decide({{...running,currentFrame}})),
+ held:[55,56,57].map(currentFrame=>decide({{...running,currentFrame,holding:true}})),
+ heldIdle:decide({{targetFrame:56,currentFrame:57,holding:true}}),
+ unknown:[decide({{...running,currentFrame:NaN}}),decide({{decoderRunning:true,currentFrame:56}})],
+}}));
+""")
+    # In the decoder start-up gap the last decoded (lead-in) frame is painted,
+    # so an idle decoder is never claimable, even with currentTime on target.
+    assert result["idle"] == ["wait", "wait", "wait", "overshoot"]
+    # Once the decoder runs, currentTime predicts the painted frame: claim
+    # anywhere in [target, target + 1], never before it; past it, overshoot.
+    assert result["running"] == ["wait", "claim", "claim", "overshoot"]
+    # With the clock held on the target, target + 1 would paint a frame the
+    # held timeline has not reached.
+    assert result["held"] == ["wait", "claim", "overshoot"]
+    assert result["heldIdle"] == "overshoot"
+    assert result["unknown"] == ["wait", "wait"]
+
+
+def test_tail_stop_decision_stops_on_the_last_source_frame():
+    module_url = (ROOT / "web/js/viewport_surface.js").as_uri()
+    result = _run_node(f"""
+const {{_tailStopDecision:decide}}=await import({json.dumps(module_url)});
+console.log(JSON.stringify([46,47,48,99].map(currentFrame=>decide({{currentFrame,lastSourceFrame:47}})).concat(
+ decide({{currentFrame:47,lastSourceFrame:null}}), decide({{currentFrame:NaN,lastSourceFrame:47}}),
+ decide({{currentFrame:40,lastSourceFrame:47,ended:true}}))));
+""")
+    # Stop on the last frame (it stays painted), and past it as the backstop.
+    # Media that ended short of the out point stops too: play() would restart it.
+    assert result == ["run", "stop", "stop", "stop", "none", "none", "stop"]
+
+
+def test_a_tail_stop_holds_only_while_the_element_is_at_its_last_frame():
+    # Clear sites cover every known reposition; this pins the invariant that
+    # makes a missed one harmless, and the ended-media backstop.
+    probe = _lag_harness(tailProbeFrame=30)["tailProbe"]
+    assert probe == {"staleRuns": True, "endedStops": True}
 
 
 def test_preroll_survives_current_safety_reclassification_and_lands():
@@ -1257,7 +1313,7 @@ console.log(JSON.stringify({{crlfLoaded: typeof crlf.createViewportSurface === '
 _LAG_HARNESS = r"""
 const cfg = Object.assign({
  fps: 24, hz: 120, startupMs: 60, clockStartupMs: 42, clockJitterMs: 4, lagVsyncs: 2, jitter: 0.35,
- decodeLate: 0.05, seed: 7, debugSession: false, adaptiveRebuffer: false, rvfc: true,
+ decodeLate: 0.05, flipLag: false, seed: 7, debugSession: false, adaptiveRebuffer: false, rvfc: true,
  clips: [
   {clip_id: 'a', source_path: 'a.mp4', timeline_start_frame: 0, timeline_end_frame: 48, source_in_frame: 0, source_out_frame: 48},
   {clip_id: 'b', source_path: 'b.mp4', timeline_start_frame: 48, timeline_end_frame: 120, source_in_frame: 24, source_out_frame: 96},
@@ -1288,7 +1344,8 @@ class Video extends EventTarget {
   if (!this.paused) this._decodeHoldUntil = T + cfg.startupMs;
   queueMicrotask(() => { this.seeking = false; if (this.paused) this._decoded = this._frameAt(this._time); this.dispatchEvent(new Event('seeked')); });
  }
- play() { if (this.paused) { controlLog.push(vsyncIndex); this.paused = false; this._clockHoldUntil = T + cfg.clockStartupMs; this._decodeHoldUntil = T + cfg.startupMs; } return Promise.resolve(); }
+ // A negative clockStartupMs models a clock that starts early (ahead).
+ play() { if (this.paused) { controlLog.push(vsyncIndex); this.paused = false; if (cfg.clockStartupMs < 0) this._time -= cfg.clockStartupMs / 1000; this._clockHoldUntil = T + Math.max(0, cfg.clockStartupMs); this._decodeHoldUntil = T + cfg.startupMs; } return Promise.resolve(); }
  pause() { if (!this.paused) { controlLog.push(vsyncIndex); this._time = this.currentTime; this._offset = 0; if (T >= (this._decodeHoldUntil || 0)) this._decoded = this._frameAt(this._time); } this.paused = true; }
  load() {}
  removeAttribute(k) { if (k === 'src') { delete this._src; this.readyState = 0; } else delete this[k]; }
@@ -1298,18 +1355,24 @@ class Video extends EventTarget {
  set muted(v) { controlLog.push(vsyncIndex); }
  _frameAt(t) { return Math.floor(t * cfg.fps + 1e-6); }
  get clip() { const key = String(this._sonderSourceCacheKey || ''); return cfg.clips.find(c => key.includes(c.source_path)) || null; }
- // The frame drawImage paints right now.
+ // The frame drawImage paints right now. With flipLag, the refresh on which
+ // currentTime enters a frame still paints the previous one (1920x1088,
+ // measured 2026-09-28: 50 of 51 such refreshes; the next one paints it).
  get drawnFrame() {
   if (this.paused || this.seeking || T < (this._decodeHoldUntil || 0)) return this._decoded;
-  return Math.max(this._decoded ?? -Infinity, this._frameAt(this.currentTime) - (this._late ? 1 : 0));
+  const settling = cfg.flipLag && this._flipVsync === vsyncIndex;
+  return Math.max(this._decoded ?? -Infinity, this._frameAt(this.currentTime) - (this._late || settling ? 1 : 0));
  }
  advance(dt) {
   if (!this._src) return;
   const clip = this.clip; if (clip) this._clipsSeen.add(clip.clip_id);
   const key = clip?.source_path || ''; if (this._streamKey !== key) { this._streamKey = key; this._rand = streamFor(key); }
   this._late = this._rand() < cfg.decodeLate; this._jitter = this._rand() < cfg.jitter ? 1 : 0;
-  this._offset = (this._rand() * 2 - 1) * cfg.clockJitterMs;
-  if (!this.paused && T >= (this._clockHoldUntil || 0)) this._time += dt / 1000;
+  if (!this.paused && T >= (this._clockHoldUntil || 0)) {
+   const before = this._frameAt(this.currentTime); this._time += dt / 1000;
+   this._offset = (this._rand() * 2 - 1) * cfg.clockJitterMs;
+   if (this._frameAt(this.currentTime) !== before) this._flipVsync = vsyncIndex;
+  } else this._offset = (this._rand() * 2 - 1) * cfg.clockJitterMs;
   if (!this.paused && !this.seeking && T >= (this._decodeHoldUntil || 0)) this._decoded = this.drawnFrame;
   this._history.push(this._decoded); if (this._history.length > 16) this._history.shift();
  }
@@ -1323,16 +1386,24 @@ class Video extends EventTarget {
 }
 if (cfg.rvfc) Video.prototype.requestVideoFrameCallback = function (cb) { this.callbacks.set(++this.next, cb); return this.next; };
 globalThis.document = {visibilityState: 'visible', hasFocus: () => true, querySelectorAll: () => [], createElement: () => new Video()};
-const raf = []; globalThis.requestAnimationFrame = cb => { raf.push(cb); return raf.length; }; globalThis.cancelAnimationFrame = () => {};
+// Cancellable, so a stopped playback loop does not keep ticking.
+const raf = new Map(); let rafSeq = 0;
+globalThis.requestAnimationFrame = cb => { raf.set(++rafSeq, cb); return rafSeq; }; globalThis.cancelAnimationFrame = id => { raf.delete(id); };
 const paintLog = [];
+// Paints of an element that is not an active playback video: a parked tail,
+// or a roll before its claim committed.
+let inactivePaints = 0;
 const ctx = new Proxy({globalAlpha: 1,
  fillRect: () => paintLog.push({v: vsyncIndex, black: true}),
- drawImage: (el) => { const c = el.clip; const f = el.drawnFrame; paintLog.push({v: vsyncIndex, clip: c?.clip_id || '?', shown: c && f !== null ? c.timeline_start_frame + f - c.source_in_frame : null}); },
+ drawImage: (el) => {
+  if (surface._state.isPlaying && ![...surface._state.activePlaybackVideos.values()].some(a => a.video === el)) inactivePaints++;
+  const c = el.clip; const f = el.drawnFrame; paintLog.push({v: vsyncIndex, clip: c?.clip_id || '?', shown: c && f !== null ? c.timeline_start_frame + f - c.source_in_frame : null});
+ },
 }, {get: (t, k) => k in t ? t[k] : () => {}, set: (t, k, v) => { t[k] = v; return true; }});
 
-const {createViewportSurface} = await loadSurface(__MODULE_URL__, '_state: state, _repaint: repaintPlaybackIfAdvanced,');
+const {createViewportSurface} = await loadSurface(__MODULE_URL__, '_state: state, _repaint: repaintPlaybackIfAdvanced, _sync: syncPreparedVideoPlayback,');
 let frame = cfg.startFrame; const scene = {clips: cfg.clips, audio_tracks: [], guide_frames: []};
-const surface = createViewportSurface({canvas: {width: 320, height: 180, getContext: () => ctx}, getScene: () => scene, getFrame: () => frame, setFrame: v => { frame = v; }, getTotalFrames: () => cfg.totalFrames, getFps: () => cfg.fps, getAssetForSourcePath: () => ({width: 320, height: 180, media_kind: 'video'}), buildViewUrl: p => 'https://fixture/' + p, getStreamingMode: () => 'auto', getDecodeConcurrency: () => 8, isAdaptiveRebufferEnabled: () => cfg.adaptiveRebuffer});
+const surface = createViewportSurface({canvas: {width: 320, height: 180, getContext: () => ctx}, getScene: () => scene, getFrame: () => frame, setFrame: v => { frame = v; }, getTotalFrames: () => cfg.totalFrames, getFps: () => cfg.fps, getAssetForSourcePath: () => ({width: 320, height: 180, media_kind: 'video'}), buildViewUrl: p => 'https://fixture/' + p, getStreamingMode: () => 'auto', getDecodeConcurrency: () => 8, isAdaptiveRebufferEnabled: () => cfg.adaptiveRebuffer, getLoopRange: () => cfg.loopRange || null});
 const settle = async () => { for (let i = 0; i < 40; i++) await Promise.resolve(); };
 const screen = []; let rebufferEntries = 0; let wasRebuffering = false;
 const vsync = async () => {
@@ -1342,9 +1413,13 @@ const vsync = async () => {
  for (const v of videos) v.advance(vsyncMs);
  for (const v of videos) v.presentStep();
  await settle();
- for (const cb of raf.splice(0)) cb(T);
+ const due = [...raf.values()]; raf.clear(); for (const cb of due) cb(T);
  await settle();
  const mine = paintLog.filter(d => d.v === vsyncIndex);
+ // Per lane, the frame the latest composite painted of it (multi-lane runs).
+ const lastFill = mine.map(d => !!d.black).lastIndexOf(true);
+ if (lastFill >= 0) for (const d of mine.slice(lastFill + 1)) if (!d.black) laneShown[d.clip] = d.shown;
+ for (const [clip, shown] of Object.entries(laneShown)) (laneFrames[clip] ||= new Set()).add(shown);
  let now = null;
  if (mine.length) { const lastBlack = mine.map(d => !!d.black).lastIndexOf(true); const image = mine.slice(lastBlack + 1).filter(d => !d.black).pop(); now = image ? image : (lastBlack >= 0 ? {black: true, shown: null} : null); }
  const last = now || (screen.length ? screen[screen.length - 1] : null);
@@ -1354,7 +1429,13 @@ const vsync = async () => {
  const bDrawn = bVideo && bVideo.drawnFrame !== null ? bClip.timeline_start_frame + bVideo.drawnFrame - bClip.source_in_frame : null;
  screen.push(last ? {...last, tl: frame, bDrawn} : {tl: frame, shown: null, bDrawn});
  const rebuffering = !!surface._state.playbackRebuffering; if (rebuffering && !wasRebuffering) rebufferEntries++; wasRebuffering = rebuffering;
+ // How far each clip's element ran, in source frames, while it was active.
+ for (const [key, active] of surface._state.activePlaybackVideos) {
+  const c = cfg.clips.find(x => x.clip_id === key); if (!c || active.video.seeking) continue;
+  activeRunFrames[key] = Math.max(activeRunFrames[key] ?? -Infinity, active.video._frameAt(active.video.currentTime));
+ }
 };
+const activeRunFrames = {}; const laneShown = {}; const laneFrames = {};
 surface.startPlayback(); await settle();
 // Guard probe: mid-clip, call the real repaint directly with the recorded
 // video one frame ahead, once plainly and once under each condition that must
@@ -1371,7 +1452,15 @@ const probeGuards = () => {
   return {did, painted: composites() - before, control: controlLog.length - controls};
  };
  const ahead = f => f + 1.5;
+ // A second paint in the same refresh must keep the pending confirm.
+ const samePaint = () => {
+  el._time = (entry.paintedFrame + 1.5) / cfg.fps; el._offset = 0;
+  surface._repaint(); const first = S.playbackPaint.entries.find(e => e.type === 'video').confirmPending;
+  surface._repaint(); const second = S.playbackPaint.entries.find(e => e.type === 'video').confirmPending;
+  return {first, second};
+ };
  return {
+  sameRefreshConfirm: samePaint(),
   advanced: attempt(ahead),
   rebuffering: attempt(ahead, () => { S.playbackRebuffering = true; }, () => { S.playbackRebuffering = false; }),
   held: attempt(ahead, () => { S.playbackBlockedSinceMs = T; }, () => { S.playbackBlockedSinceMs = null; }),
@@ -1381,12 +1470,39 @@ const probeGuards = () => {
   pastEnd: attempt(() => entry.lastSourceFrame + 1.5),
  };
 };
-let guardProbe = null;
-for (let guard = 0; frame < cfg.stopFrame && guard < 20000; guard++) {
+// Tail probe: mid-clip, the per-tick sync must let an element run whose
+// stopped marker no clear site removed once it is back before its last frame,
+// and must keep an element stopped whose media ended short of the out point.
+const probeTail = () => {
+ const S = surface._state; const active = S.activePlaybackVideos.get('a'); const el = active?.video;
+ if (!el) return {error: 'no active element'};
+ surface._sync(active, active.layer, frame);
+ const marker = el._sonderTailStop; if (!marker) return {error: 'no marker'};
+ marker.stopped = true; el.pause();
+ surface._sync(active, active.layer, frame);
+ const staleRuns = !el.paused && !marker.stopped;
+ el.ended = true;
+ surface._sync(active, active.layer, frame);
+ const endedStops = el.paused && marker.stopped;
+ el.ended = false;
+ return {staleRuns, endedStops};
+};
+let guardProbe = null; let tailProbe = null; let restarted = false;
+for (let guard = 0; frame < cfg.stopFrame && guard < (cfg.maxVsyncs || 20000); guard++) {
  await vsync();
  if (cfg.guardProbeFrame && frame >= cfg.guardProbeFrame) { guardProbe = probeGuards(); break; }
+ if (cfg.tailProbeFrame && frame >= cfg.tailProbeFrame) { tailProbe = probeTail(); break; }
+ // Stop and play again from earlier in the clip, as a user would.
+ if (cfg.restart && !restarted && frame >= cfg.restart.at) { restarted = true; surface.stopPlayback(); await settle(); frame = cfg.restart.from; surface.startPlayback(); await settle(); }
 }
 surface.stopPlayback(); await settle();
+// Frames shown per pass; a pass ends where the timeline steps backwards.
+const passes = [[]];
+for (let i = 0; i < screen.length; i++) {
+ if (i && screen[i].tl < screen[i - 1].tl) passes.push([]);
+ if (screen[i].shown !== null) passes[passes.length - 1].push(screen[i].shown);
+}
+const passFrames = passes.map(p => [...new Set(p)].sort((x, y) => x - y));
 
 const seq = [];
 for (const s of screen) { const last = seq[seq.length - 1]; if (last && last.shown === s.shown && last.clip === s.clip && !!last.black === !!s.black) last.n++; else seq.push({shown: s.shown, clip: s.clip, black: !!s.black, n: 1, tl: s.tl}); }
@@ -1415,8 +1531,11 @@ for (const s of screen) {
  if (s.clip !== 'b' || s.tl < 55 || s.tl >= Math.min(cfg.stopFrame, 117) || s.bDrawn === null) continue;
  if (s.shown !== s.bDrawn) staleRefreshes++;
 }
+// Elements whose always-on frame sampler recorded a presentation.
+const sampled = videos.filter(v => v._sonderPresentationTracker?.sample).length;
 console.log(JSON.stringify({vsyncs: vsyncIndex, clipStats, backward, excluded, cuts, rebufferEntries,
- composites: paintLog.filter(d => d.black).length, staleRefreshes, guardProbe}));
+ composites: paintLog.filter(d => d.black).length, staleRefreshes, guardProbe, tailProbe, inactivePaints, sampled, passFrames, activeRunFrames,
+ laneFrames: Object.fromEntries(Object.entries(laneFrames).map(([k, s]) => [k, [...s].filter(f => f !== null).sort((x, y) => x - y)]))}));
 surface.destroy();
 """
 
@@ -1473,6 +1592,9 @@ def test_overlapping_lanes_repaint_at_most_once_per_refresh():
 
 def test_repaint_between_ticks_paints_only_and_respects_its_guards():
     probe = _lag_harness(seed=2, guardProbeFrame=70)["guardProbe"]
+    # A paint on a new frame asks for a confirming repaint on the next
+    # refresh; a second paint within the same refresh must not consume it.
+    assert probe.pop("sameRefreshConfirm") == {"first": True, "second": True}
     # One frame ahead, it paints once and touches no video (no seek, play,
     # pause, or the muted write every sync makes).
     assert probe["advanced"] == {"did": True, "painted": 1, "control": 0}
@@ -1499,16 +1621,18 @@ console.log(JSON.stringify([
 # Cut cases. Ordinary cuts must be seamless with adaptive rebuffer on (the
 # product default) and off: B-2..B+3 each painted, no hold longer than one
 # frame plus one refresh, no rebuffer, no cold element for the incoming clip.
-# A decoder start-up of 200 ms (the live 840, 841, 840 case at cut 843) may
-# hold B-1 with the clock frozen, but must still paint B-2..B+3 with rebuffer
-# on; with rebuffer off only "no backward step, nothing outside the edit" holds.
-_ORDINARY_CUTS = ({}, {"adaptiveRebuffer": True}, {"clockStartupMs": 0}, {"seed": 2}, {"hz": 60})
+# flipLag is the 1920x1088 behaviour (the refresh on which currentTime enters
+# a frame paints the previous one), where a roll claimed on that refresh would
+# paint its lead-in frame. A decoder start-up of 200 ms (the live 840, 841, 840
+# case at cut 843) may hold B-1 with the clock frozen, but must still paint
+# B-2..B+3 with rebuffer on, from the roll itself (no cold element, so no
+# timeout); with rebuffer off only "no backward step, nothing outside the
+# edit" holds. No case may paint an element that is not active playback media.
+_ORDINARY_CUTS = ({}, {"adaptiveRebuffer": True}, {"clockStartupMs": 0}, {"seed": 2}, {"hz": 60},
+                  {"flipLag": True}, {"flipLag": True, "adaptiveRebuffer": True}, {"flipLag": True, "hz": 144})
 _SLOW_START = {"startupMs": 200}
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError,
-                   reason="Playback Follows the Presented Frame, Phase 2: the outgoing clip is paused on the "
-                   "timeline tail, and a roll is claimed before its decoder paints the target")
 def test_a_cut_is_seamless_and_never_shows_a_frame_outside_the_edit():
     failures = []
     hold_limit = lambda hz: -(-hz // 24) + 1  # one frame period, rounded up, plus one refresh
@@ -1516,12 +1640,99 @@ def test_a_cut_is_seamless_and_never_shows_a_frame_outside_the_edit():
         result = _lag_harness(**case)
         cut = result["cuts"][0]
         if (cut["missing"] or cut["maxHoldVsyncs"] > hold_limit(case.get("hz", 120)) or cut["black"]
-                or result["excluded"] or result["backward"] or result["rebufferEntries"] or cut["incomingElements"] != 1):
+                or result["excluded"] or result["backward"] or result["rebufferEntries"] or cut["incomingElements"] != 1
+                or result["inactivePaints"] or result["activeRunFrames"]["a"] > 47):
             failures.append(("ordinary", case, cut, result["excluded"], result["backward"], result["rebufferEntries"]))
-    held = _lag_harness(**_SLOW_START, adaptiveRebuffer=True)
-    if held["cuts"][0]["missing"] or held["excluded"] or held["backward"] or held["cuts"][0]["black"]:
-        failures.append(("slow, rebuffer on", held["cuts"][0], held["excluded"], held["backward"]))
-    running = _lag_harness(**_SLOW_START, adaptiveRebuffer=False)
-    if running["excluded"] or running["backward"]:
-        failures.append(("slow, rebuffer off", running["cuts"][0], running["excluded"], running["backward"]))
+    for case in ({}, {"flipLag": True}):
+        held = _lag_harness(**_SLOW_START, **case, adaptiveRebuffer=True)
+        cut = held["cuts"][0]
+        if (cut["missing"] or held["excluded"] or held["backward"] or cut["black"] or held["inactivePaints"]
+                or cut["incomingElements"] != 1 or cut["maxHoldVsyncs"] * 1000 / 120 > 1000):
+            failures.append(("slow, rebuffer on", case, cut, held["excluded"], held["backward"]))
+    # With the clock running, the roll keeps serving the frame the playhead has
+    # reached: no second (cold) element, and B-1 holds no longer than the
+    # decoder start-up plus a frame.
+    for hz in (120, 60):
+        running = _lag_harness(**_SLOW_START, adaptiveRebuffer=False, hz=hz)
+        cut = running["cuts"][0]
+        if (running["excluded"] or running["backward"] or running["inactivePaints"] or cut["incomingElements"] != 1
+                or cut["maxHoldVsyncs"] * 1000 / hz > _SLOW_START["startupMs"] + 1000 / 24):
+            failures.append(("slow, rebuffer off", hz, cut, running["excluded"], running["backward"]))
     assert failures == []
+
+
+def test_rolls_that_land_off_the_tick_stay_inside_the_edit():
+    # A clock that starts early lands the roll well into its claim window: it
+    # is claimed there and kept (seeking it back would restart its decoder
+    # and step backward), and the outgoing element, running ahead too, stops
+    # on its last frame instead of running past its out point.
+    for seed in (7, 1, 2):
+        ahead = _lag_harness(clockStartupMs=-25, seed=seed)
+        cut = ahead["cuts"][0]
+        assert (ahead["excluded"], ahead["backward"], cut["incomingElements"], ahead["activeRunFrames"]["a"]) == ([], [], 1, 47), seed
+        assert set(cut["missing"]) <= {48}, seed
+        # Kept: the first incoming frame holds under one frame period (5
+        # refreshes at 120 Hz); a seek back to the frame centre holds it ~7.
+        first_incoming = next(token for token in cut["around"].split() if token.startswith("b"))
+        assert int(first_incoming.split("x")[1]) < 5, (seed, cut["around"])
+    # A clock that starts late lands the roll just short of its target: the
+    # cut still paints B-2..B+3 from the roll, at 120 Hz without a rebuffer;
+    # at 60 Hz the clock may freeze for it, which keeps B painted.
+    for case in ({}, {"hz": 60}):
+        behind = _lag_harness(clockStartupMs=60, adaptiveRebuffer=True, **case)
+        cut = behind["cuts"][0]
+        assert (cut["missing"], behind["excluded"], behind["backward"], cut["incomingElements"]) == ([], [], [], 1), case
+        if not case:
+            assert behind["rebufferEntries"] == 0
+
+
+def test_an_upper_lane_ending_over_a_lower_lane_paints_its_last_frames():
+    # The tail stops on the element's own last frame, so a half-transparent
+    # upper lane ending mid-scene paints through its last frame, and the lower
+    # lane keeps every frame. The old tick-time pause lost the last one or two.
+    lanes = [
+        {"clip_id": "lo", "source_path": "lo.mp4", "timeline_start_frame": 0, "timeline_end_frame": 120,
+         "source_in_frame": 0, "source_out_frame": 120, "track_index": 0},
+        {"clip_id": "up", "source_path": "up.mp4", "timeline_start_frame": 0, "timeline_end_frame": 48,
+         "source_in_frame": 0, "source_out_frame": 48, "track_index": 1, "opacity": 0.5},
+    ]
+    for hz in (120, 60):
+        result = _lag_harness(clips=lanes, hz=hz)
+        assert set(range(40, 48)) <= set(result["laneFrames"]["up"]), hz
+        assert set(range(3, 107)) <= set(result["laneFrames"]["lo"]), hz
+        assert result["activeRunFrames"]["up"] == 47 and not result["excluded"], hz
+
+
+def test_cuts_without_frame_callbacks_complete_on_the_start_up_allowance():
+    # Without requestVideoFrameCallback the decoder-running gate trusts a
+    # bounded start-up allowance: an ordinary cut stays seamless, and a slow
+    # start still completes from the roll (no stall, no cold element). A
+    # start-up longer than the allowance can then show a lead-in frame; that
+    # is the fallback's known limit, counted by claimStartupFallbacks.
+    for case in ({}, {"adaptiveRebuffer": True}):
+        result = _lag_harness(rvfc=False, **case)
+        cut = result["cuts"][0]
+        assert (cut["missing"], result["excluded"], result["backward"], result["rebufferEntries"], cut["incomingElements"]) == ([], [], [], 0, 1), case
+    slow = _lag_harness(rvfc=False, **_SLOW_START, adaptiveRebuffer=True)
+    assert slow["cuts"][0]["incomingElements"] == 1 and not slow["cuts"][0]["black"]
+    assert slow["cuts"][0]["maxHoldVsyncs"] < 12
+
+
+def test_the_frame_sampler_runs_without_session_diagnostics():
+    # The claim gate reads the sampler, so it cannot depend on debug flags.
+    assert _lag_harness(debugSession=False)["sampled"] > 0
+
+
+def test_loop_restart_and_stop_restart_clear_the_tail_stop():
+    # A loop ending on the cut stops the tail on its last frame every pass;
+    # the stop must not survive the wrap and freeze the next pass.
+    looped = _lag_harness(loopRange={"start": 30, "end": 48}, maxVsyncs=700)
+    full = [list(range(30, 48))]
+    assert looped["passFrames"][:-1] == full * (len(looped["passFrames"]) - 1)
+    assert len(looped["passFrames"]) >= 4 and not looped["excluded"]
+    # Stopped after the tail stop fired, then played again from earlier in the
+    # clip: the element must run again and the cut stay seamless.
+    restarted = _lag_harness(restart={"at": 47, "from": 38})
+    assert restarted["passFrames"][1][:12] == list(range(38, 50))
+    cut = restarted["cuts"][0]
+    assert (cut["missing"], restarted["excluded"], restarted["inactivePaints"]) == ([], [], 0)

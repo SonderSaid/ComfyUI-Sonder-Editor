@@ -31,11 +31,45 @@ export function _planPlaybackPreRoll({ fps, currentFrame, targetFrame, targetSou
     return result(distance <= leadInFrames + PLAYBACK_PRE_ROLL_START_MARGIN_FRAMES ? "start-roll" : "hold");
 }
 
-export function _rollingPrebufferAtTarget(currentTime, targetTime, tolerance) {
-    return Number.isFinite(currentTime) && Number.isFinite(targetTime)
-        // Tolerate measured sub-millisecond clock quantization, never a whole
-        // preceding frame. Rolling callers supply the frame timestamp.
-        && currentTime >= targetTime - 0.001 && currentTime <= targetTime + tolerance;
+// Without frame callbacks for an element nothing proves a roll's decoder is
+// running, so it is trusted this long after play(). Measured first
+// presentations: 22-68 ms (864x480) and 30-67 ms (1920x1088), Chromium
+// 2026-09-28. Remove when every supported browser delivers frame callbacks for
+// detached playback videos and acceptance shows zero claimStartupFallbacks.
+const PLAYBACK_ROLL_STARTUP_ALLOWANCE_MS = 100;
+// Rolls again from a longer lead-in while the clock is held, before parking.
+const PLAYBACK_ROLL_MAX_RETRIES = 2;
+
+// Whether a rolling pre-roll can be claimed for its target source frame.
+// drawImage paints floor(currentTime * fps) once the decoder is running, but
+// in the start-up gap after play() it keeps painting the last decoded frame,
+// which for a roll is a lead-in frame outside the edit. So a roll is claimable
+// only once its decoder runs and its currentTime frame is in [target,
+// target + 1], a window the running clock enters once and leaves forwards.
+// `settledFrame` is the frame the element is known to paint: the refresh on
+// which currentTime enters a frame can still paint the previous one (measured
+// on 1920x1088), so a frame entered this refresh settles on the next.
+// While the clock is held the window is the target alone: a roll that went
+// past it would paint a frame the held timeline has not reached. Past the
+// window it has overshot, and waiting can never make it claimable.
+export function _rollingClaimDecision({ decoderRunning = false, currentFrame, settledFrame = currentFrame, targetFrame, holding = false } = {}) {
+    if (!Number.isFinite(currentFrame) || !Number.isFinite(targetFrame)) return "wait";
+    if (currentFrame > targetFrame + (holding ? 0 : 1)) return "overshoot";
+    if (!decoderRunning || !(settledFrame >= targetFrame)) return "wait";
+    return "claim";
+}
+
+// Whether the outgoing element has reached the clip's last source frame and
+// must stop there. currentTime predicts the painted frame, so stopping on it
+// (not on the timeline tick) leaves the last frame painted; stopping past it
+// is the backstop, and the repaint refuses to paint past the out point.
+// Media that ended short of the clip's out point stops too: play() on an
+// ended element would restart it from the beginning.
+export function _tailStopDecision({ currentFrame, lastSourceFrame, ended = false } = {}) {
+    if (!Number.isFinite(lastSourceFrame)) return "none";
+    if (ended) return "stop";
+    if (!Number.isFinite(currentFrame)) return "none";
+    return currentFrame >= lastSourceFrame ? "stop" : "run";
 }
 
 // Whether a painted playback video has advanced enough to repaint between
@@ -136,6 +170,8 @@ function createPresentationCounters() {
         boundaryStaleDraws: 0, boundaryUnsampledDraws: 0,
         preRollStarted: 0, preRollLanded: 0, preRollAborted: 0,
         preRollSkippedNoRoom: 0, preRollSkippedBudget: 0, preRollRollingFrames: 0,
+        claimDeferredDecoderIdle: 0, rollsRerolled: 0, rollsParkedOnOvershoot: 0, claimStartupFallbacks: 0, tailStops: 0,
+        cutGraceRefreshes: 0,
     };
 }
 
@@ -1070,6 +1106,7 @@ function drawEdgePadBars(ctx, element, rect, canvasW, canvasH, srcW, srcH) {
 function removeMediaSource(mediaEl) {
     if (!mediaEl) return;
     mediaEl._sonderCancelPresentationTracker?.();
+    delete mediaEl._sonderTailStop;
     try {
         mediaEl.pause?.();
     } catch (error) {}
@@ -1679,8 +1716,12 @@ export function createViewportSurface(options = {}) {
         return typeof window !== "undefined" && window.SONDER_DEBUG_SESSION === true;
     }
 
+    // Always on for every playback-owned element: the rolling claim gate reads
+    // the samples. Each callback stores a new sample object, so newness is
+    // judged by identity (presentedFrames can reset). Only the diagnostics
+    // that read the samples stay behind their flags.
     function trackVideoPresentation(video, layerKey) {
-        if (!video || !playbackPerfActive()) return;
+        if (!video) return;
         if (video._sonderPresentationTracker) {
             video._sonderPresentationTracker.layerKey = layerKey;
             return;
@@ -1696,12 +1737,12 @@ export function createViewportSurface(options = {}) {
         };
         const sampleFrame = (timestamp, metadata) => {
             if (tracker.cancelled) return;
-            if (!playbackPerfActive() || state.destroyed) {
+            if (state.destroyed) {
                 video._sonderCancelPresentationTracker?.();
                 return;
             }
             tracker.sample = { ...metadata, presentedAtMs: timestamp };
-            if (window.SONDER_DEBUG_PLAYBACK_BOUNDARY) {
+            if (typeof window !== "undefined" && window.SONDER_DEBUG_PLAYBACK_BOUNDARY) {
                 // Use the existing bounded diagnostic ring, not an unbounded array.
                 viewportDiagRecord("playback_presentation_raw", {
                     t: timestamp, layerKey: tracker.layerKey, mediaTime: metadata.mediaTime,
@@ -3209,6 +3250,7 @@ export function createViewportSurface(options = {}) {
     // never adopt an element whose source is about to be stripped.
     function parkPlaybackMedia(cache, key, element) {
         element.pause();
+        delete element._sonderTailStop;
         if (cache[key] === element) delete cache[key];
         state.pendingRelease.add(element);
     }
@@ -3420,18 +3462,19 @@ export function createViewportSurface(options = {}) {
         return entry.ready ? video : null;
     }
 
-    function abortPreRoll(entry, reason, { restore = true } = {}) {
+    function abortPreRoll(entry, reason, { restore = true, counted = true } = {}) {
         if (!entry || entry.claimedByActive || !entry.preRollPhase || entry.preRollPhase === "target") return;
         recordPlaybackTelemetry("playback_preroll_abort", { reason, frame: currentFrame(), targetFrame: entry.targetFrame,
             currentTime: entry.video.currentTime, targetTime: entry.targetTime, phase: entry.preRollPhase });
         entry.preRollToken = (entry.preRollToken || 0) + 1;
         entry.preRollAbort?.abort();
         entry.preRollAbort = null;
+        entry.rollReseeking = false;
         entry.video.pause();
         entry.preRollPhase = "target";
         entry.preRollDisabled = true;
         entry.ready = false;
-        updatePlaybackPerfCounters(c => { c.presentation.preRollAborted += 1; });
+        if (counted) updatePlaybackPerfCounters(c => { c.presentation.preRollAborted += 1; });
         if (!restore || entry.cancelled || state.destroyed) return;
         // Restoring is limiter-owned too; an abort cannot resurrect a discarded entry.
         const token = entry.preRollToken;
@@ -3444,8 +3487,88 @@ export function createViewportSurface(options = {}) {
         }, { shouldRun: current }).catch(() => {});
     }
 
+    // A roll the playhead is waiting on at its cut is the hold's way out, so
+    // it keeps rolling; every other unclaimed roll is cancelled.
     function abortPreRolls(reason) {
-        for (const entry of state.prebufferCache.values()) abortPreRoll(entry, reason);
+        for (const entry of state.prebufferCache.values()) {
+            if (awaitedRoll(entry)) continue;
+            abortPreRoll(entry, reason);
+        }
+    }
+
+    function awaitedRoll(entry) {
+        return entry?.preRollPhase === "rolling" && !entry.cancelled && !entry.claimedByActive
+            && playbackWaitingForPrebufferEntry(entry);
+    }
+    // A roll that went past its claim window before its decoder ran can never
+    // become claimable. While the clock is held it rolls again from a lead-in
+    // sized by its decoder start-up (measured when the decoder ran, else at
+    // least the time since play()), so the held frame is still painted by a
+    // running decoder; a paused claim would pay that start-up again on resume
+    // and skip frames. Failing that it is parked: paused and seeked to its
+    // target, then claimed as a paused target.
+    function handleOvershotRoll(entry) {
+        const startupMs = Math.max(PLAYBACK_PRE_ROLL_LEAD_MS, Number.isFinite(entry.rollStartupMs)
+            ? entry.rollStartupMs
+            : performance.now() - Number(entry.rollPlayAtMs) || 0);
+        const leadInFrames = Math.ceil(startupMs * fps() / 1000) + PLAYBACK_PRE_ROLL_START_MARGIN_FRAMES + 1;
+        const leadInSourceFrame = entry.targetSourceFrame - leadInFrames;
+        if (state.playbackRebuffering && (entry.rollRetries || 0) < PLAYBACK_ROLL_MAX_RETRIES && leadInSourceFrame >= 0) {
+            reRollAwaited(entry, leadInSourceFrame);
+            return;
+        }
+        updatePlaybackPerfCounters(c => { c.presentation.rollsParkedOnOvershoot += 1; });
+        abortPreRoll(entry, "overshoot", { counted: false });
+    }
+
+    function reRollAwaited(entry, leadInSourceFrame) {
+        entry.rollRetries = (entry.rollRetries || 0) + 1;
+        entry.rollReseeking = true;
+        entry.rollDecoderRunning = false;
+        updatePlaybackPerfCounters(c => { c.presentation.rollsRerolled += 1; });
+        recordPlaybackTelemetry("playback_preroll_reroll", { frame: currentFrame(), targetFrame: entry.targetFrame,
+            leadInSourceFrame, retries: entry.rollRetries, startupMs: roundTelemetryMs(performance.now() - Number(entry.rollPlayAtMs)) });
+        entry.preRollToken = (entry.preRollToken || 0) + 1;
+        entry.preRollAbort?.abort();
+        entry.preRollAbort = new AbortController();
+        const signal = entry.preRollAbort.signal;
+        const token = entry.preRollToken;
+        const current = () => !state.destroyed && !entry.cancelled && !entry.claimedByActive
+            && entry.preRollToken === token && state.prebufferCache.get(entry.key) === entry;
+        try { entry.video.pause(); } catch (_) {}
+        entry.preRollPromise = playbackDecodeLimiter.run(DECODE_PRIORITY_HIGH, async () => {
+            if (!current()) return;
+            const video = await seekMedia(entry.video, Math.max(0, sourceFrameTime(leadInSourceFrame) - 0.5 / fps()), {
+                requireTarget: true, tolerance: prebufferTargetTimeTolerance(), signal,
+            });
+            if (!current()) return;
+            if (!video) {
+                entry.rollReseeking = false;
+                abortPreRoll(entry, "reroll-seek-failed");
+                return;
+            }
+            startRoll(entry);
+            entry.rollReseeking = false;
+        }, { shouldRun: current }).catch(() => {
+            if (!current()) return;
+            entry.rollReseeking = false;
+            abortPreRoll(entry, "reroll-seek-failed");
+        });
+    }
+
+    // Start a parked lead-in rolling. The decoder-running gate needs a
+    // presentation newer than the current one, of a frame after this one.
+    function startRoll(entry) {
+        entry.preRollPhase = "rolling";
+        entry.rollPlayAtMs = performance.now();
+        entry.rollStartupMs = null;
+        entry.rollPlaySample = entry.video._sonderPresentationTracker?.sample || null;
+        entry.rollStartFrame = videoPaintFrame(entry.video);
+        entry.rollDecoderRunning = false;
+        try {
+            const promise = entry.video.play();
+            promise?.catch(() => abortPreRoll(entry, "play-rejected"));
+        } catch (_) { abortPreRoll(entry, "play-rejected"); }
     }
 
     function schedulePreRolls(frame) {
@@ -3454,6 +3577,10 @@ export function createViewportSurface(options = {}) {
         let activePreRolls = entries.filter(e => e.preRollPhase === "lead-in" || e.preRollPhase === "rolling").length;
         for (const entry of entries) {
             const phase = entry.preRollPhase || "target";
+            if (awaitedRoll(entry)) {
+                if (rollingClaimDecisionFor(entry, awaitedRollSourceFrame(entry, frame)) === "overshoot") handleOvershotRoll(entry);
+                continue;
+            }
             const plan = _planPlaybackPreRoll({ fps: fps(), currentFrame: frame, targetFrame: entry.targetFrame,
                 targetSourceFrame: entry.targetSourceFrame, sourceInFrame: Number(entry.layer?.clip?.source_in_frame) || 0,
                 clipLengthFrames: entry.layer?.clip?.timeline_end_frame - entry.layer?.clip?.timeline_start_frame,
@@ -3497,21 +3624,118 @@ export function createViewportSurface(options = {}) {
                     else abortPreRoll(entry, "lead-seek-failed");
                 }, { shouldRun: current }).catch(() => { if (current()) abortPreRoll(entry, "lead-seek-failed"); });
             } else if (plan.action === "start-roll" && entry.preRollLeadReady) {
-                entry.preRollPhase = "rolling";
                 updatePlaybackPerfCounters(c => { c.presentation.preRollStarted++; });
-                try {
-                    const promise = entry.video.play();
-                    promise?.catch(() => abortPreRoll(entry, "play-rejected"));
-                } catch (_) { abortPreRoll(entry, "play-rejected"); }
+                startRoll(entry);
             }
         }
     }
 
-    function prebufferEntryMediaAtTarget(entry, targetTime) {
+    // A roll's decoder is running once a frame callback reports a presentation
+    // made after its play(), of a frame after the one it started from.
+    // Without frame callbacks for this element (none supported, or none ever
+    // delivered), a bounded start-up allowance stands in (counted).
+    function rollDecoderRunning(entry) {
+        if (entry.rollDecoderRunning) return true;
+        const video = entry.video;
+        const playAt = Number(entry.rollPlayAtMs);
+        if (!video || !Number.isFinite(playAt)) return false;
+        const sample = video._sonderPresentationTracker?.sample;
+        let running = !!(
+            sample
+            && sample !== entry.rollPlaySample
+            && Number(sample.presentedAtMs) >= playAt
+            && Math.floor(Number(sample.mediaTime) * fps() + 1e-6) > entry.rollStartFrame
+        );
+        if (running) {
+            entry.rollStartupMs = Number(sample.presentedAtMs) - playAt;
+        } else if (!sample && performance.now() - playAt >= PLAYBACK_ROLL_STARTUP_ALLOWANCE_MS) {
+            running = true;
+            updatePlaybackPerfCounters(c => { c.presentation.claimStartupFallbacks += 1; });
+        }
+        if (running) entry.rollDecoderRunning = true;
+        return running;
+    }
+
+    // A smoothed display refresh interval from successive ticks. A dropped
+    // refresh counts as at most one frame period.
+    function noteDisplayRefresh(timestamp) {
+        const last = state.playbackLastTickAt;
+        state.playbackLastTickAt = timestamp;
+        if (!Number.isFinite(last) || timestamp <= last) return;
+        const sample = Math.min(timestamp - last, 1000 / fps());
+        const estimate = state.playbackRefreshMs;
+        state.playbackRefreshMs = Number.isFinite(estimate) ? estimate * 0.875 + sample * 0.125 : sample;
+    }
+
+    // Once per display refresh, note when each rolling element's currentTime
+    // entered its frame.
+    function observeRolls(timestamp) {
+        for (const entry of state.prebufferCache.values()) {
+            if (entry?.preRollPhase !== "rolling" || !entry.video) continue;
+            const frame = videoPaintFrame(entry.video);
+            if (frame !== entry.rollFrame) {
+                entry.rollFrame = frame;
+                entry.rollFrameAt = timestamp;
+            }
+        }
+    }
+
+    // Whether a display refresh lasts most of a frame (about 30 Hz or slower
+    // at 24 fps), or has not been measured yet.
+    function refreshSpansFrame() {
+        return !(state.playbackRefreshMs < 0.75 * 1000 / fps());
+    }
+
+    // The frame a roll is known to paint: its currentTime frame once that was
+    // already current on an earlier refresh, else the one before it. When a
+    // refresh lasts most of a frame there is no earlier refresh to wait for,
+    // so the currentTime frame stands.
+    function rollSettledFrame(entry) {
+        const frame = videoPaintFrame(entry.video);
+        if (refreshSpansFrame()) return frame;
+        const settled = frame === entry.rollFrame && entry.rollFrameAt !== state.playbackLastTickAt;
+        return settled ? frame : frame - 1;
+    }
+
+    function rollingClaimDecisionFor(entry, targetSourceFrame = entry?.targetSourceFrame) {
+        if (entry.rollReseeking) return "wait";
+        return _rollingClaimDecision({
+            decoderRunning: rollDecoderRunning(entry),
+            currentFrame: videoPaintFrame(entry.video),
+            settledFrame: rollSettledFrame(entry),
+            targetFrame: targetSourceFrame,
+            holding: state.playbackRebuffering,
+        });
+    }
+
+    // While the clock runs past a cut, the roll the playhead waits on serves
+    // the frame the playhead has reached in the same clip: dropping it for a
+    // cold element would pay the whole decoder start-up again.
+    function rollServesLaterTarget(entry, layer, target) {
+        return !state.playbackRebuffering
+            && awaitedRoll(entry)
+            && entry.layerKey === layer?.key
+            && entry.sourcePath === target?.sourcePath
+            && Number(entry.layer?.clip?.timeline_start_frame) === Number(layer.clip?.timeline_start_frame)
+            && target.targetSourceFrame > entry.targetSourceFrame;
+    }
+
+    function prebufferEntryServesTarget(entry, layer, target) {
+        return (entry.targetSourceFrame === target.targetSourceFrame && entry.sourceTargetKey === target.sourceTargetKey)
+            || rollServesLaterTarget(entry, layer, target);
+    }
+
+    // The source frame an awaited roll is judged against at timeline `frame`.
+    function awaitedRollSourceFrame(entry, frame) {
+        if (state.playbackRebuffering || !(frame > entry.targetFrame)) return entry.targetSourceFrame;
+        return entry.targetSourceFrame + (frame - entry.targetFrame);
+    }
+
+    function prebufferEntryMediaAtTarget(entry, targetTime, targetSourceFrame = entry?.targetSourceFrame) {
         if (!entry?.video || entry.video.error) return false;
         if (entry.video.seeking || (entry.video.readyState || 0) < 2) return false;
         if (entry.preRollPhase === "lead-in") return false;
-        if (entry.preRollPhase === "rolling") return _rollingPrebufferAtTarget(Number(entry.video.currentTime), Math.max(0, targetTime - 0.5 / fps()), Math.min(firstDrawTolerance(), 0.45 / fps()));
+        if (entry.preRollPhase === "rolling") return rollingClaimDecisionFor(entry, targetSourceFrame) === "claim";
         return isMediaAtTarget(
             entry.video,
             clampMediaTargetTime(entry.video, targetTime),
@@ -3541,9 +3765,8 @@ export function createViewportSurface(options = {}) {
         if (entry.cancelled || entry.consumed || entry.claimedByActive) return false;
         if (entry.warmToken !== state.playbackWarmContentToken) return false;
         if (entry.sourcePath !== resolvedTarget.sourcePath) return false;
-        if (entry.targetSourceFrame !== resolvedTarget.targetSourceFrame) return false;
-        if (entry.sourceTargetKey !== resolvedTarget.sourceTargetKey) return false;
-        if (!prebufferEntryMediaAtTarget(entry, resolvedTarget.targetTime)) return false;
+        if (!prebufferEntryServesTarget(entry, layer, resolvedTarget)) return false;
+        if (!prebufferEntryMediaAtTarget(entry, resolvedTarget.targetTime, resolvedTarget.targetSourceFrame)) return false;
         if (!entry.ready) {
             publishPrebufferEntryReady(entry, layer, frame, "media-state");
         }
@@ -3619,8 +3842,7 @@ export function createViewportSurface(options = {}) {
         const candidates = [];
         for (const [key, entry] of state.prebufferCache.entries()) {
             if (!entry || entry.sourcePath !== target.sourcePath) continue;
-            if (entry.targetSourceFrame !== target.targetSourceFrame) continue;
-            if (entry.sourceTargetKey !== target.sourceTargetKey) continue;
+            if (!prebufferEntryServesTarget(entry, layer, target)) continue;
             const exactLayerMatch = key === target.key || entry.layerKey === layer.key;
             const tokenMatches = entry.warmToken === state.playbackWarmContentToken;
             const reusable = !!entry.video && !entry.cancelled && !entry.consumed && !entry.claimedByActive;
@@ -3629,7 +3851,14 @@ export function createViewportSurface(options = {}) {
                 && tokenMatches
                 && prebufferEntryOwnerAvailableForClaim(entry, layer, frame, snapshot);
             const ready = ownerAvailable && prebufferEntryReadyAtTarget(entry, layer, frame, target);
-            const pending = reusable && tokenMatches && !entry.ready && !pendingSkipped;
+            // A live roll keeps entry.ready from its parked target, yet until
+            // its decoder runs it is a pending claim, not a miss. An overshot
+            // roll the playhead waits on stays pending until the pre-roll
+            // scheduler rolls it again or parks it.
+            const rollDecision = !ready && reusable && entry.preRollPhase === "rolling"
+                ? rollingClaimDecisionFor(entry, target.targetSourceFrame) : "";
+            const rollWaiting = rollDecision === "wait" || (rollDecision === "overshoot" && awaitedRoll(entry));
+            const pending = reusable && tokenMatches && (!entry.ready || rollWaiting) && !pendingSkipped;
             const readyClaimable = ready && ownerAvailable;
             const pendingClaimable = pending && ownerAvailable;
             const pendingExact = pendingClaimable && exactLayerMatch;
@@ -4220,8 +4449,10 @@ export function createViewportSurface(options = {}) {
             try {
                 outgoing.pause?.();
             } catch (error) {}
+            clearTailStop(outgoing);
             state.pendingRelease.add(outgoing);
         }
+        clearTailStop(entry.video);
         state.videoCache[layer.key] = entry.video;
         entry.video._sonderPresentationClaimFrame = frame;
         if (entry.preRollPhase === "rolling") updatePlaybackPerfCounters(c => { c.presentation.preRollLanded++; });
@@ -4491,6 +4722,12 @@ export function createViewportSurface(options = {}) {
                 const candidates = prebufferCandidatesForLayerFrame(layer, targetFrame, { snapshot: targetSnapshot });
                 if (candidates.some((candidate) => candidate.readyClaimable)) continue;
                 const claimablePending = candidates.find((candidate) => candidate.pendingClaimable);
+                // A roll serving a frame past its own target is this frame's
+                // recovery already; a second element would race it.
+                if (offset === 0 && claimablePending && claimablePending.entry?.targetFrame !== targetFrame
+                    && awaitedRoll(claimablePending.entry)) {
+                    continue;
+                }
                 if (
                     claimablePending
                     && offset > 0
@@ -5754,6 +5991,10 @@ export function createViewportSurface(options = {}) {
         if (!active || !layer || !candidate?.entry) return false;
         const reclassification = reclassifyPendingCandidateForCurrentFrame(candidate, layer, frame, "pending-hold");
         const entry = candidate.entry;
+        if (entry.preRollPhase === "rolling" && !entry.claimDeferredCounted && !rollDecoderRunning(entry)) {
+            entry.claimDeferredCounted = true;
+            updatePlaybackPerfCounters(c => { c.presentation.claimDeferredDecoderIdle += 1; });
+        }
         const sourcePath = layer.clip?.source_path || "";
         const sourceChanged = active.layerKey !== layer.key || active.sourcePath !== sourcePath;
         const hadPendingPrepare = !!active.pendingPrepare;
@@ -5914,10 +6155,22 @@ export function createViewportSurface(options = {}) {
         );
     }
 
+    // A claimed roll anywhere in its claim window is at its frame: seeking it
+    // back to the frame centre would restart its decoder.
+    function claimedRollAtFrame(active, layer, frame) {
+        const entry = active?.claimedPrebufferEntry;
+        if (!entry || entry.preRollPhase !== "rolling" || entry.video !== active.video || !layer?.clip) return false;
+        if (active.layerKey !== layer.key || active.sourcePath !== layer.clip.source_path) return false;
+        if (active.video.seeking || (active.video.readyState || 0) < 2) return false;
+        const target = clipSourceFrame(layer, frame);
+        const current = videoPaintFrame(active.video);
+        return current >= target && current <= target + 1;
+    }
+
     function isActiveVideoDrawable(active, layer, frame) {
         if (!active?.readyForDraw) return false;
         const tolerance = active.firstDrawComplete ? playbackDriftTolerance() : firstDrawTolerance();
-        return playbackVideoAtFrame(active, layer, frame, tolerance);
+        return playbackVideoAtFrame(active, layer, frame, tolerance) || claimedRollAtFrame(active, layer, frame);
     }
 
     function syncPreparedVideoPlayback(active, layer, frame) {
@@ -5927,18 +6180,95 @@ export function createViewportSurface(options = {}) {
             active.video.pause();
             return;
         }
-        if (layer && isPlaybackTailFrame(layer, frame)) {
-            active.video.pause();
-            return;
-        }
+        // The tail stops on the element's own last frame, not on the timeline
+        // tick: a tick-time pause froze it one frame short when it trailed.
+        // Checking on every timeline frame suffices at 1x playback: between two
+        // an element cannot cross a whole frame.
+        const marker = armTailStop(active.video, layer);
+        if (marker && fireTailStop(active.video, marker)) return;
         if (active.video.paused) {
             playMediaElement(active.video, { mediaType: "video", layerKey: layer?.key || "", sourcePath: layer?.clip?.source_path || "" });
         }
     }
 
-    function pauseTailPlaybackVideo(active, layer, frame) {
-        if (!active?.video || !layer || !isPlaybackTailFrame(layer, frame)) return;
-        active.video.pause();
+    // The tail-stop marker names the clip end it guards; it is validated
+    // before it acts and cleared wherever the element is repositioned or
+    // reassigned, so it can never stop an element that now serves elsewhere.
+    function tailStopIdentity(video, layer) {
+        const clip = layer?.clip || {};
+        return [
+            state.playbackSessionId,
+            layer?.key || "",
+            clip.timeline_end_frame ?? "",
+            clip.source_out_frame ?? "",
+            video?._sonderSourceUrl || video?.currentSrc || "",
+        ].join("|");
+    }
+
+    function armTailStop(video, layer) {
+        const lastSourceFrame = clipLastSourceFrame(layer);
+        if (!video || !Number.isFinite(lastSourceFrame)) {
+            if (video) delete video._sonderTailStop;
+            return null;
+        }
+        const identity = tailStopIdentity(video, layer);
+        const existing = video._sonderTailStop;
+        if (existing?.identity === identity && existing.lastSourceFrame === lastSourceFrame) return existing;
+        video._sonderTailStop = { identity, lastSourceFrame, stopped: false };
+        return video._sonderTailStop;
+    }
+
+    function clearTailStop(video) {
+        if (video) delete video._sonderTailStop;
+    }
+
+    function clearActiveTailStops() {
+        for (const active of state.activePlaybackVideos.values()) clearTailStop(active?.video);
+    }
+
+    // A stop holds only while its element is still at its last frame: one
+    // moved back before it (a reposition no clear site covered) runs again.
+    function fireTailStop(video, marker) {
+        const decision = _tailStopDecision({
+            currentFrame: videoPaintFrame(video), lastSourceFrame: marker.lastSourceFrame, ended: !!video.ended,
+        });
+        if (decision !== "stop") {
+            marker.stopped = false;
+            return false;
+        }
+        video.pause();
+        if (!marker.stopped) updatePlaybackPerfCounters(c => { c.presentation.tailStops += 1; });
+        marker.stopped = true;
+        return true;
+    }
+
+    // A cut commits on the timeline tick, which parks the outgoing element.
+    // One trailing the tick by less than a frame has not painted its last
+    // frame yet, so the cut waits until that frame was painted and confirmed
+    // (the repaint shows it meanwhile), but only while the next refresh still
+    // falls inside the cut frame's own period. A refresh that then arrives
+    // late can still skip the cut frame; a two-refresh margin lost B-1 on a
+    // late-starting clock (harness), which is the commoner case.
+    function holdCutForDepartingTail(nextFrame, timestamp) {
+        const paint = state.playbackPaint;
+        if (!paint || state.playbackRebuffering || nextFrame !== currentFrame() + 1) return false;
+        const refreshMs = state.playbackRefreshMs;
+        const nextFrameDueAt = state.playbackStartTime + (nextFrame + 1 - state.playbackStartFrame) * 1000 / fps();
+        if (!Number.isFinite(refreshMs) || refreshMs <= 0 || timestamp + refreshMs >= nextFrameDueAt) return false;
+        if (!playbackPaintContextValid(paint) || paint.signature !== state.playbackLastCommittedSignature) return false;
+        const departing = paint.entries.some((entry) => {
+            if (entry.type !== "video" || !Number.isFinite(entry.lastSourceFrame)) return false;
+            const active = state.activePlaybackVideos.get(entry.layerKey);
+            const clipEnd = Number(active?.layer?.clip?.timeline_end_frame);
+            if (!active || active.video !== entry.element || clipEnd !== nextFrame) return false;
+            const video = entry.element;
+            if (video.seeking || (video.readyState || 0) < 2) return false;
+            if (entry.paintedFrame >= entry.lastSourceFrame && !entry.confirmPending) return false;
+            return videoPaintFrame(video) >= entry.lastSourceFrame - 1 && (!video.paused || videoPaintFrame(video) > entry.paintedFrame || entry.confirmPending);
+        });
+        if (!departing) return false;
+        updatePlaybackPerfCounters(c => { c.presentation.cutGraceRefreshes += 1; });
+        return true;
     }
 
     function pauseActivePlaybackVideos() {
@@ -5956,7 +6286,8 @@ export function createViewportSurface(options = {}) {
         const targetTolerance = firstDrawTolerance();
         const sessionId = state.playbackSessionId;
         const warmToken = state.playbackWarmContentToken;
-        const existingAtTarget = playbackVideoAtFrame(active, layer, frame, targetTolerance);
+        const existingAtTarget = playbackVideoAtFrame(active, layer, frame, targetTolerance)
+            || claimedRollAtFrame(active, layer, frame);
         if (!force && existingAtTarget) {
             if (active.pendingPrepare) {
                 active.prepareToken = ++state.playbackPrepareToken;
@@ -6004,6 +6335,7 @@ export function createViewportSurface(options = {}) {
         // separately via the resolve_media_source diag record.
         const prepareStartedAt = performance.now();
         const prepareWasWarm = !!active.firstDrawComplete;
+        clearTailStop(active.video);
         active.claimedPrebufferKey = "";
         active.claimedPrebufferEntry = null;
         clearActivePendingPrebuffer(active);
@@ -6865,12 +7197,16 @@ export function createViewportSurface(options = {}) {
     // the painted frame by up to two frames (measured), too late to reveal it,
     // and at 60 Hz can arrive after the next flip. The marker is keyed to the
     // session and source, so an element reused elsewhere never inherits it.
+    // A second paint within the same refresh confirms nothing, so it keeps the
+    // pending confirm instead of consuming it.
     function notePaintedVideo(entry, video) {
         const frame = videoPaintFrame(video);
         const key = `${state.playbackSessionId}|${video._sonderSourceUrl || video.currentSrc || ""}`;
+        const refresh = state.playbackLastTickAt;
         const last = video._sonderLastPainted;
-        entry.confirmPending = !last || last.key !== key || last.frame !== frame;
-        video._sonderLastPainted = { key, frame };
+        const sameFrame = !!last && last.key === key && last.frame === frame;
+        entry.confirmPending = !sameFrame || (last.refresh === refresh && last.confirmPending);
+        video._sonderLastPainted = { key, frame, refresh, confirmPending: entry.confirmPending };
         entry.paintedFrame = frame;
     }
 
@@ -7042,9 +7378,6 @@ export function createViewportSurface(options = {}) {
         const committedVideoKeys = [];
         const videoDraws = telemetryActive ? (painted?.videoDraws || []) : null;
         renderables.forEach((renderable, index) => {
-            if (renderable.type === "video" && renderable.active) {
-                pauseTailPlaybackVideo(renderable.active, renderable.layer, snapshot.frame);
-            }
             // A reused commit shows this layer already, exactly as painted.
             if (!(painted ? painted.drew[index] : true)) return;
             drewAny = true;
@@ -7542,6 +7875,7 @@ export function createViewportSurface(options = {}) {
         captureRebufferToastPressure(now);
         captureRebufferHeavyPressure(now);
         state.playbackRebuffering = true;
+        clearActiveTailStops();
         abortPreRolls("rebuffer");
         // Hold at the current (runaway) frame: audio has already played to ~here, so
         // catching the frozen video up to this frame keeps audio continuous (no
@@ -7679,9 +8013,36 @@ export function createViewportSurface(options = {}) {
     // moving and the in-flight seek can land. Returns true while held (consumes the
     // tick). At the cap, prefer an honest stall (last frame held, audio paused) over
     // resuming the runaway.
+    // True when the held frame waits only on rolls whose decoders now run on
+    // their target: every other required video layer is drawable there.
+    function heldRollsClaimable(holdFrame) {
+        const snapshot = buildFrameSnapshot(holdFrame);
+        let awaiting = false;
+        for (const layer of requiredClipLayersAfterCoverage(snapshot)) {
+            if (!isRenderableVideoLayer(layer)) continue;
+            const active = state.activePlaybackVideos.get(layer.key);
+            const entry = active?.pendingPrebufferEntry;
+            if (awaitedRoll(entry)) {
+                // The claim's own classifier, so resume never disagrees with it.
+                if (!prebufferCandidatesForLayerFrame(layer, holdFrame, { snapshot })
+                    .some((candidate) => candidate.entry === entry && candidate.readyClaimable)) return false;
+                awaiting = true;
+            } else if (!isActiveVideoDrawable(active, layer, holdFrame)) {
+                return false;
+            }
+        }
+        return awaiting;
+    }
+
     function maybeHoldForRebuffer(timestamp) {
         if (!state.playbackRebuffering) return false;
         const holdFrame = clamp(Math.round(Number(state.playbackRebufferFrame) || 0), 0, totalFrames());
+        // Resume before committing: a held commit pauses every video, and a
+        // paused roll would pay its decoder start-up again on resume.
+        if (heldRollsClaimable(holdFrame)) {
+            finishRebuffer({ resume: true, reason: "roll-decoding" });
+            return false;
+        }
         state.playbackStartTime = timestamp;
         state.playbackStartFrame = holdFrame;
         if (currentFrame() !== holdFrame) {
@@ -7738,6 +8099,7 @@ export function createViewportSurface(options = {}) {
         flushPlaybackPerfSummary(timestamp, { force: true });
         const hadCommittedFrame = state.playbackCompositeCommitted;
         state.playbackSessionId += 1;
+        clearActiveTailStops();
         clearPlaybackDecisionLogs();
         clearDeferredNextBoundaryTargets("loop-restart");
         resetPlaybackCompositeState();
@@ -7756,6 +8118,8 @@ export function createViewportSurface(options = {}) {
 
     function playbackTick(timestamp) {
         if (state.destroyed || !state.isPlaying) return;
+        noteDisplayRefresh(timestamp);
+        observeRolls(timestamp);
         const tickStartedAt = playbackPerfActive() ? performance.now() : 0;
         const finishTick = () => {
             if (tickStartedAt) recordPlaybackPerfTiming("tick", performance.now() - tickStartedAt);
@@ -7790,7 +8154,7 @@ export function createViewportSurface(options = {}) {
             return;
         }
         recordFramesBehindTelemetry(timestamp, nextFrame, endFrame);
-        if (canSkipRepeatedPlaybackFrame(nextFrame)) {
+        if (canSkipRepeatedPlaybackFrame(nextFrame) || holdCutForDepartingTail(nextFrame, timestamp)) {
             notePlaybackPerfFrameSkipped();
             repaintPlaybackIfAdvanced();
             state.playbackRAF = requestAnimationFrame(playbackTick);
@@ -7811,6 +8175,7 @@ export function createViewportSurface(options = {}) {
         const visibleAudioKeys = new Set(snapshot ? snapshot.audioLayers.map(layer => layer.key) : []);
         for (const [key, active] of state.activePlaybackVideos) {
             active.video.pause();
+            clearTailStop(active.video);
             active.readyForDraw = false;
             active.pendingPrepare = null;
             if (visibleVideoKeys.has(key)) state.pendingRelease.delete(active.video);
