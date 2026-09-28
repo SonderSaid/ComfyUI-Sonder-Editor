@@ -46,6 +46,10 @@ OBLIGATIONS = {
     "operation.scene-only": ("_SCENE_ONLY_MUTATIONS (listed operations only)", (
         "test_scene_mutation_no_op_writes.py::test_the_allow_list_only_holds_operations_the_dispatcher_accepts",
         "test_scene_mutation_no_op_writes.py::test_a_scene_only_operation_leaves_the_rest_of_the_project_alone")),
+    "operation.certification": ("CERTIFIED_OPERATIONS (listed operations only)", (
+        "test_change_certificates.py::test_every_certified_operation_is_a_dispatcher_operation",
+        "test_change_certificates.py::test_the_battery_exercises_every_certified_operation",
+        "test_change_certificates.py::test_a_certified_edit_stays_in_its_scene_and_its_flags_are_true")),
     "gesture.wrapper": ("_withMutationGesture", (
         "test_mutation_gesture_coverage.py::test_editor_writer_boundary_inventory",
         "test_mutation_gesture_coverage.py::test_editor_writer_exemptions_are_live",)),

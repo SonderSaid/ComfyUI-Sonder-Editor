@@ -152,6 +152,7 @@ from . import frozen_prompt
 from . import minimax_h3
 from . import prompt_payload
 from . import scene_mutation_addressing
+from . import change_certificates
 from .guide_collision import resolve_execution_window, resolve_guide_collisions
 
 logger = logging.getLogger("sonder_editor")
@@ -294,6 +295,32 @@ def _remember_request_project(request: web.Request, project: TimelineProject | N
             pass
 
 
+def _remember_change_certificate(request: web.Request, certificate: dict | None) -> None:
+    """The change certificate of THIS request's committed save, for its header.
+
+    Written only after the guarded save succeeds; an attempt that is refused or
+    re-applied never leaves one behind, because the next success overwrites it
+    and a failure never reaches here.
+    """
+    try:
+        request["sonder_change_certificate"] = certificate
+    except Exception:
+        try:
+            setattr(request, "_sonder_change_certificate", certificate)
+        except Exception:
+            pass
+
+
+def _request_change_certificate(request: web.Request) -> dict | None:
+    try:
+        certificate = request.get("sonder_change_certificate")
+    except Exception:
+        certificate = None
+    if certificate is None:
+        certificate = getattr(request, "_sonder_change_certificate", None)
+    return certificate if isinstance(certificate, dict) else None
+
+
 def _request_project(request: web.Request) -> TimelineProject | None:
     try:
         project = request.get("sonder_editor_project")
@@ -317,16 +344,19 @@ def _project_saved_event(project: TimelineProject) -> None:
         aliases.append(alias)
         seen.add(alias)
 
+    # Ephemeral: present only for the one guarded save it was armed around, and
+    # identical on both alias emissions and on the mutation response header.
+    certificate = change_certificates.certificate_for_saved(project)
     for alias in aliases:
-        schedule_project_event(
-            alias,
-            {
-                "type": "project_updated",
-                "project_id": alias,
-                "canonical_project_id": canonical_project_id,
-                "modified_at": getattr(project, "modified_at", ""),
-            },
-        )
+        event = {
+            "type": "project_updated",
+            "project_id": alias,
+            "canonical_project_id": canonical_project_id,
+            "modified_at": getattr(project, "modified_at", ""),
+        }
+        if certificate is not None:
+            event[change_certificates.EVENT_KEY] = dict(certificate)
+        schedule_project_event(alias, event)
 
 
 register_project_saved_hook(_project_saved_event)
@@ -4909,6 +4939,9 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
     3. Review _SCENE_ONLY_MUTATIONS against every project-level side effect.
        Incorrect membership can skip a necessary save; no-op-write tests probe
        listed members, but do not decide whether a new operation belongs.
+       Review change_certificates.CERTIFIED_OPERATIONS the same way: a member
+       that writes outside its scene certifies a read as unaffected when it is
+       not. tests/test_change_certificates.py probes listed members only.
     4. Keep batch persistence, CAS, version headers and canonical responses in
        the existing route pipeline. Media extraction consumes the batch budget;
        a client-only change that batches two extracting creates can exceed it.
@@ -4927,6 +4960,7 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
     @mutation-obligation operation.addressing -- SCENE_MUTATION_ADDRESSING
     @mutation-obligation operation.collapse -- SCENE_MUTATION_COALESCING
     @mutation-obligation operation.scene-only -- _SCENE_ONLY_MUTATIONS (listed operations only)
+    @mutation-obligation operation.certification -- CERTIFIED_OPERATIONS (listed operations only)
     @mutation-obligation gesture.wrapper -- _withMutationGesture
     @mutation-obligation gesture.guard-emission -- operation literal expected*
     @mutation-obligation gesture.coalescing -- key / coalesce / merge
@@ -5318,26 +5352,42 @@ def _apply_scene_mutations_sync(request: web.Request, scene_id: str, operations:
     replay_declined = str(
         headers.get(scene_mutation_addressing.REPLAY_DECLINED_HEADER, "") or ""
     ).strip().lower() == scene_mutation_addressing.REPLAY_DECLINED_VALUE
+    # Refilled by every attempt, so a re-applied batch certifies what ITS
+    # document changed, never what the attempt that lost the race saw.
+    evidence: dict = {}
+
+    def apply(project: TimelineProject) -> tuple[bool, dict]:
+        evidence.clear()
+        return _apply_scene_mutation_batch(project, scene_id, operations, evidence=evidence)
+
     return _apply_project_versioned_sync(
         request,
-        lambda project: _apply_scene_mutation_batch(project, scene_id, operations),
+        apply,
         addressing=scene_mutation_addressing.derive_batch_addressing(
             operations, replay_declined=replay_declined),
         verify_unchanged=True,
+        change_evidence=lambda: evidence.get("flags"),
     )
 
 
 def _apply_scene_mutation_batch(project: TimelineProject, scene_id: str,
-                                operations: list) -> tuple[bool, dict]:
+                                operations: list, *,
+                                evidence: dict | None = None) -> tuple[bool, dict]:
     """Pure in-memory application of one batch to one loaded document.
 
     Runs once per commit attempt, so everything it decides -- validation, the
-    no-op comparison, the response -- is recomputed against each reloaded
-    document rather than carried over from a document that lost the race.
+    no-op comparison, the response, the change evidence -- is recomputed against
+    each reloaded document rather than carried over from a document that lost
+    the race. `evidence["flags"]` is filled only for a batch made entirely of
+    `change_certificates.CERTIFIED_OPERATIONS`.
     """
     scene = project.get_scene(scene_id)
     if not scene:
         _mutation_error(f"Scene not found: {scene_id}", 404, "item_not_found")
+    witness = (change_certificates.SceneDependencyWitness(scene)
+               if evidence is not None
+               and change_certificates.batch_is_certifiable(operations)
+               and not change_certificates.scene_ids_minted_at_load(scene) else None)
 
     if _media_io_operation_count(project, operations) > 1:
         _mutation_error(
@@ -5406,6 +5456,8 @@ def _apply_scene_mutation_batch(project: TimelineProject, scene_id: str,
             dict(value) for value in project.prompt_context_profiles]
         payload["prompt_semantic_units"] = [
             dict(value) for value in project.prompt_semantic_units]
+    if witness is not None:
+        evidence["flags"] = witness.flags(scene)
     return committed, payload
 
 
@@ -6058,6 +6110,7 @@ def _apply_project_versioned_sync(
     addressing: str = "positional",
     rebase_stale_precondition: bool = False,
     verify_unchanged: bool = False,
+    change_evidence=None,
 ):
     """Load, apply and commit one project mutation as a compare-and-swap.
 
@@ -6090,6 +6143,14 @@ def _apply_project_versioned_sync(
     the same conflict a save would raise, including the identity retry. The scene
     mutation route sets it: its response hands the client a canonical scene, and
     one from a document disk has already left is adopted with no gate of its own.
+
+    `change_evidence()` is read after each attempt's `apply_fn` and returns that
+    attempt's `{scene_id, prompt, bridge}` dependency flags, or None. When it
+    answers, the save is armed with a change certificate (`change_certificates`)
+    bound to THIS attempt's base version, so a re-applied batch certifies the
+    transition that actually committed, never the first load's. The certificate
+    reaches `project_updated` through the saved hook and the response through
+    `_remember_change_certificate`; a refused or no-op attempt publishes none.
     """
     if addressing not in ("identity", "positional"):
         raise ValueError(f"addressing must be 'identity' or 'positional', got {addressing!r}")
@@ -6128,7 +6189,19 @@ def _apply_project_versioned_sync(
                     verify_project_version(project, expected_modified_at=base_modified_at)
                 _remember_request_project(request, project)
                 return project, payload
-            save_project(project, expected_modified_at=base_modified_at)
+            flags = change_evidence() if change_evidence is not None else None
+            if flags:
+                with change_certificates.pending_certificate(
+                        project_dir=str(getattr(project, "project_dir", "") or ""),
+                        project_id=str(getattr(project, "project_id", "") or ""),
+                        scene_id=flags["scene_id"],
+                        base_modified_at=base_modified_at,
+                        prompt=flags["prompt"], bridge=flags["bridge"]):
+                    save_project(project, expected_modified_at=base_modified_at)
+                    _remember_change_certificate(
+                        request, change_certificates.published_certificate())
+            else:
+                save_project(project, expected_modified_at=base_modified_at)
             # A CAS retry replaces the object the request first remembered. The
             # version-header middleware must stamp the one that actually committed,
             # or the client immediately regresses to a stale version.
@@ -12868,7 +12941,12 @@ if routes is not None:
             return _mutation_json_error(exc)
 
         _remember_request_project(request, project)
-        return web.json_response(payload)
+        response = web.json_response(payload)
+        certificate = _request_change_certificate(request)
+        if certificate is not None:
+            response.headers[change_certificates.HEADER] = (
+                change_certificates.encode_header(certificate))
+        return response
 
     @routes.delete("/sonder-editor/project/{project_id}/scenes/{scene_id}")
     async def api_delete_scene(request: web.Request) -> web.Response:

@@ -65,6 +65,7 @@
  * @mutation-obligation operation.addressing -- SCENE_MUTATION_ADDRESSING
  * @mutation-obligation operation.collapse -- SCENE_MUTATION_COALESCING
  * @mutation-obligation operation.scene-only -- _SCENE_ONLY_MUTATIONS (listed operations only)
+ * @mutation-obligation operation.certification -- CERTIFIED_OPERATIONS (listed operations only)
  * @mutation-obligation gesture.wrapper -- _withMutationGesture
  * @mutation-obligation gesture.guard-emission -- operation literal expected*
  * @mutation-obligation gesture.coalescing -- key / coalesce / merge

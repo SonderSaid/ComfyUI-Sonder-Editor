@@ -342,11 +342,11 @@ def race(monkeypatch, tmp_path):
 
     def arm(competing_write):
         """Run `competing_write(project_dir)` inside the first attempt's window."""
-        def hooked(project, scene_id, operations):
+        def hooked(project, scene_id, operations, **kwargs):
             attempts.append(project.modified_at)
             if len(attempts) == 1:
                 competing_write(project.project_dir)
-            return original_batch(project, scene_id, operations)
+            return original_batch(project, scene_id, operations, **kwargs)
         monkeypatch.setattr(route_module, "_apply_scene_mutation_batch", hooked)
 
     def post(operations, *, project_id=folder_id, if_match="", headers=None):
