@@ -5,6 +5,16 @@
 let generationSequence = 0;
 let requestSequence = 0;
 
+// The project version each shared payload was read at, from its response
+// header. A consumer keeps a payload across newer versions only when change
+// certificates prove the read unchanged from THIS version (`api_client.js`).
+const payloadVersions = new WeakMap();
+
+/** The project version a coordinator payload describes, or "" when unknown. */
+export function bridgePayloadVersion(payload) {
+    return (payload && typeof payload === "object" && payloadVersions.get(payload)) || "";
+}
+
 function deferred() {
     let resolve;
     let reject;
@@ -36,7 +46,10 @@ async function defaultRequest({ url, generation, origin, requestId, label, nodeI
         error.status = Number(response.status) || 0;
         throw error;
     }
-    return response.json();
+    const payload = await response.json();
+    const version = response.headers?.get?.("X-Sonder-Project-Modified-At") || "";
+    if (version && payload && typeof payload === "object") payloadVersions.set(payload, version);
+    return payload;
 }
 
 function settle(waiters, payload, error = null) {

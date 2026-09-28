@@ -1749,7 +1749,9 @@ export const app = {
 };
 """,
         "api.mjs": "export const api = { apiURL: (value) => value };\n",
-        "client.mjs": "export const onProjectVersionChanged = () => {};\n",
+        "client.mjs": ("export const onProjectVersionChanged = () => {};\n"
+                       "export const certifiedUnchanged = () => false;\n"
+                       "export const sameProject = (a, b) => a === b;\n"),
         "events.mjs": "export const onEditorRenderWindowChanged = () => {};\n",
         "keyboard.mjs": "export const PRIORITY = { OVERLAY: 100 }; export const register = () => () => {};\n",
         "resolver.mjs": """
@@ -1931,7 +1933,9 @@ export const app = {
 };
 """,
         "api.mjs": "export const api = { apiURL: (value) => value };\n",
-        "client.mjs": "export const onProjectVersionChanged = () => {};\n",
+        "client.mjs": ("export const onProjectVersionChanged = () => {};\n"
+                       "export const certifiedUnchanged = () => false;\n"
+                       "export const sameProject = (a, b) => a === b;\n"),
         "events.mjs": "export const onEditorRenderWindowChanged = () => {};\n",
         "keyboard.mjs": """
 export const PRIORITY = { OVERLAY: 100 };

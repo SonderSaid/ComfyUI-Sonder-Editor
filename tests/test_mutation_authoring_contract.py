@@ -1274,6 +1274,18 @@ def test_severing_any_single_claim_link_fails_the_contract(old, new, count, mess
 # Header form: // @server-mirror relative/python_file.py::symbol
 # Authority citations and test references prove existence, never semantic coverage.
 MIRRORED_MODULES = {
+    "prompt_preview_freshness.js": {
+        "scope": ("The candidate fields a preview compile takes from its request, "
+                  "not the freshness decision built on them."),
+        "authorities": ("server/routes.py::PROMPT_CANDIDATE_OVERLAY_FIELDS",
+                        "server/routes.py::PROMPT_CANDIDATE_OVERLAY_ALIASES",
+                        "server/change_certificates.py::prompt_dependency_projection"),
+        "tests": tuple("test_prompt_preview_freshness_js.py::" + name for name in (
+            "test_the_candidate_overlay_matches_the_server",
+            "test_the_key_reads_what_the_server_reads_and_nothing_else",
+            "test_reference_lane_presentation_never_moves_the_key",
+            "test_the_hidden_narrowing_matches_the_server_projection")),
+    },
     "scene_guide_geometry.js": {
         "scope": ("Guide-swap applicability, raw frame ordering, and the guide "
                   "identity comparison host local applies gate on."),
@@ -1500,7 +1512,7 @@ def test_declared_mirror_headers_match_the_inventory_both_ways():
 
 def test_every_declared_mirror_has_a_live_parity_disposition():
     _assert_mirror_obligations(MIRRORED_MODULES, ROOT)
-    assert sum(len(row["authorities"]) for row in MIRRORED_MODULES.values()) == 48
+    assert sum(len(row["authorities"]) for row in MIRRORED_MODULES.values()) == 51
 
 @pytest.mark.parametrize("name, valid", [("TABLE", True), ("row", False), ("transform", True)])
 def test_mirror_authorities_are_module_declarations(tmp_path, name, valid):

@@ -13,11 +13,12 @@
 import { app } from "/scripts/app.js";
 import { api } from "/scripts/api.js";
 import { resolveProjectSource, getGraphLink, getGraphNode } from "./project_source_resolver.js";
-import { onProjectVersionChanged } from "./api_client.js";
+import { certifiedUnchanged, onProjectVersionChanged, sameProject } from "./api_client.js";
 import { onEditorRenderWindowChanged } from "./editor_render_window_events.js";
 import { PRIORITY as KEY_PRIORITY, register as registerKeyboardConsumer } from "./keyboard_ownership.js";
 import {
     createBridgeRefreshScheduler,
+    bridgePayloadVersion,
     requestBridgeReferencePayload,
 } from "./bridge_read_coordinator.js";
 import {
@@ -40,6 +41,10 @@ const BRIDGES = new Set([
 ]);
 const STATE = Symbol("sonderReferenceBridgeState");
 const SELECTOR_STATE = Symbol("sonderReferenceSelectorState");
+// The `{url, version}` of the bridge-references payload a node last applied.
+// Ephemeral: it only decides whether a project-version notice owes the node a
+// re-read (`needsVersionRefresh`), and it is dropped whenever a read fails.
+const ACCEPTED = Symbol("sonderReferenceAcceptedRead");
 
 const nodeType = (node) => String(node?.comfyClass || node?.type || "");
 const findWidget = (node, name) => (node?.widgets || []).find((widget) => widget?.name === name) || null;
@@ -134,16 +139,61 @@ const FULL_SHAPE = {
     imageSlotLabels: [],
 };
 
-async function referenceShapeForBridge(node, wave) {
-    const selector = upstreamSelector(node);
-    if (!selector) return FULL_SHAPE;
-    const resolution = resolveProjectSource(selector);
-    if (resolution.status !== "resolved") return FULL_SHAPE;
+/**
+ * Where a node's Reference read comes from: the resolved project, scene and the
+ * complete request URL, or null while the source is unresolved. A bridge reads
+ * through its upstream selector; a selector reads through its own project input.
+ */
+function referenceReadContext(node) {
+    const source = BRIDGES.has(nodeType(node)) ? upstreamSelector(node) : node;
+    if (!source) return null;
+    const resolution = resolveProjectSource(source);
+    if (resolution.status !== "resolved") return null;
     const controller = resolution.editor?._sonderController || null;
     const controllerState = controller?.state || null;
     const projectDir = String(controllerState?.projectDir || "");
     const projectId = projectDir.split(/[/\\]/).pop() || "";
     const sceneId = controllerState?.sceneId || controllerState?.dormantSummary?.active_scene?.scene_id || "";
+    return {
+        controller, projectDir, projectId, sceneId,
+        url: projectId && sceneId
+            ? api.apiURL(referenceBridgeUrl(projectId, sceneId, controllerState)) : "",
+    };
+}
+
+function acceptRead(node, url, payload) {
+    node[ACCEPTED] = { url, version: bridgePayloadVersion(payload) };
+}
+
+/**
+ * Whether a project-version notice owes this node a re-read. It does not when
+ * the notice is about another project, or when the payload it holds was read at
+ * the same URL and change certificates prove every transition since left the
+ * bridge read unchanged for its scene. Every doubt re-reads, and an unresolved
+ * node re-reads exactly as it always has.
+ */
+function needsVersionRefresh(node, projectId, modifiedAt) {
+    const context = referenceReadContext(node);
+    if (!context || !context.url) return true;
+    if (projectId && !sameProject(context.projectId, projectId)) return false;
+    const accepted = node[ACCEPTED];
+    if (!accepted || !accepted.version || accepted.url !== context.url || !modifiedAt) return true;
+    if (!certifiedUnchanged({
+        projectId: context.projectId, sceneId: context.sceneId,
+        fromVersion: accepted.version, toVersion: modifiedAt, dependency: "bridge",
+    })) return true;
+    // The held payload answers for the newer version too; advance it so the
+    // next notice needs only the certificates after this one.
+    node[ACCEPTED] = { ...accepted, version: String(modifiedAt) };
+    return false;
+}
+
+async function referenceShapeForBridge(node, wave) {
+    const selector = upstreamSelector(node);
+    if (!selector) return FULL_SHAPE;
+    const context = referenceReadContext(node);
+    if (!context) return FULL_SHAPE;
+    const { controller, projectDir, projectId, sceneId } = context;
     if (!projectId || !sceneId) {
         // Load-time race: the editor node is wired but its async updateProject()
         // has not resolved a project yet. Retry once when it does, mirroring the
@@ -157,24 +207,31 @@ async function referenceShapeForBridge(node, wave) {
         return FULL_SHAPE;
     }
     const payload = await requestBridgeReferencePayload({
-        url: api.apiURL(referenceBridgeUrl(projectId, sceneId, controllerState)),
+        url: context.url,
         generation: wave.generation,
         origin: wave.origin,
     });
     const selection = parseLaneSelection(findWidget(selector, "reference_lanes")?.value);
-    return mergedBridgeShape({
+    const shape = mergedBridgeShape({
         lanes: Array.isArray(payload?.references) ? payload.references : [],
         laneIndices: selection.laneIndices,
     });
+    return { shape, read: { url: context.url, payload } };
 }
 
 function refreshShape(node, wave) {
     if (!BRIDGES.has(nodeType(node))) return;
     const state = ensureState(node);
     const token = ++state.refreshToken;
+    // Revoked on dispatch, never restored by a late certificate: only the read
+    // this dispatch makes can re-establish what the node holds.
+    node[ACCEPTED] = null;
     referenceShapeForBridge(node, wave)
-        .then((shape) => {
-            if (token === state.refreshToken) applyReferenceBridgeShape(node, shape);
+        .then((result) => {
+            if (token !== state.refreshToken) return;
+            const shape = result?.shape || result;
+            if (result?.read) acceptRead(node, result.read.url, result.read.payload);
+            applyReferenceBridgeShape(node, shape);
         })
         .catch((error) => {
             console.warn("[Sonder Reference Bridge] shape refresh failed:", error);
@@ -193,11 +250,20 @@ const scheduleReferenceRefresh = createBridgeRefreshScheduler({
 });
 
 function refreshAllBridges(projectId, modifiedAt) {
+    // Only the nodes this version can have changed: another project's writes,
+    // and certified edits that leave this node's scene's bridge read unchanged,
+    // re-read nothing. Explicit Refresh and window changes keep their own paths.
+    const targets = [...(app.graph?._nodes || [])].filter((node) => {
+        const kind = nodeType(node);
+        if (!BRIDGES.has(kind) && kind !== SELECTOR) return false;
+        return needsVersionRefresh(node, projectId, modifiedAt);
+    });
+    if (!targets.length) return;
     scheduleReferenceRefresh({
         origin: "project_version",
         projectId,
         modifiedAt,
-        targets: null,
+        targets,
         delayMs: 250,
     });
 }
@@ -315,15 +381,11 @@ function selectorPanelHeight(view) {
 }
 
 async function selectorLanePayload(node, wave) {
-    const resolution = resolveProjectSource(node);
-    if (resolution.status !== "resolved") {
+    const context = referenceReadContext(node);
+    if (!context) {
         return { status: "Connect a Sonder Editor project.", lanes: [], linked: false };
     }
-    const controller = resolution.editor?._sonderController || null;
-    const controllerState = controller?.state || null;
-    const projectDir = String(controllerState?.projectDir || "");
-    const projectId = projectDir.split(/[/\\]/).pop() || "";
-    const sceneId = controllerState?.sceneId || controllerState?.dormantSummary?.active_scene?.scene_id || "";
+    const { controller, projectDir, projectId, sceneId } = context;
     if (!projectId || !sceneId) {
         if (controller && !projectDir && typeof controller.whenProjectReady === "function") {
             controller.whenProjectReady(() => scheduleReferenceRefresh({
@@ -334,11 +396,12 @@ async function selectorLanePayload(node, wave) {
         return { status: projectId ? "No active scene." : "Loading project...", lanes: [], linked: false };
     }
     const payload = await requestBridgeReferencePayload({
-        url: api.apiURL(referenceBridgeUrl(projectId, sceneId, controllerState)),
+        url: context.url,
         generation: wave.generation,
         origin: wave.origin,
     });
     return {
+        read: { url: context.url, payload },
         status: "",
         lanes: Array.isArray(payload?.references) ? payload.references : [],
         tagPresets: Array.isArray(payload?.tag_presets) ? payload.tag_presets : [],
@@ -469,9 +532,12 @@ function refreshSelectorPanel(node, wave) {
     if (!state.panel) return;
     const token = ++state.refreshToken;
     state.status.textContent = "Loading Reference lanes...";
+    node[ACCEPTED] = null;
     selectorLanePayload(node, wave)
         .then((payload) => {
-            if (token === state.refreshToken) renderSelectorPanel(node, payload);
+            if (token !== state.refreshToken) return;
+            if (payload?.read) acceptRead(node, payload.read.url, payload.read.payload);
+            renderSelectorPanel(node, payload);
         })
         .catch((error) => {
             if (token !== state.refreshToken) return;

@@ -543,6 +543,7 @@ import {
     updateEditorSettings,
 } from "./editor_settings.js";
 import {
+    certifiedUnchanged,
     createStaleReplayGovernor,
     fetchProjectJson,
     getProjectVersion,
@@ -562,6 +563,9 @@ import {
 } from "./asset_refresh_coordinator.js";
 import { ProjectMutationQueue } from "./project_mutation_queue.js";
 import { createPromptCompileCoordinator } from "./prompt_compile_coordinator.js";
+import {
+    pendingPromptWorkAnswers, promptCompileSemanticKey, promptResultAnswers,
+} from "./prompt_preview_freshness.js";
 import { applyPromptIdentityChange, sameIdentitySnapshot } from "./prompt_identity_panel.js";
 import {
     promptIdentityCleanupPlan,
@@ -15402,12 +15406,17 @@ export class EditorWidget {
         // that was deliberately emptied.
         const token = (this._promptContextScenePayloadToken || 0) + 1;
         this._promptContextScenePayloadToken = token;
+        const pending = (this._promptPreviewPending ||= {});
         if (windowStart <= 0 && windowEnd >= duration) {
             // The window IS the scene, so the two compiles would be identical.
             this._promptContextScenePayloadCache = null;
+            pending.scene = null;
             this._clearPromptStaleVisualTimerIfSettled(sceneId);
             return;
         }
+        const settlePending = () => {
+            if (pending.scene?.token === token) pending.scene = null;
+        };
         (async () => {
             try {
                 const body = this._promptCompileRequestBody({
@@ -15415,6 +15424,9 @@ export class EditorWidget {
                     selection: { selectionStart: 0, selectionEnd: duration },
                     promptSemanticUnitCreates,
                 });
+                const key = this._promptCompileKey?.(body) || "";
+                pending.scene = { state: "inflight", key, sceneId, token,
+                    version: String(body.base_modified_at || "") };
                 const result = await (this._queuePromptContextCompile
                     ? this._queuePromptContextCompile(
                         "scene-projection", dirName, sceneId, body,
@@ -15425,6 +15437,7 @@ export class EditorWidget {
                 if (!result || this._destroyed || dirName !== this._projectDirName()
                         || sceneId !== this.activeSceneId
                         || token !== this._promptContextScenePayloadToken) return;
+                settlePending();
                 const { response, payload } = result;
                 if (!response.ok || !payload) {
                     this._promptContextScenePayloadCache = null;
@@ -15438,6 +15451,10 @@ export class EditorWidget {
                     ...this._promptProjectionSubset(payload),
                     _candidate_scene_id: sceneId,
                     _stale: false,
+                    // What this result answers for (`prompt_preview_freshness.js`).
+                    _semantic_key: key,
+                    _version: String(payload.candidate_base_modified_at
+                        || body.base_modified_at || ""),
                 };
                 this._clearPromptStaleVisualTimerIfSettled(sceneId);
             } catch (error) {
@@ -15447,6 +15464,7 @@ export class EditorWidget {
                 if (this._destroyed || dirName !== this._projectDirName()
                         || sceneId !== this.activeSceneId
                         || token !== this._promptContextScenePayloadToken) return;
+                settlePending();
                 this._promptContextScenePayloadCache = null;
                 this._clearPromptStaleVisualTimerIfSettled(sceneId);
             }
@@ -15459,24 +15477,86 @@ export class EditorWidget {
         })();
     }
 
+    /**
+     * Which prompt-preview branches an intent actually needs (cut-read-fanout §2).
+     *
+     * Each branch -- the windowed compile and the scene-wide projection -- is
+     * decided on its own: `current` when a fresh result already answers the
+     * request's semantic key at this version, `joined` when scheduled or
+     * in-flight work for the same key already will, and `work` otherwise.
+     * `revoke` marks pending work for a DIFFERENT key that must not land.
+     * A selection-only change therefore re-runs only the windowed branch, and a
+     * certified prompt-irrelevant edit re-runs neither and marks nothing stale.
+     *
+     * The bodies here are built only to key the intent; the requests build
+     * their own at dispatch, at whatever version then holds.
+     */
+    _planPromptPreviewBranches({ dirName, sceneId, candidate, windowStart, windowEnd,
+        selection, promptSemanticUnitCreates = [] }) {
+        const version = getProjectVersion(dirName);
+        const all = this._promptPreviewPending || {};
+        const pendingFor = (branch) => {
+            const entry = all[branch];
+            if (!entry) return null;
+            // Pending work is alive only while it still owns its branch's token.
+            // Anything that bumps the token -- a scene switch, destroy, a newer
+            // intent -- makes that work's result unable to land, so joining it
+            // would wait for a result that never comes.
+            const liveToken = branch === "windowed"
+                ? this._promptContextPreviewToken : this._promptContextScenePayloadToken;
+            if (entry.token !== liveToken) return null;
+            // Scheduled work is alive only while its timer still is.
+            if (entry.state === "scheduled" && entry.timer !== this._promptContextPreviewTimer) {
+                return null;
+            }
+            return entry;
+        };
+        const decide = (branch, cache, body) => {
+            const key = promptCompileSemanticKey(body);
+            const pending = pendingFor(branch);
+            const args = { sceneId, key, projectId: dirName, version, certifiedUnchanged };
+            if (pendingPromptWorkAnswers({ ...args, pending })) {
+                return { state: "joined", key, revoke: false };
+            }
+            const revoke = !!pending && (pending.state === "scheduled" || pending.state === "inflight");
+            if (promptResultAnswers({ ...args, cache })) return { state: "current", key, revoke };
+            return { state: "work", key, revoke };
+        };
+        const windowed = decide("windowed", this._windowedPromptCandidate(),
+            this._promptCompileRequestBody({ dirName, candidate, windowStart, windowEnd,
+                selection, promptSemanticUnitCreates }));
+        const duration = Math.max(1, Math.round(
+            candidate.duration_frames ?? this.totalFrames ?? 1));
+        let scene;
+        if (windowStart <= 0 && windowEnd >= duration) {
+            // No scene-wide compile applies; only a cache or pending work to retire.
+            scene = { state: (this._promptContextScenePayloadCache || pendingFor("scene"))
+                ? "work" : "current", key: "", revoke: false };
+        } else {
+            scene = decide("scene", this._promptScenePayload(), this._promptCompileRequestBody({
+                dirName, candidate, windowStart: 0, windowEnd: duration,
+                selection: { selectionStart: 0, selectionEnd: duration },
+                promptSemanticUnitCreates }));
+        }
+        // A current result answers for the newer version too; advancing it
+        // means the next decision needs only the certificates after this one.
+        if (windowed.state === "current") this._promptContextCandidateCache._version = version;
+        if (scene.state === "current" && scene.key && this._promptContextScenePayloadCache) {
+            this._promptContextScenePayloadCache._version = version;
+        }
+        return { windowed, scene };
+    }
+
+    /** The semantic identity of one compile request (`prompt_preview_freshness.js`). */
+    _promptCompileKey(body) {
+        return promptCompileSemanticKey(body);
+    }
+
     _previewPromptContextCandidate(scenePatch = {}, delay = 180,
         promptSemanticUnitCreates = []) {
         const dirName = this._projectDirName();
         const sceneId = this.activeSceneId;
         if (!dirName || !sceneId || !this.activeScene) return;
-        if (this._promptContextPreviewTimer) clearTimeout(this._promptContextPreviewTimer);
-        if (this._promptContextStaleVisualTimer) {
-            clearTimeout(this._promptContextStaleVisualTimer);
-        }
-        this._promptContextStaleVisualTimer = null;
-        const token = (this._promptContextPreviewToken || 0) + 1;
-        this._promptContextPreviewToken = token;
-        // Invalidate the previous scene-wide sibling NOW, not when this edit's
-        // debounced request eventually starts. Otherwise an older response can
-        // land during the debounce gap and repaint superseded projections as
-        // fresh data.
-        this._promptContextScenePayloadToken =
-            (this._promptContextScenePayloadToken || 0) + 1;
         const candidate = { ...structuredClone(this.activeScene),
             ...structuredClone(scenePatch || {}) };
         const range = this._selectionContextRange?.();
@@ -15486,7 +15566,45 @@ export class EditorWidget {
         const candidateSelection = resolvePromptCandidateSelection(
             this.selectionStart, this.selectionEnd,
             candidate.duration_frames ?? this.totalFrames ?? 0);
-        if (this._promptScenePayload()) {
+        // Decided before anything is marked or scheduled: an intent the held
+        // results or pending work already answer must cause neither a stale
+        // transition nor a request. A host without the planner (the extracted
+        // test harnesses) keeps the unconditional behaviour.
+        const plan = this._planPromptPreviewBranches?.({
+            dirName, sceneId, candidate, windowStart, windowEnd,
+            selection: candidateSelection, promptSemanticUnitCreates }) || null;
+        if (plan && !["windowed", "scene"].some((branch) =>
+            plan[branch].state === "work" || plan[branch].revoke)) return;
+        const pending = (this._promptPreviewPending ||= {});
+        // Re-arming the timer drops the old one, so scheduled work this intent
+        // joined has to travel with the new timer.
+        const keepsScheduled = (branch) => plan?.[branch].state === "joined"
+            && pending[branch]?.state === "scheduled";
+        const runWindowed = !plan || plan.windowed.state === "work" || keepsScheduled("windowed");
+        const runScene = !plan || plan.scene.state === "work" || keepsScheduled("scene");
+        const revokeWindowed = runWindowed || !!plan?.windowed.revoke;
+        const revokeScene = runScene || !!plan?.scene.revoke;
+        if (this._promptContextPreviewTimer) clearTimeout(this._promptContextPreviewTimer);
+        if (this._promptContextStaleVisualTimer) {
+            clearTimeout(this._promptContextStaleVisualTimer);
+        }
+        this._promptContextStaleVisualTimer = null;
+        const token = revokeWindowed
+            ? (this._promptContextPreviewToken || 0) + 1
+            : (this._promptContextPreviewToken || 0);
+        this._promptContextPreviewToken = token;
+        // Invalidate the previous scene-wide sibling NOW, not when this edit's
+        // debounced request eventually starts. Otherwise an older response can
+        // land during the debounce gap and repaint superseded projections as
+        // fresh data.
+        if (revokeScene) {
+            this._promptContextScenePayloadToken =
+                (this._promptContextScenePayloadToken || 0) + 1;
+        }
+        const sceneToken = this._promptContextScenePayloadToken;
+        if (revokeWindowed) pending.windowed = null;
+        if (revokeScene) pending.scene = null;
+        if (runScene && this._promptScenePayload()) {
             // The same edge as the windowed cache below. Marked inside the
             // debounce instead, a continuous typing burst never marked it at
             // all, so dormant rows showed undimmed data from a superseded
@@ -15495,17 +15613,32 @@ export class EditorWidget {
                 ...this._promptContextScenePayloadCache,
                 _stale: true, _stale_visual: false };
         }
-        if (this._promptContextCandidateCache?._candidate_scene_id === sceneId) {
+        if (runWindowed && this._promptContextCandidateCache?._candidate_scene_id === sceneId) {
             this._promptContextCandidateCache = {
                 ...this._promptContextCandidateCache,
                 _stale: true,
                 _stale_visual: this._promptContextCandidateCache?._failed === true,
             };
         }
-        this._promptContextPreviewTimer = setTimeout(async () => {
+        if (!runWindowed && !runScene) {
+            // Only a revocation: pending work for a key this intent superseded
+            // must not land, and the held result already answers.
+            this._promptContextPreviewTimer = null;
+            return;
+        }
+        const timer = setTimeout(async () => {
+            // Scheduled entries stop answering the moment this timer fires,
+            // including when it bails below; dispatch re-records what it sends.
+            for (const branch of ["windowed", "scene"]) {
+                if (pending[branch]?.state === "scheduled" && pending[branch].timer === timer) {
+                    pending[branch] = null;
+                }
+            }
             if (this._destroyed || dirName !== this._projectDirName()
-                    || sceneId !== this.activeSceneId
-                    || token !== this._promptContextPreviewToken) return;
+                    || sceneId !== this.activeSceneId) return;
+            const windowedLive = runWindowed && token === this._promptContextPreviewToken;
+            const sceneLive = runScene && sceneToken === this._promptContextScenePayloadToken;
+            if (!windowedLive && !sceneLive) return;
             // The grace belongs to work in flight. Starting it at edit time
             // silently spent the debounce interval out of the compile's budget.
             if (this._promptScenePayload()
@@ -15548,15 +15681,25 @@ export class EditorWidget {
                     }
                 }, PROMPT_STALE_VISUAL_DELAY_MS);
             }
-            this._previewPromptContextScenePayload({
-                dirName, sceneId, candidate, windowStart, windowEnd,
-                promptSemanticUnitCreates });
+            if (sceneLive) {
+                this._previewPromptContextScenePayload({
+                    dirName, sceneId, candidate, windowStart, windowEnd,
+                    promptSemanticUnitCreates });
+            }
+            if (!windowedLive) return;
+            let windowedKey = "";
+            const settleWindowedPending = () => {
+                if (pending.windowed?.token === token) pending.windowed = null;
+            };
             try {
                 const body = this._promptCompileRequestBody({
                     dirName, candidate, windowStart, windowEnd,
                     selection: candidateSelection,
                     promptSemanticUnitCreates,
                 });
+                windowedKey = this._promptCompileKey?.(body) || "";
+                pending.windowed = { state: "inflight", key: windowedKey, sceneId, token,
+                    version: String(body.base_modified_at || "") };
                 const result = await (this._queuePromptContextCompile
                     ? this._queuePromptContextCompile(
                         "windowed-preview", dirName, sceneId, body,
@@ -15567,6 +15710,7 @@ export class EditorWidget {
                 if (!result || this._destroyed || dirName !== this._projectDirName()
                         || sceneId !== this.activeSceneId
                         || token !== this._promptContextPreviewToken) return;
+                settleWindowedPending();
                 const { response, payload } = result;
                 const failed = !response.ok || !payload;
                 const diagnostic = failed ? {
@@ -15581,6 +15725,10 @@ export class EditorWidget {
                 this._promptContextCandidateCache = !failed ? {
                     ...payload, _candidate_scene_id: sceneId,
                     _stale: false, _stale_visual: false, _failed: false,
+                    // What this result answers for (`prompt_preview_freshness.js`).
+                    _semantic_key: windowedKey,
+                    _version: String(payload.candidate_base_modified_at
+                        || body.base_modified_at || ""),
                 } : this._failedPromptContextCandidate(sceneId, diagnostic);
                 this._clearPromptStaleVisualTimerIfSettled(sceneId);
                 this._promptPanelHandle?.refreshDiagnostics?.(
@@ -15597,6 +15745,7 @@ export class EditorWidget {
                 if (!this._destroyed && dirName === this._projectDirName()
                         && sceneId === this.activeSceneId
                         && token === this._promptContextPreviewToken) {
+                    settleWindowedPending();
                     console.warn("[Sonder] Prompt Context candidate preview failed:", error);
                     this._promptContextCandidateCache = this._failedPromptContextCandidate(
                         sceneId, { code: "preview_request_failed",
@@ -15611,6 +15760,15 @@ export class EditorWidget {
                 }
             }
         }, Math.max(0, Number(delay) || 0));
+        this._promptContextPreviewTimer = timer;
+        if (runWindowed) {
+            pending.windowed = { state: "scheduled", key: plan?.windowed.key || "", sceneId,
+                token, timer };
+        }
+        if (runScene) {
+            pending.scene = { state: "scheduled", key: plan?.scene.key || "", sceneId,
+                token: sceneToken, timer };
+        }
     }
 
     /** Refresh the timeline "used / ignored-at-boundary" prompt highlight for
@@ -26171,6 +26329,7 @@ export class EditorWidget {
         this._promptContextPreviewToken = (this._promptContextPreviewToken || 0) + 1;
         this._promptContextScenePayloadToken =
             (this._promptContextScenePayloadToken || 0) + 1;
+        this._promptPreviewPending = null;
         this._promptCompileCoordinator?.dispose?.();
         if (this._promptContextPreviewTimer) {
             clearTimeout(this._promptContextPreviewTimer);

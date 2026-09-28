@@ -867,7 +867,8 @@ def test_reference_bridge_shape_tracks_project_writes_and_recipe_liveness():
     client = (ROOT / "web" / "js" / "api_client.js").read_text(encoding="utf-8")
     controller = (ROOT / "web" / "js" / "editor_node_controller.js").read_text(encoding="utf-8")
     window_events = (ROOT / "web" / "js" / "editor_render_window_events.js").read_text(encoding="utf-8")
-    assert 'import { onProjectVersionChanged } from "./api_client.js";' in bridge
+    assert ('import { certifiedUnchanged, onProjectVersionChanged, sameProject } '
+            'from "./api_client.js";') in bridge
     assert "onProjectVersionChanged(refreshAllBridges);" in bridge
     assert "onEditorRenderWindowChanged(refreshAllBridgesForWindow);" in bridge
     assert "emitEditorRenderWindowChanged({" in controller

@@ -180,11 +180,8 @@ console.log(JSON.stringify({{
     }
 
 
-def test_reference_extension_routes_all_six_node_refresh_origins_through_real_scheduler(tmp_path):
-    node = shutil.which("node")
-    if not node:
-        pytest.skip("node is required for Reference extension integration coverage")
-
+def _stage_reference_extension(tmp_path):
+    """Write reference_bridge.js with its host modules replaced by test doubles."""
     bridge_source = (ROOT / "web/js/reference_bridge.js").read_text(encoding="utf-8")
     modules = {
         "app.mjs": """
@@ -239,6 +236,15 @@ export const resolveProjectSource = () => ({
         bridge_source = bridge_source.replace(f'"{old}"', json.dumps(new))
     bridge_path = tmp_path / "reference_bridge.mjs"
     bridge_path.write_text(bridge_source, encoding="utf-8")
+    return bridge_path
+
+
+def test_reference_extension_routes_all_six_node_refresh_origins_through_real_scheduler(tmp_path):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for Reference extension integration coverage")
+
+    bridge_path = _stage_reference_extension(tmp_path)
 
     script = f"""
 class Element {{
@@ -483,3 +489,170 @@ console.log(JSON.stringify({{
         "bridge-references?selection_start=0&selection_end=20"
         "&pre_context_frames=0&post_context_frames=0"
     ]
+
+
+def test_a_version_notice_re_reads_only_what_certificates_cannot_vouch_for(tmp_path):
+    """Plan §2 for Reference bridges, through the real extension and scheduler.
+
+    A node keeps its payload across a newer version only when certificates chain
+    from the version it read to the new one without flagging its scene's bridge
+    read. Another project's writes never re-read; uncertified writes, flagged
+    edits, explicit Refresh and window changes always do; and a certificate that
+    arrives after a node was told to re-read cannot cancel that re-read.
+    """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for Reference extension integration coverage")
+    bridge_path = _stage_reference_extension(tmp_path)
+    script = f"""
+class Element {{
+  constructor(tag) {{
+    this.tagName = String(tag).toUpperCase(); this.children = []; this.parentElement = null;
+    this.style = {{ cssText: "" }}; this.attributes = {{}}; this._handlers = {{}};
+    this.textContent = ""; this.title = ""; this.disabled = false; this.type = "";
+  }}
+  appendChild(child) {{ this.children.push(child); child.parentElement = this; return child; }}
+  append(...children) {{ children.forEach((child) => this.appendChild(child)); }}
+  replaceChildren(...children) {{ this.children = []; this.append(...children); }}
+  addEventListener(type, handler) {{ (this._handlers[type] ||= []).push(handler); }}
+  setAttribute(name, value) {{ this.attributes[name] = String(value); }}
+  contains(target) {{
+    for (let value = target; value; value = value.parentElement) if (value === this) return true;
+    return false;
+  }}
+  click() {{ for (const handler of this._handlers.click || []) handler({{ target: this }}); }}
+}}
+globalThis.document = {{ createElement: (tag) => new Element(tag) }};
+globalThis.window = {{ setTimeout, clearTimeout, addEventListener() {{}}, removeEventListener() {{}} }};
+globalThis.__controller = {{
+  state: {{ projectDir: "C:/projects/Proj", sceneId: "scene-1", selectionStart: 0,
+            selectionEnd: 20, preContextFrames: 0, postContextFrames: 0 }},
+  whenProjectReady() {{}},
+}};
+const V = (n) => `2026-09-27T10:00:${{String(n).padStart(2, "0")}}.000000`;
+let servedVersion = V(1);
+const fetches = [];
+let hold = false;
+let release = null;
+globalThis.fetch = (url, options = {{}}) => {{
+  fetches.push(url);
+  const version = servedVersion;
+  const response = {{
+    ok: true, status: 200,
+    headers: {{ get: (name) => name === "X-Sonder-Project-Modified-At" ? version : null }},
+    json: async () => ({{ scene_name: "S", source: "live", references: [
+      {{ lane_index: 0, lane_name: "L", recipe_name: "Slots", image_slot_count: 1,
+         audio_slot_count: 0, prompt_slot_count: 0, live_outputs: ["image_slots"],
+         slot_labels: ["a"], image_slot_labels: ["a"], reserved_member_span: 1, member_tags: [] }},
+    ] }}),
+  }};
+  if (!hold) return Promise.resolve(response);
+  hold = false;
+  return new Promise((resolve) => {{ release = () => resolve(response); }});
+}};
+const {{ app }} = await import({json.dumps((tmp_path / "app.mjs").as_uri())});
+const client = await import({json.dumps((tmp_path / "client.mjs").as_uri())});
+await import({json.dumps(bridge_path.as_uri())});
+const extension = globalThis.__extension;
+extension.setup();
+const selector = {{
+  id: 1, type: "SonderReferenceSelector", comfyClass: "SonderReferenceSelector",
+  widgets: [{{ name: "reference_lanes", value: "0", callback() {{}} }}],
+  inputs: [], outputs: [{{ name: "reference_set", links: [100] }}],
+  addDOMWidget(name, type, element, options) {{ this.panel = element; return {{ computeSize() {{}}, ...options }}; }},
+  computeSize() {{ return [280, 120]; }}, setSize() {{}},
+}};
+const bridge = {{
+  id: 10, type: "SonderReferenceImageBridge", comfyClass: "SonderReferenceImageBridge",
+  widgets: [{{ name: "unused_slots", value: "placeholder", callback() {{}} }}],
+  inputs: [{{ name: "reference_set", link: 100 }}],
+  outputs: Array.from({{ length: 16 }}, (_, slot) => ({{
+    name: `r${{String(slot + 1).padStart(2, "0")}}`, type: "IMAGE", links: [] }})),
+  addOutput(name, type, options) {{ this.outputs.push({{ name, type, links: [], ...options }}); }},
+  removeOutput(index) {{ this.outputs.splice(index, 1); }},
+  computeSize() {{ return [280, 120]; }}, setSize() {{}},
+}};
+const nodes = [selector, bridge];
+const byId = {{ 1: selector, 10: bridge }};
+const links = {{ 100: {{ origin_id: 1, target_id: 10, target_slot: 0 }} }};
+const graph = {{ _nodes: nodes, _nodes_by_id: byId, links,
+  getLink(id) {{ return links[id] || null; }}, getNodeById(id) {{ return byId[id] || null; }},
+  setDirtyCanvas() {{}} }};
+app.graph = graph;
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+client.rememberProjectVersion("Proj", V(1));
+for (const item of nodes) {{ item.graph = graph; extension.loadedGraphNode(item); }}
+// Install waves settle fully (including any trailing read) before counting.
+await wait(400);
+const counts = {{ installed: fetches.length }};
+const certify = (base, next, over = {{}}) => client.registerChangeCertificate({{
+  schema: 1, project_id: "canon", scene_id: "scene-1", base_modified_at: V(base),
+  modified_at: V(next), prompt: false, bridge: false, ...over }}, {{ projectId: "Proj" }});
+const notice = async (projectId, version) => {{
+  servedVersion = version; client.rememberProjectVersion(projectId, version); await wait(300);
+}};
+
+certify(1, 2);
+await notice("Proj", V(2));
+counts.irrelevant = fetches.length;
+
+certify(2, 3, {{ bridge: true }});
+await notice("Proj", V(3));
+counts.flagged = fetches.length;
+
+certify(3, 4, {{ scene_id: "scene-2", bridge: true }});
+await notice("Proj", V(4));
+counts.otherScene = fetches.length;
+
+await notice("Elsewhere", V(8));
+counts.otherProject = fetches.length;
+
+await notice("Proj", V(5));
+counts.uncertified = fetches.length;
+
+certify(5, 6);
+certify(7, 8);
+await notice("Proj", V(8));
+counts.gap = fetches.length;
+
+globalThis.__renderWindowChanged({{ field: "selection_start" }});
+await wait(300);
+counts.window = fetches.length;
+
+const descendants = (root) => [root, ...root.children.flatMap(descendants)];
+descendants(selector.panel).find((el) => el.tagName === "BUTTON" && el.textContent === "Refresh").click();
+await wait(40);
+counts.manual = fetches.length;
+
+// Revocation: a flagged edit dispatches a re-read that is held in flight; the
+// certificate for the NEXT transition arrives meanwhile, but the node was told
+// to re-read and nothing it holds can answer for the new version.
+hold = true;
+certify(8, 9, {{ bridge: true }});
+servedVersion = V(9); client.rememberProjectVersion("Proj", V(9));
+await wait(300);
+certify(9, 10);
+servedVersion = V(10); client.rememberProjectVersion("Proj", V(10));
+await wait(300);
+counts.revokedBeforeRelease = fetches.length;
+release();
+await wait(60);
+counts.revokedAfterRelease = fetches.length;
+console.log(JSON.stringify(counts));
+"""
+    result = _run_node(script)
+    base = result["installed"]
+    assert base >= 1
+    assert result == {
+        "installed": base,
+        "irrelevant": base,                 # certified bridge-irrelevant: no read
+        "flagged": base + 1,                 # this scene's bridge read changed
+        "otherScene": base + 1,              # another scene's edit is scene-confined
+        "otherProject": base + 1,            # another project's write
+        "uncertified": base + 2,             # no certificate: refresh
+        "gap": base + 3,                     # a missing link breaks the chain
+        "window": base + 4,                  # a window change keeps its own path
+        "manual": base + 5,                  # explicit Refresh is never skipped
+        "revokedBeforeRelease": base + 6,    # held; the late certificate queues a re-read
+        "revokedAfterRelease": base + 7,     # ...which the late certificate did not cancel
+    }

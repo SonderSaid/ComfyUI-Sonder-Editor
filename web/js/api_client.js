@@ -56,6 +56,173 @@ function associateProjectIds(firstProjectId, secondProjectId) {
     for (const projectId of aliases) {
         projectAliases.set(projectId, aliases);
     }
+    shareCertificateStore(aliases);
+}
+
+/**
+ * Whether two project ids name the same project: equal, or known aliases (the
+ * canonical project UUID and the folder basename).
+ */
+export function sameProject(firstProjectId, secondProjectId) {
+    const first = normalizeProjectId(firstProjectId);
+    const second = normalizeProjectId(secondProjectId);
+    if (!first || !second) return false;
+    return first === second || !!projectAliases.get(first)?.has(second);
+}
+
+// ---------------------------------------------------------------------------
+// Change certificates
+//
+// The server attaches a certificate to a committed scene edit saying which of
+// two reads -- the live prompt compile and the Reference bridge read -- that one
+// version transition can change (`server/change_certificates.py`). Consumers
+// holding a result read at version A may keep it at version B only when an
+// UNINTERRUPTED chain of certificates leads from A to B and none of them flags
+// their read for their scene. Every doubt -- a missing, malformed, conflicting,
+// evicted or discontinuous certificate -- answers "refresh". Certificates are
+// ephemeral and page-local; nothing here is persisted.
+// ---------------------------------------------------------------------------
+
+const CERTIFICATE_SCHEMA = 1;
+const CERTIFICATE_HEADER = "X-Sonder-Change-Certificate";
+// Transitions retained per project. Eviction only ever costs a refresh.
+const MAX_CERTIFIED_TRANSITIONS = 32;
+const CONFLICTED = Symbol("conflicted certificate");
+const certificateStores = new Map();
+
+function newCertificateStore() {
+    return { transitions: new Map() };
+}
+
+function certificateStoreFor(projectId) {
+    const normalized = normalizeProjectId(projectId);
+    if (!normalized) return null;
+    let store = certificateStores.get(normalized);
+    if (!store) {
+        store = newCertificateStore();
+        for (const alias of projectAliases.get(normalized) || [normalized]) {
+            certificateStores.set(alias, store);
+        }
+        certificateStores.set(normalized, store);
+    }
+    return store;
+}
+
+function shareCertificateStore(aliases) {
+    const distinct = new Set();
+    for (const alias of aliases) {
+        const store = certificateStores.get(alias);
+        if (store) distinct.add(store);
+    }
+    // Two ids that each carried their own history are now one project. Their
+    // chains were recorded against separate keys and cannot be proven
+    // continuous with each other, so continuity restarts rather than merges.
+    const populated = [...distinct].filter((store) => store.transitions.size > 0);
+    const shared = populated.length > 1 ? newCertificateStore()
+        : (populated[0] || [...distinct][0] || newCertificateStore());
+    for (const alias of aliases) certificateStores.set(alias, shared);
+}
+
+function clearCertificates(projectId) {
+    const normalized = normalizeProjectId(projectId);
+    for (const alias of projectAliases.get(normalized) || [normalized]) {
+        const store = certificateStores.get(alias);
+        if (store) store.transitions.clear();
+    }
+}
+
+function validCertificate(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    if (value.schema !== CERTIFICATE_SCHEMA) return false;
+    for (const key of ["project_id", "scene_id", "base_modified_at", "modified_at"]) {
+        if (typeof value[key] !== "string" || !value[key]) return false;
+    }
+    if (typeof value.prompt !== "boolean" || typeof value.bridge !== "boolean") return false;
+    // Versions are ISO timestamps, so string order is time order; a
+    // certificate must describe a transition forwards.
+    return value.base_modified_at < value.modified_at;
+}
+
+/**
+ * Record one server certificate. `reportedVersion` is the version the same
+ * response or event reported; a certificate for any other result version is
+ * rejected. Returns true when the certificate was accepted (or was already held).
+ */
+export function registerChangeCertificate(certificate, { projectId = "", reportedVersion = "" } = {}) {
+    if (!validCertificate(certificate)) return false;
+    if (reportedVersion && String(reportedVersion) !== certificate.modified_at) return false;
+    associateProjectIds(projectId, certificate.project_id);
+    const store = certificateStoreFor(projectId || certificate.project_id);
+    if (!store) return false;
+    const record = {
+        scene_id: certificate.scene_id,
+        modified_at: certificate.modified_at,
+        prompt: certificate.prompt,
+        bridge: certificate.bridge,
+    };
+    const existing = store.transitions.get(certificate.base_modified_at);
+    if (existing === CONFLICTED) return false;
+    if (existing) {
+        const same = existing.scene_id === record.scene_id
+            && existing.modified_at === record.modified_at
+            && existing.prompt === record.prompt && existing.bridge === record.bridge;
+        // The same transition described twice with different content means
+        // neither can be trusted; the base stays poisoned until a reset.
+        if (!same) store.transitions.set(certificate.base_modified_at, CONFLICTED);
+        return same;
+    }
+    store.transitions.set(certificate.base_modified_at, record);
+    while (store.transitions.size > MAX_CERTIFIED_TRANSITIONS) {
+        store.transitions.delete(store.transitions.keys().next().value);
+    }
+    return true;
+}
+
+/** Register the certificate a `project_updated` websocket event carries, if any. */
+export function registerChangeCertificateFromEvent(event) {
+    if (!event || typeof event !== "object" || !event.change) return false;
+    return registerChangeCertificate(event.change, {
+        projectId: event.project_id || "",
+        reportedVersion: event.modified_at || "",
+    });
+}
+
+function registerChangeCertificateFromResponse(response, projectId, reportedVersion) {
+    const raw = response?.headers?.get?.(CERTIFICATE_HEADER) || "";
+    if (!raw) return;
+    try {
+        registerChangeCertificate(JSON.parse(raw), { projectId, reportedVersion });
+    } catch (_error) {
+        // A malformed certificate is no certificate: consumers refresh.
+    }
+}
+
+/**
+ * Whether a result read at `fromVersion` still answers at `toVersion` for
+ * `dependency` ("prompt" | "bridge") on `sceneId`: true only when certificates
+ * chain from one to the other without a gap and none flags that dependency on
+ * that scene. A transition on another scene is scene-confined by construction.
+ */
+export function certifiedUnchanged({ projectId, sceneId, fromVersion, toVersion, dependency } = {}) {
+    if (dependency !== "prompt" && dependency !== "bridge") return false;
+    const from = String(fromVersion || "");
+    const to = String(toVersion || "");
+    const scene = String(sceneId || "");
+    if (!from || !to || !scene) return false;
+    if (from === to) return true;
+    if (from > to) return false;
+    const store = certificateStores.get(normalizeProjectId(projectId));
+    if (!store) return false;
+    let version = from;
+    for (let step = 0; step <= MAX_CERTIFIED_TRANSITIONS; step += 1) {
+        const transition = store.transitions.get(version);
+        if (!transition || transition === CONFLICTED) return false;
+        if (transition.scene_id === scene && transition[dependency] !== false) return false;
+        version = transition.modified_at;
+        if (version === to) return true;
+        if (version > to) return false;
+    }
+    return false;
 }
 
 export function projectIdFromUrl(url) {
@@ -113,6 +280,9 @@ export function resetProjectVersion(projectId, modifiedAt) {
         changed = changed || (projectVersions.get(alias) || "") !== next;
         projectVersions.set(alias, next);
     }
+    // A backward jump means the map was ahead of the server; no chain recorded
+    // against those versions can be trusted to connect to what follows.
+    clearCertificates(normalizedProjectId);
     if (changed) emitProjectVersionChanged(normalizedProjectId, next);
 }
 
@@ -176,6 +346,9 @@ export function rememberProjectVersionFromResponse(response, fallbackProjectId =
     const projectId = normalizeProjectId(headerProjectId);
     const fallback = normalizeProjectId(fallbackProjectId);
     associateProjectIds(projectId, fallback);
+    // Before the version is remembered: remembering it notifies consumers, and
+    // they must be able to see the certificate for the transition they are told of.
+    registerChangeCertificateFromResponse(response, fallback || projectId, headerModifiedAt);
     if (headerModifiedAt) {
         if (projectId) rememberProjectVersion(projectId, headerModifiedAt);
         if (fallback && fallback !== projectId) rememberProjectVersion(fallback, headerModifiedAt);

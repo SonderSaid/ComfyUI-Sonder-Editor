@@ -1512,10 +1512,10 @@ def test_stale_cache_marking_is_immediate_and_grace_starts_with_request():
     assert "PROMPT_STALE_VISUAL_DELAY_MS = 300" in widget
     assert "_promptContextCandidateCache = {" in preview
     assert "_promptContextScenePayloadCache = {" in preview
-    compile_timer = preview.index("_promptContextPreviewTimer = setTimeout")
+    compile_timer = preview.index("const timer = setTimeout")
     stale_timer = preview.index("_promptContextStaleVisualTimer = setTimeout")
     assert compile_timer < stale_timer
-    immediate = preview[preview.index("if (this._promptScenePayload())"):compile_timer]
+    immediate = preview[preview.index("if (runScene && this._promptScenePayload())"):compile_timer]
     assert "_promptContextStaleVisualTimer = setTimeout" not in immediate
     assert "refreshDiagnostics" not in immediate
     assert "_refreshInlinePromptProjections" not in immediate
@@ -1786,8 +1786,10 @@ console.log(JSON.stringify({
         "beforeRequest": 0,
         "staleTimerCount": 1,
         "staleTimerCancelled": True,
+        # The harness has no key builder, so the freshness fields are empty.
         "cache": {"prompt": "new", "_candidate_scene_id": "scene",
-                  "_stale": False, "_stale_visual": False, "_failed": False},
+                  "_stale": False, "_stale_visual": False, "_failed": False,
+                  "_semantic_key": "", "_version": ""},
         "counts": {"diagnostics": 1, "inline": 1, "apply": 1,
                    "timeline": 1},
     }
@@ -1868,6 +1870,7 @@ console.log(JSON.stringify({failedState, superseded, success}));
     assert result["success"] == {
         "prompt": "fresh", "_candidate_scene_id": "scene",
         "_stale": False, "_stale_visual": False, "_failed": False,
+        "_semantic_key": "", "_version": "",
     }
 
 

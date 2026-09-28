@@ -10473,6 +10473,24 @@ def _timeline_job_matches_project(job, project_dir: str) -> bool:
     )
 
 
+# The candidate scene fields a preview compile takes from the REQUEST; every
+# other field is read from the stored scene. `web/js/prompt_preview_freshness.js`
+# mirrors both tables to key a preview by exactly what it sends that matters.
+PROMPT_CANDIDATE_OVERLAY_ALIASES = {
+    "sections": "prompt_sections",
+    "global_documents": "global_channel_docs",
+    "global_attachments": "global_attachments",
+}
+PROMPT_CANDIDATE_OVERLAY_FIELDS = frozenset({
+    "prompt_sections", "global_channels", "global_channel_docs",
+    "global_attachments", "prompt_context_profile_id",
+    "prompt_context_profile_config",
+    "guide_frames", "reference_items",
+    "reference_lane_recipes", "reference_lane_configs",
+    "reference_lane_count", "duration_frames", "fps",
+})
+
+
 def _compile_prompt_context_candidate_sync(
         project: TimelineProject, scene_id: str, body: dict) -> tuple[int, dict]:
     """Compile one candidate entirely off the aiohttp event loop.
@@ -10487,20 +10505,9 @@ def _compile_prompt_context_candidate_sync(
 
     candidate_data = copy.deepcopy(scene.to_dict())
     source = body.get("scene") if isinstance(body.get("scene"), dict) else body
-    aliases = {"sections": "prompt_sections",
-               "global_documents": "global_channel_docs",
-               "global_attachments": "global_attachments"}
-    allowed = {
-        "prompt_sections", "global_channels", "global_channel_docs",
-        "global_attachments", "prompt_context_profile_id",
-        "prompt_context_profile_config",
-        "guide_frames", "reference_items",
-        "reference_lane_recipes", "reference_lane_configs",
-        "reference_lane_count", "duration_frames", "fps",
-    }
     for raw_key, value in source.items():
-        key = aliases.get(raw_key, raw_key)
-        if key in allowed:
+        key = PROMPT_CANDIDATE_OVERLAY_ALIASES.get(raw_key, raw_key)
+        if key in PROMPT_CANDIDATE_OVERLAY_FIELDS:
             candidate_data[key] = copy.deepcopy(value)
     candidate = Scene.from_dict(candidate_data)
 

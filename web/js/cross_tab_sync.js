@@ -1,3 +1,5 @@
+import { registerChangeCertificateFromEvent } from "./api_client.js";
+
 const { api } = window.comfyAPI.api;
 
 function wsURL(path) {
@@ -27,8 +29,13 @@ export function connectProjectSync(projectId, handlers = {}, options = {}) {
     const dispatch = (event) => {
         if (!event || typeof event !== "object") return;
         try {
-            if (event.type === "project_updated") handlers.onProjectUpdated?.(event);
-            else if (event.type === "widget_state_changed") handlers.onWidgetStateChanged?.(event);
+            if (event.type === "project_updated") {
+                // Registered on receipt, before any debounce: the HTTP response that
+                // announces the same version may arrive later, and a consumer told
+                // of that version must find the certificate already held.
+                registerChangeCertificateFromEvent(event);
+                handlers.onProjectUpdated?.(event);
+            } else if (event.type === "widget_state_changed") handlers.onWidgetStateChanged?.(event);
             else if (event.type === "session_changed") handlers.onSessionChanged?.(event);
             else if (event.type === "host_presence_changed") handlers.onHostPresenceChanged?.(event);
             else if (event.type === "subscribed") handlers.onSubscribed?.(event);
