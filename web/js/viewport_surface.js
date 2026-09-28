@@ -39,16 +39,24 @@ export function _planPlaybackPreRoll({ fps, currentFrame, targetFrame, targetSou
 const PLAYBACK_ROLL_STARTUP_ALLOWANCE_MS = 100;
 // Rolls again from a longer lead-in while the clock is held, before parking.
 const PLAYBACK_ROLL_MAX_RETRIES = 2;
+// The display-phase estimate can sit ~0.02 frame above the phase the painted
+// flips allow (measured), so the painted frame is judged at a phase this much
+// lower. Every reader needs the prediction never ahead of the picture: a claim
+// would take a roll still painting its lead-in frame, a tail stop would stop
+// one frame short, and a repaint ahead by a hair on a refresh the decoder is
+// late spends its one confirming repaint too early and skips the frame
+// (harness). The cost: a flip can reach the canvas one refresh late.
+const PLAYBACK_PHASE_MARGIN = 0.05;
 
 // Whether a rolling pre-roll can be claimed for its target source frame.
-// drawImage paints floor(currentTime * fps) once the decoder is running, but
-// in the start-up gap after play() it keeps painting the last decoded frame,
-// which for a roll is a lead-in frame outside the edit. So a roll is claimable
-// only once its decoder runs and its currentTime frame is in [target,
+// Once the decoder is running drawImage paints the element's painted frame
+// (its currentTime frame shifted by its display phase; see videoPaintFrame),
+// but in the start-up gap after play() it keeps painting the last decoded
+// frame, which for a roll is a lead-in frame outside the edit. So a roll is
+// claimable only once its decoder runs and its painted frame is in [target,
 // target + 1], a window the running clock enters once and leaves forwards.
-// `settledFrame` is the frame the element is known to paint: the refresh on
-// which currentTime enters a frame can still paint the previous one (measured
-// on 1920x1088), so a frame entered this refresh settles on the next.
+// `settledFrame` is the frame the element is known to paint (without a
+// measured phase, a frame entered this refresh settles on the next).
 // While the clock is held the window is the target alone: a roll that went
 // past it would paint a frame the held timeline has not reached. Past the
 // window it has overshot, and waiting can never make it claimable.
@@ -59,10 +67,42 @@ export function _rollingClaimDecision({ decoderRunning = false, currentFrame, se
     return "claim";
 }
 
+// The display phase of a playing video: drawImage paints floor(currentTime *
+// fps + phase), and the phase differs per element and can move while it plays
+// (measured 2026-09-28: 0.28-0.60 across elements, one settling 0.64 -> 0.31
+// over its first 300 ms). A frame callback names the frame presented at
+// presentationTime; currentTime taken back to that moment is where the frame
+// began to paint, so the phase is their difference. It lands at the lower edge
+// of the phase the painted flips allow, within ~0.02, from the first callback.
+// Assumes 1x playback and frame timestamps on the fps grid. Null when the
+// inputs are unusable or implausible: a picture a whole frame ahead of
+// currentTime is impossible, one up to a few frames behind is not (heavy
+// content; the Watchlist's late picture).
+export function _displayPhaseEstimate({ mediaTime, presentationTime, currentTime, nowMs, fps } = {}) {
+    const values = [mediaTime, presentationTime, currentTime, nowMs, fps].map(Number);
+    if (!values.every(Number.isFinite) || !(values[4] > 0)) return null;
+    const [media, presentedAt, current, now, rate] = values;
+    const phase = media * rate - (current - (now - presentedAt) / 1000) * rate;
+    return phase > -3 && phase < 1 ? phase : null;
+}
+
+// The phase to use from the latest estimates: the median of three rejects a
+// single outlier either way (a late-decoded frame reads low by a refresh) yet
+// follows a real step, like one measured 0.60 -> 0.43, within two callbacks.
+// With two (a roll usually has two before its cut), their mean: it halves a
+// low outlier, and a high one is noise the margin already covers.
+export function _displayPhaseFromSamples(samples = []) {
+    const values = samples.filter(Number.isFinite).slice(-3).sort((a, b) => a - b);
+    if (!values.length) return null;
+    if (values.length === 2) return (values[0] + values[1]) / 2;
+    return values.length === 3 ? values[1] : values[0];
+}
+
 // Whether the outgoing element has reached the clip's last source frame and
-// must stop there. currentTime predicts the painted frame, so stopping on it
-// (not on the timeline tick) leaves the last frame painted; stopping past it
-// is the backstop, and the repaint refuses to paint past the out point.
+// must stop there, judged on its painted frame: a pause keeps the frame being
+// painted (measured), so stopping on it (not on the timeline tick) leaves the
+// last frame painted; stopping past it is the backstop, and the repaint
+// refuses to paint past the out point.
 // Media that ended short of the clip's out point stops too: play() on an
 // ended element would restart it from the beginning.
 export function _tailStopDecision({ currentFrame, lastSourceFrame, ended = false } = {}) {
@@ -73,12 +113,13 @@ export function _tailStopDecision({ currentFrame, lastSourceFrame, ended = false
 }
 
 // Whether a painted playback video has advanced enough to repaint between
-// ticks. drawImage paints the element's currentTime frame once its decoder is
-// running (measured in Chromium 2026-09-28), so `currentFrame` is
-// floor(currentTime * fps). A paint on a new frame is also confirmed once on
-// the next refresh (`confirmPending`), because the flip refresh can still
-// paint the previous decoded frame. Never repaint backwards (a drift seek
-// re-prepares on the next tick) or past the clip's last source frame.
+// ticks. `currentFrame` is the frame the element paints once its decoder is
+// running (videoPaintFrame: its currentTime frame shifted by its measured
+// display phase, never ahead of the picture). A paint on a new frame is also
+// confirmed once on the next refresh (`confirmPending`), because the flip
+// refresh can still paint the previous decoded frame. Never repaint backwards
+// (a drift seek re-prepares on the next tick) or past the clip's last source
+// frame.
 export function _presentationRepaintDecision({ paintedFrame, currentFrame, lastSourceFrame, confirmPending = false } = {}) {
     if (!Number.isFinite(currentFrame) || !Number.isFinite(paintedFrame)) return "unknown";
     if (currentFrame < paintedFrame) return "behind";
@@ -1373,6 +1414,7 @@ function seekMedia(mediaEl, targetTime, {
                     finish(true, true);
                     return;
                 }
+                element._sonderPresentationTracker?.clearPhase?.();
                 element.currentTime = safeTarget;
             } catch (error) {
                 finish(true);
@@ -1411,7 +1453,7 @@ export function createViewportSurface(options = {}) {
         playbackLastCommittedSessionId: 0,
         playbackLastCommittedContentToken: -1,
         // What the playback canvas last painted: entries plus, per video, the
-        // currentTime frame it was painted at. Ephemeral; cleared with the
+        // painted frame it was painted at. Ephemeral; cleared with the
         // composite state and by every drawBlack.
         playbackPaint: null,
         playbackFirstCommitStartedAt: null,
@@ -1719,7 +1761,9 @@ export function createViewportSurface(options = {}) {
     // Always on for every playback-owned element: the rolling claim gate reads
     // the samples. Each callback stores a new sample object, so newness is
     // judged by identity (presentedFrames can reset). Only the diagnostics
-    // that read the samples stay behind their flags.
+    // that read the samples stay behind their flags. Each callback while
+    // playing also records the element's display phase (see
+    // _displayPhaseEstimate); a seek clears it, a pause keeps it.
     function trackVideoPresentation(video, layerKey) {
         if (!video) return;
         if (video._sonderPresentationTracker) {
@@ -1727,11 +1771,18 @@ export function createViewportSurface(options = {}) {
             return;
         }
         if (typeof video.requestVideoFrameCallback !== "function") return;
-        const tracker = { layerKey, sample: null, callbackId: null, cancelled: false, mismatchKey: "", mismatchAtMs: -Infinity };
+        const tracker = { layerKey, sample: null, callbackId: null, cancelled: false, mismatchKey: "", mismatchAtMs: -Infinity,
+            phase: null, phaseSource: "", phaseSamples: [] };
+        const clearPhase = () => { tracker.phase = null; tracker.phaseSamples = []; };
+        tracker.clearPhase = clearPhase;
+        video.addEventListener?.("seeking", clearPhase);
+        video.addEventListener?.("seeked", clearPhase);
         video._sonderPresentationTracker = tracker;
         video._sonderCancelPresentationTracker = () => {
             tracker.cancelled = true;
             if (tracker.callbackId !== null) video.cancelVideoFrameCallback?.(tracker.callbackId);
+            video.removeEventListener?.("seeking", clearPhase);
+            video.removeEventListener?.("seeked", clearPhase);
             delete video._sonderPresentationTracker;
             delete video._sonderCancelPresentationTracker;
         };
@@ -1742,6 +1793,22 @@ export function createViewportSurface(options = {}) {
                 return;
             }
             tracker.sample = { ...metadata, presentedAtMs: timestamp };
+            // A frame presented before the last play() was a paused picture:
+            // taking currentTime back to it would assume the clock ran.
+            const presentedAfterPlay = !(Number(metadata?.presentationTime) < Number(video._sonderPlayCalledAt));
+            if (!video.paused && !video.seeking && presentedAfterPlay) {
+                const phase = _displayPhaseEstimate({
+                    mediaTime: metadata?.mediaTime, presentationTime: metadata?.presentationTime,
+                    currentTime: video.currentTime, nowMs: performance.now(), fps: fps(),
+                });
+                const source = mediaSourceKey(video);
+                if (phase !== null) {
+                    if (tracker.phaseSource !== source) tracker.phaseSamples = [];
+                    tracker.phaseSamples = [...tracker.phaseSamples.slice(-2), phase];
+                    tracker.phase = _displayPhaseFromSamples(tracker.phaseSamples);
+                    tracker.phaseSource = source;
+                }
+            }
             if (typeof window !== "undefined" && window.SONDER_DEBUG_PLAYBACK_BOUNDARY) {
                 // Use the existing bounded diagnostic ring, not an unbounded array.
                 viewportDiagRecord("playback_presentation_raw", {
@@ -3565,6 +3632,7 @@ export function createViewportSurface(options = {}) {
         entry.rollPlaySample = entry.video._sonderPresentationTracker?.sample || null;
         entry.rollStartFrame = videoPaintFrame(entry.video);
         entry.rollDecoderRunning = false;
+        entry.video._sonderPlayCalledAt = performance.now();
         try {
             const promise = entry.video.play();
             promise?.catch(() => abortPreRoll(entry, "play-rejected"));
@@ -3667,8 +3735,8 @@ export function createViewportSurface(options = {}) {
         state.playbackRefreshMs = Number.isFinite(estimate) ? estimate * 0.875 + sample * 0.125 : sample;
     }
 
-    // Once per display refresh, note when each rolling element's currentTime
-    // entered its frame.
+    // Once per display refresh, note when each rolling element's painted
+    // frame changed.
     function observeRolls(timestamp) {
         for (const entry of state.prebufferCache.values()) {
             if (entry?.preRollPhase !== "rolling" || !entry.video) continue;
@@ -3686,13 +3754,14 @@ export function createViewportSurface(options = {}) {
         return !(state.playbackRefreshMs < 0.75 * 1000 / fps());
     }
 
-    // The frame a roll is known to paint: its currentTime frame once that was
-    // already current on an earlier refresh, else the one before it. When a
-    // refresh lasts most of a frame there is no earlier refresh to wait for,
-    // so the currentTime frame stands.
+    // The frame a roll is known to paint. With a measured display phase that
+    // is its painted frame. Without one, the refresh on which currentTime
+    // enters a frame can still paint the previous one (1920x1088, measured),
+    // so the frame counts once it was already current on an earlier refresh;
+    // when a refresh lasts most of a frame there is none to wait for.
     function rollSettledFrame(entry) {
         const frame = videoPaintFrame(entry.video);
-        if (refreshSpansFrame()) return frame;
+        if (videoHasDisplayPhase(entry.video) || refreshSpansFrame()) return frame;
         const settled = frame === entry.rollFrame && entry.rollFrameAt !== state.playbackLastTickAt;
         return settled ? frame : frame - 1;
     }
@@ -5899,6 +5968,7 @@ export function createViewportSurface(options = {}) {
     function playMediaElement(mediaEl, context = {}) {
         if (!mediaEl || typeof mediaEl.play !== "function") return;
         try {
+            if (mediaEl.paused) mediaEl._sonderPlayCalledAt = performance.now();
             const promise = mediaEl.play();
             if (promise && typeof promise.catch === "function") {
                 promise.catch((error) => {
@@ -6182,8 +6252,7 @@ export function createViewportSurface(options = {}) {
         }
         // The tail stops on the element's own last frame, not on the timeline
         // tick: a tick-time pause froze it one frame short when it trailed.
-        // Checking on every timeline frame suffices at 1x playback: between two
-        // an element cannot cross a whole frame.
+        // watchPlaybackTails checks the refreshes between ticks.
         const marker = armTailStop(active.video, layer);
         if (marker && fireTailStop(active.video, marker)) return;
         if (active.video.paused) {
@@ -6201,7 +6270,7 @@ export function createViewportSurface(options = {}) {
             layer?.key || "",
             clip.timeline_end_frame ?? "",
             clip.source_out_frame ?? "",
-            video?._sonderSourceUrl || video?.currentSrc || "",
+            mediaSourceKey(video),
         ].join("|");
     }
 
@@ -6256,7 +6325,7 @@ export function createViewportSurface(options = {}) {
         const nextFrameDueAt = state.playbackStartTime + (nextFrame + 1 - state.playbackStartFrame) * 1000 / fps();
         if (!Number.isFinite(refreshMs) || refreshMs <= 0 || timestamp + refreshMs >= nextFrameDueAt) return false;
         if (!playbackPaintContextValid(paint) || paint.signature !== state.playbackLastCommittedSignature) return false;
-        const departing = paint.entries.some((entry) => {
+        const departing = paint.entries.filter((entry) => {
             if (entry.type !== "video" || !Number.isFinite(entry.lastSourceFrame)) return false;
             const active = state.activePlaybackVideos.get(entry.layerKey);
             const clipEnd = Number(active?.layer?.clip?.timeline_end_frame);
@@ -6264,11 +6333,50 @@ export function createViewportSurface(options = {}) {
             const video = entry.element;
             if (video.seeking || (video.readyState || 0) < 2) return false;
             if (entry.paintedFrame >= entry.lastSourceFrame && !entry.confirmPending) return false;
-            return videoPaintFrame(video) >= entry.lastSourceFrame - 1 && (!video.paused || videoPaintFrame(video) > entry.paintedFrame || entry.confirmPending);
+            const painting = videoPaintFrame(video);
+            return painting >= entry.lastSourceFrame - 1 && (!video.paused || painting > entry.paintedFrame || entry.confirmPending);
         });
-        if (!departing) return false;
+        if (!departing.length) return false;
+        // Once each last frame was painted, its confirm is not worth the
+        // incoming clip's first frame.
+        const tailsPainted = departing.every((entry) => entry.paintedFrame >= entry.lastSourceFrame);
+        if (tailsPainted && incomingRollPassesCut(nextFrame, refreshMs)) return false;
         updatePlaybackPerfCounters(c => { c.presentation.cutGraceRefreshes += 1; });
         return true;
+    }
+
+    // Whether a roll for the cut frame is painting it and would pass it by the
+    // next refresh: holding the cut to confirm the outgoing tail would then
+    // skip the incoming clip's first frame (harness, when the outgoing phase
+    // is lower than the incoming one).
+    function incomingRollPassesCut(nextFrame, refreshMs) {
+        for (const entry of state.prebufferCache.values()) {
+            if (entry?.preRollPhase !== "rolling" || entry.cancelled || entry.claimedByActive || entry.targetFrame !== nextFrame) continue;
+            if (!entry.video || entry.video.seeking || !rollDecoderRunning(entry)) continue;
+            // Judged at the top of the estimate's band (it reads up to a refresh
+            // low), because here a late prediction is what loses the frame.
+            const phase = videoDisplayPhase(entry.video) ?? 0;
+            const upper = ((Number(entry.video.currentTime) || 0) + 2 * refreshMs / 1000) * fps() + phase;
+            if (Math.floor(upper + 1e-6) > entry.targetSourceFrame) return true;
+        }
+        return false;
+    }
+
+    // On refreshes that commit no timeline frame, stop each playing active
+    // element whose painted frame reached its clip's last source frame. The
+    // per-tick stop alone misses it: at 60 Hz ticks come two or three refreshes
+    // apart, and the phase prediction can trail the picture by a refresh, so an
+    // element crosses its last frame between ticks and paints past its out
+    // point (harness: 6 of 72 cases).
+    function watchPlaybackTails() {
+        if (state.playbackRebuffering) return;
+        for (const active of state.activePlaybackVideos.values()) {
+            const video = active?.video;
+            const marker = video?._sonderTailStop;
+            if (!marker || marker.stopped || video.paused) continue;
+            if (marker.identity !== tailStopIdentity(video, active.layer)) continue;
+            fireTailStop(video, marker);
+        }
     }
 
     function pauseActivePlaybackVideos() {
@@ -7176,9 +7284,29 @@ export function createViewportSurface(options = {}) {
         });
     }
 
-    // The frame drawImage paints for a video whose decoder is running.
-    function videoPaintFrame(video) {
-        return Math.floor((Number(video?.currentTime) || 0) * fps() + 1e-6);
+    function mediaSourceKey(video) {
+        return video?._sonderSourceUrl || video?.currentSrc || "";
+    }
+
+    // The element's measured display phase: null when unknown (no callback
+    // since its last seek, or a different source since) and while seeking.
+    function videoDisplayPhase(video) {
+        const tracker = video?._sonderPresentationTracker;
+        if (!tracker || video.seeking || !Number.isFinite(tracker.phase) || tracker.phaseSource !== mediaSourceKey(video)) return null;
+        return tracker.phase;
+    }
+
+    function videoHasDisplayPhase(video) {
+        return videoDisplayPhase(video) !== null;
+    }
+
+    // The frame drawImage paints for a video whose decoder is running, or
+    // that paused while painting it: its currentTime frame shifted by its
+    // display phase, when one was measured, less PLAYBACK_PHASE_MARGIN.
+    function videoPaintFrame(video, aheadMs = 0) {
+        const phase = videoDisplayPhase(video);
+        const time = (Number(video?.currentTime) || 0) + aheadMs / 1000;
+        return Math.floor(time * fps() + (phase === null ? 0 : phase - PLAYBACK_PHASE_MARGIN) + 1e-6);
     }
 
     function clipLastSourceFrame(layer) {
@@ -7201,7 +7329,7 @@ export function createViewportSurface(options = {}) {
     // pending confirm instead of consuming it.
     function notePaintedVideo(entry, video) {
         const frame = videoPaintFrame(video);
-        const key = `${state.playbackSessionId}|${video._sonderSourceUrl || video.currentSrc || ""}`;
+        const key = `${state.playbackSessionId}|${mediaSourceKey(video)}`;
         const refresh = state.playbackLastTickAt;
         const last = video._sonderLastPainted;
         const sameFrame = !!last && last.key === key && last.frame === frame;
@@ -7289,7 +7417,7 @@ export function createViewportSurface(options = {}) {
     }
 
     // True when the canvas already shows exactly this composite: same layers,
-    // elements, opacity and fit, and every video still on the currentTime frame
+    // elements, opacity and fit, and every video still on the painted frame
     // it was painted at with no confirm pending. A composite with a still image
     // or guide is repainted every tick as before, since an animated image
     // advances without any change the record could see.
@@ -8156,6 +8284,7 @@ export function createViewportSurface(options = {}) {
         recordFramesBehindTelemetry(timestamp, nextFrame, endFrame);
         if (canSkipRepeatedPlaybackFrame(nextFrame) || holdCutForDepartingTail(nextFrame, timestamp)) {
             notePlaybackPerfFrameSkipped();
+            watchPlaybackTails();
             repaintPlaybackIfAdvanced();
             state.playbackRAF = requestAnimationFrame(playbackTick);
             finishTick();

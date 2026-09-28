@@ -1190,6 +1190,31 @@ console.log(JSON.stringify({{
     assert result["unknown"] == ["wait", "wait"]
 
 
+def test_display_phase_is_estimated_at_the_frames_presentation():
+    module_url = (ROOT / "web/js/viewport_surface.js").as_uri()
+    result = _run_node(f"""
+const {{_displayPhaseEstimate:estimate,_displayPhaseFromSamples:combine}}=await import({json.dumps(module_url)});
+// Frame 54 was presented at 1000 ms; read 10 ms later, currentTime has run on
+// 0.24 frame from 53.45, where the frame began to paint: phase 0.55.
+const read=(o)=>estimate({{mediaTime:54/24,presentationTime:1000,nowMs:1010,currentTime:(53.45+0.24)/24,fps:24,...o}});
+const round=v=>v===null?null:Math.round(v*100)/100;
+console.log(JSON.stringify({{
+ late:round(read({{}})),
+ onTime:round(read({{nowMs:1000,currentTime:53.45/24}})),
+ negative:round(read({{mediaTime:54/24,currentTime:(54.2+0.24)/24}})),
+ unusable:[read({{mediaTime:NaN}}),read({{presentationTime:undefined}}),read({{fps:0}}),read({{currentTime:52/24}})],
+ samples:[combine([]),combine([0.3]),combine([0.2,0.4]),combine([0.6,-0.02,0.55]),combine([0.9,0.1,0.2,0.3])].map(round),
+}}));
+""")
+    # currentTime taken back to the presentation removes the callback's delay.
+    assert (result["late"], result["onTime"], result["negative"]) == (0.55, 0.55, -0.2)
+    # Missing inputs, no frame rate, or a phase of a whole frame are unusable.
+    assert result["unusable"] == [None, None, None, None]
+    # One sample as is; two averaged; three by median, rejecting an outlier;
+    # only the latest three count.
+    assert result["samples"] == [None, 0.3, 0.3, 0.55, 0.2]
+
+
 def test_tail_stop_decision_stops_on_the_last_source_frame():
     module_url = (ROOT / "web/js/viewport_surface.js").as_uri()
     result = _run_node(f"""
@@ -1320,6 +1345,10 @@ const cfg = Object.assign({
  ],
  startFrame: 0, stopFrame: 110, totalFrames: 120,
 }, __CONFIG__);
+// Display phase per clip id; setting one also makes callbacks report
+// presentationTime, which the surface's phase estimate reads.
+const phaseModel = cfg.phase !== undefined;
+const phaseFor = (clip) => (phaseModel && clip ? (typeof cfg.phase === 'number' ? cfg.phase : (cfg.phase[clip.clip_id] ?? 0)) : 0);
 
 let T = 1000; const vsyncMs = 1000 / cfg.hz;
 const timers = []; let timerSeq = 0;
@@ -1334,19 +1363,19 @@ let vsyncIndex = 0;
 // Vsyncs in which any video was sought, played or paused.
 const controlLog = [];
 class Video extends EventTarget {
- constructor() { super(); this.readyState = 0; this.videoWidth = 320; this.videoHeight = 180; this.duration = 100; this.paused = true; this.seeking = false; this._time = 0; this._offset = 0; this._decoded = null; this._late = false; this._jitter = 0; this._history = []; this._presented = null; this._presentedFrames = 0; this._clipsSeen = new Set(); this.callbacks = new Map(); this.next = 0; videos.push(this); }
+ constructor() { super(); this.readyState = 0; this.videoWidth = 320; this.videoHeight = 180; this.duration = 100; this.paused = true; this.seeking = false; this._time = 0; this._offset = 0; this._decoded = null; this._late = false; this._jitter = 0; this._history = []; this._presented = null; this._presentedFrames = 0; this._clipsSeen = new Set(); this._shownAt = new Map(); this.callbacks = new Map(); this.next = 0; videos.push(this); }
  get src() { return this._src; }
  set src(v) { this._src = v; this.readyState = 4; this._decoded = this._frameAt(this.currentTime); }
  get currentTime() { return Math.max(0, this._time + (this.paused ? 0 : this._offset / 1000)); }
  set currentTime(v) {
   controlLog.push(vsyncIndex);
-  this._time = Number(v); this._offset = 0; this.seeking = true; this._history = [];
+  this._time = Number(v); this._offset = 0; this.seeking = true; this._history = []; this._shownAt = new Map();
   if (!this.paused) this._decodeHoldUntil = T + cfg.startupMs;
   queueMicrotask(() => { this.seeking = false; if (this.paused) this._decoded = this._frameAt(this._time); this.dispatchEvent(new Event('seeked')); });
  }
  // A negative clockStartupMs models a clock that starts early (ahead).
  play() { if (this.paused) { controlLog.push(vsyncIndex); this.paused = false; if (cfg.clockStartupMs < 0) this._time -= cfg.clockStartupMs / 1000; this._clockHoldUntil = T + Math.max(0, cfg.clockStartupMs); this._decodeHoldUntil = T + cfg.startupMs; } return Promise.resolve(); }
- pause() { if (!this.paused) { controlLog.push(vsyncIndex); this._time = this.currentTime; this._offset = 0; if (T >= (this._decodeHoldUntil || 0)) this._decoded = this._frameAt(this._time); } this.paused = true; }
+ pause() { if (!this.paused) { controlLog.push(vsyncIndex); this._time = this.currentTime; this._offset = 0; if (T >= (this._decodeHoldUntil || 0)) this._decoded = this._paintAt(this._time); } this.paused = true; }
  load() {}
  removeAttribute(k) { if (k === 'src') { delete this._src; this.readyState = 0; } else delete this[k]; }
  cancelVideoFrameCallback(id) { this.callbacks.delete(id); }
@@ -1354,6 +1383,9 @@ class Video extends EventTarget {
  get muted() { return true; }
  set muted(v) { controlLog.push(vsyncIndex); }
  _frameAt(t) { return Math.floor(t * cfg.fps + 1e-6); }
+ // Where a playing decoder's picture sits: the currentTime frame shifted by
+ // this clip's display phase. A seek paints _frameAt (no phase).
+ _paintAt(t) { return Math.floor(t * cfg.fps + phaseFor(this.clip) + 1e-6); }
  get clip() { const key = String(this._sonderSourceCacheKey || ''); return cfg.clips.find(c => key.includes(c.source_path)) || null; }
  // The frame drawImage paints right now. With flipLag, the refresh on which
  // currentTime enters a frame still paints the previous one (1920x1088,
@@ -1361,7 +1393,7 @@ class Video extends EventTarget {
  get drawnFrame() {
   if (this.paused || this.seeking || T < (this._decodeHoldUntil || 0)) return this._decoded;
   const settling = cfg.flipLag && this._flipVsync === vsyncIndex;
-  return Math.max(this._decoded ?? -Infinity, this._frameAt(this.currentTime) - (this._late || settling ? 1 : 0));
+  return Math.max(this._decoded ?? -Infinity, this._paintAt(this.currentTime) - (this._late || settling ? 1 : 0));
  }
  advance(dt) {
   if (!this._src) return;
@@ -1374,6 +1406,8 @@ class Video extends EventTarget {
    if (this._frameAt(this.currentTime) !== before) this._flipVsync = vsyncIndex;
   } else this._offset = (this._rand() * 2 - 1) * cfg.clockJitterMs;
   if (!this.paused && !this.seeking && T >= (this._decodeHoldUntil || 0)) this._decoded = this.drawnFrame;
+  if (this._decoded !== null && !this._shownAt.has(this._decoded)) this._shownAt.set(this._decoded, T);
+  if (this._shownAt.size > 64) this._shownAt.delete(this._shownAt.keys().next().value);
   this._history.push(this._decoded); if (this._history.length > 16) this._history.shift();
  }
  presentStep() {
@@ -1381,7 +1415,9 @@ class Video extends EventTarget {
   const h = this._history; const frame = this.paused ? this._decoded : h[Math.max(0, h.length - 1 - cfg.lagVsyncs - this._jitter)];
   if (frame === null || frame === undefined || frame === this._presented) return;
   this._presented = frame; this._presentedFrames += 1;
-  for (const [id, cb] of [...this.callbacks]) { this.callbacks.delete(id); cb(T, {mediaTime: frame / cfg.fps, presentedFrames: this._presentedFrames, expectedDisplayTime: T + vsyncMs}); }
+  const metadata = {mediaTime: frame / cfg.fps, presentedFrames: this._presentedFrames, expectedDisplayTime: T + vsyncMs};
+  if (phaseModel) metadata.presentationTime = this._shownAt.get(frame) ?? T;
+  for (const [id, cb] of [...this.callbacks]) { this.callbacks.delete(id); cb(T, metadata); }
  }
 }
 if (cfg.rvfc) Video.prototype.requestVideoFrameCallback = function (cb) { this.callbacks.set(++this.next, cb); return this.next; };
@@ -1433,9 +1469,10 @@ const vsync = async () => {
  for (const [key, active] of surface._state.activePlaybackVideos) {
   const c = cfg.clips.find(x => x.clip_id === key); if (!c || active.video.seeking) continue;
   activeRunFrames[key] = Math.max(activeRunFrames[key] ?? -Infinity, active.video._frameAt(active.video.currentTime));
+  if (active.video.drawnFrame !== null) activeDrawnFrames[key] = Math.max(activeDrawnFrames[key] ?? -Infinity, active.video.drawnFrame);
  }
 };
-const activeRunFrames = {}; const laneShown = {}; const laneFrames = {};
+const activeRunFrames = {}; const activeDrawnFrames = {}; const laneShown = {}; const laneFrames = {};
 surface.startPlayback(); await settle();
 // Guard probe: mid-clip, call the real repaint directly with the recorded
 // video one frame ahead, once plainly and once under each condition that must
@@ -1534,7 +1571,7 @@ for (const s of screen) {
 // Elements whose always-on frame sampler recorded a presentation.
 const sampled = videos.filter(v => v._sonderPresentationTracker?.sample).length;
 console.log(JSON.stringify({vsyncs: vsyncIndex, clipStats, backward, excluded, cuts, rebufferEntries,
- composites: paintLog.filter(d => d.black).length, staleRefreshes, guardProbe, tailProbe, inactivePaints, sampled, passFrames, activeRunFrames,
+ composites: paintLog.filter(d => d.black).length, staleRefreshes, guardProbe, tailProbe, inactivePaints, sampled, passFrames, activeRunFrames, activeDrawnFrames,
  laneFrames: Object.fromEntries(Object.entries(laneFrames).map(([k, s]) => [k, [...s].filter(f => f !== null).sort((x, y) => x - y)]))}));
 surface.destroy();
 """
@@ -1632,6 +1669,19 @@ _ORDINARY_CUTS = ({}, {"adaptiveRebuffer": True}, {"clockStartupMs": 0}, {"seed"
                   {"flipLag": True}, {"flipLag": True, "adaptiveRebuffer": True}, {"flipLag": True, "hz": 144})
 _SLOW_START = {"startupMs": 200}
 
+# Per-element display phases (measured live 0.28-0.60, -0.2 on heavy content):
+# the fake paints floor(ct * fps + phase) and its callbacks report the
+# presentation time. Clock jitter 1 ms, the live estimate's spread (<= 0.04
+# frame within a run); the default 4 ms per-refresh noise is coarser than live.
+_PHASE_CUTS = tuple({"clockJitterMs": 1, "adaptiveRebuffer": True, **case} for case in (
+    {"phase": 0.5}, {"phase": {"a": 0.3, "b": 0.6}}, {"phase": {"a": 0.6, "b": 0.2}}, {"phase": 0.5, "hz": 60},
+    {"phase": 0.45, "seed": 3}, {"phase": {"a": 0.2, "b": 0.55}, "seed": 2}, {"phase": -0.2}, {"phase": 0.3, "hz": 144},
+    # From the Phase 2b audit: an outgoing tail crossing its last frame between
+    # 60 Hz ticks, and a low outgoing phase against a high incoming one.
+    {"phase": 0.45, "seed": 2, "hz": 60}, {"phase": {"a": 0.1, "b": 0.55}, "seed": 4},
+    # The cut grace confirms the outgoing tail only after it was painted once.
+    {"phase": {"a": 0.1, "b": 0.45}, "seed": 1}))
+
 
 def test_a_cut_is_seamless_and_never_shows_a_frame_outside_the_edit():
     failures = []
@@ -1659,6 +1709,55 @@ def test_a_cut_is_seamless_and_never_shows_a_frame_outside_the_edit():
                 or cut["maxHoldVsyncs"] * 1000 / hz > _SLOW_START["startupMs"] + 1000 / 24):
             failures.append(("slow, rebuffer off", hz, cut, running["excluded"], running["backward"]))
     assert failures == []
+
+
+def test_a_cut_follows_each_elements_display_phase():
+    # A roll a hair short of B by currentTime but painting B by its phase is
+    # claimed on the tick (no hold), and the outgoing tail stops on the frame
+    # it paints, never one past its out point. Judged on currentTime alone,
+    # these cases skip B or paint the outgoing frame past the out point.
+    failures = []
+    for case in _PHASE_CUTS:
+        result = _lag_harness(**case)
+        cut = result["cuts"][0]
+        if (cut["missing"] or cut["black"] or result["excluded"] or result["backward"] or result["rebufferEntries"]
+                or cut["incomingElements"] != 1 or result["inactivePaints"]):
+            failures.append((case, cut, result["excluded"], result["backward"], result["rebufferEntries"]))
+    assert failures == []
+
+
+def test_a_tail_never_paints_past_its_out_point_between_ticks():
+    # At 50-75 Hz ticks come two or three refreshes apart and the phase
+    # prediction can trail the picture by a refresh, so an element leading the
+    # clock crosses its last frame between ticks: the per-refresh watcher stops
+    # it in time. Where the outgoing tail trails the tick by a frame and the
+    # incoming roll is on it, one of B-1 and B can be lost; B-2..B+3 otherwise
+    # all paint.
+    cases = [{"phase": phase, "seed": seed, "hz": 60} for phase in (0.3, 0.45, 0.6) for seed in range(1, 9)]
+    cases += [{"phase": 0.5, "seed": seed, "hz": hz, "clockStartupMs": -20} for seed in (1, 2, 3) for hz in (50, 75)]
+    failures = []
+    for case in cases:
+        result = _lag_harness(clockJitterMs=1, adaptiveRebuffer=True, **case)
+        cut = result["cuts"][0]
+        # The element itself, not only the canvas, stops on its last frame:
+        # a repaint or commit while it painted past it would show that frame.
+        if (result["excluded"] or result["backward"] or not set(cut["missing"]) <= {47, 48} or len(cut["missing"]) > 1
+                or result["activeDrawnFrames"]["a"] > 47):
+            failures.append((case, cut["around"], result["excluded"], result["activeDrawnFrames"]["a"]))
+    assert failures == []
+
+
+def test_repaint_follows_each_elements_display_phase_inside_a_clip():
+    # Every interior frame painted, the repaint following the phase-shifted
+    # frame. The canvas can trail a flip by one refresh (the prediction is
+    # held below the estimate so it is never ahead), plus one more on the
+    # fake's decode-late refreshes (5%); it never skips.
+    for case in ({"phase": 0.5}, {"phase": 0.3, "seed": 2, "hz": 60}, {"phase": {"a": 0.2, "b": 0.6}, "seed": 3}, {"phase": -0.2}):
+        result = _lag_harness(clockJitterMs=1, **case)
+        clip = result["clipStats"][1]
+        refreshes_in_clip = clip["frames"] * case.get("hz", 120) / 24
+        assert clip["missing"] == 0, case
+        assert result["staleRefreshes"] <= clip["frames"] + 0.05 * refreshes_in_clip, case
 
 
 def test_rolls_that_land_off_the_tick_stay_inside_the_edit():
@@ -1732,7 +1831,10 @@ def test_loop_restart_and_stop_restart_clear_the_tail_stop():
     assert len(looped["passFrames"]) >= 4 and not looped["excluded"]
     # Stopped after the tail stop fired, then played again from earlier in the
     # clip: the element must run again and the cut stay seamless.
-    restarted = _lag_harness(restart={"at": 47, "from": 38})
-    assert restarted["passFrames"][1][:12] == list(range(38, 50))
-    cut = restarted["cuts"][0]
-    assert (cut["missing"], restarted["excluded"], restarted["inactivePaints"]) == ([], [], 0)
+    # With a display phase, the restart's seek must also clear the phase: the
+    # sought element paints its currentTime frame until its next callback.
+    for case in ({}, {"phase": 0.5, "clockJitterMs": 1}):
+        restarted = _lag_harness(restart={"at": 47, "from": 38}, **case)
+        assert restarted["passFrames"][1][:12] == list(range(38, 50)), case
+        cut = restarted["cuts"][0]
+        assert (cut["missing"], restarted["excluded"], restarted["inactivePaints"]) == ([], [], 0), case

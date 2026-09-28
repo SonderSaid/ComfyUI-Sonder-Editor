@@ -11,6 +11,9 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Fixed
+- Playback is smoother, most visibly on continuous shots. Motion inside a clip no longer stutters: every frame is shown, where some were skipped and others shown twice. At a cut the outgoing clip's last frame is shown, the picture never steps back or flashes a frame from outside the edit, and ordinary cuts no longer pause the picture and sound for a moment.
+
 ## [0.7.2] - 2026-09-27
 
 ### Added
