@@ -1275,21 +1275,27 @@ const events = []; const videos = [];
 globalThis.window = {SONDER_DEBUG_SESSION: cfg.debugSession, __SONDER_CANVAS_DIAG: {record: (kind, payload) => events.push({kind, ...payload})}, __SONDER_DIAG_CLEARERS: new Set(), setTimeout: fakeSetTimeout, clearTimeout: fakeClearTimeout};
 globalThis.fetch = async () => ({ok: true, blob: async () => new Blob([new Uint8Array(100)])});
 let vsyncIndex = 0;
+// Vsyncs in which any video was sought, played or paused.
+const controlLog = [];
 class Video extends EventTarget {
  constructor() { super(); this.readyState = 0; this.videoWidth = 320; this.videoHeight = 180; this.duration = 100; this.paused = true; this.seeking = false; this._time = 0; this._offset = 0; this._decoded = null; this._late = false; this._jitter = 0; this._history = []; this._presented = null; this._presentedFrames = 0; this._clipsSeen = new Set(); this.callbacks = new Map(); this.next = 0; videos.push(this); }
  get src() { return this._src; }
  set src(v) { this._src = v; this.readyState = 4; this._decoded = this._frameAt(this.currentTime); }
  get currentTime() { return Math.max(0, this._time + (this.paused ? 0 : this._offset / 1000)); }
  set currentTime(v) {
+  controlLog.push(vsyncIndex);
   this._time = Number(v); this._offset = 0; this.seeking = true; this._history = [];
   if (!this.paused) this._decodeHoldUntil = T + cfg.startupMs;
   queueMicrotask(() => { this.seeking = false; if (this.paused) this._decoded = this._frameAt(this._time); this.dispatchEvent(new Event('seeked')); });
  }
- play() { if (this.paused) { this.paused = false; this._clockHoldUntil = T + cfg.clockStartupMs; this._decodeHoldUntil = T + cfg.startupMs; } return Promise.resolve(); }
- pause() { if (!this.paused) { this._time = this.currentTime; this._offset = 0; if (T >= (this._decodeHoldUntil || 0)) this._decoded = this._frameAt(this._time); } this.paused = true; }
+ play() { if (this.paused) { controlLog.push(vsyncIndex); this.paused = false; this._clockHoldUntil = T + cfg.clockStartupMs; this._decodeHoldUntil = T + cfg.startupMs; } return Promise.resolve(); }
+ pause() { if (!this.paused) { controlLog.push(vsyncIndex); this._time = this.currentTime; this._offset = 0; if (T >= (this._decodeHoldUntil || 0)) this._decoded = this._frameAt(this._time); } this.paused = true; }
  load() {}
  removeAttribute(k) { if (k === 'src') { delete this._src; this.readyState = 0; } else delete this[k]; }
  cancelVideoFrameCallback(id) { this.callbacks.delete(id); }
+ // syncPreparedVideoPlayback sets muted on every call, so this reveals it.
+ get muted() { return true; }
+ set muted(v) { controlLog.push(vsyncIndex); }
  _frameAt(t) { return Math.floor(t * cfg.fps + 1e-6); }
  get clip() { const key = String(this._sonderSourceCacheKey || ''); return cfg.clips.find(c => key.includes(c.source_path)) || null; }
  // The frame drawImage paints right now.
@@ -1324,7 +1330,7 @@ const ctx = new Proxy({globalAlpha: 1,
  drawImage: (el) => { const c = el.clip; const f = el.drawnFrame; paintLog.push({v: vsyncIndex, clip: c?.clip_id || '?', shown: c && f !== null ? c.timeline_start_frame + f - c.source_in_frame : null}); },
 }, {get: (t, k) => k in t ? t[k] : () => {}, set: (t, k, v) => { t[k] = v; return true; }});
 
-const {createViewportSurface} = await loadSurface(__MODULE_URL__, '_state: state,');
+const {createViewportSurface} = await loadSurface(__MODULE_URL__, '_state: state, _repaint: repaintPlaybackIfAdvanced,');
 let frame = cfg.startFrame; const scene = {clips: cfg.clips, audio_tracks: [], guide_frames: []};
 const surface = createViewportSurface({canvas: {width: 320, height: 180, getContext: () => ctx}, getScene: () => scene, getFrame: () => frame, setFrame: v => { frame = v; }, getTotalFrames: () => cfg.totalFrames, getFps: () => cfg.fps, getAssetForSourcePath: () => ({width: 320, height: 180, media_kind: 'video'}), buildViewUrl: p => 'https://fixture/' + p, getStreamingMode: () => 'auto', getDecodeConcurrency: () => 8, isAdaptiveRebufferEnabled: () => cfg.adaptiveRebuffer});
 const settle = async () => { for (let i = 0; i < 40; i++) await Promise.resolve(); };
@@ -1342,11 +1348,44 @@ const vsync = async () => {
  let now = null;
  if (mine.length) { const lastBlack = mine.map(d => !!d.black).lastIndexOf(true); const image = mine.slice(lastBlack + 1).filter(d => !d.black).pop(); now = image ? image : (lastBlack >= 0 ? {black: true, shown: null} : null); }
  const last = now || (screen.length ? screen[screen.length - 1] : null);
- screen.push(last ? {...last, tl: frame} : {tl: frame, shown: null});
+ // The frame the active clip-b element would paint now, as a timeline frame.
+ const bVideo = surface._state.activePlaybackVideos.get('b')?.video;
+ const bClip = cfg.clips[1];
+ const bDrawn = bVideo && bVideo.drawnFrame !== null ? bClip.timeline_start_frame + bVideo.drawnFrame - bClip.source_in_frame : null;
+ screen.push(last ? {...last, tl: frame, bDrawn} : {tl: frame, shown: null, bDrawn});
  const rebuffering = !!surface._state.playbackRebuffering; if (rebuffering && !wasRebuffering) rebufferEntries++; wasRebuffering = rebuffering;
 };
 surface.startPlayback(); await settle();
-for (let guard = 0; frame < cfg.stopFrame && guard < 20000; guard++) await vsync();
+// Guard probe: mid-clip, call the real repaint directly with the recorded
+// video one frame ahead, once plainly and once under each condition that must
+// block it. The run stops after the probe; only its result is meaningful.
+const probeGuards = () => {
+ const S = surface._state; const entry = S.playbackPaint?.entries?.find(e => e.type === 'video');
+ if (!entry) return {error: 'no recorded paint'};
+ const el = entry.element; const active = S.activePlaybackVideos.get(entry.layerKey);
+ const composites = () => paintLog.filter(d => d.black).length;
+ const attempt = (setTime, mutate = () => {}, restore = () => {}) => {
+  el._time = setTime(entry.paintedFrame) / cfg.fps; el._offset = 0;
+  const before = composites(), controls = controlLog.length;
+  mutate(); const did = surface._repaint(); restore();
+  return {did, painted: composites() - before, control: controlLog.length - controls};
+ };
+ const ahead = f => f + 1.5;
+ return {
+  advanced: attempt(ahead),
+  rebuffering: attempt(ahead, () => { S.playbackRebuffering = true; }, () => { S.playbackRebuffering = false; }),
+  held: attempt(ahead, () => { S.playbackBlockedSinceMs = T; }, () => { S.playbackBlockedSinceMs = null; }),
+  swapped: attempt(ahead, () => { active.video = new Video(); }, () => { active.video = el; videos.pop(); }),
+  seeking: attempt(ahead, () => { el.seeking = true; }, () => { el.seeking = false; }),
+  behind: attempt(f => f - 1.5),
+  pastEnd: attempt(() => entry.lastSourceFrame + 1.5),
+ };
+};
+let guardProbe = null;
+for (let guard = 0; frame < cfg.stopFrame && guard < 20000; guard++) {
+ await vsync();
+ if (cfg.guardProbeFrame && frame >= cfg.guardProbeFrame) { guardProbe = probeGuards(); break; }
+}
 surface.stopPlayback(); await settle();
 
 const seq = [];
@@ -1369,7 +1408,15 @@ const cuts = cfg.clips.slice(1).map((c, i) => {
   incomingElements: videos.filter(v => v._clipsSeen.has(c.clip_id)).length,
   around: seq.filter(s => s.black || (s.shown !== null && s.shown >= B - 4 && s.shown <= B + 4)).map(s => (s.black ? 'black' : s.clip + s.shown) + 'x' + s.n).join(' ')};
 });
-console.log(JSON.stringify({vsyncs: vsyncIndex, clipStats, backward, excluded, cuts, rebufferEntries}));
+// Canvas staleness inside clip b: refreshes where the canvas does not show
+// the frame the active element would paint now.
+let staleRefreshes = 0;
+for (const s of screen) {
+ if (s.clip !== 'b' || s.tl < 55 || s.tl >= Math.min(cfg.stopFrame, 117) || s.bDrawn === null) continue;
+ if (s.shown !== s.bDrawn) staleRefreshes++;
+}
+console.log(JSON.stringify({vsyncs: vsyncIndex, clipStats, backward, excluded, cuts, rebufferEntries,
+ composites: paintLog.filter(d => d.black).length, staleRefreshes, guardProbe}));
 surface.destroy();
 """
 
@@ -1396,14 +1443,57 @@ def test_lag_harness_is_deterministic_and_rolled_clips_run_on_the_clock():
 _JUDDER_CASES = ({"seed": 1}, {"seed": 2}, {"seed": 3}, {"seed": 1, "hz": 60})
 
 
-# Strict, and only for AssertionError, so a harness crash cannot pass as the
-# expected failure and a fix that lands flips the test red until it is unmarked.
-@pytest.mark.xfail(strict=True, raises=AssertionError,
-                   reason="Playback Follows the Presented Frame, Phase 1: the canvas repaints only on "
-                   "timeline-frame changes, so a frame that flips beside the tick is never painted")
-def test_playback_paints_every_frame_inside_a_clip():
-    missing = {json.dumps(case): _lag_harness(**case)["clipStats"][1]["missing"] for case in _JUDDER_CASES}
-    assert all(count == 0 for count in missing.values()), missing
+def test_playback_paints_every_frame_inside_a_clip_at_bounded_cost():
+    # Includes a browser without requestVideoFrameCallback: the repaint
+    # follows currentTime and needs no frame callbacks.
+    results = {json.dumps(case): _lag_harness(**case) for case in (*_JUDDER_CASES, {"seed": 1, "rvfc": False})}
+    assert {k: r["clipStats"][1]["missing"] for k, r in results.items()} == {k: 0 for k in results}
+    # On every refresh the canvas shows the frame the element would paint now;
+    # a stale reuse or a late repaint leaves it a refresh behind.
+    assert {k: r["staleRefreshes"] for k, r in results.items()} == {k: 0 for k in results}
+    # One paint per frame flip plus one confirming paint; the old tick-only
+    # paint was one per timeline frame. 110 timeline frames per run.
+    assert all(r["composites"] <= 2.1 * 110 for r in results.values()), {k: r["composites"] for k, r in results.items()}
+
+
+def test_overlapping_lanes_repaint_at_most_once_per_refresh():
+    # Each lane's flip (and its confirm) repaints the whole composite, so lanes
+    # flipping out of phase multiply paints; one per refresh is the hard bound.
+    two_lanes = [
+        {"clip_id": "a", "source_path": "a.mp4", "timeline_start_frame": 0, "timeline_end_frame": 120,
+         "source_in_frame": 0, "source_out_frame": 120, "track_index": 0},
+        {"clip_id": "b", "source_path": "b.mp4", "timeline_start_frame": 0, "timeline_end_frame": 120,
+         "source_in_frame": 0, "source_out_frame": 120, "track_index": 1, "opacity": 0.5},
+    ]
+    for hz in (120, 60):
+        result = _lag_harness(clips=two_lanes, hz=hz)
+        assert result["composites"] <= result["vsyncs"]
+        assert result["composites"] <= 4.2 * 110
+
+
+def test_repaint_between_ticks_paints_only_and_respects_its_guards():
+    probe = _lag_harness(seed=2, guardProbeFrame=70)["guardProbe"]
+    # One frame ahead, it paints once and touches no video (no seek, play,
+    # pause, or the muted write every sync makes).
+    assert probe["advanced"] == {"did": True, "painted": 1, "control": 0}
+    blocked = {"did": False, "painted": 0, "control": 0}
+    assert {k: v for k, v in probe.items() if k != "advanced"} == {
+        k: blocked for k in ("rebuffering", "held", "swapped", "seeking", "behind", "pastEnd")}
+
+
+def test_presentation_repaint_decision():
+    module_url = (ROOT / "web/js/viewport_surface.js").as_uri()
+    result = _run_node(f"""
+const {{ _presentationRepaintDecision: decide }} = await import({json.dumps(module_url)});
+const base = {{paintedFrame: 10, currentFrame: 10, lastSourceFrame: 20, confirmPending: false}};
+console.log(JSON.stringify([
+ decide(base), decide({{...base, currentFrame: 11}}), decide({{...base, confirmPending: true}}),
+ decide({{...base, currentFrame: 9}}), decide({{...base, currentFrame: 9, confirmPending: true}}),
+ decide({{...base, currentFrame: 21}}), decide({{...base, currentFrame: 20}}),
+ decide({{...base, lastSourceFrame: null, currentFrame: 99}}), decide({{...base, paintedFrame: NaN}}),
+]));
+""")
+    assert result == ["unchanged", "repaint", "repaint", "behind", "behind", "past-end", "repaint", "repaint", "unknown"]
 
 
 # Cut cases. Ordinary cuts must be seamless with adaptive rebuffer on (the

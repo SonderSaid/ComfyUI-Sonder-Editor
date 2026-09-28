@@ -38,6 +38,21 @@ export function _rollingPrebufferAtTarget(currentTime, targetTime, tolerance) {
         && currentTime >= targetTime - 0.001 && currentTime <= targetTime + tolerance;
 }
 
+// Whether a painted playback video has advanced enough to repaint between
+// ticks. drawImage paints the element's currentTime frame once its decoder is
+// running (measured in Chromium 2026-09-28), so `currentFrame` is
+// floor(currentTime * fps). A paint on a new frame is also confirmed once on
+// the next refresh (`confirmPending`), because the flip refresh can still
+// paint the previous decoded frame. Never repaint backwards (a drift seek
+// re-prepares on the next tick) or past the clip's last source frame.
+export function _presentationRepaintDecision({ paintedFrame, currentFrame, lastSourceFrame, confirmPending = false } = {}) {
+    if (!Number.isFinite(currentFrame) || !Number.isFinite(paintedFrame)) return "unknown";
+    if (currentFrame < paintedFrame) return "behind";
+    if (Number.isFinite(lastSourceFrame) && currentFrame > lastSourceFrame) return "past-end";
+    if (currentFrame !== paintedFrame || confirmPending) return "repaint";
+    return "unchanged";
+}
+
 const PLAYBACK_COMMIT_HOLD_MS = 400;
 const PLAYBACK_TAIL_HOLD_MAX_MS = 2000;
 const PLAYBACK_OPAQUE_OPACITY = 0.999;
@@ -82,6 +97,11 @@ const PLAYBACK_PERF_STAGE_NAMES = [
     "frameCallback",
     "snapshot",
     "viewportRender",
+    // Pixel work of every playback composite paint, tick or repaint; its total
+    // over the run is the composite cost per second.
+    "compositePaint",
+    // Paints between ticks because a painted video advanced (subset of compositePaint).
+    "repaint",
     "autoScroll",
     "timeline",
     "toolbar",
@@ -145,6 +165,9 @@ function createPlaybackPerfCounters(startedAtMs = 0) {
         distinctFrames: 0,
         repeatedFrames: 0,
         skippedFrames: 0,
+        compositePaints: 0,
+        compositePaintsReused: 0,
+        presentationRepaints: 0,
         largestFrameAdvance: 0,
         maxRafGapMs: 0,
         maxFramesBehind: 0,
@@ -189,6 +212,9 @@ function serializePlaybackPerfCounters(counters) {
         distinctFrames: counters?.distinctFrames || 0,
         repeatedFrames: counters?.repeatedFrames || 0,
         skippedFrames: counters?.skippedFrames || 0,
+        compositePaints: counters?.compositePaints || 0,
+        compositePaintsReused: counters?.compositePaintsReused || 0,
+        presentationRepaints: counters?.presentationRepaints || 0,
         largestFrameAdvance: counters?.largestFrameAdvance || 0,
         maxRafGapMs: Math.round((counters?.maxRafGapMs || 0) * 10) / 10,
         maxFramesBehind: counters?.maxFramesBehind || 0,
@@ -1347,6 +1373,10 @@ export function createViewportSurface(options = {}) {
         playbackLastCommittedSignature: "",
         playbackLastCommittedSessionId: 0,
         playbackLastCommittedContentToken: -1,
+        // What the playback canvas last painted: entries plus, per video, the
+        // currentTime frame it was painted at. Ephemeral; cleared with the
+        // composite state and by every drawBlack.
+        playbackPaint: null,
         playbackFirstCommitStartedAt: null,
         playbackFirstCommitFrame: null,
         playbackFirstCommitHoldExpired: false,
@@ -2354,6 +2384,7 @@ export function createViewportSurface(options = {}) {
         state.playbackLastCommittedSignature = "";
         state.playbackLastCommittedSessionId = 0;
         state.playbackLastCommittedContentToken = -1;
+        state.playbackPaint = null;
         state.lastBoundaryCoverageSig = "";
         state.lastPrebufferScheduleStats = emptyPrebufferScheduleStats("composite-reset");
     }
@@ -2528,6 +2559,9 @@ export function createViewportSurface(options = {}) {
 
     function drawBlack() {
         state.compositePassSeq += 1;
+        // Every canvas paint starts here, so any paint the playback path does
+        // not own invalidates what it recorded; that path re-records after it paints.
+        state.playbackPaint = null;
         const ctx = getCanvasContext();
         if (!ctx || !state.canvas) return null;
         ctx.fillStyle = THEME.bg0;
@@ -6810,6 +6844,169 @@ export function createViewportSurface(options = {}) {
         });
     }
 
+    // The frame drawImage paints for a video whose decoder is running.
+    function videoPaintFrame(video) {
+        return Math.floor((Number(video?.currentTime) || 0) * fps() + 1e-6);
+    }
+
+    function clipLastSourceFrame(layer) {
+        const clip = layer?.clip;
+        if (!clip) return null;
+        const end = Number(clip.timeline_end_frame);
+        let last = Number.isFinite(end) ? clipSourceFrame(layer, end - 1) : null;
+        const out = Number(clip.source_out_frame);
+        if (Number.isFinite(out)) last = last === null ? out - 1 : Math.min(last, out - 1);
+        return last;
+    }
+
+    // Record what a video was painted at. A paint on a new frame asks for one
+    // confirming repaint on the next refresh: the refresh where currentTime
+    // flips can still paint the previous decoded frame. Frame callbacks trail
+    // the painted frame by up to two frames (measured), too late to reveal it,
+    // and at 60 Hz can arrive after the next flip. The marker is keyed to the
+    // session and source, so an element reused elsewhere never inherits it.
+    function notePaintedVideo(entry, video) {
+        const frame = videoPaintFrame(video);
+        const key = `${state.playbackSessionId}|${video._sonderSourceUrl || video.currentSrc || ""}`;
+        const last = video._sonderLastPainted;
+        entry.confirmPending = !last || last.key !== key || last.frame !== frame;
+        video._sonderLastPainted = { key, frame };
+        entry.paintedFrame = frame;
+    }
+
+    function playbackPaintEntries(renderables) {
+        return renderables.map((renderable) => {
+            const entry = {
+                renderable,
+                type: renderable.type,
+                element: renderable.element,
+                opacity: renderable.opacity,
+                layerKey: renderable.layer?.key || "",
+                fit: fitOptionsFor(renderable.type === "guide" ? renderable.guide : renderable.layer?.clip),
+            };
+            if (renderable.type === "video") entry.lastSourceFrame = clipLastSourceFrame(renderable.layer);
+            return entry;
+        });
+    }
+
+    // The one playback painter, used by the tick and by repaints between ticks.
+    // Paints the entries in order and times pixel work only. The paint is
+    // recorded for reuse only when every entry drew; drawBlack cleared any
+    // earlier record, so a partial paint is never reused.
+    function paintPlaybackEntries(entries, { frame, signature, telemetry = false }) {
+        const result = { drew: [], videoDraws: telemetry ? [] : null, videoDrawMs: 0, imageDrawMs: 0, guideDrawMs: 0, outlineMs: 0 };
+        const startedAt = performance.now();
+        drawBlack();
+        for (const entry of entries) {
+            const layerStartedAt = telemetry ? performance.now() : 0;
+            const didDraw = drawImageLike(entry.element, { opacity: entry.opacity, ...entry.fit, allowScratch: true });
+            result.drew.push(didDraw);
+            if (didDraw && entry.type === "video") notePaintedVideo(entry, entry.element);
+            if (!telemetry) continue;
+            const layerDrawMs = performance.now() - layerStartedAt;
+            result[`${entry.type}DrawMs`] += layerDrawMs;
+            if (entry.type !== "video") continue;
+            const drawTelemetry = playbackVideoDrawTelemetry(entry.renderable, layerDrawMs, didDraw, frame);
+            result.videoDraws.push(drawTelemetry);
+            if (!state.slowVideoDrawReported && layerDrawMs > 8 && drawTelemetry.destScale <= VIDEO_SCRATCH_SCALE_THRESHOLD) {
+                state.slowVideoDrawReported = true;
+                recordPlaybackTelemetry("playback_slow_video_draw", { frame, ...drawTelemetry });
+            }
+        }
+        const outlineStartedAt = telemetry ? performance.now() : 0;
+        drawSceneOutline();
+        if (telemetry) result.outlineMs = performance.now() - outlineStartedAt;
+        result.paintMs = performance.now() - startedAt;
+        recordPlaybackPerfTiming("compositePaint", result.paintMs);
+        updatePlaybackPerfCounters((counters) => { counters.compositePaints += 1; });
+        state.playbackPaint = result.drew.every(Boolean) ? {
+            sessionId: state.playbackSessionId,
+            contentToken: state.playbackWarmContentToken,
+            canvasWidth: state.canvas?.width || 0,
+            canvasHeight: state.canvas?.height || 0,
+            outline: isSceneOutlineEnabled(),
+            signature,
+            entries,
+        } : null;
+        return result;
+    }
+
+    function playbackPaintContextValid(paint) {
+        return !!(
+            paint
+            && state.canvas
+            && paint.sessionId === state.playbackSessionId
+            && paint.contentToken === state.playbackWarmContentToken
+            && paint.canvasWidth === state.canvas.width
+            && paint.canvasHeight === state.canvas.height
+            && paint.outline === isSceneOutlineEnabled()
+        );
+    }
+
+    function paintedVideoDecision(entry) {
+        return _presentationRepaintDecision({
+            paintedFrame: entry.paintedFrame,
+            currentFrame: videoPaintFrame(entry.element),
+            lastSourceFrame: entry.lastSourceFrame,
+            confirmPending: entry.confirmPending,
+        });
+    }
+
+    // True when the canvas already shows exactly this composite: same layers,
+    // elements, opacity and fit, and every video still on the currentTime frame
+    // it was painted at with no confirm pending. A composite with a still image
+    // or guide is repainted every tick as before, since an animated image
+    // advances without any change the record could see.
+    function playbackPaintStillShows(renderables, signature) {
+        const paint = state.playbackPaint;
+        if (!playbackPaintContextValid(paint) || paint.signature !== signature) return false;
+        if (paint.entries.length !== renderables.length) return false;
+        return renderables.every((renderable, index) => {
+            const entry = paint.entries[index];
+            if (renderable.type !== "video" || entry.type !== "video") return false;
+            const fit = fitOptionsFor(renderable.layer?.clip);
+            if (
+                entry.element !== renderable.element
+                || entry.opacity !== renderable.opacity
+                || entry.layerKey !== (renderable.layer?.key || "")
+                || entry.fit.fitMode !== fit.fitMode
+                || entry.fit.cropPosition !== fit.cropPosition
+            ) return false;
+            const video = entry.element;
+            return !video.seeking && (video.readyState || 0) >= 2 && paintedVideoDecision(entry) === "unchanged";
+        });
+    }
+
+    // Between ticks, repaint the committed composite when a painted video has
+    // advanced, so every frame the element shows reaches the canvas at the
+    // element's own cadence instead of aliasing against the timeline tick.
+    // Paint only: no preflight, sync, tail pause, warm notes or teardown.
+    function repaintPlaybackIfAdvanced() {
+        const paint = state.playbackPaint;
+        if (!paint || !state.isPlaying || state.playbackRebuffering || state.playbackBlockedSinceMs !== null) return false;
+        if (!playbackCanvasStillValid() || !playbackPaintContextValid(paint)) return false;
+        if (paint.signature !== state.playbackLastCommittedSignature) return false;
+        let due = false;
+        for (const entry of paint.entries) {
+            if (entry.type !== "video") continue;
+            const video = entry.element;
+            const active = state.activePlaybackVideos.get(entry.layerKey);
+            if (!active || active.video !== video || video.seeking || (video.readyState || 0) < 2) return false;
+            const decision = paintedVideoDecision(entry);
+            if (decision === "repaint") due = true;
+            else if (decision !== "unchanged") return false;
+        }
+        if (!due) return false;
+        const painted = paintPlaybackEntries(paint.entries, {
+            frame: currentFrame(),
+            signature: paint.signature,
+            telemetry: playbackTelemetryActive(),
+        });
+        recordPlaybackPerfTiming("repaint", painted.paintMs);
+        updatePlaybackPerfCounters((counters) => { counters.presentationRepaints += 1; });
+        return true;
+    }
+
     function drawPlaybackComposite(snapshot, renderTiming = null) {
         const telemetryActive = playbackTelemetryActive();
         const compositeStartedAt = telemetryActive ? performance.now() : 0;
@@ -6827,64 +7024,52 @@ export function createViewportSurface(options = {}) {
 
         const preflightFinishedAt = telemetryActive ? performance.now() : 0;
         const drawStartedAt = telemetryActive ? performance.now() : 0;
-        drawBlack();
+        const renderables = preflight.renderables || [];
+        const signature = playbackLayerSignature(snapshot);
+        for (const renderable of renderables) {
+            if (renderable.type === "video" && renderable.active) syncPreparedVideoPlayback(renderable.active, renderable.layer, snapshot.frame);
+        }
+        // One draw authority: the tick commits every timeline frame, but paints
+        // pixels only when the canvas does not already show exactly this
+        // composite. Commit bookkeeping and per-layer side effects run either way.
+        let painted = null;
+        if (playbackPaintStillShows(renderables, signature)) {
+            updatePlaybackPerfCounters((counters) => { counters.compositePaintsReused += 1; });
+        } else {
+            painted = paintPlaybackEntries(playbackPaintEntries(renderables), { frame: snapshot.frame, signature, telemetry: telemetryActive });
+        }
         let drewAny = false;
         const committedVideoKeys = [];
-        const videoDraws = telemetryActive ? [] : null;
-        let videoDrawMs = 0;
-        let imageDrawMs = 0;
-        let guideDrawMs = 0;
-        for (const renderable of preflight.renderables || []) {
-            const fitItem = renderable.type === "guide" ? renderable.guide : renderable.layer?.clip;
-            const layerDrawStartedAt = telemetryActive ? performance.now() : 0;
-            if (renderable.type === "video" && renderable.active) syncPreparedVideoPlayback(renderable.active, renderable.layer, snapshot.frame);
-            const didDraw = drawImageLike(renderable.element, { opacity: renderable.opacity, ...fitOptionsFor(fitItem), allowScratch: true });
-            if (telemetryActive) {
-                const layerDrawMs = performance.now() - layerDrawStartedAt;
-                if (renderable.type === "video") {
-                    videoDrawMs += layerDrawMs;
-                    const drawTelemetry = playbackVideoDrawTelemetry(renderable, layerDrawMs, didDraw, snapshot.frame);
-                    videoDraws.push(drawTelemetry);
-                    if (!state.slowVideoDrawReported && layerDrawMs > 8 && drawTelemetry.destScale <= VIDEO_SCRATCH_SCALE_THRESHOLD) {
-                        state.slowVideoDrawReported = true;
-                        recordPlaybackTelemetry("playback_slow_video_draw", { frame: snapshot.frame, ...drawTelemetry });
-                    }
-                } else if (renderable.type === "image") {
-                    imageDrawMs += layerDrawMs;
-                } else if (renderable.type === "guide") {
-                    guideDrawMs += layerDrawMs;
-                }
-            }
+        const videoDraws = telemetryActive ? (painted?.videoDraws || []) : null;
+        renderables.forEach((renderable, index) => {
             if (renderable.type === "video" && renderable.active) {
                 pauseTailPlaybackVideo(renderable.active, renderable.layer, snapshot.frame);
             }
-            if (didDraw) {
-                drewAny = true;
-                if (renderable.type === "video") notePresentedVideoDraw(renderable, snapshot.frame);
-                if (renderable.type === "video" && renderable.active) {
-                    renderable.active.firstDrawComplete = true;
-                    renderable.active.readyForDraw = true;
-                    notePlaybackWarmLayer(renderable.layer, snapshot.frame, "warm", "composite-commit");
-                    if (renderable.layer?.key) {
-                        committedVideoKeys.push(renderable.layer.key);
-                    }
-                } else if (renderable.type === "image" && renderable.layer) {
-                    notePlaybackWarmLayer(renderable.layer, snapshot.frame, "warm", "composite-commit");
+            // A reused commit shows this layer already, exactly as painted.
+            if (!(painted ? painted.drew[index] : true)) return;
+            drewAny = true;
+            if (renderable.type === "video") notePresentedVideoDraw(renderable, snapshot.frame);
+            if (renderable.type === "video" && renderable.active) {
+                renderable.active.firstDrawComplete = true;
+                renderable.active.readyForDraw = true;
+                notePlaybackWarmLayer(renderable.layer, snapshot.frame, "warm", "composite-commit");
+                if (renderable.layer?.key) {
+                    committedVideoKeys.push(renderable.layer.key);
                 }
+            } else if (renderable.type === "image" && renderable.layer) {
+                notePlaybackWarmLayer(renderable.layer, snapshot.frame, "warm", "composite-commit");
             }
-        }
-        const outlineStartedAt = telemetryActive ? performance.now() : 0;
-        drawSceneOutline();
+        });
         const drawFinishedAt = telemetryActive ? performance.now() : 0;
         const compositeTiming = telemetryActive ? {
             preflightMs: roundTelemetryMs(preflightFinishedAt - compositeStartedAt),
             drawMs: roundTelemetryMs(drawFinishedAt - drawStartedAt),
             totalMs: roundTelemetryMs(drawFinishedAt - compositeStartedAt),
-            videoDrawMs: roundTelemetryMs(videoDrawMs),
-            imageDrawMs: roundTelemetryMs(imageDrawMs),
-            guideDrawMs: roundTelemetryMs(guideDrawMs),
-            outlineMs: roundTelemetryMs(drawFinishedAt - outlineStartedAt),
-            renderableCount: (preflight.renderables || []).length,
+            videoDrawMs: roundTelemetryMs(painted?.videoDrawMs || 0),
+            imageDrawMs: roundTelemetryMs(painted?.imageDrawMs || 0),
+            guideDrawMs: roundTelemetryMs(painted?.guideDrawMs || 0),
+            outlineMs: roundTelemetryMs(painted?.outlineMs || 0),
+            renderableCount: renderables.length,
             committedVideoCount: committedVideoKeys.length,
         } : null;
         if (renderTiming && compositeTiming) {
@@ -6907,7 +7092,7 @@ export function createViewportSurface(options = {}) {
         state.playbackCanvasWidth = state.canvas?.width || 0;
         state.playbackCanvasHeight = state.canvas?.height || 0;
         state.playbackLastCommittedFrame = snapshot.frame;
-        state.playbackLastCommittedSignature = playbackLayerSignature(snapshot);
+        state.playbackLastCommittedSignature = signature;
         state.playbackLastCommittedSessionId = state.playbackSessionId;
         state.playbackLastCommittedContentToken = state.playbackWarmContentToken;
         clearPlaybackDecisionLogs();
@@ -7009,7 +7194,10 @@ export function createViewportSurface(options = {}) {
         const timing = diagnosticsActive ? {} : null;
         let result = true;
         try {
-            if (shouldReuseCommittedPlaybackFrame(snapshot)) return true;
+            if (shouldReuseCommittedPlaybackFrame(snapshot)) {
+                repaintPlaybackIfAdvanced();
+                return true;
+            }
             notePlaybackWarmMissingLayers(snapshot, "missing-layer");
             let phaseStartedAt = diagnosticsActive ? performance.now() : 0;
             syncPlaybackVideoMedia(snapshot);
@@ -7604,6 +7792,7 @@ export function createViewportSurface(options = {}) {
         recordFramesBehindTelemetry(timestamp, nextFrame, endFrame);
         if (canSkipRepeatedPlaybackFrame(nextFrame)) {
             notePlaybackPerfFrameSkipped();
+            repaintPlaybackIfAdvanced();
             state.playbackRAF = requestAnimationFrame(playbackTick);
             finishTick();
             return;
