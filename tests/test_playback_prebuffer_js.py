@@ -8,6 +8,27 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# Imports viewport_surface.js with extra closure names exported for observation.
+# A Windows checkout writes the file CRLF (core.autocrlf, no .gitattributes)
+# while the hook anchor is LF, so the source is normalised first and a missed
+# anchor fails loudly instead of silently leaving the hook out.
+_SURFACE_LOADER = r"""
+const {readFileSync} = await import('node:fs');
+const SURFACE_HOOK_ANCHOR = '        renderFrame,\n        togglePlayback,';
+const loadSurface = async (moduleUrl, extraExports, {crlf = false, dropAnchor = false} = {}) => {
+ let source = readFileSync(new URL(moduleUrl), 'utf8');
+ if (crlf) source = source.replace(/\r?\n/g, '\r\n');
+ source = source.replace(/\r\n/g, '\n');
+ if (dropAnchor) source = source.replace(SURFACE_HOOK_ANCHOR, '        renderFrame, togglePlayback,');
+ source = source.replaceAll(/from "(\.\/[^"]+)"/g, (_, p) => 'from ' + JSON.stringify(new URL(p, moduleUrl).href));
+ const anchors = source.split(SURFACE_HOOK_ANCHOR).length - 1;
+ if (anchors === 0) throw new Error('viewport_surface.js test hook anchor not found');
+ if (anchors > 1) throw new Error('viewport_surface.js test hook anchor is not unique');
+ source = source.replace(SURFACE_HOOK_ANCHOR, '        ' + extraExports + '\n' + SURFACE_HOOK_ANCHOR);
+ return import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'));
+};
+"""
+
 
 def _run_node(script: str):
     node = shutil.which("node")
@@ -921,14 +942,9 @@ console.log(JSON.stringify({{
 
 
 def _presentation_harness(sampled=True, clear=False, abort=False, audio=False):
-    script = r"""
-const {readFileSync} = await import('node:fs');
-const moduleUrl=__MODULE_URL__;
-let source=readFileSync(new URL(moduleUrl),'utf8');
-source=source.replaceAll(/from "(\.\/[^"]+)"/g,(_,p)=>'from '+JSON.stringify(new URL(p,moduleUrl).href));
+    script = _SURFACE_LOADER + r"""
 // Observe the actual closure; do not replace its state transitions.
-source=source.replace('        renderFrame,\n        togglePlayback,','        _state: state, _sourceCache: sourceCache, _drain: drainPendingReleases, _abortPreRolls: abortPreRolls,\n        renderFrame,\n        togglePlayback,');
-const {createViewportSurface}=await import('data:text/javascript;base64,'+Buffer.from(source).toString('base64'));
+const {createViewportSurface}=await loadSurface(__MODULE_URL__,'_state: state, _sourceCache: sourceCache, _drain: drainPendingReleases, _abortPreRolls: abortPreRolls,');
 let fetches=0;globalThis.fetch=async()=>{fetches++;return {ok:true,blob:async()=>new Blob([new Uint8Array(100)])};};
 const drawnSourceFrames=[];const events = [], raf = [], videos = [], draws = [], frames=[];
 globalThis.window = {SONDER_DEBUG_SESSION:true, __SONDER_CANVAS_DIAG:{record:(kind,payload)=>events.push({kind,...payload})},__SONDER_DIAG_CLEARERS:new Set(),setTimeout,clearTimeout};
@@ -1045,14 +1061,9 @@ def test_playback_releases_passed_holder_and_preserves_stop_frame_and_readopted_
 
 
 def _live_culling_harness(missing=False, failed=False, transparent=False, partial=False, image=False, wrong_dimensions=False):
-    script = r"""
-const {readFileSync} = await import('node:fs');
-const moduleUrl=__MODULE_URL__;
-let source=readFileSync(new URL(moduleUrl),'utf8');
-source=source.replaceAll(/from "(\.\/[^"]+)"/g,(_,p)=>'from '+JSON.stringify(new URL(p,moduleUrl).href));
+    script = _SURFACE_LOADER + r"""
 // Observe the actual closure; do not replace its state transitions.
-source=source.replace('        renderFrame,\n        togglePlayback,','        _state: state, _sourceCache: sourceCache, _drain: drainPendingReleases,\n        renderFrame,\n        togglePlayback,');
-const {createViewportSurface}=await import('data:text/javascript;base64,'+Buffer.from(source).toString('base64'));
+const {createViewportSurface}=await loadSurface(__MODULE_URL__,'_state: state, _sourceCache: sourceCache, _drain: drainPendingReleases,');
 let fetches=0;globalThis.fetch=async(url)=>{if (__FAILED__ && url.endsWith('b.mp4')) throw new Error('decode unavailable');fetches++;return {ok:true,blob:async()=>new Blob([new Uint8Array(100)])};};
 const texts=[];const events = [], raf = [], videos = [], draws = [], frames=[];
 globalThis.window = {SONDER_DEBUG_SESSION:true, __SONDER_CANVAS_DIAG:{record:(kind,payload)=>events.push({kind,...payload})},__SONDER_DIAG_CLEARERS:new Set(),setTimeout,clearTimeout};
@@ -1207,3 +1218,220 @@ await pending;
 console.log(JSON.stringify({{aborted,entries:cache.snapshot().entryCount}}));
 """)
     assert result == {"aborted": True, "entries": 0}
+
+
+def test_surface_test_hook_survives_a_crlf_checkout_and_a_missed_anchor_fails_loudly():
+    module_url = json.dumps((ROOT / "web/js/viewport_surface.js").as_uri())
+    result = _run_node(_SURFACE_LOADER + f"""
+const crlf = await loadSurface({module_url}, '_state: state,', {{crlf: true}});
+let missed = '';
+try {{ await loadSurface({module_url}, '_state: state,', {{dropAnchor: true}}); }} catch (error) {{ missed = error.message; }}
+console.log(JSON.stringify({{crlfLoaded: typeof crlf.createViewportSurface === 'function', missed}}));
+""")
+    assert result == {"crlfLoaded": True, "missed": "viewport_surface.js test hook anchor not found"}
+
+
+# Presentation-lag harness. One fake clock drives timers, video presentation
+# (requestVideoFrameCallback) and requestAnimationFrame, in that order, once
+# per display refresh. The fake video follows what Chromium measured on
+# 2026-09-28 (plans/playback-presented-frame.md, Phase 0 result):
+#   - drawImage paints the frame at floor(currentTime * fps), one frame older
+#     on some refreshes (decodeLate), never newer; pausing leaves exactly the
+#     currentTime frame on the canvas;
+#   - currentTime jitters around the media clock by up to clockJitterMs, so a
+#     video whose frame boundaries sit on the redraw tick (the live condition:
+#     playhead == currentTime frame on 94% of ticks) flips either side of it;
+#   - play() starts the media clock after clockStartupMs, and after play() or a
+#     seek of a playing video the decoder paints nothing new for startupMs, so
+#     drawImage keeps painting the last decoded frame; that gap is what put a
+#     lead-in frame on screen at a cut;
+#   - requestVideoFrameCallback reports presentations trailing the painted
+#     frame by lagVsyncs, with seeded jitter.
+# Each video draws from its own random stream, seeded from its source, once per
+# vsync, so neither the number of canvas draws nor the number of elements can
+# change another element's outcome. The harness composites ONE lane: a vsync's
+# screen is the last drawImage after the last fillRect, black when a fillRect
+# has no image after it. The clips form a continuation chain: clip b's source
+# frame 24 + k shows timeline frame 48 + k, so every painted picture maps to
+# one timeline frame and an out-of-edit frame is detectable.
+_LAG_HARNESS = r"""
+const cfg = Object.assign({
+ fps: 24, hz: 120, startupMs: 60, clockStartupMs: 42, clockJitterMs: 4, lagVsyncs: 2, jitter: 0.35,
+ decodeLate: 0.05, seed: 7, debugSession: false, adaptiveRebuffer: false, rvfc: true,
+ clips: [
+  {clip_id: 'a', source_path: 'a.mp4', timeline_start_frame: 0, timeline_end_frame: 48, source_in_frame: 0, source_out_frame: 48},
+  {clip_id: 'b', source_path: 'b.mp4', timeline_start_frame: 48, timeline_end_frame: 120, source_in_frame: 24, source_out_frame: 96},
+ ],
+ startFrame: 0, stopFrame: 110, totalFrames: 120,
+}, __CONFIG__);
+
+let T = 1000; const vsyncMs = 1000 / cfg.hz;
+const timers = []; let timerSeq = 0;
+const fakeSetTimeout = (fn, ms = 0) => { const id = ++timerSeq; timers.push({id, at: T + Math.max(0, Number(ms) || 0), fn}); return id; };
+const fakeClearTimeout = (id) => { const i = timers.findIndex(t => t.id === id); if (i >= 0) timers.splice(i, 1); };
+Object.defineProperty(globalThis, 'performance', {value: {now: () => T, timeOrigin: 0}, configurable: true, writable: true});
+const streamFor = (key) => { let h = (2166136261 ^ cfg.seed) >>> 0; for (const ch of key) h = Math.imul(h ^ ch.charCodeAt(0), 16777619) >>> 0; return () => ((h = (Math.imul(h, 1664525) + 1013904223) >>> 0) / 4294967296); };
+const events = []; const videos = [];
+globalThis.window = {SONDER_DEBUG_SESSION: cfg.debugSession, __SONDER_CANVAS_DIAG: {record: (kind, payload) => events.push({kind, ...payload})}, __SONDER_DIAG_CLEARERS: new Set(), setTimeout: fakeSetTimeout, clearTimeout: fakeClearTimeout};
+globalThis.fetch = async () => ({ok: true, blob: async () => new Blob([new Uint8Array(100)])});
+let vsyncIndex = 0;
+class Video extends EventTarget {
+ constructor() { super(); this.readyState = 0; this.videoWidth = 320; this.videoHeight = 180; this.duration = 100; this.paused = true; this.seeking = false; this._time = 0; this._offset = 0; this._decoded = null; this._late = false; this._jitter = 0; this._history = []; this._presented = null; this._presentedFrames = 0; this._clipsSeen = new Set(); this.callbacks = new Map(); this.next = 0; videos.push(this); }
+ get src() { return this._src; }
+ set src(v) { this._src = v; this.readyState = 4; this._decoded = this._frameAt(this.currentTime); }
+ get currentTime() { return Math.max(0, this._time + (this.paused ? 0 : this._offset / 1000)); }
+ set currentTime(v) {
+  this._time = Number(v); this._offset = 0; this.seeking = true; this._history = [];
+  if (!this.paused) this._decodeHoldUntil = T + cfg.startupMs;
+  queueMicrotask(() => { this.seeking = false; if (this.paused) this._decoded = this._frameAt(this._time); this.dispatchEvent(new Event('seeked')); });
+ }
+ play() { if (this.paused) { this.paused = false; this._clockHoldUntil = T + cfg.clockStartupMs; this._decodeHoldUntil = T + cfg.startupMs; } return Promise.resolve(); }
+ pause() { if (!this.paused) { this._time = this.currentTime; this._offset = 0; if (T >= (this._decodeHoldUntil || 0)) this._decoded = this._frameAt(this._time); } this.paused = true; }
+ load() {}
+ removeAttribute(k) { if (k === 'src') { delete this._src; this.readyState = 0; } else delete this[k]; }
+ cancelVideoFrameCallback(id) { this.callbacks.delete(id); }
+ _frameAt(t) { return Math.floor(t * cfg.fps + 1e-6); }
+ get clip() { const key = String(this._sonderSourceCacheKey || ''); return cfg.clips.find(c => key.includes(c.source_path)) || null; }
+ // The frame drawImage paints right now.
+ get drawnFrame() {
+  if (this.paused || this.seeking || T < (this._decodeHoldUntil || 0)) return this._decoded;
+  return Math.max(this._decoded ?? -Infinity, this._frameAt(this.currentTime) - (this._late ? 1 : 0));
+ }
+ advance(dt) {
+  if (!this._src) return;
+  const clip = this.clip; if (clip) this._clipsSeen.add(clip.clip_id);
+  const key = clip?.source_path || ''; if (this._streamKey !== key) { this._streamKey = key; this._rand = streamFor(key); }
+  this._late = this._rand() < cfg.decodeLate; this._jitter = this._rand() < cfg.jitter ? 1 : 0;
+  this._offset = (this._rand() * 2 - 1) * cfg.clockJitterMs;
+  if (!this.paused && T >= (this._clockHoldUntil || 0)) this._time += dt / 1000;
+  if (!this.paused && !this.seeking && T >= (this._decodeHoldUntil || 0)) this._decoded = this.drawnFrame;
+  this._history.push(this._decoded); if (this._history.length > 16) this._history.shift();
+ }
+ presentStep() {
+  if (!this._src || this.seeking || this._decoded === null) return;
+  const h = this._history; const frame = this.paused ? this._decoded : h[Math.max(0, h.length - 1 - cfg.lagVsyncs - this._jitter)];
+  if (frame === null || frame === undefined || frame === this._presented) return;
+  this._presented = frame; this._presentedFrames += 1;
+  for (const [id, cb] of [...this.callbacks]) { this.callbacks.delete(id); cb(T, {mediaTime: frame / cfg.fps, presentedFrames: this._presentedFrames, expectedDisplayTime: T + vsyncMs}); }
+ }
+}
+if (cfg.rvfc) Video.prototype.requestVideoFrameCallback = function (cb) { this.callbacks.set(++this.next, cb); return this.next; };
+globalThis.document = {visibilityState: 'visible', hasFocus: () => true, querySelectorAll: () => [], createElement: () => new Video()};
+const raf = []; globalThis.requestAnimationFrame = cb => { raf.push(cb); return raf.length; }; globalThis.cancelAnimationFrame = () => {};
+const paintLog = [];
+const ctx = new Proxy({globalAlpha: 1,
+ fillRect: () => paintLog.push({v: vsyncIndex, black: true}),
+ drawImage: (el) => { const c = el.clip; const f = el.drawnFrame; paintLog.push({v: vsyncIndex, clip: c?.clip_id || '?', shown: c && f !== null ? c.timeline_start_frame + f - c.source_in_frame : null}); },
+}, {get: (t, k) => k in t ? t[k] : () => {}, set: (t, k, v) => { t[k] = v; return true; }});
+
+const {createViewportSurface} = await loadSurface(__MODULE_URL__, '_state: state,');
+let frame = cfg.startFrame; const scene = {clips: cfg.clips, audio_tracks: [], guide_frames: []};
+const surface = createViewportSurface({canvas: {width: 320, height: 180, getContext: () => ctx}, getScene: () => scene, getFrame: () => frame, setFrame: v => { frame = v; }, getTotalFrames: () => cfg.totalFrames, getFps: () => cfg.fps, getAssetForSourcePath: () => ({width: 320, height: 180, media_kind: 'video'}), buildViewUrl: p => 'https://fixture/' + p, getStreamingMode: () => 'auto', getDecodeConcurrency: () => 8, isAdaptiveRebufferEnabled: () => cfg.adaptiveRebuffer});
+const settle = async () => { for (let i = 0; i < 40; i++) await Promise.resolve(); };
+const screen = []; let rebufferEntries = 0; let wasRebuffering = false;
+const vsync = async () => {
+ T += vsyncMs; vsyncIndex += 1;
+ for (const t of timers.filter(t => t.at <= T).sort((a, b) => a.at - b.at)) { fakeClearTimeout(t.id); t.fn(); }
+ await settle();
+ for (const v of videos) v.advance(vsyncMs);
+ for (const v of videos) v.presentStep();
+ await settle();
+ for (const cb of raf.splice(0)) cb(T);
+ await settle();
+ const mine = paintLog.filter(d => d.v === vsyncIndex);
+ let now = null;
+ if (mine.length) { const lastBlack = mine.map(d => !!d.black).lastIndexOf(true); const image = mine.slice(lastBlack + 1).filter(d => !d.black).pop(); now = image ? image : (lastBlack >= 0 ? {black: true, shown: null} : null); }
+ const last = now || (screen.length ? screen[screen.length - 1] : null);
+ screen.push(last ? {...last, tl: frame} : {tl: frame, shown: null});
+ const rebuffering = !!surface._state.playbackRebuffering; if (rebuffering && !wasRebuffering) rebufferEntries++; wasRebuffering = rebuffering;
+};
+surface.startPlayback(); await settle();
+for (let guard = 0; frame < cfg.stopFrame && guard < 20000; guard++) await vsync();
+surface.stopPlayback(); await settle();
+
+const seq = [];
+for (const s of screen) { const last = seq[seq.length - 1]; if (last && last.shown === s.shown && last.clip === s.clip && !!last.black === !!s.black) last.n++; else seq.push({shown: s.shown, clip: s.clip, black: !!s.black, n: 1, tl: s.tl}); }
+const shownVsyncs = (f, clip) => seq.filter(s => s.shown === f && (!clip || s.clip === clip)).reduce((n, s) => n + s.n, 0);
+const clipStats = cfg.clips.map(c => {
+ const lo = Math.max(cfg.startFrame, c.timeline_start_frame) + 3, hi = Math.min(cfg.stopFrame, c.timeline_end_frame) - 3;
+ let missing = 0; for (let f = lo; f < hi; f++) if (!shownVsyncs(f, c.clip_id)) missing++;
+ const lags = screen.filter(s => s.clip === c.clip_id && s.shown !== null && s.tl >= lo && s.tl < hi).map(s => s.tl - s.shown).sort((x, y) => x - y);
+ return {clip: c.clip_id, frames: hi - lo, missing, medianLagFrames: lags.length ? lags[lags.length >> 1] : null};
+});
+const shownSteps = seq.filter(s => s.shown !== null);
+const backward = []; for (let i = 1; i < shownSteps.length; i++) if (shownSteps[i].shown < shownSteps[i - 1].shown) backward.push([shownSteps[i - 1].shown, shownSteps[i].shown]);
+const excluded = shownSteps.filter(s => { const c = cfg.clips.find(x => x.clip_id === s.clip); return c && (s.shown < c.timeline_start_frame || s.shown >= c.timeline_end_frame); }).map(s => s.clip + s.shown);
+const cuts = cfg.clips.slice(1).map((c, i) => {
+ const B = c.timeline_start_frame, out = cfg.clips[i].clip_id;
+ const window = []; for (let f = B - 2; f <= B + 3; f++) window.push({f, vsyncs: shownVsyncs(f, f < B ? out : c.clip_id)});
+ return {B, showsBminus1: !!shownVsyncs(B - 1, out), missing: window.filter(w => !w.vsyncs).map(w => w.f),
+  maxHoldVsyncs: Math.max(...window.map(w => w.vsyncs)), black: seq.some(s => s.black && s.tl >= B - 2 && s.tl <= B + 3),
+  incomingElements: videos.filter(v => v._clipsSeen.has(c.clip_id)).length,
+  around: seq.filter(s => s.black || (s.shown !== null && s.shown >= B - 4 && s.shown <= B + 4)).map(s => (s.black ? 'black' : s.clip + s.shown) + 'x' + s.n).join(' ')};
+});
+console.log(JSON.stringify({vsyncs: vsyncIndex, clipStats, backward, excluded, cuts, rebufferEntries}));
+surface.destroy();
+"""
+
+
+def _lag_harness(**config):
+    script = _SURFACE_LOADER + _LAG_HARNESS
+    script = script.replace("__MODULE_URL__", json.dumps((ROOT / "web/js/viewport_surface.js").as_uri()))
+    return _run_node(script.replace("__CONFIG__", json.dumps(config)))
+
+
+def test_lag_harness_is_deterministic_and_rolled_clips_run_on_the_clock():
+    first = _lag_harness()
+    assert first == _lag_harness()
+    # Measured live: after a rolled claim the element's currentTime frame equals
+    # the playhead on 94% of ticks, so the painted frame's median lag is zero.
+    assert first["clipStats"][1]["medianLagFrames"] == 0
+    # A different seed changes the jitter draws, not the model.
+    assert _lag_harness(seed=8)["clipStats"][1]["medianLagFrames"] == 0
+
+
+# Judder cases: the rolled clip b runs on the clock, so its frame boundaries
+# sit on the redraw tick and clock jitter flips them either side (the live
+# mechanism). Three seeds at 120 Hz and one at 60 Hz.
+_JUDDER_CASES = ({"seed": 1}, {"seed": 2}, {"seed": 3}, {"seed": 1, "hz": 60})
+
+
+# Strict, and only for AssertionError, so a harness crash cannot pass as the
+# expected failure and a fix that lands flips the test red until it is unmarked.
+@pytest.mark.xfail(strict=True, raises=AssertionError,
+                   reason="Playback Follows the Presented Frame, Phase 1: the canvas repaints only on "
+                   "timeline-frame changes, so a frame that flips beside the tick is never painted")
+def test_playback_paints_every_frame_inside_a_clip():
+    missing = {json.dumps(case): _lag_harness(**case)["clipStats"][1]["missing"] for case in _JUDDER_CASES}
+    assert all(count == 0 for count in missing.values()), missing
+
+
+# Cut cases. Ordinary cuts must be seamless with adaptive rebuffer on (the
+# product default) and off: B-2..B+3 each painted, no hold longer than one
+# frame plus one refresh, no rebuffer, no cold element for the incoming clip.
+# A decoder start-up of 200 ms (the live 840, 841, 840 case at cut 843) may
+# hold B-1 with the clock frozen, but must still paint B-2..B+3 with rebuffer
+# on; with rebuffer off only "no backward step, nothing outside the edit" holds.
+_ORDINARY_CUTS = ({}, {"adaptiveRebuffer": True}, {"clockStartupMs": 0}, {"seed": 2}, {"hz": 60})
+_SLOW_START = {"startupMs": 200}
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError,
+                   reason="Playback Follows the Presented Frame, Phase 2: the outgoing clip is paused on the "
+                   "timeline tail, and a roll is claimed before its decoder paints the target")
+def test_a_cut_is_seamless_and_never_shows_a_frame_outside_the_edit():
+    failures = []
+    hold_limit = lambda hz: -(-hz // 24) + 1  # one frame period, rounded up, plus one refresh
+    for case in _ORDINARY_CUTS:
+        result = _lag_harness(**case)
+        cut = result["cuts"][0]
+        if (cut["missing"] or cut["maxHoldVsyncs"] > hold_limit(case.get("hz", 120)) or cut["black"]
+                or result["excluded"] or result["backward"] or result["rebufferEntries"] or cut["incomingElements"] != 1):
+            failures.append(("ordinary", case, cut, result["excluded"], result["backward"], result["rebufferEntries"]))
+    held = _lag_harness(**_SLOW_START, adaptiveRebuffer=True)
+    if held["cuts"][0]["missing"] or held["excluded"] or held["backward"] or held["cuts"][0]["black"]:
+        failures.append(("slow, rebuffer on", held["cuts"][0], held["excluded"], held["backward"]))
+    running = _lag_harness(**_SLOW_START, adaptiveRebuffer=False)
+    if running["excluded"] or running["backward"]:
+        failures.append(("slow, rebuffer off", running["cuts"][0], running["excluded"], running["backward"]))
+    assert failures == []
