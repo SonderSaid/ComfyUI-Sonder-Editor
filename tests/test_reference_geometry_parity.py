@@ -1,6 +1,6 @@
-"""Intentional Python/JavaScript parity for an optimistic Reference staging paint.
+"""Intentional Python/JavaScript parity for optimistic Reference item paints.
 
-``web/js/scene_reference_geometry.js`` mirrors two things and only two:
+``web/js/scene_reference_geometry.js`` mirrors, for a staging paint:
 
 * ``_reference_item_bounds``, which clamps a start into the scene, preserves the
   ``-1`` "runs to scene end" sentinel, and refuses a range that inverts; and
@@ -11,6 +11,12 @@
   pins; and
 * the ROW ``_apply_create_reference_item`` appends, field for field, including
   the defaults a staging gesture never sends.
+
+For the Reference Lane Setup panel's item edits it also mirrors the lane-overlap
+decision (``_reference_overlapping_items``) and the row
+``_apply_update_reference_item`` leaves -- or its refusal, or a decline where the
+route's answer rests on authority the client does not hold. Those tables are at
+the end of this file.
 
 **Why the member half is mirrored at all** is the part a later reader is most
 likely to try to undo, so it is stated here as well as beside the code. Phase C
@@ -107,7 +113,8 @@ def _node(script):
     node = shutil.which("node")
     if not node:
         pytest.skip("node is required for reference geometry parity")
-    result = subprocess.run([node, "--input-type=module", "-e", script],
+    # On stdin, not `-e`: the update table is longer than a Windows command line.
+    result = subprocess.run([node, "--input-type=module"], input=script,
                             capture_output=True, text=True, encoding="utf-8")
     assert result.returncode == 0, result.stderr or result.stdout
     return json.loads(result.stdout)
@@ -127,6 +134,15 @@ BOUNDS_CASES = [
     (0, 40, 80),         # a scene with no duration: no clamping arm runs
     (100, 40, 40),       # inverted-by-equality: refused on both sides
     (100, 40, 10),       # inverted: refused on both sides
+    # An end of 0 is a frame, not the sentinel. The mirror used to read it
+    # through `|| -1` and paint "runs to scene end" for a range the route
+    # refuses as inverted.
+    (100, 40, 0),
+    (100, 0, 0),
+    # `null` is what a request carries for an absent or non-finite value, and
+    # the route reads it as the field's default.
+    (100, None, None),
+    (100, 40, None),
 ]
 
 
@@ -150,10 +166,11 @@ def _python_bounds(cases):
             # The mirror returns the bounds it had computed alongside the
             # refusal, so compare the DECISION and the partial arithmetic both.
             assert exc.code == "invalid_range", exc.code
-            start_frame = max(0, int(start))
+            start_frame = max(0, int(start if start is not None else 0))
             if duration > 0:
                 start_frame = min(start_frame, duration - 1)
-            out.append({"startFrame": start_frame, "endFrame": int(end),
+            out.append({"startFrame": start_frame,
+                        "endFrame": int(end if end is not None else -1),
                         "refusal": "invalid_range"})
             continue
         out.append({"startFrame": start_frame, "endFrame": end_frame, "refusal": ""})
@@ -184,6 +201,32 @@ def test_an_inverted_range_is_refused_on_both_sides_rather_than_repaired():
 def test_a_fractional_bound_truncates_rather_than_rounding():
     [fractional] = _javascript_bounds([(100, 40.9, 80.9)])
     assert fractional == {"startFrame": 40, "endFrame": 80, "refusal": ""}
+
+
+def test_an_end_of_zero_is_refused_rather_than_read_as_the_sentinel():
+    """`Number(0) || -1` is `-1`: the old mirror painted a refused range to scene end."""
+    [zero] = _javascript_bounds([(100, 40, 0)])
+    assert zero == {"startFrame": 40, "endFrame": 0, "refusal": "invalid_range"}
+    with pytest.raises(routes.ProjectMutationRequestError) as excinfo:
+        routes._reference_item_bounds(Scene(scene_id="s", duration_frames=100), 40, 0)
+    assert excinfo.value.code == "invalid_range"
+
+
+def test_a_non_finite_bound_reads_as_the_null_the_request_carries():
+    """`JSON.stringify` writes NaN and Infinity as `null`; the route reads the default."""
+    script = f"""
+const mod = await import({json.dumps(MODULE_URL)});
+console.log(JSON.stringify([
+  mod.referenceItemBounds(100, NaN, Infinity),
+  mod.referenceItemBounds(100, Infinity, NaN),
+  mod.referenceItemBounds(100, null, null),
+]));
+"""
+    non_finite_start, infinite_start, null_both = _node(script)
+    scene = Scene(scene_id="s", duration_frames=100)
+    assert routes._reference_item_bounds(scene, None, None) == (0, -1)
+    expected = {"startFrame": 0, "endFrame": -1, "refusal": ""}
+    assert non_finite_start == infinite_start == null_both == expected
 
 
 MEMBER_CASES = [
@@ -466,3 +509,423 @@ def test_the_stored_form_still_refuses_what_it_cannot_reproduce():
                                  "future_field": "x"}]]) == [None]
     assert _javascript_stored([[_drag("member-a"), _drag("member-a")]]) == [None]
     assert _javascript_stored([[_drag("member-gone")]]) == [None]
+
+
+# -- the overlap decision -------------------------------------------------------
+#
+# `referenceItemOverlap` mirrors `_reference_overlapping_items`, which every
+# create and update runs after the bounds. Both clamps are where a mirror would
+# drift: a requested range that collapsed to nothing is widened to one frame,
+# and a stored `-1` resolves to `max(start + 1, duration)` rather than to the
+# duration alone.
+
+OVERLAP_ROWS = [
+    # (id, lane, start, stored end)
+    ("left", 0, 10, 40),
+    ("right", 0, 50, 70),
+    ("tail", 0, 80, -1),
+    ("other-lane", 1, 0, 100),
+    ("past-end", 2, 120, -1),   # start past the duration: -1 resolves to start + 1
+]
+
+# (lane, start, end, duration, ignore id, expected first overlapping id)
+OVERLAP_CASES = [
+    (0, 40, 50, 100, "", None),            # exactly between two rows: touching is legal
+    (0, 39, 50, 100, "", "left"),          # one frame into the left row
+    (0, 45, 51, 100, "", "right"),
+    (0, 70, 80, 100, "", None),            # touches both neighbours
+    (0, 75, -1, 100, "", "tail"),          # a requested sentinel runs to the duration
+    (0, 99, -1, 100, "", "tail"),
+    (0, 95, 95, 100, "", "tail"),          # inside "tail" with or without the widening
+    (0, 50, 50, 100, "", "right"),         # collapsed range widened to one frame: decisive
+    (0, 55, -1, 0, "", "right"),           # sentinel with no duration: widened, decisive
+    (0, 20, 30, 100, "left", None),        # the row itself is ignored
+    (0, 20, 60, 100, "left", "right"),
+    (1, 40, 50, 100, "", "other-lane"),
+    (2, 120, 121, 100, "", "past-end"),    # stored -1 resolves to start + 1, not 100
+    (2, 121, 125, 100, "", None),
+    (0, 40, 50, 0, "", None),              # no duration: -1 rows resolve to start + 1
+    (0, 80, 81, 0, "", "tail"),
+]
+
+
+def _overlap_rows():
+    return [{"reference_item_id": row_id, "lane_index": lane, "start_frame": start,
+             "end_frame": end, "members": [_drag("member-a")]}
+            for row_id, lane, start, end in OVERLAP_ROWS]
+
+
+def _javascript_overlap(cases):
+    script = f"""
+const mod = await import({json.dumps(MODULE_URL)});
+const rows = {json.dumps(_overlap_rows())};
+const cases = {json.dumps([list(case) for case in cases])};
+console.log(JSON.stringify(cases.map(([laneIndex, startFrame, endFrame, durationFrames, ignoreId]) =>
+  mod.referenceItemOverlap(rows, {{ laneIndex, startFrame, endFrame, durationFrames, ignoreId }})
+    ?.reference_item_id ?? null)));
+"""
+    return _node(script)
+
+
+def _python_overlap(cases):
+    out = []
+    for lane, start, end, duration, ignore_id, _expected in cases:
+        scene = Scene(scene_id="s", duration_frames=duration, reference_items=[
+            ReferenceItem.from_dict(row) for row in _overlap_rows()])
+        ignore = next((item for item in scene.reference_items
+                       if item.reference_item_id == ignore_id), None)
+        first = next(routes._reference_overlapping_items(
+            scene, lane, start, end, ignore=ignore), None)
+        out.append(first.reference_item_id if first is not None else None)
+    return out
+
+
+def test_the_overlap_decision_agrees_in_both_languages():
+    javascript = _javascript_overlap(OVERLAP_CASES)
+    python = _python_overlap(OVERLAP_CASES)
+    assert javascript == python
+    assert python == [case[-1] for case in OVERLAP_CASES], "the table pins the decision"
+
+
+# -- the planned row of an update -----------------------------------------------
+#
+# `plannedReferenceItemUpdate` answers one of three things, and each is compared
+# with the real `_apply_update_reference_item` on identical data:
+#
+#   * a REFUSAL must be one the route makes -- a caller refuses locally and
+#     sends nothing, so a refusal the route would not make is an edit silently
+#     lost. Every case in the table has one cause, and there the code matches
+#     too; with several causes the two sides may name different ones;
+#   * a PAINT must be the row the route stores, field for field -- `_pushUndo`
+#     snapshots the painted scene verbatim;
+#   * a DECLINE sends the write unpainted. It is the only answer allowed where
+#     the route's decision rests on authority the mirror does not hold (recipe
+#     and profile validation of an authored role or intent), or on the client's
+#     copy of the Library being current. What the route does instead is pinned
+#     per case, so a decline cannot be mistaken for caution.
+
+def _update_fixture():
+    assets = [
+        Asset(asset_id="asset-a", name="a", asset_type="image", path="media/a.png"),
+        Asset(asset_id="asset-b", name="b", asset_type="image", path="media/b.png"),
+        Asset(asset_id="asset-c", name="c", asset_type="image", path="media/c.png"),
+        Asset(asset_id="asset-x", name="x", asset_type="image", path="media/x.png"),
+        Asset(asset_id="asset-s", name="s", asset_type="audio", path="media/s.wav"),
+        Asset(asset_id="asset-va", name="va", asset_type="video", path="media/va.mp4",
+              has_audio=True),
+    ]
+    subject = ReferenceEntity(reference_id="entity-1", name="Subject", members=[
+        ReferenceMember(member_id=f"member-{key}", asset_id=f"asset-{key}")
+        for key in ("a", "b", "c", "s", "va")])
+    other = ReferenceEntity(reference_id="entity-2", name="Other", members=[
+        ReferenceMember(member_id="member-x", asset_id="asset-x")])
+
+    def member(key, **extra):
+        return {"entity_id": "entity-1", "member_id": f"member-{key}", **extra}
+
+    scene = Scene(
+        scene_id="scene-1", duration_frames=100, reference_lane_count=2,
+        reference_lane_configs=[LaneConfig(), LaneConfig()],
+        reference_lane_recipes=[
+            ReferenceLaneRecipe(lane_id="lane-image", media_kind="image", recipe={
+                "soft": {"physical_population": "pictures",
+                         "role_fields": ["role", "visual_intent"]}}),
+            ReferenceLaneRecipe(lane_id="lane-audio", media_kind="audio", recipe={
+                "soft": {"role_fields": ["audio_intent"]}}),
+        ],
+        reference_items=[ReferenceItem.from_dict(row) for row in (
+            {"reference_item_id": "item-1", "lane_index": 0, "start_frame": 10,
+             "end_frame": 40, "members": [member("a", visual_intent="preserve"),
+                                          member("b")]},
+            {"reference_item_id": "item-2", "lane_index": 0, "start_frame": 50,
+             "end_frame": 70, "members": [member("c")]},
+            {"reference_item_id": "item-3", "lane_index": 0, "start_frame": 80,
+             "end_frame": -1, "members": [member("a")], "strength": 0.4,
+             "sequence_frames": 17, "prompt_override": "kept", "muted": True},
+            {"reference_item_id": "item-4", "lane_index": 1, "start_frame": 0,
+             "end_frame": 30, "members": [
+                 member("s", audio_intent="reference_characteristics"),
+                 member("va")]},
+        )],
+    )
+    project = TimelineProject(project_id="p", assets=assets,
+                              references=[subject, other], scenes=[scene])
+    return project, scene
+
+
+def _item(scene, item_id):
+    return next(item for item in scene.reference_items
+                if item.reference_item_id == item_id)
+
+
+# Fixture edits applied to BOTH sides before a case runs: states a live project
+# can hold that the mirror must notice.
+def _stale_entity(project, scene):
+    _item(scene, "item-1").members[1]["entity_id"] = "entity-2"
+
+
+def _trashed_asset(project, scene):
+    project.assets = [asset for asset in project.assets if asset.asset_id != "asset-b"]
+
+
+def _narrowed_population(project, scene):
+    scene.reference_lane_recipes[0].recipe["soft"]["physical_population"] = "videos"
+
+
+def _untrimmed_role(project, scene):
+    _item(scene, "item-1").members[0]["role"] = " identity "
+
+
+def _stored_overlap(project, scene):
+    _item(scene, "item-2").start_frame = 30
+
+
+def _stored_inverted(project, scene):
+    _item(scene, "item-2").end_frame = 50
+
+
+def _stored_start_past_scene(project, scene):
+    _item(scene, "item-3").start_frame = 150
+
+
+def _missing_recipe(project, scene):
+    # The route pads a missing slot with `ReferenceLaneRecipe()`, an image lane.
+    scene.reference_lane_recipes = scene.reference_lane_recipes[:1]
+
+
+def _orphan_lane(project, scene):
+    # `_set_scene_lane_count` does not check items, so a row can outlive its lane.
+    scene.reference_lane_count = 1
+
+
+def _members(*keys):
+    return [{"entity_id": "entity-1", "member_id": f"member-{key}"} for key in keys]
+
+
+PRESERVED_A = {"entity_id": "entity-1", "member_id": "member-a", "visual_intent": "preserve"}
+
+# (name, item id, fields, fixture edit or None, expected: "paint" | "decline" |
+# "refuse:<code>")
+UPDATE_CASES = [
+    ("strength", "item-1", {"strength": 0.5}, None, "paint"),
+    ("strength clamped high", "item-1", {"strength": 1.7}, None, "paint"),
+    ("strength clamped low", "item-1", {"strength": -3}, None, "paint"),
+    ("strength null", "item-1", {"strength": None}, None,
+     "refuse:invalid_project_mutation"),
+    ("sequence truncated", "item-1", {"sequence_frames": 12.9}, None, "paint"),
+    ("sequence clamped high", "item-1", {"sequence_frames": 9999}, None, "paint"),
+    ("sequence clamped low", "item-1", {"sequence_frames": -5}, None, "paint"),
+    ("sequence null", "item-1", {"sequence_frames": None}, None,
+     "refuse:invalid_project_mutation"),
+    ("override", "item-1", {"prompt_override": "hello"}, None, "paint"),
+    ("override cleared by null", "item-3", {"prompt_override": None}, None, "paint"),
+    ("mute", "item-1", {"muted": True}, None, "paint"),
+    ("mute by one", "item-1", {"muted": 1}, None, "paint"),
+    ("unmute by zero", "item-3", {"muted": 0}, None, "paint"),
+    # A cleared number input is NaN, which the request carries as null: the
+    # route reads the default, NOT the stored value.
+    ("start null reads as 0", "item-2", {"start_frame": None}, None,
+     "refuse:lane_collision"),
+    ("end null reads as the sentinel", "item-1", {"end_frame": None}, None,
+     "refuse:lane_collision"),
+    ("keeps untouched scalars", "item-3", {"strength": 0.9}, None, "paint"),
+    ("start", "item-1", {"start_frame": 20}, None, "paint"),
+    ("start past the end", "item-1", {"start_frame": 45}, None, "refuse:invalid_range"),
+    ("end of zero", "item-1", {"end_frame": 0}, None, "refuse:invalid_range"),
+    ("end into the next row", "item-1", {"end_frame": 60}, None, "refuse:lane_collision"),
+    ("end to scene end", "item-1", {"end_frame": -1}, None, "refuse:lane_collision"),
+    ("end touching the next row", "item-1", {"end_frame": 50}, None, "paint"),
+    ("start touching the previous row", "item-2", {"start_frame": 40}, None, "paint"),
+    ("start clamped into the scene", "item-3", {"start_frame": 200}, None, "paint"),
+    ("end clamped into the next row", "item-2", {"end_frame": 400}, None,
+     "refuse:lane_collision"),
+    ("reorder", "item-1", {"members": [_members("b")[0], PRESERVED_A]}, None, "paint"),
+    ("reorder carrying moveMember's order key", "item-1",
+     {"members": [{**_members("b")[0], "order": 0}, {**PRESERVED_A, "order": 1}]},
+     None, "paint"),
+    ("remove", "item-1", {"members": [PRESERVED_A]}, None, "paint"),
+    ("remove the last member", "item-1", {"members": []}, None,
+     "refuse:invalid_reference_item"),
+    ("a member named twice", "item-1", {"members": [PRESERVED_A, PRESERVED_A]}, None,
+     "refuse:invalid_reference_item"),
+    ("audio lane scalar", "item-4", {"strength": 0.3}, None, "paint"),
+    ("stored overlap refuses a scalar", "item-1", {"strength": 0.5}, _stored_overlap,
+     "refuse:lane_collision"),
+    ("stored inverted range refuses a scalar", "item-2", {"strength": 0.5},
+     _stored_inverted, "refuse:invalid_range"),
+    ("unknown field", "item-1", {"bogus": 1}, None, "refuse:invalid_project_mutation"),
+    ("no fields", "item-1", {}, None, "refuse:invalid_project_mutation"),
+    ("authored role", "item-1",
+     {"members": [{**PRESERVED_A, "role": "identity"}, _members("b")[0]]}, None,
+     "decline"),
+    ("authored retention", "item-1",
+     {"members": [{**PRESERVED_A, "visual_intent": "partial"}, _members("b")[0]]}, None,
+     "decline"),
+    # The route rewrites a field the write does not name. A paint may change
+    # only what it names, because rollback is per named field.
+    ("stale entity id", "item-1", {"strength": 0.5}, _stale_entity, "decline"),
+    ("stored start past the scene", "item-3", {"strength": 0.5},
+     _stored_start_past_scene, "decline"),
+    ("missing lane recipe", "item-4", {"strength": 0.2}, _missing_recipe, "decline"),
+    ("item on a lane no longer counted", "item-4", {"strength": 0.2}, _orphan_lane,
+     "decline"),
+    ("override as a boolean", "item-1", {"prompt_override": True}, None, "decline"),
+    ("asset no longer in the project", "item-1", {"strength": 0.5}, _trashed_asset,
+     "decline"),
+    ("population narrowed", "item-1", {"strength": 0.5}, _narrowed_population, "decline"),
+    ("untrimmed stored role", "item-1", {"strength": 0.5}, _untrimmed_role, "decline"),
+    ("lane move", "item-1", {"lane_index": 1}, None, "decline"),
+    ("strength as a string", "item-1", {"strength": "0.5"}, None, "decline"),
+]
+
+
+def _python_update(item_id, fields, fixture):
+    project, scene = _update_fixture()
+    if fixture:
+        fixture(project, scene)
+    item = _item(scene, item_id)
+    current = item.to_dict()
+    try:
+        routes._apply_update_reference_item(project, scene, {
+            "reference_item_id": item_id,
+            "fields": dict(fields),
+            "expected": {key: current.get(key) for key in fields},
+        })
+    except routes.ProjectMutationRequestError as exc:
+        return {"refused": exc.code}
+    return {"row": _item(scene, item_id).to_dict()}
+
+
+def _update_context(item_id, fixture):
+    """Everything the mirror is handed, read from the same fixture."""
+    project, scene = _update_fixture()
+    if fixture:
+        fixture(project, scene)
+    item = _item(scene, item_id)
+    owners, assets = {}, {}
+    for reference in project.references:
+        for member in reference.members:
+            owners[member.member_id] = reference.reference_id
+            asset = project.get_asset(member.asset_id)
+            assets[member.member_id] = None if asset is None else {
+                "asset_type": asset.asset_type, "has_audio": bool(asset.has_audio)}
+    recipes = scene.reference_lane_recipes
+    return {
+        "item": item.to_dict(),
+        "laneItems": [row.to_dict() for row in scene.reference_items],
+        "durationFrames": scene.duration_frames,
+        "laneRecipe": (recipes[item.lane_index].to_dict()
+                       if item.lane_index < len(recipes) else None),
+        "laneCount": scene.reference_lane_count,
+        "owners": owners,
+        "assets": assets,
+    }
+
+
+def _javascript_updates(cases):
+    payload = [{"context": _update_context(item_id, fixture), "fields": fields}
+               for _name, item_id, fields, fixture, _expected in cases]
+    script = f"""
+const mod = await import({json.dumps(MODULE_URL)});
+const cases = {json.dumps(payload)};
+console.log(JSON.stringify(cases.map(({{ context, fields }}) =>
+  mod.plannedReferenceItemUpdate(context.item, fields, {{
+    durationFrames: context.durationFrames,
+    laneItems: context.laneItems,
+    laneRecipe: context.laneRecipe,
+    laneCount: context.laneCount,
+    entityIdFor: (id) => context.owners[id] || "",
+    assetFor: (id) => context.assets[id] || null,
+  }}))));
+"""
+    return _node(script)
+
+
+def test_the_planned_update_agrees_with_the_route_in_both_directions():
+    planned = _javascript_updates(UPDATE_CASES)
+    for (name, item_id, fields, fixture, expected), mirror in zip(UPDATE_CASES, planned):
+        route = _python_update(item_id, fields, fixture)
+        if mirror["refusal"]:
+            outcome = f"refuse:{mirror['refusal']}"
+            # A local refusal sends nothing, so it must be the route's own.
+            assert route == {"refused": mirror["refusal"]}, name
+        elif mirror["paintable"]:
+            outcome = "paint"
+            # A paint is the stored row, field for field.
+            assert route == {"row": mirror["painted"]}, name
+        else:
+            outcome = "decline"
+            assert mirror["painted"] is None, name
+        assert outcome == expected, name
+        # The converse: whatever the route refuses, the mirror never paints --
+        # it refuses the same way or declines.
+        if "refused" in route:
+            assert not mirror["paintable"], name
+
+
+def test_every_update_decline_stands_in_for_a_route_outcome_the_mirror_cannot_see():
+    """What each decline would have painted wrongly.
+
+    A decline is not free -- the edit waits for the server before it shows -- so
+    each one must be a case where painting the obvious row would disagree with
+    the route, or where the route's answer rests on authority this client does
+    not mirror.
+    """
+    routed = {name: _python_update(item_id, fields, fixture)
+              for name, item_id, fields, fixture, expected in UPDATE_CASES
+              if expected == "decline"}
+    assert routed["asset no longer in the project"] == {"refused": "asset_not_found"}
+    assert routed["population narrowed"] == {"refused": "reference_media_kind_mismatch"}
+    # Rewritten on a write that does not name them: rollback could not undo them.
+    assert routed["stale entity id"]["row"]["members"][1]["entity_id"] == "entity-1"
+    assert routed["stored start past the scene"]["row"]["start_frame"] == 99
+    # The lane the route resolves is not the lane the client can see.
+    assert routed["missing lane recipe"] == {"refused": "reference_media_kind_mismatch"}
+    assert routed["item on a lane no longer counted"] == {"refused": "item_not_found"}
+    # Python's `str(True)` is "True"; JavaScript's is "true".
+    assert routed["override as a boolean"]["row"]["prompt_override"] == "True"
+    # Validated against recipe and intent vocabulary, then stored.
+    assert routed["authored retention"]["row"]["members"][0]["visual_intent"] == "partial"
+    # Decided by prompt-profile authority the mirror does not hold.
+    assert routed["authored role"] == {"refused": "unsupported_reference_role"}
+    assert routed["untrimmed stored role"] == {"refused": "unsupported_reference_role"}
+    # Moving lanes re-derives the destination's recipe and checks both locks;
+    # here the destination is an audio lane, whose recipe refuses the images.
+    assert routed["lane move"] == {"refused": "reference_media_kind_mismatch"}
+    assert routed["strength as a string"]["row"]["strength"] == 0.5
+
+
+def test_the_updatable_field_set_is_the_routes():
+    """A field the route gains and the mirror lacks would be refused locally, and lost."""
+    script = f"""
+const mod = await import({json.dumps(MODULE_URL)});
+console.log(JSON.stringify([...mod.REFERENCE_ITEM_FIELDS]));
+"""
+    assert set(_node(script)) == set(routes._REFERENCE_ITEM_FIELDS)
+
+
+def test_an_undefined_field_is_judged_as_the_request_carries_it():
+    """`JSON.stringify` drops an `undefined` value, so the route never sees the key."""
+    context = _update_context("item-1", None)
+    script = f"""
+const mod = await import({json.dumps(MODULE_URL)});
+const context = {json.dumps(context)};
+const plan = (fields) => mod.plannedReferenceItemUpdate(context.item, fields, {{
+  durationFrames: context.durationFrames, laneItems: context.laneItems,
+  laneRecipe: context.laneRecipe, laneCount: context.laneCount,
+  entityIdFor: (id) => context.owners[id] || "",
+  assetFor: (id) => context.assets[id] || null }});
+console.log(JSON.stringify([plan({{ strength: 0.5, bogus: undefined }}),
+  plan({{ strength: 0.5 }}), plan({{ strength: undefined }})]));
+"""
+    with_undefined, plain, only_undefined = _node(script)
+    assert with_undefined == plain and plain["paintable"]
+    assert only_undefined["refusal"] == "invalid_project_mutation"
+
+
+def test_a_painted_scalar_update_stores_the_routes_member_records():
+    """A scalar write re-canonicalizes members it did not name; the paint does too."""
+    [planned] = _javascript_updates([UPDATE_CASES[0]])
+    route = _python_update("item-1", {"strength": 0.5}, None)
+    assert planned["painted"]["members"] == route["row"]["members"] == [
+        PRESERVED_A, _members("b")[0]]

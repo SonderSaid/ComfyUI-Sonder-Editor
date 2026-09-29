@@ -1428,15 +1428,21 @@ MIRRORED_MODULES = {
             "test_the_client_declines_exactly_the_linked_moves_the_server_refuses")),
     },
     "scene_reference_geometry.js": {
-        "scope": "Reference bounds, canonical member-ref record shape and staged-row defaults, not all route applicability.",
+        "scope": ("Reference bounds, canonical member-ref record shape, staged-row defaults, the "
+                  "lane-overlap decision and the planned update row or refusal; not recipe or "
+                  "prompt-profile validation of authored roles and intents, which decline."),
         "authorities": tuple("server/routes.py::" + name for name in (
-            "_reference_item_bounds", "_canonical_reference_member_refs", "_apply_create_reference_item")),
+            "_reference_item_bounds", "_canonical_reference_member_refs", "_apply_create_reference_item",
+            "_reference_overlapping_items", "_apply_update_reference_item")),
         "tests": tuple("test_reference_geometry_parity.py::" + name for name in (
             "test_reference_bounds_agree_in_both_languages",
             "test_an_inverted_range_is_refused_on_both_sides_rather_than_repaired",
             "test_the_painted_member_record_is_the_record_the_route_stores",
             "test_the_painted_row_matches_the_stored_row_field_for_field",
-            "test_a_stored_member_round_trips_through_an_append_unchanged")),
+            "test_a_stored_member_round_trips_through_an_append_unchanged",
+            "test_the_overlap_decision_agrees_in_both_languages",
+            "test_the_planned_update_agrees_with_the_route_in_both_directions",
+            "test_every_update_decline_stands_in_for_a_route_outcome_the_mirror_cannot_see")),
     },
     "scene_mutation_addressing.js": {
         "scope": ("Per-operation addressing class, promotion guards, payload refinements "
@@ -1519,7 +1525,7 @@ def test_declared_mirror_headers_match_the_inventory_both_ways():
 
 def test_every_declared_mirror_has_a_live_parity_disposition():
     _assert_mirror_obligations(MIRRORED_MODULES, ROOT)
-    assert sum(len(row["authorities"]) for row in MIRRORED_MODULES.values()) == 53
+    assert sum(len(row["authorities"]) for row in MIRRORED_MODULES.values()) == 55
 
 @pytest.mark.parametrize("name, valid", [("TABLE", True), ("row", False), ("transform", True)])
 def test_mirror_authorities_are_module_declarations(tmp_path, name, valid):
