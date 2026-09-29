@@ -121,9 +121,21 @@ def _entity_lookup(references):
 
 
 def _asset_lookup(assets):
+    """Media facts by asset id. Setup resolution never reads provenance.
+
+    `include_provenance=False` is the backing accessor: a plain `to_dict()`
+    reads `generation_params`, which hydrates every asset's provenance from
+    its state component on every H3 compile and Reference bridge read
+    (`tests/test_minimax_h3_asset_lookup.py`).
+    """
     result = {}
     for value in assets or []:
-        asset = as_plain_record(value)
+        if isinstance(value, dict):
+            asset = value
+        elif hasattr(value, "to_dict"):
+            asset = value.to_dict(include_provenance=False)
+        else:
+            asset = {}
         asset_id = str(asset.get("asset_id") or "")
         if asset_id:
             result[asset_id] = asset
