@@ -1,6 +1,6 @@
 # ComfyUI-Sonder-Editor
 
-**Version 0.7.3** — see the [CHANGELOG](CHANGELOG.md) for release notes.
+**Version 0.7.4** — see the [CHANGELOG](CHANGELOG.md) for release notes.
 
 Sonder Editor is a timeline-based video editor for ComfyUI, built for iterative
 long-form generation. Arrange scenes, clips, audio, guide frames and prompts on
