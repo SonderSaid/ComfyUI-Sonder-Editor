@@ -128,6 +128,18 @@ export class ProjectMutationQueue {
         return !!this._active;
     }
 
+    /**
+     * The running slot, then every pending one, oldest first, as `{ key,
+     * intent }`. For callers that must know whether a write they did not make
+     * is still unsettled -- a local rollback cannot trust a baseline another
+     * writer has painted over. Read it, never write it; an inline owner-token
+     * write runs inside its owner's slot and is not listed separately.
+     */
+    slots() {
+        const slots = this._active ? [this._active] : [];
+        return [...slots, ...this._pending].map(({ key, intent }) => ({ key, intent }));
+    }
+
     isBusy() {
         return this.isActive() || this.hasPending();
     }

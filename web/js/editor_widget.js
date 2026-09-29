@@ -4575,6 +4575,14 @@ export class EditorWidget {
         historyOrderContext = undefined,
         stampHistory = true,
         historyFailureOwnedByCaller = false,
+        // An optimistic writer whose paint may be REFUSED, and which a later
+        // gesture's Undo snapshot could otherwise capture: start (or join) a
+        // queue-order history baseline for this scene before the write, so
+        // later before-snapshots come from canonical queue-position state.
+        // Ordinary edits keep their authored guards (`rebaseIntents: false`).
+        // Callers: explicit link/unlink and the Reference Lane Setup panel's
+        // staged-item writers (`durable_rules.md`, the link-optimism rule).
+        orderedHistoryBaseline = false,
     }) {
         // Invalidate any in-flight scenes GET when a mutation is enqueued.
         // Mutation invalidation is deliberately separate from fetch dispatch
@@ -4670,14 +4678,14 @@ export class EditorWidget {
         // queue slot; coalescing keeps it with the slot's surviving entry.
         let capturedHistoryOrderContext = historyOrderContext === undefined
             ? (this._latestHistoryOrderContext || null) : historyOrderContext;
-        if (historyOrderContext === undefined
-                && intent?.operations?.some((op) => op.type === "create_link_group" || op.type === "unlink_items")) {
-            // Optimistic groups enter later gestures' Undo snapshots. Start an
-            // ordered baseline before this write, including any earlier split's
-            // server-only repartition. Reuse history's queue-position authority,
-            // but do NOT re-author guards: no Undo changed these intents.
+        if (historyOrderContext === undefined && orderedHistoryBaseline && intent?.sceneId) {
+            // An optimistic paint enters later gestures' Undo snapshots even if
+            // its own save fails. Start an ordered baseline before this write,
+            // including any earlier split's server-only repartition. Reuse
+            // history's queue-position authority, but do NOT re-author guards:
+            // no Undo changed these intents.
             if (!capturedHistoryOrderContext) {
-                capturedHistoryOrderContext = this._beginHistoryOrderContext("link optimism", 0);
+                capturedHistoryOrderContext = this._beginHistoryOrderContext("ordered baseline", 0);
                 capturedHistoryOrderContext.rebaseIntents = false;
             }
             const sceneId = String(intent.sceneId);
@@ -4888,6 +4896,7 @@ export class EditorWidget {
         historyOrderContext = undefined,
         stampHistory = true,
         historyFailureOwnedByCaller = false,
+        orderedHistoryBaseline = false,
     } = {}) {
         const context = this._snapshotProjectMutationContext();
         if (!context) return Promise.resolve(null);
@@ -4918,6 +4927,7 @@ export class EditorWidget {
             historyOrderContext,
             stampHistory,
             historyFailureOwnedByCaller,
+            orderedHistoryBaseline,
             run: async (queuedIntent, diagnostics) => {
                 // Derived HERE, not at enqueue: coalescing replaces the pending
                 // entry's intent, and a `merge` may combine operations from
@@ -5752,25 +5762,105 @@ export class EditorWidget {
     }
 
     /**
+     * Open one write on the per-field chains of acknowledged values.
+     *
+     * A paint-first field write that fails rolls back locally, because the
+     * refetch heal fails exactly when the server is unreachable
+     * (`durable_rules.md`: a local optimistic apply owes a rollback that works
+     * without the network). It restores the field's last ACKNOWLEDGED value,
+     * never the gesture's own snapshot: with a second write queued behind a
+     * running one, the second's snapshot is the first's paint, which the server
+     * never held. So each `(row, field)` keeps one chain of unsettled writes:
+     * its acknowledged value is the value before the chain's first write,
+     * advanced by each accepted one (the queue sends them in order, so the
+     * newest accepted is what the server holds), and only the chain's last
+     * write to settle may roll back -- and only while the field still shows the
+     * chain's newest paint on the same row. An earlier failure with a newer
+     * write still queued leaves the newer paint, which carries what the author
+     * last chose.
+     *
+     * `baselineUnknown(field, chain)` is asked on EVERY write, not only when a
+     * chain opens: another writer's unsettled write may name this field, so
+     * the value on the row is that write's paint, not what the server holds --
+     * and it may have been queued between two of this chain's own writes. The
+     * chain then has no known acknowledged value, and a failure defers rather
+     * than restoring a value the server may never have held. Only an accepted
+     * write queued AFTER the foreign one makes it known again: an earlier one
+     * lands before the foreign write does. (`_trackLaneRecipeWrite`'s null
+     * acknowledged recipe is the same rule.) `chain.ownKeys` is the caller's
+     * to fill with its own queue keys, so the question can exclude them.
+     *
+     * Call it before painting, with the row still showing the prior values.
+     * Returns the links `_settleFieldWriteChains` takes.
+     */
+    _openFieldWriteChains(chains, rowKey, row, fields, { baselineUnknown = null } = {}) {
+        return Object.keys(fields).map((field) => {
+            const key = `${rowKey}:${field}`;
+            let chain = chains.get(key);
+            if (!chain) {
+                chain = { acked: row[field], ackedKnown: true, knownFromSeq: 0,
+                    ackedSeq: 0, seq: 0, pending: 0, painted: undefined, ownKeys: new Set() };
+                chains.set(key, chain);
+            }
+            chain.seq += 1;
+            if (typeof baselineUnknown === "function" && baselineUnknown(field, chain)) {
+                chain.ackedKnown = false;
+                chain.knownFromSeq = chain.seq;
+            }
+            chain.pending += 1;
+            chain.painted = fields[field];
+            return { key, chain, field, seq: chain.seq, value: fields[field], prior: row[field] };
+        });
+    }
+
+    /**
+     * Settle one write's links. `outcome` is `"ok"`, `"failed"` (sent and not
+     * accepted) or `"refused"` (nothing was sent). `isLive()` says whether the
+     * painted row is still the one on screen, in the same scene object;
+     * `read`/`write` access one field of it; `equals` compares a field's
+     * values. Returns `{ restored, deferred }` -- the caller renders when
+     * something was restored and records the deferred field NAMES.
+     */
+    _settleFieldWriteChains(chains, links, outcome, {
+        isLive, read, write, equals = (left, right) => left === right,
+    }) {
+        const deferred = [];
+        let restored = false;
+        for (const link of links) {
+            const { chain, field } = link;
+            chain.pending -= 1;
+            if (outcome === "ok" && link.seq > chain.ackedSeq) {
+                chain.acked = link.value;
+                chain.ackedSeq = link.seq;
+                if (link.seq >= chain.knownFromSeq) chain.ackedKnown = true;
+            }
+            // Nothing was sent: undo this gesture's own paint, unless a newer
+            // paint has already replaced it.
+            if (outcome === "refused" && equals(read(field), link.value)) {
+                write(field, link.prior);
+                restored = true;
+            }
+            if (chain.pending > 0) continue;
+            if (chains.get(link.key) === chain) chains.delete(link.key);
+            if (outcome !== "failed") continue;
+            if (chain.ackedKnown && isLive() && equals(read(field), chain.painted)) {
+                write(field, chain.acked);
+                restored = true;
+            } else {
+                deferred.push(field);
+            }
+        }
+        return { restored, deferred };
+    }
+
+    /**
      * The Guides popup's paint-first write of a guide field (strength, muted).
      *
      * The field goes onto `live` and the save starts without being awaited --
      * its synchronous part claims the Undo entry -- then the timeline repaints.
-     * A success reconciles from the canonical scene (`refresh: true`).
-     *
-     * A failure rolls back locally, because the refetch heal fails exactly when
-     * the server is unreachable (`durable_rules.md`: a local optimistic apply
-     * owes a rollback that works without the network). It restores the field's
-     * last ACKNOWLEDGED value, never this gesture's own snapshot: with a second
-     * write queued behind a running one, the second's snapshot is the first's
-     * paint, which the server never held. So each guide field keeps one chain
-     * of unsettled writes: its acknowledged value is the value before the
-     * chain's first write, advanced by each accepted one (the queue sends them
-     * in order, so the newest accepted is what the server holds), and only the
-     * chain's last write to settle may roll back -- and only while the field
-     * still shows the chain's newest paint on the same scene object. An earlier
-     * failure with a newer write still queued leaves the newer paint, which
-     * carries what the author last chose.
+     * A success reconciles from the canonical scene (`refresh: true`). A
+     * failure rolls back locally through the per-field chains
+     * (`_openFieldWriteChains`).
      *
      * Resolves to the `_updateItemProperty` outcome.
      */
@@ -5784,18 +5874,8 @@ export class EditorWidget {
         }
         const chains = (this._guideFieldWriteChains ||= new Map());
         const guideKey = live.guide_id ? `id:${live.guide_id}` : `frame:${live.frame_index}`;
-        const links = Object.keys(props).map((field) => {
-            const key = `${scene.scene_id}:${guideKey}:${field}`;
-            let chain = chains.get(key);
-            if (!chain) {
-                chain = { acked: live[field], ackedSeq: 0, seq: 0, pending: 0, painted: undefined };
-                chains.set(key, chain);
-            }
-            chain.seq += 1;
-            chain.pending += 1;
-            chain.painted = props[field];
-            return { key, chain, field, seq: chain.seq, value: props[field], prior: live[field] };
-        });
+        const links = this._openFieldWriteChains(
+            chains, `${scene.scene_id}:${guideKey}`, live, props);
         const entry = this._pushUndo(undoLabel);
         Object.assign(live, props);
         const pending = this._updateItemProperty("guide", live.frame_index, props, {
@@ -5805,37 +5885,122 @@ export class EditorWidget {
         });
         this._renderSceneAfterLocalMutation({ viewport: true });
         const outcome = await pending;
-        const deferred = [];
-        let restored = false;
-        for (const link of links) {
-            const { chain, field } = link;
-            chain.pending -= 1;
-            if (outcome === "ok" && link.seq > chain.ackedSeq) {
-                chain.acked = link.value;
-                chain.ackedSeq = link.seq;
-            }
-            // Nothing was sent: undo this gesture's own paint, unless a newer
-            // paint has already replaced it.
-            if (outcome === "refused" && live[field] === link.value) {
-                live[field] = link.prior;
-                restored = true;
-            }
-            if (chain.pending > 0) continue;
-            if (chains.get(link.key) === chain) chains.delete(link.key);
-            if (outcome !== "failed") continue;
-            if (this.activeScene === scene && scene.guide_frames?.includes(live)
-                    && live[field] === chain.painted) {
-                live[field] = chain.acked;
-                restored = true;
-            } else {
-                deferred.push(field);
-            }
-        }
+        const { restored, deferred } = this._settleFieldWriteChains(chains, links, outcome, {
+            isLive: () => this.activeScene === scene && !!scene.guide_frames?.includes(live),
+            read: (field) => live[field],
+            write: (field, value) => { live[field] = value; },
+        });
         if (outcome === "refused") this._discardUnstampableUndoEntry(entry);
         // Field names only, never values (`durable_rules.md`, diagnostics).
         if (deferred.length) sessionDiagRecord("guide_field_rollback_deferred", { fields: deferred });
         if (restored) this._renderSceneAfterLocalMutation({ viewport: true });
         return outcome;
+    }
+
+    /**
+     * Ephemeral bookkeeping for the Reference Lane Setup panel's staged-item
+     * writes, all host-owned and never persisted:
+     *
+     *  * `chains` -- per `(scene, item, field)` acknowledged-value chains
+     *    (`_openFieldWriteChains`);
+     *  * `deleteHolds` -- item id -> `{ scene, row, index, voided }` for a
+     *    painted delete still in flight, so a failure can reinsert the row;
+     *  * `barriers` -- item id -> the promise of the item's newest write the
+     *    mirror could not paint; later gestures that guard on the item's members
+     *    await it instead of reading members the response is about to replace.
+     *
+     * Replaced wholesale on a project change and on destroy. A write still
+     * settling from before keeps the objects it opened and its settle checks
+     * the scene object it painted, so it can touch nothing of the new project.
+     * A writer therefore captures this object when it opens and settles
+     * against that capture; calling this again after a reset would create the
+     * new project's maps. A chain keeps `row[field]` by reference, so a
+     * members paint replaces the array rather than mutating it.
+     */
+    _referenceItemWriteState() {
+        return (this._referenceItemWrites ||= {
+            chains: new Map(),
+            deleteHolds: new Map(),
+            barriers: new Map(),
+            // Queue keys of item writes sent UNPAINTED: the route may rewrite
+            // their members, so they name `members` whatever fields they send.
+            unpaintedKeys: new Set(),
+        });
+    }
+
+    _resetReferenceItemWriteState() {
+        this._referenceItemWrites = null;
+    }
+
+    /**
+     * Whether a queued or running write -- other than the caller's own, named
+     * by `excludeKeys` -- can change this Reference item's field on this scene,
+     * so the row shows that write's paint (or a value the server is about to
+     * rewrite) rather than what the server holds.
+     *
+     * Conservative where the write carries no readable intent, and narrow
+     * where it does:
+     *  * a history slot (Undo/Redo carries no operations) names every field;
+     *  * a Library batch that deletes a member or a Reference names every
+     *    field, because the route thins staged members and deletes items left
+     *    empty (`_reconcile_staged_reference_members`);
+     *  * removing or moving a Reference lane names every field -- it deletes or
+     *    re-indexes the lane's items;
+     *  * a scene-duration or FPS change names the bounds, which the route
+     *    clamps or retimes;
+     *  * a delete or bulk delete naming the item names every field;
+     *  * a split names the end it moves;
+     *  * an `update_reference_item` names the fields it writes, and `members`
+     *    only when it writes members or was sent UNPAINTED
+     *    (`state.unpaintedKeys`): the route re-canonicalizes members on every
+     *    update, but a painted write's members round-trip by construction
+     *    (`plannedReferenceItemUpdate` declines otherwise).
+     *
+     * Not visible here, and accepted: an asset-trash cascade, which is written
+     * by the asset routes outside this queue; and a foreign write that has
+     * settled but whose own rollback or heal has not.
+     */
+    _referenceItemFieldWritePending(sceneId, itemId, field, { excludeKeys = null } = {}) {
+        const scene = String(sceneId || "");
+        const id = String(itemId || "");
+        const unpainted = this._referenceItemWrites?.unpaintedKeys || new Set();
+        const bounds = field === "start_frame" || field === "end_frame";
+        for (const slot of this._projectMutationQueue?.slots?.() || []) {
+            const key = String(slot?.key || "");
+            if (excludeKeys?.has?.(key)) continue;
+            if (key.startsWith("history:")) return true;
+            const payload = slot?.intent?.payload;
+            if (key.startsWith("references:") && Array.isArray(payload)) {
+                if (payload.some((op) => op?.type === "delete_member"
+                        || op?.type === "delete_reference")) return true;
+                continue;
+            }
+            if (!Array.isArray(payload?.operations) || String(payload.sceneId || "") !== scene) {
+                continue;
+            }
+            for (const op of payload.operations) {
+                if (!op || typeof op !== "object") continue;
+                if ((op.type === "remove_lane" || op.type === "move_lane")
+                        && op.lane_type === "reference") return true;
+                if (op.type === "update_scene_fields" && bounds
+                        && ["duration_frames", "fps"].some((name) =>
+                            Object.prototype.hasOwnProperty.call(op.fields || {}, name))) {
+                    return true;
+                }
+                if (op.type === "bulk_delete_items") {
+                    if ((op.items || []).some((entry) => entry?.type === "reference"
+                            && String(entry.id || "") === id)) return true;
+                    continue;
+                }
+                if (String(op.reference_item_id || "") !== id) continue;
+                if (op.type === "delete_reference_item") return true;
+                if (op.type === "split_reference_item" && field === "end_frame") return true;
+                if (op.type === "update_reference_item"
+                        && (Object.prototype.hasOwnProperty.call(op.fields || {}, field)
+                            || (field === "members" && unpainted.has(key)))) return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -17628,6 +17793,7 @@ export class EditorWidget {
                     label: "link items",
                     coalesce: false,
                     historyEntry,
+                    orderedHistoryBaseline: true,
                     failureMessage: (error) => error?.message || "Link operation was refused.",
                 }
             );
@@ -17678,6 +17844,7 @@ export class EditorWidget {
                     label: "unlink items",
                     coalesce: false,
                     historyEntry,
+                    orderedHistoryBaseline: true,
                     failureMessage: (error) => error?.message || "Unlink operation was refused.",
                 }
             );
@@ -25171,6 +25338,7 @@ export class EditorWidget {
         this._historyMergeCapabilities = null;
         this._referenceLibraryHandle?.reset?.();
         this._referencePanelHandle?.close?.();
+        this._resetReferenceItemWriteState();
         this._queueBatchExpanded = {};
         this._updateSceneIdentity("Loading…");
         this._updateProjectIdentity();
@@ -26531,6 +26699,7 @@ export class EditorWidget {
         this._hidePromptHoverPreview();
         if (this._promptPanelHandle) { this._promptPanelHandle.cleanup(); this._promptPanelHandle = null; }
         this._referencePanelHandle?.close?.();
+        this._resetReferenceItemWriteState();
         this._managementActivityOff?.();
         if (this._contextMenuMouseOff) { this._contextMenuMouseOff(); this._contextMenuMouseOff = null; }
         if (this._focusHandler) {

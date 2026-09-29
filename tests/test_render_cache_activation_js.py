@@ -194,6 +194,7 @@ class Host {{
   _fetchReferences() {{}}
   _renderTimeline() {{}}
   _clearUnconfirmedReferenceRetry() {{}}
+  _resetReferenceItemWriteState() {{}}
   {methods}
   {update_project}
 }}
