@@ -1286,6 +1286,13 @@ MIRRORED_MODULES = {
             "test_reference_lane_presentation_never_moves_the_key",
             "test_the_hidden_narrowing_matches_the_server_projection")),
     },
+    "prompt_preview_stream.js": {
+        "scope": ("The streamed preview's opt-in value and projection names, "
+                  "not how records are read or settled."),
+        "authorities": ("server/routes.py::PROMPT_PREVIEW_STREAM",
+                        "server/routes.py::PROMPT_PREVIEW_PROJECTIONS"),
+        "tests": ("test_prompt_preview_stream.py::test_the_stream_constants_match_the_server",),
+    },
     "scene_guide_geometry.js": {
         "scope": ("Guide-swap applicability, raw frame ordering, and the guide "
                   "identity comparison host local applies gate on."),
@@ -1512,7 +1519,7 @@ def test_declared_mirror_headers_match_the_inventory_both_ways():
 
 def test_every_declared_mirror_has_a_live_parity_disposition():
     _assert_mirror_obligations(MIRRORED_MODULES, ROOT)
-    assert sum(len(row["authorities"]) for row in MIRRORED_MODULES.values()) == 51
+    assert sum(len(row["authorities"]) for row in MIRRORED_MODULES.values()) == 53
 
 @pytest.mark.parametrize("name, valid", [("TABLE", True), ("row", False), ("transform", True)])
 def test_mirror_authorities_are_module_declarations(tmp_path, name, valid):

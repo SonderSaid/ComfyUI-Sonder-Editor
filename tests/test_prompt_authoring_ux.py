@@ -1231,10 +1231,17 @@ def _prompt_compile_test_support(widget):
     """Run the actual shared request/cache helpers in isolated host harnesses."""
     methods = _method(widget, "_requestPromptContextCompile", "_promptCompileRequestBody")
     api_url = (ROOT / "web/js/api_client.js").as_uri()
+    coordinator_url = (ROOT / "web/js/prompt_compile_coordinator.js").as_uri()
+    freshness_url = (ROOT / "web/js/prompt_preview_freshness.js").as_uri()
+    stream_url = (ROOT / "web/js/prompt_preview_stream.js").as_uri()
     return f"""
-const {{ getProjectVersion, rememberProjectVersion, resetProjectVersion,
+const {{ certifiedUnchanged, getProjectVersion, rememberProjectVersion, resetProjectVersion,
     rememberProjectVersionFromPayload, rememberProjectVersionFromResponse }} =
     await import({json.dumps(api_url)});
+const {{ createPromptCompileCoordinator }} = await import({json.dumps(coordinator_url)});
+const {{ promptResultAnswers }} = await import({json.dumps(freshness_url)});
+const {{ PROMPT_PREVIEW_STREAM, PromptPreviewStreamError, isPromptPreviewStream,
+    readPromptPreviewRecords }} = await import({json.dumps(stream_url)});
 class CompileSupport {{
   _projectDirName() {{ return "project"; }}
   {methods}
@@ -1336,7 +1343,7 @@ def test_prompt_panel_consumes_only_windowed_candidate_diagnostics():
     # And nothing on the scene payload's arrival path can reach diagnostics,
     # the queue gate, or Reference Prompting -- which derives from a
     # `setup_manifest` this payload deliberately does not carry.
-    arrival = _method_body(widget, "_previewPromptContextScenePayload",
+    arrival = _method_body(widget, "_landPromptScenePayload",
                            marker="refreshProjections?.();")
     # Comments stripped: the body explains at length what it must not do, and
     # matching that prose would make the guard pass or fail on the wording.
@@ -1356,12 +1363,17 @@ def test_the_scene_wide_compile_asks_for_the_whole_scene():
     exists to supplement, with nothing to show it went wrong.
     """
     widget = _source("web/js/editor_widget.js")
-    arrival = _method_body(widget, "_previewPromptContextScenePayload",
-                           marker="refreshProjections?.();")
-    assert "selection: { selectionStart: 0, selectionEnd: duration }" in arrival
-    assert "windowStart: 0, windowEnd: duration" in arrival
+    derive = _method_body(widget, "_promptSceneRequestBody")
+    assert "selection_start: 0, selection_end: duration" in derive
+    assert "window_start: 0, window_end: duration" in derive
+    # The planner keys, and the branch keys, exactly that derivation of the
+    # windowed body; the server derives the same (`test_prompt_preview_stream.py`).
+    plan = _method_body(widget, "_planPromptPreviewBranches")
+    assert "this._promptSceneRequestBody(windowedBody, duration)" in plan
+    begin = _method_body(widget, "_beginPromptScenePayload")
+    assert "this._promptSceneRequestBody(body, duration)" in begin
     # ...and it does not fire at all when the window already is the scene.
-    assert "if (windowStart <= 0 && windowEnd >= duration)" in arrival
+    assert "if (windowStart <= 0 && windowEnd >= duration)" in begin
 
 
 def test_timeline_prompt_labels_gate_compiles_by_collapse_and_debounce_hot_refreshes():
@@ -1380,7 +1392,7 @@ def test_timeline_prompt_labels_gate_compiles_by_collapse_and_debounce_hot_refre
     # pass through the timeline-only debounce instead of hard-coding zero.
     assert widget.count("this._promptContextPreviewDelay(0)") >= 5
 
-    scene = _method_body(widget, "_previewPromptContextScenePayload",
+    scene = _method_body(widget, "_landPromptScenePayload",
                          marker="this._renderTimeline();")
     windowed = _method_body(widget, "    _previewPromptContextCandidate",
                             marker="this._renderTimeline();")
@@ -1570,9 +1582,9 @@ class Subject {
   _projectDirName() { return "project"; }
   _selectionContextRange() { return { contextStart: 0, contextEnd: 100 }; }
   _promptScenePayload() { return this._promptContextScenePayloadCache; }
-  _previewPromptContextScenePayload() {}
+  _beginPromptScenePayload() { return null; }
   _promptCompileRequestBody() { return {}; }
-  _requestPromptContextCompile() { return new Promise(() => {}); }
+  _queuePromptPreviewPair() { return { windowed: new Promise(() => {}) }; }
 }
 const subject = new Subject();
 subject._previewPromptContextCandidate({}, 1000);
@@ -1658,9 +1670,9 @@ class Subject {
   _projectDirName() { return "project"; }
   _selectionContextRange() { return {contextStart: 0, contextEnd: 100}; }
   _promptScenePayload() { return null; }
-  _previewPromptContextScenePayload() {}
+  _beginPromptScenePayload() { return null; }
   _promptCompileRequestBody() { return {}; }
-  _requestPromptContextCompile() { return new Promise(() => {}); }
+  _queuePromptPreviewPair() { return { windowed: new Promise(() => {}) }; }
   _renderTimeline() {}
 }
 const subject = new Subject();
@@ -1758,10 +1770,10 @@ class Subject {
   _projectDirName() { return "project"; }
   _selectionContextRange() { return { contextStart: 0, contextEnd: 100 }; }
   _promptScenePayload() { return null; }
-  _previewPromptContextScenePayload() {}
+  _beginPromptScenePayload() { return null; }
   _promptCompileRequestBody() { return {}; }
-  async _requestPromptContextCompile() {
-    return {response: {ok: true}, payload: {prompt: "new"}};
+  _queuePromptPreviewPair() {
+    return {windowed: Promise.resolve({response: {ok: true}, payload: {prompt: "new"}})};
   }
   _renderTimeline() { this.counts.timeline++; }
 }
@@ -1839,9 +1851,9 @@ class Subject {
   _projectDirName() { return "project"; }
   _selectionContextRange() { return {contextStart: 0, contextEnd: 100}; }
   _promptScenePayload() { return null; }
-  _previewPromptContextScenePayload() {}
+  _beginPromptScenePayload() { return null; }
   _promptCompileRequestBody() { return {}; }
-  async _requestPromptContextCompile() { return this.results.shift(); }
+  _queuePromptPreviewPair() { return {windowed: Promise.resolve(this.results.shift())}; }
   _renderTimeline() {}
 }
 const subject = new Subject();
@@ -1909,11 +1921,11 @@ class Subject {
   _projectDirName() { return "project"; }
   _selectionContextRange() { return {contextStart: 0, contextEnd: 100}; }
   _promptScenePayload() { return null; }
-  _previewPromptContextScenePayload() {}
+  _beginPromptScenePayload() { return null; }
   _promptCompileRequestBody() { return {}; }
-  async _requestPromptContextCompile() {
-    return {response: {ok: false, status: 409},
-      payload: {code: "project_version_conflict", error: "project_version_conflict"}};
+  _queuePromptPreviewPair() {
+    return {windowed: Promise.resolve({response: {ok: false, status: 409},
+      payload: {code: "project_version_conflict", error: "project_version_conflict"}})};
   }
   _renderTimeline() {}
 }
@@ -1973,9 +1985,9 @@ class Subject {
   _projectDirName() { return "project"; }
   _selectionContextRange() { return {contextStart: 0, contextEnd: 100}; }
   _promptScenePayload() { return this._promptContextScenePayloadCache; }
-  _previewPromptContextScenePayload() {}
+  _beginPromptScenePayload() { return null; }
   _promptCompileRequestBody() { return {}; }
-  _requestPromptContextCompile() { return new Promise(() => {}); }
+  _queuePromptPreviewPair() { return { windowed: new Promise(() => {}) }; }
   _renderTimeline() { this.counts.timeline++; }
 }
 const fresh = () => ({_candidate_scene_id: "scene", _stale: false,
@@ -2073,7 +2085,15 @@ console.log(JSON.stringify({ whileScenePending, afterSceneSettles,
     }
 
 
-def test_invalid_window_payload_publishes_failure_and_settles_timer():
+@pytest.mark.parametrize("answer, message", [
+    # A stream whose record cannot be read.
+    ('new Response("not json\\n", {headers: {"Content-Type": "application/x-ndjson"}})',
+     "unreadable record"),
+    # A success that is not a stream: a server older than this editor.
+    ('new Response("{}", {headers: {"Content-Type": "application/json"}})',
+     "Restart ComfyUI"),
+])
+def test_invalid_window_payload_publishes_failure_and_settles_timer(answer, message):
     node = shutil.which("node")
     if not node:
         pytest.skip("node is required for invalid-payload lifecycle coverage")
@@ -2096,8 +2116,7 @@ globalThis.setTimeout = (fn, ms) => {
   timers.push(timer); return timer;
 };
 globalThis.clearTimeout = (timer) => { if (timer) timer.cancelled = true; };
-globalThis.fetch = async () => ({ ok: true, status: 200,
-  json: async () => null });
+globalThis.fetch = async () => """ + answer + """;
 class Subject extends CompileSupport {
 """ + settle + """
 """ + preview + """
@@ -2119,7 +2138,8 @@ class Subject extends CompileSupport {
   _projectDirName() { return "project"; }
   _selectionContextRange() { return { contextStart: 0, contextEnd: 100 }; }
   _promptScenePayload() { return null; }
-  _previewPromptContextScenePayload() {}
+  _windowedPromptCandidate() { return this._promptContextCandidateCache; }
+  _beginPromptScenePayload() { return null; }
   _promptCompileRequestBody() { return {}; }
   _renderTimeline() { this.counts.timeline++; }
 }
@@ -2130,6 +2150,7 @@ await compile.fn();
 const staleTimer = timers.find((timer) => timer.ms === 300);
 console.log(JSON.stringify({
   code: subject._promptContextCandidateCache.errors[0].code,
+  message: subject._promptContextCandidateCache.errors[0].message,
   stale: subject._promptContextCandidateCache._stale,
   failed: subject._promptContextCandidateCache._failed,
   staleTimerCancelled: staleTimer.cancelled,
@@ -2137,30 +2158,32 @@ console.log(JSON.stringify({
 }));
 """
     result = _run_node(script)
+    assert message in result.pop("message")
     assert result == {
-        "code": "preview_invalid_response", "stale": True, "failed": True,
+        "code": "preview_request_failed", "stale": True, "failed": True,
         "staleTimerCancelled": True,
         "counts": {"diagnostics": 1, "inline": 1, "apply": 1, "timeline": 1},
     }
 
 
-def test_invalid_scene_payload_clears_obsolete_dormant_projections():
+@pytest.mark.parametrize("result", [
+    "Promise.resolve({ response: { ok: false, status: 500 }, payload: { code: 'x' } })",
+    "Promise.reject(new Error('stream broke'))",
+])
+def test_invalid_scene_payload_clears_obsolete_dormant_projections(result):
     node = shutil.which("node")
     if not node:
         pytest.skip("node is required for scene failure settlement coverage")
     widget = _source("web/js/editor_widget.js")
-    scene_start = widget.index("\n    _previewPromptContextScenePayload(")
-    scene_method = _method_body(widget[scene_start:],
-                                "_previewPromptContextScenePayload",
-                                marker="refreshProjections?.();")
+    scene_start = widget.index("\n    async _landPromptScenePayload(")
+    scene_method = "async " + _method_body(widget[scene_start:],
+                                           "_landPromptScenePayload",
+                                           marker="refreshProjections?.();")
     settle_start = widget.index("\n    _clearPromptStaleVisualTimerIfSettled(")
     settle = _method_body(widget[settle_start:],
                           "_clearPromptStaleVisualTimerIfSettled",
                           marker="return true;")
     script = _prompt_compile_test_support(widget) + """
-const api = { apiURL: (value) => value };
-globalThis.fetch = async () => ({ ok: true, status: 200,
-  json: async () => null });
 class Subject extends CompileSupport {
 """ + settle + """
 """ + scene_method + """
@@ -2174,28 +2197,30 @@ class Subject extends CompileSupport {
     this._promptContextScenePayloadCache = {
       _candidate_scene_id: "scene", _stale: true, _stale_visual: false };
     this._promptContextStaleVisualTimer = setTimeout(() => {}, 10000);
+    this._promptPreviewPending = {};
     this.counts = { inline: 0, projections: 0, timeline: 0 };
     this._refreshInlinePromptProjections = () => this.counts.inline++;
     this._promptPanelHandle = {
       refreshProjections: () => this.counts.projections++,
     };
   }
-  _promptCompileRequestBody() { return {}; }
   _promptProjectionSubset(value) { return value; }
   _renderTimeline() { this.counts.timeline++; }
 }
 const subject = new Subject();
-subject._previewPromptContextScenePayload({ dirName: "project", sceneId: "scene",
-  candidate: { duration_frames: 100 }, windowStart: 10, windowEnd: 20 });
-await new Promise((resolve) => setTimeout(resolve, 0));
+const entry = { state: "inflight", key: "k", sceneId: "scene", token: 0 };
+subject._promptPreviewPending.scene = entry;
+await subject._landPromptScenePayload({ dirName: "project", sceneId: "scene",
+  spec: { token: 0, key: "k", entry }, result: """ + result + """ });
 console.log(JSON.stringify({ cache: subject._promptContextScenePayloadCache,
-  timer: subject._promptContextStaleVisualTimer, counts: subject.counts }));
+  timer: subject._promptContextStaleVisualTimer, counts: subject.counts,
+  pending: subject._promptPreviewPending.scene }));
 """
     result = json.loads(subprocess.run(
         [node, "--input-type=module", "-e", script], capture_output=True,
         text=True, encoding="utf-8", check=True).stdout)
     assert result == {
-        "cache": None, "timer": None,
+        "cache": None, "timer": None, "pending": None,
         "counts": {"inline": 1, "projections": 1, "timeline": 1},
     }
 
@@ -8765,7 +8790,7 @@ def test_writing_pending_identity_overlay_uses_shared_preview_and_atomic_apply_p
     widget = _source("web/js/editor_widget.js")
     builder_start = widget.index("    _promptCompileRequestBody({")
     builder_end = widget.index("    _promptProjectionSubset(", builder_start)
-    scene_start = widget.index("    _previewPromptContextScenePayload({")
+    scene_start = widget.index("    _beginPromptScenePayload({")
     window_start = widget.index("    _previewPromptContextCandidate(", scene_start)
     window_end = widget.index("    _refreshPromptUsageHighlight(", window_start)
     builder = widget[builder_start:builder_end]
@@ -8775,7 +8800,9 @@ def test_writing_pending_identity_overlay_uses_shared_preview_and_atomic_apply_p
                    widget.index("/** Browser-local prompt template library")]
 
     assert "prompt_semantic_unit_creates:" in builder
-    assert "promptSemanticUnitCreates" in scene_preview
+    # The scene-wide projection is derived from the windowed body, which the
+    # window preview builds with the pending creates, so both carry them.
+    assert "this._promptSceneRequestBody(body, duration)" in scene_preview
     assert "promptSemanticUnitCreates" in window_preview
     assert "pruneWritingSemanticUnitCreates())" in panel
     assert "prompt_semantic_unit_creates: promptSemanticUnitCreates" in panel
@@ -8891,6 +8918,7 @@ console.log(JSON.stringify(rows));
 
 
 def test_exhausted_preview_conflict_fails_window_and_settles_scene_sibling():
+    """One paired request, retried once, answers both branches with the conflict."""
     node = shutil.which("node")
     if not node:
         pytest.skip("node is required for exhausted preview-conflict coverage")
@@ -8898,9 +8926,14 @@ def test_exhausted_preview_conflict_fails_window_and_settles_scene_sibling():
     preview = _method_body(
         widget[widget.index("\n    _previewPromptContextCandidate("):],
         "_previewPromptContextCandidate", marker="Math.max(0, Number(delay) || 0)")
-    scene = _method_body(
-        widget[widget.index("\n    _previewPromptContextScenePayload("):],
-        "_previewPromptContextScenePayload", marker="refreshProjections?.();")
+    scene = "\n".join([
+        _method_body(widget[widget.index("\n    _promptSceneRequestBody("):],
+                     "_promptSceneRequestBody"),
+        _method_body(widget[widget.index("\n    _beginPromptScenePayload("):],
+                     "_beginPromptScenePayload"),
+        "async " + _method_body(widget[widget.index("\n    async _landPromptScenePayload("):],
+                                "_landPromptScenePayload", marker="refreshProjections?.();"),
+    ])
     settle = _method_body(
         widget[widget.index("\n    _clearPromptStaleVisualTimerIfSettled("):],
         "_clearPromptStaleVisualTimerIfSettled", marker="return true;")
@@ -8914,9 +8947,9 @@ globalThis.setTimeout = (fn, ms) => {
 };
 globalThis.clearTimeout = (timer) => { if (timer) timer.cancelled = true; };
 resetProjectVersion("project", "v1");
-let calls = 0;
-globalThis.fetch = async () => {
-  calls++;
+const bodies = [];
+globalThis.fetch = async (_url, init) => {
+  bodies.push(JSON.parse(init.body));
   return new Response(JSON.stringify({code: "project_version_conflict",
     error: "project_version_conflict", actual_modified_at: "v2",
     project: {project_id: "project", modified_at: "v2"}}), {status: 409});
@@ -8939,6 +8972,7 @@ class Subject extends CompileSupport {
   _projectDirName() { return "project"; }
   _selectionContextRange() { return {contextStart: 10, contextEnd: 20}; }
   _promptScenePayload() { return this._promptContextScenePayloadCache; }
+  _windowedPromptCandidate() { return this._promptContextCandidateCache; }
   _promptCompileRequestBody() { return {base_modified_at: getProjectVersion("project")}; }
   _promptProjectionSubset(payload) { return payload; }
   _renderTimeline() {}
@@ -8948,10 +8982,15 @@ subject._previewPromptContextCandidate({}, 0);
 await timers.find((timer) => timer.ms === 0 && !timer.cancelled).fn();
 for (let index = 0; index < 40; index++) await Promise.resolve();
 const grace = timers.find((timer) => timer.ms === 300);
-console.log(JSON.stringify({calls, candidate: subject._promptContextCandidateCache,
+console.log(JSON.stringify({bodies, candidate: subject._promptContextCandidateCache,
   scene: subject._promptContextScenePayloadCache, graceCancelled: grace.cancelled}));
 """)
-    assert result["calls"] == 4
+    # One physical request and its one bounded retry, not one per branch.
+    assert len(result["bodies"]) == 2
+    for body in result["bodies"]:
+        assert body["preview_response"] == "stream-v1"
+        assert body["projections"] == ["windowed", "scene"]
+    assert [body["base_modified_at"] for body in result["bodies"]] == ["v1", "v2"]
     assert result["scene"] is None
     assert result["graceCancelled"] is True
     assert result["candidate"]["_failed"] is True
@@ -8988,12 +9027,17 @@ console.log(JSON.stringify({same:host._failedPromptContextCandidate("scene",diag
 
 
 def test_compile_callers_recheck_ownership_after_helper_return():
+    """An owner can change between a result's delivery and its continuation."""
     widget = _source("web/js/editor_widget.js")
     methods = "\n".join([
         "async " + _method_body(widget[widget.index("\n    async _promptCopyPlan("):],
             "_promptCopyPlan"),
-        _method_body(widget[widget.index("\n    _previewPromptContextScenePayload("):],
-            "_previewPromptContextScenePayload"),
+        _method_body(widget[widget.index("\n    _promptSceneRequestBody("):],
+            "_promptSceneRequestBody"),
+        _method_body(widget[widget.index("\n    _beginPromptScenePayload("):],
+            "_beginPromptScenePayload"),
+        "async " + _method_body(widget[widget.index("\n    async _landPromptScenePayload("):],
+            "_landPromptScenePayload"),
         _method_body(widget[widget.index("\n    _previewPromptContextCandidate("):],
             "_previewPromptContextCandidate"),
     ])
@@ -9006,14 +9050,21 @@ globalThis.setTimeout = fn => {timers.push(fn);return timers.length;};
 globalThis.clearTimeout = () => {};
 globalThis.fetch = async () => new Response(JSON.stringify({
   prompt:"OLD",copy_plan:{lines:["OLD"]},attachment_capability_projections:[]}));
+const bump = (host) => queueMicrotask(() => {
+  host._promptContextPreviewToken++;
+  host._promptContextScenePayloadToken++;
+  host._promptContextCandidateCache={prompt:"NEW",_stale:true};
+  host._promptContextScenePayloadCache={prompt:"NEW",_stale:true};
+});
 class Subject extends CompileSupport {
 """ + methods + """
   constructor() {
     super(); this.activeSceneId="scene";this.activeScene={duration_frames:100};
     this._promptContextPreviewToken=0; this._promptContextScenePayloadToken=0;
   }
-  _selectionContextRange() {return null;}
+  _selectionContextRange() {return {contextStart:10,contextEnd:20};}
   _promptScenePayload() {return null;}
+  _windowedPromptCandidate() {return null;}
   _promptCompileRequestBody() {return {};}
   _clearPromptStaleVisualTimerIfSettled() {}
   _renderTimeline() {}
@@ -9021,29 +9072,38 @@ class Subject extends CompileSupport {
   async _requestPromptContextCompile(...args) {
     const result = await super._requestPromptContextCompile(...args);
     // An external microtask can run after the helper's final ownership check.
-    queueMicrotask(() => {
-      this._promptContextPreviewToken++;
-      this._promptContextScenePayloadToken++;
-      this._promptContextCandidateCache={prompt:"NEW",_stale:true};
-      this._promptContextScenePayloadCache={prompt:"NEW",_stale:true};
-    });
+    bump(this);
     return result;
+  }
+  _queuePromptPreviewPair(_dirName, _sceneId, _body, branches) {
+    // Each branch is delivered while it still owns its guard; the owner then
+    // changes before the continuation that would apply it runs.
+    const results = {};
+    for (const [name, spec] of Object.entries(branches)) {
+      if (!spec) continue;
+      results[name] = Promise.resolve().then(() => {
+        const live = spec.isCurrent();
+        bump(this);
+        return live ? {response:{ok:true,status:200},payload:{prompt:"OLD"}} : null;
+      });
+    }
+    return results;
   }
 }
 const rows=[];
 for(const caller of ["copy","window","scene"]) {
   const host=new Subject();
-    if(caller==="copy") {
-      const value=await host._promptCopyPlan("a","c");
-      rows.push({caller,refused:value?.refused||null});
+  if(caller==="copy") {
+    const value=await host._promptCopyPlan("a","c");
+    rows.push({caller,refused:value?.refused||null});
   } else if(caller==="window") {
-    host._previewPromptContextScenePayload=()=>{};
+    host._beginPromptScenePayload=()=>null;
     host._previewPromptContextCandidate({},0);
     await timers.pop()();
     rows.push({caller,cache:host._promptContextCandidateCache});
   } else {
-    host._previewPromptContextScenePayload({dirName:"project",sceneId:"scene",
-      candidate:{duration_frames:100},windowStart:10,windowEnd:20});
+    host._previewPromptContextCandidate({},0);
+    await timers.pop()();
     for(let i=0;i<30;i++) await Promise.resolve();
     rows.push({caller,cache:host._promptContextScenePayloadCache});
   }
@@ -9114,40 +9174,35 @@ console.log(JSON.stringify({requests:host.requests,second,remountAttempt,
 
 def test_coordinator_obsolete_409_heals_without_retry_then_trailing_owns_retry():
     widget = _source("web/js/editor_widget.js")
-    coordinator_url = (ROOT / "web/js/prompt_compile_coordinator.js").as_uri()
-    result = _run_node(_prompt_compile_test_support(widget) + f"""
-const {{createPromptCompileCoordinator}}=await import({json.dumps(coordinator_url)});
-const api={{apiURL:value=>value}}; resetProjectVersion("project","v1");
+    result = _run_node(_prompt_compile_test_support(widget) + """
+const api={apiURL:value=>value}; resetProjectVersion("project","v1");
 let releaseA; const requests=[];
-globalThis.fetch=async (_url,init)=>{{
-  const row={{body:JSON.parse(init.body),headers:init.headers}}; requests.push(row);
-  if(requests.length===1) return await new Promise(resolve=>{{releaseA=resolve;}});
-  if(requests.length===2) return new Response(JSON.stringify({{
+globalThis.fetch=async (_url,init)=>{
+  const row={body:JSON.parse(init.body),headers:init.headers}; requests.push(row);
+  if(requests.length===1) return await new Promise(resolve=>{releaseA=resolve;});
+  if(requests.length===2) return new Response(JSON.stringify({
     code:"project_version_conflict",actual_modified_at:"v3",
-    project:{{project_id:"project",modified_at:"v3"}}}}),{{status:409}});
-  return new Response(JSON.stringify({{prompt:"B"}}));
-}};
-class Subject extends CompileSupport {{
-  constructor() {{
-    super(); this.activeSceneId="scene";
-    this._promptCompileCoordinator=createPromptCompileCoordinator(
-      (request)=>this._requestPromptContextCompile(request.projectId,request.sceneId,
-        request.body,request.isCurrent,{{purpose:request.purpose,
-          requestId:request.requestId}}));
-  }}
-}}
+    project:{project_id:"project",modified_at:"v3"}}),{status:409});
+  return new Response(JSON.stringify({projection:"windowed",status:200,
+    payload:{prompt:"B"}})+"\\n",{headers:{"Content-Type":"application/x-ndjson"}});
+};
+class Subject extends CompileSupport {
+  constructor() { super(); this.activeSceneId="scene"; }
+}
 const host=new Subject();
-const a=host._queuePromptContextCompile("windowed-preview","project","scene",
-  {{base_modified_at:"v1",scene:{{text:"A"}}}},()=>true);
+const branch=(key)=>({windowed:{key,isCurrent:()=>true,
+  answers:(body)=>body.scene.text===key}});
+const a=host._queuePromptPreviewPair("project","scene",
+  {base_modified_at:"v1",scene:{text:"A"}},branch("A"));
 await Promise.resolve(); await Promise.resolve();
-const b=host._queuePromptContextCompile("windowed-preview","project","scene",
-  {{base_modified_at:"v1",scene:{{text:"B"}}}},()=>true);
-releaseA(new Response(JSON.stringify({{
+const b=host._queuePromptPreviewPair("project","scene",
+  {base_modified_at:"v1",scene:{text:"B"}},branch("B"));
+releaseA(new Response(JSON.stringify({
   code:"project_version_conflict",actual_modified_at:"v2",
-  project:{{project_id:"project",modified_at:"v2"}}}}),{{status:409}}));
-const values=await Promise.all([a,b]);
-console.log(JSON.stringify({{requests,version:getProjectVersion("project"),
-  aDiscarded:values[0]===null,bPrompt:values[1]?.payload?.prompt}}));
+  project:{project_id:"project",modified_at:"v2"}}),{status:409}));
+const values=await Promise.all([a.windowed,b.windowed]);
+console.log(JSON.stringify({requests,version:getProjectVersion("project"),
+  aDiscarded:values[0]===null,bPrompt:values[1]?.payload?.prompt}));
 """)
     assert result["aDiscarded"] is True
     assert result["bPrompt"] == "B"
@@ -9158,6 +9213,8 @@ console.log(JSON.stringify({{requests,version:getProjectVersion("project"),
             for row in result["requests"]] == ["prompt-1", "prompt-2", "prompt-2"]
     assert [row["headers"]["X-Sonder-Prompt-Attempt"]
             for row in result["requests"]] == ["1", "1", "2"]
+    assert all(row["headers"]["X-Sonder-Prompt-Purpose"] == "paired-preview"
+               for row in result["requests"])
     assert result["requests"][2]["body"]["base_modified_at"] == "v3"
 
 

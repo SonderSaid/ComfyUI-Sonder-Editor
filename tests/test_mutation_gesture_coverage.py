@@ -30,6 +30,7 @@ EXEMPT = {
     "_restoreScene": "Threaded history restore/token requests; never a new gesture.",
     "_getBulkAssetUsages": "Read-shaped POST.",
     "_requestPromptContextCompile": "Read-shaped POST.",
+    "_requestPromptPreviewPair": "Read-shaped POST (the streamed paired preview compile).",
     "_sweepRenderCache": "Background cache maintenance, deliberately unscoped.",
     "_maybeHealFrameConstraint": "Background metadata healing, deliberately unscoped.",
     "_maybeHealDimensionConstraint": "Background metadata healing, deliberately unscoped.",

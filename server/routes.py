@@ -10491,14 +10491,27 @@ PROMPT_CANDIDATE_OVERLAY_FIELDS = frozenset({
 })
 
 
-def _compile_prompt_context_candidate_sync(
-        project: TimelineProject, scene_id: str, body: dict) -> tuple[int, dict]:
-    """Compile one candidate entirely off the aiohttp event loop.
+class _PreparedPromptCandidate:
+    """One candidate, prepared once, that any number of windows compile from.
 
-    The loaded project is request-local. This worker owns every CPU-heavy copy,
-    overlay, window-resolution and compiler step, and returns plain response
-    data so aiohttp objects remain loop-owned.
+    Everything here is request-local: the loaded project, the overlaid candidate
+    scene and the template. The streamed preview compiles its windowed result
+    and its scene-wide projection from ONE of these, which is what makes it one
+    load and one preparation per pair (`plans/cut-read-fanout.md` §3).
     """
+
+    __slots__ = ("project", "compile_project", "candidate", "template", "fps",
+                 "labels_on", "prompt_threshold", "reference_threshold", "delimiter")
+
+    def __init__(self, **values):
+        for key, value in values.items():
+            setattr(self, key, value)
+
+
+def _prepare_prompt_context_candidate_sync(
+        project: TimelineProject, scene_id: str,
+        body: dict) -> _PreparedPromptCandidate | tuple[int, dict]:
+    """The window-independent half of a candidate compile, or its refusal."""
     scene = project.get_scene(scene_id)
     if scene is None:
         return 404, {"error": "Scene not found"}
@@ -10548,10 +10561,35 @@ def _compile_prompt_context_candidate_sync(
             return exc.status, payload
 
     try:
+        fps = float(body.get("fps") or effective_scene_fps(project, candidate))
+        prompt_threshold = float(body.get(
+            "prompt_frame_threshold",
+            (project.metadata or {}).get("prompt_frame_threshold", 10.0)) or 0.0)
+        reference_threshold = float(body.get(
+            "reference_frame_threshold",
+            (project.metadata or {}).get("reference_frame_threshold", 0.0)) or 0.0)
+    except (TypeError, ValueError):
+        return 400, {"error": "Invalid Prompt Context preview parameters"}
+    delimiter = str(body.get(
+        "delimiter", (project.metadata or {}).get(
+            "prompt_section_delimiter",
+            prompt_payload.DEFAULT_SECTION_DELIMITER)) or "")
+    return _PreparedPromptCandidate(
+        project=project, compile_project=compile_project, candidate=candidate,
+        template=template, fps=fps, labels_on=body.get("labels_on", False) is True,
+        prompt_threshold=prompt_threshold,
+        reference_threshold=reference_threshold, delimiter=delimiter)
+
+
+def _resolve_prompt_candidate_window(
+        prepared: _PreparedPromptCandidate, body: dict) -> dict | tuple[int, dict]:
+    """The execution window `body` asks for, or its refusal."""
+    candidate = prepared.candidate
+    try:
         raw_window_start = max(0, int(body.get("window_start", 0) or 0))
         raw_window_end = int(body.get(
             "window_end", candidate.duration_frames) or candidate.duration_frames)
-        execution_window = resolve_execution_window(
+        return resolve_execution_window(
             scene_duration=candidate.duration_frames,
             selection_start=int(body.get(
                 "selection_start", raw_window_start) or 0),
@@ -10568,34 +10606,217 @@ def _compile_prompt_context_candidate_sync(
     except (TypeError, ValueError):
         return 400, {"error": "Invalid Prompt Context preview window"}
 
-    try:
-        fps = float(body.get("fps") or effective_scene_fps(project, candidate))
-        prompt_threshold = float(body.get(
-            "prompt_frame_threshold",
-            (project.metadata or {}).get("prompt_frame_threshold", 10.0)) or 0.0)
-        reference_threshold = float(body.get(
-            "reference_frame_threshold",
-            (project.metadata or {}).get("reference_frame_threshold", 0.0)) or 0.0)
-    except (TypeError, ValueError):
-        return 400, {"error": "Invalid Prompt Context preview parameters"}
-    delimiter = str(body.get(
-        "delimiter", (project.metadata or {}).get(
-            "prompt_section_delimiter",
-            prompt_payload.DEFAULT_SECTION_DELIMITER)) or "")
+
+def _compile_prepared_prompt_candidate(
+        prepared: _PreparedPromptCandidate, execution_window: dict,
+        copy_plan_for: dict | None = None) -> tuple[int, dict]:
     compiled = compile_live_scene_prompt_context(
-        compile_project, candidate, template=template,
+        prepared.compile_project, prepared.candidate, template=prepared.template,
         window_start=execution_window["render_start"],
-        window_end=execution_window["render_end"], fps=fps,
-        labels_on=body.get("labels_on", False) is True,
-        delimiter=delimiter, prompt_threshold=prompt_threshold,
-        reference_threshold=reference_threshold,
+        window_end=execution_window["render_end"], fps=prepared.fps,
+        labels_on=prepared.labels_on,
+        delimiter=prepared.delimiter, prompt_threshold=prepared.prompt_threshold,
+        reference_threshold=prepared.reference_threshold,
+        copy_plan_for=copy_plan_for)
+    compiled["execution_window"] = execution_window
+    compiled["candidate_base_modified_at"] = str(
+        getattr(prepared.project, "modified_at", "") or "")
+    return 200, compiled
+
+
+def _compile_prompt_context_candidate_sync(
+        project: TimelineProject, scene_id: str, body: dict) -> tuple[int, dict]:
+    """Compile one candidate entirely off the aiohttp event loop.
+
+    The loaded project is request-local. This worker owns every CPU-heavy copy,
+    overlay, window-resolution and compiler step, and returns plain response
+    data so aiohttp objects remain loop-owned.
+    """
+    prepared = _prepare_prompt_context_candidate_sync(project, scene_id, body)
+    if isinstance(prepared, tuple):
+        return prepared
+    execution_window = _resolve_prompt_candidate_window(prepared, body)
+    if isinstance(execution_window, tuple):
+        return execution_window
+    return _compile_prepared_prompt_candidate(
+        prepared, execution_window,
         copy_plan_for=(body.get("copy_plan_for")
                        if isinstance(body.get("copy_plan_for"), dict)
                        else None))
-    compiled["execution_window"] = execution_window
-    compiled["candidate_base_modified_at"] = str(
-        getattr(project, "modified_at", "") or "")
-    return 200, compiled
+
+
+# The streamed paired preview (`plans/cut-read-fanout.md` §3). Opt-in by
+# `preview_response`; every other caller, Copy Plan included, keeps the ordinary
+# JSON response. Records are delivered in this order, so the live window's
+# result is readable while the scene-wide projection still compiles.
+PROMPT_PREVIEW_STREAM = "stream-v1"
+PROMPT_PREVIEW_PROJECTIONS = ("windowed", "scene")
+PROMPT_PREVIEW_STREAM_CONTENT_TYPE = "application/x-ndjson"
+
+
+def _prompt_preview_stream_request(body: dict) -> tuple[list[str], None] | tuple[None, tuple[int, dict]]:
+    """The requested projections in delivery order, or the refusal."""
+    projections = body.get("projections")
+    if (not isinstance(projections, list) or not projections
+            or any(value not in PROMPT_PREVIEW_PROJECTIONS for value in projections)
+            or len(set(projections)) != len(projections)):
+        return None, (400, {
+            "error": "projections must list windowed and/or scene once each",
+            "code": "invalid_prompt_preview_projections",
+        })
+    if "copy_plan_for" in body:
+        # A plan answers for one window; it is never a projection record.
+        return None, (400, {
+            "error": "Copy Plan uses the ordinary compile response",
+            "code": "invalid_prompt_preview_response",
+        })
+    return [name for name in PROMPT_PREVIEW_PROJECTIONS if name in projections], None
+
+
+def _scene_projection_body(prepared: _PreparedPromptCandidate, body: dict) -> dict:
+    """The request a separate scene-wide compile would have sent.
+
+    A full-scene SELECTION, not a full-scene window: the server resolves the
+    real window from `selection +/- context`, so window fields alone would
+    compile the narrow window again. At a full-scene selection the context frames
+    clamp to zero and the frame constraint moves `frame_count`, not `render_end`,
+    so both are kept exactly as the windowed request sends them. The duration is
+    the one `editor_widget.js::_promptSceneRequestBody` sends.
+    """
+    duration = max(1, int(prepared.candidate.duration_frames or 0))
+    return {**body, "window_start": 0, "window_end": duration,
+            "selection_start": 0, "selection_end": duration}
+
+
+def _prepare_prompt_preview_stream_sync(
+        project: TimelineProject, scene_id: str, body: dict,
+        projections: list[str]) -> tuple[_PreparedPromptCandidate, dict] | tuple[int, dict]:
+    """Shared validation for a streamed pair, all of it before the stream opens.
+
+    Both windows are resolved here, so a refusal is still an ordinary JSON
+    response. Neither can fail where a separate request for it would not have:
+    the scene window differs only in server-built selection integers.
+    """
+    prepared = _prepare_prompt_context_candidate_sync(project, scene_id, body)
+    if isinstance(prepared, tuple):
+        return prepared
+    windows = {}
+    for name in projections:
+        window = _resolve_prompt_candidate_window(
+            prepared, body if name == "windowed" else _scene_projection_body(prepared, body))
+        if isinstance(window, tuple):
+            return window
+        windows[name] = window
+    return prepared, windows
+
+
+def _prompt_preview_record_sync(
+        prepared: _PreparedPromptCandidate, name: str, window: dict,
+        reuse: dict | None = None) -> tuple[bytes, dict | None]:
+    """One encoded record, compiled and serialized in a worker.
+
+    `reuse` is the windowed result when its render window equals the scene's:
+    the compile reads only the render window, so a second evaluation would
+    return the same payload.
+    """
+    version = str(getattr(prepared.project, "modified_at", "") or "")
+
+    def encode(status: int, payload: dict) -> bytes:
+        record = {"projection": name, "status": status, "payload": payload,
+                  "candidate_base_modified_at": version}
+        return (json.dumps(record) + "\n").encode("utf-8")
+
+    try:
+        if reuse is not None:
+            status, payload = 200, {**reuse, "execution_window": window}
+        else:
+            status, payload = _compile_prepared_prompt_candidate(prepared, window)
+        # Serialized inside the guard: a payload that cannot be encoded fails
+        # this record, not the stream.
+        return encode(status, payload), (payload if status == 200 else None)
+    except ProjectStorageError:
+        logger.exception("Sonder prompt preview %s projection: project storage unreadable", name)
+        return encode(500, {"error": PROJECT_STORAGE_UNREADABLE_MESSAGE,
+                            "code": "project_storage_unreadable"}), None
+    except Exception:
+        # The stream has started, so the response cannot become a 500; only
+        # this record fails. The message stays generic: it reaches the browser.
+        logger.exception("Sonder prompt preview %s projection failed", name)
+        return encode(500, {"error": "Prompt Context preview failed",
+                            "code": "prompt_preview_projection_failed"}), None
+
+
+def _request_disconnected(request: web.Request) -> bool:
+    transport = getattr(request, "transport", None)
+    return transport is None or transport.is_closing()
+
+
+async def _stream_prompt_preview(
+        request: web.Request, project: TimelineProject, body: dict,
+        projections: list[str]) -> web.StreamResponse:
+    def abandon(skipped: list[str], answer: web.StreamResponse) -> web.StreamResponse:
+        # The browser has gone. Work not yet started is skipped; a worker
+        # already running is not cancelled -- nothing can cancel it -- and is
+        # not claimed to be. aiohttp ignores a response it can no longer send.
+        if skipped:
+            record_diag_event(
+                "prompt_preview_stream_abandoned",
+                project_id=_middleware_project_id(request),
+                scene_id=str(request.match_info.get("scene_id", "") or ""),
+                skipped=skipped)
+        return answer
+
+    gone = web.Response(status=499)
+    if _request_disconnected(request):
+        return abandon(list(projections), gone)
+    prepared = await asyncio.to_thread(
+        _prepare_prompt_preview_stream_sync, project,
+        request.match_info["scene_id"], body, projections)
+    if not isinstance(prepared[0], _PreparedPromptCandidate):
+        status, payload = prepared
+        return web.json_response(payload, status=status)
+    prepared, windows = prepared
+    if _request_disconnected(request):
+        return abandon(list(projections), gone)
+    response = web.StreamResponse(status=200, headers={
+        "Content-Type": f"{PROMPT_PREVIEW_STREAM_CONTENT_TYPE}; charset=utf-8",
+        "Cache-Control": "no-store",
+    })
+    # The middlewares that add these run after the handler returns, which is
+    # after the headers of a streamed response have been sent.
+    _attach_project_version_headers(
+        response,
+        getattr(project, "project_id", "") or _middleware_project_id(request),
+        getattr(project, "modified_at", ""))
+    _apply_sonder_security_headers(request, response)
+    try:
+        await response.prepare(request)
+    except (ConnectionResetError, ConnectionError, RuntimeError):
+        return abandon(list(projections), response)
+
+    windowed = None
+    for index, name in enumerate(projections):
+        if _request_disconnected(request):
+            return abandon(list(projections[index:]), response)
+        window = windows[name]
+        reuse = None
+        if (name == "scene" and windowed is not None
+                and (window["render_start"], window["render_end"])
+                == (windows["windowed"]["render_start"], windows["windowed"]["render_end"])):
+            reuse = windowed
+        line, compiled = await asyncio.to_thread(
+            _prompt_preview_record_sync, prepared, name, window, reuse)
+        if name == "windowed":
+            windowed = compiled
+        try:
+            await response.write(line)
+        except (ConnectionResetError, ConnectionError, RuntimeError):
+            return abandon(list(projections[index + 1:]), response)
+    try:
+        await response.write_eof()
+    except (ConnectionResetError, ConnectionError, RuntimeError):
+        pass
+    return response
 
 
 if routes is not None:
@@ -10934,6 +11155,16 @@ if routes is not None:
             return _json_error("Invalid JSON body", 400)
         if not isinstance(body, dict):
             return _json_error("Prompt Context candidate must be an object", 400)
+        projections = None
+        if "preview_response" in body:
+            if body.get("preview_response") != PROMPT_PREVIEW_STREAM:
+                return web.json_response({
+                    "error": "Unknown preview_response",
+                    "code": "invalid_prompt_preview_response",
+                }, status=400)
+            projections, refusal = _prompt_preview_stream_request(body)
+            if refusal is not None:
+                return web.json_response(refusal[1], status=refusal[0])
         try:
             project = await run_project_io(
                 _load_project_from_request, request,
@@ -10952,6 +11183,8 @@ if routes is not None:
                 current_data=project_conflict_projection(project),
             )
 
+        if projections is not None:
+            return await _stream_prompt_preview(request, project, body, projections)
         status, payload = await asyncio.to_thread(
             _compile_prompt_context_candidate_sync,
             project,

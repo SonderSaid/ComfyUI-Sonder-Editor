@@ -566,6 +566,10 @@ import { createPromptCompileCoordinator } from "./prompt_compile_coordinator.js"
 import {
     pendingPromptWorkAnswers, promptCompileSemanticKey, promptResultAnswers,
 } from "./prompt_preview_freshness.js";
+import {
+    PROMPT_PREVIEW_STREAM, PromptPreviewStreamError, isPromptPreviewStream,
+    readPromptPreviewRecords,
+} from "./prompt_preview_stream.js";
 import { applyPromptIdentityChange, sameIdentitySnapshot } from "./prompt_identity_panel.js";
 import {
     promptIdentityCleanupPlan,
@@ -936,9 +940,7 @@ export class EditorWidget {
         });
         this._projectMutationCloseInProgress = null;
         this._promptCompileCoordinator = createPromptCompileCoordinator(
-            ({ purpose, projectId, sceneId, body, requestId, isCurrent }) =>
-                this._requestPromptContextCompile(
-                    projectId, sceneId, body, isCurrent, { purpose, requestId }));
+            (request) => this._requestPromptPreviewPair(request));
 
         // Asset state
         this.assets = { video: [], image: [], audio: [], artifact: [] };
@@ -15185,18 +15187,8 @@ export class EditorWidget {
             const value = await response.json().catch(() => null);
             const payload = value && typeof value === "object" && !Array.isArray(value)
                 ? value : null;
-            rememberProjectVersionFromResponse(response, dirName);
-            rememberProjectVersionFromPayload(payload, dirName);
-            const conflict = response.status === 409
-                && payload?.code === "project_version_conflict";
-            if (conflict) {
-                const actual = String(payload.actual_modified_at || "");
-                if (actual && sentVersion && actual < sentVersion) {
-                    resetProjectVersion(dirName, actual);
-                } else if (actual) {
-                    rememberProjectVersion(dirName, actual);
-                }
-            }
+            const conflict = this._healPromptCompileConflict(
+                response, payload, dirName, sentVersion);
             // Even an obsolete 409 heals the shared version map, but ownership
             // is required before any retry or result leaves this helper.
             if (!current()) return null;
@@ -15207,17 +15199,123 @@ export class EditorWidget {
         return null;
     }
 
-    _queuePromptContextCompile(purpose, dirName, sceneId, body, isCurrent) {
-        // Extracted-method test harnesses intentionally omit constructor state.
-        // Production always owns the coordinator; the fallback preserves that
-        // narrow harness seam without creating a second runtime authority.
-        if (!this._promptCompileCoordinator?.schedule) {
-            return this._requestPromptContextCompile(
-                dirName, sceneId, body, isCurrent, { purpose });
+    /** Heal the shared version map from a compile answer; true on a conflict. */
+    _healPromptCompileConflict(response, payload, dirName, sentVersion) {
+        rememberProjectVersionFromResponse(response, dirName);
+        rememberProjectVersionFromPayload(payload, dirName);
+        const conflict = response.status === 409
+            && payload?.code === "project_version_conflict";
+        if (conflict) {
+            const actual = String(payload.actual_modified_at || "");
+            if (actual && sentVersion && actual < sentVersion) {
+                resetProjectVersion(dirName, actual);
+            } else if (actual) {
+                rememberProjectVersion(dirName, actual);
+            }
         }
+        return conflict;
+    }
+
+    /**
+     * One streamed paired preview request (`plans/cut-read-fanout.md` §3).
+     *
+     * The coordinator's dispatch. Records are delivered through `onRecord` as
+     * they arrive, windowed first, so the live window's result shows while the
+     * scene-wide projection is still compiling. A refusal before the stream
+     * opens -- a version conflict, a bad request -- is one ordinary JSON answer,
+     * delivered to every requested projection, as two separate requests would
+     * each have received it. The bounded retry is `_requestPromptContextCompile`'s:
+     * once, from the same snapshot, and only while some branch can still use it.
+     */
+    async _requestPromptPreviewPair({ projectId: dirName, sceneId, body, projections,
+        requestId = "", signal = undefined, isCurrent = () => true, onRecord }) {
+        const current = () => !this._destroyed
+            && dirName === this._projectDirName()
+            && sceneId === this.activeSceneId && isCurrent();
+        const requestBody = { ...structuredClone(body),
+            preview_response: PROMPT_PREVIEW_STREAM, projections: [...projections] };
+        for (let attempt = 0; attempt < 2; attempt++) {
+            if (!current()) return;
+            const sentVersion = String(requestBody.base_modified_at || "");
+            const response = await fetch(api.apiURL(
+                `/sonder-editor/project/${encodeURIComponent(dirName)}/scenes/${encodeURIComponent(sceneId)}/prompt-context/compile`
+            ), {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "X-Sonder-Prompt-Purpose": "paired-preview",
+                    "X-Sonder-Prompt-Request-Id": String(requestId || ""),
+                    "X-Sonder-Prompt-Attempt": String(attempt + 1),
+                },
+                body: JSON.stringify(requestBody),
+                signal,
+            });
+            if (isPromptPreviewStream(response)) {
+                rememberProjectVersionFromResponse(response, dirName);
+                await readPromptPreviewRecords(response, projections, (record) => {
+                    rememberProjectVersionFromPayload(record.payload, dirName);
+                    onRecord(record.projection, {
+                        response: { ok: record.status >= 200 && record.status < 300,
+                            status: record.status },
+                        payload: record.payload,
+                    });
+                });
+                return;
+            }
+            if (response.ok) {
+                // Frontend and backend deploy together; a success that is not a
+                // stream is a server that predates this editor, never a result.
+                throw new PromptPreviewStreamError(
+                    "The server answered the preview without streaming it. Restart"
+                    + " ComfyUI so the server matches this editor.");
+            }
+            const value = await response.json().catch(() => null);
+            const payload = value && typeof value === "object" && !Array.isArray(value)
+                ? value : null;
+            const conflict = this._healPromptCompileConflict(
+                response, payload, dirName, sentVersion);
+            if (!current()) return;
+            if (!conflict || attempt === 1) {
+                for (const name of projections) onRecord(name, { response, payload });
+                return;
+            }
+            // Never rebuild selection/context or authoring between attempts.
+            requestBody.base_modified_at = getProjectVersion(dirName);
+        }
+    }
+
+    /** Schedule one paired preview; resolves one promise per requested branch. */
+    _queuePromptPreviewPair(dirName, sceneId, body, branches) {
+        // Extracted-method test harnesses omit constructor state; production
+        // creates this one coordinator in the constructor.
+        this._promptCompileCoordinator ||= createPromptCompileCoordinator(
+            (request) => this._requestPromptPreviewPair(request));
         return this._promptCompileCoordinator.schedule({
-            purpose, projectId: dirName, sceneId, body, isCurrent,
+            projectId: dirName, sceneId, body, branches,
         });
+    }
+
+    /** Whether a held branch result already answers `key` at the current version. */
+    _promptBranchAnswered(cache, key, dirName, sceneId, version = getProjectVersion(dirName)) {
+        return !!key && promptResultAnswers({ cache, sceneId, key, projectId: dirName,
+            version, certifiedUnchanged });
+    }
+
+    /**
+     * Whether a carried branch's success still holds at the current version.
+     *
+     * Carried work was sent before a transition its key cannot see -- project-
+     * level state such as identities or the Reference Library never enters the
+     * key -- so it lands only when it was compiled at the current version or
+     * certificates prove the prompt read unchanged since. Otherwise the
+     * re-request queued behind it answers, and the held result stays dimmed.
+     */
+    _promptCarriedResultHolds(result, dirName, sceneId) {
+        const from = String(result?.payload?.candidate_base_modified_at || "");
+        const to = String(getProjectVersion(dirName) || "");
+        if (!from || !to) return false;
+        return from === to || certifiedUnchanged({ projectId: dirName, sceneId,
+            fromVersion: from, toVersion: to, dependency: "prompt" }) === true;
     }
 
     _failedPromptContextCandidate(sceneId, diagnostic) {
@@ -15381,100 +15479,118 @@ export class EditorWidget {
     }
 
     /**
-     * The same candidate, compiled over the WHOLE scene, for dormant sections.
+     * The request a scene-wide projection answers: the same candidate as `body`,
+     * compiled over the WHOLE scene, for dormant sections.
      *
-     * Fired from inside the windowed preview so both requests describe the same
-     * candidate by construction — two hand-built bodies is how a surface ends up
-     * answering about a scene the author is not looking at, which is the reason
-     * `_promptCompileRequestBody` exists at all.
+     * Derived from the windowed body so both describe the same candidate by
+     * construction — two hand-built bodies is how a surface ends up answering
+     * about a scene the author is not looking at, which is the reason
+     * `_promptCompileRequestBody` exists at all. A streamed pair sends only the
+     * windowed body, and the server derives exactly this from it
+     * (`routes.py::_scene_projection_body`), so the key made here is the key of
+     * the record the server sends.
      *
-     * NOTE it passes a full-scene SELECTION, not a full-scene window. The
+     * NOTE it is a full-scene SELECTION, not a full-scene window. The
      * server reads `window_start`/`window_end` only as defaults for the
      * selection and resolves the real window from `selection ± context`, so
      * window fields alone would have compiled the narrow window again. At a
      * full-scene selection the context frames clamp to zero by arithmetic and
      * the frame constraint moves `frame_count` rather than `render_end`, so
-     * both can be left exactly as the windowed request sends them.
+     * both are left exactly as the windowed request sends them.
      */
-    _previewPromptContextScenePayload({ dirName, sceneId, candidate,
-        windowStart, windowEnd, promptSemanticUnitCreates = [] }) {
+    _promptSceneRequestBody(body, duration) {
+        return { ...body, window_start: 0, window_end: duration,
+            selection_start: 0, selection_end: duration };
+    }
+
+    /**
+     * Start the scene-wide branch of a paired preview, or retire it.
+     *
+     * Returns the branch spec the coordinator and `_landPromptScenePayload`
+     * share, or null when no scene-wide compile applies: when the window IS
+     * the scene, the two compiles would be identical, so the held projection is
+     * dropped. `token` is the scene token of the intent that asked for this
+     * work; an intent that must not let older work land has already bumped it.
+     */
+    _beginPromptScenePayload({ dirName, sceneId, candidate, windowStart, windowEnd,
+        body, token }) {
         const duration = Math.max(1, Math.round(
             candidate.duration_frames ?? this.totalFrames ?? 1));
-        // Bumped BEFORE the early return too: a fetch issued while a
-        // selection was active is still in flight when the selection clears, and
-        // without a new token it passes its own guard and repopulates a cache
-        // that was deliberately emptied.
-        const token = (this._promptContextScenePayloadToken || 0) + 1;
-        this._promptContextScenePayloadToken = token;
         const pending = (this._promptPreviewPending ||= {});
         if (windowStart <= 0 && windowEnd >= duration) {
-            // The window IS the scene, so the two compiles would be identical.
             this._promptContextScenePayloadCache = null;
             pending.scene = null;
             this._clearPromptStaleVisualTimerIfSettled(sceneId);
-            return;
+            return null;
         }
-        const settlePending = () => {
-            if (pending.scene?.token === token) pending.scene = null;
+        const key = this._promptCompileKey?.(this._promptSceneRequestBody(body, duration)) || "";
+        const entry = { state: "inflight", key, sceneId, token,
+            version: String(body.base_modified_at || "") };
+        pending.scene = entry;
+        return {
+            key, token, entry,
+            isCurrent: () => token === this._promptContextScenePayloadToken,
+            stillNeeded: () => !this._promptBranchAnswered?.(
+                this._promptScenePayload(), key, dirName, sceneId),
+            answers: (next) => !!key
+                && this._promptCompileKey?.(this._promptSceneRequestBody(next, duration)) === key,
+            acceptsCarried: (result) => this._promptCarriedResultHolds?.(
+                result, dirName, sceneId) === true,
         };
-        (async () => {
-            try {
-                const body = this._promptCompileRequestBody({
-                    dirName, candidate, windowStart: 0, windowEnd: duration,
-                    selection: { selectionStart: 0, selectionEnd: duration },
-                    promptSemanticUnitCreates,
-                });
-                const key = this._promptCompileKey?.(body) || "";
-                pending.scene = { state: "inflight", key, sceneId, token,
-                    version: String(body.base_modified_at || "") };
-                const result = await (this._queuePromptContextCompile
-                    ? this._queuePromptContextCompile(
-                        "scene-projection", dirName, sceneId, body,
-                        () => token === this._promptContextScenePayloadToken)
-                    : this._requestPromptContextCompile(
-                        dirName, sceneId, body,
-                        () => token === this._promptContextScenePayloadToken));
-                if (!result || this._destroyed || dirName !== this._projectDirName()
-                        || sceneId !== this.activeSceneId
-                        || token !== this._promptContextScenePayloadToken) return;
-                settlePending();
-                const { response, payload } = result;
-                if (!response.ok || !payload) {
-                    this._promptContextScenePayloadCache = null;
-                    this._clearPromptStaleVisualTimerIfSettled(sceneId);
-                    this._refreshInlinePromptProjections?.();
-                    this._promptPanelHandle?.refreshProjections?.();
-                    this._renderTimeline();
-                    return;
-                }
-                this._promptContextScenePayloadCache = {
-                    ...this._promptProjectionSubset(payload),
-                    _candidate_scene_id: sceneId,
-                    _stale: false,
-                    // What this result answers for (`prompt_preview_freshness.js`).
-                    _semantic_key: key,
-                    _version: String(payload.candidate_base_modified_at
-                        || body.base_modified_at || ""),
-                };
+    }
+
+    /** Apply a scene-wide branch result, if it still owns the branch. */
+    async _landPromptScenePayload({ dirName, sceneId, spec, result }) {
+        const { token, key, entry } = spec;
+        const owns = () => !this._destroyed && dirName === this._projectDirName()
+            && sceneId === this.activeSceneId
+            && token === this._promptContextScenePayloadToken;
+        const settlePending = () => {
+            if (this._promptPreviewPending?.scene === entry) this._promptPreviewPending.scene = null;
+        };
+        try {
+            const value = await result;
+            if (!value || !owns()) return;
+            settlePending();
+            if (value.satisfied) {
+                // A result that landed meanwhile already answers; nothing was sent.
                 this._clearPromptStaleVisualTimerIfSettled(sceneId);
-            } catch (error) {
-                // A dormant projection is an aid, not a result. Leaving the
-                // cache null degrades to the empty box this feature replaces
-                // rather than to a wrong one, so a failure is not reported.
-                if (this._destroyed || dirName !== this._projectDirName()
-                        || sceneId !== this.activeSceneId
-                        || token !== this._promptContextScenePayloadToken) return;
-                settlePending();
+                return;
+            }
+            const { response, payload } = value;
+            if (!response.ok || !payload) {
                 this._promptContextScenePayloadCache = null;
                 this._clearPromptStaleVisualTimerIfSettled(sceneId);
+                this._refreshInlinePromptProjections?.();
+                this._promptPanelHandle?.refreshProjections?.();
+                this._renderTimeline();
+                return;
             }
-            // Deliberately NOT `refreshDiagnostics` and NOT `applyCandidate`.
-            // Diagnostics must stay windowed-only, and Reference Prompting
-            // derives from a `setup_manifest` this payload does not carry.
-            this._refreshInlinePromptProjections?.();
-            this._promptPanelHandle?.refreshProjections?.();
-            this._renderTimeline();
-        })();
+            this._promptContextScenePayloadCache = {
+                ...this._promptProjectionSubset(payload),
+                _candidate_scene_id: sceneId,
+                _stale: false,
+                // What this result answers for (`prompt_preview_freshness.js`).
+                _semantic_key: key,
+                _version: String(payload.candidate_base_modified_at
+                    || entry.version || ""),
+            };
+            this._clearPromptStaleVisualTimerIfSettled(sceneId);
+        } catch (error) {
+            // A dormant projection is an aid, not a result. Leaving the
+            // cache null degrades to the empty box this feature replaces
+            // rather than to a wrong one, so a failure is not reported.
+            if (!owns()) return;
+            settlePending();
+            this._promptContextScenePayloadCache = null;
+            this._clearPromptStaleVisualTimerIfSettled(sceneId);
+        }
+        // Deliberately NOT `refreshDiagnostics` and NOT `applyCandidate`.
+        // Diagnostics must stay windowed-only, and Reference Prompting
+        // derives from a `setup_manifest` this payload does not carry.
+        this._refreshInlinePromptProjections?.();
+        this._promptPanelHandle?.refreshProjections?.();
+        this._renderTimeline();
     }
 
     /**
@@ -15487,6 +15603,13 @@ export class EditorWidget {
      * `revoke` marks pending work for a DIFFERENT key that must not land.
      * A selection-only change therefore re-runs only the windowed branch, and a
      * certified prompt-irrelevant edit re-runs neither and marks nothing stale.
+     *
+     * `carry` is the one case in between: work for the SAME key in flight at
+     * an older version. It is not joined, because it may fail and would strand
+     * every intent joined to it, and it is not revoked either: it may still
+     * land. The re-request queued behind it is then dropped as satisfied before
+     * it is sent when certificates prove the transitions since irrelevant
+     * (`prompt_compile_coordinator.js`), and sent otherwise.
      *
      * The bodies here are built only to key the intent; the requests build
      * their own at dispatch, at whatever version then holds.
@@ -15514,29 +15637,31 @@ export class EditorWidget {
         const decide = (branch, cache, body) => {
             const key = promptCompileSemanticKey(body);
             const pending = pendingFor(branch);
-            const args = { sceneId, key, projectId: dirName, version, certifiedUnchanged };
-            if (pendingPromptWorkAnswers({ ...args, pending })) {
-                return { state: "joined", key, revoke: false };
+            if (pendingPromptWorkAnswers({ pending, sceneId, key, version })) {
+                return { state: "joined", key, revoke: false, carry: false };
             }
-            const revoke = !!pending && (pending.state === "scheduled" || pending.state === "inflight");
-            if (promptResultAnswers({ ...args, cache })) return { state: "current", key, revoke };
-            return { state: "work", key, revoke };
+            const carry = pending?.state === "inflight" && pending.key === key
+                && pending.sceneId === sceneId;
+            const revoke = !!pending && !carry
+                && (pending.state === "scheduled" || pending.state === "inflight");
+            if (this._promptBranchAnswered(cache, key, dirName, sceneId, version)) {
+                return { state: "current", key, revoke, carry };
+            }
+            return { state: "work", key, revoke, carry };
         };
-        const windowed = decide("windowed", this._windowedPromptCandidate(),
-            this._promptCompileRequestBody({ dirName, candidate, windowStart, windowEnd,
-                selection, promptSemanticUnitCreates }));
+        const windowedBody = this._promptCompileRequestBody({ dirName, candidate,
+            windowStart, windowEnd, selection, promptSemanticUnitCreates });
+        const windowed = decide("windowed", this._windowedPromptCandidate(), windowedBody);
         const duration = Math.max(1, Math.round(
             candidate.duration_frames ?? this.totalFrames ?? 1));
         let scene;
         if (windowStart <= 0 && windowEnd >= duration) {
             // No scene-wide compile applies; only a cache or pending work to retire.
             scene = { state: (this._promptContextScenePayloadCache || pendingFor("scene"))
-                ? "work" : "current", key: "", revoke: false };
+                ? "work" : "current", key: "", revoke: false, carry: false };
         } else {
-            scene = decide("scene", this._promptScenePayload(), this._promptCompileRequestBody({
-                dirName, candidate, windowStart: 0, windowEnd: duration,
-                selection: { selectionStart: 0, selectionEnd: duration },
-                promptSemanticUnitCreates }));
+            scene = decide("scene", this._promptScenePayload(),
+                this._promptSceneRequestBody(windowedBody, duration));
         }
         // A current result answers for the newer version too; advancing it
         // means the next decision needs only the certificates after this one.
@@ -15582,8 +15707,10 @@ export class EditorWidget {
             && pending[branch]?.state === "scheduled";
         const runWindowed = !plan || plan.windowed.state === "work" || keepsScheduled("windowed");
         const runScene = !plan || plan.scene.state === "work" || keepsScheduled("scene");
-        const revokeWindowed = runWindowed || !!plan?.windowed.revoke;
-        const revokeScene = runScene || !!plan?.scene.revoke;
+        // New work takes a new token so older work cannot land -- except work
+        // it carries, which asks for exactly this and may still land.
+        const revokeWindowed = (runWindowed && !plan?.windowed.carry) || !!plan?.windowed.revoke;
+        const revokeScene = (runScene && !plan?.scene.carry) || !!plan?.scene.revoke;
         if (this._promptContextPreviewTimer) clearTimeout(this._promptContextPreviewTimer);
         if (this._promptContextStaleVisualTimer) {
             clearTimeout(this._promptContextStaleVisualTimer);
@@ -15681,36 +15808,60 @@ export class EditorWidget {
                     }
                 }, PROMPT_STALE_VISUAL_DELAY_MS);
             }
-            if (sceneLive) {
-                this._previewPromptContextScenePayload({
-                    dirName, sceneId, candidate, windowStart, windowEnd,
-                    promptSemanticUnitCreates });
+            // One body, one physical request: the server prepares the candidate
+            // once and derives the scene-wide projection from it.
+            const body = this._promptCompileRequestBody({
+                dirName, candidate, windowStart, windowEnd,
+                selection: candidateSelection,
+                promptSemanticUnitCreates,
+            });
+            const scene = sceneLive ? this._beginPromptScenePayload({
+                dirName, sceneId, candidate, windowStart, windowEnd, body,
+                token: sceneToken }) : null;
+            if (!windowedLive && !scene) return;
+            const windowedKey = windowedLive ? (this._promptCompileKey?.(body) || "") : "";
+            const windowedEntry = windowedLive ? { state: "inflight", key: windowedKey,
+                sceneId, token, version: String(body.base_modified_at || "") } : null;
+            if (windowedEntry) pending.windowed = windowedEntry;
+            const settleWindowedPending = () => {
+                if (pending.windowed === windowedEntry) pending.windowed = null;
+            };
+            let results;
+            try {
+                results = this._queuePromptPreviewPair(dirName, sceneId, body, {
+                    windowed: windowedLive ? {
+                        key: windowedKey,
+                        isCurrent: () => token === this._promptContextPreviewToken,
+                        stillNeeded: () => !this._promptBranchAnswered?.(
+                            this._windowedPromptCandidate(), windowedKey, dirName, sceneId),
+                        answers: (next) => !!windowedKey
+                            && this._promptCompileKey?.(next) === windowedKey,
+                        acceptsCarried: (result) => this._promptCarriedResultHolds?.(
+                            result, dirName, sceneId) === true,
+                    } : null,
+                    scene,
+                }) || {};
+            } catch (error) {
+                results = {};
+                if (windowedLive) results.windowed = Promise.reject(error);
+                if (scene) results.scene = Promise.reject(error);
+            }
+            if (scene) {
+                this._landPromptScenePayload({ dirName, sceneId, spec: scene,
+                    result: results.scene });
             }
             if (!windowedLive) return;
-            let windowedKey = "";
-            const settleWindowedPending = () => {
-                if (pending.windowed?.token === token) pending.windowed = null;
-            };
             try {
-                const body = this._promptCompileRequestBody({
-                    dirName, candidate, windowStart, windowEnd,
-                    selection: candidateSelection,
-                    promptSemanticUnitCreates,
-                });
-                windowedKey = this._promptCompileKey?.(body) || "";
-                pending.windowed = { state: "inflight", key: windowedKey, sceneId, token,
-                    version: String(body.base_modified_at || "") };
-                const result = await (this._queuePromptContextCompile
-                    ? this._queuePromptContextCompile(
-                        "windowed-preview", dirName, sceneId, body,
-                        () => token === this._promptContextPreviewToken)
-                    : this._requestPromptContextCompile(
-                        dirName, sceneId, body,
-                        () => token === this._promptContextPreviewToken));
+                const result = await results.windowed;
                 if (!result || this._destroyed || dirName !== this._projectDirName()
                         || sceneId !== this.activeSceneId
                         || token !== this._promptContextPreviewToken) return;
                 settleWindowedPending();
+                if (result.satisfied) {
+                    // A result that landed meanwhile already answers; nothing was sent.
+                    this._clearPromptStaleVisualTimerIfSettled(sceneId);
+                    return;
+                }
                 const { response, payload } = result;
                 const failed = !response.ok || !payload;
                 const diagnostic = failed ? {

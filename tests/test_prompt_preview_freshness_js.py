@@ -28,6 +28,7 @@ from test_prompt_authoring_ux import _method_body
 ROOT = Path(__file__).resolve().parents[1]
 FRESHNESS = (ROOT / "web/js/prompt_preview_freshness.js").as_uri()
 CLIENT = (ROOT / "web/js/api_client.js").as_uri()
+COORDINATOR = (ROOT / "web/js/prompt_compile_coordinator.js").as_uri()
 
 
 def _node(script: str) -> dict:
@@ -118,9 +119,12 @@ console.log(JSON.stringify({{
 # ---------------------------------------------------------------------------
 
 LIFTED = (
-    "_previewPromptContextScenePayload", "_planPromptPreviewBranches", "_promptCompileKey",
-    "_previewPromptContextCandidate", "_clearPromptStaleVisualTimerIfSettled",
-    "_windowedPromptCandidate", "_promptScenePayload", "_failedPromptContextCandidate",
+    "_beginPromptScenePayload", "_landPromptScenePayload", "_promptSceneRequestBody",
+    "_planPromptPreviewBranches", "_promptCompileKey", "_promptBranchAnswered",
+    "_promptCarriedResultHolds",
+    "_queuePromptPreviewPair", "_previewPromptContextCandidate",
+    "_clearPromptStaleVisualTimerIfSettled", "_windowedPromptCandidate",
+    "_promptScenePayload", "_failedPromptContextCandidate",
     "_promptProjectionSubset", "_promptCompileRequestBody",
 )
 
@@ -129,17 +133,30 @@ def _lifted_methods() -> str:
     widget = (ROOT / "web/js/editor_widget.js").read_text(encoding="utf-8")
     bodies = []
     for name in LIFTED:
-        start = widget.index("\n    " + name + "(")
-        bodies.append(_method_body(widget[start:], name))
+        for prefix in ("", "async "):
+            marker = "\n    " + prefix + name + "("
+            if marker in widget:
+                start = widget.index(marker)
+                bodies.append(prefix + _method_body(widget[start:], name))
+                break
+        else:
+            raise AssertionError(f"method {name} not found")
     return "\n".join(bodies)
 
 
 def _lifecycle(scenario: str) -> dict:
+    """The real widget methods and the real coordinator; only the network is fake.
+
+    Each physical request is recorded with the projections it asked for.
+    `respond` answers every unanswered one with a record per projection, and
+    `fail` picks which projections answer with a failure instead.
+    """
     script = f"""
 import {{ certifiedUnchanged, getProjectVersion, registerChangeCertificate,
          rememberProjectVersion }} from {json.dumps(CLIENT)};
 import {{ pendingPromptWorkAnswers, promptCompileSemanticKey, promptResultAnswers }}
     from {json.dumps(FRESHNESS)};
+import {{ createPromptCompileCoordinator }} from {json.dumps(COORDINATOR)};
 const PROMPT_STALE_VISUAL_DELAY_MS = 300;
 const templateFreezeValue = (value) => value;
 const projectErrorMessage = (_error, fallback) => fallback;
@@ -170,24 +187,35 @@ class Subject {{
   _getActiveFrameConstraint() {{ return null; }}
   _refreshInlinePromptProjections() {{}}
   _renderTimeline() {{}}
-  _queuePromptContextCompile(purpose, dirName, sceneId, body, isCurrent) {{
-    return new Promise((resolve) => requests.push({{ purpose, body, isCurrent, resolve,
-      answered: false }}));
+  _requestPromptPreviewPair(request) {{
+    return new Promise((done, fail) => {{
+      const row = {{ ...request, done, fail, answered: false, aborted: false }};
+      request.signal?.addEventListener("abort", () => {{
+        row.aborted = true; row.answered = true;
+        fail(Object.assign(new Error("aborted"), {{ name: "AbortError" }}));
+      }});
+      requests.push(row);
+    }});
   }}
 }}
 const tick = () => new Promise((resolve) => setTimeout(resolve, 5));
-const respond = async (filter = () => true, fail = false) => {{
-  for (const request of requests.filter((one) => !one.answered && filter(one))) {{
-    request.answered = true;
-    request.resolve(fail ? {{ response: {{ ok: false, status: 500 }}, payload: null }} : {{
-      response: {{ ok: true, status: 200 }},
-      payload: {{ prompt: request.body.scene.prompt_sections[0].text,
-        purpose: request.purpose, section_window_states: [],
-        candidate_base_modified_at: request.body.base_modified_at }} }});
+const textOf = (row) => row.body.scene.prompt_sections[0].text;
+const respond = async (filter = () => true, fail = () => false) => {{
+  for (const row of requests.filter((one) => !one.answered && filter(one))) {{
+    row.answered = true;
+    for (const name of row.projections) {{
+      row.onRecord(name, fail(name, row) ? {{ response: {{ ok: false, status: 500 }},
+        payload: {{ code: "boom" }} }} : {{
+        response: {{ ok: true, status: 200 }},
+        payload: {{ prompt: textOf(row), projection: name, section_window_states: [],
+          candidate_base_modified_at: row.body.base_modified_at }} }});
+    }}
+    row.done();
   }}
   await tick();
 }};
-const sent = () => requests.map((one) => one.purpose);
+// Every projection asked for, request by request, in dispatch order.
+const sent = () => requests.map((one) => one.projections.join("+"));
 const cert = (base, next, over = {{}}) => registerChangeCertificate({{
   schema: 1, project_id: "project", scene_id: "scene", base_modified_at: V(base),
   modified_at: V(next), prompt: false, bridge: false, ...over }}, {{ projectId: "project" }});
@@ -203,6 +231,8 @@ const state = () => ({{
     stale: !!subject._promptContextScenePayloadCache._stale,
     version: subject._promptContextScenePayloadCache._version || "" }},
 }});
+const queued = () => subject._promptCompileCoordinator.debugState().lanes
+  .flatMap((lane) => lane.trailing);
 rememberProjectVersion("project", V(1));
 await preview();
 await respond();
@@ -214,9 +244,9 @@ console.log(JSON.stringify(out));
     return _node(script)
 
 
-def test_the_first_preview_compiles_both_branches_and_records_what_they_answer():
+def test_the_first_preview_compiles_both_branches_in_one_request_and_records_what_they_answer():
     out = _lifecycle("")
-    assert sorted(out["first"]["sent"]) == ["scene-projection", "windowed-preview"]
+    assert out["first"]["sent"] == ["windowed+scene"]
     assert out["first"]["state"] == {
         "windowed": {"prompt": "A", "stale": False, "failed": False,
                      "version": "2026-09-27T10:00:01.000000"},
@@ -256,15 +286,15 @@ def test_a_flagged_or_uncertified_version_re_runs_both_branches():
 cert(1, 2, { prompt: true });
 rememberProjectVersion("project", V(2));
 await preview();
-out.flagged = sent().sort();
+out.flagged = sent();
 await respond();
 requests.length = 0;
 rememberProjectVersion("project", V(3));
 await preview();
-out.uncertified = sent().sort();
+out.uncertified = sent();
 """)
-    assert out["flagged"] == ["scene-projection", "windowed-preview"]
-    assert out["uncertified"] == ["scene-projection", "windowed-preview"]
+    assert out["flagged"] == ["windowed+scene"]
+    assert out["uncertified"] == ["windowed+scene"]
 
 
 def test_a_selection_change_re_runs_only_the_windowed_branch():
@@ -273,7 +303,7 @@ subject.selectionStart = 30; subject.selectionEnd = 60;
 await preview();
 out.selection = { sent: sent(), sceneStale: subject._promptContextScenePayloadCache._stale };
 """)
-    assert out["selection"] == {"sent": ["windowed-preview"], "sceneStale": False}
+    assert out["selection"] == {"sent": ["windowed"], "sceneStale": False}
 
 
 def test_an_authoring_change_re_runs_both_and_marks_both_stale_at_once():
@@ -293,40 +323,42 @@ subject._previewPromptContextCandidate(patch, 50);
 subject._previewPromptContextCandidate(patch, 50);   // joins the scheduled work
 await new Promise((resolve) => setTimeout(resolve, 80));
 await preview(patch);                                  // joins the in-flight work
-out.joined = sent().sort();
+out.joined = sent();
 await respond();
 out.after = state().windowed.prompt;
 """)
-    assert out["joined"] == ["scene-projection", "windowed-preview"]
+    assert out["joined"] == ["windowed+scene"]
     assert out["after"] == "B"
 
 
-def test_a_superseded_in_flight_result_never_lands():
+def test_a_superseded_in_flight_request_never_lands_and_keeps_its_lane():
     out = _lifecycle("""
 await preview({ prompt_sections: [{ prompt_id: "p", start_frame: 0, end_frame: 100, text: "B" }] });
-out.inFlight = sent().sort();
+out.inFlight = sent();
 // Back to "A". The held "A" result was marked stale when "B" was scheduled, so
-// "A" is asked again -- and "B", still in flight, must lose its authority.
+// "A" is asked again -- and "B", still in flight, loses its authority. It keeps
+// the lane until its response ends: the server cannot cancel it.
 await preview();
-const textOf = (one) => one.body.scene.prompt_sections[0].text;
-out.revoked = requests.map((one) => [one.purpose, textOf(one), one.isCurrent()]).sort();
+out.during = { sent: sent(), aborted: requests[0].aborted, live: requests[0].isCurrent() };
+await respond();               // "B" answers, and lands nowhere
+out.afterB = { sent: sent(), windowed: state().windowed.prompt };
 await respond();
 out.after = state();
 """)
-    assert out["inFlight"] == ["scene-projection", "windowed-preview"]
-    assert out["revoked"] == [
-        ["scene-projection", "A", True], ["scene-projection", "B", False],
-        ["windowed-preview", "A", True], ["windowed-preview", "B", False]]
+    assert out["inFlight"] == ["windowed+scene"]
+    assert out["during"] == {"sent": ["windowed+scene"], "aborted": False, "live": False}
+    assert out["afterB"] == {"sent": ["windowed+scene", "windowed+scene"], "windowed": "A"}
     assert out["after"]["windowed"]["prompt"] == "A"
+    assert out["after"]["windowed"]["stale"] is False
 
 
 def test_a_failure_never_answers_a_later_identical_intent():
     out = _lifecycle("""
 rememberProjectVersion("project", V(2));
 await preview();
-await respond((one) => one.purpose === "windowed-preview", true);
-await respond();
+await respond(() => true, (name) => name === "windowed");
 out.failed = state().windowed.failed;
+out.sceneFresh = state().scene.stale === false;
 requests.length = 0;
 cert(2, 3);
 rememberProjectVersion("project", V(3));
@@ -334,7 +366,8 @@ await preview();
 out.retried = sent();
 """)
     assert out["failed"] is True
-    assert out["retried"] == ["windowed-preview"]
+    assert out["sceneFresh"] is True       # one branch failing leaves the other landed
+    assert out["retried"] == ["windowed"]
 
 
 # The scene-switch block of `_setActiveScene` for a real switch, verbatim in effect.
@@ -351,53 +384,137 @@ const switchScene = (sceneId) => {
 """
 
 
+def test_the_scene_switch_block_is_the_one_the_widget_runs():
+    widget = (ROOT / "web/js/editor_widget.js").read_text(encoding="utf-8")
+    block = widget[widget.index("        if (!isSameScene) {"):]
+    block = block[:block.index("this._selectionDraftAnchor = null;")]
+    for line in ("this._promptContextScenePayloadToken =",
+                 "this._promptContextPreviewToken = (this._promptContextPreviewToken || 0) + 1;"):
+        assert line in block, line
+
+
 def test_work_a_scene_switch_orphaned_is_never_joined():
     """Phase 3 audit #1: A (in flight) -> B (no consumers) -> A must ask again."""
     out = _lifecycle(SWITCH_SCENE + """
 await preview({ prompt_sections: [{ prompt_id: "p", start_frame: 0, end_frame: 100, text: "B" }] });
-out.inFlight = sent().sort();
+out.inFlight = sent();
 switchScene("other");          // the Prompt tool is closed there: no preview runs
 await respond();               // the orphaned responses land nowhere
+out.orphanLanded = state();
 switchScene("scene");
 requests.length = 0;
 await preview({ prompt_sections: [{ prompt_id: "p", start_frame: 0, end_frame: 100, text: "B" }] });
-out.afterReturn = sent().sort();
+out.afterReturn = sent();
 await respond();
 out.state = state();
 """)
-    assert out["inFlight"] == ["scene-projection", "windowed-preview"]
-    assert out["afterReturn"] == ["scene-projection", "windowed-preview"]
+    assert out["inFlight"] == ["windowed+scene"]
+    assert out["orphanLanded"] == {"windowed": None, "scene": None}
+    assert out["afterReturn"] == ["windowed+scene"]
     assert out["state"]["windowed"]["prompt"] == "B"
     assert out["state"]["scene"] is not None
 
 
-def test_in_flight_work_is_not_joined_across_a_version_transition():
-    """Phase 3 audit #2: joined work that then fails must not strand the branch.
+def test_carried_work_that_fails_leaves_its_re_request_to_answer():
+    """Phase 3 audit #2 holds: work carried across a transition cannot strand a branch.
 
-    Once a transition lands, in-flight work sent at the older version is
-    re-sent rather than joined, so its failure cannot leave every later intent
-    waiting on it.
+    The same request in flight at an older version is carried, not joined and
+    not revoked. When it fails, its failure does not land; the re-request queued
+    behind it is sent and answers.
     """
     out = _lifecycle("""
 const patch = { prompt_sections: [{ prompt_id: "p", start_frame: 0, end_frame: 100, text: "B" }] };
 await preview(patch);
-out.first = sent().sort();
+out.first = sent();
 cert(1, 2);
 rememberProjectVersion("project", V(2));
 await preview(patch);          // same key, one certified irrelevant transition later
-out.resent = sent().sort();
-const stale = requests.filter((one) => one.body.base_modified_at === V(1));
-out.oldRevoked = stale.every((one) => !one.isCurrent());
-await respond((one) => one.body.base_modified_at === V(1), true);   // the old ones fail
+out.carried = { sent: sent(), queued: queued(), live: requests[0].isCurrent() };
+await respond(() => true, () => true);   // the carried request fails on both branches
+out.afterFailure = { sent: sent(), failed: state().windowed.failed };
 await respond();
 out.state = state();
 """)
-    assert out["first"] == ["scene-projection", "windowed-preview"]
-    assert out["resent"] == ["scene-projection", "scene-projection",
-                             "windowed-preview", "windowed-preview"]
-    assert out["oldRevoked"] is True
+    assert out["first"] == ["windowed+scene"]
+    assert out["carried"] == {"sent": ["windowed+scene"], "queued": [["windowed", "scene"]],
+                              "live": True}
+    assert out["afterFailure"] == {"sent": ["windowed+scene", "windowed+scene"],
+                                   "failed": False}
     assert out["state"]["windowed"] == {"prompt": "B", "stale": False, "failed": False,
                                         "version": "2026-09-27T10:00:02.000000"}
+
+
+def test_carried_work_that_lands_satisfies_its_re_request_without_sending_it():
+    out = _lifecycle("""
+const patch = { prompt_sections: [{ prompt_id: "p", start_frame: 0, end_frame: 100, text: "B" }] };
+await preview(patch);
+cert(1, 2);
+rememberProjectVersion("project", V(2));
+await preview(patch);
+await respond();               // the carried request lands at V1 ...
+out.sent = sent();             // ... and the certificate proves it for V2
+out.state = state();
+out.pending = subject._promptPreviewPending;
+requests.length = 0;
+await preview(patch);
+out.again = sent();
+""")
+    assert out["sent"] == ["windowed+scene"]
+    assert out["state"]["windowed"] == {"prompt": "B", "stale": False, "failed": False,
+                                        "version": "2026-09-27T10:00:01.000000"}
+    assert out["state"]["scene"]["stale"] is False
+    assert out["pending"] == {"windowed": None, "scene": None}
+    assert out["again"] == []
+
+
+def test_carried_work_across_an_unproven_transition_stays_dimmed_until_its_re_request():
+    """Audit #1: the key cannot see project-level state, so a carried result sent
+    before a transition lands only when that transition is certified away."""
+    out = _lifecycle("""
+const patch = { prompt_sections: [{ prompt_id: "p", start_frame: 0, end_frame: 100, text: "B" }] };
+await preview(patch);
+cert(1, 2, { prompt: true });  // e.g. an identity edit: same key, prompt read changed
+rememberProjectVersion("project", V(2));
+await preview(patch);
+out.stale = state().windowed.stale;
+await respond();               // the carried V1 result must not land as fresh
+out.afterCarried = { sent: sent(), windowed: state().windowed, scene: state().scene };
+await respond();
+out.state = state();
+""")
+    assert out["stale"] is True
+    assert out["afterCarried"]["sent"] == ["windowed+scene", "windowed+scene"]
+    assert out["afterCarried"]["windowed"]["stale"] is True
+    assert out["afterCarried"]["windowed"]["prompt"] == "A"
+    assert out["afterCarried"]["scene"]["stale"] is True
+    assert out["state"]["windowed"] == {"prompt": "B", "stale": False, "failed": False,
+                                        "version": "2026-09-27T10:00:02.000000"}
+    assert out["state"]["scene"] == {"stale": False, "version": "2026-09-27T10:00:02.000000"}
+
+
+def test_a_scene_result_landing_during_a_selection_burst_removes_the_queued_scene_work():
+    """§3: recalculate before dispatching trailing work."""
+    out = _lifecycle("""
+const patch = { prompt_sections: [{ prompt_id: "p", start_frame: 0, end_frame: 100, text: "B" }] };
+await preview(patch);                                  // authoring: both branches in flight
+cert(1, 2);                                            // a lane lock lands meanwhile
+rememberProjectVersion("project", V(2));
+subject.selectionStart = 30; subject.selectionEnd = 60;
+await preview(patch);                                  // a new window; the scene work is carried
+subject.selectionStart = 35; subject.selectionEnd = 65;
+await preview(patch);
+out.queued = queued();
+await respond();                                       // the carried scene result lands
+await respond();
+out.sent = sent();
+out.state = state();
+""")
+    assert out["queued"] == [["windowed", "scene"]]
+    # The scene re-request was dropped as satisfied; only the newest window went out.
+    assert out["sent"] == ["windowed+scene", "windowed"]
+    assert out["state"]["scene"] == {"stale": False, "version": "2026-09-27T10:00:01.000000"}
+    assert out["state"]["windowed"]["prompt"] == "B"
+    assert out["state"]["windowed"]["stale"] is False
 
 
 def test_the_hidden_narrowing_matches_the_server_projection():
