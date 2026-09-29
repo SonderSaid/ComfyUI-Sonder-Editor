@@ -252,7 +252,7 @@ ComfyUI.
 
 ## Requirements
 
-- **ComfyUI** — 0.7.3 was validated on ComfyUI **0.37.0** with frontend
+- **ComfyUI** — 0.7.4 was validated on ComfyUI **0.37.0** with frontend
   **1.53.6**. That is what this release was tested against, not a minimum;
   other versions are expected to work. The V3 nodes noted above load only on
   builds that provide `comfy_api`, and the complete V1 set loads otherwise.

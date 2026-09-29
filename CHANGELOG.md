@@ -11,9 +11,11 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-09-29
+
 ### Changed
-- In the full editor, a timeline edit that can't change the prompt preview or the Reference nodes no longer refreshes them. That covers moving, trimming, cutting or muting a clip, and locking, colouring or renaming a media lane. On a large project each such edit used to keep ComfyUI busy for another 7–8 seconds after its save.
-- The Prompt tool's preview for the current selection and its view of sections outside the selection now arrive from a single request, and the current selection shows first. Changing only the selection refreshes just the current-selection preview.
+- In the full editor, a timeline edit that can't change the prompt preview or the Reference nodes no longer refreshes them. That covers moving, trimming, cutting or muting a clip, and locking, coloring or renaming a media lane. On a large project each such edit used to keep ComfyUI busy for another 7–8 seconds after its save.
+- Prompt Management's preview for the current selection and its view of sections outside the selection now arrive from a single request, and the current selection shows first. Changing only the selection refreshes just the current-selection preview.
 - MiniMax H3 prompt previews and the Reference nodes no longer read every asset's generation details. On a 757-asset project the preview now arrives in about 1 second instead of 2–8.
 
 ### Fixed
