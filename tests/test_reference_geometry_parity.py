@@ -929,3 +929,28 @@ def test_a_painted_scalar_update_stores_the_routes_member_records():
     route = _python_update("item-1", {"strength": 0.5}, None)
     assert planned["painted"]["members"] == route["row"]["members"] == [
         PRESERVED_A, _members("b")[0]]
+
+
+def test_the_planned_update_does_not_mind_member_key_order():
+    """Live regression: a stored member record keeps its own key order through
+    the unknown-field overlay, which can differ from the order the route builds
+    records in. Python's `==` ignores the order; a planner comparing by plain
+    `JSON.stringify` declined every edit of an item holding a stored retention."""
+    context = _update_context("item-1", None)
+    for member in context["item"]["members"]:
+        member_sorted = dict(sorted(member.items(), reverse=True))
+        member.clear()
+        member.update(member_sorted)
+    script = f"""
+const mod = await import({json.dumps(MODULE_URL)});
+const context = {json.dumps(context)};
+console.log(JSON.stringify(mod.plannedReferenceItemUpdate(context.item, {{ strength: 0.5 }}, {{
+  durationFrames: context.durationFrames, laneItems: context.laneItems,
+  laneRecipe: context.laneRecipe, laneCount: context.laneCount,
+  entityIdFor: (id) => context.owners[id] || "",
+  assetFor: (id) => context.assets[id] || null }})));
+"""
+    planned = _node(script)
+    assert list(context["item"]["members"][0]) == ["visual_intent", "member_id", "entity_id"]
+    assert planned["paintable"] is True
+    assert planned["painted"] == _python_update("item-1", {"strength": 0.5}, None)["row"]

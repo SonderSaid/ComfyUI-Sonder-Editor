@@ -14,6 +14,12 @@ Harness contract (plan: Paint First in Reference Lane Setup, "Tests"):
   is live, and a scene replacement bumps what it bumps. Only ``fetch`` itself,
   the DOM, and the timeline/viewport painters and widget plumbing
   ``_setActiveScene`` calls are stood in for, each named where it is.
+* Every scene reaches the client with its keys SORTED. The server does not
+  sort -- a stored record keeps its own key order through the unknown-field
+  overlay -- but a stored order that differs from the route's field order is
+  what a real project delivers (the QA project stores members as
+  `entity_id, member_id, role, visual_intent`), and sorting is one such order.
+  A comparison that minds key order fails here as it did live.
 * **There is no route copy in JavaScript.** ``fetch`` forwards every mutation
   batch to a Python child process that applies it with the real
   ``routes._apply_scene_mutation_batch`` to the fixture project, round-trips
@@ -65,7 +71,7 @@ for line in sys.stdin:
     request = json.loads(line)
     if request.get("read"):
         scene = project.get_scene(request["sceneId"])
-        print("@@" + json.dumps({"ok": True, "scene": scene.to_dict()}), flush=True)
+        print("@@" + json.dumps({"ok": True, "scene": scene.to_dict()}, sort_keys=True), flush=True)
         continue
     candidate = copy.deepcopy(project)
     try:
@@ -81,7 +87,7 @@ for line in sys.stdin:
         continue
     # A save and the next load, so what a later batch sees is what disk holds.
     project = TimelineProject.from_dict(json.loads(json.dumps(candidate.to_dict(), default=str)))
-    print("@@" + json.dumps({"ok": True, "payload": payload}, default=str), flush=True)
+    print("@@" + json.dumps({"ok": True, "payload": payload}, default=str, sort_keys=True), flush=True)
 """
 
 
@@ -113,8 +119,12 @@ def fixture_project():
                 "hard": {"assembly": "audio"}, "soft": {}}),
         ],
         reference_items=[ReferenceItem.from_dict(row) for row in (
+            # A stored role and retention: a member record the route carries
+            # unchanged, and whose key ORDER differs on the wire (sorted) from
+            # the order the route builds it in.
             {"reference_item_id": "item-1", "lane_index": 0, "start_frame": 10,
-             "end_frame": 40, "members": [member("a"), member("b")]},
+             "end_frame": 40, "members": [member("a", role="identity", visual_intent="preserve"),
+                                          member("b")]},
             {"reference_item_id": "item-2", "lane_index": 0, "start_frame": 50,
              "end_frame": 70, "members": [member("c")]},
             {"reference_item_id": "item-4", "lane_index": 1, "start_frame": 0,
@@ -352,7 +362,8 @@ def run_item_panel(body, tmp_path, project=None):
               .replace("__QUEUE__", json.dumps((ROOT / "web/js/project_mutation_queue.js").as_uri()))
               .replace("__PANEL__", json.dumps((ROOT / "web/js/editor_reference_panel.js").as_uri()))
               .replace("__NOTES__", json.dumps((ROOT / "web/js/editor_notifications.js").as_uri()))
-              .replace("__FIXTURE__", json.dumps(fixture))
+              # Sorted, as a project loaded from storage reaches the client.
+              .replace("__FIXTURE__", json.dumps(fixture, sort_keys=True))
               .replace("__BODY__", body))
     completed = subprocess.run([node, "--input-type=module"], input=script,
                                capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -1012,3 +1023,543 @@ def test_a_row_is_live_on_its_scene_object_or_in_a_live_delete_hold(tmp_path):
     """, tmp_path, project=_two_scene_project())
     assert result == {"onScene": True, "removed": False, "held": True, "voided": False,
                       "switchedAway": True, "replaced": False}
+
+
+# -- Phase 4: field edits -----------------------------------------------------------
+
+_FIELDS = _PANEL + """
+const strengthOf = (start) => inputsOf(cardAt(start))[2];
+const setStrength = (start, value) => { const input = strengthOf(start);
+  input.value = String(value); input.dispatch('change'); return input; };
+const muteButton = (start) => cardAt(start).querySelectorAll('button')
+  .find((b) => b.textContent === 'Active' || b.textContent === 'Muted');
+const updates = () => sent.flat().filter((op) => op.type === 'update_reference_item');
+"""
+
+
+def test_a_field_edit_paints_before_the_write_and_a_second_one_is_sent_behind_it(tmp_path):
+    """No drop: the second edit made while the first is saving reads the first
+    one's paint as its guard, is sent in order, and both land."""
+    result = run_item_panel(_FIELDS + """
+    mount();
+    hold(2);
+    setStrength(10, 0.5);
+    const paintedFirst = item('item-1').strength;
+    setStrength(10, 0.7);
+    const paintedSecond = item('item-1').strength;
+    await release();
+    await release();
+    await settle();
+    return { paintedFirst, paintedSecond,
+      sent: updates().map((op) => [op.fields.strength, op.expected.strength]),
+      local: item('item-1').strength, server: item('item-1', await serverScene()).strength,
+      undo: w._undoStack.map((entry) => [entry.label, !!entry.postSnapshot]) };
+    """, tmp_path)
+    assert result["paintedFirst"] == 0.5 and result["paintedSecond"] == 0.7
+    assert result["sent"] == [[0.5, 1.0], [0.7, 0.5]]
+    assert result["local"] == 0.7 and result["server"] == 0.7
+    assert result["undo"] == [["change reference strength", True]] * 2
+
+
+def test_mute_clicked_twice_before_a_repaint_ends_active(tmp_path):
+    result = run_item_panel(_FIELDS + """
+    mount();
+    hold(2);
+    const button = muteButton(10);
+    button.dispatch('click');
+    const afterFirst = item('item-1').muted;
+    button.dispatch('click');                 // the card has not repainted yet
+    await release(); await release(); await settle();
+    return { afterFirst, local: item('item-1').muted, server: item('item-1', await serverScene()).muted,
+      sent: updates().map((op) => op.fields.muted) };
+    """, tmp_path)
+    assert result == {"afterFirst": True, "local": False, "server": False, "sent": [True, False]}
+
+
+def test_two_refused_edits_return_the_field_to_its_saved_value_without_the_network(tmp_path):
+    result = run_item_panel(_FIELDS + """
+    mount();
+    hold(2);
+    setStrength(10, 0.5);
+    setStrength(10, 0.7);
+    refuseNext('identity_mismatch'); refuseNext('identity_mismatch');
+    await release(); await release(); await settle();
+    return { local: item('item-1').strength, gets: gets.length, undo: w._undoStack.length,
+      toasts: toasts.filter((t) => t.source === 'project-mutation-failed').length };
+    """, tmp_path)
+    assert result == {"local": 1.0, "gets": 0, "undo": 0, "toasts": 1}
+
+
+def test_a_refused_edit_behind_an_accepted_one_keeps_the_accepted_value(tmp_path):
+    result = run_item_panel(_FIELDS + """
+    mount();
+    hold(2);
+    setStrength(10, 0.5);
+    setStrength(10, 0.7);
+    await release();                          // the first lands
+    refuseNext('identity_mismatch');
+    await release();                          // the second is refused
+    await settle();
+    return { local: item('item-1').strength, server: item('item-1', await serverScene()).strength,
+      undo: w._undoStack.map((entry) => entry.label) };
+    """, tmp_path)
+    # Bug Tracker 0.4a: the accepted step stays; only the refused one leaves.
+    assert result == {"local": 0.5, "server": 0.5, "undo": ["change reference strength"]}
+
+
+def test_a_rollback_defers_when_another_writers_edit_of_the_field_is_pending(tmp_path):
+    """A timeline move queued on the item: the row shows its paint, so the panel
+    chain has no known baseline and a failure must not restore a guess."""
+    result = run_item_panel(_FIELDS + """
+    mount();
+    hold(2);
+    // The timeline's move: painted, then queued.
+    item('item-1').start_frame = 12;
+    const moving = w._runSceneMutation([{ type: 'update_reference_item', reference_item_id: 'item-1',
+      fields: { start_frame: 12 }, expected: { start_frame: 10 } }],
+      { key: 'timeline-move', coalesce: false, refreshScenes: false }).catch(() => {});
+    const start = inputsOf(cardAt(10))[0];
+    start.value = '14'; start.dispatch('change');
+    const painted = item('item-1').start_frame;
+    await release();                          // the move lands
+    refuseNext('identity_mismatch');
+    await release();                          // the panel edit is refused
+    await settle();
+    await moving;
+    return { painted, shownAfter: item('item-1').start_frame,
+      deferred: diag('reference_item_rollback_deferred').map((e) => e.fields ?? e.payload?.fields ?? e.data?.fields),
+      gets: gets.length, server: item('item-1', await serverScene()).start_frame };
+    """, tmp_path)
+    assert result["painted"] == 14
+    assert result["deferred"] == [["start_frame"]]
+    # The re-armed heal read the scene: the row shows what the server holds.
+    assert result["gets"] == 1
+    assert result["server"] == 12 and result["shownAfter"] == 12
+
+
+def test_local_field_refusals_send_nothing_push_nothing_and_put_the_field_back(tmp_path):
+    result = run_item_panel(_FIELDS + """
+    mount();
+    w._redoStack = [{ label: 'undone', snapshot: {} }];
+    const end = inputsOf(cardAt(10))[1];
+    end.value = '60'; end.dispatch('change');         // into item-2 at 50
+    await settle(2);
+    const overlapShown = end.value;
+    end.value = '0'; end.dispatch('change');          // an end of 0 is not "to scene end"
+    await settle(2);
+    const zeroShown = end.value;
+    const unchanged = await w._writeReferenceItemFromPanel('item-1', { strength: 1 }, 'noop');
+    return { overlapShown, zeroShown, unchanged, sent: sent.length, undo: w._undoStack.length,
+      redo: w._redoStack.length, end: item('item-1').end_frame,
+      messages: toasts.map((t) => t.message) };
+    """, tmp_path)
+    assert result["overlapShown"] == "40" and result["zeroShown"] == "40"
+    assert result["unchanged"] == "unchanged"
+    assert (result["sent"], result["undo"], result["redo"], result["end"]) == (0, 0, 1, 40)
+    assert "That range overlaps another item on this lane." in result["messages"]
+
+
+def test_an_edit_from_an_undrawn_card_writes_the_live_row(tmp_path):
+    """The panel was not rebuilt (its field has focus) after the scene object was
+    replaced; the edit still addresses and guards the live row."""
+    result = run_item_panel(_FIELDS + """
+    mount();
+    const input = strengthOf(50);
+    input.focus();
+    await w._writeReferenceItemFromPanel('item-2', { muted: true }, 'toggle reference mute');
+    await settle();
+    const replaced = w.activeScene;
+    const stillDrawn = strengthOf(50) === input;
+    input.value = '0.3'; input.dispatch('change');
+    await settle();
+    const last = updates().at(-1);
+    return { stillDrawn, expected: last.expected, liveMuted: item('item-2').muted,
+      live: item('item-2').strength, sameScene: w.activeScene === replaced,
+      server: item('item-2', await serverScene()).strength };
+    """, tmp_path)
+    assert result["stillDrawn"] is True
+    assert result["expected"] == {"strength": 1.0}
+    assert result["liveMuted"] is True and result["live"] == 0.3 and result["server"] == 0.3
+
+
+def test_a_focused_field_is_not_rebuilt_and_a_button_repaints_on_the_next_frame(tmp_path):
+    result = run_item_panel(_FIELDS + """
+    mount();
+    hold(2);
+    const input = strengthOf(10);
+    input.focus();
+    input.value = '0.4'; input.dispatch('change');
+    flushFrames();
+    const kept = strengthOf(10) === input;
+    input.blur();
+    muteButton(50).dispatch('click');
+    const beforeFrame = muteButton(50).textContent;
+    await settle(2);
+    flushFrames();
+    const afterFrame = muteButton(50).textContent;
+    await release(); await release(); await settle();
+    return { kept, beforeFrame, afterFrame };
+    """, tmp_path)
+    assert result == {"kept": True, "beforeFrame": "Active", "afterFrame": "Muted"}
+
+
+def test_an_edit_that_fails_behind_a_delete_rolls_back_onto_the_held_row(tmp_path):
+    """The failed delete then reinserts the corrected row, not the edit's paint."""
+    result = run_item_panel(_FIELDS + """
+    mount();
+    hold(2);
+    setStrength(10, 0.5);
+    deleteAt(10);
+    refuseNext('identity_mismatch');
+    await release();                          // the edit is refused
+    offlineNext(); offlineGetNext();
+    await release();                          // the delete fails
+    await settle(8);
+    return { rows: ids(), strength: item('item-1')?.strength };
+    """, tmp_path)
+    assert result == {"rows": ["item-1", "item-2", "item-4"], "strength": 1.0}
+
+
+def _stale_entity_project():
+    project = fixture_project()
+    project.scenes[0].reference_items[1].members[0]["entity_id"] = "entity-stale"
+    return project
+
+
+def test_an_edit_the_mirror_cannot_paint_is_sent_unpainted_behind_a_barrier_and_adopted(tmp_path):
+    """The route rewrites the stale member record on any update, so painting only
+    the strength would leave a row the server does not hold: nothing is painted,
+    member-guarded gestures wait on the item, and the answer is adopted."""
+    result = run_item_panel(_FIELDS + """
+    mount();
+    hold();
+    setStrength(50, 0.5);
+    const duringWrite = { strength: item('item-2').strength,
+      barrier: w._referenceItemWriteState().barriers.has('item-2'),
+      unpainted: w._referenceItemWriteState().unpaintedKeys.size };
+    await release();
+    await settle();
+    return { duringWrite, after: { strength: item('item-2').strength,
+      entity: item('item-2').members[0].entity_id,
+      barrier: w._referenceItemWriteState().barriers.has('item-2'),
+      unpainted: w._referenceItemWriteState().unpaintedKeys.size } };
+    """, tmp_path, project=_stale_entity_project())
+    assert result["duringWrite"] == {"strength": 1.0, "barrier": True, "unpainted": 1}
+    assert result["after"] == {"strength": 0.5, "entity": "entity-1", "barrier": False,
+                               "unpainted": 0}
+
+
+def test_an_unpainted_edit_adopts_its_answer_when_the_reconcile_defers(tmp_path):
+    """Another write queued behind it defers the scene reconcile, so the host
+    brings the canonical row's fields in itself -- and only onto the same,
+    untouched row."""
+    result = run_item_panel(_FIELDS + """
+    mount();
+    hold(2);
+    setStrength(50, 0.5);                     // unpainted (stale member record)
+    setStrength(10, 0.8);                     // queued behind: the reconcile will defer
+    const before = w.activeScene;
+    await release();
+    const adopted = { strength: item('item-2').strength, entity: item('item-2').members[0].entity_id,
+      sameScene: w.activeScene === before };
+    await release();
+    await settle();
+    return adopted;
+    """, tmp_path, project=_stale_entity_project())
+    assert result == {"strength": 0.5, "entity": "entity-1", "sameScene": True}
+
+
+def test_a_project_switch_releases_the_field_chains(tmp_path):
+    """Plan test 13, field half."""
+    result = run_item_panel(_FIELDS + """
+    mount();
+    Object.assign(w, { _clearStaleReplayState(){}, _clearVideoCache(){}, _sweepRenderCache(){},
+      _fetchProjectSettings(){}, _renderQueuePanel(){}, _updateProjectIdentity(){},
+      _clearUnconfirmedReferenceRetry(){}, _fetchReferences: async () => {},
+      _fetchAssets: () => new Promise(() => {}), _renderCacheSweepGeneration: 0 });
+    hold();
+    setStrength(10, 0.5);
+    const oldScene = w.activeScene;
+    const chainsBefore = w._referenceItemWriteState().chains.size;
+    w.updateProject('other-project');
+    const chainsAfter = w._referenceItemWriteState().chains.size;
+    refuseNext('identity_mismatch');
+    await release();
+    await settle();
+    return { chainsBefore, chainsAfter, oldStrength: item('item-1', oldScene).strength };
+    """, tmp_path)
+    # The old scene object is no longer held by the editor, so its paint is left
+    # alone rather than restored into a project nobody shows.
+    assert result == {"chainsBefore": 1, "chainsAfter": 0, "oldStrength": 0.5}
+
+
+def test_two_quick_edits_behind_an_unpainted_one_both_land(tmp_path):
+    """The second edit waits on the item's barrier and guards against the
+    answer, not against the value the unpainted write left on screen."""
+    result = run_item_panel(_FIELDS + """
+    mount();
+    hold();
+    setStrength(50, 0.5);                     // unpainted: stale member record
+    setStrength(50, 0.7);                     // waits on the barrier
+    const sentWhileHeld = updates().length;
+    await release();
+    await settle(10);
+    return { sentWhileHeld, sent: updates().map((op) => [op.fields.strength, op.expected.strength]),
+      local: item('item-2').strength, server: item('item-2', await serverScene()).strength };
+    """, tmp_path, project=_stale_entity_project())
+    assert result["sentWhileHeld"] <= 1
+    assert result["sent"] == [[0.5, 1.0], [0.7, 0.5]]
+    assert result["local"] == 0.7 and result["server"] == 0.7
+
+
+def test_an_item_with_stored_roles_paints_its_edit(tmp_path):
+    """Live regression: stored members arrive with sorted keys, and a
+    key-order-sensitive comparison declined every such edit to paint."""
+    result = run_item_panel(_FIELDS + """
+    mount();
+    hold();
+    setStrength(10, 0.5);
+    const painted = item('item-1').strength;
+    const keys = Object.keys(item('item-1').members[0]);
+    await release(); await settle();
+    return { painted, keys, unpainted: w._referenceItemWriteState().unpaintedKeys.size };
+    """, tmp_path)
+    assert result["keys"] == ["entity_id", "member_id", "role", "visual_intent"]
+    assert result["painted"] == 0.5 and result["unpainted"] == 0
+
+
+# -- Phase 4 audit: fixes and the gaps it found ------------------------------------
+
+def test_three_quick_edits_behind_an_unpainted_one_all_land(tmp_path):
+    """Audit finding 1: the second waiting edit installs a barrier of its own, so
+    the third must wait again rather than read a row the second never painted."""
+    result = run_item_panel(_FIELDS + """
+    // Unpaintable for the whole test: the client cannot see member c's asset,
+    // while the route still holds it -- a Library the client has not reloaded.
+    const findAsset = w._findAssetById.bind(w);
+    w._findAssetById = (assetId) => assetId === 'asset-c' ? null : findAsset(assetId);
+    mount();
+    hold();
+    setStrength(50, 0.5);
+    setStrength(50, 0.6);
+    setStrength(50, 0.7);
+    await release();
+    await settle(20);
+    return { sent: updates().map((op) => [op.fields.strength, op.expected.strength]),
+      local: item('item-2').strength, server: item('item-2', await serverScene()).strength,
+      toasts: toasts.length };
+    """, tmp_path)
+    assert result["sent"] == [[0.5, 1.0], [0.6, 0.5], [0.7, 0.6]]
+    assert result["local"] == 0.7 and result["server"] == 0.7
+    assert result["toasts"] == 0
+
+
+def test_mute_twice_and_a_value_set_back_behind_an_unpainted_edit_are_both_sent(tmp_path):
+    """Audit finding 4: the panel no longer decides "unchanged" or the toggle's
+    direction from a row an unpainted write has not reached."""
+    result = run_item_panel(_FIELDS + """
+    // Unpaintable for the whole test: the client cannot see member c's asset,
+    // while the route still holds it -- a Library the client has not reloaded.
+    const findAsset = w._findAssetById.bind(w);
+    w._findAssetById = (assetId) => assetId === 'asset-c' ? null : findAsset(assetId);
+    mount();
+    hold();
+    const button = muteButton(50);
+    button.dispatch('click');
+    button.dispatch('click');
+    await release();
+    await settle(16);
+    const muted = { local: item('item-2').muted, sent: updates().map((op) => op.fields.muted) };
+    hold();
+    setStrength(50, 0.5);
+    setStrength(50, 1);
+    await release();
+    await settle(16);
+    return { muted, strength: { local: item('item-2').strength,
+      server: item('item-2', await serverScene()).strength,
+      sent: updates().filter((op) => 'strength' in op.fields).map((op) => op.fields.strength) } };
+    """, tmp_path)
+    assert result["muted"] == {"local": False, "sent": [True, False]}
+    assert result["strength"] == {"local": 1.0, "server": 1.0, "sent": [0.5, 1.0]}
+
+
+def test_an_edit_waiting_on_a_barrier_is_dropped_by_a_project_switch_not_sent_there(tmp_path):
+    """Audit finding 2: the waiting edit must not post to, nor reconcile into, the
+    project the editor switched to."""
+    result = run_item_panel(_FIELDS + """
+    mount();
+    Object.assign(w, { _clearStaleReplayState(){}, _clearVideoCache(){}, _sweepRenderCache(){},
+      _fetchProjectSettings(){}, _renderQueuePanel(){}, _updateProjectIdentity(){},
+      _clearUnconfirmedReferenceRetry(){}, _fetchReferences: async () => {},
+      _fetchAssets: () => new Promise(() => {}), _renderCacheSweepGeneration: 0 });
+    hold();
+    const first = w._writeReferenceItemFromPanel('item-2', { strength: 0.5 }, 'change reference strength');
+    const second = w._writeReferenceItemFromPanel('item-2', { strength: 0.6 }, 'change reference strength');
+    await tick();
+    w.updateProject('copy-project');
+    w.activeScene = structuredClone(fixture.scenes[0]);     // same ids, another project
+    w.activeSceneId = 'scene';
+    const other = w.activeScene;
+    await release();
+    const outcomes = [await first, await second];
+    await settle();
+    return { outcomes, posted: sent.length, otherUntouched: w.activeScene === other
+      && item('item-2', other).strength === 1 };
+    """, tmp_path, project=_stale_entity_project())
+    assert result == {"outcomes": ["ok", "refused"], "posted": 1, "otherUntouched": True}
+
+
+def test_an_unpainted_answer_reaches_a_scene_the_author_switched_away_from(tmp_path):
+    """Audit finding 3: the reconcile only replaces the ACTIVE scene; the scene
+    object in the list gets the answer adopted onto it, so switching back shows
+    it and the next edit guards against it."""
+    project = _stale_entity_project()
+    project.scenes.append(Scene(scene_id="scene-b", duration_frames=100, reference_lane_count=1,
+                                reference_lane_configs=[LaneConfig()],
+                                reference_lane_recipes=[ReferenceLaneRecipe(lane_id="lane-b")]))
+    result = run_item_panel(_FIELDS + """
+    mount();
+    const sceneA = w.activeScene;
+    hold();
+    const pending = w._writeReferenceItemFromPanel('item-2', { strength: 0.5 }, 'change reference strength');
+    await tick();
+    w._setActiveScene(w.scenes.find((scene) => scene.scene_id === 'scene-b'));
+    await release();
+    await pending;
+    await settle();
+    const adopted = item('item-2', sceneA).strength;
+    w._setActiveScene(sceneA);
+    const next = await w._writeReferenceItemFromPanel('item-2', { strength: 0.8 }, 'change reference strength');
+    await settle();
+    return { adopted, next, expected: updates().at(-1).expected.strength,
+      server: item('item-2', await serverScene()).strength };
+    """, tmp_path, project=project)
+    assert result == {"adopted": 0.5, "next": "ok", "expected": 0.5, "server": 0.8}
+
+
+def test_a_failed_edit_in_a_focused_field_shows_the_saved_value_again(tmp_path):
+    """Audit finding 5, and plan Verification 3 in the harness: strength with the
+    server down reverts with one message, and the focused field follows."""
+    result = run_item_panel(_FIELDS + """
+    mount();
+    const input = strengthOf(10);
+    input.focus();
+    offlineNext(); offlineGetNext();
+    input.value = '0.40'; input.dispatch('change');
+    const painted = item('item-1').strength;
+    await settle(12);
+    return { painted, row: item('item-1').strength, shown: input.value,
+      toasts: toasts.map((t) => t.message), undo: w._undoStack.length, gets: gets.length };
+    """, tmp_path)
+    # No answer means it may have saved: the gated scenes read is scheduled
+    # (and fails here, the server being down), which is why the local rollback
+    # is what the author sees.
+    assert result == {"painted": 0.4, "row": 1.0, "shown": "1.00",
+                      "toasts": ["The Reference item change could not be saved."], "undo": 0,
+                      "gets": 1}
+
+
+def test_a_refused_field_paint_does_not_enter_the_next_edits_undo_snapshot(tmp_path):
+    """Plan test 12, field half: the writer opts into the ordered baseline."""
+    result = run_item_panel(_FIELDS + """
+    mount();
+    hold();
+    refuseNext('identity_mismatch');
+    setStrength(10, 0.5);
+    setStrength(50, 0.6);
+    const atPush = item('item-1', w._undoStack.at(-1).snapshot).strength;
+    await release();
+    await settle(12);
+    return { atPush, now: item('item-1', w._undoStack.at(-1).snapshot).strength,
+      label: w._undoStack.at(-1).label, entries: w._undoStack.length };
+    """, tmp_path)
+    assert result == {"atPush": 0.5, "now": 1.0, "label": "change reference strength", "entries": 1}
+
+
+def test_a_write_with_no_project_context_counts_as_refused(tmp_path):
+    result = run_item_panel(_FIELDS + """
+    mount();
+    const snapshot = w._snapshotProjectMutationContext;
+    w._snapshotProjectMutationContext = () => null;
+    const outcome = await w._writeReferenceItemFromPanel('item-1', { strength: 0.5 }, 'change reference strength');
+    w._snapshotProjectMutationContext = snapshot;
+    return { outcome, row: item('item-1').strength, undo: w._undoStack.length, sent: sent.length };
+    """, tmp_path)
+    assert result == {"outcome": "refused", "row": 1.0, "undo": 0, "sent": 0}
+
+
+def test_a_field_edit_on_a_locked_lane_is_refused_before_anything_else(tmp_path):
+    result = run_item_panel(_FIELDS + """
+    mount();
+    w._redoStack = [{ label: 'undone', snapshot: {} }];
+    w.activeScene.reference_lane_configs[0].locked = true;
+    w._buildTrackLayout();
+    const outcome = await w._writeReferenceItemFromPanel('item-1', { strength: 0.5 }, 'change reference strength');
+    return { outcome, row: item('item-1').strength, sent: sent.length, undo: w._undoStack.length,
+      redo: w._redoStack.length, sources: toasts.map((t) => t.source) };
+    """, tmp_path)
+    assert result == {"outcome": "refused", "row": 1.0, "sent": 0, "undo": 0, "redo": 1,
+                      "sources": ["reference-panel-refused"]}
+
+
+def test_an_unpainted_write_takes_the_baseline_from_an_open_chain(tmp_path):
+    """A painted edit is in flight when the item becomes unpaintable; the second
+    edit is sent unpainted and may change what the server holds, so the first
+    one's failure must not restore the value from before both."""
+    result = run_item_panel(_FIELDS + """
+    mount();
+    hold(2);
+    setStrength(50, 0.5);                                   // painted, chain open
+    const find = w._findAssetById.bind(w);
+    w._findAssetById = (assetId) => assetId === 'asset-c' ? null : find(assetId);
+    const second = w._writeReferenceItemFromPanel('item-2', { strength: 0.6 }, 'change reference strength');
+    refuseNext('identity_mismatch');
+    await release();                                        // the painted one is refused
+    const afterFirst = item('item-2').strength;
+    await release();
+    await second;
+    await settle();
+    return { afterFirst, deferred: diag('reference_item_rollback_deferred').length,
+      final: item('item-2').strength, server: item('item-2', await serverScene()).strength };
+    """, tmp_path)
+    assert result["afterFirst"] == 0.5, "not restored to 1.0 under an unpainted write"
+    assert result["deferred"] >= 1
+    # The unpainted edit guarded against the refused paint, so the route refuses
+    # it too; the re-armed refresh then shows what the server holds.
+    assert result["server"] == 1.0 and result["final"] == 1.0
+
+
+def test_edit_as_override_derives_from_the_live_members(tmp_path):
+    result = run_item_panel(_FIELDS + """
+    const { deriveReferencePrompt } = await import(__RESOLUTION__);
+    mount();
+    const card = cardAt(10);
+    card.querySelectorAll('details').forEach((d) => { d.open = true; });
+    const take = walk(card).find((n) => n.tagName === 'BUTTON' && n.textContent === 'Edit as override');
+    // A reconcile replaced the scene since the card was drawn (the panel has
+    // not repainted), and the live row stages only member b now.
+    w.activeScene = structuredClone(w.activeScene);
+    item('item-1').members = [item('item-1').members[1]];
+    const soft = w.activeScene.reference_lane_recipes[0].recipe?.soft || {};
+    const expectedText = deriveReferencePrompt({ promptOverride: '', soft, members:
+      item('item-1').members.map((ref) => { const r = w._referenceMemberForRef(ref);
+        return { entity_name: r?.reference?.name || '', member_name: r?.member?.name || '',
+          prompt: r?.member?.prompt || '' }; }) });
+    take.dispatch('click');
+    await settle(4);
+    return { sent: updates().at(-1)?.fields?.prompt_override, expectedText };
+    """.replace("__RESOLUTION__", json.dumps((ROOT / "web/js/reference_resolution.js").as_uri())), tmp_path)
+    assert result["sent"] == result["expectedText"] and result["sent"]
+
+
+def test_each_settled_field_edit_refreshes_the_prompt_consumers_once(tmp_path):
+    result = run_item_panel(_FIELDS + """
+    mount();
+    let refreshed = 0;
+    w._refreshPromptContextDependencyConsumers = () => { refreshed += 1; };
+    await w._writeReferenceItemFromPanel('item-1', { strength: 0.5 }, 'change reference strength');
+    const afterOk = refreshed;
+    await w._writeReferenceItemFromPanel('item-1', { end_frame: 60 }, 'trim reference item');
+    return { afterOk, afterLocalRefusal: refreshed };
+    """, tmp_path)
+    assert result == {"afterOk": 1, "afterLocalRefusal": 1}

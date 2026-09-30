@@ -16,6 +16,7 @@
 //   _saveLaneConfig(entries, { expectedLaneId, undoLabel }),
 //   _stageReferenceItemOnLane(payload, laneIndex, startFrame),
 //   _deleteReferenceItemFromPanel(itemId),
+//   _writeReferenceItemFromPanel(itemId, fields | (liveRow) => fields, undoLabel),
 //   _runSceneMutation(ops, opts), _mutateReferences(ops),
 //   _fetchReferences(opts), _fetchScenes(opts), _buildTrackLayout(),
 //   _renderTimeline(), _pushUndo(label), _discardLastUndo(label)
@@ -26,10 +27,10 @@
 //      deliberately rematerializes the catalog's current values.
 //   2. Every reference-item write carries exact prior values in `expected` and
 //      runs non-coalesced — the backend requires the snapshot and treats a
-//      mismatch as a terminal conflict, never a replay signal. Staging and
-//      deleting are host writers that meet this themselves (the panel sends
-//      intent: members, or an item id); the field edits below still build their
-//      own operation.
+//      mismatch as a terminal conflict, never a replay signal. Staging,
+//      deleting and field edits are host writers that meet this themselves --
+//      the panel sends intent: members, an item id, or the fields to change;
+//      only the member edits below still build their own operation.
 
 import {
     EDITOR_COLORS as COLORS,
@@ -391,6 +392,30 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         host._buildTrackLayout?.();
         host._renderTimeline?.();
         render();
+    };
+
+    // ── Staged-item field edits ────────────────────────────────────────────
+    //
+    // Every item control acts on the row the scene holds NOW, looked up by id
+    // when the author acts; the object a card was drawn from is display-only.
+    // The host writer paints the edit, orders it behind an earlier one still
+    // saving -- it is never dropped -- and owns the guard, the Undo step and
+    // the rollback. Nothing here re-renders after a write: the host's gated
+    // refresh repaints, and never under a focused field.
+    const liveItem = (id) => (host.activeScene?.reference_items || [])
+        .find((row) => row?.reference_item_id === id) || null;
+    const writeField = (id, fields, label) => (mounted
+        ? host._writeReferenceItemFromPanel(id, fields, label)
+        : Promise.resolve("refused"));
+    /** A field whose edit was refused, found unchanged or failed may still show
+     *  what the author typed. The gated refresh will not rebuild it while it has
+     *  focus -- and after a failed edit's rollback the scene matches the panel's
+     *  last stamp again, so nothing would rebuild it later either. Put the live
+     *  value back into it. */
+    const resync = (input, outcome, read) => {
+        if (outcome === "ok") return;
+        const row = liveItem(input.dataset.referenceItemId || "");
+        if (row) input.value = read(row);
     };
 
     const writeMemberAudioIntent = (item, memberRef, value, label) => {
@@ -1373,9 +1398,10 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         return note;
     };
 
-    const renderPromptRow = (item, locked) => {
+    /** The prompt `row` derives from its staged members under this lane's recipe. */
+    const derivedPrompt = (row) => {
         const soft = laneRecipe().recipe?.soft || {};
-        const members = (item.members || []).map((memberRef) => {
+        const members = (row?.members || []).map((memberRef) => {
             const resolved = host._referenceMemberForRef?.(memberRef);
             return {
                 entity_name: resolved?.reference?.name || "",
@@ -1383,7 +1409,12 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                 prompt: resolved?.member?.prompt || "",
             };
         });
-        const derived = deriveReferencePrompt({ promptOverride: "", members, soft });
+        return deriveReferencePrompt({ promptOverride: "", members, soft });
+    };
+
+    const renderPromptRow = (item, locked) => {
+        const id = item.reference_item_id;
+        const derived = derivedPrompt(item);
         const overridden = !!item.prompt_override;
         const wrap = el("div", "", "display:flex;flex-direction:column;gap:4px;");
         const header = el("div", "", `display:flex;align-items:center;gap:6px;font-size:10px;color:${COLORS.textMuted};`);
@@ -1412,9 +1443,12 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             // silently stop tracking member changes.
             const takeOver = button("Edit as override", "Start from this text and edit it freely");
             takeOver.disabled = locked || !derived;
-            takeOver.addEventListener("click", () => {
-                void writeItem(item, { prompt_override: derived }, "override reference prompt");
-            });
+            // The text is derived from the LIVE members when the host acts --
+            // after any member edit still saving -- not from this drawn card.
+            takeOver.addEventListener("click", () => void writeField(id, (row) => {
+                const text = derivedPrompt(row);
+                return text ? { prompt_override: text } : null;
+            }, "override reference prompt"));
             header.append(copy, takeOver);
             wrap.appendChild(promptExitNote(item));
             return wrap;
@@ -1424,15 +1458,18 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         box.value = item.prompt_override || "";
         box.disabled = locked;
         box.addEventListener("keydown", (event) => event.stopPropagation());
+        box.dataset.referenceItemId = id;
         box.addEventListener("change", () => {
-            if (box.value !== (item.prompt_override || "")) {
-                void writeItem(item, { prompt_override: box.value }, "edit reference prompt override");
-            }
+            // No local "unchanged" check: the host decides after any earlier
+            // write on this item has settled, against the row it then holds.
+            void writeField(id, { prompt_override: box.value }, "edit reference prompt override")
+                .then((outcome) => resync(box, outcome, (row) => row.prompt_override || ""));
         });
         wrap.appendChild(box);
         const revert = button("Clear", "Go back to the prompt derived from the staged members");
         revert.disabled = locked;
-        revert.addEventListener("click", () => void writeItem(item, { prompt_override: "" }, "clear reference prompt override"));
+        revert.addEventListener("click", () => void writeField(
+            id, { prompt_override: "" }, "clear reference prompt override"));
         const derivedNote = el("span", derived ? `derived: ${derived}` : "", `flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
         derivedNote.title = derived;
         header.append(derivedNote, revert);
@@ -1489,6 +1526,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         }
 
         for (const item of items) {
+            const id = item.reference_item_id;
             const verdict = verdicts.get(item.reference_item_id) || null;
             const effective = verdict === REFERENCE_VERDICT.WINNER;
             const card = el("div", "", `
@@ -1517,9 +1555,12 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             startInput.min = "0";
             startInput.value = String(item.start_frame || 0);
             startInput.disabled = locked;
+            startInput.dataset.referenceItemId = id;
             startInput.addEventListener("change", () => {
                 const parsed = parseInt(startInput.value, 10);
-                if (Number.isFinite(parsed)) void writeItem(item, { start_frame: Math.max(0, parsed) }, "move reference item");
+                if (!Number.isFinite(parsed)) return;
+                void writeField(id, { start_frame: Math.max(0, parsed) }, "move reference item")
+                    .then((outcome) => resync(startInput, outcome, (row) => String(row.start_frame || 0)));
             });
             const endInput = el("input", "", chromeInputCss({ padding: "3px 6px", fontSize: "11px" }) + "width:74px;");
             endInput.type = "number";
@@ -1527,9 +1568,12 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             endInput.value = String(item.end_frame ?? -1);
             endInput.title = "-1 runs to the end of the scene";
             endInput.disabled = locked;
+            endInput.dataset.referenceItemId = id;
             endInput.addEventListener("change", () => {
                 const parsed = parseInt(endInput.value, 10);
-                if (Number.isFinite(parsed)) void writeItem(item, { end_frame: parsed < 0 ? -1 : parsed }, "trim reference item");
+                if (!Number.isFinite(parsed)) return;
+                void writeField(id, { end_frame: parsed < 0 ? -1 : parsed }, "trim reference item")
+                    .then((outcome) => resync(endInput, outcome, (row) => String(row.end_frame ?? -1)));
             });
             top.append(
                 el("span", "Frames", `font-size:11px;color:${COLORS.textMuted};`),
@@ -1545,11 +1589,13 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             strengthInput.value = Number(item.strength ?? 1).toFixed(2);
             strengthInput.title = "Conditioning strength for this staged item";
             strengthInput.disabled = locked;
+            strengthInput.dataset.referenceItemId = id;
             strengthInput.addEventListener("change", () => {
                 const value = Math.max(0, Math.min(1, Number(strengthInput.value)));
-                if (Number.isFinite(value) && value !== Number(item.strength ?? 1)) {
-                    void writeItem(item, { strength: value }, "change reference strength");
-                }
+                if (!Number.isFinite(value)) return;
+                void writeField(id, { strength: value }, "change reference strength")
+                    .then((outcome) => resync(strengthInput, outcome,
+                        (row) => Number(row.strength ?? 1).toFixed(2)));
             });
             top.append(el("span", "Strength", `font-size:11px;color:${COLORS.textMuted};`), strengthInput);
 
@@ -1570,17 +1616,22 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                 sequenceSelect.value = String(Math.max(0, parseInt(item.sequence_frames, 10) || 0));
                 sequenceSelect.disabled = locked;
                 sequenceSelect.title = "Temporal Reference sequence length";
+                sequenceSelect.dataset.referenceItemId = id;
                 sequenceSelect.addEventListener("change", () => {
                     const value = Math.max(0, parseInt(sequenceSelect.value, 10) || 0);
-                    if (value !== Math.max(0, parseInt(item.sequence_frames, 10) || 0)) {
-                        void writeItem(item, { sequence_frames: value }, "change reference sequence length");
-                    }
+                    void writeField(id, { sequence_frames: value }, "change reference sequence length")
+                        .then((outcome) => resync(sequenceSelect, outcome,
+                            (row) => String(Math.max(0, parseInt(row.sequence_frames, 10) || 0))));
                 });
                 top.append(sequenceSelect);
             }
             const mute = button(item.muted ? "Muted" : "Active", "Exclude this item from resolution without deleting it");
             mute.disabled = locked;
-            mute.addEventListener("click", () => void writeItem(item, { muted: !item.muted }, "toggle reference mute"));
+            // Toggles what the row holds when the host acts -- after any earlier
+            // write on this item has settled -- so a second click before the
+            // card repaints undoes the first rather than repeating it.
+            mute.addEventListener("click", () => void writeField(
+                id, (row) => ({ muted: !row.muted }), "toggle reference mute"));
             const del = button("Delete item", "Remove this staged item", "danger");
             del.disabled = locked;
             // The host resolves the live row by id when it acts, builds the

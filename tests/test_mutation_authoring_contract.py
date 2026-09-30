@@ -608,6 +608,8 @@ SCANNED_RESERVING_UNITS = (
     "saveNewPromptSection", "splitItem", "stageReferenceItemOnLane", "swapGuides", "toggleMute",
     "unlinkItems", "updateLinkedPromptAttachment", "updatePromptSection",
     "updateSceneDuration", "updateSceneGlobalContext",
+    # Paint-first Reference Lane Setup Phase 4: the panel's field edits.
+    "writeReferenceItemFromPanel",
 )
 
 

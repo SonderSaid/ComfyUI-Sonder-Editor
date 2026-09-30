@@ -486,7 +486,8 @@ import {
 } from "./scene_move_geometry.js";
 import { LINK_ITEM_TYPES, pruneLinkedItemGroups, editedLinkGroups, rollbackLinkGroupPrediction } from "./scene_link_groups.js";
 import {
-    canonicalStagedMemberRefs, canonicalStoredMemberRefs, referenceItemOverlap, stagedReferenceItem,
+    canonicalJson, canonicalStagedMemberRefs, canonicalStoredMemberRefs, plannedReferenceItemUpdate,
+    REFERENCE_ITEM_FIELDS, referenceItemOverlap, stagedReferenceItem,
 } from "./scene_reference_geometry.js";
 import { applyGuideSwap, guideIdentityMatches } from "./scene_guide_geometry.js";
 import { createViewportSurface } from "./viewport_surface.js";
@@ -6050,12 +6051,23 @@ export class EditorWidget {
     async _deleteReferenceItemFromPanelWithinGesture(itemId) {
         const id = String(itemId || "");
         const state = this._referenceItemWriteState();
+        const startedIn = this.projectDir;
+        const sceneId = String(this.activeSceneId || "");
+        const diagnostics = this._snapshotMutationDiagnostics?.() ?? null;
         // A write the mirror could not paint is still settling on this item:
-        // its response may replace the members this delete's guard names.
-        const barrier = state.barriers.get(id);
-        if (barrier) await barrier.catch?.(() => {});
+        // its response may replace the members this delete's guard names. Wait
+        // again if a newer one was installed while this waited.
+        for (let earlier = state.barriers.get(id); earlier; earlier = state.barriers.get(id)) {
+            await earlier;
+        }
+        if (this.projectDir !== startedIn || this._referenceItemWrites !== state) return "refused";
         const scene = this.activeScene;
         if (!scene || !this.projectDir) return "refused";
+        if (String(scene.scene_id || "") !== sceneId) {
+            notifyWarning("The scene changed before this Reference item could be deleted.",
+                { source: "reference-panel-refused" });
+            return "refused";
+        }
         const row = (scene.reference_items || []).find((candidate) => candidate?.reference_item_id === id);
         if (!row) {
             notifyWarning("This Reference item no longer exists.", { source: "reference-panel-refused" });
@@ -6121,6 +6133,7 @@ export class EditorWidget {
                 coalesce: false,
                 refreshScenes: false,
                 historyEntry,
+                diagnostics,
                 orderedHistoryBaseline: true,
                 failureMessage: "The Reference item could not be deleted.",
                 failureDetail: (error) => error?.payload?.error || error?.message || null,
@@ -6140,9 +6153,239 @@ export class EditorWidget {
             return "refused";
         }
         releaseHold();
-        this._reconcileActiveSceneFromMutation(result, { reason: "reference_panel", ignoreTimelineGate: true });
+        if (this.projectDir === projectDir) {
+            this._reconcileActiveSceneFromMutation(result, { reason: "reference_panel", ignoreTimelineGate: true });
+        }
         this._refreshPromptContextDependencyConsumers();
         return "ok";
+    }
+
+    /** What a refused staged-item edit tells the author, by the route's code. */
+    _referenceItemRefusalMessage(code) {
+        return {
+            invalid_range: "That range is not valid for this item.",
+            lane_collision: "That range overlaps another item on this lane.",
+            invalid_reference_item: "An item must keep at least one Library member.",
+            item_not_found: "This Reference item no longer exists.",
+        }[code] || "That value cannot be saved for this item.";
+    }
+
+    /** The Reference Lane Setup panel's edit of staged-item fields.
+     *
+     *  The panel sends intent (`fields`, as the author entered them); the host
+     *  resolves the LIVE row by id when it acts and does the rest, in the
+     *  plan's order:
+     *
+     *   1. refuse locally -- no row, a locked lane, a refusal the route would
+     *      make (`plannedReferenceItemUpdate`), or no change -- before any Undo
+     *      push, so Redo survives and nothing is sent;
+     *   2. read `expected` from the live row, and plan the painted row;
+     *   3. open the per-field chains (`_openFieldWriteChains`), each asking
+     *      whether another writer's unsettled write can change that field;
+     *   4. push the Undo entry and hand it over explicitly;
+     *   5. paint only the named fields -- or, when the mirror declines, paint
+     *      nothing, send the write unpainted and install a per-item barrier
+     *      that member-guarded gestures await until it settles;
+     *   6. send the raw fields, `coalesce: false`, one toast on failure.
+     *
+     *  A failure restores each field's acknowledged value locally; a field
+     *  whose baseline is unknown, or whose row no longer shows this chain's
+     *  paint, defers and re-arms the gated scenes refresh instead. A `null`
+     *  result (no project context) counts as refused. An unpainted write that
+     *  succeeds while its reconcile is deferred adopts the canonical row's
+     *  named fields and members, when the row is the same object and still
+     *  shows what it showed before the write.
+     *
+     *  Resolves to `"ok"`, `"failed"`, `"refused"` or `"unchanged"`. A no-op
+     *  is silent: nothing was asked that the row does not already hold.
+     */
+    async _writeReferenceItemFromPanel(...args) {
+        return this._withMutationGesture(
+            "writeReferenceItemFromPanel", () => this._writeReferenceItemFromPanelWithinGesture(...args));
+    }
+
+    async _writeReferenceItemFromPanelWithinGesture(itemId, intent, undoLabel) {
+        const id = String(itemId || "");
+        const state = this._referenceItemWriteState();
+        const projectDir = this.projectDir;
+        const sceneId = String(this.activeSceneId || "");
+        // Attributed to the gesture that started now: after a wait below, the
+        // ambient gesture is gone and the enqueue would read as unscoped.
+        const diagnostics = this._snapshotMutationDiagnostics?.() ?? null;
+        // An earlier write on this item that could not be painted is still
+        // settling: the row does not show what it sent, so a guard read now
+        // would describe a state the server is about to leave. Wait for its
+        // answer (adopted, reconciled or refused) and read the row after it --
+        // and wait again if another waiting edit installed a barrier of its own
+        // meanwhile, or this one would read the row that edit has not painted.
+        for (let earlier = state.barriers.get(id); earlier; earlier = state.barriers.get(id)) {
+            await earlier;
+        }
+        // The project or scene moved on while this edit waited: it no longer
+        // names anything on screen. A project switch is silent (the panel went
+        // with it); a scene switch says so.
+        if (this.projectDir !== projectDir || this._referenceItemWrites !== state || !projectDir) {
+            return "refused";
+        }
+        const refuse = (message) => {
+            notifyWarning(message, { source: "reference-panel-refused" });
+            return "refused";
+        };
+        const scene = this.activeScene;
+        if (!scene || String(scene.scene_id || "") !== sceneId) {
+            return refuse("The scene changed before this Reference edit could be saved.");
+        }
+        const row = (scene.reference_items || []).find((candidate) => candidate?.reference_item_id === id);
+        if (!row) return refuse(this._referenceItemRefusalMessage("item_not_found"));
+        // An intent may be a function of the LIVE row -- a toggle, a value
+        // derived from the members -- resolved here, after any wait, so it
+        // acts on what the row holds rather than on what it held when clicked.
+        const fields = typeof intent === "function" ? intent(row) : intent;
+        if (!fields || typeof fields !== "object") return "unchanged";
+        const laneIndex = Number(row.lane_index) || 0;
+        if (this._isLaneLocked(TRACK_TYPE.REFERENCE, laneIndex)) {
+            return refuse("This Reference lane is locked. Unlock it on the timeline header to edit.");
+        }
+        const plan = plannedReferenceItemUpdate(row, fields, {
+            durationFrames: scene.duration_frames,
+            laneItems: scene.reference_items || [],
+            laneRecipe: scene.reference_lane_recipes?.[laneIndex] || null,
+            laneCount: laneCountFor(scene, TRACK_TYPE.REFERENCE),
+            entityIdFor: (memberId) => this._referenceMemberForRef({ member_id: memberId })
+                ?.reference?.reference_id || "",
+            assetFor: (memberId) => {
+                const resolved = this._referenceMemberForRef({ member_id: memberId });
+                return resolved ? this._findAssetById(resolved.member.asset_id) : null;
+            },
+        });
+        if (plan.refusal) return refuse(this._referenceItemRefusalMessage(plan.refusal));
+        // Key-order-blind, as the route's `==` is (`canonicalJson`).
+        const same = (left, right) => canonicalJson(left) === canonicalJson(right);
+        const names = Object.keys(fields);
+        const target = plan.paintable ? plan.painted : fields;
+        if (names.every((name) => same(target[name], row[name]))) return "unchanged";
+
+        // Read before anything is painted: the guard states what the author saw.
+        const expected = {};
+        for (const name of names) {
+            expected[name] = structuredClone(row[name] ?? (name === "end_frame" ? -1 : null));
+        }
+        // Unique even for two edits in one millisecond: the chain and the
+        // unpainted set are keyed on it.
+        this._referenceItemWriteSeq = (Number(this._referenceItemWriteSeq) || 0) + 1;
+        const writeStamp = `${Date.now()}-${this._referenceItemWriteSeq}`;
+        const key = `scene:${scene.scene_id}:reference-panel:${id}:${writeStamp}`;
+        const rowKey = `${scene.scene_id}:${id}`;
+        let links = [];
+        if (plan.paintable) {
+            links = this._openFieldWriteChains(state.chains, rowKey, row,
+                Object.fromEntries(names.map((name) => [name, structuredClone(plan.painted[name])])), {
+                    baselineUnknown: (field, chain) => this._referenceItemFieldWritePending(
+                        scene.scene_id, id, field, { excludeKeys: chain.ownKeys }),
+                });
+            for (const link of links) link.chain.ownKeys.add(key);
+        } else {
+            // Nothing is painted, so there is nothing of this write's own to
+            // roll back. What the server will hold is unknown until the
+            // response -- for every field, not only the named ones, since one
+            // reason the mirror declines is that the route will rewrite an
+            // unnamed field (a start clamped into the scene, a member record).
+            // An open chain loses its baseline, and one opening later sees this
+            // write as another writer's.
+            for (const name of REFERENCE_ITEM_FIELDS) {
+                const chain = state.chains.get(`${rowKey}:${name}`);
+                if (chain) {
+                    chain.ackedKnown = false;
+                    chain.knownFromSeq = chain.seq + 1;
+                }
+            }
+        }
+        const historyEntry = this._pushUndo(undoLabel);
+        let barrier = null;
+        let settleBarrier = null;
+        if (plan.paintable) {
+            // Replace, never mutate in place: a chain holds the prior value by
+            // reference.
+            for (const name of names) row[name] = structuredClone(plan.painted[name]);
+            this._renderSceneAfterLocalMutation({ viewport: false });
+        } else {
+            state.unpaintedKeys.add(key);
+            barrier = new Promise((resolve) => { settleBarrier = resolve; });
+            state.barriers.set(id, barrier);
+        }
+        const before = Object.fromEntries(names.concat("members").map((name) =>
+            [name, structuredClone(row[name])]));
+        let outcome = "ok";
+        let result = null;
+        let unconfirmed = false;
+        try {
+            result = await this._runSceneMutation([{
+                type: "update_reference_item",
+                reference_item_id: id,
+                fields,
+                expected,
+            }], {
+                key,
+                label: undoLabel,
+                coalesce: false,
+                refreshScenes: false,
+                historyEntry,
+                diagnostics,
+                orderedHistoryBaseline: true,
+                failureMessage: "The Reference item change could not be saved.",
+                failureDetail: (error) => error?.payload?.error || error?.message || null,
+                failureTier: "warning",
+            });
+            if (!result) outcome = "refused";
+        } catch (error) {
+            outcome = "failed";
+            unconfirmed = !Number.isInteger(error?.status);
+        }
+        for (const link of links) link.chain.ownKeys.delete(key);
+        state.unpaintedKeys.delete(key);
+        if (outcome === "refused") this._discardUnstampableUndoEntry(historyEntry);
+        const { restored, deferred } = this._settleFieldWriteChains(state.chains, links, outcome, {
+            isLive: () => this._referenceItemRowLive(state, scene, row),
+            read: (field) => row[field],
+            write: (field, value) => { row[field] = structuredClone(value); },
+            equals: same,
+        });
+        if (outcome === "ok" && this.projectDir === projectDir) {
+            this._reconcileActiveSceneFromMutation(result, { reason: "reference_panel", ignoreTimelineGate: true });
+            // An unpainted write's answer still has to reach the scene object it
+            // was written on when the reconcile did not replace it: the
+            // reconcile deferred behind another write, or the author switched
+            // to another scene and this one waits in the list to be returned to.
+            const kept = this.activeScene === scene
+                || (this.activeScene?.scene_id !== scene.scene_id && this._sceneObjectCurrent(scene));
+            if (!plan.paintable && kept) {
+                // Bring in what this write changed on the server, unless
+                // something newer has been painted over the row since.
+                const canonical = (result?.payload?.scene?.reference_items || [])
+                    .find((candidate) => candidate?.reference_item_id === id);
+                const untouched = Object.keys(before).every((name) => same(row[name], before[name]));
+                if (canonical && untouched && this._referenceItemRowLive(state, scene, row)) {
+                    for (const name of Object.keys(before)) row[name] = structuredClone(canonical[name]);
+                    this._renderSceneAfterLocalMutation({ viewport: false });
+                } else {
+                    // Not adoptable here: converge by the gated refresh.
+                    this._deferProjectBackedRefresh(["scenes"], "reference_item_unadopted");
+                }
+            }
+        }
+        if (barrier) {
+            // Only this write's own barrier leaves the map; a newer one stays.
+            if (state.barriers.get(id) === barrier) state.barriers.delete(id);
+            settleBarrier();
+        }
+        // Field names only, never values (`durable_rules.md`, diagnostics).
+        if (deferred.length) sessionDiagRecord("reference_item_rollback_deferred", { fields: deferred });
+        if ((deferred.length || unconfirmed) && this.projectDir === projectDir) {
+            this._deferProjectBackedRefresh(["scenes"], "reference_item_unconfirmed");
+        }
+        if (restored) this._renderSceneAfterLocalMutation({ viewport: false });
+        this._refreshPromptContextDependencyConsumers();
+        return outcome;
     }
 
     /**

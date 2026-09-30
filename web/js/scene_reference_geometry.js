@@ -296,6 +296,23 @@ export function referenceItemOverlap(items, {
     return null;
 }
 
+/** JSON with every object's keys sorted: the comparison Python's `==` makes.
+ *
+ *  A stored member record's key ORDER is whatever the stored file holds --
+ *  `_overlay_unknown_record` keeps a record's own key order on load, while the
+ *  route builds new records in field order -- and `==` on dicts ignores it. A
+ *  comparison by plain `JSON.stringify` does not, and on a real project read
+ *  every item carrying a stored role as changed.
+ */
+export function canonicalJson(value) {
+    const sorted = (entry) => {
+        if (Array.isArray(entry)) return entry.map(sorted);
+        if (!entry || typeof entry !== "object") return entry;
+        return Object.fromEntries(Object.keys(entry).sort().map((key) => [key, sorted(entry[key])]));
+    };
+    return JSON.stringify(sorted(value));
+}
+
 /** `_REFERENCE_ITEM_FIELDS`: what an update may name. Exported so the parity
  *  suite can hold it equal to the route's set; a field the route gains and this
  *  lacks would be refused locally, and the edit lost. */
@@ -511,7 +528,7 @@ export function plannedReferenceItemUpdate(item, fields, {
     }
     if (has("muted")) painted.muted = !!fields.muted;
     if (!members.members) return decline();
-    const same = (left, right) => JSON.stringify(left) === JSON.stringify(right);
+    const same = (left, right) => canonicalJson(left) === canonicalJson(right);
     if (Object.keys(painted).some((key) => !has(key) && !same(painted[key], item[key]))) {
         return decline();
     }

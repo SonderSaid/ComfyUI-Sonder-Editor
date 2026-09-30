@@ -71,8 +71,10 @@ EXPECTED_LITERAL_COUNTS = {
     # 80 -> 81 and the Reference panel's 3 -> 1 on 2026-09-29: the panel's
     # create and delete moved to host writers (`_commitReferenceStageWithinGesture`
     # shared with the timeline stage, and `_deleteReferenceItemFromPanelWithinGesture`),
-    # paint-first Reference Lane Setup Phase 3.
-    "editor_widget.js": 81,
+    # paint-first Reference Lane Setup Phase 3. 81 -> 82 in Phase 4: the panel's
+    # field edits gained the host writer `_writeReferenceItemFromPanelWithinGesture`
+    # (the panel's own `writeItem` keeps the member edits until Phase 5).
+    "editor_widget.js": 82,
     "editor_prompt_panel.js": 4,
     "editor_reference_panel.js": 1,
     "prompt_context_chips.js": 1,
@@ -83,7 +85,8 @@ EXPECTED_LITERAL_COUNTS = {
 # literal counts above: a scan that quietly stops matching reports a clean
 # surface forever. Update deliberately when adding or removing an enqueue.
 # 57 -> 56 on 2026-09-22: the dead legacy guide popup's delete enqueue went with it.
-EXPECTED_ENQUEUE_SITES = 56
+# 56 -> 57 on 2026-09-29: the Reference panel's field writer on the host.
+EXPECTED_ENQUEUE_SITES = 57
 
 # Geometry the client computed from what it could see. Matched with a trailing
 # `[:,}]` so ES6 shorthand counts — `split_clip` passes its frame that way, and a
@@ -2364,6 +2367,10 @@ OPAQUE_GUARD_SITES = {
         "so a lexical key list could not certify it either way.",
     "editor_reference_panel.js:writeItem:update_reference_item":
         "`expected` is built above the literal from the prior row.",
+    "editor_widget.js:_writeReferenceItemFromPanelWithinGesture:update_reference_item":
+        "`expected` is built above the literal from the LIVE row, one key per "
+        "field the edit names, before anything is painted; `fields` is the "
+        "panel's raw intent.",
     "editor_widget.js:_applyPromptSetupWithinGesture:update_scene_fields":
         "`expected: expectedSceneFields`, an identifier accumulated field by "
         "field above the literal, inside a conditional spread.",
@@ -3563,7 +3570,8 @@ def _scope_body(item) -> str:
 # finding that justified two tripwires instead of one.
 # 18 -> 17 on 2026-09-22: the legacy guide popup's declined delete was deleted.
 EXPECTED_STABLE_KEY_OPT_OUTS = 17
-EXPECTED_UNIQUIFIED_KEY_OPT_OUTS = 29
+# 29 -> 30 on 2026-09-29: the Reference panel's field writer on the host.
+EXPECTED_UNIQUIFIED_KEY_OPT_OUTS = 30
 EXPECTED_CALLER_SUPPLIED_OPT_OUTS = 1
 
 STABLE = "stable"
@@ -3812,6 +3820,9 @@ KEY_INTERPOLATIONS = {
                "`temp-queue-${Date.now()...}-${Math.random()...}` minted per "
                "queue addition"),
     "batchId": (UNIQUIFYING, "`crypto.randomUUID()` minted per batch"),
+    "writeStamp": (UNIQUIFYING,
+                   "`${Date.now()}-${counter}` minted per Reference panel field edit "
+                   "in `_writeReferenceItemFromPanelWithinGesture`"),
     "++this._referenceMutationSeq": (UNIQUIFYING,
                                      "pre-incremented counter on the widget"),
     # -- stable: the same gesture on the same target repeats it ---------------
@@ -4029,6 +4040,11 @@ COALESCE_OPT_OUT_REVIEWED = {
         "`create_reference_item` creates a row, alongside the lane it needs. "
         "Two placements are two items; the timeline drop and the panel's Add "
         "share this tail."),
+    "editor_widget.js:_writeReferenceItemFromPanelWithinGesture:scene:${}:reference-panel:${}:${}": (
+        UNREACHABLE,
+        "one staged-item field edit, its own Undo step and its own rollback "
+        "chain link. Two edits of one item are two intents the chain orders; "
+        "a merge would fold a later edit's guard into an earlier write's."),
     "editor_widget.js:_deleteReferenceItemFromPanelWithinGesture:scene:${}:reference-panel-delete:${}:${}": (
         UNREACHABLE,
         "one `delete_reference_item` naming one row by id with its whole prior "
