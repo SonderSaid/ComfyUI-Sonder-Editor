@@ -42,7 +42,7 @@ def test_overlays_paint_creates_and_reorders_over_acknowledged_data():
             model.referenceOverlayFromOperation({{ type: 'create_member', reference_id: 'gone',
                 fields: {{ asset_id: 'a-x' }} }}, 'pending:4'),
         ];
-        assert.equal(model.referenceOverlayFromOperation({{ type: 'update_reference' }}, 'k'), null);
+        assert.equal(model.referenceOverlayFromOperation({{ type: 'materialize_member_handle' }}, 'k'), null);
         const shown = model.applyPendingReferenceOverlays(acknowledged, overlays);
         // View-only: acknowledged data is never written.
         assert.equal(JSON.stringify(acknowledged), frozen);

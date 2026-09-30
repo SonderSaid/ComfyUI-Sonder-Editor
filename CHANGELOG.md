@@ -15,12 +15,15 @@ a fresh `[Unreleased]` block.
 - Reference Lane Setup: adding or deleting a staged item and editing its range, strength, sequence length, mute, prompt override or members now show at once and save in the background, instead of waiting about a second for the server. A member role or retention change still waits for the server, and other edits of that item wait with it.
 - A failed Reference staging drop on the timeline shows one message instead of two.
 - Reference Lane Setup: clearing a member's saved role or retention now says it can't be saved yet, instead of appearing to work and reverting later.
+- Reference Library: editing or deleting a Reference or a member now shows at once and saves in the background, and the form closes when you save. A removed member's staged bars leave the timeline at once too.
 
 ### Fixed
 - Reference Lane Setup: a second edit made while the first was still saving was silently dropped. It is now saved after the first.
 - Reference Lane Setup: a refused item edit also removed the Undo step of an earlier edit of the same kind.
 - Reference Lane Setup: an invalid role or unsupported recipe value no longer takes keyboard focus again after every edit.
 - Dropping a Library member onto a staged Reference bar while another edit of that item was saving could be refused, and a failed drop refetched the scene over edits queued behind it.
+- Reference Library: a second edit of a Reference or member made while the first was still saving, or removing a member just after editing it, was refused as "changed elsewhere". Both are now saved in order.
+- Reference Library: saving an edit no longer reverts a field another tab changed while the form was open, when you did not change that field yourself.
 - Removing a Library member or Reference, or permanently deleting the asset of a staged Library member, now updates the timeline as soon as it is saved. Its staged bars used to stay on the timeline, in every scene, until the editor reloaded, and editing them failed.
 
 ## [0.7.4] - 2026-09-29

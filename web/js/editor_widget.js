@@ -371,6 +371,8 @@ import {
     applyPendingReferenceOverlays,
     formatReferenceTag,
     moveMember,
+    referenceFieldStoredAs,
+    referenceIdsBeingDeleted,
     referenceOverlayFromOperation,
     referenceOverlayReflected,
     shouldApplyReferenceResponse,
@@ -727,6 +729,10 @@ const SPLITTABLE_ITEM_TYPES = new Set(["clip", "audio", "prompt", "reference"]);
 
 // A refusal the user cannot read is indistinguishable from a broken drag, and
 // one message covering every cause names the wrong one three times out of four.
+/** Said when a staging, append or Attach names a Library member whose delete
+ *  is still in flight: the write would name a member the server is removing. */
+const REFERENCE_MEMBER_BEING_DELETED = "That Library member is being deleted.";
+
 const REFERENCE_DROP_REFUSALS = {
     locked: "That Reference lane is locked — unlock it on the lane header.",
     collapsed: "That Reference lane is collapsed — expand it to stage into it.",
@@ -2540,9 +2546,10 @@ export class EditorWidget {
     _referenceLibraryData() {
         return {
             projectKey: this._projectDirName(),
-            // The only reader of overlays. Staging, Attach and pickers read
-            // `_references`, so a row the server has not acknowledged is never
-            // offered to them.
+            // The display of overlays. Staging, Attach and pickers read
+            // `_references` (less what a delete in flight is taking away,
+            // `_referencesOfferable`), so a row the server has not acknowledged
+            // is never offered to them.
             references: applyPendingReferenceOverlays(this._references, this._referenceOverlays),
             catalog: this._referenceTagPresets,
             tagFamilies: this._referenceTagFamilies,
@@ -2987,7 +2994,7 @@ export class EditorWidget {
 
     _mutateReferences(
         operations, label = "Reference Library change", diagnostics = null,
-        ownerToken = null, historyOrderContext = undefined, { overlays = null } = {}) {
+        ownerToken = null, historyOrderContext = undefined, { overlays = null, cascade = null } = {}) {
         if (!this.projectDir || !Array.isArray(operations) || !operations.length) return Promise.resolve(null);
         const projectDir = this.projectDir;
         const dirName = this._projectDirName();
@@ -3026,6 +3033,7 @@ export class EditorWidget {
                     { projectId: dirName, retryOnConflict: true, maxAttempts: 2 },
                 );
                 if (projectDir !== this.projectDir) return result;
+                this._proveEarlierReferenceUpdates(ownOverlays);
                 const applied = this._applyReferencePayload(result?.payload || {}, {
                     projectDir, requestSeq, source: "mutation", ownOverlays });
                 if (removedMemberIds.length) {
@@ -3034,7 +3042,9 @@ export class EditorWidget {
                     this._adoptReferenceDeleteCascade({
                         removedMemberIds,
                         reports: this._referenceDeleteCascadeReports(result?.payload?.results),
+                        prepainted: cascade?.sets || null,
                     });
+                    this._releaseReferenceCascade(cascade);
                 }
                 // Settled inside `run`, before the queue can send the next write,
                 // so that write's payload finds these overlays acknowledged.
@@ -3064,13 +3074,21 @@ export class EditorWidget {
                 // not showing.
                 this._deferredReferencesForce = true;
                 this._deferProjectBackedRefresh(["references"], "reference_unconfirmed");
-                if (removedMemberIds.length) {
+                // A painted cascade keeps its paint and holds until the read
+                // that decides the delete (`_pruneReferenceOverlays`).
+                if (removedMemberIds.length && !cascade) {
                     // A delete that may have landed may also have thinned or
                     // removed staged items, and no report came back to say so.
                     sessionDiagRecord("reference_cascade_heal", { reason: "unconfirmed" });
                     this._historyOrderContextCascade(new Set(removedMemberIds.map(String)));
                     this._deferProjectBackedRefresh(["scenes"], "reference_cascade_heal");
                 }
+            }
+            if (answered) {
+                // The route's code is on the payload; `fetchProjectJson` lifts
+                // only a version conflict onto `error.code`.
+                this._restoreReferenceCascade(cascade,
+                    String(error?.payload?.code || error?.code || ""));
             }
             if (!ownOverlays) return;
             if (answered) {
@@ -3092,7 +3110,7 @@ export class EditorWidget {
         return promise;
     }
 
-    /** Paint a Library create/add/reorder now and send it through the queue.
+    /** Paint a Library write now and send it through the queue.
      *
      *  Acknowledged References stay the only authority: the overlays are drawn
      *  on top of them by `_referenceLibraryData` and read by nothing else. Each
@@ -3101,17 +3119,24 @@ export class EditorWidget {
      *  was queued describes the Library without it (Finding L).
      */
     _mutateReferencesPaintFirst(operations, { onUnconfirmedResolved = null } = {}) {
+        // The staged-item half of a delete paints now too, as scene state
+        // with holds, and every delete overlay of the batch carries it so the
+        // read that decides a lost answer can restore or release it.
+        const cascade = this._paintReferenceDeleteCascade(
+            this._referenceDeleteRemovedMemberIds(operations));
         const overlays = (Array.isArray(operations) ? operations : [])
             .map((operation) => referenceOverlayFromOperation(
                 operation, `pending:${++this._referenceOverlaySeq}`))
             .filter(Boolean)
-            .map((overlay) => ({ ...overlay, state: "pending", clearAfterSeq: 0, onUnconfirmedResolved }));
+            .map((overlay) => ({ ...overlay, state: "pending", clearAfterSeq: 0, onUnconfirmedResolved,
+                cascade: overlay.type === "delete_member" || overlay.type === "delete_reference"
+                    ? cascade : null }));
         if (this.projectDir && overlays.length) {
             this._referenceOverlays.push(...overlays);
             this._referenceLibraryHandle?.render?.();
         }
         return this._withMutationGesture("referenceLibrary", () => this._mutateReferences(
-            operations, undefined, null, null, undefined, { overlays }));
+            operations, undefined, null, null, undefined, { overlays, cascade }));
     }
 
     /** A settled write whose own payload did not apply: keep its rows until a
@@ -3127,7 +3152,9 @@ export class EditorWidget {
             const result = results.find((entry, index) => !claimed.has(index)
                 && entry?.type === overlay.type
                 && (overlay.type === "create_reference"
-                    || String(entry?.reference_id || "") === overlay.reference_id));
+                    || (String(entry?.reference_id || "") === overlay.reference_id
+                        && (!overlay.member_id
+                            || String(entry?.member_id || "") === overlay.member_id))));
             if (result) {
                 claimed.add(results.indexOf(result));
                 overlay.committedId = String(
@@ -3136,9 +3163,23 @@ export class EditorWidget {
             overlay.state = "acknowledged";
             overlay.clearAfterSeq = this._referenceFetchSeq;
         }
-        this._referenceOverlays = this._referenceOverlays.filter((overlay) =>
-            !(overlays.includes(overlay) && referenceOverlayReflected(this._references, overlay)));
+        this._referenceOverlays = this._referenceOverlays.filter((overlay) => {
+            const leaves = overlays.includes(overlay) && referenceOverlayReflected(this._references, overlay);
+            if (leaves) this._decideReflectedReferenceCascade(overlay);
+            return !leaves;
+        });
         this._referenceLibraryHandle?.render?.();
+    }
+
+    /** A delete overlay leaving because acknowledged data already shows its
+     *  target gone: the delete landed, so its cascade holds are released and,
+     *  with no report to check the paint against, the timeline is healed. */
+    _decideReflectedReferenceCascade(overlay) {
+        if (!overlay?.cascade || overlay.cascade.settled) return;
+        this._releaseReferenceCascade(overlay.cascade);
+        sessionDiagRecord("reference_cascade_heal", { reason: "unconfirmed_saved" });
+        this._historyOrderContextCascade(overlay.cascade.removed, { vouched: false });
+        this._deferProjectBackedRefresh(["scenes"], "reference_cascade_heal");
     }
 
     /** Keep re-reading while a settled write's row still waits for a read and
@@ -3185,6 +3226,25 @@ export class EditorWidget {
      *  committed id this is a match on what the write carried, among rows the
      *  Library did not hold when the write settled. */
     _unconfirmedReferenceOverlaySaved(overlay) {
+        const type = overlay?.type;
+        if (type === "delete_reference" || type === "delete_member") {
+            // Saved if and only if the target is gone.
+            return referenceOverlayReflected(this._references, overlay);
+        }
+        if (type === "update_reference" || type === "update_member") {
+            if (overlay.provenSaved) return true;
+            const reference = (this._references || []).find((entry) =>
+                String(entry?.reference_id || "") === overlay.reference_id);
+            const row = type === "update_member"
+                ? (reference?.members || []).find((entry) =>
+                    String(entry?.member_id || "") === overlay.member_id)
+                : reference;
+            // Gone since (a later delete of it landed): there is nothing to
+            // save the edit into and nothing to hand back, so no warning.
+            if (!row) return true;
+            return Object.entries(overlay.fields || {}).every(([field, value]) =>
+                referenceFieldStoredAs(field, row[field], value));
+        }
         const known = overlay?.knownIds instanceof Set ? overlay.knownIds : new Set();
         if (overlay?.type === "create_reference") {
             return (this._references || []).some((entry) =>
@@ -3224,13 +3284,26 @@ export class EditorWidget {
                 if (overlay.status === "unconfirmed") resolved.push(overlay);
                 return false;
             }
-            return !referenceOverlayReflected(this._references, overlay);
+            if (!referenceOverlayReflected(this._references, overlay)) return true;
+            this._decideReflectedReferenceCascade(overlay);
+            return false;
         });
         // An unconfirmed write is decided now. Say so when it did not land —
         // otherwise its row just vanishes — and let the Library hand the draft
         // back. After the payload has fully applied, so the Library renders it.
         for (const overlay of resolved) {
             const saved = this._unconfirmedReferenceOverlaySaved(overlay);
+            if (overlay.cascade && !overlay.cascade.settled) {
+                if (saved) {
+                    // It landed, but no report came back to check the paint.
+                    this._releaseReferenceCascade(overlay.cascade);
+                    sessionDiagRecord("reference_cascade_heal", { reason: "unconfirmed_saved" });
+                    this._historyOrderContextCascade(overlay.cascade.removed, { vouched: false });
+                    this._deferProjectBackedRefresh(["scenes"], "reference_cascade_heal");
+                } else {
+                    this._restoreReferenceCascade(overlay.cascade);
+                }
+            }
             if (!saved) {
                 notifyWarning("A Reference Library change was not saved.", {
                     source: "reference-library-unconfirmed",
@@ -3392,7 +3465,7 @@ export class EditorWidget {
      *
      *  Returns whether anything was painted.
      */
-    _adoptReferenceDeleteCascade({ removedMemberIds = [], reports = null } = {}) {
+    _adoptReferenceDeleteCascade({ removedMemberIds = [], reports = null, prepainted = null } = {}) {
         const removed = new Set([...(removedMemberIds || [])]
             .map((id) => String(id ?? "")).filter(Boolean));
         if (!removed.size) return false;
@@ -3408,44 +3481,29 @@ export class EditorWidget {
             heal("gesture_active");
             return false;
         }
-        const objects = [this.activeScene, ...(this.scenes || [])]
-            .filter((scene, index, list) => scene && list.indexOf(scene) === index);
         const sets = () => ({ removed: new Set(), thinned: new Set() });
-        const local = new Map();
-        const activeRemoved = new Set();
-        let painted = false;
-        let unpainted = false;
-        for (const scene of objects) {
-            const sceneId = String(scene.scene_id || "");
-            const rows = Array.isArray(scene.reference_items) ? scene.reference_items : [];
-            const entry = local.get(sceneId) || sets();
-            local.set(sceneId, entry);
-            for (let index = rows.length - 1; index >= 0; index -= 1) {
-                const row = rows[index];
-                const after = referenceRowAfterMemberRemoval(row, removed);
-                if (!after) continue;
-                const itemId = String(row?.reference_item_id || "");
-                if (after.removed) {
-                    rows.splice(index, 1);
-                    entry.removed.add(itemId);
-                    if (scene === this.activeScene) activeRemoved.add(itemId);
-                } else {
-                    if (this._referenceItemMembersUnpainted(sceneId, itemId)) unpainted = true;
-                    row.members = after.members;
-                    entry.thinned.add(itemId);
-                }
-                painted = true;
+        const { local, painted, unpainted: unpaintedNow } = this._paintReferenceMemberRemoval(removed);
+        let unpainted = unpaintedNow;
+        // A paint-first delete painted its cascade at enqueue; what it did then
+        // is part of what the route reports now.
+        for (const [sceneId, entry] of prepainted || []) {
+            const target = local.get(sceneId) || sets();
+            local.set(sceneId, target);
+            for (const id of entry.removed) target.removed.add(id);
+            for (const id of entry.thinned) {
+                target.thinned.add(id);
+                if (this._referenceItemMembersUnpainted(sceneId, id)) unpainted = true;
             }
         }
-        if (painted) {
-            const editorOnRemoved = this.selectedItem?.type === "reference"
-                && activeRemoved.has(String(this.selectedItem.id || ""));
-            this._renderSceneAfterLocalMutation({ viewport: false });
-            if (editorOnRemoved) this._hideItemEditor();
-            this._refreshPromptContextDependencyConsumers();
+        for (const entry of local.values()) {
+            for (const id of entry.removed) entry.thinned.delete(id);
         }
         const paintedSceneIds = new Set([...local].filter(([, entry]) =>
             entry.removed.size || entry.thinned.size).map(([sceneId]) => sceneId));
+        if (!painted && !paintedSceneIds.size && Array.isArray(reports)
+                && reports.every((report) => !Object.keys(report || {}).length)) {
+            return false;
+        }
         if (!Array.isArray(reports)) {
             heal("no_report", paintedSceneIds);
             return painted;
@@ -3484,6 +3542,214 @@ export class EditorWidget {
         }
         this._historyOrderContextCascade(removed, { vouched: true, sceneIds: reported.keys() });
         return painted;
+    }
+
+    /** Remove the given Library members from every staged row the editor
+     *  holds -- the active scene first, then the list, each object once -- by
+     *  the route's own rule, and render once. With `holds`, each change is
+     *  recorded so a refused delete can put it back without the network.
+     *  Returns per-scene id sets, whether anything was painted, and whether a
+     *  thinned row has a member write the mirror could not paint. */
+    _paintReferenceMemberRemoval(removed, { holds = null } = {}) {
+        const objects = [this.activeScene, ...(this.scenes || [])]
+            .filter((scene, index, list) => scene && list.indexOf(scene) === index);
+        const local = new Map();
+        const activeRemoved = new Set();
+        let painted = false;
+        let unpainted = false;
+        for (const scene of objects) {
+            const sceneId = String(scene.scene_id || "");
+            const rows = Array.isArray(scene.reference_items) ? scene.reference_items : [];
+            const entry = local.get(sceneId) || { removed: new Set(), thinned: new Set() };
+            local.set(sceneId, entry);
+            for (let index = rows.length - 1; index >= 0; index -= 1) {
+                const row = rows[index];
+                const after = referenceRowAfterMemberRemoval(row, removed);
+                if (!after) continue;
+                const itemId = String(row?.reference_item_id || "");
+                if (after.removed) {
+                    rows.splice(index, 1);
+                    entry.removed.add(itemId);
+                    if (scene === this.activeScene) activeRemoved.add(itemId);
+                    holds?.push({ kind: "removed", scene, sceneId, itemId, row, index, voided: false });
+                } else {
+                    if (this._referenceItemMembersUnpainted(sceneId, itemId)) unpainted = true;
+                    holds?.push({ kind: "thinned", scene, sceneId, itemId, row,
+                        before: row.members, painted: after.members, voided: false });
+                    row.members = after.members;
+                    entry.thinned.add(itemId);
+                }
+                painted = true;
+            }
+        }
+        if (painted) {
+            const editorOnRemoved = this.selectedItem?.type === "reference"
+                && activeRemoved.has(String(this.selectedItem.id || ""));
+            this._renderSceneAfterLocalMutation({ viewport: false });
+            if (editorOnRemoved) this._hideItemEditor();
+            this._refreshPromptContextDependencyConsumers();
+        }
+        return { local, painted, unpainted };
+    }
+
+    /** Paint a Library delete's staged-item cascade when it is queued.
+     *
+     *  The timeline half of a delete is scene state, not an overlay: it is
+     *  painted into the scene objects the editor holds, with a hold per row
+     *  (`state.cascadeHolds`) so a refusal can restore it locally. The settle
+     *  then checks the route's report against what was painted here plus
+     *  anything painted since (`_adoptReferenceDeleteCascade`). During a drag
+     *  nothing is painted, and the settle's adoption takes over.
+     */
+    _paintReferenceDeleteCascade(removedMemberIds) {
+        const removed = new Set([...(removedMemberIds || [])]
+            .map((id) => String(id ?? "")).filter(Boolean));
+        if (!removed.size || !this.projectDir) return null;
+        const state = this._referenceItemWriteState();
+        const cascade = { state, removed, holds: [], sets: null, settled: false };
+        if (this.isDragging || this._timelineMutationDepth > 0) return cascade;
+        const { local } = this._paintReferenceMemberRemoval(removed, { holds: cascade.holds });
+        cascade.sets = local;
+        for (const hold of cascade.holds) state.cascadeHolds.add(hold);
+        // This paint can still be refused, and it is now in the scene every
+        // later gesture snapshots for its Undo entry. Start (or join) the
+        // queue-order baseline for each painted scene, as a writer opting into
+        // `orderedHistoryBaseline` does: a gesture queued in this window then
+        // takes its before-state from what the server holds at its queue
+        // position, not from this paint (`durable_rules.md`, "An optimistic
+        // group edit can enter the next gesture's Undo target"). No intent is
+        // re-authored.
+        const paintedSceneIds = [...local].filter(([, entry]) =>
+            entry.removed.size || entry.thinned.size).map(([sceneId]) => sceneId);
+        if (paintedSceneIds.length) {
+            let context = this._latestHistoryOrderContext;
+            if (!context) {
+                context = this._beginHistoryOrderContext("ordered baseline", 0);
+                context.rebaseIntents = false;
+            }
+            for (const sceneId of paintedSceneIds) {
+                let hasBaseline = false;
+                for (let current = context; current; current = current.parent) {
+                    if (current.scenes?.has(sceneId) || current.ambiguousScenes?.has(sceneId)) {
+                        hasBaseline = true;
+                        break;
+                    }
+                }
+                if (!hasBaseline) context.scenes.set(sceneId, null);
+            }
+        }
+        return cascade;
+    }
+
+    /** A delete settled as saved: its holds have nothing left to restore. */
+    _releaseReferenceCascade(cascade) {
+        if (!cascade || cascade.settled) return;
+        cascade.settled = true;
+        for (const hold of cascade.holds) cascade.state.cascadeHolds.delete(hold);
+    }
+
+    /** A delete the server did not apply: put its cascade back, locally.
+     *
+     *  A thinned row gets its members back only while it is live -- in its
+     *  scene, or held by a delete still in flight -- and still shows this
+     *  paint (`row.members === painted`); a later writer's paint is not ours
+     *  to undo. A removed row goes back at its old index under the Lane Setup
+     *  delete's rule: the same scene object, a hold not voided (its own create
+     *  failed), no row with that id already, and a code other than
+     *  `item_not_found`. Anything else records
+     *  `reference_cascade_rollback_deferred {reason}` and heals with the gated
+     *  scenes read. Thinned rows are restored first, so a delete of member A
+     *  followed by a delete of its Reference, both refused, brings the item
+     *  back whole in either settle order.
+     */
+    _restoreReferenceCascade(cascade, code = "") {
+        if (!cascade || cascade.settled) return;
+        cascade.settled = true;
+        const state = cascade.state;
+        for (const hold of cascade.holds) state.cascadeHolds.delete(hold);
+        let restored = false;
+        let deferred = "";
+        for (const hold of cascade.holds.filter((entry) => entry.kind === "thinned")) {
+            // For a Library delete `item_not_found` means the Reference or
+            // member is already gone, so the server's own cascade has run.
+            if (code === "item_not_found") {
+                deferred ||= "item_not_found";
+                continue;
+            }
+            if (this._referenceItemRowLive(state, hold.scene, hold.row) && hold.row.members === hold.painted) {
+                hold.row.members = hold.before;
+                restored = true;
+            } else {
+                deferred ||= !this._sceneObjectCurrent(hold.scene) ? "scene_replaced" : "row_changed";
+            }
+        }
+        const removed = cascade.holds.filter((entry) => entry.kind === "removed")
+            .sort((left, right) => left.index - right.index);
+        for (const hold of removed) {
+            const rows = hold.scene?.reference_items;
+            const current = this._sceneObjectCurrent(hold.scene) && Array.isArray(rows);
+            const back = current && !hold.voided && code !== "item_not_found"
+                && !rows.some((row) => row?.reference_item_id === hold.itemId);
+            if (back) {
+                rows.splice(Math.min(hold.index, rows.length), 0, hold.row);
+                restored = true;
+            } else {
+                deferred ||= hold.voided ? "voided" : (!current ? "scene_replaced"
+                    : (code === "item_not_found" ? "item_not_found" : "row_present"));
+            }
+        }
+        if (restored) {
+            this._renderSceneAfterLocalMutation({ viewport: false });
+            this._refreshPromptContextDependencyConsumers();
+        }
+        if (deferred) {
+            // A reason CODE, never contents (`durable_rules.md`, diagnostics).
+            sessionDiagRecord("reference_cascade_rollback_deferred", { reason: deferred });
+            this._historyOrderContextCascade(cascade.removed, { vouched: false });
+            this._deferProjectBackedRefresh(["scenes"], "reference_cascade_heal");
+        }
+    }
+
+    /** Ids a Library delete in flight is taking away. Staging, the append,
+     *  Attach and the chip pickers refuse or skip these until it settles. */
+    _referenceIdsBeingDeleted() {
+        return referenceIdsBeingDeleted(this._referenceOverlays, this._references);
+    }
+
+    _referenceMemberBeingDeleted(memberId) {
+        return this._referenceIdsBeingDeleted().memberIds.has(String(memberId || ""));
+    }
+
+    /** The acknowledged Library minus what a delete in flight is taking away:
+     *  what a picker that creates something durable may offer. */
+    _referencesOfferable() {
+        const { referenceIds, memberIds } = this._referenceIdsBeingDeleted();
+        if (!referenceIds.size && !memberIds.size) return this._references || [];
+        return (this._references || [])
+            .filter((reference) => !referenceIds.has(String(reference?.reference_id || "")))
+            .map((reference) => ({ ...reference, members: (reference.members || [])
+                .filter((member) => !memberIds.has(String(member?.member_id || ""))) }));
+    }
+
+    /** An accepted update was guarded by what its form was opened from. When
+     *  that value is what an earlier update of the same row sent, and that
+     *  update's answer was lost, the server held it: the earlier write landed.
+     *  Without this, a lost Save A followed by an accepted Save B would read as
+     *  "A not saved" and hand back a draft that reverts B. */
+    _proveEarlierReferenceUpdates(accepted) {
+        for (const later of accepted || []) {
+            if (later?.type !== "update_reference" && later?.type !== "update_member") continue;
+            for (const earlier of this._referenceOverlays) {
+                if (earlier === later || earlier.status !== "unconfirmed" || earlier.type !== later.type
+                        || earlier.reference_id !== later.reference_id
+                        || earlier.member_id !== later.member_id) continue;
+                if (Object.keys(later.expected || {}).some((key) =>
+                    Object.prototype.hasOwnProperty.call(earlier.fields || {}, key)
+                    && canonicalJson(later.expected[key]) === canonicalJson(earlier.fields[key]))) {
+                    earlier.provenSaved = true;
+                }
+            }
+        }
     }
 
     /** Bring the ordered history baseline along with a Library delete.
@@ -3609,8 +3875,7 @@ export class EditorWidget {
             getData: () => this._referenceLibraryData(),
             mutate: (operations) => this._withMutationGesture(
                 "referenceLibrary", () => this._mutateReferences(operations)),
-            // Create identity, add member and reorder paint before the server
-            // answers; every other Library write stays server-first.
+            // Every Library sidebar write paints before the server answers.
             mutatePaintFirst: (operations, options) => this._mutateReferencesPaintFirst(operations, options),
             confirm: (message) => window.confirm(message),
             pickAsset: ({ assetType, currentAssetId, onPick }) => this._showImagePicker({
@@ -5256,6 +5521,15 @@ export class EditorWidget {
 
     _acceptPromptAttachmentConfiguration(result) {
         const configured = promptAttachmentConfiguration(result);
+        // A dialog opened before a Library delete and confirmed while it is in
+        // flight: the chip is durable and its write never checks the member.
+        const source = configured.attachment?.source || {};
+        const { memberIds } = this._referenceIdsBeingDeleted?.() || { memberIds: new Set() };
+        if (memberIds.size && ["picture_ids", "video_ids", "audio_ids"].some((key) =>
+            (Array.isArray(source[key]) ? source[key] : []).some((id) => memberIds.has(String(id))))) {
+            notifyWarning(REFERENCE_MEMBER_BEING_DELETED, { source: "prompt-reference-attach-refused" });
+            return null;
+        }
         const intent = configured.identityCreateIntent;
         const attachmentId = String(configured.attachment?.attachment_id || "");
         if (intent?.unit?.semantic_unit_id) {
@@ -6215,6 +6489,12 @@ export class EditorWidget {
             // Queue keys of item writes sent UNPAINTED: the route may rewrite
             // their members, so they name `members` whatever fields they send.
             unpaintedKeys: new Set(),
+            // A Library delete's staged-item cascade, painted at enqueue: one
+            // hold per row it removed (`{kind: "removed", scene, row, index}`)
+            // or thinned (`{kind: "thinned", scene, row, before, painted}`),
+            // each naming `sceneId` and `itemId`, because item ids are unique
+            // only within a scene. Released when the delete settles.
+            cascadeHolds: new Set(),
         });
     }
 
@@ -6314,6 +6594,10 @@ export class EditorWidget {
         if ((scene?.reference_items || []).includes(row)) return true;
         for (const hold of state?.deleteHolds?.values?.() || []) {
             if (hold.row === row && hold.scene === scene && !hold.voided) return true;
+        }
+        for (const hold of state?.cascadeHolds || []) {
+            if (hold.kind === "removed" && hold.row === row && hold.scene === scene
+                    && !hold.voided) return true;
         }
         return false;
     }
@@ -12023,6 +12307,8 @@ export class EditorWidget {
         const members = [];
         const kinds = new Set();
         for (const memberRef of payload?.members || []) {
+            // Rejected on hover as on drop: a delete in flight is taking it.
+            if (this._referenceMemberBeingDeleted(memberRef?.member_id)) return null;
             const resolved = this._referenceMemberForRef(memberRef);
             const asset = resolved ? this._findAssetById(resolved.member.asset_id) : null;
             if (!resolved || !asset) return null;
@@ -12118,6 +12404,7 @@ export class EditorWidget {
             const additions = [];
             for (const member of payload?.members || []) {
                 const memberId = String(member?.member_id || "");
+                if (this._referenceMemberBeingDeleted(memberId)) return REFERENCE_MEMBER_BEING_DELETED;
                 if (staged.has(memberId)) return REFERENCE_DROP_REFUSALS.duplicate_member;
                 staged.add(memberId);
                 additions.push({ ...member });
@@ -12154,6 +12441,10 @@ export class EditorWidget {
 
     async _placeReferencePayloadWithinGesture(payload, frame, trackRawY) {
         if (!this.activeScene || !this.projectDir || !Array.isArray(payload?.members) || !payload.members.length) return;
+        if (payload.members.some((member) => this._referenceMemberBeingDeleted(member?.member_id))) {
+            notifyWarning(REFERENCE_MEMBER_BEING_DELETED, { source: "reference-stage-refused" });
+            return;
+        }
         const mediaKind = this._referencePayloadMediaKind(payload);
         if (!mediaKind) {
             notifyWarning("Stage image/video references separately from voice-reference audio.", { source: "reference-stage-refused" });
@@ -12268,6 +12559,9 @@ export class EditorWidget {
             return refuse("This Reference lane has no model input kind. Choose its template first.");
         }
         const population = laneStagingPopulation(recipe);
+        if (payload.members.some((member) => this._referenceMemberBeingDeleted(member?.member_id))) {
+            return refuse(REFERENCE_MEMBER_BEING_DELETED);
+        }
         for (const memberRef of payload.members) {
             const resolved = this._referenceMemberForRef(memberRef);
             const asset = resolved ? this._findAssetById(resolved.member.asset_id) : null;
@@ -12425,6 +12719,14 @@ export class EditorWidget {
         const rollBack = () => {
             const hold = this._referenceItemWrites?.deleteHolds?.get(referenceItemId);
             if (hold) hold.voided = true;
+            // A Library delete may have taken this bar out while its stage was
+            // queued; the delete's failure must not reinsert a row that never
+            // existed on the server either.
+            for (const cascadeHold of this._referenceItemWrites?.cascadeHolds || []) {
+                if (cascadeHold.scene === scene && cascadeHold.itemId === referenceItemId) {
+                    cascadeHold.voided = true;
+                }
+            }
             const undone = { row: false, lane: !paintedLane };
             if (!painted || !this._sceneObjectCurrent(scene)) return undone;
             const at = (scene.reference_items || []).findIndex(
@@ -14730,7 +15032,7 @@ export class EditorWidget {
             const configure = (attachment) => configurePromptAttachment(attachment, {
                 referenceProsePolicy: this._referenceProsePolicy,
                 scene: contextScene,
-                references: this._references || [],
+                references: this._referencesOfferable(),
                 semanticUnits: this._promptSemanticUnits || [],
                 channelKey: key,
                 profileId: this.activeScene?.prompt_context_profile_id
@@ -14816,7 +15118,9 @@ export class EditorWidget {
                 profile: this._resolvedPromptContextProfile(),
                 referenceContext: () => ({
                     scene: contextScene,
-                    references: this._references || [],
+                    // A chip is durable and its write never checks the member,
+                    // so a member whose delete is in flight is not offered.
+                    references: this._referencesOfferable(),
                     semanticUnits: this._promptSemanticUnits || [],
                     profileId: this.activeScene?.prompt_context_profile_id
                         || template.default_context_profile || "generic@1",
@@ -14911,7 +15215,7 @@ export class EditorWidget {
                                 _context_consumer_end: consumerSection?.end_frame
                                     ?? this.activeScene?.duration_frames ?? 0,
                                 _context_reference_frame_threshold: this._referenceFrameThreshold || 0 },
-                            references: this._references || [], semanticUnits: this._promptSemanticUnits || [],
+                            references: this._referencesOfferable(), semanticUnits: this._promptSemanticUnits || [],
                             channelKey: key,
                             profileId: this.activeScene?.prompt_context_profile_id
                                 || template.default_context_profile || "generic@1",
@@ -15012,7 +15316,7 @@ export class EditorWidget {
                 _context_consumer_end: consumerSection?.end_frame
                     ?? this.activeScene?.duration_frames ?? 0,
                 _context_reference_frame_threshold: this._referenceFrameThreshold || 0 },
-            references: this._references || [],
+            references: this._referencesOfferable(),
             semanticUnits: this._promptSemanticUnits || [],
             channelKey: wideKey,
             profileId: this.activeScene?.prompt_context_profile_id

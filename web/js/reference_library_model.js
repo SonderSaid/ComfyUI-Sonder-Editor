@@ -452,17 +452,21 @@ export function filterReferences(references = [], query = "", assets = [], catal
     });
 }
 
-/** Library writes that paint before the server answers. Update/delete stay
- *  server-first: their exact-prior-value guards read what the author saw, and
- *  an overlay over a row the server may still refuse would be read as that. */
+/** Library writes that paint before the server answers: every Library
+ *  sidebar write. Each paint is an overlay its own mutation owns, so a refusal
+ *  drops it with no network. The guards stay exact-prior-value: a form's
+ *  `expected` comes from the record it was opened from, and a button with no
+ *  form reads the displayed row at the click. */
 export const PAINT_FIRST_REFERENCE_OPERATIONS = Object.freeze(new Set([
-    "create_reference", "create_member", "reorder_members"]));
+    "create_reference", "create_member", "reorder_members",
+    "update_reference", "update_member", "delete_reference", "delete_member"]));
 
 /** Describe one paint-first operation as a display overlay, or null.
  *
  *  `key` doubles as the temporary id of the row a create paints (`pending:<n>`);
- *  it never reaches the server and no request can name it, which is why every
- *  pending row is inert.
+ *  it never reaches the server and no request can name it, which is why a
+ *  pending CREATE is inert (`pendingInert`). An update or delete names a real
+ *  id, so the row it paints stays usable while it saves.
  */
 export function referenceOverlayFromOperation(operation, key) {
     const type = String(operation?.type || "");
@@ -471,13 +475,39 @@ export function referenceOverlayFromOperation(operation, key) {
         key: String(key),
         type,
         reference_id: String(operation?.reference_id || ""),
+        member_id: String(operation?.member_id || ""),
         fields: operation?.fields && typeof operation.fields === "object"
             ? structuredClone(operation.fields) : {},
+        expected: operation?.expected && typeof operation.expected === "object"
+            ? structuredClone(operation.expected) : {},
         member_ids: Array.isArray(operation?.member_ids)
             ? operation.member_ids.map(String) : [],
         status: "saving",
         committedId: "",
     };
+}
+
+/** The ids a pending Library delete is taking away: References, and every
+ *  member either a `delete_member` or a `delete_reference` removes. The host
+ *  refuses to stage, append or attach these while the delete is in flight. */
+export function referenceIdsBeingDeleted(overlays = [], references = []) {
+    const referenceIds = new Set();
+    const memberIds = new Set();
+    for (const overlay of Array.isArray(overlays) ? overlays : []) {
+        if (overlay?.type === "delete_member" && overlay.member_id) {
+            memberIds.add(String(overlay.member_id));
+        } else if (overlay?.type === "delete_reference") {
+            referenceIds.add(String(overlay.reference_id));
+            for (const id of Array.isArray(overlay.expected?.member_ids) ? overlay.expected.member_ids : []) {
+                memberIds.add(String(id));
+            }
+            const target = (Array.isArray(references) ? references : []).find((entry) =>
+                String(entry?.reference_id || "") === overlay.reference_id);
+            for (const member of target?.members || []) memberIds.add(String(member?.member_id || ""));
+        }
+    }
+    memberIds.delete("");
+    return { referenceIds, memberIds };
 }
 
 /** The Library as displayed: acknowledged References plus pending overlays.
@@ -489,7 +519,9 @@ export function referenceOverlayFromOperation(operation, key) {
  *
  *  Overlays apply in authoring order, which is the queue's send order, so the
  *  displayed order is what the server will hold once they all land. Painted
- *  rows carry `pendingStatus`; untouched References keep their identity.
+ *  rows carry `pendingStatus` for their "Saving…" label; only a create's row
+ *  also carries `pendingInert`, because only its id is temporary. Untouched
+ *  References keep their identity.
  */
 export function applyPendingReferenceOverlays(references = [], overlays = []) {
     const result = Array.isArray(references) ? [...references] : [];
@@ -506,6 +538,7 @@ export function applyPendingReferenceOverlays(references = [], overlays = []) {
                 reference_id: overlay.key,
                 members: [],
                 pendingStatus: overlay.status || "saving",
+                pendingInert: true,
             });
             continue;
         }
@@ -526,8 +559,27 @@ export function applyPendingReferenceOverlays(references = [], overlays = []) {
                     member_id: overlay.key,
                     order: members.length,
                     pendingStatus: overlay.status || "saving",
+                    pendingInert: true,
                 }],
             };
+        } else if (overlay.type === "update_reference") {
+            result[index] = { ...reference, ...overlay.fields,
+                pendingStatus: overlay.status || "saving" };
+        } else if (overlay.type === "delete_reference") {
+            result.splice(index, 1);
+        } else if (overlay.type === "update_member") {
+            if (!members.some((member) => String(member?.member_id || "") === overlay.member_id)) continue;
+            result[index] = { ...reference, members: members.map((member) =>
+                String(member?.member_id || "") === overlay.member_id
+                    ? { ...member, ...overlay.fields, pendingStatus: overlay.status || "saving" }
+                    : member) };
+        } else if (overlay.type === "delete_member") {
+            // Dense `order`, as `_apply_delete_reference_member` renumbers.
+            const kept = members.filter((member) =>
+                String(member?.member_id || "") !== overlay.member_id);
+            if (kept.length !== members.length) {
+                result[index] = { ...reference, members: denseMemberOrder(kept) };
+            }
         } else if (overlay.type === "reorder_members") {
             const byId = new Map(members.map((member) => [String(member?.member_id || ""), member]));
             const desired = overlay.member_ids.filter((id) => byId.has(id));
@@ -544,12 +596,14 @@ export function applyPendingReferenceOverlays(references = [], overlays = []) {
     return result;
 }
 
-/** True once acknowledged References already show what this create painted.
+/** True once acknowledged References already show what this overlay painted.
  *
- *  Only a committed id the server returned counts. A reorder never qualifies:
- *  an order can match by coincidence — Up then Down restores it — so a later
- *  reorder would leave ahead of an earlier one and the display would show an
- *  order the server does not hold. It waits for a payload that postdates it.
+ *  A create counts only by a committed id the server returned. A delete counts
+ *  once its target is gone. An update or a reorder never qualifies: a value
+ *  or an order can match by coincidence — Up then Down restores an order, and
+ *  a later edit can restore a value — so a later write would leave ahead of
+ *  an earlier one and the display would show what the server does not hold.
+ *  Each waits for a payload that postdates it.
  */
 export function referenceOverlayReflected(references = [], overlay = null) {
     const list = Array.isArray(references) ? references : [];
@@ -559,11 +613,39 @@ export function referenceOverlayReflected(references = [], overlay = null) {
     }
     const reference = list.find((entry) =>
         String(entry?.reference_id || "") === overlay?.reference_id);
+    if (overlay?.type === "delete_reference") return !reference;
     const memberIds = (reference?.members || []).map((member) => String(member?.member_id || ""));
+    if (overlay?.type === "delete_member") return !memberIds.includes(overlay.member_id);
     if (overlay?.type === "create_member") {
         return !!overlay.committedId && memberIds.includes(overlay.committedId);
     }
     return false;
+}
+
+/** Whether a Library value read back equals the value an update sent, as the
+ *  route stores it: names and text as sent (the draft serializers trim as the
+ *  route does), tags without regard to case (the route casefolds preset ids),
+ *  and numbers as numbers (the route stores floats). Used to decide whether an
+ *  update whose answer was lost landed; a false "no" costs a returned draft,
+ *  never data. */
+export function referenceFieldStoredAs(field, stored, sent) {
+    if (field === "tags") {
+        const fold = (value) => (Array.isArray(value) ? value : []).map((tag) =>
+            String(tag).toLocaleLowerCase());
+        return JSON.stringify(fold(stored)) === JSON.stringify(fold(sent));
+    }
+    if (field === "crop") {
+        if (stored == null || sent == null) return stored == null && sent == null;
+        return ["x", "y", "w", "h"].every((key) =>
+            Math.abs(Number(stored[key]) - Number(sent[key])) < 1e-9);
+    }
+    if (field === "source_start_sec" || field === "source_end_sec") {
+        if (stored == null || sent == null || sent === "") {
+            return (stored == null) === (sent == null || sent === "");
+        }
+        return Math.abs(Number(stored) - Number(sent)) < 1e-9;
+    }
+    return JSON.stringify(stored ?? null) === JSON.stringify(sent ?? null);
 }
 
 export function shouldApplyReferenceResponse({ requestedProject, currentProject, requestGeneration, currentGeneration }) {

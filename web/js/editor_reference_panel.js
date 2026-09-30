@@ -9,6 +9,7 @@
 //   activeScene, activeSceneId, projectDir, totalFrames, playhead, _trackLayout,
 //   _references, _referenceRecipePresets, _customReferenceRecipes,
 //   _referenceRecipeFieldSchema, _referenceMemberForRef(ref),
+//   _referenceMemberBeingDeleted(memberId),
 //   _referenceLaneAdvisories(entry, definition), _defaultReferenceLaneRecipe(),
 //   _findAssetById(id), _referenceAssetPreviewUrl(asset),
 //   _openReferenceMediaEditor({ asset, draft, readOnly }),
@@ -1291,6 +1292,9 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             for (const reference of host._references || []) {
                 for (const member of reference.members || []) {
                     if (staged.has(member.member_id)) continue;
+                    // A Library delete in flight is taking it away; staging
+                    // it would name a member the server is removing.
+                    if (host._referenceMemberBeingDeleted?.(member.member_id)) continue;
                     const asset = host._findAssetById?.(member.asset_id) || null;
                     // A wrong-kind member is never offered: media_kind is a hard
                     // lane property and the backend refuses the write anyway.

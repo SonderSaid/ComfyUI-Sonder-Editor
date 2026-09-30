@@ -1,3 +1,34 @@
+// Reference Library sidebar — the project's Reference identities and their
+// members, with the forms that create, edit, reorder and delete them.
+//
+// Module-host contract (fullscreen seam pattern): the host owns the Library,
+// networking and every durable write; this module owns its DOM, listeners and
+// drafts, and returns a cleanup handle. Host surface used:
+//   getData() -> { projectKey, references (the displayed view: acknowledged
+//     data plus pending overlays), catalog, tagFamilies, assets, scenes,
+//     semanticUnits, loading, loaded, error },
+//   mutatePaintFirst(operations, { onUnconfirmedResolved }) -> Promise,
+//   mutate(operations) -> Promise (server-first; no sidebar write uses it now),
+//   confirm(message), notify(message), pickAsset({ assetType, currentAssetId,
+//   onPick }), inspectAsset(asset), editMemberMedia(opts),
+//   previewMemberMedia(opts), assetPreviewUrl(asset), addToTimeline(payload)
+//
+// Invariants this module must keep:
+//   1. Every write paints first. A form closes at Save; a refusal hands its
+//      draft back only into an empty form slot, because an open form is the
+//      author's newer work.
+//   2. Guards describe what the author saw. A form's `expected` comes from
+//      the record it was OPENED from (its base), and a Save sends only the
+//      keys the author changed from it. A draft handed back after a refusal
+//      still sends only those keys, guarded by the row displayed when it is
+//      saved again: a guard captured at the handback could hold the refused
+//      paint, a follower's, or predate the refresh the refusal asked for.
+//      A button with no form (Remove, Delete, Up, Down) reads the displayed
+//      row at the click. Never re-read the live row to build a guard.
+//   3. A row whose create is still saving (`pendingInert`) has a temporary id
+//      no request may name: it is never edited, dragged, staged or deleted.
+//      A row whose update is saving (`pendingStatus` alone) is fully usable.
+
 import {
     compatibleReferencePresets,
     createMemberDraft,
@@ -119,7 +150,16 @@ export function mountReferenceLibrary(container, host) {
         query: "",
         selectedReferenceId: "",
         entityDraft: null,
+        // The displayed record a form was opened from, for its Save's diff and
+        // guard (invariant 2).
+        entityBase: null,
+        // A draft handed back after a refusal keeps the base it was first
+        // diffed from: which keys the author changed. Its guard is read at
+        // the next Save from the row then displayed.
+        entityOrigin: null,
         memberDraft: null,
+        memberBase: null,
+        memberOrigin: null,
         memberMode: "",
         manage: false,
         memberNotice: "",
@@ -154,10 +194,17 @@ export function mountReferenceLibrary(container, host) {
     };
     container.style.cssText = "display:flex;flex-direction:column;min-height:0;overflow:hidden;height:100%;background:#11161b;color:#e6ebf0;";
 
-    // A pending row has a temporary id no request can name, so it is never
-    // staged, dragged or offered to the timeline until the server settles it.
+    // A row still being created has a temporary id no request can name, so it
+    // is never staged, dragged or offered to the timeline until it settles.
     const settledMembers = (reference) => (reference?.members || [])
-        .filter((member) => !member?.pendingStatus);
+        .filter((member) => !member?.pendingInert);
+    // A displayed record as stored: without the view's decoration.
+    const storedRecord = (record) => {
+        const { pendingStatus: _status, pendingInert: _inert, ...rest } = record || {};
+        return structuredClone(rest);
+    };
+    const displayedReference = (referenceId) => (host.getData().references || [])
+        .find((entry) => entry.reference_id === referenceId) || null;
     const pendingLabel = (status) => status === "unconfirmed" ? "Not confirmed — checking…" : "Saving…";
     const WAIT_FOR_MEMBER = "Wait for the new member to finish saving.";
 
@@ -208,7 +255,11 @@ export function mountReferenceLibrary(container, host) {
         state.query = "";
         state.selectedReferenceId = "";
         state.entityDraft = null;
+        state.entityBase = null;
+        state.entityOrigin = null;
         state.memberDraft = null;
+        state.memberBase = null;
+        state.memberOrigin = null;
         state.memberMode = "";
         state.manage = false;
         state.memberNotice = "";
@@ -237,7 +288,11 @@ export function mountReferenceLibrary(container, host) {
                 && String(host.getData().projectKey || "") === projectKey;
             if (closeForm) {
                 state.entityDraft = null;
+                state.entityBase = null;
+                state.entityOrigin = null;
                 state.memberDraft = null;
+                state.memberBase = null;
+                state.memberOrigin = null;
                 state.memberMode = "";
                 state.memberNotice = "";
             }
@@ -286,7 +341,7 @@ export function mountReferenceLibrary(container, host) {
     const renderEntityEditor = (body, reference) => {
         const draft = state.entityDraft;
         const editor = el("div", "", "display:flex;flex-direction:column;gap:11px;padding:10px;border:1px solid #303a43;border-radius:8px;background:#151b21;");
-        editor.appendChild(el("div", reference ? "Edit Reference" : "New Reference", "font-size:12px;font-weight:700;color:#e4ebf1;margin-bottom:1px;"));
+        editor.appendChild(el("div", draft.reference_id ? "Edit Reference" : "New Reference", "font-size:12px;font-weight:700;color:#e4ebf1;margin-bottom:1px;"));
         const name = inputField("Name", draft.name, (value) => { draft.name = value; }, {
             help: "The Library name used to identify this reference.",
         });
@@ -356,15 +411,48 @@ export function mountReferenceLibrary(container, host) {
             const errors = validateReferenceDraft(draft);
             if (errors.length) { state.error = errors[0]; render(); return; }
             const values = serializeReferenceDraft(draft);
-            if (reference) {
+            if (draft.reference_id) {
+                // An edit of a Reference no longer displayed is refused here and
+                // never falls through to the create branch below. A draft handed
+                // back after a refusal has no base: it takes the displayed row
+                // now, once the refusal's own paint -- and any follower's -- has
+                // left, or it would be refused again on every Save.
+                const base = state.entityBase || (reference ? storedRecord(reference) : null);
+                const origin = state.entityBase || state.entityOrigin || base;
+                if (!reference || !base) {
+                    state.error = "This Reference no longer exists.";
+                    render();
+                    return;
+                }
+                // Diff against the base, serialized the same way, so an
+                // untouched field -- even one another tab changed since -- is
+                // not sent, and `expected` is what the author saw.
+                const before = serializeReferenceDraft(createReferenceDraft(origin));
                 const fields = {};
                 const expected = {};
                 for (const key of ["name", "kind", "reference_class", "description",
                     "visual_intent", "audio_intent"]) {
-                    if (values[key] !== reference[key]) { fields[key] = values[key]; expected[key] = reference[key]; }
+                    if (values[key] !== before[key]) { fields[key] = values[key]; expected[key] = base[key]; }
                 }
-                if (!Object.keys(fields).length) { state.entityDraft = null; render(); return; }
-                void perform([{ type: "update_reference", reference_id: reference.reference_id, fields, expected }]);
+                if (!Object.keys(fields).length) {
+                    state.entityDraft = null;
+                    state.entityBase = null;
+                    render();
+                    return;
+                }
+                void perform([{ type: "update_reference", reference_id: base.reference_id, fields, expected }], {
+                    paintFirst: true,
+                    closeForm: true,
+                    onRefused: () => {
+                        if (state.entityDraft || state.memberDraft) return;
+                        if (!displayedReference(base.reference_id)) return;
+                        state.entityDraft = draft;
+                        // Its guard is recaptured at the next Save (above);
+                        // what it changes is still judged against `origin`.
+                        state.entityBase = null;
+                        state.entityOrigin = origin;
+                    },
+                });
             } else {
                 void perform([{ type: "create_reference", fields: values }], {
                     paintFirst: true,
@@ -378,7 +466,7 @@ export function mountReferenceLibrary(container, host) {
                 });
             }
         });
-        cancel.addEventListener("click", () => { state.entityDraft = null; render(); });
+        cancel.addEventListener("click", () => { state.entityDraft = null; state.entityBase = null; state.entityOrigin = null; render(); });
         row.append(save, cancel);
         editor.appendChild(row);
         body.appendChild(editor);
@@ -543,13 +631,50 @@ export function mountReferenceLibrary(container, host) {
             const errors = validateMemberDraft(draft, catalog, asset, families);
             if (errors.length) { state.error = errors[0]; render(); return; }
             const values = serializeMemberDraft(draft, catalog);
-            if (member) {
-                const fields = {};
-                for (const key of ["asset_id", "name", "tags", "prompt", "crop", "source_start_sec", "source_end_sec"]) {
-                    if (JSON.stringify(values[key]) !== JSON.stringify(member[key])) fields[key] = values[key];
+            if (state.memberMode && state.memberMode !== "create") {
+                // A returned draft takes its base at Save, as the entity form does.
+                const base = state.memberBase || (member ? storedRecord(member) : null);
+                const origin = state.memberBase || state.memberOrigin || base;
+                if (!member || !base) {
+                    state.error = "This Library member no longer exists.";
+                    render();
+                    return;
                 }
-                if (!Object.keys(fields).length) { state.memberDraft = null; render(); return; }
-                void perform([{ type: "update_member", reference_id: reference.reference_id, member_id: member.member_id, fields, expected: member }]);
+                const originAsset = assets.find((entry) => entry.asset_id === origin.asset_id) || null;
+                const before = serializeMemberDraft(createMemberDraft(origin, originAsset), catalog);
+                const fields = {};
+                const expected = {};
+                for (const key of ["asset_id", "name", "tags", "prompt", "crop", "source_start_sec", "source_end_sec"]) {
+                    if (JSON.stringify(values[key]) !== JSON.stringify(before[key])) {
+                        fields[key] = values[key];
+                        // Only the keys sent: the route compares only those.
+                        expected[key] = base[key] ?? null;
+                    }
+                }
+                if (!Object.keys(fields).length) {
+                    state.memberDraft = null;
+                    state.memberBase = null;
+                    state.memberMode = "";
+                    render();
+                    return;
+                }
+                const referenceId = reference.reference_id;
+                const memberId = base.member_id;
+                void perform([{ type: "update_member", reference_id: referenceId, member_id: memberId, fields, expected }], {
+                    paintFirst: true,
+                    closeForm: true,
+                    onRefused: () => {
+                        if (state.entityDraft || state.memberDraft) return;
+                        const shown = (displayedReference(referenceId)?.members || [])
+                            .find((entry) => entry.member_id === memberId);
+                        if (!shown) return;
+                        state.selectedReferenceId = referenceId;
+                        state.memberDraft = draft;
+                        state.memberMode = memberId;
+                        state.memberBase = null;
+                        state.memberOrigin = origin;
+                    },
+                });
             } else {
                 void perform([{ type: "create_member", reference_id: reference.reference_id, fields: values }], {
                     paintFirst: true,
@@ -565,7 +690,7 @@ export function mountReferenceLibrary(container, host) {
                 });
             }
         });
-        cancel.addEventListener("click", () => { state.memberDraft = null; state.memberMode = ""; render(); });
+        cancel.addEventListener("click", () => { state.memberDraft = null; state.memberBase = null; state.memberOrigin = null; state.memberMode = ""; render(); });
         row.append(save, cancel);
         editor.appendChild(row);
         body.appendChild(editor);
@@ -658,8 +783,10 @@ export function mountReferenceLibrary(container, host) {
         const references = filterReferences(data.references, state.query, allAssets, data.catalog, data.tagFamilies);
         if (!references.length) body.appendChild(el("div", data.references.length ? "No references match." : "No references yet.", "color:#788692;padding:18px;text-align:center;font-size:11px;"));
         for (const reference of references) {
-            const pendingEntity = reference.pendingStatus || "";
-            const memberPending = (reference.members || []).some((member) => member?.pendingStatus);
+            // Inert only while its create saves; an update's paint is usable.
+            const pendingEntity = reference.pendingInert ? (reference.pendingStatus || "saving") : "";
+            const savingEntity = reference.pendingStatus || "";
+            const memberPending = (reference.members || []).some((member) => member?.pendingInert);
             const card = el("section", "", `border:1px solid #303841;border-radius:8px;background:#171d23;margin-bottom:8px;overflow:hidden;${pendingEntity ? "opacity:.6;" : ""}`);
             const header = el("div", "", `display:flex;flex-direction:column;gap:5px;padding:8px;cursor:${pendingEntity ? "default" : "pointer"};`);
             if (pendingEntity) header.title = "Saving this Reference. It can be opened and used once saved.";
@@ -678,13 +805,19 @@ export function mountReferenceLibrary(container, host) {
             const topLine = el("div", "", "display:flex;align-items:center;gap:6px;min-width:0;");
             const title = el("div", reference.name, "flex:1;min-width:0;font-size:12px;font-weight:600;overflow:hidden;text-overflow:ellipsis;");
             const count = el("span", `${reference.members?.length || 0}`, `font-size:9px;color:${unresolved || trashed || missingFiles ? "#e2ab68" : "#82909c"};`);
-            topLine.append(title, pendingEntity
-                ? el("span", pendingLabel(pendingEntity), `font-size:9px;color:${THEME.statusPending};`)
+            topLine.append(title, savingEntity
+                ? el("span", pendingLabel(savingEntity), `font-size:9px;color:${THEME.statusPending};`)
                 : count);
             if (state.manage && !pendingEntity) {
                 const edit = el("button", "Edit", `${css.button}padding:3px 6px;font-size:9px;`);
                 const remove = el("button", "Delete", `${css.button}padding:3px 6px;font-size:9px;`);
-                edit.addEventListener("click", (event) => { event.stopPropagation(); state.entityDraft = createReferenceDraft(reference); render(); });
+                edit.addEventListener("click", (event) => {
+                    event.stopPropagation();
+                    state.entityDraft = createReferenceDraft(reference);
+                    state.entityBase = storedRecord(reference);
+                    state.entityOrigin = null;
+                    render();
+                });
                 remove.addEventListener("click", (event) => {
                     event.stopPropagation();
                     const unitIds = new Set((data.semanticUnits || [])
@@ -710,7 +843,12 @@ export function mountReferenceLibrary(container, host) {
                         ? `\n\nWhere used: ${staged} staged item(s), ${unitIds.size} Subject unit(s), ${chips} Context chip(s). Deletion keeps broken chips visible for repair.`
                         : "";
                     if (!host.confirm(`Delete “${reference.name}” and its ${reference.members?.length || 0} member(s)?${usage}`)) return;
-                    void perform([{ type: "delete_reference", reference_id: reference.reference_id, expected: { name: reference.name, kind: reference.kind, reference_class: reference.reference_class, description: reference.description || "", visual_intent: reference.visual_intent || "preserve", audio_intent: reference.audio_intent || "reference_characteristics", member_ids: (reference.members || []).map((member) => member.member_id) } }]);
+                    // The displayed row at the click, own pending edits included:
+                    // the queue lands them before this delete is checked.
+                    const shown = displayedReference(reference.reference_id);
+                    if (!shown) { state.error = "This Reference no longer exists."; render(); return; }
+                    void perform([{ type: "delete_reference", reference_id: shown.reference_id, expected: { name: shown.name, kind: shown.kind, reference_class: shown.reference_class, description: shown.description || "", visual_intent: shown.visual_intent || "preserve", audio_intent: shown.audio_intent || "reference_characteristics", member_ids: (shown.members || []).map((member) => member.member_id) } }],
+                    { paintFirst: true });
                 });
                 // Its exact member list is part of the delete's guard, and a
                 // member still being added is not in the server's list yet.
@@ -750,7 +888,8 @@ export function mountReferenceLibrary(container, host) {
                 } else {
                     for (const member of reference.members || []) {
                         const asset = allAssets.find((entry) => entry.asset_id === member.asset_id);
-                        const pendingMember = member.pendingStatus || "";
+                        // Inert only while its create saves (invariant 3).
+                        const pendingMember = member.pendingInert ? (member.pendingStatus || "saving") : "";
                         const row = el("div", "", `display:grid;grid-template-columns:40px minmax(0,1fr);gap:7px;padding:7px 0;border-top:1px solid #293039;${pendingMember ? "opacity:.6;" : ""}`);
                         row.draggable = !pendingMember;
                         if (!pendingMember) {
@@ -794,11 +933,15 @@ export function mountReferenceLibrary(container, host) {
                         preview.addEventListener("click", inspectMember);
                         nameLine.addEventListener("click", inspectMember);
                         info.appendChild(nameLine);
+                        if (member.pendingStatus) {
+                            info.appendChild(el("div", pendingLabel(member.pendingStatus),
+                                `font-size:9px;color:${THEME.statusPending};margin-top:2px;`));
+                        }
                         if (member.tags?.length) info.appendChild(el("div", member.tags.map((tag) => formatReferenceTag(tag, { catalog: data.catalog, families: data.tagFamilies })).join(" · "), "font-size:9px;color:#829fba;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:2px;"));
                         if (member.prompt) info.appendChild(el("div", member.prompt, "font-size:9px;color:#b8c2ca;line-height:1.4;white-space:pre-wrap;overflow-wrap:anywhere;margin-top:3px;"));
                         const controls = el("div", "", "display:flex;gap:3px;margin-top:4px;");
                         for (const [label, handler] of [
-                            ["Edit", () => { state.memberDraft = createMemberDraft(member, asset); state.memberDraft.has_audio = asset?.has_audio === true; state.memberNotice = ""; state.memberMode = member.member_id; render(); }],
+                            ["Edit", () => { state.memberDraft = createMemberDraft(member, asset); state.memberDraft.has_audio = asset?.has_audio === true; state.memberBase = storedRecord(member); state.memberOrigin = null; state.memberNotice = ""; state.memberMode = member.member_id; render(); }],
                             ["Remove", () => {
                                 const unitIds = new Set((data.semanticUnits || [])
                                     .filter((unit) => (unit.sources || []).some((value) =>
@@ -825,8 +968,15 @@ export function mountReferenceLibrary(container, host) {
                                     ? `\n\nWhere used: ${staged} staged item(s), ${unitIds.size} Subject unit(s), ${chips} Context chip(s). Deletion keeps broken chips visible for repair.`
                                     : "";
                                 if (host.confirm(`Remove this Library member?${usage}`)) {
+                                    // The displayed row at the click, as stored:
+                                    // the route requires every `to_dict` key and
+                                    // no overlay decoration.
+                                    const shown = (displayedReference(reference.reference_id)?.members || [])
+                                        .find((entry) => entry.member_id === member.member_id);
+                                    if (!shown) { state.error = "This Library member no longer exists."; render(); return; }
                                     void perform([{ type: "delete_member", reference_id: reference.reference_id,
-                                        member_id: member.member_id, expected: member }]);
+                                        member_id: shown.member_id, expected: storedRecord(shown) }],
+                                    { paintFirst: true });
                                 }
                             }],
                             ["Up", () => reorder(reference, member, -1)], ["Down", () => reorder(reference, member, 1)],
@@ -868,7 +1018,7 @@ export function mountReferenceLibrary(container, host) {
         const reference = (host.getData().references || []).find((entry) =>
             entry.reference_id === drawnReference.reference_id);
         const members = reference?.members || [];
-        if (!reference || members.some((entry) => entry?.pendingStatus)) return;
+        if (!reference || members.some((entry) => entry?.pendingInert)) return;
         const desired = moveMember(members, member.member_id, direction).map((entry) => entry.member_id);
         const expected = members.map((entry) => entry.member_id);
         if (JSON.stringify(expected) !== JSON.stringify(desired)) {

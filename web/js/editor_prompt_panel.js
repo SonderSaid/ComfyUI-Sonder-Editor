@@ -923,9 +923,15 @@ export function writingSectionsFromDraft({
 }
 
 export function mountPromptManagementPanel(host) {
+    // The host may refuse a configuration (null): a member a Library delete in
+    // flight is taking away.
     const acceptDurableConfiguration = (result) =>
-        host._acceptPromptAttachmentConfiguration?.(result)
-        || promptAttachmentConfiguration(result).attachment;
+        typeof host._acceptPromptAttachmentConfiguration === "function"
+            ? host._acceptPromptAttachmentConfiguration(result)
+            : promptAttachmentConfiguration(result).attachment;
+    // What a chip picker or configure dialog may offer: the acknowledged
+    // Library less what a delete in flight is taking away.
+    const offerableReferences = () => host._referencesOfferable?.() ?? (host._references || []);
     const acceptDraftConfiguration = (result) => {
         const configured = promptAttachmentConfiguration(result);
         const intent = configured.identityCreateIntent;
@@ -1891,7 +1897,7 @@ Server value: ${serverValue}` : ""}`;
             return configurePromptAttachment(attachment, {
                 referenceProsePolicy: host._referenceProsePolicy,
                 scene: context.scene,
-                references: host._references || [],
+                references: offerableReferences(),
                 semanticUnits: writingSemanticUnits(),
                 profileId: scene?.prompt_context_profile_id
                     || host._channelTemplate().default_context_profile || "generic@1",
@@ -2473,7 +2479,7 @@ Server value: ${serverValue}` : ""}`;
                 scene: { ...(scene || {}),
                     _context_reference_frame_threshold:
                         host._referenceFrameThreshold || 0 },
-                references: host._references || [],
+                references: offerableReferences(),
                 semanticUnits: host._promptSemanticUnits || [],
                 profileId: scene?.prompt_context_profile_id
                     || host._channelTemplate().default_context_profile || "generic@1",
@@ -2755,7 +2761,7 @@ Server value: ${serverValue}` : ""}`;
                                 await configurePromptAttachment({ kind }, {
                                 referenceProsePolicy: host._referenceProsePolicy,
                                 scene: attachmentScene,
-                                references: host._references || [],
+                                references: offerableReferences(),
                                 semanticUnits: writingSemanticUnits(),
                                 profileId: scene?.prompt_context_profile_id
                                     || host._channelTemplate().default_context_profile || "generic@1",
@@ -2783,7 +2789,7 @@ Server value: ${serverValue}` : ""}`;
                                 await configurePromptAttachment(attachment, {
                                 referenceProsePolicy: host._referenceProsePolicy,
                                 scene: attachmentScene,
-                                references: host._references || [],
+                                references: offerableReferences(),
                                 semanticUnits: writingSemanticUnits(),
                                 profileId: scene?.prompt_context_profile_id
                                     || host._channelTemplate().default_context_profile || "generic@1",
@@ -3525,6 +3531,14 @@ Server value: ${serverValue}` : ""}`;
                 host._promptSemanticUnits || [], change), label, options);
         };
         const attachReference = async (owner, target, overrides = null) => {
+            // A Library delete in flight is taking this member away: the chip
+            // would name a member the server is removing.
+            if (owner?.type === "physical"
+                    && host._referenceMemberBeingDeleted?.(owner.memberId)) {
+                notifyWarning("That Library member is being deleted.",
+                    { source: "prompt-reference-attach-refused" });
+                return false;
+            }
             const supportsLifecycle = typeof host._beginSceneHistoryLifecycle === "function";
             const lifecycleToken = host._beginSceneHistoryLifecycle?.("attach prompt Reference");
             if (supportsLifecycle && !lifecycleToken) return false;
@@ -3782,7 +3796,7 @@ Server value: ${serverValue}` : ""}`;
                 referenceProsePolicy: host._referenceProsePolicy,
                 scene: { ...(scene || {}), _context_channel_keys: globalKeys,
                     _context_reference_frame_threshold: host._referenceFrameThreshold || 0 },
-                references: host._references || [], channelKey: key,
+                references: offerableReferences(), channelKey: key,
                 semanticUnits: host._promptSemanticUnits || [],
                 profileId: scene.prompt_context_profile_id
                     || globalTemplate.default_context_profile || "generic@1",
@@ -3901,7 +3915,7 @@ Server value: ${serverValue}` : ""}`;
                     scene: { ...(scene || {}),
                         _context_reference_frame_threshold:
                             host._referenceFrameThreshold || 0 },
-                    references: host._references || [],
+                    references: offerableReferences(),
                     semanticUnits: host._promptSemanticUnits || [],
                     profileId: scene.prompt_context_profile_id
                         || globalTemplate.default_context_profile || "generic@1",
@@ -3968,7 +3982,7 @@ Server value: ${serverValue}` : ""}`;
             referenceProsePolicy: host._referenceProsePolicy,
             scene: { ...(scene || {}), _context_channel_keys: globalKeys,
                 _context_reference_frame_threshold: host._referenceFrameThreshold || 0 },
-            references: host._references || [], channelKey: globalKeys[0] || "visual",
+            references: offerableReferences(), channelKey: globalKeys[0] || "visual",
             semanticUnits: host._promptSemanticUnits || [],
             profileId: scene.prompt_context_profile_id
                 || globalTemplate.default_context_profile || "generic@1",
@@ -4149,7 +4163,7 @@ Server value: ${serverValue}` : ""}`;
                         _context_consumer_start: section.start_frame,
                         _context_consumer_end: section.end_frame,
                         _context_reference_frame_threshold: host._referenceFrameThreshold || 0 },
-                    references: host._references || [], channelKey: key,
+                    references: offerableReferences(), channelKey: key,
                     semanticUnits: host._promptSemanticUnits || [],
                     profileId: scene.prompt_context_profile_id
                         || template.default_context_profile || "generic@1",
@@ -4235,7 +4249,7 @@ Server value: ${serverValue}` : ""}`;
                             _context_consumer_end: section.end_frame,
                             _context_reference_frame_threshold:
                                 host._referenceFrameThreshold || 0 },
-                        references: host._references || [],
+                        references: offerableReferences(),
                         semanticUnits: host._promptSemanticUnits || [],
                         profileId: scene.prompt_context_profile_id
                             || template.default_context_profile || "generic@1",
@@ -4371,7 +4385,7 @@ Server value: ${serverValue}` : ""}`;
                     _context_consumer_start: section.start_frame,
                     _context_consumer_end: section.end_frame,
                     _context_reference_frame_threshold: host._referenceFrameThreshold || 0 },
-                references: host._references || [], channelKey: wideKey,
+                references: offerableReferences(), channelKey: wideKey,
                 semanticUnits: host._promptSemanticUnits || [],
                 profileId: scene.prompt_context_profile_id
                     || template.default_context_profile || "generic@1",

@@ -114,6 +114,8 @@ globalThis.fetch = async (url, init = {}) => {
     if (holdNext > 0) { holdNext -= 1; await new Promise((resolve, reject) => held.push({resolve, reject})); }
     const script = libraryScripted.shift();
     if (script?.kind === 'refuse') return json(script.status, { error: script.code, code: script.code });
+    // No answer, and nothing committed: the request never reached the route.
+    if (script?.kind === 'lost-before') throw new TypeError('Failed to fetch');
     const reply = await ask({ references: operations });
     if (script?.kind === 'lost') throw new TypeError('Failed to fetch');
     if (!reply.ok) return json(reply.status, { error: reply.message, code: reply.code });
@@ -144,6 +146,7 @@ const removeMember = (id) => w._mutateReferences([{ type: 'delete_member', refer
 const rows = (scene = w.activeScene) => Object.fromEntries((scene.reference_items || [])
   .map((row) => [row.reference_item_id, row.members.map((member) => member.member_id)]));
 const serverRows = async (sceneId = 'scene') => rows((await ask({ read: true, sceneId })).scene);
+const serverLibrary = async () => (await ask({ referencesRead: true })).payload.references;
 """
 
 
@@ -479,3 +482,329 @@ def test_an_ordered_write_queued_behind_the_delete_takes_the_thinned_scene_as_it
     restored = {row["reference_item_id"]: row for row in merged["reference_items"]}
     assert [member["member_id"] for member in restored["item-1"]["members"]] == ["member-b"]
     assert restored["item-2"]["strength"] == 1
+
+
+# -- Phase 2: Library edits and deletes paint first, on the real route -------------
+#
+# The real Library is mounted on the harness DOM. Two patches let it run there:
+# its `innerHTML = ""` rebuild clears children, and its double-quoted
+# `[data-...="..."]` lookups return nothing (the scroll bookkeeping they feed
+# is not under test here).
+_LIBRARY_UI = r"""
+Object.defineProperty(N.prototype, 'innerHTML', { configurable: true,
+  get() { return ''; }, set(_value) { this.textContent = ''; } });
+const { mountReferenceLibrary } = await import(__LIBRARY_MODULE__);
+const libraryEl = document.createElement('div');
+document.body.appendChild(libraryEl);
+const library = mountReferenceLibrary(libraryEl, {
+  getData: () => w._referenceLibraryData(),
+  mutate: (operations) => w._mutateReferences(operations),
+  mutatePaintFirst: (operations, options) => w._mutateReferencesPaintFirst(operations, options),
+  confirm: () => true, pickAsset: () => {}, assetPreviewUrl: () => null, notify: () => {},
+});
+w._referenceLibraryHandle = library;
+w._allProjectAssetsForGallery = () => Object.values(w.assets || {}).flat();
+const libNodes = () => walk(libraryEl);
+const libButtons = (text, scope = libraryEl) => walk(scope).filter((n) => n.tagName === 'BUTTON' && n.textContent === text);
+const libField = (label) => libNodes().find((n) => ['INPUT', 'TEXTAREA', 'SELECT'].includes(n.tagName)
+  && n.getAttribute('aria-label') === label);
+const libType = (label, value) => { const f = libField(label); f.value = value; f.dispatch('input'); };
+const libClick = (text, scope) => libButtons(text, scope)[0].dispatch('click');
+const libCard = (name) => libNodes().find((n) => n.tagName === 'SECTION'
+  && walk(n).some((c) => c.textContent === name));
+const libManage = () => { const m = libButtons('Manage')[0]; if (m.getAttribute('aria-pressed') !== 'true') m.dispatch('click'); };
+const libEditIdentity = (name) => { libManage(); libClick('Edit', libCard(name)); };
+const libOpenCard = (name) => { const card = libCard(name); if (!libButtons('+ Member', card).length) card.children[0].dispatch('click'); };
+const libMemberControl = (name, memberName, label) => {
+  const line = walk(libCard(name)).find((n) => n.tagName === 'BUTTON' && n.textContent.startsWith(`${name} · ${memberName} —`));
+  return line.parentElement.children.at(-1).children.find((n) => n.textContent === label);
+};
+"""
+
+
+def run_library_ui(body, tmp_path, project=None):
+    return run_library(_LIBRARY_UI.replace(
+        "__LIBRARY_MODULE__", json.dumps((ROOT / "web/js/editor_reference_library.js").as_uri())) + body,
+        tmp_path, project=project)
+
+
+def test_save_reopen_and_save_again_inside_the_first_write_keeps_both(tmp_path):
+    result = run_library_ui("""
+    hold(1);
+    libEditIdentity('Subject');
+    libType('Name', 'Subject One');
+    libClick('Save');
+    const closed = !libField('Name');
+    libEditIdentity('Subject One');
+    libType('Name', 'Subject Two');
+    libClick('Save');
+    await release();
+    await settle(12);
+    const stored = (await serverLibrary()).find((ref) => ref.reference_id === 'entity-1');
+    return { closed, sent: librarySent.map((ops) => [ops[0].fields, ops[0].expected]),
+      stored: stored.name, toasts: toasts.map((t) => t.message) };
+    """, tmp_path)
+    assert result["closed"] is True
+    assert result["sent"] == [[{"name": "Subject One"}, {"name": "Subject"}],
+                              [{"name": "Subject Two"}, {"name": "Subject One"}]]
+    assert result["stored"] == "Subject Two"
+    assert result["toasts"] == []
+
+
+def test_edit_a_member_then_remove_it_inside_the_first_write_keeps_both(tmp_path):
+    result = run_library_ui("""
+    hold(1);
+    libOpenCard('Subject');
+    libMemberControl('Subject', 'C', 'Edit').dispatch('click');
+    libType('Prompt', 'edited prompt');
+    libClick('Save');
+    libMemberControl('Subject', 'C', 'Remove').dispatch('click');
+    const barGone = !item('item-2');
+    await release();
+    await settle(12);
+    const stored = (await serverLibrary()).find((ref) => ref.reference_id === 'entity-1');
+    return { barGone, types: librarySent.map((ops) => ops[0].type),
+      removeGuardPrompt: librarySent[1]?.[0]?.expected?.prompt,
+      members: stored.members.map((m) => m.member_id), local: rows(), server: await serverRows(),
+      toasts: toasts.map((t) => t.message) };
+    """, tmp_path)
+    assert result["barGone"] is True, "the staged item leaves when the Remove is clicked"
+    assert result["types"] == ["update_member", "delete_member"]
+    assert result["removeGuardPrompt"] == "edited prompt"
+    assert "member-c" not in result["members"]
+    assert result["local"] == result["server"] and "item-2" not in result["server"]
+    assert result["toasts"] == []
+
+
+def test_a_description_edit_leaves_a_name_changed_elsewhere_alone(tmp_path):
+    result = run_library_ui("""
+    libEditIdentity('Subject');
+    // Another writer renames it while the form is open.
+    await ask({ references: [{ type: 'update_reference', reference_id: 'entity-1',
+      fields: { name: 'Renamed Elsewhere' }, expected: { name: 'Subject' } }] });
+    libType('Description', 'one line');
+    libClick('Save');
+    await settle(12);
+    const stored = (await serverLibrary()).find((ref) => ref.reference_id === 'entity-1');
+    return { sent: librarySent[0][0], name: stored.name, description: stored.description };
+    """, tmp_path)
+    assert result["sent"]["fields"] == {"description": "one line"}
+    assert result["sent"]["expected"] == {"description": ""}
+    assert result["name"] == "Renamed Elsewhere"
+    assert result["description"] == "one line"
+
+
+def test_a_name_edit_against_a_name_changed_elsewhere_is_refused(tmp_path):
+    result = run_library_ui("""
+    libEditIdentity('Subject');
+    await ask({ references: [{ type: 'update_reference', reference_id: 'entity-1',
+      fields: { name: 'Renamed Elsewhere' }, expected: { name: 'Subject' } }] });
+    libType('Name', 'Mine');
+    libClick('Save');
+    await settle(12);
+    const stored = (await serverLibrary()).find((ref) => ref.reference_id === 'entity-1');
+    return { sent: librarySent[0][0], name: stored.name, draft: libField('Name')?.value ?? null,
+      toasts: toasts.map((t) => t.message) };
+    """, tmp_path)
+    assert result["sent"]["fields"] == {"name": "Mine"}
+    assert result["sent"]["expected"] == {"name": "Subject"}
+    assert result["name"] == "Renamed Elsewhere"
+    assert result["draft"] == "Mine"
+    assert result["toasts"] == ["Reference changed elsewhere — Library refreshed."]
+
+
+def test_a_member_delete_then_its_reference_delete_both_refused_bring_the_item_back_whole(tmp_path):
+    result = run_library("""
+    hold(1);
+    libraryRefuseNext('invalid_reference_mutation', 400);
+    libraryRefuseNext('identity_mismatch');
+    const removing = removeMember('member-a');
+    const shown = w._referenceLibraryData().references.find((ref) => ref.reference_id === 'entity-1');
+    const deleting = w._mutateReferencesPaintFirst([{ type: 'delete_reference', reference_id: 'entity-1',
+      expected: { name: shown.name, kind: shown.kind, reference_class: shown.reference_class,
+        description: shown.description || '', visual_intent: shown.visual_intent || 'preserve',
+        audio_intent: shown.audio_intent || 'reference_characteristics',
+        member_ids: shown.members.map((m) => m.member_id) } }]).catch((error) => error);
+    const painted = rows();
+    await release();
+    await removing; await deleting;
+    await settle(12);
+    return { painted, local: rows(), server: await serverRows(), gets: gets.length,
+      deferred: diag('reference_cascade_rollback_deferred').length };
+    """, tmp_path)
+    assert result["painted"] == {}
+    assert result["local"] == FIXTURE_ROWS == result["server"]
+    assert result["gets"] == 0 and result["deferred"] == 0
+
+
+def test_a_refused_member_delete_behind_a_panel_edit_of_its_item_converges(tmp_path):
+    result = run_library("""
+    hold(1);
+    const editing = w._writeReferenceItemFromPanel('item-1', { strength: 0.5 }, 'change reference strength');
+    libraryRefuseNext('identity_mismatch');
+    const removing = w._mutateReferencesPaintFirst([{ type: 'delete_member', reference_id: 'entity-1',
+      member_id: 'member-a', expected: libraryMember('member-a') }]).catch((error) => error);
+    const painted = rows()['item-1'];
+    await release();
+    await editing; await removing;
+    await settle(16);
+    const local = w.activeScene.reference_items.find((row) => row.reference_item_id === 'item-1');
+    const server = (await ask({ read: true, sceneId: 'scene' })).scene.reference_items
+      .find((row) => row.reference_item_id === 'item-1');
+    return { painted, local: [local.members.map((m) => m.member_id), local.strength],
+      server: [server.members.map((m) => m.member_id), server.strength] };
+    """, tmp_path)
+    assert result["painted"] == ["member-b"]
+    assert result["local"] == result["server"] == [["member-a", "member-b"], 0.5]
+
+
+def test_a_lost_delete_keeps_its_bars_hidden_and_a_read_that_still_holds_it_brings_them_back(tmp_path):
+    result = run_library("""
+    libraryScripted.push({ kind: 'lost-before' });
+    const outcome = await w._mutateReferencesPaintFirst([{ type: 'delete_member', reference_id: 'entity-1',
+      member_id: 'member-c', expected: libraryMember('member-c') }]).catch((error) => error);
+    // Kept hidden once the answer is lost: the delete may have landed.
+    const hidden = !item('item-2');
+    // The lost answer's own Library read decides: the member is still there.
+    await settle(12);
+    return { status: outcome?.status ?? null, hidden, back: rows(), server: await serverRows(),
+      toasts: toasts.map((t) => t.message) };
+    """, tmp_path)
+    assert result["status"] is None
+    assert result["hidden"] is True
+    assert result["back"] == FIXTURE_ROWS == result["server"]
+    assert "A Reference Library change was not saved." in result["toasts"]
+
+
+def test_the_lane_setup_picker_hides_a_member_being_deleted_and_staging_refuses_it(tmp_path):
+    result = run_library(r"""
+    hold(1);
+    const removing = w._mutateReferencesPaintFirst([{ type: 'delete_member', reference_id: 'entity-1',
+      member_id: 'member-c', expected: libraryMember('member-c') }]).catch((error) => error);
+    mount();
+    nodes().find((n) => n.tagName === 'BUTTON' && n.textContent === '+ Add item').dispatch('click');
+    const offered = nodes().filter((n) => n.tagName === 'BUTTON' && n.title === 'Stage this member')
+      .map((n) => n.textContent);
+    const staged = await w._stageReferenceItemOnLane(
+      { members: [{ entity_id: 'entity-1', member_id: 'member-c' }] }, 0, 80);
+    await release();
+    await removing;
+    await settle(8);
+    return { offered, staged, toasts: toasts.map((t) => t.message) };
+    """, tmp_path)
+    assert "Subject · C" not in result["offered"]
+    assert "Subject · A" in result["offered"]
+    assert result["staged"] == "refused"
+    assert "That Library member is being deleted." in result["toasts"]
+
+
+def test_a_lost_delete_that_did_land_releases_its_holds_and_heals_with_one_read(tmp_path):
+    result = run_library("""
+    libraryLostNext();
+    await w._mutateReferencesPaintFirst([{ type: 'delete_member', reference_id: 'entity-1',
+      member_id: 'member-c', expected: libraryMember('member-c') }]).catch((error) => error);
+    const hidden = !item('item-2');
+    await settle(16);
+    return { hidden, local: rows(), server: await serverRows(), gets: gets.length,
+      holds: w._referenceItemWrites?.cascadeHolds?.size ?? 0,
+      reasons: diag('reference_cascade_heal').map((event) => event.reason ?? event.data?.reason),
+      toasts: toasts.map((t) => t.message) };
+    """, tmp_path)
+    assert result["hidden"] is True
+    assert result["local"] == result["server"] and "item-2" not in result["server"]
+    assert result["holds"] == 0
+    assert result["reasons"] == ["unconfirmed_saved"] and result["gets"] == 1
+    assert "A Reference Library change was not saved." not in result["toasts"]
+
+
+def test_a_member_being_deleted_is_not_offered_to_chip_creation_until_the_delete_settles(tmp_path):
+    """A chip is durable and its scene write never checks the member, so the
+    chip pickers read the Library minus what a delete in flight takes away."""
+    result = run_library("""
+    hold(1);
+    const removing = w._mutateReferencesPaintFirst([{ type: 'delete_member', reference_id: 'entity-1',
+      member_id: 'member-c', expected: libraryMember('member-c') }]).catch((error) => error);
+    const offered = () => w._referencesOfferable().flatMap((ref) => ref.members.map((m) => m.member_id));
+    const during = { offered: offered(), deleting: w._referenceMemberBeingDeleted('member-c'),
+      acknowledged: w._references.flatMap((ref) => ref.members.map((m) => m.member_id)) };
+    await release();
+    await removing;
+    await settle(8);
+    return { during, after: offered(), deleting: w._referenceMemberBeingDeleted('member-c') };
+    """, tmp_path)
+    assert "member-c" not in result["during"]["offered"]
+    assert result["during"]["deleting"] is True
+    assert "member-c" in result["during"]["acknowledged"], "acknowledged data is untouched"
+    assert "member-c" not in result["after"] and result["deleting"] is False
+
+
+def test_a_gesture_made_while_a_refused_delete_was_queued_cannot_undo_the_delete_into_the_server(tmp_path):
+    """Phase 2 audit #1: the cascade is painted at enqueue, so a gesture made in
+    the window would snapshot the painted scene as its Undo before-state. The
+    paint starts an ordered baseline, so that entry's before-state is what the
+    server held at its queue position instead."""
+    from server.scene_history_merge import merge_scene_history
+
+    result = run_library("""
+    hold(1);
+    libraryRefuseNext('identity_mismatch');
+    const removing = w._mutateReferencesPaintFirst([{ type: 'delete_member', reference_id: 'entity-1',
+      member_id: 'member-c', expected: libraryMember('member-c') }]).catch((error) => error);
+    const painted = rows();
+    const entry = w._pushUndo('change strength');
+    const writing = w._runSceneMutation([{ type: 'update_reference_item', reference_item_id: 'item-4',
+      fields: { strength: 0.5 }, expected: { strength: 1 } }],
+      { key: 'test', label: 'change strength', historyEntry: entry, coalesce: false, refreshScenes: false });
+    await release();
+    await removing; await writing.catch((error) => error);
+    await settle(16);
+    const top = w._undoStack[w._undoStack.length - 1];
+    return { painted, local: rows(), server: await serverRows(),
+      before: top?.snapshot, post: top?.postSnapshot, stored: await serverScene() };
+    """, tmp_path)
+    assert "item-2" not in result["painted"]
+    assert result["local"] == result["server"] == FIXTURE_ROWS
+    before = [row["reference_item_id"] for row in result["before"]["reference_items"]]
+    assert "item-2" in before, "the before-state is the server's, not the refused paint"
+    merged = merge_scene_history(result["post"], result["before"], result["stored"])
+    assert [row["reference_item_id"] for row in merged["reference_items"]] == \
+        [row["reference_item_id"] for row in result["stored"]["reference_items"]]
+
+
+def test_a_lost_edit_then_an_accepted_remove_of_the_same_member_says_nothing_about_the_edit(tmp_path):
+    """Phase 2 audit #4: an update whose target a later delete removed is moot."""
+    result = run_library("""
+    libraryLostNext();
+    const shown = () => w._referenceLibraryData().references.flatMap((ref) => ref.members)
+      .find((m) => m.member_id === 'member-c');
+    const editing = w._mutateReferencesPaintFirst([{ type: 'update_member', reference_id: 'entity-1',
+      member_id: 'member-c', fields: { prompt: 'edited' }, expected: { prompt: libraryMember('member-c').prompt ?? '' } }])
+      .catch((error) => error);
+    const { pendingStatus, pendingInert, ...guard } = shown();
+    const removing = w._mutateReferencesPaintFirst([{ type: 'delete_member', reference_id: 'entity-1',
+      member_id: 'member-c', expected: guard }]).catch((error) => error);
+    await editing; await removing;
+    await settle(16);
+    const stored = (await serverLibrary()).flatMap((ref) => ref.members).map((m) => m.member_id);
+    return { stored, toasts: toasts.map((t) => t.message) };
+    """, tmp_path)
+    assert "member-c" not in result["stored"]
+    assert "A Reference Library change was not saved." not in result["toasts"]
+
+
+def test_a_delete_answered_item_not_found_leaves_a_thinned_row_to_the_heal(tmp_path):
+    """Phase 2 audit #6: for a Library delete, `item_not_found` means the member
+    is already gone, so the server's cascade has run; the thinned row is not
+    given its removed member back."""
+    result = run_library("""
+    libraryRefuseNext('item_not_found', 404);
+    await w._mutateReferencesPaintFirst([{ type: 'delete_member', reference_id: 'entity-1',
+      member_id: 'member-a', expected: libraryMember('member-a') }]).catch((error) => error);
+    const right = rows()['item-1'];
+    await settle(12);
+    return { right, reasons: diag('reference_cascade_rollback_deferred').map((event) => event.reason ?? event.data?.reason),
+      gets: gets.length };
+    """, tmp_path)
+    assert result["right"] == ["member-b"]
+    assert result["reasons"] == ["item_not_found"]
+    assert result["gets"] == 1
