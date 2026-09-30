@@ -488,7 +488,8 @@ import {
 import { LINK_ITEM_TYPES, pruneLinkedItemGroups, editedLinkGroups, rollbackLinkGroupPrediction } from "./scene_link_groups.js";
 import {
     canonicalJson, canonicalStagedMemberRefs, plannedReferenceItemUpdate,
-    REFERENCE_ITEM_FIELDS, referenceItemOverlap, stagedReferenceItem,
+    REFERENCE_ITEM_FIELDS, referenceItemOverlap, referenceRowAfterMemberRemoval,
+    stagedReferenceItem,
 } from "./scene_reference_geometry.js";
 import { applyGuideSwap, guideIdentityMatches } from "./scene_guide_geometry.js";
 import { createViewportSurface } from "./viewport_surface.js";
@@ -2993,6 +2994,7 @@ export class EditorWidget {
         const requestSeq = ++this._referenceFetchSeq;
         this._referenceSeqSource = "mutation";
         const ownOverlays = Array.isArray(overlays) && overlays.length ? overlays : null;
+        const removedMemberIds = this._referenceDeleteRemovedMemberIds(operations);
         const promise = this._queueProjectMutation({
             key: `references:${++this._referenceMutationSeq}`,
             label,
@@ -3026,6 +3028,14 @@ export class EditorWidget {
                 if (projectDir !== this.projectDir) return result;
                 const applied = this._applyReferencePayload(result?.payload || {}, {
                     projectDir, requestSeq, source: "mutation", ownOverlays });
+                if (removedMemberIds.length) {
+                    // Settled here, inside `run`, so the timeline shows the
+                    // delete before the next queued write is sent.
+                    this._adoptReferenceDeleteCascade({
+                        removedMemberIds,
+                        reports: this._referenceDeleteCascadeReports(result?.payload?.results),
+                    });
+                }
                 // Settled inside `run`, before the queue can send the next write,
                 // so that write's payload finds these overlays acknowledged.
                 if (!applied) this._acknowledgeReferenceOverlays(ownOverlays, result?.payload);
@@ -3054,6 +3064,13 @@ export class EditorWidget {
                 // not showing.
                 this._deferredReferencesForce = true;
                 this._deferProjectBackedRefresh(["references"], "reference_unconfirmed");
+                if (removedMemberIds.length) {
+                    // A delete that may have landed may also have thinned or
+                    // removed staged items, and no report came back to say so.
+                    sessionDiagRecord("reference_cascade_heal", { reason: "unconfirmed" });
+                    this._historyOrderContextCascade(new Set(removedMemberIds.map(String)));
+                    this._deferProjectBackedRefresh(["scenes"], "reference_cascade_heal");
+                }
             }
             if (!ownOverlays) return;
             if (answered) {
@@ -3283,6 +3300,240 @@ export class EditorWidget {
         } else {
             this._referencesDirty = true;
         }
+    }
+
+    /** The Library members an acknowledged Library batch removed: a
+     *  `delete_member`'s member, and every member a `delete_reference` named in
+     *  its guard, which the route has just proven equal to the members it
+     *  removed. Read from what was sent, never from `_references`, which a
+     *  superseded payload may or may not have replaced (Finding L). */
+    _referenceDeleteRemovedMemberIds(operations) {
+        const ids = [];
+        for (const operation of Array.isArray(operations) ? operations : []) {
+            if (operation?.type === "delete_member") ids.push(operation.member_id);
+            if (operation?.type === "delete_reference"
+                    && Array.isArray(operation.expected?.member_ids)) {
+                ids.push(...operation.expected.member_ids);
+            }
+        }
+        return ids;
+    }
+
+    /** The per-scene cascade reports of a Library batch's deletes, in result
+     *  order, or null when any delete came back without one (a server older than
+     *  the report). */
+    _referenceDeleteCascadeReports(results) {
+        const reports = [];
+        for (const result of Array.isArray(results) ? results : []) {
+            if (result?.type !== "delete_member" && result?.type !== "delete_reference") continue;
+            const scenes = result?.cascade?.scenes;
+            if (!scenes || typeof scenes !== "object" || Array.isArray(scenes)) return null;
+            reports.push(scenes);
+        }
+        return reports;
+    }
+
+    /** Whether a staged row's members are being rewritten by a write the mirror
+     *  could not paint: its barrier is up, or a queued slot sent unpainted names
+     *  it. The route re-canonicalizes such a row's members, so a local thinning
+     *  of them is not what the server will hold. */
+    _referenceItemMembersUnpainted(sceneId, itemId) {
+        const state = this._referenceItemWrites;
+        if (!state) return false;
+        if (state.barriers?.has?.(itemId)) return true;
+        for (const slot of this._projectMutationQueue?.slots?.() || []) {
+            if (!state.unpaintedKeys?.has?.(String(slot?.key || ""))) continue;
+            const payload = slot?.intent?.payload;
+            if (String(payload?.sceneId || "") !== sceneId) continue;
+            if ((payload?.operations || []).some((op) =>
+                String(op?.reference_item_id || "") === itemId)) return true;
+        }
+        return false;
+    }
+
+    /** A Library member or Reference delete reaches the timeline.
+     *
+     *  `_reconcile_staged_reference_members` thins the removed members out of
+     *  staged items and deletes items left empty, in every scene. The Library
+     *  route answers with the Library, its write sends `refreshScenes: false`,
+     *  and the editor's own save broadcast is dropped as a self-echo, so without
+     *  this the bar stays on the timeline and its next edit fails
+     *  `item_not_found`. Asset permanent deletes run the same cascade.
+     *
+     *  Called once the delete is acknowledged. The cascade is painted with the
+     *  route's own rule (`referenceRowAfterMemberRemoval`) into every scene
+     *  object the editor holds -- the active one first, then the list; after a
+     *  refused scene switch they can be two objects for one scene, and both are
+     *  painted -- and the result is checked against the route's per-scene
+     *  `reports`. Anything the paint cannot vouch for is healed by a scenes read
+     *  gated behind the queue drain, so it cannot replace a queued paint, and
+     *  recorded as `reference_cascade_heal {reason}`:
+     *
+     *   * `gesture_active` -- a drag or trim holds scene objects; nothing is
+     *     touched (inside a Library write `_shouldDeferSceneRefresh` is always
+     *     true, because the queue counts the running slot, so it is not the test);
+     *   * `no_report` -- a server older than the report;
+     *   * `scene_not_held` -- a reported scene the editor holds no object for;
+     *   * `unpainted_member_write` -- a thinned row whose members an unpainted
+     *     write is about to have the route re-canonicalize;
+     *   * `mismatch` -- the painted result differs from the report;
+     *   * `unconfirmed` (recorded by `_mutateReferences`) -- the answer was lost.
+     *
+     *  The heal runs as the deferred replay's scenes read. The ordered history
+     *  baseline (`_historyOrderContextCascade`) is brought along: without it the
+     *  next ordered write's Undo entry would take the pre-cascade scene as its
+     *  before-state and an Undo would bring the deleted member back.
+     *
+     *  Thinned rows get a NEW `members` array: an acknowledged-value chain keeps
+     *  `row.members` by reference, and the replacement is how its rollback sees
+     *  "not my paint". Removed rows leave the scene in place, so a Lane Setup
+     *  delete hold that reinserts by splice still sees the same array. Nothing
+     *  is pushed on the Undo stack: Library writes have none.
+     *
+     *  Returns whether anything was painted.
+     */
+    _adoptReferenceDeleteCascade({ removedMemberIds = [], reports = null } = {}) {
+        const removed = new Set([...(removedMemberIds || [])]
+            .map((id) => String(id ?? "")).filter(Boolean));
+        if (!removed.size) return false;
+        const reportedSceneIds = Array.isArray(reports)
+            ? new Set(reports.flatMap((report) => Object.keys(report || {}))) : null;
+        const heal = (reason, sceneIds = reportedSceneIds) => {
+            // A reason CODE, never contents (`durable_rules.md`, diagnostics).
+            sessionDiagRecord("reference_cascade_heal", { reason });
+            this._historyOrderContextCascade(removed, { vouched: false, sceneIds });
+            this._deferProjectBackedRefresh(["scenes"], "reference_cascade_heal");
+        };
+        if (this.isDragging || this._timelineMutationDepth > 0) {
+            heal("gesture_active");
+            return false;
+        }
+        const objects = [this.activeScene, ...(this.scenes || [])]
+            .filter((scene, index, list) => scene && list.indexOf(scene) === index);
+        const sets = () => ({ removed: new Set(), thinned: new Set() });
+        const local = new Map();
+        const activeRemoved = new Set();
+        let painted = false;
+        let unpainted = false;
+        for (const scene of objects) {
+            const sceneId = String(scene.scene_id || "");
+            const rows = Array.isArray(scene.reference_items) ? scene.reference_items : [];
+            const entry = local.get(sceneId) || sets();
+            local.set(sceneId, entry);
+            for (let index = rows.length - 1; index >= 0; index -= 1) {
+                const row = rows[index];
+                const after = referenceRowAfterMemberRemoval(row, removed);
+                if (!after) continue;
+                const itemId = String(row?.reference_item_id || "");
+                if (after.removed) {
+                    rows.splice(index, 1);
+                    entry.removed.add(itemId);
+                    if (scene === this.activeScene) activeRemoved.add(itemId);
+                } else {
+                    if (this._referenceItemMembersUnpainted(sceneId, itemId)) unpainted = true;
+                    row.members = after.members;
+                    entry.thinned.add(itemId);
+                }
+                painted = true;
+            }
+        }
+        if (painted) {
+            const editorOnRemoved = this.selectedItem?.type === "reference"
+                && activeRemoved.has(String(this.selectedItem.id || ""));
+            this._renderSceneAfterLocalMutation({ viewport: false });
+            if (editorOnRemoved) this._hideItemEditor();
+            this._refreshPromptContextDependencyConsumers();
+        }
+        const paintedSceneIds = new Set([...local].filter(([, entry]) =>
+            entry.removed.size || entry.thinned.size).map(([sceneId]) => sceneId));
+        if (!Array.isArray(reports)) {
+            heal("no_report", paintedSceneIds);
+            return painted;
+        }
+        // One id set per scene across the batch: a row thinned by an earlier
+        // delete and emptied by a later one ends removed.
+        const reported = new Map();
+        for (const report of reports) {
+            for (const [sceneId, entry] of Object.entries(report || {})) {
+                const target = reported.get(String(sceneId)) || sets();
+                reported.set(String(sceneId), target);
+                for (const id of entry?.removed_reference_item_ids || []) target.removed.add(String(id));
+                for (const id of entry?.thinned_reference_item_ids || []) target.thinned.add(String(id));
+            }
+        }
+        for (const entry of reported.values()) {
+            for (const id of entry.removed) entry.thinned.delete(id);
+        }
+        if ([...reported.keys()].some((sceneId) => !local.has(sceneId))) {
+            heal("scene_not_held", new Set([...reported.keys(), ...paintedSceneIds]));
+            return painted;
+        }
+        if (unpainted) {
+            heal("unpainted_member_write", new Set([...reported.keys(), ...paintedSceneIds]));
+            return painted;
+        }
+        const same = (left, right) => left.size === right.size && [...left].every((id) => right.has(id));
+        const empty = sets();
+        for (const sceneId of new Set([...local.keys(), ...reported.keys()])) {
+            const mine = local.get(sceneId) || empty;
+            const theirs = reported.get(sceneId) || empty;
+            if (!same(mine.removed, theirs.removed) || !same(mine.thinned, theirs.thinned)) {
+                heal("mismatch", new Set([...reported.keys(), ...paintedSceneIds]));
+                return painted;
+            }
+        }
+        this._historyOrderContextCascade(removed, { vouched: true, sceneIds: reported.keys() });
+        return painted;
+    }
+
+    /** Bring the ordered history baseline along with a Library delete.
+     *
+     *  A Library slot names no scene, so the queue neither tombstones nor
+     *  records an ordered scene for it, and the next ordered write would take
+     *  the pre-cascade scene as its Undo before-state. When the paint matched
+     *  the route's report (`vouched`), each recorded scene is thinned by the
+     *  same row rule -- a Library delete changes nothing else on a scene, so
+     *  that IS the scene at this queue position, and no read is needed.
+     *  Otherwise each recorded scene is tombstoned, and the next ordered write
+     *  reads its baseline at its own position. `sceneIds` null means every
+     *  scene the chain holds. Every context on the chain is corrected, because
+     *  a write queued behind the delete looks its baseline up from its own
+     *  context through its parents.
+     */
+    _historyOrderContextCascade(removedMemberIds, { vouched = false, sceneIds = null } = {}) {
+        const scope = sceneIds ? new Set([...sceneIds].map(String)) : null;
+        for (let context = this._latestHistoryOrderContext; context; context = context.parent) {
+            for (const [sceneId, scene] of context.scenes || []) {
+                if (!scene || (scope && !scope.has(String(sceneId)))) continue;
+                if (!vouched) {
+                    context.scenes.set(sceneId, null);
+                    continue;
+                }
+                const rows = Array.isArray(scene.reference_items) ? scene.reference_items : [];
+                scene.reference_items = rows.flatMap((row) => {
+                    const after = referenceRowAfterMemberRemoval(row, removedMemberIds);
+                    if (!after) return [row];
+                    return after.removed ? [] : [{ ...row, members: after.members }];
+                });
+            }
+        }
+    }
+
+    /** An asset permanent delete (single, bulk or Empty trash) ran the Library
+     *  cascade on the server; bring its staged-item half to the timeline. */
+    _adoptAssetDeleteReferenceCascade(payload, projectDir) {
+        if (projectDir !== this.projectDir) return;
+        const removed = (Array.isArray(payload?.removed_reference_members)
+            ? payload.removed_reference_members : []).map((entry) => entry?.member_id);
+        if (!removed.length) return;
+        const scenes = payload?.scenes;
+        const report = scenes && typeof scenes === "object" && !Array.isArray(scenes) ? scenes : null;
+        const painted = this._adoptReferenceDeleteCascade({
+            removedMemberIds: removed, reports: report ? [report] : null });
+        // This delete ran outside the mutation queue, so no enqueue invalidated
+        // a scenes read already in flight; one served before the delete would
+        // otherwise put the removed bars back with nothing left to heal them.
+        if (painted || report) this._sceneMutationInvalidationSeq += 1;
     }
 
     _inspectReferenceAsset(asset) {
@@ -3700,6 +3951,7 @@ export class EditorWidget {
     async _permanentDeleteAssetWithinGesture(diagnostics, assetId, force = false) {
         if (!this.projectDir || !assetId) return { status: "noop" };
         const dirName = this.projectDir.split(/[/\\]/).pop();
+        const projectDir = this.projectDir;
         markProjectAssetMutation(dirName, "asset_permanent_delete");
         const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/permanent`), withEditorMutationDiagnostics({
             method: "POST",
@@ -3714,6 +3966,7 @@ export class EditorWidget {
             throw new Error(`Permanent asset delete failed: ${resp.status}`);
         }
         const payload = await resp.json();
+        this._adoptAssetDeleteReferenceCascade(payload, projectDir);
         await Promise.all([
             this._fetchAssets(),
             this._fetchRenderQueue(),
@@ -3730,6 +3983,7 @@ export class EditorWidget {
     async _bulkPermanentDeleteAssetsWithinGesture(diagnostics, assetIds, force = false) {
         if (!this.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { status: "noop" };
         const dirName = this.projectDir.split(/[/\\]/).pop();
+        const projectDir = this.projectDir;
         markProjectAssetMutation(dirName, "asset_bulk_permanent_delete");
         const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/bulk-permanent-delete`), withEditorMutationDiagnostics({
             method: "POST",
@@ -3744,6 +3998,7 @@ export class EditorWidget {
             throw new Error(`Bulk permanent asset delete failed: ${resp.status}`);
         }
         const payload = await resp.json();
+        this._adoptAssetDeleteReferenceCascade(payload, projectDir);
         await Promise.all([
             this._fetchAssets(),
             this._fetchRenderQueue(),
@@ -3760,6 +4015,7 @@ export class EditorWidget {
     async _emptyTrashWithinGesture(diagnostics) {
         if (!this.projectDir) return { status: "noop" };
         const dirName = this.projectDir.split(/[/\\]/).pop();
+        const projectDir = this.projectDir;
         markProjectAssetMutation(dirName, "asset_empty_trash");
         const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/empty-trash`), withEditorMutationDiagnostics({
             method: "POST",
@@ -3768,6 +4024,7 @@ export class EditorWidget {
             throw new Error(`Empty trash failed: ${resp.status}`);
         }
         const payload = await resp.json();
+        this._adoptAssetDeleteReferenceCascade(payload, projectDir);
         await Promise.all([
             this._fetchAssets(),
             this._fetchRenderQueue(),

@@ -3,9 +3,11 @@
 // @server-mirror server/routes.py::_apply_create_reference_item
 // @server-mirror server/routes.py::_reference_overlapping_items
 // @server-mirror server/routes.py::_apply_update_reference_item
+// @server-mirror server/routes.py::_reconcile_staged_reference_members
 // Scope and parity disposition: tests/test_mutation_authoring_contract.py::MIRRORED_MODULES
 // Bounds and member arithmetic for an optimistic Reference staging paint, the
-// lane-overlap decision, and the planned row of a staged-item update.
+// lane-overlap decision, the planned row of a staged-item update, and what a
+// Library member or Reference delete does to staged items.
 //
 // Leaf module: DOM-free, host-free, no editor imports — the same shape and the
 // same reason as `scene_move_geometry.js` and `scene_split_geometry.js`. Its one
@@ -489,4 +491,58 @@ export function plannedReferenceItemUpdate(item, fields, {
         return decline();
     }
     return { painted, refusal: "", paintable: true };
+}
+
+// -- a Library delete's staged-item cascade ---------------------------------------
+
+/** The route's `{str(value) for value in removed_member_ids}`. */
+function removedMemberIdSet(removedMemberIds) {
+    return new Set([...(removedMemberIds || [])].map((value) => String(value)));
+}
+
+/** What a Library member or Reference delete does to one staged row.
+ *
+ *  `_reconcile_staged_reference_members` drops every staged member whose
+ *  `member_id` the delete removed, deletes a row left with none, and keeps the
+ *  survivors' records exactly as stored and in order. Nothing else on the row
+ *  changes. A member staged twice leaves twice.
+ *
+ *  The comparison is on the raw stored value, as Python's
+ *  `member.get("member_id") not in removed_member_ids` makes it: removed ids
+ *  are strings, so a missing or non-string stored id never matches.
+ *
+ *  Returns `null` when the row is untouched, `{ removed: true }` when it is
+ *  deleted, and `{ removed: false, members }` -- a NEW array -- when it is
+ *  thinned. A caller paints `members` as a replacement array, because an
+ *  acknowledged-value chain keeps `row.members` by reference and tells its own
+ *  paint from another writer's by identity.
+ */
+export function referenceRowAfterMemberRemoval(row, removedMemberIds) {
+    const removed = removedMemberIdSet(removedMemberIds);
+    const members = Array.isArray(row?.members) ? row.members : [];
+    const kept = members.filter((member) => !removed.has(member?.member_id));
+    if (kept.length === members.length) return null;
+    return kept.length ? { removed: false, members: kept } : { removed: true };
+}
+
+/** The staged-item half of a Library delete on one scene, as the route
+ *  decides it: `{ removed: [itemId], thinned: [{ itemId, members }] }`, in
+ *  row order. Staged items only -- prompt-identity source pruning is
+ *  project-level and not the timeline's.
+ *
+ *  Built only from `referenceRowAfterMemberRemoval`, which is what the editor
+ *  applies, row by row, because it splices rows in place and replaces
+ *  `members` arrays. This scene-level form is what the parity table compares
+ *  with the route, so parity holds per row; the editor's loop adds nothing
+ *  but that iteration. */
+export function plannedReferenceMemberCascade(scene, removedMemberIds) {
+    const removedIds = removedMemberIdSet(removedMemberIds);
+    const plan = { removed: [], thinned: [] };
+    for (const row of Array.isArray(scene?.reference_items) ? scene.reference_items : []) {
+        const after = referenceRowAfterMemberRemoval(row, removedIds);
+        if (!after) continue;
+        if (after.removed) plan.removed.push(row?.reference_item_id);
+        else plan.thinned.push({ itemId: row?.reference_item_id, members: after.members });
+    }
+    return plan;
 }

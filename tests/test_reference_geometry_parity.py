@@ -18,6 +18,10 @@ decision (``_reference_overlapping_items``) and the row
 route's answer rests on authority the client does not hold. Those tables are at
 the end of this file.
 
+For a Library member or Reference delete it mirrors which staged rows
+``_reconcile_staged_reference_members`` removes and thins, and the members a
+thinned row keeps; that table is last.
+
 **Why the member half is mirrored at all** is the part a later reader is most
 likely to try to undo, so it is stated here as well as beside the code. Phase C
 §3 decided the Reference local apply must be geometry-only, on the reasoning
@@ -986,3 +990,117 @@ console.log(JSON.stringify(mod.plannedReferenceItemUpdate(context.item, {{ stren
     assert list(context["item"]["members"][0]) == ["visual_intent", "member_id", "entity_id"]
     assert planned["paintable"] is True
     assert planned["painted"] == _python_update("item-1", {"strength": 0.5}, None)["row"]
+
+
+# -- a Library delete's staged-item cascade ---------------------------------------
+#
+# `plannedReferenceMemberCascade` must name the rows `_reconcile_staged_reference_members`
+# removes and thins, and leave each thinned row the members the route keeps, in
+# order and record for record -- the editor paints that result into the scenes
+# it holds and checks it against the route's per-scene report. Compared in both
+# directions: a row the mirror keeps and the route deletes is a phantom bar, a
+# row the mirror deletes and the route keeps is a bar that vanishes wrongly.
+
+def _cascade_member(key, **extra):
+    return {"entity_id": "entity-1", "member_id": f"member-{key}", **extra}
+
+
+CASCADE_SCENES = [
+    {"scene_id": "scene-1", "rows": [
+        ("solo", [_cascade_member("a")]),
+        ("pair", [_cascade_member("a", role="identity"), _cascade_member("b")]),
+        ("other", [_cascade_member("c")]),
+        ("twice", [_cascade_member("a"), _cascade_member("b"), _cascade_member("a")]),
+        ("both", [_cascade_member("a"), _cascade_member("d")]),
+    ]},
+    {"scene_id": "scene-2", "rows": [
+        ("far-solo", [_cascade_member("d")]),
+        ("far-pair", [_cascade_member("b"), _cascade_member("d", visual_intent="preserve")]),
+    ]},
+    {"scene_id": "scene-3", "rows": [("untouched", [_cascade_member("c")])]},
+]
+
+# (removed member ids) -- one member, a Reference's several, none staged, and a
+# numeric id the route's `str()` turns into a string that matches nothing.
+CASCADE_CASES = [
+    ["member-a"],
+    ["member-d"],
+    ["member-a", "member-d"],
+    ["member-z"],
+    [7],
+]
+
+
+def _cascade_scene_dicts():
+    return [{"scene_id": spec["scene_id"], "duration_frames": 100, "reference_lane_count": 1,
+             "reference_items": [{"reference_item_id": item_id, "lane_index": 0,
+                                  "start_frame": index * 10, "end_frame": index * 10 + 5,
+                                  "members": members}
+                                 for index, (item_id, members) in enumerate(spec["rows"])]}
+            for spec in CASCADE_SCENES]
+
+
+def _javascript_cascade(cases):
+    script = f"""
+const mod = await import({json.dumps(MODULE_URL)});
+const scenes = {json.dumps(_cascade_scene_dicts())};
+const cases = {json.dumps(cases)};
+console.log(JSON.stringify(cases.map((removed) => Object.fromEntries(scenes.map((scene) => {{
+  const plan = mod.plannedReferenceMemberCascade(scene, removed);
+  return [scene.scene_id, {{ removed: plan.removed,
+    thinned: plan.thinned.map((entry) => [entry.itemId, entry.members]) }}];
+}})))));
+"""
+    return _node(script)
+
+
+def _python_cascade(cases):
+    out = []
+    for removed in cases:
+        project = TimelineProject(project_id="p", scenes=[
+            Scene.from_dict(raw) for raw in _cascade_scene_dicts()])
+        report = routes._reconcile_staged_reference_members(project, set(removed))
+        per_scene = {}
+        for scene in project.scenes:
+            entry = report["scenes"].get(scene.scene_id, {
+                "removed_reference_item_ids": [], "thinned_reference_item_ids": []})
+            rows = {item.reference_item_id: item.members for item in scene.reference_items}
+            per_scene[scene.scene_id] = {
+                "removed": entry["removed_reference_item_ids"],
+                "thinned": [[item_id, rows[item_id]]
+                            for item_id in entry["thinned_reference_item_ids"]]}
+        out.append(per_scene)
+    return out
+
+
+def test_the_delete_cascade_agrees_with_the_route_in_both_directions():
+    javascript = _javascript_cascade(CASCADE_CASES)
+    python = _python_cascade(CASCADE_CASES)
+    assert javascript == python
+    first = python[0]
+    assert first["scene-1"] == {
+        "removed": ["solo"],
+        "thinned": [["pair", [_cascade_member("b")]],
+                    ["twice", [_cascade_member("b")]],
+                    ["both", [_cascade_member("d")]]]}, "the table pins the decision"
+    assert python[2]["scene-1"]["removed"] == ["solo", "both"]
+    assert python[2]["scene-2"] == {"removed": ["far-solo"],
+                                    "thinned": [["far-pair", [_cascade_member("b")]]]}
+    assert all(scene == {"removed": [], "thinned": []}
+               for case in python[3:] for scene in case.values())
+
+
+def test_a_thinned_row_is_painted_with_a_new_members_array():
+    """A chain tells its own paint from another writer's by `row.members`
+    identity, so the cascade must hand back a replacement, never the stored
+    array edited in place."""
+    script = f"""
+const mod = await import({json.dumps(MODULE_URL)});
+const row = {{ reference_item_id: 'pair', members: [{{ member_id: 'member-a' }}, {{ member_id: 'member-b' }}] }};
+const before = row.members;
+const after = mod.referenceRowAfterMemberRemoval(row, ['member-a']);
+console.log(JSON.stringify({{ fresh: after.members !== before, untouched: before.length,
+  kept: after.members.map((m) => m.member_id),
+  none: mod.referenceRowAfterMemberRemoval(row, ['member-z']) }}));
+"""
+    assert _node(script) == {"fresh": True, "untouched": 2, "kept": ["member-b"], "none": None}

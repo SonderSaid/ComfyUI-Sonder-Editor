@@ -14,8 +14,8 @@ from server import prompt_context
 from server.project_manager import load_project, save_project
 from server.timeline_state import (
     ALL_REFERENCE_RECIPE_PRESETS, REFERENCE_TAG_FAMILIES,
-    REFERENCE_TAG_PRESETS, Asset, ReferenceEntity, ReferenceMember,
-    TimelineProject,
+    REFERENCE_TAG_PRESETS, Asset, LaneConfig, ReferenceEntity, ReferenceItem,
+    ReferenceLaneRecipe, ReferenceMember, Scene, TimelineProject,
 )
 import server.routes as routes
 
@@ -858,3 +858,140 @@ def test_member_intents_outside_the_vocabulary_are_preserved_not_blanked():
         "visual_intent": next(iter(prompt_context.VISUAL_INTENTS)),
     })
     assert canonical.visual_intent in prompt_context.VISUAL_INTENTS
+
+
+# -- a Library delete's staged-item cascade, reported per scene --------------------
+#
+# The route thins removed members out of staged items and deletes items left
+# empty in every scene; the editor paints the same cascade and checks it
+# against the per-scene report on the delete's result (`cascade.scenes`).
+
+def _staged_cascade_project(tmp_path):
+    project = _project(tmp_path)
+    project.assets.append(Asset(asset_id="image-2", name="Profile", asset_type="image",
+                                path="media/profile.png"))
+    project.references = [ReferenceEntity(reference_id="ref-1", name="Lead", members=[
+        ReferenceMember(member_id="member-a", asset_id="image-1", order=0),
+        ReferenceMember(member_id="member-b", asset_id="image-2", order=1),
+    ])]
+
+    def staged(*keys):
+        return [{"entity_id": "ref-1", "member_id": f"member-{key}"} for key in keys]
+
+    def scene(scene_id, rows):
+        return Scene(scene_id=scene_id, duration_frames=100, reference_lane_count=1,
+                     reference_lane_configs=[LaneConfig()],
+                     reference_lane_recipes=[ReferenceLaneRecipe(lane_id=f"lane-{scene_id}",
+                                                                 media_kind="image")],
+                     reference_items=[ReferenceItem(reference_item_id=item_id, lane_index=0,
+                                                    start_frame=start, end_frame=start + 10,
+                                                    members=members)
+                                      for item_id, start, members in rows])
+
+    project.scenes = [
+        scene("scene-1", [("solo", 0, staged("a")), ("pair", 20, staged("a", "b")),
+                          ("other", 40, staged("b"))]),
+        scene("scene-2", [("solo", 0, staged("a"))]),
+        scene("scene-3", [("keep", 0, staged("b"))]),
+    ]
+    return project
+
+
+def _staged_ids(project):
+    return {scene.scene_id: {item.reference_item_id: [member["member_id"] for member in item.members]
+                             for item in scene.reference_items}
+            for scene in project.scenes}
+
+
+def test_delete_member_thins_and_removes_staged_items_and_reports_each_scene(tmp_path):
+    project = _staged_cascade_project(tmp_path)
+    member = project.references[0].members[0]
+    payload = routes._apply_reference_mutation_operations(project, [{
+        "type": "delete_member", "reference_id": "ref-1", "member_id": "member-a",
+        "expected": member.to_dict()}])
+    assert _staged_ids(project) == {
+        "scene-1": {"pair": ["member-b"], "other": ["member-b"]},
+        "scene-2": {},
+        "scene-3": {"keep": ["member-b"]},
+    }
+    [result] = payload["results"]
+    assert result["type"] == "delete_member"
+    assert result["reference_id"] == "ref-1" and result["member_id"] == "member-a"
+    # Item ids are unique only within a scene, so the report is per scene and
+    # names no scene the delete did not touch.
+    assert result["cascade"]["scenes"] == {
+        "scene-1": {"removed_reference_item_ids": ["solo"],
+                    "thinned_reference_item_ids": ["pair"]},
+        "scene-2": {"removed_reference_item_ids": ["solo"],
+                    "thinned_reference_item_ids": []},
+    }
+    # The flat keys stay for older readers.
+    assert result["cascade"]["affected_scene_ids"] == ["scene-1", "scene-2"]
+    assert result["cascade"]["removed_reference_item_ids"] == ["solo", "solo"]
+    assert result["cascade"]["thinned_reference_item_ids"] == ["pair"]
+
+
+def test_delete_reference_removes_every_item_its_members_staged(tmp_path):
+    project = _staged_cascade_project(tmp_path)
+    payload = routes._apply_reference_mutation_operations(project, [{
+        "type": "delete_reference", "reference_id": "ref-1",
+        "expected": {"name": "Lead", "kind": "character", "reference_class": "subject",
+                     "description": "", "member_ids": ["member-a", "member-b"]}}])
+    assert _staged_ids(project) == {"scene-1": {}, "scene-2": {}, "scene-3": {}}
+    [result] = payload["results"]
+    assert result["cascade"]["scenes"] == {
+        "scene-1": {"removed_reference_item_ids": ["solo", "pair", "other"],
+                    "thinned_reference_item_ids": []},
+        "scene-2": {"removed_reference_item_ids": ["solo"], "thinned_reference_item_ids": []},
+        "scene-3": {"removed_reference_item_ids": ["keep"], "thinned_reference_item_ids": []},
+    }
+
+
+def test_a_delete_that_touches_no_staged_item_reports_no_scene(tmp_path):
+    project = _staged_cascade_project(tmp_path)
+    for scene in project.scenes:
+        scene.reference_items = []
+    member = project.references[0].members[1]
+    payload = routes._apply_reference_mutation_operations(project, [{
+        "type": "delete_member", "reference_id": "ref-1", "member_id": "member-b",
+        "expected": member.to_dict()}])
+    assert payload["results"][0]["cascade"]["scenes"] == {}
+
+
+def test_member_update_results_name_their_reference(tmp_path):
+    project = _staged_cascade_project(tmp_path)
+    payload = routes._apply_reference_mutation_operations(project, [{
+        "type": "update_member", "reference_id": "ref-1", "member_id": "member-b",
+        "fields": {"prompt": "profile"}, "expected": {"prompt": ""}}])
+    assert payload["results"] == [{"type": "update_member", "reference_id": "ref-1",
+                                   "member_id": "member-b"}]
+
+
+def test_a_permanent_asset_delete_reports_its_staged_cascade_per_scene(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    project = _staged_cascade_project(tmp_path)
+    (tmp_path / "project" / "media" / "portrait.png").write_bytes(b"image")
+    (tmp_path / "project" / "media" / "profile.png").write_bytes(b"image")
+    save_project(project)
+    monkeypatch.setattr(route_module, "_get_base_dir", lambda: str(tmp_path))
+    single = _route_handler(route_module, "POST", "/sonder-editor/project/{project_id}/assets/permanent")
+    response = asyncio.run(single(DummyRequest(
+        match_info={"project_id": "project"}, method="POST",
+        body={"asset_id": "image-1", "force": True},
+    )))
+    payload = json.loads(response.body.decode("utf-8"))
+    # The keys the gallery and editor already read are unchanged.
+    for key in ("deleted", "asset_id", "usages_orphaned", "reference_members_removed",
+                "affected_reference_ids", "removed_reference_members", "affected_scene_ids",
+                "removed_reference_item_ids", "thinned_reference_item_ids"):
+        assert key in payload, key
+    assert payload["removed_reference_members"] == [
+        {"reference_id": "ref-1", "member_id": "member-a", "asset_id": "image-1"}]
+    assert payload["scenes"] == {
+        "scene-1": {"removed_reference_item_ids": ["solo"],
+                    "thinned_reference_item_ids": ["pair"]},
+        "scene-2": {"removed_reference_item_ids": ["solo"],
+                    "thinned_reference_item_ids": []},
+    }
+    assert _staged_ids(load_project(project.project_dir))["scene-1"] == {
+        "pair": ["member-b"], "other": ["member-b"]}

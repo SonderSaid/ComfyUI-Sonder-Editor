@@ -6806,7 +6806,9 @@ def _apply_update_reference(project: TimelineProject, operation: dict) -> Refere
     return reference
 
 
-def _apply_delete_reference(project: TimelineProject, operation: dict) -> ReferenceEntity:
+def _apply_delete_reference(project: TimelineProject,
+                            operation: dict) -> tuple[ReferenceEntity, dict]:
+    """Delete one Reference; returns it and its staged-item cascade."""
     reference = _find_reference(project, str(operation.get("reference_id", "") or ""))
     # `description` is included deliberately, keeping the exact-prior-value
     # rule whole: it is model-facing text, so a delete racing an edit to it
@@ -6827,9 +6829,9 @@ def _apply_delete_reference(project: TimelineProject, operation: dict) -> Refere
     _validate_reference_expected(reference, expected, guarded)
     removed_member_ids = {member.member_id for member in reference.members}
     project.references = [candidate for candidate in project.references if candidate is not reference]
-    _reconcile_staged_reference_members(project, removed_member_ids,
-                                        {reference.reference_id})
-    return reference
+    cascade = _reconcile_staged_reference_members(project, removed_member_ids,
+                                                  {reference.reference_id})
+    return reference, cascade
 
 
 def _apply_create_reference_member(project: TimelineProject, operation: dict) -> ReferenceMember:
@@ -6894,7 +6896,9 @@ def _apply_materialize_reference_member_handle(
     return member
 
 
-def _apply_delete_reference_member(project: TimelineProject, operation: dict) -> ReferenceMember:
+def _apply_delete_reference_member(project: TimelineProject,
+                                   operation: dict) -> tuple[ReferenceMember, dict]:
+    """Delete one Library member; returns it and its staged-item cascade."""
     reference = _find_reference(project, str(operation.get("reference_id", "") or ""))
     member = _find_reference_member(reference, str(operation.get("member_id", "") or ""))
     required = set(member.to_dict())
@@ -6908,8 +6912,8 @@ def _apply_delete_reference_member(project: TimelineProject, operation: dict) ->
     reference.members = [candidate for candidate in reference.members if candidate is not member]
     for order, candidate in enumerate(reference.members):
         candidate.order = order
-    _reconcile_staged_reference_members(project, {member.member_id})
-    return member
+    cascade = _reconcile_staged_reference_members(project, {member.member_id})
+    return member, cascade
 
 
 def _apply_reorder_reference_members(project: TimelineProject, operation: dict) -> ReferenceEntity:
@@ -7249,9 +7253,16 @@ def _reconcile_staged_reference_members(project: TimelineProject, removed_member
     affected_scene_ids = []
     removed_item_ids = []
     thinned_item_ids = []
+    # Per scene, because item ids are unique only within one: the editor paints
+    # this cascade into the scenes it holds and checks its result against this
+    # report (`web/js/scene_reference_geometry.js::plannedReferenceMemberCascade`
+    # mirrors the decision). The flat keys above are kept for older readers.
+    scenes = {}
     for scene in project.scenes:
         next_items = []
         changed = False
+        scene_removed = []
+        scene_thinned = []
         for item in getattr(scene, "reference_items", []) or []:
             kept = [member for member in item.members if member.get("member_id") not in removed_member_ids]
             if len(kept) != len(item.members):
@@ -7259,14 +7270,20 @@ def _reconcile_staged_reference_members(project: TimelineProject, removed_member
                 if kept:
                     item.members = kept
                     thinned_item_ids.append(item.reference_item_id)
+                    scene_thinned.append(item.reference_item_id)
                     next_items.append(item)
                 else:
                     removed_item_ids.append(item.reference_item_id)
+                    scene_removed.append(item.reference_item_id)
             else:
                 next_items.append(item)
         if changed:
             scene.reference_items = next_items
             affected_scene_ids.append(scene.scene_id)
+            scenes[scene.scene_id] = {
+                "removed_reference_item_ids": scene_removed,
+                "thinned_reference_item_ids": scene_thinned,
+            }
     affected_identity_ids = []
     pruned_source_count = 0
     for unit in project.prompt_semantic_units or []:
@@ -7293,6 +7310,7 @@ def _reconcile_staged_reference_members(project: TimelineProject, removed_member
         "affected_scene_ids": affected_scene_ids,
         "removed_reference_item_ids": removed_item_ids,
         "thinned_reference_item_ids": thinned_item_ids,
+        "scenes": scenes,
         "affected_prompt_identity_ids": affected_identity_ids,
         "pruned_prompt_identity_sources": pruned_source_count,
     }
@@ -7311,8 +7329,11 @@ def _apply_reference_mutation_operations(project: TimelineProject, operations: l
             reference = _apply_update_reference(project, operation)
             results.append({"type": op_type, "reference_id": reference.reference_id})
         elif op_type == "delete_reference":
-            reference = _apply_delete_reference(project, operation)
-            results.append({"type": op_type, "reference_id": reference.reference_id})
+            # `cascade` reports what the delete did to staged items, per scene,
+            # so the editor can check its own copy instead of re-reading scenes.
+            reference, cascade = _apply_delete_reference(project, operation)
+            results.append({"type": op_type, "reference_id": reference.reference_id,
+                            "cascade": cascade})
         elif op_type == "create_member":
             member = _apply_create_reference_member(project, operation)
             results.append({
@@ -7322,14 +7343,18 @@ def _apply_reference_mutation_operations(project: TimelineProject, operations: l
             })
         elif op_type == "update_member":
             member = _apply_update_reference_member(project, operation)
-            results.append({"type": op_type, "member_id": member.member_id})
+            results.append({"type": op_type,
+                            "reference_id": str(operation.get("reference_id", "") or ""),
+                            "member_id": member.member_id})
         elif op_type == "materialize_member_handle":
             member = _apply_materialize_reference_member_handle(project, operation)
             results.append({"type": op_type, "member_id": member.member_id,
                             "handle": member.handle})
         elif op_type == "delete_member":
-            member = _apply_delete_reference_member(project, operation)
-            results.append({"type": op_type, "member_id": member.member_id})
+            member, cascade = _apply_delete_reference_member(project, operation)
+            results.append({"type": op_type,
+                            "reference_id": str(operation.get("reference_id", "") or ""),
+                            "member_id": member.member_id, "cascade": cascade})
         elif op_type == "reorder_members":
             reference = _apply_reorder_reference_members(project, operation)
             results.append({"type": op_type, "reference_id": reference.reference_id})

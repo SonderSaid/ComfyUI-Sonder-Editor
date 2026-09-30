@@ -21,6 +21,7 @@ a fresh `[Unreleased]` block.
 - Reference Lane Setup: a refused item edit also removed the Undo step of an earlier edit of the same kind.
 - Reference Lane Setup: an invalid role or unsupported recipe value no longer takes keyboard focus again after every edit.
 - Dropping a Library member onto a staged Reference bar while another edit of that item was saving could be refused, and a failed drop refetched the scene over edits queued behind it.
+- Removing a Library member or Reference, or permanently deleting the asset of a staged Library member, now updates the timeline as soon as it is saved. Its staged bars used to stay on the timeline, in every scene, until the editor reloaded, and editing them failed.
 
 ## [0.7.4] - 2026-09-29
 
