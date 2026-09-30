@@ -4,6 +4,9 @@
 // @server-mirror server/routes.py::_apply_create_reference
 // @server-mirror server/routes.py::_member_from_fields
 // @server-mirror server/routes.py::_CLIENT_ID_PATTERN
+// @server-mirror server/routes.py::_CLIENT_RECIPE_ID_PATTERN
+// @server-mirror server/routes.py::_normalize_custom_reference_recipe
+// @server-mirror server/routes.py::_require_prompt_handle_available
 // Scope and parity disposition: tests/test_mutation_authoring_contract.py::MIRRORED_MODULES
 const RESERVED_TAG_PREFIX = "sonder:";
 const VALID_KINDS = new Set(["character", "location", "prop", "outfit"]);
@@ -475,6 +478,110 @@ export function mintReferenceLibraryId() {
     return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+/** A durable id for a new custom recipe: the `custom:` namespace the route
+ *  mints into, then a library id (`_CLIENT_RECIPE_ID_PATTERN`). */
+export function mintReferenceRecipeId() {
+    return `custom:${mintReferenceLibraryId()}`;
+}
+
+/** The custom recipe `_normalize_custom_reference_recipe` stores, for fields
+ *  the route accepts. `schema` is the served `recipe_field_schema`: an `int`
+ *  field is truncated and a `number` field made a number, as the route
+ *  coerces them; other values are copied. A recipe write's row is painted as
+ *  this record, so an Update or Delete guarded by the displayed definition
+ *  compares equal once the write has landed. */
+export function referenceRecipeRecord(fields = {}, recipeId = "", schema = []) {
+    const source = fields && typeof fields === "object" ? fields : {};
+    const kinds = new Map((Array.isArray(schema) ? schema : [])
+        .map((field) => [`${field?.section}:${field?.key}`, field?.type]));
+    const section = (name) => {
+        const values = source[name] && typeof source[name] === "object" ? source[name] : {};
+        return Object.fromEntries(Object.entries(values).map(([key, value]) => {
+            const kind = kinds.get(`${name}:${key}`);
+            if (kind === "int" && typeof value === "number") return [key, Math.trunc(value)];
+            if (kind === "number" && typeof value === "number") return [key, Number(value)];
+            return [key, structuredClone(value)];
+        }));
+    };
+    return {
+        id: String(recipeId || source.id || "").trim(),
+        name: String(source.name || "").trim(),
+        builtIn: false,
+        media_kind: String(source.media_kind || "image"),
+        hard: section("hard"),
+        soft: section("soft"),
+    };
+}
+
+/** Custom recipes as displayed: acknowledged recipes plus pending recipe
+ *  overlays, in authoring order. Pure, like `applyPendingReferenceOverlays`,
+ *  and read by the same surfaces through the host's `_referenceRecipesView`.
+ *  An update merges its fields into the displayed definition, as
+ *  `update_recipe` merges them into the stored one; a delete removes it; a
+ *  create whose id is already shown is not painted twice. */
+export function applyPendingRecipeOverlays(recipes = [], overlays = [], schema = []) {
+    let result = Array.isArray(recipes) ? [...recipes] : [];
+    for (const overlay of Array.isArray(overlays) ? overlays : []) {
+        if (overlay?.type === "create_recipe") {
+            if (!overlay.createdId || result.some((recipe) => String(recipe?.id || "") === overlay.createdId)) continue;
+            result.push({ ...referenceRecipeRecord(overlay.fields, overlay.createdId, schema),
+                pendingStatus: overlay.status || "saving" });
+        } else if (overlay?.type === "update_recipe") {
+            const index = result.findIndex((recipe) => String(recipe?.id || "") === overlay.recipe_id);
+            if (index < 0) continue;
+            const { builtIn: _builtIn, pendingStatus: _status, ...current } = result[index];
+            result = [...result];
+            result[index] = { ...referenceRecipeRecord({ ...current, ...overlay.fields }, overlay.recipe_id, schema),
+                pendingStatus: overlay.status || "saving" };
+        } else if (overlay?.type === "delete_recipe") {
+            result = result.filter((recipe) => String(recipe?.id || "") !== overlay.recipe_id);
+        }
+    }
+    return result;
+}
+
+/** `referenceOverlayReflected` for a recipe overlay, against acknowledged
+ *  recipes: a create by its id, a delete once its recipe is gone, an update
+ *  never (it waits for a payload that postdates it). */
+export function recipeOverlayReflected(recipes = [], overlay = null) {
+    const ids = (Array.isArray(recipes) ? recipes : []).map((recipe) => String(recipe?.id || ""));
+    if (overlay?.type === "create_recipe") {
+        const id = String(overlay.committedId || overlay.createdId || "");
+        return !!id && ids.includes(id);
+    }
+    if (overlay?.type === "delete_recipe") return !ids.includes(overlay.recipe_id);
+    return false;
+}
+
+/** Who already owns a prompt handle, as `_require_prompt_handle_available`
+ *  decides it: Library member handles and prompt identity handles share one
+ *  namespace, compared case-insensitively (handles are ASCII, so lower-casing
+ *  is the route's `casefold`). Returns `{ kind, id }` for an owner other than
+ *  `ownerKind`/`ownerId`, or null when the handle is free. */
+export function promptHandleOwner(handle, {
+    references = [], semanticUnits = [], ownerKind = "", ownerId = "",
+} = {}) {
+    const wanted = String(handle ?? "").trim();
+    if (!wanted) return null;
+    const folded = wanted.toLowerCase();
+    const owners = [];
+    for (const reference of Array.isArray(references) ? references : []) {
+        for (const member of reference?.members || []) {
+            owners.push([String(member?.handle ?? "").trim(), "physical reference", String(member?.member_id || "")]);
+        }
+    }
+    for (const unit of Array.isArray(semanticUnits) ? semanticUnits : []) {
+        if (!unit || typeof unit !== "object") continue;
+        owners.push([String(unit.handle ?? "").trim(), "prompt identity", String(unit.semantic_unit_id || "")]);
+    }
+    for (const [current, kind, id] of owners) {
+        if (!current || current.toLowerCase() !== folded) continue;
+        if (kind === ownerKind && id === ownerId) continue;
+        return { kind, id };
+    }
+    return null;
+}
+
 /** The Reference `_apply_create_reference` stores, as `to_dict` serves it,
  *  for fields the route accepts. A create's row is painted as this record, so
  *  a guard later read from that row (an Edit's base, a Delete's snapshot) is
@@ -539,7 +646,13 @@ export function referenceMemberCreateRecord(fields = {}, memberId = "", order = 
  *  form reads the displayed row at the click. */
 export const PAINT_FIRST_REFERENCE_OPERATIONS = Object.freeze(new Set([
     "create_reference", "create_member", "reorder_members",
-    "update_reference", "update_member", "delete_reference", "delete_member"]));
+    "update_reference", "update_member", "delete_reference", "delete_member",
+    "create_recipe", "update_recipe", "delete_recipe"]));
+
+/** The custom-recipe writes among them, painted into the recipe view
+ *  (`applyPendingRecipeOverlays`) rather than the References. */
+export const RECIPE_OVERLAY_TYPES = Object.freeze(new Set([
+    "create_recipe", "update_recipe", "delete_recipe"]));
 
 /** Describe one paint-first operation as a display overlay, or null.
  *
@@ -555,13 +668,15 @@ export function referenceOverlayFromOperation(operation, key) {
     const type = String(operation?.type || "");
     if (!PAINT_FIRST_REFERENCE_OPERATIONS.has(type)) return null;
     const createdId = type === "create_reference" ? String(operation?.reference_id || "")
-        : (type === "create_member" ? String(operation?.member_id || "") : "");
+        : (type === "create_member" ? String(operation?.member_id || "")
+            : (type === "create_recipe" ? String(operation?.fields?.id || "") : ""));
     return {
         key: String(key),
         type,
         createdId,
         reference_id: String(operation?.reference_id || ""),
         member_id: String(operation?.member_id || ""),
+        recipe_id: String(operation?.recipe_id || ""),
         fields: operation?.fields && typeof operation.fields === "object"
             ? structuredClone(operation.fields) : {},
         expected: operation?.expected && typeof operation.expected === "object"
@@ -592,6 +707,7 @@ export function referenceOverlayFromOperation(operation, key) {
 export function applyPendingReferenceOverlays(references = [], overlays = []) {
     const result = Array.isArray(references) ? [...references] : [];
     for (const overlay of Array.isArray(overlays) ? overlays : []) {
+        if (RECIPE_OVERLAY_TYPES.has(overlay?.type)) continue;
         if (overlay?.type === "create_reference") {
             if (overlay.createdId && result.some((reference) =>
                 String(reference?.reference_id || "") === overlay.createdId)) continue;

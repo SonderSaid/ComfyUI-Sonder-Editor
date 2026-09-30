@@ -932,6 +932,15 @@ export function mountPromptManagementPanel(host) {
     // What a chip picker or configure dialog may offer: the effective view
     // without rows still being created (`_referencesOfferable`).
     const offerableReferences = () => host._referencesOfferable?.() ?? (host._references || []);
+    // Reference Prompting's Save-defaults drafts handed back after a refusal,
+    // keyed by member id. The identity panel remounts on every render, so it
+    // cannot hold them; a project change drops them.
+    let defaultsDrafts = { projectKey: null, drafts: new Map() };
+    const referenceDefaultsDrafts = () => {
+        const projectKey = String(host._projectDirName?.() || "");
+        if (defaultsDrafts.projectKey !== projectKey) defaultsDrafts = { projectKey, drafts: new Map() };
+        return defaultsDrafts.drafts;
+    };
     const acceptDraftConfiguration = (result) => {
         const configured = promptAttachmentConfiguration(result);
         const intent = configured.identityCreateIntent;
@@ -3403,15 +3412,14 @@ Server value: ${serverValue}` : ""}`;
                         // The old whole-list PUT deleted by omission, so a
                         // format created in another window — absent from this
                         // browser's copy — was destroyed alongside the target.
-                        await host._mutateReferences?.([{
-                            type: "delete_prompt_context_profile",
-                            profile_key: target.key,
+                        await host._deletePromptContextProfile?.({
+                            profileKey: target.key,
                             expected: {
                                 profile_id: target.profile_id,
                                 version: target.version,
                                 name: target.name,
                             },
-                        }], "delete prompt format");
+                        });
                         menu.remove();
                         notifySuccess(`Deleted prompt format ${target.name}.`,
                             { source: "prompt-profile-delete" });
@@ -3531,6 +3539,19 @@ Server value: ${serverValue}` : ""}`;
                 host._promptSemanticUnits || [], change), label, options);
         };
         const attachReference = async (owner, target, overrides = null) => {
+            // The handles as they are when the author acts, not as the row was
+            // drawn: the render after a handle edit can be deferred behind the
+            // very press that clicked Attach, and the target picker holds the
+            // owner while it is open. `pendingHandle` is the displayed handle
+            // (a handle edit still saving, possibly a clear to "").
+            if (owner?.type === "physical" && typeof host._referenceStoredHandle === "function") {
+                const storedHandle = String(host._referenceStoredHandle(owner.memberId) || "");
+                const shown = host._referenceMemberForRef?.({ member_id: owner.memberId })?.member;
+                const pendingHandle = shown ? String(shown.handle || "") : storedHandle;
+                owner = { ...owner, storedHandle, pendingHandle,
+                    handlePending: pendingHandle !== storedHandle,
+                    handle: pendingHandle || owner.suggestion || owner.handle };
+            }
             // A Library delete in flight is taking this member away: the chip
             // would name a member the server is removing.
             if (owner?.type === "physical"
@@ -3562,10 +3583,16 @@ Server value: ${serverValue}` : ""}`;
             let materializedHandle = "";
             let history = {};
             let identityMaterialization = null;
-            if (owner?.type === "physical" && !owner.storedHandle) {
+            // A handle edit still saving is waited for, not overwritten: the
+            // materialize is queued behind it and expects the typed handle,
+            // which the server then returns unchanged (and Attach does not own).
+            if (owner?.type === "physical" && (!owner.storedHandle || owner.handlePending)) {
                 const physicalMaterialization = await host._materializeReferenceMemberHandle?.({
                     referenceId: owner.referenceId, memberId: owner.memberId,
-                    suggestion: owner.handle, expectedHandle: "",
+                    suggestion: owner.handle || owner.suggestion,
+                    // A cleared handle still saving expects "": the route then
+                    // materializes the suggestion, and Attach owns it.
+                    expectedHandle: owner.handlePending ? String(owner.pendingHandle || "") : "",
                 });
                 materializedHandle = String(physicalMaterialization?.handle || "");
                 if (!materializedHandle) {
@@ -3679,8 +3706,13 @@ Server value: ${serverValue}` : ""}`;
             scenes: (host.scenes || []).length
                 ? host.scenes : [host.activeScene].filter(Boolean),
             saveSemanticUnitChange,
-            mutateReferences: (operations, label) =>
-                host._mutateReferences?.(operations, label),
+            // Handle and defaults writes paint first through the host writer.
+            writeReferenceMember: (write) => host._writePromptReferenceMember?.(write),
+            displayedMember: (memberId) =>
+                host._referenceMemberForRef?.({ member_id: memberId })?.member || null,
+            storedHandleFor: (memberId) => host._referenceStoredHandle?.(memberId) ?? "",
+            handleCollision: (handle, memberId) => host._promptHandleCollision?.(handle, memberId) || null,
+            defaultsDrafts: referenceDefaultsDrafts(),
             attachReference,
             assetPreviewUrl: (asset) => host._referenceAssetPreviewUrl?.(asset),
             confirm: (message) => globalThis.confirm?.(message) ?? false,

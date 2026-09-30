@@ -807,7 +807,11 @@ def test_format_menu_defers_to_that_predicate_and_declares_no_migration():
     # is what puts it in use, so acting on the selection made Delete reachable
     # only when the server was guaranteed to refuse it.
     assert "promptFormatDeleteTargets(host._promptContextCatalog?.profiles)" in panel
-    assert 'type: "delete_prompt_context_profile",' in panel
+    # Targeted delete, through the host's gestured writer (Library paint-first
+    # Phase 4), which sends the identity-checked `delete_prompt_context_profile`.
+    assert "host._deletePromptContextProfile?.({" in panel
+    assert 'type: "delete_prompt_context_profile", profile_key:' in (
+        ROOT / "web/js/editor_widget.js").read_text(encoding="utf-8")
     # The whole-list PUT deleted by omission and must not come back here.
     assert "_savePromptContextProfiles" not in panel
     # The declaration editor replaced the label-flattening role inputs.

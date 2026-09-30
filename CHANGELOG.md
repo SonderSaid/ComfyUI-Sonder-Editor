@@ -15,7 +15,9 @@ a fresh `[Unreleased]` block.
 - Reference Lane Setup: adding or deleting a staged item and editing its range, strength, sequence length, mute, prompt override or members now show at once and save in the background, instead of waiting about a second for the server. A member role or retention change still waits for the server, and other edits of that item wait with it.
 - A failed Reference staging drop on the timeline shows one message instead of two.
 - Reference Lane Setup: clearing a member's saved role or retention now says it can't be saved yet, instead of appearing to work and reverting later.
-- Reference Library: editing or deleting a Reference or a member now shows at once and saves in the background, and the form closes when you save. A removed member's staged bars leave the timeline at once too.
+- Reference Library: editing or deleting a Reference or a member now shows at once and saves in the background, and the form closes when you save. Removing a member or deleting a Reference takes its staged bars off the timeline at once too.
+- Reference Prompting: changing a member's handle or its defaults shows at once and saves in the background. Save defaults saves only the fields you changed, and a handle another Reference or identity already uses is refused before anything is sent.
+- Reference Lane Setup: Edit as custom, Save as custom, and Update, Rename or Delete of a custom recipe show at once and save in the background.
 - Reference Library: a new Reference or member can be used while it is still saving. You can edit it, remove it, reorder it, drag it onto the timeline or add it there, and each change is saved after it. Context chip pickers list it once it has saved.
 
 ### Fixed
@@ -25,8 +27,11 @@ a fresh `[Unreleased]` block.
 - Dropping a Library member onto a staged Reference bar while another edit of that item was saving could be refused, and a failed drop refetched the scene over edits queued behind it.
 - Reference Library: a second edit of a Reference or member made while the first was still saving, or removing a member just after editing it, was refused as "changed elsewhere". Both are now saved in order.
 - Reference Library: saving an edit no longer reverts a field another tab changed while the form was open, when you did not change that field yourself.
+- Reference Prompting: attaching a member right after changing its handle was refused as "changed elsewhere". It now waits for the handle change and uses the new handle.
+- Deleting a prompt format that is still in use shows one message instead of two.
 - Reference Library: when the answer to creating a Reference was lost, a Reference with the same name created elsewhere could be taken for it, and the warning that yours was not saved never appeared.
-- Removing a Library member or Reference, or permanently deleting the asset of a staged Library member, now updates the timeline as soon as it is saved. Its staged bars used to stay on the timeline, in every scene, until the editor reloaded, and editing them failed.
+- Removing a Library member or Reference, or permanently deleting the asset of a staged Library member, now updates the timeline in every scene. Its staged bars used to stay until the editor reloaded, and editing them failed.
+- Reference Lane Setup: choosing a custom recipe that was deleted elsewhere now says so and keeps the lane's recipe, instead of pointing the lane at a recipe that no longer exists.
 
 ## [0.7.4] - 2026-09-29
 

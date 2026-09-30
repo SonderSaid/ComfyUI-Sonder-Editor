@@ -368,11 +368,17 @@ import { INSPECT_OVERLAY_SHORTCUTS, mountSharedAssetGallery, getActiveDragAsset 
 import { getActiveReferenceDrag, mountReferenceLibrary, referenceMemberMediaKind, SONDER_REFERENCE_MIME } from "./editor_reference_library.js";
 import { openReferenceMediaEditor, REFERENCE_MEDIA_EDITOR_SHORTCUTS } from "./reference_media_editor.js";
 import {
+    applyPendingRecipeOverlays,
     applyPendingReferenceOverlays,
     formatReferenceTag,
     mintReferenceLibraryId,
+    mintReferenceRecipeId,
     moveMember,
+    promptHandleOwner,
+    RECIPE_OVERLAY_TYPES,
+    recipeOverlayReflected,
     referenceFieldStoredAs,
+    referenceRecipeRecord,
     referenceOverlayFromOperation,
     referenceOverlayReflected,
     shouldApplyReferenceResponse,
@@ -2595,6 +2601,30 @@ export class EditorWidget {
         return this._referencesViewCache.members;
     }
 
+    /** Custom recipes as displayed: acknowledged `_customReferenceRecipes`
+     *  plus pending recipe overlays (`applyPendingRecipeOverlays`). Lane
+     *  Setup's definitions and the lane header's recipe label read it; the
+     *  acknowledged list stays the authority. Memoized like `_referencesView`. */
+    _referenceRecipesView() {
+        const cache = this._referenceRecipesViewCache;
+        const version = this._referenceOverlayVersion || 0;
+        if (cache && cache.recipes === this._customReferenceRecipes && cache.version === version) {
+            return cache.view;
+        }
+        const view = applyPendingRecipeOverlays(this._customReferenceRecipes, this._referenceOverlays,
+            this._referenceRecipeFieldSchema);
+        this._referenceRecipesViewCache = { recipes: this._customReferenceRecipes, version, view };
+        return view;
+    }
+
+    /** Whether acknowledged data already shows what an overlay painted, for
+     *  either kind of overlay. */
+    _referenceOverlayReflected(overlay) {
+        return RECIPE_OVERLAY_TYPES.has(overlay?.type)
+            ? recipeOverlayReflected(this._customReferenceRecipes, overlay)
+            : referenceOverlayReflected(this._references, overlay);
+    }
+
     /** Every overlay list replacement goes through here, so the view's
      *  memo cannot outlive the list it was computed from. */
     _setReferenceOverlays(overlays) {
@@ -2626,7 +2656,7 @@ export class EditorWidget {
             catalog: this._referenceTagPresets,
             tagFamilies: this._referenceTagFamilies,
             recipePresets: this._referenceRecipePresets,
-            customRecipes: this._customReferenceRecipes,
+            customRecipes: this._referenceRecipesView(),
             assets: this._allProjectAssetsForGallery(),
             scenes: this.scenes || [],
             semanticUnits: this._promptSemanticUnits || [],
@@ -2954,7 +2984,6 @@ export class EditorWidget {
         // into an older build stops the minting at its next answer.
         this._referenceClientIds = Array.isArray(payload?.client_ids)
             && payload.client_ids.includes("reference") && payload.client_ids.includes("member");
-        this._pruneReferenceOverlays({ source, requestSeq, ownOverlays });
         this._referenceUnconfirmedRetryAttempt = 0;
         this._referenceTagPresets = Array.isArray(payload?.tag_presets) ? payload.tag_presets : [];
         this._referenceTagFamilies = payload?.tag_families && typeof payload.tag_families === "object"
@@ -2969,6 +2998,9 @@ export class EditorWidget {
         this._promptContextCatalog = payload?.prompt_context_catalog
             && typeof payload.prompt_context_catalog === "object"
             ? payload.prompt_context_catalog : {};
+        // After every list is replaced: a settle checks recipe overlays against
+        // `_customReferenceRecipes`, not only Library ones against `_references`.
+        this._pruneReferenceOverlays({ source, requestSeq, ownOverlays });
         this._referencesLoaded = true;
         this._referencesDirty = false;
         this._referencesLoading = false;
@@ -3072,7 +3104,9 @@ export class EditorWidget {
 
     _mutateReferences(
         operations, label = "Reference Library change", diagnostics = null,
-        ownerToken = null, historyOrderContext = undefined, { overlays = null, cascade = null } = {}) {
+        ownerToken = null, historyOrderContext = undefined, {
+            overlays = null, cascade = null, failureMessage = null, failureDetail = null,
+        } = {}) {
         if (!this.projectDir || !Array.isArray(operations) || !operations.length) return Promise.resolve(null);
         const projectDir = this.projectDir;
         const dirName = this._projectDirName();
@@ -3091,14 +3125,24 @@ export class EditorWidget {
             refreshScenes: false,
             refreshKeysOnError: ["references"],
             // `fetchProjectJson` lifts only `project_version_conflict` onto
-            // `error.code`; every other route code stays on the payload.
-            failureMessage: (error) => (error?.code || error?.payload?.code) === "identity_mismatch"
-                ? "Reference changed elsewhere — Library refreshed."
+            // `error.code`; every other route code stays on the payload. A
+            // caller's own sentence wins when it returns one (null: the caller
+            // says it itself; undefined: this default).
+            failureMessage: (error) => {
+                const own = typeof failureMessage === "function" ? failureMessage(error) : undefined;
+                if (own !== undefined) return own;
+                const code = error?.code || error?.payload?.code;
+                if (code === "identity_mismatch") return "Reference changed elsewhere — Library refreshed.";
+                if (code === "handle_collision") {
+                    return "That handle is already used by another Reference or prompt identity.";
+                }
                 // No status: the write may have committed. A failure claim
                 // would invite a re-save that duplicates it.
-                : (!Number.isInteger(error?.status)
+                return !Number.isInteger(error?.status)
                     ? "Reference Library change could not be confirmed — refreshing the Library."
-                    : "Reference Library change failed."),
+                    : "Reference Library change failed.";
+            },
+            failureDetail,
             run: async (queuedOperations, diagnostics) => {
                 const result = await this._runVersionedProjectMutation(
                     `/sonder-editor/project/${encodeURIComponent(dirName)}/references/mutations`,
@@ -3232,7 +3276,14 @@ export class EditorWidget {
      *  behind the create. Against an older server nothing is minted and the
      *  row stays inert until acknowledged.
      */
-    _mutateReferencesPaintFirst(operations, { onUnconfirmedResolved = null } = {}) {
+    _mutateReferencesPaintFirst(operations, options = {}) {
+        return this._withMutationGesture("referenceLibrary",
+            () => this._mutateReferencesPaintFirstWithinGesture(operations, options));
+    }
+
+    _mutateReferencesPaintFirstWithinGesture(operations, {
+        onUnconfirmedResolved = null, label = undefined, failureMessage = null, failureDetail = null,
+    } = {}) {
         const mint = this._referenceClientIds && !this._referenceClientIdsDemoted;
         const sent = (Array.isArray(operations) ? operations : []).map((operation) => {
             if (mint && operation?.type === "create_reference" && !operation.reference_id) {
@@ -3259,8 +3310,171 @@ export class EditorWidget {
             this._setReferenceOverlays([...this._referenceOverlays, ...overlays]);
             this._renderReferenceViewConsumers();
         }
-        return this._withMutationGesture("referenceLibrary", () => this._mutateReferences(
-            sent, undefined, null, null, undefined, { overlays, cascade }));
+        return this._mutateReferences(sent, label, null, null, undefined,
+            { overlays, cascade, failureMessage, failureDetail });
+    }
+
+    // ── Module-facing Library writers ──────────────────────────────────────
+    //
+    // Reference Prompting, Lane Setup's custom recipes and the Prompt panel's
+    // format delete write the Library through these, never through
+    // `_mutateReferences` (`rollbackPromptPhysicalAttachment`, a compensation,
+    // is the one exception; `tests/test_mutation_gesture_coverage.py` pins it).
+    // Each runs inside its own mutation gesture, and every write but the
+    // format delete paints first.
+
+    /** Reference Prompting's write of a Library member: a handle edit or Save
+     *  defaults. `fields` holds only the keys the author changed from `drawn`,
+     *  the row the panel drew. The panel re-renders behind a gate, so the row
+     *  it drew can lag the view; each key's guard is therefore the view's value
+     *  when the author's own queued writes touch that key (they land first) and
+     *  the drawn value otherwise (a change made elsewhere is refused). Rejects
+     *  when the write is refused or its answer lost, as the Library's writes do. */
+    _writePromptReferenceMember(...args) {
+        return this._withMutationGesture("promptReferenceMember",
+            () => this._writePromptReferenceMemberWithinGesture(...args));
+    }
+
+    _writePromptReferenceMemberWithinGesture({
+        referenceId, memberId, drawn = {}, fields = {}, label = undefined, onUnconfirmedResolved = null,
+    } = {}) {
+        const keys = Object.keys(fields || {});
+        if (!keys.length) return Promise.resolve(null);
+        const shown = this._referenceViewIndex().get(String(memberId || ""))?.member || null;
+        const expected = {};
+        for (const key of keys) {
+            expected[key] = shown && this._referenceOverlayTouchesMember(memberId, key)
+                ? structuredClone(shown[key] ?? null) : structuredClone(drawn?.[key] ?? null);
+        }
+        return this._mutateReferencesPaintFirstWithinGesture([{
+            type: "update_member", reference_id: String(referenceId || ""),
+            member_id: String(memberId || ""), fields: structuredClone(fields), expected,
+        }], { label, onUnconfirmedResolved });
+    }
+
+    /** Whether one of the author's own Library writes still in the overlay
+     *  list sets this member field (or creates the member). */
+    _referenceOverlayTouchesMember(memberId, key) {
+        const id = String(memberId || "");
+        return (this._referenceOverlays || []).some((overlay) =>
+            (overlay.type === "create_member" && overlay.createdId === id)
+            || (overlay.type === "update_member" && overlay.member_id === id
+                && Object.prototype.hasOwnProperty.call(overlay.fields || {}, key)));
+    }
+
+    /** Another owner of a prompt handle, judged against the Library as
+     *  displayed (the author's own pending handles included) and the prompt
+     *  identities: the local mirror of the route's `handle_collision`. */
+    _promptHandleCollision(handle, memberId) {
+        return promptHandleOwner(handle, {
+            references: this._referencesView(), semanticUnits: this._promptSemanticUnits || [],
+            ownerKind: "physical reference", ownerId: String(memberId || ""),
+        });
+    }
+
+    /** A member's handle as the server holds it. Attach materializes against
+     *  this, not the displayed handle, which may be a handle edit still saving. */
+    _referenceStoredHandle(memberId) {
+        const id = String(memberId || "");
+        for (const reference of this._references || []) {
+            const member = (reference?.members || []).find((entry) => String(entry?.member_id || "") === id);
+            if (member) return String(member.handle || "");
+        }
+        return "";
+    }
+
+    /** Lane Setup's "Edit as custom" / "Save as custom": one gesture that
+     *  creates a custom recipe under a minted id and points the lane at it.
+     *
+     *  The create paints into the recipe view and is queued; the lane write
+     *  (`_saveLaneConfigWithinGesture`, its own Undo step "change lane
+     *  recipe") paints and is queued behind it, so no round trip separates
+     *  them. When the create is refused, the route refuses the lane write too
+     *  (`unknown_reference_recipe`: a lane may not newly name a missing custom
+     *  recipe), and the lane's acknowledged-value rollback returns it to its
+     *  previous recipe. One message: the create's. The panel has already run
+     *  every check a recipe write runs, so nothing here can orphan a recipe.
+     *  `laneRecipeFor(recipeId)` is the lane's next recipe, built by the panel
+     *  so the lane keeps its identity. Resolves once both have settled. */
+    _forkReferenceRecipe(...args) {
+        return this._withMutationGesture("forkReferenceRecipe",
+            () => this._forkReferenceRecipeWithinGesture(...args));
+    }
+
+    _forkReferenceRecipeWithinGesture({ entry, expectedLaneId = "", fields = {}, laneRecipeFor } = {}) {
+        if (!entry || typeof laneRecipeFor !== "function") return Promise.resolve("refused");
+        const recipeId = mintReferenceRecipeId();
+        const creating = this._mutateReferencesPaintFirstWithinGesture(
+            [{ type: "create_recipe", fields: { ...structuredClone(fields), id: recipeId } }], {
+                label: "create custom Reference recipe",
+                failureMessage: (error) => Number.isInteger(error?.status)
+                    ? "The custom recipe could not be created." : undefined,
+                failureDetail: (error) => error?.payload?.error || error?.message || null,
+            }).then(() => "ok", () => "failed");
+        entry.referenceRecipe = laneRecipeFor(recipeId);
+        const pointing = this._saveLaneConfigWithinGesture([entry], {
+            expectedLaneId, undoLabel: "change lane recipe", rollbackRecipe: true,
+            // The create has already spoken for the pair.
+            quietCodes: ["unknown_reference_recipe"],
+        });
+        return Promise.all([creating, pointing]).then(([created]) => created);
+    }
+
+    /** Lane Setup's Update and Rename of a custom recipe: paint first,
+     *  guarded by the displayed definition at the click. Resolves "ok" or
+     *  "failed"; a failure has already said why. */
+    _updateReferenceRecipe(...args) {
+        return this._withMutationGesture("updateReferenceRecipe",
+            () => this._updateReferenceRecipeWithinGesture(...args));
+    }
+
+    _updateReferenceRecipeWithinGesture({ recipeId, expected, fields } = {}) {
+        return this._mutateReferencesPaintFirstWithinGesture([{
+            type: "update_recipe", recipe_id: String(recipeId || ""),
+            expected: structuredClone(expected), fields: structuredClone(fields),
+        }], { label: "update custom Reference recipe" }).then(() => "ok", () => "failed");
+    }
+
+    /** Lane Setup's Delete of a custom recipe: the removal paints first; the
+     *  lane's detach (`detach`, which re-reads the lane) runs only once the
+     *  delete is acknowledged, in the same gesture, so a refused delete leaves
+     *  the lane attached. */
+    _deleteReferenceRecipe(...args) {
+        return this._withMutationGesture("deleteReferenceRecipe",
+            (gesture) => this._deleteReferenceRecipeWithinGesture(gesture, ...args));
+    }
+
+    async _deleteReferenceRecipeWithinGesture(gesture, { recipeId, expected, detach = null } = {}) {
+        try {
+            await this._mutateReferencesPaintFirstWithinGesture([{
+                type: "delete_recipe", recipe_id: String(recipeId || ""), expected: structuredClone(expected),
+            }], { label: "delete custom Reference recipe" });
+        } catch (_error) {
+            return "failed";
+        }
+        if (typeof detach === "function") {
+            await this._withMutationGesture("deleteReferenceRecipe", () => detach(),
+                gesture?.gestureId || "");
+        }
+        return "ok";
+    }
+
+    /** The Prompt panel's delete of a custom prompt format. Server-first: a
+     *  format is not Library data, and its refusal
+     *  (`prompt_context_profile_in_use`) must be seen before anything changes.
+     *  The panel says what happened, so an answered refusal adds no toast. */
+    _deletePromptContextProfile(...args) {
+        return this._withMutationGesture("deletePromptContextProfile",
+            () => this._deletePromptContextProfileWithinGesture(...args));
+    }
+
+    _deletePromptContextProfileWithinGesture({ profileKey, expected } = {}) {
+        return this._mutateReferences([{
+            type: "delete_prompt_context_profile", profile_key: String(profileKey || ""),
+            expected: structuredClone(expected),
+        }], "delete prompt format", null, null, undefined, {
+            failureMessage: (error) => Number.isInteger(error?.status) ? null : undefined,
+        });
     }
 
     /** A settled write whose own payload did not apply: keep its rows until a
@@ -3275,9 +3489,16 @@ export class EditorWidget {
         // any result of its kind.
         const claimed = new Set();
         const target = (overlay, entry) => overlay.type === "create_reference"
-            || String(entry?.reference_id || "") === overlay.reference_id;
+            || overlay.type === "create_recipe"
+            || (RECIPE_OVERLAY_TYPES.has(overlay.type)
+                ? String(entry?.recipe_id || "") === overlay.recipe_id
+                : String(entry?.reference_id || "") === overlay.reference_id);
         const matches = (overlay, entry) => {
             if (!target(overlay, entry)) return false;
+            if (RECIPE_OVERLAY_TYPES.has(overlay.type)) {
+                return overlay.type !== "create_recipe"
+                    || String(entry?.recipe_id || "") === overlay.createdId;
+            }
             if (overlay.type === "create_reference") {
                 return !overlay.createdId || String(entry?.reference_id || "") === overlay.createdId;
             }
@@ -3295,12 +3516,12 @@ export class EditorWidget {
             this._setReferenceOverlayFields(overlay, {
                 state: "acknowledged",
                 clearAfterSeq: this._referenceFetchSeq,
-                ...(result ? { committedId: String(overlay.type === "create_member"
-                    ? result.member_id || "" : result.reference_id || "") } : {}),
+                ...(result ? { committedId: String(overlay.type === "create_member" ? result.member_id || ""
+                    : (overlay.type === "create_recipe" ? result.recipe_id || "" : result.reference_id || "")) } : {}),
             });
         }
         this._setReferenceOverlays(this._referenceOverlays.filter((overlay) => {
-            const leaves = overlays.includes(overlay) && referenceOverlayReflected(this._references, overlay);
+            const leaves = overlays.includes(overlay) && this._referenceOverlayReflected(overlay);
             if (leaves) this._decideReflectedReferenceCascade(overlay);
             return !leaves;
         }));
@@ -3363,9 +3584,22 @@ export class EditorWidget {
      *  Library did not hold when the write settled. */
     _unconfirmedReferenceOverlaySaved(overlay) {
         const type = overlay?.type;
-        if (type === "delete_reference" || type === "delete_member") {
+        if (type === "delete_reference" || type === "delete_member" || type === "delete_recipe") {
             // Saved if and only if the target is gone.
-            return referenceOverlayReflected(this._references, overlay);
+            return this._referenceOverlayReflected(overlay);
+        }
+        if (type === "update_recipe") {
+            if (overlay.provenSaved) return true;
+            const stored = (this._customReferenceRecipes || []).find((entry) =>
+                String(entry?.id || "") === overlay.recipe_id);
+            // Deleted since: nothing to save into and nothing to hand back.
+            if (!stored) return true;
+            // Each sent key in the form the route stores it (`update_recipe`
+            // merges the fields into the stored definition, then normalizes).
+            const sent = referenceRecipeRecord({ ...stored, ...overlay.fields }, overlay.recipe_id,
+                this._referenceRecipeFieldSchema);
+            return Object.keys(overlay.fields || {}).every((field) =>
+                canonicalJson(stored[field]) === canonicalJson(sent[field]));
         }
         if (type === "update_reference" || type === "update_member") {
             if (overlay.provenSaved) return true;
@@ -3386,8 +3620,8 @@ export class EditorWidget {
             // present -- which also ends a false "saved" on a same-named
             // Reference someone else created meanwhile -- or a later own write
             // naming it was accepted (a Remove made while it saved, say).
-            return overlay.provenSaved === true || referenceOverlayReflected(this._references,
-                { ...overlay, committedId: "" });
+            return overlay.provenSaved === true
+                || this._referenceOverlayReflected({ ...overlay, committedId: "" });
         }
         // Heuristics for a create sent without a minted id, to a server that
         // does not adopt client ids. Remove with `client_ids` (routes.py
@@ -3431,7 +3665,7 @@ export class EditorWidget {
                 if (overlay.status === "unconfirmed") resolved.push(overlay);
                 return false;
             }
-            if (!referenceOverlayReflected(this._references, overlay)) return true;
+            if (!this._referenceOverlayReflected(overlay)) return true;
             this._decideReflectedReferenceCascade(overlay);
             return false;
         }));
@@ -3494,7 +3728,11 @@ export class EditorWidget {
                     && String(value?.member_id || "") === targetMemberId)?.handle;
             const storedHandle = responseHandle || storedTarget()?.handle;
             if (!storedHandle) throw new Error("The Reference handle was not materialized.");
-            return { handle: String(storedHandle), ownsHandle: true };
+            // Owned only when this materialized it from the suggestion. With
+            // `expectedHandle` set, the handle is one the author typed (a
+            // handle edit queued ahead of this): recording it as Attach's
+            // would let Undo, or a refused attach's rollback, clear it.
+            return { handle: String(storedHandle), ownsHandle: !expectedHandle };
         } catch (error) {
             // The POST may have committed before its response was lost. Re-read
             // the exact target and let Attach use any now-durable handle. The
@@ -3506,7 +3744,10 @@ export class EditorWidget {
                 force: true,
             });
             const observedHandle = reconciled ? String(storedTarget()?.handle || "") : "";
-            if (observedHandle) {
+            // Behind a handle edit (`expectedHandle`), anything but that handle
+            // means the edit did not land: the attach stops rather than go on
+            // under a handle the author just replaced.
+            if (observedHandle && (!expectedHandle || observedHandle === expectedHandle)) {
                 return { handle: observedHandle, ownsHandle: false };
             }
             throw error;
@@ -3910,7 +4151,7 @@ export class EditorWidget {
         const named = new Set();
         for (const operation of Array.isArray(operations) ? operations : []) {
             if (operation?.type === "create_reference" || operation?.type === "create_member") continue;
-            for (const key of ["reference_id", "member_id"]) {
+            for (const key of ["reference_id", "member_id", "recipe_id"]) {
                 if (operation?.[key]) named.add(String(operation[key]));
             }
         }
@@ -3929,11 +4170,13 @@ export class EditorWidget {
      *  "A not saved" and hand back a draft that reverts B. */
     _proveEarlierReferenceUpdates(accepted) {
         for (const later of accepted || []) {
-            if (later?.type !== "update_reference" && later?.type !== "update_member") continue;
+            if (later?.type !== "update_reference" && later?.type !== "update_member"
+                    && later?.type !== "update_recipe") continue;
             for (const earlier of this._referenceOverlays) {
                 if (earlier === later || earlier.status !== "unconfirmed" || earlier.type !== later.type
                         || earlier.reference_id !== later.reference_id
-                        || earlier.member_id !== later.member_id) continue;
+                        || earlier.member_id !== later.member_id
+                        || earlier.recipe_id !== later.recipe_id) continue;
                 if (Object.keys(later.expected || {}).some((key) =>
                     Object.prototype.hasOwnProperty.call(earlier.fields || {}, key)
                     && canonicalJson(later.expected[key]) === canonicalJson(earlier.fields[key]))) {
@@ -4103,7 +4346,7 @@ export class EditorWidget {
     _referenceLaneRecipeLabel(laneIndex) {
         const recipe = this.activeScene?.reference_lane_recipes?.[laneIndex || 0];
         if (!recipe) return "";
-        const definition = [...(this._referenceRecipePresets || []), ...(this._customReferenceRecipes || [])]
+        const definition = [...(this._referenceRecipePresets || []), ...this._referenceRecipesView()]
             .find((entry) => entry.id === recipe.recipe_id);
         return definition?.name || String(recipe.recipe?.name || "");
     }
@@ -5601,7 +5844,9 @@ export class EditorWidget {
                 // because then it is the only visible failure signal.
                 const panelOwnsPromptConflict = error?.payload?.code === "prompt_edit_conflict"
                     && this._promptPanelHandle?.isMounted?.();
-                if (!panelOwnsPromptConflict)
+                // A `failureMessage` function returning null: the caller has
+                // already said it, or a sibling write of the same gesture has.
+                if (!panelOwnsPromptConflict && message !== null)
                     notify(message, { source: "project-mutation-failed", detail: detail || null });
                 if (Array.isArray(refreshKeysOnError) && refreshKeysOnError.length) {
                     this._deferProjectBackedRefresh(refreshKeysOnError, `${label || key}_error`);
@@ -14120,7 +14365,7 @@ export class EditorWidget {
      * `_trackLaneRecipeWrite` for which value it restores and when.
      */
     async _saveLaneConfigWithinGesture(changedEntries, {
-        expectedLaneId = "", undoLabel = "", rollbackRecipe = false,
+        expectedLaneId = "", undoLabel = "", rollbackRecipe = false, quietCodes = [],
     } = {}) {
         if (!this.activeScene || !this.projectDir) return;
         // Only entries that write: pushing an entry clears Redo and can trim the
@@ -14223,6 +14468,15 @@ export class EditorWidget {
                 // scene reconciler; pending newer edits defer to the idle refresh.
                 refreshScenes: true,
                 onSupersededByCoalescing: () => { joinedPendingSlot = true; },
+                // A refusal a sibling write of the gesture has already
+                // explained (a fork's refused create) adds no second message.
+                failureMessage: (error) => {
+                    const code = error?.payload?.code || error?.code;
+                    if (quietCodes.includes(code)) return null;
+                    return code === "unknown_reference_recipe"
+                        ? "That custom recipe no longer exists. The lane keeps its previous recipe."
+                        : "lane config failed — timeline restored.";
+                },
             });
         } catch (e) {
             saving = Promise.reject(e);
@@ -14237,6 +14491,11 @@ export class EditorWidget {
             }
         } catch (e) {
             console.warn("[Sonder] Failed to save lane config:", e);
+            if ((e?.payload?.code || e?.code) === "unknown_reference_recipe") {
+                // Deleted elsewhere: the recipe list offering it is stale.
+                this._deferredReferencesForce = true;
+                this._deferProjectBackedRefresh(["references"], "unknown_reference_recipe");
+            }
             let rolledBack = false;
             if (!joinedPendingSlot) {
                 for (const chain of recipeChains) {

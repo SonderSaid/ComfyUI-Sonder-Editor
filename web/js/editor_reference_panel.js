@@ -9,7 +9,8 @@
 //   activeScene, activeSceneId, projectDir, totalFrames, playhead, _trackLayout,
 //   _referencesView() (the Library as displayed: a member still saving is
 //   offered, one a delete in flight is taking away is not),
-//   _referenceRecipePresets, _customReferenceRecipes,
+//   _referenceRecipePresets, _referenceRecipesView() (custom recipes as
+//   displayed: acknowledged plus pending recipe writes),
 //   _referenceRecipeFieldSchema, _referenceMemberForRef(ref),
 //   _referenceLaneAdvisories(entry, definition), _defaultReferenceLaneRecipe(),
 //   _findAssetById(id), _referenceAssetPreviewUrl(asset),
@@ -21,7 +22,10 @@
 //   _writeReferenceItemFromPanel(itemId, fields | (liveRow) => fields, undoLabel),
 //   _editReferenceItemMembersFromPanel(itemId, edit, undoLabel),
 //   _appendReferenceMembers(itemId, { members }),
-//   _mutateReferences(ops), _fetchReferences(opts), _buildTrackLayout(),
+//   _forkReferenceRecipe({ entry, expectedLaneId, fields, laneRecipeFor }),
+//   _updateReferenceRecipe({ recipeId, expected, fields }),
+//   _deleteReferenceRecipe({ recipeId, expected, detach }),
+//   _fetchReferences(opts), _buildTrackLayout(),
 //   _renderTimeline(), _renderSceneAfterLocalMutation(opts),
 //   _stampManagementPanel(kind, stamp)
 //
@@ -304,7 +308,10 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         .filter((item) => (item.lane_index || 0) === state.laneIndex)
         .slice()
         .sort((left, right) => (left.start_frame || 0) - (right.start_frame || 0));
-    const definitions = () => [...(host._referenceRecipePresets || []), ...(host._customReferenceRecipes || [])];
+    // Custom recipes as displayed, so a recipe still saving is offered and a
+    // deleted one is not.
+    const definitions = () => [...(host._referenceRecipePresets || []),
+        ...(host._referenceRecipesView?.() ?? (host._customReferenceRecipes || []))];
     const definitionFor = (recipeId) => definitions().find((entry) => entry.id === recipeId) || null;
     const isBuiltIn = (recipeId) => !!definitionFor(recipeId)?.builtIn;
     const laneLocked = () => host._isLaneLocked?.(TRACK_TYPE.REFERENCE, state.laneIndex) || false;
@@ -324,10 +331,13 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
     // would leave the old form under a focused select. A plain field edit
     // leaves the repaint to that gate, so the field the author tabbed into is
     // never rebuilt under them.
-    const writeRecipe = async (recipe, { structural = true, evenIfLocked = false } = {}) => {
+    // Every check a recipe write runs, before anything is painted or queued.
+    // A custom-recipe fork runs them too, before its recipe is created, so a
+    // refusal here can never leave a recipe no lane names.
+    const recipeWriteRefused = ({ evenIfLocked = false } = {}) => {
         // A references refresh can close the panel under an open custom-recipe
         // flow; nothing may be written from a closed one.
-        if (!mounted) return;
+        if (!mounted) return true;
         if (drawnLaneMoved()) {
             // An Undo or a refetch moved the lanes under an unrepainted panel:
             // the index now names another lane, whose recipe this would replace.
@@ -336,10 +346,9 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                 notifyWarning("This Reference lane moved since the panel was drawn.",
                     { source: "reference-panel-stale" });
             }
-            return;
+            return true;
         }
-        const entry = currentEntry();
-        if (!entry) return;
+        if (!currentEntry()) return true;
         if (laneLocked() && !evenIfLocked) {
             // Locked since the form was drawn (an Undo, the header toggle)
             // while its repaint waited on the author. The server does not
@@ -349,8 +358,14 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                 notifyWarning("This Reference lane is locked. Unlock it on the timeline header to edit.",
                     { source: "reference-panel-locked" });
             }
-            return;
+            return true;
         }
+        return false;
+    };
+
+    const writeRecipe = async (recipe, { structural = true, evenIfLocked = false } = {}) => {
+        if (recipeWriteRefused({ evenIfLocked })) return;
+        const entry = currentEntry();
         const expectedLaneId = state.renderedLaneId || "";
         const current = laneRecipe();
         const nextRecipe = preserveLaneRecipeIdentity(
@@ -999,43 +1014,36 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         soft: { ...(recipe.recipe?.soft || {}) },
     });
 
-    // _mutateReferences resolves the versioned mutation result and the host has
-    // already applied the canonical Library payload by then, so the panel only
-    // needs to re-render — never a second fetch.
-    const createdRecipeId = (result) => String(
-        (result?.payload?.results || []).find((row) => row?.type === "create_recipe")?.recipe_id || "",
-    );
-
-    // Each action reads the lane when the author acts, and again after the
-    // Library round trip: the lane's values may have been edited meanwhile, and
-    // the lane keeps what the author last set rather than the click-time copy.
-    // A lane that switched recipe during the round trip keeps its new recipe:
-    // the created one would name values it was never made from. It stays in
-    // the Library, where the author can pick or delete it.
-    const attachCreatedRecipe = async (result, clickedRecipeId, name) => {
-        const recipeId = createdRecipeId(result);
-        const now = laneRecipe();
-        if (!recipeId || String(now.recipe_id || "") !== clickedRecipeId) {
-            render();
-            return;
-        }
-        await writeRecipe({ ...now, recipe_id: recipeId, recipe: { ...(now.recipe || {}), name } });
+    // One host writer creates the recipe and points the lane at it in one
+    // gesture, both painted at the click and queued in that order; the lane's
+    // values are read when the author acts. The checks run first, so a lane
+    // that moved or locked refuses before any recipe exists.
+    const forkRecipe = async (name) => {
+        if (recipeWriteRefused()) return;
+        const recipe = laneRecipe();
+        const pending = host._forkReferenceRecipe?.({
+            entry: currentEntry(),
+            expectedLaneId: state.renderedLaneId || "",
+            fields: recipePayload(recipe, name),
+            laneRecipeFor: (recipeId) => preserveLaneRecipeIdentity(recipe,
+                { ...recipe, recipe_id: recipeId, recipe: { ...(recipe.recipe || {}), name } },
+                host._defaultReferenceLaneRecipe().lane_id),
+        });
+        host._buildTrackLayout?.();
+        host._renderTimeline?.();
+        render();
+        await pending;
     };
 
     const forkToCustom = async () => {
-        const recipe = laneRecipe();
-        const definition = definitionFor(recipe.recipe_id);
-        const name = `${definition?.name || "Reference recipe"} (custom)`;
-        const result = await host._mutateReferences?.([{ type: "create_recipe", fields: recipePayload(recipe, name) }]);
-        await attachCreatedRecipe(result, String(recipe.recipe_id || ""), name);
+        const definition = definitionFor(laneRecipe().recipe_id);
+        await forkRecipe(`${definition?.name || "Reference recipe"} (custom)`);
     };
 
     const saveAsCustom = async () => {
-        const recipe = laneRecipe();
-        const name = window.prompt("Custom recipe name:", recipe.recipe?.name || "Custom Reference Recipe");
+        const name = window.prompt("Custom recipe name:", laneRecipe().recipe?.name || "Custom Reference Recipe");
         if (!name?.trim()) return;
-        const result = await host._mutateReferences?.([{ type: "create_recipe", fields: recipePayload(recipe, name.trim()) }]);
-        await attachCreatedRecipe(result, String(recipe.recipe_id || ""), name.trim());
+        await forkRecipe(name.trim());
     };
 
     const expectedRecipe = (definition) => ({
@@ -1046,6 +1054,9 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         soft: { ...(definition.soft || {}) },
     });
 
+    // Update, Rename and Delete paint first. Each guard is the displayed
+    // definition at the click: a recipe still saving is displayed as the
+    // record its create stores, so its guard matches once that create lands.
     const updateCustom = async () => {
         const recipe = laneRecipe();
         const definition = definitionFor(recipe.recipe_id);
@@ -1053,42 +1064,56 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             render();
             return;
         }
-        await host._mutateReferences?.([{
-            type: "update_recipe",
-            recipe_id: definition.id,
+        const pending = host._updateReferenceRecipe?.({
+            recipeId: definition.id,
             expected: expectedRecipe(definition),
             fields: recipePayload(recipe, definition.name),
-        }]);
+        });
         render();
+        await pending;
     };
 
     const renameCustom = async (definition) => {
         const name = window.prompt("Recipe name:", definition.name || "");
         if (!name?.trim() || name.trim() === definition.name) return;
-        await host._mutateReferences?.([{
-            type: "update_recipe",
-            recipe_id: definition.id,
-            expected: expectedRecipe(definition),
+        const shown = definitionFor(definition.id);
+        if (!shown) {
+            render();
+            return;
+        }
+        const pending = host._updateReferenceRecipe?.({
+            recipeId: shown.id,
+            expected: expectedRecipe(shown),
             fields: { name: name.trim() },
-        }]);
+        });
         render();
+        await pending;
     };
 
     const deleteCustom = async (definition) => {
-        await host._mutateReferences?.([{
-            type: "delete_recipe",
-            recipe_id: definition.id,
-            expected: expectedRecipe(definition),
-        }]);
-        // The lane keeps its materialized values and falls back to Detached.
-        const recipe = laneRecipe();
-        if (recipe.recipe_id === definition.id) {
-            // Not an edit of the lane's values: the recipe it named is gone, so
-            // it detaches whatever the lock says, as it always has.
-            await writeRecipe({ ...recipe, recipe_id: "" }, { evenIfLocked: true });
+        const shown = definitionFor(definition.id);
+        if (!shown) {
+            render();
             return;
         }
+        const pending = host._deleteReferenceRecipe?.({
+            recipeId: shown.id,
+            expected: expectedRecipe(shown),
+            // Only once the delete is acknowledged, so a refused delete leaves
+            // the lane attached. The lane keeps its materialized values and
+            // falls back to Detached; not an edit of its values -- the recipe
+            // it named is gone -- so it detaches whatever the lock says.
+            detach: async () => {
+                const recipe = laneRecipe();
+                if (recipe.recipe_id === shown.id) {
+                    await writeRecipe({ ...recipe, recipe_id: "" }, { evenIfLocked: true });
+                    return;
+                }
+                if (mounted) render();
+            },
+        });
         render();
+        await pending;
     };
 
     // ── Staged items ───────────────────────────────────────────────────────

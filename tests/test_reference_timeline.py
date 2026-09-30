@@ -288,7 +288,7 @@ def test_populated_reference_lane_refuses_media_kind_change():
         members=[{"entity_id": "entity-1", "member_id": "member-1"}],
     )]
     with pytest.raises(routes.ProjectMutationRequestError) as mismatch:
-        routes._apply_lane_config(scene, {
+        routes._apply_lane_config(TimelineProject(project_id="lanes"), scene, {
             "lane_type": "reference",
             "lane_index": 0,
             "fields": {"reference_recipe": ReferenceLaneRecipe(media_kind="audio").to_dict()},
@@ -506,7 +506,7 @@ def test_reference_lane_config_save_preserves_lane_id_and_population():
     incoming = lane.to_dict()
     incoming.pop("lane_id")
     incoming["recipe"]["name"] = "Edited"
-    routes._apply_lane_config(scene, {
+    routes._apply_lane_config(TimelineProject(project_id="lanes"), scene, {
         "lane_type": "reference", "lane_index": 0,
         "fields": {"reference_recipe": incoming},
     })
@@ -1936,7 +1936,7 @@ def test_lane_config_identity_refusal_precedes_field_writes(expected):
     scene = _movable_scene()
     before = scene.to_dict()
     with pytest.raises(routes.ProjectMutationRequestError) as caught:
-        routes._apply_lane_config(scene, {
+        routes._apply_lane_config(TimelineProject(project_id="lanes"), scene, {
             "lane_type": "reference", "lane_index": 0, "expected": expected,
             "fields": {"name": "Wrong target", "locked": True, "hidden": True,
                        "reference_recipe": {"lane_id": "replacement"}},
@@ -1955,7 +1955,7 @@ def test_lane_config_stored_id_wins_over_client_minted_recipe(with_expected):
                      "reference_recipe": {"lane_id": "client-minted", "media_kind": "image"}}}
     if with_expected:
         op["expected"] = {"lane_id": lane_id}
-    routes._apply_lane_config(scene, op)
+    routes._apply_lane_config(TimelineProject(project_id="lanes"), scene, op)
     assert scene.reference_lane_recipes[0].lane_id == lane_id
     assert scene.reference_lane_configs[0].name == "Renamed"
     assert scene.reference_lane_configs[0].locked
@@ -1986,7 +1986,7 @@ def test_lane_config_bootstraps_recipe_less_default_and_same_batch_appended_lane
 
 def test_lane_config_positional_family_keeps_writing_without_recipe_identity():
     scene = Scene(scene_id="scene", video_lane_count=1)
-    routes._apply_lane_config(scene, {
+    routes._apply_lane_config(TimelineProject(project_id="lanes"), scene, {
         "lane_type": "video", "lane_index": 0, "fields": {"name": "Video", "locked": True},
     })
     assert scene.video_lane_configs[0].name == "Video"
@@ -2003,7 +2003,7 @@ def test_loaded_bootstrap_lane_identity_survives_get_then_mutation(raw_recipes):
     write = Scene.from_dict(raw)
     assert [r.lane_id for r in read.reference_lane_recipes] == [r.lane_id for r in write.reference_lane_recipes]
     assert len({r.lane_id for r in read.reference_lane_recipes}) == 2
-    routes._apply_lane_config(write, {
+    routes._apply_lane_config(TimelineProject(project_id="lanes"), write, {
         "lane_type": "reference", "lane_index": 0,
         "expected": {"lane_id": read.reference_lane_recipes[0].lane_id},
         "fields": {"name": "First durable edit", "reference_recipe": {"lane_id": "client-draft"}},

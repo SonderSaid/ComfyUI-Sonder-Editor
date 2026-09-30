@@ -1160,3 +1160,54 @@ def test_a_stored_recipe_id_is_never_revalidated_by_an_update(tmp_path):
 def test_the_library_payload_advertises_client_minted_ids(tmp_path):
     assert routes._references_payload(_project(tmp_path))["client_ids"] == [
         "reference", "member", "recipe"]
+
+
+# --- A lane may not newly name a missing custom recipe (paint-first Phase 4) --
+
+def _lane_recipe_project(tmp_path, stored_recipe_id="sonder:minimax_h3_picture"):
+    project = _project(tmp_path)
+    project.scenes = [Scene(scene_id="scene-1", reference_lane_count=1,
+                            reference_lane_configs=[LaneConfig()],
+                            reference_lane_recipes=[ReferenceLaneRecipe(
+                                lane_id="lane-1", recipe_id=stored_recipe_id, media_kind="image")])]
+    return project
+
+
+def _lane_recipe_op(recipe_id, **config):
+    return {"type": "update_lane_config", "lane_type": "reference", "lane_index": 0,
+            "expected": {"lane_id": "lane-1"},
+            "fields": {"name": config.get("name", ""), "color": "", "locked": config.get("locked", False),
+                       "hidden": False, "reference_recipe": {
+                           "recipe_id": recipe_id, "media_kind": "image", "recipe": {}}}}
+
+
+def test_a_lane_write_newly_naming_a_missing_custom_recipe_is_refused(tmp_path):
+    project = _lane_recipe_project(tmp_path)
+    scene = project.scenes[0]
+    with pytest.raises(routes.ProjectMutationRequestError) as refused:
+        routes._apply_lane_config(project, scene, _lane_recipe_op("custom:" + "d" * 32))
+    assert (refused.value.status, refused.value.code) == (409, "unknown_reference_recipe")
+    assert scene.reference_lane_recipes[0].recipe_id == "sonder:minimax_h3_picture"
+    # A preset, and detaching, are always allowed.
+    routes._apply_lane_config(project, scene, _lane_recipe_op("sonder:minimax_h3_picture"))
+    routes._apply_lane_config(project, scene, _lane_recipe_op(""))
+    assert scene.reference_lane_recipes[0].recipe_id == ""
+
+
+def test_a_stored_dangling_recipe_id_is_tolerated_when_re_sent(tmp_path):
+    """A lock, rename or hide re-sends the lane's recipe; a dangling id already
+    stored (legacy, or left by a delete elsewhere) is not the write's doing."""
+    project = _lane_recipe_project(tmp_path, stored_recipe_id="custom:gone")
+    scene = project.scenes[0]
+    routes._apply_lane_config(project, scene, _lane_recipe_op("custom:gone", locked=True, name="Kept"))
+    assert scene.reference_lane_recipes[0].recipe_id == "custom:gone"
+    assert scene.reference_lane_configs[0].locked is True
+
+
+def test_a_lane_write_behind_the_create_of_its_recipe_is_accepted(tmp_path):
+    project = _lane_recipe_project(tmp_path)
+    recipe_id = "custom:" + "e" * 32
+    routes._apply_reference_mutation_operations(project, [{"type": "create_recipe", "fields": {
+        "id": recipe_id, "name": "Fork", "media_kind": "image", "hard": {}, "soft": {}}}])
+    routes._apply_lane_config(project, project.scenes[0], _lane_recipe_op(recipe_id))
+    assert project.scenes[0].reference_lane_recipes[0].recipe_id == recipe_id

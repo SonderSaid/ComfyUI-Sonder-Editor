@@ -458,3 +458,50 @@ def test_duplicate_staging_blocks_only_when_the_member_is_referenced():
     error = next(value for value in referenced["errors"]
                  if value["code"] == "ambiguous_physical_handle")
     assert "lane-a" in error["message"] and "lane-b" in error["message"]
+
+
+def test_the_local_handle_collision_check_matches_the_route():
+    """Reference Prompting refuses a handle another owner holds before sending
+    it (`promptHandleOwner`, `reference_library_model.js`); the decision must be
+    the route's `_require_prompt_handle_available`, in both directions."""
+    import json
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for the handle parity test")
+    project = _project()
+    project.references.append(ReferenceEntity(reference_id="man", name="Man", members=[
+        ReferenceMember(member_id="man-member", asset_id="portrait", handle=" Rider "),
+        ReferenceMember(member_id="blank-member", asset_id="portrait", handle="")]))
+    units = [prompt_context.normalize_semantic_unit(value) for value in (
+        {"semantic_unit_id": "lead", "handle": "Lead", "name": "Lead"},
+        {"semantic_unit_id": "blank", "handle": "", "name": "Blank"})]
+    cases = [(handle, owner) for handle in ("KWoman", "kwoman", "KWOMAN", "Rider", "rider", "Lead",
+                                            "LEAD", "Free", "", "  kwoman  ")
+             for owner in ("portrait-member", "man-member", "blank-member")]
+    expected = []
+    for handle, owner in cases:
+        try:
+            routes._require_prompt_handle_available(
+                project, handle.strip(), "physical reference", owner, semantic_units=units)
+            expected.append(False)
+        except routes.ProjectMutationRequestError as error:
+            assert error.code == "handle_collision"
+            expected.append(True)
+    model = (Path(__file__).resolve().parents[1] / "web" / "js" / "reference_library_model.js").as_uri()
+    script = f"""
+        import * as model from {model!r};
+        const references = {json.dumps([reference.to_dict() for reference in project.references])};
+        const semanticUnits = {json.dumps(units)};
+        const cases = {json.dumps(cases)};
+        console.log(JSON.stringify(cases.map(([handle, ownerId]) => !!model.promptHandleOwner(handle,
+            {{ references, semanticUnits, ownerKind: 'physical reference', ownerId }}))));
+    """
+    completed = subprocess.run([node, "--input-type=module", "-e", script], capture_output=True,
+                               text=True, encoding="utf-8", timeout=60)
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout.strip().splitlines()[-1]) == expected
+    assert any(expected) and not all(expected)

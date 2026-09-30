@@ -116,3 +116,43 @@ def test_a_minted_library_id_has_the_shape_the_route_accepts():
         assert re.fullmatch(r"[0-9a-f]{32}", value)
         assert routes._CLIENT_ID_PATTERN.match(value)
         assert routes._client_library_id(value, set(), "Reference") == value
+
+
+RECIPE_FIELDS = [
+    # What Lane Setup's fork and Update send (`recipePayload`).
+    {"name": "Fork", "media_kind": "image",
+     "hard": {"assembly": "sheet", "layout": "grid", "max_members": 4, "width": 1024.0,
+              "frame_rate": 24, "allowed_frame_counts": [17, 33]},
+     "soft": {"suggested_tags": ["sonder:portrait"], "recommended_duration_sec": 3,
+              "prompt_prefix": "Reference:"}},
+    {"name": "  Padded name  ", "media_kind": "audio", "hard": {}, "soft": {}},
+    {"name": "Truncated", "hard": {"max_members": 6.9, "frame_step": 8}, "soft": {}},
+    {"name": "Video", "media_kind": "video", "hard": {"frame_rate": 12.5}, "soft": {"physical_population": "videos"}},
+]
+
+
+def test_a_created_recipe_is_painted_as_the_route_stores_it():
+    from server.timeline_state import REFERENCE_RECIPE_FIELDS
+    expected = [routes._normalize_custom_reference_recipe(dict(fields), recipe_id="custom:" + "f" * 32)
+                for fields in RECIPE_FIELDS]
+    painted = _node(f"""
+        import * as model from {MODEL!r};
+        const cases = {json.dumps(RECIPE_FIELDS)};
+        const schema = {json.dumps([dict(field) for field in REFERENCE_RECIPE_FIELDS])};
+        console.log(JSON.stringify(cases.map((fields) =>
+            model.referenceRecipeRecord(fields, 'custom:' + 'f'.repeat(32), schema))));
+    """)
+    # Compared as JSON, which is what the guard travels as: 1024.0 and 1024 are one number there.
+    assert json.loads(json.dumps(expected)) == painted
+
+
+def test_a_minted_recipe_id_has_the_shape_the_route_accepts():
+    minted = _node(f"""
+        import * as model from {MODEL!r};
+        console.log(JSON.stringify(Array.from({{ length: 16 }}, () => model.mintReferenceRecipeId())));
+    """)
+    assert len(set(minted)) == len(minted)
+    for value in minted:
+        assert routes._CLIENT_RECIPE_ID_PATTERN.match(value)
+        assert routes._client_library_id(value, set(), "Reference recipe",
+                                         pattern=routes._CLIENT_RECIPE_ID_PATTERN) == value

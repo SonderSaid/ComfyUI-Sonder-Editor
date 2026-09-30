@@ -392,6 +392,7 @@ Object.assign(w, {
   _referenceRecipePresets:[{id:'preset:sheet', name:'Sheet preset', builtIn:true,
     media_kind:'image', hard:{assembly:'sheet', layout:'grid'}, soft:{}}],
   _customReferenceRecipes:[], _referenceRecipeFieldSchema:schema,
+  _referenceOverlays:[], _referenceOverlaySeq:0,
   _promptContextProfiles:[], _promptContextCatalog:{},
   _defaultReferenceLaneRecipe:()=>({lane_id:'', recipe_id:'', media_kind:'image',
     recipe:{hard:{}, soft:{}}}),
@@ -532,22 +533,33 @@ def test_save_as_custom_right_after_a_field_change_keeps_the_field():
     """
     result = _run_recipe_panel("""
     const created = [];
-    w._mutateReferences = async (operations) => {
+    let answer;
+    // The Library write, held: the fork's lane write must not wait for it.
+    w._mutateReferences = (operations) => {
       created.push(structuredClone(operations[0].fields));
-      w._customReferenceRecipes.push({id:'custom:new', name:'Kept', builtIn:false,
-        media_kind:'image', ...operations[0].fields});
-      return {payload:{results:[{type:'create_recipe', recipe_id:'custom:new'}]}};
+      return new Promise((resolve) => { answer = resolve; });
     };
     globalThis.__promptAnswer = 'Kept';
     edit('Maximum members', 6);
     clickButton('Save as custom');
     for (let i = 0; i < 6; i += 1) await tick();
-    return {created: created[0]?.hard, lane: w.activeScene.reference_lane_recipes[0],
-      server: server.reference_lane_recipes[0]};
+    const minted = created[0]?.id;
+    const laneWriteBeforeAnswer = recipeWrites().some((ops) => ops.some((op) =>
+      op.fields?.reference_recipe?.recipe_id === minted));
+    const shownBeforeAnswer = (w._referenceRecipesView() || []).some((entry) => entry.id === minted);
+    answer({payload:{results:[{type:'create_recipe', recipe_id: minted}]}});
+    await drain();
+    return {created: created[0]?.hard, minted, laneWriteBeforeAnswer, shownBeforeAnswer,
+      lane: w.activeScene.reference_lane_recipes[0], server: server.reference_lane_recipes[0],
+      entries: recipeEntries().length};
     """)
     assert result["created"]["max_members"] == 6
-    assert result["lane"]["recipe_id"] == "custom:new"
+    assert re.fullmatch(r"custom:[0-9a-f]{32}", result["minted"])
+    assert result["laneWriteBeforeAnswer"] is True
+    assert result["shownBeforeAnswer"] is True
+    assert result["lane"]["recipe_id"] == result["minted"]
     assert result["lane"]["recipe"]["hard"]["max_members"] == 6
+    assert result["lane"]["recipe"]["name"] == "Kept"
     assert result["server"]["recipe"]["hard"]["max_members"] == 6
     assert result["lane"]["lane_id"] == "lane-a"
 
@@ -788,20 +800,26 @@ def test_an_edit_on_a_lane_locked_since_the_form_was_drawn_is_refused():
     assert result == {"writes": 0, "local": 4}
 
 
-def test_a_recipe_created_while_the_lane_switched_template_is_not_attached():
+def test_a_template_switch_after_the_fork_is_a_later_write_and_wins():
+    """The fork's lane write is queued at the click, so a template picked right
+    after it is a later write of the same lane, and the lane ends on it."""
     result = _run_recipe_panel("""
     let answer;
-    w._mutateReferences = () => new Promise((resolve) => { answer = resolve; });
+    w._mutateReferences = (operations) => new Promise((resolve) => {
+      answer = () => resolve({payload:{results:[{type:'create_recipe',
+        recipe_id: operations[0].fields.id}]}}); });
     globalThis.__promptAnswer = 'Late';
     clickButton('Save as custom');
-    w.activeScene.reference_lane_recipes[0] = {...w.activeScene.reference_lane_recipes[0],
-      recipe_id:'preset:sheet'};
-    answer({payload:{results:[{type:'create_recipe', recipe_id:'custom:late'}]}});
-    for (let i = 0; i < 4; i += 1) await tick();
-    return {recipeId: w.activeScene.reference_lane_recipes[0].recipe_id,
-      writes: recipeWrites().length};
+    const entry = {...w._trackLayout[0], referenceRecipe: {
+      ...structuredClone(w.activeScene.reference_lane_recipes[0]), recipe_id:'preset:sheet'}};
+    const switching = w._saveLaneConfig([entry], {expectedLaneId:'lane-a', undoLabel:'change lane recipe'});
+    answer();
+    await drain();
+    await switching;
+    return {lane: w.activeScene.reference_lane_recipes[0].recipe_id,
+      server: server.reference_lane_recipes[0].recipe_id};
     """)
-    assert result == {"recipeId": "preset:sheet", "writes": 0}
+    assert result == {"lane": "preset:sheet", "server": "preset:sheet"}
 
 
 def test_a_failed_lane_write_without_the_rollback_opt_in_keeps_the_heal_only():

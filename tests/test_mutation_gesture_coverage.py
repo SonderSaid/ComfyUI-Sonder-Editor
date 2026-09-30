@@ -21,7 +21,9 @@ ROOT = Path(__file__).resolve().parents[1]
 EXEMPT = {
     "_queuePromptProjectWrite": "Uses the caller's snapshot and queue diagnostics.",
     "_applyReferenceHistoryOperations": "All seven callers thread history/recovery diagnostics and owner token.",
-    "_mutateReferences": "Queues caller diagnostics; Library callback is the user boundary.",
+    "_mutateReferences": ("Queues caller diagnostics. Its callers are the Library callback and the "
+                          "module-facing writers, each inside its own gesture; modules never call it "
+                          "(but `rollbackPromptPhysicalAttachment`, a compensation)."),
     "_runSceneMutation": "Serializes already-attributed intent.",
     "_runQueueMutation": "Serializes already-attributed intent.",
     "_handleAssetDropWithinGesture": "Existing threaded asset-drop composite.",
@@ -63,7 +65,8 @@ def test_editor_writer_boundary_inventory():
         r"^    (?:async )?(\w+)\(.*?^    \}\n", source[source.index("export class EditorWidget {"):], re.M | re.S)}
     helper_write = re.compile(r"this\.(?:_runSceneMutation|_runQueueMutation|"
                               r"_queueProjectMutation|_queuePromptProjectWrite|"
-                              r"_mutateReferences|_runVersionedProjectMutation|"
+                              r"_mutateReferences|_mutateReferencesPaintFirst|"
+                              r"_runVersionedProjectMutation|"
                               r"_runGalleryAssetWrite)\(")
     uncovered = []
     for name, body in methods.items():
@@ -126,3 +129,59 @@ def test_gallery_trash_retry_preserves_host_gesture_with_fresh_request_ids():
         await handleAssetDelete(shown('dormant'));
         assert.equal(dormantCalls, 1); assert.equal(starts().length, 3);
     """)
+
+
+
+# Module-facing Library writers (Library paint-first Phase 4). Every Library
+# write a module makes goes through one of these, each its own gesture.
+LIBRARY_MODULE_WRITERS = (
+    "_writePromptReferenceMember", "_forkReferenceRecipe", "_updateReferenceRecipe",
+    "_deleteReferenceRecipe", "_deletePromptContextProfile",
+)
+
+_WIDGET_METHOD = re.compile(r"^    (?:async )?(\w+)\(.*?^    \}\n", re.M | re.S)
+
+
+def _widget_methods():
+    source = (ROOT / "web/js/editor_widget.js").read_text(encoding="utf-8")
+    return {m[1]: m[0] for m in _WIDGET_METHOD.finditer(
+        source[source.index("export class EditorWidget {"):])}
+
+
+def test_modules_write_the_library_only_through_the_host_writers():
+    from test_scene_mutation_registration import _code_mask, _enclosing_scope, _scopes
+    call = re.compile(r"\b_?mutateReferences\??\.?\(")
+    offenders = []
+    for path in sorted((ROOT / "web/js").glob("*.js")):
+        if path.name == "editor_widget.js":
+            continue
+        source = path.read_text(encoding="utf-8")
+        mask = _code_mask(source)
+        scopes = None
+        for match in call.finditer(source):
+            if not mask[match.start()]:
+                continue
+            scopes = scopes or _scopes(source, mask)
+            scope = _enclosing_scope(scopes, match.start())
+            if (path.name, scope) != ("editor_prompt_panel.js", "rollbackPromptPhysicalAttachment"):
+                offenders.append((path.name, scope))
+    assert not offenders, f"Write the Library through a host writer: {offenders}"
+
+
+def test_each_module_facing_library_writer_is_its_own_gesture():
+    methods = _widget_methods()
+    for name in LIBRARY_MODULE_WRITERS:
+        assert "this._withMutationGesture(" in methods.get(name, ""), name
+
+
+def test_the_fork_reserves_its_lane_step_in_the_gesture_turn():
+    """The fork's Undo step is reserved by `_saveLaneConfigWithinGesture` (the
+    `laneConfig` unit the authoring contract scans), two levels below the
+    gesture, which that scan does not follow; so this pins that the fork calls
+    it without awaiting first, and that nothing else reaches it that way."""
+    methods = _widget_methods()
+    body = methods["_forkReferenceRecipeWithinGesture"]
+    assert "await " not in body[:body.index("this._saveLaneConfigWithinGesture(")]
+    callers = sorted(name for name, text in methods.items()
+                     if "this._saveLaneConfigWithinGesture(" in text)
+    assert callers == ["_forkReferenceRecipeWithinGesture", "_saveLaneConfig"]

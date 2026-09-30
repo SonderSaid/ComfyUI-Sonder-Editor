@@ -33,7 +33,7 @@ JS = ROOT / "web" / "js"
 
 _READ = re.compile(r"\b(?:this|host)\._(references|customReferenceRecipes)\b")
 # The legacy fallback of a view read, for a host without the view.
-_VIEW_FALLBACK = re.compile(r"_(?:referencesView|referencesOfferable)\?\.\(\)\s*\?\?\s*\(?$")
+_VIEW_FALLBACK = re.compile(r"_(?:referencesView|referencesOfferable|referenceRecipesView)\?\.\(\)\s*\?\?\s*\(?$")
 
 WRITERS = {
     ("editor_widget.js", "constructor"),
@@ -44,28 +44,24 @@ WRITERS = {
 ACKNOWLEDGED = {
     ("editor_widget.js", "_referencesView"):
         "builds the view from the acknowledged payload",
+    ("editor_widget.js", "_referenceRecipesView"):
+        "builds the recipe view from the acknowledged payload",
+    ("editor_widget.js", "_referenceOverlayReflected"):
+        "an overlay leaves when acknowledged data shows what it painted",
+    ("editor_widget.js", "_referenceStoredHandle"):
+        "Attach materializes against the handle the server stored",
     ("editor_widget.js", "stateFor"):
         "a history operation compares server truth after a forced read",
-    ("editor_widget.js", "_acknowledgeReferenceOverlays"):
-        "an overlay leaves when acknowledged data shows what it painted",
     ("editor_widget.js", "_referenceOverlayKnownIds"):
         "records what the server held when an answer was lost",
     ("editor_widget.js", "_unconfirmedReferenceOverlaySaved"):
         "decides a lost answer from what the server holds",
-    ("editor_widget.js", "_pruneReferenceOverlays"):
-        "an overlay leaves when acknowledged data shows what it painted",
     ("editor_widget.js", "_materializeReferenceMemberHandleWithinGesture"):
         "materialize returns the handle the server stored",
     ("editor_widget.js", "_referenceMemberBeingDeleted"):
         "held by the server but no longer displayed is what a delete in flight means",
     ("editor_widget.js", "_candidateNamesPendingReferenceCreate"):
         "which creates the server does not hold yet",
-    ("editor_widget.js", "_referenceLibraryData"):
-        "custom recipes are not painted before Phase 4's recipe view",
-    ("editor_widget.js", "_referenceLaneRecipeLabel"):
-        "custom recipes are not painted before Phase 4's recipe view",
-    ("editor_reference_panel.js", "mountReferenceLanePanel"):
-        "custom recipes are not painted before Phase 4's recipe view",
     ("editor_prompt_panel.js", "rollbackPromptPhysicalAttachment"):
         "a compensation compares the stored handle after a forced read",
     ("editor_prompt_panel.js", "runCopyContribution"):

@@ -22,6 +22,7 @@ route commits and the report is stripped), and may hold a Library write.
 """
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -891,3 +892,285 @@ def test_a_minted_member_can_be_removed_before_its_create_answers(tmp_path):
       toasts: toasts.map((t) => t.message) };
     """, tmp_path)
     assert result == {"created": "ok", "removed": "ok", "stored": False, "overlays": 0, "toasts": []}
+
+
+# --- Library paint-first Phase 4: Reference Prompting and custom recipes ------
+
+# The Library as the route serves it, a gesture-id recorder, and a fork of the
+# image lane (`lane-image`, detached) into a new custom recipe.
+_PHASE4 = """
+    w._applyReferencePayload((await ask({ referencesRead: true })).payload);
+    const gestureOf = [];
+    const innerFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init = {}) => {
+      const headers = new Headers(init.headers || {});
+      if (String(init.method || 'GET').toUpperCase() === 'POST') {
+        gestureOf.push([String(url).split('?')[0].split('/').slice(-2).join('/'),
+          headers.get('X-Sonder-Gesture-Id') || '']);
+      }
+      return innerFetch(url, init);
+    };
+    const laneRecipe = () => w.activeScene.reference_lane_recipes[0];
+    const fork = (name = 'Fork') => {
+      const recipe = structuredClone(laneRecipe());
+      return w._forkReferenceRecipe({
+        entry: { ...w._trackLayout[0] }, expectedLaneId: 'lane-image',
+        fields: { name, media_kind: 'image', hard: { assembly: 'batch' }, soft: {} },
+        laneRecipeFor: (recipeId) => ({ ...recipe, recipe_id: recipeId,
+          recipe: { ...(recipe.recipe || {}), name } }),
+      });
+    };
+    const serverRecipes = async () => (await ask({ referencesRead: true })).payload.reference_recipes;
+    const serverLane = async () => (await ask({ read: true, sceneId: 'scene' })).scene.reference_lane_recipes[0];
+"""
+
+
+def test_a_fork_creates_its_recipe_and_points_the_lane_in_one_gesture(tmp_path):
+    result = run_library(_PHASE4 + """
+    const before = w._undoStack.length;
+    const forking = fork();
+    const minted = laneRecipe().recipe_id;
+    const shown = w._referenceRecipesView().some((entry) => entry.id === minted);
+    const outcome = await forking;
+    await settle(12);
+    return { minted, shown, outcome, gestures: gestureOf, undo: w._undoStack.length - before,
+      lane: laneRecipe().recipe_id, server: (await serverLane()).recipe_id,
+      stored: (await serverRecipes()).map((entry) => entry.id), toasts: toasts.map((t) => t.message) };
+    """, tmp_path)
+    assert re.fullmatch(r"custom:[0-9a-f]{32}", result["minted"])
+    assert result["shown"] is True
+    assert result["outcome"] == "ok"
+    paths = [path for path, _ in result["gestures"]]
+    assert paths == ["references/mutations", "scene/mutations"]
+    ids = {gesture for _, gesture in result["gestures"]}
+    assert len(ids) == 1 and "" not in ids, "the create and the lane write share one gesture"
+    assert result["undo"] == 1
+    assert result["lane"] == result["server"] == result["minted"]
+    assert result["minted"] in result["stored"]
+    assert result["toasts"] == []
+
+
+def test_a_refused_fork_returns_the_lane_to_its_recipe_with_one_message(tmp_path):
+    result = run_library(_PHASE4 + """
+    // What is on screen at the end: failures sharing a source fold into one
+    // toast, whose message the later one would overwrite and whose count it
+    // would bump.
+    let onScreen = [];
+    notes.subscribe((list) => { onScreen = list.map((n) => [n.message, n.count]); });
+    const previous = laneRecipe().recipe_id;
+    libraryRefuseNext('invalid_reference_recipe', 400);
+    const outcome = await fork();
+    await settle(12);
+    return { previous, outcome, lane: laneRecipe().recipe_id, server: (await serverLane()).recipe_id,
+      stored: (await serverRecipes()).length, shown: w._referenceRecipesView().length, onScreen };
+    """, tmp_path)
+    assert result["outcome"] == "failed"
+    assert result["lane"] == result["server"] == result["previous"]
+    assert result["stored"] == 0 and result["shown"] == 0
+    assert result["onScreen"] == [["The custom recipe could not be created.", 1]]
+
+
+def test_a_recipe_renamed_while_its_create_saves_keeps_both(tmp_path):
+    result = run_library(_PHASE4 + """
+    hold();
+    const forking = fork('First');
+    const minted = laneRecipe().recipe_id;
+    const shown = w._referenceRecipesView().find((entry) => entry.id === minted);
+    const expected = { id: shown.id, name: shown.name, media_kind: shown.media_kind,
+      hard: { ...shown.hard }, soft: { ...shown.soft } };
+    const renaming = w._updateReferenceRecipe({ recipeId: minted, expected, fields: { name: 'Second' } });
+    const painted = w._referenceRecipesView().find((entry) => entry.id === minted)?.name;
+    await release();
+    const outcomes = [await forking, await renaming];
+    await settle(12);
+    const stored = (await serverRecipes()).find((entry) => entry.id === minted);
+    return { painted, outcomes, name: stored?.name, toasts: toasts.map((t) => t.message) };
+    """, tmp_path)
+    assert result == {"painted": "Second", "outcomes": ["ok", "ok"], "name": "Second", "toasts": []}
+
+
+def test_a_recipe_delete_paints_first_and_detaches_the_lane_after_it_saves(tmp_path):
+    result = run_library(_PHASE4 + """
+    await fork();
+    await settle(12);
+    const recipe = w._referenceRecipesView()[0];
+    const expected = { id: recipe.id, name: recipe.name, media_kind: recipe.media_kind,
+      hard: { ...recipe.hard }, soft: { ...recipe.soft } };
+    let detachedWhileSaving = null;
+    hold();
+    const deleting = w._deleteReferenceRecipe({ recipeId: recipe.id, expected, detach: async () => {
+      const entry = { ...w._trackLayout[0], referenceRecipe: { ...laneRecipe(), recipe_id: '' } };
+      await w._saveLaneConfig([entry], { expectedLaneId: 'lane-image', undoLabel: 'change lane recipe' });
+    } });
+    const goneAtOnce = !w._referenceRecipesView().some((entry) => entry.id === recipe.id);
+    detachedWhileSaving = laneRecipe().recipe_id === '';
+    await release();
+    const outcome = await deleting;
+    await settle(12);
+    const deleteGesture = gestureOf.at(-2)?.[1], detachGesture = gestureOf.at(-1)?.[1];
+    return { goneAtOnce, detachedWhileSaving, outcome, lane: laneRecipe().recipe_id,
+      server: (await serverLane()).recipe_id, stored: (await serverRecipes()).length,
+      sameGesture: !!deleteGesture && deleteGesture === detachGesture };
+    """, tmp_path)
+    assert result == {"goneAtOnce": True, "detachedWhileSaving": False, "outcome": "ok",
+                      "lane": "", "server": "", "stored": 0, "sameGesture": True}
+
+
+def test_a_refused_recipe_delete_leaves_the_lane_attached(tmp_path):
+    result = run_library(_PHASE4 + """
+    await fork();
+    await settle(12);
+    const recipe = w._referenceRecipesView()[0];
+    libraryRefuseNext('identity_mismatch', 409);
+    let detached = false;
+    const outcome = await w._deleteReferenceRecipe({ recipeId: recipe.id, expected: { id: recipe.id },
+      detach: async () => { detached = true; } });
+    await settle(12);
+    return { outcome, detached, lane: laneRecipe().recipe_id === recipe.id,
+      shown: w._referenceRecipesView().some((entry) => entry.id === recipe.id) };
+    """, tmp_path)
+    assert result == {"outcome": "failed", "detached": False, "lane": True, "shown": True}
+
+
+def test_a_handle_edit_then_attach_materializes_behind_it_and_does_not_own_it(tmp_path):
+    result = run_library(_PHASE4 + """
+    const editing = w._writePromptReferenceMember({ referenceId: 'entity-1', memberId: 'member-a',
+      drawn: { handle: '' }, fields: { handle: 'Typed' }, label: 'edit physical Reference handle' });
+    const shown = w._referenceMemberForRef({ member_id: 'member-a' }).member.handle;
+    const stored = w._referenceStoredHandle('member-a');
+    const materialized = await w._materializeReferenceMemberHandle({ referenceId: 'entity-1',
+      memberId: 'member-a', suggestion: 'A', expectedHandle: 'Typed' });
+    await editing;
+    await settle(8);
+    const server = (await serverLibrary()).flatMap((ref) => ref.members).find((m) => m.member_id === 'member-a');
+    return { shown, stored, materialized, server: server.handle, toasts: toasts.map((t) => t.message) };
+    """, tmp_path)
+    assert result == {"shown": "Typed", "stored": "", "server": "Typed", "toasts": [],
+                      "materialized": {"handle": "Typed", "ownsHandle": False}}
+
+
+def test_an_attach_behind_a_refused_handle_edit_aborts(tmp_path):
+    result = run_library(_PHASE4 + """
+    libraryRefuseNext('handle_collision', 409);
+    const editing = w._writePromptReferenceMember({ referenceId: 'entity-1', memberId: 'member-a',
+      drawn: { handle: '' }, fields: { handle: 'Taken' } }).catch((error) => error?.status);
+    let attached = 'ok';
+    try {
+      await w._materializeReferenceMemberHandle({ referenceId: 'entity-1', memberId: 'member-a',
+        suggestion: 'A', expectedHandle: 'Taken' });
+    } catch (error) { attached = error?.payload?.code || error?.code || 'refused'; }
+    const refused = await editing;
+    await settle(8);
+    const server = (await serverLibrary()).flatMap((ref) => ref.members).find((m) => m.member_id === 'member-a');
+    return { refused, attached, server: server.handle,
+      shown: w._referenceMemberForRef({ member_id: 'member-a' }).member.handle,
+      toasts: toasts.map((t) => t.message) };
+    """, tmp_path)
+    assert result["refused"] == 409
+    assert result["attached"] == "identity_mismatch"
+    assert result["server"] == "" and result["shown"] == ""
+    assert "That handle is already used by another Reference or prompt identity." in result["toasts"]
+
+
+def test_save_defaults_twice_keeps_both_and_a_change_elsewhere_is_refused(tmp_path):
+    result = run_library(_PHASE4 + """
+    // The panel has not re-rendered between the two Saves: both drew prompt ''.
+    const first = w._writePromptReferenceMember({ referenceId: 'entity-1', memberId: 'member-b',
+      drawn: { prompt: '' }, fields: { prompt: 'one' } });
+    const second = w._writePromptReferenceMember({ referenceId: 'entity-1', memberId: 'member-b',
+      drawn: { prompt: '' }, fields: { prompt: 'two' } });
+    const sentGuards = [];
+    await first; await second;
+    await settle(8);
+    const afterTwo = (await serverLibrary()).flatMap((ref) => ref.members).find((m) => m.member_id === 'member-b').prompt;
+    // Another writer changes the prompt; a panel that drew the old value is refused.
+    await ask({ references: [{ type: 'update_member', reference_id: 'entity-1', member_id: 'member-b',
+      fields: { prompt: 'elsewhere' }, expected: { prompt: 'two' } }] });
+    const stale = await w._writePromptReferenceMember({ referenceId: 'entity-1', memberId: 'member-b',
+      drawn: { prompt: 'two' }, fields: { prompt: 'mine' } }).then(() => 'ok', (error) => error?.status);
+    await settle(8);
+    const final = (await serverLibrary()).flatMap((ref) => ref.members).find((m) => m.member_id === 'member-b').prompt;
+    return { afterTwo, stale, final, guards: librarySent.slice(0, 2).map((ops) => ops[0].expected) };
+    """, tmp_path)
+    assert result["afterTwo"] == "two"
+    assert result["guards"] == [{"prompt": ""}, {"prompt": "one"}]
+    assert result["stale"] == 409 and result["final"] == "elsewhere"
+
+
+def test_a_lost_fork_that_landed_is_not_reported_unsaved(tmp_path):
+    """Phase 4 audit #1: the deciding read must compare recipe overlays with the
+    recipes it carries, not the list from before it."""
+    result = run_library(_PHASE4 + """
+    libraryLostNext();
+    const outcome = await fork();
+    await settle(12);
+    const minted = laneRecipe().recipe_id;
+    await w._fetchReferences({ force: true, ignoreMutationGate: true, reason: 'decide' });
+    await settle(8);
+    return { outcome, lane: minted === (await serverLane()).recipe_id,
+      stored: (await serverRecipes()).some((entry) => entry.id === minted),
+      shown: w._referenceRecipesView().some((entry) => entry.id === minted),
+      overlays: w._referenceOverlays.length, toasts: toasts.map((t) => t.message) };
+    """, tmp_path)
+    assert result["outcome"] == "failed", "the answer was lost"
+    assert result["lane"] and result["stored"] and result["shown"]
+    assert result["overlays"] == 0
+    assert "A Reference Library change was not saved." not in result["toasts"]
+
+
+def test_a_lost_recipe_delete_that_landed_is_not_reported_unsaved(tmp_path):
+    result = run_library(_PHASE4 + """
+    await fork();
+    await settle(12);
+    const recipe = w._referenceRecipesView()[0];
+    libraryLostNext();
+    await w._deleteReferenceRecipe({ recipeId: recipe.id, expected: { id: recipe.id, name: recipe.name,
+      media_kind: recipe.media_kind, hard: { ...recipe.hard }, soft: { ...recipe.soft } } });
+    await settle(8);
+    await w._fetchReferences({ force: true, ignoreMutationGate: true, reason: 'decide' });
+    await settle(8);
+    return { stored: (await serverRecipes()).length, shown: w._referenceRecipesView().length,
+      toasts: toasts.map((t) => t.message) };
+    """, tmp_path)
+    assert result["stored"] == 0 and result["shown"] == 0
+    assert "A Reference Library change was not saved." not in result["toasts"]
+
+
+def test_an_attach_behind_a_cleared_handle_materializes_the_suggestion_and_owns_it(tmp_path):
+    """Phase 4 audit #3: a handle cleared while its clear is saving is expected
+    as an empty handle, so the route materializes the suggestion behind it."""
+    result = run_library(_PHASE4 + """
+    await w._writePromptReferenceMember({ referenceId: 'entity-1', memberId: 'member-a',
+      drawn: { handle: '' }, fields: { handle: 'Old' } });
+    await settle(8);
+    const clearing = w._writePromptReferenceMember({ referenceId: 'entity-1', memberId: 'member-a',
+      drawn: { handle: 'Old' }, fields: { handle: '' } });
+    const materialized = await w._materializeReferenceMemberHandle({ referenceId: 'entity-1',
+      memberId: 'member-a', suggestion: 'Suggested', expectedHandle: '' });
+    await clearing;
+    await settle(8);
+    const server = (await serverLibrary()).flatMap((ref) => ref.members).find((m) => m.member_id === 'member-a');
+    return { materialized, server: server.handle };
+    """, tmp_path)
+    assert result == {"materialized": {"handle": "Suggested", "ownsHandle": True}, "server": "Suggested"}
+
+
+def test_an_attach_behind_a_refused_edit_of_a_stored_handle_aborts(tmp_path):
+    """Phase 4 audit #6: with a handle already stored, a refused edit ahead of
+    the materialize stops the attach instead of going on under the old handle."""
+    result = run_library(_PHASE4 + """
+    await w._writePromptReferenceMember({ referenceId: 'entity-1', memberId: 'member-a',
+      drawn: { handle: '' }, fields: { handle: 'Orig' } });
+    await settle(8);
+    libraryRefuseNext('handle_collision', 409);
+    const editing = w._writePromptReferenceMember({ referenceId: 'entity-1', memberId: 'member-a',
+      drawn: { handle: 'Orig' }, fields: { handle: 'Taken' } }).catch((error) => error?.status);
+    let attached = 'ok';
+    try {
+      await w._materializeReferenceMemberHandle({ referenceId: 'entity-1', memberId: 'member-a',
+        suggestion: 'A', expectedHandle: 'Taken' });
+    } catch (error) { attached = 'aborted'; }
+    await editing;
+    return { attached };
+    """, tmp_path)
+    assert result == {"attached": "aborted"}

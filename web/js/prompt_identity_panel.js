@@ -1353,18 +1353,43 @@ export function mountPromptIdentityPanel(container, options = {}) {
                 handle.setSelectionRange?.(caret, caret);
             });
             handle.style.cssText = `${chromeInputCss()}font-weight:600;color:${COLORS.text};`;
+            // The row as this panel last knew it: the render that redraws it
+            // can be deferred (a press in the panel), so the panel's own
+            // accepted writes advance it, and a later write's guard is not
+            // an older value than the author saw.
+            let drawnMember = row.member;
+            // Paints at once through the host writer. A no-op is judged against
+            // the Library as displayed (a second edit of the same handle may
+            // follow an unsaved first), and a handle another Reference or
+            // identity already owns is refused here, before anything is sent.
+            // A refusal the server answers is said once, by the host, which
+            // also drops the paint.
             const commitHandle = async () => {
-                if (!row.member || !row.reference
-                        || handle.value.trim() === String(row.member.handle || "")) return;
+                if (!drawnMember || !row.reference) return;
+                const next = handle.value.trim();
+                const shown = String(options.displayedMember?.(row.member.member_id)?.handle
+                    ?? row.member.handle ?? "");
+                if (next === shown) {
+                    handle.value = shown;
+                    return;
+                }
+                const owner = next ? options.handleCollision?.(next, row.member.member_id) : null;
+                if (owner) {
+                    handle.value = shown;
+                    options.onError?.(new Error(`@${next} is already used by another ${
+                        owner.kind === "prompt identity" ? "prompt identity" : "Reference"}.`));
+                    return;
+                }
+                const pending = options.writeReferenceMember?.({
+                    referenceId: row.reference.reference_id, memberId: row.member.member_id,
+                    drawn: { handle: String(drawnMember.handle || "") },
+                    fields: { handle: next }, label: "edit physical Reference handle",
+                });
+                rerender();
                 try {
-                    await options.mutateReferences?.([{
-                        type: "update_member", reference_id: row.reference.reference_id,
-                        member_id: row.member.member_id,
-                        fields: { handle: handle.value.trim() },
-                        expected: { handle: String(row.member.handle || "") },
-                    }], "edit physical Reference handle");
-                    rerender();
-                } catch (error) { handle.value = row.member.handle || ""; options.onError?.(error); }
+                    await pending;
+                    drawnMember = { ...drawnMember, handle: next };
+                } catch (_error) { rerender(); }
             };
             handle.addEventListener("change", () => { void commitHandle(); });
             handle.addEventListener("keydown", (event) => {
@@ -1397,29 +1422,44 @@ export function mountPromptIdentityPanel(container, options = {}) {
             // identity AND no prose.
             status.style.cssText = `font:9px system-ui;color:${COLORS.textDim};`;
             const defaults = makeButton("Defaults", "Edit physical prompt text and preservation defaults");
-            defaults.addEventListener("click", () => {
+            // The defaults as drawn, in the form the route stores them.
+            const drawnDefaults = () => ({
+                prompt: String(drawnMember?.prompt || ""),
+                visual_intent: String(drawnMember?.visual_intent || ""),
+                audio_intent: String(drawnMember?.audio_intent || ""),
+                disabled_capabilities: [...(drawnMember?.disabled_capabilities || [])].map(String),
+            });
+            // `draft`: typed values handed back after a refusal, and the
+            // defaults they were first diffed from (which keys they send).
+            const openDefaults = (draft = null) => {
                 const existing = groupEl.querySelector(
                     `[data-physical-defaults='${CSS.escape(row.memberId)}']`);
-                if (existing) { existing.remove(); return; }
+                if (existing) {
+                    // Closing it dismisses a draft handed back after a refusal.
+                    existing.remove();
+                    options.defaultsDrafts?.delete(row.memberId);
+                    return;
+                }
                 if (!row.member || !row.reference) return;
                 const editor = document.createElement("div");
                 editor.dataset.physicalDefaults = row.memberId;
                 editor.style.cssText = `display:grid;grid-template-columns:minmax(160px,1fr) auto auto auto;gap:5px;padding:6px;border:1px solid ${COLORS.border};border-radius:5px;background:${COLORS.panelRaised};`;
                 const prompt = document.createElement("textarea");
-                prompt.rows = 2; prompt.value = row.member.prompt || "";
+                prompt.rows = 2; prompt.value = draft ? draft.values.prompt : (row.member.prompt || "");
                 prompt.placeholder = "Physical Reference prompt description";
                 prompt.style.cssText = chromeInputCss();
                 const visual = makeSelect(intentValues(
                     profile, "visual_intent", { includeInherited: true }),
-                row.member.visual_intent || "");
+                draft ? draft.values.visual_intent : (row.member.visual_intent || ""));
                 const audio = makeSelect(intentValues(
                     profile, "audio_intent", { includeInherited: true }),
-                row.member.audio_intent || "");
+                draft ? draft.values.audio_intent : (row.member.audio_intent || ""));
                 // Which prompt parts this Reference contributes at all is a
                 // property of the Reference; WHERE each part lands stays
                 // per-attachment and remains in the chip's routing panel.
-                const storedDisabled = new Set(
-                    (row.member.disabled_capabilities || []).map(String));
+                const storedDisabled = new Set(draft
+                    ? draft.values.disabled_capabilities
+                    : (row.member.disabled_capabilities || []).map(String));
                 const parts = document.createElement("div");
                 parts.dataset.sonderMemberCapabilityDefaults = "1";
                 parts.style.cssText = "grid-column:1/-1;display:flex;flex-wrap:wrap;gap:8px;align-items:center;";
@@ -1453,29 +1493,52 @@ export function mountPromptIdentityPanel(container, options = {}) {
                         ...[...partBoxes].filter(([, box]) => !box.checked)
                             .map(([id]) => id),
                     ];
-                    const fields = {
+                    // Stored as `normalize_disabled_capabilities` stores it.
+                    const disabled = [];
+                    for (const id of nextDisabled.map((value) => String(value || "").trim())) {
+                        if (id && !disabled.includes(id)) disabled.push(id);
+                    }
+                    const values = {
                         prompt: prompt.value,
                         visual_intent: visual.value,
                         audio_intent: audio.value,
-                        disabled_capabilities: nextDisabled,
+                        disabled_capabilities: disabled,
                     };
-                    try {
-                        await options.mutateReferences?.([{
-                            type: "update_member", reference_id: row.reference.reference_id,
-                            member_id: row.member.member_id, fields,
-                            expected: {
-                                prompt: String(row.member.prompt || ""),
-                                visual_intent: String(row.member.visual_intent || ""),
-                                audio_intent: String(row.member.audio_intent || ""),
-                                disabled_capabilities: [...storedDisabled],
-                            },
-                        }], "edit physical Reference prompt defaults");
+                    // Only the keys that differ from what the author started
+                    // from: sending an untouched key would revert a change made
+                    // meanwhile elsewhere (the Library's prompt field, say).
+                    const origin = draft?.origin || drawnDefaults();
+                    const fields = Object.fromEntries(Object.entries(values).filter(([key, value]) =>
+                        JSON.stringify(value) !== JSON.stringify(origin[key])));
+                    editor.remove();
+                    options.defaultsDrafts?.delete(row.memberId);
+                    if (!Object.keys(fields).length) return;
+                    // A refusal, or a lost answer that turns out unsaved,
+                    // reopens the editor with what was typed; the panel
+                    // remounts on every render, so the host-owned map holds it.
+                    const handBack = () => {
+                        if (options.defaultsDrafts?.has(row.memberId)) return;
+                        options.defaultsDrafts?.set(row.memberId, { values, origin });
                         rerender();
-                    } catch (error) { options.onError?.(error); }
+                    };
+                    const pending = options.writeReferenceMember?.({
+                        referenceId: row.reference.reference_id, memberId: row.member.member_id,
+                        drawn: drawnDefaults(), fields, label: "edit physical Reference prompt defaults",
+                        onUnconfirmedResolved: (saved) => { if (!saved) handBack(); },
+                    });
+                    rerender();
+                    try {
+                        await pending;
+                        drawnMember = { ...drawnMember, ...fields };
+                    } catch (error) {
+                        if (Number.isInteger(error?.status)) handBack();
+                        else rerender();
+                    }
                 });
                 editor.append(prompt, visual, audio, save, parts);
                 rowEl.insertAdjacentElement("afterend", editor);
-            });
+            };
+            defaults.addEventListener("click", () => openDefaults());
             // Labelled, not a bare glyph. This is the step that turns staged
             // media into something a prompt can name, and it was the single
             // least discoverable control in the tool. The `+` prefix makes it
@@ -1486,11 +1549,20 @@ export function mountPromptIdentityPanel(container, options = {}) {
                 "primary", "Create prompt identity from physical Reference");
             create.addEventListener("click", () => openEditor(null, row));
             const attach = makeButton("Attach...", "Attach this physical Reference to the scene or a section");
+            // The stored handle is the server's; the displayed one may be a
+            // handle edit still saving, which Attach then waits for rather
+            // than materializing a suggestion over it.
+            const displayedHandle = String(row.member?.handle || "");
+            const storedHandle = options.storedHandleFor
+                ? String(options.storedHandleFor(row.memberId) || "") : displayedHandle;
             attach.addEventListener("click", () => openAttach({
                 type: "physical", memberId: row.memberId,
                 referenceId: row.reference?.reference_id || "",
-                handle: row.member?.handle || suggestion,
-                storedHandle: row.member?.handle || "",
+                handle: displayedHandle || suggestion,
+                suggestion,
+                // As drawn; the host re-reads both when the attach acts.
+                storedHandle,
+                handlePending: displayedHandle !== storedHandle,
                 displayName: row.member?.name || row.reference?.name || "Reference",
                 declaration: group.declaration,
             }));
@@ -1498,6 +1570,7 @@ export function mountPromptIdentityPanel(container, options = {}) {
                 thumbnail, handle, status, attach, defaults, create,
             ]);
             rowEl.dataset.physicalMemberId = row.memberId;
+            const returnedDraft = options.defaultsDrafts?.get(row.memberId);
             rowEl.title = [
                 `Resolved: ${row.resolvedLabel}`,
                 `Window: ${candidate?.window_start ?? 0}-${candidate?.window_end ?? "scene"}`,
@@ -1506,6 +1579,7 @@ export function mountPromptIdentityPanel(container, options = {}) {
                 `Linked identities: ${row.linkedIdentities.map((value) => `@${value.handle || value.name}`).join(", ") || "none"}`,
             ].join("\n");
             groupEl.appendChild(rowEl);
+            if (returnedDraft) openDefaults(returnedDraft);
         }
         for (const diagnostic of group.unresolved) {
             const unresolved = document.createElement("div");

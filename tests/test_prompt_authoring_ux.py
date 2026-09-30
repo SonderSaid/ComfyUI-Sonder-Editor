@@ -3085,7 +3085,7 @@ mod.mountPromptIdentityPanel(root, {{
     {{semantic_unit_id:"unstored",name:"Korean Woman",kind:"subject",sources:[]}},
     {{semantic_unit_id:"stored",name:"Sailor",handle:"Captain",kind:"subject",sources:[]}},
   ],
-  mutateReferences:async()=>{{referenceMutations += 1;}},
+  writeReferenceMember:async()=>{{referenceMutations += 1;}},
   saveSemanticUnitChange:async()=>{{identitySaves += 1;}},
 }});
 const walk=(n,out=[])=>{{out.push(n);n.children.forEach((c)=>walk(c,out));return out;}};
@@ -7649,6 +7649,30 @@ console.log(JSON.stringify({{success,lost,concurrent,missing}}));
         "concurrent": {"handle": "OtherAuthor", "ownsHandle": False},
         "missing": "offline",
     }
+
+
+def test_a_materialize_behind_a_typed_handle_does_not_own_it():
+    """Attach made while a handle edit is saving expects the typed handle; the
+    route returns it unchanged, and Attach must not record it as its own, or
+    Undo of the attach (or a refused attach's rollback) would clear it."""
+    widget = _source("web/js/editor_widget.js")
+    materialize = _method(
+        widget, "_materializeReferenceMemberHandle",
+        "_reconcileReferencesAfterAssetDeletion")
+    result = _run_node(f"""
+class Harness {{
+{materialize}
+  constructor() {{ this._references=[{{reference_id:"r",members:[{{member_id:"m",handle:"Typed"}}]}}]; this.sent=null; }}
+  async _mutateReferences(operations) {{ this.sent=operations[0];
+    return {{payload:{{results:[{{type:"materialize_member_handle",member_id:"m",handle:"Typed"}}]}}}}; }}
+}}
+const h=new Harness();
+const outcome=await h._materializeReferenceMemberHandle({{
+  referenceId:"r",memberId:"m",suggestion:"Portrait",expectedHandle:"Typed"}});
+console.log(JSON.stringify({{outcome,expected:h.sent.expected}}));
+""")
+    assert result == {"outcome": {"handle": "Typed", "ownsHandle": False},
+                      "expected": {"handle": "Typed"}}
 
 
 def test_production_scene_restore_rejects_http_and_network_failures():

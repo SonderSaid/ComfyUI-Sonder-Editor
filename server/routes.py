@@ -2439,7 +2439,11 @@ def _replace_reference_lane_recipes(scene: Scene, raw_recipes) -> None:
     scene.reference_lane_recipes = incoming
 
 
-def _apply_lane_config(scene: Scene, op: dict) -> dict:
+_REFERENCE_RECIPE_PRESET_IDS = frozenset(
+    str(preset["id"]) for preset in ALL_REFERENCE_RECIPE_PRESETS)
+
+
+def _apply_lane_config(project: TimelineProject, scene: Scene, op: dict) -> dict:
     """Scoped per-lane config update (mutation-integrity F1).
 
     Unlike the legacy full-replace `update_lane_configs`, this writes exactly
@@ -2498,6 +2502,20 @@ def _apply_lane_config(scene: Scene, op: dict) -> dict:
         if previous_lane_id:
             raw_recipe["lane_id"] = previous_lane_id
         next_recipe = ReferenceLaneRecipe.from_dict(raw_recipe)
+        # A lane may not newly name a custom recipe the project does not hold.
+        # The editor paints a fork's lane write behind the fork's own
+        # `create_recipe`; when that create is refused, this refuses the lane
+        # write with it instead of storing a dangling id. A lane that already
+        # names a missing recipe (legacy, or detached elsewhere) keeps it at
+        # rest and may re-send it -- a lock, rename or hide carries the recipe.
+        next_recipe_id = str(next_recipe.recipe_id or "")
+        if (next_recipe_id and next_recipe_id != str(previous_recipe.recipe_id or "")
+                and next_recipe_id not in _REFERENCE_RECIPE_PRESET_IDS
+                and not any(isinstance(recipe, dict)
+                            and str(recipe.get("id", "") or "") == next_recipe_id
+                            for recipe in project.reference_recipes)):
+            _mutation_error(f"Reference recipe not found: {next_recipe_id}", 409,
+                            "unknown_reference_recipe")
         if (
             next_recipe.media_kind != recipes[lane_index].media_kind
             and _media_lane_items(scene, lane_type, lane_index)
@@ -5031,7 +5049,7 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
         _apply_lane_configs(scene, op.get("fields", {}))
         return {"type": op_type}
     if op_type == "update_lane_config":
-        return _apply_lane_config(scene, op)
+        return _apply_lane_config(project, scene, op)
     if op_type == "set_lane_count":
         lane_type = str(op.get("lane_type", ""))
         _set_scene_lane_count(scene, lane_type, max(1, _mutation_int(op.get("count"), "count")))
@@ -5342,7 +5360,8 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
 #
 # Both were traced, not assumed. `_apply_scene_fields` takes `project` but reads
 # it only — `effective_scene_fps` and `_require_scene_queue_idle` — and writes
-# only scene attributes. `_apply_lane_config` takes no project at all.
+# only scene attributes. `_apply_lane_config` takes `project` too, and reads
+# only its custom recipe ids (a lane may not newly name a missing one).
 # `test_a_scene_only_operation_leaves_the_rest_of_the_project_alone` proves it at
 # runtime rather than trusting this comment, because an AST check cannot: the
 # handler legitimately receives `project`.
