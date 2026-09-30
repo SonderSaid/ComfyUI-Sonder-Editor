@@ -375,7 +375,10 @@ import {
     shouldApplyReferenceResponse,
 } from "./reference_library_model.js";
 import { mountReferenceLanePanel } from "./editor_reference_panel.js";
-import { referenceConfigurationAdvisories, resolveReferenceDropVerdict } from "./reference_lane_identity.js";
+import {
+    laneStagingPopulation, memberPopulationCompatible, referenceConfigurationAdvisories,
+    resolveReferenceDropVerdict,
+} from "./reference_lane_identity.js";
 import { REFERENCE_LANE_CAUSE, classifyReferenceChunks } from "./reference_resolution.js";
 import { deriveCurrentSceneAssetIds } from "./current_scene_assets.js";
 import { notifyInfo, notifySuccess, notifyWarning, notifyError, notifyProgress } from "./editor_notifications.js";
@@ -483,7 +486,7 @@ import {
 } from "./scene_move_geometry.js";
 import { LINK_ITEM_TYPES, pruneLinkedItemGroups, editedLinkGroups, rollbackLinkGroupPrediction } from "./scene_link_groups.js";
 import {
-    canonicalStagedMemberRefs, canonicalStoredMemberRefs, stagedReferenceItem,
+    canonicalStagedMemberRefs, canonicalStoredMemberRefs, referenceItemOverlap, stagedReferenceItem,
 } from "./scene_reference_geometry.js";
 import { applyGuideSwap, guideIdentityMatches } from "./scene_guide_geometry.js";
 import { createViewportSurface } from "./viewport_surface.js";
@@ -6001,6 +6004,145 @@ export class EditorWidget {
             }
         }
         return false;
+    }
+
+    /** Whether `scene` is still an object this editor holds for its scene --
+     *  the active one, or one kept in the scene list a switch returns to. A
+     *  scene switch REUSES the list's objects, so a write that settles after
+     *  the author switched away still owes that object its rollback; only a
+     *  replacement from the server (a reconcile or a refetch) makes it stale. */
+    _sceneObjectCurrent(scene) {
+        return !!scene && (this.activeScene === scene || (this.scenes || []).includes(scene));
+    }
+
+    /** Whether `row` is still the live Reference item on `scene`.
+     *
+     *  A row taken out by a delete still in flight counts: its hold keeps the
+     *  object, and a failed delete puts that same object back. So an edit that
+     *  fails behind the delete rolls back onto the held row, and the reinserted
+     *  row is the corrected one. A voided hold -- its create failed -- does not
+     *  count. */
+    _referenceItemRowLive(state, scene, row) {
+        if (!row || !this._sceneObjectCurrent(scene)) return false;
+        if ((scene?.reference_items || []).includes(row)) return true;
+        for (const hold of state?.deleteHolds?.values?.() || []) {
+            if (hold.row === row && hold.scene === scene && !hold.voided) return true;
+        }
+        return false;
+    }
+
+    /** The Reference Lane Setup panel's Delete item, painted first.
+     *
+     *  The row leaves the scene at once and its object is kept in a hold. On a
+     *  failure it goes back at its old index -- without the network, which is
+     *  what just failed -- unless the scene object was replaced (the canonical
+     *  scene is newer than anything the hold knows), the hold was voided (its
+     *  own create failed, so the row never existed on the server), a row with
+     *  that id is back already, or the route answered `item_not_found` (the
+     *  row is gone there too). Any of those records
+     *  `reference_delete_rollback_deferred` instead.
+     */
+    async _deleteReferenceItemFromPanel(...args) {
+        return this._withMutationGesture(
+            "deleteReferenceItemFromPanel", () => this._deleteReferenceItemFromPanelWithinGesture(...args));
+    }
+
+    async _deleteReferenceItemFromPanelWithinGesture(itemId) {
+        const id = String(itemId || "");
+        const state = this._referenceItemWriteState();
+        // A write the mirror could not paint is still settling on this item:
+        // its response may replace the members this delete's guard names.
+        const barrier = state.barriers.get(id);
+        if (barrier) await barrier.catch?.(() => {});
+        const scene = this.activeScene;
+        if (!scene || !this.projectDir) return "refused";
+        const row = (scene.reference_items || []).find((candidate) => candidate?.reference_item_id === id);
+        if (!row) {
+            notifyWarning("This Reference item no longer exists.", { source: "reference-panel-refused" });
+            return "refused";
+        }
+        if (this._isLaneLocked(TRACK_TYPE.REFERENCE, row.lane_index || 0)) {
+            notifyWarning("This Reference lane is locked. Unlock it on the timeline header to edit.",
+                { source: "reference-panel-refused" });
+            return "refused";
+        }
+        // The route compares every `ReferenceItem.to_dict` key, read from the
+        // live row before the paint.
+        const expected = {};
+        for (const key of ["reference_item_id", "lane_index", "start_frame", "end_frame", "members",
+            "prompt_override", "strength", "sequence_frames", "muted"]) {
+            expected[key] = structuredClone(row[key]);
+        }
+        const historyEntry = this._pushUndo("delete reference item");
+        const projectDir = this.projectDir;
+        const index = scene.reference_items.indexOf(row);
+        scene.reference_items.splice(index, 1);
+        const hold = { scene, row, index, voided: false };
+        state.deleteHolds.set(id, hold);
+        this._renderSceneAfterLocalMutation({ viewport: false });
+        const releaseHold = () => {
+            if (state.deleteHolds.get(id) === hold) state.deleteHolds.delete(id);
+        };
+        // `reason` is the route's code; `unconfirmed` means no answer arrived,
+        // so the delete may have committed.
+        const restore = (reason, { unconfirmed = false } = {}) => {
+            releaseHold();
+            const current = this._sceneObjectCurrent(scene);
+            const back = current && !hold.voided
+                && !(scene.reference_items || []).some((candidate) => candidate?.reference_item_id === id)
+                && reason !== "item_not_found";
+            if (back) {
+                scene.reference_items.splice(Math.min(index, scene.reference_items.length), 0, row);
+                this._renderSceneAfterLocalMutation({ viewport: false });
+            } else {
+                // A reason CODE, never contents (`durable_rules.md`, diagnostics).
+                sessionDiagRecord("reference_delete_rollback_deferred", {
+                    reason: hold.voided ? "voided" : (!current ? "scene_replaced"
+                        : (reason === "item_not_found" ? "item_not_found" : "row_present")),
+                });
+            }
+            // No answer, or a scene the server has replaced since: the local row
+            // may not be what the server holds. Heal by the gated refresh, which
+            // runs once the queue drains and so cannot replace a queued paint.
+            if ((unconfirmed || !current) && this.projectDir === projectDir) {
+                this._deferProjectBackedRefresh(["scenes"], "reference_delete_unconfirmed");
+            }
+            this._refreshPromptContextDependencyConsumers();
+        };
+        let result;
+        try {
+            result = await this._runSceneMutation([{
+                type: "delete_reference_item",
+                reference_item_id: id,
+                expected,
+            }], {
+                key: `scene:${scene.scene_id}:reference-panel-delete:${id}:${Date.now()}`,
+                label: "delete reference item",
+                coalesce: false,
+                refreshScenes: false,
+                historyEntry,
+                orderedHistoryBaseline: true,
+                failureMessage: "The Reference item could not be deleted.",
+                failureDetail: (error) => error?.payload?.error || error?.message || null,
+                failureTier: "warning",
+            });
+        } catch (error) {
+            // The queue has said why and removed this delete's Undo entry by
+            // exact object. The route's code is on the payload; `fetchProjectJson`
+            // lifts only a version conflict onto `error.code`.
+            restore(String(error?.payload?.code || error?.code || ""),
+                { unconfirmed: !Number.isInteger(error?.status) });
+            return "failed";
+        }
+        if (!result) {
+            this._discardUnstampableUndoEntry(historyEntry);
+            restore("");
+            return "refused";
+        }
+        releaseHold();
+        this._reconcileActiveSceneFromMutation(result, { reason: "reference_panel", ignoreTimelineGate: true });
+        this._refreshPromptContextDependencyConsumers();
+        return "ok";
     }
 
     /**
@@ -11533,8 +11675,110 @@ export class EditorWidget {
         // an existing compatible lane, which is what the ruler explicitly is not.
         if (!entry && !forceNewLane) entry = referenceEntries.find(canUse) || null;
 
+        const laneIndex = entry ? (entry.laneIndex || 0) : laneCountFor(scene, TRACK_TYPE.REFERENCE);
+        // Its own Undo step, held rather than labelled, so a refused stage drops
+        // the entry it created instead of leaving one with no post-snapshot.
+        const historyEntry = this._pushUndo("add reference item");
+        return this._commitReferenceStageWithinGesture({
+            payload, laneIndex, startFrame, laneEntry: entry, mediaKind, historyEntry,
+            allowLaneWrites: true,
+        });
+    }
+
+    /** Stage a panel-picked Library member as a new item on one Reference lane.
+     *
+     *  The Reference Lane Setup panel's "+ Add item". It shares the timeline's
+     *  stage tail, but not its drop resolver: `resolveReferenceDropVerdict`
+     *  takes the media kind from `referenceMemberMediaKind`, which would refuse
+     *  an audio lane's video-with-audio, and it may retype a never-configured
+     *  lane -- a panel addressing one lane by index must do neither. The lane's
+     *  own recipe decides the kind, `memberPopulationCompatible` (the rule the
+     *  picker offers by and the route enforces) decides each member, and the
+     *  tail is told to build no lane writes. A collapsed lane is irrelevant: it
+     *  is addressed by index.
+     *
+     *  Every refusal is local, before the Undo push, so it costs neither an
+     *  entry nor the Redo stack.
+     */
+    async _stageReferenceItemOnLane(...args) {
+        return this._withMutationGesture(
+            "stageReferenceItemOnLane", () => this._stageReferenceItemOnLaneWithinGesture(...args));
+    }
+
+    async _stageReferenceItemOnLaneWithinGesture(payload, laneIndex, startFrame) {
+        const scene = this.activeScene;
+        if (!scene || !this.projectDir || !Array.isArray(payload?.members) || !payload.members.length) {
+            return "refused";
+        }
+        const refuse = (message) => {
+            notifyWarning(message, { source: "reference-panel-refused" });
+            return "refused";
+        };
+        const lane = Math.max(0, parseInt(laneIndex, 10) || 0);
+        if (lane >= laneCountFor(scene, TRACK_TYPE.REFERENCE)) {
+            return refuse("This Reference lane no longer exists.");
+        }
+        if (this._isLaneLocked(TRACK_TYPE.REFERENCE, lane)) {
+            return refuse("This Reference lane is locked. Unlock it on the timeline header to edit.");
+        }
+        const duration = Math.max(1, parseInt(scene.duration_frames, 10) || this.totalFrames || 1);
+        const start = Math.min(duration - 1, Math.max(0, Math.round(Number(startFrame) || 0)));
+        // The route's own overlap rule, over the frame the item starts on.
+        if (referenceItemOverlap(scene.reference_items || [], {
+            laneIndex: lane, startFrame: start, endFrame: start + 1,
+            durationFrames: scene.duration_frames,
+        })) {
+            return refuse("Another item already covers the playhead on this lane. Move the playhead and try again.");
+        }
+        const recipe = this._referenceLaneRecipe(lane);
+        const mediaKind = String(recipe?.media_kind || "");
+        if (!["image", "video", "audio"].includes(mediaKind)) {
+            // The tail would have to write the lane's recipe to stage here,
+            // which this caller never does; say so before any Undo push.
+            return refuse("This Reference lane has no model input kind. Choose its template first.");
+        }
+        const population = laneStagingPopulation(recipe);
+        for (const memberRef of payload.members) {
+            const resolved = this._referenceMemberForRef(memberRef);
+            const asset = resolved ? this._findAssetById(resolved.member.asset_id) : null;
+            if (!asset) return refuse("That Library member is no longer available.");
+            if (!memberPopulationCompatible(population, mediaKind, asset.asset_type,
+                { hasAudio: !!asset.has_audio })) {
+                return refuse("That Library member does not fit this lane's model input.");
+            }
+        }
+        const historyEntry = this._pushUndo("add reference item");
+        return this._commitReferenceStageWithinGesture({
+            payload, laneIndex: lane, startFrame: start, laneEntry: { laneIndex: lane },
+            mediaKind, historyEntry, allowLaneWrites: false,
+        });
+    }
+
+    /** The stage both gestures share, from the operations build to the settle.
+     *
+     *  `laneEntry` null means "a new lane at `laneIndex`"; the lane count and a
+     *  recipe for a kind the lane does not hold travel in the same ordered
+     *  batch, and only a caller passing `allowLaneWrites` may build them. The
+     *  caller has pushed its own Undo entry and hands it over as
+     *  `historyEntry`, which this sends explicitly.
+     *
+     *  A failure rolls the painted row back LOCALLY (`durable_rules.md`: a
+     *  local optimistic apply owes a rollback that works without the network):
+     *  the row is spliced out by its minted id when it is still on the scene
+     *  object it was painted on, and an in-flight delete holding that id is
+     *  voided, so a later failure of that delete cannot reinsert a row the
+     *  project never accepted. A lane or recipe painted with it keeps the
+     *  refetch heal, run only when the queue is idle and re-armed otherwise.
+     *
+     *  Resolves to `"ok"`, `"failed"` or `"refused"` (nothing sent).
+     */
+    async _commitReferenceStageWithinGesture({
+        historyEntry, payload, laneIndex, startFrame, laneEntry, mediaKind,
+        allowLaneWrites = false,
+    }) {
+        const scene = this.activeScene;
+        const entry = laneEntry;
         const operations = [];
-        let laneIndex;
         if (!entry) {
             laneIndex = laneCountFor(scene, TRACK_TYPE.REFERENCE);
             operations.push({ type: "set_lane_count", lane_type: "reference", count: laneIndex + 1 });
@@ -11587,10 +11831,20 @@ export class EditorWidget {
             expected: referenceGuard,
             fields: stagedFields,
         });
+        if (!allowLaneWrites && operations.length !== 1) {
+            // An assertion, not a user path: a caller that addresses an existing
+            // lane must never retype it or grow the lane count to legalize its
+            // own stage (`durable_rules.md`: staging adopts a kind only on a lane
+            // never configured), and `_stageReferenceItemOnLaneWithinGesture`
+            // refuses every such lane before its Undo push. Nothing is painted
+            // or sent.
+            this._discardUnstampableUndoEntry(historyEntry);
+            sessionDiagRecord("reference_stage_lane_write_refused", { operations: operations.length });
+            notifyWarning("This Reference lane cannot be staged from here.",
+                { source: "reference-panel-refused" });
+            return "refused";
+        }
 
-        // Held rather than labelled, so a refused stage drops the entry it
-        // created instead of leaving one with no post-snapshot behind.
-        const undoEntry = this._pushUndo("add reference item");
         // The lane, its recipe and the bar are one ordered batch, so the paint
         // is the same sequence in the same order -- and equally all-or-nothing:
         // a row that cannot be painted must not leave its lane and recipe
@@ -11599,6 +11853,15 @@ export class EditorWidget {
         // become a false `expected.lane_id` on a config edit queued before
         // creation.
         const painted = this._plannedReferenceItemRow(stagedFields);
+        // What the lane paint changes, so a failure can put exactly that back:
+        // a new lane grows the count and both aligned arrays by one, a retyped
+        // lane replaces one recipe slot.
+        const laneBefore = {
+            count: scene.reference_lane_count,
+            configs: (scene.reference_lane_configs || []).length,
+            recipes: (scene.reference_lane_recipes || []).length,
+            recipe: scene.reference_lane_recipes?.[laneIndex],
+        };
         if (painted) {
             if (!entry) this._applyLocalSetLaneCount(TRACK_TYPE.REFERENCE, laneIndex + 1);
             if (stagedRecipe) {
@@ -11617,33 +11880,106 @@ export class EditorWidget {
             // -- matching every other lane and Reference paint in this file.
             this._renderSceneAfterLocalMutation({ viewport: false });
         }
+        const paintedLane = !!painted && operations.length > 1;
+        const projectDir = this.projectDir;
+        const laneRecipePainted = paintedLane ? scene.reference_lane_recipes?.[laneIndex] : undefined;
+        // Undo this stage's own paint on the scene object it was painted on --
+        // the active scene, or the list's object a scene switch left behind; a
+        // scene the server has replaced since is newer than anything here.
+        //  * The bar, by its minted id. A delete hold for that id is voided
+        //    first, so the delete's own failure never reinserts it.
+        //  * The lane and recipe painted with it, only while they still show
+        //    this paint: the lane is still the last, still empty and still
+        //    holds this recipe object. Otherwise the refetch heal takes over.
+        // Returns what it put back.
+        const rollBack = () => {
+            const hold = this._referenceItemWrites?.deleteHolds?.get(referenceItemId);
+            if (hold) hold.voided = true;
+            const undone = { row: false, lane: !paintedLane };
+            if (!painted || !this._sceneObjectCurrent(scene)) return undone;
+            const at = (scene.reference_items || []).findIndex(
+                (row) => row?.reference_item_id === referenceItemId);
+            if (at >= 0) {
+                scene.reference_items.splice(at, 1);
+                undone.row = true;
+            }
+            if (!paintedLane || scene.reference_lane_recipes?.[laneIndex] !== laneRecipePainted) {
+                return undone;
+            }
+            if (!entry) {
+                const stillLast = laneCountFor(scene, TRACK_TYPE.REFERENCE) === laneIndex + 1;
+                const empty = !(scene.reference_items || []).some(
+                    (row) => (Number(row?.lane_index) || 0) === laneIndex);
+                if (!stillLast || !empty) return undone;
+                scene.reference_lane_count = laneBefore.count;
+                (scene.reference_lane_configs || []).splice(laneBefore.configs);
+                (scene.reference_lane_recipes || []).splice(laneBefore.recipes);
+            } else if (laneBefore.recipes <= laneIndex) {
+                // The paint padded the recipe array up to this lane.
+                scene.reference_lane_recipes.splice(laneBefore.recipes);
+            } else {
+                scene.reference_lane_recipes[laneIndex] = laneBefore.recipe;
+            }
+            undone.lane = true;
+            return undone;
+        };
+        let result;
         try {
-            const result = await this._runSceneMutation(operations, {
+            result = await this._runSceneMutation(operations, {
                 key: `scene:${this.activeSceneId}:reference-stage:${Date.now()}`,
                 label: "stage reference",
                 coalesce: false,
                 refreshScenes: false,
+                historyEntry,
+                // Panel staging opts into queue-order Undo snapshots; the
+                // timeline's Reference paints keep today's exposure (a residual
+                // recorded with this change).
+                orderedHistoryBaseline: !allowLaneWrites,
+                failureMessage: "The Reference item could not be staged.",
+                failureDetail: (error) => error?.payload?.error || error?.message || null,
+                failureTier: "warning",
             });
-            this._reportStagedReferenceIdShortfall(result, painted ? referenceItemId : "");
-            this._reconcileActiveSceneFromMutation(result, { reason: "reference_stage", ignoreTimelineGate: true });
-            this._buildTrackLayout();
-            this._renderTimeline();
         } catch (error) {
-            notifyWarning(error?.message || "Reference placement was refused.", { source: "reference-stage-refused" });
-            // Discards the painted bar AND the lane and recipe painted with it:
-            // the three were one ordered batch, so they roll back together or
-            // the timeline keeps an empty lane the project never accepted.
-            const healed = await this._fetchScenes(
-                { ignoreMutationGate: true, reason: "reference_stage_error" });
-            this._discardUnstampableUndoEntry(undoEntry);
-            if (painted) {
+            // The queue has already said why (`failureMessage`/`failureDetail`)
+            // and removed this stage's Undo entry by exact object.
+            this._discardUnstampableUndoEntry(historyEntry);
+            const undone = rollBack();
+            // The three were one ordered batch, so they roll back together or
+            // the timeline keeps an empty lane the project never accepted --
+            // which the next ruler drop would then commit, because its lane
+            // count is absolute. When the local undo could not run, heal by
+            // refetch: only when the queue is idle, since an ungated GET would
+            // replace a queued write's paint, and re-armed otherwise.
+            if (this.projectDir !== projectDir) {
+                // A project switch replaced everything this paint touched.
+            } else if (!undone.lane) {
+                const healed = this._hasPendingProjectMutations()
+                    ? (this._deferProjectBackedRefresh(["scenes"], "reference_stage_error"), false)
+                    : await this._fetchScenes({ ignoreMutationGate: true, reason: "reference_stage_error" });
                 if (healed === false) sessionDiagRecord("reference_stage_rollback_deferred", {});
-                this._renderSceneAfterLocalMutation({ viewport: false });
+            } else if (!Number.isInteger(error?.status) || !this._sceneObjectCurrent(scene)) {
+                // No answer arrived, so the stage may have committed; or the
+                // server replaced the scene since. Converge by the gated refresh.
+                this._deferProjectBackedRefresh(["scenes"], "reference_stage_unconfirmed");
             }
+            if (undone.row || paintedLane) this._renderSceneAfterLocalMutation({ viewport: false });
             // Staging changes what the Prompt tool resolves, so a refusal has
             // to reach its Reference Prompting rows too.
             this._refreshPromptContextDependencyConsumers();
+            return "failed";
         }
+        if (!result) {
+            // No project context to send it under: nothing was written.
+            this._discardUnstampableUndoEntry(historyEntry);
+            const undone = rollBack();
+            if (undone.row || paintedLane) this._renderSceneAfterLocalMutation({ viewport: false });
+            return "refused";
+        }
+        this._reportStagedReferenceIdShortfall(result, painted ? referenceItemId : "");
+        this._reconcileActiveSceneFromMutation(result, { reason: "reference_stage", ignoreTimelineGate: true });
+        this._buildTrackLayout();
+        this._renderTimeline();
+        return "ok";
     }
 
     async _handleAssetDrop(asset, frame, trackRawY) {

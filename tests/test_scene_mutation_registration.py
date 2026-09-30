@@ -68,9 +68,13 @@ EXPECTED_LITERAL_COUNTS = {
     # 81 -> 80 on 2026-09-22: `_showGuideManagementPopupLegacy`, dead since the
     # current popup replaced it, was deleted with its `delete_guide` emission
     # (0.6.0 release blockers, L3).
-    "editor_widget.js": 80,
+    # 80 -> 81 and the Reference panel's 3 -> 1 on 2026-09-29: the panel's
+    # create and delete moved to host writers (`_commitReferenceStageWithinGesture`
+    # shared with the timeline stage, and `_deleteReferenceItemFromPanelWithinGesture`),
+    # paint-first Reference Lane Setup Phase 3.
+    "editor_widget.js": 81,
     "editor_prompt_panel.js": 4,
-    "editor_reference_panel.js": 3,
+    "editor_reference_panel.js": 1,
     "prompt_context_chips.js": 1,
     "prompt_identity_transactions.js": 1,
 }
@@ -2353,10 +2357,11 @@ GUARD_CONTRACTS.update({op: (_NOTHING, frozenset(), evidence) for op, evidence i
 # plan's own warning is that "treating opaque as green is a false-confidence
 # test". Each entry says what makes it opaque and where the real keys are built.
 OPAQUE_GUARD_SITES = {
-    "editor_reference_panel.js:renderItems:delete_reference_item":
-        "`expected` is an identifier holding the item snapshot. The contract is "
-        "_WHOLE_RECORD, which requires every key of item.to_dict(), so a lexical "
-        "key list could not certify it either way.",
+    "editor_widget.js:_deleteReferenceItemFromPanelWithinGesture:delete_reference_item":
+        "`expected` is an identifier built above the literal from the LIVE row's "
+        "nine `ReferenceItem.to_dict` keys, read before the paint removes it. The "
+        "contract is _WHOLE_RECORD, which requires every key of item.to_dict(), "
+        "so a lexical key list could not certify it either way.",
     "editor_reference_panel.js:writeItem:update_reference_item":
         "`expected` is built above the literal from the prior row.",
     "editor_widget.js:_applyPromptSetupWithinGesture:update_scene_fields":
@@ -2382,15 +2387,14 @@ OPAQUE_GUARD_SITES = {
         "ES6 shorthand `expected,` -- the shape Phase A's predicate was corrected "
         "twice to see at all.",
     **{site:
-       "`expected` is `_referenceCreationGuard(...)` on the host, which BOTH "
-       "surfaces call -- the timeline drop and the Reference panel's Add -- and "
-       "which each then reads `end_frame` back off, so the guard cannot describe "
-       "a different measurement than the payload was built from. It landed as a "
-       "method for that reason and the panel grew a second copy anyway; an audit "
-       "caught it."
+       "`expected` is `_referenceCreationGuard(...)` on the host, read inside the "
+       "stage tail BOTH surfaces now share -- the timeline drop and the Reference "
+       "panel's Add -- which reads `end_frame` back off it, so the guard cannot "
+       "describe a different measurement than the payload was built from. The "
+       "panel once grew a second copy; since paint-first Phase 3 it sends only "
+       "the members."
        for site in (
-           "editor_widget.js:_placeReferencePayloadWithinGesture:create_reference_item",
-           "editor_reference_panel.js:createItem:create_reference_item",
+           "editor_widget.js:_commitReferenceStageWithinGesture:create_reference_item",
        )},
     "editor_widget.js:_applyPromptSetupWithinGesture:replace_prompt_sections":
         "`expected` is `_promptSectionsReplacementGuard()`, which must be read "
@@ -3447,10 +3451,6 @@ GUARDED_OPERATIONS_NEEDING_A_MESSAGE = frozenset({
 # are listed rather than computed -- a computed version would have to guess at
 # what a shared runner is.
 MESSAGE_OWNED_ELSEWHERE = {
-    "editor_reference_panel.js:createItem":
-        "Delegates its enqueue to `runItemOperation`, which owns the catch and "
-        "already notifies with `error?.message`. The scope itself never calls "
-        "`_runSceneMutation`, so its own body cannot show a message.",
     "editor_widget.js:_planItemSplit":
         "A PURE planner. It builds the operation and never enqueues, because "
         "planning every target before `_pushUndo` is what makes a wholly "
@@ -3992,10 +3992,6 @@ COALESCE_OPT_OUT_REVIEWED = {
         "the Reference panel's own dispatcher; the key already names the item, "
         "so the clock is what keeps two edits of ONE item apart. Sibling "
         "surface, out of umbrella Phase C's scope."),
-    "editor_reference_panel.js:runItemOperation:scene:${}:reference-panel-op:${}": (
-        UNREACHABLE,
-        "the Reference panel's own dispatcher, operations built outside the "
-        "scope. Sibling surface, out of umbrella Phase C's scope."),
     "editor_widget.js:_mutateReferences:references:${}": (
         UNREACHABLE,
         "the project-level Reference dispatcher. The counter gives every "
@@ -4028,10 +4024,16 @@ COALESCE_OPT_OUT_REVIEWED = {
         "reversed it in both halves: the canonical record for a Library drop is "
         "byte-identical to what `dragPayload` sends, and NOT painting is what "
         "loses the drop. See `web/js/scene_reference_geometry.js`."),
-    "editor_widget.js:_placeReferencePayloadWithinGesture:scene:${}:reference-stage:${}": (
+    "editor_widget.js:_commitReferenceStageWithinGesture:scene:${}:reference-stage:${}": (
         UNREACHABLE,
         "`create_reference_item` creates a row, alongside the lane it needs. "
-        "Two placements are two items."),
+        "Two placements are two items; the timeline drop and the panel's Add "
+        "share this tail."),
+    "editor_widget.js:_deleteReferenceItemFromPanelWithinGesture:scene:${}:reference-panel-delete:${}:${}": (
+        UNREACHABLE,
+        "one `delete_reference_item` naming one row by id with its whole prior "
+        "record. Two deletes are two rows (or a refused repeat), and each owns "
+        "its Undo step and its reinsertion hold."),
     "editor_widget.js:_handleAssetDropWithinGesture:scene:${}:drop:${}:${}": (
         UNREACHABLE,
         "`create_clip` / `create_audio_track` / `create_guide`: each drop "

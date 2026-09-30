@@ -244,14 +244,18 @@ def test_panel_honours_the_overlay_and_mutation_contracts():
     assert "unregisterKeyboard();" in panel
 
     # Every reference-item write is non-coalesced and carries exact prior values.
-    # Item writes and item operations are exact, non-coalesced mutations.
-    assert panel.count("coalesce: false") == 2
-    for block in ("const writeItem =", "const runItemOperation ="):
-        body = panel.split(block, 1)[1].split("\n    };", 1)[0]
-        assert "coalesce: false" in body
+    # The field edits still build their own operation; staging and deleting are
+    # host writers (`_stageReferenceItemOnLane`, `_deleteReferenceItemFromPanel`)
+    # that own the guard, the paint and the rollback, so the panel sends intent.
+    assert panel.count("coalesce: false") == 1
+    body = panel.split("const writeItem =", 1)[1].split("\n    };", 1)[0]
+    assert "coalesce: false" in body
     assert "expected[key] = item[key]" in panel
-    assert "expected: { ...item }" in panel
     assert "expected: expectedRecipe(definition)" in panel
+    assert "const runItemOperation" not in panel
+    assert '"create_reference_item"' not in panel and '"delete_reference_item"' not in panel
+    assert "host._stageReferenceItemOnLane({ members }, state.laneIndex, start)" in panel
+    assert "host._deleteReferenceItemFromPanel(item.reference_item_id)" in panel
 
     # A built-in recipe is never edited in place. `state.busy` now belongs to
     # item operations only: a recipe save never drops, or waits behind, the

@@ -196,12 +196,21 @@ globalThis.location = { href:'http://test/' };
 // is observable. The gated refresh's 50 ms fallback timer is real.
 const frames = [];
 globalThis.requestAnimationFrame = (cb) => { frames.push(cb); return frames.length; };
-const flushFrames = () => { while (frames.length) frames.shift()(performance.now()); };
+// One frame: the callbacks queued before it. A callback that schedules the next
+// frame (the session-diagnostics gap monitor does) waits for the next flush.
+const flushFrames = () => { const now = performance.now(); for (const cb of frames.splice(0)) cb(now); };
 
 // -- the widget -----------------------------------------------------------------
 const { EditorWidget } = await import(__WIDGET__);
 const { ProjectMutationQueue } = await import(__QUEUE__);
 const panelModule = await import(__PANEL__);
+// Every toast the page raises, as {tier, message, detail, source}.
+const notes = await import(__NOTES__);
+const toasts = [];
+const seenToasts = new Set();
+notes.subscribe((list) => { for (const n of list) {
+  if (seenToasts.has(n.id)) continue; seenToasts.add(n.id);
+  toasts.push({ tier: n.tier, message: n.message, detail: n.detail || null, source: n.source || '' }); } });
 const fixture = __FIXTURE__;
 const w = Object.create(EditorWidget.prototype);
 const sent = [];
@@ -213,7 +222,7 @@ const tick = () => new Promise((r) => setTimeout(r, 0));
 const settle = async (n = 6) => { for (let i = 0; i < n; i += 1) await tick(); };
 Object.assign(w, {
   projectDir:'project', projectId:'project', activeSceneId:'scene',
-  activeScene: structuredClone(fixture.scene), scenes: [],
+  activeScene: null, scenes: structuredClone(fixture.scenes),
   assets: fixture.assets, _references: fixture.references, _referencesLoaded: true,
   _referenceRecipePresets:[], _customReferenceRecipes:[], _referenceRecipeFieldSchema:[],
   _promptContextProfiles:[], _promptContextCatalog:{},
@@ -248,6 +257,7 @@ Object.assign(w, {
   _clearProjectNotFound(){}, _showProjectNotFound(){}, _markStaleReplayApplied(){},
   _governStaleVersionReplay(){ return true; },
 });
+w.activeScene = w.scenes[0];
 w._buildTrackLayout();
 // Stand-in: `fetch`. Mutation POSTs go to the route child unless the test
 // scripted the answer; scene GETs read the child's project. Everything above
@@ -266,6 +276,11 @@ globalThis.fetch = async (url, init = {}) => {
     if (holdNext > 0) { holdNext -= 1; await new Promise((resolve, reject) => held.push({resolve, reject})); }
     const script = scripted[0]?.kind === 'offline-get' ? null : scripted.shift();
     if (script?.kind === 'offline') throw new TypeError('Failed to fetch');
+    if (script?.kind === 'lost') {
+      // The route commits; the answer never reaches the client.
+      await ask({ sceneId: decodeURIComponent(mutation[1]), operations });
+      throw new TypeError('Failed to fetch');
+    }
     if (script?.kind === 'refuse') return json(script.status, { error: script.code, code: script.code });
     const answer = await ask({ sceneId: decodeURIComponent(mutation[1]), operations });
     return answer.ok ? json(200, answer.payload)
@@ -274,7 +289,9 @@ globalThis.fetch = async (url, init = {}) => {
   if (method === 'GET' && /\/scenes$/.test(path)) {
     gets.push(path);
     if (scripted[0]?.kind === 'offline-get') { scripted.shift(); throw new TypeError('Failed to fetch'); }
-    return json(200, { scenes: [(await ask({ read: true, sceneId: 'scene' })).scene] });
+    const scenes = [];
+    for (const id of fixture.sceneIds) scenes.push((await ask({ read: true, sceneId: id })).scene);
+    return json(200, { scenes });
   }
   const single = /\/scenes\/([^/]+)$/.exec(path);
   assert.ok(method === 'GET' && single, `unexpected fetch ${method} ${path}`);
@@ -285,6 +302,7 @@ const hold = (count = 1) => { holdNext += count; };
 const refuseNext = (code, status = 409) => scripted.push({ kind: 'refuse', code, status });
 const offlineNext = () => scripted.push({ kind: 'offline' });
 const offlineGetNext = () => scripted.push({ kind: 'offline-get' });
+const lostNext = () => scripted.push({ kind: 'lost' });
 const nextHeld = async () => { for (let i = 0; i < 40 && !held.length; i += 1) await tick();
   assert.ok(held.length, 'no write is held'); return held.shift(); };
 const release = async () => { (await nextHeld()).resolve(); await settle(); };
@@ -318,11 +336,12 @@ def run_item_panel(body, tmp_path, project=None):
     project = project or fixture_project()
     project_file = tmp_path / "project.json"
     project_file.write_text(json.dumps(project.to_dict()), encoding="utf-8")
-    scene = project.scenes[0].to_dict()
+    scenes = [scene.to_dict() for scene in project.scenes]
     assets = {}
     for asset in project.assets:
         assets.setdefault(asset.asset_type, []).append(asset.to_dict())
-    fixture = {"scene": scene, "assets": assets,
+    fixture = {"scenes": scenes, "sceneIds": [scene["scene_id"] for scene in scenes],
+               "assets": assets,
                "references": [reference.to_dict() for reference in project.references]}
     script = (_HARNESS
               .replace("__PYTHON__", json.dumps(sys.executable))
@@ -332,6 +351,7 @@ def run_item_panel(body, tmp_path, project=None):
               .replace("__WIDGET__", json.dumps((ROOT / "web/js/editor_widget.js").as_uri()))
               .replace("__QUEUE__", json.dumps((ROOT / "web/js/project_mutation_queue.js").as_uri()))
               .replace("__PANEL__", json.dumps((ROOT / "web/js/editor_reference_panel.js").as_uri()))
+              .replace("__NOTES__", json.dumps((ROOT / "web/js/editor_notifications.js").as_uri()))
               .replace("__FIXTURE__", json.dumps(fixture))
               .replace("__BODY__", body))
     completed = subprocess.run([node, "--input-type=module"], input=script,
@@ -578,3 +598,417 @@ def test_the_item_write_state_is_replaced_on_project_change_and_destroy():
     destroy = widget.split("    destroy() {", 1)[1].split("\n    }\n", 1)[0]
     assert "this._resetReferenceItemWriteState();" in update
     assert "this._resetReferenceItemWriteState();" in destroy
+
+
+# -- Phase 3: Add item and Delete item --------------------------------------------
+#
+# Shared helpers for the panel's picker and cards.
+_PANEL = """
+const addItem = (memberName) => {
+  nodes().find((n) => n.tagName === 'BUTTON' && n.textContent === '+ Add item').dispatch('click');
+  const row = nodes().find((n) => n.tagName === 'BUTTON' && n.title === 'Stage this member'
+    && n.textContent === `Subject · ${memberName}`);
+  assert.ok(row, `the picker does not offer ${memberName}`);
+  row.dispatch('click');
+};
+const deleteAt = (start) => {
+  const card = cardAt(start);
+  assert.ok(card, `no card at ${start}`);
+  card.querySelectorAll('button').find((b) => b.textContent === 'Delete item').dispatch('click');
+};
+const ids = (scene = w.activeScene) => (scene.reference_items || []).map((row) => row.reference_item_id);
+const creates = () => sent.flat().filter((op) => op.type === 'create_reference_item');
+"""
+
+
+def test_add_item_paints_the_minted_bar_before_the_write_and_an_edit_behind_it_addresses_it(tmp_path):
+    result = run_item_panel(_PANEL + """
+    mount();
+    w.playhead = 80;
+    hold();
+    addItem('C');
+    const minted = ids().find((id) => /^ref-/.test(id));
+    const paintedBeforeAck = !!item(minted) && !!cardAt(80);
+    // The new card is drawn, so its strength can be edited before the stage lands.
+    const strength = inputsOf(cardAt(80))[2];
+    strength.value = '0.4'; strength.dispatch('change');
+    await release();
+    await settle();
+    const server = await serverScene();
+    return { minted: creates()[0]?.fields?.reference_item_id === minted, paintedBeforeAck,
+      editAddressed: sent[1]?.[0]?.reference_item_id === minted,
+      stored: item(minted, server) && { start: item(minted, server).start_frame,
+        end: item(minted, server).end_frame, strength: item(minted, server).strength },
+      sentOps: sent.map((ops) => ops.map((op) => op.type)), gets: gets.length,
+      undo: w._undoStack.map((entry) => entry.label) };
+    """, tmp_path)
+    assert result["minted"] and result["paintedBeforeAck"] and result["editAddressed"]
+    assert result["stored"] == {"start": 80, "end": -1, "strength": 0.4}
+    # Panel staging never writes the lane: one create, no lane-count or recipe op.
+    assert result["sentOps"] == [["create_reference_item"], ["update_reference_item"]]
+    assert result["undo"] == ["add reference item", "change reference strength"]
+
+
+def test_a_refused_add_item_removes_its_bar_locally_with_one_message(tmp_path):
+    result = run_item_panel(_PANEL + """
+    mount();
+    w.playhead = 80;
+    refuseNext('invalid_reference_item', 400);
+    addItem('C');
+    const painted = ids().length;
+    await settle();
+    return { painted, after: ids(), gets: gets.length, undo: w._undoStack.length,
+      toasts: toasts.filter((t) => t.tier !== 'info').map((t) => [t.message, t.detail]) };
+    """, tmp_path)
+    assert result["painted"] == 4
+    assert result["after"] == ["item-1", "item-2", "item-4"]
+    assert result["gets"] == 0
+    assert result["undo"] == 0
+    assert result["toasts"] == [["The Reference item could not be staged.", "invalid_reference_item"]]
+
+
+def test_add_item_on_an_audio_lane_accepts_a_video_that_has_audio(tmp_path):
+    result = run_item_panel(_PANEL + """
+    mount(1);
+    w.playhead = 50;
+    addItem('VA');
+    await settle();
+    const staged = (await serverScene()).reference_items.filter((row) => row.lane_index === 1
+      && row.start_frame === 50);
+    return { staged: staged.map((row) => row.members.map((m) => m.member_id)), toasts: toasts.length };
+    """, tmp_path)
+    assert result == {"staged": [["member-va"]], "toasts": 0}
+
+
+def _unconfigured_lane_project():
+    project = fixture_project()
+    scene = project.scenes[0]
+    scene.reference_lane_count = 3
+    scene.reference_lane_configs.append(LaneConfig())
+    scene.reference_lane_recipes.append(ReferenceLaneRecipe(lane_id="lane-blank"))
+    project.assets.append(Asset(asset_id="asset-voice", name="voice.mp4", asset_type="video",
+                                path="media/voice.mp4", has_audio=True))
+    project.references[0].members.append(ReferenceMember(
+        member_id="member-voice", asset_id="asset-voice", name="VOICE",
+        tags=["sonder:voice_identity"]))
+    return project
+
+
+def test_add_item_on_a_never_configured_lane_does_not_retype_it(tmp_path):
+    """The drop resolver would retype this lane to audio for a voice-tagged video;
+    the panel addresses the lane it shows and keeps its recipe."""
+    result = run_item_panel(_PANEL + """
+    mount(2);
+    w.playhead = 10;
+    addItem('VOICE');
+    await settle();
+    const server = await serverScene();
+    return { ops: sent.map((ops) => ops.map((op) => op.type)),
+      recipe: server.reference_lane_recipes[2], staged: server.reference_items
+        .filter((row) => row.lane_index === 2).map((row) => row.members[0].member_id) };
+    """, tmp_path, project=_unconfigured_lane_project())
+    assert result["ops"] == [["create_reference_item"]]
+    assert result["recipe"]["lane_id"] == "lane-blank"
+    assert result["recipe"]["media_kind"] == "image" and result["recipe"]["recipe_id"] == ""
+    assert result["staged"] == ["member-voice"]
+
+
+def test_local_add_and_delete_refusals_send_nothing_and_keep_redo(tmp_path):
+    result = run_item_panel(_PANEL + """
+    mount();
+    w._redoStack = [{ label: 'something undone', snapshot: {} }];
+    w.playhead = 20;                                   // inside item-1
+    addItem('C');
+    const overlap = { sent: sent.length, undo: w._undoStack.length, redo: w._redoStack.length };
+    const missing = await w._deleteReferenceItemFromPanel('no-such-item');
+    w.activeScene.reference_lane_configs[0].locked = true;
+    w._buildTrackLayout();
+    w.playhead = 80;
+    const lockedStage = await w._stageReferenceItemOnLane({ members: [{ entity_id: 'entity-1',
+      member_id: 'member-c' }] }, 0, 80);
+    const lockedDelete = await w._deleteReferenceItemFromPanel('item-1');
+    return { overlap, missing, lockedStage, lockedDelete, sent: sent.length,
+      undo: w._undoStack.length, redo: w._redoStack.length,
+      rows: ids(), warnings: toasts.map((t) => t.source) };
+    """, tmp_path)
+    assert result["overlap"] == {"sent": 0, "undo": 0, "redo": 1}
+    assert result["missing"] == "refused"
+    assert result["lockedStage"] == "refused" and result["lockedDelete"] == "refused"
+    assert (result["sent"], result["undo"], result["redo"]) == (0, 0, 1)
+    assert result["rows"] == ["item-1", "item-2", "item-4"]
+    # One source, so the notifier coalesces them into one toast with a count.
+    assert result["warnings"] and set(result["warnings"]) == {"reference-panel-refused"}
+
+
+def test_delete_item_paints_at_once_and_a_failed_delete_puts_the_row_back_at_its_index(tmp_path):
+    result = run_item_panel(_PANEL + """
+    mount();
+    hold();
+    offlineNext();
+    offlineGetNext();                                  // the heal finds the server down too
+    deleteAt(10);
+    const rowsAtOnce = ids();
+    // A button action repaints through the host's gated refresh, on the next frame.
+    flushFrames();
+    const painted = { rows: rowsAtOnce, card: !!cardAt(10) };
+    await release();
+    await settle();
+    flushFrames();
+    return { painted, after: ids(), card: !!cardAt(10), undo: w._undoStack.length,
+      gets: gets.length, toasts: toasts.map((t) => t.message) };
+    """, tmp_path)
+    assert result["painted"] == {"rows": ["item-2", "item-4"], "card": False}
+    assert result["after"] == ["item-1", "item-2", "item-4"]
+    assert result["card"] is True
+    # No answer means the delete may have committed, so a gated refresh is
+    # armed -- and fails here, which is exactly when the local rollback matters.
+    assert result["undo"] == 0 and result["gets"] == 1
+    assert result["toasts"] == ["The Reference item could not be deleted."]
+
+
+def test_an_accepted_delete_stays_deleted_and_owns_its_undo_step(tmp_path):
+    result = run_item_panel(_PANEL + """
+    mount();
+    deleteAt(50);
+    await settle();
+    return { local: ids(), server: ids(await serverScene()),
+      undo: w._undoStack.map((entry) => [entry.label, !!entry.postSnapshot]) };
+    """, tmp_path)
+    assert result == {"local": ["item-1", "item-4"], "server": ["item-1", "item-4"],
+                      "undo": [["delete reference item", True]]}
+
+
+def test_with_the_server_stopped_add_then_delete_leaves_no_phantom_row(tmp_path):
+    """The create fails first and voids the delete's hold; the delete's failure
+    must not reinsert a row the project never accepted."""
+    result = run_item_panel(_PANEL + """
+    mount();
+    w.playhead = 80;
+    offlineNext(); offlineNext(); offlineGetNext(); offlineGetNext();
+    addItem('C');
+    const minted = ids().find((id) => /^ref-/.test(id));
+    deleteAt(80);
+    await settle(12);
+    return { rows: ids(), minted: ids().includes(minted), undo: w._undoStack.length,
+      server: ids(await serverScene()), deferred: diag('reference_delete_rollback_deferred').length };
+    """, tmp_path)
+    assert result["rows"] == ["item-1", "item-2", "item-4"]
+    assert result["minted"] is False
+    assert result["undo"] == 0
+    assert result["server"] == ["item-1", "item-2", "item-4"]
+    assert result["deferred"] == 1
+
+
+def test_a_refused_delete_keeps_the_previous_accepted_undo_step(tmp_path):
+    """Bug Tracker 0.4a, delete half: the panel used to pop the top entry by label
+    after the queue had already removed this write's own."""
+    result = run_item_panel(_PANEL + """
+    mount();
+    const strength = inputsOf(cardAt(50))[2];
+    strength.value = '0.6'; strength.dispatch('change');
+    await settle();
+    refuseNext('identity_mismatch');
+    deleteAt(10);
+    await settle();
+    return { undo: w._undoStack.map((entry) => [entry.label, !!entry.postSnapshot]), rows: ids() };
+    """, tmp_path)
+    assert result["undo"] == [["change reference strength", True]]
+    assert result["rows"] == ["item-1", "item-2", "item-4"]
+
+
+def test_a_refused_delete_does_not_enter_the_next_edits_undo_snapshot(tmp_path):
+    """Plan test 12. The panel's delete opts into the queue-order history
+    baseline, so an edit queued behind it takes its before-snapshot from the
+    canonical scene at its queue position -- which still holds the row the
+    refused delete had painted away. Undoing that edit therefore cannot delete
+    the row."""
+    result = run_item_panel(_PANEL + """
+    mount();
+    hold();
+    refuseNext('identity_mismatch');
+    deleteAt(10);
+    const strength = inputsOf(cardAt(50))[2];
+    strength.value = '0.6'; strength.dispatch('change');
+    const snapshotAtPush = ids(w._undoStack.at(-1).snapshot);
+    await release();
+    await settle(12);
+    const entry = w._undoStack.at(-1);
+    return { snapshotAtPush, snapshotNow: ids(entry.snapshot), label: entry.label,
+      rows: ids(), sceneReads: sceneReads.length };
+    """, tmp_path)
+    assert result["snapshotAtPush"] == ["item-2", "item-4"], "the paint was in the push-time snapshot"
+    assert result["snapshotNow"] == ["item-1", "item-2", "item-4"]
+    assert result["label"] == "change reference strength"
+    assert result["rows"] == ["item-1", "item-2", "item-4"]
+    assert result["sceneReads"] >= 1
+
+
+def test_a_project_switch_releases_an_in_flight_delete_hold(tmp_path):
+    """Plan test 13, delete half: the old project's hold neither survives the
+    switch nor reinserts its row anywhere when its write fails afterwards."""
+    result = run_item_panel(_PANEL + """
+    mount();
+    Object.assign(w, { _clearStaleReplayState(){}, _clearVideoCache(){}, _sweepRenderCache(){},
+      _fetchProjectSettings(){}, _renderQueuePanel(){}, _updateProjectIdentity(){},
+      _clearUnconfirmedReferenceRetry(){}, _fetchReferences: async () => {},
+      _fetchAssets: () => new Promise(() => {}), _renderCacheSweepGeneration: 0 });
+    hold();
+    offlineNext();
+    deleteAt(10);
+    const oldScene = w.activeScene;
+    const holdsBefore = w._referenceItemWriteState().deleteHolds.size;
+    w.updateProject('other-project');
+    const holdsAfter = w._referenceItemWriteState().deleteHolds.size;
+    await release();
+    await settle();
+    return { holdsBefore, holdsAfter, oldRows: ids(oldScene), active: w.activeScene,
+      deferred: diag('reference_delete_rollback_deferred').map((e) => e.reason ?? e.payload?.reason ?? e.data?.reason) };
+    """, tmp_path)
+    assert result["holdsBefore"] == 1 and result["holdsAfter"] == 0
+    assert result["oldRows"] == ["item-2", "item-4"]
+    assert result["active"] is None
+    assert result["deferred"] == ["scene_replaced"]
+
+
+def test_the_stage_tail_keeps_its_diagnostics():
+    """`_reportStagedReferenceIdShortfall` still hears the minted id, and the
+    lane/recipe heal still records a deferral."""
+    widget = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
+    tail = widget.split("    async _commitReferenceStageWithinGesture({", 1)[1]
+    tail = tail.split("\n    async _handleAssetDrop(", 1)[0]
+    assert 'this._reportStagedReferenceIdShortfall(result, painted ? referenceItemId : "");' in tail
+    assert 'sessionDiagRecord("reference_stage_rollback_deferred", {});' in tail
+
+
+def _two_scene_project():
+    project = fixture_project()
+    other = Scene(scene_id="scene-b", duration_frames=100, reference_lane_count=1,
+                  reference_lane_configs=[LaneConfig()],
+                  reference_lane_recipes=[ReferenceLaneRecipe(lane_id="lane-b", media_kind="image")])
+    project.scenes.append(other)
+    return project
+
+
+def test_a_write_that_fails_after_a_scene_switch_still_rolls_back_the_scene_it_painted(tmp_path):
+    """A switch reuses the list's scene objects, so the painted scene is still the
+    one the author returns to; only a server replacement makes it stale."""
+    result = run_item_panel(_PANEL + """
+    mount();
+    const sceneA = w.activeScene;
+    w.playhead = 80;
+    hold(2);
+    refuseNext('invalid_reference_item', 400);
+    refuseNext('identity_mismatch');
+    addItem('C');
+    const minted = ids().find((id) => /^ref-/.test(id));
+    deleteAt(10);
+    const painted = ids(sceneA);
+    w._setActiveScene(w.scenes.find((scene) => scene.scene_id === 'scene-b'));
+    await release();
+    await release();
+    await settle();
+    return { painted, rowsA: ids(sceneA), phantom: ids(sceneA).includes(minted),
+      active: w.activeScene.scene_id, listed: w.scenes.includes(sceneA) };
+    """, tmp_path, project=_two_scene_project())
+    assert result["painted"] == ["item-2", "item-4", result["painted"][2]]
+    assert result["phantom"] is False
+    assert result["rowsA"] == ["item-1", "item-2", "item-4"]
+    assert result["active"] == "scene-b" and result["listed"] is True
+
+
+def test_a_stage_whose_answer_was_lost_converges_on_what_the_server_committed(tmp_path):
+    """No answer: the bar is removed locally, and a gated refresh brings back the
+    row the server did commit."""
+    result = run_item_panel(_PANEL + """
+    mount();
+    w.playhead = 80;
+    lostNext();
+    addItem('C');
+    await settle(16);
+    const server = await serverScene();
+    const staged = (scene) => scene.reference_items.filter((row) => row.start_frame === 80).length;
+    return { local: staged(w.activeScene), server: staged(server), gets: gets.length };
+    """, tmp_path)
+    assert result == {"local": 1, "server": 1, "gets": 1}
+
+
+def test_a_delete_the_route_answers_item_not_found_is_not_put_back(tmp_path):
+    """The route's code is on `error.payload.code`; `item_not_found` means the row
+    is gone there too, so reinserting it would show a row nobody holds."""
+    result = run_item_panel(_PANEL + """
+    mount();
+    refuseNext('item_not_found', 404);
+    deleteAt(10);
+    await settle();
+    return { rows: ids(), reasons: diag('reference_delete_rollback_deferred')
+      .map((e) => e.reason ?? e.payload?.reason ?? e.data?.reason) };
+    """, tmp_path)
+    assert result == {"rows": ["item-2", "item-4"], "reasons": ["item_not_found"]}
+
+
+def test_an_accepted_delete_releases_its_hold(tmp_path):
+    result = run_item_panel(_PANEL + """
+    mount();
+    deleteAt(50);
+    const during = w._referenceItemWriteState().deleteHolds.size;
+    await settle();
+    return { during, after: w._referenceItemWriteState().deleteHolds.size };
+    """, tmp_path)
+    assert result == {"during": 1, "after": 0}
+
+
+def test_a_member_the_lane_cannot_take_is_refused_before_anything_is_sent(tmp_path):
+    result = run_item_panel(_PANEL + """
+    const audio = await w._stageReferenceItemOnLane({ members: [{ entity_id: 'entity-1',
+      member_id: 'member-s' }] }, 0, 80);
+    const unknown = await w._stageReferenceItemOnLane({ members: [{ entity_id: 'entity-1',
+      member_id: 'member-nobody' }] }, 0, 80);
+    return { audio, unknown, sent: sent.length, undo: w._undoStack.length, rows: ids() };
+    """, tmp_path)
+    assert result == {"audio": "refused", "unknown": "refused", "sent": 0, "undo": 0,
+                      "rows": ["item-1", "item-2", "item-4"]}
+
+
+def test_a_refused_add_item_does_not_enter_the_next_edits_undo_snapshot(tmp_path):
+    """Plan test 12, Add half: panel staging opts into the ordered baseline too."""
+    result = run_item_panel(_PANEL + """
+    mount();
+    w.playhead = 80;
+    hold();
+    refuseNext('invalid_reference_item', 400);
+    addItem('C');
+    const minted = ids().find((id) => /^ref-/.test(id));
+    const strength = inputsOf(cardAt(50))[2];
+    strength.value = '0.6'; strength.dispatch('change');
+    const atPush = ids(w._undoStack.at(-1).snapshot).includes(minted);
+    await release();
+    await settle(12);
+    return { atPush, now: ids(w._undoStack.at(-1).snapshot).includes(minted),
+      label: w._undoStack.at(-1).label };
+    """, tmp_path)
+    assert result == {"atPush": True, "now": False, "label": "change reference strength"}
+
+
+def test_a_row_is_live_on_its_scene_object_or_in_a_live_delete_hold(tmp_path):
+    result = run_item_panel("""
+    const state = w._referenceItemWriteState();
+    const sceneA = w.activeScene;
+    const row = item('item-1');
+    const live = () => w._referenceItemRowLive(state, sceneA, row);
+    const onScene = live();
+    sceneA.reference_items.splice(sceneA.reference_items.indexOf(row), 1);
+    const removed = live();
+    const hold = { scene: sceneA, row, index: 0, voided: false };
+    state.deleteHolds.set('item-1', hold);
+    const held = live();
+    hold.voided = true;
+    const voided = live();
+    hold.voided = false;
+    w._setActiveScene(w.scenes.find((scene) => scene.scene_id === 'scene-b'));
+    const switchedAway = live();
+    w.scenes = w.scenes.filter((scene) => scene !== sceneA);
+    const replaced = live();
+    return { onScene, removed, held, voided, switchedAway, replaced };
+    """, tmp_path, project=_two_scene_project())
+    assert result == {"onScene": True, "removed": False, "held": True, "voided": False,
+                      "switchedAway": True, "replaced": False}

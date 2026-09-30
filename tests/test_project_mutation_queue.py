@@ -4473,21 +4473,70 @@ def test_an_unpaintable_row_leaves_no_lane_or_recipe_painted_behind_it():
     """)
 
 
-def test_a_refused_stage_repaints_after_discarding_the_optimistic_bar():
-    """The refetch discards the paint; the repaint is what makes it visible.
+def test_a_refused_ruler_stage_rolls_its_lane_back_locally_and_heals_only_what_it_cannot():
+    """The bar, the lane and its recipe were one ordered batch, so they go back
+    together -- locally, because the refetch fails exactly when the write did,
+    and a lane left behind would be COMMITTED by the next ruler drop, whose
+    `set_lane_count` is absolute. When something else has since used the new
+    lane, the local undo stands down and the refetch heal takes over: run when
+    the queue is idle, re-armed when it is not, recorded when it could not."""
+    _run_gesture_node(_CLASS_C_SETUP + """
+        const run = async ({ busy, occupy }) => {
+            const scene = referenceScene();
+            const w = referenceWidget(scene);
+            let refetched = 0;
+            const deferred = [];
+            w._fetchScenes = async () => { refetched += 1; return false; };
+            w._hasPendingProjectMutations = () => busy;
+            w._deferProjectBackedRefresh = (keys, reason) => deferred.push([keys, reason]);
+            w._timelineRulerHeight = () => 40;
+            const pending = w._placeReferencePayload({members: [drag('member-a')]}, 40, 10);
+            await new Promise((r) => setTimeout(r, 0));
+            assert.equal(scene.reference_lane_count, 2, 'the new lane is painted');
+            if (occupy) scene.reference_items.push({reference_item_id: 'other', lane_index: 1,
+                start_frame: 0, end_frame: 10, members: []});
+            w.released[0].reject(Object.assign(new Error('refused'), {status: 409}));
+            await pending;
+            const diag = (window.__SONDER_CANVAS_DIAG?.events || [])
+                .filter((e) => e.kind === 'reference_stage_rollback_deferred').length;
+            return { refetched, deferred, diag, lanes: scene.reference_lane_count,
+                recipes: scene.reference_lane_recipes.length,
+                configs: scene.reference_lane_configs.length,
+                bars: scene.reference_items.filter((row) => row.reference_item_id !== 'other').length };
+        };
+        for (const busy of [false, true]) {
+            const local = await run({ busy, occupy: false });
+            assert.equal(local.bars, 0, 'the bar went locally');
+            assert.deepEqual([local.lanes, local.recipes, local.configs], [1, 1, 1],
+                'and so did its lane and recipe');
+            assert.equal(local.refetched, 0, 'with no refetch');
+            assert.deepEqual(local.deferred, [], 'and nothing to heal');
+        }
+        const idle = await run({ busy: false, occupy: true });
+        assert.equal(idle.lanes, 2, 'a lane something else now uses is not taken away');
+        assert.equal(idle.refetched, 1, 'idle: the heal runs');
+        const busy = await run({ busy: true, occupy: true });
+        assert.equal(busy.refetched, 0, 'busy: no ungated GET over a queued paint');
+        assert.deepEqual(busy.deferred, [[['scenes'], 'reference_stage_error']], 'the heal is re-armed');
+        assert.ok(idle.diag >= 1, 'a heal that could not apply is recorded');
+        assert.equal(busy.diag, idle.diag + 1, 'and so is a re-armed one');
+    """)
 
-    Both Reference catches used to refetch and draw nothing, which was harmless
-    while there was no optimistic state to discard.
+
+def test_a_refused_stage_repaints_after_discarding_the_optimistic_bar():
+    """The painted bar is removed locally; the repaint is what makes it visible.
+
+    The discard used to be a refetch, which fails exactly when the write did for
+    an unreachable server (`durable_rules.md`: a local optimistic apply owes a
+    rollback that works without the network). A stage onto an existing lane of
+    its own kind painted only the bar, so nothing is fetched at all.
     """
     _run_gesture_node(_CLASS_C_SETUP + """
         const scene = referenceScene();
         const w = referenceWidget(scene);
         let refetched = 0;
-        w._fetchScenes = async () => {
-            refetched += 1;
-            scene.reference_items = [];      // what the server actually holds
-            return true;
-        };
+        w._fetchScenes = async () => { refetched += 1; return false; };
+        w._hasPendingProjectMutations = () => false;
         const pending = w._placeReferencePayload({members: [drag('member-a')]}, 40);
         await new Promise((r) => setTimeout(r, 0));
         assert.equal(scene.reference_items.length, 1, 'painted');
@@ -4495,7 +4544,7 @@ def test_a_refused_stage_repaints_after_discarding_the_optimistic_bar():
 
         w.released[0].reject(new Error('Reference placement was refused.'));
         await pending;
-        assert.equal(refetched, 1);
+        assert.equal(refetched, 0, 'no network heal for a bar-only paint');
         assert.equal(scene.reference_items.length, 0, 'the paint was discarded');
         assert.ok(w.paints > paintsBefore, 'and the discard was drawn');
     """)

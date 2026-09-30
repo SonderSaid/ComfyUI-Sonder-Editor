@@ -25,6 +25,9 @@ EXEMPT = {
     "_runSceneMutation": "Serializes already-attributed intent.",
     "_runQueueMutation": "Serializes already-attributed intent.",
     "_handleAssetDropWithinGesture": "Existing threaded asset-drop composite.",
+    "_commitReferenceStageWithinGesture": (
+        "Shared Reference stage tail; called only from inside the placeReferencePayload "
+        "and stageReferenceItemOnLane gestures, which own the diagnostics and the Undo step."),
     "_queueUndoWithinGesture": "Existing FIFO history boundary.",
     "_queueRedoWithinGesture": "Existing FIFO history boundary.",
     "_restoreScene": "Threaded history restore/token requests; never a new gesture.",

@@ -417,6 +417,10 @@ _MUTATION_HELPERS = {
 # scene candidate: posting is not stamping, and their intents lack sceneId.
 
 UNDO_CLAIM_EXEMPTIONS = {
+    **{(gesture, finding): ("Reserves its own step, then hands the exact entry to the stage tail both Reference staging gestures share, which sends it as `historyEntry`. The handoff is pinned by DEFERRED_UNDO_CLAIMS['reference stage ({})'], link by link. Delete this exception when the scan follows argument handoffs, or when the tail is folded back into its callers.".format(surface))
+       for gesture, surface in (("placeReferencePayload", "timeline drop"),
+                                ("stageReferenceItemOnLane", "panel add"))
+       for finding in ("forward-not-followed", "missing-mutation-helper")},
     ("_toggleHeaderVisibility", "missing-mutation-helper"): (
         "Reserves and hands the entry to _applyHeaderVisibilityBulkWithinGesture "
         "as an argument, which this scan does not follow. The handoff is pinned "
@@ -507,6 +511,22 @@ DEFERRED_UNDO_CLAIMS = {
         "expiry": "Remove when a single-lane control calls it, or when the "
                   "method is deleted with its test anchor.",
     },
+    **{f"reference stage ({surface})": {
+        "form": "argument",
+        "producer": producer,
+        "consumer": "_commitReferenceStageWithinGesture",
+        "label": "add reference item", "binding": "historyEntry",
+        "entrypoint": "_commitReferenceStageWithinGesture",
+        "parameter": "historyEntry", "entry": "historyEntry",
+        "reason": "The timeline drop and the Reference panel's Add each reserve "
+                  "their own step after their own refusals, then share one stage "
+                  "tail that paints, sends and rolls back. The tail never "
+                  "reserves; it sends the entry it was handed.",
+        "expiry": "Remove when the scan follows argument handoffs, or when the "
+                  "tail is folded back into its callers.",
+    } for surface, producer in (
+        ("timeline drop", "_placeReferencePayloadWithinGesture"),
+        ("panel add", "_stageReferenceItemOnLaneWithinGesture"))},
     "asset drop": {
         "form": "local-helper",
         "producer": "_handleAssetDropWithinGesture",
@@ -574,6 +594,9 @@ SCANNED_RESERVING_UNITS = (
     "appendReferenceMembers", "applyPromptSetup", "assetDrop",
     "consolidateSelectedItemsToLane", "convertClipRole", "deleteGuide",
     "deleteItemsInLane", "deletePromptSection",
+    # Paint-first Reference Lane Setup Phase 3: the panel's Delete item and Add
+    # item are host gestures that reserve their own step.
+    "deleteReferenceItemFromPanel",
     "deleteSelectedItems", "deleteSelectedLanesAndItems",
     # 0.6.0 L4c: a lane rename and a recipe save own their Undo step, pushed by
     # `_saveLaneConfigWithinGesture` itself when given `undoLabel`.
@@ -582,7 +605,7 @@ SCANNED_RESERVING_UNITS = (
     "moveReferenceLane", "placeReferencePayload", "removeLane",
     "removeLaneDeletingItems", "removeLaneWithItems", "renameScene",
     "replaceAudioSource", "replaceClipSource", "replaceGuideImage",
-    "saveNewPromptSection", "splitItem", "swapGuides", "toggleMute",
+    "saveNewPromptSection", "splitItem", "stageReferenceItemOnLane", "swapGuides", "toggleMute",
     "unlinkItems", "updateLinkedPromptAttachment", "updatePromptSection",
     "updateSceneDuration", "updateSceneGlobalContext",
 )

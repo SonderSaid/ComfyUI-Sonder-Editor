@@ -14,6 +14,8 @@
 //   _openReferenceMediaEditor({ asset, draft, readOnly }),
 //   _isLaneLocked(type, laneIndex),
 //   _saveLaneConfig(entries, { expectedLaneId, undoLabel }),
+//   _stageReferenceItemOnLane(payload, laneIndex, startFrame),
+//   _deleteReferenceItemFromPanel(itemId),
 //   _runSceneMutation(ops, opts), _mutateReferences(ops),
 //   _fetchReferences(opts), _fetchScenes(opts), _buildTrackLayout(),
 //   _renderTimeline(), _pushUndo(label), _discardLastUndo(label)
@@ -24,7 +26,10 @@
 //      deliberately rematerializes the catalog's current values.
 //   2. Every reference-item write carries exact prior values in `expected` and
 //      runs non-coalesced — the backend requires the snapshot and treats a
-//      mismatch as a terminal conflict, never a replay signal.
+//      mismatch as a terminal conflict, never a replay signal. Staging and
+//      deleting are host writers that meet this themselves (the panel sends
+//      intent: members, or an item id); the field edits below still build their
+//      own operation.
 
 import {
     EDITOR_COLORS as COLORS,
@@ -40,7 +45,11 @@ import {
     PRIORITY as KEY_PRIORITY,
 } from "./keyboard_ownership.js";
 import { TRACK_TYPE } from "./editor_timeline_constants.js";
-import { preserveLaneRecipeIdentity } from "./reference_lane_identity.js";
+import {
+    laneStagingPopulation,
+    memberPopulationCompatible,
+    preserveLaneRecipeIdentity,
+} from "./reference_lane_identity.js";
 import {
     createMemberDraft,
     formatReferenceTag,
@@ -389,30 +398,6 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             entry.member_id === memberRef.member_id
                 ? { ...entry, audio_intent: value } : entry);
         return writeItem(item, { members }, label);
-    };
-
-    const runItemOperation = async (operation, label) => {
-        if (state.busy) return;
-        state.busy = true;
-        host._pushUndo?.(label);
-        try {
-            const result = await host._runSceneMutation([operation], {
-                key: `scene:${host.activeSceneId}:reference-panel-op:${Date.now()}`,
-                label,
-                coalesce: false,
-                refreshScenes: false,
-            });
-            host._reconcileActiveSceneFromMutation?.(result, { reason: "reference_panel", ignoreTimelineGate: true });
-        } catch (error) {
-            host._discardLastUndo?.(label);
-            notifyWarning(error?.message || "Reference edit was refused.", { source: "reference-panel-refused" });
-            await host._fetchScenes?.({ ignoreMutationGate: true, reason: "reference_panel_error" });
-        } finally {
-            state.busy = false;
-        }
-        host._buildTrackLayout?.();
-        host._renderTimeline?.();
-        render();
     };
 
     // ── Recipe form ────────────────────────────────────────────────────────
@@ -1265,10 +1250,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
      */
     const renderMemberPicker = (item, mediaKind) => {
         const creating = item.reference_item_id === NEW_ITEM;
-        const physicalPopulation = String(
-            laneRecipe().recipe?.soft?.physical_population || "");
-        const picturesOnly = physicalPopulation === "pictures";
-        const videosOnly = physicalPopulation === "videos";
+        const physicalPopulation = laneStagingPopulation(laneRecipe());
         const wrap = el("div", "", `
             display:flex; flex-direction:column; gap:5px; padding:6px;
             border:1px dashed ${COLORS.border}; border-radius:6px;
@@ -1298,14 +1280,9 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                     const asset = host._findAssetById?.(member.asset_id) || null;
                     // A wrong-kind member is never offered: media_kind is a hard
                     // lane property and the backend refuses the write anyway.
-                    const compatible = mediaKind === "image"
-                        ? (picturesOnly ? asset?.asset_type === "image"
-                            : (videosOnly ? asset?.asset_type === "video"
-                                : ["image", "video"].includes(asset?.asset_type)))
-                        : (mediaKind === "video" ? asset?.asset_type === "video"
-                            : (asset?.asset_type === "audio"
-                                || (asset?.asset_type === "video" && asset?.has_audio)));
-                    if (!asset || !compatible) continue;
+                    // One rule, the route's mirror, for the offer and the stage.
+                    if (!asset || !memberPopulationCompatible(physicalPopulation, mediaKind,
+                        asset.asset_type, { hasAudio: !!asset.has_audio })) continue;
                     const tagSearch = (member.tags || []).map((tag) => referenceTagSearchText(tag, {
                         catalog: host._referenceTagPresets,
                         families: host._referenceTagFamilies,
@@ -1321,7 +1298,10 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                         state.pickerQuery = "";
                         const memberRef = { entity_id: reference.reference_id, member_id: member.member_id };
                         if (creating) {
-                            void createItem([memberRef]);
+                            // Staging paints synchronously, so this render
+                            // closes the picker and shows the new card at once.
+                            createItem([memberRef]);
+                            render();
                             return;
                         }
                         void writeItem(item, {
@@ -1603,11 +1583,13 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             mute.addEventListener("click", () => void writeItem(item, { muted: !item.muted }, "toggle reference mute"));
             const del = button("Delete item", "Remove this staged item", "danger");
             del.disabled = locked;
-            del.addEventListener("click", () => void runItemOperation({
-                type: "delete_reference_item",
-                reference_item_id: item.reference_item_id,
-                expected: { ...item },
-            }, "delete reference item"));
+            // The host resolves the live row by id when it acts, builds the
+            // guard from it, paints the removal and owns the rollback.
+            // Addressed by id, so a lane moved since the draw names the same row.
+            del.addEventListener("click", () => {
+                if (!mounted) return;
+                void host._deleteReferenceItemFromPanel(item.reference_item_id);
+            });
             top.append(mute, del);
             card.appendChild(top);
 
@@ -1671,36 +1653,23 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
 
     // A reference item must carry at least one member — the backend refuses an
     // empty one — so creation runs from the picker, never from a bare button.
-    const createItem = async (members) => {
-        const items = laneItems();
-        const duration = Math.max(1, parseInt(host.activeScene?.duration_frames, 10) || host.totalFrames || 1);
-        const start = Math.min(duration - 1, Math.max(0, Math.round(Number(host.playhead) || 0)));
-        if (items.some((item) => {
-            const end = item.end_frame === -1 ? duration : item.end_frame;
-            return (item.start_frame || 0) <= start && end > start;
-        })) {
-            notifyWarning("Another item already covers the playhead on this lane. Move the playhead and try again.", { source: "reference-panel-refused" });
+    // The host stages it through the timeline's own tail: it refuses locally
+    // (lock, an item already covering the playhead, a member the lane cannot
+    // take), mints the id, paints the bar and owns the rollback. The painted
+    // bar reaches this panel through the host's gated refresh.
+    const createItem = (members) => {
+        if (!mounted) return;
+        if (drawnLaneMoved()) {
             render();
+            if (mounted) {
+                notifyWarning("This Reference lane moved since the panel was drawn.",
+                    { source: "reference-panel-stale" });
+            }
             return;
         }
-        // The host owns the scan, so this surface and the timeline drop cannot
-        // measure the lane differently. `end_frame` is read back off the guard
-        // rather than recomputed, for the same reason.
-        const guard = host._referenceCreationGuard(state.laneIndex, start);
-        await runItemOperation({
-            type: "create_reference_item",
-            expected: guard,
-            fields: {
-                lane_index: state.laneIndex,
-                start_frame: start,
-                end_frame: guard.next_start_frame,
-                members,
-                prompt_override: "",
-                strength: 1.0,
-                sequence_frames: 0,
-                muted: false,
-            },
-        }, "add reference item");
+        const duration = Math.max(1, parseInt(host.activeScene?.duration_frames, 10) || host.totalFrames || 1);
+        const start = Math.min(duration - 1, Math.max(0, Math.round(Number(host.playhead) || 0)));
+        void host._stageReferenceItemOnLane({ members }, state.laneIndex, start);
     };
 
     // ── Shell ──────────────────────────────────────────────────────────────
