@@ -1,6 +1,9 @@
 // @server-mirror server/timeline_state.py::default_reference_class
 // @server-mirror server/timeline_state.py::normalize_reference_tags
 // @server-mirror server/routes.py::_validated_reference_tags
+// @server-mirror server/routes.py::_apply_create_reference
+// @server-mirror server/routes.py::_member_from_fields
+// @server-mirror server/routes.py::_CLIENT_ID_PATTERN
 // Scope and parity disposition: tests/test_mutation_authoring_contract.py::MIRRORED_MODULES
 const RESERVED_TAG_PREFIX = "sonder:";
 const VALID_KINDS = new Set(["character", "location", "prop", "outfit"]);
@@ -452,6 +455,83 @@ export function filterReferences(references = [], query = "", assets = [], catal
     });
 }
 
+/** A durable id for a new Reference or Library member, minted by the client
+ *  so the row it paints carries the id the server will store (32 hex, the
+ *  shape `_new_reference_id` mints and `_CLIENT_ID_PATTERN` accepts).
+ *
+ *  `crypto.getRandomValues` rather than `randomUUID`, which a non-secure
+ *  origin (a LAN address over http) does not provide. Uniqueness is not
+ *  attempted: the route refuses a taken id with 409 `id_conflict` rather than
+ *  re-minting it, and at 128 bits that refusal is vanishingly rare. */
+export function mintReferenceLibraryId() {
+    const bytes = new Uint8Array(16);
+    if (typeof globalThis.crypto?.getRandomValues === "function") {
+        globalThis.crypto.getRandomValues(bytes);
+    } else {
+        for (let index = 0; index < bytes.length; index += 1) {
+            bytes[index] = Math.floor(Math.random() * 256) & 0xff;
+        }
+    }
+    return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/** The Reference `_apply_create_reference` stores, as `to_dict` serves it,
+ *  for fields the route accepts. A create's row is painted as this record, so
+ *  a guard later read from that row (an Edit's base, a Delete's snapshot) is
+ *  what the server holds once the create lands. */
+export function referenceCreateRecord(fields = {}, referenceId = "") {
+    const source = fields && typeof fields === "object" ? fields : {};
+    const kind = source.kind ?? "character";
+    return {
+        reference_id: String(referenceId ?? ""),
+        name: String(source.name || "").trim(),
+        kind,
+        reference_class: source.reference_class ?? defaultReferenceClass(kind),
+        description: String(source.description || ""),
+        visual_intent: source.visual_intent ?? "preserve",
+        audio_intent: source.audio_intent ?? "reference_characteristics",
+        members: [],
+    };
+}
+
+/** The member `_member_from_fields` builds, as `ReferenceMember.to_dict`
+ *  serves it, for fields the route accepts. `delete_member` requires every
+ *  `to_dict` key in its guard, so a Remove of a member still saving sends this
+ *  whole record. Tags keep the route's whitespace and duplicate
+ *  normalization; a preset tag is expected in its canonical spelling, as the
+ *  member form sends it (the route would re-case a preset sent otherwise, and
+ *  a Remove guarded by the painted spelling would then be refused, loudly). */
+export function referenceMemberCreateRecord(fields = {}, memberId = "", order = 0) {
+    const source = fields && typeof fields === "object" ? fields : {};
+    const tags = normalizeReferenceTags(source.tags).tags;
+    const crop = source.crop == null ? null
+        : Object.fromEntries(["x", "y", "w", "h"].map((key) => [key, Number(source.crop[key])]));
+    const end = source.source_end_sec == null || source.source_end_sec === ""
+        ? null : Number(source.source_end_sec);
+    const capabilities = [];
+    for (const value of Array.isArray(source.disabled_capabilities) ? source.disabled_capabilities : []) {
+        const id = String(value || "").trim();
+        if (id && !capabilities.includes(id)) capabilities.push(id);
+    }
+    return {
+        member_id: String(memberId ?? ""),
+        asset_id: String(source.asset_id || ""),
+        name: String(source.name || "").trim(),
+        handle: String(source.handle || "").trim(),
+        visual_intent: source.visual_intent ? String(source.visual_intent) : "",
+        audio_intent: source.audio_intent ? String(source.audio_intent) : "",
+        attachment_defaults: source.attachment_defaults && typeof source.attachment_defaults === "object"
+            ? structuredClone(source.attachment_defaults) : {},
+        disabled_capabilities: capabilities,
+        tags,
+        prompt: String(source.prompt || ""),
+        crop,
+        order: Number(order) || 0,
+        source_start_sec: Number(source.source_start_sec ?? 0),
+        source_end_sec: end,
+    };
+}
+
 /** Library writes that paint before the server answers: every Library
  *  sidebar write. Each paint is an overlay its own mutation owns, so a refusal
  *  drops it with no network. The guards stay exact-prior-value: a form's
@@ -463,17 +543,23 @@ export const PAINT_FIRST_REFERENCE_OPERATIONS = Object.freeze(new Set([
 
 /** Describe one paint-first operation as a display overlay, or null.
  *
- *  `key` doubles as the temporary id of the row a create paints (`pending:<n>`);
- *  it never reaches the server and no request can name it, which is why a
- *  pending CREATE is inert (`pendingInert`). An update or delete names a real
- *  id, so the row it paints stays usable while it saves.
+ *  A create carries the id the client minted for it (`createdId`, the
+ *  operation's own `reference_id` or `member_id`), and its row is painted
+ *  under that id, usable at once: every later write naming it is queued behind
+ *  the create. Against a server that does not adopt client ids nothing is
+ *  minted, and `key` doubles as the row's temporary id (`pending:<n>`), which
+ *  no request may name -- that row alone is inert (`pendingInert`). An update
+ *  or delete names a real id, so the row it paints stays usable while it saves.
  */
 export function referenceOverlayFromOperation(operation, key) {
     const type = String(operation?.type || "");
     if (!PAINT_FIRST_REFERENCE_OPERATIONS.has(type)) return null;
+    const createdId = type === "create_reference" ? String(operation?.reference_id || "")
+        : (type === "create_member" ? String(operation?.member_id || "") : "");
     return {
         key: String(key),
         type,
+        createdId,
         reference_id: String(operation?.reference_id || ""),
         member_id: String(operation?.member_id || ""),
         fields: operation?.fields && typeof operation.fields === "object"
@@ -487,58 +573,33 @@ export function referenceOverlayFromOperation(operation, key) {
     };
 }
 
-/** The ids a pending Library delete is taking away: References, and every
- *  member either a `delete_member` or a `delete_reference` removes. The host
- *  refuses to stage, append or attach these while the delete is in flight. */
-export function referenceIdsBeingDeleted(overlays = [], references = []) {
-    const referenceIds = new Set();
-    const memberIds = new Set();
-    for (const overlay of Array.isArray(overlays) ? overlays : []) {
-        if (overlay?.type === "delete_member" && overlay.member_id) {
-            memberIds.add(String(overlay.member_id));
-        } else if (overlay?.type === "delete_reference") {
-            referenceIds.add(String(overlay.reference_id));
-            for (const id of Array.isArray(overlay.expected?.member_ids) ? overlay.expected.member_ids : []) {
-                memberIds.add(String(id));
-            }
-            const target = (Array.isArray(references) ? references : []).find((entry) =>
-                String(entry?.reference_id || "") === overlay.reference_id);
-            for (const member of target?.members || []) memberIds.add(String(member?.member_id || ""));
-        }
-    }
-    memberIds.delete("");
-    return { referenceIds, memberIds };
-}
-
 /** The Library as displayed: acknowledged References plus pending overlays.
  *
- *  Pure and view-only. Nothing is written back into `references`; the host
- *  keeps the server's payload as the only authority and every other consumer
- *  (staging, Attach, pickers, prompt compilation) reads that, never this.
- *  Rolling a failed write back is therefore just dropping its overlay.
+ *  Pure. Nothing is written back into `references`, which stay the server's
+ *  payload and the only authority; rolling a failed write back is dropping its
+ *  overlay. The host's effective view (`_referencesView`) is this, and it is
+ *  what surfaces that display or offer Library data read. Paths that describe
+ *  server truth read the acknowledged data instead.
  *
  *  Overlays apply in authoring order, which is the queue's send order, so the
  *  displayed order is what the server will hold once they all land. Painted
- *  rows carry `pendingStatus` for their "Saving…" label; only a create's row
- *  also carries `pendingInert`, because only its id is temporary. Untouched
- *  References keep their identity.
+ *  rows carry `pendingStatus` for their "Saving…" label. A create's row also
+ *  carries `pendingCreate` -- a chip picker skips it, because a chip names a
+ *  member without the route checking it exists -- and `pendingInert` when it
+ *  has no minted id. A create whose id acknowledged data already shows is not
+ *  painted twice. Untouched References keep their identity.
  */
 export function applyPendingReferenceOverlays(references = [], overlays = []) {
     const result = Array.isArray(references) ? [...references] : [];
     for (const overlay of Array.isArray(overlays) ? overlays : []) {
         if (overlay?.type === "create_reference") {
-            const kind = VALID_KINDS.has(overlay.fields?.kind) ? overlay.fields.kind : "character";
+            if (overlay.createdId && result.some((reference) =>
+                String(reference?.reference_id || "") === overlay.createdId)) continue;
             result.push({
-                description: "",
-                visual_intent: "preserve",
-                audio_intent: "reference_characteristics",
-                reference_class: defaultReferenceClass(kind),
-                ...overlay.fields,
-                kind,
-                reference_id: overlay.key,
-                members: [],
+                ...referenceCreateRecord(overlay.fields, overlay.createdId || overlay.key),
                 pendingStatus: overlay.status || "saving",
-                pendingInert: true,
+                pendingCreate: true,
+                ...(overlay.createdId ? {} : { pendingInert: true }),
             });
             continue;
         }
@@ -550,16 +611,17 @@ export function applyPendingReferenceOverlays(references = [], overlays = []) {
         const reference = result[index];
         const members = Array.isArray(reference.members) ? reference.members : [];
         if (overlay.type === "create_member") {
+            if (overlay.createdId && members.some((member) =>
+                String(member?.member_id || "") === overlay.createdId)) continue;
             // `order = len(members)`, as `_apply_create_reference_member` assigns.
             result[index] = {
                 ...reference,
                 members: [...members, {
-                    tags: [], prompt: "", crop: null, source_start_sec: 0, source_end_sec: null,
-                    ...overlay.fields,
-                    member_id: overlay.key,
-                    order: members.length,
+                    ...referenceMemberCreateRecord(overlay.fields,
+                        overlay.createdId || overlay.key, members.length),
                     pendingStatus: overlay.status || "saving",
-                    pendingInert: true,
+                    pendingCreate: true,
+                    ...(overlay.createdId ? {} : { pendingInert: true }),
                 }],
             };
         } else if (overlay.type === "update_reference") {
@@ -598,18 +660,19 @@ export function applyPendingReferenceOverlays(references = [], overlays = []) {
 
 /** True once acknowledged References already show what this overlay painted.
  *
- *  A create counts only by a committed id the server returned. A delete counts
- *  once its target is gone. An update or a reorder never qualifies: a value
- *  or an order can match by coincidence — Up then Down restores an order, and
- *  a later edit can restore a value — so a later write would leave ahead of
- *  an earlier one and the display would show what the server does not hold.
- *  Each waits for a payload that postdates it.
+ *  A create counts by its id: the one the server returned, else the one the
+ *  client minted. A delete counts once its target is gone. An update or a
+ *  reorder never qualifies: a value or an order can match by coincidence — Up
+ *  then Down restores an order, and a later edit can restore a value — so a
+ *  later write would leave ahead of an earlier one and the display would show
+ *  what the server does not hold. Each waits for a payload that postdates it.
  */
 export function referenceOverlayReflected(references = [], overlay = null) {
     const list = Array.isArray(references) ? references : [];
+    const createdId = String(overlay?.committedId || overlay?.createdId || "");
     if (overlay?.type === "create_reference") {
-        return !!overlay.committedId && list.some((reference) =>
-            String(reference?.reference_id || "") === overlay.committedId);
+        return !!createdId && list.some((reference) =>
+            String(reference?.reference_id || "") === createdId);
     }
     const reference = list.find((entry) =>
         String(entry?.reference_id || "") === overlay?.reference_id);
@@ -617,7 +680,7 @@ export function referenceOverlayReflected(references = [], overlay = null) {
     const memberIds = (reference?.members || []).map((member) => String(member?.member_id || ""));
     if (overlay?.type === "delete_member") return !memberIds.includes(overlay.member_id);
     if (overlay?.type === "create_member") {
-        return !!overlay.committedId && memberIds.includes(overlay.committedId);
+        return !!createdId && memberIds.includes(createdId);
     }
     return false;
 }

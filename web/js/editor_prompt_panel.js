@@ -929,8 +929,8 @@ export function mountPromptManagementPanel(host) {
         typeof host._acceptPromptAttachmentConfiguration === "function"
             ? host._acceptPromptAttachmentConfiguration(result)
             : promptAttachmentConfiguration(result).attachment;
-    // What a chip picker or configure dialog may offer: the acknowledged
-    // Library less what a delete in flight is taking away.
+    // What a chip picker or configure dialog may offer: the effective view
+    // without rows still being created (`_referencesOfferable`).
     const offerableReferences = () => host._referencesOfferable?.() ?? (host._references || []);
     const acceptDraftConfiguration = (result) => {
         const configured = promptAttachmentConfiguration(result);
@@ -998,7 +998,7 @@ export function mountPromptManagementPanel(host) {
     const guard = { suppressBlurCommit: false, focusedBox: null };
     const attachmentLabelFor = (attachment) => resolveReferenceAttachmentIdentity(attachment, {
         scene: host.activeScene,
-        references: host._references || [],
+        references: host._referencesView?.() ?? (host._references || []),
         semanticUnits: host._promptSemanticUnits || [],
     });
     const registerPromptBoxGuard = (area, revertValue) => {
@@ -3665,7 +3665,11 @@ Server value: ${serverValue}` : ""}`;
             scene,
             profile: identityProfile,
             catalog: host._promptContextCatalog || {},
-            references: host._references || [],
+            // What may be offered: the effective view without rows still being
+            // created. An identity's sources are saved by a direct write that
+            // never checks the member exists, and handle and defaults writes
+            // must not name a create that may yet be refused.
+            references: host._referencesOfferable?.() ?? (host._references || []),
             assets: host._allProjectAssetsForGallery?.() || [],
             semanticUnits: host._promptSemanticUnits || [],
             projectKey: host._projectDirName?.() || host.projectId || "project",

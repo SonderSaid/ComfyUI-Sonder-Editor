@@ -1403,13 +1403,21 @@ MIRRORED_MODULES = {
             "test_declared_token_grammar_matches_between_python_and_javascript")),
     },
     "reference_library_model.js": {
-        "scope": "Default Reference class and tag normalization/preset-asset compatibility intent; input tolerance and case handling are not certified equivalent.",
+        "scope": ("Default Reference class and tag normalization/preset-asset compatibility intent "
+                  "(input tolerance and case handling are not certified equivalent); the Reference and "
+                  "member records a create stores, for accepted fields; the minted id's shape."),
         "authorities": ("server/timeline_state.py::default_reference_class",
                         "server/timeline_state.py::normalize_reference_tags",
-                        "server/routes.py::_validated_reference_tags"),
-        "tests": (),
+                        "server/routes.py::_validated_reference_tags",
+                        "server/routes.py::_apply_create_reference",
+                        "server/routes.py::_member_from_fields",
+                        "server/routes.py::_CLIENT_ID_PATTERN"),
+        "tests": tuple("test_reference_library_record_parity.py::" + name for name in (
+            "test_a_created_reference_is_painted_as_the_route_stores_it",
+            "test_a_created_member_is_painted_as_the_route_stores_it",
+            "test_a_minted_library_id_has_the_shape_the_route_accepts")),
         "exemption": {
-            "reason": "Reference Library JS tests assert literals, not backend decisions; normalization/case/input boundaries also need comparison.",
+            "reason": "Covers the first three authorities only: Reference Library JS tests assert literals, not backend decisions; normalization/case/input boundaries also need comparison.",
             "owner": "Reference Library maintainer (server/routes.py::_validated_reference_tags)",
             "expiry": "Remove when direct class/tag/asset decision comparisons pin intended equivalence and explain deliberate input-tolerance differences.",
         },
@@ -1556,7 +1564,7 @@ def test_declared_mirror_headers_match_the_inventory_both_ways():
 
 def test_every_declared_mirror_has_a_live_parity_disposition():
     _assert_mirror_obligations(MIRRORED_MODULES, ROOT)
-    assert sum(len(row["authorities"]) for row in MIRRORED_MODULES.values()) == 56
+    assert sum(len(row["authorities"]) for row in MIRRORED_MODULES.values()) == 59
 
 @pytest.mark.parametrize("name, valid", [("TABLE", True), ("row", False), ("transform", True)])
 def test_mirror_authorities_are_module_declarations(tmp_path, name, valid):

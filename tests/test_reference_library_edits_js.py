@@ -79,10 +79,10 @@ def test_the_model_paints_edits_and_deletes_and_keeps_only_creates_inert():
         assert.equal(model.referenceOverlayReflected(
             [{{ ...acknowledged[0], name: 'Rider' }}], overlays[0]), false);
 
-        // What a delete in flight takes away.
-        const going = model.referenceIdsBeingDeleted(overlays, acknowledged);
-        assert.deepEqual([...going.referenceIds], ['q']);
-        assert.deepEqual([...going.memberIds].sort(), ['m0', 'n0']);
+        // What a delete in flight takes away is not displayed; the host's
+        // `_referenceMemberBeingDeleted` is "stored, but not in the view".
+        const displayed = shown.flatMap((entry) => entry.members.map((m) => m.member_id));
+        assert.deepEqual(displayed.filter((id) => ['m0', 'n0'].includes(id)), []);
 
         // Stored-form comparison for a lost update.
         assert.equal(model.referenceFieldStoredAs('tags', ['Sonder:Portrait'], ['sonder:portrait']), true);

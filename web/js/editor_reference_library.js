@@ -25,9 +25,13 @@
 //      paint, a follower's, or predate the refresh the refusal asked for.
 //      A button with no form (Remove, Delete, Up, Down) reads the displayed
 //      row at the click. Never re-read the live row to build a guard.
-//   3. A row whose create is still saving (`pendingInert`) has a temporary id
-//      no request may name: it is never edited, dragged, staged or deleted.
-//      A row whose update is saving (`pendingStatus` alone) is fully usable.
+//   3. A row still saving is fully usable: an update's row keeps its real id,
+//      and a create's row carries the id the host minted for it, so every
+//      write naming it is queued behind the create. Only a create sent to a
+//      server that does not adopt client ids is inert (`pendingInert`): its
+//      temporary id no request may name, so it is never edited, dragged,
+//      staged or deleted, and its Reference's Delete, Remove and reorder wait
+//      for it (`WAIT_FOR_MEMBER`).
 
 import {
     compatibleReferencePresets,
@@ -194,13 +198,13 @@ export function mountReferenceLibrary(container, host) {
     };
     container.style.cssText = "display:flex;flex-direction:column;min-height:0;overflow:hidden;height:100%;background:#11161b;color:#e6ebf0;";
 
-    // A row still being created has a temporary id no request can name, so it
+    // An inert row (invariant 3) has a temporary id no request can name, so it
     // is never staged, dragged or offered to the timeline until it settles.
     const settledMembers = (reference) => (reference?.members || [])
         .filter((member) => !member?.pendingInert);
     // A displayed record as stored: without the view's decoration.
     const storedRecord = (record) => {
-        const { pendingStatus: _status, pendingInert: _inert, ...rest } = record || {};
+        const { pendingStatus: _status, pendingInert: _inert, pendingCreate: _create, ...rest } = record || {};
         return structuredClone(rest);
     };
     const displayedReference = (referenceId) => (host.getData().references || [])

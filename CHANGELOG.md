@@ -16,6 +16,7 @@ a fresh `[Unreleased]` block.
 - A failed Reference staging drop on the timeline shows one message instead of two.
 - Reference Lane Setup: clearing a member's saved role or retention now says it can't be saved yet, instead of appearing to work and reverting later.
 - Reference Library: editing or deleting a Reference or a member now shows at once and saves in the background, and the form closes when you save. A removed member's staged bars leave the timeline at once too.
+- Reference Library: a new Reference or member can be used while it is still saving. You can edit it, remove it, reorder it, drag it onto the timeline or add it there, and each change is saved after it. Context chip pickers list it once it has saved.
 
 ### Fixed
 - Reference Lane Setup: a second edit made while the first was still saving was silently dropped. It is now saved after the first.
@@ -24,6 +25,7 @@ a fresh `[Unreleased]` block.
 - Dropping a Library member onto a staged Reference bar while another edit of that item was saving could be refused, and a failed drop refetched the scene over edits queued behind it.
 - Reference Library: a second edit of a Reference or member made while the first was still saving, or removing a member just after editing it, was refused as "changed elsewhere". Both are now saved in order.
 - Reference Library: saving an edit no longer reverts a field another tab changed while the form was open, when you did not change that field yourself.
+- Reference Library: when the answer to creating a Reference was lost, a Reference with the same name created elsewhere could be taken for it, and the warning that yours was not saved never appeared.
 - Removing a Library member or Reference, or permanently deleting the asset of a staged Library member, now updates the timeline as soon as it is saved. Its staged bars used to stay on the timeline, in every scene, until the editor reloaded, and editing them failed.
 
 ## [0.7.4] - 2026-09-29

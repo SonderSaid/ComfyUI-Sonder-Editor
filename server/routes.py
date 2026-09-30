@@ -1976,6 +1976,45 @@ def _client_reference_item_id(raw_id, taken: "set[str]") -> str:
     return candidate
 
 
+# A client-minted custom recipe id: the `custom:` namespace the server mints
+# into, then the shape `_CLIENT_ID_PATTERN` accepts.
+_CLIENT_RECIPE_ID_PATTERN = re.compile(r"^custom:[a-z0-9][a-z0-9_-]{3,63}$")
+
+
+def _client_library_id(raw_id, taken: "set[str]", label: str, *,
+                       pattern=_CLIENT_ID_PATTERN) -> str:
+    """A client-minted durable id for a new Library row, or "".
+
+    The contract `_client_reference_item_id` states, for the Reference
+    Library's creates: `create_reference`'s op-level `reference_id`,
+    `create_member`'s op-level `member_id`, and a `create_recipe` whose
+    `fields.id` the client supplied. The editor paints the new row under this
+    id before the write answers, so its next write -- an edit, a Remove, a stage
+    onto the timeline -- names it; a server-substituted id would send those to a
+    row that does not exist. A taken id is therefore refused `409 id_conflict`,
+    never re-minted.
+
+    `taken` is read by the caller at append time and includes the ids a delete
+    retired earlier in the same batch: `_preserve_project_unknown_fields`
+    overlays the loaded document's unknown fields by `reference_id` and
+    `member_id` until the next save, so a reused id would inherit the deleted
+    row's unknown fields.
+
+    `""` or None is ABSENT (the server mints, as before), as for the other
+    client ids. Stored ids are never revalidated.
+    """
+    if raw_id is None or raw_id == "":
+        return ""
+    # A string, not anything that stringifies, for the reason
+    # `_client_split_half_id` states.
+    candidate = raw_id if isinstance(raw_id, str) else None
+    if candidate is None or not pattern.match(candidate):
+        _mutation_error(f"{label} id is not a usable id", 400, "invalid_id")
+    if candidate in taken:
+        _mutation_error(f"{label} id {candidate} is already in use", 409, "id_conflict")
+    return candidate
+
+
 def _split_clip_object(scene: Scene, clip: ClipReference, split_frame: int,
                        right_id: str = "") -> ClipReference:
     if getattr(clip, "role", "render") == "motion_driver":
@@ -6364,6 +6403,12 @@ def _references_payload(project: TimelineProject) -> dict:
         "prompt_semantic_units": [dict(value) for value in
                                   project.prompt_semantic_units
                                   if isinstance(value, dict)],
+        # The Library creates that adopt a client-minted id
+        # (`_client_library_id`). The editor mints only when this is advertised,
+        # because a server older than it ignores an op-level id and the editor
+        # would paint a row under a name the server never stores. Remove once
+        # no supported server can ignore a client-minted id.
+        "client_ids": ["reference", "member", "recipe"],
         "prompt_context_catalog": {
             "schema_version": 1,
             "placement_phases": copy.deepcopy(
@@ -6754,15 +6799,19 @@ def _member_from_fields(project: TimelineProject, fields: dict, *, member_id: st
     )
 
 
-def _apply_create_reference(project: TimelineProject, fields: dict) -> ReferenceEntity:
+def _apply_create_reference(project: TimelineProject, fields: dict, *,
+                            reference_id: str = "") -> ReferenceEntity:
     if not isinstance(fields, dict):
         _mutation_error("Reference fields must be an object", 400, "invalid_reference")
+    # `fields.reference_id` stays an unknown field: a client-minted id travels
+    # at operation level, which a server older than it ignores rather than
+    # refusing (`_client_library_id`).
     unknown = set(fields).difference(_REFERENCE_ENTITY_FIELDS)
     if unknown:
         _mutation_error(f"Unsupported reference fields: {', '.join(sorted(unknown))}", 400, "invalid_reference_mutation")
     kind = _validated_reference_kind(fields.get("kind", "character"))
     reference = ReferenceEntity(
-        reference_id=_new_reference_id(project),
+        reference_id=reference_id or _new_reference_id(project),
         name=_validated_reference_name(fields.get("name")),
         kind=kind,
         reference_class=_validated_reference_class(
@@ -6834,9 +6883,11 @@ def _apply_delete_reference(project: TimelineProject,
     return reference, cascade
 
 
-def _apply_create_reference_member(project: TimelineProject, operation: dict) -> ReferenceMember:
+def _apply_create_reference_member(project: TimelineProject, operation: dict, *,
+                                   member_id: str = "") -> ReferenceMember:
     reference = _find_reference(project, str(operation.get("reference_id", "") or ""))
-    member = _member_from_fields(project, operation.get("fields"), order=len(reference.members))
+    member = _member_from_fields(project, operation.get("fields"), member_id=member_id,
+                                 order=len(reference.members))
     _require_prompt_handle_available(
         project, member.handle, "physical reference", member.member_id)
     reference.members.append(member)
@@ -7318,12 +7369,20 @@ def _reconcile_staged_reference_members(project: TimelineProject, removed_member
 
 def _apply_reference_mutation_operations(project: TimelineProject, operations: list) -> dict:
     results = []
+    # Ids a delete earlier in this batch retired. A client-minted create may not
+    # reuse one (`_client_library_id` says why).
+    retired: set[str] = set()
     for operation in operations:
         if not isinstance(operation, dict):
             _mutation_error("Reference operation must be an object", 400, "invalid_reference_mutation")
         op_type = str(operation.get("type", "") or "")
         if op_type == "create_reference":
-            reference = _apply_create_reference(project, operation.get("fields"))
+            reference_id = _client_library_id(
+                operation.get("reference_id"),
+                {reference.reference_id for reference in project.references} | retired,
+                "Reference")
+            reference = _apply_create_reference(project, operation.get("fields"),
+                                                reference_id=reference_id)
             results.append({"type": op_type, "reference_id": reference.reference_id})
         elif op_type == "update_reference":
             reference = _apply_update_reference(project, operation)
@@ -7332,10 +7391,19 @@ def _apply_reference_mutation_operations(project: TimelineProject, operations: l
             # `cascade` reports what the delete did to staged items, per scene,
             # so the editor can check its own copy instead of re-reading scenes.
             reference, cascade = _apply_delete_reference(project, operation)
+            retired.add(reference.reference_id)
+            retired.update(member.member_id for member in reference.members)
             results.append({"type": op_type, "reference_id": reference.reference_id,
                             "cascade": cascade})
         elif op_type == "create_member":
-            member = _apply_create_reference_member(project, operation)
+            # Member ids are unique project-wide, so an id another Reference
+            # holds is taken too.
+            member_id = _client_library_id(
+                operation.get("member_id"),
+                {member.member_id for reference in project.references
+                 for member in reference.members} | retired,
+                "Reference member")
+            member = _apply_create_reference_member(project, operation, member_id=member_id)
             results.append({
                 "type": op_type,
                 "reference_id": str(operation.get("reference_id", "") or ""),
@@ -7352,6 +7420,7 @@ def _apply_reference_mutation_operations(project: TimelineProject, operations: l
                             "handle": member.handle})
         elif op_type == "delete_member":
             member, cascade = _apply_delete_reference_member(project, operation)
+            retired.add(member.member_id)
             results.append({"type": op_type,
                             "reference_id": str(operation.get("reference_id", "") or ""),
                             "member_id": member.member_id, "cascade": cascade})
@@ -7359,15 +7428,35 @@ def _apply_reference_mutation_operations(project: TimelineProject, operations: l
             reference = _apply_reorder_reference_members(project, operation)
             results.append({"type": op_type, "reference_id": reference.reference_id})
         elif op_type == "create_recipe":
-            recipe = _normalize_custom_reference_recipe(operation.get("fields"))
+            fields = operation.get("fields")
+            supplied = fields.get("id") if isinstance(fields, dict) else None
+            recipe = _normalize_custom_reference_recipe(fields)
             _validate_reference_recipe_context(project, recipe)
-            existing_ids = {
+            taken = {
                 str(candidate.get("id", "") or "")
                 for candidate in project.reference_recipes if isinstance(candidate, dict)
             }
-            existing_ids.update(str(preset["id"]) for preset in ALL_REFERENCE_RECIPE_PRESETS)
-            if recipe["id"] in existing_ids:
-                recipe["id"] = f"custom:{uuid.uuid4().hex}"
+            taken.update(str(preset["id"]) for preset in ALL_REFERENCE_RECIPE_PRESETS)
+            taken |= retired
+            # A lane can still name a deleted recipe (the Lane Setup delete
+            # detaches only the current lane), and a reused id would silently
+            # re-link it.
+            taken.update(
+                str(getattr(lane_recipe, "recipe_id", "") or "")
+                for scene in project.scenes
+                for lane_recipe in getattr(scene, "reference_lane_recipes", []) or [])
+            taken.discard("")
+            if supplied not in (None, ""):
+                # Validated here and never inside
+                # `_normalize_custom_reference_recipe`, which `update_recipe`
+                # also runs on the STORED id.
+                recipe["id"] = _client_library_id(
+                    supplied, taken, "Reference recipe", pattern=_CLIENT_RECIPE_ID_PATTERN)
+            else:
+                # A server-minted id is still re-minted on a collision: no
+                # caller holds it yet.
+                while recipe["id"] in taken:
+                    recipe["id"] = f"custom:{uuid.uuid4().hex}"
             project.reference_recipes.append(recipe)
             results.append({"type": op_type, "recipe_id": recipe["id"]})
         elif op_type == "update_recipe":
@@ -7387,6 +7476,7 @@ def _apply_reference_mutation_operations(project: TimelineProject, operations: l
             index, current = _find_custom_reference_recipe(project, recipe_id)
             _validate_recipe_expected(current, operation.get("expected"))
             project.reference_recipes.pop(index)
+            retired.add(recipe_id)
             results.append({"type": op_type, "recipe_id": recipe_id})
         elif op_type == "delete_prompt_context_profile":
             profile_key = _apply_delete_prompt_context_profile(project, operation)

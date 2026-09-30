@@ -195,6 +195,7 @@ class Host {{
   _renderTimeline() {{}}
   _clearUnconfirmedReferenceRetry() {{}}
   _resetReferenceItemWriteState() {{}}
+  _setReferenceOverlays(overlays) {{ this._referenceOverlays = overlays; }}
   {methods}
   {update_project}
 }}

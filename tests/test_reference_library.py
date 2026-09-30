@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import importlib
 import json
 import os
@@ -10,7 +11,7 @@ import pytest
 from aiohttp import web
 
 import server
-from server import prompt_context
+from server import prompt_context, timeline_state
 from server.project_manager import load_project, save_project
 from server.timeline_state import (
     ALL_REFERENCE_RECIPE_PRESETS, REFERENCE_TAG_FAMILIES,
@@ -995,3 +996,167 @@ def test_a_permanent_asset_delete_reports_its_staged_cascade_per_scene(monkeypat
     }
     assert _staged_ids(load_project(project.project_dir))["scene-1"] == {
         "pair": ["member-b"], "other": ["member-b"]}
+
+
+# --- Client-minted Library ids (Library paint-first Phase 3) ---------------
+
+def _library_error(project, operations):
+    """The refusal of one batch. On a copy, as the route saves only a batch
+    that succeeds: operations before the refused one are never stored."""
+    with pytest.raises(routes.ProjectMutationRequestError) as exc_info:
+        routes._apply_reference_mutation_operations(copy.deepcopy(project), operations)
+    return exc_info.value.status, exc_info.value.code
+
+
+def _create_reference_op(reference_id=None, name="Minted"):
+    op = {"type": "create_reference", "fields": {"name": name, "kind": "character"}}
+    if reference_id is not None:
+        op["reference_id"] = reference_id
+    return op
+
+
+def _create_member_op(reference_id, member_id=None, **fields):
+    op = {"type": "create_member", "reference_id": reference_id,
+          "fields": _member_fields(**fields)}
+    if member_id is not None:
+        op["member_id"] = member_id
+    return op
+
+
+def test_library_creates_adopt_an_op_level_client_id(tmp_path):
+    project = _project(tmp_path)
+    payload = routes._apply_reference_mutation_operations(project, [
+        _create_reference_op("a" * 32),
+        _create_member_op("a" * 32, "b" * 32),
+    ])
+    assert payload["results"] == [
+        {"type": "create_reference", "reference_id": "a" * 32},
+        {"type": "create_member", "reference_id": "a" * 32, "member_id": "b" * 32},
+    ]
+    assert project.references[0].reference_id == "a" * 32
+    assert project.references[0].members[0].member_id == "b" * 32
+
+
+def test_an_absent_library_id_is_minted_by_the_server(tmp_path):
+    project = _project(tmp_path)
+    for absent in (None, ""):
+        payload = routes._apply_reference_mutation_operations(project, [
+            _create_reference_op(absent, name=f"R{absent!r}")])
+        reference_id = payload["results"][0]["reference_id"]
+        assert len(reference_id) == 32
+        payload = routes._apply_reference_mutation_operations(project, [
+            _create_member_op(reference_id, absent)])
+        assert len(payload["results"][0]["member_id"]) == 32
+
+
+@pytest.mark.parametrize("bad", ["Has Space", "ab", "UPPER-case", "-lead", "x" * 65, 12345, ["id"]])
+def test_a_library_id_of_the_wrong_shape_or_type_is_refused(tmp_path, bad):
+    project = _project(tmp_path)
+    project.references = [ReferenceEntity(reference_id="ref-1", name="Held")]
+    assert _library_error(project, [_create_reference_op(bad)]) == (400, "invalid_id")
+    assert _library_error(project, [_create_member_op("ref-1", bad)]) == (400, "invalid_id")
+
+
+def test_a_taken_library_id_is_refused_never_re_minted(tmp_path):
+    project = _project(tmp_path)
+    project.references = [
+        ReferenceEntity(reference_id="ref-1", name="One", members=[
+            ReferenceMember(member_id="member-1", asset_id="image-1")]),
+        ReferenceEntity(reference_id="ref-2", name="Two"),
+    ]
+    assert _library_error(project, [_create_reference_op("ref-1")]) == (409, "id_conflict")
+    # Member ids are unique project-wide: another Reference's member is taken.
+    assert _library_error(project, [_create_member_op("ref-2", "member-1")]) == (409, "id_conflict")
+    # Two creates in one batch minting the same id.
+    assert _library_error(project, [
+        _create_reference_op("fresh-id"), _create_reference_op("fresh-id")]) == (409, "id_conflict")
+
+
+def test_an_id_a_delete_retired_earlier_in_the_batch_is_taken(tmp_path):
+    """`[delete R, create R]` is refused, because the save would hand the new R
+    the old R's unknown fields (`_preserve_project_unknown_fields`)."""
+    project = _project(tmp_path)
+    member = ReferenceMember(member_id="member-1", asset_id="image-1")
+    project.references = [ReferenceEntity(reference_id="ref-1", name="Old", members=[member])]
+    raw = project.to_dict()
+    raw["references"][0]["future_field"] = "kept for R"
+    raw["references"][0]["members"][0]["future_field"] = "kept for M"
+    delete_reference = {"type": "delete_reference", "reference_id": "ref-1", "expected": {
+        "name": "Old", "kind": "character", "reference_class": "subject", "description": "",
+        "member_ids": ["member-1"]}}
+    assert _library_error(project, [delete_reference, _create_reference_op("ref-1")]) == (
+        409, "id_conflict")
+    assert _library_error(project, [delete_reference, _create_reference_op("fresh-ref"),
+                                    _create_member_op("fresh-ref", "member-1")]) == (409, "id_conflict")
+    delete_member = {"type": "delete_member", "reference_id": "ref-1", "member_id": "member-1",
+                     "expected": member.to_dict()}
+    assert _library_error(project, [delete_member, _create_member_op("ref-1", "member-1")]) == (
+        409, "id_conflict")
+
+    # The reason: a row reusing the id inherits what the loaded document held.
+    reused = TimelineProject.from_dict(raw, str(tmp_path / "reused"))
+    reused.references = []
+    routes._apply_create_reference(reused, {"name": "New"}, reference_id="ref-1")
+    preserved = timeline_state._preserve_project_unknown_fields(raw, reused.to_dict())
+    assert preserved["references"][0]["future_field"] == "kept for R"
+
+
+def test_a_reference_id_in_fields_stays_an_unknown_field(tmp_path):
+    """The id travels at operation level, which an older server ignores; in
+    `fields` it would be refused there."""
+    project = _project(tmp_path)
+    op = {"type": "create_reference", "fields": {"name": "R", "kind": "character",
+                                                  "reference_id": "a" * 32}}
+    assert _library_error(project, [op]) == (400, "invalid_reference_mutation")
+
+
+def _recipe_fields(**overrides):
+    fields = {"name": "Custom", "media_kind": "image", "hard": {}, "soft": {}}
+    fields.update(overrides)
+    return fields
+
+
+def test_create_recipe_refuses_a_taken_client_id_instead_of_re_minting(tmp_path):
+    project = _project(tmp_path)
+    project.reference_recipes = [{"id": "custom:held", "name": "Held", "builtIn": False,
+                                  "media_kind": "image", "hard": {}, "soft": {}}]
+    project.scenes = [Scene(scene_id="scene-1", reference_lane_count=1,
+                            reference_lane_configs=[LaneConfig()],
+                            reference_lane_recipes=[ReferenceLaneRecipe(
+                                lane_id="lane-1", recipe_id="custom:dangling", media_kind="image")])]
+    create = lambda recipe_id: {"type": "create_recipe", "fields": _recipe_fields(id=recipe_id)}
+    assert _library_error(project, [create("custom:held")]) == (409, "id_conflict")
+    # A lane still names it: reusing it would re-link that lane silently.
+    assert _library_error(project, [create("custom:dangling")]) == (409, "id_conflict")
+    delete = {"type": "delete_recipe", "recipe_id": "custom:held",
+              "expected": {"id": "custom:held", "name": "Held", "media_kind": "image",
+                           "hard": {}, "soft": {}}}
+    assert _library_error(project, [delete, create("custom:held")]) == (409, "id_conflict")
+    for bad in ("custom:Has Space", "custom:ab", "plain-id", 7):
+        assert _library_error(project, [create(bad)]) == (400, "invalid_id")
+
+    minted = "custom:" + "c" * 32
+    payload = routes._apply_reference_mutation_operations(project, [create(minted)])
+    assert payload["results"] == [{"type": "create_recipe", "recipe_id": minted}]
+    # A server-minted id is still the server's to choose.
+    payload = routes._apply_reference_mutation_operations(project, [
+        {"type": "create_recipe", "fields": _recipe_fields(name="Server minted")}])
+    assert payload["results"][0]["recipe_id"].startswith("custom:")
+
+
+def test_a_stored_recipe_id_is_never_revalidated_by_an_update(tmp_path):
+    project = _project(tmp_path)
+    legacy = {"id": "My Legacy Recipe", "name": "Legacy", "builtIn": False,
+              "media_kind": "image", "hard": {}, "soft": {}}
+    project.reference_recipes = [dict(legacy)]
+    expected = {key: legacy[key] for key in ("id", "name", "media_kind", "hard", "soft")}
+    routes._apply_reference_mutation_operations(project, [{
+        "type": "update_recipe", "recipe_id": "My Legacy Recipe",
+        "fields": {"name": "Renamed"}, "expected": expected}])
+    assert project.reference_recipes[0]["id"] == "My Legacy Recipe"
+    assert project.reference_recipes[0]["name"] == "Renamed"
+
+
+def test_the_library_payload_advertises_client_minted_ids(tmp_path):
+    assert routes._references_payload(_project(tmp_path))["client_ids"] == [
+        "reference", "member", "recipe"]

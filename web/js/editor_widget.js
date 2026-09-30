@@ -370,9 +370,9 @@ import { openReferenceMediaEditor, REFERENCE_MEDIA_EDITOR_SHORTCUTS } from "./re
 import {
     applyPendingReferenceOverlays,
     formatReferenceTag,
+    mintReferenceLibraryId,
     moveMember,
     referenceFieldStoredAs,
-    referenceIdsBeingDeleted,
     referenceOverlayFromOperation,
     referenceOverlayReflected,
     shouldApplyReferenceResponse,
@@ -1007,10 +1007,21 @@ export class EditorWidget {
         // that fetch may have been sent before the write committed (Finding L).
         // Lost to a later mutation it need not — that one runs after it.
         this._referenceSeqSource = "fetch";
-        // Paint-first Library overlays (ephemeral, view-only). Each is owned by
-        // its own mutation; see `_mutateReferencesPaintFirst`.
+        // Paint-first Library overlays (ephemeral). Each is owned by its own
+        // mutation; see `_mutateReferencesPaintFirst`. Written only through
+        // `_setReferenceOverlays` / `_setReferenceOverlayFields`, which bump the
+        // version the effective view (`_referencesView`) is memoized on.
         this._referenceOverlays = [];
         this._referenceOverlaySeq = 0;
+        this._referenceOverlayVersion = 0;
+        this._referencesViewCache = null;
+        // Whether the server adopts client-minted Library ids (its payload's
+        // `client_ids`), and whether a minted id once failed to come back, which
+        // stops minting until the project changes. Ids of creates the server
+        // refused, so a stage naming one can say why it failed.
+        this._referenceClientIds = false;
+        this._referenceClientIdsDemoted = false;
+        this._referenceRefusedCreateIds = new Set();
         this._referenceUnconfirmedRetryTimer = null;
         this._referenceUnconfirmedRetryAttempt = 0;
         // The server's history merge lists, from the last restore-token answer
@@ -2543,14 +2554,75 @@ export class EditorWidget {
         });
     }
 
+    /** The Library as the author sees it: acknowledged `_references` plus
+     *  every pending overlay (`applyPendingReferenceOverlays`).
+     *
+     *  Surfaces that display or offer Library data read this -- the Library,
+     *  Lane Setup, timeline labels, staging and drop, chip labels and pickers,
+     *  Reference Prompting -- so a row still saving is usable and a row being
+     *  deleted is not offered. `_references` keeps its meaning, the server's
+     *  acknowledged payload, and paths that describe server truth read it:
+     *  overlay settles, a history operation's comparison after a forced read,
+     *  materialize's stored handle, and the compensations that pair with a
+     *  server-compiled plan. A new reader of `_references` is therefore server
+     *  truth by default, the safe failure; `tests/test_reference_view_readers.py`
+     *  keeps the classification closed.
+     *
+     *  Memoized on the `_references` object and `_referenceOverlayVersion`,
+     *  which every overlay write bumps. Carries a `member_id -> {reference,
+     *  member}` index for `_referenceMemberForRef`. */
+    _referencesView() {
+        const cache = this._referencesViewCache;
+        const version = this._referenceOverlayVersion || 0;
+        if (cache && cache.references === this._references && cache.version === version) return cache.view;
+        const view = applyPendingReferenceOverlays(this._references, this._referenceOverlays);
+        const members = new Map();
+        for (const reference of view) {
+            for (const member of reference?.members || []) {
+                const memberId = String(member?.member_id || "");
+                // An inert row's id is temporary: nothing may resolve or name it.
+                if (memberId && !member?.pendingInert && !members.has(memberId)) {
+                    members.set(memberId, { reference, member });
+                }
+            }
+        }
+        this._referencesViewCache = { references: this._references, version, view, members };
+        return view;
+    }
+
+    _referenceViewIndex() {
+        this._referencesView();
+        return this._referencesViewCache.members;
+    }
+
+    /** Every overlay list replacement goes through here, so the view's
+     *  memo cannot outlive the list it was computed from. */
+    _setReferenceOverlays(overlays) {
+        this._referenceOverlays = overlays;
+        this._referenceOverlayVersion = (this._referenceOverlayVersion || 0) + 1;
+    }
+
+    /** Every in-place overlay field write goes through here, for the same
+     *  reason: `state`, `status`, `committedId`, `knownIds`, `provenSaved`,
+     *  `clearAfterSeq`. */
+    _setReferenceOverlayFields(overlay, fields) {
+        Object.assign(overlay, fields);
+        this._referenceOverlayVersion = (this._referenceOverlayVersion || 0) + 1;
+    }
+
+    /** Re-render every surface that draws the effective view. Called when a
+     *  paint lands, is dropped, or is pruned by a payload. */
+    _renderReferenceViewConsumers() {
+        this._referenceLibraryHandle?.render?.();
+        this._referencePanelHandle?.refresh?.();
+        this._renderTimeline?.();
+    }
+
     _referenceLibraryData() {
         return {
             projectKey: this._projectDirName(),
-            // The display of overlays. Staging, Attach and pickers read
-            // `_references` (less what a delete in flight is taking away,
-            // `_referencesOfferable`), so a row the server has not acknowledged
-            // is never offered to them.
-            references: applyPendingReferenceOverlays(this._references, this._referenceOverlays),
+            // The effective view: acknowledged data plus pending overlays.
+            references: this._referencesView(),
             catalog: this._referenceTagPresets,
             tagFamilies: this._referenceTagFamilies,
             recipePresets: this._referenceRecipePresets,
@@ -2878,6 +2950,10 @@ export class EditorWidget {
             currentGeneration: this._referenceFetchSeq,
         })) return false;
         this._references = Array.isArray(payload?.references) ? payload.references : [];
+        // Read from every payload the route serves, so a server restarted
+        // into an older build stops the minting at its next answer.
+        this._referenceClientIds = Array.isArray(payload?.client_ids)
+            && payload.client_ids.includes("reference") && payload.client_ids.includes("member");
         this._pruneReferenceOverlays({ source, requestSeq, ownOverlays });
         this._referenceUnconfirmedRetryAttempt = 0;
         this._referenceTagPresets = Array.isArray(payload?.tag_presets) ? payload.tag_presets : [];
@@ -2897,6 +2973,8 @@ export class EditorWidget {
         this._referencesDirty = false;
         this._referencesLoading = false;
         this._referencesError = "";
+        // The timeline is refreshed (or deferred behind a drag) by the
+        // dependency consumers below.
         this._referenceLibraryHandle?.render?.();
         this._referencePanelHandle?.refresh?.();
         this._refreshPromptContextDependencyConsumers();
@@ -3033,7 +3111,9 @@ export class EditorWidget {
                     { projectId: dirName, retryOnConflict: true, maxAttempts: 2 },
                 );
                 if (projectDir !== this.projectDir) return result;
+                this._noteMintedReferenceIds(queuedOperations, result?.payload?.results);
                 this._proveEarlierReferenceUpdates(ownOverlays);
+                this._proveEarlierReferenceCreates(queuedOperations);
                 const applied = this._applyReferencePayload(result?.payload || {}, {
                     projectDir, requestSeq, source: "mutation", ownOverlays });
                 if (removedMemberIds.length) {
@@ -3089,6 +3169,13 @@ export class EditorWidget {
                 // only a version conflict onto `error.code`.
                 this._restoreReferenceCascade(cascade,
                     String(error?.payload?.code || error?.code || ""));
+                // A stage queued behind a refused create names a member the
+                // project never held; its failure can then say why.
+                for (const operation of operations) {
+                    if (operation?.type === "create_member" && operation.member_id) {
+                        (this._referenceRefusedCreateIds ||= new Set()).add(String(operation.member_id));
+                    }
+                }
             }
             if (!ownOverlays) return;
             if (answered) {
@@ -3100,31 +3187,68 @@ export class EditorWidget {
                 // is recorded so the deciding read can tell a row this write
                 // added from one that was there before.
                 for (const overlay of ownOverlays) {
-                    overlay.status = "unconfirmed";
-                    overlay.knownIds = this._referenceOverlayKnownIds(overlay);
+                    this._setReferenceOverlayFields(overlay, {
+                        status: "unconfirmed", knownIds: this._referenceOverlayKnownIds(overlay) });
                 }
                 this._acknowledgeReferenceOverlays(ownOverlays, null);
             }
-            this._referenceLibraryHandle?.render?.();
+            this._renderReferenceViewConsumers();
         });
         return promise;
+    }
+
+    /** A create whose minted id did not come back: the server ignored it (a
+     *  build older than the id, answering behind a newer payload). The
+     *  canonical payload heals the row by itself, so this is a diagnostic, not
+     *  a message (`durable_rules.md`: a minted id that does not come back is not
+     *  the same finding as nothing having been written). Minting stops until
+     *  the project changes; writes that already named the minted id fail loudly
+     *  into their own rollbacks. The route answers one result per operation,
+     *  in operation order. */
+    _noteMintedReferenceIds(operations, results) {
+        const list = Array.isArray(results) ? results : [];
+        (Array.isArray(operations) ? operations : []).forEach((operation, index) => {
+            const key = operation?.type === "create_reference" ? "reference_id"
+                : (operation?.type === "create_member" ? "member_id" : "");
+            if (!key || !operation[key]) return;
+            const result = list[index];
+            if (result?.type !== operation.type || String(result?.[key] || "") === String(operation[key])) return;
+            sessionDiagRecord("reference_minted_id_ignored", { operation_type: operation.type });
+            this._referenceClientIdsDemoted = true;
+        });
     }
 
     /** Paint a Library write now and send it through the queue.
      *
      *  Acknowledged References stay the only authority: the overlays are drawn
-     *  on top of them by `_referenceLibraryData` and read by nothing else. Each
-     *  overlay is owned by its own mutation and leaves only when that mutation
-     *  settles — never because a fetch landed, since a fetch sent while the write
-     *  was queued describes the Library without it (Finding L).
+     *  on top of them into the effective view (`_referencesView`). Each overlay
+     *  is owned by its own mutation and leaves only when that mutation settles
+     *  — never because a fetch landed, since a fetch sent while the write was
+     *  queued describes the Library without it (Finding L).
+     *
+     *  A create is sent under an id minted here when the server adopts client
+     *  ids (`client_ids`), so its row is painted under the id the server will
+     *  store and is usable at once: an edit, Remove or stage naming it is queued
+     *  behind the create. Against an older server nothing is minted and the
+     *  row stays inert until acknowledged.
      */
     _mutateReferencesPaintFirst(operations, { onUnconfirmedResolved = null } = {}) {
+        const mint = this._referenceClientIds && !this._referenceClientIdsDemoted;
+        const sent = (Array.isArray(operations) ? operations : []).map((operation) => {
+            if (mint && operation?.type === "create_reference" && !operation.reference_id) {
+                return { ...operation, reference_id: mintReferenceLibraryId() };
+            }
+            if (mint && operation?.type === "create_member" && !operation.member_id) {
+                return { ...operation, member_id: mintReferenceLibraryId() };
+            }
+            return operation;
+        });
         // The staged-item half of a delete paints now too, as scene state
         // with holds, and every delete overlay of the batch carries it so the
         // read that decides a lost answer can restore or release it.
         const cascade = this._paintReferenceDeleteCascade(
-            this._referenceDeleteRemovedMemberIds(operations));
-        const overlays = (Array.isArray(operations) ? operations : [])
+            this._referenceDeleteRemovedMemberIds(sent));
+        const overlays = sent
             .map((operation) => referenceOverlayFromOperation(
                 operation, `pending:${++this._referenceOverlaySeq}`))
             .filter(Boolean)
@@ -3132,11 +3256,11 @@ export class EditorWidget {
                 cascade: overlay.type === "delete_member" || overlay.type === "delete_reference"
                     ? cascade : null }));
         if (this.projectDir && overlays.length) {
-            this._referenceOverlays.push(...overlays);
-            this._referenceLibraryHandle?.render?.();
+            this._setReferenceOverlays([...this._referenceOverlays, ...overlays]);
+            this._renderReferenceViewConsumers();
         }
         return this._withMutationGesture("referenceLibrary", () => this._mutateReferences(
-            operations, undefined, null, null, undefined, { overlays, cascade }));
+            sent, undefined, null, null, undefined, { overlays, cascade }));
     }
 
     /** A settled write whose own payload did not apply: keep its rows until a
@@ -3146,29 +3270,41 @@ export class EditorWidget {
         if (!overlays?.length) return;
         const results = Array.isArray(payload?.results) ? payload.results : [];
         // One route result per operation, in operation order; each overlay
-        // claims the first unclaimed result of its own kind and target.
+        // claims the first unclaimed result of its own kind and target -- a
+        // create with a minted id, its own id first, then (the id was ignored)
+        // any result of its kind.
         const claimed = new Set();
-        for (const overlay of overlays) {
-            const result = results.find((entry, index) => !claimed.has(index)
-                && entry?.type === overlay.type
-                && (overlay.type === "create_reference"
-                    || (String(entry?.reference_id || "") === overlay.reference_id
-                        && (!overlay.member_id
-                            || String(entry?.member_id || "") === overlay.member_id))));
-            if (result) {
-                claimed.add(results.indexOf(result));
-                overlay.committedId = String(
-                    overlay.type === "create_member" ? result.member_id || "" : result.reference_id || "");
+        const target = (overlay, entry) => overlay.type === "create_reference"
+            || String(entry?.reference_id || "") === overlay.reference_id;
+        const matches = (overlay, entry) => {
+            if (!target(overlay, entry)) return false;
+            if (overlay.type === "create_reference") {
+                return !overlay.createdId || String(entry?.reference_id || "") === overlay.createdId;
             }
-            overlay.state = "acknowledged";
-            overlay.clearAfterSeq = this._referenceFetchSeq;
+            if (overlay.type === "create_member") {
+                return !overlay.createdId || String(entry?.member_id || "") === overlay.createdId;
+            }
+            return !overlay.member_id || String(entry?.member_id || "") === overlay.member_id;
+        };
+        const claim = (overlay, test) => results.find((entry, index) => !claimed.has(index)
+            && entry?.type === overlay.type && test(overlay, entry));
+        for (const overlay of overlays) {
+            const result = claim(overlay, matches)
+                || (overlay.createdId ? claim(overlay, target) : null);
+            if (result) claimed.add(results.indexOf(result));
+            this._setReferenceOverlayFields(overlay, {
+                state: "acknowledged",
+                clearAfterSeq: this._referenceFetchSeq,
+                ...(result ? { committedId: String(overlay.type === "create_member"
+                    ? result.member_id || "" : result.reference_id || "") } : {}),
+            });
         }
-        this._referenceOverlays = this._referenceOverlays.filter((overlay) => {
+        this._setReferenceOverlays(this._referenceOverlays.filter((overlay) => {
             const leaves = overlays.includes(overlay) && referenceOverlayReflected(this._references, overlay);
             if (leaves) this._decideReflectedReferenceCascade(overlay);
             return !leaves;
-        });
-        this._referenceLibraryHandle?.render?.();
+        }));
+        this._renderReferenceViewConsumers();
     }
 
     /** A delete overlay leaving because acknowledged data already shows its
@@ -3245,6 +3381,17 @@ export class EditorWidget {
             return Object.entries(overlay.fields || {}).every(([field, value]) =>
                 referenceFieldStoredAs(field, row[field], value));
         }
+        if (overlay?.createdId) {
+            // A create under a minted id is saved if and only if that id is
+            // present -- which also ends a false "saved" on a same-named
+            // Reference someone else created meanwhile -- or a later own write
+            // naming it was accepted (a Remove made while it saved, say).
+            return overlay.provenSaved === true || referenceOverlayReflected(this._references,
+                { ...overlay, committedId: "" });
+        }
+        // Heuristics for a create sent without a minted id, to a server that
+        // does not adopt client ids. Remove with `client_ids` (routes.py
+        // `_references_payload`), once no supported server can ignore one.
         const known = overlay?.knownIds instanceof Set ? overlay.knownIds : new Set();
         if (overlay?.type === "create_reference") {
             return (this._references || []).some((entry) =>
@@ -3264,7 +3411,7 @@ export class EditorWidget {
 
     _dropReferenceOverlays(overlays) {
         if (!overlays?.length) return;
-        this._referenceOverlays = this._referenceOverlays.filter((overlay) => !overlays.includes(overlay));
+        this._setReferenceOverlays(this._referenceOverlays.filter((overlay) => !overlays.includes(overlay)));
     }
 
     /** Called for every applied References payload, before anything renders.
@@ -3277,7 +3424,7 @@ export class EditorWidget {
     _pruneReferenceOverlays({ source = "fetch", requestSeq = 0, ownOverlays = null } = {}) {
         if (!this._referenceOverlays.length) return;
         const resolved = [];
-        this._referenceOverlays = this._referenceOverlays.filter((overlay) => {
+        this._setReferenceOverlays(this._referenceOverlays.filter((overlay) => {
             if (ownOverlays?.includes(overlay)) return false;
             if (overlay.state !== "acknowledged") return true;
             if (source === "mutation" || requestSeq > overlay.clearAfterSeq) {
@@ -3287,7 +3434,7 @@ export class EditorWidget {
             if (!referenceOverlayReflected(this._references, overlay)) return true;
             this._decideReflectedReferenceCascade(overlay);
             return false;
-        });
+        }));
         // An unconfirmed write is decided now. Say so when it did not land —
         // otherwise its row just vanishes — and let the Library hand the draft
         // back. After the payload has fully applied, so the Library renders it.
@@ -3710,25 +3857,69 @@ export class EditorWidget {
         }
     }
 
-    /** Ids a Library delete in flight is taking away. Staging, the append,
-     *  Attach and the chip pickers refuse or skip these until it settles. */
-    _referenceIdsBeingDeleted() {
-        return referenceIdsBeingDeleted(this._referenceOverlays, this._references);
-    }
-
+    /** Whether a Library delete in flight is taking this member away: the
+     *  server still holds it and the effective view no longer shows it, which
+     *  only a delete overlay does. Staging, the append and Attach refuse it at
+     *  act time with a sentence that says so. */
     _referenceMemberBeingDeleted(memberId) {
-        return this._referenceIdsBeingDeleted().memberIds.has(String(memberId || ""));
+        const id = String(memberId || "");
+        if (!id || this._referenceViewIndex().has(id)) return false;
+        return (this._references || []).some((reference) => (reference?.members || [])
+            .some((member) => String(member?.member_id || "") === id));
     }
 
-    /** The acknowledged Library minus what a delete in flight is taking away:
-     *  what a picker that creates something durable may offer. */
+    /** What a chip picker or configure dialog may offer: the effective view
+     *  (so nothing a delete in flight is taking away) without rows whose create
+     *  is still saving. A chip names a member without the scene write checking
+     *  that it exists, so a chip made on a create later refused would be a
+     *  durable broken chip. Staging needs no such filter: its write 404s behind
+     *  a refused create and rolls back. */
     _referencesOfferable() {
-        const { referenceIds, memberIds } = this._referenceIdsBeingDeleted();
-        if (!referenceIds.size && !memberIds.size) return this._references || [];
-        return (this._references || [])
-            .filter((reference) => !referenceIds.has(String(reference?.reference_id || "")))
-            .map((reference) => ({ ...reference, members: (reference.members || [])
-                .filter((member) => !memberIds.has(String(member?.member_id || ""))) }));
+        const view = this._referencesView();
+        if (!view.some((reference) => reference?.pendingCreate
+            || (reference?.members || []).some((member) => member?.pendingCreate))) return view;
+        return view.filter((reference) => !reference?.pendingCreate)
+            .map((reference) => (reference.members || []).some((member) => member?.pendingCreate)
+                ? { ...reference, members: reference.members.filter((member) => !member?.pendingCreate) }
+                : reference);
+    }
+
+    /** Whether a scene candidate stages a Library member (or names a
+     *  Reference) that exists only in a create still saving. */
+    _candidateNamesPendingReferenceCreate(candidate) {
+        const pending = new Set();
+        for (const overlay of this._referenceOverlays || []) {
+            if ((overlay?.type === "create_reference" || overlay?.type === "create_member")
+                    && overlay.createdId) pending.add(overlay.createdId);
+        }
+        if (!pending.size) return false;
+        for (const reference of this._references || []) {
+            pending.delete(String(reference?.reference_id || ""));
+            for (const member of reference?.members || []) pending.delete(String(member?.member_id || ""));
+        }
+        return pending.size > 0 && (candidate?.reference_items || []).some((item) =>
+            (item?.members || []).some((member) => pending.has(String(member?.member_id || ""))
+                || pending.has(String(member?.entity_id || ""))));
+    }
+
+    /** A later write naming a created id was accepted, so the create landed:
+     *  the queue is serial and the route answers 404 for an id it does not
+     *  hold. Without this, a lost create followed by an accepted Remove of the
+     *  same row would read as "not saved" and hand the add form back. */
+    _proveEarlierReferenceCreates(operations) {
+        const named = new Set();
+        for (const operation of Array.isArray(operations) ? operations : []) {
+            if (operation?.type === "create_reference" || operation?.type === "create_member") continue;
+            for (const key of ["reference_id", "member_id"]) {
+                if (operation?.[key]) named.add(String(operation[key]));
+            }
+        }
+        if (!named.size) return;
+        for (const earlier of this._referenceOverlays) {
+            if (earlier.status === "unconfirmed" && earlier.createdId && named.has(earlier.createdId)) {
+                this._setReferenceOverlayFields(earlier, { provenSaved: true });
+            }
+        }
     }
 
     /** An accepted update was guarded by what its form was opened from. When
@@ -3746,7 +3937,7 @@ export class EditorWidget {
                 if (Object.keys(later.expected || {}).some((key) =>
                     Object.prototype.hasOwnProperty.call(earlier.fields || {}, key)
                     && canonicalJson(later.expected[key]) === canonicalJson(earlier.fields[key]))) {
-                    earlier.provenSaved = true;
+                    this._setReferenceOverlayFields(earlier, { provenSaved: true });
                 }
             }
         }
@@ -5524,10 +5715,19 @@ export class EditorWidget {
         // A dialog opened before a Library delete and confirmed while it is in
         // flight: the chip is durable and its write never checks the member.
         const source = configured.attachment?.source || {};
-        const { memberIds } = this._referenceIdsBeingDeleted?.() || { memberIds: new Set() };
-        if (memberIds.size && ["picture_ids", "video_ids", "audio_ids"].some((key) =>
-            (Array.isArray(source[key]) ? source[key] : []).some((id) => memberIds.has(String(id))))) {
+        const sourceIds = ["picture_ids", "video_ids", "audio_ids"].flatMap((key) =>
+            Array.isArray(source[key]) ? source[key] : []);
+        if (sourceIds.some((id) => this._referenceMemberBeingDeleted(id))) {
             notifyWarning(REFERENCE_MEMBER_BEING_DELETED, { source: "prompt-reference-attach-refused" });
+            return null;
+        }
+        // A member still being created: the chip's scene write never checks
+        // that it exists, so a create refused after this would leave a durable
+        // broken chip. A staged row offers it as a physical source before its
+        // create answers, so this is refused where every dialog converges.
+        if (sourceIds.some((id) => this._referenceViewIndex().get(String(id || ""))?.member?.pendingCreate)) {
+            notifyWarning("That Library member is still being saved. Try again once it has saved.",
+                { source: "prompt-reference-attach-refused" });
             return null;
         }
         const intent = configured.identityCreateIntent;
@@ -12767,7 +12967,13 @@ export class EditorWidget {
                 // timeline's Reference paints keep today's exposure (a residual
                 // recorded with this change).
                 orderedHistoryBaseline: !allowLaneWrites,
-                failureMessage: "The Reference item could not be staged.",
+                // A member whose create was still saving at the drop, and was
+                // refused, is the one cause worth naming: the author saw it.
+                failureMessage: (error) => (error?.payload?.code || error?.code) === "item_not_found"
+                    && (payload.members || []).some((member) =>
+                        this._referenceRefusedCreateIds?.has(String(member?.member_id || "")))
+                    ? "The new Library member was not saved, so it could not be staged."
+                    : "The Reference item could not be staged.",
                 failureDetail: (error) => error?.payload?.error || error?.message || null,
                 failureTier: "warning",
             });
@@ -14970,7 +15176,7 @@ export class EditorWidget {
                 [key, input.promptDocument])), attachmentId);
         const attachmentLabelFor = (attachment) => resolveReferenceAttachmentIdentity(attachment, {
             scene: this.activeScene,
-            references: this._references || [],
+            references: this._referencesView(),
             semanticUnits: this._promptSemanticUnits || [],
         });
         const managedSpeakerSubjectIds = () => (
@@ -17019,6 +17225,11 @@ export class EditorWidget {
         if (!dirName || !sceneId || !this.activeScene) return;
         const candidate = { ...structuredClone(this.activeScene),
             ...structuredClone(scenePatch || {}) };
+        // The compile resolves staged members from the stored Library, which
+        // does not hold a member whose create is still saving. The payload
+        // that acknowledges it refreshes the Prompt Context consumers, which
+        // previews again.
+        if (this._candidateNamesPendingReferenceCreate?.(candidate)) return;
         const range = this._selectionContextRange?.();
         const windowStart = Math.max(0, Math.round(range?.contextStart ?? 0));
         const windowEnd = Math.max(windowStart + 1, Math.round(
@@ -26535,7 +26746,10 @@ export class EditorWidget {
         this._referenceMediaEditorHandle = null;
         // Overlays belong to the old project's writes; their settle handlers
         // check the project before touching these.
-        this._referenceOverlays = [];
+        this._setReferenceOverlays([]);
+        this._referenceClientIds = false;
+        this._referenceClientIdsDemoted = false;
+        this._referenceRefusedCreateIds = new Set();
         this._clearUnconfirmedReferenceRetry();
         this._historyMergeCapabilities = null;
         this._referenceLibraryHandle?.reset?.();
@@ -26610,12 +26824,12 @@ export class EditorWidget {
         }
     }
 
+    /** A staged member's Library record, from the effective view: a member
+     *  still saving resolves, one a delete in flight is taking away does not.
+     *  Its callers predict state at the time their write applies, when every
+     *  Library write queued before it has landed. */
     _referenceMemberForRef(memberRef) {
-        for (const reference of this._references || []) {
-            const member = (reference.members || []).find((candidate) => candidate.member_id === memberRef?.member_id);
-            if (member) return { reference, member };
-        }
-        return null;
+        return this._referenceViewIndex().get(String(memberRef?.member_id || "")) || null;
     }
 
     _referenceLaneAdvisories(entry, recipeDefinition) {

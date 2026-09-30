@@ -808,3 +808,86 @@ def test_a_delete_answered_item_not_found_leaves_a_thinned_row_to_the_heal(tmp_p
     assert result["right"] == ["member-b"]
     assert result["reasons"] == ["item_not_found"]
     assert result["gets"] == 1
+
+
+# --- Library paint-first Phase 3: client-minted ids --------------------------
+
+# The Library as the route serves it, `client_ids` included, so the host mints.
+_ADOPT = """
+    w._applyReferencePayload((await ask({ referencesRead: true })).payload);
+    const newMember = () => w._mutateReferencesPaintFirst([{ type: 'create_member', reference_id: 'entity-1',
+      fields: { asset_id: 'asset-c', name: 'New', tags: [], prompt: '', crop: null,
+        source_start_sec: 0, source_end_sec: null } }]).catch((error) => error);
+    const mintedId = () => w._referenceOverlays.at(-1).createdId;
+    const stageAt80 = (memberId) => w._stageReferenceItemOnLane(
+      { members: [{ entity_id: 'entity-1', member_id: memberId }] }, 0, 80);
+    const staged = (source) => Object.entries(source).filter(([, members]) =>
+      members.length === 1 && members[0] === minted).map(([id]) => id);
+    let minted = '';
+"""
+
+
+def test_a_member_staged_while_its_create_saves_lands_behind_it(tmp_path):
+    result = run_library(_ADOPT + """
+    hold();
+    const creating = newMember();
+    minted = mintedId();
+    const staging = stageAt80(minted);
+    await settle();
+    const painted = staged(rows());
+    const offered = w._referencesOfferable().flatMap((ref) => ref.members).some((m) => m.member_id === minted);
+    await release();
+    const outcome = await staging;
+    await creating;
+    await settle(12);
+    const stored = (await serverLibrary()).flatMap((ref) => ref.members).map((m) => m.member_id);
+    return { minted, painted: painted.length, offered, outcome, local: staged(rows()).length,
+      server: staged(await serverRows()).length, stored: stored.includes(minted),
+      toasts: toasts.map((t) => t.message) };
+    """, tmp_path)
+    assert len(result["minted"]) == 32
+    assert result["painted"] == 1, "the bar shows before the member's create answers"
+    assert result["offered"] is False, "a chip picker does not offer a member still saving"
+    assert result["outcome"] == "ok"
+    assert result["local"] == result["server"] == 1
+    assert result["stored"] is True
+    assert result["toasts"] == []
+
+
+def test_a_stage_behind_a_refused_create_rolls_back_and_says_why(tmp_path):
+    result = run_library(_ADOPT + """
+    libraryRefuseNext('invalid_reference_member', 400);
+    const creating = newMember();
+    minted = mintedId();
+    const outcome = await stageAt80(minted);
+    await creating;
+    await settle(12);
+    return { outcome, local: rows(), server: await serverRows(),
+      shown: w._referencesView().flatMap((ref) => ref.members).some((m) => m.member_id === minted),
+      toasts: toasts.map((t) => t.message) };
+    """, tmp_path)
+    assert result["outcome"] == "failed"
+    assert result["local"] == result["server"] == FIXTURE_ROWS
+    assert result["shown"] is False
+    assert "The new Library member was not saved, so it could not be staged." in result["toasts"]
+
+
+def test_a_minted_member_can_be_removed_before_its_create_answers(tmp_path):
+    result = run_library(_ADOPT + """
+    hold();
+    const creating = newMember();
+    minted = mintedId();
+    const shown = w._referencesView().flatMap((ref) => ref.members).find((m) => m.member_id === minted);
+    const { pendingStatus, pendingCreate, ...guard } = shown;
+    const removing = w._mutateReferencesPaintFirst([{ type: 'delete_member', reference_id: 'entity-1',
+      member_id: minted, expected: guard }]).catch((error) => error);
+    await release();
+    const created = await creating;
+    const removed = await removing;
+    await settle(12);
+    const stored = (await serverLibrary()).flatMap((ref) => ref.members).map((m) => m.member_id);
+    return { created: created?.status ?? 'ok', removed: removed?.status ?? 'ok',
+      stored: stored.includes(minted), overlays: w._referenceOverlays.length,
+      toasts: toasts.map((t) => t.message) };
+    """, tmp_path)
+    assert result == {"created": "ok", "removed": "ok", "stored": False, "overlays": 0, "toasts": []}

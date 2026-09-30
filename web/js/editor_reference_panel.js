@@ -7,9 +7,10 @@
 // networking, and durable writes; this module owns its DOM/listeners and
 // returns a cleanup handle. Host surface used:
 //   activeScene, activeSceneId, projectDir, totalFrames, playhead, _trackLayout,
-//   _references, _referenceRecipePresets, _customReferenceRecipes,
+//   _referencesView() (the Library as displayed: a member still saving is
+//   offered, one a delete in flight is taking away is not),
+//   _referenceRecipePresets, _customReferenceRecipes,
 //   _referenceRecipeFieldSchema, _referenceMemberForRef(ref),
-//   _referenceMemberBeingDeleted(memberId),
 //   _referenceLaneAdvisories(entry, definition), _defaultReferenceLaneRecipe(),
 //   _findAssetById(id), _referenceAssetPreviewUrl(asset),
 //   _openReferenceMediaEditor({ asset, draft, readOnly }),
@@ -1289,12 +1290,15 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             list.textContent = "";
             const query = state.pickerQuery.trim().toLowerCase();
             let offered = 0;
-            for (const reference of host._references || []) {
+            // The effective view: a member a Library delete in flight is
+            // taking away is not in it, and one still saving is, since the
+            // stage is queued behind its create.
+            for (const reference of host._referencesView?.() ?? (host._references || [])) {
                 for (const member of reference.members || []) {
                     if (staged.has(member.member_id)) continue;
-                    // A Library delete in flight is taking it away; staging
-                    // it would name a member the server is removing.
-                    if (host._referenceMemberBeingDeleted?.(member.member_id)) continue;
+                    // A temporary id (a create sent to a server that does not
+                    // adopt client ids) may not be named by any request.
+                    if (member.pendingInert) continue;
                     const asset = host._findAssetById?.(member.asset_id) || null;
                     // A wrong-kind member is never offered: media_kind is a hard
                     // lane property and the backend refuses the write anyway.
