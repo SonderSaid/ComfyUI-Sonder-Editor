@@ -11,6 +11,17 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Changed
+- Reference Lane Setup: adding or deleting a staged item and editing its range, strength, sequence length, mute, prompt override or members now show at once and save in the background, instead of waiting about a second for the server. A member role or retention change still waits for the server, and other edits of that item wait with it.
+- A failed Reference staging drop on the timeline shows one message instead of two.
+- Reference Lane Setup: clearing a member's saved role or retention now says it can't be saved yet, instead of appearing to work and reverting later.
+
+### Fixed
+- Reference Lane Setup: a second edit made while the first was still saving was silently dropped. It is now saved after the first.
+- Reference Lane Setup: a refused item edit also removed the Undo step of an earlier edit of the same kind.
+- Reference Lane Setup: an invalid role or unsupported recipe value no longer takes keyboard focus again after every edit.
+- Dropping a Library member onto a staged Reference bar while another edit of that item was saving could be refused, and a failed drop refetched the scene over edits queued behind it.
+
 ## [0.7.4] - 2026-09-29
 
 ### Changed

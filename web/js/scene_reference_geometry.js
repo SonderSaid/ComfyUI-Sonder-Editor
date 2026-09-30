@@ -372,9 +372,10 @@ function updatedMemberRefs(rawMembers, legacyMembers, { entityIdFor, laneRecipe,
  *  applicability test).
  *
  *  **Why this planner re-derives applicability when staging does not.** The
- *  staging and append paths above leave member applicability to the drop
- *  resolver, which has already decided it for the members being added. No
- *  resolver runs before a panel field edit, and the route re-validates the
+ *  staging path above leaves member applicability to the drop resolver (or
+ *  the panel stage's own population check), which has already decided it for
+ *  the members being added. No resolver runs before a panel field edit, or
+ *  before an append's priors, and the route re-validates the
  *  whole stored list on every update, so the lookups the route runs regardless
  *  of `legacy_members` -- member resolution, asset presence, the lane
  *  population -- are repeated here. The population rule is imported from its

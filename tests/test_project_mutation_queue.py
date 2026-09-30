@@ -4261,7 +4261,7 @@ def test_unlink_history_reads_the_servers_unknown_split_partition():
 # believed painting `item.members` would create. Probed against the route, the
 # opposite holds: the canonical record for a Library drop is byte-identical to
 # what `dragPayload` sends, and NOT painting is what loses a drop, because
-# `_appendReferenceMembersWithinGesture` reads `priorMembers` before its await.
+# the append reads its `expected` members from the live row before its await.
 # `tests/test_reference_geometry_parity.py` holds the route half of that; these
 # hold the gesture half.
 

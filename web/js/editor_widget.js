@@ -6464,9 +6464,9 @@ export class EditorWidget {
         if (edit.kind === "patch") {
             // A stored role or retention cannot be cleared: the route drops the
             // field, and the save's unknown-field overlay then restores the
-            // stored value (Bug Tracker, "clearing a member role or retention is
-            // not saved"). Refused here rather than painted and silently
-            // reverted. Expiry: remove when the overlay stops restoring known
+            // stored value (Bug Tracker, "Clearing a staged member's role or
+            // retention is never saved"). Refused here rather than painted and
+            // silently reverted. Expiry: remove when the overlay stops restoring known
             // member fields a mutation cleared.
             const cleared = Object.entries(edit.patch || {}).some(([field, value]) =>
                 !String(value ?? "").trim() && String(current[field] ?? "").trim());

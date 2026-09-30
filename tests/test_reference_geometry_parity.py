@@ -300,7 +300,7 @@ def _append(project, scene, item_id, prior, added):
 def test_two_appends_in_one_window_both_land_when_the_first_is_painted():
     """The reversal of Phase C §3, held in both directions.
 
-    The gesture reads `priorMembers` before its await, so the second drop's
+    The gesture reads its guard from the live row before its await, so the second drop's
     guard describes whatever the local scene holds at that moment. With the
     paint that is the list the route is about to store; without it, it is the
     list the route has already replaced.
@@ -905,7 +905,7 @@ def test_every_update_decline_stands_in_for_a_route_outcome_the_mirror_cannot_se
 
 
 @pytest.mark.xfail(strict=True, reason=(
-    "Bug Tracker: clearing a member role or retention is not saved. The route "
+    "Bug Tracker: clearing a staged member's role or retention is never saved. The route "
     "drops the cleared field, and the save's unknown-field overlay "
     "(`_overlay_unknown_keyed_records`) copies the stored value back, because "
     "the canonical member no longer carries that key. The panel refuses the "

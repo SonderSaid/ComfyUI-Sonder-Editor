@@ -822,8 +822,11 @@ def test_with_the_server_stopped_add_then_delete_leaves_no_phantom_row(tmp_path)
 
 
 def test_a_refused_delete_keeps_the_previous_accepted_undo_step(tmp_path):
-    """Bug Tracker 0.4a, delete half: the panel used to pop the top entry by label
-    after the queue had already removed this write's own."""
+    """The same-label Undo discard (formerly a Bug Tracker entry), delete half: a
+    refused delete leaves an earlier accepted step alone. The labels differ here,
+    so this also passed on the old label-matched code; what holds the delete half
+    is the pin that the panel no longer calls `_discardLastUndo`
+    (`test_reference_panel_js.py`)."""
     result = run_item_panel(_PANEL + """
     mount();
     const strength = inputsOf(cardAt(50))[2];
@@ -1114,7 +1117,8 @@ def test_a_refused_edit_behind_an_accepted_one_keeps_the_accepted_value(tmp_path
     return { local: item('item-1').strength, server: item('item-1', await serverScene()).strength,
       undo: w._undoStack.map((entry) => entry.label) };
     """, tmp_path)
-    # Bug Tracker 0.4a: the accepted step stays; only the refused one leaves.
+    # The same-label Undo discard (formerly a Bug Tracker entry): the accepted
+    # step stays; only the refused one leaves.
     assert result == {"local": 0.5, "server": 0.5, "undo": ["change reference strength"]}
 
 
