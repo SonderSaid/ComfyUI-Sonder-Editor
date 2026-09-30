@@ -24,10 +24,9 @@ likely to try to undo, so it is stated here as well as beside the code. Phase C
 that painting ``item.members`` would make the next append send an ``expected``
 the server never stored. Probed against the route, that is wrong in both halves:
 the canonical record for a Library drop is byte-identical to what ``dragPayload``
-sends, and it is NOT painting that loses a drop --
-``_appendReferenceMembersWithinGesture`` reads ``priorMembers`` before its await,
-so a second drop inside one in-flight window guards against state the route has
-already left. ``test_two_appends_in_one_window`` below holds the ROUTE half of
+sends, and it is NOT painting that loses a drop -- an append reads its
+``expected`` guard from the live row before its await, so a second drop inside
+one in-flight window guards against state the route has already left. ``test_two_appends_in_one_window`` below holds the ROUTE half of
 that. It does not hold the gesture half -- removing the paint from
 ``editor_widget.js`` leaves every test in this file green -- so the reversal is
 pinned jointly with ``test_an_append_reads_its_guard_before_the_paint`` and
@@ -52,12 +51,12 @@ recipe- and profile-dependent validation here would duplicate authority this
 file has no business holding, while copying the values unvalidated paints a
 record the save would refuse or rewrite.
 
-**One refusal the append paints through, deliberately.** ``_apply_update_reference_item``
-re-canonicalizes the whole list including priors, so a lane recipe whose
-``physical_population`` narrowed after a member was staged refuses that prior
-member. The caller re-resolves its priors -- which catches an unresolvable
-member or a trashed asset -- but does not re-derive recipe rules, so that one
-arrives as a refusal from the response.
+**An append is planned as an update.** ``_apply_update_reference_item``
+re-canonicalizes the whole list including priors, so a prior whose asset was
+trashed, whose lane population narrowed, or whose stored role the route would
+trim is refused for a member the drop resolver never examined. The append
+therefore goes through ``plannedReferenceItemUpdate`` like every other
+staged-item update, and its shapes are rows of ``UPDATE_CASES``.
 """
 
 import json
@@ -458,17 +457,6 @@ def test_an_unknown_member_field_is_refused_too():
     assert painted is None
 # -- priors: the members an append re-sends without the author touching them ---
 
-def _javascript_stored(cases):
-    script = f"""
-const mod = await import({json.dumps(MODULE_URL)});
-const cases = {json.dumps(cases)};
-const owns = new Set(["member-a", "member-b", "member-c"]);
-console.log(JSON.stringify(cases.map((members) =>
-  mod.canonicalStoredMemberRefs(members, (id) => owns.has(id) ? "entity-1" : ""))));
-"""
-    return _node(script)
-
-
 def test_a_stored_member_round_trips_through_an_append_unchanged():
     """Why priors may carry role fields where a fresh drop may not.
 
@@ -498,17 +486,8 @@ def test_a_stored_member_round_trips_through_an_append_unchanged():
         routes._canonical_reference_member_refs(
             project, [stored, added], "image", narrowed, "", None)
     assert excinfo.value.code == "unsupported_reference_member_field"
-
-    [painted] = _javascript_stored([[stored, added]])
-    assert painted == under_narrowed
-
-
-def test_the_stored_form_still_refuses_what_it_cannot_reproduce():
-    """It is not a way around the fail-closed rule -- only a wider allow-list."""
-    assert _javascript_stored([[{"entity_id": "entity-1", "member_id": "member-a",
-                                 "future_field": "x"}]]) == [None]
-    assert _javascript_stored([[_drag("member-a"), _drag("member-a")]]) == [None]
-    assert _javascript_stored([[_drag("member-gone")]]) == [None]
+    # The mirror half is the UPDATE_CASES row "append after the recipe stopped
+    # exposing retention", which the planner paints and the route stores.
 
 
 # -- the overlap decision -------------------------------------------------------
@@ -698,6 +677,11 @@ def _orphan_lane(project, scene):
     scene.reference_lane_count = 1
 
 
+def _retention_withdrawn(project, scene):
+    # The recipe stopped exposing a field a stored member still carries.
+    scene.reference_lane_recipes[0].recipe["soft"]["role_fields"] = ["role"]
+
+
 def _members(*keys):
     return [{"entity_id": "entity-1", "member_id": f"member-{key}"} for key in keys]
 
@@ -776,6 +760,25 @@ UPDATE_CASES = [
     ("untrimmed stored role", "item-1", {"strength": 0.5}, _untrimmed_role, "decline"),
     ("lane move", "item-1", {"lane_index": 1}, None, "decline"),
     ("strength as a string", "item-1", {"strength": "0.5"}, None, "decline"),
+    # An append (`_appendReferenceMembersWithinGesture`): the stored priors as
+    # they are, the dragged members after them.
+    ("append", "item-1", {"members": [PRESERVED_A, *_members("b", "c")]}, None, "paint"),
+    ("append after the recipe stopped exposing retention", "item-1",
+     {"members": [PRESERVED_A, *_members("b", "c")]}, _retention_withdrawn, "paint"),
+    ("append a drag with a stale entity id", "item-2",
+     {"members": [*_members("c"), {"entity_id": "entity-2", "member_id": "member-a"}]},
+     None, "paint"),
+    ("append a member carrying an unknown key", "item-2",
+     {"members": [*_members("c"), {**_members("a")[0], "future_field": "x"}]}, None, "paint"),
+    ("append over a trashed prior", "item-1",
+     {"members": [PRESERVED_A, *_members("b", "c")]}, _trashed_asset, "decline"),
+    ("append over an untrimmed stored role", "item-1",
+     {"members": [{**PRESERVED_A, "role": " identity "}, *_members("b", "c")]},
+     _untrimmed_role, "decline"),
+    ("append a member the lane cannot take", "item-1",
+     {"members": [PRESERVED_A, *_members("b", "s")]}, None, "decline"),
+    ("append a member already staged", "item-1",
+     {"members": [PRESERVED_A, *_members("b", "b")]}, None, "refuse:invalid_reference_item"),
 ]
 
 
@@ -893,6 +896,35 @@ def test_every_update_decline_stands_in_for_a_route_outcome_the_mirror_cannot_se
     # here the destination is an audio lane, whose recipe refuses the images.
     assert routed["lane move"] == {"refused": "reference_media_kind_mismatch"}
     assert routed["strength as a string"]["row"]["strength"] == 0.5
+    # An append's priors are re-validated by the route, not only its additions.
+    assert routed["append over a trashed prior"] == {"refused": "asset_not_found"}
+    assert routed["append over an untrimmed stored role"] == {
+        "refused": "unsupported_reference_role"}
+    assert routed["append a member the lane cannot take"] == {
+        "refused": "reference_media_kind_mismatch"}
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "Bug Tracker: clearing a member role or retention is not saved. The route "
+    "drops the cleared field, and the save's unknown-field overlay "
+    "(`_overlay_unknown_keyed_records`) copies the stored value back, because "
+    "the canonical member no longer carries that key. The panel refuses the "
+    "clear locally until this passes."))
+def test_clearing_a_stored_member_field_is_saved():
+    """Through the batch and a save/load, as a project on disk goes -- the table
+    above compares `to_dict()` of the in-memory row, which never meets the
+    overlay, so it cannot see this."""
+    project, _scene = _update_fixture()
+    project = TimelineProject.from_dict(json.loads(json.dumps(project.to_dict())))
+    scene = project.scenes[0]
+    stored = _item(scene, "item-1").to_dict()["members"]
+    cleared = [{key: value for key, value in stored[0].items() if key != "visual_intent"},
+               stored[1]]
+    routes._apply_scene_mutation_batch(project, scene.scene_id, [{
+        "type": "update_reference_item", "reference_item_id": "item-1",
+        "fields": {"members": cleared}, "expected": {"members": stored}}])
+    saved = TimelineProject.from_dict(json.loads(json.dumps(project.to_dict())))
+    assert "visual_intent" not in _item(saved.scenes[0], "item-1").members[0]
 
 
 def test_the_updatable_field_set_is_the_routes():

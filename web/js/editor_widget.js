@@ -370,6 +370,7 @@ import { openReferenceMediaEditor, REFERENCE_MEDIA_EDITOR_SHORTCUTS } from "./re
 import {
     applyPendingReferenceOverlays,
     formatReferenceTag,
+    moveMember,
     referenceOverlayFromOperation,
     referenceOverlayReflected,
     shouldApplyReferenceResponse,
@@ -486,7 +487,7 @@ import {
 } from "./scene_move_geometry.js";
 import { LINK_ITEM_TYPES, pruneLinkedItemGroups, editedLinkGroups, rollbackLinkGroupPrediction } from "./scene_link_groups.js";
 import {
-    canonicalJson, canonicalStagedMemberRefs, canonicalStoredMemberRefs, plannedReferenceItemUpdate,
+    canonicalJson, canonicalStagedMemberRefs, plannedReferenceItemUpdate,
     REFERENCE_ITEM_FIELDS, referenceItemOverlap, stagedReferenceItem,
 } from "./scene_reference_geometry.js";
 import { applyGuideSwap, guideIdentityMatches } from "./scene_guide_geometry.js";
@@ -734,6 +735,34 @@ const REFERENCE_DROP_REFUSALS = {
     duplicate_member: "That member is already staged on this Reference item.",
     default: "That Reference lane is locked, occupied at this frame, or uses a different media kind.",
 };
+
+// The two surfaces that write a staged Reference item through
+// `_writeReferenceItemFromPanelWithinGesture`, and what each says and records:
+// the Lane Setup panel's field and member edits, and the append a Library drop
+// on a bar (or the panel's member picker) makes. One writer, so both share the
+// barrier and the per-field rollback chains; the key discriminator keeps an
+// append readable in the queue and the session log.
+//
+// Only the panel opts into the ordered history baseline. It costs a scene GET
+// before the first write of every wave, and the append is mostly a timeline
+// gesture, which -- like the timeline's other Reference paints -- keeps today's
+// exposure (a Bug Tracker residual) rather than paying that read per drop.
+const REFERENCE_ITEM_WRITERS = Object.freeze({
+    panel: Object.freeze({
+        key: "reference-panel",
+        failureMessage: "The Reference item change could not be saved.",
+        refusalSource: "reference-panel-refused",
+        rollbackDiag: "reference_item_rollback_deferred",
+        orderedHistoryBaseline: true,
+    }),
+    append: Object.freeze({
+        key: "reference-append",
+        failureMessage: "The Reference member could not be added.",
+        refusalSource: "reference-stage-refused",
+        rollbackDiag: "reference_append_rollback_deferred",
+        orderedHistoryBaseline: false,
+    }),
+});
 
 const FULLSCREEN_TIMELINE_MIN_HEIGHT = 160;
 const FULLSCREEN_TIMELINE_FALLBACK_MAX_HEIGHT = 600;
@@ -6198,13 +6227,20 @@ export class EditorWidget {
      *
      *  Resolves to `"ok"`, `"failed"`, `"refused"` or `"unchanged"`. A no-op
      *  is silent: nothing was asked that the row does not already hold.
+     *
+     *  `intent` is the fields to write, or a function of the live row resolved
+     *  after any wait, returning the fields, `null` for nothing to do, or a
+     *  string -- a refusal the caller words, said once and sent nowhere.
+     *  `writer` names the surface (`REFERENCE_ITEM_WRITERS`): the member
+     *  append shares this whole path and differs only in what it says.
      */
     async _writeReferenceItemFromPanel(...args) {
         return this._withMutationGesture(
             "writeReferenceItemFromPanel", () => this._writeReferenceItemFromPanelWithinGesture(...args));
     }
 
-    async _writeReferenceItemFromPanelWithinGesture(itemId, intent, undoLabel) {
+    async _writeReferenceItemFromPanelWithinGesture(itemId, intent, undoLabel, { writer = "panel" } = {}) {
+        const surface = REFERENCE_ITEM_WRITERS[writer] || REFERENCE_ITEM_WRITERS.panel;
         const id = String(itemId || "");
         const state = this._referenceItemWriteState();
         const projectDir = this.projectDir;
@@ -6228,7 +6264,7 @@ export class EditorWidget {
             return "refused";
         }
         const refuse = (message) => {
-            notifyWarning(message, { source: "reference-panel-refused" });
+            notifyWarning(message, { source: surface.refusalSource });
             return "refused";
         };
         const scene = this.activeScene;
@@ -6237,15 +6273,18 @@ export class EditorWidget {
         }
         const row = (scene.reference_items || []).find((candidate) => candidate?.reference_item_id === id);
         if (!row) return refuse(this._referenceItemRefusalMessage("item_not_found"));
-        // An intent may be a function of the LIVE row -- a toggle, a value
-        // derived from the members -- resolved here, after any wait, so it
-        // acts on what the row holds rather than on what it held when clicked.
-        const fields = typeof intent === "function" ? intent(row) : intent;
-        if (!fields || typeof fields !== "object") return "unchanged";
         const laneIndex = Number(row.lane_index) || 0;
+        // Before the intent: a locked lane refuses whatever is asked of it.
         if (this._isLaneLocked(TRACK_TYPE.REFERENCE, laneIndex)) {
             return refuse("This Reference lane is locked. Unlock it on the timeline header to edit.");
         }
+        // An intent may be a function of the LIVE row -- a toggle, a member
+        // edit, a value derived from the members -- resolved here, after any
+        // wait, so it acts on what the row holds rather than on what it held
+        // when clicked.
+        const fields = typeof intent === "function" ? intent(row) : intent;
+        if (typeof fields === "string") return refuse(fields);
+        if (!fields || typeof fields !== "object") return "unchanged";
         const plan = plannedReferenceItemUpdate(row, fields, {
             durationFrames: scene.duration_frames,
             laneItems: scene.reference_items || [],
@@ -6274,7 +6313,7 @@ export class EditorWidget {
         // unpainted set are keyed on it.
         this._referenceItemWriteSeq = (Number(this._referenceItemWriteSeq) || 0) + 1;
         const writeStamp = `${Date.now()}-${this._referenceItemWriteSeq}`;
-        const key = `scene:${scene.scene_id}:reference-panel:${id}:${writeStamp}`;
+        const key = `scene:${scene.scene_id}:${surface.key}:${id}:${writeStamp}`;
         const rowKey = `${scene.scene_id}:${id}`;
         let links = [];
         if (plan.paintable) {
@@ -6331,8 +6370,8 @@ export class EditorWidget {
                 refreshScenes: false,
                 historyEntry,
                 diagnostics,
-                orderedHistoryBaseline: true,
-                failureMessage: "The Reference item change could not be saved.",
+                orderedHistoryBaseline: surface.orderedHistoryBaseline,
+                failureMessage: surface.failureMessage,
                 failureDetail: (error) => error?.payload?.error || error?.message || null,
                 failureTier: "warning",
             });
@@ -6341,51 +6380,110 @@ export class EditorWidget {
             outcome = "failed";
             unconfirmed = !Number.isInteger(error?.status);
         }
-        for (const link of links) link.chain.ownKeys.delete(key);
-        state.unpaintedKeys.delete(key);
-        if (outcome === "refused") this._discardUnstampableUndoEntry(historyEntry);
-        const { restored, deferred } = this._settleFieldWriteChains(state.chains, links, outcome, {
-            isLive: () => this._referenceItemRowLive(state, scene, row),
-            read: (field) => row[field],
-            write: (field, value) => { row[field] = structuredClone(value); },
-            equals: same,
-        });
-        if (outcome === "ok" && this.projectDir === projectDir) {
-            this._reconcileActiveSceneFromMutation(result, { reason: "reference_panel", ignoreTimelineGate: true });
-            // An unpainted write's answer still has to reach the scene object it
-            // was written on when the reconcile did not replace it: the
-            // reconcile deferred behind another write, or the author switched
-            // to another scene and this one waits in the list to be returned to.
-            const kept = this.activeScene === scene
-                || (this.activeScene?.scene_id !== scene.scene_id && this._sceneObjectCurrent(scene));
-            if (!plan.paintable && kept) {
-                // Bring in what this write changed on the server, unless
-                // something newer has been painted over the row since.
-                const canonical = (result?.payload?.scene?.reference_items || [])
-                    .find((candidate) => candidate?.reference_item_id === id);
-                const untouched = Object.keys(before).every((name) => same(row[name], before[name]));
-                if (canonical && untouched && this._referenceItemRowLive(state, scene, row)) {
-                    for (const name of Object.keys(before)) row[name] = structuredClone(canonical[name]);
-                    this._renderSceneAfterLocalMutation({ viewport: false });
-                } else {
-                    // Not adoptable here: converge by the gated refresh.
-                    this._deferProjectBackedRefresh(["scenes"], "reference_item_unadopted");
+        let restored = false;
+        let deferred = [];
+        try {
+            for (const link of links) link.chain.ownKeys.delete(key);
+            state.unpaintedKeys.delete(key);
+            if (outcome === "refused") this._discardUnstampableUndoEntry(historyEntry);
+            ({ restored, deferred } = this._settleFieldWriteChains(state.chains, links, outcome, {
+                isLive: () => this._referenceItemRowLive(state, scene, row),
+                read: (field) => row[field],
+                write: (field, value) => { row[field] = structuredClone(value); },
+                equals: same,
+            }));
+            if (outcome === "ok" && this.projectDir === projectDir) {
+                this._reconcileActiveSceneFromMutation(result, { reason: "reference_panel", ignoreTimelineGate: true });
+                // An unpainted write's answer still has to reach the scene object it
+                // was written on when the reconcile did not replace it: the
+                // reconcile deferred behind another write, or the author switched
+                // to another scene and this one waits in the list to be returned to.
+                const kept = this.activeScene === scene
+                    || (this.activeScene?.scene_id !== scene.scene_id && this._sceneObjectCurrent(scene));
+                if (!plan.paintable && kept) {
+                    // Bring in what this write changed on the server, unless
+                    // something newer has been painted over the row since.
+                    const canonical = (result?.payload?.scene?.reference_items || [])
+                        .find((candidate) => candidate?.reference_item_id === id);
+                    const untouched = Object.keys(before).every((name) => same(row[name], before[name]));
+                    if (canonical && untouched && this._referenceItemRowLive(state, scene, row)) {
+                        for (const name of Object.keys(before)) row[name] = structuredClone(canonical[name]);
+                        this._renderSceneAfterLocalMutation({ viewport: false });
+                    } else {
+                        // Not adoptable here: converge by the gated refresh.
+                        this._deferProjectBackedRefresh(["scenes"], "reference_item_unadopted");
+                    }
                 }
             }
-        }
-        if (barrier) {
-            // Only this write's own barrier leaves the map; a newer one stays.
-            if (state.barriers.get(id) === barrier) state.barriers.delete(id);
-            settleBarrier();
+        } finally {
+            // Released whatever the settle above did, a throw included: a
+            // barrier that never settles would hold every later member-guarded
+            // gesture on this item -- an append, a Delete -- until a project
+            // switch. Only this write's own barrier leaves the map.
+            if (barrier) {
+                if (state.barriers.get(id) === barrier) state.barriers.delete(id);
+                settleBarrier();
+            }
         }
         // Field names only, never values (`durable_rules.md`, diagnostics).
-        if (deferred.length) sessionDiagRecord("reference_item_rollback_deferred", { fields: deferred });
+        if (deferred.length) sessionDiagRecord(surface.rollbackDiag, { fields: deferred });
         if ((deferred.length || unconfirmed) && this.projectDir === projectDir) {
             this._deferProjectBackedRefresh(["scenes"], "reference_item_unconfirmed");
         }
         if (restored) this._renderSceneAfterLocalMutation({ viewport: false });
         this._refreshPromptContextDependencyConsumers();
         return outcome;
+    }
+
+    /** The Reference Lane Setup panel's member edits: role, retention,
+     *  reorder and remove.
+     *
+     *  The panel sends the edit, never a built list: `{ kind: "patch",
+     *  memberId, patch }`, `{ kind: "move", memberId, direction }` or
+     *  `{ kind: "remove", memberId }`. The list is built from the LIVE row when
+     *  the writer acts -- after any unpainted write on the item has settled --
+     *  so an edit queued behind another applies to the members that one left,
+     *  and a stale ↑ at the top of the list is a silent no-op. Everything else
+     *  is `_writeReferenceItemFromPanel`'s: a reorder or remove paints, an
+     *  authored role or retention change goes unpainted behind the item's
+     *  barrier, and removing the last member is refused locally.
+     */
+    _editReferenceItemMembersFromPanel(itemId, edit, undoLabel) {
+        return this._writeReferenceItemFromPanel(itemId, (row) => {
+            const members = this._referenceMembersAfterEdit(row.members, edit);
+            return Array.isArray(members) ? { members } : members;
+        }, undoLabel);
+    }
+
+    /** The member list `edit` leaves, or a refusal the author is told. */
+    _referenceMembersAfterEdit(members, edit) {
+        const list = Array.isArray(members) ? members : [];
+        const memberId = String(edit?.memberId || "");
+        const current = list.find((member) => member?.member_id === memberId);
+        if (!current) return "That member is no longer on this Reference item.";
+        if (edit.kind === "patch") {
+            // A stored role or retention cannot be cleared: the route drops the
+            // field, and the save's unknown-field overlay then restores the
+            // stored value (Bug Tracker, "clearing a member role or retention is
+            // not saved"). Refused here rather than painted and silently
+            // reverted. Expiry: remove when the overlay stops restoring known
+            // member fields a mutation cleared.
+            const cleared = Object.entries(edit.patch || {}).some(([field, value]) =>
+                !String(value ?? "").trim() && String(current[field] ?? "").trim());
+            if (cleared) return "A saved role or retention cannot be cleared yet. Choose another value instead.";
+        }
+        if (edit.kind === "move") {
+            // `moveMember` stamps a dense `order` the item schema does not
+            // have; the route ignores it, and it is dropped here.
+            return moveMember(list, memberId, edit.direction)
+                .map(({ order: _order, ...member }) => member);
+        }
+        if (edit.kind === "remove") return list.filter((member) => member?.member_id !== memberId);
+        if (edit.kind === "patch") {
+            return list.map((member) => member?.member_id === memberId
+                ? { ...member, ...(edit.patch || {}) } : member);
+        }
+        return null;
     }
 
     /**
@@ -6468,19 +6566,6 @@ export class EditorWidget {
             this._referenceMemberForRef({ member_id: memberId })?.reference?.reference_id || "");
     }
 
-    /** The same, for members this client read back from the route.
-     *
-     *  A stored member may carry `visual_intent`, `audio_intent` or `role`,
-     *  which the staged form refuses because it cannot validate them. It does
-     *  not have to: an append passes `legacy_members`, so the route returns a
-     *  stored record unchanged. Using the staged form for priors would make
-     *  every bar with a member role silently lose its optimistic paint.
-     */
-    _storedMemberRefs(rawMembers) {
-        return canonicalStoredMemberRefs(rawMembers, (memberId) =>
-            this._referenceMemberForRef({ member_id: memberId })?.reference?.reference_id || "");
-    }
-
     /** Plan, then paint, a newly staged Reference bar.
      *
      *  This pair mirrors `_apply_create_reference_item`:
@@ -6538,28 +6623,6 @@ export class EditorWidget {
         if (!Array.isArray(scene.reference_items)) scene.reference_items = [];
         scene.reference_items.push(row);
         return row;
-    }
-
-    /** Paint an append onto an already-staged bar.
-     *
-     *  This is the half Phase C §3 decided to leave out, and the probe that
-     *  reversed that decision is written up in `scene_reference_geometry.js`.
-     *  The short version: the second drop into one in-flight window is refused
-     *  TODAY, because `priorMembers` is read from a scene the first drop never
-     *  updated, and painting is what makes that guard describe reality.
-     *
-     *  `_referenceDropResolver`'s `duplicate_member` and `covering` tests read
-     *  the same list, so the paint also decides create-vs-append correctly for
-     *  the rest of the window — which is the point of the exercise, not the bar
-     *  redrawing sooner.
-     */
-    _applyLocalAppendReferenceMembers(referenceItemId, members) {
-        const scene = this.activeScene;
-        const item = (scene?.reference_items || []).find(
-            (candidate) => candidate.reference_item_id === referenceItemId);
-        if (!item || !Array.isArray(members) || !members.length) return null;
-        item.members = members.map((member) => ({ ...member }));
-        return item.members;
     }
 
     /** Report a staged bar that came back under a name the client did not mint.
@@ -11756,6 +11819,35 @@ export class EditorWidget {
      *  order within the item, so inserting at the drop position would silently
      *  renumber every member after it. Reordering stays in the lane overlay's
      *  Members section, where it already lives.
+     *
+     *  An append is an `update_reference_item` naming `members`, so it is
+     *  written by the same host writer as the Lane Setup panel's member edits
+     *  (`_writeReferenceItemFromPanelWithinGesture`, surface `append`) and gets
+     *  everything that writer owns:
+     *
+     *   * it waits for an unpainted write on the item to settle, then reads the
+     *     priors and the `expected` guard from the LIVE row -- before its own
+     *     paint, so the guard states what the author saw;
+     *   * a locked lane and a member already on the item are refused when the
+     *     write acts, not only when the drop resolver or the panel's picker
+     *     judged them -- both are draw-time readings;
+     *   * the paint is the route's canonical list when the mirror can produce
+     *     it (`plannedReferenceItemUpdate`). That re-validates the PRIORS too,
+     *     because the route re-canonicalizes the whole list while
+     *     `resolveReferenceDropVerdict` only ever examined the dragged members:
+     *     a bar holding a member whose asset was trashed, whose lane population
+     *     narrowed, or whose stored role the route would trim is sent unpainted
+     *     behind the item's barrier, and the response speaks;
+     *   * a failure rolls the members back locally, per the members chain, with
+     *     one message -- never by an ungated refetch, which would replace a
+     *     panel write painted and queued behind this one.
+     *
+     *  The paint matters beyond the bar redrawing sooner: the drop resolver's
+     *  `duplicate_member` and `covering` tests read the same list, so it decides
+     *  create-vs-append correctly for the rest of the window, and a second drop's
+     *  guard describes the list the route is about to store rather than one it
+     *  has left. Phase C §3 decided the opposite; `scene_reference_geometry.js`
+     *  records the probe that reversed it.
      */
     async _appendReferenceMembers(...args) {
         return this._withMutationGesture(
@@ -11763,101 +11855,39 @@ export class EditorWidget {
     }
 
     async _appendReferenceMembersWithinGesture(referenceItemId, payload) {
-        const scene = this.activeScene;
-        const item = (scene?.reference_items || []).find(
-            (candidate) => candidate.reference_item_id === referenceItemId);
-        if (!item) return;
-        // Read BEFORE the local apply, per the cross-cutting rule: `expected`
-        // states what the author saw, and a guard read after the paint compares
-        // the client's own answer against itself.
-        const priorMembers = (item.members || []).map((value) => ({ ...value }));
-        // The canonical record, not the payload's copy of it, so the painted
-        // list and the stored list cannot differ. `null` means the route would
-        // refuse -- an unresolvable member, one named twice, or a stored field
-        // this client cannot reproduce -- in which case nothing is painted and
-        // the raw payload is sent so the server's own message reaches the author
-        // instead of a local guess.
-        //
-        // The PRIORS are re-resolved too, and that is not belt and braces.
-        // `_apply_update_reference_item` re-canonicalizes the whole list, while
-        // `resolveReferenceDropVerdict` only ever looked at the dragged members
-        // -- so a bar holding a member whose asset was trashed since it was
-        // staged is refused for a row the drop rules never examined. Painting
-        // over that refusal would put the new member on a bar the save is about
-        // to reject outright.
-        const stagedPriors = priorMembers.length
-            ? this._storedMemberRefs(priorMembers) : [];
-        const stagedAdditions = this._stagedMemberRefs(payload.members);
-        const staged = stagedPriors && stagedAdditions
-            ? [...stagedPriors, ...stagedAdditions] : null;
-        const members = staged
-            || [...priorMembers, ...(payload.members || []).map((value) => ({ ...value }))];
-        const laneIndex = item.lane_index || 0;
-        // The cap is HARD — `nodes/reference_core.py` raises when a lane's
-        // reserved span exceeds `hard.max_members` — but the append still
-        // ALLOWS the over-cap state, because the overlay's `+ Add member`
-        // picker allows it and a stricter rule for one of two paths into the
-        // same durable state would be a second authority. What changes is that
-        // the breach is said out loud at the moment it happens, while undo is
-        // still one keystroke away, instead of only inside a collapsed group
-        // in an overlay this author has not opened.
-        const cap = Number(this._referenceLaneRecipe(laneIndex)?.recipe?.hard?.max_members);
-        const overCap = Number.isFinite(cap) && cap >= 0 && members.length > cap;
-
-        // Pushed before the paint, so the entry restores the pre-drop scene.
-        // The entry itself is held, not just its label, so a refused write can
-        // drop the one it created rather than leaving an unstampable entry --
-        // the shape of the tracked Undo-wedge defect, and the convention every
-        // other optimistic writer here already follows.
-        const undoEntry = this._pushUndo("add reference member");
-        if (staged) {
-            // `staged` is the already-canonical list, so this does not resolve
-            // the members a second time.
-            this._applyLocalAppendReferenceMembers(referenceItemId, staged);
-            this._renderSceneAfterLocalMutation({ viewport: false });
-        }
-        try {
-            const result = await this._runSceneMutation([{
-                type: "update_reference_item",
-                reference_item_id: referenceItemId,
-                fields: { members },
-                // `expected` names only what the server compares. The
-                // branch validates `fields.keys()`, so a `reference_item_id`
-                // here would be required and then ignored -- and the operation
-                // is already addressed by the top-level id above.
-                expected: { members: priorMembers },
-            }], {
-                key: `scene:${this.activeSceneId}:reference-append:${referenceItemId}:${Date.now()}`,
-                label: "add reference member",
-                coalesce: false,
-                refreshScenes: false,
-            });
-            this._reconcileActiveSceneFromMutation(result, { reason: "reference_append", ignoreTimelineGate: true });
-            this._buildTrackLayout();
-            this._renderTimeline();
-            this._refreshPromptContextDependencyConsumers();
-            if (overCap) {
-                notifyWarning(
-                    `${members.length} staged members exceed this lane recipe's hard cap of ${cap}; the render will be refused. Undo, or raise the cap in Reference Lane Setup.`,
-                    { source: "reference-stage-over-cap" });
+        let overCap = null;
+        const outcome = await this._writeReferenceItemFromPanelWithinGesture(referenceItemId, (row) => {
+            const staged = new Set((row.members || []).map((member) => String(member?.member_id || "")));
+            const additions = [];
+            for (const member of payload?.members || []) {
+                const memberId = String(member?.member_id || "");
+                if (staged.has(memberId)) return REFERENCE_DROP_REFUSALS.duplicate_member;
+                staged.add(memberId);
+                additions.push({ ...member });
             }
-        } catch (error) {
-            notifyWarning(error?.message || "Reference member was not added.", { source: "reference-stage-refused" });
-            // The refetch is what discards the painted members, and the repaint
-            // is what makes the discard visible -- this catch used to refetch
-            // and draw nothing, which was harmless while there was no optimistic
-            // state and is not now. `_fetchScenes` can still decline, and then
-            // the queue's deferred refresh is what heals; the diagnostic records
-            // that it happened rather than leaving it silent.
-            const healed = await this._fetchScenes(
-                { ignoreMutationGate: true, reason: "reference_append_error" });
-            this._discardUnstampableUndoEntry(undoEntry);
-            if (staged) {
-                if (healed === false) sessionDiagRecord("reference_append_rollback_deferred", {});
-                this._renderSceneAfterLocalMutation({ viewport: false });
-            }
-            this._refreshPromptContextDependencyConsumers();
+            if (!additions.length) return null;
+            // As the author asked: the priors as stored, the additions as
+            // dragged. The paint is the planner's canonical list.
+            const members = [...(row.members || []).map((member) => ({ ...member })), ...additions];
+            // The cap is HARD -- `nodes/reference_core.py` raises when a lane's
+            // reserved span exceeds `hard.max_members` -- but the append still
+            // ALLOWS the over-cap state, because the overlay's `+ Add member`
+            // picker allows it and a stricter rule for one of two paths into
+            // the same durable state would be a second authority. What changes
+            // is that the breach is said out loud at the moment it happens,
+            // while undo is still one keystroke away, instead of only inside a
+            // collapsed group in an overlay this author has not opened.
+            const cap = Number(this._referenceLaneRecipe(Number(row.lane_index) || 0)?.recipe?.hard?.max_members);
+            overCap = Number.isFinite(cap) && cap >= 0 && members.length > cap
+                ? { count: members.length, cap } : null;
+            return { members };
+        }, "add reference member", { writer: "append" });
+        if (outcome === "ok" && overCap) {
+            notifyWarning(
+                `${overCap.count} staged members exceed this lane recipe's hard cap of ${overCap.cap}; the render will be refused. Undo, or raise the cap in Reference Lane Setup.`,
+                { source: "reference-stage-over-cap" });
         }
+        return outcome;
     }
 
     async _placeReferencePayload(...args) {
@@ -18914,19 +18944,50 @@ export class EditorWidget {
 
     async _deleteSelectedItemsWithinGesture() {
         if (this.selectedItems.length === 0 || !this.activeScene || !this.projectDir) return;
-        const expanded = this._expandItemsWithLinked(this.selectedItems);
+        // A Reference item in the selection may have a member write the mirror
+        // could not paint still settling (`_referenceItemWriteState().barriers`).
+        // The delete's per-item guard names the members, so it waits for that
+        // answer and reads the rows after it. What it deletes is what was
+        // selected when Delete was pressed -- captured by address now, and
+        // resolved against the live rows after the wait -- never whatever the
+        // author has selected by the time the answer arrives. Attributed to
+        // the gesture that started now; after a wait the ambient gesture is gone.
+        const diagnostics = this._snapshotMutationDiagnostics?.() ?? null;
+        const writes = this._referenceItemWrites;
+        const projectDir = this.projectDir;
+        const pressed = this.selectedItems.map((item) => ({ type: item?.type, id: item?.id }));
+        let waited = false;
+        for (;;) {
+            const pending = pressed
+                .filter((item) => item.type === "reference")
+                .map((item) => writes?.barriers?.get(String(item.id || "")))
+                .filter(Boolean);
+            if (!pending.length) break;
+            waited = true;
+            await Promise.all(pending);
+        }
+        if (waited && (this.projectDir !== projectDir || this._referenceItemWrites !== writes
+                || !this.activeScene)) return;
+        const targets = waited
+            ? pressed.map((item) => this._findSceneItemBySelection(item.type, item.id)).filter(Boolean)
+            : this.selectedItems;
+        if (!targets.length) return;
+        const expanded = this._expandItemsWithLinked(targets);
         if (!expanded.length) return;
         if (expanded.some((item) => this._isItemLocked(item))) {
             notifyWarning("Delete refused because one or more linked/selected items are locked.", { source: "timeline-delete-refused" });
             return;
         }
-        const applyLinked = expanded.length > this.selectedItems.length
-            || this.selectedItems.some((item) => this._shouldApplyLinked(item));
+        const applyLinked = expanded.length > targets.length
+            || targets.some((item) => this._shouldApplyLinked(item));
         const undoLabel = "delete items";
         this._pushUndo(undoLabel);
         const items = expanded.map((item) => this._mutationItemFromSelection(item)).filter(Boolean);
         this._applyLocalBulkDeleteItems(items);
-        this._clearSelection();
+        // A selection the author changed during the wait is theirs: only the
+        // deleted rows leave it.
+        if (targets === this.selectedItems) this._clearSelection();
+        else this._reconcileSelection();
         this._hideItemEditor();
         this._renderSceneAfterLocalMutation();
 
@@ -18937,6 +18998,7 @@ export class EditorWidget {
                     key: `scene:${this.activeSceneId}:delete-selected:${Date.now()}`,
                     label: "delete items",
                     coalesce: false,
+                    diagnostics,
                     // The per-item `expected` these items already carry is now
                     // honoured on the linked path too, so this can refuse where
                     // it used to delete whatever inherited the position.

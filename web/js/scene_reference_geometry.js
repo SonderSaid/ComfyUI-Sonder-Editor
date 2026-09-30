@@ -31,25 +31,25 @@
 //     stores. `canonicalStagedMemberRefs` is what keeps that structural rather
 //     than accidental: it builds the record the server would build, from the
 //     same inputs, and drops anything else.
-//   * NOT painting is what loses a drop. `_appendReferenceMembersWithinGesture`
-//     reads `priorMembers` before its await, so during the in-flight window a
-//     second drop guards against state the server has already moved past and is
-//     refused `identity_mismatch`. The route floor is ~2 s at 6 MB and ~7.8 s at
-//     28 MB, so that window is the ordinary case, not a race. Both halves are
-//     pinned by tests, but by DIFFERENT ones: the route half by
+//   * NOT painting is what loses a drop. An append reads its `expected` guard
+//     from the live row before its own paint, so without a paint a second drop
+//     during the in-flight window guards against state the server has already
+//     moved past and is refused `identity_mismatch`. The route floor is ~2 s at
+//     6 MB and ~7.8 s at 28 MB, so that window is the ordinary case, not a race.
+//     Both halves are pinned by tests, but by DIFFERENT ones: the route half by
 //     `test_reference_geometry_parity.py`, the gesture half by
 //     `test_an_append_reads_its_guard_before_the_paint` in
 //     `test_project_mutation_queue.py`. Removing the paint leaves the route
 //     tests green, so neither file holds the reversal on its own.
 //
-// For STAGING and APPEND (`stagedReferenceItem`, `canonicalStagedMemberRefs`,
-// `canonicalStoredMemberRefs`) applicability is deliberately NOT re-derived
-// here, and the exact extent of that has to be stated rather than waved at,
-// because an audit disproved the blanket version of this paragraph. The UPDATE
-// planner at the end of this file takes the opposite stance for a stated reason;
-// see `plannedReferenceItemUpdate`.
+// For STAGING (`stagedReferenceItem`, `canonicalStagedMemberRefs`)
+// applicability is deliberately NOT re-derived here, and the exact extent of
+// that has to be stated rather than waved at, because an audit disproved the
+// blanket version of this paragraph. The UPDATE planner at the end of this file
+// takes the opposite stance for a stated reason; see
+// `plannedReferenceItemUpdate`.
 //
-// For the members a gesture is ADDING, `resolveReferenceDropVerdict`
+// For the members a staging gesture is ADDING, `resolveReferenceDropVerdict`
 // (`reference_lane_identity.js`) already decides every refusal
 // `_canonical_reference_member_refs` and `_require_no_reference_overlap` can
 // raise — unresolvable member, missing asset, duplicate member, incompatible
@@ -58,21 +58,17 @@
 // a JS↔Python parity test. A second copy of those rules here would be a second
 // authority over the same decision, which is what §2 rule 5 forbids.
 //
-// An APPEND is not only about what it adds. `_apply_update_reference_item`
+// An APPEND is an update naming `members`, and is planned as one
+// (`plannedReferenceItemUpdate`): `_apply_update_reference_item`
 // re-canonicalizes the WHOLE list, priors included, while the drop resolver
-// iterates the dragged members alone — so a bar holding a member whose asset
-// was trashed since it was staged is refused `asset_not_found` for a member the
-// resolver never looked at. The caller therefore re-resolves its priors through
-// `canonicalStagedMemberRefs` too, and paints nothing when they no longer
-// resolve. That is not a second authority: it is the same lookup the resolver
-// runs, applied to the rows the resolver skips.
+// iterates the dragged members alone. So a bar holding a member whose asset was
+// trashed, whose lane population narrowed, or whose stored role the route would
+// trim, is refused for a member the resolver never looked at -- and the append
+// is sent unpainted, letting the response speak.
 //
-// Two server refusals have no twin in the staging and append paths, and are deliberate. The lane recipe's
-// `hard.max_members` cap is allowed on the route's side as well — the append
-// permits the over-cap state and warns. And a recipe whose `physical_population`
-// NARROWED after a member was staged refuses that prior member; the paint goes
-// ahead and the response corrects it, because refusing locally would need this
-// file to re-derive the recipe rules the panel owns.
+// One server refusal has no twin anywhere here, deliberately: the lane recipe's
+// `hard.max_members` cap is allowed on the route's side as well -- the append
+// permits the over-cap state and warns.
 //
 // Member canonicalization itself stays server-authoritative, exactly as §3
 // required. What this file mirrors is the record SHAPE for refs the drop path
@@ -141,16 +137,16 @@ export function referenceItemBounds(durationFrames, start, end) {
  *  and diverged from the route in six measured ways, every one of which paints a
  *  record the save would refuse or rewrite.
  *
- *  Refusing is free because nothing reaches THIS function carrying them: both
+ *  Refusing is free because nothing reaches THIS function carrying them: its
  *  callers pass Library drag payloads, which are `{entity_id, member_id}` and
  *  nothing else. Mirroring the validation would duplicate recipe and profile
  *  authority this file has no business holding; carrying the fields unvalidated
  *  would paint a lie.
  *
  *  A member the route already stored is a different question with a different
- *  answer — see `canonicalStoredMemberRefs` below, which an append uses for its
- *  priors. Splitting them is what stops a bar whose members carry roles from
- *  quietly losing its optimistic paint.
+ *  answer -- see `updatedMemberRefs` below, which the update planner (and so an
+ *  append) uses: a stored value `unchanged` against the item's own record is
+ *  carried, because the route's `legacy_members` leniency returns it as is.
  */
 export const PAINTABLE_MEMBER_FIELDS = Object.freeze(["entity_id", "member_id"]);
 
@@ -158,14 +154,11 @@ export const PAINTABLE_MEMBER_FIELDS = Object.freeze(["entity_id", "member_id"])
 const STORED_MEMBER_FIELDS = Object.freeze(
     ["visual_intent", "audio_intent", "role"]);
 
-function canonicalMemberRefs(rawMembers, entityIdFor, carryStoredFields) {
+export function canonicalStagedMemberRefs(rawMembers, entityIdFor) {
     if (!Array.isArray(rawMembers) || !rawMembers.length) return null;
     const resolve = typeof entityIdFor === "function" ? entityIdFor : () => "";
     const out = [];
     const seen = new Set();
-    const allowed = carryStoredFields
-        ? [...PAINTABLE_MEMBER_FIELDS, ...STORED_MEMBER_FIELDS]
-        : PAINTABLE_MEMBER_FIELDS;
     for (const raw of rawMembers) {
         if (!raw || typeof raw !== "object") return null;
         const memberId = String(raw.member_id || "");
@@ -176,52 +169,14 @@ function canonicalMemberRefs(rawMembers, entityIdFor, carryStoredFields) {
         // diverge silently, which is precisely the failure `_pushUndo` turns
         // durable.
         for (const key of Object.keys(raw)) {
-            if (!allowed.includes(key)) return null;
+            if (!PAINTABLE_MEMBER_FIELDS.includes(key)) return null;
         }
         const entityId = String(resolve(memberId) || "");
         if (!entityId) return null;
         seen.add(memberId);
-        const record = { entity_id: entityId, member_id: memberId };
-        if (carryStoredFields) {
-            for (const field of STORED_MEMBER_FIELDS) {
-                if (field in raw) record[field] = raw[field];
-            }
-        }
-        out.push(record);
+        out.push({ entity_id: entityId, member_id: memberId });
     }
     return out;
-}
-
-export function canonicalStagedMemberRefs(rawMembers, entityIdFor) {
-    return canonicalMemberRefs(rawMembers, entityIdFor, false);
-}
-
-/** The same record for members this client READ BACK from the route.
- *
- *  Separated from the staged form rather than given a flag, because the two
- *  differ on a question that has one right answer per call site and no sensible
- *  default: may a stored `visual_intent` / `audio_intent` / `role` be carried?
- *
- *  For a record the route returned, yes, and measurably so.
- *  `_apply_update_reference_item` passes `legacy_members=item.members`, and
- *  `_canonical_reference_member_refs` suppresses every intent and role check
- *  whose value is `unchanged` against that legacy record. Probed against the
- *  route: a stored member round-trips **byte-identically** through an append,
- *  including under a recipe that has since stopped exposing the field. So
- *  copying it is not a guess — it is the route's own answer.
- *
- *  For a record the AUTHOR just produced there is no legacy entry to be
- *  unchanged against, every check runs, and this file cannot mirror them without
- *  duplicating recipe and profile authority. Hence the two names.
- *
- *  Two prior-member refusals are deliberately NOT caught here and arrive from
- *  the response instead: `member_population_compatible` and the asset lookup run
- *  for every member regardless of `legacy_members`, so a lane whose population
- *  narrowed after staging refuses a prior. The asset half IS caught, because an
- *  unresolvable member fails `entityIdFor`.
- */
-export function canonicalStoredMemberRefs(rawMembers, entityIdFor) {
-    return canonicalMemberRefs(rawMembers, entityIdFor, true);
 }
 
 /** The row `_apply_create_reference_item` would append, or null on a refusal.

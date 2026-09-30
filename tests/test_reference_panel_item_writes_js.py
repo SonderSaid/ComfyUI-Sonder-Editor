@@ -181,8 +181,12 @@ class N {
     preventDefault() {}, stopPropagation() {}, ...extra })); }
   setAttribute(k,v) { this.attributes[k]=String(v); }
   getAttribute(k) { return this.attributes[k] ?? null; }
-  querySelectorAll(sel) { const tags=String(sel).split(",").map((v)=>v.trim().toUpperCase());
-    const out=[]; const walk=(n)=>n.children.forEach((c)=>{ if(tags.includes(c.tagName)) out.push(c); walk(c); });
+  // Tag lists, and one `[data-x='v']` attribute selector (the panel's autofocus).
+  querySelectorAll(sel) { const attr=/^\[data-([\w-]+)='([^']*)'\]$/.exec(String(sel).trim());
+    const key=attr && attr[1].replace(/-(\w)/g, (_m, c) => c.toUpperCase());
+    const tags=String(sel).split(",").map((v)=>v.trim().toUpperCase());
+    const hit=(c)=>attr ? c.dataset[key] === attr[2] : tags.includes(c.tagName);
+    const out=[]; const walk=(n)=>n.children.forEach((c)=>{ if(hit(c)) out.push(c); walk(c); });
     walk(this); return out; }
   querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
   contains(node) { for (let n = node; n; n = n.parentElement) if (n === this) return true; return false; }
@@ -238,7 +242,14 @@ Object.assign(w, {
   _promptContextProfiles:[], _promptContextCatalog:{},
   _activeMutationGesture:null, _timelineMutationDepth:0, _sceneMutationInvalidationSeq:0,
   _queueFetchSeq:0, isDragging:false,
-  _projectMutationQueue: new ProjectMutationQueue({ onIdle: () => w._replayDeferredProjectBackedRefresh() }),
+  // The shipped `onIdle`, so an ordered history context is dropped when the
+  // queue drains and the next wave pays its baseline read again, as it does live.
+  _projectMutationQueue: new ProjectMutationQueue({ onIdle: () => {
+    if (!w._historyOrderContextNeedsRetention?.(w._latestHistoryOrderContext)) {
+      w._latestHistoryOrderContext = null;
+    }
+    w._replayDeferredProjectBackedRefresh();
+  } }),
   _undoStack:[], _redoStack:[], _maxUndoSteps:50, _historyStackRevision:0,
   totalFrames: 100, playhead: 0,
   _trimUndoStack(){}, _clearRedoForNewEdit(){}, _replayDeferredHistoryWidgetStateIfIdle(){},
@@ -1563,3 +1574,535 @@ def test_each_settled_field_edit_refreshes_the_prompt_consumers_once(tmp_path):
     return { afterOk, afterLocalRefusal: refreshed };
     """, tmp_path)
     assert result == {"afterOk": 1, "afterLocalRefusal": 1}
+
+
+# -- Phase 5: member edits ------------------------------------------------------------
+
+_MEMBERS = _FIELDS + """
+const order = (id = 'item-1', scene = w.activeScene) => item(id, scene).members.map((m) => m.member_id);
+const retentions = (id = 'item-1', scene = w.activeScene) =>
+  item(id, scene).members.map((m) => m.visual_intent || '');
+const memberButtons = (start, text) => cardAt(start).querySelectorAll('button')
+  .filter((b) => b.textContent === text);
+const drag = (key) => ({ entity_id: 'entity-1', member_id: `member-${key}` });
+"""
+
+
+def _retention_project():
+    """Lane 0 exposes per-member retention: a retention change is an authored
+    member field the mirror declines to paint, and the route accepts."""
+    project = fixture_project()
+    project.scenes[0].reference_lane_recipes[0].recipe["soft"]["role_fields"] = ["visual_intent"]
+    return project
+
+
+def _three_member_project():
+    """item-1 holds [a, b, d], so a member can move twice."""
+    project = fixture_project()
+    project.assets.append(Asset(asset_id="asset-d", name="d.png", asset_type="image",
+                                path="media/d.png"))
+    project.references[0].members.append(
+        ReferenceMember(member_id="member-d", asset_id="asset-d", name="D"))
+    project.scenes[0].reference_items[0].members.append(
+        {"entity_id": "entity-1", "member_id": "member-d"})
+    return project
+
+
+def test_a_member_moved_up_twice_quickly_moves_twice_and_both_persist(tmp_path):
+    """Plan manual row "move a member ↑ twice quickly": the second click on the
+    same, unrepainted button moves the member again from where the first put it."""
+    result = run_item_panel(_MEMBERS + """
+    mount();
+    hold(2);
+    const up = memberButtons(10, '↑')[2];            // member d
+    up.dispatch('click');
+    const afterFirst = order();
+    up.dispatch('click');
+    const afterSecond = order();
+    await release(); await release(); await settle();
+    return { afterFirst, afterSecond, local: order(), server: order('item-1', await serverScene()),
+      sent: updates().map((op) => op.fields.members.map((m) => m.member_id)),
+      undo: w._undoStack.map((entry) => entry.label) };
+    """, tmp_path, project=_three_member_project())
+    assert result["afterFirst"] == ["member-a", "member-d", "member-b"]
+    assert result["afterSecond"] == ["member-d", "member-a", "member-b"]
+    assert result["sent"] == [result["afterFirst"], result["afterSecond"]]
+    assert result["local"] == result["server"] == result["afterSecond"]
+    assert result["undo"] == ["reorder reference members"] * 2
+
+
+def test_a_stale_move_past_the_top_of_the_list_is_a_silent_no_op(tmp_path):
+    result = run_item_panel(_MEMBERS + """
+    mount();
+    const outcome = await w._editReferenceItemMembersFromPanel('item-1',
+      { kind: 'move', memberId: 'member-a', direction: -1 }, 'reorder reference members');
+    return { outcome, sent: sent.length, undo: w._undoStack.length, toasts: toasts.length };
+    """, tmp_path)
+    assert result == {"outcome": "unchanged", "sent": 0, "undo": 0, "toasts": 0}
+
+
+def test_removing_a_member_paints_and_removing_the_last_one_is_refused_locally(tmp_path):
+    result = run_item_panel(_MEMBERS + """
+    mount();
+    hold();
+    memberButtons(10, '×')[1].dispatch('click');     // member b
+    const painted = order();
+    await release(); await settle();
+    w._redoStack = [{ label: 'undone', snapshot: {} }];
+    memberButtons(50, '×')[0].dispatch('click');     // item-2's only member
+    await settle(4);
+    return { painted, server: order('item-1', await serverScene()), sent: sent.length,
+      redo: w._redoStack.length, lone: order('item-2'), messages: toasts.map((t) => t.message) };
+    """, tmp_path)
+    assert result["painted"] == ["member-a"] and result["server"] == ["member-a"]
+    assert (result["sent"], result["redo"], result["lone"]) == (1, 1, ["member-c"])
+    assert "An item must keep at least one Library member." in result["messages"]
+
+
+def test_a_member_edit_behind_an_unpainted_one_waits_and_both_persist(tmp_path):
+    """Plan test 9, first row: an authored member field is sent unpainted behind
+    the item's barrier. A second member edit made while it saves -- with the
+    first select still focused -- waits, reads the adopted members as its guard,
+    and both persist."""
+    result = run_item_panel(_MEMBERS + """
+    mount();
+    hold();
+    const [first, second] = cardAt(10).querySelectorAll('select');
+    first.focus();
+    first.value = 'partial'; first.dispatch('change');
+    const unpainted = retentions();
+    await settle(2);
+    second.value = 'preserve'; second.dispatch('change');
+    await settle(4);
+    const whileHeld = sent.length;
+    await release();
+    await settle(10);
+    return { unpainted, whileHeld,
+      guard: updates()[1]?.expected.members.map((m) => m.visual_intent || ''),
+      local: retentions(), server: retentions('item-1', await serverScene()),
+      shown: [first.value, second.value], stillFocused: document.activeElement === first,
+      toasts: toasts.length };
+    """, tmp_path, project=_retention_project())
+    assert result["unpainted"] == ["preserve", ""]
+    assert result["whileHeld"] == 1
+    assert result["guard"] == ["partial", ""]
+    assert result["local"] == result["server"] == ["partial", "preserve"]
+    assert result["shown"] == ["partial", "preserve"] and result["stillFocused"] is True
+    assert result["toasts"] == 0
+
+
+def test_a_refused_retention_change_puts_the_select_back(tmp_path):
+    result = run_item_panel(_MEMBERS + """
+    mount();
+    const [select] = cardAt(10).querySelectorAll('select');
+    select.focus();
+    refuseNext('unsupported_reference_member_field');
+    select.value = 'partial'; select.dispatch('change');
+    await settle(8);
+    return { shown: select.value, local: retentions()[0], undo: w._undoStack.length,
+      toasts: toasts.length, barrier: w._referenceItemWriteState().barriers.size };
+    """, tmp_path, project=_retention_project())
+    assert result == {"shown": "preserve", "local": "preserve", "undo": 0, "toasts": 1,
+                      "barrier": 0}
+
+
+def test_delete_item_behind_an_unpainted_member_edit_waits_and_succeeds(tmp_path):
+    """Plan test 9, second row."""
+    result = run_item_panel(_MEMBERS + """
+    mount();
+    hold();
+    const [select] = cardAt(10).querySelectorAll('select');
+    select.value = 'partial'; select.dispatch('change');
+    await settle(2);
+    deleteAt(10);
+    await settle(4);
+    const whileHeld = sent.length;
+    await release();
+    await settle(10);
+    return { whileHeld, rows: ids(), server: ids(await serverScene()),
+      messages: toasts.map((t) => t.message) };
+    """, tmp_path, project=_retention_project())
+    assert result == {"whileHeld": 1, "rows": ["item-2", "item-4"],
+                      "server": ["item-2", "item-4"], "messages": []}
+
+
+def test_a_timeline_append_behind_an_unpainted_member_edit_waits_and_succeeds(tmp_path):
+    """Plan test 9, third row."""
+    result = run_item_panel(_MEMBERS + """
+    mount();
+    hold();
+    const [select] = cardAt(10).querySelectorAll('select');
+    select.value = 'partial'; select.dispatch('change');
+    await settle(2);
+    const appending = w._appendReferenceMembers('item-1', { members: [drag('c')] });
+    await settle(4);
+    const whileHeld = sent.length;
+    await release();
+    const outcome = await appending;
+    await settle(8);
+    const both = (scene) => item('item-1', scene).members.map((m) => [m.member_id, m.visual_intent || '']);
+    return { whileHeld, outcome, local: both(), server: both(await serverScene()),
+      toasts: toasts.length };
+    """, tmp_path, project=_retention_project())
+    assert result["whileHeld"] == 1 and result["outcome"] == "ok"
+    assert result["local"] == result["server"] == [
+        ["member-a", "partial"], ["member-b", ""], ["member-c", ""]]
+    assert result["toasts"] == 0
+
+
+def test_the_timeline_delete_key_waits_for_an_unpainted_member_edit(tmp_path):
+    """Its per-item guard names the members, which the answer is about to change."""
+    result = run_item_panel(_MEMBERS + """
+    mount();
+    hold();
+    const [select] = cardAt(10).querySelectorAll('select');
+    select.value = 'partial'; select.dispatch('change');
+    await settle(2);
+    w.selectedItems = [{ type: 'reference', id: 'item-1', data: item('item-1') }];
+    const deleting = w._deleteSelectedItems();
+    await settle(4);
+    const whileHeld = sent.length;
+    await release();
+    await deleting;
+    await settle(8);
+    const bulk = sent.flat().find((op) => op.type === 'bulk_delete_items');
+    return { whileHeld, guard: bulk?.items[0].expected.members.map((m) => m.visual_intent || ''),
+      rows: ids(), server: ids(await serverScene()) };
+    """, tmp_path, project=_retention_project())
+    assert result == {"whileHeld": 1, "guard": ["partial", ""],
+                      "rows": ["item-2", "item-4"], "server": ["item-2", "item-4"]}
+
+
+def test_adoption_is_skipped_when_a_newer_paint_changed_the_members(tmp_path):
+    """Plan test 9, fourth row: the answer is not written over a row something
+    newer has painted; the scenes refresh converges instead."""
+    result = run_item_panel(_MEMBERS + """
+    mount();
+    hold(2);
+    const [select] = cardAt(10).querySelectorAll('select');
+    select.value = 'partial'; select.dispatch('change');   // unpainted
+    setStrength(50, 0.5);                                   // queued: the reconcile defers
+    const row = item('item-1');
+    row.members = [row.members[1], row.members[0]];          // a newer paint
+    await release();
+    const atSettle = { order: order(), retentions: retentions() };
+    await release();
+    await settle(12);
+    return { atSettle, local: order(), server: order('item-1', await serverScene()),
+      localRetention: retentions(), serverRetention: retentions('item-1', await serverScene()) };
+    """, tmp_path, project=_retention_project())
+    assert result["atSettle"] == {"order": ["member-b", "member-a"], "retentions": ["", "preserve"]}
+    assert result["local"] == result["server"] == ["member-a", "member-b"]
+    assert result["localRetention"] == result["serverRetention"] == ["partial", ""]
+
+
+def test_the_invalid_role_autofocus_runs_on_a_lanes_first_draw_only(tmp_path):
+    """Plan test 10: a redraw after an edit must not take the author's focus."""
+    project = fixture_project()
+    project.scenes[0].reference_lane_recipes[0].recipe["soft"]["role_fields"] = ["role"]
+    result = run_item_panel(_MEMBERS + """
+    w._promptContextCatalog = { schema_version: 1 };
+    mount();
+    await tick();
+    const first = document.activeElement;
+    const focusedInvalid = first?.dataset?.sonderInvalid === '1';
+    first.blur();
+    await w._writeReferenceItemFromPanel('item-2', { strength: 0.5 }, 'change reference strength');
+    await settle(2); flushFrames(); await settle(2);
+    return { focusedInvalid, redrawn: strengthOf(50).value,
+      focusAfterRedraw: document.activeElement === document.body };
+    """, tmp_path, project=project)
+    assert result == {"focusedInvalid": True, "redrawn": "0.50", "focusAfterRedraw": True}
+
+
+def test_the_picker_adds_a_member_to_an_existing_item_through_the_append(tmp_path):
+    result = run_item_panel(_MEMBERS + """
+    mount();
+    hold();
+    memberButtons(50, '+ Add member')[0].dispatch('click');
+    const pick = nodes().find((n) => n.tagName === 'BUTTON' && n.title === 'Stage this member'
+      && n.textContent === 'Subject · A');
+    pick.dispatch('click');
+    const painted = order('item-2');
+    const pickerClosed = !nodes().some((n) => n.title === 'Stage this member');
+    await release(); await settle();
+    return { painted, pickerClosed, server: order('item-2', await serverScene()),
+      undo: w._undoStack.map((entry) => entry.label) };
+    """, tmp_path)
+    assert result == {"painted": ["member-c", "member-a"], "pickerClosed": True,
+                      "server": ["member-c", "member-a"], "undo": ["add reference member"]}
+
+
+def test_a_member_picked_from_a_stale_picker_is_refused_as_already_staged(tmp_path):
+    """The picker's duplicate filter is draw-time; the append checks again when it
+    acts, so a member staged on the item since the list was drawn is refused,
+    not silently folded into a no-op."""
+    result = run_item_panel(_MEMBERS + """
+    mount();
+    memberButtons(50, '+ Add member')[0].dispatch('click');
+    const pick = nodes().find((n) => n.tagName === 'BUTTON' && n.title === 'Stage this member'
+      && n.textContent === 'Subject · A');
+    await w._appendReferenceMembers('item-2', { members: [drag('a')] });   // e.g. a timeline drop
+    await settle();
+    const sentBefore = sent.length;
+    pick.dispatch('click');
+    await settle(4);
+    return { members: order('item-2'), extraSends: sent.length - sentBefore,
+      messages: toasts.map((t) => t.message) };
+    """, tmp_path)
+    assert result["members"] == ["member-c", "member-a"] and result["extraSends"] == 0
+    assert "That member is already staged on this Reference item." in result["messages"]
+
+
+def test_an_append_refuses_a_duplicate_and_a_locked_lane_when_it_acts(tmp_path):
+    """The drop resolver and the picker judged both when they were drawn."""
+    result = run_item_panel(_MEMBERS + """
+    mount();
+    // One source folds into one notification, so read what it says after each.
+    let shown = null;
+    notes.subscribe((list) => {
+      shown = list.find((n) => n.source === 'reference-stage-refused')?.message ?? shown; });
+    w._redoStack = [{ label: 'undone', snapshot: {} }];
+    const said = [];
+    said.push([await w._appendReferenceMembers('item-1', { members: [drag('b')] }), shown]);
+    said.push([await w._appendReferenceMembers('item-2', { members: [drag('a'), drag('a')] }), shown]);
+    w.activeScene.reference_lane_configs[0].locked = true;
+    w._buildTrackLayout();
+    said.push([await w._appendReferenceMembers('item-1', { members: [drag('c')] }), shown]);
+    return { said, sent: sent.length, undo: w._undoStack.length, redo: w._redoStack.length };
+    """, tmp_path)
+    duplicate = ["refused", "That member is already staged on this Reference item."]
+    assert result["said"] == [duplicate, duplicate, [
+        "refused", "This Reference lane is locked. Unlock it on the timeline header to edit."]]
+    assert (result["sent"], result["undo"], result["redo"]) == (0, 0, 1)
+
+
+def test_an_append_that_fails_keeps_a_held_panel_writes_paint(tmp_path):
+    """Plan test 11: the rollback is local, per the members chain -- no refetch
+    replaces the panel's strength paint queued behind the append."""
+    result = run_item_panel(_MEMBERS + """
+    mount();
+    hold(2);
+    const appending = w._appendReferenceMembers('item-1', { members: [drag('c')] });
+    const painted = order();
+    setStrength(10, 0.5);
+    refuseNext('identity_mismatch');
+    await release();                          // the append is refused
+    const afterRefusal = { members: order(), strength: item('item-1').strength, gets: gets.length };
+    await release();
+    const outcome = await appending;
+    await settle(8);
+    return { painted, afterRefusal, outcome, strength: item('item-1').strength,
+      server: { members: order('item-1', await serverScene()),
+        strength: item('item-1', await serverScene()).strength },
+      messages: toasts.map((t) => t.message) };
+    """, tmp_path)
+    assert result["painted"] == ["member-a", "member-b", "member-c"]
+    assert result["afterRefusal"] == {"members": ["member-a", "member-b"], "strength": 0.5, "gets": 0}
+    assert result["outcome"] == "failed" and result["strength"] == 0.5
+    assert result["server"] == {"members": ["member-a", "member-b"], "strength": 0.5}
+    assert result["messages"] == ["The Reference member could not be added."]
+
+
+def test_an_append_refused_under_a_queued_reorder_returns_both_to_the_saved_list(tmp_path):
+    """Plan test 3 for members: the reorder guards on the append's paint, so it is
+    refused too, and the chain's last write puts the saved list back."""
+    result = run_item_panel(_MEMBERS + """
+    mount();
+    hold(2);
+    const appending = w._appendReferenceMembers('item-1', { members: [drag('c')] });
+    const moving = w._editReferenceItemMembersFromPanel('item-1',
+      { kind: 'move', memberId: 'member-c', direction: -1 }, 'reorder reference members');
+    const painted = order();
+    refuseNext('identity_mismatch');
+    await release();
+    await release();
+    const outcomes = [await appending, await moving];
+    await settle(10);
+    return { painted, outcomes, local: order(), server: order('item-1', await serverScene()),
+      undo: w._undoStack.length };
+    """, tmp_path)
+    assert result["painted"] == ["member-a", "member-c", "member-b"]
+    assert result["outcomes"] == ["failed", "failed"]
+    assert result["local"] == result["server"] == ["member-a", "member-b"]
+    assert result["undo"] == 0
+
+
+def test_an_unpainted_append_holds_a_member_edit_behind_it(tmp_path):
+    """A prior this client cannot resolve (its asset list lags the project's)
+    makes the append unpaintable: it installs the item's barrier, and a reorder
+    made meanwhile waits and moves the member the answer brought in. (A stale
+    `entity_id` alone does not: the append names `members`, and the paint
+    re-derives it as the route does.)"""
+    result = run_item_panel(_MEMBERS + """
+    mount();
+    const find = w._findAssetById.bind(w);
+    w._findAssetById = (assetId) => assetId === 'asset-c' ? null : find(assetId);
+    hold();
+    const appending = w._appendReferenceMembers('item-2', { members: [drag('a')] });
+    const duringWrite = { members: order('item-2'),
+      barrier: w._referenceItemWriteState().barriers.has('item-2') };
+    const moving = w._editReferenceItemMembersFromPanel('item-2',
+      { kind: 'move', memberId: 'member-a', direction: -1 }, 'reorder reference members');
+    await settle(4);
+    const whileHeld = sent.length;
+    await release();
+    const outcomes = [await appending, await moving];
+    await settle(8);
+    return { duringWrite, whileHeld, outcomes, local: order('item-2'),
+      server: order('item-2', await serverScene()) };
+    """, tmp_path)
+    assert result["duringWrite"] == {"members": ["member-c"], "barrier": True}
+    assert result["whileHeld"] == 1 and result["outcomes"] == ["ok", "ok"]
+    assert result["local"] == result["server"] == ["member-a", "member-c"]
+
+
+def test_an_append_over_the_lane_cap_is_kept_and_said_out_loud(tmp_path):
+    project = fixture_project()
+    project.scenes[0].reference_lane_recipes[0].recipe["hard"]["max_members"] = 2
+    result = run_item_panel(_MEMBERS + """
+    mount();
+    const outcome = await w._appendReferenceMembers('item-1', { members: [drag('c')] });
+    await settle();
+    return { outcome, server: order('item-1', await serverScene()),
+      sources: toasts.map((t) => t.source) };
+    """, tmp_path, project=project)
+    assert result == {"outcome": "ok", "server": ["member-a", "member-b", "member-c"],
+                      "sources": ["reference-stage-over-cap"]}
+
+
+# -- Phase 5 audit ---------------------------------------------------------------------
+
+def test_the_delete_key_deletes_what_was_selected_when_pressed_not_after_the_wait(tmp_path):
+    """Audit finding 1: the author presses Delete on item-1, then selects item-2
+    while item-1's unpainted member write settles."""
+    result = run_item_panel(_MEMBERS + """
+    mount();
+    hold();
+    const [select] = cardAt(10).querySelectorAll('select');
+    select.value = 'partial'; select.dispatch('change');
+    await settle(2);
+    w.selectedItems = [{ type: 'reference', id: 'item-1', data: item('item-1') }];
+    const deleting = w._deleteSelectedItems();
+    await settle(2);
+    w.selectedItems = [{ type: 'reference', id: 'item-2', data: item('item-2') }];
+    await release();
+    await deleting;
+    await settle(8);
+    return { rows: ids(), server: ids(await serverScene()),
+      selected: w.selectedItems.map((entry) => entry.id) };
+    """, tmp_path, project=_retention_project())
+    assert result == {"rows": ["item-2", "item-4"], "server": ["item-2", "item-4"],
+                      "selected": ["item-2"]}
+
+
+def test_an_append_pays_no_ordered_baseline_read_and_a_panel_edit_does(tmp_path):
+    """Audit finding 2: the append keeps the timeline's exposure rather than a
+    scene GET per drop; the panel's writers opt in (plan: three panel writers)."""
+    result = run_item_panel(_MEMBERS + """
+    mount();
+    await w._appendReferenceMembers('item-2', { members: [drag('a')] });
+    await settle(4);
+    const afterAppend = sceneReads.length;
+    await w._writeReferenceItemFromPanel('item-1', { strength: 0.5 }, 'change reference strength');
+    await settle(4);
+    return { afterAppend, afterPanelEdit: sceneReads.length };
+    """, tmp_path)
+    assert result == {"afterAppend": 0, "afterPanelEdit": 1}
+
+
+def test_clearing_a_saved_retention_is_refused_rather_than_silently_reverted(tmp_path):
+    """Audit finding 3: the save restores a cleared member field, so the panel
+    says so and sends nothing (Bug Tracker; see the strict xfail in the parity
+    suite)."""
+    result = run_item_panel(_MEMBERS + """
+    mount();
+    const [select] = cardAt(10).querySelectorAll('select');
+    select.focus();
+    select.value = ''; select.dispatch('change');
+    await settle(4);
+    return { shown: select.value, sent: sent.length, undo: w._undoStack.length,
+      messages: toasts.map((t) => t.message) };
+    """, tmp_path, project=_retention_project())
+    assert result["shown"] == "preserve" and (result["sent"], result["undo"]) == (0, 0)
+    assert result["messages"] == [
+        "A saved role or retention cannot be cleared yet. Choose another value instead."]
+
+
+def test_an_edit_of_a_member_no_longer_on_the_item_is_refused_with_a_message(tmp_path):
+    """Audit finding 8."""
+    result = run_item_panel(_MEMBERS + """
+    mount();
+    const outcome = await w._editReferenceItemMembersFromPanel('item-2',
+      { kind: 'remove', memberId: 'member-a' }, 'remove reference member');
+    return { outcome, sent: sent.length, messages: toasts.map((t) => t.message) };
+    """, tmp_path)
+    assert result == {"outcome": "refused", "sent": 0,
+                      "messages": ["That member is no longer on this Reference item."]}
+
+
+def test_a_barrier_is_released_even_when_the_settle_throws(tmp_path):
+    """Audit finding 4: a later member edit on the item must not wait forever."""
+    result = run_item_panel(_MEMBERS + """
+    mount();
+    const reconcile = w._reconcileActiveSceneFromMutation.bind(w);
+    let throwOnce = true;
+    w._reconcileActiveSceneFromMutation = (...args) => {
+      if (throwOnce) { throwOnce = false; throw new Error('reconcile failed'); }
+      return reconcile(...args);
+    };
+    const first = w._editReferenceItemMembersFromPanel('item-1',
+      { kind: 'patch', memberId: 'member-a', patch: { visual_intent: 'partial' } }, 'change visual retention')
+      .then(() => 'settled', () => 'threw');
+    const second = w._editReferenceItemMembersFromPanel('item-1',
+      { kind: 'move', memberId: 'member-b', direction: -1 }, 'reorder reference members');
+    const firstOutcome = await first;
+    const secondOutcome = await Promise.race([second, new Promise((r) => setTimeout(() => r('stuck'), 3000))]);
+    return { firstOutcome, secondOutcome, barriers: w._referenceItemWriteState().barriers.size };
+    """, tmp_path, project=_retention_project())
+    # The second is released and settles; its guard read a row the thrown settle
+    # never adopted the answer onto, so the route refuses it -- which is the
+    # point: an answer, not a wait that never ends.
+    assert result == {"firstOutcome": "threw", "secondOutcome": "failed", "barriers": 0}
+
+
+def test_the_invalid_role_autofocus_waits_for_a_draw_that_can_judge_a_role(tmp_path):
+    """Audit finding 5: a lane first drawn while the Prompt Format catalog loads
+    still gets its one autofocus when the catalog arrives -- and only one."""
+    project = fixture_project()
+    project.scenes[0].reference_lane_recipes[0].recipe["soft"]["role_fields"] = ["role"]
+    result = run_item_panel(_MEMBERS + """
+    mount();
+    await tick();
+    const whileLoading = document.activeElement === document.body;
+    w._promptContextCatalog = { schema_version: 1 };
+    handle.refresh();
+    await tick();
+    const focused = document.activeElement?.dataset?.sonderInvalid === '1';
+    document.activeElement.blur();
+    handle.refresh();
+    await tick();
+    return { whileLoading, focused, again: document.activeElement !== document.body };
+    """, tmp_path, project=project)
+    assert result == {"whileLoading": True, "focused": True, "again": False}
+
+
+def test_a_newer_change_of_the_same_select_decides_what_it_shows(tmp_path):
+    """Audit finding 6: the first change is refused while a second change of the
+    same select waits behind it; the refusal must not put back a value over the
+    second one, which then lands."""
+    result = run_item_panel(_MEMBERS + """
+    mount();
+    hold();
+    const [select] = cardAt(10).querySelectorAll('select');
+    select.focus();
+    select.value = 'partial'; select.dispatch('change');
+    refuseNext('unsupported_reference_member_field');
+    await settle(2);
+    select.value = 'transfer_attributes'; select.dispatch('change');
+    await release();
+    await settle(10);
+    return { shown: select.value, local: retentions()[0], server: retentions('item-1', await serverScene())[0] };
+    """, tmp_path, project=_retention_project())
+    assert result == {"shown": "transfer_attributes", "local": "transfer_attributes",
+                      "server": "transfer_attributes"}

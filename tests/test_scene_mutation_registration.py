@@ -48,10 +48,12 @@ JS_DIR = ROOT / "web/js"
 # not an input filter: `test_the_emitting_module_set_is_closed` globs every file
 # under web/js and fails when the real set differs, so a new emitter cannot
 # escape the scan by not being listed here.
+# `editor_reference_panel.js` left on 2026-09-30 (paint-first Reference Lane
+# Setup Phase 5): every staged-item write is a host writer now, and the panel
+# sends intent only.
 EMITTING_MODULES = (
     "editor_widget.js",
     "editor_prompt_panel.js",
-    "editor_reference_panel.js",
     "prompt_context_chips.js",
     "prompt_identity_transactions.js",
 )
@@ -72,11 +74,12 @@ EXPECTED_LITERAL_COUNTS = {
     # create and delete moved to host writers (`_commitReferenceStageWithinGesture`
     # shared with the timeline stage, and `_deleteReferenceItemFromPanelWithinGesture`),
     # paint-first Reference Lane Setup Phase 3. 81 -> 82 in Phase 4: the panel's
-    # field edits gained the host writer `_writeReferenceItemFromPanelWithinGesture`
-    # (the panel's own `writeItem` keeps the member edits until Phase 5).
-    "editor_widget.js": 82,
+    # field edits gained the host writer `_writeReferenceItemFromPanelWithinGesture`.
+    # 82 -> 81 and the panel's 1 -> none in Phase 5: the panel's member edits
+    # and the timeline append both go through that writer, so the panel's
+    # `writeItem` and the append's own `update_reference_item` are gone.
+    "editor_widget.js": 81,
     "editor_prompt_panel.js": 4,
-    "editor_reference_panel.js": 1,
     "prompt_context_chips.js": 1,
     "prompt_identity_transactions.js": 1,
 }
@@ -86,7 +89,9 @@ EXPECTED_LITERAL_COUNTS = {
 # surface forever. Update deliberately when adding or removing an enqueue.
 # 57 -> 56 on 2026-09-22: the dead legacy guide popup's delete enqueue went with it.
 # 56 -> 57 on 2026-09-29: the Reference panel's field writer on the host.
-EXPECTED_ENQUEUE_SITES = 57
+# 57 -> 55 on 2026-09-30: the panel's `writeItem` and the append's own enqueue
+# both went; each now writes through the host's staged-item writer.
+EXPECTED_ENQUEUE_SITES = 55
 
 # Geometry the client computed from what it could see. Matched with a trailing
 # `[:,}]` so ES6 shorthand counts — `split_clip` passes its frame that way, and a
@@ -2365,12 +2370,10 @@ OPAQUE_GUARD_SITES = {
         "nine `ReferenceItem.to_dict` keys, read before the paint removes it. The "
         "contract is _WHOLE_RECORD, which requires every key of item.to_dict(), "
         "so a lexical key list could not certify it either way.",
-    "editor_reference_panel.js:writeItem:update_reference_item":
-        "`expected` is built above the literal from the prior row.",
     "editor_widget.js:_writeReferenceItemFromPanelWithinGesture:update_reference_item":
         "`expected` is built above the literal from the LIVE row, one key per "
         "field the edit names, before anything is painted; `fields` is the "
-        "panel's raw intent.",
+        "raw intent -- a panel field or member edit, or a timeline append.",
     "editor_widget.js:_applyPromptSetupWithinGesture:update_scene_fields":
         "`expected: expectedSceneFields`, an identifier accumulated field by "
         "field above the literal, inside a conditional spread.",
@@ -3571,7 +3574,9 @@ def _scope_body(item) -> str:
 # 18 -> 17 on 2026-09-22: the legacy guide popup's declined delete was deleted.
 EXPECTED_STABLE_KEY_OPT_OUTS = 17
 # 29 -> 30 on 2026-09-29: the Reference panel's field writer on the host.
-EXPECTED_UNIQUIFIED_KEY_OPT_OUTS = 30
+# 30 -> 28 on 2026-09-30: the panel's `writeItem` and the append's own enqueue
+# went into that writer.
+EXPECTED_UNIQUIFIED_KEY_OPT_OUTS = 28
 EXPECTED_CALLER_SUPPLIED_OPT_OUTS = 1
 
 STABLE = "stable"
@@ -3821,8 +3826,11 @@ KEY_INTERPOLATIONS = {
                "queue addition"),
     "batchId": (UNIQUIFYING, "`crypto.randomUUID()` minted per batch"),
     "writeStamp": (UNIQUIFYING,
-                   "`${Date.now()}-${counter}` minted per Reference panel field edit "
+                   "`${Date.now()}-${counter}` minted per staged Reference item write "
                    "in `_writeReferenceItemFromPanelWithinGesture`"),
+    "surface.key": (STABLE, "a literal discriminator from `REFERENCE_ITEM_WRITERS` "
+                            "-- \"reference-panel\" or \"reference-append\" -- naming "
+                            "the surface a staged Reference item write came from"),
     "++this._referenceMutationSeq": (UNIQUIFYING,
                                      "pre-incremented counter on the widget"),
     # -- stable: the same gesture on the same target repeats it ---------------
@@ -3839,8 +3847,6 @@ KEY_INTERPOLATIONS = {
     "clipId": (STABLE, "a clip's durable id"),
     "clip.clip_id": (STABLE, "a clip's durable id"),
     "track.track_id": (STABLE, "an audio track's durable id"),
-    "item.reference_item_id": (STABLE, "a Reference item's durable id"),
-    "referenceItemId": (STABLE, "a Reference item's durable id"),
     "before.prompt_id": (STABLE, "a prompt section's durable id"),
     "groupId": (STABLE, "a link group's durable id"),
     "fromLaneId": (STABLE, "a Reference lane's durable id"),
@@ -3998,11 +4004,6 @@ COALESCE_OPT_OUT_REVIEWED = {
         "prompt-context document built from the panel's draft, and two drafts "
         "are two documents. A sibling surface umbrella Phase C leaves out of "
         "scope."),
-    "editor_reference_panel.js:writeItem:scene:${}:reference-panel:${}:${}": (
-        UNREACHABLE,
-        "the Reference panel's own dispatcher; the key already names the item, "
-        "so the clock is what keeps two edits of ONE item apart. Sibling "
-        "surface, out of umbrella Phase C's scope."),
     "editor_widget.js:_mutateReferences:references:${}": (
         UNREACHABLE,
         "the project-level Reference dispatcher. The counter gives every "
@@ -4021,30 +4022,22 @@ COALESCE_OPT_OUT_REVIEWED = {
         "the render-queue dispatcher; each batch is its own set of jobs. "
         "Sibling surface."),
 
-    "editor_widget.js:_appendReferenceMembersWithinGesture:scene:${}:reference-append:${}:${}": (
-        UNREACHABLE,
-        "each append sends the WHOLE new member list as `fields.members`, guarded by "
-        "`expected: { members: priorMembers }`. Two appends are two additions and "
-        "neither may be dropped, which is what the uniquified key preserves. "
-        "The gesture DOES have a local apply, and that is what makes the second "
-        "append work: `priorMembers` is read before the await, so without the "
-        "paint the second drop in one in-flight window guards against state the "
-        "server has already left and is refused `identity_mismatch`. Phase C "
-        "§3 Class C specified the opposite -- a geometry-only apply, to stop a "
-        "409 it believed painting would create -- and a probe against the route "
-        "reversed it in both halves: the canonical record for a Library drop is "
-        "byte-identical to what `dragPayload` sends, and NOT painting is what "
-        "loses the drop. See `web/js/scene_reference_geometry.js`."),
     "editor_widget.js:_commitReferenceStageWithinGesture:scene:${}:reference-stage:${}": (
         UNREACHABLE,
         "`create_reference_item` creates a row, alongside the lane it needs. "
         "Two placements are two items; the timeline drop and the panel's Add "
         "share this tail."),
-    "editor_widget.js:_writeReferenceItemFromPanelWithinGesture:scene:${}:reference-panel:${}:${}": (
+    "editor_widget.js:_writeReferenceItemFromPanelWithinGesture:scene:${}:${}:${}:${}": (
         UNREACHABLE,
-        "one staged-item field edit, its own Undo step and its own rollback "
-        "chain link. Two edits of one item are two intents the chain orders; "
-        "a merge would fold a later edit's guard into an earlier write's."),
+        "one staged-item write -- a panel field or member edit, or an append -- "
+        "with its own Undo step and its own rollback chain link. Two writes of "
+        "one item are two intents the chain orders; a merge would fold a later "
+        "write's guard into an earlier one's. An append sends the WHOLE new "
+        "member list guarded by the list it read, so two appends are two "
+        "additions and neither may be dropped. The append's paint is what lets "
+        "the second one in a window guard against the list the route is about "
+        "to store (Phase C §3 said the opposite; a probe against the route "
+        "reversed it -- see `web/js/scene_reference_geometry.js`)."),
     "editor_widget.js:_deleteReferenceItemFromPanelWithinGesture:scene:${}:reference-panel-delete:${}:${}": (
         UNREACHABLE,
         "one `delete_reference_item` naming one row by id with its whole prior "

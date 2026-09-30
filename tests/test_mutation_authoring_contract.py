@@ -591,7 +591,10 @@ UNWRAPPED_RESERVING_SCOPES = (
 SCANNED_RESERVING_UNITS = (
     "_setupTimelineEvents", "_showGuideManagementPopup", "_showItemEditor",
     "_toggleHeaderVisibility", "addClipFrameToGuides", "addLane",
-    "appendReferenceMembers", "applyPromptSetup", "assetDrop",
+    # `appendReferenceMembers` left in Phase 5: an append is written by the
+    # staged-item writer, which reserves the step and is scanned under
+    # `writeReferenceItemFromPanel` below.
+    "applyPromptSetup", "assetDrop",
     "consolidateSelectedItemsToLane", "convertClipRole", "deleteGuide",
     "deleteItemsInLane", "deletePromptSection",
     # Paint-first Reference Lane Setup Phase 3: the panel's Delete item and Add

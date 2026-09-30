@@ -17,9 +17,11 @@
 //   _stageReferenceItemOnLane(payload, laneIndex, startFrame),
 //   _deleteReferenceItemFromPanel(itemId),
 //   _writeReferenceItemFromPanel(itemId, fields | (liveRow) => fields, undoLabel),
-//   _runSceneMutation(ops, opts), _mutateReferences(ops),
-//   _fetchReferences(opts), _fetchScenes(opts), _buildTrackLayout(),
-//   _renderTimeline(), _pushUndo(label), _discardLastUndo(label)
+//   _editReferenceItemMembersFromPanel(itemId, edit, undoLabel),
+//   _appendReferenceMembers(itemId, { members }),
+//   _mutateReferences(ops), _fetchReferences(opts), _buildTrackLayout(),
+//   _renderTimeline(), _renderSceneAfterLocalMutation(opts),
+//   _stampManagementPanel(kind, stamp)
 //
 // Two invariants this module must not break:
 //   1. A built-in recipe is never edited in place. Its materialized lane values
@@ -27,10 +29,10 @@
 //      deliberately rematerializes the catalog's current values.
 //   2. Every reference-item write carries exact prior values in `expected` and
 //      runs non-coalesced — the backend requires the snapshot and treats a
-//      mismatch as a terminal conflict, never a replay signal. Staging,
-//      deleting and field edits are host writers that meet this themselves --
-//      the panel sends intent: members, an item id, or the fields to change;
-//      only the member edits below still build their own operation.
+//      mismatch as a terminal conflict, never a replay signal. Every staged-item
+//      write is a host writer that meets this itself -- the panel sends intent
+//      (members to stage or append, an item id, the fields to change, or a
+//      member edit) and never builds an operation or a guard of its own.
 
 import {
     EDITOR_COLORS as COLORS,
@@ -54,7 +56,6 @@ import {
 import {
     createMemberDraft,
     formatReferenceTag,
-    moveMember,
     referenceTagSearchText,
 } from "./reference_library_model.js";
 import { createDisclosureMemory } from "./disclosure_memory.js";
@@ -188,7 +189,6 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         laneIndex: Math.max(0, parseInt(laneIndex, 10) || 0),
         pickerItemId: "",
         pickerQuery: "",
-        busy: false,
         // The durable id of the lane the panel last drew (null before the first
         // render). Lanes reorder, and an Undo can shift them under an open
         // panel, so the index alone can name another lane by the time anything
@@ -199,6 +199,16 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         renderedLaneCount: 0,
         // `recipeFormShape` of the recipe form as last drawn.
         drawnFormShape: "",
+        // The lane (`{ key: laneMemoryKey(), index }`) whose invalid controls
+        // have had their one autofocus, for the recipe form and for the items.
+        // An invalid control is focused on a lane's first draw only: the host's
+        // gated refresh redraws after every write, and focusing on each redraw
+        // would steal the author's focus -- and, since the gate does not
+        // rebuild a panel holding a focused field, pin the panel stale behind
+        // it. The items' turn is spent only on a draw that could judge a role
+        // (the Prompt Format catalog ready), so a lane first drawn while the
+        // catalog loads still gets it once.
+        autofocused: { recipe: null, items: null },
     };
     const storedLaneId = (index = state.laneIndex) => String(
         host.activeScene?.reference_lane_recipes?.[index]?.lane_id || "").trim();
@@ -249,6 +259,8 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         disclosureMemory.remember(disclosureKey(kind, value), open);
     };
     let mounted = true;
+    // Whether the render in progress may autofocus (`state.autofocused`).
+    let autofocusDue = { recipe: false, items: false };
 
     const close = () => {
         if (!mounted) return;
@@ -363,49 +375,25 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         await saving;
     };
 
-    const writeItem = async (item, fields, label) => {
-        if (state.busy) return;
-        const expected = {};
-        for (const key of Object.keys(fields)) expected[key] = item[key] ?? (key === "end_frame" ? -1 : null);
-        state.busy = true;
-        host._pushUndo?.(label);
-        try {
-            const result = await host._runSceneMutation([{
-                type: "update_reference_item",
-                reference_item_id: item.reference_item_id,
-                expected,
-                fields,
-            }], {
-                key: `scene:${host.activeSceneId}:reference-panel:${item.reference_item_id}:${Date.now()}`,
-                label,
-                coalesce: false,
-                refreshScenes: false,
-            });
-            host._reconcileActiveSceneFromMutation?.(result, { reason: "reference_panel", ignoreTimelineGate: true });
-        } catch (error) {
-            host._discardLastUndo?.(label);
-            notifyWarning(error?.message || "Reference edit was refused.", { source: "reference-panel-refused" });
-            await host._fetchScenes?.({ ignoreMutationGate: true, reason: "reference_panel_error" });
-        } finally {
-            state.busy = false;
-        }
-        host._buildTrackLayout?.();
-        host._renderTimeline?.();
-        render();
-    };
-
-    // ── Staged-item field edits ────────────────────────────────────────────
+    // ── Staged-item edits ──────────────────────────────────────────────────
     //
     // Every item control acts on the row the scene holds NOW, looked up by id
     // when the author acts; the object a card was drawn from is display-only.
-    // The host writer paints the edit, orders it behind an earlier one still
-    // saving -- it is never dropped -- and owns the guard, the Undo step and
-    // the rollback. Nothing here re-renders after a write: the host's gated
-    // refresh repaints, and never under a focused field.
+    // The host writer paints the edit (or, for a member role or retention it
+    // cannot mirror, sends it unpainted and holds later edits of the item until
+    // it answers), orders it behind an earlier one still saving -- it is never
+    // dropped -- and owns the guard, the Undo step and the rollback. Nothing
+    // here re-renders after a write: the host's gated refresh repaints, and
+    // never under a focused field.
     const liveItem = (id) => (host.activeScene?.reference_items || [])
         .find((row) => row?.reference_item_id === id) || null;
     const writeField = (id, fields, label) => (mounted
         ? host._writeReferenceItemFromPanel(id, fields, label)
+        : Promise.resolve("refused"));
+    /** A member edit, as intent: `{ kind: "patch" | "move" | "remove",
+     *  memberId, ... }`. The host builds the list from the live row. */
+    const editMembers = (id, edit, label) => (mounted
+        ? host._editReferenceItemMembersFromPanel(id, edit, label)
         : Promise.resolve("refused"));
     /** A field whose edit was refused, found unchanged or failed may still show
      *  what the author typed. The gated refresh will not rebuild it while it has
@@ -416,13 +404,6 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         if (outcome === "ok") return;
         const row = liveItem(input.dataset.referenceItemId || "");
         if (row) input.value = read(row);
-    };
-
-    const writeMemberAudioIntent = (item, memberRef, value, label) => {
-        const members = (item.members || []).map((entry) =>
-            entry.member_id === memberRef.member_id
-                ? { ...entry, audio_intent: value } : entry);
-        return writeItem(item, { members }, label);
     };
 
     // ── Recipe form ────────────────────────────────────────────────────────
@@ -855,7 +836,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         state.drawnFormShape = recipeFormShape(recipe);
         const definition = definitionFor(recipe.recipe_id);
         const builtIn = isBuiltIn(recipe.recipe_id);
-        const locked = builtIn || laneLocked() || state.busy;
+        const locked = builtIn || laneLocked();
         const occupied = laneItems().length > 0;
 
         body.appendChild(sectionTitle("Recipe"));
@@ -872,7 +853,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             select.appendChild(option);
         }
         select.value = recipe.recipe_id || "";
-        select.disabled = laneLocked() || state.busy;
+        select.disabled = laneLocked();
         select.addEventListener("change", () => {
             const chosen = definitionFor(select.value);
             const actingRecipe = laneRecipe();
@@ -898,7 +879,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             `Media: ${recipe.media_kind === "audio" ? "Audio" : (recipe.media_kind === "video" ? "Video" : "Image")}`,
             occupied ? "Clear the lane before changing media kind" : "Switch this detached lane between Image and Audio model inputs",
         );
-        mediaBtn.disabled = occupied || laneLocked() || state.busy;
+        mediaBtn.disabled = occupied || laneLocked();
         if (mediaBtn.disabled) mediaBtn.style.opacity = "0.5";
         mediaBtn.addEventListener("click", () => {
             void writeRecipe(host._defaultReferenceLaneRecipe({
@@ -909,7 +890,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
 
         if (builtIn) {
             const fork = button("Edit as custom", "Copy these values into a project recipe you can edit", "primary");
-            fork.disabled = laneLocked() || state.busy;
+            fork.disabled = laneLocked();
             fork.addEventListener("click", () => void forkToCustom());
             templateRow.appendChild(fork);
         }
@@ -962,19 +943,17 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             }
             block.appendChild(groupBody);
             body.appendChild(block);
-            if (invalidFields.length) queueMicrotask(() => {
+            if (invalidFields.length && autofocusDue.recipe) queueMicrotask(() => {
                 block.querySelector("button,select,input")?.focus?.();
             });
         }
 
         const actions = el("div", "", "display:flex;gap:6px;flex-wrap:wrap;margin-top:2px;");
         const saveAs = button("Save as custom…", "Create a project recipe from this lane's current values");
-        saveAs.disabled = state.busy;
         saveAs.addEventListener("click", () => void saveAsCustom());
         actions.appendChild(saveAs);
         if (definition && !definition.builtIn) {
             const update = button(`Update “${definition.name}”`, "Push this lane's values back into the project recipe");
-            update.disabled = state.busy;
             update.addEventListener("click", () => void updateCustom());
             const rename = button("Rename", "Rename this project recipe");
             rename.addEventListener("click", () => void renameCustom(definition));
@@ -1155,10 +1134,26 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         if (detail) text.appendChild(el("div", detail, `font-size:10px;color:${COLORS.textMuted};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`));
         row.appendChild(text);
 
-        const updateMember = (patch, label) => void writeItem(item, {
-            members: (item.members || []).map((entry) => entry.member_id === memberRef.member_id
-                ? { ...entry, ...patch } : entry),
-        }, label);
+        const id = item.reference_item_id;
+        const memberId = memberRef.member_id;
+        const liveMember = (row) => (row.members || []).find((entry) => entry?.member_id === memberId) || {};
+        // A member's role or retention cannot be painted (the mirror does not
+        // hold recipe or profile authority), so its select keeps showing the
+        // author's choice until the answer is adopted. On any other outcome it
+        // is put back to what the live row holds, via `resync` -- unless a
+        // newer change of the same select is still outstanding, whose own
+        // outcome decides what it shows.
+        const updateMember = (select, field, label) => {
+            select.dataset.referenceItemId = id;
+            let edits = 0;
+            select.addEventListener("change", () => {
+                const mine = ++edits;
+                void editMembers(id, { kind: "patch", memberId, patch: { [field]: select.value } }, label)
+                    .then((outcome) => {
+                        if (mine === edits) resync(select, outcome, (row) => String(liveMember(row)[field] || ""));
+                    });
+            });
+        };
         const recipe = laneRecipe();
         const soft = recipe.recipe?.soft || {};
         const roleFields = new Set(Array.isArray(soft.role_fields) ? soft.role_fields : []);
@@ -1201,7 +1196,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                     const option = el("option", label); option.value = value; role.appendChild(option);
                 }
                 role.value = canonicalRole; role.disabled = locked || !catalogReady;
-                role.addEventListener("change", () => updateMember({ role: role.value }, "change Reference role"));
+                updateMember(role, "role", "change Reference role");
                 controls.appendChild(role);
             }
             if (roleFields.has("visual_intent")) {
@@ -1219,7 +1214,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                 });
                 retention.value = memberRef.visual_intent || "";
                 retention.disabled = locked || !catalogReady;
-                retention.addEventListener("change", () => updateMember({ visual_intent: retention.value }, "change visual retention"));
+                updateMember(retention, "visual_intent", "change visual retention");
                 controls.appendChild(retention);
             }
             if (roleFields.has("audio_intent")) {
@@ -1237,21 +1232,18 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                 });
                 audioIntent.value = memberRef.audio_intent || "";
                 audioIntent.disabled = locked || !catalogReady;
-                audioIntent.addEventListener("change", () => void writeMemberAudioIntent(
-                    item, memberRef, audioIntent.value, "change audio retention"));
+                updateMember(audioIntent, "audio_intent", "change audio retention");
                 controls.appendChild(audioIntent);
             }
             row.appendChild(controls);
         }
 
-        const reorder = (direction) => {
-            // Slot order is what the model receives, so it is authored here.
-            // moveMember stamps a dense `order`; the item schema has no such
-            // field, so it is dropped before the write.
-            const next = moveMember(item.members || [], memberRef.member_id, direction)
-                .map(({ order: _order, ...entry }) => entry);
-            void writeItem(item, { members: next }, "reorder reference members");
-        };
+        // Slot order is what the model receives, so it is authored here. The
+        // move is applied to the live list when the host acts, so two quick
+        // clicks move the member twice, and a stale one at the end of the list
+        // does nothing.
+        const reorder = (direction) => void editMembers(
+            id, { kind: "move", memberId, direction }, "reorder reference members");
         const up = button("↑", "Move earlier");
         up.disabled = locked || index === 0;
         up.addEventListener("click", () => reorder(-1));
@@ -1260,11 +1252,8 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         down.addEventListener("click", () => reorder(1));
         const remove = button("×", "Remove this member from the item", "danger");
         remove.disabled = locked || total <= 1;
-        remove.addEventListener("click", () => {
-            void writeItem(item, {
-                members: (item.members || []).filter((entry) => entry.member_id !== memberRef.member_id),
-            }, "remove reference member");
-        });
+        remove.addEventListener("click", () => void editMembers(
+            id, { kind: "remove", memberId }, "remove reference member"));
         row.append(up, down, remove);
         return row;
     };
@@ -1329,9 +1318,12 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                             render();
                             return;
                         }
-                        void writeItem(item, {
-                            members: [...(item.members || []), memberRef],
-                        }, "add reference member");
+                        // The host's append: it refuses a member staged on
+                        // the item since this list was drawn, paints, and
+                        // owns the rollback. Closing the picker is local.
+                        if (!mounted) return;
+                        void host._appendReferenceMembers(item.reference_item_id, { members: [memberRef] });
+                        render();
                     });
                     list.appendChild(row);
                 }
@@ -1480,7 +1472,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
     const renderItems = (body) => {
         const items = laneItems();
         const recipe = laneRecipe();
-        const locked = laneLocked() || state.busy;
+        const locked = laneLocked();
         const verdicts = itemVerdicts();
         const soft = recipe.recipe?.soft || {};
         const population = String(soft.physical_population || "none");
@@ -1696,7 +1688,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             advanced.appendChild(advancedBody);
             card.appendChild(advanced);
             body.appendChild(card);
-            if (invalidMember) queueMicrotask(() => {
+            if (invalidMember && autofocusDue.items) queueMicrotask(() => {
                 advanced.querySelector("[data-sonder-invalid='1']")?.focus?.();
             });
         }
@@ -1810,6 +1802,18 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             }
             body.appendChild(notice);
         }
+        // The same lane when its key is unchanged, or when a lane that had no
+        // durable id yet (`index:N`) gained one at the same index -- its first
+        // recipe write materializes it, which is not a new lane.
+        const drawn = { key: laneMemoryKey(), index: state.laneIndex };
+        const sameLane = (prior) => !!prior && (prior.key === drawn.key
+            || (prior.key.startsWith("index:") && prior.index === drawn.index));
+        autofocusDue = {
+            recipe: !sameLane(state.autofocused.recipe),
+            items: !sameLane(state.autofocused.items),
+        };
+        state.autofocused.recipe = drawn;
+        if (catalogAuthority.ready) state.autofocused.items = drawn;
         // Staged items first: this panel is opened to see what is on the lane.
         // The recipe is set once and read rarely.
         renderItems(body);

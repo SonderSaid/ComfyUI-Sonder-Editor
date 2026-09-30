@@ -243,26 +243,30 @@ def test_panel_honours_the_overlay_and_mutation_contracts():
     assert 'if (event.key !== "Escape") return false;' in panel
     assert "unregisterKeyboard();" in panel
 
-    # Every reference-item write is non-coalesced and carries exact prior values.
-    # The field edits still build their own operation; staging and deleting are
-    # host writers (`_stageReferenceItemOnLane`, `_deleteReferenceItemFromPanel`)
-    # that own the guard, the paint and the rollback, so the panel sends intent.
-    assert panel.count("coalesce: false") == 1
-    body = panel.split("const writeItem =", 1)[1].split("\n    };", 1)[0]
-    assert "coalesce: false" in body
-    assert "expected[key] = item[key]" in panel
+    # Every reference-item write is a host writer that is non-coalesced and
+    # carries exact prior values itself (`_stageReferenceItemOnLane`,
+    # `_deleteReferenceItemFromPanel`, `_writeReferenceItemFromPanel`,
+    # `_editReferenceItemMembersFromPanel`, `_appendReferenceMembers`): the
+    # panel sends intent, and builds no operation, guard or Undo step.
+    assert "coalesce: false" not in panel
+    assert "_runSceneMutation" not in panel and "_pushUndo" not in panel
+    assert "_discardLastUndo" not in panel and "expected[" not in panel
     assert "expected: expectedRecipe(definition)" in panel
-    assert "const runItemOperation" not in panel
+    for gone in ("const runItemOperation", "const writeItem", "writeMemberAudioIntent"):
+        assert gone not in panel
     assert '"create_reference_item"' not in panel and '"delete_reference_item"' not in panel
+    assert '"update_reference_item"' not in panel
     assert "host._stageReferenceItemOnLane({ members }, state.laneIndex, start)" in panel
     assert "host._deleteReferenceItemFromPanel(item.reference_item_id)" in panel
+    assert "host._editReferenceItemMembersFromPanel(id, edit, label)" in panel
+    assert "host._appendReferenceMembers(item.reference_item_id, { members: [memberRef] })" in panel
 
-    # A built-in recipe is never edited in place. `state.busy` now belongs to
-    # item operations only: a recipe save never drops, or waits behind, the
-    # next recipe edit (the Critical silent-drop bug).
-    assert "const locked = builtIn || laneLocked() || state.busy;" in panel
+    # A built-in recipe is never edited in place. Nothing is busy-gated any
+    # more: an edit made while another saves is ordered behind it by the host,
+    # never dropped (the Critical silent-drop bug, recipe and item alike).
+    assert "state.busy" not in panel and "busy:" not in panel
+    assert "const locked = builtIn || laneLocked();" in panel
     write_recipe = panel.split("const writeRecipe =", 1)[1].split("\n    };", 1)[0]
-    assert "state.busy" not in write_recipe
     assert "rollbackRecipe: true" in write_recipe
     assert 'button("Edit as custom"' in panel
 
@@ -830,7 +834,7 @@ def test_panel_uses_catalog_controls_and_progressive_disclosure():
     assert 'select.dataset.sonderInvalid = "1"' in panel
     assert "Unsupported saved value:" in panel
     assert panel.count("referenceRoleChoices(activeProfile, population)") == 2
-    assert "writeMemberAudioIntent" in panel
+    assert 'updateMember(audioIntent, "audio_intent", "change audio retention")' in panel
     assert "role_aliases" not in panel
 
 
