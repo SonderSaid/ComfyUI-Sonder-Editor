@@ -11,6 +11,8 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+## [0.7.6] - 2026-10-01
+
 ### Fixed
 - Timeline: right-clicking an item on a locked lane opened no menu. It now opens that item's menu and leaves the selection alone. Inspect in Gallery, Set Selection, Add Frame to Guides and the other entries that don't change the item still work, and the rest show "(locked)".
 - Timeline: on a locked lane, Delete Items in Lane and Remove Lane showed the change, then restored it when the save was refused. On a locked lane's header they are now greyed out with "(locked)", as are Delete Lane and Move Items and Delete Selected Lanes. When only the lane the items would move to is locked, Delete Lane and Move Items names that lane.
