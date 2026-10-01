@@ -736,6 +736,8 @@ const SPLITTABLE_ITEM_TYPES = new Set(["clip", "audio", "prompt", "reference"]);
 // is locked (`_itemContextMenuEntries`). Prompt sections are absent: their
 // row's menu is the prompt-track entries, which read the lock themselves.
 const LOCKED_ITEM_MENU_TYPES = new Set(["clip", "audio", "guide", "reference"]);
+// The selection item type of each lane family's item list (`itemsSource.listField`).
+const ITEM_TYPE_BY_LIST_FIELD = Object.freeze({ clips: "clip", audio_tracks: "audio", reference_items: "reference" });
 
 // A refusal the user cannot read is indistinguishable from a broken drag, and
 // one message covering every cause names the wrong one three times out of four.
@@ -15140,6 +15142,9 @@ export class EditorWidget {
             this._showToast("Lane is locked.");
             return;
         }
+        // Attributed to the gesture that started now; after a wait the
+        // ambient gesture is gone (as in the selection delete).
+        const diagnostics = this._snapshotMutationDiagnostics?.() ?? null;
         const descriptor = descriptorFor(trackType);
         const laneType = variableLaneTypeFor(trackType);
         const label = laneLogLabel(trackType);
@@ -15150,15 +15155,37 @@ export class EditorWidget {
         }
         if (!confirm(`Delete ${items.length} ${label} item(s) on lane ${laneIndex + 1}? The lane will remain.`)) return;
 
+        // The lane's rows by address, as they stood at the confirm, each built
+        // by the per-item builder every bulk delete uses: a Reference row
+        // carries the `expected` identity the route requires; clips and audio
+        // carry none. (Every non-clip row used to go out as "audio", so a
+        // Reference lane's delete always failed.)
+        const { listField, idField, indexField } = descriptor.itemsSource;
+        const pressed = items.map((row) => ({ type: ITEM_TYPE_BY_LIST_FIELD[listField], id: row[idField] }));
+        // A Reference row may have a member write the mirror could not paint
+        // still settling, and its guard names the members: wait, then read the
+        // rows after it, as the selection delete does.
+        if (this._referenceItemWriteBarriers(pressed).length) {
+            if (!(await this._awaitReferenceItemWriteBarriers(pressed))) return;
+            // The author may have locked the lane while waiting.
+            if (this._isLaneLocked(trackType, laneIndex)) {
+                this._showToast("Lane is locked.");
+                return;
+            }
+        }
+        const rows = pressed
+            .map((item) => this._findSceneItemBySelection(item.type, item.id))
+            .filter((hit) => hit && (parseInt(hit.data?.[indexField], 10) || 0) === laneIndex);
+        if (!rows.length) {
+            this._showToast("Nothing left to delete on this lane.");
+            return;
+        }
+
         const undoLabel = "delete lane items";
         const operation = {
             type: "bulk_delete_items",
             preserve_lanes: true,
-            items: items.map((item) => ({
-                type: descriptor.itemsSource.listField === "clips" ? "clip" : "audio",
-                id: item[descriptor.itemsSource.idField],
-                preserve_lane: true,
-            })),
+            items: rows.map((hit) => ({ ...this._mutationItemFromSelection(hit), preserve_lane: true })),
         };
 
         try {
@@ -15173,6 +15200,10 @@ export class EditorWidget {
                     key: `scene:${this.activeSceneId}:${laneType}-delete-lane-items:${laneIndex}`,
                     label: "delete lane items",
                     coalesce: false,
+                    diagnostics,
+                    // A Reference row's `expected` can refuse; say what moved.
+                    failureMessage: (error) => error?.message
+                        || "Delete lane items failed — timeline restored.",
                 }
             );
         } catch (e) {
@@ -20088,6 +20119,35 @@ export class EditorWidget {
             "deleteSelectedItems", () => this._deleteSelectedItemsWithinGesture(...args));
     }
 
+    /** The settling promises of the member writes the mirror could not paint
+     *  (`_referenceItemWriteState().barriers`) behind any Reference item in
+     *  `pressed` ({type, id} addresses). Synchronous, so a gesture with nothing
+     *  to wait for never yields. */
+    _referenceItemWriteBarriers(pressed, writes = this._referenceItemWrites) {
+        return pressed
+            .filter((item) => item?.type === "reference")
+            .map((item) => writes?.barriers?.get(String(item.id || "")))
+            .filter(Boolean);
+    }
+
+    /** Wait until no Reference item in `pressed` has such a write settling. A
+     *  delete's per-item guard names the members, so it must read the rows
+     *  after that answer. Resolves false when the project, its write state or
+     *  the active scene changed during the wait: the gesture must then stop,
+     *  because item ids are unique only within a scene. */
+    async _awaitReferenceItemWriteBarriers(pressed) {
+        const writes = this._referenceItemWrites;
+        const projectDir = this.projectDir;
+        const sceneId = this.activeSceneId;
+        for (;;) {
+            const pending = this._referenceItemWriteBarriers(pressed, writes);
+            if (!pending.length) break;
+            await Promise.all(pending);
+        }
+        return this.projectDir === projectDir && this._referenceItemWrites === writes
+            && !!this.activeScene && this.activeSceneId === sceneId;
+    }
+
     async _deleteSelectedItemsWithinGesture() {
         if (this.selectedItems.length === 0 || !this.activeScene || !this.projectDir) return;
         // A Reference item in the selection may have a member write the mirror
@@ -20099,21 +20159,9 @@ export class EditorWidget {
         // author has selected by the time the answer arrives. Attributed to
         // the gesture that started now; after a wait the ambient gesture is gone.
         const diagnostics = this._snapshotMutationDiagnostics?.() ?? null;
-        const writes = this._referenceItemWrites;
-        const projectDir = this.projectDir;
         const pressed = this.selectedItems.map((item) => ({ type: item?.type, id: item?.id }));
-        let waited = false;
-        for (;;) {
-            const pending = pressed
-                .filter((item) => item.type === "reference")
-                .map((item) => writes?.barriers?.get(String(item.id || "")))
-                .filter(Boolean);
-            if (!pending.length) break;
-            waited = true;
-            await Promise.all(pending);
-        }
-        if (waited && (this.projectDir !== projectDir || this._referenceItemWrites !== writes
-                || !this.activeScene)) return;
+        const waited = this._referenceItemWriteBarriers(pressed).length > 0;
+        if (waited && !(await this._awaitReferenceItemWriteBarriers(pressed))) return;
         const targets = waited
             ? pressed.map((item) => this._findSceneItemBySelection(item.type, item.id)).filter(Boolean)
             : this.selectedItems;

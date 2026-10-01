@@ -2110,3 +2110,123 @@ def test_a_newer_change_of_the_same_select_decides_what_it_shows(tmp_path):
     """, tmp_path, project=_retention_project())
     assert result == {"shown": "transfer_attributes", "local": "transfer_attributes",
                       "server": "transfer_attributes"}
+
+
+# -- Timeline Lock Menus Phase 4: Delete Items in Lane on a Reference lane --------
+# Plan: memory/plans/timeline-lock-menus.md. Every non-clip row used to go out
+# as "audio", so the route answered "Audio track not found" for every
+# Reference lane.
+
+def test_delete_items_in_a_reference_lane_deletes_through_the_route(tmp_path):
+    """The lane's rows go out as Reference rows carrying the identity the route
+    requires, and only that lane is emptied."""
+    result = run_item_panel(_FIELDS + """
+    globalThis.confirm = () => true;
+    await w._deleteItemsInLaneWithinGesture('reference', 0);
+    await settle(8);
+    const bulk = sent.flat().find((op) => op.type === 'bulk_delete_items');
+    return { types: bulk.items.map((row) => row.type), ids: bulk.items.map((row) => row.id),
+      guarded: bulk.items.every((row) => row.expected?.reference_item_id === row.id && row.preserve_lane),
+      rows: ids(), server: ids(await serverScene()), undo: w._undoStack.length };
+    """, tmp_path)
+    assert result == {"types": ["reference", "reference"], "ids": ["item-1", "item-2"],
+                      "guarded": True, "rows": ["item-4"], "server": ["item-4"], "undo": 1}
+
+
+def test_delete_items_in_a_reference_lane_waits_for_an_unpainted_member_edit(tmp_path):
+    """Its per-item guard names the members, which the held answer is about to
+    change: it waits, then reads the rows after it -- as the Delete key does."""
+    result = run_item_panel(_MEMBERS + """
+    globalThis.confirm = () => true;
+    mount();
+    hold();
+    const [select] = cardAt(10).querySelectorAll('select');
+    select.value = 'partial'; select.dispatch('change');
+    await settle(2);
+    const deleting = w._deleteItemsInLaneWithinGesture('reference', 0);
+    await settle(4);
+    const whileHeld = sent.length;
+    await release();
+    await deleting;
+    await settle(8);
+    const bulk = sent.flat().find((op) => op.type === 'bulk_delete_items');
+    const first = bulk?.items.find((row) => row.id === 'item-1');
+    return { whileHeld, guard: first?.expected.members.map((m) => m.visual_intent || ''),
+      rows: ids(), server: ids(await serverScene()) };
+    """, tmp_path, project=_retention_project())
+    assert result == {"whileHeld": 1, "guard": ["partial", ""],
+                      "rows": ["item-4"], "server": ["item-4"]}
+
+
+# Phase 4 audit: what the wait must re-read. Each holds item-1's unpainted member
+# edit, starts the lane delete behind it, changes the world, then releases.
+_LANE_DELETE_BEHIND_A_HELD_EDIT = _MEMBERS + """
+globalThis.confirm = () => true;
+mount();
+hold();
+const [select] = cardAt(10).querySelectorAll('select');
+select.value = 'partial'; select.dispatch('change');
+await settle(2);
+const undoBefore = w._undoStack.length;
+const deleting = w._deleteItemsInLaneWithinGesture('reference', 0);
+await settle(4);
+"""
+
+
+def _three_lane_retention_project():
+    """`_retention_project` plus a second image lane (index 2) to move into."""
+    project = _retention_project()
+    scene = project.scenes[0]
+    scene.reference_lane_count = 3
+    scene.reference_lane_configs.append(LaneConfig())
+    scene.reference_lane_recipes.append(ReferenceLaneRecipe(
+        lane_id="lane-image-2", media_kind="image",
+        recipe={"hard": {"assembly": "batch"}, "soft": {"physical_population": "pictures"}}))
+    return project
+
+
+def test_a_lane_delete_skips_a_row_moved_off_the_lane_during_the_wait(tmp_path):
+    result = run_item_panel(_LANE_DELETE_BEHIND_A_HELD_EDIT + """
+    // Another writer moves item-2 to lane 2 while item-1's answer is held.
+    const moved = await ask({ sceneId: 'scene', operations: [{ type: 'update_reference_item',
+      reference_item_id: 'item-2', fields: { lane_index: 2 }, expected: { lane_index: 0 } }] });
+    await release();
+    await deleting;
+    await settle(8);
+    const bulk = sent.flat().find((op) => op.type === 'bulk_delete_items');
+    return { moved: moved.ok, deleted: bulk?.items.map((row) => row.id),
+      server: ids(await serverScene()) };
+    """, tmp_path, project=_three_lane_retention_project())
+    assert result == {"moved": True, "deleted": ["item-1"], "server": ["item-2", "item-4"]}
+
+
+def test_a_lane_locked_during_the_wait_refuses_before_the_paint(tmp_path):
+    result = run_item_panel(_LANE_DELETE_BEHIND_A_HELD_EDIT + """
+    // The author locks the lane while item-1's answer is held, through the
+    // header's own lock path (its write queues behind the held one).
+    w._pushUndo('toggle track lock');
+    w._trackLayout[0].locked = true;
+    w._saveLaneConfig([w._trackLayout[0]]);
+    await release();
+    await deleting;
+    await settle(8);
+    return { sent: sent.flat().some((op) => op.type === 'bulk_delete_items'),
+      undo: w._undoStack.map((entry) => entry.label).slice(undoBefore), rows: ids(),
+      locked: (await serverScene()).reference_lane_configs[0].locked,
+      toast: toasts.some((t) => t.message === 'Lane is locked.') };
+    """, tmp_path, project=_retention_project())
+    # Only the lock's own Undo step: the delete added none and sent nothing.
+    assert result == {"sent": False, "undo": ["toggle track lock"], "locked": True,
+                      "rows": ["item-1", "item-2", "item-4"], "toast": True}
+
+
+def test_a_project_or_scene_switch_during_the_wait_sends_nothing(tmp_path):
+    for switch in ("w.projectDir = 'elsewhere';", "w.activeSceneId = 'another-scene';"):
+        result = run_item_panel(_LANE_DELETE_BEHIND_A_HELD_EDIT + switch + """
+        await release();
+        await deleting;
+        await settle(8);
+        return { sent: sent.flat().some((op) => op.type === 'bulk_delete_items'),
+          undo: w._undoStack.length - undoBefore };
+        """, tmp_path, project=_retention_project())
+        assert result == {"sent": False, "undo": 0}, switch

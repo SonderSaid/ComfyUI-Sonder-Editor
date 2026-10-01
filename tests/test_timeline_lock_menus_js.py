@@ -804,6 +804,7 @@ for (const [name, { run, lock }] of Object.entries(CASES)) {
   for (const [idx, locked] of Object.entries(lock || {})) layout[Number(idx)].locked = locked;
   const scene = structuredClone(SCENE);
   const calls = [];
+  const sentOps = [];
   const spy = (label, value) => (...args) => { calls.push(label); return value; };
   const pathToAsset = {};
   for (const asset of [...ASSETS.video, ...ASSETS.image, ...ASSETS.audio]) {
@@ -823,7 +824,7 @@ for (const [name, { run, lock }] of Object.entries(CASES)) {
     _renderTimeline: spy("render"),
     _renderViewportFrame: spy("render"),
     _updateToolbar() {},
-    _runSceneMutation: spy("runSceneMutation", Promise.resolve({})),
+    _runSceneMutation: (ops) => { calls.push("runSceneMutation"); sentOps.push(ops); return Promise.resolve({}); },
     _fetchScenes: spy("fetchScenes", Promise.resolve()),
     _clearSelection: spy("clearSelection"),
     _hideItemEditor: spy("hideItemEditor"),
@@ -832,7 +833,7 @@ for (const [name, { run, lock }] of Object.entries(CASES)) {
   });
   globalThis.confirm = () => { calls.push("confirm"); return true; };
   await run(w);
-  out[name] = { calls };
+  out[name] = { calls, ops: sentOps };
 }
 console.log(JSON.stringify(out));
 """
@@ -871,3 +872,16 @@ def test_a_locked_gesture_refuses_before_confirm_undo_or_paint(guards, gesture):
 @pytest.mark.parametrize("case", ["move_new_lane_stale_locked", "convert_driver_locked"])
 def test_the_guard_reads_the_live_row_and_its_own_lane_family(guards, case):
     assert guards[case]["calls"] == ["toast:Lane is locked."], case
+
+
+def test_a_video_lane_delete_sends_its_render_clips_by_id_and_leaves_the_driver_clip(guards):
+    # Phase 4 kept the clip and audio payload as it was: durable ids, no
+    # identity, the lane kept. Driver clip c5 shares track 0 but is not a
+    # video-lane item.
+    [[operation]] = guards["delete_items_unlocked"]["ops"]
+    assert operation == {
+        "type": "bulk_delete_items",
+        "preserve_lanes": True,
+        "items": [{"type": "clip", "id": clip_id, "preserve_lane": True}
+                  for clip_id in ("c1", "c3", "c4", "c6")],
+    }

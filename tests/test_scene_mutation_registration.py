@@ -1170,9 +1170,11 @@ GUARD_EXEMPT_REASONS = {
                     "guard would catch.",
     # The two sites differ materially, so the reason names both rather than
     # generalising from the worse one.
-    "bulk_delete_items": "Two shapes. `_deleteItemsInLaneWithinGesture` carries "
-                         "durable clip/audio ids and a boolean -- there is no "
-                         "prior row state an `expected` would describe. "
+    "bulk_delete_items": "Two shapes. `_deleteItemsInLaneWithinGesture` builds "
+                         "its rows with `_mutationItemFromSelection`: clip and "
+                         "audio rows carry durable ids and a boolean, and a "
+                         "Reference lane's rows carry the `expected` identity "
+                         "the route requires. "
                          "`_deleteSelectedItemsWithinGesture` passes `items` as "
                          "an identifier, and the array it names DOES carry "
                          "per-item `expected` that the server validates; the "
@@ -3173,9 +3175,10 @@ GUARD_SITE_DISPOSITIONS = {
         "unlinking a wrong row is also recoverable in a way that deleting one "
         "is not."),
     "editor_widget.js:_deleteItemsInLaneWithinGesture:bulk_delete_items": (_FAIR,
-        "Carries durable clip/audio ids and a boolean. There is no prior row "
-        "state an `expected` would describe, and clip/audio are exactly the two "
-        "item types `_apply_bulk_delete_items` resolves by durable id."),
+        "Builds its rows with `_mutationItemFromSelection`. Clip and audio rows "
+        "carry durable ids, the two item types `_apply_bulk_delete_items` "
+        "resolves by durable id; a Reference lane's rows carry the full "
+        "`expected` identity the route validates."),
     "editor_widget.js:_deleteSelectedItemsWithinGesture:bulk_delete_items": (_REASONED,
         "`items` is an identifier the scan cannot see through, and the array DOES "
         "carry per-item `expected` -- built by `_mutationItemFromSelection` -- "
@@ -3469,11 +3472,6 @@ MESSAGE_OWNED_ELSEWHERE = {
         "`failureMessage` this test looks for; "
         "`test_the_split_runner_surfaces_the_server_message` pins that, so "
         "the exemption cannot outlive the thing it assumes.",
-    "editor_widget.js:_deleteItemsInLaneWithinGesture":
-        "Its `items` are clip and audio ids with no snapshot -- "
-        "`_mutationItemFromSelection` builds one only for guide, prompt and "
-        "reference -- so no identity guard can refuse this emission and there is "
-        "no specific message for it to surface.",
 }
 
 
