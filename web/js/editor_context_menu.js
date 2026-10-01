@@ -1,6 +1,12 @@
 import { EDITOR_CHROME as COLORS, chromeMenuCss } from "./editor_theme.js";
 import { PRIORITY as KEY_PRIORITY, register as registerKeyboardConsumer } from "./keyboard_ownership.js";
 
+// A context menu exists only while the user is pointing at it, so it sits above
+// every editor layer, including the gallery's Inspect overlay (99999) and the
+// focused Reference media editor (100003). Below one of them it still opened,
+// unseen, and took Escape and the arrow keys until the next click.
+export const CONTEXT_MENU_Z_INDEX = 100100;
+
 let activeClose = null;
 let sequence = 0;
 
@@ -91,7 +97,7 @@ export function openContextMenu({ x = 0, y = 0, items = [], closeOnScroll = fals
         element.dataset.sonderContextMenuDepth = String(depth);
         element.setAttribute("role", "menu");
         element.setAttribute("aria-label", depth ? "Context submenu" : "Context menu");
-        element.style.cssText = `${chromeMenuCss(160)}left:${panelX}px;top:${panelY}px;z-index:${10000 + depth};max-width:min(440px,92vw);`;
+        element.style.cssText = `${chromeMenuCss(160)}left:${panelX}px;top:${panelY}px;z-index:${CONTEXT_MENU_Z_INDEX + depth};max-width:min(440px,92vw);`;
         const panel = { element, rows: [], activeIndex: -1, parentEntry };
         stack[depth] = panel;
 

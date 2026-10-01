@@ -32,6 +32,7 @@ a fresh `[Unreleased]` block.
 - Reference Library: when the answer to creating a Reference was lost, a Reference with the same name created elsewhere could be taken for it, and the warning that yours was not saved never appeared.
 - Removing a Library member or Reference, or permanently deleting the asset of a staged Library member, now updates the timeline in every scene. Its staged bars used to stay until the editor reloaded, and editing them failed.
 - Reference Lane Setup: choosing a custom recipe that was deleted elsewhere now says so and keeps the lane's recipe, instead of pointing the lane at a recipe that no longer exists.
+- Asset gallery: right-click menus in the fullscreen Inspect metadata panel (Copy, Pin to top, Filter by this field, Pin section) now appear. They opened behind the overlay, unseen, and held Escape and the arrow keys until the next click.
 
 ## [0.7.4] - 2026-09-29
 

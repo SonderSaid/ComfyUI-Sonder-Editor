@@ -107,3 +107,29 @@ def test_writing_aid_rows_preview_the_text_they_insert():
     assert "function writingAidPreview(aid)" in chips
     assert "hint = writingAidPreview(aid)" in chips
     assert "example" not in chips.split("function writingAidPreview")[1].split("}")[0]
+
+
+def test_context_menu_layer_sits_above_every_editor_layer():
+    # A menu opened from inside an overlay (gallery Inspect, the focused
+    # Reference media editor) must paint over it; below it the menu opens unseen
+    # and still owns the keyboard.
+    import re
+
+    menu = _source("web/js/editor_context_menu.js")
+    match = re.search(r"export const CONTEXT_MENU_Z_INDEX = (\d+);", menu)
+    assert match, "the menu layer must stay one named constant"
+    menu_layer = int(match.group(1))
+    assert "z-index:${CONTEXT_MENU_Z_INDEX + depth};" in menu
+
+    layer = re.compile(r"""z-?index\s*[:=]\s*["']?(\d+)""", re.IGNORECASE)
+    offenders = []
+    for path in sorted((ROOT / "web/js").glob("*.js")):
+        if path.name == "editor_context_menu.js":
+            continue
+        for value in layer.findall(path.read_text(encoding="utf-8")):
+            if int(value) >= menu_layer:
+                offenders.append(f"{path.name}: {value}")
+    assert not offenders, offenders
+
+    gallery = _source("web/js/shared_asset_gallery.js")
+    assert "z-index:99999;" in gallery, "Inspect overlay layer moved; recheck the menu layer"
