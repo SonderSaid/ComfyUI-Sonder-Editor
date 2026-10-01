@@ -732,6 +732,10 @@ const FULLSCREEN_SIDEBAR_DEFAULT_FRACTION = 0.382; // first-run gallery sidebar 
 // Reference items are source-less half-open scopes, exactly like prompt
 // sections, so they divide the same way clips, audio and prompts do.
 const SPLITTABLE_ITEM_TYPES = new Set(["clip", "audio", "prompt", "reference"]);
+// The item types whose right-click menu is built per item even when their lane
+// is locked (`_itemContextMenuEntries`). Prompt sections are absent: their
+// row's menu is the prompt-track entries, which read the lock themselves.
+const LOCKED_ITEM_MENU_TYPES = new Set(["clip", "audio", "guide", "reference"]);
 
 // A refusal the user cannot read is indistinguishable from a broken drag, and
 // one message covering every cause names the wrong one three times out of four.
@@ -12311,11 +12315,11 @@ export class EditorWidget {
 
             // Order matters: the item menu selects the hit first, and the
             // prompt entries read that selection for their linked delete.
-            const { items: menuItems, exclusive } = this._itemContextMenuItems(this._hitTestItem(x, rawY));
+            const { items: menuItems, exclusive, selectionDeleteOffered } = this._itemContextMenuItems(this._hitTestItem(x, rawY));
             if (!exclusive) {
                 const _pli3 = this._promptLayoutIdx();
                 if (_pli3 >= 0 && this._layoutIndexFromRawY(rawY) === _pli3) {
-                    menuItems.push(...this._promptTrackContextMenuItems(frame));
+                    menuItems.push(...this._promptTrackContextMenuItems(frame, { selectionDeleteOffered }));
                 }
             }
 
@@ -12381,30 +12385,45 @@ export class EditorWidget {
                     });
                 }
             }
+            // A destructive lane entry the lane lock would refuse shows why and
+            // does nothing; its gesture refuses again before any paint.
+            const lockedOr = (text, lockNote, action) => ({
+                label: lockNote ? `${text} (${lockNote})` : text,
+                action: lockNote ? () => {} : action,
+                danger: true,
+                disabled: !!lockNote,
+            });
+            const laneLocked = this._isLaneLocked(entry.type, entry.laneIndex);
             if (this._isLaneSelected(entry) && (this._selectedLanes || []).length > 1) {
                 const selectedLaneDeletes = this._selectedLaneDeleteEntries();
                 if (selectedLaneDeletes.length > 0) {
-                    menuItems.push({
-                        label: `Delete ${selectedLaneDeletes.length} Selected Lane${selectedLaneDeletes.length === 1 ? "" : "s"}`,
-                        action: () => this._deleteSelectedLanesAndItems(entry),
-                        danger: true,
-                    });
+                    const anySelectedLocked = selectedLaneDeletes.some((lane) => this._isLaneLocked(lane.type, lane.laneIndex));
+                    menuItems.push(lockedOr(
+                        `Delete ${selectedLaneDeletes.length} Selected Lane${selectedLaneDeletes.length === 1 ? "" : "s"}`,
+                        anySelectedLocked ? "locked" : "",
+                        () => this._deleteSelectedLanesAndItems(entry),
+                    ));
                 }
             }
             if (laneCount > 1) {
                 const hasItems = laneItemsForType(this.activeScene, entry.type, entry.laneIndex).length > 0;
                 if (hasItems) {
-                    menuItems.push({ label: `Delete ${label} Lane and Move Items`, action: () => this._removeLaneWithItems(entry.type, entry.laneIndex), danger: true });
-                    const laneLocked = this._isLaneLocked(entry.type, entry.laneIndex);
-                    menuItems.push({
-                        label: laneLocked ? `Delete ${label} Lane and Items (locked)` : `Delete ${label} Lane and Items`,
-                        action: laneLocked ? () => {} : () => this._removeLaneDeletingItems(entry.type, entry.laneIndex),
-                        danger: true,
-                        disabled: laneLocked,
-                    });
-                    menuItems.push({ label: `Delete Items in ${label} Lane`, action: () => this._deleteItemsInLane(entry.type, entry.laneIndex), danger: true });
+                    // Moving items is refused when either end is locked; name
+                    // the destination when only it is, so an unlocked lane's
+                    // greyed entry does not read as its own lock.
+                    const moveTarget = this._laneRemovalMoveTarget(entry.laneIndex || 0);
+                    const moveLockNote = laneLocked
+                        ? "locked"
+                        : (this._isLaneLocked(entry.type, moveTarget) ? `lane ${moveTarget + 1} locked` : "");
+                    menuItems.push(lockedOr(`Delete ${label} Lane and Move Items`, moveLockNote,
+                        () => this._removeLaneWithItems(entry.type, entry.laneIndex)));
+                    menuItems.push(lockedOr(`Delete ${label} Lane and Items`, laneLocked ? "locked" : "",
+                        () => this._removeLaneDeletingItems(entry.type, entry.laneIndex)));
+                    menuItems.push(lockedOr(`Delete Items in ${label} Lane`, laneLocked ? "locked" : "",
+                        () => this._deleteItemsInLane(entry.type, entry.laneIndex)));
                 } else {
-                    menuItems.push({ label: `Remove ${label} Lane`, action: () => this._removeLane(entry.type, entry.laneIndex), danger: true });
+                    menuItems.push(lockedOr(`Remove ${label} Lane`, laneLocked ? "locked" : "",
+                        () => this._removeLane(entry.type, entry.laneIndex)));
                 }
             }
         }
@@ -12414,14 +12433,29 @@ export class EditorWidget {
     /** The right-click menu for the item under the pointer, or for none.
      *  Not a pure builder: an unlocked hit becomes the selection (or refreshes
      *  its selected copy) and the timeline repaints, as right-click always did.
-     *  `exclusive` means no other row's entries join it. */
+     *  `exclusive` means no other row's entries join it;
+     *  `selectionDeleteOffered` means it offers deleting the whole selection. */
     _itemContextMenuItems(hit) {
         const menuItems = [];
-        // Locked items are not selectable (locked-selection rule): right-click
-        // falls through to the background menu instead of selecting the item.
-        // prompt_global keeps its own lock-aware menu branch below.
+        // A locked item is never selected (locked-selection rule), but it gets
+        // a menu of its own, built from the hit alone: entries that leave the
+        // item alone stay usable, and the ones its lane lock refuses show
+        // `(locked)`. The selection is not touched, so entries that act on the
+        // selection (link, consolidate, multi-delete) are not offered. A locked
+        // prompt section has no item menu; the prompt-track entries own that
+        // row. prompt_global keeps its own lock-aware branch below.
         if (hit && hit.type !== "prompt_global" && this._isItemLocked(hit)) {
-            hit = null;
+            if (!LOCKED_ITEM_MENU_TYPES.has(hit.type)) {
+                hit = null;
+            } else {
+                menuItems.push({
+                    label: `${hit.data?.muted ? "Unmute" : "Mute"} (locked)`,
+                    action: () => {},
+                    disabled: true,
+                });
+                menuItems.push(...this._itemContextMenuEntries(hit, { itemLocked: true, linkedDeleteLabel: null }));
+                return { items: menuItems, exclusive: true };
+            }
         }
         if (hit && hit.type === "prompt_global") {
             // Never enters selectedItems (bulk paths don't know the type)
@@ -12501,6 +12535,7 @@ export class EditorWidget {
                 }
                 const deleteLabel = hasLinkedSelection ? `Delete Linked Items (${expandedDeleteCount})` : `Delete ${count} items`;
                 menuItems.push({ label: itemLocked ? `${deleteLabel} (locked)` : deleteLabel, action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
+                return { items: menuItems, exclusive: false, selectionDeleteOffered: true };
             } else {
                 menuItems.push(...this._itemContextMenuEntries(hit, {
                     itemLocked,
@@ -12525,8 +12560,11 @@ export class EditorWidget {
                 action: itemLocked ? () => {} : () => this._moveItemToNewLane(hit),
                 disabled: itemLocked,
             });
+            const convertLabel = isMotionDriverClip ? "Convert to Render Clip" : "Convert to Driver";
             menuItems.push({
-                label: !canConvertRole && !itemLocked ? "Convert to Driver (video only)" : (isMotionDriverClip ? "Convert to Render Clip" : "Convert to Driver"),
+                label: itemLocked
+                    ? `${convertLabel} (locked)`
+                    : (canConvertRole ? convertLabel : "Convert to Driver (video only)"),
                 action: itemLocked || !canConvertRole
                     ? () => {}
                     : () => this._convertClipRole(hit.data.clip_id, isMotionDriverClip ? "render" : "motion_driver"),
@@ -12639,17 +12677,25 @@ export class EditorWidget {
         return menuItems;
     }
 
-    /** The right-click entries for the prompt section at `frame`, if any. */
-    _promptTrackContextMenuItems(frame) {
+    /** The right-click entries for the prompt section at `frame`, if any.
+     *  `selectionDeleteOffered`: the item menu already offers deleting the
+     *  whole selection, so a linked section's delete (which deletes the same
+     *  selection) is not offered a second time. */
+    _promptTrackContextMenuItems(frame, { selectionDeleteOffered = false } = {}) {
         const menuItems = [];
         const sections = this.activeScene?.prompt_sections || [];
         const idx = sections.findIndex(s => frame >= s.start_frame && frame <= s.end_frame);
         if (idx < 0) return menuItems;
-        menuItems.push({ label: "Edit Prompt", action: () => {
-            this._selectedPromptIdx = idx;
-            this._showPromptEditor(sections[idx], idx);
-            this._renderTimeline();
-        }});
+        const promptLocked = this._isPromptTrackLocked();
+        menuItems.push({
+            label: promptLocked ? "Edit Prompt (locked)" : "Edit Prompt",
+            action: promptLocked ? () => {} : () => {
+                this._selectedPromptIdx = idx;
+                this._showPromptEditor(sections[idx], idx);
+                this._renderTimeline();
+            },
+            disabled: promptLocked,
+        });
         menuItems.push({
             label: "Set Selection to Prompt",
             action: () => this._setSelectionToFrameRange(sections[idx].start_frame || 0, sections[idx].end_frame || 0),
@@ -12658,21 +12704,28 @@ export class EditorWidget {
             label: "Queue Prompt Section",
             action: () => { this._queuePromptSection(sections[idx]).catch(() => {}); },
         });
+        // Muting the section selects it and mutes it with its links, so it is
+        // refused -- and greyed here, before anything is selected -- when the
+        // track or any linked partner is locked.
+        const sectionHit = { type: "prompt", id: idx, data: sections[idx] };
+        const muteLocked = this._expandItemsWithLinked([sectionHit]).some((item) => this._isItemLocked(item));
+        const muteLabel = sections[idx].muted ? "Unmute Section" : "Mute Section";
         menuItems.push({
-            label: sections[idx].muted ? "Unmute Section" : "Mute Section",
-            action: () => {
-                this._selectItem({ type: "prompt", id: idx, data: sections[idx] });
+            label: muteLocked ? `${muteLabel} (locked)` : muteLabel,
+            action: muteLocked ? () => {} : () => {
+                this._selectItem(sectionHit);
                 void this._toggleSelectedMute();
             },
+            disabled: muteLocked,
         });
         menuItems.push({ label: "Open Prompt Management", action: () => this._showPromptManagementPanel() });
-        const promptLocked = this._isPromptTrackLocked();
         const promptSelected = this.selectedItems.some((item) => item.type === "prompt" && item.id === idx);
         const promptLinked = promptSelected && this.selectedItems.some((item) => this._isLinkedItem(item));
         const promptExpanded = promptLinked ? this._expandItemsWithLinked(this.selectedItems) : [];
         const promptDeleteLocked = promptLinked
             ? promptExpanded.some((item) => this._isItemLocked(item))
             : promptLocked;
+        if (promptLinked && selectionDeleteOffered) return menuItems;
         const promptDeleteLabel = promptLinked
             ? `Delete Linked Items (${Math.max(1, promptExpanded.length)})`
             : "Delete Prompt";
@@ -13881,6 +13934,11 @@ export class EditorWidget {
         if (!this.activeScene || !this.projectDir || !clipId) return;
         const clip = (this.activeScene.clips || []).find(c => c.clip_id === clipId);
         if (!clip) return;
+        // Before the paint: the route refuses a clip on a locked lane.
+        if (this._isLaneLocked(this._clipTrackType(clip), clip.track_index || 0)) {
+            this._showToast("Lane is locked.");
+            return;
+        }
         if (targetRole === "motion_driver") {
             const sourceAsset = this._getAssetForSourcePath(clip.source_path);
             if (sourceAsset?.asset_type !== "video") {
@@ -13984,6 +14042,12 @@ export class EditorWidget {
             localApply = { laneType: "audio", newCount, field: "lane_index", newLane };
         }
         if (!operations.length) return;
+        // Before the paint: the route refuses moving an item off a locked lane.
+        // The live row decides, not the hit the menu was built from.
+        if (this._isItemLocked(this._findSceneItemBySelection(hit.type, hit.id) || hit)) {
+            this._showToast("Lane is locked.");
+            return;
+        }
 
         this._pushUndo("move to new lane");
         // `_applyLocalSetLaneCount` already mirrors the append; the item's own
@@ -15070,6 +15134,12 @@ export class EditorWidget {
 
     async _deleteItemsInLaneWithinGesture(trackType, laneIndex) {
         if (!this.activeScene || !this.projectDir) return;
+        // Before the confirm and the paint: the route refuses a locked lane,
+        // and a delete painted first would vanish and come back.
+        if (this._isLaneLocked(trackType, laneIndex)) {
+            this._showToast("Lane is locked.");
+            return;
+        }
         const descriptor = descriptorFor(trackType);
         const laneType = variableLaneTypeFor(trackType);
         const label = laneLogLabel(trackType);
@@ -15222,6 +15292,11 @@ export class EditorWidget {
 
     async _removeLaneWithinGesture(trackType, laneIndex) {
         if (!this.activeScene || !this.projectDir) return;
+        // Before the paint: the route refuses a locked lane.
+        if (this._isLaneLocked(trackType, laneIndex)) {
+            this._showToast("Lane is locked.");
+            return;
+        }
         const laneType = variableLaneTypeFor(trackType);
         const currentCount = laneCountFor(this.activeScene, trackType);
         if (currentCount <= 1) return;
