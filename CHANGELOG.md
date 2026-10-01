@@ -11,27 +11,29 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+## [0.7.5] - 2026-10-01
+
 ### Changed
 - Reference Lane Setup: adding or deleting a staged item and editing its range, strength, sequence length, mute, prompt override or members now show at once and save in the background, instead of waiting about a second for the server. A member role or retention change still waits for the server, and other edits of that item wait with it.
-- A failed Reference staging drop on the timeline shows one message instead of two.
-- Reference Lane Setup: clearing a member's saved role or retention now says it can't be saved yet, instead of appearing to work and reverting later.
-- Reference Library: editing or deleting a Reference or a member now shows at once and saves in the background, and the form closes when you save. Removing a member or deleting a Reference takes its staged bars off the timeline at once too.
-- Reference Prompting: changing a member's handle or its defaults shows at once and saves in the background. Save defaults saves only the fields you changed, and a handle another Reference or identity already uses is refused before anything is sent.
 - Reference Lane Setup: Edit as custom, Save as custom, and Update, Rename or Delete of a custom recipe show at once and save in the background.
+- Reference Library: editing or deleting a Reference or a member now shows at once and saves in the background, and the form closes when you save. Removing a member or deleting a Reference takes its staged bars off the timeline at once too.
 - Reference Library: a new Reference or member can be used while it is still saving. You can edit it, remove it, reorder it, drag it onto the timeline or add it there, and each change is saved after it. Context chip pickers list it once it has saved.
+- Reference Prompting: changing a member's handle or its defaults shows at once and saves in the background. Save defaults saves only the fields you changed, and a handle another Reference or identity already uses is refused before anything is sent.
 
 ### Fixed
 - Reference Lane Setup: a second edit made while the first was still saving was silently dropped. It is now saved after the first.
 - Reference Lane Setup: a refused item edit also removed the Undo step of an earlier edit of the same kind.
 - Reference Lane Setup: an invalid role or unsupported recipe value no longer takes keyboard focus again after every edit.
-- Dropping a Library member onto a staged Reference bar while another edit of that item was saving could be refused, and a failed drop refetched the scene over edits queued behind it.
+- Reference Lane Setup: clearing a member's saved role or retention appeared to work, then reverted later. It now says it can't be saved yet.
+- Reference Lane Setup: choosing a custom recipe that was deleted elsewhere now says so and keeps the lane's recipe, instead of pointing the lane at a recipe that no longer exists.
 - Reference Library: a second edit of a Reference or member made while the first was still saving, or removing a member just after editing it, was refused as "changed elsewhere". Both are now saved in order.
 - Reference Library: saving an edit no longer reverts a field another tab changed while the form was open, when you did not change that field yourself.
-- Reference Prompting: attaching a member right after changing its handle was refused as "changed elsewhere". It now waits for the handle change and uses the new handle.
-- Deleting a prompt format that is still in use shows one message instead of two.
 - Reference Library: when the answer to creating a Reference was lost, a Reference with the same name created elsewhere could be taken for it, and the warning that yours was not saved never appeared.
+- Reference Prompting: attaching a member right after changing its handle was refused as "changed elsewhere". It now waits for the handle change and uses the new handle.
 - Removing a Library member or Reference, or permanently deleting the asset of a staged Library member, now updates the timeline in every scene. Its staged bars used to stay until the editor reloaded, and editing them failed.
-- Reference Lane Setup: choosing a custom recipe that was deleted elsewhere now says so and keeps the lane's recipe, instead of pointing the lane at a recipe that no longer exists.
+- Dropping a Library member onto a staged Reference bar while another edit of that item was saving could be refused, and a failed drop refetched the scene over edits queued behind it.
+- A failed Reference staging drop on the timeline shows one message instead of two.
+- Deleting a prompt format that is still in use shows one message instead of two.
 - Asset gallery: right-click menus in the fullscreen Inspect metadata panel (Copy, Pin to top, Filter by this field, Pin section) now appear. They opened behind the overlay, unseen, and held Escape and the arrow keys until the next click.
 
 ## [0.7.4] - 2026-09-29
