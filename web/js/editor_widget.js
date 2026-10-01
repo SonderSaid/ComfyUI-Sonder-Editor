@@ -6620,7 +6620,7 @@ export class EditorWidget {
         const laneItems = laneItemsForType(this.activeScene, descriptor.trackType, laneIndex);
         if (laneItems.length && itemPolicy === "require_empty") return false;
         if (laneItems.length && itemPolicy === "move_items") {
-            const nextTarget = targetLane == null ? (laneIndex > 0 ? laneIndex - 1 : 1) : parseInt(targetLane, 10);
+            const nextTarget = targetLane == null ? this._laneRemovalMoveTarget(laneIndex) : parseInt(targetLane, 10);
             if (!Number.isFinite(nextTarget) || nextTarget < 0 || nextTarget >= currentCount || nextTarget === laneIndex) return false;
             for (const item of laneItems) {
                 item[descriptor.itemsSource.indexField] = nextTarget;
@@ -12299,352 +12299,23 @@ export class EditorWidget {
             const { x, rawY } = this._canvasMouseCoords(e);
             const frame = Math.max(0, this._xToFrame(x));
 
-            const menuItems = [];
-
-            // Check for track header right-click (lane management)
+            // Track header right-click (lane management)
             const headerHit = this._hitTestTrackHeader(x, rawY);
             if (headerHit) {
-                const entry = this._trackLayout[headerHit.layoutIdx];
-                if (entry.type === TRACK_TYPE.GUIDES) {
-                    // Explicit menu entry — auto-open removed (ux_patterns
-                    // follow-up direction); the header ☰ icon is the primary path
-                    menuItems.push({ label: "Open Guide Management", action: () => this._showGuideManagementPopup(e.clientX, e.clientY) });
-                    this._showContextMenu(e.clientX, e.clientY, menuItems);
-                    return;
-                }
-                if (entry.type === TRACK_TYPE.PROMPT || entry.type === TRACK_TYPE.PROMPT_GLOBAL) {
-                    // Explicit menu action (ux_patterns follow-up direction) —
-                    // do not copy the guides auto-open.
-                    menuItems.push({ label: "Open Prompt Management", action: () => this._showPromptManagementPanel() });
-                    if (entry.type === TRACK_TYPE.PROMPT_GLOBAL) {
-                        const globalLocked = this._isGlobalPromptTrackLocked();
-                        menuItems.push({
-                            label: globalLocked ? "Edit Global Prompt (locked)" : "Edit Global Prompt",
-                            action: globalLocked ? () => {} : () => this._showGlobalPromptEditor(),
-                            disabled: globalLocked,
-                        });
-                    }
-                    this._showContextMenu(e.clientX, e.clientY, menuItems);
-                    return;
-                }
-                if (entry.type === TRACK_TYPE.REFERENCE) {
-                    // Setup joins the generic lane menu rather than replacing
-                    // it: a Reference lane still renames, adds and removes like
-                    // every other variable lane.
-                    menuItems.push({ label: "Reference Lane Setup…", action: () => void this._showReferenceLanePanel(entry) });
-                }
-                if (this._isLaneTrackType(entry.type)) {
-                    const descriptor = descriptorFor(entry.type);
-                    const laneCount = laneCountFor(this.activeScene, entry.type);
-                    const label = descriptor.menuLabel;
-
-                    menuItems.push({ label: "Rename Lane", action: () => this._startLaneRename(headerHit.layoutIdx) });
-                    menuItems.push({ label: `Add ${label} Lane`, action: () => this._addLane(entry.type) });
-                    // Gated on the DESCRIPTOR, not the track type. Lane order
-                    // means something different in every family — video lane
-                    // order is compositing order, Reference lane order numbers
-                    // the H3 population ordinals — so only a family whose
-                    // reorder has been designed and tested opts in.
-                    if (descriptor.laneMovable) {
-                        const laneIndex = entry.laneIndex || 0;
-                        for (const [moveLabel, direction] of [["Move Lane Up", -1], ["Move Lane Down", 1]]) {
-                            const target = laneIndex + direction;
-                            if (target < 0 || target >= laneCount) continue;
-                            const moveLocked = this._isLaneLocked(entry.type, laneIndex)
-                                || this._isLaneLocked(entry.type, target);
-                            menuItems.push({
-                                label: moveLocked ? `${moveLabel} (locked)` : moveLabel,
-                                action: moveLocked ? () => {} : () => void this._moveReferenceLane(entry, direction),
-                                disabled: moveLocked,
-                            });
-                        }
-                    }
-                    if (this._isLaneSelected(entry) && (this._selectedLanes || []).length > 1) {
-                        const selectedLaneDeletes = this._selectedLaneDeleteEntries();
-                        if (selectedLaneDeletes.length > 0) {
-                            menuItems.push({
-                                label: `Delete ${selectedLaneDeletes.length} Selected Lane${selectedLaneDeletes.length === 1 ? "" : "s"}`,
-                                action: () => this._deleteSelectedLanesAndItems(entry),
-                                danger: true,
-                            });
-                        }
-                    }
-                    if (laneCount > 1) {
-                        const hasItems = laneItemsForType(this.activeScene, entry.type, entry.laneIndex).length > 0;
-                        if (hasItems) {
-                            menuItems.push({ label: `Delete ${label} Lane and Move Items`, action: () => this._removeLaneWithItems(entry.type, entry.laneIndex), danger: true });
-                            const laneLocked = this._isLaneLocked(entry.type, entry.laneIndex);
-                            menuItems.push({
-                                label: laneLocked ? `Delete ${label} Lane and Items (locked)` : `Delete ${label} Lane and Items`,
-                                action: laneLocked ? () => {} : () => this._removeLaneDeletingItems(entry.type, entry.laneIndex),
-                                danger: true,
-                                disabled: laneLocked,
-                            });
-                            menuItems.push({ label: `Delete Items in ${label} Lane`, action: () => this._deleteItemsInLane(entry.type, entry.laneIndex), danger: true });
-                        } else {
-                            menuItems.push({ label: `Remove ${label} Lane`, action: () => this._removeLane(entry.type, entry.laneIndex), danger: true });
-                        }
-                    }
-                }
-                if (menuItems.length > 0) {
-                    this._showContextMenu(e.clientX, e.clientY, menuItems);
+                const headerItems = this._laneHeaderContextMenuItems(headerHit.layoutIdx, e.clientX, e.clientY);
+                if (headerItems.length > 0) {
+                    this._showContextMenu(e.clientX, e.clientY, headerItems);
                 }
                 return;
             }
 
-            // Check for timeline item hits
-            let hit = this._hitTestItem(x, rawY);
-            // Locked items are not selectable (locked-selection rule): right-click
-            // falls through to the background menu instead of selecting the item.
-            // prompt_global keeps its own lock-aware menu branch below.
-            if (hit && hit.type !== "prompt_global" && this._isItemLocked(hit)) {
-                hit = null;
-            }
-            if (hit && hit.type === "prompt_global") {
-                // Never enters selectedItems (bulk paths don't know the type)
-                const globalLocked = this._isGlobalPromptTrackLocked();
-                menuItems.push({
-                    label: globalLocked ? "Edit Global Prompt (locked)" : "Edit Global Prompt",
-                    action: globalLocked ? () => {} : () => this._showGlobalPromptEditor(),
-                    disabled: globalLocked,
-                });
-                menuItems.push({ label: "Open Prompt Management", action: () => this._showPromptManagementPanel() });
-                this._showContextMenu(e.clientX, e.clientY, menuItems);
-                return;
-            }
-            if (hit) {
-                if (!this._isSelected(hit.type, hit.id)) {
-                    this._selectItem(hit);
-                } else {
-                    this._refreshSelectedHit(hit);
-                }
-                this._renderTimeline();
-
-                const count = this.selectedItems.length;
-                const expandedMenuItems = this._expandItemsWithLinked(this.selectedItems);
-                const hasLinkedSelection = this.selectedItems.some((item) => this._isLinkedItem(item));
-                const expandedDeleteCount = Math.max(count, expandedMenuItems.length);
-                const itemLocked = expandedMenuItems.some((item) => this._isItemLocked(item));
-                const linkableCount = this._selectedLinkableItems().length;
-                if (linkableCount >= 2) {
-                    menuItems.push({ label: "Link Selected Items", action: () => this._createLinkGroupFromSelection() });
-                }
-                if (hasLinkedSelection) {
-                    menuItems.push({ label: "Select Linked Items", action: () => this._selectLinkedItemsForSelection() });
-                }
-                if (this.selectedItems.some((item) => this._shouldApplyLinked(item))) {
-                    menuItems.push({ label: "Unlink Linked Items", action: () => this._unlinkSelectedItems() });
-                }
-                // Discoverable mirror of the M shortcut (linked-aware via
-                // _toggleSelectedMute's own expansion + lock refusal).
-                const muteCandidates = expandedMenuItems.filter((item) =>
-                    item?.type === "clip" || item?.type === "audio" || item?.type === "guide" || item?.type === "prompt" || item?.type === "reference");
-                if (muteCandidates.length > 0) {
-                    const allMuted = muteCandidates.every((item) => !!item.data?.muted);
-                    const muteLabel = `${allMuted ? "Unmute" : "Mute"} Selected (${muteCandidates.length})`;
-                    menuItems.push({
-                        label: itemLocked ? `${muteLabel} (locked)` : muteLabel,
-                        action: itemLocked ? () => {} : () => void this._toggleSelectedMute(),
-                        disabled: itemLocked,
-                    });
-                }
-                const consolidateItems = this._selectedConsolidationItems(hit);
-                const consolidateTargetLane = hit.type === "clip"
-                    ? (hit.data.track_index || 0)
-                    : hit.type === "audio" ? (hit.data.lane_index || 0) : -1;
-                if (consolidateItems.length >= 2 && consolidateItems.some((item) => {
-                    const lane = item.type === "clip" ? (item.data.track_index || 0) : (item.data.lane_index || 0);
-                    return lane !== consolidateTargetLane;
-                })) {
-                    const typeLabel = hit.type === "clip" ? "Clips" : "Audio";
-                    menuItems.push({
-                        label: `Consolidate Selected ${typeLabel} to This Lane (${consolidateItems.length})`,
-                        action: () => void this._consolidateSelectedItemsToLane(hit),
-                    });
-                }
-                if (count > 1) {
-                    const rangeItems = expandedMenuItems.filter((item) => this._selectionRangeForItem(item));
-                    if (rangeItems.length > 0) {
-                        menuItems.push({
-                            label: `Set Selection to Selected (${rangeItems.length})`,
-                            action: () => this._setSelectionToItems(expandedMenuItems),
-                        });
-                    }
-                    const promptQueueItems = this._promptItemsForQueueBatch(expandedMenuItems);
-                    if (promptQueueItems.length > 0) {
-                        menuItems.push({
-                            label: `Queue Prompt Sections (${promptQueueItems.length})`,
-                            action: () => { this._queueSelectedPromptSections(expandedMenuItems).catch(() => {}); },
-                        });
-                    }
-                    const deleteLabel = hasLinkedSelection ? `Delete Linked Items (${expandedDeleteCount})` : `Delete ${count} items`;
-                    menuItems.push({ label: itemLocked ? `${deleteLabel} (locked)` : deleteLabel, action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
-                } else if (hit.type === "clip") {
-                    const clipAsset = this._getAssetForSourcePath(hit.data.source_path);
-                    const isMotionDriverClip = this._isMotionDriverClip(hit.data);
-                    const canConvertRole = isMotionDriverClip || clipAsset?.asset_type === "video";
-                    menuItems.push({
-                        label: itemLocked ? "Move to New Lane (locked)" : "Move to New Lane",
-                        action: itemLocked ? () => {} : () => this._moveItemToNewLane(hit),
-                        disabled: itemLocked,
-                    });
-                    menuItems.push({
-                        label: !canConvertRole && !itemLocked ? "Convert to Driver (video only)" : (isMotionDriverClip ? "Convert to Render Clip" : "Convert to Driver"),
-                        action: itemLocked || !canConvertRole
-                            ? () => {}
-                            : () => this._convertClipRole(hit.data.clip_id, isMotionDriverClip ? "render" : "motion_driver"),
-                        disabled: itemLocked || !canConvertRole,
-                    });
-                    menuItems.push({
-                        label: itemLocked ? "Replace clip with… (locked)" : "Replace clip with…",
-                        action: itemLocked ? () => {} : () => this._replaceClipSource(hit.data),
-                        disabled: itemLocked,
-                    });
-                    menuItems.push({
-                        label: "Set Selection to Clip",
-                        action: () => this._setSelectionToFrameRange(hit.data.timeline_start_frame || 0, hit.data.timeline_end_frame || 0),
-                    });
-                    const guidesLocked = this._isGuideTrackLocked();
-                    menuItems.push({ label: guidesLocked ? "Add Frame to Guides (locked)" : "Add Frame to Guides", action: guidesLocked ? () => {} : () => this._addClipFrameToGuides(hit.data), disabled: guidesLocked });
-                    if (clipAsset?.asset_id) {
-                        menuItems.push({ label: "Inspect in Gallery", action: () => this._inspectAssetInGallery(clipAsset) });
-                    }
-                    if ((clipAsset?.width || 0) > 0 && (clipAsset?.height || 0) > 0) {
-                        menuItems.push({
-                            label: `Set Scene Aspect Ratio (${clipAsset.width}:${clipAsset.height})`,
-                            action: () => this._setSceneAspectRatioFromDimensions(clipAsset.width, clipAsset.height),
-                        });
-                    }
-                    // Extend scene to clip end
-                    const clipEnd = hit.data.timeline_end_frame || 0;
-                    const sceneDur = this.activeScene?.duration_frames || 0;
-                    if (clipEnd > sceneDur) {
-                        menuItems.push({ label: "Extend Scene to Clip End", action: () => this._updateSceneDuration(clipEnd) });
-                    }
-                    const deleteLabel = hasLinkedSelection ? `Delete Linked Items (${expandedDeleteCount})` : "Delete Clip";
-                    menuItems.push({ label: itemLocked ? `${deleteLabel} (locked)` : deleteLabel, action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
-                } else if (hit.type === "audio") {
-                    menuItems.push({ label: itemLocked ? "Move to New Lane (locked)" : "Move to New Lane", action: itemLocked ? () => {} : () => this._moveItemToNewLane(hit), disabled: itemLocked });
-                    menuItems.push({
-                        label: itemLocked ? "Replace audio with… (locked)" : "Replace audio with…",
-                        action: itemLocked ? () => {} : () => this._replaceAudioSource(hit.data),
-                        disabled: itemLocked,
-                    });
-                    menuItems.push({
-                        label: "Set Selection to Audio",
-                        action: () => this._setSelectionToFrameRange(hit.data.timeline_start_frame || 0, hit.data.timeline_end_frame || 0),
-                    });
-                    // Extend scene to audio end
-                    const audioEnd = hit.data.timeline_end_frame || 0;
-                    const audioSceneDur = this.activeScene?.duration_frames || 0;
-                    const audioAsset = this._getAssetForSourcePath(hit.data.source_path);
-                    if (audioAsset?.asset_id) {
-                        menuItems.push({ label: "Inspect in Gallery", action: () => this._inspectAssetInGallery(audioAsset) });
-                    }
-                    if (audioEnd > audioSceneDur) {
-                        menuItems.push({ label: "Extend Scene to Audio End", action: () => this._updateSceneDuration(audioEnd) });
-                    }
-                    const deleteLabel = hasLinkedSelection ? `Delete Linked Items (${expandedDeleteCount})` : "Delete Audio Track";
-                    menuItems.push({ label: itemLocked ? `${deleteLabel} (locked)` : deleteLabel, action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
-                } else if (hit.type === "guide") {
-                    const guideAsset = this._getGuideAsset(hit.data);
-                    const guidesLocked = this._isGuideTrackLocked();
-                    menuItems.push({
-                        label: guidesLocked ? "Replace guide with… (locked)" : "Replace guide with…",
-                        action: guidesLocked ? () => {} : () => this._replaceGuideImage(hit.data, { refresh: true }),
-                        disabled: guidesLocked,
-                    });
-                    if (guideAsset?.asset_id) {
-                        menuItems.push({ label: "Inspect in Gallery", action: () => this._inspectAssetInGallery(guideAsset) });
-                    }
-                    if ((guideAsset?.width || 0) > 0 && (guideAsset?.height || 0) > 0) {
-                        menuItems.push({
-                            label: `Set Scene Aspect Ratio (${guideAsset.width}:${guideAsset.height})`,
-                            action: () => this._setSceneAspectRatioFromDimensions(guideAsset.width, guideAsset.height),
-                        });
-                    }
-                    const guideRange = this._guideHoldFrameRange(hit.data);
-                    if (guideRange) {
-                        menuItems.push({
-                            label: "Select Guide Range",
-                            action: () => this._setSelectionToFrameRange(guideRange.start, guideRange.end),
-                        });
-                    }
-                    const guideFrame = this._resolvedGuideFrame(hit.data);
-                    menuItems.push({
-                        label: "Set Selection In",
-                        action: () => this._setSelectionStartFrame(guideFrame),
-                    });
-                    menuItems.push({
-                        label: "Set Selection Out",
-                        action: () => this._setSelectionEndFrame(guideFrame),
-                    });
-                    const deleteLabel = hasLinkedSelection ? `Delete Linked Items (${expandedDeleteCount})` : "Delete Guide";
-                    menuItems.push({ label: itemLocked ? `${deleteLabel} (locked)` : deleteLabel, action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
-                } else if (hit.type === "reference") {
-                    const endFrame = hit.data.end_frame === -1 ? this.totalFrames : (hit.data.end_frame || 0);
-                    menuItems.push({
-                        label: "Set Selection to Reference",
-                        action: () => this._setSelectionToFrameRange(hit.data.start_frame || 0, endFrame),
-                    });
-                    const laneEntry = (this._trackLayout || []).find((entry) =>
-                        entry.type === TRACK_TYPE.REFERENCE && (entry.laneIndex || 0) === (hit.data.lane_index || 0));
-                    if (laneEntry) {
-                        menuItems.push({ label: "Reference Lane Setup", action: () => void this._showReferenceLanePanel(laneEntry) });
-                    }
-                    menuItems.push({
-                        label: itemLocked ? "Delete Reference (locked)" : "Delete Reference",
-                        action: itemLocked ? () => {} : () => this._deleteSelectedItems(),
-                        danger: true,
-                        disabled: itemLocked,
-                    });
-                }
-            }
-
-            // Check prompt track
-            const _pli3 = this._promptLayoutIdx();
-            if (_pli3 >= 0 && this._layoutIndexFromRawY(rawY) === _pli3) {
-                const sections = this.activeScene?.prompt_sections || [];
-                const idx = sections.findIndex(s => frame >= s.start_frame && frame <= s.end_frame);
-                if (idx >= 0) {
-                    menuItems.push({ label: "Edit Prompt", action: () => {
-                        this._selectedPromptIdx = idx;
-                        this._showPromptEditor(sections[idx], idx);
-                        this._renderTimeline();
-                    }});
-                    menuItems.push({
-                        label: "Set Selection to Prompt",
-                        action: () => this._setSelectionToFrameRange(sections[idx].start_frame || 0, sections[idx].end_frame || 0),
-                    });
-                    menuItems.push({
-                        label: "Queue Prompt Section",
-                        action: () => { this._queuePromptSection(sections[idx]).catch(() => {}); },
-                    });
-                    menuItems.push({
-                        label: sections[idx].muted ? "Unmute Section" : "Mute Section",
-                        action: () => {
-                            this._selectItem({ type: "prompt", id: idx, data: sections[idx] });
-                            void this._toggleSelectedMute();
-                        },
-                    });
-                    menuItems.push({ label: "Open Prompt Management", action: () => this._showPromptManagementPanel() });
-                    const promptLocked = this._isPromptTrackLocked();
-                    const promptSelected = this.selectedItems.some((item) => item.type === "prompt" && item.id === idx);
-                    const promptLinked = promptSelected && this.selectedItems.some((item) => this._isLinkedItem(item));
-                    const promptExpanded = promptLinked ? this._expandItemsWithLinked(this.selectedItems) : [];
-                    const promptDeleteLocked = promptLinked
-                        ? promptExpanded.some((item) => this._isItemLocked(item))
-                        : promptLocked;
-                    const promptDeleteLabel = promptLinked
-                        ? `Delete Linked Items (${Math.max(1, promptExpanded.length)})`
-                        : "Delete Prompt";
-                    menuItems.push({ label: promptDeleteLocked ? `${promptDeleteLabel} (locked)` : promptDeleteLabel, action: promptDeleteLocked ? () => {} : () => {
-                        if (promptLinked) {
-                            this._deleteSelectedItems();
-                        } else if (confirm("Delete this prompt section?")) {
-                            this._deletePromptSection(idx);
-                        }
-                    }, danger: true, disabled: promptDeleteLocked });
+            // Order matters: the item menu selects the hit first, and the
+            // prompt entries read that selection for their linked delete.
+            const { items: menuItems, exclusive } = this._itemContextMenuItems(this._hitTestItem(x, rawY));
+            if (!exclusive) {
+                const _pli3 = this._promptLayoutIdx();
+                if (_pli3 >= 0 && this._layoutIndexFromRawY(rawY) === _pli3) {
+                    menuItems.push(...this._promptTrackContextMenuItems(frame));
                 }
             }
 
@@ -12652,6 +12323,367 @@ export class EditorWidget {
                 this._showContextMenu(e.clientX, e.clientY, menuItems);
             }
         });
+    }
+
+    /** The right-click menu for a timeline lane header. */
+    _laneHeaderContextMenuItems(layoutIdx, clientX, clientY) {
+        const menuItems = [];
+        const entry = this._trackLayout[layoutIdx];
+        if (entry.type === TRACK_TYPE.GUIDES) {
+            // Explicit menu entry — auto-open removed (ux_patterns
+            // follow-up direction); the header ☰ icon is the primary path
+            menuItems.push({ label: "Open Guide Management", action: () => this._showGuideManagementPopup(clientX, clientY) });
+            return menuItems;
+        }
+        if (entry.type === TRACK_TYPE.PROMPT || entry.type === TRACK_TYPE.PROMPT_GLOBAL) {
+            // Explicit menu action (ux_patterns follow-up direction) —
+            // do not copy the guides auto-open.
+            menuItems.push({ label: "Open Prompt Management", action: () => this._showPromptManagementPanel() });
+            if (entry.type === TRACK_TYPE.PROMPT_GLOBAL) {
+                const globalLocked = this._isGlobalPromptTrackLocked();
+                menuItems.push({
+                    label: globalLocked ? "Edit Global Prompt (locked)" : "Edit Global Prompt",
+                    action: globalLocked ? () => {} : () => this._showGlobalPromptEditor(),
+                    disabled: globalLocked,
+                });
+            }
+            return menuItems;
+        }
+        if (entry.type === TRACK_TYPE.REFERENCE) {
+            // Setup joins the generic lane menu rather than replacing
+            // it: a Reference lane still renames, adds and removes like
+            // every other variable lane.
+            menuItems.push({ label: "Reference Lane Setup…", action: () => void this._showReferenceLanePanel(entry) });
+        }
+        if (this._isLaneTrackType(entry.type)) {
+            const descriptor = descriptorFor(entry.type);
+            const laneCount = laneCountFor(this.activeScene, entry.type);
+            const label = descriptor.menuLabel;
+
+            menuItems.push({ label: "Rename Lane", action: () => this._startLaneRename(layoutIdx) });
+            menuItems.push({ label: `Add ${label} Lane`, action: () => this._addLane(entry.type) });
+            // Gated on the DESCRIPTOR, not the track type. Lane order
+            // means something different in every family — video lane
+            // order is compositing order, Reference lane order numbers
+            // the H3 population ordinals — so only a family whose
+            // reorder has been designed and tested opts in.
+            if (descriptor.laneMovable) {
+                const laneIndex = entry.laneIndex || 0;
+                for (const [moveLabel, direction] of [["Move Lane Up", -1], ["Move Lane Down", 1]]) {
+                    const target = laneIndex + direction;
+                    if (target < 0 || target >= laneCount) continue;
+                    const moveLocked = this._isLaneLocked(entry.type, laneIndex)
+                        || this._isLaneLocked(entry.type, target);
+                    menuItems.push({
+                        label: moveLocked ? `${moveLabel} (locked)` : moveLabel,
+                        action: moveLocked ? () => {} : () => void this._moveReferenceLane(entry, direction),
+                        disabled: moveLocked,
+                    });
+                }
+            }
+            if (this._isLaneSelected(entry) && (this._selectedLanes || []).length > 1) {
+                const selectedLaneDeletes = this._selectedLaneDeleteEntries();
+                if (selectedLaneDeletes.length > 0) {
+                    menuItems.push({
+                        label: `Delete ${selectedLaneDeletes.length} Selected Lane${selectedLaneDeletes.length === 1 ? "" : "s"}`,
+                        action: () => this._deleteSelectedLanesAndItems(entry),
+                        danger: true,
+                    });
+                }
+            }
+            if (laneCount > 1) {
+                const hasItems = laneItemsForType(this.activeScene, entry.type, entry.laneIndex).length > 0;
+                if (hasItems) {
+                    menuItems.push({ label: `Delete ${label} Lane and Move Items`, action: () => this._removeLaneWithItems(entry.type, entry.laneIndex), danger: true });
+                    const laneLocked = this._isLaneLocked(entry.type, entry.laneIndex);
+                    menuItems.push({
+                        label: laneLocked ? `Delete ${label} Lane and Items (locked)` : `Delete ${label} Lane and Items`,
+                        action: laneLocked ? () => {} : () => this._removeLaneDeletingItems(entry.type, entry.laneIndex),
+                        danger: true,
+                        disabled: laneLocked,
+                    });
+                    menuItems.push({ label: `Delete Items in ${label} Lane`, action: () => this._deleteItemsInLane(entry.type, entry.laneIndex), danger: true });
+                } else {
+                    menuItems.push({ label: `Remove ${label} Lane`, action: () => this._removeLane(entry.type, entry.laneIndex), danger: true });
+                }
+            }
+        }
+        return menuItems;
+    }
+
+    /** The right-click menu for the item under the pointer, or for none.
+     *  Not a pure builder: an unlocked hit becomes the selection (or refreshes
+     *  its selected copy) and the timeline repaints, as right-click always did.
+     *  `exclusive` means no other row's entries join it. */
+    _itemContextMenuItems(hit) {
+        const menuItems = [];
+        // Locked items are not selectable (locked-selection rule): right-click
+        // falls through to the background menu instead of selecting the item.
+        // prompt_global keeps its own lock-aware menu branch below.
+        if (hit && hit.type !== "prompt_global" && this._isItemLocked(hit)) {
+            hit = null;
+        }
+        if (hit && hit.type === "prompt_global") {
+            // Never enters selectedItems (bulk paths don't know the type)
+            const globalLocked = this._isGlobalPromptTrackLocked();
+            menuItems.push({
+                label: globalLocked ? "Edit Global Prompt (locked)" : "Edit Global Prompt",
+                action: globalLocked ? () => {} : () => this._showGlobalPromptEditor(),
+                disabled: globalLocked,
+            });
+            menuItems.push({ label: "Open Prompt Management", action: () => this._showPromptManagementPanel() });
+            return { items: menuItems, exclusive: true };
+        }
+        if (hit) {
+            if (!this._isSelected(hit.type, hit.id)) {
+                this._selectItem(hit);
+            } else {
+                this._refreshSelectedHit(hit);
+            }
+            this._renderTimeline();
+
+            const count = this.selectedItems.length;
+            const expandedMenuItems = this._expandItemsWithLinked(this.selectedItems);
+            const hasLinkedSelection = this.selectedItems.some((item) => this._isLinkedItem(item));
+            const expandedDeleteCount = Math.max(count, expandedMenuItems.length);
+            const itemLocked = expandedMenuItems.some((item) => this._isItemLocked(item));
+            const linkableCount = this._selectedLinkableItems().length;
+            if (linkableCount >= 2) {
+                menuItems.push({ label: "Link Selected Items", action: () => this._createLinkGroupFromSelection() });
+            }
+            if (hasLinkedSelection) {
+                menuItems.push({ label: "Select Linked Items", action: () => this._selectLinkedItemsForSelection() });
+            }
+            if (this.selectedItems.some((item) => this._shouldApplyLinked(item))) {
+                menuItems.push({ label: "Unlink Linked Items", action: () => this._unlinkSelectedItems() });
+            }
+            // Discoverable mirror of the M shortcut (linked-aware via
+            // _toggleSelectedMute's own expansion + lock refusal).
+            const muteCandidates = expandedMenuItems.filter((item) =>
+                item?.type === "clip" || item?.type === "audio" || item?.type === "guide" || item?.type === "prompt" || item?.type === "reference");
+            if (muteCandidates.length > 0) {
+                const allMuted = muteCandidates.every((item) => !!item.data?.muted);
+                const muteLabel = `${allMuted ? "Unmute" : "Mute"} Selected (${muteCandidates.length})`;
+                menuItems.push({
+                    label: itemLocked ? `${muteLabel} (locked)` : muteLabel,
+                    action: itemLocked ? () => {} : () => void this._toggleSelectedMute(),
+                    disabled: itemLocked,
+                });
+            }
+            const consolidateItems = this._selectedConsolidationItems(hit);
+            const consolidateTargetLane = hit.type === "clip"
+                ? (hit.data.track_index || 0)
+                : hit.type === "audio" ? (hit.data.lane_index || 0) : -1;
+            if (consolidateItems.length >= 2 && consolidateItems.some((item) => {
+                const lane = item.type === "clip" ? (item.data.track_index || 0) : (item.data.lane_index || 0);
+                return lane !== consolidateTargetLane;
+            })) {
+                const typeLabel = hit.type === "clip" ? "Clips" : "Audio";
+                menuItems.push({
+                    label: `Consolidate Selected ${typeLabel} to This Lane (${consolidateItems.length})`,
+                    action: () => void this._consolidateSelectedItemsToLane(hit),
+                });
+            }
+            if (count > 1) {
+                const rangeItems = expandedMenuItems.filter((item) => this._selectionRangeForItem(item));
+                if (rangeItems.length > 0) {
+                    menuItems.push({
+                        label: `Set Selection to Selected (${rangeItems.length})`,
+                        action: () => this._setSelectionToItems(expandedMenuItems),
+                    });
+                }
+                const promptQueueItems = this._promptItemsForQueueBatch(expandedMenuItems);
+                if (promptQueueItems.length > 0) {
+                    menuItems.push({
+                        label: `Queue Prompt Sections (${promptQueueItems.length})`,
+                        action: () => { this._queueSelectedPromptSections(expandedMenuItems).catch(() => {}); },
+                    });
+                }
+                const deleteLabel = hasLinkedSelection ? `Delete Linked Items (${expandedDeleteCount})` : `Delete ${count} items`;
+                menuItems.push({ label: itemLocked ? `${deleteLabel} (locked)` : deleteLabel, action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
+            } else {
+                menuItems.push(...this._itemContextMenuEntries(hit, {
+                    itemLocked,
+                    linkedDeleteLabel: hasLinkedSelection ? `Delete Linked Items (${expandedDeleteCount})` : null,
+                }));
+            }
+        }
+        return { items: menuItems, exclusive: false };
+    }
+
+    /** The entries that act on one item: its own edits, its range, its
+     *  asset, and its delete. `itemLocked` greys the ones the lane lock
+     *  refuses; `linkedDeleteLabel` replaces the item's own delete label. */
+    _itemContextMenuEntries(hit, { itemLocked, linkedDeleteLabel }) {
+        const menuItems = [];
+        if (hit.type === "clip") {
+            const clipAsset = this._getAssetForSourcePath(hit.data.source_path);
+            const isMotionDriverClip = this._isMotionDriverClip(hit.data);
+            const canConvertRole = isMotionDriverClip || clipAsset?.asset_type === "video";
+            menuItems.push({
+                label: itemLocked ? "Move to New Lane (locked)" : "Move to New Lane",
+                action: itemLocked ? () => {} : () => this._moveItemToNewLane(hit),
+                disabled: itemLocked,
+            });
+            menuItems.push({
+                label: !canConvertRole && !itemLocked ? "Convert to Driver (video only)" : (isMotionDriverClip ? "Convert to Render Clip" : "Convert to Driver"),
+                action: itemLocked || !canConvertRole
+                    ? () => {}
+                    : () => this._convertClipRole(hit.data.clip_id, isMotionDriverClip ? "render" : "motion_driver"),
+                disabled: itemLocked || !canConvertRole,
+            });
+            menuItems.push({
+                label: itemLocked ? "Replace clip with… (locked)" : "Replace clip with…",
+                action: itemLocked ? () => {} : () => this._replaceClipSource(hit.data),
+                disabled: itemLocked,
+            });
+            menuItems.push({
+                label: "Set Selection to Clip",
+                action: () => this._setSelectionToFrameRange(hit.data.timeline_start_frame || 0, hit.data.timeline_end_frame || 0),
+            });
+            const guidesLocked = this._isGuideTrackLocked();
+            menuItems.push({ label: guidesLocked ? "Add Frame to Guides (locked)" : "Add Frame to Guides", action: guidesLocked ? () => {} : () => this._addClipFrameToGuides(hit.data), disabled: guidesLocked });
+            if (clipAsset?.asset_id) {
+                menuItems.push({ label: "Inspect in Gallery", action: () => this._inspectAssetInGallery(clipAsset) });
+            }
+            if ((clipAsset?.width || 0) > 0 && (clipAsset?.height || 0) > 0) {
+                menuItems.push({
+                    label: `Set Scene Aspect Ratio (${clipAsset.width}:${clipAsset.height})`,
+                    action: () => this._setSceneAspectRatioFromDimensions(clipAsset.width, clipAsset.height),
+                });
+            }
+            // Extend scene to clip end
+            const clipEnd = hit.data.timeline_end_frame || 0;
+            const sceneDur = this.activeScene?.duration_frames || 0;
+            if (clipEnd > sceneDur) {
+                menuItems.push({ label: "Extend Scene to Clip End", action: () => this._updateSceneDuration(clipEnd) });
+            }
+            const deleteLabel = linkedDeleteLabel || "Delete Clip";
+            menuItems.push({ label: itemLocked ? `${deleteLabel} (locked)` : deleteLabel, action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
+        } else if (hit.type === "audio") {
+            menuItems.push({ label: itemLocked ? "Move to New Lane (locked)" : "Move to New Lane", action: itemLocked ? () => {} : () => this._moveItemToNewLane(hit), disabled: itemLocked });
+            menuItems.push({
+                label: itemLocked ? "Replace audio with… (locked)" : "Replace audio with…",
+                action: itemLocked ? () => {} : () => this._replaceAudioSource(hit.data),
+                disabled: itemLocked,
+            });
+            menuItems.push({
+                label: "Set Selection to Audio",
+                action: () => this._setSelectionToFrameRange(hit.data.timeline_start_frame || 0, hit.data.timeline_end_frame || 0),
+            });
+            // Extend scene to audio end
+            const audioEnd = hit.data.timeline_end_frame || 0;
+            const audioSceneDur = this.activeScene?.duration_frames || 0;
+            const audioAsset = this._getAssetForSourcePath(hit.data.source_path);
+            if (audioAsset?.asset_id) {
+                menuItems.push({ label: "Inspect in Gallery", action: () => this._inspectAssetInGallery(audioAsset) });
+            }
+            if (audioEnd > audioSceneDur) {
+                menuItems.push({ label: "Extend Scene to Audio End", action: () => this._updateSceneDuration(audioEnd) });
+            }
+            const deleteLabel = linkedDeleteLabel || "Delete Audio Track";
+            menuItems.push({ label: itemLocked ? `${deleteLabel} (locked)` : deleteLabel, action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
+        } else if (hit.type === "guide") {
+            const guideAsset = this._getGuideAsset(hit.data);
+            const guidesLocked = this._isGuideTrackLocked();
+            menuItems.push({
+                label: guidesLocked ? "Replace guide with… (locked)" : "Replace guide with…",
+                action: guidesLocked ? () => {} : () => this._replaceGuideImage(hit.data, { refresh: true }),
+                disabled: guidesLocked,
+            });
+            if (guideAsset?.asset_id) {
+                menuItems.push({ label: "Inspect in Gallery", action: () => this._inspectAssetInGallery(guideAsset) });
+            }
+            if ((guideAsset?.width || 0) > 0 && (guideAsset?.height || 0) > 0) {
+                menuItems.push({
+                    label: `Set Scene Aspect Ratio (${guideAsset.width}:${guideAsset.height})`,
+                    action: () => this._setSceneAspectRatioFromDimensions(guideAsset.width, guideAsset.height),
+                });
+            }
+            const guideRange = this._guideHoldFrameRange(hit.data);
+            if (guideRange) {
+                menuItems.push({
+                    label: "Select Guide Range",
+                    action: () => this._setSelectionToFrameRange(guideRange.start, guideRange.end),
+                });
+            }
+            const guideFrame = this._resolvedGuideFrame(hit.data);
+            menuItems.push({
+                label: "Set Selection In",
+                action: () => this._setSelectionStartFrame(guideFrame),
+            });
+            menuItems.push({
+                label: "Set Selection Out",
+                action: () => this._setSelectionEndFrame(guideFrame),
+            });
+            const deleteLabel = linkedDeleteLabel || "Delete Guide";
+            menuItems.push({ label: itemLocked ? `${deleteLabel} (locked)` : deleteLabel, action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
+        } else if (hit.type === "reference") {
+            const endFrame = hit.data.end_frame === -1 ? this.totalFrames : (hit.data.end_frame || 0);
+            menuItems.push({
+                label: "Set Selection to Reference",
+                action: () => this._setSelectionToFrameRange(hit.data.start_frame || 0, endFrame),
+            });
+            const laneEntry = (this._trackLayout || []).find((entry) =>
+                entry.type === TRACK_TYPE.REFERENCE && (entry.laneIndex || 0) === (hit.data.lane_index || 0));
+            if (laneEntry) {
+                menuItems.push({ label: "Reference Lane Setup", action: () => void this._showReferenceLanePanel(laneEntry) });
+            }
+            menuItems.push({
+                label: itemLocked ? "Delete Reference (locked)" : "Delete Reference",
+                action: itemLocked ? () => {} : () => this._deleteSelectedItems(),
+                danger: true,
+                disabled: itemLocked,
+            });
+        }
+        return menuItems;
+    }
+
+    /** The right-click entries for the prompt section at `frame`, if any. */
+    _promptTrackContextMenuItems(frame) {
+        const menuItems = [];
+        const sections = this.activeScene?.prompt_sections || [];
+        const idx = sections.findIndex(s => frame >= s.start_frame && frame <= s.end_frame);
+        if (idx < 0) return menuItems;
+        menuItems.push({ label: "Edit Prompt", action: () => {
+            this._selectedPromptIdx = idx;
+            this._showPromptEditor(sections[idx], idx);
+            this._renderTimeline();
+        }});
+        menuItems.push({
+            label: "Set Selection to Prompt",
+            action: () => this._setSelectionToFrameRange(sections[idx].start_frame || 0, sections[idx].end_frame || 0),
+        });
+        menuItems.push({
+            label: "Queue Prompt Section",
+            action: () => { this._queuePromptSection(sections[idx]).catch(() => {}); },
+        });
+        menuItems.push({
+            label: sections[idx].muted ? "Unmute Section" : "Mute Section",
+            action: () => {
+                this._selectItem({ type: "prompt", id: idx, data: sections[idx] });
+                void this._toggleSelectedMute();
+            },
+        });
+        menuItems.push({ label: "Open Prompt Management", action: () => this._showPromptManagementPanel() });
+        const promptLocked = this._isPromptTrackLocked();
+        const promptSelected = this.selectedItems.some((item) => item.type === "prompt" && item.id === idx);
+        const promptLinked = promptSelected && this.selectedItems.some((item) => this._isLinkedItem(item));
+        const promptExpanded = promptLinked ? this._expandItemsWithLinked(this.selectedItems) : [];
+        const promptDeleteLocked = promptLinked
+            ? promptExpanded.some((item) => this._isItemLocked(item))
+            : promptLocked;
+        const promptDeleteLabel = promptLinked
+            ? `Delete Linked Items (${Math.max(1, promptExpanded.length)})`
+            : "Delete Prompt";
+        menuItems.push({ label: promptDeleteLocked ? `${promptDeleteLabel} (locked)` : promptDeleteLabel, action: promptDeleteLocked ? () => {} : () => {
+            if (promptLinked) {
+                this._deleteSelectedItems();
+            } else if (confirm("Delete this prompt section?")) {
+                this._deletePromptSection(idx);
+            }
+        }, danger: true, disabled: promptDeleteLocked });
+        return menuItems;
     }
 
     /** Landing preview for an in-flight asset drag (zone-model rules).
@@ -14674,6 +14706,14 @@ export class EditorWidget {
         return leftStart < rightEnd && leftEnd > rightStart;
     }
 
+    /** Where "Delete Lane and Move Items" sends a lane's items: the lane
+     *  above, or lane 1 when removing lane 0. The route keeps its own copy
+     *  for a batch that names no `target_lane` (`_remove_media_lane`); this
+     *  client always names it, so the two cannot disagree on a live write. */
+    _laneRemovalMoveTarget(laneIndex) {
+        return laneIndex > 0 ? laneIndex - 1 : 1;
+    }
+
     _laneMoveItemsRefusal(trackType, sourceLane, targetLane) {
         if (this._isLaneLocked(trackType, sourceLane) || this._isLaneLocked(trackType, targetLane)) {
             return "Move refused because the source or destination lane is locked.";
@@ -14975,7 +15015,7 @@ export class EditorWidget {
         const laneType = variableLaneTypeFor(trackType);
         const label = laneLogLabel(trackType);
         const items = laneItemsForType(this.activeScene, trackType, laneIndex);
-        const targetLane = laneIndex > 0 ? laneIndex - 1 : 1;
+        const targetLane = this._laneRemovalMoveTarget(laneIndex);
         const currentCount = laneCountFor(this.activeScene, trackType);
 
         const willMove = currentCount > 1 && targetLane !== laneIndex;
