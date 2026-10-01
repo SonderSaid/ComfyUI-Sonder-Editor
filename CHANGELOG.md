@@ -11,6 +11,13 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Fixed
+- Timeline: right-clicking an item on a locked lane opened no menu. It now opens that item's menu and leaves the selection alone. Inspect in Gallery, Set Selection, Add Frame to Guides and the other entries that don't change the item still work, and the rest show "(locked)".
+- Timeline: on a locked lane, Delete Items in Lane and Remove Lane showed the change, then restored it when the save was refused. On a locked lane's header they are now greyed out with "(locked)", as are Delete Lane and Move Items and Delete Selected Lanes. When only the lane the items would move to is locked, Delete Lane and Move Items names that lane.
+- Timeline: Delete Items in Lane failed with an error after its confirm on a Reference lane. It now deletes the lane's items.
+- Timeline: on a locked prompt track, Edit Prompt did nothing, and Mute Section selected the section before refusing. Both are now greyed out. Mute Section is also greyed out when a linked item is locked.
+- Timeline: with a linked prompt section in a multi-selection, the prompt row no longer offers the same Delete twice.
+
 ## [0.7.5] - 2026-10-01
 
 ### Changed
