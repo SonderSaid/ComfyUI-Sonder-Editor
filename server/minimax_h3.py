@@ -152,6 +152,23 @@ def _recipe_lookup(recipes):
     return result
 
 
+def staged_member_intent(member_ref, field) -> str:
+    """A staged member's `visual_intent`/`audio_intent`, or "" when unrecognized.
+
+    Stored records preserve an out-of-vocabulary intent verbatim
+    (`timeline_state.normalize_staged_member`), so every reader filters here:
+    an unrecognized value must fall through to the Library member and the
+    Reference exactly as an absent one does, keeping the setup manifest and
+    its content hash unchanged.
+    """
+    from . import prompt_context  # lazily, for the reason `resolve_setup` gives
+
+    vocabulary = (prompt_context.VISUAL_INTENTS if field == "visual_intent"
+                  else prompt_context.AUDIO_INTENTS)
+    value = member_ref.get(field) if isinstance(member_ref, dict) else None
+    return value if isinstance(value, str) and value in vocabulary else ""
+
+
 def _member_slots(winner, lane_id, population, member_lookup, asset_lookup):
     if not winner:
         return []
@@ -190,10 +207,10 @@ def _member_slots(winner, lane_id, population, member_lookup, asset_lookup):
             "source_start_sec": float(member.get("source_start_sec") or 0.0),
             "source_end_sec": member.get("source_end_sec"),
             "role": str(member_ref.get("role") or ""),
-            "visual_intent": str(member_ref.get("visual_intent") or
+            "visual_intent": str(staged_member_intent(member_ref, "visual_intent") or
                                  member.get("visual_intent") or
                                  reference.get("visual_intent") or "preserve"),
-            "audio_intent": str(member_ref.get("audio_intent") or
+            "audio_intent": str(staged_member_intent(member_ref, "audio_intent") or
                                 member.get("audio_intent") or
                                 reference.get("audio_intent") or
                                 "reference_characteristics"),

@@ -1219,6 +1219,16 @@ def text_document(text="", *, node_id=None) -> dict:
     }
 
 
+# Every key `normalize_prompt_document` can emit, per node type; an attachment
+# node's `capability_id` is optional (see `CAPABILITY_FIELDS`). The overlay
+# models the union, since a node id can change type between saves.
+DOCUMENT_NODE_FIELDS = {
+    "text": ("type", "node_id", "text"),
+    "attachment": ("type", "node_id", "attachment_id", "capability_id"),
+}
+DOCUMENT_NODE_KEYS = frozenset(key for fields in DOCUMENT_NODE_FIELDS.values() for key in fields)
+
+
 def normalize_prompt_document(raw=None, fallback_text="") -> dict:
     """Return a bounded, ordered text/attachment document.
 
@@ -1407,6 +1417,11 @@ def replace_document_text(document, text) -> dict:
     normalized = normalize_prompt_document(document)
     node_id = normalized["nodes"][0]["node_id"]
     return text_document(text, node_id=node_id)
+
+
+# Every key `normalize_capability` can emit; `enabled` is optional. The save
+# overlay never restores a modeled key a write cleared (`_overlay_unknown_record`).
+CAPABILITY_FIELDS = ("capability_id", "kind", "channel_key", "placement", "config", "enabled")
 
 
 def normalize_capability(raw, *, index=0) -> dict:
@@ -1638,6 +1653,15 @@ def normalize_disabled_capabilities(raw) -> list:
         if capability_id and capability_id not in result:
             result.append(capability_id)
     return result
+
+
+# Every key `normalize_semantic_unit` can emit; the last three are optional
+# (see `CAPABILITY_FIELDS`). Clearing `voice` is the identity panel's legacy
+# repair, which therefore depends on this.
+SEMANTIC_UNIT_FIELDS = (
+    "semantic_unit_id", "handle", "name", "kind", "order", "sources", "definition",
+    "attachment_defaults", "disabled_capabilities", "voice", "visual_intent", "audio_intent",
+)
 
 
 def normalize_semantic_unit(raw) -> dict:
@@ -2063,6 +2087,16 @@ TEMPLATE_DEFAULT_PROFILES = {
     "minimax_h3_base": "minimax_h3_base@1",
     "minimax_h3_ref": "minimax_h3_ref@1",
 }
+
+
+# Every key `normalize_profile` can emit; `compatible_templates` and
+# `contribution_catalog` are optional (see `CAPABILITY_FIELDS`).
+PROFILE_FIELDS = (
+    "profile_id", "version", "name", "template_id", "compatible_templates",
+    "capabilities", "writing_aids", "separators", "validators", "role_catalogs",
+    "physical_populations", "identity_kinds", "speaker_policy", "builtin",
+    "contribution_catalog", "content_hash",
+)
 
 
 def normalize_profile(raw, *, builtin=False) -> dict:

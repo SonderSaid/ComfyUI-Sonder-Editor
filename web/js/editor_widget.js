@@ -7453,17 +7453,6 @@ export class EditorWidget {
         const memberId = String(edit?.memberId || "");
         const current = list.find((member) => member?.member_id === memberId);
         if (!current) return "That member is no longer on this Reference item.";
-        if (edit.kind === "patch") {
-            // A stored role or retention cannot be cleared: the route drops the
-            // field, and the save's unknown-field overlay then restores the
-            // stored value (Bug Tracker, "Clearing a staged member's role or
-            // retention is never saved"). Refused here rather than painted and
-            // silently reverted. Expiry: remove when the overlay stops restoring known
-            // member fields a mutation cleared.
-            const cleared = Object.entries(edit.patch || {}).some(([field, value]) =>
-                !String(value ?? "").trim() && String(current[field] ?? "").trim());
-            if (cleared) return "A saved role or retention cannot be cleared yet. Choose another value instead.";
-        }
         if (edit.kind === "move") {
             // `moveMember` stamps a dense `order` the item schema does not
             // have; the route ignores it, and it is dropped here.

@@ -2015,22 +2015,24 @@ def test_an_append_pays_no_ordered_baseline_read_and_a_panel_edit_does(tmp_path)
     assert result == {"afterAppend": 0, "afterPanelEdit": 1}
 
 
-def test_clearing_a_saved_retention_is_refused_rather_than_silently_reverted(tmp_path):
-    """Audit finding 3: the save restores a cleared member field, so the panel
-    says so and sends nothing (Bug Tracker; see the strict xfail in the parity
-    suite)."""
+def test_clearing_a_saved_retention_is_saved(tmp_path):
+    """Audit finding 3 of the paint-first plan, closed by backlog step 1: the
+    save no longer restores a member field a write cleared, so the panel sends
+    the clear and the server keeps it (`test_overlay_modeled_keys.py`)."""
     result = run_item_panel(_MEMBERS + """
     mount();
     const [select] = cardAt(10).querySelectorAll('select');
     select.focus();
     select.value = ''; select.dispatch('change');
-    await settle(4);
+    await settle(8);
+    const member = (row) => row.members.find((value) => value.member_id === 'member-a');
     return { shown: select.value, sent: sent.length, undo: w._undoStack.length,
+      painted: 'visual_intent' in member(item('item-1')),
+      stored: 'visual_intent' in member(item('item-1', await serverScene())),
       messages: toasts.map((t) => t.message) };
     """, tmp_path, project=_retention_project())
-    assert result["shown"] == "preserve" and (result["sent"], result["undo"]) == (0, 0)
-    assert result["messages"] == [
-        "A saved role or retention cannot be cleared yet. Choose another value instead."]
+    assert result == {"shown": "", "sent": 1, "undo": 1, "painted": False,
+                      "stored": False, "messages": []}
 
 
 def test_an_edit_of_a_member_no_longer_on_the_item_is_refused_with_a_message(tmp_path):

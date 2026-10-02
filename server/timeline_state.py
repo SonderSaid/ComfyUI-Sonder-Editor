@@ -69,20 +69,28 @@ REFERENCE_TAG_PRESETS = (
 )
 
 
-def _overlay_unknown_record(raw: Any, canonical: dict) -> dict:
-    """Overlay known canonical fields while retaining unknown persisted keys."""
+def _overlay_unknown_record(raw: Any, canonical: dict, modeled=()) -> dict:
+    """Overlay known canonical fields while retaining unknown persisted keys.
+
+    `modeled` names the keys this record kind's normalizer owns. Canonical
+    state alone owns them: one it does not carry was CLEARED, and is never
+    copied back from raw. Without that, a kind whose normalizer emits a key
+    only when it is set could never save a clear (backlog step 1;
+    `test_overlay_modeled_keys.py`).
+    """
     # Canonical keys replace raw values wholesale. Copy only unknown raw keys;
     # retain the detached deep-copy contract for callers mutating the result.
     canonical_copy = copy.deepcopy(canonical)
     result = {
         key: canonical_copy[key] if key in canonical_copy else copy.deepcopy(value)
         for key, value in raw.items()
+        if key in canonical_copy or key not in modeled
     } if isinstance(raw, dict) else {}
     result.update(canonical_copy)
     return result
 
 
-def _overlay_unknown_keyed_records(raw: Any, canonical: list, key: str) -> list:
+def _overlay_unknown_keyed_records(raw: Any, canonical: list, key: str, modeled=()) -> list:
     """Preserve unknown member fields without resurrecting deleted members."""
     raw_by_id = {}
     if isinstance(raw, list):
@@ -93,7 +101,7 @@ def _overlay_unknown_keyed_records(raw: Any, canonical: list, key: str) -> list:
             if item_id and item_id not in raw_by_id:
                 raw_by_id[item_id] = item
     return [
-        _overlay_unknown_record(raw_by_id.get(str(item.get(key) or "")), item)
+        _overlay_unknown_record(raw_by_id.get(str(item.get(key) or "")), item, modeled)
         if isinstance(item, dict) else copy.deepcopy(item)
         for item in canonical
     ]
@@ -120,21 +128,25 @@ def project_prompt_fields_with_unknowns(
     """Overlay the two project-level prompt collections without other fields."""
     raw_project = raw if isinstance(raw, dict) else {}
 
-    def overlay_record(raw_record: Any, canonical: dict) -> dict:
+    def overlay_record(raw_record: Any, canonical: dict, modeled=()) -> dict:
         if deep_copy:
-            return _overlay_unknown_record(raw_record, canonical)
-        result = dict(raw_record) if isinstance(raw_record, dict) else {}
+            return _overlay_unknown_record(raw_record, canonical, modeled)
+        result = {
+            key: value for key, value in raw_record.items()
+            if key in canonical or key not in modeled
+        } if isinstance(raw_record, dict) else {}
         result.update(canonical)
         return result
 
-    def overlay_keyed(raw_values: Any, canonical_values: list, key: str) -> list:
+    def overlay_keyed(raw_values: Any, canonical_values: list, key: str,
+                      modeled=()) -> list:
         raw_by_id = {
             str(item.get(key) or ""): item
             for item in (raw_values if isinstance(raw_values, list) else [])
             if isinstance(item, dict) and item.get(key)
         }
         return [
-            overlay_record(raw_by_id.get(str(item.get(key) or "")), item)
+            overlay_record(raw_by_id.get(str(item.get(key) or "")), item, modeled)
             if isinstance(item, dict)
             else (copy.deepcopy(item) if deep_copy else item)
             for item in canonical_values
@@ -144,6 +156,7 @@ def project_prompt_fields_with_unknowns(
         raw_project.get("prompt_semantic_units"),
         semantic_units if isinstance(semantic_units, list) else [],
         "semantic_unit_id",
+        prompt_context.SEMANTIC_UNIT_FIELDS,
     )
     raw_units = {
         str(item.get("semantic_unit_id") or ""): item
@@ -174,7 +187,8 @@ def project_prompt_fields_with_unknowns(
     profiles = [
         overlay_record(
             raw_profiles.get((str(item.get("profile_id") or ""),
-                              str(item.get("version") or "1"))), item)
+                              str(item.get("version") or "1"))), item,
+            prompt_context.PROFILE_FIELDS)
         for item in (context_profiles if isinstance(context_profiles, list) else [])
         if isinstance(item, dict)
     ]
@@ -186,7 +200,7 @@ def _overlay_unknown_attachment(raw: Any, canonical: dict) -> dict:
     raw_attachment = raw if isinstance(raw, dict) else {}
     result["capabilities"] = _overlay_unknown_keyed_records(
         raw_attachment.get("capabilities"), canonical.get("capabilities", []),
-        "capability_id")
+        "capability_id", prompt_context.CAPABILITY_FIELDS)
     return result
 
 
@@ -206,7 +220,8 @@ def _overlay_unknown_prompt_document(raw: Any, canonical: dict) -> dict:
     result = _overlay_unknown_record(raw, canonical)
     raw_document = raw if isinstance(raw, dict) else {}
     result["nodes"] = _overlay_unknown_keyed_records(
-        raw_document.get("nodes"), canonical.get("nodes", []), "node_id")
+        raw_document.get("nodes"), canonical.get("nodes", []), "node_id",
+        prompt_context.DOCUMENT_NODE_KEYS)
     return result
 
 
@@ -277,7 +292,8 @@ def _preserve_scene_unknown_fields(raw: Any, canonical: dict) -> dict:
     for item in result.get("reference_items", []):
         raw_item = raw_reference_items.get(str(item.get("reference_item_id") or ""), {})
         item["members"] = _overlay_unknown_keyed_records(
-            raw_item.get("members"), item.get("members", []), "member_id")
+            raw_item.get("members"), item.get("members", []), "member_id",
+            STAGED_MEMBER_FIELDS)
 
     raw_sections = {
         str(item.get("prompt_id") or ""): item
@@ -1245,6 +1261,49 @@ class ReferenceLaneRecipe:
         )
 
 
+# Every key a staged member record can hold. The last three are optional: absent
+# means "inherit", so the save overlay must never restore one a write cleared
+# (`_overlay_unknown_record`). Mirrored as `STORED_MEMBER_FIELDS` in
+# `web/js/scene_reference_geometry.js` (parity-tested).
+STAGED_MEMBER_FIELDS = ("entity_id", "member_id", "visual_intent", "audio_intent", "role")
+
+
+def normalize_staged_member(raw) -> dict | None:
+    """One staged member record as stored, or None when it names no member.
+
+    Intents and role are PRESERVED, even outside the current vocabulary and
+    even when not a string: canonical state is the only owner of a modeled
+    key, so dropping an unknown value here would lose it at the next save.
+    Only `None` and a blank string mean "absent". Consumers read intents
+    through `minimax_h3.staged_member_intent`, which treats an unrecognized
+    one as absent.
+    """
+    if not isinstance(raw, dict):
+        return None
+    member_id = str(raw.get("member_id", "") or "")
+    if not member_id:
+        return None
+    member = {"entity_id": str(raw.get("entity_id", "") or ""), "member_id": member_id}
+    for field_name in ("visual_intent", "audio_intent", "role"):
+        value = raw.get(field_name)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        # A truthy non-string role has always been stored as its `str()`, and
+        # the route's "unchanged" leniency compares strings, so keep that.
+        member[field_name] = (str(value) if field_name == "role" and value
+                              else copy.deepcopy(value))
+    return member
+
+
+def normalize_staged_members(raw) -> list:
+    members = []
+    for raw_member in raw if isinstance(raw, list) else []:
+        member = normalize_staged_member(raw_member)
+        if member is not None:
+            members.append(member)
+    return members
+
+
 @dataclass
 class ReferenceItem:
     reference_item_id: str = field(default_factory=lambda: uuid.uuid4().hex)
@@ -1274,23 +1333,7 @@ class ReferenceItem:
     def from_dict(cls, data: dict) -> "ReferenceItem":
         if not isinstance(data, dict):
             data = {}
-        members = []
-        for raw_member in data.get("members", []) if isinstance(data.get("members", []), list) else []:
-            if not isinstance(raw_member, dict):
-                continue
-            member_id = str(raw_member.get("member_id", "") or "")
-            if not member_id:
-                continue
-            members.append({
-                "entity_id": str(raw_member.get("entity_id", "") or ""),
-                "member_id": member_id,
-                **({"visual_intent": str(raw_member.get("visual_intent"))}
-                   if raw_member.get("visual_intent") in prompt_context.VISUAL_INTENTS else {}),
-                **({"audio_intent": str(raw_member.get("audio_intent"))}
-                   if raw_member.get("audio_intent") in prompt_context.AUDIO_INTENTS else {}),
-                **({"role": str(raw_member.get("role"))}
-                   if str(raw_member.get("role") or "").strip() else {}),
-            })
+        members = normalize_staged_members(data.get("members", []))
         try:
             lane_index = max(0, int(data.get("lane_index", 0) or 0))
             start_frame = max(0, int(data.get("start_frame", 0) or 0))

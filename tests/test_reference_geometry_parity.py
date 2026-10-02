@@ -64,6 +64,7 @@ staged-item update, and its shapes are rows of ``UPDATE_CASES``.
 """
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -78,6 +79,7 @@ from server.timeline_state import (
     ReferenceItem,
     ReferenceLaneRecipe,
     ReferenceMember,
+    STAGED_MEMBER_FIELDS,
     Scene,
     TimelineProject,
 )
@@ -743,6 +745,12 @@ UPDATE_CASES = [
      _stored_inverted, "refuse:invalid_range"),
     ("unknown field", "item-1", {"bogus": 1}, None, "refuse:invalid_project_mutation"),
     ("no fields", "item-1", {}, None, "refuse:invalid_project_mutation"),
+    # A clear is painted: the row the route stores simply lacks the field.
+    ("clear a stored retention", "item-1",
+     {"members": [_members("a")[0], _members("b")[0]]}, None, "paint"),
+    ("clear a stored audio retention", "item-4",
+     {"members": [{"entity_id": "entity-1", "member_id": "member-s"},
+                  {"entity_id": "entity-1", "member_id": "member-va"}]}, None, "paint"),
     ("authored role", "item-1",
      {"members": [{**PRESERVED_A, "role": "identity"}, _members("b")[0]]}, None,
      "decline"),
@@ -908,16 +916,11 @@ def test_every_update_decline_stands_in_for_a_route_outcome_the_mirror_cannot_se
         "refused": "reference_media_kind_mismatch"}
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "Bug Tracker: clearing a staged member's role or retention is never saved. The route "
-    "drops the cleared field, and the save's unknown-field overlay "
-    "(`_overlay_unknown_keyed_records`) copies the stored value back, because "
-    "the canonical member no longer carries that key. The panel refuses the "
-    "clear locally until this passes."))
 def test_clearing_a_stored_member_field_is_saved():
     """Through the batch and a save/load, as a project on disk goes -- the table
     above compares `to_dict()` of the in-memory row, which never meets the
-    overlay, so it cannot see this."""
+    overlay, so it cannot see this. The save overlay never restores a modeled
+    member key a write cleared (`test_overlay_modeled_keys.py`)."""
     project, _scene = _update_fixture()
     project = TimelineProject.from_dict(json.loads(json.dumps(project.to_dict())))
     scene = project.scenes[0]
@@ -929,6 +932,15 @@ def test_clearing_a_stored_member_field_is_saved():
         "fields": {"members": cleared}, "expected": {"members": stored}}])
     saved = TimelineProject.from_dict(json.loads(json.dumps(project.to_dict())))
     assert "visual_intent" not in _item(saved.scenes[0], "item-1").members[0]
+
+
+def test_the_stored_member_field_set_is_the_routes():
+    """`STORED_MEMBER_FIELDS` is the optional half of `STAGED_MEMBER_FIELDS`."""
+    source = (ROOT / "web" / "js" / "scene_reference_geometry.js").read_text(encoding="utf-8")
+    match = re.search(r"const STORED_MEMBER_FIELDS = Object\.freeze\(\s*\[([^\]]*)\]", source)
+    assert match, "STORED_MEMBER_FIELDS literal not found"
+    mirrored = re.findall(r'"([a-z_]+)"', match.group(1))
+    assert ["entity_id", "member_id", *mirrored] == list(STAGED_MEMBER_FIELDS)
 
 
 def test_the_updatable_field_set_is_the_routes():
