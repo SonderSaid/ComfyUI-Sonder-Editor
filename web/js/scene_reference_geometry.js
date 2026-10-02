@@ -3,6 +3,7 @@
 // @server-mirror server/routes.py::_apply_create_reference_item
 // @server-mirror server/routes.py::_reference_overlapping_items
 // @server-mirror server/routes.py::_apply_update_reference_item
+// @server-mirror server/routes.py::_reference_item_update_bounds
 // @server-mirror server/routes.py::_reconcile_staged_reference_members
 // Scope and parity disposition: tests/test_mutation_authoring_contract.py::MIRRORED_MODULES
 // Bounds and member arithmetic for an optimistic Reference staging paint, the
@@ -101,21 +102,58 @@ import {
  *  through a refusal would be writing a row the project will not accept.
  */
 export function referenceItemBounds(durationFrames, start, end) {
+    const startFrame = referenceItemStart(durationFrames, start);
+    return { startFrame, ...referenceItemEnd(durationFrames, startFrame, end) };
+}
+
+/** `_reference_item_start`: an authored start, clamped to `[0, duration - 1]`. */
+function referenceItemStart(durationFrames, start) {
     const duration = Math.max(0, Math.trunc(Number(durationFrames) || 0));
     const requestedStart = Number(start);
-    let startFrame = Math.max(0, Number.isFinite(requestedStart) ? Math.trunc(requestedStart) : 0);
-    if (duration > 0) startFrame = Math.min(startFrame, duration - 1);
+    const startFrame = Math.max(0, Number.isFinite(requestedStart) ? Math.trunc(requestedStart) : 0);
+    return duration > 0 ? Math.min(startFrame, duration - 1) : startFrame;
+}
+
+/** `_reference_item_end`: `{ endFrame, refusal }` for an authored end. */
+function referenceItemEnd(durationFrames, startFrame, end) {
+    const duration = Math.max(0, Math.trunc(Number(durationFrames) || 0));
     const requestedEnd = Number(end ?? -1);
     let endFrame = Number.isFinite(requestedEnd) ? Math.trunc(requestedEnd) : -1;
-    if (endFrame < 0) {
-        endFrame = -1;
-    } else if (endFrame <= startFrame) {
-        return { startFrame, endFrame, refusal: "invalid_range" };
-    } else if (duration > 0) {
+    if (endFrame < 0) return { endFrame: -1, refusal: "" };
+    if (endFrame <= startFrame) return { endFrame, refusal: "invalid_range" };
+    if (duration > 0) {
         endFrame = Math.min(endFrame, duration);
-        if (endFrame <= startFrame) {
-            return { startFrame, endFrame, refusal: "invalid_range" };
-        }
+        if (endFrame <= startFrame) return { endFrame, refusal: "invalid_range" };
+    }
+    return { endFrame, refusal: "" };
+}
+
+/** `_reference_item_update_bounds`: an update changes only the bounds it NAMES.
+ *
+ *  An unnamed bound is the stored value verbatim, even outside the scene (D8):
+ *  re-clamping it cut a straddling item's end on a Start-only write. A bound
+ *  sent at its stored value counts as unnamed, because the trim and drag
+ *  commits send both. `named` is the set of fields the request carries.
+ */
+function referenceItemUpdateBounds(durationFrames, item, fields, named) {
+    let startFrame = Math.trunc(Number(item.start_frame) || 0);
+    let endFrame = Math.trunc(Number(item.end_frame ?? -1));
+    // `_mutation_int` with the route's defaults: a non-finite number is null on
+    // the wire, read as 0 for a start and -1 for an end.
+    const requested = (value, fallback) => {
+        const number = Number(value ?? fallback);
+        return Number.isFinite(number) ? Math.trunc(number) : fallback;
+    };
+    const requestedEnd = requested(fields.end_frame, -1);
+    const startNamed = named("start_frame") && requested(fields.start_frame, 0) !== startFrame;
+    const endNamed = named("end_frame") && (requestedEnd < 0 ? -1 : requestedEnd) !== endFrame;
+    if (startNamed) startFrame = referenceItemStart(durationFrames, fields.start_frame);
+    if (endNamed) {
+        const end = referenceItemEnd(durationFrames, startFrame, fields.end_frame);
+        if (end.refusal) return { startFrame, endFrame: end.endFrame, refusal: end.refusal };
+        endFrame = end.endFrame;
+    } else if (startNamed && endFrame >= 0 && endFrame <= startFrame) {
+        return { startFrame, endFrame, refusal: "invalid_range" };
     }
     return { startFrame, endFrame, refusal: "" };
 }
@@ -365,32 +403,32 @@ function updatedMemberRefs(rawMembers, legacyMembers, { entityIdFor, laneRecipe,
  *     authority this file does not mirror, so the caller sends the write
  *     unpainted and lets the response speak.
  *
- *  **Every update re-canonicalizes every member**, a scalar one included,
- *  because the route calls `_canonical_reference_member_refs` with the stored
- *  list whenever `members` is absent. So a strength change on an item whose
- *  members no longer round-trip is unpaintable too: the route would rewrite or
- *  refuse those members, and a paint that kept them would be a row the project
- *  never holds (`durable_rules.md`: an optimistic apply reproduces the server's
- *  applicability test).
+ *  **The route judges only what the write names** (backlog step 1). It
+ *  re-canonicalizes the stored members when a write names `members` or moves
+ *  the item to another lane, and otherwise keeps them as stored, so a strength
+ *  edit beside a member whose asset went to Trash paints (#66). It clamps only
+ *  the bounds a write names, keeping an unnamed one verbatim even outside the
+ *  scene, and checks overlap only when the lane or range changes (D8). This
+ *  planner follows the same three rules: `referenceItemUpdateBounds`, the
+ *  `has("members")` branch, and `rangeChanged`.
  *
  *  **Why this planner re-derives applicability when staging does not.** The
  *  staging path above leaves member applicability to the drop resolver (or
  *  the panel stage's own population check), which has already decided it for
- *  the members being added. No resolver runs before a panel field edit, or
- *  before an append's priors, and the route re-validates the
- *  whole stored list on every update, so the lookups the route runs regardless
- *  of `legacy_members` -- member resolution, asset presence, the lane
- *  population -- are repeated here. The population rule is imported from its
- *  one JS home, not re-stated. Recipe and prompt-profile validation of an
- *  AUTHORED role or intent is still not mirrored; such a write declines.
+ *  the members being added. No resolver runs before a panel member edit, or
+ *  before an append's priors, and the route re-validates the whole list a
+ *  write names, so the lookups the route runs regardless of `legacy_members`
+ *  -- member resolution, asset presence, the lane population -- are repeated
+ *  here. The population rule is imported from its one JS home, not re-stated.
+ *  Recipe and prompt-profile validation of an AUTHORED role or intent is
+ *  still not mirrored; such a write declines.
  *
  *  **A paint changes only the fields the write names.** A rollback restores
  *  the fields it wrote, one chain per field, so a paint that also moved an
- *  unnamed field -- a stale `entity_id` the route re-derives on a strength
- *  write, a stored start past the scene end the route clamps -- would leave
- *  that change behind on a refusal, and the next edit's guard would describe a
- *  row the server does not hold. The route's answer is still exact in those
- *  cases, so the write declines and its response brings the rewrite in.
+ *  unnamed field would leave that change behind on a refusal, and the next
+ *  edit's guard would describe a row the server does not hold. The check at
+ *  the end declines any such paint; since the route stopped rewriting unnamed
+ *  fields it is a backstop, not a path a valid write takes.
  *
  *  The `expected` guard and the lane lock are the caller's. The guard is read
  *  from the same live row and matches it by construction; the lock is a lane
@@ -438,18 +476,20 @@ export function plannedReferenceItemUpdate(item, fields, {
             && typeof fields.prompt_override !== "string") return decline();
     if (has("muted") && fields.muted !== null && typeof fields.muted === "object") return decline();
 
-    const bounds = referenceItemBounds(
-        durationFrames,
-        has("start_frame") ? fields.start_frame : item.start_frame,
-        has("end_frame") ? fields.end_frame : item.end_frame);
+    const bounds = referenceItemUpdateBounds(durationFrames, item, fields, has);
     if (bounds.refusal) return refuse(bounds.refusal);
 
-    const members = updatedMemberRefs(
-        has("members") ? fields.members : item.members, item.members,
-        { entityIdFor, laneRecipe, assetFor });
+    // The stored members are judged only by a write that names them; a lane
+    // move would too, and is declined above.
+    const members = has("members")
+        ? updatedMemberRefs(fields.members, item.members, { entityIdFor, laneRecipe, assetFor })
+        : { members: Array.isArray(item.members) ? item.members.map((member) => ({ ...member })) : [] };
     if (members.refusal) return refuse(members.refusal);
 
-    if (referenceItemOverlap(laneItems, {
+    // An unchanged range creates no new overlap.
+    const rangeChanged = bounds.startFrame !== Math.trunc(Number(item.start_frame) || 0)
+        || bounds.endFrame !== Math.trunc(Number(item.end_frame ?? -1));
+    if (rangeChanged && referenceItemOverlap(laneItems, {
         laneIndex: item.lane_index,
         startFrame: bounds.startFrame,
         endFrame: bounds.endFrame,

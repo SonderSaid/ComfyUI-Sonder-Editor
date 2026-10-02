@@ -126,7 +126,7 @@ from .timeline_state import (
     REFERENCE_RECIPE_PRESETS, ALL_REFERENCE_RECIPE_PRESETS,
     apply_color_metadata, classify_asset_path, default_reference_class,
     effective_scene_fps, media_timeline_frames, normalize_reference_tags,
-    retime_scene_geometry,
+    normalize_staged_members, retime_scene_geometry,
 )
 from .lane_registry import (
     LANE_DESCRIPTORS,
@@ -4085,10 +4085,25 @@ def _find_reference_item(scene: Scene, reference_item_id: str) -> ReferenceItem:
 
 
 def _reference_item_expected(item: ReferenceItem, expected, keys) -> None:
+    """Refuse unless `expected` describes the stored item on every key named.
+
+    `members` is compared after the route's own member normalization on both
+    sides. The client sends the rows it was SERVED, which carry the save
+    overlay's unknown member keys and stored spellings `from_dict` reads as
+    absent; comparing those with the canonical rows made such an item
+    undeletable (backlog step 1, #81). The compare stays strict on every
+    modeled member field, on member order and on membership.
+    """
     expected = _require_expected(expected, set(keys), "reference item mutation")
     current = item.to_dict()
     for key in keys:
-        if not _expected_matches(current.get(key), expected.get(key)):
+        value, wanted = current.get(key), expected.get(key)
+        if key == "members":
+            if not isinstance(wanted, list):
+                _mutation_error("Reference item identity mismatch", 409, "identity_mismatch")
+            value = normalize_staged_members(value)
+            wanted = normalize_staged_members(wanted)
+        if not _expected_matches(value, wanted):
             _mutation_error("Reference item identity mismatch", 409, "identity_mismatch")
 
 
@@ -4228,20 +4243,62 @@ def _canonical_reference_member_refs(
     return result
 
 
-def _reference_item_bounds(scene: Scene, start, end) -> tuple[int, int]:
+def _reference_item_start(scene: Scene, start) -> int:
+    """An authored start, clamped into the scene: `[0, duration - 1]`."""
     start_frame = max(0, _mutation_int(start, "start_frame", 0))
     duration = max(0, int(getattr(scene, "duration_frames", 0) or 0))
     if duration > 0:
         start_frame = min(start_frame, duration - 1)
+    return start_frame
+
+
+def _reference_item_end(scene: Scene, start_frame: int, end) -> int:
+    """An authored end after `start_frame`, clamped to the scene; `-1` runs to its end."""
     end_frame = _mutation_int(end, "end_frame", -1)
     if end_frame < 0:
-        end_frame = -1
-    elif end_frame <= start_frame:
+        return -1
+    if end_frame <= start_frame:
         _mutation_error("Reference item range must be at least one frame", 409, "invalid_range")
-    elif duration > 0:
+    duration = max(0, int(getattr(scene, "duration_frames", 0) or 0))
+    if duration > 0:
         end_frame = min(end_frame, duration)
         if end_frame <= start_frame:
             _mutation_error("Reference item range is outside the scene", 409, "invalid_range")
+    return end_frame
+
+
+def _reference_item_bounds(scene: Scene, start, end) -> tuple[int, int]:
+    start_frame = _reference_item_start(scene, start)
+    return start_frame, _reference_item_end(scene, start_frame, end)
+
+
+def _reference_item_update_bounds(scene: Scene, item: ReferenceItem,
+                                  fields: dict) -> tuple[int, int]:
+    """The range an update leaves: only the bounds it NAMES change (D8).
+
+    A named bound is clamped as `_reference_item_bounds` clamps it; an unnamed
+    one is kept verbatim, even outside the scene. Re-clamping both cut the
+    stored end of an item straddling the scene end on a Start-only write, and
+    moved a stored start past the scene on any write at all.
+
+    A bound sent at its stored value counts as unnamed: the trim and drag
+    commits send both bounds, so a left-edge trim would otherwise still cut an
+    end the author never touched. The "end follows start" check judges the
+    resulting pair whenever either bound changes.
+    """
+    start_frame = int(item.start_frame)
+    end_frame = int(item.end_frame)
+    start_named = ("start_frame" in fields
+                   and _mutation_int(fields["start_frame"], "start_frame", 0) != start_frame)
+    requested_end = _mutation_int(fields.get("end_frame"), "end_frame", -1)
+    end_named = ("end_frame" in fields
+                 and (-1 if requested_end < 0 else requested_end) != end_frame)
+    if start_named:
+        start_frame = _reference_item_start(scene, fields["start_frame"])
+    if end_named:
+        end_frame = _reference_item_end(scene, start_frame, fields["end_frame"])
+    elif start_named and 0 <= end_frame <= start_frame:
+        _mutation_error("Reference item range must be at least one frame", 409, "invalid_range")
     return start_frame, end_frame
 
 
@@ -4608,21 +4665,27 @@ def _apply_update_reference_item(project: TimelineProject, scene: Scene, operati
     _require_lane_unlocked(scene, "reference", old_lane)
     if lane_index != old_lane:
         _require_lane_unlocked(scene, "reference", lane_index)
-    recipe = _reference_lane_recipe(scene, lane_index)
-    start_frame, end_frame = _reference_item_bounds(
-        scene,
-        fields.get("start_frame", item.start_frame),
-        fields.get("end_frame", item.end_frame),
-    )
-    members = _canonical_reference_member_refs(
-        project,
-        fields.get("members", item.members),
-        recipe.media_kind,
-        recipe.recipe,
-        _scene_prompt_context_profile_key(project, scene),
-        item.members,
-    )
-    _require_no_reference_overlap(scene, lane_index, start_frame, end_frame, ignore=item)
+    start_frame, end_frame = _reference_item_update_bounds(scene, item, fields)
+    # The stored members are re-judged only by a write that names them or moves
+    # them onto another lane's recipe. A scalar edit keeps them as stored, so a
+    # member whose asset went to Trash, or whose lane population narrowed, no
+    # longer blocks a strength or mute edit (backlog step 1, #66).
+    members = item.members
+    if "members" in fields or lane_index != old_lane:
+        recipe = _reference_lane_recipe(scene, lane_index)
+        members = _canonical_reference_member_refs(
+            project,
+            fields.get("members", item.members),
+            recipe.media_kind,
+            recipe.recipe,
+            _scene_prompt_context_profile_key(project, scene),
+            item.members,
+        )
+    # An unchanged lane and range create no new overlap, so a scalar edit on
+    # legacy rows already overlapping (two items squashed onto one frame) saves.
+    if (lane_index, start_frame, end_frame) != (
+            old_lane, int(item.start_frame), int(item.end_frame)):
+        _require_no_reference_overlap(scene, lane_index, start_frame, end_frame, ignore=item)
     item.lane_index = lane_index
     item.start_frame = start_frame
     item.end_frame = end_frame

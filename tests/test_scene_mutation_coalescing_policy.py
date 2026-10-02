@@ -549,10 +549,19 @@ def _field_subsets(space):
 def _differential(builder, make_operation, space):
     """(collapsed pairs checked, pairs whose collapse changed the outcome)."""
     checked, divergent = 0, []
-    cases = [((older_names, newer_names),
-              [make_operation({name: space[name][0] for name in older_names})],
-              [make_operation({name: space[name][1] for name in newer_names})])
+    def newer_operation(older, names):
+        fields = {name: space[name][1] for name in names}
+        if not getattr(make_operation, "guard_reads_the_older_paint", False):
+            return make_operation(fields)
+        # Its author read `expected` after the older gesture's paint
+        # (`scene_mutation_coalescing.js`), and the paint is the route's row.
+        outcome = _outcome(builder, older)
+        return make_operation(fields, seen=outcome[1]["scene"] if outcome[0] == "applied" else None)
+
+    cases = [((older_names, newer_names), older,
+              [newer_operation(older, newer_names)])
              for older_names in _field_subsets(space)
+             for older in [[make_operation({name: space[name][0] for name in older_names})]]
              for newer_names in _field_subsets(space)]
     merges = _coalesced_many([[older, newer] for _, older, newer in cases])
     for ((older_names, newer_names), older, newer), merged in zip(cases, merges):
@@ -588,13 +597,23 @@ def _describe(outcome):
     return value if kind == "refused" else "applied"
 
 
-def _reference_operation(fields):
+def _reference_operation(fields, seen=None):
     # `_reference_item_expected` requires a snapshot covering every field named,
-    # so the guard is built from the seeded item's own values.
+    # so the guard is built from the row its author saw: the seeded item for the
+    # older operation, the row the older one left for the newer. A seeded guard
+    # on both made every same-field pair a stale write, which only went unseen
+    # while the route refused the memberless seed on every update (backlog
+    # step 1 stopped scalar writes re-judging members).
     current = {"start_frame": 10, "end_frame": 60, "muted": False}
+    if seen is not None:
+        current = next(row for row in seen["reference_items"]
+                       if row["reference_item_id"] == "ri1")
     return {"type": "update_reference_item", "reference_item_id": "ri1",
             "fields": fields,
             "expected": {name: current[name] for name in fields}}
+
+
+_reference_operation.guard_reads_the_older_paint = True
 
 
 DIFFERENTIAL_CASES = [

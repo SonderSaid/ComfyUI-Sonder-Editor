@@ -673,6 +673,22 @@ def _stored_start_past_scene(project, scene):
     _item(scene, "item-3").start_frame = 150
 
 
+def _squashed(project, scene):
+    # What a pre-step-1 duration shrink did to rows lying past the new end.
+    for item_id in ("item-2", "item-3"):
+        _item(scene, item_id).start_frame = 99
+        _item(scene, item_id).end_frame = 100
+
+
+def _straddling(project, scene):
+    _item(scene, "item-3").end_frame = 150
+
+
+def _past_end(project, scene):
+    _item(scene, "item-3").start_frame = 150
+    _item(scene, "item-3").end_frame = 170
+
+
 def _missing_recipe(project, scene):
     # The route pads a missing slot with `ReferenceLaneRecipe()`, an image lane.
     scene.reference_lane_recipes = scene.reference_lane_recipes[:1]
@@ -739,10 +755,34 @@ UPDATE_CASES = [
     ("a member named twice", "item-1", {"members": [PRESERVED_A, PRESERVED_A]}, None,
      "refuse:invalid_reference_item"),
     ("audio lane scalar", "item-4", {"strength": 0.3}, None, "paint"),
-    ("stored overlap refuses a scalar", "item-1", {"strength": 0.5}, _stored_overlap,
+    # D8: a write changes only the bounds it names, and an unchanged lane and
+    # range create no new overlap, so stored range defects do not block it.
+    ("scalar beside a stored overlap", "item-1", {"strength": 0.5}, _stored_overlap,
+     "paint"),
+    ("scalar on a stored inverted range", "item-2", {"strength": 0.5},
+     _stored_inverted, "paint"),
+    ("scalar on squashed items", "item-2", {"strength": 0.5}, _squashed, "paint"),
+    ("start on a squashed item", "item-2", {"start_frame": 98}, _squashed,
      "refuse:lane_collision"),
-    ("stored inverted range refuses a scalar", "item-2", {"strength": 0.5},
-     _stored_inverted, "refuse:invalid_range"),
+    ("start on a straddling item keeps its end", "item-3", {"start_frame": 85},
+     _straddling, "paint"),
+    ("end on a straddling item is clamped", "item-3", {"end_frame": 400},
+     _straddling, "paint"),
+    ("start past a straddling item's kept end", "item-3", {"start_frame": 160},
+     _straddling, "paint"),
+    ("start onto a kept end", "item-1", {"start_frame": 40}, None, "refuse:invalid_range"),
+    # The trim and drag commits send both bounds: one sent at its stored value
+    # counts as unnamed, so it is neither clamped nor overlap-checked.
+    ("left trim of a straddling item keeps its end", "item-3",
+     {"start_frame": 85, "end_frame": 150}, _straddling, "paint"),
+    ("both bounds sent unchanged on squashed items", "item-2",
+     {"start_frame": 99, "end_frame": 100}, _squashed, "paint"),
+    ("sentinel end sent unchanged", "item-3", {"start_frame": 85, "end_frame": -1},
+     None, "paint"),
+    # A named end is still clamped to the scene (D8), so a past-end item's
+    # right edge cannot be trimmed short of the end of the scene.
+    ("right trim of a past-end item", "item-3", {"start_frame": 150, "end_frame": 160},
+     _past_end, "refuse:invalid_range"),
     ("unknown field", "item-1", {"bogus": 1}, None, "refuse:invalid_project_mutation"),
     ("no fields", "item-1", {}, None, "refuse:invalid_project_mutation"),
     # A clear is painted: the row the route stores simply lacks the field.
@@ -757,19 +797,19 @@ UPDATE_CASES = [
     ("authored retention", "item-1",
      {"members": [{**PRESERVED_A, "visual_intent": "partial"}, _members("b")[0]]}, None,
      "decline"),
-    # The route rewrites a field the write does not name. A paint may change
-    # only what it names, because rollback is per named field.
-    ("stale entity id", "item-1", {"strength": 0.5}, _stale_entity, "decline"),
+    # A write that names neither members nor a lane keeps every stored member
+    # and both unnamed bounds as stored (#66, D8), so none of these blocks it.
+    ("stale entity id", "item-1", {"strength": 0.5}, _stale_entity, "paint"),
     ("stored start past the scene", "item-3", {"strength": 0.5},
-     _stored_start_past_scene, "decline"),
-    ("missing lane recipe", "item-4", {"strength": 0.2}, _missing_recipe, "decline"),
+     _stored_start_past_scene, "paint"),
+    ("missing lane recipe", "item-4", {"strength": 0.2}, _missing_recipe, "paint"),
+    ("asset no longer in the project", "item-1", {"strength": 0.5}, _trashed_asset,
+     "paint"),
+    ("population narrowed", "item-1", {"strength": 0.5}, _narrowed_population, "paint"),
+    ("untrimmed stored role", "item-1", {"strength": 0.5}, _untrimmed_role, "paint"),
     ("item on a lane no longer counted", "item-4", {"strength": 0.2}, _orphan_lane,
      "decline"),
     ("override as a boolean", "item-1", {"prompt_override": True}, None, "decline"),
-    ("asset no longer in the project", "item-1", {"strength": 0.5}, _trashed_asset,
-     "decline"),
-    ("population narrowed", "item-1", {"strength": 0.5}, _narrowed_population, "decline"),
-    ("untrimmed stored role", "item-1", {"strength": 0.5}, _untrimmed_role, "decline"),
     ("lane move", "item-1", {"lane_index": 1}, None, "decline"),
     ("strength as a string", "item-1", {"strength": "0.5"}, None, "decline"),
     # An append (`_appendReferenceMembersWithinGesture`): the stored priors as
@@ -889,13 +929,6 @@ def test_every_update_decline_stands_in_for_a_route_outcome_the_mirror_cannot_se
     routed = {name: _python_update(item_id, fields, fixture)
               for name, item_id, fields, fixture, expected in UPDATE_CASES
               if expected == "decline"}
-    assert routed["asset no longer in the project"] == {"refused": "asset_not_found"}
-    assert routed["population narrowed"] == {"refused": "reference_media_kind_mismatch"}
-    # Rewritten on a write that does not name them: rollback could not undo them.
-    assert routed["stale entity id"]["row"]["members"][1]["entity_id"] == "entity-1"
-    assert routed["stored start past the scene"]["row"]["start_frame"] == 99
-    # The lane the route resolves is not the lane the client can see.
-    assert routed["missing lane recipe"] == {"refused": "reference_media_kind_mismatch"}
     assert routed["item on a lane no longer counted"] == {"refused": "item_not_found"}
     # Python's `str(True)` is "True"; JavaScript's is "true".
     assert routed["override as a boolean"]["row"]["prompt_override"] == "True"
@@ -903,7 +936,6 @@ def test_every_update_decline_stands_in_for_a_route_outcome_the_mirror_cannot_se
     assert routed["authored retention"]["row"]["members"][0]["visual_intent"] == "partial"
     # Decided by prompt-profile authority the mirror does not hold.
     assert routed["authored role"] == {"refused": "unsupported_reference_role"}
-    assert routed["untrimmed stored role"] == {"refused": "unsupported_reference_role"}
     # Moving lanes re-derives the destination's recipe and checks both locks;
     # here the destination is an audio lane, whose recipe refuses the images.
     assert routed["lane move"] == {"refused": "reference_media_kind_mismatch"}
@@ -914,6 +946,28 @@ def test_every_update_decline_stands_in_for_a_route_outcome_the_mirror_cannot_se
         "refused": "unsupported_reference_role"}
     assert routed["append a member the lane cannot take"] == {
         "refused": "reference_media_kind_mismatch"}
+
+
+def test_a_scalar_update_keeps_what_it_does_not_name():
+    """#66 and D8: these rows declined, or were refused, before backlog step 1,
+    because the route re-judged stored members and re-clamped both bounds on
+    every update. Now the route keeps them as stored, and the paint (pinned
+    equal to the route by the table) does too."""
+    routed = {name: _python_update(item_id, fields, fixture)["row"]
+              for name, item_id, fields, fixture, _expected in UPDATE_CASES
+              if name in {"stale entity id", "stored start past the scene",
+                          "asset no longer in the project", "untrimmed stored role",
+                          "start on a straddling item keeps its end",
+                          "scalar on squashed items"}}
+    assert routed["stale entity id"]["members"][1]["entity_id"] == "entity-2"
+    assert routed["stored start past the scene"]["start_frame"] == 150
+    assert [member["member_id"] for member in
+            routed["asset no longer in the project"]["members"]] == ["member-a", "member-b"]
+    assert routed["untrimmed stored role"]["members"][0]["role"] == " identity "
+    assert (routed["start on a straddling item keeps its end"]["start_frame"],
+            routed["start on a straddling item keeps its end"]["end_frame"]) == (85, 150)
+    assert (routed["scalar on squashed items"]["start_frame"],
+            routed["scalar on squashed items"]["strength"]) == (99, 0.5)
 
 
 def test_clearing_a_stored_member_field_is_saved():
@@ -972,7 +1026,7 @@ console.log(JSON.stringify([plan({{ strength: 0.5, bogus: undefined }}),
 
 
 def test_a_painted_scalar_update_stores_the_routes_member_records():
-    """A scalar write re-canonicalizes members it did not name; the paint does too."""
+    """A scalar write keeps the stored member records; the paint does too."""
     [planned] = _javascript_updates([UPDATE_CASES[0]])
     route = _python_update("item-1", {"strength": 0.5}, None)
     assert planned["painted"]["members"] == route["row"]["members"] == [

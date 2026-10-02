@@ -1235,53 +1235,59 @@ def test_an_edit_that_fails_behind_a_delete_rolls_back_onto_the_held_row(tmp_pat
     assert result == {"rows": ["item-1", "item-2", "item-4"], "strength": 1.0}
 
 
-def _stale_entity_project():
-    project = fixture_project()
-    project.scenes[0].reference_items[1].members[0]["entity_id"] = "entity-stale"
-    return project
+# The unpainted write the tests below build on: an authored retention, which
+# the route validates against recipe authority the mirror does not hold, so
+# the mirror declines to paint it and the route accepts it (`_retention_project`).
+# Until backlog step 1 a strength edit beside a stale member record, or beside
+# a member whose asset the client could not see, declined as well; the route
+# no longer re-judges members a scalar write does not name, so those paint.
+_UNPAINTED = _FIELDS + """
+const retain = (id, member, value) => w._editReferenceItemMembersFromPanel(id,
+  { kind: 'patch', memberId: member, patch: { visual_intent: value } }, 'change visual retention');
+const retentionOf = (id, member, scene = w.activeScene) =>
+  item(id, scene).members.find((m) => m.member_id === member)?.visual_intent || '';
+"""
 
 
 def test_an_edit_the_mirror_cannot_paint_is_sent_unpainted_behind_a_barrier_and_adopted(tmp_path):
-    """The route rewrites the stale member record on any update, so painting only
-    the strength would leave a row the server does not hold: nothing is painted,
-    member-guarded gestures wait on the item, and the answer is adopted."""
-    result = run_item_panel(_FIELDS + """
+    """Nothing is painted, member-guarded gestures wait on the item, and the
+    answer is adopted."""
+    result = run_item_panel(_UNPAINTED + """
     mount();
     hold();
-    setStrength(50, 0.5);
-    const duringWrite = { strength: item('item-2').strength,
+    const pending = retain('item-2', 'member-c', 'partial');
+    const duringWrite = { retention: retentionOf('item-2', 'member-c'),
       barrier: w._referenceItemWriteState().barriers.has('item-2'),
       unpainted: w._referenceItemWriteState().unpaintedKeys.size };
     await release();
+    await pending;
     await settle();
-    return { duringWrite, after: { strength: item('item-2').strength,
-      entity: item('item-2').members[0].entity_id,
+    return { duringWrite, after: { retention: retentionOf('item-2', 'member-c'),
       barrier: w._referenceItemWriteState().barriers.has('item-2'),
       unpainted: w._referenceItemWriteState().unpaintedKeys.size } };
-    """, tmp_path, project=_stale_entity_project())
-    assert result["duringWrite"] == {"strength": 1.0, "barrier": True, "unpainted": 1}
-    assert result["after"] == {"strength": 0.5, "entity": "entity-1", "barrier": False,
-                               "unpainted": 0}
+    """, tmp_path, project=_retention_project())
+    assert result["duringWrite"] == {"retention": "", "barrier": True, "unpainted": 1}
+    assert result["after"] == {"retention": "partial", "barrier": False, "unpainted": 0}
 
 
 def test_an_unpainted_edit_adopts_its_answer_when_the_reconcile_defers(tmp_path):
     """Another write queued behind it defers the scene reconcile, so the host
     brings the canonical row's fields in itself -- and only onto the same,
     untouched row."""
-    result = run_item_panel(_FIELDS + """
+    result = run_item_panel(_UNPAINTED + """
     mount();
     hold(2);
-    setStrength(50, 0.5);                     // unpainted (stale member record)
+    retain('item-2', 'member-c', 'partial');  // unpainted
     setStrength(10, 0.8);                     // queued behind: the reconcile will defer
     const before = w.activeScene;
     await release();
-    const adopted = { strength: item('item-2').strength, entity: item('item-2').members[0].entity_id,
+    const adopted = { retention: retentionOf('item-2', 'member-c'),
       sameScene: w.activeScene === before };
     await release();
     await settle();
     return adopted;
-    """, tmp_path, project=_stale_entity_project())
-    assert result == {"strength": 0.5, "entity": "entity-1", "sameScene": True}
+    """, tmp_path, project=_retention_project())
+    assert result == {"retention": "partial", "sameScene": True}
 
 
 def test_a_project_switch_releases_the_field_chains(tmp_path):
@@ -1308,23 +1314,26 @@ def test_a_project_switch_releases_the_field_chains(tmp_path):
     assert result == {"chainsBefore": 1, "chainsAfter": 0, "oldStrength": 0.5}
 
 
-def test_two_quick_edits_behind_an_unpainted_one_both_land(tmp_path):
-    """The second edit waits on the item's barrier and guards against the
-    answer, not against the value the unpainted write left on screen."""
-    result = run_item_panel(_FIELDS + """
+def test_an_edit_behind_an_unpainted_one_waits_and_guards_against_the_answer(tmp_path):
+    """The second edit waits on the item's barrier and reads its guard from the
+    adopted answer. It names the field the unpainted write changed, because
+    only then does waiting change the result: without the wait its guard would
+    state the drawn retention, and the route would refuse it."""
+    result = run_item_panel(_UNPAINTED + """
     mount();
     hold();
-    setStrength(50, 0.5);                     // unpainted: stale member record
-    setStrength(50, 0.7);                     // waits on the barrier
-    const sentWhileHeld = updates().length;
+    retain('item-2', 'member-c', 'partial');  // unpainted
+    retain('item-2', 'member-c', 'preserve'); // waits on the barrier
     await release();
     await settle(10);
-    return { sentWhileHeld, sent: updates().map((op) => [op.fields.strength, op.expected.strength]),
-      local: item('item-2').strength, server: item('item-2', await serverScene()).strength };
-    """, tmp_path, project=_stale_entity_project())
-    assert result["sentWhileHeld"] <= 1
-    assert result["sent"] == [[0.5, 1.0], [0.7, 0.5]]
-    assert result["local"] == 0.7 and result["server"] == 0.7
+    const retention = (members) => members[0].visual_intent || '';
+    return { guards: updates().map((op) => retention(op.expected.members)),
+      local: retentionOf('item-2', 'member-c'),
+      server: retentionOf('item-2', 'member-c', await serverScene()), toasts: toasts.length };
+    """, tmp_path, project=_retention_project())
+    assert result["guards"] == ["", "partial"]
+    assert result["local"] == result["server"] == "preserve"
+    assert result["toasts"] == 0
 
 
 def test_an_item_with_stored_roles_paints_its_edit(tmp_path):
@@ -1348,67 +1357,62 @@ def test_an_item_with_stored_roles_paints_its_edit(tmp_path):
 def test_three_quick_edits_behind_an_unpainted_one_all_land(tmp_path):
     """Audit finding 1: the second waiting edit installs a barrier of its own, so
     the third must wait again rather than read a row the second never painted."""
-    result = run_item_panel(_FIELDS + """
-    // Unpaintable for the whole test: the client cannot see member c's asset,
-    // while the route still holds it -- a Library the client has not reloaded.
-    const findAsset = w._findAssetById.bind(w);
-    w._findAssetById = (assetId) => assetId === 'asset-c' ? null : findAsset(assetId);
+    result = run_item_panel(_UNPAINTED + """
+    // Each authored retention is unpaintable, so every edit raises a barrier.
     mount();
     hold();
-    setStrength(50, 0.5);
-    setStrength(50, 0.6);
-    setStrength(50, 0.7);
+    retain('item-2', 'member-c', 'partial');
+    retain('item-2', 'member-c', 'preserve');
+    retain('item-2', 'member-c', 'partial');
     await release();
     await settle(20);
-    return { sent: updates().map((op) => [op.fields.strength, op.expected.strength]),
-      local: item('item-2').strength, server: item('item-2', await serverScene()).strength,
-      toasts: toasts.length };
-    """, tmp_path)
-    assert result["sent"] == [[0.5, 1.0], [0.6, 0.5], [0.7, 0.6]]
-    assert result["local"] == 0.7 and result["server"] == 0.7
+    const retention = (members) => members[0].visual_intent || '';
+    return { sent: updates().map((op) => [retention(op.fields.members),
+                                          retention(op.expected.members)]),
+      local: retentionOf('item-2', 'member-c'),
+      server: retentionOf('item-2', 'member-c', await serverScene()), toasts: toasts.length };
+    """, tmp_path, project=_retention_project())
+    assert result["sent"] == [["partial", ""], ["preserve", "partial"], ["partial", "preserve"]]
+    assert result["local"] == result["server"] == "partial"
     assert result["toasts"] == 0
 
 
-def test_mute_twice_and_a_value_set_back_behind_an_unpainted_edit_are_both_sent(tmp_path):
-    """Audit finding 4: the panel no longer decides "unchanged" or the toggle's
-    direction from a row an unpainted write has not reached."""
-    result = run_item_panel(_FIELDS + """
-    // Unpaintable for the whole test: the client cannot see member c's asset,
-    // while the route still holds it -- a Library the client has not reloaded.
-    const findAsset = w._findAssetById.bind(w);
-    w._findAssetById = (assetId) => assetId === 'asset-c' ? null : findAsset(assetId);
+def test_a_value_set_back_behind_an_unpainted_edit_is_sent(tmp_path):
+    """Audit finding 4: the panel no longer decides "unchanged" from a row an
+    unpainted write has not reached. Setting the retention back to what is
+    drawn looks like no change until the answer is adopted; resolved after the
+    wait, it is one, and it is sent.
+
+    The toggle-direction half of this finding (mute twice) needs an unpainted
+    write on `muted` itself. Since backlog step 1 a mute always paints, so that
+    case has no realistic form and is no longer tested here."""
+    result = run_item_panel(_UNPAINTED + """
     mount();
     hold();
-    const button = muteButton(50);
-    button.dispatch('click');
-    button.dispatch('click');
+    retain('item-2', 'member-c', 'partial');  // unpainted
+    retain('item-2', 'member-c', '');         // waits; '' is what is drawn
     await release();
     await settle(16);
-    const muted = { local: item('item-2').muted, sent: updates().map((op) => op.fields.muted) };
-    hold();
-    setStrength(50, 0.5);
-    setStrength(50, 1);
-    await release();
-    await settle(16);
-    return { muted, strength: { local: item('item-2').strength,
-      server: item('item-2', await serverScene()).strength,
-      sent: updates().filter((op) => 'strength' in op.fields).map((op) => op.fields.strength) } };
-    """, tmp_path)
-    assert result["muted"] == {"local": False, "sent": [True, False]}
-    assert result["strength"] == {"local": 1.0, "server": 1.0, "sent": [0.5, 1.0]}
+    const retention = (members) => members[0].visual_intent || '';
+    return { sent: updates().map((op) => retention(op.fields.members)),
+      local: retentionOf('item-2', 'member-c'),
+      server: retentionOf('item-2', 'member-c', await serverScene()) };
+    """, tmp_path, project=_retention_project())
+    assert result["sent"] == ["partial", ""]
+    assert result["local"] == result["server"] == ""
 
 
 def test_an_edit_waiting_on_a_barrier_is_dropped_by_a_project_switch_not_sent_there(tmp_path):
     """Audit finding 2: the waiting edit must not post to, nor reconcile into, the
     project the editor switched to."""
-    result = run_item_panel(_FIELDS + """
+    result = run_item_panel(_UNPAINTED + """
     mount();
     Object.assign(w, { _clearStaleReplayState(){}, _clearVideoCache(){}, _sweepRenderCache(){},
       _fetchProjectSettings(){}, _renderQueuePanel(){}, _updateProjectIdentity(){},
       _clearUnconfirmedReferenceRetry(){}, _fetchReferences: async () => {},
       _fetchAssets: () => new Promise(() => {}), _renderCacheSweepGeneration: 0 });
     hold();
-    const first = w._writeReferenceItemFromPanel('item-2', { strength: 0.5 }, 'change reference strength');
+    const first = retain('item-2', 'member-c', 'partial');
     const second = w._writeReferenceItemFromPanel('item-2', { strength: 0.6 }, 'change reference strength');
     await tick();
     w.updateProject('copy-project');
@@ -1419,8 +1423,8 @@ def test_an_edit_waiting_on_a_barrier_is_dropped_by_a_project_switch_not_sent_th
     const outcomes = [await first, await second];
     await settle();
     return { outcomes, posted: sent.length, otherUntouched: w.activeScene === other
-      && item('item-2', other).strength === 1 };
-    """, tmp_path, project=_stale_entity_project())
+      && item('item-2', other).strength === 1 && retentionOf('item-2', 'member-c', other) === '' };
+    """, tmp_path, project=_retention_project())
     assert result == {"outcomes": ["ok", "refused"], "posted": 1, "otherUntouched": True}
 
 
@@ -1428,28 +1432,29 @@ def test_an_unpainted_answer_reaches_a_scene_the_author_switched_away_from(tmp_p
     """Audit finding 3: the reconcile only replaces the ACTIVE scene; the scene
     object in the list gets the answer adopted onto it, so switching back shows
     it and the next edit guards against it."""
-    project = _stale_entity_project()
+    project = _retention_project()
     project.scenes.append(Scene(scene_id="scene-b", duration_frames=100, reference_lane_count=1,
                                 reference_lane_configs=[LaneConfig()],
                                 reference_lane_recipes=[ReferenceLaneRecipe(lane_id="lane-b")]))
-    result = run_item_panel(_FIELDS + """
+    result = run_item_panel(_UNPAINTED + """
     mount();
     const sceneA = w.activeScene;
     hold();
-    const pending = w._writeReferenceItemFromPanel('item-2', { strength: 0.5 }, 'change reference strength');
+    const pending = retain('item-2', 'member-c', 'partial');
     await tick();
     w._setActiveScene(w.scenes.find((scene) => scene.scene_id === 'scene-b'));
     await release();
     await pending;
     await settle();
-    const adopted = item('item-2', sceneA).strength;
+    const adopted = retentionOf('item-2', 'member-c', sceneA);
     w._setActiveScene(sceneA);
-    const next = await w._writeReferenceItemFromPanel('item-2', { strength: 0.8 }, 'change reference strength');
+    const next = await retain('item-2', 'member-c', 'preserve');
     await settle();
-    return { adopted, next, expected: updates().at(-1).expected.strength,
-      server: item('item-2', await serverScene()).strength };
+    return { adopted, next, expected: updates().at(-1).expected.members[0].visual_intent || '',
+      server: retentionOf('item-2', 'member-c', await serverScene()) };
     """, tmp_path, project=project)
-    assert result == {"adopted": 0.5, "next": "ok", "expected": 0.5, "server": 0.8}
+    assert result == {"adopted": "partial", "next": "ok", "expected": "partial",
+                      "server": "preserve"}
 
 
 def test_a_failed_edit_in_a_focused_field_shows_the_saved_value_again(tmp_path):
@@ -1518,16 +1523,15 @@ def test_a_field_edit_on_a_locked_lane_is_refused_before_anything_else(tmp_path)
 
 
 def test_an_unpainted_write_takes_the_baseline_from_an_open_chain(tmp_path):
-    """A painted edit is in flight when the item becomes unpaintable; the second
-    edit is sent unpainted and may change what the server holds, so the first
-    one's failure must not restore the value from before both."""
-    result = run_item_panel(_FIELDS + """
+    """A painted edit is in flight when an unpainted one is sent behind it. The
+    host cannot know which fields the unpainted answer rewrites until it
+    arrives, so the first one's failure must not restore the value from before
+    both; the re-armed refresh shows what the server holds instead."""
+    result = run_item_panel(_UNPAINTED + """
     mount();
     hold(2);
     setStrength(50, 0.5);                                   // painted, chain open
-    const find = w._findAssetById.bind(w);
-    w._findAssetById = (assetId) => assetId === 'asset-c' ? null : find(assetId);
-    const second = w._writeReferenceItemFromPanel('item-2', { strength: 0.6 }, 'change reference strength');
+    const second = retain('item-2', 'member-c', 'partial'); // unpainted
     refuseNext('identity_mismatch');
     await release();                                        // the painted one is refused
     const afterFirst = item('item-2').strength;
@@ -1535,13 +1539,13 @@ def test_an_unpainted_write_takes_the_baseline_from_an_open_chain(tmp_path):
     await second;
     await settle();
     return { afterFirst, deferred: diag('reference_item_rollback_deferred').length,
-      final: item('item-2').strength, server: item('item-2', await serverScene()).strength };
-    """, tmp_path)
+      final: item('item-2').strength, server: item('item-2', await serverScene()).strength,
+      retention: retentionOf('item-2', 'member-c', await serverScene()) };
+    """, tmp_path, project=_retention_project())
     assert result["afterFirst"] == 0.5, "not restored to 1.0 under an unpainted write"
     assert result["deferred"] >= 1
-    # The unpainted edit guarded against the refused paint, so the route refuses
-    # it too; the re-armed refresh then shows what the server holds.
     assert result["server"] == 1.0 and result["final"] == 1.0
+    assert result["retention"] == "partial"
 
 
 def test_edit_as_override_derives_from_the_live_members(tmp_path):

@@ -3802,8 +3802,10 @@ export class EditorWidget {
 
     /** Whether a staged row's members are being rewritten by a write the mirror
      *  could not paint: its barrier is up, or a queued slot sent unpainted names
-     *  it. The route re-canonicalizes such a row's members, so a local thinning
-     *  of them is not what the server will hold. */
+     *  it. The route re-canonicalizes such a row's members when the write
+     *  names them (or moves the item to another lane), so a local thinning of
+     *  them may not be what the server will hold. A scalar write does not, and
+     *  is counted here anyway: conservative, since the heal it triggers is exact. */
     _referenceItemMembersUnpainted(sceneId, itemId) {
         const state = this._referenceItemWrites;
         if (!state) return false;
@@ -6973,8 +6975,9 @@ export class EditorWidget {
      *  * a split names the end it moves;
      *  * an `update_reference_item` names the fields it writes, and `members`
      *    only when it writes members or was sent UNPAINTED
-     *    (`state.unpaintedKeys`): the route re-canonicalizes members on every
-     *    update, but a painted write's members round-trip by construction
+     *    (`state.unpaintedKeys`): the route re-canonicalizes members on a write
+     *    naming them or moving lanes, and a lane move is always sent unpainted,
+     *    while a painted write's members round-trip by construction
      *    (`plannedReferenceItemUpdate` declines otherwise).
      *
      * Not visible here, and accepted: an asset-trash cascade, which is written
@@ -7318,9 +7321,11 @@ export class EditorWidget {
         } else {
             // Nothing is painted, so there is nothing of this write's own to
             // roll back. What the server will hold is unknown until the
-            // response -- for every field, not only the named ones, since one
-            // reason the mirror declines is that the route will rewrite an
-            // unnamed field (a start clamped into the scene, a member record).
+            // response. Every field is treated that way, not only the named
+            // ones. Since backlog step 1 the route rewrites an unnamed field only
+            // on a lane move (members, re-judged against the destination's
+            // recipe), which no panel write sends, so this is conservative:
+            // narrowing it to the named fields is a logged follow-up.
             // An open chain loses its baseline, and one opening later sees this
             // write as another writer's.
             for (const name of REFERENCE_ITEM_FIELDS) {
