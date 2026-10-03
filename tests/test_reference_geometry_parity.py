@@ -529,6 +529,11 @@ OVERLAP_CASES = [
     (1, 40, 50, 100, "", "other-lane"),
     (2, 120, 121, 100, "", "past-end"),    # stored -1 resolves to start + 1, not 100
     (2, 121, 125, 100, "", None),
+    # A requested -1 runs without limit: it overlaps a later row even one past
+    # the current end, which it would overlap once the scene grew back.
+    (2, 100, -1, 100, "", "past-end"),
+    (0, 75, -1, 60, "", "tail"),           # "tail" lies past a 60-frame end
+    (0, 85, -1, 60, "", None),             # nothing on lane 0 starts after 85
     (0, 40, 50, 0, "", None),              # no duration: -1 rows resolve to start + 1
     (0, 80, 81, 0, "", "tail"),
 ]
@@ -780,9 +785,17 @@ UPDATE_CASES = [
     ("sentinel end sent unchanged", "item-3", {"start_frame": 85, "end_frame": -1},
      None, "paint"),
     # A named end is still clamped to the scene (D8), so a past-end item's
-    # right edge cannot be trimmed short of the end of the scene.
+    # right edge cannot be trimmed short of the end of the scene. Kept by the
+    # maintainer 2026-10-02: the timeline refuses that trim before it starts
+    # (`_refusePastEndReferenceTrim`, tests/test_scene_duration_client_js.py).
     ("right trim of a past-end item", "item-3", {"start_frame": 150, "end_frame": 160},
      _past_end, "refuse:invalid_range"),
+    # A sentinel beside a row a shrink left past the end would overlap it once
+    # the scene grew back, so it is refused; the explicit end is accepted.
+    ("sentinel beside a row past the end", "item-2", {"end_frame": -1}, _past_end,
+     "refuse:lane_collision"),
+    ("scene end beside a row past the end", "item-2", {"end_frame": 100}, _past_end,
+     "paint"),
     ("unknown field", "item-1", {"bogus": 1}, None, "refuse:invalid_project_mutation"),
     ("no fields", "item-1", {}, None, "refuse:invalid_project_mutation"),
     # A clear is painted: the row the route stores simply lacks the field.

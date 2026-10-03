@@ -5,6 +5,7 @@
 // @server-mirror server/routes.py::_apply_update_reference_item
 // @server-mirror server/routes.py::_reference_item_update_bounds
 // @server-mirror server/routes.py::_reconcile_staged_reference_members
+// @server-mirror server/routes.py::_reference_effective_bounds
 // Scope and parity disposition: tests/test_mutation_authoring_contract.py::MIRRORED_MODULES
 // Bounds and member arithmetic for an optimistic Reference staging paint, the
 // lane-overlap decision, the planned row of a staged-item update, and what a
@@ -251,11 +252,28 @@ export function stagedReferenceItem({
     };
 }
 
+/** A stored row's drawn and hit-tested range: `_reference_effective_bounds`.
+ *
+ *  A `-1` end runs to the scene end but never ends before the frame after the
+ *  start, so a sentinel row lying past a shrunk scene is one frame long rather
+ *  than an empty or inverted bar. An explicit end is returned as stored: a row
+ *  past the end keeps its authored range, and live resolution, not this, is
+ *  what treats that part as absent. The overlap check below reads the same
+ *  rule.
+ */
+export function referenceItemEffectiveBounds(item, durationFrames) {
+    const start = Math.trunc(Number(item?.start_frame) || 0);
+    const storedEnd = Math.trunc(Number(item?.end_frame ?? -1));
+    const duration = Math.trunc(Number(durationFrames) || 0);
+    return { start, end: storedEnd < 0 ? Math.max(start + 1, duration) : storedEnd };
+}
+
 /** The first row on `laneIndex` a range would overlap, or null.
  *
- *  Mirrors `_reference_overlapping_items` with `_reference_effective_bounds`,
- *  including both clamps: a requested end at or before the start is widened to
- *  one frame, and a stored `-1` resolves to `max(start + 1, duration)`. The
+ *  Mirrors `_reference_overlapping_items` with `_reference_effective_bounds`:
+ *  a requested end at or before the start is widened to one frame, a requested
+ *  `-1` runs without limit (it overlaps every later row on the lane), and a
+ *  stored `-1` resolves to `max(start + 1, duration)`. The
  *  range is expected to have been through `referenceItemBounds` already, as it
  *  has on the route by the time the overlap check runs.
  *
@@ -276,16 +294,16 @@ export function referenceItemOverlap(items, {
     const lane = Math.trunc(Number(laneIndex) || 0);
     const start = Math.trunc(Number(startFrame) || 0);
     const end = Math.trunc(Number(endFrame ?? -1));
-    let resolvedEnd = end < 0 ? Math.max(0, duration) : end;
+    // A requested `-1` runs to whatever end the scene will have, so it
+    // overlaps every later row on the lane, one past the current end included.
+    let resolvedEnd = end < 0 ? Infinity : end;
     if (resolvedEnd <= start) resolvedEnd = start + 1;
     const ignore = String(ignoreId || "");
     for (const other of Array.isArray(items) ? items : []) {
         if (!other || typeof other !== "object" || other === ignoreRow) continue;
         if (ignore && String(other.reference_item_id || "") === ignore) continue;
         if (Math.trunc(Number(other.lane_index) || 0) !== lane) continue;
-        const otherStart = Math.trunc(Number(other.start_frame) || 0);
-        const storedEnd = Math.trunc(Number(other.end_frame ?? -1));
-        const otherEnd = storedEnd < 0 ? Math.max(otherStart + 1, duration) : storedEnd;
+        const { start: otherStart, end: otherEnd } = referenceItemEffectiveBounds(other, duration);
         if (start < otherEnd && resolvedEnd > otherStart) return other;
     }
     return null;

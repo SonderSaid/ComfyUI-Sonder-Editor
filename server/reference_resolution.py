@@ -60,7 +60,8 @@ def resolve_reference_verdicts(
     """Return one most-specific overlapping item per Reference lane.
 
     Ranges are half-open. A negative item end resolves to scene end before
-    scoring. Muted items and hidden lanes do not participate.
+    scoring, every end is clipped to it, and an item starting at or after it
+    is `outside`. Muted items and hidden lanes do not participate.
 
     `frame_threshold_pct` drops an item whose in-window overlap is under that
     percentage of the shorter of its span and the window span, before the
@@ -106,7 +107,11 @@ def resolve_reference_verdicts(
             if bool(hidden):
                 verdicts[item_index] = REFERENCE_VERDICT["EXCLUDED"]
                 continue
-        item_start = min(max(0, _integer(get("start_frame", 0), 0)), max(0, duration - 1))
+        # The part of an item past the scene end is absent: a duration change
+        # leaves items as authored, so one may start after the end, and it is
+        # then simply outside. It used to be squashed onto the last frame,
+        # where it won its lane.
+        item_start = max(0, _integer(get("start_frame", 0), 0))
         raw_end = _integer(get("end_frame", -1), -1)
         item_end = duration if raw_end < 0 else min(duration, raw_end)
         if item_end <= item_start:

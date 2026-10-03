@@ -3082,9 +3082,10 @@ GUARD_SITE_DISPOSITIONS = {
         "`expected`, so last-write-wins is correct and the coalescing collapse is "
         "not a defect."),
     "editor_widget.js:_updateSceneDurationWithinGesture:update_scene_fields": (_FAIR,
-        "Whole-value `duration_frames` set. Note the tail effect is NOT unguarded "
-        "collateral: `_apply_scene_fields` calls `_clamp_reference_items_to_scene`, "
-        "which is derived from the new duration rather than from client state."),
+        "Whole-value `duration_frames` set, with no tail effect: a duration change "
+        "never moves or resizes a Reference item, and the cap check "
+        "(`_require_scene_duration_within_cap`) reads only the stored and the new "
+        "duration, never client state."),
     "editor_widget.js:_updateSceneResolutionWithinGesture:update_scene_fields": (_FAIR,
         "Whole-value `width`/`height` set."),
     "editor_widget.js:_updateSceneFpsWithinGesture:update_scene_fields": (_FAIR,

@@ -209,10 +209,9 @@ export function resolveReferenceVerdicts({
             verdicts.set(itemIndex, REFERENCE_VERDICT.EXCLUDED);
             return;
         }
-        const itemStart = Math.min(
-            Math.max(0, integer(item?.start_frame, 0)),
-            Math.max(0, duration - 1),
-        );
+        // Past the scene end is absent: an item starting there is outside,
+        // never squashed onto the last frame (`resolve_reference_verdicts`).
+        const itemStart = Math.max(0, integer(item?.start_frame, 0));
         const rawEnd = integer(item?.end_frame, -1);
         const itemEnd = rawEnd < 0 ? duration : Math.min(duration, rawEnd);
         if (itemEnd <= itemStart) {

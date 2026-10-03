@@ -932,7 +932,7 @@ def _mutation_int(value, field_name: str, default: int | None = None) -> int:
         return default
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         _mutation_error(f"Invalid integer for {field_name}: {value!r}", 400)
 
 
@@ -1027,6 +1027,21 @@ def _require_lane_unlocked(scene: Scene, lane_type: str, lane_index: int | None 
         return
     if _is_lane_config_locked(_lane_config(scene, lane_type, lane_index)):
         _mutation_error("Lane is locked", 409, "track_locked")
+
+
+def _require_lane_index_in_range(scene: Scene, lane_type: str, value, field_name: str) -> int:
+    """The lane an update names, parsed and range-checked before any lock check.
+
+    Create already refuses a lane the scene does not have; this gives an update
+    the same answer. It must run first: the lock check reaches `_lane_config`,
+    which pads the config list out to whatever index it is asked about.
+    """
+    lane_index = _mutation_int(value, field_name, 0)
+    if lane_index < 0 or lane_index >= _scene_lane_count(scene, lane_type):
+        _mutation_error(
+            f"{lane_type.replace('_', ' ').title()} lane index is out of range",
+            404, "item_not_found")
+    return lane_index
 
 
 def _clip_lane_type(clip: ClipReference) -> str:
@@ -2342,16 +2357,44 @@ def _validate_global_prompt_expectations(scene, expected):
                             409, "prompt_edit_conflict")
 
 
+# The longest scene an author may write. The browser holds the same number as
+# `MAX_SCENE_DURATION_FRAMES` in `web/js/editor_settings.js`
+# (`tests/test_scene_duration_cap.py` keeps the two equal).
+MAX_SCENE_DURATION_FRAMES = 99999
+
+
+def _authored_scene_duration(value) -> int:
+    """A duration a writer was sent: an integer, floored at 0."""
+    return max(0, _mutation_int(value, "duration_frames"))
+
+
+def _require_scene_duration_within_cap(scene: Scene, previous: int) -> None:
+    """Refuse a write that raises a scene's duration above the cap.
+
+    Run once after every field is written, because an fps retime writes the
+    duration too. A write may always LOWER the duration, so a project already
+    holding a longer scene loads, takes unrelated edits and can be corrected.
+    Only authored writes pass through here: history restore, scene import and
+    project load build scenes with `Scene.from_dict` and are never capped.
+    """
+    duration = int(getattr(scene, "duration_frames", 0) or 0)
+    if duration > MAX_SCENE_DURATION_FRAMES and duration > int(previous or 0):
+        _mutation_error(f"A scene may be at most {MAX_SCENE_DURATION_FRAMES} frames long.",
+                        400, "duration_limit")
+
+
 def _apply_scene_fields(project: TimelineProject, scene: Scene, fields: dict) -> None:
     if not isinstance(fields, dict):
         _mutation_error("update_scene_fields requires fields", 400)
     fields = _merge_prompt_edit_fields(fields, scene.global_channel_docs,
                                        scene.global_attachments, global_scope=True)
+    previous_duration = int(getattr(scene, "duration_frames", 0) or 0)
     if "name" in fields:
         scene.name = str(fields["name"])
     if "duration_frames" in fields:
-        scene.duration_frames = max(0, int(fields["duration_frames"]))
-        _clamp_reference_items_to_scene(scene)
+        # A Reference item is never moved or resized by a duration change; one
+        # lying past the new end stays as authored, like a clip or audio track.
+        scene.duration_frames = _authored_scene_duration(fields["duration_frames"])
     if "prompt" in fields:
         _require_lane_unlocked(scene, "prompt_global")
         scene.set_global_prompt(fields["prompt"])
@@ -2405,6 +2448,7 @@ def _apply_scene_fields(project: TimelineProject, scene: Scene, fields: dict) ->
                 max(1, int(fields[descriptor.count_attr])),
             )
     _ensure_scene_lane_config_lengths(scene)
+    _require_scene_duration_within_cap(scene, previous_duration)
 
 
 def _apply_lane_configs(scene: Scene, fields: dict) -> None:
@@ -2663,7 +2707,9 @@ def _scene_history_content_violations(scene):
                                          list(_media_item_bounds(item)))
     for item in scene.reference_items:
         lane = int(getattr(item, "lane_index", 0) or 0)
-        for other in _reference_overlapping_items(scene, lane, int(item.start_frame or 0), int(item.end_frame), ignore=item):
+        # A stored row, so its `-1` resolves as stored (not as a request).
+        stored_start, stored_end = _reference_effective_bounds(duration, item)
+        for other in _reference_overlapping_items(scene, lane, stored_start, stored_end, ignore=item):
             yield _history_violation("reference_overlap", "Reference items cannot overlap on one lane",
                                      "reference", item.reference_item_id, other.reference_item_id, "reference", lane,
                                      [list(_reference_effective_bounds(duration, item)), list(_reference_effective_bounds(duration, other))])
@@ -3162,17 +3208,25 @@ def _apply_update_clip(
     if not isinstance(fields, dict):
         _mutation_error("update_clip requires fields", 400)
     clip = _find_clip(scene, clip_id)
-    _require_clip_unlocked(scene, clip)
     target_role = fields.get("role", getattr(clip, "role", "render"))
-    if "role" in fields:
-        if target_role not in {"render", "motion_driver"}:
-            _mutation_error(f"Invalid clip role: {target_role}", 400)
-        if target_role == "motion_driver" and _clip_source_asset_type(project, clip) != "video":
-            _mutation_error("Driver clips require video assets", 400)
-    target_lane = int(fields.get("track_index", getattr(clip, "track_index", 0)) or 0)
+    if "role" in fields and target_role not in {"render", "motion_driver"}:
+        _mutation_error(f"Invalid clip role: {target_role}", 400)
+    target_lane_type = "video" if target_role in {"", "render"} else "motion_driver"
+    # A role names a lane as surely as an index does: it moves the clip into
+    # the other lane family at the same index, which that family may not have.
+    lane_named = "role" in fields or "track_index" in fields
+    if lane_named:
+        target_lane = _require_lane_index_in_range(
+            scene, target_lane_type,
+            fields.get("track_index", getattr(clip, "track_index", 0)), "track_index")
+    else:
+        target_lane = int(getattr(clip, "track_index", 0) or 0)
+    _require_clip_unlocked(scene, clip)
+    if ("role" in fields and target_role == "motion_driver"
+            and _clip_source_asset_type(project, clip) != "video"):
+        _mutation_error("Driver clips require video assets", 400)
     _preflight_driver_lane_target(scene, clip, target_role, target_lane)
-    if "track_index" in fields:
-        target_lane_type = "video" if target_role in {"", "render"} else "motion_driver"
+    if lane_named:
         _require_lane_unlocked(scene, target_lane_type, target_lane)
 
     if validate_lane_collision and any(key in fields for key in ("timeline_start_frame", "timeline_end_frame", "track_index", "role")):
@@ -3181,7 +3235,6 @@ def _apply_update_clip(
             proposed_end = proposed_start + (clip.timeline_end_frame - clip.timeline_start_frame)
         else:
             proposed_end = int(fields.get("timeline_end_frame", clip.timeline_end_frame))
-        target_lane_type = "video" if target_role in {"", "render"} else "motion_driver"
         _require_media_target_bounds_fit(
             scene,
             [(clip, proposed_start, proposed_end, target_lane_type, target_lane)],
@@ -3203,8 +3256,8 @@ def _apply_update_clip(
         clip.source_out_frame = int(fields["source_out_frame"])
     if "opacity" in fields:
         clip.opacity = float(fields["opacity"])
-    if "track_index" in fields:
-        clip.track_index = int(fields["track_index"])
+    if lane_named:
+        clip.track_index = target_lane
     if "role" in fields:
         clip.role = target_role
     if "strength" in fields:
@@ -3228,9 +3281,11 @@ def _apply_update_audio_track(
     if not isinstance(fields, dict):
         _mutation_error("update_audio_track requires fields", 400)
     track = _find_audio_track(scene, track_id)
+    target_lane = (_require_lane_index_in_range(scene, "audio", fields["lane_index"], "lane_index")
+                   if "lane_index" in fields else int(getattr(track, "lane_index", 0) or 0))
     _require_audio_unlocked(scene, track)
     if "lane_index" in fields:
-        _require_lane_unlocked(scene, "audio", int(fields["lane_index"]))
+        _require_lane_unlocked(scene, "audio", target_lane)
 
     if validate_lane_collision and any(key in fields for key in ("timeline_start_frame", "timeline_end_frame", "lane_index")):
         proposed_start = max(0, int(fields.get("timeline_start_frame", track.timeline_start_frame)))
@@ -3238,10 +3293,9 @@ def _apply_update_audio_track(
             proposed_end = proposed_start + (track.timeline_end_frame - track.timeline_start_frame)
         else:
             proposed_end = int(fields.get("timeline_end_frame", track.timeline_end_frame))
-        proposed_lane = int(fields.get("lane_index", track.lane_index) or 0)
         _require_media_target_bounds_fit(
             scene,
-            [(track, proposed_start, proposed_end, "audio", proposed_lane)],
+            [(track, proposed_start, proposed_end, "audio", target_lane)],
         )
 
     if "timeline_start_frame" in fields:
@@ -3261,7 +3315,7 @@ def _apply_update_audio_track(
     if "volume" in fields:
         track.volume = float(fields["volume"])
     if "lane_index" in fields:
-        track.lane_index = int(fields["lane_index"])
+        track.lane_index = target_lane
     return track
 
 
@@ -4302,26 +4356,28 @@ def _reference_item_update_bounds(scene: Scene, item: ReferenceItem,
     return start_frame, end_frame
 
 
-def _clamp_reference_items_to_scene(scene: Scene) -> None:
-    duration = max(0, int(getattr(scene, "duration_frames", 0) or 0))
-    if duration <= 0:
-        return
-    for item in getattr(scene, "reference_items", []) or []:
-        item.start_frame = min(max(0, int(getattr(item, "start_frame", 0) or 0)), duration - 1)
-        end_frame = int(getattr(item, "end_frame", -1))
-        if end_frame >= 0:
-            item.end_frame = min(duration, max(item.start_frame + 1, end_frame))
-
-
 def _reference_effective_bounds(duration, item):
+    """A stored row's range for overlap: a `-1` end runs to the scene end, and
+    never ends before the frame after its start, so a sentinel row lying past a
+    shrunk scene still occupies one frame. Mirrored by
+    `referenceItemEffectiveBounds` (`web/js/scene_reference_geometry.js`), which
+    the timeline draws and hit-tests with."""
     start = int(getattr(item, "start_frame", 0) or 0)
     end = int(getattr(item, "end_frame", -1))
     return start, max(start + 1, int(duration or 0)) if end < 0 else end
 
 
 def _reference_overlapping_items(scene, lane_index, start_frame, end_frame, *, ignore=None):
+    """Rows on the lane a requested range would overlap.
+
+    A requested `-1` end runs to whatever end the scene will have, so it
+    overlaps every later row on the lane, including one lying past the current
+    end: a duration change leaves rows there, and a sentinel written beside one
+    would overlap it as soon as the scene grew back. A STORED `-1` still
+    resolves by `_reference_effective_bounds`.
+    """
     duration = int(getattr(scene, "duration_frames", 0) or 0)
-    resolved_end = max(0, duration) if end_frame < 0 else end_frame
+    resolved_end = math.inf if end_frame < 0 else end_frame
     if resolved_end <= start_frame:
         resolved_end = start_frame + 1
     for other in getattr(scene, "reference_items", []) or []:
@@ -4590,9 +4646,10 @@ def _validate_reference_creation_identity(scene: Scene, lane_index: int,
     `_reference_item_bounds` and by `ReferenceItem.from_dict`, so -1 is never a
     real start.
 
-    **Not covered:** a concurrent SCENE DURATION shrink produces the same harm
-    for an item drawn to the -1 sentinel, and nothing here sees it --
-    `_clamp_reference_items_to_scene` simply retimes what is stored.
+    **Not covered:** a concurrent SCENE DURATION change. An item drawn to the -1
+    sentinel then runs to whatever end the scene has when it is read, which is
+    what -1 means. A duration change never rewrites a stored item, so there is
+    no moved row here to compare against.
     """
     if not isinstance(expected, dict) or "next_start_frame" not in expected:
         _mutation_error(
@@ -5787,6 +5844,30 @@ def _freeze_reference_input_snapshots(
     job.reference_input_snapshots = snapshots
 
 
+def _frozen_reference_item_row(item, duration) -> dict:
+    """A staged row as a queued job keeps it: bounded by the enqueue duration.
+
+    A `-1` end becomes that duration, and an end past it is clipped to it, so
+    the row covers exactly what the enqueue compile resolved. A duration
+    change leaves rows past the end in the scene, and `resolve_reference_set`
+    widens a snapshot's duration to its largest explicit end (until jobs freeze
+    the duration): copied verbatim, one such row widened every `-1` and
+    straddling row past the scene and changed the lane winner. A row starting
+    at or after the end keeps its bounds; it is outside the window either way.
+    """
+    row = item.to_dict() if hasattr(item, "to_dict") else copy.deepcopy(item)
+    if not isinstance(row, dict):
+        return row
+    duration = max(0, int(duration or 0))
+    try:
+        start, end = int(row.get("start_frame", 0) or 0), int(row.get("end_frame", -1))
+    except (TypeError, ValueError):
+        return row
+    if duration > 0 and start < duration and (end < 0 or end > duration):
+        row["end_frame"] = duration
+    return row
+
+
 def _compose_frozen_job_prompt(project: TimelineProject, job: GenerationJob) -> None:
     """Server-side frozen-prompt compose at enqueue (single source of truth).
 
@@ -5946,7 +6027,7 @@ def _compose_frozen_job_prompt(project: TimelineProject, job: GenerationJob) -> 
         for value in (scene.reference_lane_recipes or [])
     ]
     job.reference_item_snapshots = [
-        value.to_dict() if hasattr(value, "to_dict") else copy.deepcopy(value)
+        _frozen_reference_item_row(value, scene.duration_frames)
         for value in (scene.reference_items or [])
     ]
 
@@ -13170,11 +13251,16 @@ if routes is not None:
         except json.JSONDecodeError:
             return _json_error("Invalid JSON body", 400)
 
-        scene = Scene(
-            name=body.get("name", "Untitled Scene"),
-            duration_frames=body.get("duration_frames", 200),
-            prompt=body.get("prompt", ""),
-        )
+        try:
+            duration = _authored_scene_duration(body.get("duration_frames", 200))
+            scene = Scene(
+                name=body.get("name", "Untitled Scene"),
+                duration_frames=duration,
+                prompt=body.get("prompt", ""),
+            )
+            _require_scene_duration_within_cap(scene, 0)
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
         project.add_scene(scene)
         await run_project_io(save_project, project)
 
@@ -13288,12 +13374,15 @@ if routes is not None:
             return _json_error("Invalid JSON body", 400)
 
         old_effective_fps = effective_scene_fps(project, scene)
+        previous_duration = int(getattr(scene, "duration_frames", 0) or 0)
 
         if "name" in body:
             scene.name = body["name"]
         if "duration_frames" in body:
-            scene.duration_frames = int(body["duration_frames"])
-            _clamp_reference_items_to_scene(scene)
+            try:
+                scene.duration_frames = _authored_scene_duration(body["duration_frames"])
+            except ProjectMutationRequestError as e:
+                return _mutation_json_error(e)
         if "prompt" in body:
             if getattr(scene.global_prompt_track_config, "locked", False):
                 return _json_error("Global prompt track is locked", 409)
@@ -13348,6 +13437,7 @@ if routes is not None:
 
         try:
             _validate_single_driver_per_lane(scene)
+            _require_scene_duration_within_cap(scene, previous_duration)
         except ProjectMutationRequestError as e:
             return _mutation_json_error(e)
 
@@ -14479,9 +14569,11 @@ if routes is not None:
         except json.JSONDecodeError:
             return _json_error("Invalid JSON body", 400)
         try:
+            target_lane = (_require_lane_index_in_range(scene, "audio", body["lane_index"], "lane_index")
+                           if "lane_index" in body else None)
             _require_audio_unlocked(scene, track)
-            if "lane_index" in body:
-                _require_lane_unlocked(scene, "audio", int(body["lane_index"]))
+            if target_lane is not None:
+                _require_lane_unlocked(scene, "audio", target_lane)
         except ProjectMutationRequestError as e:
             return _mutation_json_error(e)
 
@@ -14506,8 +14598,8 @@ if routes is not None:
 
         if "volume" in body:
             track.volume = float(body["volume"])
-        if "lane_index" in body:
-            track.lane_index = int(body["lane_index"])
+        if target_lane is not None:
+            track.lane_index = target_lane
 
         await run_project_io(save_project, project)
         return web.json_response(track.to_dict())

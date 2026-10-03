@@ -14,6 +14,7 @@ import {
     REFERENCE_VERDICT_LABEL,
     resolveReferenceVerdicts,
 } from "./reference_resolution.js";
+import { referenceItemEffectiveBounds } from "./scene_reference_geometry.js";
 
 /**
  * Which staged Reference item each verdict applies to for the live generation
@@ -884,7 +885,8 @@ export function _drawClips(host, ctx, width) {
             const isSourceLess = item.type === "prompt" || item.type === "reference";
             const curStart = isSourceLess ? item.data.start_frame : item.data.timeline_start_frame;
             const rawEnd = isSourceLess ? item.data.end_frame : item.data.timeline_end_frame;
-            const curEnd = item.type === "reference" && rawEnd === -1 ? host.totalFrames : rawEnd;
+            const curEnd = item.type === "reference"
+                ? referenceItemEffectiveBounds(item.data, host.totalFrames).end : rawEnd;
             ctx.globalAlpha = 0.25;
             ctx.fillStyle = color;
             if (item.edge === "left" && curStart > item.origStart) {
@@ -1386,9 +1388,11 @@ export function _drawClips(host, ctx, width) {
             for (const [itemIndex, item] of (host.activeScene.reference_items || []).entries()) {
                 if ((item.lane_index || 0) !== entry.laneIndex) continue;
                 const verdict = referenceVerdicts?.get(itemIndex) || null;
-                const endFrame = item.end_frame === -1 ? host.totalFrames : item.end_frame;
-                const x1 = host._frameToX(item.start_frame || 0);
-                const x2 = host._frameToX(endFrame || 0);
+                // Drawn as stored, past the end marker too; a sentinel row
+                // past the end is one frame, by the route's own rule.
+                const bounds = referenceItemEffectiveBounds(item, host.totalFrames);
+                const x1 = host._frameToX(bounds.start);
+                const x2 = host._frameToX(bounds.end);
                 if (x2 < 0 || x1 > width) continue;
                 const selected = host._isSelected("reference", item.reference_item_id);
                 const hidden = laneHidden || !!item.muted;
@@ -1634,9 +1638,9 @@ export function _hitTestReference(host, x, rawY) {
         if (entry.type !== TRACK_TYPE.REFERENCE || entry.collapsed) return null;
         for (const item of (host.activeScene.reference_items || [])) {
             if ((item.lane_index || 0) !== entry.laneIndex) continue;
-            const end = item.end_frame === -1 ? host.totalFrames : item.end_frame;
-            const x1 = host._frameToX(item.start_frame || 0);
-            const x2 = host._frameToX(end || 0);
+            const bounds = referenceItemEffectiveBounds(item, host.totalFrames);
+            const x1 = host._frameToX(bounds.start);
+            const x2 = host._frameToX(bounds.end);
             if (x >= x1 && x <= x2) return { type: "reference", id: item.reference_item_id, data: item };
         }
         return null;
@@ -1748,9 +1752,9 @@ export function _hitTestEdge(host, x, rawY) {
         if (entry.type === TRACK_TYPE.REFERENCE && !entry.collapsed) {
             for (const item of (host.activeScene.reference_items || [])) {
                 if ((item.lane_index || 0) !== entry.laneIndex) continue;
-                const end = item.end_frame === -1 ? host.totalFrames : item.end_frame;
-                const x1 = host._frameToX(item.start_frame || 0);
-                const x2 = host._frameToX(end || 0);
+                const bounds = referenceItemEffectiveBounds(item, host.totalFrames);
+                const x1 = host._frameToX(bounds.start);
+                const x2 = host._frameToX(bounds.end);
                 addCandidate("reference", item.reference_item_id, item, "left", x1, item.start_frame || 0);
                 addCandidate("reference", item.reference_item_id, item, "right", x2, item.start_frame || 0);
             }

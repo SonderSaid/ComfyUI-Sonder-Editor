@@ -581,10 +581,10 @@ def _dispatcher_writable_scene_fields():
     """Input keys `_apply_scene_fields` membership-tests directly.
 
     Deliberately narrow, and narrower than "fields a scene mutation can write":
-    it reads `"x" in fields` tests in one function. It does not follow the four
+    it reads `"x" in fields` tests in one function. It does not follow the
     helpers that function calls (`_set_scene_lane_count`, `retime_scene_geometry`,
-    `_clamp_reference_items_to_scene`, `_ensure_scene_lane_config_lengths`), and
-    it does not look at the other 37 dispatcher branches at all.
+    `_ensure_scene_lane_config_lengths`, `_require_scene_duration_within_cap`),
+    and it does not look at the other 37 dispatcher branches at all.
 
     That is enough for the one claim it supports -- that the pass-through five are
     not in this allow-list -- and not enough for the stronger claim that nothing

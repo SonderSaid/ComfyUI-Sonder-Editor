@@ -614,6 +614,139 @@ def test_selector_uses_frozen_explicit_snapshot_end_after_scene_shrinks(monkeypa
     assert core._reference_frame_rate(core._reference_decode_context(selected, "image")) == 30.0
 
 
+def test_a_queued_job_resolves_identically_after_a_live_shrink(monkeypatch, tmp_path):
+    """D9: the snapshot keeps its duration inflation, until jobs freeze the duration.
+
+    A queued job freezes its rows but still reads the LIVE scene duration. At
+    100 frames the sentinel row "tail" is [10, 100) and loses the window
+    [0, 20) to "whole"; after a live shrink to 20 it would be [10, 20) and win,
+    changing a job that was already queued. Widening to the largest explicit
+    frozen end ("past", 100) keeps the queued answer.
+    """
+    core = _import_module(monkeypatch, "reference_core")
+    project = _project(tmp_path, ReferenceLaneRecipe())
+    members = [{"entity_id": "entity", "member_id": "member"}]
+    frozen = [
+        {"reference_item_id": "whole", "lane_index": 0, "start_frame": 0, "end_frame": 20,
+         "members": members},
+        {"reference_item_id": "tail", "lane_index": 0, "start_frame": 10, "end_frame": -1,
+         "members": members},
+        {"reference_item_id": "past", "lane_index": 0, "start_frame": 30, "end_frame": 100,
+         "members": members},
+    ]
+    project.generation_queue = [GenerationJob(
+        job_id="queued", scene_id="scene", params={"snapshot_version": 1},
+        reference_lane_count=1,
+        reference_lane_configs=[LaneConfig().to_dict()],
+        reference_lane_recipes=[ReferenceLaneRecipe().to_dict()],
+        reference_item_snapshots=frozen,
+        reference_input_snapshots=[
+            {"kind": "reference", "value": project.references[0].to_dict()},
+            {"kind": "asset", "value": project.assets[0].to_dict()},
+        ],
+    )]
+    project._execution_context.update({
+        "queue_job_ref_id": "queued", "context_start": 0, "context_end": 20})
+
+    def winner():
+        selected = core.resolve_reference_set(project, 0)
+        assert selected["source"] == "snapshot"
+        return selected["lanes"][0]["item"]["reference_item_id"]
+
+    project.scenes[0].duration_frames = 100
+    at_enqueue = winner()
+    project.scenes[0].duration_frames = 20
+    assert winner() == at_enqueue == "whole"
+
+
+def test_a_job_enqueued_beside_a_row_past_the_end_resolves_what_enqueue_showed(monkeypatch, tmp_path):
+    """The freeze bounds every row by the enqueue duration (audit, Phase 3 #1).
+
+    A duration change leaves "past" [30, 100) in a 20-frame scene. Frozen
+    verbatim, its end widened the snapshot to 100 frames, "tail" became
+    [10, 100), and the queued job picked "whole" while the compile, the
+    timeline and the bridge had all shown "tail". The freeze now stores
+    "tail" as [10, 20), so the job answers "tail" at enqueue and after a
+    later live shrink alike.
+    """
+    from server import routes
+    from server.reference_resolution import resolve_reference_verdicts
+
+    core = _import_module(monkeypatch, "reference_core")
+    project = _project(tmp_path, ReferenceLaneRecipe())
+    scene = project.scenes[0]
+    members = [{"entity_id": "entity", "member_id": "member"}]
+    scene.duration_frames = 20
+    scene.reference_items = [
+        ReferenceItem(reference_item_id="whole", lane_index=0, start_frame=0, end_frame=20,
+                      members=members),
+        ReferenceItem(reference_item_id="tail", lane_index=0, start_frame=10, end_frame=-1,
+                      members=members),
+        ReferenceItem(reference_item_id="past", lane_index=0, start_frame=30, end_frame=100,
+                      members=members),
+    ]
+    shown = resolve_reference_verdicts(
+        reference_items=scene.reference_items, lane_count=1, scene_duration=20,
+        window_start=0, window_end=20)["winners"][0]["item"].reference_item_id
+    project.generation_queue = [GenerationJob(
+        job_id="queued", scene_id="scene", params={"snapshot_version": 1},
+        reference_lane_count=1,
+        reference_lane_configs=[LaneConfig().to_dict()],
+        reference_lane_recipes=[ReferenceLaneRecipe().to_dict()],
+        reference_item_snapshots=[routes._frozen_reference_item_row(item, scene.duration_frames)
+                                  for item in scene.reference_items],
+        reference_input_snapshots=[
+            {"kind": "reference", "value": project.references[0].to_dict()},
+            {"kind": "asset", "value": project.assets[0].to_dict()},
+        ],
+    )]
+    project._execution_context.update({
+        "queue_job_ref_id": "queued", "context_start": 0, "context_end": 20})
+
+    def winner():
+        selected = core.resolve_reference_set(project, 0)
+        assert selected["source"] == "snapshot"
+        return selected["lanes"][0]["item"]["reference_item_id"]
+
+    assert winner() == shown == "tail"
+    scene.duration_frames = 12
+    assert winner() == "tail"
+
+
+def test_live_selector_resolves_against_the_live_duration_as_the_server_does(monkeypatch, tmp_path):
+    """D9: only a frozen snapshot inflates the duration to its largest explicit end.
+
+    Live, a row past the scene end ("past", explicit end 100) used to inflate
+    the duration to 100, so the sentinel row "tail" resolved to [10, 100) and
+    lost to "whole". The server resolves against the scene's own 20 frames,
+    where "tail" is [10, 20) and wins. The node must answer what the timeline
+    and the preview show.
+    """
+    from server.reference_resolution import resolve_reference_verdicts
+
+    core = _import_module(monkeypatch, "reference_core")
+    project = _project(tmp_path, ReferenceLaneRecipe())
+    scene = project.scenes[0]
+    members = [{"entity_id": "entity", "member_id": "member"}]
+    scene.duration_frames = 20
+    scene.reference_items = [
+        ReferenceItem(reference_item_id="whole", lane_index=0, start_frame=0, end_frame=20,
+                      members=members),
+        ReferenceItem(reference_item_id="tail", lane_index=0, start_frame=10, end_frame=-1,
+                      members=members),
+        ReferenceItem(reference_item_id="past", lane_index=0, start_frame=30, end_frame=100,
+                      members=members),
+    ]
+    project._execution_context.update({"context_start": 0, "context_end": 20})
+
+    selected = core.resolve_reference_set(project, 0)
+    server_side = resolve_reference_verdicts(
+        reference_items=scene.reference_items, lane_count=1, scene_duration=20,
+        window_start=0, window_end=20)["winners"][0]["item"].reference_item_id
+    assert selected["source"] == "live"
+    assert selected["lanes"][0]["item"]["reference_item_id"] == server_side == "tail"
+
+
 def test_snapshot_selector_uses_frozen_library_catalog_after_live_edits(monkeypatch, tmp_path):
     core = _import_module(monkeypatch, "reference_core")
     monkeypatch.setattr(core, "resolve_existing_project_path",

@@ -496,8 +496,8 @@ import {
 import { LINK_ITEM_TYPES, pruneLinkedItemGroups, editedLinkGroups, rollbackLinkGroupPrediction } from "./scene_link_groups.js";
 import {
     canonicalJson, canonicalStagedMemberRefs, plannedReferenceItemUpdate,
-    REFERENCE_ITEM_FIELDS, referenceItemOverlap, referenceRowAfterMemberRemoval,
-    stagedReferenceItem,
+    REFERENCE_ITEM_FIELDS, referenceItemEffectiveBounds, referenceItemOverlap,
+    referenceRowAfterMemberRemoval, stagedReferenceItem,
 } from "./scene_reference_geometry.js";
 import { applyGuideSwap, guideIdentityMatches } from "./scene_guide_geometry.js";
 import { createViewportSurface } from "./viewport_surface.js";
@@ -548,6 +548,7 @@ import {
     getRecommendedDurationSec,
     getRecommendedResolutions,
     getMaxRes,
+    MAX_SCENE_DURATION_FRAMES,
     resolveBatchChunkSizes,
     resolveFrameConstraintForTemplate,
     resolutionToolbarSelectionMemory,
@@ -2232,13 +2233,21 @@ export class EditorWidget {
                     // the opt-out dict rather than answered here.
                     coalesce: false,
                     reconcileFromResult: reconcileRetimedScene,
-                    failureTier: (error) => error?.code === "queue_jobs_pending" ? "warning" : "error",
+                    failureTier: (error) => error?.code === "queue_jobs_pending"
+                        || error?.payload?.code === "duration_limit" ? "warning" : "error",
                     failureMessage: (error) => error?.code === "queue_jobs_pending"
+                        || error?.payload?.code === "duration_limit"
                         ? "Scene FPS change refused."
                         : "Scene FPS change failed — timeline restored.",
+                    // A retime scales the duration, so a faster rate can carry
+                    // it past the cap. Read from `error.payload.code`: the
+                    // `error.code` arms here never match a real response
+                    // (Bug Tracker, "dead error?.code checks").
                     failureDetail: (error) => error?.code === "queue_jobs_pending"
                         ? "This scene has pending or running queue jobs. Finish or clear them before changing FPS so their frozen frame ranges stay valid."
-                        : null,
+                        : error?.payload?.code === "duration_limit"
+                            ? `This FPS would make the scene longer than ${MAX_SCENE_DURATION_FRAMES} frames.`
+                            : null,
                 }
             );
         } catch (e) {
@@ -2295,6 +2304,46 @@ export class EditorWidget {
         }
     }
 
+    /** Commit what the toolbar duration field holds; refused past the cap.
+     *
+     *  Refusal comes before anything changes: `totalFrames` keeps its value, the
+     *  field is restored, and nothing is sent. The input's `max` constrains
+     *  nothing (and timecode mode makes it `type="text"`), so this is the bound.
+     *  Timecode values are converted first, since the cap is in frames.
+     *
+     *  Returns `{status: "refused"}` or `{status: "applied", frames}`.
+     */
+    _commitSceneDurationInput(rawValue) {
+        const requested = this._timecodeMode === "timecode"
+            ? Math.max(1, this._secondsToFrames(parseFloat(rawValue) || 0))
+            : Math.max(1, parseInt(rawValue, 10) || this._defaultNewSceneDuration?.() || 241);
+        if (this._refuseSceneDurationOverCap(requested)) {
+            this._refreshDurationInput();
+            return { status: "refused" };
+        }
+        let frames = this._snapSceneDurationToTemplate(requested);
+        if (frames > MAX_SCENE_DURATION_FRAMES) {
+            // The grid snap rounds to the NEAREST multiple, so it can land above
+            // the cap; one grid unit down is the largest value on the grid that
+            // a scene may hold.
+            const step = Math.max(1, Math.round(Number(this._getActiveFrameConstraint()?.step) || 1));
+            while (frames > MAX_SCENE_DURATION_FRAMES) frames -= step;
+        }
+        this.totalFrames = frames;
+        this._refreshDurationInput();
+        if (this.activeScene) this._updateSceneDuration(frames);
+        this._renderTimeline();
+        return { status: "applied", frames };
+    }
+
+    /** Warn and return true when `frames` exceeds the authored-duration cap. */
+    _refuseSceneDurationOverCap(frames) {
+        if (!(frames > MAX_SCENE_DURATION_FRAMES)) return false;
+        notifyWarning(`A scene may be at most ${MAX_SCENE_DURATION_FRAMES} frames long.`,
+            { source: "scene-duration-limit" });
+        return true;
+    }
+
     async _updateSceneDuration(...args) {
         return this._withMutationGesture(
             "updateSceneDuration", () => this._updateSceneDurationWithinGesture(...args));
@@ -2303,6 +2352,8 @@ export class EditorWidget {
     async _updateSceneDurationWithinGesture(frames) {
         if (!this.activeScene || !this.projectDir) return;
         frames = Math.max(1, parseInt(frames, 10) || 1);
+        // The menus' "Extend Scene to ... End" reach here without the field.
+        if (this._refuseSceneDurationOverCap(frames)) return;
         this._pushUndo("change duration");
         const sceneRef = this.activeScene;
         const sceneId = this.activeSceneId;
@@ -2326,6 +2377,15 @@ export class EditorWidget {
                     label: "scene duration",
                     coalesce: true,
                     refreshScenes: false,
+                    // The code lives on `error.payload`; `api_client.js` lifts
+                    // only a version conflict's code onto `error.code`.
+                    failureTier: (error) => error?.payload?.code === "duration_limit" ? "warning" : "error",
+                    failureMessage: (error) => error?.payload?.code === "duration_limit"
+                        ? "Scene duration change refused."
+                        : "scene duration failed — timeline restored.",
+                    failureDetail: (error) => error?.payload?.code === "duration_limit"
+                        ? `A scene may be at most ${MAX_SCENE_DURATION_FRAMES} frames long.`
+                        : null,
                     // Only the head of a coalesced group may roll back. The queue
                     // replaces the older intent outright and settles every collapsed
                     // waiter from the survivor's single result, so on failure each
@@ -9391,9 +9451,8 @@ export class EditorWidget {
             end = data.end_frame;
         } else if (item.type === "reference") {
             start = data.start_frame;
-            end = data.end_frame === -1
-                ? (this.totalFrames || this.activeScene?.duration_frames || 0)
-                : data.end_frame;
+            end = referenceItemEffectiveBounds(
+                data, this.totalFrames || this.activeScene?.duration_frames || 0).end;
         } else if (item.type === "guide") {
             start = this._resolvedGuideFrame(data);
             end = start + 1;
@@ -11148,7 +11207,7 @@ export class EditorWidget {
             const layoutIdx = this._trackLayout.findIndex((entry) =>
                 entry.type === TRACK_TYPE.REFERENCE && entry.laneIndex === (item.lane_index || 0)
             );
-            const end = item.end_frame === -1 ? Math.max(0, this.totalFrames) : item.end_frame;
+            const end = referenceItemEffectiveBounds(item, Math.max(0, this.totalFrames)).end;
             if (intersectsRow(layoutIdx) && intersectsFrames(item.start_frame || 0, end || 0)) {
                 hits.push({ type: "reference", id: item.reference_item_id, data: item });
             }
@@ -11527,11 +11586,13 @@ export class EditorWidget {
                         if (edgeHit.type === "audio" && this._isLaneLocked(TRACK_TYPE.AUDIO, edgeHit.data.lane_index || 0)) return;
                         if (edgeHit.type === "prompt" && this._isPromptTrackLocked()) return;
                         if (edgeHit.type === "reference" && this._isLaneLocked(TRACK_TYPE.REFERENCE, edgeHit.data.lane_index || 0)) return;
+                        if (this._refusePastEndReferenceTrim(edgeHit)) return;
                         const historyEntry = this._pushUndo("trim");
                         const isSourceLess = edgeHit.type === "prompt" || edgeHit.type === "reference";
                         const trimOrigStart = isSourceLess ? edgeHit.data.start_frame : edgeHit.data.timeline_start_frame;
                         const trimStoredEnd = isSourceLess ? edgeHit.data.end_frame : edgeHit.data.timeline_end_frame;
-                        const trimOrigEnd = edgeHit.type === "reference" && trimStoredEnd === -1 ? this.totalFrames : trimStoredEnd;
+                        const trimOrigEnd = edgeHit.type === "reference"
+                            ? referenceItemEffectiveBounds(edgeHit.data, this.totalFrames).end : trimStoredEnd;
                         const trimOrigSourceIn = edgeHit.data.source_in_frame || 0;
                         const trimOrigSourceOut = edgeHit.data.source_out_frame || (trimOrigEnd - trimOrigStart);
                         // Read total_source_frames from item data (set by backend on placement/split).
@@ -11603,6 +11664,10 @@ export class EditorWidget {
                         const anyLocked = this.selectedItems.some(s => this._isItemLocked(s));
                         if (anyLocked) return;
                         this._dragHistoryEntry = this._pushUndo("move items"); // Capture BEFORE drag modifies data
+                        // Still armed when refused, so a click selects and opens
+                        // the editor as usual; only movement is withheld.
+                        const dragRefusal = this._pastEndReferenceDragRefusal(this.selectedItems);
+                        this._dragRefusal = dragRefusal ? { message: dragRefusal, shown: false } : null;
                         this.isDragging = true;
                         this.dragType = "moveItem";
                         this._dragStartFrame = frame;
@@ -11610,7 +11675,9 @@ export class EditorWidget {
                         this._dragLastValidDelta = 0; // Group hold delta (linked collision)
                         this._dragItemOrigStart = hit.data.timeline_start_frame ?? hit.data.start_frame ?? hit.data.frame_index ?? 0;
                         this._dragItemOrigEnd = hit.data.timeline_end_frame
-                            ?? (hit.data.end_frame === -1 ? this.totalFrames : hit.data.end_frame)
+                            ?? (hit.type === "reference"
+                                ? referenceItemEffectiveBounds(hit.data, this.totalFrames).end
+                                : hit.data.end_frame)
                             ?? this._dragItemOrigStart;
                         // Anchor lane/type for per-item lane-delta calculation (#15)
                         this._dragAnchorType = hit.type;
@@ -11624,7 +11691,9 @@ export class EditorWidget {
                             type: s.type, id: s.id, data: s.data,
                             origStart: s.data.timeline_start_frame ?? s.data.start_frame ?? s.data.frame_index ?? 0,
                             origEnd: s.data.timeline_end_frame
-                                ?? (s.data.end_frame === -1 ? this.totalFrames : s.data.end_frame)
+                                ?? (s.type === "reference"
+                                    ? referenceItemEffectiveBounds(s.data, this.totalFrames).end
+                                    : s.data.end_frame)
                                 ?? (s.data.timeline_start_frame ?? s.data.start_frame ?? s.data.frame_index ?? 0),
                             origStoredEnd: s.data.end_frame,
                             origLane: s.type === "clip" ? (s.data.track_index || 0)
@@ -11665,7 +11734,7 @@ export class EditorWidget {
                         this._origAllReferenceRanges = (this.activeScene?.reference_items || []).map((item) => ({
                             data: item,
                             start: item.start_frame || 0,
-                            end: item.end_frame === -1 ? this.totalFrames : (item.end_frame || 0),
+                            end: referenceItemEffectiveBounds(item, this.totalFrames).end,
                             storedEnd: item.end_frame,
                             lane: item.lane_index || 0,
                         }));
@@ -11760,7 +11829,9 @@ export class EditorWidget {
                         : (this.activeScene?.reference_items || []).filter((scope) =>
                             scope !== item.data && (scope.lane_index || 0) === (item.data.lane_index || 0)
                         );
-                    const resolvedEnd = (scope) => scope.end_frame === -1 ? this.totalFrames : (scope.end_frame || 0);
+                    const resolvedEnd = (scope) => item.type === "reference"
+                        ? referenceItemEffectiveBounds(scope, this.totalFrames).end
+                        : (scope.end_frame || 0);
                     if (item.edge === "left") {
                         let leftBound = 0;
                         for (const s of otherSections) {
@@ -11773,7 +11844,9 @@ export class EditorWidget {
                             if ((s.start_frame || 0) >= item.origEnd) rightBound = Math.min(rightBound, s.start_frame || 0);
                         }
                         const nextEnd = Math.max(item.origStart + 1, Math.min(rightBound, snappedFrame));
-                        item.data.end_frame = item.type === "reference" && nextEnd >= this.totalFrames ? -1 : nextEnd;
+                        item.data.end_frame = item.type === "reference"
+                            ? this._referenceStoredEnd(item.data, item.origStart, nextEnd)
+                            : nextEnd;
                     }
                 } else {
                     // Clips and audio — clamp to source media bounds
@@ -11798,6 +11871,12 @@ export class EditorWidget {
                             item.data.source_out_frame = item.origSourceOut + (newEnd - item.origEnd);
                         }
                     }
+                }
+            } else if (this.dragType === "moveItem" && this._dragRefusal) {
+                // Nothing moves; the snapped delta stays 0, so mouseup reads a click.
+                if (!this._dragRefusal.shown && frame !== this._dragStartFrame) {
+                    this._dragRefusal.shown = true;
+                    notifyWarning(this._dragRefusal.message, { source: "reference-drag-past-end" });
                 }
             } else if (this.dragType === "moveItem" && this.selectedItems.length > 0) {
                 canvas.style.cursor = "grabbing";
@@ -12104,6 +12183,7 @@ export class EditorWidget {
                 this._origAllAudioEnds = {};
                 this._origAllReferenceRanges = [];
                 this._dragReferenceHold = null;
+                this._dragRefusal = null;
                 this._lastSnappedDelta = 0;
                 this._dragLaneChanged = false;
                 this._dragSwapTarget = null;
@@ -12653,7 +12733,7 @@ export class EditorWidget {
             const deleteLabel = linkedDeleteLabel || "Delete Guide";
             menuItems.push({ label: itemLocked ? `${deleteLabel} (locked)` : deleteLabel, action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
         } else if (hit.type === "reference") {
-            const endFrame = hit.data.end_frame === -1 ? this.totalFrames : (hit.data.end_frame || 0);
+            const endFrame = referenceItemEffectiveBounds(hit.data, this.totalFrames).end;
             menuItems.push({
                 label: "Set Selection to Reference",
                 action: () => this._setSelectionToFrameRange(hit.data.start_frame || 0, endFrame),
@@ -14757,7 +14837,8 @@ export class EditorWidget {
     _mediaItemsOverlap(left, right) {
         const bounds = (item) => {
             if (item?.reference_item_id) {
-                return [item.start_frame || 0, item.end_frame === -1 ? this.totalFrames : (item.end_frame || 0)];
+                const effective = referenceItemEffectiveBounds(item, this.totalFrames);
+                return [effective.start, effective.end];
             }
             return [item?.timeline_start_frame || 0, item?.timeline_end_frame || 0];
         };
@@ -18888,8 +18969,9 @@ export class EditorWidget {
 
         if (type === "clip" || type === "audio" || type === "reference") {
             const startFrame = type === "reference" ? (data.start_frame || 0) : data.timeline_start_frame;
-            const storedEndFrame = type === "reference" ? (data.end_frame ?? -1) : data.timeline_end_frame;
-            const endFrame = storedEndFrame === -1 ? this.totalFrames : storedEndFrame;
+            const endFrame = type === "reference"
+                ? referenceItemEffectiveBounds(data, this.totalFrames).end
+                : data.timeline_end_frame;
             const duration = endFrame - startFrame;
 
             // Start frame input
@@ -19230,6 +19312,13 @@ export class EditorWidget {
             notifyWarning("Move refused because one or more linked items are locked.", { source: "timeline-move-refused" });
             return;
         }
+        if (type === "reference") {
+            const refusal = this._pastEndReferenceDragRefusal([hit]);
+            if (refusal) {
+                notifyWarning(refusal, { source: "reference-drag-past-end" });
+                return;
+            }
+        }
         this._pushUndo("move item");
         const referenceMove = (() => {
             if (type !== "reference") return null;
@@ -19245,7 +19334,11 @@ export class EditorWidget {
                 type: "update_reference_item",
                 reference_item_id: data.reference_item_id || id,
                 expected: { start_frame: oldStart, end_frame: data.end_frame === -1 ? -1 : oldEnd },
-                fields: { start_frame: nextStart, end_frame: nextEnd >= this.totalFrames ? -1 : nextEnd },
+                fields: {
+                    start_frame: nextStart,
+                    end_frame: this._referenceStoredEnd(data, nextStart, nextEnd,
+                        { explicit: data.end_frame > this.totalFrames }),
+                },
             };
         })();
         const operation = type === "clip"
@@ -20200,6 +20293,67 @@ export class EditorWidget {
         }
     }
 
+    /** Refuse a right-edge trim of a Reference item starting at or past the
+     *  scene end, before it pushes Undo or paints. Returns true when refused.
+     *
+     *  Every end the gesture can reach is inside the scene, so before such an
+     *  item's start: the route refuses a named end there (`invalid_range`), and
+     *  the gesture used to save it as `-1` instead, leaving the item one frame
+     *  long. A duration change leaves these items where they were authored, so
+     *  this is routine after a shrink. A left-edge trim or a drag brings the
+     *  item back into the scene, and both stay available.
+     */
+    _refusePastEndReferenceTrim(edgeHit) {
+        if (edgeHit?.type !== "reference" || edgeHit.edge !== "right") return false;
+        const start = referenceItemEffectiveBounds(edgeHit.data, this.totalFrames).start;
+        if (start < this.totalFrames) return false;
+        notifyWarning(
+            "This Reference item starts after the scene end, so its end cannot be trimmed. "
+                + "Drag it into the scene or lengthen the scene first.",
+            { source: "reference-trim-past-end" });
+        return true;
+    }
+
+    /** The end a Reference gesture stores for a range ending at `end`.
+     *
+     *  A range reaching the scene end is stored as `-1` ("runs to the scene
+     *  end"), as gestures always have, but only where that is still true once
+     *  the scene grows: a later row on the lane, which a shrink may have left
+     *  past the end, would then overlap it, so the route refuses that `-1`
+     *  (`_reference_overlapping_items`) and the end stays explicit. `explicit`
+     *  keeps an authored end that lay past the scene, for an item a drag pulls
+     *  back in.
+     */
+    _referenceStoredEnd(row, startFrame, end, { explicit = false } = {}) {
+        if (explicit || end < this.totalFrames) return end;
+        const clash = referenceItemOverlap(this.activeScene?.reference_items || [], {
+            laneIndex: row?.lane_index || 0, startFrame, endFrame: -1,
+            durationFrames: this.totalFrames, ignore: row, ignoreId: row?.reference_item_id || "",
+        });
+        return clash ? end : -1;
+    }
+
+    /** Why a drag of these items may not move them, or null.
+     *
+     *  A Reference item running past the scene end can be dragged back in only
+     *  on its own, and only when it fits: every dragged member shares one delta,
+     *  so pulling it in would move everything selected with it, and an item
+     *  longer than the scene would be cut to fit (maintainer, 2026-10-02).
+     */
+    _pastEndReferenceDragRefusal(items) {
+        const pastEnd = (items || []).filter((item) => item?.type === "reference"
+            && referenceItemEffectiveBounds(item.data, this.totalFrames).end > this.totalFrames);
+        if (!pastEnd.length) return null;
+        if ((items || []).length > 1) {
+            return "A Reference item that runs past the scene end can only be dragged on its own.";
+        }
+        const bounds = referenceItemEffectiveBounds(pastEnd[0].data, this.totalFrames);
+        if (bounds.end - bounds.start > this.totalFrames) {
+            return "This Reference item is longer than the scene. Trim it or lengthen the scene before moving it.";
+        }
+        return null;
+    }
+
     _previewReferenceDrag(frameDelta) {
         const dragged = (this._dragItemsOrig || []).filter((item) => item.type === "reference");
         if (!dragged.length) return;
@@ -20214,7 +20368,7 @@ export class EditorWidget {
             const overlaps = (otherStart, otherEnd) => start < otherEnd && end > otherStart;
             for (const other of (this.activeScene?.reference_items || [])) {
                 if (draggedSet.has(other) || (other.lane_index || 0) !== orig.origLane) continue;
-                const otherEnd = other.end_frame === -1 ? this.totalFrames : (other.end_frame || 0);
+                const otherEnd = referenceItemEffectiveBounds(other, this.totalFrames).end;
                 if (overlaps(other.start_frame || 0, otherEnd)) return false;
             }
             for (let otherIndex = index + 1; otherIndex < proposals.length; otherIndex++) {
@@ -20226,17 +20380,25 @@ export class EditorWidget {
         if (valid) {
             for (const proposal of proposals) {
                 proposal.orig.data.start_frame = proposal.start;
-                proposal.orig.data.end_frame = proposal.end >= this.totalFrames ? -1 : proposal.end;
+                proposal.orig.data.end_frame = proposal.end;
+            }
+            // Decided once every dragged row is in place, since each is a
+            // neighbour the others' sentinel is judged against.
+            for (const proposal of proposals) {
+                proposal.storedEnd = this._referenceStoredEnd(proposal.orig.data, proposal.start,
+                    proposal.end, { explicit: proposal.orig.origStoredEnd > this.totalFrames });
+                proposal.orig.data.end_frame = proposal.storedEnd;
             }
             this._dragReferenceHold = proposals.map((proposal) => ({
                 data: proposal.orig.data,
                 start: proposal.start,
                 end: proposal.end,
+                storedEnd: proposal.storedEnd,
             }));
         } else if (this._dragReferenceHold) {
             for (const held of this._dragReferenceHold) {
                 held.data.start_frame = held.start;
-                held.data.end_frame = held.end >= this.totalFrames ? -1 : held.end;
+                held.data.end_frame = held.storedEnd;
             }
         }
     }
@@ -20714,8 +20876,8 @@ export class EditorWidget {
         // A Reference item's `-1` end means "follow scene end"; the razor drew
         // against the resolved bar, so the bounds check must use the same value
         // the user saw, and the server is told which one that was.
-        const resolvedEnd = type === "reference" && hit.data?.end_frame === -1
-            ? this.totalFrames
+        const resolvedEnd = type === "reference"
+            ? referenceItemEffectiveBounds(hit.data, this.totalFrames).end
             : (sourceLess ? hit.data?.end_frame : hit.data?.timeline_end_frame);
         if (!Number.isFinite(start) || !Number.isFinite(resolvedEnd)) return refuse("missing");
         if (!(frame > start && frame < resolvedEnd)) return refuse("outside_bounds");

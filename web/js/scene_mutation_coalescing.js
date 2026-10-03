@@ -319,8 +319,8 @@ export const SCENE_MUTATION_COALESCING = Object.freeze({
             ? "scene:fields" : null),
         "`_apply_scene_fields` writes only the keys `fields` names -- but it "
         + "writes them in a FIXED internal order, and several carry effects on "
-        + "state another field also writes: `duration_frames` runs "
-        + "`_clamp_reference_items_to_scene`, `fps` runs `retime_scene_geometry`, "
+        + "state another field also writes: `fps` runs `retime_scene_geometry`, "
+        + "which rewrites `duration_frames` and every endpoint, "
         + "each lane-count field runs `_set_scene_lane_count`, which POPS "
         + "configs, and `prompt` reaches `Scene.set_global_prompt`, whose own "
         + "docstring calls it destructive. Folding two operations reorders their "

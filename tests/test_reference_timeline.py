@@ -105,7 +105,10 @@ def test_generic_queue_freezes_reference_entity_member_and_asset_catalog():
                                            for value in scene.reference_lane_configs]
     assert job.reference_lane_recipes == [value.to_dict()
                                            for value in scene.reference_lane_recipes]
-    assert job.reference_item_snapshots == [scene.reference_items[0].to_dict()]
+    # Frozen bounded by the enqueue duration: the `-1` end becomes it.
+    assert job.reference_item_snapshots == [{
+        **scene.reference_items[0].to_dict(), "end_frame": scene.duration_frames}]
+    assert scene.duration_frames > 0
     assert by_kind["reference"]["name"] == "Subject"
     assert by_kind["reference"]["members"][0]["name"] == "portrait"
     assert by_kind["asset"]["path"] == "media/one.image"

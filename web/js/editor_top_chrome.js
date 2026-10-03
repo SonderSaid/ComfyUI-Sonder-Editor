@@ -1,4 +1,4 @@
-import { ASPECT_RATIO_PRESETS } from "./editor_settings.js";
+import { ASPECT_RATIO_PRESETS, MAX_SCENE_DURATION_FRAMES } from "./editor_settings.js";
 import { subscribeForeground, formatProgress } from "./editor_notifications.js";
 import {
     EDITOR_COLORS as COLORS,
@@ -235,22 +235,13 @@ export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
     widget.durationInput = document.createElement("input");
     widget.durationInput.type = "number";
     widget.durationInput.min = 1;
-    widget.durationInput.max = 99999;
+    widget.durationInput.max = MAX_SCENE_DURATION_FRAMES;
     widget.durationInput.value = widget.totalFrames;
     widget.durationInput.style.cssText = topInputCss({ width: "55px", fontSize: `${TYPE.t11}px`, padding: "2px 4px" });
+    // Parse, cap, snap and write live in the widget, which refuses a value
+    // past the cap before anything changes.
     widget.durationInput.addEventListener("change", () => {
-        if (widget._timecodeMode === "timecode") {
-            const sec = parseFloat(widget.durationInput.value) || 0;
-            widget.totalFrames = Math.max(1, widget._secondsToFrames(sec));
-        } else {
-            widget.totalFrames = Math.max(1, parseInt(widget.durationInput.value, 10) || widget._defaultNewSceneDuration?.() || 241);
-        }
-        widget.totalFrames = widget._snapSceneDurationToTemplate(widget.totalFrames);
-        widget._refreshDurationInput();
-        if (widget.activeScene) {
-            widget._updateSceneDuration(widget.totalFrames);
-        }
-        widget._renderTimeline();
+        widget._commitSceneDurationInput(widget.durationInput.value);
     });
 
     const ctxLabel = document.createElement("span");

@@ -28,7 +28,11 @@ def test_mutation_produced_geometry_is_restorable(tmp_path, monkeypatch):
             if case == "negative":
                 module._apply_update_clip(project, scene, clip.clip_id, {"timeline_start_frame": -3})
             elif case == "stranded_lane":
-                module._apply_update_clip(project, scene, clip.clip_id, {"track_index": 9})
+                # An update naming a missing lane is refused (#28); a lane-count
+                # shrink still strands a clip, since it does not check occupancy.
+                module._set_scene_lane_count(scene, "video", 2)
+                module._apply_update_clip(project, scene, clip.clip_id, {"track_index": 1})
+                module._set_scene_lane_count(scene, "video", 1)
             elif case == "overlap":
                 second, _, _ = module._apply_create_clip(project, scene, {"asset_id": "video", "timeline_start_frame": 30})
                 module._apply_update_clip(project, scene, second.clip_id, {"timeline_start_frame": 2, "timeline_end_frame": 6})

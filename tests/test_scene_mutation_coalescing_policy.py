@@ -525,12 +525,15 @@ _LANE_CONFIG_FIELD_SPACE = {
     "locked": (False, False),
     "hidden": (True, False),
 }
-# Chosen to FIRE the side effects, not to avoid them. `duration_frames` 40 is
-# below the seeded Reference item's end, so `_clamp_reference_items_to_scene`
-# actually clamps; `fps` retimes and is applied after `duration_frames` whatever
-# order the client authored; the lane counts shrink before they grow, which is
-# the shape that destroys a named config. A space that fires nothing would let
-# this test pass over a table that folds all of them.
+# Chosen to FIRE the side effects, not to avoid them. `fps` retimes every
+# endpoint, the duration included, and is applied after `duration_frames`
+# whatever order the client authored, so the pair's outcome depends on which
+# ran first; `duration_frames` 40 is below the seeded Reference item's end, so a
+# fold that let a shrink touch that item would show (a duration change no
+# longer moves Reference items, and this keeps a fold from bringing that back);
+# the lane counts shrink before they grow, which is the shape that destroys a
+# named config. A space that fires nothing would let this test pass over a
+# table that folds all of them.
 _SCENE_FIELD_SPACE = {
     "name": ("one", "two"),
     "width": (640, 1280),

@@ -13,6 +13,11 @@ import {
 const SETTINGS_STORAGE_KEY = "sonder-editor-settings";
 const SETTINGS_VERSION = 1;
 
+// The longest scene an author may write, in frames. The server's own cap is
+// `MAX_SCENE_DURATION_FRAMES` in `server/routes.py`, and
+// `tests/test_scene_duration_cap.py` keeps the two equal.
+export const MAX_SCENE_DURATION_FRAMES = 99999;
+
 export const GALLERY_SORT_OPTIONS = [
     { value: "newest", label: "Newest" },
     { value: "oldest", label: "Oldest" },
@@ -1460,7 +1465,7 @@ export function normalizeEditorSettings(source = null) {
             newSceneDuration: clampNumber(
                 stored?.projectDefaults?.newSceneDuration,
                 1,
-                99999,
+                MAX_SCENE_DURATION_FRAMES,
                 defaults.projectDefaults.newSceneDuration,
                 true,
             ),

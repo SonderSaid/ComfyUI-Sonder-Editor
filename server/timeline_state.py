@@ -2477,11 +2477,10 @@ def retime_scene_geometry(scene: Scene, old_fps: float, new_fps: float) -> None:
             int(item.timeline_end_frame),
         )
 
-    max_reference_start = max(0, int(getattr(scene, "duration_frames", 0) or 0) - 1)
+    # Scaled like clips and never clamped to the scene: a duration change leaves
+    # a Reference item past the end as authored, and a retime is not a resize.
     for item in getattr(scene, "reference_items", []) or []:
-        start = scaled(getattr(item, "start_frame", 0))
-        if int(getattr(scene, "duration_frames", 0) or 0) > 0:
-            start = min(max_reference_start, max(0, start))
+        start = max(0, scaled(getattr(item, "start_frame", 0)))
         old_end = int(getattr(item, "end_frame", -1))
         item.start_frame = start
         item.end_frame = -1 if old_end < 0 else max(start + 1, scaled(old_end))

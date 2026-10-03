@@ -285,15 +285,16 @@ def resolve_reference_set(project, reference_lanes="0") -> dict[str, Any]:
     scene = _active_scene(project)
     render_start, render_end, width, height = _render_window(project, scene)
     source = _source(project, scene)
-    explicit_item_ends = [
-        _int(getattr(item, "end_frame", -1), -1)
-        for item in source["items"]
-    ]
-    duration = max(
-        render_end,
-        _int(getattr(scene, "duration_frames", 0), render_end),
-        *(end for end in explicit_item_ends if end >= 0),
-    )
+    duration = max(render_end, _int(getattr(scene, "duration_frames", 0), render_end))
+    if source["source"] == "snapshot":
+        # Retained until jobs freeze the scene duration at enqueue. A queued job
+        # still reads the LIVE duration, so a shrink after enqueue would cut its
+        # frozen rows short; widening to their largest explicit end keeps what
+        # was queued. Live resolution uses the live duration, as the server
+        # resolver and the timeline do, so a row past the end is absent.
+        duration = max([duration, *(
+            end for end in (_int(getattr(item, "end_frame", -1), -1) for item in source["items"])
+            if end >= 0)])
     resolved = resolve_effective_references(
         reference_items=source["items"],
         window_start=render_start,

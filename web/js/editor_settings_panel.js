@@ -19,6 +19,7 @@ import {
     GALLERY_PROVENANCE_CACHE_MAX,
     GALLERY_SORT_OPTIONS,
     GALLERY_THUMBNAIL_SIZE_OPTIONS,
+    MAX_SCENE_DURATION_FRAMES,
     PLAYBACK_RESOLUTION_OPTIONS,
     SAVE_PRESET_OPTIONS,
     SNAP_TARGET_OPTIONS,
@@ -2016,7 +2017,7 @@ function showSettingsPanel() {
         "Applies only when creating a new blank scene; duplicated scenes keep their source duration.",
         {
             min: 1,
-            max: 99999,
+            max: MAX_SCENE_DURATION_FRAMES,
             step: 1,
             getter: () => this._settings.projectDefaults.newSceneDuration,
             onChange: (value) => updateCategory("projectDefaults", "newSceneDuration", Math.round(value)),

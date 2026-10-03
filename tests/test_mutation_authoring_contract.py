@@ -1449,7 +1449,8 @@ MIRRORED_MODULES = {
             "test_reference_panel_js.py::test_reference_threshold_matches_between_python_and_javascript",
             "test_reference_subject_registry.py::test_member_prompt_fragment_matches_between_python_and_javascript",
             "test_reference_subject_registry.py::test_token_vocabulary_matches_between_python_and_javascript",
-            "test_reference_prose_policy.py::test_reference_verdict_python_js_parity"),
+            "test_reference_prose_policy.py::test_reference_verdict_python_js_parity",
+            "test_scene_duration_reference_items.py::test_the_browser_resolver_agrees_with_the_server_past_the_end"),
     },
     "scene_link_groups.js": {
         "scope": "Route link pruning, explicit link/unlink editing and id-collision refusal.",
@@ -1471,14 +1472,16 @@ MIRRORED_MODULES = {
             "test_the_client_declines_exactly_the_linked_moves_the_server_refuses")),
     },
     "scene_reference_geometry.js": {
-        "scope": ("Reference bounds, canonical member-ref record shape, staged-row defaults, the "
+        "scope": ("Reference bounds, the effective range of a stored row, canonical member-ref "
+                  "record shape, staged-row defaults, the "
                   "lane-overlap decision, the planned update row or refusal, and the staged-item "
                   "half of a Library delete; not recipe or prompt-profile validation of authored "
                   "roles and intents, which decline."),
         "authorities": tuple("server/routes.py::" + name for name in (
             "_reference_item_bounds", "_canonical_reference_member_refs", "_apply_create_reference_item",
             "_reference_overlapping_items", "_apply_update_reference_item",
-            "_reference_item_update_bounds", "_reconcile_staged_reference_members")),
+            "_reference_item_update_bounds", "_reconcile_staged_reference_members",
+            "_reference_effective_bounds")),
         "tests": tuple("test_reference_geometry_parity.py::" + name for name in (
             "test_reference_bounds_agree_in_both_languages",
             "test_an_inverted_range_is_refused_on_both_sides_rather_than_repaired",
@@ -1489,7 +1492,8 @@ MIRRORED_MODULES = {
             "test_the_planned_update_agrees_with_the_route_in_both_directions",
             "test_every_update_decline_stands_in_for_a_route_outcome_the_mirror_cannot_see",
             "test_a_scalar_update_keeps_what_it_does_not_name",
-            "test_the_delete_cascade_agrees_with_the_route_in_both_directions")),
+            "test_the_delete_cascade_agrees_with_the_route_in_both_directions")) + (
+            "test_scene_duration_reference_items.py::test_the_client_resolves_a_stored_sentinel_as_the_route_does",),
     },
     "scene_mutation_addressing.js": {
         "scope": ("Per-operation addressing class, promotion guards, payload refinements "
@@ -1572,7 +1576,7 @@ def test_declared_mirror_headers_match_the_inventory_both_ways():
 
 def test_every_declared_mirror_has_a_live_parity_disposition():
     _assert_mirror_obligations(MIRRORED_MODULES, ROOT)
-    assert sum(len(row["authorities"]) for row in MIRRORED_MODULES.values()) == 63
+    assert sum(len(row["authorities"]) for row in MIRRORED_MODULES.values()) == 64
 
 @pytest.mark.parametrize("name, valid", [("TABLE", True), ("row", False), ("transform", True)])
 def test_mirror_authorities_are_module_declarations(tmp_path, name, valid):
