@@ -27,7 +27,7 @@
 //   _appendReferenceMembers(itemId, { members }),
 //   _forkReferenceRecipe({ entry, expectedLaneId, fields, laneRecipeFor }),
 //   _updateReferenceRecipe({ recipeId, expected, fields }),
-//   _deleteReferenceRecipe({ recipeId, expected, detach }),
+//   _deleteReferenceRecipe({ recipeId, expected, detachLane: { laneId } }),
 //   _fetchReferences(opts), _buildTrackLayout(),
 //   _renderTimeline(), _renderSceneAfterLocalMutation(opts),
 //   _stampManagementPanel(kind, stamp)
@@ -1114,24 +1114,20 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             render();
             return;
         }
+        // The lane this panel shows falls back to Detached once the delete
+        // lands, when it names the recipe: the host detaches it, keeping its
+        // materialized values, on acknowledgement or -- the answer lost -- once
+        // the deciding read says the delete landed. It repaints the panel
+        // through the gated refresh; a refused delete leaves the lane attached.
+        const lane = laneRecipe();
         const pending = host._deleteReferenceRecipe?.({
             recipeId: shown.id,
             expected: expectedRecipe(shown),
-            // Only once the delete is acknowledged, so a refused delete leaves
-            // the lane attached. The lane keeps its materialized values and
-            // falls back to Detached; not an edit of its values -- the recipe
-            // it named is gone -- so it detaches whatever the lock says.
-            detach: async () => {
-                const recipe = laneRecipe();
-                if (recipe.recipe_id === shown.id) {
-                    await writeRecipe({ ...recipe, recipe_id: "" }, { evenIfLocked: true });
-                    return;
-                }
-                if (mounted) render();
-            },
+            detachLane: lane.recipe_id === shown.id ? { laneId: lane.lane_id || "" } : null,
         });
         render();
         await pending;
+        if (mounted) render();
     };
 
     // ── Staged items ───────────────────────────────────────────────────────

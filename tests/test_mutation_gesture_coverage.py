@@ -178,10 +178,14 @@ def test_the_fork_reserves_its_lane_step_in_the_gesture_turn():
     """The fork's Undo step is reserved by `_saveLaneConfigWithinGesture` (the
     `laneConfig` unit the authoring contract scans), two levels below the
     gesture, which that scan does not follow; so this pins that the fork calls
-    it without awaiting first, and that nothing else reaches it that way."""
+    it without awaiting first, and that nothing else reaches it that way. The
+    deferred detach of a deleted recipe (backlog step 1, Phase 6) is the other
+    such caller, held to the same rule."""
     methods = _widget_methods()
-    body = methods["_forkReferenceRecipeWithinGesture"]
-    assert "await " not in body[:body.index("this._saveLaneConfigWithinGesture(")]
+    for name in ("_forkReferenceRecipeWithinGesture", "_detachDeletedRecipeWithinGesture"):
+        body = methods[name]
+        assert "await " not in body[:body.index("this._saveLaneConfigWithinGesture(")], name
     callers = sorted(name for name, text in methods.items()
                      if "this._saveLaneConfigWithinGesture(" in text)
-    assert callers == ["_forkReferenceRecipeWithinGesture", "_saveLaneConfig"]
+    assert callers == ["_detachDeletedRecipeWithinGesture", "_forkReferenceRecipeWithinGesture",
+                       "_saveLaneConfig"]

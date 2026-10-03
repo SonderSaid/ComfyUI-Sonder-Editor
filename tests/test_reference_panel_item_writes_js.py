@@ -2236,3 +2236,176 @@ def test_a_project_or_scene_switch_during_the_wait_sends_nothing(tmp_path):
           undo: w._undoStack.length - undoBefore };
         """, tmp_path, project=_retention_project())
         assert result == {"sent": False, "undo": 0}, switch
+
+
+# --- Backlog step 1, Phase 6: timeline gestures and an unpainted write (D5) ----
+
+# A retention edit on item-1 the mirror cannot paint, held: its barrier is up.
+_HELD_UNPAINTED_EDIT = _MEMBERS + """
+mount();
+hold();
+const [retentionSelect] = cardAt(10).querySelectorAll('select');
+retentionSelect.value = 'partial'; retentionSelect.dispatch('change');
+await settle(2);
+const lane0Rows = (scene) => (scene.reference_items || []).filter((row) => row.lane_index === 0)
+  .sort((left, right) => left.start_frame - right.start_frame)
+  .map((row) => [row.start_frame, row.end_frame, row.members.map((m) => m.visual_intent || '')]);
+"""
+
+
+def test_a_split_waits_for_an_unpainted_member_edit_and_cuts_the_answered_row(tmp_path):
+    """D5: a split waits for the item's unsettled member writes, including one
+    parked behind the first, so it is sent after every edit made while the item
+    was whole and both halves carry them (audit #1: without the wait the parked
+    edit went after the split and reached only the left half)."""
+    result = run_item_panel(_HELD_UNPAINTED_EDIT + """
+    const parked = w._editReferenceItemMembersFromPanel('item-1',
+      { kind: 'patch', memberId: 'member-b', patch: { visual_intent: 'partial' } }, 'change visual retention');
+    await settle(2);
+    const splitting = w._splitItemsAtFrame([{ type: 'reference', id: 'item-1', data: item('item-1') }], 25);
+    await settle(4);
+    const whileHeld = lane0Rows(w.activeScene);
+    await release();
+    await parked; await splitting;
+    await settle(10);
+    return { whileHeld, local: lane0Rows(w.activeScene), server: lane0Rows(await serverScene()),
+      toasts: toasts.map((t) => t.message) };
+    """, tmp_path, project=_retention_project())
+    assert result["whileHeld"] == [[10, 40, ["preserve", ""]], [50, 70, [""]]]
+    assert result["local"] == result["server"] == [
+        [10, 25, ["partial", "partial"]], [25, 40, ["partial", "partial"]], [50, 70, [""]]]
+    assert result["toasts"] == []
+
+
+def test_a_split_after_an_unpainted_append_snapshots_the_appended_member(tmp_path):
+    """Audit #2: the split's Undo entry is pushed after the wait, so its
+    before-state holds the member the append added, and Undo of the split does
+    not take it away."""
+    result = run_item_panel(_MEMBERS + """
+    mount();
+    hold();
+    // An authored retention: the mirror cannot paint it, so the append is sent
+    // unpainted behind a barrier.
+    const appending = w._appendReferenceMembers('item-1', { members: [{ ...drag('c'), visual_intent: 'partial' }] });
+    const barrier = w._referenceItemWriteState().barriers.has('item-1');
+    await settle(2);
+    const splitting = w._splitItemsAtFrame([{ type: 'reference', id: 'item-1', data: item('item-1') }], 25);
+    await settle(4);
+    await release();
+    await appending; await splitting;
+    await settle(10);
+    const entry = w._undoStack.find((candidate) => /split/.test(candidate.label));
+    const snapshotRow = entry?.snapshot?.reference_items?.find((row) => row.reference_item_id === 'item-1');
+    return { barrier, snapshot: snapshotRow?.members?.map((m) => m.member_id),
+      server: item('item-1', await serverScene()).members.map((m) => m.member_id) };
+    """, tmp_path, project=_retention_project())
+    assert result["barrier"] is True
+    assert result["server"] == ["member-a", "member-b", "member-c"]
+    assert result["snapshot"] == result["server"]
+
+
+def test_the_item_editor_move_waits_for_an_unpainted_member_edit(tmp_path):
+    """D5: the Start field's move reads its guard from the row after the answer."""
+    result = run_item_panel(_HELD_UNPAINTED_EDIT + """
+    const moving = w._moveItemToFrame('reference', 'item-1', item('item-1'), 12);
+    await settle(4);
+    const whileHeld = lane0Rows(w.activeScene)[0];
+    await release();
+    await moving;
+    await settle(10);
+    return { whileHeld, local: lane0Rows(w.activeScene)[0], server: lane0Rows(await serverScene())[0],
+      toasts: toasts.map((t) => t.message) };
+    """, tmp_path, project=_retention_project())
+    assert result["whileHeld"] == [10, 40, ["preserve", ""]]
+    assert result["local"] == result["server"] == [12, 42, ["partial", ""]]
+    assert result["toasts"] == []
+
+
+def test_a_move_after_the_wait_paints_the_row_the_scene_now_holds(tmp_path):
+    """A scenes read may replace the scene object while the move waits; the
+    move then acts on the live row, not the one the item editor was built on."""
+    result = run_item_panel(_HELD_UNPAINTED_EDIT + """
+    hold();  // the move's own write, after the wait
+    const moving = w._moveItemToFrame('reference', 'item-1', item('item-1'), 12);
+    await settle(2);
+    const replaced = structuredClone(w.activeScene);
+    w.scenes = (w.scenes || []).map((scene) => (scene === w.activeScene ? replaced : scene));
+    w.activeScene = replaced;
+    await release();
+    await settle(4);
+    const paintedWhileSaving = lane0Rows(w.activeScene)[0].slice(0, 2);
+    await release();
+    await moving;
+    await settle(8);
+    return { paintedWhileSaving, server: lane0Rows(await serverScene())[0].slice(0, 2) };
+    """, tmp_path, project=_retention_project())
+    assert result == {"paintedWhileSaving": [12, 42], "server": [12, 42]}
+
+
+def test_a_move_after_a_wait_closes_the_item_editor_built_on_the_old_row(tmp_path):
+    """Audit #3: the reconcile of the answer may replace the row the open item
+    editor was built on; a second Start from it would guard a stale range."""
+    result = run_item_panel(_HELD_UNPAINTED_EDIT + """
+    hold();  // the move's own write
+    let hidden = 0;
+    const realHide = w._hideItemEditor.bind(w);
+    w._hideItemEditor = () => { hidden += 1; return realHide(); };
+    const moving = w._moveItemToFrame('reference', 'item-1', item('item-1'), 12);
+    await settle(2);
+    const beforeAnswer = hidden;
+    await release();
+    await settle(4);
+    const whileMoveSaves = hidden;
+    await release();
+    await moving;
+    return { beforeAnswer, whileMoveSaves };
+    """, tmp_path, project=_retention_project())
+    assert result["beforeAnswer"] == 0 and result["whileMoveSaves"] >= 1
+
+
+def test_a_move_abandoned_by_a_scene_switch_during_the_wait_sends_nothing(tmp_path):
+    for gesture in ("w._moveItemToFrame('reference', 'item-1', item('item-1'), 12)",):
+        result = run_item_panel(_HELD_UNPAINTED_EDIT + f"""
+        const pending = {gesture};
+        await settle(2);
+        w.activeSceneId = 'another-scene';
+        await release();
+        await pending;
+        await settle(8);
+        return {{ sent: sent.flat().filter((op) => Object.hasOwn(op.fields || {{}}, 'start_frame')).length,
+          undo: w._undoStack.filter((entry) => /split|move item/.test(entry.label)).length }};
+        """, tmp_path, project=_retention_project())
+        assert result == {"sent": 0, "undo": 0}, gesture
+
+
+def test_a_drag_or_trim_of_an_item_still_saving_does_not_start(tmp_path):
+    """D5: they name only the range, but the answer may still replace the row
+    they would drag; they say why instead of waiting under the pointer."""
+    result = run_item_panel(_HELD_UNPAINTED_EDIT + """
+    const saving = w._referenceItemSavingRefusal([{ type: 'reference', id: 'item-1' }]);
+    const other = w._referenceItemSavingRefusal([{ type: 'reference', id: 'item-2' }]);
+    const notReference = w._referenceItemSavingRefusal([{ type: 'clip', id: 'item-1' }]);
+    const trimRefused = w._refuseReferenceItemSaving([{ type: 'reference', id: 'item-1' }]);
+    await release();
+    await settle(8);
+    return { saving, other, notReference, trimRefused,
+      after: w._referenceItemSavingRefusal([{ type: 'reference', id: 'item-1' }]),
+      toasts: toasts.map((t) => [t.message, t.source]) };
+    """, tmp_path, project=_retention_project())
+    message = "This Reference item is still saving. Try again in a moment."
+    assert result["saving"] == message
+    assert result["other"] == "" and result["notReference"] == "" and result["after"] == ""
+    assert result["trimRefused"] is True
+    assert [message, "reference-item-saving"] in result["toasts"]
+
+
+def test_the_timeline_pointer_handlers_ask_whether_the_item_is_saving():
+    """The mousedown handler is inline in `_setupTimelineEvents`; pinned lexically."""
+    source = (ROOT / "web/js/editor_widget.js").read_text(encoding="utf-8")
+    start = source.index("    _setupTimelineEvents(")
+    body = source[start:source.index("\n    }\n", start)]
+    trim = body.index("this._refusePastEndReferenceTrim(edgeHit)")
+    assert body.index("this._refuseReferenceItemSaving([edgeHit])", trim) < body.index(
+        'this._pushUndo("trim")', trim), "a trim of a saving item must refuse before its Undo step"
+    assert "this._referenceItemSavingRefusal(this.selectedItems)" in body
+    assert "this._dragRefusal.source" in body

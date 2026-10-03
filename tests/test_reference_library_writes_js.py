@@ -1174,3 +1174,181 @@ def test_an_attach_behind_a_refused_edit_of_a_stored_handle_aborts(tmp_path):
     return { attached };
     """, tmp_path)
     assert result == {"attached": "aborted"}
+
+
+# --- Backlog step 1, Phase 6: a lost recipe delete, and refused removals -------
+
+def _recipe_expected():
+    return """
+    const recipe = w._referenceRecipesView()[0];
+    const expected = { id: recipe.id, name: recipe.name, media_kind: recipe.media_kind,
+      hard: { ...recipe.hard }, soft: { ...recipe.soft } };
+    """
+
+
+def test_a_lost_recipe_delete_that_landed_detaches_its_lane_as_its_own_undo_step(tmp_path):
+    """The deciding read says the delete landed: the lane that named the recipe
+    is detached then, in a gesture of its own, since the delete's own detach
+    never ran (its answer was lost)."""
+    result = run_library(_PHASE4 + """
+    await fork();
+    await settle(12);
+    """ + _recipe_expected() + """
+    libraryLostNext();
+    let detachedAtOnce = false;
+    // The lost answer's own Library read decides it, right after the loss.
+    const outcome = await w._deleteReferenceRecipe({ recipeId: recipe.id, expected, detachLane: { laneId: 'lane-image' },
+      detach: async () => { detachedAtOnce = true; } });
+    await settle(16);
+    await w._fetchReferences({ force: true, ignoreMutationGate: true, reason: 'decide' });
+    await settle(16);
+    return { outcome, detachedAtOnce, lane: laneRecipe().recipe_id,
+      laneId: laneRecipe().lane_id, server: (await serverLane()).recipe_id,
+      undo: w._undoStack.map((entry) => entry.label).filter((label) => label === "detach deleted recipe"),
+      toasts: toasts.map((t) => t.message) };
+    """, tmp_path)
+    assert result["outcome"] == "failed" and result["detachedAtOnce"] is False
+    assert result["lane"] == result["server"] == ""
+    assert result["laneId"] == "lane-image"
+    assert result["undo"] == ["detach deleted recipe"]
+    assert "A Reference Library change was not saved." not in result["toasts"]
+
+
+def test_a_deferred_detach_skips_a_lane_that_no_longer_names_the_recipe(tmp_path):
+    result = run_library(_PHASE4 + """
+    await fork();
+    await settle(12);
+    """ + _recipe_expected() + """
+    hold();
+    libraryLostNext();
+    const deleting = w._deleteReferenceRecipe({ recipeId: recipe.id, expected, detachLane: { laneId: 'lane-image' },
+      detach: async () => {} });
+    // The author picks another recipe for the lane while the delete saves.
+    const switching = w._saveLaneConfig([{ ...w._trackLayout[0], referenceRecipe: { ...laneRecipe(),
+      recipe_id: 'sonder:minimax_h3_picture' } }], { expectedLaneId: 'lane-image', undoLabel: 'change lane recipe' });
+    await release();
+    await deleting; await switching;
+    await settle(16);
+    await w._fetchReferences({ force: true, ignoreMutationGate: true, reason: 'decide' });
+    await settle(16);
+    return { lane: laneRecipe().recipe_id, server: (await serverLane()).recipe_id,
+      undo: w._undoStack.filter((entry) => entry.label === 'detach deleted recipe').length,
+      skipped: diag('recipe_detach_skipped').map((e) => e.reason ?? e.payload?.reason ?? e.data?.reason) };
+    """, tmp_path)
+    assert result["lane"] == result["server"] == "sonder:minimax_h3_picture"
+    assert result["undo"] == 0
+    assert result["skipped"] == ["recipe_changed"]
+
+
+def test_a_lost_recipe_delete_that_did_not_land_detaches_nothing(tmp_path):
+    result = run_library(_PHASE4 + """
+    await fork();
+    await settle(12);
+    """ + _recipe_expected() + """
+    libraryScripted.push({ kind: 'lost-before' });
+    await w._deleteReferenceRecipe({ recipeId: recipe.id, expected, detachLane: { laneId: 'lane-image' },
+      detach: async () => {} });
+    await settle(8);
+    const undoBefore = w._undoStack.length;
+    await w._fetchReferences({ force: true, ignoreMutationGate: true, reason: 'decide' });
+    await settle(16);
+    return { lane: laneRecipe().recipe_id === recipe.id, undo: w._undoStack.length - undoBefore };
+    """, tmp_path)
+    assert result == {"lane": True, "undo": 0}
+
+
+_ORDER = """
+const order = (scene = w.activeScene) => (scene.reference_items || []).map((row) => row.reference_item_id);
+const serverOrder = async () => order((await ask({ read: true, sceneId: 'scene' })).scene);
+const deleteMember = (key) => w._mutateReferencesPaintFirst([{ type: 'delete_member',
+  reference_id: 'entity-1', member_id: `member-${key}`, expected: libraryMember(`member-${key}`) }])
+  .catch((error) => error);
+"""
+
+
+@pytest.mark.parametrize("first,second", [("c", "s"), ("s", "c")])
+def test_two_refused_deletes_removing_rows_of_one_scene_restore_its_order(first, second, tmp_path):
+    """Each hold kept the index its row had when IT was removed, against an
+    array the other removal had already shortened. Restored one by one they
+    could come back in a different order from the server's, so a restore with
+    another removal of that scene still outstanding is left to the gated
+    scenes read, which is exact."""
+    result = run_library(_ORDER + f"""
+    hold(1);
+    libraryRefuseNext('identity_mismatch');
+    libraryRefuseNext('identity_mismatch');
+    const one = deleteMember('{first}');
+    const two = deleteMember('{second}');
+    const painted = order();
+    await release();
+    await one; await two;
+    await settle(16);
+    return {{ painted, local: order(), server: await serverOrder() }};
+    """, tmp_path)
+    assert result["painted"] == ["item-1"]
+    assert result["local"] == result["server"] == ["item-1", "item-2", "item-4"]
+
+
+def test_a_refused_panel_delete_beside_a_refused_library_delete_restores_the_order(tmp_path):
+    """The Lane Setup delete's hold follows the same rule."""
+    result = run_library(_ORDER + """
+    hold(1);
+    refuseNext('identity_mismatch');
+    libraryRefuseNext('identity_mismatch');
+    const deleting = w._deleteReferenceItemFromPanel('item-2');
+    const removing = deleteMember('s');
+    const painted = order();
+    await release();
+    await deleting; await removing;
+    await settle(16);
+    return { painted, local: order(), server: await serverOrder() };
+    """, tmp_path)
+    assert result["painted"] == ["item-1"]
+    assert result["local"] == result["server"] == ["item-1", "item-2", "item-4"]
+
+
+def test_a_detach_waits_for_a_recipe_edit_still_saving_and_copies_what_the_lane_holds(tmp_path):
+    """The detach copies the lane's recipe whole. A field edit still saving may
+    yet fail; copying its paint would save the value the author was told was
+    lost (the Phase 5 residual). The delete is acknowledged while an edit made
+    during its save is still queued and then refused: the detach waits for it.
+    (A lost answer is decided only once the queue drains, so the wait matters on
+    the acknowledged path.)"""
+    result = run_library(_PHASE4 + """
+    await fork();
+    await settle(12);
+    """ + _recipe_expected() + """
+    hold();  // the delete
+    const deleting = w._deleteReferenceRecipe({ recipeId: recipe.id, expected, detachLane: { laneId: 'lane-image' } });
+    refuseNext('identity_mismatch');
+    const editing = w._saveLaneConfig([{ ...w._trackLayout[0] }], { expectedLaneId: 'lane-image',
+      undoLabel: 'change lane recipe', rollbackRecipe: true, recipePatch: { hard: { max_members: 3 } } });
+    const painted = laneRecipe().recipe.hard?.max_members;
+    await release();
+    await deleting; await editing;
+    await settle(20);
+    const server = await serverLane();
+    return { painted, patch: w._laneRecipePatch, serverId: server.recipe_id,
+      serverMax: server.recipe.hard?.max_members ?? null, local: laneRecipe().recipe.hard?.max_members ?? null };
+    """, tmp_path)
+    assert result["patch"] is True and result["painted"] == 3
+    assert result["serverId"] == ""
+    assert result["serverMax"] is None and result["local"] is None
+
+
+def test_an_acknowledged_recipe_delete_detaches_the_named_lane_in_its_gesture(tmp_path):
+    """The host detaches the lane `detachLane` names, as the delete's own
+    gesture and its own Undo step, with no closure from the panel."""
+    result = run_library(_PHASE4 + """
+    await fork();
+    await settle(12);
+    """ + _recipe_expected() + """
+    const outcome = await w._deleteReferenceRecipe({ recipeId: recipe.id, expected,
+      detachLane: { laneId: 'lane-image' } });
+    await settle(12);
+    const deleteGesture = gestureOf.at(-2)?.[1], detachGesture = gestureOf.at(-1)?.[1];
+    return { outcome, lane: laneRecipe().recipe_id, server: (await serverLane()).recipe_id,
+      sameGesture: !!deleteGesture && deleteGesture === detachGesture,
+      undo: w._undoStack.filter((entry) => entry.label === 'detach deleted recipe').length };
+    """, tmp_path)
+    assert result == {"outcome": "ok", "lane": "", "server": "", "sameGesture": True, "undo": 1}

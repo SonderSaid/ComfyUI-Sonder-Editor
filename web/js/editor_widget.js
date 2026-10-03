@@ -3510,28 +3510,107 @@ export class EditorWidget {
         }], { label: "update custom Reference recipe" }).then(() => "ok", () => "failed");
     }
 
-    /** Lane Setup's Delete of a custom recipe: the removal paints first; the
-     *  lane's detach (`detach`, which re-reads the lane) runs only once the
-     *  delete is acknowledged, in the same gesture, so a refused delete leaves
-     *  the lane attached. */
+    /** Lane Setup's Delete of a custom recipe: the removal paints first, and
+     *  a refused delete leaves the lane attached.
+     *
+     *  `detachLane: { laneId }` names the lane that should fall back to
+     *  Detached once the delete lands: the lane the panel showed, when it named
+     *  the recipe. The host detaches it (`_detachDeletedRecipe`) once the
+     *  delete is acknowledged, in the same gesture, or -- when the answer is
+     *  lost and the deciding read says the delete landed -- in a gesture of its
+     *  own. One authority either way, which keeps working when the panel has
+     *  closed. `detach`, a caller's own closure run on acknowledgement, is the
+     *  older form, kept for a caller that names no lane. */
     _deleteReferenceRecipe(...args) {
         return this._withMutationGesture("deleteReferenceRecipe",
             (gesture) => this._deleteReferenceRecipeWithinGesture(gesture, ...args));
     }
 
-    async _deleteReferenceRecipeWithinGesture(gesture, { recipeId, expected, detach = null } = {}) {
+    async _deleteReferenceRecipeWithinGesture(gesture, {
+        recipeId, expected, detach = null, detachLane = null,
+    } = {}) {
+        const target = detachLane ? {
+            projectDir: this.projectDir, sceneId: String(this.activeSceneId || ""),
+            laneId: String(detachLane.laneId || "").trim(), recipeId: String(recipeId || ""),
+        } : null;
         try {
             await this._mutateReferencesPaintFirstWithinGesture([{
                 type: "delete_recipe", recipe_id: String(recipeId || ""), expected: structuredClone(expected),
-            }], { label: "delete custom Reference recipe" });
+            }], {
+                label: "delete custom Reference recipe",
+                onUnconfirmedResolved: target
+                    ? (saved) => { if (saved) void this._detachDeletedRecipe(target); } : null,
+            });
         } catch (_error) {
             return "failed";
         }
-        if (typeof detach === "function") {
+        if (target) {
+            await this._detachDeletedRecipe(target, { gestureId: gesture?.gestureId || "" });
+        } else if (typeof detach === "function") {
             await this._withMutationGesture("deleteReferenceRecipe", () => detach(),
                 gesture?.gestureId || "");
         }
         return "ok";
+    }
+
+    /** The detach a recipe delete owed its lane: on acknowledgement (in the
+     *  delete's gesture, `gestureId`), or once a lost answer is decided as
+     *  saved (in its own). Either way its own Undo step, "detach deleted
+     *  recipe": every lane-family write owns one (`durable_rules.md`).
+     *
+     *  Only in the project and scene the delete captured, on the lane it named
+     *  by durable id, and only while that lane still names the deleted recipe.
+     *  Anything else -- another project or scene shown, the lane gone or
+     *  without a durable id, another recipe picked meanwhile -- is left as it
+     *  is and records `recipe_detach_skipped {reason}`; a lane naming a deleted
+     *  recipe is tolerated at rest, as one deleted elsewhere is. A recipe field
+     *  edit still saving on the lane is waited for first, so the detach copies
+     *  what the lane holds, not a paint that may yet fail. It detaches whatever
+     *  the lock says: not an edit of the lane's values, the recipe it named is
+     *  gone. */
+    async _detachDeletedRecipe(target = {}, { gestureId = "" } = {}) {
+        if (!target.laneId) return this._skipRecipeDetach("no_lane_id");
+        if (!this.projectDir || this.projectDir !== target.projectDir
+                || this.activeSceneId !== target.sceneId) {
+            return this._skipRecipeDetach("scene_changed");
+        }
+        const index = this._laneIndexById(target.laneId);
+        if (index < 0) return this._skipRecipeDetach("lane_gone");
+        const saving = this._laneRecipeWritesIdle(index);
+        if (saving) await saving;
+        return this._withMutationGesture("detachDeletedRecipe",
+            () => this._detachDeletedRecipeWithinGesture(target), gestureId);
+    }
+
+    _detachDeletedRecipeWithinGesture({ projectDir, sceneId, laneId, recipeId } = {}) {
+        if (this.projectDir !== projectDir || this.activeSceneId !== sceneId) {
+            return this._skipRecipeDetach("scene_changed");
+        }
+        const index = this._laneIndexById(laneId);
+        const recipe = this.activeScene?.reference_lane_recipes?.[index];
+        const entry = (this._trackLayout || []).find((candidate) =>
+            candidate?.type === TRACK_TYPE.REFERENCE && (candidate.laneIndex || 0) === index);
+        if (index < 0 || !entry) return this._skipRecipeDetach("lane_gone");
+        if (String(recipe?.recipe_id || "") !== recipeId) return this._skipRecipeDetach("recipe_changed");
+        // The lane keeps its materialized values and falls back to Detached.
+        return this._saveLaneConfigWithinGesture(
+            [{ ...entry, referenceRecipe: { ...structuredClone(recipe), recipe_id: "" } }],
+            { expectedLaneId: laneId, undoLabel: "detach deleted recipe", rollbackRecipe: true })
+            .then(() => "detached");
+    }
+
+    _skipRecipeDetach(reason) {
+        // A reason CODE, never contents (`durable_rules.md`, diagnostics).
+        sessionDiagRecord("recipe_detach_skipped", { reason });
+        return "skipped";
+    }
+
+    /** The active scene's Reference lane with durable id `laneId`, or -1. */
+    _laneIndexById(laneId) {
+        const id = String(laneId || "").trim();
+        if (!id) return -1;
+        return (this.activeScene?.reference_lane_recipes || [])
+            .findIndex((recipe) => String(recipe?.lane_id || "").trim() === id);
     }
 
     /** The Prompt panel's delete of a custom prompt format. Server-first: a
@@ -4153,14 +4232,19 @@ export class EditorWidget {
         for (const hold of removed) {
             const rows = hold.scene?.reference_items;
             const current = this._sceneObjectCurrent(hold.scene) && Array.isArray(rows);
-            const back = current && !hold.voided && code !== "item_not_found"
+            // Another removal from this scene still outstanding kept its index
+            // against a different array: restoring one by one could reorder
+            // the rows. The gated scenes read is exact.
+            const crowded = current && this._referenceRemovalPending(state, hold.scene);
+            const back = current && !hold.voided && code !== "item_not_found" && !crowded
                 && !rows.some((row) => row?.reference_item_id === hold.itemId);
             if (back) {
                 rows.splice(Math.min(hold.index, rows.length), 0, hold.row);
                 restored = true;
             } else {
                 deferred ||= hold.voided ? "voided" : (!current ? "scene_replaced"
-                    : (code === "item_not_found" ? "item_not_found" : "row_present"));
+                    : (code === "item_not_found" ? "item_not_found"
+                        : (crowded ? "removal_pending" : "row_present")));
             }
         }
         if (restored) {
@@ -4173,6 +4257,26 @@ export class EditorWidget {
             this._historyOrderContextCascade(cascade.removed, { vouched: false });
             this._deferProjectBackedRefresh(["scenes"], "reference_cascade_heal");
         }
+    }
+
+    /** Whether a removal of a Reference row from `scene` is still outstanding:
+     *  a Lane Setup Delete item (`deleteHolds`) or a Library delete's cascade
+     *  (`cascadeHolds`, removed rows) not yet settled. A refused removal puts
+     *  its row back at the index it had when IT was removed; while another is
+     *  outstanding that index was taken against a different array, so the
+     *  restore is left to the gated scenes read instead. Rare: it takes two
+     *  overlapping removals both refused. The caller's own hold has already
+     *  been released. */
+    _referenceRemovalPending(state, scene) {
+        // A voided hold's row never comes back (its create failed), so it
+        // cannot shift another row's index.
+        for (const hold of state?.deleteHolds?.values?.() || []) {
+            if (hold.scene === scene && !hold.voided) return true;
+        }
+        for (const hold of state?.cascadeHolds || []) {
+            if (hold.kind === "removed" && hold.scene === scene && !hold.voided) return true;
+        }
+        return false;
     }
 
     /** Whether a Library delete in flight is taking this member away: the
@@ -7198,7 +7302,10 @@ export class EditorWidget {
         const restore = (reason, { unconfirmed = false } = {}) => {
             releaseHold();
             const current = this._sceneObjectCurrent(scene);
-            const back = current && !hold.voided
+            // Another removal from this scene still outstanding: see
+            // `_referenceRemovalPending`; the gated read restores the order.
+            const crowded = current && this._referenceRemovalPending(state, scene);
+            const back = current && !hold.voided && !crowded
                 && !(scene.reference_items || []).some((candidate) => candidate?.reference_item_id === id)
                 && reason !== "item_not_found";
             if (back) {
@@ -7208,8 +7315,12 @@ export class EditorWidget {
                 // A reason CODE, never contents (`durable_rules.md`, diagnostics).
                 sessionDiagRecord("reference_delete_rollback_deferred", {
                     reason: hold.voided ? "voided" : (!current ? "scene_replaced"
-                        : (reason === "item_not_found" ? "item_not_found" : "row_present")),
+                        : (reason === "item_not_found" ? "item_not_found"
+                            : (crowded ? "removal_pending" : "row_present"))),
                 });
+            }
+            if (crowded && !hold.voided && this.projectDir === projectDir) {
+                this._deferProjectBackedRefresh(["scenes"], "reference_cascade_heal");
             }
             // No answer, or a scene the server has replaced since: the local row
             // may not be what the server holds. Heal by the gated refresh, which
@@ -11612,6 +11723,7 @@ export class EditorWidget {
                         if (edgeHit.type === "prompt" && this._isPromptTrackLocked()) return;
                         if (edgeHit.type === "reference" && this._isLaneLocked(TRACK_TYPE.REFERENCE, edgeHit.data.lane_index || 0)) return;
                         if (this._refusePastEndReferenceTrim(edgeHit)) return;
+                        if (this._refuseReferenceItemSaving([edgeHit])) return;
                         const historyEntry = this._pushUndo("trim");
                         const isSourceLess = edgeHit.type === "prompt" || edgeHit.type === "reference";
                         const trimOrigStart = isSourceLess ? edgeHit.data.start_frame : edgeHit.data.timeline_start_frame;
@@ -11692,7 +11804,13 @@ export class EditorWidget {
                         // Still armed when refused, so a click selects and opens
                         // the editor as usual; only movement is withheld.
                         const dragRefusal = this._pastEndReferenceDragRefusal(this.selectedItems);
-                        this._dragRefusal = dragRefusal ? { message: dragRefusal, shown: false } : null;
+                        const savingRefusal = dragRefusal ? ""
+                            : this._referenceItemSavingRefusal(this.selectedItems);
+                        this._dragRefusal = dragRefusal
+                            ? { message: dragRefusal, source: "reference-drag-past-end", shown: false }
+                            : (savingRefusal
+                                ? { message: savingRefusal, source: "reference-item-saving", shown: false }
+                                : null);
                         this.isDragging = true;
                         this.dragType = "moveItem";
                         this._dragStartFrame = frame;
@@ -11901,7 +12019,7 @@ export class EditorWidget {
                 // Nothing moves; the snapped delta stays 0, so mouseup reads a click.
                 if (!this._dragRefusal.shown && frame !== this._dragStartFrame) {
                     this._dragRefusal.shown = true;
-                    notifyWarning(this._dragRefusal.message, { source: "reference-drag-past-end" });
+                    notifyWarning(this._dragRefusal.message, { source: this._dragRefusal.source });
                 }
             } else if (this.dragType === "moveItem" && this.selectedItems.length > 0) {
                 canvas.style.cursor = "grabbing";
@@ -19607,6 +19725,21 @@ export class EditorWidget {
 
     async _moveItemToFrameWithinGesture(type, id, data, newStart) {
         if (!this.activeScene || !this.projectDir) return;
+        // Attributed to the gesture that started now; after a wait the ambient
+        // gesture is gone.
+        const diagnostics = this._snapshotMutationDiagnostics?.() ?? null;
+        if (type === "reference" && this._referenceItemWriteBarriers([{ type, id }]).length) {
+            // A write the mirror could not paint is settling on this item (D5).
+            // Its answer may replace the row this move would paint over, so
+            // wait for it; another project or scene shown meanwhile ends the
+            // move. The guard stays what the author saw -- the range, which a
+            // member write does not change -- and the paint finds the row by id.
+            if (!(await this._awaitReferenceItemWriteBarriers([{ type, id }]))) return;
+            // The open item editor was built on a row the answer's reconcile
+            // may have replaced, and a second Start from it would guard
+            // against a stale range. The move closes it on success anyway.
+            this._hideItemEditor();
+        }
         const hit = { type, id, data };
         // Backstop for any caller: the item's own lane, before Undo or paint.
         // No caller pushes an entry for this path (it pushes its own below), so
@@ -19667,6 +19800,7 @@ export class EditorWidget {
                 key: `${type}:${id}:timeline`,
                 label: "move item",
                 coalesce: false,
+                diagnostics,
                 // The lock and prompt-range checks stay on the server, so a
                 // refusal has to name which one refused rather than be replaced
                 // by the generic toast. NOT the lane-fit check: this operation
@@ -20609,6 +20743,25 @@ export class EditorWidget {
         }
     }
 
+    /** Why a drag or trim of these items may not start now, or "": a Reference
+     *  item among them has a write the mirror could not paint still settling
+     *  (`_referenceItemWriteBarriers`). Its answer may replace the row the
+     *  gesture would drag (D5). The gesture is under the pointer, so it says
+     *  why rather than waiting; a drag or trim after the answer works. */
+    _referenceItemSavingRefusal(items) {
+        const pressed = (items || []).map((item) => ({ type: item?.type, id: item?.id }));
+        return this._referenceItemWriteBarriers(pressed).length
+            ? "This Reference item is still saving. Try again in a moment." : "";
+    }
+
+    /** `_referenceItemSavingRefusal`, said; for a trim, before its Undo step.
+     *  Returns true when refused. */
+    _refuseReferenceItemSaving(items) {
+        const refusal = this._referenceItemSavingRefusal(items);
+        if (refusal) notifyWarning(refusal, { source: "reference-item-saving" });
+        return !!refusal;
+    }
+
     /** Refuse a right-edge trim of a Reference item starting at or past the
      *  scene end, before it pushes Undo or paints. Returns true when refused.
      *
@@ -21509,6 +21662,17 @@ export class EditorWidget {
                 { source: "timeline-split-refused:empty-selection" });
             return;
         }
+        // Attributed to the gesture that started now; after a wait the ambient
+        // gesture is gone.
+        const diagnostics = this._snapshotMutationDiagnostics?.() ?? null;
+        // D5: a Reference item with a write the mirror could not paint still
+        // settling -- or another member edit parked behind it -- waits for
+        // them, so the cut is sent after every edit made while the item was
+        // whole and both halves carry them, and the Undo entry below snapshots
+        // the answered row. Planning re-resolves each target by id.
+        const pressed = targets.map((hit) => ({ type: hit?.type, id: hit?.id }));
+        if (this._referenceItemWriteBarriers(pressed).length
+                && !(await this._awaitReferenceItemWriteBarriers(pressed))) return;
         const plans = targets.map((hit) => this._planItemSplit(hit, frame));
 
         // One operation per link CLOSURE, not per target. `_apply_split_linked`
@@ -21577,6 +21741,7 @@ export class EditorWidget {
             const result = await this._runSceneMutation(operations, {
                 key: `scene:${sceneId}:split:${Date.now()}`,
                 label,
+                diagnostics,
                 // The key already uniquifies, so this states the decision rather
                 // than creating it: under a stable key the queue would REPLACE a
                 // pending cut and settle both waiters from the second result,

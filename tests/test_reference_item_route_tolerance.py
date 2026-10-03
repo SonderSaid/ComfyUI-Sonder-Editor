@@ -297,3 +297,22 @@ def test_a_left_trim_sending_both_bounds_keeps_the_end_it_did_not_change():
                       "expected": {"start_frame": 80, "end_frame": 150}}])
     after = _item(_saved(project), "item-1")
     assert (after.start_frame, after.end_frame) == (85, 150)
+
+
+# -- Phase 6 (D5): an unpainted write and the bounds ---------------------------------
+
+@pytest.mark.parametrize("start,end", [(80, 120), (110, 130), (60, -1), (10, 40)])
+def test_a_member_write_keeps_both_stored_bounds(start, end):
+    """What the editor sends unpainted -- an authored member role or retention --
+    names neither bound, so it leaves both as stored, even on an item straddling
+    the scene end, lying past it, or running to it (`-1`). This is why the
+    timeline's move, trim and split need not wait on such a write for their
+    range: the guards cover only a write that names one."""
+    project = _project([_row("item-1", start, end, [_member("a"), _member("b")])])
+    stored = _item(project, "item-1").to_dict()["members"]
+    authored = [{**stored[0], "visual_intent": "partial"}, stored[1]]
+    _batch(project, [{"type": "update_reference_item", "reference_item_id": "item-1",
+                      "fields": {"members": authored}, "expected": {"members": stored}}])
+    row = _item(project, "item-1")
+    assert (row.start_frame, row.end_frame) == (start, end)
+    assert row.members[0]["visual_intent"] == "partial"
