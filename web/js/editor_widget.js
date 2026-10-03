@@ -509,6 +509,7 @@ import {
     chromeSelectCss,
     lightenColor,
     scaleColor,
+    setButtonDisabled,
 } from "./editor_theme.js";
 import {
     buildEditorSceneBar,
@@ -6944,6 +6945,11 @@ export class EditorWidget {
     async _writeGuideFieldFromPanel(live, expected, props, undoLabel) {
         const scene = this.activeScene;
         if (!scene || !live) return "refused";
+        // Read live: the popup's own lock read is from when it was built.
+        if (this._isGuideTrackLocked()) {
+            notifyWarning("Guide track is locked.", { source: "guide-edit-locked" });
+            return "refused";
+        }
         if ("muted" in props && this._linkedMuteBlocked("guide", live.frame_index)) {
             notifyWarning("Linked mute refused because one or more linked items are locked.",
                 { source: "timeline-mute-refused" });
@@ -10813,6 +10819,17 @@ export class EditorWidget {
 
     // ── Timeline Rendering ─────────────────────────────────────────────
     _renderTimeline() {
+        // The item editor follows the lock its item derives NOW. Every lock
+        // change -- the header toggle, bulk lock, a menu, Undo or Redo, a scenes
+        // read bringing another writer's lock, history replacement -- repaints
+        // the timeline, and the header toggle writes the layout entry in place
+        // without a layout rebuild, so this structural render is the one point
+        // they all pass. Re-rendering the editor renders the timeline itself.
+        if (this._itemEditorEl && this._isItemEditorFor(this.selectedItem)
+            && this._itemEditorLocked !== !!this._isItemLocked(this.selectedItem)) {
+            this._showItemEditor();
+            return null;
+        }
         return this._paintTimelineFrame(false);
     }
 
@@ -18942,9 +18959,16 @@ export class EditorWidget {
     _showItemEditor() {
         this._hideItemEditor();
         if (!this.selectedItem) return;
+        // Clips, audio, Reference items and guides only. Anything else used to
+        // fall through to the guide branch's label with a live Delete.
+        if (!["clip", "audio", "reference", "guide"].includes(this.selectedItem.type)) return;
 
         const { type, id, data } = this.selectedItem;
+        const locked = !!this._isItemLocked(this.selectedItem);
+        const editTarget = { type, id, data };
+        const refuseLocked = () => this._refuseLockedItemEdit(editTarget);
         const isMotionDriverClip = type === "clip" && this._isMotionDriverClip(data);
+        let setupBtnForLock = null;
         const editorAccent = type === "clip"
             ? (isMotionDriverClip ? COLORS.motionDriverSelected : COLORS.clipSelected)
             : type === "audio"
@@ -18966,6 +18990,11 @@ export class EditorWidget {
             ? (isMotionDriverClip ? "Driver" : "Video Clip")
             : type === "audio" ? "Audio Track" : type === "reference" ? "Reference" : "Guide Frame";
         editor.appendChild(typeLabel);
+        if (locked) {
+            const lockNote = this._makeEditorLabel("(locked) Unlock the lane to edit.");
+            lockNote.style.color = COLORS.textDim;
+            editor.appendChild(lockNote);
+        }
 
         if (type === "clip" || type === "audio" || type === "reference") {
             const startFrame = type === "reference" ? (data.start_frame || 0) : data.timeline_start_frame;
@@ -18993,6 +19022,7 @@ export class EditorWidget {
                 // derived text this override replaces. A bare input here could only
                 // ever offer the override half of that contract.
                 const setupBtn = this._makeBtn("Lane Setup…", "Recipe, staged members and prompt for this Reference lane");
+                setupBtnForLock = setupBtn;
                 setupBtn.addEventListener("click", () => {
                     const laneEntry = (this._trackLayout || []).find((entry) =>
                         entry.type === TRACK_TYPE.REFERENCE && (entry.laneIndex || 0) === (data.lane_index || 0));
@@ -19000,6 +19030,7 @@ export class EditorWidget {
                 });
                 const muteBtn = this._makeBtn(data.muted ? "Muted" : "Active", "Toggle reference item");
                 muteBtn.addEventListener("click", () => {
+                    if (refuseLocked()) return;
                     this._pushUndo("toggle reference mute");
                     const nextMuted = !data.muted;
                     this._updateItemProperty(type, id, { muted: nextMuted });
@@ -19011,8 +19042,12 @@ export class EditorWidget {
                 const strengthInput = this._makeEditorInput((Number(data.strength ?? 1)).toFixed(2), 0, 1);
                 strengthInput.step = "0.05";
                 strengthInput.addEventListener("change", async () => {
-                    const strength = Math.max(0, Math.min(1, Number(strengthInput.value)));
                     const previous = Number(data.strength ?? 1);
+                    if (refuseLocked()) {
+                        strengthInput.value = previous.toFixed(2);
+                        return;
+                    }
+                    const strength = Math.max(0, Math.min(1, Number(strengthInput.value)));
                     if (!Number.isFinite(strength) || strength === previous) {
                         strengthInput.value = previous.toFixed(2);
                         return;
@@ -19030,6 +19065,10 @@ export class EditorWidget {
                     const strengthInput = this._makeEditorInput((data.strength ?? 1.0).toFixed(2), 0, 1);
                     strengthInput.step = "0.05";
                     strengthInput.addEventListener("change", () => {
+                        if (refuseLocked()) {
+                            strengthInput.value = (data.strength ?? 1.0).toFixed(2);
+                            return;
+                        }
                         const strength = Math.max(0, Math.min(1, parseFloat(strengthInput.value)));
                         if (Number.isFinite(strength)) {
                             data.strength = strength;
@@ -19049,18 +19088,24 @@ export class EditorWidget {
                     const opVal = this._makeEditorLabel(`${opInput.value}%`);
                     opVal.style.minWidth = "28px";
                     opInput.addEventListener("input", () => {
+                        if (refuseLocked()) {
+                            opInput.value = Math.round((data.opacity ?? 1.0) * 100);
+                            return;
+                        }
                         opVal.textContent = `${opInput.value}%`;
                         opInput.title = `Opacity: ${opInput.value}%`;
                         data.opacity = parseInt(opInput.value) / 100;
                         this._renderTimeline();
                     });
                     opInput.addEventListener("change", () => {
+                        if (this._isItemLocked(editTarget)) return;
                         this._updateItemProperty(type, id, { opacity: parseInt(opInput.value) / 100 });
                     });
                     editor.append(opLabel, opInput, opVal);
                 }
                 const clipMuteBtn = this._makeBtn(data.muted ? "Hidden" : "Visible", "Toggle clip visibility");
                 clipMuteBtn.addEventListener("click", () => {
+                    if (refuseLocked()) return;
                     this._pushUndo("toggle clip mute");
                     data.muted = !data.muted;
                     clipMuteBtn.textContent = data.muted ? "Hidden" : "Visible";
@@ -19082,18 +19127,24 @@ export class EditorWidget {
                 const volVal = this._makeEditorLabel(`${volInput.value}%`);
                 volVal.style.minWidth = "28px";
                 volInput.addEventListener("input", () => {
+                    if (refuseLocked()) {
+                        volInput.value = Math.round((data.volume ?? 1.0) * 100);
+                        return;
+                    }
                     volVal.textContent = `${volInput.value}%`;
                     volInput.title = `Volume: ${volInput.value}%`;
                     data.volume = parseInt(volInput.value) / 100;
                     this._renderTimeline();
                 });
                 volInput.addEventListener("change", () => {
+                    if (this._isItemLocked(editTarget)) return;
                     this._updateItemProperty(type, id, { volume: parseInt(volInput.value) / 100 });
                 });
 
                 // Mute toggle
                 const muteBtn = this._makeBtn(data.muted ? "🔇" : "🔊", "Toggle mute");
                 muteBtn.addEventListener("click", () => {
+                    if (refuseLocked()) return;
                     this._pushUndo("toggle mute");
                     data.muted = !data.muted;
                     muteBtn.textContent = data.muted ? "🔇" : "🔊";
@@ -19104,23 +19155,20 @@ export class EditorWidget {
                 editor.append(volLabel, volInput, volVal, muteBtn);
             }
 
-            // Apply button
+            // Apply button and Enter share one commit, refusals included.
+            const commitStart = () => {
+                if (refuseLocked()) return;
+                const newStart = this._parseItemEditorPosition(startInput, startFrame, "Start");
+                if (newStart !== null) this._moveItemToFrame(type, id, data, newStart);
+            };
             const applyBtn = this._makeBtn("Apply", "Apply timeline position");
-            applyBtn.addEventListener("click", () => {
-                const newStart = this._parsePositionInput(startInput.value);
-                if (!isNaN(newStart) && newStart >= 0) {
-                    this._moveItemToFrame(type, id, data, newStart);
-                }
-            });
+            applyBtn.addEventListener("click", commitStart);
             editor.appendChild(applyBtn);
 
             // Enter key in input
             startInput.addEventListener("keydown", (e) => {
                 if (e.key === "Enter") {
-                    const newStart = this._parsePositionInput(startInput.value);
-                    if (!isNaN(newStart) && newStart >= 0) {
-                        this._moveItemToFrame(type, id, data, newStart);
-                    }
+                    commitStart();
                 } else if (e.key === "Escape") {
                     this._hideItemEditor();
                     this._clearSelection();
@@ -19159,6 +19207,7 @@ export class EditorWidget {
 
             const guideMuteBtn = this._makeBtn(data.muted ? "Hidden" : "Visible", "Toggle guide visibility");
             guideMuteBtn.addEventListener("click", () => {
+                if (refuseLocked()) return;
                 this._pushUndo("toggle guide mute");
                 data.muted = !data.muted;
                 guideMuteBtn.textContent = data.muted ? "Hidden" : "Visible";
@@ -19170,9 +19219,10 @@ export class EditorWidget {
             this._appendFitModeControls(editor, type, id, data);
 
             const applyGuideEdit = () => {
-                const newIdx = this._parsePositionInput(frameInput.value);
+                if (refuseLocked()) return;
+                const newIdx = this._parseItemEditorPosition(frameInput, idx, "Frame");
                 const strength = Math.max(0, Math.min(1, parseFloat(strengthInput.value)));
-                if (!isNaN(newIdx) && newIdx >= 0 && !isNaN(strength)) {
+                if (newIdx !== null && !isNaN(strength)) {
                     this._moveGuideToFrame(data, newIdx, strength);
                 }
             };
@@ -19206,15 +19256,40 @@ export class EditorWidget {
         }
 
         // Delete button (always present)
-        const deleteBtn = this._makeBtn("Delete", "Delete this item");
+        const deleteBtn = this._makeBtn(locked ? "Delete (locked)" : "Delete", "Delete this item");
         setButtonVariant(deleteBtn, "danger");
         deleteBtn.dataset.sonderHoverVariant = "danger";
         deleteBtn.addEventListener("click", () => this._deleteSelectedItems());
         editor.appendChild(deleteBtn);
 
+        if (locked) {
+            // Read-only: every value control and button but Lane Setup, which
+            // has its own lock handling. Each handler also refuses first, so a
+            // lock arriving between renders still paints nothing.
+            for (const control of editor.children) {
+                if (control === setupBtnForLock) continue;
+                const tag = String(control?.tagName || "").toUpperCase();
+                if (tag === "INPUT" || tag === "SELECT" || tag === "BUTTON") {
+                    control.title = "Unlock the lane to edit.";
+                }
+                if (tag === "INPUT" || tag === "SELECT") {
+                    // Inline-styled, so `disabled` alone changes nothing visible.
+                    control.disabled = true;
+                    control.style.opacity = "0.42";
+                    control.style.cursor = "not-allowed";
+                } else if (tag === "BUTTON") {
+                    setButtonDisabled(control, true);
+                    // `_makeBtn`'s hover handler would still light it up.
+                    control.dataset.sonderHoverVariant = control.dataset.sonderBaseVariant || "muted";
+                }
+            }
+        }
+
         // Insert after timeline canvas
         this.timelineCanvas.parentElement.insertBefore(editor, this.timelineCanvas.nextSibling);
         this._itemEditorEl = editor;
+        this._itemEditorLocked = locked;
+        this._itemEditorItem = { type, id };
         this._refreshTimelineLayout();
     }
 
@@ -19222,6 +19297,8 @@ export class EditorWidget {
         if (this._itemEditorEl) {
             this._itemEditorEl.remove();
             this._itemEditorEl = null;
+            this._itemEditorLocked = null;
+            this._itemEditorItem = null;
             this._refreshTimelineLayout();
         }
     }
@@ -19231,6 +19308,61 @@ export class EditorWidget {
             this._recalcFullscreenHeights();
         }
         this._renderTimeline();
+    }
+
+    /** Whether the open item editor was built for `item` (type and id). A
+     *  selection that moved elsewhere -- a right-click selects without opening
+     *  an editor -- is not the editor's item, so a lock read from it must not
+     *  rebuild the editor around it.
+     */
+    _isItemEditorFor(item) {
+        const shown = this._itemEditorItem;
+        return !!(shown && item && shown.type === item.type && String(shown.id) === String(item.id));
+    }
+
+    /** Refuse an edit to an item on a locked lane. Returns true when refused.
+     *
+     *  The item editor's controls call this before they push Undo or paint, and
+     *  the two write paths every editor control reaches call it as a backstop,
+     *  discarding the Undo entry their caller pushed for them (`discardUndo`).
+     *  Only the item's own lane is read: an unlocked item with a locked linked
+     *  partner stays editable, and the linked refusal answers for the group.
+     */
+    _refuseLockedItemEdit(item, { discardUndo = false } = {}) {
+        if (!item || !this._isItemLocked(item)) return false;
+        if (discardUndo) this._discardUnstampableUndoEntry(this._historyPostSnapshotCaptureCandidate);
+        notifyWarning("This item is on a locked lane. Unlock the lane to edit it.",
+            { source: "timeline-item-locked" });
+        if (this._itemEditorEl && this._isItemEditorFor(item) && this._isItemEditorFor(this.selectedItem)) {
+            this._showItemEditor();
+        }
+        return true;
+    }
+
+    /** The frame an item editor position field holds, or null after refusing.
+     *
+     *  An unreadable or negative value was dropped in silence, leaving the typed
+     *  text in the field with nothing written (#125). Each refusal now says
+     *  which, and restores the field to `current`. Frames mode rounds half-up,
+     *  as the timecode branch's seconds-to-frames conversion already does.
+     */
+    _parseItemEditorPosition(input, current, fieldName = "Start") {
+        const numeric = evalNumericExpression(input?.value);
+        const refuse = (message, source) => {
+            notifyWarning(message, { source });
+            if (input) input.value = this._formatPositionInput(current);
+            return null;
+        };
+        if (!Number.isFinite(numeric)) {
+            return refuse(this._timecodeMode === "timecode"
+                ? `${fieldName} must be a time in seconds.`
+                : `${fieldName} must be a frame number.`, "item-editor-position-unreadable");
+        }
+        if (numeric < 0) {
+            return refuse(`${fieldName} cannot be before the start of the scene.`,
+                "item-editor-position-negative");
+        }
+        return this._timecodeMode === "timecode" ? this._secondsToFrames(numeric) : Math.round(numeric);
     }
 
     _makeEditorLabel(text) {
@@ -19284,13 +19416,21 @@ export class EditorWidget {
         };
         syncCropVisibility();
 
+        const refuseLocked = () => {
+            if (!this._refuseLockedItemEdit({ type, id, data })) return false;
+            fitSelect.value = VALID_FIT_MODES.has(data.fit_mode) ? data.fit_mode : "pad_edge";
+            cropSelect.value = VALID_CROP_POSITIONS.has(data.crop_position) ? data.crop_position : "center";
+            return true;
+        };
         fitSelect.addEventListener("change", () => {
+            if (refuseLocked()) return;
             const value = VALID_FIT_MODES.has(fitSelect.value) ? fitSelect.value : "pad_edge";
             data.fit_mode = value;
             syncCropVisibility();
             this._updateItemProperty(type, id, { fit_mode: value });
         });
         cropSelect.addEventListener("change", () => {
+            if (refuseLocked()) return;
             const value = VALID_CROP_POSITIONS.has(cropSelect.value) ? cropSelect.value : "center";
             data.crop_position = value;
             this._updateItemProperty(type, id, { crop_position: value });
@@ -19307,6 +19447,10 @@ export class EditorWidget {
     async _moveItemToFrameWithinGesture(type, id, data, newStart) {
         if (!this.activeScene || !this.projectDir) return;
         const hit = { type, id, data };
+        // Backstop for any caller: the item's own lane, before Undo or paint.
+        // No caller pushes an entry for this path (it pushes its own below), so
+        // there is none to discard.
+        if (this._refuseLockedItemEdit(this._findSceneItemBySelection(type, id) || hit)) return;
         const applyLinked = this._shouldApplyLinked(hit);
         if (applyLinked && this._expandItemsWithLinked([hit]).some((item) => this._isItemLocked(item))) {
             notifyWarning("Move refused because one or more linked items are locked.", { source: "timeline-move-refused" });
@@ -19411,6 +19555,17 @@ export class EditorWidget {
         failureMessage = null, failureDetail = null,
     } = {}) {
         if (!this.activeScene || !this.projectDir) return "refused";
+        // Backstop for every property and caller, before anything is built or
+        // painted here. It runs in the caller's synchronous turn (the gesture
+        // wrapper invokes this directly), so the Undo entry the caller pushed is
+        // still the capture candidate it discards. Limit: a caller that pushes
+        // none (Fit, Crop, opacity, volume, driver strength) has nothing to
+        // discard, and only an unstamped entry another gesture pushed in this
+        // same synchronous turn could be taken instead -- the linked-mute path
+        // below has always relied on the same window.
+        if (this._refuseLockedItemEdit(this._findSceneItemBySelection(type, id), { discardUndo: true })) {
+            return "refused";
+        }
         const guideCaller = type === "guide" && expected && typeof expected === "object";
         const guideMatches = !guideCaller || !!this._guideMatchingIdentity(id, expected);
         // Linked mute propagation (manual-test #7): muting one linked member mutes
@@ -22107,6 +22262,11 @@ export class EditorWidget {
                 const expected = this._guideIdentityForAction(guide);
                 if (!expected) {
                     if (onDone) await onDone();
+                    return;
+                }
+                // The lock may have arrived while the picker was open.
+                if (this._isGuideTrackLocked()) {
+                    notifyWarning("Guide track is locked.", { source: "guide-replace-locked" });
                     return;
                 }
                 this._pushUndo("replace guide");

@@ -1508,6 +1508,14 @@ COALESCE_WITHOUT_MERGE_REVIEWED: dict = {}
 _FORWARDING_SCOPES = frozenset({
     "_runSceneMutation", "_queueProjectMutation", "_runQueueMutation"})
 
+# Scopes that build controls whose LISTENERS write, and send nothing when
+# called. `_renderTimeline` re-renders the item editor when its item's lock
+# changes (backlog step 1, Phase 4), so without this every gesture that repaints
+# the timeline read as building its payload through the editor's buttons. Only
+# the transitive hop is withheld: an operation literal written in the scope's
+# own body still makes it an emitter.
+_LISTENER_ONLY_SCOPES = frozenset({"_showItemEditor"})
+
 # A receiver is required. `_queueProjectMutation({` -- the declaration itself --
 # otherwise matches, and reads as a call site with no enclosing scope.
 _ENQUEUE_RE = re.compile(r"\.\s*(_runSceneMutation|_queueProjectMutation)\s*\(")
@@ -4800,7 +4808,7 @@ def _operation_emitting_scopes(sources: tuple) -> dict:
         while changed:
             changed = False
             for name, called in bodies.items():
-                if name in _FORWARDING_SCOPES:
+                if name in _FORWARDING_SCOPES or name in _LISTENER_ONLY_SCOPES:
                     continue        # never re-admitted by the closure either
                 if name not in emitters and called & emitters:
                     emitters.add(name)
