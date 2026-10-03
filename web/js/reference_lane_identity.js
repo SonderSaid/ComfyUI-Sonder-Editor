@@ -1,5 +1,6 @@
 // @server-mirror server/minimax_h3.py::lane_population
 // @server-mirror server/routes.py::member_population_compatible
+// @server-mirror server/routes.py::_patched_reference_lane_recipe
 // Scope and parity disposition: tests/test_mutation_authoring_contract.py::MIRRORED_MODULES
 /** Pure Reference-lane identity rules shared by the panel and node tests. */
 
@@ -9,6 +10,43 @@ export function preserveLaneRecipeIdentity(currentRecipe, nextRecipe, fallbackLa
         ...(nextRecipe || {}),
         ...(laneId ? { lane_id: laneId } : {}),
     };
+}
+
+/** A recipe patch's prior value for a key the lane's recipe does not hold. */
+export const RECIPE_PATCH_ABSENT = Object.freeze({ $absent: true });
+
+const isPlainObject = (value) => !!value && typeof value === "object" && !Array.isArray(value);
+
+/**
+ * One recipe field edit, `{ hard?: {key: value}, soft?: {key: value} }`, read
+ * against the lane recipe it is painted onto.
+ *
+ * Returns the patch, the priors that guard it (each patched key's value as the
+ * author saw it, or `RECIPE_PATCH_ABSENT`), and the lane recipe the server
+ * stores once it applies the patch, which is what the editor paints. A section
+ * the recipe holds as something other than an object cannot be patched (the
+ * server refuses `reference_recipe_unpatchable`), so `patchable` is false and
+ * `recipe` replaces that section, as a whole-value write does.
+ *
+ * Mirrors the merge in `_patched_reference_lane_recipe`, not the load-time
+ * repairs `ReferenceLaneRecipe.from_dict` also runs: a lane recipe the editor
+ * holds has already been through them.
+ */
+export function laneRecipePatchPlan(laneRecipe, patch) {
+    const recipe = isPlainObject(laneRecipe?.recipe) ? laneRecipe.recipe : {};
+    const next = { ...recipe };
+    const priors = {};
+    let patchable = true;
+    for (const [section, values] of Object.entries(patch || {})) {
+        const stored = Object.hasOwn(recipe, section) ? recipe[section] : {};
+        const current = isPlainObject(stored) ? stored : {};
+        if (!isPlainObject(stored)) patchable = false;
+        priors[section] = Object.fromEntries(Object.keys(values).map((key) => [key,
+            Object.hasOwn(current, key) ? structuredClone(current[key]) : { ...RECIPE_PATCH_ABSENT }]));
+        next[section] = { ...current, ...structuredClone(values) };
+    }
+    return { patchable, patch: structuredClone(patch || {}), priors,
+        recipe: { ...(laneRecipe || {}), recipe: next } };
 }
 
 /** Advisories whose truth depends only on the materialized recipe shape. */

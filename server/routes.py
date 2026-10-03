@@ -2486,6 +2486,94 @@ def _replace_reference_lane_recipes(scene: Scene, raw_recipes) -> None:
 _REFERENCE_RECIPE_PRESET_IDS = frozenset(
     str(preset["id"]) for preset in ALL_REFERENCE_RECIPE_PRESETS)
 
+# A recipe patch's prior value for a key the stored section does not hold.
+_RECIPE_PATCH_ABSENT = {"$absent": True}
+# Every `(section, key)` a recipe declares; a patch names nothing else.
+_RECIPE_PATCH_KEYS = frozenset(
+    (str(field["section"]), str(field["key"])) for field in REFERENCE_RECIPE_FIELDS)
+
+
+def _recipe_patch_value_equal(stored, prior) -> bool:
+    """Whether a stored recipe value is the value a patch's author saw.
+
+    Compared as JSON values: the editor spells a stored `24.0` as `24`, so
+    numbers compare by value, but a boolean never equals a number, as Python's
+    `True == 1` would have it.
+    """
+    if isinstance(stored, bool) or isinstance(prior, bool):
+        return isinstance(stored, bool) and isinstance(prior, bool) and stored == prior
+    if isinstance(stored, (int, float)) and isinstance(prior, (int, float)):
+        return stored == prior
+    if isinstance(stored, list) and isinstance(prior, list):
+        return len(stored) == len(prior) and all(
+            _recipe_patch_value_equal(left, right) for left, right in zip(stored, prior))
+    if isinstance(stored, dict) and isinstance(prior, dict):
+        return stored.keys() == prior.keys() and all(
+            _recipe_patch_value_equal(stored[key], prior[key]) for key in stored)
+    return type(stored) is type(prior) and stored == prior
+
+
+def _reference_recipe_patch(raw_patch, expected) -> tuple[dict, dict]:
+    """A per-field recipe patch and the priors that guard it, validated.
+
+    The patch is `{hard?: {key: value}, soft?: {key: value}}`, naming only keys
+    `REFERENCE_RECIPE_FIELDS` declares in that section. `expected.
+    reference_recipe_fields` must name exactly the same keys, each with the
+    value its author saw (`{"$absent": true}` for a key the recipe lacked).
+    Values are not validated: a whole-value write stores them as sent, and a
+    patch must store what the editor painted.
+    """
+    def refuse(message: str) -> None:
+        _mutation_error(message, 400, "invalid_reference_recipe")
+
+    if not isinstance(raw_patch, dict) or not raw_patch:
+        refuse("A recipe patch must name at least one field")
+    priors = expected.get("reference_recipe_fields") if isinstance(expected, dict) else None
+    if not isinstance(priors, dict) or set(priors) != set(raw_patch):
+        refuse("A recipe patch must carry the prior value of every field it names")
+    for section, values in raw_patch.items():
+        if not isinstance(values, dict) or not values:
+            refuse("A recipe patch section must name at least one field")
+        unknown = sorted(str(key) for key in values
+                         if (section, key) not in _RECIPE_PATCH_KEYS)
+        if unknown:
+            refuse(f"Unsupported recipe fields: {', '.join(unknown)}")
+        section_priors = priors[section]
+        if not isinstance(section_priors, dict) or set(section_priors) != set(values):
+            refuse("A recipe patch must carry the prior value of every field it names")
+    return raw_patch, priors
+
+
+def _patched_reference_lane_recipe(stored: ReferenceLaneRecipe, patch: dict,
+                                   priors: dict) -> ReferenceLaneRecipe:
+    """The lane recipe with `patch` applied, or a refusal naming why not.
+
+    Every prior is compared before any key is written, so a refused patch
+    writes nothing. The result goes through the same `ReferenceLaneRecipe.
+    from_dict` as a whole-value write, keeping `lane_id`, `recipe_id` and
+    `media_kind`.
+    """
+    stored_data = stored.to_dict()
+    recipe = copy.deepcopy(stored_data["recipe"])
+    for section, values in patch.items():
+        current = recipe.get(section, {})
+        if not isinstance(current, dict):
+            # Tolerant loading keeps a malformed section as stored; replacing
+            # it key by key would discard it.
+            _mutation_error("This lane's recipe cannot be edited one setting at a time",
+                            409, "reference_recipe_unpatchable")
+        for key in values:
+            prior = priors[section][key]
+            seen = (key not in current
+                    if _recipe_patch_value_equal(prior, _RECIPE_PATCH_ABSENT)
+                    else key in current and _recipe_patch_value_equal(current[key], prior))
+            if not seen:
+                _mutation_error("This recipe setting changed before your edit saved.",
+                                409, "identity_mismatch")
+    for section, values in patch.items():
+        recipe[section] = {**recipe.get(section, {}), **copy.deepcopy(values)}
+    return ReferenceLaneRecipe.from_dict({**stored_data, "recipe": recipe})
+
 
 def _apply_lane_config(project: TimelineProject, scene: Scene, op: dict) -> dict:
     """Scoped per-lane config update (mutation-integrity F1).
@@ -2526,6 +2614,25 @@ def _apply_lane_config(project: TimelineProject, scene: Scene, op: dict) -> dict
                 or expected.get("lane_id") != lane_id):
             _mutation_error("Reference lane identity mismatch", 409,
                             "identity_mismatch")
+    result = {"type": "update_lane_config", "lane_type": lane_type, "lane_index": lane_index}
+    # A recipe field edit names only the keys it writes, guarded per key, so a
+    # write queued behind a failed one cannot re-commit the failed value
+    # ([#62]). Resolved before any field is written: a refusal writes nothing.
+    # A lock, rename or hide sends no recipe at all.
+    patched_recipe = None
+    if "reference_recipe_patch" in fields:
+        if not descriptor.recipe_attr:
+            _mutation_error("Only a Reference lane has a recipe to patch", 400,
+                            "invalid_reference_recipe")
+        if "reference_recipe" in fields:
+            _mutation_error("Send a whole recipe or a recipe patch, not both", 400,
+                            "invalid_reference_recipe")
+        patch, priors = _reference_recipe_patch(
+            fields["reference_recipe_patch"], op.get("expected"))
+        # The lane identity check above has run: a patch's `expected` names
+        # its priors, so it is always compared, and needs a stored recipe.
+        patched_recipe = _patched_reference_lane_recipe(
+            getattr(scene, descriptor.recipe_attr)[lane_index], patch, priors)
     if "name" in fields:
         config.name = str(fields["name"] or "")
     if "color" in fields:
@@ -2551,7 +2658,8 @@ def _apply_lane_config(project: TimelineProject, scene: Scene, op: dict) -> dict
         # `create_recipe`; when that create is refused, this refuses the lane
         # write with it instead of storing a dangling id. A lane that already
         # names a missing recipe (legacy, or detached elsewhere) keeps it at
-        # rest and may re-send it -- a lock, rename or hide carries the recipe.
+        # rest and may re-send it unchanged: an editor older than the recipe
+        # patch re-sends the whole recipe with every lock and rename.
         next_recipe_id = str(next_recipe.recipe_id or "")
         if (next_recipe_id and next_recipe_id != str(previous_recipe.recipe_id or "")
                 and next_recipe_id not in _REFERENCE_RECIPE_PRESET_IDS
@@ -2570,7 +2678,12 @@ def _apply_lane_config(project: TimelineProject, scene: Scene, op: dict) -> dict
                 "reference_media_kind_mismatch",
             )
         recipes[lane_index] = next_recipe
-    return {"type": "update_lane_config", "lane_type": lane_type, "lane_index": lane_index}
+    if patched_recipe is not None:
+        getattr(scene, descriptor.recipe_attr)[lane_index] = patched_recipe
+        # The positive acknowledgement the editor checks: a server older than
+        # the patch ignores the field as unknown and cannot produce this.
+        result["reference_recipe_patch"] = True
+    return result
 
 
 def _media_lane_items(scene: Scene, lane_type: str, lane_index: int) -> list:
@@ -6572,6 +6685,12 @@ def _references_payload(project: TimelineProject) -> dict:
         # would paint a row under a name the server never stores. Remove once
         # no supported server can ignore a client-minted id.
         "client_ids": ["reference", "member", "recipe"],
+        # `update_lane_config` applies `fields.reference_recipe_patch`. The
+        # editor sends a recipe field edit as a patch only when this is
+        # advertised, because a server older than it ignores the field and
+        # would answer 200 having written nothing. Remove once no supported
+        # server can ignore a recipe patch.
+        "lane_recipe_patch": True,
         "prompt_context_catalog": {
             "schema_version": 1,
             "placement_phases": copy.deepcopy(

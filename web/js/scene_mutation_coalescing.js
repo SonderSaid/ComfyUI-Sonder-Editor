@@ -116,23 +116,27 @@
  *
  * ## Consumers
  *
- * Three, all from umbrella Phase C stage 1:
+ * Three from umbrella Phase C stage 1:
  * `_applyHeaderVisibilityBulkWithinGesture` (L2),
  * `_convertClipRoleWithinGesture` and `_toggleSelectedMuteWithinGesture` (L3).
  * `_updateSceneFpsWithinGesture` and `_updateSceneGlobalContextWithinGesture`
  * were examined in L3 and deliberately left uncoalesced; their reasons are in
- * `COALESCE_OPT_OUT_REVIEWED`.
+ * `COALESCE_OPT_OUT_REVIEWED`. `_saveLaneConfigWithinGesture` replaced its
+ * inline "latest config wins per lane" merge with this one when a lock and a
+ * rename stopped re-sending the lane's recipe and a recipe field edit became a
+ * patch (backlog step 1, Phase 5): replacing a matched operation wholesale
+ * would then have dropped the recipe a lock folded over. Its recipe rollback
+ * counts every gesture's write rather than relying on head-ness.
  *
- * Two gestures still define their own merge inline —
- * `_saveLaneConfigWithinGesture`'s per-lane merge and
+ * One gesture still defines its own merge inline —
  * `_updateItemPropertyWithinGesture`'s single-operation merge — and this module
- * was written to reproduce both. They are intentional mirrors and
- * `tests/test_scene_mutation_coalescing_policy.py` holds them to parity, which
- * is what `agent_workflow.md` requires of a mirror. Retiring them is stage 1
- * L3's, not this landing's: each carries its own rollback and undo behaviour
- * that has to be traced before its merge changes shape. Expiry for the parity
- * test: it goes when those two call sites pass `coalesceSceneMutationIntents`
- * and the inline copies are deleted.
+ * was written to reproduce it. It is an intentional mirror and
+ * `tests/test_scene_mutation_coalescing_policy.py` holds it to parity, which
+ * is what `agent_workflow.md` requires of a mirror. Retiring it is stage 1
+ * L3's: it carries its own rollback and undo behaviour that has to be traced
+ * before its merge changes shape. Expiry for the parity test: it goes when
+ * that call site passes `coalesceSceneMutationIntents` and the inline copy is
+ * deleted.
  */
 
 /** The row and variant two operations must share before they may collapse. */
@@ -215,9 +219,35 @@ export const SUBKEYED_FIELDS = Object.freeze([
     "channels",
     "channel_docs",
     "prompt_edit",
+    "reference_recipe_patch",
 ]);
 
 const SUBKEYED = new Set(SUBKEYED_FIELDS);
+
+/** The lane a lane-config operation names, by durable id where known. */
+function laneConfigRow(operation) {
+    return `lane:${text(operation?.lane_type)}:` + (text(operation?.expected?.lane_id)
+        ? `id:${text(operation.expected.lane_id)}` : `index:${text(operation?.lane_index || 0)}`);
+}
+
+function writesRecipePatch(operation) {
+    return Object.hasOwn(operation?.fields || {}, "reference_recipe_patch");
+}
+
+/** Whether two lane-config operations may name one lane: by durable id, or by
+ *  index, since a lane write may know its lane's id where another does not.
+ *  A reorder seals the coalescing epoch, so an index means one lane here. */
+function sameLane(left, right) {
+    return laneConfigRow(left) === laneConfigRow(right)
+        || (text(left?.lane_type) === text(right?.lane_type)
+            && text(left?.lane_index || 0) === text(right?.lane_index || 0));
+}
+
+/** Whether a lane-config operation writes its lane's Reference recipe. */
+function writesLaneRecipe(operation) {
+    const fields = operation?.fields || {};
+    return Object.hasOwn(fields, "reference_recipe") || writesRecipePatch(operation);
+}
 
 /**
  * The `update_scene_fields` fields two operations may fold across.
@@ -305,13 +335,15 @@ export const SCENE_MUTATION_COALESCING = Object.freeze({
         + "same rule `update_clip` takes."),
 
     update_lane_config: collapsible(
-        (op) => `lane:${text(op.lane_type)}:` + (text(op.expected?.lane_id)
-            ? `id:${text(op.expected.lane_id)}` : `index:${text(op.lane_index || 0)}`),
+        (op) => (writesRecipePatch(op) ? null : laneConfigRow(op)),
         "`_apply_lane_config` writes one lane's config from the fields named. "
         + "Keyed by durable `lane_id` when the author knew one and by index "
-        + "otherwise, mirroring the merge `_saveLaneConfigWithinGesture` already "
-        + "ships: distinct lanes that occupy the same index across a reorder "
-        + "must not erase each other's edits."),
+        + "otherwise: distinct lanes that occupy the same index across a "
+        + "reorder must not erase each other's edits. A `reference_recipe_patch` "
+        + "is applied key by key behind each key's prior "
+        + "(`_patched_reference_lane_recipe`), so an operation carrying one is "
+        + "preserved: a union would compare the newer value against the older "
+        + "prior, or drop the older patch's keys."),
 
     update_scene_fields: collapsible(
         (op) => (Object.keys(op?.fields || {})
@@ -520,9 +552,14 @@ function foldWouldNotReorder(merged, at, folding) {
         // cross-row effect is `locked` gating ITEM operations, which this
         // clause does not cover -- a lane config may not jump an item write.
         // Without this pair a bulk hide over N lanes would stop folding
-        // entirely, which is the measured case rather than an edge one.
+        // entirely, which is the measured case rather than an edge one. The
+        // exception is two writes of ONE lane's recipe: a whole recipe moved in
+        // front of a patch it followed would be patched on top of, against
+        // priors read from the recipe it replaced.
         if (jumped.type === "update_lane_config"
-                && folding?.type === "update_lane_config") continue;
+                && folding?.type === "update_lane_config"
+                && !(writesLaneRecipe(jumped) && writesLaneRecipe(folding)
+                    && sameLane(jumped, folding))) continue;
         return false;
     }
     return true;

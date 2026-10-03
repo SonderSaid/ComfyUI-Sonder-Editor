@@ -91,7 +91,9 @@ EXPECTED_LITERAL_COUNTS = {
 # 56 -> 57 on 2026-09-29: the Reference panel's field writer on the host.
 # 57 -> 55 on 2026-09-30: the panel's `writeItem` and the append's own enqueue
 # both went; each now writes through the host's staged-item writer.
-EXPECTED_ENQUEUE_SITES = 55
+# 55 -> 56 on 2026-10-03: a lane recipe patch is enqueued on its own, beside
+# the lane-config save's coalescing enqueue (backlog step 1, Phase 5).
+EXPECTED_ENQUEUE_SITES = 56
 
 # Geometry the client computed from what it could see. Matched with a trailing
 # `[:,}]` so ES6 shorthand counts — `split_clip` passes its frame that way, and a
@@ -1488,6 +1490,10 @@ SUBKEYED_PAYLOAD_VALUES = {
     "prompt_edit": "`_merge_prompt_edit_fields` applies one change per document "
                    "and per attachment key, each behind its own `expected`. A "
                    "replaced intent drops the changes it does not name.",
+    "reference_recipe_patch": "`_patched_reference_lane_recipe` writes only the "
+                              "recipe keys the patch names, each behind its prior "
+                              "in `expected.reference_recipe_fields`; a replaced "
+                              "intent drops the older patch's keys.",
 }
 
 # A coalescing site with no merge that the scan cannot clear on its own. Keyed
@@ -2169,11 +2175,13 @@ GUARD_CONTRACTS = {
         "-- are written with no comparison of any kind. "
         "`_require_prompt_mutation_contract` runs first but only checks that the "
         "keys are PRESENT, so it is not a second comparison."),
-    "update_lane_config": (_FIXED, frozenset({"lane_id"}),
+    "update_lane_config": (_FIXED, frozenset({"lane_id", "reference_recipe_fields"}),
         "`_apply_lane_config`, guarded only when the lane descriptor has a "
-        "`recipe_attr` and only on lane_id. The deliberate bootstrap tolerance "
-        "-- expected stays optional -- is owned by durable_rules.md, not by "
-        "this entry."),
+        "`recipe_attr`, on lane_id, and -- for a recipe patch -- on each patched "
+        "key's prior in `reference_recipe_fields`, which `_reference_recipe_patch` "
+        "requires and `_patched_reference_lane_recipe` compares. The deliberate "
+        "bootstrap tolerance -- expected stays optional -- is owned by "
+        "durable_rules.md, not by this entry."),
     "move_lane": (_FIXED, frozenset({"from_lane_id", "to_lane_id"}),
         "`_move_media_lane`. Unlike `_apply_lane_config` it REQUIRES expected "
         "and refuses a blank stored id, because the lane index is the thing the "
@@ -3579,7 +3587,8 @@ def _scope_body(item) -> str:
 # Pinned rather than bounded: the split between the two spellings is the
 # finding that justified two tripwires instead of one.
 # 18 -> 17 on 2026-09-22: the legacy guide popup's declined delete was deleted.
-EXPECTED_STABLE_KEY_OPT_OUTS = 17
+# 17 -> 18 on 2026-10-03: a lane recipe patch declines coalescing (Phase 5).
+EXPECTED_STABLE_KEY_OPT_OUTS = 18
 # 29 -> 30 on 2026-09-29: the Reference panel's field writer on the host.
 # 30 -> 28 on 2026-09-30: the panel's `writeItem` and the append's own enqueue
 # went into that writer.
@@ -4180,6 +4189,19 @@ COALESCE_OPT_OUT_REVIEWED = {
         "gesture carries its own revision-token rollback that selects the "
         "NEWEST author where a coalesced group needs the oldest -- two "
         "head-ness mechanisms for no gain."),
+    "editor_widget.js:_saveLaneConfigWithinGesture:scene:${}:lane-recipe-patch:${}": (
+        DECLINED,
+        "a Reference recipe field edit sent as `reference_recipe_patch` "
+        "(backlog step 1, Phase 5). `_apply_scene_mutation_batch` applies a "
+        "batch all or nothing, and `_patched_reference_lane_recipe` refuses a "
+        "patch whose prior a failed earlier write left behind -- by design, so "
+        "the failed value is not re-committed. Sharing a request would let that "
+        "deterministic 409 take a lock, a rename or another field's patch down "
+        "with it; the shared merge already keeps every patch as its own "
+        "operation (`SUBKEYED_FIELDS`), so coalescing could save writes only by "
+        "batching them. Each patch is one user-paced edit, its own write and "
+        "its own Undo step. The config writes of the same method keep the "
+        "coalescing `lane-config` key."),
     "editor_widget.js:_updateSceneFpsWithinGesture:scene:${}:fps": (
         DECLINED,
         "`_fpsUpdatePending` already serialises fps by DROPPING a second "
@@ -4473,7 +4495,10 @@ def test_a_coalescing_site_is_not_reported_as_an_opt_out():
     findings = _coalescing_opt_out_findings()
     for scope in ("_updateSceneResolutionWithinGesture", "_renameSceneWithinGesture",
                   "_updateSceneDurationWithinGesture", "_saveLaneConfigWithinGesture"):
-        assert not [key for key in findings if f":{scope}:" in key], (
+        # The lane-config save's recipe patch declines, reviewed; its config
+        # enqueue must still coalesce.
+        assert not [key for key in findings if f":{scope}:" in key
+                    and ":lane-recipe-patch:" not in key], (
             f"{scope} coalesces on a repeating key and must not read as an opt-out")
     # `_updateItemPropertyWithinGesture` is deliberately NOT in that list. It
     # was, and the assertion pinned a hole shut: the gesture passes `coalesce`

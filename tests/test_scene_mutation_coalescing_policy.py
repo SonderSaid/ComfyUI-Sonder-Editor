@@ -858,11 +858,12 @@ def test_a_second_media_io_create_really_is_refused():
 
 
 # ---------------------------------------------------------------------------
-# The two inline merges this module supersedes
+# The inline merge this module supersedes
 # ---------------------------------------------------------------------------
 
+# `_saveLaneConfigWithinGesture` passes the shared merge since backlog step 1
+# Phase 5, which met its half of this test's expiry.
 _INLINE_MERGE_SOURCES = {
-    "_saveLaneConfigWithinGesture": ("async _saveLaneConfigWithinGesture", "async _addLane"),
     "_updateItemPropertyWithinGesture": ("async _updateItemPropertyWithinGesture",
                                          "async _createLinkGroupFromSelection"),
 }
@@ -892,20 +893,6 @@ def _inline_merge(name: str) -> str:
 
 
 @pytest.mark.parametrize("gesture,intents", [
-    ("_saveLaneConfigWithinGesture", [
-        [{"type": "update_lane_config", "lane_type": "video", "lane_index": 0,
-          "expected": {"lane_id": "a"},
-          "fields": {"name": "A", "color": "", "locked": False, "hidden": False}}],
-        [{"type": "update_lane_config", "lane_type": "video", "lane_index": 0,
-          "expected": {"lane_id": "a"},
-          "fields": {"name": "A latest", "color": "", "locked": False, "hidden": True}}],
-    ]),
-    ("_saveLaneConfigWithinGesture", [
-        [{"type": "update_lane_config", "lane_type": "video", "lane_index": 0,
-          "expected": {"lane_id": "a"}, "fields": {"name": "A"}}],
-        [{"type": "update_lane_config", "lane_type": "video", "lane_index": 0,
-          "expected": {"lane_id": "b"}, "fields": {"name": "B"}}],
-    ]),
     ("_updateItemPropertyWithinGesture", [
         [{"type": "update_reference_item", "reference_item_id": "r",
           "expected": {"muted": True}, "fields": {"muted": False}}],
@@ -916,19 +903,14 @@ def _inline_merge(name: str) -> str:
 def test_the_shared_merge_agrees_with_the_inline_merge_it_supersedes(gesture, intents):
     """An intentional mirror, so it owes a parity test (`agent_workflow.md`).
 
-    Two gestures still define their own merge inline, and this module was written
-    to reproduce both. Nothing compared them: the module has no importer yet, so
-    drift would be silent in BOTH directions until stage 1 L2 wires it up.
+    One gesture still defines its own merge inline, and this module was written
+    to reproduce it. `_saveLaneConfigWithinGesture` was the other; it passes
+    `coalesceSceneMutationIntents` since its lock and rename stopped re-sending
+    the recipe, which a wholesale replacement would then have dropped.
 
-    They are not textually equivalent and the test does not pretend otherwise —
-    the inline lane merge replaces a matched operation wholesale while the shared
-    one unions `fields` and keeps the OLDEST `expected`. They agree only because
-    `_saveLaneConfigWithinGesture` re-sends every config field and `lane_id` is
-    in the row key. That is a property of today's payloads, and this is where it
-    is stated and checked.
-
-    Expiry: delete when both call sites pass `coalesceSceneMutationIntents` and
-    the inline copies are gone — umbrella Phase C stage 1 L2/L3.
+    Expiry: delete when `_updateItemPropertyWithinGesture` passes
+    `coalesceSceneMutationIntents` and its inline copy is gone — umbrella Phase C
+    stage 1 L3.
     """
     older, newer = intents
     url = COALESCING_JS.as_uri()
@@ -1178,3 +1160,84 @@ def test_what_a_fold_may_jump_is_a_short_explicit_list():
                           [config(0, False), config(1, False)])) == 2, (
         "a bulk hide over two lanes must still fold to one operation per lane")
     assert fold_over({"type": "create_guide", "fields": {"frame_index": 5}}) == 3
+
+
+# ---------------------------------------------------------------------------
+# A recipe patch is preserved, never folded (backlog step 1, Phase 5)
+# ---------------------------------------------------------------------------
+
+def _recipe_patch(key, value, prior, lane_id="L1"):
+    return {"type": "update_lane_config", "lane_type": "reference", "lane_index": 0,
+            "expected": {"lane_id": lane_id,
+                         "reference_recipe_fields": {"hard": {key: prior}}},
+            "fields": {"reference_recipe_patch": {"hard": {key: value}}}}
+
+
+def _lane_write(lane_id="L1", **fields):
+    return {"type": "update_lane_config", "lane_type": "reference", "lane_index": 0,
+            "expected": {"lane_id": lane_id},
+            "fields": {"name": "", "color": "", "locked": False, "hidden": False, **fields}}
+
+
+def test_a_recipe_patch_is_never_collapsed():
+    """`_apply_lane_config` applies a patch key by key behind per-key priors.
+
+    A union would keep only the newer patch's keys and the older guard, so two
+    patches of one key would compare the second value against the first prior.
+    Each patch therefore stays its own operation, in authoring order.
+    """
+    evidence = _evidence_for([_recipe_patch("max_members", 5, 4)])[0]
+    assert evidence["collapsible"] is False and evidence["rowKey"] is None
+    merged = _coalesced([_recipe_patch("max_members", 5, 4)],
+                        [_recipe_patch("max_members", 6, 5)])
+    assert [op["fields"]["reference_recipe_patch"]["hard"]["max_members"]
+            for op in merged] == [5, 6]
+    assert [op["expected"]["reference_recipe_fields"]["hard"]["max_members"]
+            for op in merged] == [4, 5]
+
+
+def test_a_lock_behind_a_recipe_patch_keeps_both():
+    patch = _recipe_patch("max_members", 5, 4)
+    lock = _lane_write(locked=True)
+    merged = _coalesced([patch], [lock])
+    assert merged == [patch, lock]
+
+
+def test_a_whole_recipe_write_never_jumps_a_patch_of_its_lane():
+    """Folding moves the newer whole recipe in front of the patch it followed.
+
+    The patch would then apply on top of the newer recipe and be compared
+    against priors read from the older one.
+    """
+    whole = lambda name: _lane_write(reference_recipe={"recipe": {"name": name}})
+    patch = _recipe_patch("max_members", 5, 4)
+    merged = _coalesced([whole("A"), patch], [whole("B")])
+    assert len(merged) == 3, merged
+    assert merged[1] == patch
+    assert merged[2]["fields"]["reference_recipe"]["recipe"]["name"] == "B"
+    # A lock writes no recipe, so it still folds past the patch.
+    folded = _coalesced([_lane_write(locked=True), patch], [_lane_write(locked=False)])
+    assert len(folded) == 2 and folded[0]["fields"]["locked"] is False
+    assert folded[1] == patch
+
+
+def test_a_lock_folded_into_a_whole_recipe_write_keeps_the_recipe():
+    """A lock no longer re-sends the recipe, so a fold must union the fields."""
+    whole = _lane_write(reference_recipe={"recipe": {"name": "A"}})
+    merged = _coalesced([whole], [_lane_write(locked=True)])
+    assert len(merged) == 1
+    assert merged[0]["fields"]["reference_recipe"] == {"recipe": {"name": "A"}}
+    assert merged[0]["fields"]["locked"] is True
+
+
+def test_a_recipe_patch_is_applied_key_by_key_by_the_server():
+    """The server half of `reference_recipe_patch` being in `SUBKEYED_FIELDS`."""
+    from server.timeline_state import LaneConfig, ReferenceLaneRecipe, Scene, TimelineProject
+    scene = Scene(scene_id="s", duration_frames=10, reference_lane_count=1,
+                  reference_lane_configs=[LaneConfig()],
+                  reference_lane_recipes=[ReferenceLaneRecipe(
+                      lane_id="L1", recipe={"hard": {"max_members": 4, "frame_step": 8}})])
+    project = TimelineProject(project_id="p", scenes=[scene])
+    routes._apply_scene_mutation_operation(project, scene, _recipe_patch("max_members", 5, 4))
+    assert scene.reference_lane_recipes[0].recipe["hard"] == {
+        "max_members": 5, "frame_step": 8}

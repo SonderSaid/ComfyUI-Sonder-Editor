@@ -1430,11 +1430,14 @@ MIRRORED_MODULES = {
         },
     },
     "reference_lane_identity.js": {
-        "scope": "Lane population and member-population compatibility decisions.",
-        "authorities": ("server/minimax_h3.py::lane_population", "server/routes.py::member_population_compatible"),
+        "scope": "Lane population and member-population compatibility decisions, "
+                 "and the lane recipe a recipe patch stores.",
+        "authorities": ("server/minimax_h3.py::lane_population", "server/routes.py::member_population_compatible",
+                        "server/routes.py::_patched_reference_lane_recipe"),
         "tests": (
             "test_reference_timeline.py::test_lane_population_matches_between_python_and_the_browser",
-            "test_reference_timeline.py::test_member_population_compatibility_matches_between_python_and_the_browser"),
+            "test_reference_timeline.py::test_member_population_compatibility_matches_between_python_and_the_browser",
+            "test_lane_recipe_patch.py::test_the_editor_paints_exactly_what_the_server_stores"),
     },
     "reference_resolution.js": {
         "scope": "Winner/threshold/prose verdicts, output liveness and derived member prompt text.",
@@ -1576,7 +1579,7 @@ def test_declared_mirror_headers_match_the_inventory_both_ways():
 
 def test_every_declared_mirror_has_a_live_parity_disposition():
     _assert_mirror_obligations(MIRRORED_MODULES, ROOT)
-    assert sum(len(row["authorities"]) for row in MIRRORED_MODULES.values()) == 64
+    assert sum(len(row["authorities"]) for row in MIRRORED_MODULES.values()) == 65
 
 @pytest.mark.parametrize("name, valid", [("TABLE", True), ("row", False), ("transform", True)])
 def test_mirror_authorities_are_module_declarations(tmp_path, name, valid):

@@ -359,6 +359,10 @@ globalThis.requestAnimationFrame=()=>0;
 const { EditorWidget } = await import(__WIDGET__);
 const { ProjectMutationQueue } = await import(__QUEUE__);
 const panelModule = await import(__PANEL__);
+const notes = await import(__NOTES__);
+const messages = [];
+notes.subscribe((list) => { for (const n of list) {
+  if (!messages.includes(n.message)) messages.push(n.message); } });
 const schema = __SCHEMA__;
 const baseRecipe = () => ({lane_id:'lane-a', recipe_id:'', media_kind:'image',
   recipe:{name:'Mine', hard:{assembly:'batch', max_members:4, frame_step:8,
@@ -399,13 +403,56 @@ Object.assign(w, {
   _referenceMemberForRef:()=>null, _findAssetById:()=>null,
   _referenceAssetPreviewUrl:()=>null, _referenceLaneAdvisories:()=>[],
   _isLaneLocked:()=>false, _channelTemplate:()=>({}),
+  // The Library payload's advertisement (`lane_recipe_patch`).
+  _laneRecipePatch:true,
 });
 w._buildTrackLayout();
 server = structuredClone(w.activeScene);
 const sent = [];
 const held = [];
 let holdNext = 0;
+// An older server: it ignores `reference_recipe_patch` as an unknown field.
+let serverIgnoresPatch = false;
 const hold = (count = 1) => { holdNext += count; };
+const sameValue = (left, right) => JSON.stringify(left) === JSON.stringify(right);
+// `_apply_lane_config` as the route applies it: one batch, all or nothing.
+const applyBatch = (operations) => {
+  const scene = structuredClone(server);
+  const results = [];
+  for (const op of operations) {
+    if (op.type !== 'update_lane_config') { results.push({type: op.type}); continue; }
+    const stored = scene.reference_lane_recipes[op.lane_index];
+    const result = {type: op.type, lane_type: op.lane_type, lane_index: op.lane_index};
+    const fields = op.fields || {};
+    for (const key of ['name', 'color', 'locked', 'hidden']) {
+      if (key in fields) scene.reference_lane_configs[op.lane_index][key] = fields[key];
+    }
+    if (fields.reference_recipe) {
+      scene.reference_lane_recipes[op.lane_index] = {
+        ...fields.reference_recipe, lane_id: stored?.lane_id || ''};
+    } else if (fields.reference_recipe_patch && !serverIgnoresPatch) {
+      const recipe = structuredClone(stored.recipe || {});
+      for (const [section, values] of Object.entries(fields.reference_recipe_patch)) {
+        const current = recipe[section] || {};
+        for (const [key, value] of Object.entries(values)) {
+          const prior = op.expected.reference_recipe_fields[section][key];
+          const ok = prior?.$absent ? !(key in current)
+            : (key in current && sameValue(current[key], prior));
+          if (!ok) throw Object.assign(new Error('This recipe setting changed before your edit saved.'),
+            {status: 409, payload: {code: 'identity_mismatch',
+              error: 'This recipe setting changed before your edit saved.'}});
+          current[key] = value;
+        }
+        recipe[section] = current;
+      }
+      scene.reference_lane_recipes[op.lane_index] = {...stored, recipe};
+      result.reference_recipe_patch = true;
+    }
+    results.push(result);
+  }
+  server = scene;
+  return results;
+};
 w._runSceneMutation = (operations, options) => w._queueProjectMutation({
   ...options, refreshScenes:false, intent:{sceneId:'scene', operations},
   run: async (intent) => {
@@ -414,13 +461,8 @@ w._runSceneMutation = (operations, options) => w._queueProjectMutation({
       holdNext -= 1;
       await new Promise((resolve, reject) => held.push({resolve, reject}));
     }
-    for (const op of intent.operations) {
-      if (op.type !== 'update_lane_config') continue;
-      const stored = server.reference_lane_recipes[op.lane_index];
-      server.reference_lane_recipes[op.lane_index] = {
-        ...op.fields.reference_recipe, lane_id: stored?.lane_id || ''};
-    }
-    return {payload:{scene: structuredClone(server)}};
+    const results = applyBatch(intent.operations);
+    return {payload:{results, scene: structuredClone(server)}};
   },
 });
 const tick = () => new Promise((r) => setTimeout(r, 0));
@@ -462,6 +504,7 @@ console.log(JSON.stringify(result ?? null));
               .replace("__WIDGET__", json.dumps((ROOT / "web/js/editor_widget.js").as_uri()))
               .replace("__QUEUE__", json.dumps((ROOT / "web/js/project_mutation_queue.js").as_uri()))
               .replace("__PANEL__", json.dumps((ROOT / "web/js/editor_reference_panel.js").as_uri()))
+              .replace("__NOTES__", json.dumps((ROOT / "web/js/editor_notifications.js").as_uri()))
               .replace("__SCHEMA__", json.dumps(_RECIPE_SCHEMA))
               .replace("__BODY__", body))
     completed = subprocess.run(
@@ -476,7 +519,7 @@ def test_a_recipe_edit_made_while_the_previous_save_runs_is_sent_not_dropped():
 
     It used to hit `state.busy` and vanish. Now it reads the scene the first
     edit painted, opens its own queue slot (a running write cannot be merged
-    into) and its own Undo step, and the second write carries both fields.
+    into) and its own Undo step, and each write names only its own field.
     """
     result = _run_recipe_panel("""
     hold();
@@ -487,24 +530,27 @@ def test_a_recipe_edit_made_while_the_previous_save_runs_is_sent_not_dropped():
     await release();
     await tick();
     return {shownBeforeAnyAck, writes: recipeWrites().map((ops) =>
-      ops[0].fields.reference_recipe.recipe.hard), entries: recipeEntries().length,
+      ops.map((op) => op.fields)), entries: recipeEntries().length,
       stamped: recipeEntries().every((entry) => entry.postSnapshot),
       server: server.reference_lane_recipes[0].recipe.hard};
     """)
     assert result["shownBeforeAnyAck"]["max_members"] == 5
     assert result["shownBeforeAnyAck"]["frame_step"] == 9
-    assert len(result["writes"]) == 2
-    assert result["writes"][1]["max_members"] == 5 and result["writes"][1]["frame_step"] == 9
+    assert result["writes"] == [
+        [{"reference_recipe_patch": {"hard": {"max_members": 5}}}],
+        # A pegged value carries its source, un-pegging it.
+        [{"reference_recipe_patch": {"hard": {"frame_step": 9, "frame_grid_source": "custom"}}}],
+    ]
     assert result["entries"] == 2 and result["stamped"]
     assert result["server"]["max_members"] == 5 and result["server"]["frame_step"] == 9
 
 
-def test_recipe_edits_behind_a_pending_save_fold_into_one_write_and_one_undo_step():
-    """Edits that meet a still-pending recipe write fold into it.
+def test_recipe_edits_behind_a_pending_save_are_each_their_own_write_and_undo_step():
+    """A patch travels alone, in authoring order.
 
-    A blocker holds the queue, so the first recipe edit's slot is pending when
-    the second and third arrive: one merged write, one Undo step, all three
-    fields present.
+    A blocker holds the queue, so all three edits wait together. They used to
+    fold into one write; a patch shares no request, because a batch is applied
+    all or nothing and one refused patch would take the others with it.
     """
     result = _run_recipe_panel("""
     hold();
@@ -514,15 +560,37 @@ def test_recipe_edits_behind_a_pending_save_fold_into_one_write_and_one_undo_ste
     edit('Frame step', 9);
     edit('Prompt prefix', 'hello');
     await release();
-    await tick();
-    return {writes: recipeWrites().map((ops) => ops[0].fields.reference_recipe.recipe),
-      entries: recipeEntries().length};
+    await drain();
+    return {writes: recipeWrites().map((ops) => ops.map((op) => op.fields.reference_recipe_patch)),
+      entries: recipeEntries().length, server: server.reference_lane_recipes[0].recipe};
     """)
-    assert len(result["writes"]) == 1
-    merged = result["writes"][0]
+    assert result["writes"] == [
+        [{"hard": {"max_members": 5}}],
+        [{"hard": {"frame_step": 9, "frame_grid_source": "custom"}}],
+        [{"soft": {"prompt_prefix": "hello"}}],
+    ]
+    merged = result["server"]
     assert merged["hard"]["max_members"] == 5 and merged["hard"]["frame_step"] == 9
     assert merged["soft"]["prompt_prefix"] == "hello"
-    assert result["entries"] == 1
+    assert result["entries"] == 3
+
+
+def test_whole_recipe_edits_behind_a_pending_save_still_fold():
+    """Without the capability an edit writes the whole recipe, and folds."""
+    result = _run_recipe_panel("""
+    w._laneRecipePatch = false;
+    hold();
+    w._runSceneMutation([{type:'blocker'}], {key:'blocker', coalesce:false});
+    await tick();
+    edit('Maximum members', 5);
+    edit('Frame step', 9);
+    await release();
+    await drain();
+    return {writes: recipeWrites().length, entries: recipeEntries().length,
+      server: server.reference_lane_recipes[0].recipe.hard};
+    """)
+    assert result["writes"] == 1 and result["entries"] == 1
+    assert result["server"]["max_members"] == 5 and result["server"]["frame_step"] == 9
 
 
 def test_save_as_custom_right_after_a_field_change_keeps_the_field():
@@ -635,9 +703,12 @@ def test_a_failed_coalesced_burst_restores_what_the_server_holds_not_a_sibling_p
     """Every folded gesture sees the failure; the restore is the pre-burst value.
 
     A joiner's own snapshot is an earlier sibling's paint, which the server
-    never held (`durable_rules.md`, the head-of-a-coalesced-group rule).
+    never held (`durable_rules.md`, the head-of-a-coalesced-group rule). Only
+    whole-value writes coalesce now (a server without the recipe patch); every
+    gesture of the burst settles, and the chain restores once, at the last.
     """
     result = _run_recipe_panel("""
+    w._laneRecipePatch = false;
     hold(2);
     w._runSceneMutation([{type:'blocker'}], {key:'blocker', coalesce:false}).catch(() => {});
     await tick();
@@ -652,8 +723,13 @@ def test_a_failed_coalesced_burst_restores_what_the_server_holds_not_a_sibling_p
     assert result["hard"]["max_members"] == 4 and result["hard"]["frame_step"] == 8
 
 
-def test_a_failed_recipe_write_with_a_newer_write_queued_does_not_flash_back():
-    """The newer queued write carries what the author last saw; it decides."""
+def test_a_failed_recipe_write_with_a_newer_write_queued_is_not_re_committed():
+    """[#62]: the newer write names only its own field.
+
+    It used to re-send the whole painted recipe, so the server stored the field
+    whose save had just failed. Now the failed field rolls back at once, since
+    no queued write names it, and the newer field still saves.
+    """
     result = _run_recipe_panel("""
     hold(2);
     edit('Maximum members', 5);
@@ -661,19 +737,42 @@ def test_a_failed_recipe_write_with_a_newer_write_queued_does_not_flash_back():
     edit('Frame step', 9);
     await fail();
     const whileNewerQueued = structuredClone(recipe().hard);
+    await release();
+    await tick();
+    return {whileNewerQueued, final: recipe().hard,
+      server: server.reference_lane_recipes[0].recipe.hard};
+    """)
+    assert result["whileNewerQueued"]["max_members"] == 4
+    assert result["whileNewerQueued"]["frame_step"] == 9
+    assert result["server"]["max_members"] == 4 and result["server"]["frame_step"] == 9
+    assert result["final"]["max_members"] == 4 and result["final"]["frame_step"] == 9
+
+
+def test_a_second_edit_of_a_failed_field_is_refused_and_rolls_back():
+    """The same-key case: the queued write's prior is the failed paint."""
+    result = _run_recipe_panel("""
+    hold(2);
+    edit('Maximum members', 5);
+    await tick();
+    edit('Maximum members', 6);
+    await fail();
+    const whileNewerQueued = recipe().hard.max_members;
     const skipped = diag('recipe_rollback_skipped').map((e) => e.reason
       ?? e.payload?.reason ?? e.data?.reason);
     await release();
     await tick();
-    return {whileNewerQueued, skipped, final: recipe().hard,
-      server: server.reference_lane_recipes[0].recipe.hard};
+    await tick();
+    return {whileNewerQueued, skipped, final: recipe().hard.max_members,
+      server: server.reference_lane_recipes[0].recipe.hard.max_members, messages,
+      entries: recipeEntries().length};
     """)
-    assert result["whileNewerQueued"]["max_members"] == 5
-    assert result["whileNewerQueued"]["frame_step"] == 9
-    assert len(result["skipped"]) == 1
-    # Residual logged on the Bug Tracker: the newer whole-value write
-    # re-commits the failed field, because it is what the author last saw.
-    assert result["server"]["max_members"] == 5 and result["server"]["frame_step"] == 9
+    # The newer write names the field, so the first failure does not flash back.
+    assert result["whileNewerQueued"] == 6
+    assert "newer_write_queued" in result["skipped"]
+    assert result["server"] == 4
+    assert result["final"] == 4
+    assert "This recipe setting changed before your edit saved." in result["messages"]
+    assert result["entries"] == 0
 
 
 def test_two_failed_recipe_writes_restore_the_value_before_both():
@@ -836,6 +935,194 @@ def test_a_failed_lane_write_without_the_rollback_opt_in_keeps_the_heal_only():
     return recipe().hard.max_members;
     """)
     assert result == 9
+
+
+def test_a_recipe_field_edit_sends_only_its_patch_and_the_priors_it_saw():
+    result = _run_recipe_panel(_ROW + """
+    edit('Maximum members', 5);
+    const input = inRow('Suggested tags', (n) => n.tagName === 'INPUT')[0];
+    input.value = 'A'; input.dispatch('keydown', {key:'Enter'});
+    await drain();
+    return recipeWrites().flat().map(({type, lane_type, lane_index, fields, expected}) =>
+      ({type, lane_type, lane_index, fields, expected}));
+    """)
+    assert result == [
+        {"type": "update_lane_config", "lane_type": "reference", "lane_index": 0,
+         "fields": {"reference_recipe_patch": {"hard": {"max_members": 5}}},
+         "expected": {"lane_id": "lane-a",
+                      "reference_recipe_fields": {"hard": {"max_members": 4}}}},
+        # A key the recipe lacks is guarded by the absent marker.
+        {"type": "update_lane_config", "lane_type": "reference", "lane_index": 0,
+         "fields": {"reference_recipe_patch": {"soft": {"suggested_tags": ["A"]}}},
+         "expected": {"lane_id": "lane-a",
+                      "reference_recipe_fields": {"soft": {"suggested_tags": {"$absent": True}}}}},
+    ]
+
+
+def test_a_lock_before_a_recipe_edit_is_sent_keeps_both():
+    """The lock neither replaces the pending patch nor rides in its request."""
+    result = _run_recipe_panel("""
+    hold();
+    w._runSceneMutation([{type:'blocker'}], {key:'blocker', coalesce:false});
+    await tick();
+    edit('Maximum members', 5);
+    const lock = {...w._trackLayout[0], locked: true};
+    w._saveLaneConfig([lock]);
+    await release();
+    await drain();
+    return {ops: recipeWrites().map((ops) => ops.map((op) => op.fields)),
+      server: {max: server.reference_lane_recipes[0].recipe.hard.max_members,
+        locked: server.reference_lane_configs[0].locked}};
+    """)
+    assert result["server"] == {"max": 5, "locked": True}
+    assert result["ops"] == [
+        [{"reference_recipe_patch": {"hard": {"max_members": 5}}}],
+        [{"name": "", "color": "", "locked": True, "hidden": False}],
+    ]
+
+
+def test_a_lock_joining_a_pending_template_switch_keeps_the_template():
+    """A lock folds into the pending whole-recipe write; the fields are unioned.
+
+    The inline merge replaced a matched operation wholesale, which was harmless
+    only while a lock re-sent the recipe too.
+    """
+    result = _run_recipe_panel("""
+    hold();
+    w._runSceneMutation([{type:'blocker'}], {key:'blocker', coalesce:false});
+    await tick();
+    const select = nodes().find((n) => n.tagName === 'SELECT'
+      && n.options.some((o) => o.value === 'preset:sheet'));
+    select.value = 'preset:sheet';
+    select.dispatch('change');
+    w._saveLaneConfig([{...w._trackLayout[0], locked: true}]);
+    await release();
+    await drain();
+    return {writes: recipeWrites().length, recipeId: server.reference_lane_recipes[0].recipe_id,
+      locked: server.reference_lane_configs[0].locked};
+    """)
+    assert result == {"writes": 1, "recipeId": "preset:sheet", "locked": True}
+
+
+def test_a_refused_patch_does_not_take_a_lock_queued_beside_it():
+    """The audit's reproduction: a batch is applied all or nothing.
+
+    Max 5 is in flight and fails; Max 6 is queued, and its prior (5) is the
+    failed paint, so the server refuses it by design. A lock queued after it
+    used to share its request and was refused with it.
+    """
+    result = _run_recipe_panel("""
+    hold(2);
+    edit('Maximum members', 5);
+    await tick();
+    edit('Maximum members', 6);
+    w._saveLaneConfig([{...w._trackLayout[0], locked: true}]);
+    await fail();
+    await drain();
+    await tick();
+    return {locked: server.reference_lane_configs[0].locked,
+      max: server.reference_lane_recipes[0].recipe.hard.max_members, shown: recipe().hard.max_members};
+    """)
+    assert result == {"locked": True, "max": 4, "shown": 4}
+
+
+def test_a_refused_patch_does_not_take_another_fields_edit_with_it():
+    """A failed patch rolls back only its own keys, even behind a same-key refusal."""
+    result = _run_recipe_panel("""
+    hold(2);
+    edit('Maximum members', 5);
+    await tick();
+    edit('Maximum members', 6);
+    edit('Frame step', 9);
+    await fail();
+    await drain();
+    await tick();
+    return {server: server.reference_lane_recipes[0].recipe.hard, shown: recipe().hard};
+    """)
+    assert result["server"]["max_members"] == 4 and result["server"]["frame_step"] == 9
+    assert result["shown"]["max_members"] == 4 and result["shown"]["frame_step"] == 9
+
+
+def test_save_as_custom_waits_for_a_field_edit_still_saving():
+    """The copy takes what the lane holds once the edit settles, not its paint.
+
+    A fork copies the whole recipe; copying a patch that then failed would
+    write the lost value into the new recipe and the lane ([#62]).
+    """
+    result = _run_recipe_panel("""
+    const created = [];
+    w._mutateReferences = (operations) => {
+      created.push(structuredClone(operations[0].fields));
+      return Promise.resolve({payload:{results:[{type:'create_recipe', recipe_id: operations[0].fields.id}]}});
+    };
+    globalThis.__promptAnswer = 'Copy';
+    hold();
+    edit('Maximum members', 7);
+    clickButton('Save as custom');
+    await tick();
+    const createdWhileSaving = created.length;
+    await fail();
+    await drain();
+    return {createdWhileSaving, created: created[0]?.hard?.max_members,
+      lane: server.reference_lane_recipes[0].recipe.hard.max_members};
+    """)
+    assert result["createdWhileSaving"] == 0
+    assert result["created"] == 4
+    assert result["lane"] == 4
+
+
+def test_lock_and_rename_do_not_send_the_recipe():
+    """They re-sent the whole painted recipe, re-committing any pending edit."""
+    result = _run_recipe_panel("""
+    w._saveLaneConfig([{...w._trackLayout[0], locked: true}]);
+    w._saveLaneConfig([{...w._trackLayout[0], customName: 'Renamed'}], {undoLabel: 'rename lane'});
+    await drain();
+    return {ops: recipeWrites().map((ops) => ops.map((op) => op.fields)),
+      lane: server.reference_lane_recipes[0]};
+    """)
+    for ops in result["ops"]:
+        for fields in ops:
+            assert "reference_recipe" not in fields and "reference_recipe_patch" not in fields
+    assert result["lane"]["lane_id"] == "lane-a"
+    assert result["lane"]["recipe"]["hard"]["max_members"] == 4
+
+
+def test_without_the_capability_a_field_edit_sends_the_whole_recipe():
+    """A server that does not advertise `lane_recipe_patch` gets today's write."""
+    result = _run_recipe_panel("""
+    w._laneRecipePatch = false;
+    edit('Maximum members', 5);
+    await drain();
+    return recipeWrites().map((ops) => ops.map((op) => Object.keys(op.fields).sort()));
+    """)
+    assert result == [[["color", "hidden", "locked", "name", "reference_recipe"]]]
+
+
+def test_a_server_that_ignores_the_patch_is_treated_as_a_refusal():
+    """No `reference_recipe_patch` in its result: the field was not applied.
+
+    The edit rolls back, says so, records why, and the next edit goes whole.
+    """
+    result = _run_recipe_panel("""
+    serverIgnoresPatch = true;
+    edit('Maximum members', 5);
+    await drain();
+    await tick();
+    const afterIgnored = recipe().hard.max_members;
+    // The write changed nothing, so it leaves no Undo step that undoes nothing.
+    const entriesAfterIgnored = recipeEntries().length;
+    edit('Frame step', 9);
+    await drain();
+    return {afterIgnored, entriesAfterIgnored, ignored: diag('recipe_patch_ignored').length, messages,
+      second: Object.keys(recipeWrites().at(-1)[0].fields).sort(),
+      server: server.reference_lane_recipes[0].recipe.hard};
+    """)
+    assert result["afterIgnored"] == 4
+    assert result["entriesAfterIgnored"] == 0
+    assert result["ignored"] == 1
+    assert any("not saved" in message for message in result["messages"])
+    assert result["second"] == ["color", "hidden", "locked", "name", "reference_recipe"]
+    assert result["server"]["frame_step"] == 9 and result["server"]["max_members"] == 4
 
 
 def test_panel_uses_catalog_controls_and_progressive_disclosure():

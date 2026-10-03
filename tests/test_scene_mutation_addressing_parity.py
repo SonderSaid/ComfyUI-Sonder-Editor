@@ -132,6 +132,11 @@ def _battery():
             if expected is not None:
                 case["expected"] = expected
             cases.append(case)
+            # A recipe patch: its priors add a compared guard, not an identity.
+            patch = {**case, "fields": {"reference_recipe_patch": {"hard": {"max_members": 2}}},
+                     "expected": {**(expected or {}),
+                                  "reference_recipe_fields": {"hard": {"max_members": 1}}}}
+            cases.append(patch)
     for items in (
             [], None, "x", [None], ["clip"], [{"type": "clip"}],
             [{"type": "clip", "id": 0}], [{"type": "clip", "id": "  "}],

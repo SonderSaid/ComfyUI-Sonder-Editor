@@ -9689,8 +9689,10 @@ def test_lane_config_emitters_use_scene_identity_and_merge_by_durable_lane():
     widget = _source("web/js/editor_widget.js")
     save = _method(widget, "async _saveLaneConfigWithinGesture", "async _addLane")
     registry = (ROOT / "web/js/lane_registry.js").as_uri()
+    coalescing = (ROOT / "web/js/scene_mutation_coalescing.js").as_uri()
     result = _run_node(f"""
 import {{descriptorFor, laneTypeFor}} from {registry!r};
+import {{coalesceSceneMutationIntents}} from {coalescing!r};
 class Harness {{
 {save}
   constructor() {{ this.projectDir='project'; this.activeSceneId='scene'; this.calls=[]; }}
@@ -9744,10 +9746,12 @@ def test_reference_config_bootstrap_and_move_barrier_use_real_queue_adapter():
     ])
     queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
     registry_url = (ROOT / "web/js/lane_registry.js").as_uri()
+    coalescing_url = (ROOT / "web/js/scene_mutation_coalescing.js").as_uri()
     result = _run_node(f"""
 import assert from 'node:assert/strict';
 import {{ProjectMutationQueue}} from {queue_url!r};
 import {{descriptorFor,laneTypeFor}} from {registry_url!r};
+import {{coalesceSceneMutationIntents}} from {coalescing_url!r};
 globalThis.notifyError=()=>{{}}; globalThis.notifyWarning=()=>{{}};
 class Harness {{
 {methods}

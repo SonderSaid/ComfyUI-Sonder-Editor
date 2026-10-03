@@ -385,8 +385,8 @@ import {
 } from "./reference_library_model.js";
 import { mountReferenceLanePanel } from "./editor_reference_panel.js";
 import {
-    laneStagingPopulation, memberPopulationCompatible, referenceConfigurationAdvisories,
-    resolveReferenceDropVerdict,
+    laneRecipePatchPlan, laneStagingPopulation, memberPopulationCompatible,
+    referenceConfigurationAdvisories, resolveReferenceDropVerdict,
 } from "./reference_lane_identity.js";
 import { REFERENCE_LANE_CAUSE, classifyReferenceChunks } from "./reference_resolution.js";
 import { deriveCurrentSceneAssetIds } from "./current_scene_assets.js";
@@ -1035,6 +1035,11 @@ export class EditorWidget {
         // refused, so a stage naming one can say why it failed.
         this._referenceClientIds = false;
         this._referenceClientIdsDemoted = false;
+        // Whether the server applies a recipe field edit as a patch (its
+        // payload's `lane_recipe_patch`), and whether one was ignored, which
+        // returns recipe edits to whole-value writes until the project changes.
+        this._laneRecipePatch = false;
+        this._laneRecipePatchDemoted = false;
         this._referenceRefusedCreateIds = new Set();
         this._referenceUnconfirmedRetryTimer = null;
         this._referenceUnconfirmedRetryAttempt = 0;
@@ -3051,6 +3056,7 @@ export class EditorWidget {
         // into an older build stops the minting at its next answer.
         this._referenceClientIds = Array.isArray(payload?.client_ids)
             && payload.client_ids.includes("reference") && payload.client_ids.includes("member");
+        this._laneRecipePatch = payload?.lane_recipe_patch === true;
         this._referenceUnconfirmedRetryAttempt = 0;
         this._referenceTagPresets = Array.isArray(payload?.tag_presets) ? payload.tag_presets : [];
         this._referenceTagFamilies = payload?.tag_families && typeof payload.tag_families === "object"
@@ -3478,8 +3484,10 @@ export class EditorWidget {
                     ? "The custom recipe could not be created." : undefined,
                 failureDetail: (error) => error?.payload?.error || error?.message || null,
             }).then(() => "ok", () => "failed");
-        entry.referenceRecipe = laneRecipeFor(recipeId);
-        const pointing = this._saveLaneConfigWithinGesture([entry], {
+        // A copy: a recipe left on the timeline's own entry would be re-sent
+        // by its next lock or rename.
+        const pointing = this._saveLaneConfigWithinGesture([{
+            ...entry, referenceRecipe: laneRecipeFor(recipeId) }], {
             expectedLaneId, undoLabel: "change lane recipe", rollbackRecipe: true,
             // The create has already spoken for the pair.
             quietCodes: ["unknown_reference_recipe"],
@@ -14548,6 +14556,15 @@ export class EditorWidget {
      * is refused and stays on top. The lock toggle pushes its own entry before
      * calling, so it passes none.
      *
+     * What the save does to a Reference lane's recipe is the caller's to say.
+     * A lock, rename or hide writes none: they used to re-send the painted
+     * recipe, which re-committed a recipe edit whose own save had failed
+     * ([#62]). An entry carrying `referenceRecipe` replaces the whole recipe
+     * (a template, media kind, detach or fork). `recipePatch`, one field edit
+     * as `{ hard?, soft? }` for a single entry, is sent as
+     * `reference_recipe_patch`, guarded by each key's prior value and never
+     * folded with another write.
+     *
      * `rollbackRecipe` (the Reference Lane panel's recipe writes) restores the
      * painted recipe locally when the write fails, so a dead server cannot
      * leave a recipe on screen that the project never accepted. See
@@ -14555,6 +14572,7 @@ export class EditorWidget {
      */
     async _saveLaneConfigWithinGesture(changedEntries, {
         expectedLaneId = "", undoLabel = "", rollbackRecipe = false, quietCodes = [],
+        recipePatch = null,
     } = {}) {
         if (!this.activeScene || !this.projectDir) return;
         // Only entries that write: pushing an entry clears Redo and can trim the
@@ -14564,7 +14582,7 @@ export class EditorWidget {
         if (!entries.length) return;
         const sceneId = this.activeSceneId;
         const sceneRef = this.activeScene;
-        if (undoLabel) this._pushUndo(undoLabel);
+        const undoEntry = undoLabel ? this._pushUndo(undoLabel) : null;
         // A lane's durable id where one is known; positional families and lanes
         // without a known id keep their index. Distinct lanes that occupy the
         // same index across a reorder must not erase each other's edits.
@@ -14572,34 +14590,57 @@ export class EditorWidget {
             ? `${op.lane_type}:lane:${op.expected.lane_id}`
             : `${op.lane_type}:index:${op.lane_index || 0}`);
         const operations = [];
-        // The recipe chains this save painted into (see `_trackLaneRecipeWrite`).
-        const recipeChains = [];
+        // The recipe writes this save painted, one per lane (see
+        // `_trackLaneRecipeWrite`).
+        const recipeWrites = [];
+        // Whether this save sent a recipe patch, which an older server ignores.
+        let sentPatch = false;
         for (const e of entries) {
             const laneType = this._laneTypeForEntry(e);
             if (!laneType) continue;
             const laneIndex = e.laneIndex || 0;
-            const fields = { name: e.customName || "", color: e.color || "", locked: !!e.locked, hidden: !!e.hidden };
+            const configFields = { name: e.customName || "", color: e.color || "", locked: !!e.locked, hidden: !!e.hidden };
             const descriptor = descriptorFor(e.type);
-            if (descriptor?.recipeAttr) {
-                fields.reference_recipe = e.referenceRecipe
-                    || sceneRef?.[descriptor.recipeAttr]?.[laneIndex]
-                    || this._defaultReferenceLaneRecipe();
-            }
             const storedLaneId = String(sceneRef?.[descriptorFor(laneType)?.recipeAttr]?.[laneIndex]?.lane_id || "").trim();
             // One caller identity names one lane: a multi-entry call cannot say
             // which of its entries the id belongs to, so it gets none.
             const callerLaneId = descriptor?.recipeAttr && entries.length === 1
                 ? String(expectedLaneId || "").trim() : "";
             const laneId = callerLaneId || storedLaneId;
+            let wholeRecipe = descriptor?.recipeAttr ? (e.referenceRecipe || null) : null;
+            let patchPlan = null;
+            if (descriptor?.recipeAttr && recipePatch && entries.length === 1) {
+                const plan = laneRecipePatchPlan(
+                    sceneRef?.[descriptor.recipeAttr]?.[laneIndex] || this._defaultReferenceLaneRecipe(),
+                    recipePatch);
+                // A patch is guarded by the lane's durable id, and needs a
+                // server that applies it. Without either the edit is written
+                // whole, as every recipe edit was before. Expiry: the whole
+                // fallback goes once the oldest supported server advertises
+                // `lane_recipe_patch` and every lane has a durable id at creation.
+                if (plan.patchable && laneId && this._laneRecipePatch
+                        && !this._laneRecipePatchDemoted) {
+                    patchPlan = plan;
+                    sentPatch = true;
+                } else {
+                    wholeRecipe = plan.recipe;
+                }
+            }
+            const fields = patchPlan
+                ? { reference_recipe_patch: patchPlan.patch }
+                : { ...configFields, ...(wholeRecipe ? { reference_recipe: wholeRecipe } : {}) };
+            // A patch is only sent with a lane id (above).
             operations.push({ type: "update_lane_config", lane_type: laneType, lane_index: laneIndex, fields,
-                ...(laneId ? { expected: { lane_id: laneId } } : {}),
+                ...(patchPlan
+                    ? { expected: { lane_id: laneId, reference_recipe_fields: patchPlan.priors } }
+                    : laneId ? { expected: { lane_id: laneId } } : {}),
             });
             if (callerLaneId && callerLaneId !== storedLaneId) continue;
             // Optimistic per-lane scene write (icon-flicker fix, now scoped):
             // _buildTrackLayout re-derives icon state from scene configs, so any
             // rebuild during the in-flight window must already see the new value.
-            if (sceneRef) {
-                const { reference_recipe: _referenceRecipe, ...configFields } = fields;
+            if (!sceneRef) continue;
+            if (!patchPlan) {
                 const cfg = { ...configFields };
                 if (laneType === "guide") {
                     sceneRef.guide_track_config = cfg;
@@ -14613,20 +14654,20 @@ export class EditorWidget {
                     while (list.length <= laneIndex) list.push(this._defaultLaneConfig());
                     list[laneIndex] = { ...(list[laneIndex] || {}), ...cfg };
                     sceneRef[listKey] = list;
-                    if (descriptor?.recipeAttr && fields.reference_recipe) {
-                        const chain = this._trackLaneRecipeWrite(
-                            sceneId, laneConfigKey(operations.at(-1)), sceneRef,
-                            descriptor.recipeAttr, laneIndex, laneId, rollbackRecipe);
-                        recipeChains.push(chain);
-                        const recipes = Array.isArray(sceneRef[descriptor.recipeAttr]) ? sceneRef[descriptor.recipeAttr] : [];
-                        while (recipes.length <= laneIndex) recipes.push({ ...this._defaultReferenceLaneRecipe(), lane_id: "" });
-                        // Only an identity already read from the scene is known
-                        // durable. A panel draft cannot mint it optimistically.
-                        recipes[laneIndex] = { ...fields.reference_recipe, lane_id: laneId };
-                        sceneRef[descriptor.recipeAttr] = recipes;
-                        chain.lastPainted = recipes[laneIndex];
-                    }
                 }
+            }
+            if (descriptor?.recipeAttr && (wholeRecipe || patchPlan)) {
+                const chain = this._trackLaneRecipeWrite(
+                    sceneId, laneConfigKey(operations.at(-1)), sceneRef,
+                    descriptor.recipeAttr, laneIndex, laneId, rollbackRecipe);
+                const recipes = Array.isArray(sceneRef[descriptor.recipeAttr]) ? sceneRef[descriptor.recipeAttr] : [];
+                while (recipes.length <= laneIndex) recipes.push({ ...this._defaultReferenceLaneRecipe(), lane_id: "" });
+                // Only an identity already read from the scene is known
+                // durable. A panel draft cannot mint it optimistically.
+                recipes[laneIndex] = { ...(patchPlan ? patchPlan.recipe : wholeRecipe), lane_id: laneId };
+                sceneRef[descriptor.recipeAttr] = recipes;
+                recipeWrites.push(this._openLaneRecipeWrite(
+                    chain, recipes[laneIndex], patchPlan?.patch || null));
             }
         }
         if (!operations.length) return;
@@ -14635,49 +14676,54 @@ export class EditorWidget {
         // at the cost of one document write per lane in a burst. A scene-wide
         // key folded locks on three different lanes into one Undo step.
         const laneSetKey = [...new Set(operations.map(laneConfigKey))].sort().join(",");
-        // Latest config wins per lane.
-        const merge = (oldIntent, nextIntent) => {
-            const byLane = new Map();
-            for (const op of [...(oldIntent?.operations || []), ...(nextIntent?.operations || [])]) {
-                byLane.set(laneConfigKey(op), op);
+        // A refusal a sibling write of the gesture has already explained (a
+        // fork's refused create) adds no second message.
+        const failureMessage = (error) => {
+            const code = error?.payload?.code || error?.code;
+            if (quietCodes.includes(code)) return null;
+            if (code === "identity_mismatch" && sentPatch) {
+                return "This recipe setting changed before your edit saved.";
             }
-            return { ...nextIntent, operations: [...byLane.values()] };
+            return code === "unknown_reference_recipe"
+                ? "That custom recipe no longer exists. The lane keeps its previous recipe."
+                : "lane config failed — timeline restored.";
         };
-        // Whether this save opened its own queue slot or folded into a pending
-        // one: only a slot's head settles the recipe chains it painted into.
-        let joinedPendingSlot = false;
         let saving;
         try {
-            saving = this._runSceneMutation(operations, {
-                key: `scene:${sceneId}:lane-config:${laneSetKey}`,
-                label: "lane config",
-                coalesce: true,
-                merge,
-                // Adopt server-minted bootstrap ids through the normal guarded
-                // scene reconciler; pending newer edits defer to the idle refresh.
-                refreshScenes: true,
-                onSupersededByCoalescing: () => { joinedPendingSlot = true; },
-                // A refusal a sibling write of the gesture has already
-                // explained (a fork's refused create) adds no second message.
-                failureMessage: (error) => {
-                    const code = error?.payload?.code || error?.code;
-                    if (quietCodes.includes(code)) return null;
-                    return code === "unknown_reference_recipe"
-                        ? "That custom recipe no longer exists. The lane keeps its previous recipe."
-                        : "lane config failed — timeline restored.";
-                },
-            });
+            saving = sentPatch
+                // A recipe patch travels alone, its own write and its own Undo
+                // step. The server applies a batch all or nothing, and a patch
+                // whose prior a failed write left behind is refused by design;
+                // sharing its request would take a lock, or another field's
+                // edit, down with it.
+                ? this._runSceneMutation(operations, {
+                    key: `scene:${sceneId}:lane-recipe-patch:${laneSetKey}`,
+                    label: "lane config",
+                    coalesce: false,
+                    // Adopt the canonical scene through the guarded reconciler.
+                    refreshScenes: true,
+                    failureMessage,
+                })
+                : this._runSceneMutation(operations, {
+                    key: `scene:${sceneId}:lane-config:${laneSetKey}`,
+                    label: "lane config",
+                    coalesce: true,
+                    // A config write folds into the pending one for its lane,
+                    // the fields unioned; a whole recipe never jumps a patch of
+                    // its lane (`scene_mutation_coalescing.js`).
+                    merge: coalesceSceneMutationIntents,
+                    // Adopt server-minted bootstrap ids through the normal
+                    // guarded scene reconciler; pending newer edits defer to the
+                    // idle refresh.
+                    refreshScenes: true,
+                    failureMessage,
+                });
         } catch (e) {
             saving = Promise.reject(e);
         }
-        if (!joinedPendingSlot) {
-            for (const chain of recipeChains) chain.open += 1;
-        }
+        let result;
         try {
-            const result = await saving;
-            if (!joinedPendingSlot) {
-                for (const chain of recipeChains) this._settleLaneRecipeWrite(chain, result);
-            }
+            result = await saving;
         } catch (e) {
             console.warn("[Sonder] Failed to save lane config:", e);
             if ((e?.payload?.code || e?.code) === "unknown_reference_recipe") {
@@ -14686,11 +14732,9 @@ export class EditorWidget {
                 this._deferProjectBackedRefresh(["references"], "unknown_reference_recipe");
             }
             let rolledBack = false;
-            if (!joinedPendingSlot) {
-                for (const chain of recipeChains) {
-                    rolledBack = this._settleLaneRecipeWrite(chain, null, { failed: true })
-                        || rolledBack;
-                }
+            for (const write of recipeWrites) {
+                rolledBack = this._settleLaneRecipeWrite(write, null, { failed: true })
+                    || rolledBack;
             }
             if (rolledBack) this._renderSceneAfterLocalMutation({ viewport: false });
             // An ungated GET dispatched while a later write is still queued
@@ -14706,14 +14750,36 @@ export class EditorWidget {
             const healed = await this._fetchScenes({ ignoreMutationGate: true, reason: "lane_config_error" });
             // The heal is the only rollback lock/rename/hide have, and it fails
             // for the same reason the write did when the server is unreachable.
-            if (healed === false && recipeChains.length && !joinedPendingSlot) {
+            if (healed === false && recipeWrites.length) {
                 sessionDiagRecord("lane_config_rollback_deferred", {
                     recipe_rolled_back: rolledBack,
                 });
             }
             this._buildTrackLayout();
             this._renderTimeline();
+            return;
         }
+        // A server older than the patch ignores it as an unknown field and
+        // answers 200 having written nothing; one that applied it says so.
+        // Expiry: with the whole-value fallback above.
+        const ignored = sentPatch && !!result?.payload
+            && !(result.payload.results || []).some((entry) =>
+                entry?.type === "update_lane_config" && entry?.reference_recipe_patch === true);
+        if (ignored) {
+            this._laneRecipePatchDemoted = true;
+            // The write changed nothing, so its Undo step would undo nothing.
+            // A patch is alone in its slot, so the entry is this write's own.
+            if (undoEntry) this._discardUndoEntry(undoEntry);
+            sessionDiagRecord("recipe_patch_ignored", {});
+            notifyWarning("This recipe setting was not saved. Try the edit again.",
+                { source: "reference-recipe-patch-ignored" });
+        }
+        let rolledBack = false;
+        for (const write of recipeWrites) {
+            rolledBack = this._settleLaneRecipeWrite(write, result,
+                { failed: ignored && !!write.keys }) || rolledBack;
+        }
+        if (rolledBack) this._renderSceneAfterLocalMutation({ viewport: false });
     }
 
     /**
@@ -14726,19 +14792,24 @@ export class EditorWidget {
      * unsettled write, advanced by each write the server accepts -- never a
      * snapshot one gesture captured for itself. Two writes A then B, both
      * failing: B's own snapshot is A's paint, which the server never held.
-     * Every lane-config write that carries the lane's recipe joins the chain
-     * (a lock or rename re-sends the recipe too), but only a chain some write
-     * opted into with `rollbackRecipe` restores it; lock/rename/hide keep the
-     * refetch heal alone.
+     * Every write that carries the lane's recipe joins the chain, whole or a
+     * patch; a lock, rename or hide carries none. Only a chain some write
+     * opted into with `rollbackRecipe` restores it.
+     *
+     * Each write is counted, per gesture, on the lane and on every key it
+     * names (a whole recipe names them all). A failed patch rolls back only
+     * its own keys, at once, unless a queued write names one of them: that
+     * write's prior is the failed paint, so the server refuses it, and its own
+     * failure restores the key. When the chain's last write settles after any
+     * failure, the whole acknowledged recipe -- the server's -- is restored.
      */
     _trackLaneRecipeWrite(sceneId, laneKey, sceneRef, recipeAttr, laneIndex, laneId, rollbackRecipe) {
         const chains = this._laneRecipeWriteChains ||= new Map();
         const key = `${sceneId}|${laneKey}`;
         let chain = chains.get(key);
-        // Every enqueued head opens a slot in the same synchronous turn it
-        // painted, and the last settle deletes the chain, so a chain with no
-        // open slot here was left by a save that threw before enqueueing: its
-        // acknowledged value is stale, and it starts over.
+        // A write opens its count in the same synchronous turn it painted, and
+        // the last settle deletes the chain, so a chain with no open write here
+        // is stale, and it starts over.
         if (!chain || chain.open === 0) {
             const prior = sceneRef?.[recipeAttr]?.[laneIndex];
             chain = {
@@ -14747,6 +14818,10 @@ export class EditorWidget {
                 // null: unknown, so nothing is restored.
                 acknowledged: prior ? structuredClone(prior) : null,
                 open: 0,
+                // Unsettled writes per recipe key (`section.key`), and whole ones.
+                keyOpen: new Map(),
+                wholeOpen: 0,
+                failed: false,
                 rollback: false,
             };
             chains.set(key, chain);
@@ -14761,49 +14836,135 @@ export class EditorWidget {
         return chain;
     }
 
-    /** One settled queue slot of a recipe chain. Returns whether it restored
-     *  the acknowledged recipe locally (the caller renders). */
-    _settleLaneRecipeWrite(chain, result, { failed = false } = {}) {
-        chain.open = Math.max(0, chain.open - 1);
-        if (!failed) {
-            const recipes = result?.payload?.scene?.[chain.recipeAttr];
-            const accepted = Array.isArray(recipes)
-                ? (chain.laneId
-                    ? recipes.find((recipe) => String(recipe?.lane_id || "").trim() === chain.laneId)
-                    : recipes[chain.laneIndex])
-                : null;
-            chain.acknowledged = accepted ? structuredClone(accepted) : null;
-            if (!chain.open) this._laneRecipeWriteChains?.delete(chain.key);
-            return false;
+    /** Count one gesture's recipe write on its chain, after its paint. A
+     *  patch names its keys; a whole recipe (null `patch`) names them all. */
+    _openLaneRecipeWrite(chain, painted, patch) {
+        const keys = patch ? Object.entries(patch).flatMap(([section, values]) =>
+            Object.keys(values || {}).map((key) => `${section}.${key}`)) : null;
+        chain.open += 1;
+        if (keys) {
+            for (const key of keys) chain.keyOpen.set(key, (chain.keyOpen.get(key) || 0) + 1);
+        } else {
+            chain.wholeOpen += 1;
         }
-        if (!chain.rollback) {
-            if (!chain.open) this._laneRecipeWriteChains?.delete(chain.key);
-            return false;
-        }
-        if (chain.open) {
-            // A newer write for this lane is still queued. It carries what the
-            // author last saw and settles the chain itself: restoring now would
-            // flash a value that write is about to re-commit.
-            sessionDiagRecord("recipe_rollback_skipped", { reason: "newer_write_queued" });
-            return false;
-        }
-        this._laneRecipeWriteChains?.delete(chain.key);
+        chain.lastPainted = painted;
+        return { chain, keys };
+    }
+
+    /** Why the chain may not put a value back on the lane now, or "". */
+    _laneRecipeRestoreRefusal(chain) {
         const scene = this.activeScene;
         const recipes = scene?.[chain.recipeAttr];
         const current = Array.isArray(recipes) ? recipes[chain.laneIndex] : null;
         // Restore only over this chain's own last paint: anything else there
         // (a Reference stage painting the lane's recipe, a canonical scene) is
         // newer than the value the chain would put back.
-        const reason = !chain.acknowledged ? "unknown_acknowledged_recipe"
+        return !chain.acknowledged ? "unknown_acknowledged_recipe"
             : scene !== chain.sceneRef ? "scene_replaced"
                 : !current || String(current.lane_id || "").trim() !== chain.laneId
                     || (!chain.laneId && recipes.length !== chain.laneCount)
                     ? "lane_moved"
                     : current !== chain.lastPainted ? "repainted_elsewhere" : "";
+    }
+
+    /** One settled recipe write. A write the server answered (`result`), even
+     *  one treated as `failed`, advances the acknowledged recipe to the one it
+     *  holds. Returns whether a value was restored locally (the caller
+     *  renders). */
+    _settleLaneRecipeWrite(write, result, { failed = false } = {}) {
+        const { chain, keys } = write;
+        chain.open = Math.max(0, chain.open - 1);
+        if (keys) {
+            for (const key of keys) {
+                const left = (chain.keyOpen.get(key) || 0) - 1;
+                if (left > 0) chain.keyOpen.set(key, left);
+                else chain.keyOpen.delete(key);
+            }
+        } else {
+            chain.wholeOpen = Math.max(0, chain.wholeOpen - 1);
+        }
+        if (result?.payload) {
+            const recipes = result.payload.scene?.[chain.recipeAttr];
+            const accepted = Array.isArray(recipes)
+                ? (chain.laneId
+                    ? recipes.find((recipe) => String(recipe?.lane_id || "").trim() === chain.laneId)
+                    : recipes[chain.laneIndex])
+                : null;
+            chain.acknowledged = accepted ? structuredClone(accepted) : null;
+        }
+        if (failed) chain.failed = true;
+        let restored = false;
+        if (failed && chain.rollback && chain.open) {
+            restored = this._restoreLaneRecipeKeys(chain, keys);
+        }
+        if (!chain.open) {
+            this._laneRecipeWriteChains?.delete(chain.key);
+            if (chain.failed && chain.rollback) restored = this._restoreLaneRecipe(chain) || restored;
+            chain.settled?.();
+        }
+        return restored;
+    }
+
+    /** A promise that resolves once no recipe write of the active scene's lane
+     *  `laneIndex` is unsettled, or null when none is. A whole-recipe copy
+     *  (Save as custom) waits for it: a patch still saving may yet fail, and
+     *  copying its paint would write the value the author is about to be told
+     *  was lost. Null keeps an idle copy synchronous, so a later write of the
+     *  lane is still queued after it. */
+    _laneRecipeWritesIdle(laneIndex) {
+        const prefix = `${this.activeSceneId}|`;
+        const open = [...(this._laneRecipeWriteChains?.values() || [])].filter((chain) =>
+            chain.key.startsWith(prefix) && chain.laneIndex === laneIndex && chain.open > 0);
+        if (!open.length) return null;
+        return Promise.all(open.map((chain) => chain.idle ||= new Promise((resolve) => {
+            chain.settled = resolve;
+        })));
+    }
+
+    /** A failed patch's keys put back while other writes of the lane are
+     *  still queued. A key a queued write also names is left to that write. */
+    _restoreLaneRecipeKeys(chain, keys) {
+        const free = chain.wholeOpen ? [] : (keys || []).filter((key) => !chain.keyOpen.has(key));
+        if (free.length < (keys || [1]).length) {
+            // A queued write names it. Restoring now would flash a value that
+            // write may yet commit; whichever settles last puts it back.
+            sessionDiagRecord("recipe_rollback_skipped", { reason: "newer_write_queued" });
+        }
+        if (!free.length) return false;
+        const reason = this._laneRecipeRestoreRefusal(chain);
         if (reason) {
             sessionDiagRecord("recipe_rollback_skipped", { reason });
             return false;
         }
+        const recipes = this.activeScene[chain.recipeAttr];
+        const next = structuredClone(recipes[chain.laneIndex]);
+        const isObject = (value) => !!value && typeof value === "object" && !Array.isArray(value);
+        if (!isObject(next.recipe)) next.recipe = {};
+        for (const path of free) {
+            const [section, field] = [path.slice(0, path.indexOf(".")), path.slice(path.indexOf(".") + 1)];
+            const acknowledged = chain.acknowledged.recipe?.[section];
+            if (!isObject(next.recipe[section])) next.recipe[section] = {};
+            if (isObject(acknowledged) && Object.hasOwn(acknowledged, field)) {
+                next.recipe[section][field] = structuredClone(acknowledged[field]);
+            } else {
+                delete next.recipe[section][field];
+            }
+        }
+        recipes[chain.laneIndex] = next;
+        chain.lastPainted = next;
+        return true;
+    }
+
+    /** The chain's last write has settled after a failure: the lane shows the
+     *  recipe the server holds. */
+    _restoreLaneRecipe(chain) {
+        const reason = this._laneRecipeRestoreRefusal(chain);
+        if (reason) {
+            sessionDiagRecord("recipe_rollback_skipped", { reason });
+            return false;
+        }
+        const recipes = this.activeScene[chain.recipeAttr];
+        if (JSON.stringify(recipes[chain.laneIndex]) === JSON.stringify(chain.acknowledged)) return false;
         recipes[chain.laneIndex] = structuredClone(chain.acknowledged);
         return true;
     }
@@ -27487,6 +27648,8 @@ export class EditorWidget {
         this._setReferenceOverlays([]);
         this._referenceClientIds = false;
         this._referenceClientIdsDemoted = false;
+        this._laneRecipePatch = false;
+        this._laneRecipePatchDemoted = false;
         this._referenceRefusedCreateIds = new Set();
         this._clearUnconfirmedReferenceRetry();
         this._historyMergeCapabilities = null;

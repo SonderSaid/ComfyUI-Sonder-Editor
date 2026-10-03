@@ -47,7 +47,9 @@ console.log(JSON.stringify(cases));
     assert golden["case_count"] == 215
     migrated = []
     for case in golden["cases"]:
-        rows = [{**row, "referenceRecipe": None} for row in case["rows"]]
+        # Layout rows carry no Reference recipe: a recipe on a row was re-sent
+        # by every lock and rename of it (backlog step 1, Phase 5).
+        rows = [dict(row) for row in case["rows"]]
         guide_index = next(index for index, row in enumerate(rows) if row["type"] == "guides")
         rows.insert(guide_index, {
             "type": "reference",
@@ -58,7 +60,6 @@ console.log(JSON.stringify(cases));
             "color": "",
             "locked": False,
             "hidden": False,
-            "referenceRecipe": {"media_kind": "image", "recipe_id": "", "recipe": {}},
         })
         migrated.append({**case, "rows": rows, "length": len(rows)})
     assert actual == migrated

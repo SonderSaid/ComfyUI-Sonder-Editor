@@ -406,9 +406,6 @@ export function buildTrackLayout({ scene, collapsedKeys = null, theme = {} } = {
                     color: config.color || fallbackColor(descriptor, laneIndex, theme),
                     locked: config.locked || false,
                     hidden: config.hidden || false,
-                    referenceRecipe: descriptor.recipeAttr
-                        ? (scene?.[descriptor.recipeAttr]?.[laneIndex] || { media_kind: "image", recipe_id: "", recipe: {} })
-                        : null,
                 });
             }
             continue;
@@ -424,7 +421,6 @@ export function buildTrackLayout({ scene, collapsedKeys = null, theme = {} } = {
             color: "",
             locked: !!config.locked,
             hidden: !!config.hidden,
-            referenceRecipe: null,
         });
     }
     return layout;

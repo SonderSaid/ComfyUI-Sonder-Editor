@@ -16,7 +16,10 @@
 //   _findAssetById(id), _referenceAssetPreviewUrl(asset),
 //   _openReferenceMediaEditor({ asset, draft, readOnly }),
 //   _isLaneLocked(type, laneIndex),
-//   _saveLaneConfig(entries, { expectedLaneId, undoLabel }),
+//   _saveLaneConfig(entries, { expectedLaneId, undoLabel, rollbackRecipe,
+//     recipePatch }) -- a copied entry carrying `referenceRecipe` writes the
+//     whole recipe; `recipePatch` writes one field edit's keys,
+//   _laneRecipeWritesIdle(laneIndex),
 //   _stageReferenceItemOnLane(payload, laneIndex, startFrame),
 //   _deleteReferenceItemFromPanel(itemId),
 //   _writeReferenceItemFromPanel(itemId, fields | (liveRow) => fields, undoLabel),
@@ -363,23 +366,27 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         return false;
     };
 
-    const writeRecipe = async (recipe, { structural = true, evenIfLocked = false } = {}) => {
+    // `patch` is a field edit's `{ hard?, soft? }`: the host sends only those
+    // keys, guarded by the values they replace, so a write queued behind a
+    // failed one cannot re-commit it. Without one, `recipe` replaces the
+    // lane's whole recipe (a template, media kind, detach or fork).
+    const writeRecipe = async (recipe, { structural = true, evenIfLocked = false, patch = null } = {}) => {
         if (recipeWriteRefused({ evenIfLocked })) return;
-        const entry = currentEntry();
         const expectedLaneId = state.renderedLaneId || "";
-        const current = laneRecipe();
-        const nextRecipe = preserveLaneRecipeIdentity(
-            current,
-            recipe,
-            host._defaultReferenceLaneRecipe().lane_id,
-        );
-        entry.referenceRecipe = nextRecipe;
+        // A copy of the timeline's entry: a recipe left on the entry itself
+        // would be re-sent by its next lock or rename.
+        const entry = patch ? { ...currentEntry() } : {
+            ...currentEntry(),
+            referenceRecipe: preserveLaneRecipeIdentity(
+                laneRecipe(), recipe, host._defaultReferenceLaneRecipe().lane_id),
+        };
         // Its own Undo step: a recipe is part of the lane family, and a lane
         // write no entry reverses blocks every earlier lane Undo. The save's
         // synchronous part pushes that step and paints the scene; a failed
         // write restores the acknowledged recipe locally (`rollbackRecipe`).
         const saving = host._saveLaneConfig([entry], {
-            expectedLaneId, undoLabel: "change lane recipe", rollbackRecipe: true });
+            expectedLaneId, undoLabel: "change lane recipe", rollbackRecipe: true,
+            ...(patch ? { recipePatch: patch } : {}) });
         if (structural) {
             host._buildTrackLayout?.();
             host._renderTimeline?.();
@@ -433,18 +440,21 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         const recipe = laneRecipe();
         const materialized = recipe.recipe && typeof recipe.recipe === "object" ? recipe.recipe : {};
         const section = field.section === "soft" ? "soft" : "hard";
-        const next = { ...(materialized[section] || {}), [field.key]: value };
+        const values = { [field.key]: value };
         // Typing a pegged value by hand un-pegs it: the number you just entered
         // is the intent, not the source it used to follow.
         const peg = PEG_SOURCE_FIELD[field.key];
-        if (peg) next[peg] = "custom";
-        materialized[section] = next;
+        if (peg) values[peg] = "custom";
+        materialized[section] = { ...(materialized[section] || {}), ...values };
         recipe.recipe = materialized;
         // A value that shows, hides, un-pegs or re-validates other controls
         // reshapes the form, which must repaint now; any other value is already
         // on screen. Compared with what the panel DREW, so a scene change whose
         // repaint was deferred also counts.
-        void writeRecipe(recipe, { structural: recipeFormShape(recipe) !== state.drawnFormShape });
+        void writeRecipe(recipe, {
+            structural: recipeFormShape(recipe) !== state.drawnFormShape,
+            patch: { [section]: values },
+        });
     };
 
     /** A saved value the control cannot offer, which the form flags in red. */
@@ -1020,6 +1030,14 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
     // that moved or locked refuses before any recipe exists.
     const forkRecipe = async (name) => {
         if (recipeWriteRefused()) return;
+        // A field edit still saving may yet fail; the copy waits for it and
+        // takes what the lane then holds, rather than the edit's paint. With
+        // nothing saving it stays synchronous, so a write after it queues after.
+        const saving = host._laneRecipeWritesIdle?.(state.laneIndex);
+        if (saving) {
+            await saving;
+            if (recipeWriteRefused()) return;
+        }
         const recipe = laneRecipe();
         const pending = host._forkReferenceRecipe?.({
             entry: currentEntry(),
