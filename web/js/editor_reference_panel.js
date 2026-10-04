@@ -321,10 +321,13 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
 
     // ── Durable writes ─────────────────────────────────────────────────────
     //
-    // A recipe write paints and returns to the author at once; it never waits
-    // for, or is dropped behind, an earlier recipe save. The host's lane-config
-    // queue orders the writes and folds edits that meet a still-pending one
-    // into it, so a second edit reads the scene the first one painted. Every
+    // A recipe write paints and returns to the author at once; it is never
+    // dropped behind an earlier recipe save. The host's queue orders the
+    // writes: a field edit is a patch sent alone, after any earlier one, and a
+    // structural write folds into a pending config write for the lane, so a
+    // second edit reads the scene the first one painted. Save as custom, which
+    // copies the whole recipe, first waits for the lane's recipe saves
+    // (`_laneRecipeWritesIdle`). Every
     // recipe action therefore reads `laneRecipe()` when the author acts, never
     // the recipe a render drew: the draw-time copy is exactly the stale value a
     // quick "change a field, then click Save as custom" would write back.

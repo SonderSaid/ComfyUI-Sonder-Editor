@@ -518,6 +518,18 @@ export const VALID_FIT_MODES = new Set(FIT_MODE_OPTIONS.map((entry) => entry.val
 export const VALID_CROP_POSITIONS = new Set(CROP_POSITION_OPTIONS.map((entry) => entry.value));
 export const DEFAULT_FIT_MODE = "cover";
 export const DEFAULT_CROP_POSITION = "center";
+// Project-durable Reference defaults; mirror media_helpers.resolve_reference_framing.
+// These do not belong in browser-local DEFAULT_EDITOR_SETTINGS.
+export const DEFAULT_REFERENCE_FIT_MODE = "cover";
+export const DEFAULT_REFERENCE_CROP_POSITION = "center";
+export function normalizeReferenceFraming(values) {
+    return {
+        fitMode: VALID_FIT_MODES.has(values?.reference_fit_mode)
+            ? values.reference_fit_mode : DEFAULT_REFERENCE_FIT_MODE,
+        cropPosition: VALID_CROP_POSITIONS.has(values?.reference_crop_position)
+            ? values.reference_crop_position : DEFAULT_REFERENCE_CROP_POSITION,
+    };
+}
 const VALID_CUSTOM_CONTAINERS = new Set(CUSTOM_CONTAINER_OPTIONS);
 const VALID_CUSTOM_VIDEO_CODECS = new Set(CUSTOM_VIDEO_CODEC_OPTIONS);
 const VALID_CUSTOM_PIX_FMTS = new Set(CUSTOM_PIX_FMT_OPTIONS);

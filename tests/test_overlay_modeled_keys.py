@@ -222,9 +222,9 @@ def test_a_staged_member_clear_commits_and_keeps_unknown_member_keys():
     data = json.loads(json.dumps(project.to_dict()))
     data["scenes"][0]["reference_items"][0]["members"][0]["future_member"] = "kept"
     project = TimelineProject.from_dict(data)
-    # The canonical members, not the served row: a guard spelled with the
-    # unknown key is refused until Phase 2's normalized compare (Bug Tracker
-    # "...can never be bulk-deleted"), which this test is not about.
+    # The canonical members, not the served row: this test is about the save
+    # overlay, not the update guard, which since Phase 2 compares members after
+    # normalization either way.
     stored = project.get_scene("s").reference_items[0].to_dict()["members"]
     cleared = [{key: value for key, value in stored[0].items()
                 if key not in ("visual_intent", "role")}]

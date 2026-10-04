@@ -165,6 +165,33 @@ A Reference lane header's **☰** (also on its right-click menu) opens the lane
 Setup overlay — staged members, their order, and the recipe that decides how
 they're assembled for the model.
 
+## Reference image fitting
+
+**Settings → References** sets how individual reference images and video
+frames fill their recipe's output dimensions, across all built-in and custom
+recipes in the project. New and existing projects default to **Fill (crop),
+Center** until you choose a setting.
+
+| Fit Mode | Result |
+|---|---|
+| **Fit (black bars)** | Keeps the whole image and its aspect ratio, adding black bars. |
+| **Fit (edge pad)** | Keeps the whole image and fills the remaining space with its edge pixels. |
+| **Fill (crop)** | Fills the output while keeping aspect ratio, cropping what extends past it. |
+| **Stretch** | Fills the output by resizing to its width and height. |
+
+Fill also offers a **Crop Anchor**: Center, Top, Bottom, Left or Right. The
+anchor stays saved when another mode hides the control. These settings travel
+with the project; the clip and guide creation defaults are separate browser
+preferences. A choice appears in the controls once its save succeeds.
+
+Fitting happens after the Library member's own crop and after the recipe
+chooses output dimensions. It applies to **Batch**, **Temporal** and **Slots**.
+**Sheet** grids and strips keep their recipe's fitting, layout and background.
+
+Queued jobs keep the fit mode and anchor captured when they were added, even
+if Settings changes before they run. Jobs queued before these controls were
+added retain the former **Fit (edge pad), Center** behavior.
+
 ## Recipes and lane setup
 
 A lane's **recipe** decides how its staged members become model input. Open it

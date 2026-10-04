@@ -20,12 +20,14 @@ import numpy as np
 import torch
 
 from ..server.media_helpers import (
+    DEFAULT_REFERENCE_FIT_MODE,
     apply_rgb_color_correction,
     color_correction_for_interpretation,
     decode_audio_samples,
     decode_video_frame,
     decode_video_range,
     fit_frame_to_canvas,
+    resolve_reference_framing,
     resolve_source_color_interpretation,
 )
 from ..server.path_security import resolve_existing_project_path
@@ -134,6 +136,10 @@ def _render_window(project, scene) -> tuple[int, int, int, int]:
 
 def _source(project, scene) -> dict[str, Any]:
     job = _find_queue_job(project)
+    framing = resolve_reference_framing(
+        getattr(job, "params", None) if job is not None else getattr(project, "metadata", None),
+        snapshot=job is not None,
+    )
     if job is not None and _snapshot_version(job) > 0:
         catalog_project = _snapshot_catalog_project(project, job)
         lane_count = max(1, _int(getattr(job, "reference_lane_count", 1), 1))
@@ -184,6 +190,7 @@ def _source(project, scene) -> dict[str, Any]:
         "recipes": recipes[:lane_count],
         "items": items,
         "frame_threshold_pct": threshold,
+        "framing": framing,
         "pegs": pegs,
         "catalog_project": catalog_project,
     }
@@ -337,6 +344,7 @@ def resolve_reference_set(project, reference_lanes="0") -> dict[str, Any]:
         "render_end": render_end,
         "width": width,
         "height": height,
+        "framing": source["framing"],
         # Peg sources travel with the resolved set so the bridge resolves them
         # the same way whether it runs live or from a frozen job, and so they
         # land in the selector fingerprint.
@@ -642,8 +650,9 @@ def _member_geometry(
     return bounded(output_width, output_height)
 
 
-def _to_tensor(frame: np.ndarray, width: int, height: int) -> torch.Tensor:
-    fitted, _ = fit_frame_to_canvas(frame, width, height, mode="pad_edge", crop_position="center")
+def _to_tensor(frame: np.ndarray, width: int, height: int, *,
+               fit_mode: str = DEFAULT_REFERENCE_FIT_MODE, crop_position: str = "center") -> torch.Tensor:
+    fitted, _ = fit_frame_to_canvas(frame, width, height, mode=fit_mode, crop_position=crop_position)
     return torch.from_numpy(np.ascontiguousarray(fitted, dtype=np.float32) / 255.0)
 
 
@@ -868,6 +877,7 @@ def _reference_decode_context(reference_set, expected_media_kind: str | None = N
         "records": records,
         "media_kind": media_kind,
         "reserved_span": reserved_span,
+        "framing": ref.get("framing") or resolve_reference_framing(),
     }
 
 
@@ -918,9 +928,11 @@ def _member_tensor_batch(
     output_width: int,
     output_height: int,
     member_count: int,
+    framing: dict | None = None,
 ) -> torch.Tensor:
     width, height = _member_geometry(frames[0], hard, output_width, output_height, member_count)
-    return torch.stack([_to_tensor(frame, width, height) for frame in frames], dim=0)
+    framing = framing or resolve_reference_framing()
+    return torch.stack([_to_tensor(frame, width, height, **framing) for frame in frames], dim=0)
 
 
 def _decode_lane_images(context) -> list[torch.Tensor]:
@@ -939,8 +951,10 @@ def _decode_lane_images(context) -> list[torch.Tensor]:
         _load_member_images(record, decode_span=decode_span, target_fps=target_fps, hard=hard)
         for record in records
     ]
-    member_tensors = [
-        _member_tensor_batch(frames, hard, context["width"], context["height"], len(records))
+    # Sheets fit the raw cropped members through their own compositor below.
+    member_tensors = [] if assembly == "sheet" else [
+        _member_tensor_batch(
+            frames, hard, context["width"], context["height"], len(records), context["framing"])
         for frames in member_frames
     ]
 

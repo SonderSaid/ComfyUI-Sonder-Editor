@@ -15,6 +15,8 @@ import {
     DEFAULT_EDITOR_SETTINGS,
     DEFAULT_SAVE_PRESET,
     FIT_MODE_OPTIONS,
+    DEFAULT_REFERENCE_FIT_MODE,
+    DEFAULT_REFERENCE_CROP_POSITION,
     GALLERY_PRELOAD_FOLLOWING_MAX,
     GALLERY_PROVENANCE_CACHE_MAX,
     GALLERY_SORT_OPTIONS,
@@ -336,6 +338,14 @@ function syncSettingsPanelControls() {
     if (controls.promptFrameThreshold) controls.promptFrameThreshold.value = String(this._promptFrameThreshold ?? 10);
     if (controls.referenceProsePolicy) controls.referenceProsePolicy.value = this._referenceProsePolicy || "drop";
     if (controls.referenceFrameThreshold) controls.referenceFrameThreshold.value = String(this._referenceFrameThreshold ?? 0);
+    if (controls.referenceFitMode) controls.referenceFitMode.value = this._referenceFitMode ?? DEFAULT_REFERENCE_FIT_MODE;
+    if (controls.referenceCropPosition) {
+        controls.referenceCropPosition.value = this._referenceCropPosition ?? DEFAULT_REFERENCE_CROP_POSITION;
+        controls.referenceCropPosition.parentElement.parentElement.hidden =
+            (this._referenceFitMode ?? DEFAULT_REFERENCE_FIT_MODE) !== "cover";
+        controls.referenceCropPosition.parentElement.parentElement.style.display =
+            (this._referenceFitMode ?? DEFAULT_REFERENCE_FIT_MODE) === "cover" ? "flex" : "none";
+    }
     if (controls.allowExternalProjectLinks) {
         const resolved = this._serverSettingsLoaded === true;
         controls.allowExternalProjectLinks.disabled = !resolved;
@@ -1473,6 +1483,33 @@ function showSettingsPanel() {
         "Reset Guides Section",
         "Restore browser-local guide snapshot and hover preview defaults. The project-wide collision toggle is unchanged.",
         () => this._updateSettings({ guides: DEFAULT_EDITOR_SETTINGS.guides })
+    );
+
+    const referencesSection = createSection(
+        "References",
+        "Project-wide fitting for individual reference images and video frames. Sheet grids and strips use their recipe's layout."
+    );
+    const commitReferenceFraming = (field, value) => {
+        // Native selects paint their choice immediately; restore acknowledged state
+        // until the project writer accepts it. Rapid choices still queue in order.
+        syncSettingsPanelControls.call(this);
+        Promise.resolve(this._setReferenceFraming(field, value))
+            .catch(() => {}) // The host mutation queue owns the notification.
+            .finally(() => syncSettingsPanelControls.call(this));
+    };
+    createSelect(
+        referencesSection, "referenceFitMode", "Fit Mode (project-wide)",
+        "How individual Reference outputs fill their recipe's dimensions. Saved with this project.",
+        FIT_MODE_OPTIONS,
+        () => this._referenceFitMode ?? DEFAULT_REFERENCE_FIT_MODE,
+        value => commitReferenceFraming("reference_fit_mode", value)
+    );
+    createSelect(
+        referencesSection, "referenceCropPosition", "Crop Anchor",
+        "Which side to keep when Fill (crop) removes part of the reference.",
+        CROP_POSITION_OPTIONS,
+        () => this._referenceCropPosition ?? DEFAULT_REFERENCE_CROP_POSITION,
+        value => commitReferenceFraming("reference_crop_position", value)
     );
 
     const serverSection = createSection(

@@ -535,6 +535,9 @@ import {
     RESOLUTION_TIERS,
     VALID_CROP_POSITIONS,
     VALID_FIT_MODES,
+    DEFAULT_REFERENCE_FIT_MODE,
+    DEFAULT_REFERENCE_CROP_POSITION,
+    normalizeReferenceFraming,
     computeResolutionFromTier,
     detectResolutionPresetSelections,
     frameConstraintsEqual,
@@ -1106,6 +1109,8 @@ export class EditorWidget {
         this._promptFrameThreshold = 10;
         this._referenceFrameThreshold = 0;
         this._referenceProsePolicy = "drop";
+        this._referenceFitMode = DEFAULT_REFERENCE_FIT_MODE;
+        this._referenceCropPosition = DEFAULT_REFERENCE_CROP_POSITION;
         this._serverSettings = null;
         this._serverSettingsLoaded = false;
         this._activeProjectLinked = false;
@@ -2248,7 +2253,8 @@ export class EditorWidget {
                     // A retime scales the duration, so a faster rate can carry
                     // it past the cap. Read from `error.payload.code`: the
                     // `error.code` arms here never match a real response
-                    // (Bug Tracker, "dead error?.code checks").
+                    // (Bug Tracker, "The FPS gesture's `queue_jobs_pending`
+                    // arms read `error?.code`").
                     failureDetail: (error) => error?.code === "queue_jobs_pending"
                         ? "This scene has pending or running queue jobs. Finish or clear them before changing FPS so their frozen frame ranges stay valid."
                         : error?.payload?.code === "duration_limit"
@@ -10606,6 +10612,8 @@ export class EditorWidget {
             get _promptFrameThreshold() { return editor._promptFrameThreshold; },
             get _referenceProsePolicy() { return editor._referenceProsePolicy; },
             get _referenceFrameThreshold() { return editor._referenceFrameThreshold; },
+            get _referenceFitMode() { return editor._referenceFitMode; },
+            get _referenceCropPosition() { return editor._referenceCropPosition; },
             get _guideCollisionAutoOffset() { return editor._guideCollisionAutoOffset; },
             get _serverSettings() { return editor._serverSettings; },
             get _serverSettingsLoaded() { return editor._serverSettingsLoaded; },
@@ -10623,6 +10631,7 @@ export class EditorWidget {
             _setPromptFrameThreshold: (value) => editor._setPromptFrameThreshold(value),
             _setReferenceProsePolicy: (value) => editor._setReferenceProsePolicy(value),
             _setReferenceFrameThreshold: (value) => editor._setReferenceFrameThreshold(value),
+            _setReferenceFraming: (field, value) => editor._setReferenceFraming(field, value),
             _keyboardConsumerId: (suffix) => editor._keyboardConsumerId(suffix),
             _hideSettingsPanel: () => editor._hideSettingsPanel(),
         };
@@ -17331,6 +17340,41 @@ export class EditorWidget {
                 );
             }
         }
+    }
+
+    async _setReferenceFraming(field, value) {
+        return this._withMutationGesture("setReferenceFraming", async (diagnostics) => {
+            const projectDir = this.projectDir;
+            const projectId = this._projectDirName();
+            if (!projectId) return;
+            const fit = field === "reference_fit_mode";
+            const valid = fit ? VALID_FIT_MODES : VALID_CROP_POSITIONS;
+            if ((!fit && field !== "reference_crop_position") || !valid.has(value)) {
+                throw new Error("Invalid Reference framing setting.");
+            }
+            const result = await this._queueProjectMutation({
+                key: `reference-framing:${projectId}`, label: "Reference framing",
+                coalesce: false, refreshScenes: false, refreshKeysOnError: ["project"],
+                failureMessage: "Reference framing could not be saved.",
+                diagnostics, intent: { projectId, field, value },
+                run: async (intent, queuedDiagnostics) => {
+                    if (this._destroyed || this.projectDir !== projectDir) {
+                        throw new Error("The active project changed before Reference framing saved.");
+                    }
+                    return this._runVersionedProjectMutation(
+                        `/sonder-editor/project/${encodeURIComponent(intent.projectId)}`,
+                        { method: "PUT", headers: { "Content-Type": "application/json",
+                            ...this._mutationDiagnosticHeaders(queuedDiagnostics) },
+                          body: JSON.stringify({ metadata: { [intent.field]: intent.value } }) },
+                        { projectId: intent.projectId });
+                },
+            });
+            if (this._destroyed || this.projectDir !== projectDir) return;
+            const framing = normalizeReferenceFraming(result?.payload?.metadata);
+            if (fit) this._referenceFitMode = framing.fitMode;
+            else this._referenceCropPosition = framing.cropPosition;
+            this._syncSettingsPanelControls();
+        });
     }
 
     async _setReferenceProsePolicy(value) {
@@ -27785,6 +27829,9 @@ export class EditorWidget {
         cancelThumbnailRepairOwner(this._thumbnailRepairOwnerId);
         this._referenceFetchSeq += 1;
         this.projectDir = projectDir;
+        this._referenceFitMode = DEFAULT_REFERENCE_FIT_MODE;
+        this._referenceCropPosition = DEFAULT_REFERENCE_CROP_POSITION;
+        this._syncSettingsPanelControls();
         this._renderCacheSweepGeneration += 1;
         this._renderCacheUsage = null;
         this._renderCacheSweepPending = false;
@@ -27953,6 +28000,7 @@ export class EditorWidget {
 
     async _fetchProjectSettings({ ignoreMutationGate = false, reason = "project_settings" } = {}) {
         if (!this.projectDir) return;
+        const projectDir = this.projectDir;
         if (!ignoreMutationGate && this._hasPendingProjectMutations()) {
             this._deferProjectBackedRefresh(["project"], reason);
             return;
@@ -27962,6 +28010,7 @@ export class EditorWidget {
             const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}`));
             if (resp.ok) {
                 const data = await resp.json();
+                if (this._destroyed || this.projectDir !== projectDir) return;
                 this.fps = data.fps || 24;
                 if (data.resolution) {
                     this.sceneWidth = data.resolution[0] || DEFAULT_EDITOR_SETTINGS.projectDefaults.width;
@@ -27980,6 +28029,15 @@ export class EditorWidget {
                 this._promptFrameThreshold = Number(data.metadata?.prompt_frame_threshold ?? 10) || 0;
                 this._referenceProsePolicy = data.metadata?.reference_prose_policy === "keep" ? "keep" : "drop";
                 this._referenceFrameThreshold = Number(data.metadata?.reference_frame_threshold ?? 0) || 0;
+                // A read started before a save must not replace its acknowledged framing.
+                const servedVersion = resp.headers.get("X-Sonder-Project-Modified-At") || data.modified_at || "";
+                const knownVersion = getProjectVersion(dirName);
+                if (!servedVersion || !knownVersion || servedVersion >= knownVersion) {
+                    const framing = normalizeReferenceFraming(data.metadata);
+                    this._referenceFitMode = framing.fitMode;
+                    this._referenceCropPosition = framing.cropPosition;
+                    this._syncSettingsPanelControls();
+                }
                 await this._maybeHealFrameConstraint(this.projectDir, dirName, data.frame_constraint);
                 await this._maybeHealDimensionConstraint(this.projectDir, dirName, data.dimension_constraint);
                 this._syncSceneResolutionControls({ detectSelections: false });

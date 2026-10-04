@@ -34,6 +34,7 @@ from .media_helpers import (
     probe_media_metadata,
     probe_video_color_metadata,
     resize_frame_to_long_edge,
+    resolve_reference_framing,
     write_png,
 )
 from .path_security import (
@@ -6147,6 +6148,23 @@ def _compose_frozen_job_prompt(project: TimelineProject, job: GenerationJob) -> 
     _freeze_reference_input_snapshots(project, job, compiled, template_id)
 
 
+def _freeze_reference_framing_param(project: TimelineProject, job: GenerationJob) -> None:
+    """Freeze project framing once, retaining explicit values on a reused job."""
+    # Released v0.2.2 jobs predate References; keep their reviewed params allowlist.
+    # Expiry: remove this exemption with the released v0.2.2 queue input contract.
+    if frozen_prompt.prompt_context_format(job) is None:
+        return
+    params = dict(job.params) if isinstance(job.params, dict) else {}
+    framing = resolve_reference_framing(getattr(project, "metadata", None))
+    params["reference_fit_mode"] = (
+        _validated_fit_mode(params["reference_fit_mode"])
+        if "reference_fit_mode" in params else framing["fit_mode"])
+    params["reference_crop_position"] = (
+        _validated_crop_position(params["reference_crop_position"])
+        if "reference_crop_position" in params else framing["crop_position"])
+    job.params = params
+
+
 def _freeze_guide_collision_param(project: TimelineProject, job: GenerationJob) -> None:
     """Freeze the render-affecting project toggle into snapshot jobs."""
     params = getattr(job, "params", {}) or {}
@@ -11720,6 +11738,21 @@ if routes is not None:
         except json.JSONDecodeError:
             return _json_error("Invalid JSON body", 400)
 
+        # Validate framing before changing any project field or saving.
+        incoming_metadata = body.get("metadata") if isinstance(body, dict) else None
+        if isinstance(incoming_metadata, dict):
+            incoming_metadata = dict(incoming_metadata)
+            try:
+                if "reference_fit_mode" in incoming_metadata:
+                    incoming_metadata["reference_fit_mode"] = _validated_fit_mode(
+                        incoming_metadata["reference_fit_mode"])
+                if "reference_crop_position" in incoming_metadata:
+                    incoming_metadata["reference_crop_position"] = _validated_crop_position(
+                        incoming_metadata["reference_crop_position"])
+            except ProjectMutationRequestError as exc:
+                return _mutation_json_error(exc)
+            body = {**body, "metadata": incoming_metadata}
+
         normalized_profile_update = None
         if ("prompt_context_profiles" in body
                 and "create_prompt_context_profile" in body):
@@ -15039,6 +15072,7 @@ if routes is not None:
             _freeze_new_job_channel_template(project, job)
             _compose_frozen_job_prompt(project, job)
             _freeze_guide_collision_param(project, job)
+            _freeze_reference_framing_param(project, job)
             _queue_guide_collision_prediction(project, job)
             project.generation_queue.append(job)
             _record_prompt_history(project, [job])
@@ -15077,6 +15111,7 @@ if routes is not None:
                 _freeze_new_job_channel_template(project, job)
                 _compose_frozen_job_prompt(project, job)
                 _freeze_guide_collision_param(project, job)
+                _freeze_reference_framing_param(project, job)
                 _queue_guide_collision_prediction(project, job)
             project.generation_queue.extend(jobs)
             _record_prompt_history(project, jobs)

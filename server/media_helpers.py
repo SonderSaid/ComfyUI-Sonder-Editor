@@ -1213,6 +1213,21 @@ FIT_MODES = ("fit", "pad_edge", "cover", "stretch")
 CROP_POSITIONS = ("center", "top", "bottom", "left", "right")
 DEFAULT_FIT_MODE = "pad_edge"
 DEFAULT_CROP_POSITION = "center"
+DEFAULT_REFERENCE_FIT_MODE = "cover"
+
+
+def resolve_reference_framing(values=None, *, snapshot: bool = False) -> dict[str, str]:
+    """Resolve Reference framing without rewriting tolerant stored metadata."""
+    values = values if isinstance(values, dict) else {}
+    # Queued Reference snapshots predating authored framing used edge padding.
+    # Expiry: remove only when support for those persisted jobs is dropped.
+    default_mode = DEFAULT_FIT_MODE if snapshot else DEFAULT_REFERENCE_FIT_MODE
+    mode = values.get("reference_fit_mode")
+    anchor = values.get("reference_crop_position")
+    return {
+        "fit_mode": mode if isinstance(mode, str) and mode in FIT_MODES else default_mode,
+        "crop_position": anchor if isinstance(anchor, str) and anchor in CROP_POSITIONS else DEFAULT_CROP_POSITION,
+    }
 
 
 def _resize_interpolation(src_w: int, src_h: int, dst_w: int, dst_h: int) -> int:
