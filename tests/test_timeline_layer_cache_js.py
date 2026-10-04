@@ -121,7 +121,8 @@ const {strict:assert}=await import('node:assert');
 const getProjectAssetMutationEpoch=()=>1,sessionDiagRecord=()=>{},api={apiURL:x=>x};
 const getTemplateById=()=>({id:'free'}),PROJECT_TEMPLATE_KEY='channel_template',DEFAULT_CHANNEL_TEMPLATE_ID='standard';
 const DEFAULT_EDITOR_SETTINGS={projectDefaults:{width:1280,height:720}};
-const h={projectDir:'test',_timelineLayerCache:{valid:true},_playbackWarmState:null,
+const normalizeReferenceFraming=()=>({fitMode:'cover',cropPosition:'center'});
+const h={projectDir:'test',_referenceFramingAckSeq:0,_syncSettingsPanelControls(){},_timelineLayerCache:{valid:true},_playbackWarmState:null,
  _projectDirName:()=> 'test',_currentSceneAssetIdsForGallery:()=>[],
  _clearPlaybackWarmOverlay(reason,opts){assert.equal(opts.render,false);},
  _renderTimeline(){this._timelineLayerCache.valid=false;},

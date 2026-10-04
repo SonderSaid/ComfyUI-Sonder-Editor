@@ -170,7 +170,8 @@ they're assembled for the model.
 **Settings → References** sets how individual reference images and video
 frames fill their recipe's output dimensions, across all built-in and custom
 recipes in the project. New and existing projects default to **Fill (crop),
-Center** until you choose a setting.
+Center** until you choose a setting. Earlier versions padded these outputs with
+edge pixels; choose **Fit (edge pad)** to keep that look in an existing project.
 
 | Fit Mode | Result |
 |---|---|
@@ -182,15 +183,16 @@ Center** until you choose a setting.
 Fill also offers a **Crop Anchor**: Center, Top, Bottom, Left or Right. The
 anchor stays saved when another mode hides the control. These settings travel
 with the project; the clip and guide creation defaults are separate browser
-preferences. A choice appears in the controls once its save succeeds.
+preferences. A choice shows at once while it saves; if the save fails, the
+control returns to the saved setting.
 
 Fitting happens after the Library member's own crop and after the recipe
 chooses output dimensions. It applies to **Batch**, **Temporal** and **Slots**.
 **Sheet** grids and strips keep their recipe's fitting, layout and background.
 
 Queued jobs keep the fit mode and anchor captured when they were added, even
-if Settings changes before they run. Jobs queued before these controls were
-added retain the former **Fit (edge pad), Center** behavior.
+if Settings changes before they run. Jobs the editor queued before these
+controls were added retain the former **Fit (edge pad), Center** behavior.
 
 ## Recipes and lane setup
 

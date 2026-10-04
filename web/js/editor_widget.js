@@ -1111,6 +1111,11 @@ export class EditorWidget {
         this._referenceProsePolicy = "drop";
         this._referenceFitMode = DEFAULT_REFERENCE_FIT_MODE;
         this._referenceCropPosition = DEFAULT_REFERENCE_CROP_POSITION;
+        // Latest unacknowledged choice per framing field, shown until its save settles.
+        this._referenceFramingIntents = new Map();
+        this._referenceFramingIntentSeq = 0;
+        // Counts acknowledged framing saves; a project read started before one is stale.
+        this._referenceFramingAckSeq = 0;
         this._serverSettings = null;
         this._serverSettingsLoaded = false;
         this._activeProjectLinked = false;
@@ -10614,6 +10619,7 @@ export class EditorWidget {
             get _referenceFrameThreshold() { return editor._referenceFrameThreshold; },
             get _referenceFitMode() { return editor._referenceFitMode; },
             get _referenceCropPosition() { return editor._referenceCropPosition; },
+            get _referenceFramingDisplay() { return editor._displayedReferenceFraming(); },
             get _guideCollisionAutoOffset() { return editor._guideCollisionAutoOffset; },
             get _serverSettings() { return editor._serverSettings; },
             get _serverSettingsLoaded() { return editor._serverSettingsLoaded; },
@@ -17342,6 +17348,16 @@ export class EditorWidget {
         }
     }
 
+    /** The framing the Settings controls show: the latest unsaved choice, else the saved value. */
+    _displayedReferenceFraming() {
+        return {
+            fitMode: this._referenceFramingIntents.get("reference_fit_mode")?.value
+                ?? this._referenceFitMode,
+            cropPosition: this._referenceFramingIntents.get("reference_crop_position")?.value
+                ?? this._referenceCropPosition,
+        };
+    }
+
     async _setReferenceFraming(field, value) {
         return this._withMutationGesture("setReferenceFraming", async (diagnostics) => {
             const projectDir = this.projectDir;
@@ -17352,28 +17368,49 @@ export class EditorWidget {
             if ((!fit && field !== "reference_crop_position") || !valid.has(value)) {
                 throw new Error("Invalid Reference framing setting.");
             }
-            const result = await this._queueProjectMutation({
-                key: `reference-framing:${projectId}`, label: "Reference framing",
-                coalesce: false, refreshScenes: false, refreshKeysOnError: ["project"],
-                failureMessage: "Reference framing could not be saved.",
-                diagnostics, intent: { projectId, field, value },
-                run: async (intent, queuedDiagnostics) => {
-                    if (this._destroyed || this.projectDir !== projectDir) {
-                        throw new Error("The active project changed before Reference framing saved.");
-                    }
-                    return this._runVersionedProjectMutation(
-                        `/sonder-editor/project/${encodeURIComponent(intent.projectId)}`,
-                        { method: "PUT", headers: { "Content-Type": "application/json",
-                            ...this._mutationDiagnosticHeaders(queuedDiagnostics) },
-                          body: JSON.stringify({ metadata: { [intent.field]: intent.value } }) },
-                        { projectId: intent.projectId });
-                },
-            });
-            if (this._destroyed || this.projectDir !== projectDir) return;
-            const framing = normalizeReferenceFraming(result?.payload?.metadata);
-            if (fit) this._referenceFitMode = framing.fitMode;
-            else this._referenceCropPosition = framing.cropPosition;
+            // Show the choice while it saves; every pick queues, even one equal
+            // to the saved value, so the last choice made is the one that lands.
+            const token = ++this._referenceFramingIntentSeq;
+            this._referenceFramingIntents.set(field, { value, token });
             this._syncSettingsPanelControls();
+            try {
+                const result = await this._queueProjectMutation({
+                    key: `reference-framing:${projectId}`, label: "Reference framing",
+                    coalesce: false, refreshScenes: false, refreshKeysOnError: ["project"],
+                    failureMessage: "Reference framing could not be saved.",
+                    diagnostics, intent: { projectId, field, value },
+                    run: async (intent, queuedDiagnostics) => {
+                        if (this._destroyed || this.projectDir !== projectDir) {
+                            throw new Error("The active project changed before Reference framing saved.");
+                        }
+                        return this._runVersionedProjectMutation(
+                            `/sonder-editor/project/${encodeURIComponent(intent.projectId)}`,
+                            { method: "PUT", headers: { "Content-Type": "application/json",
+                                ...this._mutationDiagnosticHeaders(queuedDiagnostics) },
+                              body: JSON.stringify({ metadata: { [intent.field]: intent.value } }) },
+                            { projectId: intent.projectId });
+                    },
+                });
+                if (this._destroyed || this.projectDir !== projectDir) return;
+                // Serialized acknowledgements are monotonic, so each carries the
+                // stored framing for both fields.
+                const metadata = result?.payload?.metadata;
+                if (metadata && typeof metadata === "object") {
+                    const framing = normalizeReferenceFraming(metadata);
+                    this._referenceFitMode = framing.fitMode;
+                    this._referenceCropPosition = framing.cropPosition;
+                } else if (fit) {
+                    this._referenceFitMode = value;
+                } else {
+                    this._referenceCropPosition = value;
+                }
+                this._referenceFramingAckSeq += 1;
+            } finally {
+                if (this._referenceFramingIntents.get(field)?.token === token) {
+                    this._referenceFramingIntents.delete(field);
+                }
+                if (!this._destroyed && this.projectDir === projectDir) this._syncSettingsPanelControls();
+            }
         });
     }
 
@@ -27831,6 +27868,7 @@ export class EditorWidget {
         this.projectDir = projectDir;
         this._referenceFitMode = DEFAULT_REFERENCE_FIT_MODE;
         this._referenceCropPosition = DEFAULT_REFERENCE_CROP_POSITION;
+        this._referenceFramingIntents.clear();
         this._syncSettingsPanelControls();
         this._renderCacheSweepGeneration += 1;
         this._renderCacheUsage = null;
@@ -28006,6 +28044,7 @@ export class EditorWidget {
             return;
         }
         const dirName = this.projectDir.split(/[/\\]/).pop();
+        const framingAckSeq = this._referenceFramingAckSeq;
         try {
             const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}`));
             if (resp.ok) {
@@ -28029,10 +28068,10 @@ export class EditorWidget {
                 this._promptFrameThreshold = Number(data.metadata?.prompt_frame_threshold ?? 10) || 0;
                 this._referenceProsePolicy = data.metadata?.reference_prose_policy === "keep" ? "keep" : "drop";
                 this._referenceFrameThreshold = Number(data.metadata?.reference_frame_threshold ?? 0) || 0;
-                // A read started before a save must not replace its acknowledged framing.
-                const servedVersion = resp.headers.get("X-Sonder-Project-Modified-At") || data.modified_at || "";
-                const knownVersion = getProjectVersion(dirName);
-                if (!servedVersion || !knownVersion || servedVersion >= knownVersion) {
+                // A read started before a framing save was acknowledged must not
+                // replace it. Only framing saves count: an unrelated save landing
+                // during the read leaves this read's framing current.
+                if (this._referenceFramingAckSeq === framingAckSeq) {
                     const framing = normalizeReferenceFraming(data.metadata);
                     this._referenceFitMode = framing.fitMode;
                     this._referenceCropPosition = framing.cropPosition;

@@ -226,6 +226,24 @@ def test_historical_snapshot_retains_edge_padding_while_live_defaults_to_crop(mo
     assert "reference_fit_mode" not in project.metadata
 
 
+def test_a_queued_job_without_a_snapshot_follows_the_live_framing(monkeypatch, tmp_path):
+    # Such a job (a marker-absent v0.2.2 request) renders live References, so
+    # its framing is live too; edge padding is only a frozen snapshot's fallback.
+    core = _import_module(monkeypatch, "reference_core")
+    project = patterned_project(tmp_path)
+    project.metadata.update(reference_fit_mode="stretch", reference_crop_position="right")
+    scene = project.scenes[0]
+    job = GenerationJob(job_id="live", scene_id=scene.scene_id, params={})
+    project.generation_queue = [job]
+    project._execution_context["queue_job_ref_id"] = job.job_id
+    resolved = core.resolve_reference_set(project)
+    assert resolved["framing"] == {"fit_mode": "stretch", "crop_position": "right"}
+    project._execution_context.pop("queue_job_ref_id")
+    assert np.array_equal(core.decode_reference_images(resolved)[0].numpy(),
+                          core.decode_reference_images(core.resolve_reference_set(project))[0].numpy())
+    assert job.params == {}
+
+
 def test_fingerprint_tracks_live_framing_even_without_a_revision_change(monkeypatch, tmp_path):
     core = _import_module(monkeypatch, "reference_core")
     project = patterned_project(tmp_path)

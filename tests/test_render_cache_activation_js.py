@@ -165,6 +165,7 @@ import assert from 'node:assert/strict';
 const {{ shouldJoinSweep }} = await import({json.dumps(activation_url)});
 const api = {{ apiURL: (path) => path }};
 const cancelThumbnailRepairOwner = () => {{}};
+const DEFAULT_REFERENCE_FIT_MODE = 'cover', DEFAULT_REFERENCE_CROP_POSITION = 'center';
 class Host {{
   constructor() {{
     this.projectDir = 'A';
@@ -175,6 +176,7 @@ class Host {{
     this._renderCacheSweepPending = false;
     this._renderCacheUsage = null;
     this._referenceFetchSeq = 0;
+    this._referenceFramingIntents = new Map();
     this._settings = {{ render: {{ maxRenderCacheSizeBytes: 0 }} }};
     this.paints = 0;
     {status_handler}

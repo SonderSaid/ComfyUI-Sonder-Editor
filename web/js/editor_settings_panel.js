@@ -210,6 +210,15 @@ function createHandle(host) {
     };
 }
 
+/** Framing the Settings controls show: the host's latest unsaved choice, else the saved value. */
+function shownReferenceFraming(host) {
+    const shown = host._referenceFramingDisplay;
+    return {
+        fitMode: shown?.fitMode ?? host._referenceFitMode ?? DEFAULT_REFERENCE_FIT_MODE,
+        cropPosition: shown?.cropPosition ?? host._referenceCropPosition ?? DEFAULT_REFERENCE_CROP_POSITION,
+    };
+}
+
 function syncSettingsPanelControls() {
     if (!this._settingsPanelControls) return;
     const controls = this._settingsPanelControls;
@@ -338,13 +347,13 @@ function syncSettingsPanelControls() {
     if (controls.promptFrameThreshold) controls.promptFrameThreshold.value = String(this._promptFrameThreshold ?? 10);
     if (controls.referenceProsePolicy) controls.referenceProsePolicy.value = this._referenceProsePolicy || "drop";
     if (controls.referenceFrameThreshold) controls.referenceFrameThreshold.value = String(this._referenceFrameThreshold ?? 0);
-    if (controls.referenceFitMode) controls.referenceFitMode.value = this._referenceFitMode ?? DEFAULT_REFERENCE_FIT_MODE;
+    const framing = shownReferenceFraming(this);
+    if (controls.referenceFitMode) controls.referenceFitMode.value = framing.fitMode;
     if (controls.referenceCropPosition) {
-        controls.referenceCropPosition.value = this._referenceCropPosition ?? DEFAULT_REFERENCE_CROP_POSITION;
-        controls.referenceCropPosition.parentElement.parentElement.hidden =
-            (this._referenceFitMode ?? DEFAULT_REFERENCE_FIT_MODE) !== "cover";
+        controls.referenceCropPosition.value = framing.cropPosition;
+        controls.referenceCropPosition.parentElement.parentElement.hidden = framing.fitMode !== "cover";
         controls.referenceCropPosition.parentElement.parentElement.style.display =
-            (this._referenceFitMode ?? DEFAULT_REFERENCE_FIT_MODE) === "cover" ? "flex" : "none";
+            framing.fitMode === "cover" ? "flex" : "none";
     }
     if (controls.allowExternalProjectLinks) {
         const resolved = this._serverSettingsLoaded === true;
@@ -1490,9 +1499,8 @@ function showSettingsPanel() {
         "Project-wide fitting for individual reference images and video frames. Sheet grids and strips use their recipe's layout."
     );
     const commitReferenceFraming = (field, value) => {
-        // Native selects paint their choice immediately; restore acknowledged state
-        // until the project writer accepts it. Rapid choices still queue in order.
-        syncSettingsPanelControls.call(this);
+        // The host shows the choice while it saves and restores the saved value
+        // if the save fails. Rapid choices queue in order; the last one lands.
         Promise.resolve(this._setReferenceFraming(field, value))
             .catch(() => {}) // The host mutation queue owns the notification.
             .finally(() => syncSettingsPanelControls.call(this));
@@ -1501,14 +1509,14 @@ function showSettingsPanel() {
         referencesSection, "referenceFitMode", "Fit Mode (project-wide)",
         "How individual Reference outputs fill their recipe's dimensions. Saved with this project.",
         FIT_MODE_OPTIONS,
-        () => this._referenceFitMode ?? DEFAULT_REFERENCE_FIT_MODE,
+        () => shownReferenceFraming(this).fitMode,
         value => commitReferenceFraming("reference_fit_mode", value)
     );
     createSelect(
         referencesSection, "referenceCropPosition", "Crop Anchor",
         "Which side to keep when Fill (crop) removes part of the reference.",
         CROP_POSITION_OPTIONS,
-        () => this._referenceCropPosition ?? DEFAULT_REFERENCE_CROP_POSITION,
+        () => shownReferenceFraming(this).cropPosition,
         value => commitReferenceFraming("reference_crop_position", value)
     );
 

@@ -136,9 +136,12 @@ def _render_window(project, scene) -> tuple[int, int, int, int]:
 
 def _source(project, scene) -> dict[str, Any]:
     job = _find_queue_job(project)
+    # Only a snapshot job freezes framing; a job without a snapshot renders
+    # live References and so follows the project's live setting.
+    snapshot = job is not None and _snapshot_version(job) > 0
     framing = resolve_reference_framing(
-        getattr(job, "params", None) if job is not None else getattr(project, "metadata", None),
-        snapshot=job is not None,
+        getattr(job, "params", None) if snapshot else getattr(project, "metadata", None),
+        snapshot=snapshot,
     )
     if job is not None and _snapshot_version(job) > 0:
         catalog_project = _snapshot_catalog_project(project, job)
@@ -651,7 +654,7 @@ def _member_geometry(
 
 
 def _to_tensor(frame: np.ndarray, width: int, height: int, *,
-               fit_mode: str = DEFAULT_REFERENCE_FIT_MODE, crop_position: str = "center") -> torch.Tensor:
+               fit_mode: str, crop_position: str) -> torch.Tensor:
     fitted, _ = fit_frame_to_canvas(frame, width, height, mode=fit_mode, crop_position=crop_position)
     return torch.from_numpy(np.ascontiguousarray(fitted, dtype=np.float32) / 255.0)
 
@@ -877,6 +880,9 @@ def _reference_decode_context(reference_set, expected_media_kind: str | None = N
         "records": records,
         "media_kind": media_kind,
         "reserved_span": reserved_span,
+        # Every set resolve_reference_set builds carries framing; hand-built sets
+        # (tests, external callers) get the live default. Expiry: remove once
+        # REFERENCE_SET framing is required by a validated set schema.
         "framing": ref.get("framing") or resolve_reference_framing(),
     }
 
@@ -928,10 +934,9 @@ def _member_tensor_batch(
     output_width: int,
     output_height: int,
     member_count: int,
-    framing: dict | None = None,
+    framing: dict,
 ) -> torch.Tensor:
     width, height = _member_geometry(frames[0], hard, output_width, output_height, member_count)
-    framing = framing or resolve_reference_framing()
     return torch.stack([_to_tensor(frame, width, height, **framing) for frame in frames], dim=0)
 
 

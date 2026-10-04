@@ -876,7 +876,8 @@ def test_a_project_switch_releases_an_in_flight_delete_hold(tmp_path):
     Object.assign(w, { _clearStaleReplayState(){}, _clearVideoCache(){}, _sweepRenderCache(){},
       _fetchProjectSettings(){}, _renderQueuePanel(){}, _updateProjectIdentity(){},
       _clearUnconfirmedReferenceRetry(){}, _fetchReferences: async () => {},
-      _fetchAssets: () => new Promise(() => {}), _renderCacheSweepGeneration: 0 });
+      _fetchAssets: () => new Promise(() => {}), _renderCacheSweepGeneration: 0,
+      _referenceFramingIntents: new Map() });
     hold();
     offlineNext();
     deleteAt(10);
@@ -1297,7 +1298,8 @@ def test_a_project_switch_releases_the_field_chains(tmp_path):
     Object.assign(w, { _clearStaleReplayState(){}, _clearVideoCache(){}, _sweepRenderCache(){},
       _fetchProjectSettings(){}, _renderQueuePanel(){}, _updateProjectIdentity(){},
       _clearUnconfirmedReferenceRetry(){}, _fetchReferences: async () => {},
-      _fetchAssets: () => new Promise(() => {}), _renderCacheSweepGeneration: 0 });
+      _fetchAssets: () => new Promise(() => {}), _renderCacheSweepGeneration: 0,
+      _referenceFramingIntents: new Map() });
     hold();
     setStrength(10, 0.5);
     const oldScene = w.activeScene;
@@ -1410,7 +1412,8 @@ def test_an_edit_waiting_on_a_barrier_is_dropped_by_a_project_switch_not_sent_th
     Object.assign(w, { _clearStaleReplayState(){}, _clearVideoCache(){}, _sweepRenderCache(){},
       _fetchProjectSettings(){}, _renderQueuePanel(){}, _updateProjectIdentity(){},
       _clearUnconfirmedReferenceRetry(){}, _fetchReferences: async () => {},
-      _fetchAssets: () => new Promise(() => {}), _renderCacheSweepGeneration: 0 });
+      _fetchAssets: () => new Promise(() => {}), _renderCacheSweepGeneration: 0,
+      _referenceFramingIntents: new Map() });
     hold();
     const first = retain('item-2', 'member-c', 'partial');
     const second = w._writeReferenceItemFromPanel('item-2', { strength: 0.6 }, 'change reference strength');

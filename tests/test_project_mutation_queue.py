@@ -809,6 +809,9 @@ def _run_gesture_node(body: str, *, debug: bool = True) -> None:
                 _activeMutationGesture: null, _timelineMutationDepth: 0,
                 _sceneMutationInvalidationSeq: 0,
                 _projectMutationQueue: new ProjectMutationQueue(),
+                // Constructor state for project-wide Reference framing.
+                _referenceFramingIntents: new Map(), _referenceFramingIntentSeq: 0,
+                _referenceFramingAckSeq: 0,
                 _claimHistoryPostSnapshotCapture: () => null,
                 _stampHistoryPostSnapshot: () => {{}},
                 _reconcileActiveSceneFromMutation: () => true,

@@ -15,6 +15,7 @@ a fresh `[Unreleased]` block.
 - Settings → References: choose project-wide image fitting and a crop anchor for batch, temporal and separate-slot recipes. Defaults to Fill (crop), Center; sheet layouts stay recipe-defined, and already queued jobs keep their framing.
 
 ### Changed
+- References: batch, temporal and separate-slot recipes now crop each reference to fill its output instead of padding it with edge pixels, in existing projects too. To keep the previous look, choose Settings → References → Fit (edge pad). Jobs already queued keep edge padding.
 - Reference Lane Setup: each recipe setting you change is saved, and undone, on its own. Changes made while an earlier one was saving used to share one Undo step.
 
 ### Fixed
