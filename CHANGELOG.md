@@ -11,27 +11,29 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+## [0.7.7] - 2026-10-03
+
 ### Added
-- Settings → References: choose project-wide image fitting and a crop anchor for batch, temporal and separate-slot recipes. Defaults to Fill (crop), Center; sheet layouts stay recipe-defined, and already queued jobs keep their framing.
+- Settings → References: choose project-wide image fitting and a crop anchor for batch, temporal and separate-slot recipes. Defaults to Fill (crop), Center; sheet layouts stay recipe-defined.
 
 ### Changed
 - References: batch, temporal and separate-slot recipes now crop each reference to fill its output instead of padding it with edge pixels, in existing projects too. To keep the previous look, choose Settings → References → Fit (edge pad). Jobs already queued keep edge padding.
 - Reference Lane Setup: each recipe setting you change is saved, and undone, on its own. Changes made while an earlier one was saving used to share one Undo step.
 
 ### Fixed
-- Prompt Context: a setting you cleared came back after saving. Re-enabling a Reference chip's Summary through Attach, and repairing an identity's old voice binding, are the ones you would notice. Both now save, and a re-enabled Summary goes back to following its default.
 - Reference Lane Setup: clearing a member's saved role or retention now saves. It used to say it could not be saved yet.
 - Reference Lane Setup: a strength or mute edit is no longer refused because of another member on the item, such as one that no longer suits the lane's recipe.
-- Timeline: a Reference item whose saved members carry a field this version doesn't recognize can be deleted again.
-- Scene duration: making a scene shorter no longer moves or squashes its Reference items, on locked lanes or unlocked ones. Items past the new end stay where you placed them and come back when the scene grows. Trimming the right edge of one that starts past the end, or dragging one in alongside other items, now says why it can't, instead of cutting the item short.
-- Scene duration: a duration above 99,999 frames is refused with a message. It used to be saved, and a mistyped value could leave a scene millions of frames long.
-- Item editor: on a locked lane it opens read-only and says why, instead of applying your edit and then undoing it.
-- Item editor: a negative or unreadable Start now shows a message and restores the field. It used to do nothing.
-- Guides: on a locked guide track, the Guides popup's fields and Replace guide now refuse before changing anything. They used to show the change, then undo it.
 - Reference Lane Setup: when a recipe change fails, a change queued behind it no longer saves the failed value. Locking or renaming the lane no longer saves the recipe again.
-- Timeline: moving a Reference item to a typed Start, or splitting it, while a member role or retention change is saving now waits for that change, so both halves of a split keep it. Dragging or trimming the item says it is still saving instead.
 - Reference Lane Setup: deleting a custom recipe now switches its lane to Detached even when the delete's answer was lost, once it is found to have saved.
 - Reference Library: two refused deletes no longer put staged items back on the timeline in a different order.
+- Timeline: a Reference item whose saved members carry a field this version doesn't recognize can be deleted again.
+- Timeline: moving a Reference item to a typed Start, or splitting it, while a member role or retention change is saving now waits for that change, so both halves of a split keep it. Dragging or trimming the item says it is still saving instead.
+- Item editor: on a locked lane it opens read-only and says why, instead of applying your edit and then undoing it.
+- Item editor: a negative or unreadable Start now shows a message and restores the field. It used to do nothing.
+- Scene duration: making a scene shorter no longer moves or squashes its Reference items, on locked lanes or unlocked ones. Items past the new end stay where you placed them and come back when the scene grows. Trimming the right edge of one that starts past the end, or dragging one in alongside other items, now says why it can't, instead of cutting the item short.
+- Scene duration: a duration above 99,999 frames is refused with a message. It used to be saved, and a mistyped value could leave a scene millions of frames long.
+- Guides: on a locked guide track, the Guides popup's fields and Replace guide now refuse before changing anything. They used to show the change, then undo it.
+- Prompt Context: a setting you cleared came back after saving. Re-enabling a Reference chip's Summary through Attach, and repairing an identity's old voice binding, are the ones you would notice. Both now save, and a re-enabled Summary goes back to following its default.
 
 ## [0.7.6] - 2026-10-01
 

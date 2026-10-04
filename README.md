@@ -1,6 +1,6 @@
 # ComfyUI-Sonder-Editor
 
-**Version 0.7.6** — see the [CHANGELOG](CHANGELOG.md) for release notes.
+**Version 0.7.7** — see the [CHANGELOG](CHANGELOG.md) for release notes.
 
 Sonder Editor is a timeline-based video editor for ComfyUI, built for iterative
 long-form generation. Arrange scenes, clips, audio, guide frames and prompts on
@@ -252,8 +252,8 @@ ComfyUI.
 
 ## Requirements
 
-- **ComfyUI** — 0.7.6 was validated on ComfyUI **0.37.0** with frontend
-  **1.53.6**. That is what this release was tested against, not a minimum;
+- **ComfyUI** — 0.7.7 was validated on ComfyUI **0.38.0** with frontend
+  **1.53.10**. That is what this release was tested against, not a minimum;
   other versions are expected to work. The V3 nodes noted above load only on
   builds that provide `comfy_api`, and the complete V1 set loads otherwise.
 - **Python 3.10+** (matching your ComfyUI environment; validated on 3.12).
