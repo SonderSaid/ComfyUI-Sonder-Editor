@@ -19,7 +19,10 @@ from ..server.project_manager import ProjectVersionConflict, load_project, creat
 from ..server.project_storage import PROJECT_STORAGE_UNREADABLE_MESSAGE, ProjectStorageError
 from ..server import external_links
 from ..server import prompt_channel_templates
+from ..server import prompt_graph
 from ..server import prompt_payload
+from ..server import sdk_runs
+from ..server.session_registry import project_event_aliases
 from ..server.timeline_state import (
     ClipReference, GuideFrame, TimelineProject, Scene, effective_scene_fps,
 )
@@ -463,22 +466,11 @@ class SonderEditor:
 
     @staticmethod
     def _prompt_linked_node_id(value):
-        if not isinstance(value, (list, tuple)) or not value:
-            return None
-        node_id = value[0]
-        if isinstance(node_id, (str, int)):
-            return str(node_id)
-        return None
+        return prompt_graph.linked_node_id(value)
 
     @staticmethod
     def _prompt_bool(value) -> bool:
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)):
-            return bool(value)
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "on"}
-        return False
+        return prompt_graph.prompt_bool(value)
 
     @staticmethod
     def _coerce_bool(value, default: bool = False) -> bool:
@@ -496,15 +488,7 @@ class SonderEditor:
 
     @classmethod
     def _prompt_node_inputs(cls, prompt, node_id):
-        if not isinstance(prompt, dict):
-            return {}
-        node = prompt.get(str(node_id))
-        if not isinstance(node, dict):
-            node = prompt.get(node_id)
-        if not isinstance(node, dict):
-            return {}
-        inputs = node.get("inputs", {})
-        return inputs if isinstance(inputs, dict) else {}
+        return prompt_graph.node_inputs(prompt, node_id)
 
     @classmethod
     def _referenced_output_slots(cls, prompt, unique_id):
@@ -559,23 +543,7 @@ class SonderEditor:
 
     @classmethod
     def _upstream_reaches_editor(cls, prompt, source_id, editor_id) -> bool:
-        if source_id is None:
-            return False
-        target_id = str(editor_id)
-        stack = [str(source_id)]
-        seen = set()
-        while stack:
-            current_id = stack.pop()
-            if current_id == target_id:
-                return True
-            if current_id in seen:
-                continue
-            seen.add(current_id)
-            for upstream in cls._prompt_node_inputs(prompt, current_id).values():
-                upstream_id = cls._prompt_linked_node_id(upstream)
-                if upstream_id and upstream_id not in seen:
-                    stack.append(upstream_id)
-        return False
+        return prompt_graph.upstream_reaches(prompt, source_id, editor_id)
 
     @classmethod
     def _execution_reaches_color_correcting_save_video(cls, prompt, unique_id) -> bool:
@@ -637,23 +605,7 @@ class SonderEditor:
 
     @classmethod
     def _execution_reaches_save_with_mark(cls, prompt, unique_id, expected_mark_queue_complete: bool) -> bool:
-        if not isinstance(prompt, dict) or unique_id in {None, ""}:
-            return False
-        target_id = str(unique_id)
-        for node in prompt.values():
-            if not isinstance(node, dict):
-                continue
-            if node.get("class_type") not in {"SonderSaveVideo", "SonderSaveBridge"}:
-                continue
-            inputs = node.get("inputs", {})
-            if not isinstance(inputs, dict):
-                continue
-            if cls._prompt_bool(inputs.get("mark_queue_complete")) is not expected_mark_queue_complete:
-                continue
-            project_source = cls._prompt_linked_node_id(inputs.get("project"))
-            if cls._upstream_reaches_editor(prompt, project_source, target_id):
-                return True
-        return False
+        return prompt_graph.execution_reaches_save_with_mark(prompt, unique_id, expected_mark_queue_complete)
 
     @classmethod
     def _execution_reaches_terminal_save(cls, prompt, unique_id) -> bool:
@@ -692,12 +644,21 @@ class SonderEditor:
                 job.error = ""
                 job.progress = 0.0
                 job.base_modified_at = base_modified_at
+                # Lease before the claim is saved, so no window exists in which a
+                # saved `running` job has no run responsible for returning it.
+                lease_key = getattr(self, "_run_lease_key", "")
+                if lease_key:
+                    sdk_runs.take_lease(lease_key, getattr(proj, "project_dir", ""), job.job_id)
                 try:
                     if base_modified_at:
                         save_project(proj, expected_modified_at=base_modified_at)
                     else:
                         save_project(proj)
                 except ProjectVersionConflict as exc:
+                    # The claim was not saved; a lease left on it could reset a
+                    # claim someone else saved in the meantime.
+                    if lease_key:
+                        sdk_runs.settle_lease(getattr(proj, "project_dir", ""), job.job_id)
                     last_conflict = exc
                     proj = load_project(proj.project_dir)
                     break
@@ -764,11 +725,38 @@ class SonderEditor:
                     save_project(proj, expected_modified_at=base_modified_at)
                 else:
                     save_project(proj)
+                sdk_runs.settle_lease(getattr(proj, "project_dir", ""), target.job_id)
                 return
             except ProjectVersionConflict as exc:
                 last_conflict = exc
                 proj = load_project(proj.project_dir)
         raise RuntimeError("Failed to mark queue job failed after concurrent editor saves.") from last_conflict
+
+    @staticmethod
+    def _project_aliases(proj: TimelineProject) -> list[str]:
+        return project_event_aliases(proj)
+
+    @staticmethod
+    def _run_token(prompt, unique_id) -> str:
+        node = prompt.get(str(unique_id)) if isinstance(prompt, dict) and unique_id not in (None, "") else None
+        meta = node.get("_meta") if isinstance(node, dict) else None
+        token = meta.get("sonder_run") if isinstance(meta, dict) else None
+        return token.strip() if isinstance(token, str) else ""
+
+    def _bind_run(self, proj: TimelineProject, prompt, unique_id) -> tuple[str, str]:
+        """Bind this execution to its queue run; refuse a stale SDK token.
+
+        Runs before anything is claimed or saved. Returns the trusted run key (empty
+        when the prompt did not come through ComfyUI's queue) and the run token.
+        """
+        aliases = self._project_aliases(proj)
+        key = sdk_runs.trusted_key_for_prompt(prompt)
+        if key:
+            sdk_runs.note_project(key, proj.project_dir, aliases)
+        token = self._run_token(prompt, unique_id)
+        if token and sdk_runs.claim_token(token, aliases, key) != sdk_runs.TOKEN_OK:
+            raise RuntimeError("This run's SDK session has ended. Start it again from the editor.")
+        return key, token
 
     def execute(self, project, project_name, fps, width, height,
                 scene_id="", selection_start=0, selection_end=0,
@@ -844,14 +832,25 @@ class SonderEditor:
             proj_w, proj_h = proj.resolution
             execution_base_modified_at = getattr(proj, "modified_at", "")
 
+            run_key, run_token = self._bind_run(proj, prompt, unique_id)
             terminal_save_reached = self._execution_reaches_terminal_save(prompt, unique_id)
             unmarked_save_reached = self._execution_targets_unmarked_save(prompt, unique_id)
             queue_length = len(getattr(proj, "generation_queue", []) or [])
             queue_job_mode = ""
             if render_queue_active and terminal_save_reached:
-                proj, queue_job = self._consume_queue_job(proj)
+                if not run_key:
+                    logger.warning(
+                        "Claiming a queue job without a queue-hook run key; it is not leased, "
+                        "so only the next consume can reset it if this run fails.")
+                self._run_lease_key = run_key
+                try:
+                    proj, queue_job = self._consume_queue_job(proj)
+                finally:
+                    self._run_lease_key = ""
                 queue_job_consumed = queue_job is not None
                 queue_job_mode = "consume" if queue_job else ""
+                if run_token and queue_job is not None:
+                    sdk_runs.note_token_job(run_token, queue_job.job_id)
             elif render_queue_active:
                 # Peek the queued snapshot for any non-consume queue-active case,
                 # including when no save node is wired (e.g. preview/show-any-only

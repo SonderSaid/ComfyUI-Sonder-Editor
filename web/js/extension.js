@@ -942,7 +942,10 @@ function installBridgeFolderPicker(node) {
 }
 
 const pendingBridgeEditorNodeIds = new Map();
+const bridgeTrackingSerials = new Map();
 let queuedExecutionRefreshToken = 0;
+// How long a tracked bridge waits for `run_finished` after the settle ladder ends.
+const RUN_FINISHED_GRACE_MS = 60000;
 
 function trackBridgeExecution(bridgeNode) {
     for (const editorNode of getSaveBridgeEditorNodes(bridgeNode, "Save Bridge execution tracking")) {
@@ -950,6 +953,7 @@ function trackBridgeExecution(bridgeNode) {
         if (!projectDir) continue;
         editorNode._sonderController.beginBridgeExecutionTracking?.();
         pendingBridgeEditorNodeIds.set(editorNode.id, projectDir);
+        bridgeTrackingSerials.set(editorNode.id, (bridgeTrackingSerials.get(editorNode.id) || 0) + 1);
     }
 }
 
@@ -964,6 +968,39 @@ function getTrackedBridgeEditorNodes() {
         tracked.push(node);
     }
     return tracked;
+}
+
+// The server announces `run_finished` once Sonder has finalized a prompt's
+// bridges and returned any job the run left running. It is the only moment a
+// bridge's assets are known to have landed; ComfyUI's own "queue empty" status
+// arrives before that, so the ladder below only refreshes early and never decides.
+async function handleRunFinished(editorNode) {
+    const controller = editorNode?._sonderController;
+    if (!controller) return;
+    try {
+        if (pendingBridgeEditorNodeIds.has(editorNode.id)) {
+            await controller.handleBridgeExecutionSettled?.({ attemptIndex: "run_finished" });
+            controller.completeBridgeExecutionTracking?.();
+            pendingBridgeEditorNodeIds.delete(editorNode.id);
+        } else {
+            await controller.handleQueueExecutionSettled?.();
+        }
+    } catch (error) {
+        console.warn("[Sonder] run_finished refresh failed:", error);
+    }
+}
+
+// A backstop for an announcement that never comes (sent during a socket
+// reconnect, or for a run Sonder could not bind): stop tracking instead of
+// re-running the bridge settle ladder on every later "queue empty".
+function scheduleBridgeTrackingExpiry(editorNode) {
+    const serial = bridgeTrackingSerials.get(editorNode.id);
+    window.setTimeout(() => {
+        if (!pendingBridgeEditorNodeIds.has(editorNode.id)) return;
+        if (bridgeTrackingSerials.get(editorNode.id) !== serial) return;
+        editorNode._sonderController?.completeBridgeExecutionTracking?.();
+        pendingBridgeEditorNodeIds.delete(editorNode.id);
+    }, RUN_FINISHED_GRACE_MS);
 }
 
 function schedulePostPromptRefresh() {
@@ -991,16 +1028,10 @@ function schedulePostPromptRefresh() {
                 try {
                     if (bridgeNodeIds.has(editorNode.id)) {
                         return await editorNode._sonderController?.handleBridgeExecutionSettled?.({
-                            allowRollback: index === delays.length - 1,
                             attemptIndex: index,
-                            delay,
                         });
                     }
-                    return await editorNode._sonderController?.handleQueueExecutionSettled?.({
-                        allowRollback: index === delays.length - 1,
-                        attemptIndex: index,
-                        delay,
-                    });
+                    return await editorNode._sonderController?.handleQueueExecutionSettled?.();
                 } catch (error) {
                     console.warn("[Sonder] Queue reconciliation failed:", error);
                     return null;
@@ -1009,10 +1040,16 @@ function schedulePostPromptRefresh() {
             if (token !== queuedExecutionRefreshToken) return;
             const hasRunning = counts.some((value) => (value?.running || 0) > 0);
             if (index === delays.length - 1) {
+                // Fallback only: an editor whose sync socket is down never hears
+                // `run_finished`, so its bridge tracking ends here as it used to.
                 for (const editorNode of bridgeNodes) {
+                    if (editorNode._sonderController?.receivesRunFinished?.()) {
+                        scheduleBridgeTrackingExpiry(editorNode);
+                        continue;
+                    }
                     editorNode._sonderController?.completeBridgeExecutionTracking?.();
+                    pendingBridgeEditorNodeIds.delete(editorNode.id);
                 }
-                pendingBridgeEditorNodeIds.clear();
             }
             if (!hasRunning && !pendingBridgeEditorNodeIds.size) {
                 queuedExecutionRefreshToken += 1;
@@ -1061,6 +1098,7 @@ app.registerExtension({
 
                 const controller = new EditorNodeController(node, projectWidget);
                 node._sonderController = controller;
+                controller.onRunFinished = () => handleRunFinished(node);
                 node.resizable = true;
                 node.flags = { ...(node.flags || {}), resizable: true };
                 controller.render();

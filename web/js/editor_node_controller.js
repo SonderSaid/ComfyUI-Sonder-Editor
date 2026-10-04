@@ -530,10 +530,6 @@ function buildQueueUrl(projectDir) {
     return api.apiURL(`/sonder-editor/project/${projectIdFromDir(projectDir)}/queue`);
 }
 
-function buildQueueJobUrl(projectDir, jobId) {
-    return api.apiURL(`/sonder-editor/project/${projectIdFromDir(projectDir)}/queue/${jobId}`);
-}
-
 function buildSceneUrl(projectDir, sceneId) {
     return api.apiURL(`/sonder-editor/project/${projectIdFromDir(projectDir)}/scenes/${sceneId}`);
 }
@@ -1347,8 +1343,6 @@ export class EditorNodeController {
         this._resizeScheduled = false;
         this._programmaticResize = false;
         this._destroyed = false;
-        this._queueSaveCompletionCounter = 0;
-        this._lastQueueSettledSaveCompletionCounter = 0;
         this._knownAssetIds = null;
         this._knownAssetIdsProjectDir = "";
         this._bridgeAssetSettleSession = null;
@@ -1906,6 +1900,7 @@ export class EditorNodeController {
             onSessionChanged: (event) => this._handleSessionChanged(event),
             onHostPresenceChanged: (event) => this._handleHostPresenceChanged(event),
             onSubscribed: (event) => this._handleSyncSubscribed(event),
+            onRunFinished: (event) => this._handleRunFinished(event),
             onConnectionState: (state, details = {}) => {
                 if (state !== "open") this._syncSubscribed = false;
                 this._recordDiagEvent("sync_transport_state", { state, url: details.url || "" });
@@ -2316,8 +2311,6 @@ export class EditorNodeController {
                 this.fullscreenSession = null;
                 session.destroy();
             }
-            this._queueSaveCompletionCounter = 0;
-            this._lastQueueSettledSaveCompletionCounter = 0;
             this._resetBridgeAssetTracking({ clearKnown: true });
             this._frameConstraintHealedFor = "";
             this.state.projectDir = "";
@@ -2341,8 +2334,6 @@ export class EditorNodeController {
                 this.fullscreenSession = null;
                 session.destroy();
             }
-            this._queueSaveCompletionCounter = 0;
-            this._lastQueueSettledSaveCompletionCounter = 0;
             this._resetBridgeAssetTracking({ clearKnown: true });
             this._frameConstraintHealedFor = "";
             this.state.projectDir = projectDir;
@@ -3038,7 +3029,6 @@ export class EditorNodeController {
 
     handleSaveVideoExecuted() {
         if (this._destroyed || !this.state.projectDir) return;
-        this._queueSaveCompletionCounter += 1;
         this.syncStateFromWidgets();
         const assetRefresh = {
             mode: "read",
@@ -3055,7 +3045,7 @@ export class EditorNodeController {
         );
     }
 
-    async handleBridgeExecutionSettled({ allowRollback = false, attemptIndex = 0 } = {}) {
+    async handleBridgeExecutionSettled({ attemptIndex = 0 } = {}) {
         if (this._destroyed || !this.state.projectDir) {
             return this.state.dormantSummary?.queue_counts || {};
         }
@@ -3119,56 +3109,41 @@ export class EditorNodeController {
         return counts;
     }
 
-    async handleQueueExecutionSettled({ allowRollback = false } = {}) {
+    // A run that left its claimed job `running` (failure, interrupt, encoder error)
+    // is returned to `pending` by the server when ComfyUI finishes it, with or
+    // without a browser; this only refreshes what the canvas shows.
+    async handleQueueExecutionSettled() {
         if (this._destroyed || !this.state.projectDir) {
             return this.state.dormantSummary?.queue_counts || {};
         }
         this.syncStateFromWidgets();
-        let refreshed = await this.refreshSummary();
+        const refreshed = await this.refreshSummary();
         if (refreshed) {
             this._invalidateModules(["queue", "preview"]);
             this._reloadExpandedModuleIfNeeded(["queue", "preview"]);
         }
-        let counts = this.state.dormantSummary?.queue_counts || {};
-        const sawSaveCompletion = this._queueSaveCompletionCounter > this._lastQueueSettledSaveCompletionCounter;
-        if (allowRollback && (counts.running || 0) > 0 && !sawSaveCompletion) {
-            const rolledBack = await this._rollbackStaleRunningQueueJobs();
-            if (rolledBack) {
-                refreshed = await this.refreshSummary();
-                if (refreshed) {
-                    this._invalidateModules(["queue", "preview"]);
-                    this._reloadExpandedModuleIfNeeded(["queue", "preview"]);
-                }
-                counts = this.state.dormantSummary?.queue_counts || {};
-            }
-        }
-        this._lastQueueSettledSaveCompletionCounter = this._queueSaveCompletionCounter;
+        const counts = this.state.dormantSummary?.queue_counts || {};
         this.fullscreenSession?.refresh(["queue"]);
         this.render();
         return counts;
     }
 
-    async _rollbackStaleRunningQueueJobs() {
-        const queue = await this._loadQueueModule();
-        const runningJobs = queue.filter((job) => (job?.status || "").toLowerCase() === "running" && job?.job_id);
-        if (!runningJobs.length) return false;
-        await Promise.all(runningJobs.map(async (job) => {
-            const response = await fetch(buildQueueJobUrl(this.state.projectDir, job.job_id), {
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    status: "pending",
-                    progress: 0.0,
-                    error: "",
-                    completed_at: "",
-                    result_asset_id: "",
-                }),
-            });
-            if (!response.ok) {
-                throw new Error(`Failed to reconcile queue job ${job.job_id}: ${response.status}`);
-            }
-        }));
-        return true;
+    /** Whether `run_finished` can reach this controller over its project sync socket. */
+    receivesRunFinished() {
+        return this._syncSubscribed === true && this.state.syncConnectionState === "open";
+    }
+
+    _handleRunFinished(event) {
+        if (this._destroyed || !this.state.projectDir) return;
+        this._recordDiagEvent("run_finished", {
+            outcome: event?.outcome || "",
+            returned_jobs: Array.isArray(event?.returned_job_ids) ? event.returned_job_ids.length : 0,
+        });
+        try {
+            this.onRunFinished?.(event);
+        } catch (error) {
+            console.warn("[Sonder] run_finished handler failed:", error);
+        }
     }
 
     async importFiles(files, folder = "") {

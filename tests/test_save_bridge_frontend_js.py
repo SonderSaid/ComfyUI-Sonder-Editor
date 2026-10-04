@@ -320,11 +320,17 @@ def test_bridge_tracking_lifecycle_is_wired_to_extension_and_controller():
     refresh_start = extension.index("function schedulePostPromptRefresh")
     refresh_end = extension.index("app.registerExtension", refresh_start)
     refresh_source = extension[refresh_start:refresh_end]
-    assert "completeBridgeExecutionTracking" in refresh_source
-    assert refresh_source.index("completeBridgeExecutionTracking") < refresh_source.index(
-        "pendingBridgeEditorNodeIds.clear();",
-        refresh_source.index("completeBridgeExecutionTracking"),
+    # The ladder's last rung ends tracking only for an editor that cannot hear
+    # `run_finished`; otherwise the server's announcement does it.
+    fallback = refresh_source[refresh_source.index("receivesRunFinished"):]
+    assert fallback.index("completeBridgeExecutionTracking") < fallback.index(
+        "pendingBridgeEditorNodeIds.delete(editorNode.id);"
     )
+
+    finished = _between(extension, "async function handleRunFinished", "function schedulePostPromptRefresh")
+    assert finished.index("handleBridgeExecutionSettled") < finished.index("completeBridgeExecutionTracking")
+    assert "pendingBridgeEditorNodeIds.delete(editorNode.id);" in finished
+    assert "controller.onRunFinished = () => handleRunFinished(node);" in extension
 
     destroy_start = controller.index("    destroy()")
     destroy_end = controller.index("    getElement()", destroy_start)
@@ -337,15 +343,13 @@ def test_queue_only_settlement_refreshes_summary_without_assets():
     method = _between(
         source,
         "    async handleQueueExecutionSettled(",
-        "    async _rollbackStaleRunningQueueJobs(",
+        "    /** Whether `run_finished` can reach",
     )
     script = f"""
 class Harness {{
     constructor() {{
         this._destroyed = false;
         this.state = {{ projectDir: "project-1", dormantSummary: {{ queue_counts: {{ pending: 0, running: 0 }} }} }};
-        this._queueSaveCompletionCounter = 0;
-        this._lastQueueSettledSaveCompletionCounter = 0;
         this.summaryCalls = 0;
         this.assetCalls = 0;
         this.fullscreenSession = {{ refresh: (keys) => {{ this.fullscreenKeys = keys; }} }};
@@ -354,13 +358,12 @@ class Harness {{
     async refreshSummary() {{ this.summaryCalls += 1; return true; }}
     _invalidateModules() {{}}
     _reloadExpandedModuleIfNeeded() {{}}
-    async _rollbackStaleRunningQueueJobs() {{ return false; }}
     async _refreshAssets() {{ this.assetCalls += 1; }}
     render() {{}}
 {method}
 }}
 const harness = new Harness();
-const counts = await harness.handleQueueExecutionSettled({{ allowRollback: true }});
+const counts = await harness.handleQueueExecutionSettled();
 console.log(JSON.stringify({{
     counts,
     summaryCalls: harness.summaryCalls,
@@ -373,6 +376,101 @@ console.log(JSON.stringify({{
         "summaryCalls": 1,
         "assetCalls": 0,
         "fullscreenKeys": ["queue"],
+    }
+
+
+def test_canvas_no_longer_resets_running_jobs_itself():
+    controller = CONTROLLER.read_text(encoding="utf-8")
+    extension = EXTENSION.read_text(encoding="utf-8")
+    # The server returns a job its run left running; the browser never PUTs status.
+    assert "_rollbackStaleRunningQueueJobs" not in controller
+    assert "buildQueueJobUrl" not in controller
+    assert "allowRollback" not in controller
+    assert "allowRollback" not in extension
+
+
+def test_run_finished_settles_a_tracked_bridge_editor_then_stops_tracking():
+    extension = EXTENSION.read_text(encoding="utf-8")
+    finished = _between(extension, "async function handleRunFinished", "function schedulePostPromptRefresh")
+    script = f"""
+const pendingBridgeEditorNodeIds = new Map();
+const calls = [];
+const controller = {{
+    async handleBridgeExecutionSettled(options) {{ calls.push(["bridge", options.attemptIndex]); }},
+    completeBridgeExecutionTracking() {{ calls.push(["complete"]); }},
+    async handleQueueExecutionSettled() {{ calls.push(["queue"]); }},
+}};
+{finished}
+pendingBridgeEditorNodeIds.set(7, "project-1");
+await handleRunFinished({{ id: 7, _sonderController: controller }});
+const afterBridge = [...pendingBridgeEditorNodeIds.keys()];
+await handleRunFinished({{ id: 8, _sonderController: controller }});
+console.log(JSON.stringify({{ calls, afterBridge }}));
+"""
+    assert _run_node(script) == {
+        "calls": [["bridge", "run_finished"], ["complete"], ["queue"]],
+        "afterBridge": [],
+    }
+
+
+def test_bridge_tracking_expires_only_for_the_run_it_was_scheduled_for():
+    extension = EXTENSION.read_text(encoding="utf-8")
+    expiry = _between(extension, "function scheduleBridgeTrackingExpiry", "function schedulePostPromptRefresh")
+    script = f"""
+const pendingBridgeEditorNodeIds = new Map();
+const bridgeTrackingSerials = new Map();
+const RUN_FINISHED_GRACE_MS = 60000;
+const timers = [];
+const window = {{ setTimeout(fn, ms) {{ timers.push([fn, ms]); }} }};
+const completed = [];
+const node = {{ id: 3, _sonderController: {{ completeBridgeExecutionTracking() {{ completed.push(3); }} }} }};
+{expiry}
+pendingBridgeEditorNodeIds.set(3, "p");
+bridgeTrackingSerials.set(3, 1);
+scheduleBridgeTrackingExpiry(node);
+bridgeTrackingSerials.set(3, 2);           // a newer run started tracking the same editor
+timers[0][0]();
+const afterStale = [...pendingBridgeEditorNodeIds.keys()];
+scheduleBridgeTrackingExpiry(node);
+timers[1][0]();
+console.log(JSON.stringify({{ delays: timers.map((t) => t[1]), afterStale, completed,
+    after: [...pendingBridgeEditorNodeIds.keys()] }}));
+"""
+    assert _run_node(script) == {
+        "delays": [60000, 60000],
+        "afterStale": [3],
+        "completed": [3],
+        "after": [],
+    }
+
+
+def test_controller_forwards_run_finished_from_its_sync_socket():
+    source = CONTROLLER.read_text(encoding="utf-8")
+    sync = (ROOT / "web" / "js" / "cross_tab_sync.js").read_text(encoding="utf-8")
+    assert 'event.type === "run_finished") handlers.onRunFinished?.(event)' in sync
+    assert "onRunFinished: (event) => this._handleRunFinished(event)," in source
+    method = _between(source, "    _handleRunFinished(event) {", "    async importFiles(")
+    script = f"""
+class Harness {{
+    constructor() {{
+        this._destroyed = false;
+        this.state = {{ projectDir: "project-1" }};
+        this.diag = [];
+        this.seen = [];
+        this.onRunFinished = (event) => this.seen.push(event.outcome);
+    }}
+    _recordDiagEvent(kind, payload) {{ this.diag.push([kind, payload]); }}
+{method}
+}}
+const harness = new Harness();
+harness._handleRunFinished({{ outcome: "error", returned_job_ids: ["job-1"] }});
+harness._destroyed = true;
+harness._handleRunFinished({{ outcome: "success" }});
+console.log(JSON.stringify({{ seen: harness.seen, diag: harness.diag }}));
+"""
+    assert _run_node(script) == {
+        "seen": ["error"],
+        "diag": [["run_finished", {"outcome": "error", "returned_jobs": 1}]],
     }
 
 
@@ -390,7 +488,6 @@ class Harness {{
     constructor() {{
         this._destroyed = false;
         this.state = {{ projectDir: "p" }};
-        this._queueSaveCompletionCounter = 0;
         this.controllerCalls = [];
         this.fullscreenCalls = [];
         this.fullscreenSession = {{
@@ -409,7 +506,6 @@ harness.handleSaveVideoExecuted();
 console.log(JSON.stringify({{
     controllerCalls: harness.controllerCalls,
     fullscreenCalls: harness.fullscreenCalls,
-    saveCounter: harness._queueSaveCompletionCounter,
 }}));
 """
     result = _run_node(script)
@@ -426,7 +522,6 @@ console.log(JSON.stringify({{
     assert controller_asset == fullscreen_asset
     assert controller_asset["mode"] == "read"
     assert controller_asset["reason"] == "save_video_complete"
-    assert result["saveCounter"] == 1
 
 
 def test_audio_completion_notices_keep_headroom_routine_and_failures_sticky():

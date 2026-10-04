@@ -110,6 +110,7 @@ from .session_registry import (
     release_session,
     remember_event_loop,
     refresh_canvas_host,
+    project_event_aliases,
     schedule_project_event,
     seed_widget_state,
     subscribe,
@@ -154,6 +155,7 @@ from . import minimax_h3
 from . import prompt_payload
 from . import scene_mutation_addressing
 from . import change_certificates
+from . import control_descriptors
 from .guide_collision import resolve_execution_window, resolve_guide_collisions
 
 logger = logging.getLogger("sonder_editor")
@@ -196,6 +198,26 @@ try:
 except Exception:
     routes = None
     logger.warning("PromptServer not available — Sonder Editor API routes disabled")
+
+
+# An API prompt for the Controls panel; the largest Testground graph is ~0.2 MiB.
+CONTROLS_DESCRIBE_MAX_BYTES = 32 * 1024 * 1024
+
+
+class _ControlsRequestError(ValueError):
+    pass
+
+
+def _describe_controls_body(raw: bytes) -> dict:
+    """Parse a describe request and describe its prompt. Blocking."""
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise _ControlsRequestError("The request body must be JSON.") from None
+    prompt = body.get("prompt") if isinstance(body, dict) else None
+    if not isinstance(prompt, dict):
+        raise _ControlsRequestError("The request must carry an API-format prompt object.")
+    return control_descriptors.describe_controls(prompt)
 
 
 def _json_error(msg: str, status: int = 400) -> web.Response:
@@ -334,16 +356,7 @@ def _request_project(request: web.Request) -> TimelineProject | None:
 
 def _project_saved_event(project: TimelineProject) -> None:
     canonical_project_id = str(getattr(project, "project_id", "") or "")
-    project_dir = str(getattr(project, "project_dir", "") or "")
-    folder_project_id = os.path.basename(os.path.normpath(project_dir)) if project_dir else ""
-
-    aliases = []
-    seen = set()
-    for alias in (canonical_project_id, folder_project_id):
-        if not alias or alias in seen:
-            continue
-        aliases.append(alias)
-        seen.add(alias)
+    aliases = project_event_aliases(project)
 
     # Ephemeral: present only for the one guarded save it was armed around, and
     # identical on both alias emissions and on the mutation response header.
@@ -6573,8 +6586,8 @@ def _apply_queue_versioned_sync(request: web.Request, apply_fn):
     tolerance; rapid gestures coalescing on `POST /queue/mutations` compound it but
     are not its cause — add and batch use unique keys and never coalesce.
 
-    What the tolerance costs, stated plainly rather than assumed away. Four of the
-    six callers name a durable `job_id` or a status set predicate, so rebasing cannot
+    What the tolerance costs, stated plainly rather than assumed away. Three of the
+    five callers name a durable `job_id` or a status set predicate, so rebasing cannot
     touch a row the caller did not name. The two enqueue callers (`add_one`,
     `add_batch`) are creates: they mint a new job and freeze a compiled prompt
     context, channel template and setup manifest from the scene of whatever document
@@ -15158,48 +15171,6 @@ if routes is not None:
         _remember_request_project(request, project)
         return web.json_response(payload)
 
-    @routes.put("/sonder-editor/project/{project_id}/queue/{job_id}")
-    async def api_update_queue_job(request: web.Request) -> web.Response:
-        job_id = request.match_info["job_id"]
-
-        try:
-            body = await request.json()
-        except json.JSONDecodeError:
-            return _json_error("Invalid JSON body", 400)
-        if not isinstance(body, dict):
-            return _json_error("Queue update body must be an object", 400)
-
-        def update_one(project: TimelineProject) -> tuple[bool, dict | None]:
-            job = next((j for j in project.generation_queue if j.job_id == job_id), None)
-            if not job:
-                return False, None
-            changed = False
-            if "status" in body:
-                job.status = body["status"]
-                changed = True
-            if "progress" in body:
-                job.progress = float(body["progress"])
-                changed = True
-            if "error" in body:
-                job.error = body["error"]
-                changed = True
-            if "result_asset_id" in body:
-                job.result_asset_id = body["result_asset_id"]
-                changed = True
-            if "completed_at" in body:
-                job.completed_at = body["completed_at"]
-                changed = True
-            return changed, job.to_dict()
-
-        try:
-            project, payload = await run_project_io(_apply_queue_versioned_sync, request, update_one)
-        except FileNotFoundError as e:
-            return _json_error(str(e), 404)
-        if payload is None:
-            return _json_error(f"Job not found: {job_id}", 404)
-        _remember_request_project(request, project)
-        return web.json_response(payload)
-
     @routes.delete("/sonder-editor/project/{project_id}/queue/{job_id}")
     async def api_delete_queue_job(request: web.Request) -> web.Response:
         job_id = request.match_info["job_id"]
@@ -15236,6 +15207,36 @@ if routes is not None:
         except ProjectMutationRequestError as exc:
             return _mutation_json_error(exc)
         _remember_request_project(request, project)
+        return web.json_response(payload)
+
+    # -----------------------------------------------------------------------
+    # Sonder Controls
+    # -----------------------------------------------------------------------
+
+    @routes.post("/sonder-editor/controls/describe")
+    async def api_describe_controls(request: web.Request) -> web.Response:
+        """Describe the Sonder Controls and registry fields in an API prompt.
+
+        Reads the posted graph only, never a project, so it is outside the
+        change-certificate contract. Parsing and target validator dry runs run
+        off the event loop.
+        """
+        limit = CONTROLS_DESCRIBE_MAX_BYTES
+        if request.content_length is not None and request.content_length > limit:
+            return _json_error("The prompt is too large to describe.", 413)
+        chunks, total = [], 0
+        async for chunk in request.content.iter_chunked(1024 * 1024):
+            total += len(chunk)
+            if total > limit:
+                return _json_error("The prompt is too large to describe.", 413)
+            chunks.append(chunk)
+        try:
+            payload = await asyncio.to_thread(_describe_controls_body, b"".join(chunks))
+        except _ControlsRequestError as exc:
+            return _json_error(str(exc), 400)
+        except Exception:
+            logger.exception("Describing Sonder Controls failed")
+            return _json_error("The controls could not be described.", 500)
         return web.json_response(payload)
 
     # -----------------------------------------------------------------------

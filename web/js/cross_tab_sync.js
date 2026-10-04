@@ -39,6 +39,9 @@ export function connectProjectSync(projectId, handlers = {}, options = {}) {
             else if (event.type === "session_changed") handlers.onSessionChanged?.(event);
             else if (event.type === "host_presence_changed") handlers.onHostPresenceChanged?.(event);
             else if (event.type === "subscribed") handlers.onSubscribed?.(event);
+            // Sent once per ComfyUI prompt that touched this project, after Sonder
+            // finished its bridges and returned any job the run left running.
+            else if (event.type === "run_finished") handlers.onRunFinished?.(event);
         } catch (err) {
             console.warn("[Sonder] sync event handler failed:", err);
         }

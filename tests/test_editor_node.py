@@ -4161,3 +4161,383 @@ def test_queue_job_failure_never_writes_a_server_path_into_the_project(tmp_path,
     assert STORAGE_SENTINEL_PATH not in saved_job.error
     assert "__SECRET_ABSOLUTE_PATH__" not in (
         Path(created.project_dir) / "project.json").read_text(encoding="utf-8")
+
+
+# --- Run release, claim leases and SDK run tokens (SDK v2 Phase 2a) ---------------
+
+
+def _fresh_sdk_runs(module):
+    module.sdk_runs.reset_for_tests()
+    return module.sdk_runs
+
+
+def test_claim_is_leased_before_its_save(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    runs = _fresh_sdk_runs(editor_node)
+    prompt = _prompt_graph({"1": _prompt_node("SonderEditor")})
+    runs.open_release("12", "prompt-12", prompt)
+
+    job = types.SimpleNamespace(job_id="job-a", status="pending", error="", progress=0.0)
+    project = types.SimpleNamespace(project_dir="dir-a", modified_at="v1", generation_queue=[job])
+    leases_at_save = []
+
+    def fake_save(proj, **_kwargs):
+        with runs._LOCK:
+            leases_at_save.append([dict(lease) for lease in runs._RELEASES["12"]["leases"]])
+
+    monkeypatch.setattr(editor_node, "save_project", fake_save)
+    node = editor_node.SonderEditor()
+    node._run_lease_key = "12"
+    node._consume_queue_job(project)
+
+    assert leases_at_save == [[{"project_dir": "dir-a", "job_id": "job-a"}]]
+    runs.reset_for_tests()
+
+
+def test_claim_retry_re_leases_instead_of_adding(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    runs = _fresh_sdk_runs(editor_node)
+    runs.open_release("13", "prompt-13")
+    first = types.SimpleNamespace(project_dir="dir-a", modified_at="v1",
+                                  generation_queue=[types.SimpleNamespace(job_id="job-a", status="pending", error="", progress=0.0)])
+    retry = types.SimpleNamespace(project_dir="dir-a", modified_at="v2",
+                                  generation_queue=[types.SimpleNamespace(job_id="job-b", status="pending", error="", progress=0.0)])
+    saves = {"n": 0}
+
+    def fake_save(proj, **kwargs):
+        saves["n"] += 1
+        if saves["n"] == 1:
+            raise editor_node.ProjectVersionConflict(
+                project_dir="dir-a", expected_modified_at="v1", actual_modified_at="v2")
+
+    monkeypatch.setattr(editor_node, "save_project", fake_save)
+    monkeypatch.setattr(editor_node, "load_project", lambda _dir: retry)
+    node = editor_node.SonderEditor()
+    node._run_lease_key = "13"
+    node._consume_queue_job(first)
+
+    assert runs.close_release("13")["leases"] == [{"project_dir": "dir-a", "job_id": "job-b"}]
+
+
+def test_bind_run_notes_the_project_for_a_trusted_prompt_only(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    runs = _fresh_sdk_runs(editor_node)
+    project = types.SimpleNamespace(project_id="proj-id", project_dir=str(tmp_path / "My Folder"))
+    trusted = _prompt_graph({"1": _prompt_node("SonderEditor")})
+    untrusted = _prompt_graph({"1": _prompt_node("SonderEditor")})
+    runs.open_release("21", "prompt-21", trusted)
+    node = editor_node.SonderEditor()
+
+    assert node._bind_run(project, trusted, "1") == ("21", "")
+    assert node._bind_run(project, untrusted, "1") == ("", "")
+    record = runs.close_release("21")
+    assert record["projects"] == {str(tmp_path / "My Folder"): ["My Folder", "proj-id"]}
+
+
+def test_bind_run_refuses_an_unknown_used_or_foreign_token(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    runs = _fresh_sdk_runs(editor_node)
+    project = types.SimpleNamespace(project_id="proj-id", project_dir=str(tmp_path / "proj"))
+    prompt = _prompt_graph({"1": _prompt_node("SonderEditor")})
+    prompt["1"]["_meta"] = {"title": "Sonder Editor", "sonder_run": "tok-1"}
+    node = editor_node.SonderEditor()
+
+    with pytest.raises(RuntimeError, match="SDK session has ended"):
+        node._bind_run(project, prompt, "1")
+
+    runs.register_token("tok-1", ["someone-else"])
+    with pytest.raises(RuntimeError, match="SDK session has ended"):
+        node._bind_run(project, prompt, "1")
+
+    runs.register_token("tok-1", ["proj-id"])
+    assert node._bind_run(project, prompt, "1") == ("", "tok-1")
+    with pytest.raises(RuntimeError, match="SDK session has ended"):
+        node._bind_run(project, prompt, "1")
+    runs.reset_for_tests()
+
+
+def test_editor_reads_its_own_run_token(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    prompt = _prompt_graph({"1": _prompt_node("SonderEditor"), "2": _prompt_node("SonderEditor")})
+    prompt["2"]["_meta"] = {"sonder_run": "  tok-2 "}
+    run_token = editor_node.SonderEditor._run_token
+    assert run_token(prompt, "2") == "tok-2"
+    assert run_token(prompt, "1") == ""
+    assert run_token(prompt, None) == ""
+    assert run_token(None, "2") == ""
+
+
+def _install_hooks_on_fake_queue(io_nodes, monkeypatch, calls):
+    class FakeQueue:
+        def __init__(self):
+            self.items = []
+
+        def get(self, timeout=None):
+            item = self.items.pop(0)
+            return item, 0
+
+        def task_done(self, item_id, history_result, status=None, process_item=None):
+            calls.append(("comfy_task_done", item_id))
+
+    queue = FakeQueue()
+    monkeypatch.setattr(io_nodes, "_load_prompt_server_instance", lambda: types.SimpleNamespace(prompt_queue=queue))
+    monkeypatch.setattr(io_nodes, "_BRIDGE_HOOKED_PROMPT_QUEUE_ID", None)
+    assert io_nodes._install_bridge_prompt_queue_hooks()
+    return queue
+
+
+def test_queue_hooks_open_a_release_and_close_it_after_bridge_finalization(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    runs = _fresh_sdk_runs(io_nodes)
+    calls = []
+    queue = _install_hooks_on_fake_queue(io_nodes, monkeypatch, calls)
+    monkeypatch.setattr(io_nodes, "_finalize_prompt_bridges",
+                        lambda key, source="": calls.append(("finalize", key)))
+    original_release = io_nodes._release_prompt_run
+    monkeypatch.setattr(io_nodes, "_release_prompt_run",
+                        lambda key, status: (calls.append(("release", key)), original_release(key, status)))
+
+    prompt = _prompt_graph({"1": _prompt_node("SonderEditor")})
+    queue.items.append((1, "prompt-uuid", prompt, {}, []))
+    queue.get()
+    assert runs.trusted_key_for_prompt(prompt) == "0"
+    assert runs._RELEASES["0"]["prompt_id"] == "prompt-uuid"
+
+    status = types.SimpleNamespace(status_str="success", completed=True, messages=[])
+    queue.task_done(0, {}, status=status)
+    assert calls == [("comfy_task_done", 0), ("finalize", "0"), ("release", "0")]
+    assert not runs.is_trusted("0")
+
+
+def test_fallback_prompt_keys_are_never_trusted(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    runs = _fresh_sdk_runs(io_nodes)
+    prompt = _prompt_graph({"1": _prompt_node("SonderEditor")})
+    key, source = io_nodes._resolve_bridge_prompt_key(prompt)
+    assert key
+    assert not runs.is_trusted(key)
+    assert runs.trusted_key_for_prompt(prompt) == ""
+
+
+def _release_fixture(io_nodes, monkeypatch, job_status):
+    job = types.SimpleNamespace(job_id="job-a", status=job_status, error="", progress=0.4)
+    project = types.SimpleNamespace(project_dir="dir-a", modified_at="v1", generation_queue=[job])
+    loads, saves, events = [], [], []
+    monkeypatch.setattr(io_nodes, "load_project", lambda d: (loads.append(d), project)[1])
+    monkeypatch.setattr(io_nodes, "_find_queue_job",
+                        lambda proj, job_id: next((j for j in proj.generation_queue if j.job_id == job_id), None))
+    monkeypatch.setattr(io_nodes, "save_project", lambda proj, **kw: saves.append(kw))
+    monkeypatch.setattr(io_nodes, "schedule_project_event", lambda alias, event: events.append((alias, event)))
+    return job, loads, saves, events
+
+
+def _open_leased_run(runs, key="5"):
+    runs.open_release(key, "prompt-5")
+    runs.note_project(key, "dir-a", ["proj-id", "Folder"])
+    runs.take_lease(key, "dir-a", "job-a")
+
+
+def test_release_returns_a_failed_runs_job_to_pending_and_announces_it(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    runs = _fresh_sdk_runs(io_nodes)
+    job, loads, saves, events = _release_fixture(io_nodes, monkeypatch, "running")
+    _open_leased_run(runs)
+    status = types.SimpleNamespace(status_str="error", completed=False, messages=[
+        ("execution_start", {}),
+        ("execution_error", {"node_type": "KSampler", "exception_message": "C:\\secret\\path failed"}),
+    ])
+
+    io_nodes._release_prompt_run("5", status)
+
+    assert (job.status, job.progress) == ("pending", 0.0)
+    assert job.error == "The run failed in KSampler before this job completed."
+    assert "secret" not in job.error
+    assert saves == [{"expected_modified_at": "v1"}]
+    assert sorted(alias for alias, _ in events) == ["Folder", "proj-id"]
+    event = events[0][1]
+    assert event["type"] == "run_finished"
+    assert event["outcome"] == "error"
+    assert event["leased_job_ids"] == ["job-a"]
+    assert event["returned_job_ids"] == ["job-a"]
+
+
+def test_release_after_an_interrupt_says_so(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    runs = _fresh_sdk_runs(io_nodes)
+    job, _loads, _saves, events = _release_fixture(io_nodes, monkeypatch, "running")
+    _open_leased_run(runs)
+    status = types.SimpleNamespace(status_str="error", completed=False,
+                                   messages=[("execution_interrupted", {})])
+    io_nodes._release_prompt_run("5", status)
+    assert job.status == "pending"
+    assert job.error == "The run was interrupted before this job completed."
+    assert events[0][1]["outcome"] == "interrupted"
+
+
+def test_release_leaves_a_job_that_is_no_longer_running_alone(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    runs = _fresh_sdk_runs(io_nodes)
+    job, loads, saves, events = _release_fixture(io_nodes, monkeypatch, "failed")
+    _open_leased_run(runs)
+    io_nodes._release_prompt_run("5", types.SimpleNamespace(status_str="error", messages=[]))
+    assert job.status == "failed"
+    assert saves == []
+    assert events[0][1]["returned_job_ids"] == []
+
+
+def test_a_completed_and_saved_job_is_settled_so_release_reads_nothing(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    runs = _fresh_sdk_runs(io_nodes)
+    job, loads, saves, events = _release_fixture(io_nodes, monkeypatch, "running")
+    _open_leased_run(runs)
+    project = types.SimpleNamespace(project_dir="dir-a", generation_queue=[job])
+    assert io_nodes._mark_queue_job_completed(project, "job-a", "asset-1")
+    io_nodes._save_generated_project(project)
+    assert len(saves) == 1
+
+    io_nodes._release_prompt_run("5", types.SimpleNamespace(status_str="success", messages=[]))
+    assert loads == []
+    assert len(saves) == 1
+    assert events[0][1]["outcome"] == "success"
+    assert events[0][1]["leased_job_ids"] == []
+
+
+def test_every_noted_run_is_announced_once_even_without_a_lease(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    runs = _fresh_sdk_runs(io_nodes)
+    _job, loads, _saves, events = _release_fixture(io_nodes, monkeypatch, "pending")
+    runs.open_release("8", "prompt-8")
+    runs.note_project("8", "dir-a", ["proj-id"])
+    io_nodes._release_prompt_run("8", types.SimpleNamespace(status_str="success", messages=[]))
+    io_nodes._release_prompt_run("8", types.SimpleNamespace(status_str="success", messages=[]))
+    assert loads == []
+    assert [(alias, event["type"]) for alias, event in events] == [("proj-id", "run_finished")]
+
+
+def test_execute_binds_the_run_before_claiming_and_leases_under_its_key(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    from server.project_manager import create_project, load_project
+    from server.timeline_state import GenerationJob, Scene
+
+    base = tmp_path / "projects"
+    base.mkdir()
+    created = create_project("Lease order", 24.0, 64, 64, "free", str(base))
+    project = load_project(created.project_dir)
+    project.add_scene(Scene(scene_id="scene-1", name="Scene", duration_frames=8))
+    project.generation_queue = [GenerationJob(job_id="job-1", scene_id="scene-1", status="pending",
+                                              selection_start=0, selection_end=4)]
+    from server.project_manager import save_project as real_save
+    real_save(project, notify=False)
+    loaded = load_project(created.project_dir)
+
+    order = []
+    monkeypatch.setattr(editor_node, "load_project", lambda _dir: loaded)
+    monkeypatch.setattr(editor_node, "_resolve_project_choice_dir", lambda _base, _choice: created.project_dir)
+    monkeypatch.setattr(editor_node.SonderEditor, "_execution_reaches_terminal_save",
+                        lambda self, prompt, unique_id: True)
+    monkeypatch.setattr(editor_node.SonderEditor, "_bind_run",
+                        lambda self, proj, prompt, unique_id: (order.append("bind"), ("run-7", ""))[1])
+
+    def fake_consume(self, proj):
+        order.append(("consume", getattr(self, "_run_lease_key", None)))
+        return proj, None
+
+    monkeypatch.setattr(editor_node.SonderEditor, "_consume_queue_job", fake_consume)
+
+    def stop(*_args, **_kwargs):
+        raise RuntimeError("stop after claim")
+
+    monkeypatch.setattr(editor_node.SonderEditor, "_render_scene_frames", stop)
+    node = editor_node.SonderEditor()
+    with pytest.raises(Exception):
+        node.execute(project="Lease order", project_name="Lease order", fps=24.0, width=64, height=64,
+                     scene_id="scene-1", selection_start=0, selection_end=4)
+
+    assert order == ["bind", ("consume", "run-7")]
+    assert node._run_lease_key == ""
+
+
+def test_returning_a_job_retries_a_save_conflict(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    jobs = [types.SimpleNamespace(job_id="job-a", status="running", error="", progress=0.4) for _ in range(2)]
+    projects = [types.SimpleNamespace(project_dir="dir-a", modified_at=f"v{i}", generation_queue=[jobs[i]])
+                for i in range(2)]
+    loads, saves = [], []
+    def fake_load(project_dir):
+        loads.append(project_dir)
+        return projects[len(loads) - 1]
+
+    monkeypatch.setattr(io_nodes, "load_project", fake_load)
+
+    def fake_save(proj, **kwargs):
+        saves.append(kwargs["expected_modified_at"])
+        if len(saves) == 1:
+            raise io_nodes.ProjectVersionConflict(project_dir="dir-a", expected_modified_at="v0",
+                                                  actual_modified_at="v1")
+
+    monkeypatch.setattr(io_nodes, "save_project", fake_save)
+    assert io_nodes._return_leased_job_to_pending("dir-a", "job-a", "note")
+    assert saves == ["v0", "v1"]
+    assert (jobs[1].status, jobs[1].error) == ("pending", "note")
+
+
+def test_a_failed_completion_save_keeps_the_lease(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    runs = _fresh_sdk_runs(io_nodes)
+    _open_leased_run(runs)
+    job = types.SimpleNamespace(job_id="job-a", status="running", error="", progress=0.4)
+    project = types.SimpleNamespace(project_dir="dir-a", generation_queue=[job])
+    monkeypatch.setattr(io_nodes, "_find_queue_job", lambda proj, job_id: job)
+    assert io_nodes._mark_queue_job_completed(project, "job-a", "asset-1")
+
+    def failing_save(proj):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(io_nodes, "save_project", failing_save)
+    with pytest.raises(OSError):
+        io_nodes._save_generated_project(project)
+    with runs._LOCK:
+        assert runs._RELEASES["5"]["leases"] == [{"project_dir": "dir-a", "job_id": "job-a"}]
+
+    monkeypatch.setattr(io_nodes, "save_project", lambda proj: None)
+    io_nodes._save_generated_project(project)
+    with runs._LOCK:
+        assert runs._RELEASES["5"]["leases"] == []
+
+
+def test_a_raising_task_done_still_releases_the_run(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    _fresh_sdk_runs(io_nodes)
+    calls = []
+
+    class RaisingQueue:
+        def get(self, timeout=None):
+            return (1, "prompt-x", {"1": {"class_type": "X", "inputs": {}}}, {}, []), 0
+
+        def task_done(self, item_id, history_result, status=None, process_item=None):
+            raise RuntimeError("history write failed")
+
+    queue = RaisingQueue()
+    monkeypatch.setattr(io_nodes, "_load_prompt_server_instance", lambda: types.SimpleNamespace(prompt_queue=queue))
+    monkeypatch.setattr(io_nodes, "_BRIDGE_HOOKED_PROMPT_QUEUE_ID", None)
+    assert io_nodes._install_bridge_prompt_queue_hooks()
+    monkeypatch.setattr(io_nodes, "_finalize_prompt_bridges", lambda key, source="": calls.append("finalize"))
+    monkeypatch.setattr(io_nodes, "_release_prompt_run", lambda key, status: calls.append("release"))
+    queue.get()
+    with pytest.raises(RuntimeError):
+        queue.task_done(0, {}, status=None)
+    assert calls == ["finalize", "release"]
+
+
+def test_an_sdk_run_that_never_reached_its_editor_is_still_announced(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    runs = _fresh_sdk_runs(io_nodes)
+    _job, _loads, _saves, events = _release_fixture(io_nodes, monkeypatch, "pending")
+    runs.register_token("tok-9", ["proj-id", "Folder"])
+    prompt = _prompt_graph({"1": _prompt_node("SonderEditor")})
+    prompt["1"]["_meta"] = {"sonder_run": "tok-9"}
+    runs.open_release("9", "prompt-9", prompt)
+    io_nodes._release_prompt_run("9", types.SimpleNamespace(
+        status_str="error", messages=[("execution_error", {"node_type": "UNETLoader"})]))
+    assert sorted(alias for alias, _ in events) == ["Folder", "proj-id"]
+    assert all(event["outcome"] == "error" and event["leased_job_ids"] == [] for _, event in events)

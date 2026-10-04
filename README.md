@@ -201,8 +201,8 @@ block always shows it.
 ## Nodes
 
 **Sonder Editor** is the only node you always add — the rest are optional pipeline
-adapters, grouped under the `Sonder`, `Sonder/IO`, and `Sonder/Logic` menus in
-ComfyUI.
+adapters, grouped under the `Sonder`, `Sonder/IO`, `Sonder/Logic`, and
+`Sonder/Controls` menus in ComfyUI.
 
 ### Editor & generation bridges — `Sonder`
 
@@ -237,8 +237,14 @@ ComfyUI.
 | **Sonder Cluster** | Routes a shared branch selection across multiple lanes, each lane carrying its own type (lazy). |
 | **Sonder Gate** | Per-lane lazy gate: each lane's condition decides whether its value is evaluated and passed on or skipped entirely, emitting nothing. Place it directly in front of an optional input — for example after a resize fed by a Reference Bridge slot set to `nothing`. |
 
+### Controls — `Sonder/Controls`
+
+| Node | What it does |
+|------|--------------|
+| **Sonder Control** | One named value, wired to the widget inputs it should drive (steps, CFG, a sampler or LoRA name, a seed). The node's title is its label. Its type follows what it is connected to (you pick it when the input accepts any type), and it checks its value against each input's range and options, because ComfyUI skips those checks for a linked input. Inputs that check their value before the run, such as Load Image, refuse the link. |
+
 > **Sonder Switch**, **Sonder Cluster**, **Sonder Gate**, **Sonder Reference Selector**, the three
-> **Sonder Reference Bridges**, and
+> **Sonder Reference Bridges**, **Sonder Control**, and
 > **Sonder Metadata Collector Nodes 2.0** use ComfyUI's
 > newer V3 node API and load only on recent ComfyUI builds.
 > V3 registration is schema-validated before it changes discovery:

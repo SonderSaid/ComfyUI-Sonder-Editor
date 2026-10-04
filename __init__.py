@@ -136,6 +136,24 @@ try:
             PROMPT_BRIDGE_NODE_ID: "Sonder Reference Prompt Bridge",
         })
 
+    try:
+        from .nodes.sonder_control import NODE_ID as CONTROL_NODE_ID, SonderControl
+        _control_schema = SonderControl.GET_SCHEMA()
+        if getattr(_control_schema, "node_id", None) != CONTROL_NODE_ID:
+            raise RuntimeError("Sonder Control schema returned an unexpected node id")
+    except ModuleNotFoundError as exc:
+        if not (exc.name or "").startswith("comfy_api"):
+            logging.getLogger(__name__).warning(
+                "Sonder Control import failed: %s", exc, exc_info=True
+            )
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "Sonder Control unavailable: %s", exc, exc_info=True
+        )
+    else:
+        NODE_CLASS_MAPPINGS[CONTROL_NODE_ID] = SonderControl
+        NODE_DISPLAY_NAME_MAPPINGS[CONTROL_NODE_ID] = "Sonder Control"
+
     WEB_DIRECTORY = "./web"
 
     # Import server module to register API routes with PromptServer

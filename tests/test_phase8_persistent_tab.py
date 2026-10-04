@@ -1559,3 +1559,32 @@ def test_get_owner_advances_lifecycle_lazily_and_sweeper_does_too():
         await release_session(project_id_b, "tab-sweeper", force=True, host_id=host_id_b)
 
     asyncio.run(run())
+
+
+def test_broadcast_still_fans_out_when_the_diag_recorder_fails(monkeypatch, caplog):
+    class FakeSocket:
+        closed = False
+
+        def __init__(self):
+            self.sent = []
+
+        async def send_json(self, event):
+            self.sent.append(event)
+
+    async def run():
+        import server.session_registry as registry
+
+        def failing_recorder(*_args, **_kwargs):
+            raise RuntimeError("diag ring unavailable")
+
+        project_id = "phase-8-broadcast-diag"
+        socket = FakeSocket()
+        monkeypatch.setattr(registry, "record_diag_event", failing_recorder)
+        monkeypatch.setitem(registry._subscribers, project_id, {socket})
+        event = {"type": "project_saved"}
+        with caplog.at_level("DEBUG", logger="sonder_editor"):
+            await registry.broadcast_project_event(project_id, event)
+        assert "failed to emit diag event" in caplog.text
+        assert socket.sent == [event]
+
+    asyncio.run(run())

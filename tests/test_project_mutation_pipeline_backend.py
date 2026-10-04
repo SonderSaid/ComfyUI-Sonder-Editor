@@ -2324,39 +2324,6 @@ def test_queue_mutations_retry_stale_deletes_without_resurrection(monkeypatch, t
     assert _queue_ids(restored) == ["job-c"]
 
 
-def test_queue_update_retries_stale_version_and_preserves_newer_jobs(monkeypatch, tmp_path):
-    route_module = _load_route_module(monkeypatch)
-    project_dir = tmp_path / "project"
-    project_dir.mkdir()
-    project = TimelineProject(project_dir=str(project_dir), name="Project")
-    project.project_id = "proj"
-    project.generation_queue = [GenerationJob(job_id="job-a", status="pending")]
-    route_module.save_project(project)
-    monkeypatch.setattr(route_module, "_get_base_dir", lambda: str(tmp_path))
-    base_version = project.modified_at
-
-    current = route_module.load_project(str(project_dir))
-    current.generation_queue.append(GenerationJob(job_id="job-b", status="pending"))
-    route_module.save_project(current)
-
-    handler = _route_handler(route_module, "PUT", "/sonder-editor/project/{project_id}/queue/{job_id}")
-    response = asyncio.run(handler(DummyRequest(
-        match_info={"project_id": "proj", "job_id": "job-a"},
-        headers={"If-Match": base_version},
-        method="PUT",
-        body={"status": "completed", "progress": 1.0},
-    )))
-    payload = _response_json(response)
-    restored = route_module.load_project(str(project_dir))
-
-    assert response.status == 200
-    assert payload["status"] == "completed"
-    assert {job.job_id: job.status for job in restored.generation_queue} == {
-        "job-a": "completed",
-        "job-b": "pending",
-    }
-
-
 def test_asset_sync_stale_version_returns_409_conflict(monkeypatch, tmp_path):
     # After a generation commit bumps the project version, the editor's asset
     # refresh POSTs /assets/sync with a now-stale If-Match. The load-time

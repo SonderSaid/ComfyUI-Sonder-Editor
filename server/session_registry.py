@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import time
 import uuid
@@ -7,6 +8,7 @@ from typing import Any
 
 from aiohttp import web
 
+logger = logging.getLogger("sonder_editor")
 
 SESSION_TTL_SECONDS = 30.0
 CANVAS_HOST_TTL_SECONDS = 90.0
@@ -960,6 +962,17 @@ async def broadcast_project_event(project_id: str, event: dict[str, Any]) -> Non
         async with _lock:
             for ws in dead:
                 _subscribers.get(project_id, set()).discard(ws)
+
+
+def project_event_aliases(project: Any) -> list[str]:
+    """The ids a project's events go to: its canonical id and its folder name.
+
+    Sync sockets subscribe under either, so every project event is sent to both.
+    """
+    canonical = str(getattr(project, "project_id", "") or "")
+    project_dir = str(getattr(project, "project_dir", "") or "")
+    folder = os.path.basename(os.path.normpath(project_dir)) if project_dir else ""
+    return [alias for alias in dict.fromkeys((canonical, folder)) if alias]
 
 
 def schedule_project_event(project_id: str, event: dict[str, Any]) -> None:

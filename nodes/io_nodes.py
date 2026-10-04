@@ -23,7 +23,7 @@ from ..server.timeline_state import ClipReference, Asset, LaneConfig, AudioTrack
 from ..server.lane_registry import ensure_lane_index
 from ..server import external_links
 from ..server.atomic_io import atomic_replace
-from ..server.project_manager import load_project, save_project
+from ..server.project_manager import ProjectVersionConflict, load_project, save_project
 from ..server.path_security import (
     PathSecurityError,
     log_path_quarantine,
@@ -51,7 +51,8 @@ from ..server.color_correction import (
     transform_tensor_to_uint8_frames,
 )
 from ..server.guide_collision import check_frame_count_excess
-from ..server.session_registry import record_diag_event
+from ..server.session_registry import record_diag_event, schedule_project_event
+from ..server import sdk_runs
 from ..server.media_helpers import (
     CUSTOM_AUDIO_CODEC_OPTIONS,
     CUSTOM_CONTAINER_OPTIONS,
@@ -135,11 +136,31 @@ def _copy_execution_context(project) -> dict:
     return dict(context) if isinstance(context, dict) else {}
 
 
+def _settle_after_save(project, queue_job_id: str) -> None:
+    """Queue a job's lease for settling once this project's save succeeds.
+
+    Settling before the save would leave a job that is `running` on disk with no
+    lease when the save fails, so nothing would return it.
+    """
+    if not queue_job_id:
+        return
+    pending = getattr(project, "_sonder_settle_after_save", None)
+    if not isinstance(pending, list):
+        pending = []
+        project._sonder_settle_after_save = pending
+    pending.append(str(queue_job_id))
+
+
 def _save_generated_project(project, base_modified_at: str = "", created_ids=None):
     if base_modified_at:
-        return save_generated_project(project, str(base_modified_at), created_ids)
-    save_project(project)
-    return project
+        committed = save_generated_project(project, str(base_modified_at), created_ids)
+    else:
+        save_project(project)
+        committed = project
+    for job_id in getattr(project, "_sonder_settle_after_save", None) or []:
+        sdk_runs.settle_lease(getattr(project, "project_dir", ""), job_id)
+    project._sonder_settle_after_save = []
+    return committed
 
 
 EDITOR_EXPORT_SCHEMA_VERSION = "1.0"
@@ -388,6 +409,7 @@ def _mark_queue_job_failed(project, queue_job_id: str, error_message: str) -> bo
     queue_job.completed_at = ""
     queue_job.result_asset_id = ""
     _mark_later_batch_jobs_failed(project, queue_job)
+    _settle_after_save(project, queue_job_id)
     return True
 
 
@@ -407,6 +429,7 @@ def _mark_queue_job_completed(project, queue_job_id: str, result_asset_id: str) 
     queue_job.error = ""
     queue_job.completed_at = datetime.now().isoformat()
     queue_job.result_asset_id = result_asset_id
+    _settle_after_save(project, queue_job_id)
     return True
 
 
@@ -993,6 +1016,105 @@ def _extract_prompt_key_from_task_done_call(args, kwargs) -> str:
     return ""
 
 
+def _prompt_id_from_queue_get_result(result) -> str:
+    """ComfyUI's ``get`` returns ``(item, item_id)``; ``item[1]`` is the prompt id."""
+    if isinstance(result, tuple) and result and isinstance(result[0], (tuple, list)) and len(result[0]) >= 2:
+        value = result[0][1]
+        if isinstance(value, (str, int)) and not isinstance(value, bool):
+            return str(value)
+    return ""
+
+
+def _status_from_task_done_call(args, kwargs):
+    status = kwargs.get("status") if isinstance(kwargs, dict) else None
+    if status is None and len(args) >= 3:
+        status = args[2]
+    return status
+
+
+def _run_outcome(status) -> tuple[str, str]:
+    """Classify a finished run and word the note a returned job carries.
+
+    The note is written into ``project.json``, so it names only the node type,
+    never an exception message that may hold a path.
+    """
+    messages = getattr(status, "messages", None) or []
+    kinds = [message[0] for message in messages if isinstance(message, (list, tuple)) and message]
+    if "execution_interrupted" in kinds:
+        return "interrupted", "The run was interrupted before this job completed."
+    if str(getattr(status, "status_str", "") or "") == "error":
+        node_type = ""
+        for message in messages:
+            if (isinstance(message, (list, tuple)) and len(message) >= 2
+                    and message[0] == "execution_error" and isinstance(message[1], dict)):
+                node_type = str(message[1].get("node_type") or "")
+        where = f" in {node_type}" if node_type else ""
+        return "error", f"The run failed{where} before this job completed."
+    return "success", "The run finished without completing this job."
+
+
+def _return_leased_job_to_pending(project_dir: str, job_id: str, note: str) -> bool:
+    """Return a job its run left ``running`` to ``pending``, retrying save conflicts."""
+    for _attempt in range(3):
+        project = load_project(project_dir)
+        # Status lives on the root record; hydrating the job's frozen payload would
+        # make this recovery path depend on that component being readable.
+        job = next((item for item in getattr(project, "generation_queue", []) or []
+                    if getattr(item, "job_id", "") == job_id), None)
+        if job is None or (job.status or "pending").lower() != "running":
+            return False
+        job.status = "pending"
+        job.progress = 0.0
+        job.error = note
+        try:
+            save_project(project, expected_modified_at=getattr(project, "modified_at", "") or None)
+            return True
+        except ProjectVersionConflict:
+            continue
+    logger.warning("Could not return leased job %s to pending after save conflicts", job_id)
+    return False
+
+
+def _release_prompt_run(prompt_key: str, status) -> None:
+    """Close the run's release record, return any job it left running, announce it."""
+    record = sdk_runs.close_release(prompt_key)
+    if record is None:
+        return
+    outcome, note = _run_outcome(status)
+    returned = []
+    for lease in record["leases"]:
+        try:
+            if _return_leased_job_to_pending(lease["project_dir"], lease["job_id"], note):
+                returned.append(lease["job_id"])
+        except Exception:
+            logger.exception("Failed to return leased job %s to pending", lease.get("job_id"))
+    if returned:
+        logger.info("Run %s ended %s; returned leased job(s) %s to pending", prompt_key, outcome, returned)
+    announced = set()
+
+    def announce(alias, job_ids):
+        announced.add(alias)
+        schedule_project_event(alias, {
+            "type": "run_finished",
+            "project_id": alias,
+            "prompt_id": record.get("prompt_id", ""),
+            "outcome": outcome,
+            "leased_job_ids": job_ids,
+            "returned_job_ids": [job_id for job_id in returned if job_id in job_ids],
+            "run_token": record.get("token", ""),
+        })
+
+    for project_dir, aliases in record["projects"].items():
+        job_ids = [lease["job_id"] for lease in record["leases"] if lease["project_dir"] == project_dir]
+        for alias in aliases:
+            announce(alias, job_ids)
+    # An SDK run that ended before its editor executed (an upstream failure, a
+    # cancel) is still announced to the projects its token was registered for.
+    for alias in record.get("token_project_ids", []):
+        if alias not in announced:
+            announce(alias, [])
+
+
 def _install_bridge_prompt_queue_hooks() -> bool:
     global _BRIDGE_HOOKED_PROMPT_QUEUE_ID
 
@@ -1016,6 +1138,8 @@ def _install_bridge_prompt_queue_hooks() -> bool:
                 try:
                     prompt_key, prompt = _extract_prompt_key_from_queue_get_result(result)
                     _set_bridge_prompt_key_for_object(prompt_key, prompt)
+                    if prompt_key:
+                        sdk_runs.open_release(prompt_key, _prompt_id_from_queue_get_result(result), prompt)
                 except Exception:
                     logger.exception("Failed to capture bridge prompt identity from prompt queue get()")
                 return result
@@ -1035,6 +1159,13 @@ def _install_bridge_prompt_queue_hooks() -> bool:
                             _finalize_prompt_bridges(prompt_key, source="task_done")
                         except Exception:
                             logger.exception("Bridge finalization failed from prompt queue task_done for %s", prompt_key)
+                        # After finalization, never before: a bridge completes its
+                        # job inside finalization, and only then may a still-running
+                        # leased job be returned to pending.
+                        try:
+                            _release_prompt_run(prompt_key, _status_from_task_done_call(args, kwargs))
+                        except Exception:
+                            logger.exception("Run release failed from prompt queue task_done for %s", prompt_key)
 
             wrapped_task_done._sonder_bridge_wrapped = True
             setattr(prompt_queue, "task_done", wrapped_task_done)
