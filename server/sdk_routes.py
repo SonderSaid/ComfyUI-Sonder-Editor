@@ -19,7 +19,7 @@ from typing import Any, Awaitable, Callable
 
 from aiohttp import web
 
-from . import sdk_proxy, sdk_templates
+from . import sdk_install, sdk_proxy, sdk_templates
 from .sdk_install import install_state
 from .sdk_runner import SdkError, get_runner
 
@@ -28,6 +28,12 @@ logger = logging.getLogger("sonder_editor")
 SECRET_HEADER = "X-Sonder-SDK-Session"
 TAB_HEADER = "X-Sonder-Tab-Session"
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+# Headers a relaying proxy or tunnel adds; any of them means the peer is not the user.
+_FORWARDING_HEADERS = (
+    "Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Real-IP",
+    "Via", "CF-Connecting-IP", "True-Client-IP",
+)
+UNINSTALL_DRAIN_SEC = 30.0
 
 
 def is_loopback_request(request: web.Request) -> bool:
@@ -37,6 +43,12 @@ def is_loopback_request(request: web.Request) -> bool:
     DNS-rebound page reaches 127.0.0.1 under a foreign Host), and no forwarding
     header may be present (a reverse proxy on this machine makes every peer
     look local).
+
+    Residual: a forwarder that adds none of these headers and sends a loopback
+    Host (a raw TCP tunnel such as ``ssh -R``, or a bare nginx ``proxy_pass``)
+    is indistinguishable from a local browser. Such a setup already exposes
+    ComfyUI's own unauthenticated routes; this gate only adds install/uninstall
+    of the two pinned packages.
     """
     remote = str(request.remote or "")
     try:
@@ -47,7 +59,7 @@ def is_loopback_request(request: web.Request) -> bool:
         address = address.ipv4_mapped
     if not address.is_loopback:
         return False
-    if request.headers.get("Forwarded") or request.headers.get("X-Forwarded-For"):
+    if any(request.headers.get(name) for name in _FORWARDING_HEADERS):
         return False
     host = request.headers.get("Host", "")
     if host.startswith("["):
@@ -85,13 +97,54 @@ def _sdk_error(exc: SdkError) -> web.Response:
     return web.json_response(exc.payload(), status=exc.status)
 
 
+def _public_installer(installer: dict) -> dict:
+    """The installer status for a browser on another machine: no commands or pip
+    output, which carry ComfyUI's absolute interpreter path."""
+    job = dict(installer.get("job") or {})
+    if isinstance(job.get("result"), dict):
+        job["result"] = {k: v for k, v in job["result"].items() if k not in ("commands", "detail")}
+    interrupted = installer.get("interrupted")
+    if isinstance(interrupted, dict):
+        interrupted = {k: v for k, v in interrupted.items() if k != "commands"}
+    return {**installer, "job": job, "interrupted": interrupted}
+
+
+def _upstream_or_empty() -> str:
+    try:
+        return sdk_proxy.own_upstream_url()
+    except sdk_proxy.ProxyUnavailable:
+        return ""  # HTTPS ComfyUI: no shortcut
+
+
 def register_sdk_routes(
     routes,
     *,
     resolve_project: Callable[[str], Awaitable[tuple[str, list]]],
     remember_event_loop: Callable[[], None],
+    projects_dir: Callable[[], str] = lambda: "",
+    app=None,
 ) -> None:
     runner = get_runner(resolve_project=resolve_project)
+
+    def write_shortcut() -> str:
+        return sdk_install.write_shortcut(projects_dir(), _upstream_or_empty())
+
+    def delete_shortcut() -> bool:
+        return sdk_install.delete_shortcut(projects_dir())
+
+    def proxy_running_elsewhere() -> bool:
+        status = sdk_proxy.proxy_status()
+        return bool(status.get("running")) and not status.get("managed")
+
+    if app is not None:
+        async def refresh_shortcut(_app=None) -> None:
+            # The port may differ from the last run; only while both packages are present.
+            try:
+                await asyncio.to_thread(sdk_install.refresh_shortcut, projects_dir(), _upstream_or_empty())
+            except Exception:
+                logger.warning("Refreshing the Sonder Launcher shortcut failed", exc_info=True)
+
+        app.on_startup.append(refresh_shortcut)
 
     def handle(func):
         async def wrapper(request: web.Request) -> web.StreamResponse:
@@ -125,13 +178,77 @@ def register_sdk_routes(
     async def api_sdk_status(request: web.Request) -> web.Response:
         install = await asyncio.to_thread(install_state)
         proxy = await asyncio.to_thread(sdk_proxy.proxy_status)
+        installer = await asyncio.to_thread(sdk_install.installer_status)
+        can_manage = is_loopback_request(request)
         return web.json_response({
             "ok": True,
             "install": install,
             "proxy": proxy,
-            "can_manage": is_loopback_request(request),
+            "installer": installer if can_manage else _public_installer(installer),
+            "pinned": sdk_install.PINNED,
+            "can_manage": can_manage,
             "launcher_url": "/sonder-editor/app",
         })
+
+    # ── Install and uninstall (from the ComfyUI machine only) ───────────────
+
+    def _local_only(request: web.Request) -> web.Response | None:
+        if is_loopback_request(request):
+            return None
+        return web.json_response(
+            {"ok": False, "code": "not_local", "error": "Install from the ComfyUI machine."}, status=403)
+
+    def _refused(exc: sdk_install.InstallRefused) -> web.Response:
+        status = 409 if exc.code in ("busy", "runs_active") else 400
+        return web.json_response({"ok": False, "code": exc.code, "error": str(exc), **exc.details}, status=status)
+
+    @routes.post("/sonder-editor/sdk/install")
+    @handle
+    async def api_sdk_install(request: web.Request) -> web.Response:
+        refused = _local_only(request)
+        if refused is not None:
+            return refused
+        try:
+            job = sdk_install.start_install(shortcut=write_shortcut)
+        except sdk_install.InstallRefused as exc:
+            return _refused(exc)
+        return web.json_response({"ok": True, "job": job}, status=202)
+
+    @routes.post("/sonder-editor/sdk/uninstall")
+    @handle
+    async def api_sdk_uninstall(request: web.Request) -> web.Response:
+        refused = _local_only(request)
+        if refused is not None:
+            return refused
+        # Reserve first: from here new Generates and proxy starts are refused
+        # (sdk_install.uninstall_running), so the checks below cannot go stale.
+        try:
+            previous = sdk_install.reserve_job("uninstall")
+        except sdk_install.InstallRefused as exc:
+            return _refused(exc)
+        launched = False
+        try:
+            if not await runner.wait_idle(UNINSTALL_DRAIN_SEC) or runner.has_unfinished_runs():
+                return _refused(sdk_install.InstallRefused(
+                    "Takes are still generating. Wait for them or cancel them, then uninstall.", "runs_active"))
+            await runner.aclose_clients()
+            job = sdk_install.launch_job("uninstall", lambda: sdk_install.uninstall(
+                stop_proxy=sdk_proxy.stop_owned_proxy,
+                proxy_running_elsewhere=proxy_running_elsewhere,
+                shortcut_delete=delete_shortcut,
+            ))
+            launched = True
+        finally:
+            if not launched:
+                sdk_install.release_job(previous)
+        return web.json_response({"ok": True, "job": job}, status=202)
+
+    # The Launcher shortcut's probe. It is a file:// page, so the response must
+    # allow cross-origin reads: a no-cors fetch of any other Sonder route fails
+    # on its same-origin Cross-Origin-Resource-Policy, ComfyUI up or not.
+    @routes.get("/sonder-editor/sdk/ping")
+    async def api_sdk_ping(request: web.Request) -> web.Response:
+        return web.Response(status=204, headers={"Cross-Origin-Resource-Policy": "cross-origin"})
 
     # ── Templates ────────────────────────────────────────────────────────────
 

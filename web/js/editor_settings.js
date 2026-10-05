@@ -457,6 +457,11 @@ export const DEFAULT_EDITOR_SETTINGS = {
         compareCycleSide: "B",
         referenceMediaViewMode: "source",
     },
+    // Sonder App (Settings → Sonder App): the Launcher icon beside ⚙ in every
+    // editor mode. Off by default; the entry is meant to be discreet.
+    sdk: {
+        showLauncherButton: false,
+    },
 };
 
 const VALID_SORT_MODES = new Set(GALLERY_SORT_OPTIONS.map((entry) => entry.value));
@@ -1571,6 +1576,11 @@ export function normalizeEditorSettings(source = null) {
             referenceMediaViewMode: VALID_REFERENCE_MEDIA_VIEW_MODES.has(stored?.inspector?.referenceMediaViewMode)
                 ? stored.inspector.referenceMediaViewMode
                 : defaults.inspector.referenceMediaViewMode,
+        },
+        sdk: {
+            showLauncherButton: stored?.sdk?.showLauncherButton == null
+                ? defaults.sdk.showLauncherButton
+                : !!stored.sdk.showLauncherButton,
         },
     };
 }

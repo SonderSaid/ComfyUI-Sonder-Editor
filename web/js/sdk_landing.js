@@ -27,6 +27,7 @@ import { configureNotifications, notifyError, notifySuccess } from "./editor_not
 import { getEditorSettings, notificationCoreConfig, subscribeEditorSettings } from "./editor_settings.js";
 import { createSonderProject, listSonderProjects, projectFolderName } from "./project_create.js";
 import { SDK_SECRET_HEADER, isUnfinishedRun, readSdkSecret, storeSdkSecret, takeSdkExitFlag } from "./sdk_host.js";
+import { LAUNCHER_WINDOW_NAME } from "./sdk_setup_client.js";
 
 // ComfyUI loads every script under web/ as an extension on its own page, so
 // this module does nothing on import: it starts only on the Launcher page,
@@ -708,6 +709,7 @@ export function isLauncherPage(doc = globalThis.document) {
 }
 
 function boot() {
+    window.name = LAUNCHER_WINDOW_NAME;
     installComfyApiShim();
     injectSonderFontFaces();
     applyNativeControlTheme(document.documentElement);

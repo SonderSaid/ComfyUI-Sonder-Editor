@@ -47,7 +47,7 @@ from typing import Any, Callable
 
 from . import control_descriptors, sdk_proxy, sdk_runs, sdk_templates, session_registry
 from .editor_inputs import clean_editor_value, editor_optional_inputs
-from .sdk_install import install_state
+from .sdk_install import install_state, uninstall_running
 
 logger = logging.getLogger("sonder_editor")
 
@@ -273,6 +273,7 @@ class SdkRunner:
         emit: Callable[[str, dict], None] = session_registry.schedule_project_event,
         get_owner: Callable[..., Any] = session_registry.get_owner,
         sdk_ready: Callable[[], bool] = lambda: bool(install_state()["sdk"]["supported"]),
+        uninstalling: Callable[[], bool] = uninstall_running,
         describe: Callable[[dict], dict] | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -283,6 +284,8 @@ class SdkRunner:
         self._emit_event = emit
         self._get_owner = get_owner
         self._sdk_ready = sdk_ready
+        self._uninstalling = uninstalling
+        self._generating = 0  # Generates between their gate and their submit
         self._describe = describe or control_descriptors.describe_controls
         self._clock = clock
         self._sessions: dict[str, SdkSession] = {}
@@ -400,6 +403,8 @@ class SdkRunner:
         }
 
     async def _warm_proxy(self) -> None:
+        if self._uninstalling():
+            return  # the packages are going; Generate reports it
         try:
             await self._ensure_proxy()
         except Exception as exc:  # reported again, with its reason, by Generate
@@ -478,6 +483,29 @@ class SdkRunner:
         self._remember_loop()
         if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= MAX_COUNT:
             raise SdkError(f"Generate count must be 1 to {MAX_COUNT}.", "invalid_count")
+        # Gate and count with no await between them: an uninstall reserved
+        # before this point is seen, and one reserved after waits for it.
+        self._check_not_uninstalling()
+        self._generating += 1
+        try:
+            return await self._generate(session, count, editor_values, render_cache_max_bytes)
+        finally:
+            self._generating -= 1
+
+    def _check_not_uninstalling(self) -> None:
+        if self._uninstalling():
+            raise SdkError("The Sonder App packages are being removed.", "sdk_uninstalling", 409)
+
+    async def wait_idle(self, timeout: float) -> bool:
+        """Wait until no Generate is between its gate and its submit; False on timeout."""
+        deadline = time.monotonic() + timeout
+        while self._generating:
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(0.05)
+        return True
+
+    async def _generate(self, session: SdkSession, count: int, editor_values: Any, render_cache_max_bytes: Any) -> dict:
         if not await asyncio.to_thread(self._sdk_ready):
             raise SdkError("The comfy-sdk package is not installed.", "sdk_not_installed", 409)
         valid, render_cache_max_bytes = clean_editor_value("render_cache_max_bytes", render_cache_max_bytes)

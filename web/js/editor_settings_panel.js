@@ -2,7 +2,9 @@ import {
     EDITOR_COLORS as COLORS,
     FONT,
     lightenColor,
+    setButtonDisabled,
 } from "./editor_theme.js";
+import { describeSdkSetup } from "./sdk_setup_client.js";
 import {
     register as registerKeyboardConsumer,
     PRIORITY as KEY_PRIORITY,
@@ -206,6 +208,7 @@ function createHandle(host) {
         renderModelTemplateSettings: () => host._renderModelTemplateSettings?.(),
         unregisterKeyboard: host._settingsPanelKeyOff,
         sync: () => syncSettingsPanelControls.call(host),
+        syncSdkSetup: () => syncSdkSetupControls.call(host),
         cleanup: () => hideSettingsPanel.call(host),
     };
 }
@@ -363,8 +366,47 @@ function syncSettingsPanelControls() {
             ? ""
             : "Loading server setting…";
     }
+    if (controls.sdkShowLauncherButton) controls.sdkShowLauncherButton.checked = !!this._settings.sdk?.showLauncherButton;
+    syncSdkSetupControls.call(this, controls);
     this._renderModelTemplateSettings?.();
     this._renderPromptChannelTemplateSettings?.();
+}
+
+const SDK_MESSAGE_COLORS = {
+    error: COLORS.dangerText,
+    warning: COLORS.warningText,
+    detail: COLORS.textDim,
+    code: COLORS.textSecondary,
+};
+
+// Settings → Sonder App: the host owns the setup state (sdk_setup_client.js).
+// Its own sync, so a status poll repaints only this section, never the
+// template forms elsewhere in the panel.
+function syncSdkSetupControls(controls = this._settingsPanelControls) {
+    if (!controls?.sdkStatusLine) return;
+    const setup = this._sdkSetup || {};
+    const view = describeSdkSetup(setup.status, { requesting: setup.requesting, error: setup.error });
+    controls.sdkStatusLine.textContent = view.line;
+    controls.sdkStatusLine.style.color = view.tone === "error" ? COLORS.dangerText
+        : view.tone === "pending" ? COLORS.warningText : COLORS.textSecondary;
+    for (const [button, state] of [[controls.sdkInstallButton, view.install], [controls.sdkUninstallButton, view.uninstall]]) {
+        setButtonDisabled(button, state.disabled);
+        button.title = state.title;
+    }
+    controls.sdkMessages.replaceChildren(...view.messages.map((message) => {
+        const line = document.createElement(message.tone === "code" ? "code" : "div");
+        line.textContent = message.text;
+        line.style.cssText = `
+            display: block;
+            color: ${SDK_MESSAGE_COLORS[message.tone] || COLORS.textDim};
+            font-size: 10px;
+            line-height: 1.45;
+            overflow-wrap: anywhere;
+            ${message.tone === "code" ? `font-family: ${FONT.mono}; user-select: all; background: ${COLORS.panel}; border: 1px solid ${COLORS.borderSoft}; border-radius: 4px; padding: 4px 6px;` : ""}
+        `;
+        return line;
+    }));
+    controls.sdkMessages.style.display = view.messages.length ? "flex" : "none";
 }
 
 function showSettingsPanel() {
@@ -2272,11 +2314,52 @@ function showSettingsPanel() {
         })
     );
 
+    // Last on purpose: an experimental, opt-in entry (Phase 4 Decision 2).
+    const sdkSection = createSection(
+        "Sonder App (experimental)",
+        "Run a workflow on a project from its own page, without the ComfyUI canvas. Needs two Python packages in ComfyUI's environment."
+    );
+    const sdkPackagesWrap = createRow(sdkSection, "Packages", "comfy-sdk and comfy-api-proxy, pinned versions. Install only adds packages; Uninstall removes only what it added.");
+    const sdkInstallButton = document.createElement("button");
+    sdkInstallButton.type = "button";
+    sdkInstallButton.textContent = "Install";
+    sdkInstallButton.style.cssText = chromeButtonCss({ variant: "primary", padding: "5px 10px", fontSize: "10px", radius: "6px" });
+    sdkInstallButton.addEventListener("click", () => { Promise.resolve(this._installSdk?.()).catch(() => {}); });
+    const sdkUninstallButton = document.createElement("button");
+    sdkUninstallButton.type = "button";
+    sdkUninstallButton.textContent = "Uninstall";
+    sdkUninstallButton.style.cssText = chromeButtonCss({ variant: "subtle", padding: "5px 10px", fontSize: "10px", radius: "6px" });
+    sdkUninstallButton.addEventListener("click", () => { Promise.resolve(this._uninstallSdk?.()).catch(() => {}); });
+    sdkPackagesWrap.append(sdkInstallButton, sdkUninstallButton);
+    const sdkStatusLine = document.createElement("div");
+    sdkStatusLine.style.cssText = `font-size:10px; line-height:1.45; color:${COLORS.textSecondary}; overflow-wrap:anywhere;`;
+    const sdkMessages = document.createElement("div");
+    sdkMessages.style.cssText = "display:none; flex-direction:column; gap:4px;";
+    sdkSection.append(sdkStatusLine, sdkMessages);
+    const sdkLauncherWrap = createRow(sdkSection, "Launcher", "Choose a workflow and a project, then open the editor on them.");
+    const sdkLauncherButton = document.createElement("button");
+    sdkLauncherButton.type = "button";
+    sdkLauncherButton.textContent = "Open Launcher";
+    sdkLauncherButton.title = "Open the Sonder App Launcher in its own tab";
+    sdkLauncherButton.style.cssText = chromeButtonCss({ variant: "subtle", padding: "5px 10px", fontSize: "10px", radius: "6px" });
+    sdkLauncherButton.addEventListener("click", () => this._openSonderLauncher?.());
+    sdkLauncherWrap.appendChild(sdkLauncherButton);
+    createCheckbox(
+        sdkSection,
+        "sdkShowLauncherButton",
+        "Show Launcher Button In The Editor",
+        "Adds a Launcher icon beside Settings in the toolbar, in every editor mode.",
+        () => !!this._settings.sdk?.showLauncherButton,
+        (checked) => updateCategory("sdk", "showLauncherButton", checked)
+    );
+    Object.assign(controls, { sdkStatusLine, sdkMessages, sdkInstallButton, sdkUninstallButton });
+
     backdrop.appendChild(panel);
     document.body.appendChild(backdrop);
     this._settingsPanelEl = backdrop;
     syncSettingsPanelControls.call(this);
     Promise.resolve(this._loadServerSettings?.()).catch(() => {});
+    Promise.resolve(this._loadSdkSetup?.()).catch(() => {});
     Promise.resolve(this._refreshRenderCacheUsage?.()).catch(() => {});
 
     backdrop.addEventListener("click", (e) => {

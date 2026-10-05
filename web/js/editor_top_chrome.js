@@ -577,6 +577,16 @@ export function buildEditorToolbar(widget) {
     const settingsBtn = makeButton("\u2699", "Editor Settings", { ...BUTTON_OPTIONS.tertiary, radius: "999px", fontSize: `${TYPE.t12}px` }, "margin-left:4px;");
     settingsBtn.addEventListener("click", () => widget._showSettingsPanel());
 
+    // Sonder App Launcher, shown while Settings → Sonder App → "Show Launcher
+    // Button In The Editor" is on (syncLauncherButton). Same in every mode.
+    widget._launcherBtn = makeButton("", "Open the Sonder App Launcher", { ...BUTTON_OPTIONS.tertiary, radius: "999px" },
+        "display:inline-flex; align-items:center; justify-content:center;");
+    // Feather "grid": stroke:currentColor follows the tertiary button colour.
+    widget._launcherBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" style="display:block;"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>`;
+    widget._launcherBtn.setAttribute("aria-label", "Open the Sonder App Launcher");
+    widget._launcherBtn.dataset.sonderLauncherButton = "true";
+    widget._launcherBtn.addEventListener("click", () => widget._openSonderLauncher?.());
+
     widget._bookmarkBtn = makeButton("", "Saved Selections", BUTTON_OPTIONS.tertiary, "position:relative; display:inline-flex; align-items:center; justify-content:center;");
     // Simple outline bookmark (Feather "bookmark"); stroke:currentColor inherits the
     // tertiary button color + hover, replacing the filled white/red \ud83d\udd16 emoji.
@@ -709,7 +719,7 @@ export function buildEditorToolbar(widget) {
     widget._sceneGeometryGroup.style.marginLeft = "auto";
 
     const toolbarUtilsGroup = makeToolbarGroup("flex-end", true);
-    toolbarUtilsGroup.append(helpBtn, settingsBtn);
+    toolbarUtilsGroup.append(widget._launcherBtn, helpBtn, settingsBtn);
 
     // Group boundaries: history │ tools  …gap…  geometry │ utilities. The tools↔geometry boundary
     // is the margin-left:auto gap (a stronger separator than a line), so no divider is placed there.
@@ -733,8 +743,14 @@ export function buildEditorToolbar(widget) {
     widget._toolbarWrap.appendChild(toolbar);
     widget.container.appendChild(widget._toolbarWrap);
     wireForegroundPill(widget);
+    syncLauncherButton(widget);
     updateEditorToolbar(widget);
     return toolbar;
+}
+
+export function syncLauncherButton(widget) {
+    if (!widget?._launcherBtn) return;
+    widget._launcherBtn.style.display = widget._settings?.sdk?.showLauncherButton ? "inline-flex" : "none";
 }
 
 export function queueChromeBadges(widget, queue = widget._renderQueue) {

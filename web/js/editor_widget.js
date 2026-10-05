@@ -516,9 +516,11 @@ import {
     buildEditorToolbar,
     queueChromeBadges,
     refreshChannelTemplateControl,
+    syncLauncherButton,
     updateEditorToolbar,
     updateQueueChromeStatus,
 } from "./editor_top_chrome.js";
+import { getSdkSetupClient, LAUNCHER_WINDOW_NAME } from "./sdk_setup_client.js";
 import {
     _debugListConsumers as debugKeyboardConsumers,
     isKeyboardDebugEnabled,
@@ -1215,6 +1217,9 @@ export class EditorWidget {
         // Apply initial UI scales (bars + canvas will be scaled on first render)
         this._applyScales();
         this._settingsUnsubscribe = subscribeEditorSettings((settings) => this._handleSettingsChange(settings));
+        // Settings → Sonder App reads the page's shared setup state; no request
+        // is made until the panel opens. A poll repaints only that section.
+        this._sdkSetupUnsubscribe = getSdkSetupClient().subscribe(() => this._settingsPanelHandle?.syncSdkSetup?.());
         if (typeof api.addEventListener === "function") {
             this._renderCacheStatusHandler = (event) => {
                 const remaining = Number(event?.detail?.exec_info?.queue_remaining);
@@ -10544,6 +10549,7 @@ export class EditorWidget {
             this._showItemEditor();
         }
         this._syncSettingsPanelControls();
+        syncLauncherButton(this);
         if (this._toolbar) {
             this._applyScales();
         }
@@ -10632,6 +10638,11 @@ export class EditorWidget {
             get _serverSettingsLoaded() { return editor._serverSettingsLoaded; },
             _loadServerSettings: () => editor._loadServerSettings(),
             _setAllowExternalProjectLinks: (enabled) => editor._setAllowExternalProjectLinks(enabled),
+            get _sdkSetup() { return getSdkSetupClient().state; },
+            _loadSdkSetup: () => getSdkSetupClient().refresh(),
+            _installSdk: () => getSdkSetupClient().install(),
+            _uninstallSdk: () => getSdkSetupClient().uninstall(),
+            _openSonderLauncher: () => editor._openSonderLauncher(),
             _channelTemplate: () => editor._channelTemplate(),
             _promptChannelTemplateOptions: () => editor._promptChannelTemplateOptions(),
             _setPromptChannelTemplate: (template) => editor._setPromptChannelTemplate(template),
@@ -23000,6 +23011,11 @@ export class EditorWidget {
         return projects;
     }
 
+    // The Launcher opens in one named window, so repeated clicks reuse it.
+    _openSonderLauncher() {
+        window.open(api.apiURL("/sonder-editor/app"), LAUNCHER_WINDOW_NAME);
+    }
+
     async _loadServerSettings() {
         this._serverSettingsLoaded = false;
         this._syncSettingsPanelControls();
@@ -29295,6 +29311,10 @@ export class EditorWidget {
         if (this._settingsUnsubscribe) {
             this._settingsUnsubscribe();
             this._settingsUnsubscribe = null;
+        }
+        if (this._sdkSetupUnsubscribe) {
+            this._sdkSetupUnsubscribe();
+            this._sdkSetupUnsubscribe = null;
         }
         cancelThumbnailRepairOwner(this._thumbnailRepairOwnerId);
         if (this._thumbnailRepairUnsubscribe) {

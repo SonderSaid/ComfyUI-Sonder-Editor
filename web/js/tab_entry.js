@@ -3,6 +3,7 @@ import { FONT, THEME, applyNativeControlTheme, chromeButtonCss, injectSonderFont
 import { mountToastStack } from "./editor_toast_stack.js";
 import { configureNotifications } from "./editor_notifications.js";
 import { notificationCoreConfig, subscribeEditorSettings } from "./editor_settings.js";
+import { LAUNCHER_WINDOW_NAME } from "./sdk_setup_client.js";
 
 installComfyApiShim();
 injectSonderFontFaces();
@@ -377,6 +378,9 @@ async function runSdkTab() {
         });
     };
 
+    // The Launcher navigated this window here: give up its name, or the
+    // editor's Launcher button would navigate this editor away.
+    if (window.name === LAUNCHER_WINDOW_NAME) window.name = "";
     const secret = sdk.readSdkSecret(sdkSessionId);
     if (!sdkSessionId || !secret) {
         showEnded("This tab doesn't hold that session. Open it from the Launcher.");

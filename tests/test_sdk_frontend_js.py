@@ -402,6 +402,8 @@ out.notices = {
     not_owner: gc.generateResultNotice({ ok: false, status: 409, payload: { code: "not_owner" } }, 1),
     ended: gc.generateResultNotice({ ok: false, status: 404, payload: { code: "session_ended" } }, 1),
     not_installed: gc.generateResultNotice({ ok: false, status: 409, payload: { code: "sdk_not_installed" } }, 1),
+    proxy_not_installed: gc.generateResultNotice({ ok: false, status: 503, payload: { code: "proxy_not_installed", error: "The comfy-api-proxy package is not installed." } }, 1),
+    uninstalling: gc.generateResultNotice({ ok: false, status: 409, payload: { code: "sdk_uninstalling", error: "The Sonder App packages are being removed." } }, 1),
     busy: gc.generateResultNotice({ ok: false, status: 429, payload: { code: "too_many_runs", error: "Too many takes are already waiting." } }, 1),
     proxy: gc.generateResultNotice({ ok: false, status: 503, payload: { code: "proxy_unavailable", error: "No free port." } }, 1),
     network: gc.generateResultNotice({ ok: false, status: 0, payload: { code: "network", error: "Failed to fetch" } }, 1),
@@ -721,6 +723,9 @@ def test_refusal_notices_put_the_sentence_in_message_and_the_reason_in_detail(re
     assert notices["not_owner"] is None and notices["ended"] is None
     assert notices["not_installed"]["message"] == "The Sonder App packages are not installed."
     assert "Settings → Sonder App" in notices["not_installed"]["detail"]
+    assert notices["proxy_not_installed"] == notices["not_installed"]
+    assert notices["uninstalling"]["tier"] == "warning"
+    assert notices["uninstalling"]["message"] == "The Sonder App packages are being removed."
     assert notices["busy"]["tier"] == "warning"
     assert notices["proxy"] == {"tier": "error", "message": "The Sonder App couldn't connect to ComfyUI.", "detail": "No free port."}
     assert notices["network"]["message"] == "Couldn't reach ComfyUI to generate."

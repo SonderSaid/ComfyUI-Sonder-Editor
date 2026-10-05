@@ -92,12 +92,15 @@ export function generateResultNotice(result, requested) {
         const problems = Array.isArray(payload.problems) ? payload.problems : [];
         return { tier: "error", message: "This workflow can't generate yet.", detail: problems.join("\n") || null };
     }
-    if (code === "sdk_not_installed") {
+    if (code === "sdk_not_installed" || code === "proxy_not_installed") {
         return {
             tier: "error",
             message: "The Sonder App packages are not installed.",
             detail: "Install them from the editor: Settings → Sonder App.",
         };
+    }
+    if (code === "sdk_uninstalling") {
+        return { tier: "warning", message: "The Sonder App packages are being removed.", detail: "Generate is unavailable until they are installed again." };
     }
     if (code === "too_many_runs") {
         return { tier: "warning", message: "Too many takes are already waiting.", detail: payload.error || null };

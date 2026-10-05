@@ -15287,7 +15287,13 @@ if routes is not None:
     try:
         from .sdk_routes import register_sdk_routes
 
-        register_sdk_routes(routes, resolve_project=_sdk_resolve_project, remember_event_loop=remember_event_loop)
+        register_sdk_routes(
+            routes,
+            resolve_project=_sdk_resolve_project,
+            remember_event_loop=remember_event_loop,
+            projects_dir=_configured_base_dir,
+            app=app,
+        )
     except Exception:
         logger.exception("Sonder App (SDK) routes unavailable")
 
