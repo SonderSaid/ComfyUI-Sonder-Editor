@@ -1,0 +1,438 @@
+"""Mounted Controls transport: real coercion, ownership, lifecycle and HTTP."""
+
+import asyncio
+import copy
+import importlib
+import json
+import threading
+from types import SimpleNamespace
+
+import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+
+import server
+from server import control_descriptors as cd, session_registry as sr
+from test_control_descriptors import describe
+from test_sdk_controls_routes import prompt
+
+PID, HID, CANVAS, TAB = 'ZZ-controls-relay-20261005', 'host-A', 'canvas-A', 'tab-A'
+
+
+@pytest.fixture(autouse=True)
+def registry(monkeypatch):
+    for name in ('_sessions', '_canvas_hosts', '_handoffs', '_widget_state', '_widget_sources', '_controls_relay'):
+        monkeypatch.setattr(sr, name, {})
+    monkeypatch.setattr(sr, '_lock', asyncio.Lock())
+    monkeypatch.setattr(sr, '_sdk_secret_for_host', None)
+    events = []
+    monkeypatch.setattr(sr, 'schedule_project_event', lambda p, e: events.append((p, copy.deepcopy(e))))
+    async def broadcast(p, e):
+        events.append((p, copy.deepcopy(e)))
+    monkeypatch.setattr(sr, 'broadcast_project_event', broadcast)
+    return events
+
+
+async def setup(pid=PID, hid=HID, canvas=CANVAS, tab=TAB):
+    assert (await sr.register_canvas_host(pid, 'editor-1', canvas, host_id=hid))['ok']
+    info = {'host_id': hid, 'source_node_id': 'editor-1'}
+    assert (await sr.claim_session(pid, tab + '-fs', 'fullscreen', info))['ok']
+    handoff = await sr.create_handoff(pid, tab + '-fs', host_id=hid)
+    assert (await sr.claim_session(pid, tab, 'tab', info, handoff_token=handoff['token']))['ok']
+
+
+def publication(seq=1, applied=None, rejected=None):
+    return {'view': describe(prompt()), 'view_seq': seq, 'prompt_hash': 'hash-' + str(seq),
+            'applied': applied or [], 'rejected': rejected or []}
+
+
+async def publish(body=None, canvas=CANVAS):
+    return await sr.publish_controls_view(PID, HID, canvas, body or publication())
+
+
+async def post(changes=None, tab=TAB):
+    return await sr.post_control_changes(PID, HID, tab, changes or {'control:steps:value': '30'})
+
+
+async def pending():
+    return await sr.get_control_changes(PID, HID, CANVAS)
+
+
+def test_acknowledgement_survives_poll_retry_socket_loss_and_later_publication(registry):
+    async def run():
+        await setup()
+        body = publication()
+        assert (await publish(body))['ok']
+        body['view']['controls'].clear()  # published state does not alias the caller
+        changes = {'control:steps:value': '30', 'control:seed:seed': '18446744073709551615',
+                   'control:seed:seed_mode': 'decrement', 'note:intro:text': '# Updated',
+                   'field:SonderSaveVideo/mark_queue_complete': 'true'}
+        rid = (await post(changes))['request_id']
+        first = await pending()
+        assert first == await pending()  # polling cannot drain before an acknowledgement
+        assert first['pending'][0]['changes'] == dict(changes, **{'field:SonderSaveVideo/mark_queue_complete': True})
+        first['pending'].clear()
+        assert len((await pending())['pending']) == 1
+        ack = publication(2, [rid])
+        assert (await publish(ack))['ok']
+        assert (await publish(ack))['duplicate'] is True
+        assert not (await pending())['pending']
+        assert (await sr.get_controls_view(PID, HID))['applied'] == [rid]
+        assert (await publish(publication(3)))['ok']
+        fetched = await sr.get_controls_view(PID, HID)
+        assert fetched['applied'] == [rid]  # an outage does not lose the prior outcome
+        fetched['view']['controls'].clear()
+        assert (await sr.get_controls_view(PID, HID))['view']['controls']
+    asyncio.run(run())
+    announced = [e for p, e in registry if e['type'] == 'controls_changed']
+    assert [e['view_seq'] for e in announced] == [1, 2, 3]
+    assert all(set(e) == {'type', 'project_id', 'host_id', 'view_seq'} for e in announced)
+
+
+@pytest.mark.parametrize('changes', [
+    {}, [], {'anything': True}, {'control:steps:value': 'bad'},
+    {'control:steps:value': -1}, {'control:steps:value': 10001},
+    {'control:seed:seed': '18446744073709551616'}, {'control:seed:seed': -1},
+    {'control:seed:seed_mode': 'surprise'}, {'note:intro:text': 'x' * 4001},
+    {'control:steps:note': 2}, {'control:steps:order': 2},
+    {'field:SonderSaveVideo/mark_queue_complete': 'maybe'},
+    {f'note:n{i}:text': '' for i in range(65)},
+])
+def test_invalid_batches_never_partially_enqueue(changes):
+    async def run():
+        await setup()
+        await publish()
+        result = await sr.post_control_changes(PID, HID, TAB, changes)
+        assert result['code'] == 'invalid_change' and result['rejected']
+        assert not (await pending())['pending']
+        result = await post({'control:steps:value': 3, 'unknown': 2})
+        assert result['code'] == 'invalid_change'
+        assert not (await pending())['pending']
+    asyncio.run(run())
+
+
+def test_queue_bound_is_atomic_under_concurrent_requests():
+    async def run():
+        await setup()
+        await publish()
+        results = await asyncio.gather(*(post() for _ in range(40)))
+        assert sum(r['ok'] for r in results) == 32
+        assert [r['code'] for r in results if not r['ok']] == ['queue_full'] * 8
+        queued = (await pending())['pending']
+        assert len({r['request_id'] for r in queued}) == 32
+        await publish(publication(2, [queued[0]['request_id']]))
+        assert (await post())['ok']
+        assert len((await pending())['pending']) == 32
+    asyncio.run(run())
+
+
+def test_refused_ack_unknown_target_contradictions_and_sequence_are_atomic():
+    async def run():
+        await setup()
+        await publish()
+        rid = (await post())['request_id']
+        for body in (publication(2, ['unknown']), publication(2, [rid], [
+            {'request_id': rid, 'target': 'control:steps:value', 'reason': 'refused'}]),
+            publication(2, rejected=[{'request_id': rid, 'target': 'other', 'reason': 'refused'}])):
+            assert (await publish(body))['code'] == 'invalid_ack'
+            assert (await sr.get_controls_view(PID, HID))['view_seq'] == 1
+            assert len((await pending())['pending']) == 1
+        rows = [{'request_id': rid, 'target': 'control:steps:value', 'reason': 'Target changed'}]
+        assert (await publish(publication(2, rejected=rows)))['ok']
+        assert (await sr.get_controls_view(PID, HID))['rejected'] == rows
+        assert (await publish(publication(3, [rid])))['code'] == 'invalid_ack'
+        assert (await publish(publication(1)))['code'] == 'stale_view'
+        body = publication(2, rejected=rows)
+        body['prompt_hash'] = 'different'
+        assert (await publish(body))['code'] == 'stale_view'
+        assert not (await pending())['pending']
+    asyncio.run(run())
+
+
+def test_host_project_owner_and_sdk_boundaries():
+    async def run():
+        await setup()
+        await publish()
+        assert (await publish(canvas=TAB))['code'] == 'not_canvas_host'
+        assert (await sr.get_control_changes(PID, HID, TAB))['code'] == 'not_canvas_host'
+        assert (await post(tab=CANVAS))['code'] == 'not_owner'
+        assert (await sr.set_controls_visibility(PID, HID, 'other-tab', True))['code'] == 'not_owner'
+        assert (await sr.post_control_changes(PID, 'other-host', TAB, {'x': 2}))['code'] == 'canvas_host_disconnected'
+        assert (await sr.get_controls_view('other-project', HID))['view'] is None
+        sr.set_sdk_secret_resolver(lambda h: 'secret' if h == HID else None)
+        assert (await publish())['code'] == 'invalid_host'
+        assert (await post())['code'] == 'invalid_host'
+        assert (await pending())['code'] == 'invalid_host'
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('visible', [None, 1, 'true', [], {}])
+def test_visibility_requires_boolean(visible):
+    assert asyncio.run(sr.set_controls_visibility(PID, HID, TAB, visible))['code'] == 'invalid_visibility'
+
+
+def test_visibility_presence_and_orphan_recovery_preserve_the_queue(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(sr, '_now', lambda: now[0])
+    async def run():
+        await setup()
+        await publish()
+        await post()
+        assert (await sr.set_controls_visibility(PID, HID, TAB, True))['controls_visible']
+        state = await sr.get_widget_state(PID, 'editor-1', host_id=HID)
+        assert state['controls_visible'] and state['controls_view_seq'] == 1
+        now[0] += 31
+        assert not (await sr.get_controls_view(PID, HID))['controls_visible']
+        assert (await post())['code'] == 'session_orphaned'
+        assert len((await pending())['pending']) == 1
+        assert (await sr.heartbeat_session(PID, TAB, host_id=HID))['ok']
+        assert (await sr.get_controls_view(PID, HID))['controls_visible']
+        assert (await sr.set_controls_visibility(PID, HID, TAB, False))['controls_visible'] is False
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('cleanup', ['release', 'unregister', 'replace', 'lazy-host-expiry', 'sweep-host-expiry', 'owner-expiry'])
+def test_relay_lifecycle_clears_everything_but_not_another_host(cleanup, monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(sr, '_now', lambda: now[0])
+    async def run():
+        await setup()
+        await setup(hid='host-B', canvas='canvas-B', tab='tab-B')
+        await publish()
+        await post()
+        await sr.set_controls_visibility(PID, HID, TAB, True)
+        if cleanup == 'release':
+            await sr.release_session(PID, TAB, host_id=HID)
+        elif cleanup == 'unregister':
+            await sr.unregister_canvas_host(PID, 'editor-1', CANVAS, host_id=HID)
+        elif cleanup == 'replace':
+            await sr.register_canvas_host(PID, 'editor-1', 'new-canvas', host_id=HID)
+        elif cleanup == 'owner-expiry':
+            sr._sessions[(PID, HID)].update(status='orphaned', orphan_expires_at=99)
+        else:
+            sr._canvas_hosts[(PID, HID)]['last_seen'] = 1
+            if cleanup == 'sweep-host-expiry':
+                await sr.sweep_stale_sessions_once()
+        result = await sr.get_controls_view(PID, HID)
+        assert result['view'] is None and result['view_seq'] == 0 and not result['controls_visible']
+        assert (PID, HID) not in sr._controls_relay
+        assert await sr.get_canvas_host(PID, host_id='host-B')
+    asyncio.run(run())
+
+
+def test_same_host_reconnect_keeps_requests_and_ack_history_is_bounded():
+    async def run():
+        await setup()
+        await publish()
+        rid = (await post())['request_id']
+        await sr.register_canvas_host(PID, 'editor-1', CANVAS, host_id=HID)
+        assert (await pending())['pending'][0]['request_id'] == rid
+        await publish(publication(2, [rid]))
+        first = rid
+        for seq in range(3, 130):
+            rid = (await post())['request_id']
+            assert (await publish(publication(seq, [rid])))['ok']
+        fetched = await sr.get_controls_view(PID, HID)
+        assert len(fetched['applied']) == 128 and first in fetched['applied']
+        assert (await post())['code'] == 'queue_full'
+        assert (await sr.set_controls_visibility(PID, HID, 'wrong-tab', True, fetched['applied']))['code'] == 'not_owner'
+        assert (await sr.set_controls_visibility(PID, HID, TAB, True, first))['code'] == 'invalid_receipts'
+        assert (await sr.set_controls_visibility(PID, HID, TAB, True, fetched['applied']))['ok']
+        assert (await sr.set_controls_visibility(PID, HID, TAB, True, fetched['applied']))['ok']
+        assert not (await sr.get_controls_view(PID, HID))['applied']
+        rid = (await post())['request_id']
+        await sr.set_controls_visibility(PID, HID, TAB, True, [rid])
+        assert (await pending())['pending'][0]['request_id'] == rid
+        assert (await publish(publication(130, [rid])))['ok']
+        assert (await sr.get_controls_view(PID, HID))['applied'] == [rid]
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('mutation', ['new-view', 'release', 'host-replace'])
+def test_validation_worker_does_not_hold_registry_lock_and_cannot_cross_lifecycle(mutation, monkeypatch):
+    entered, resume = threading.Event(), threading.Event()
+    original = cd.validate_control_changes
+    def slow(*args):
+        entered.set()
+        assert resume.wait(5)
+        return original(*args)
+    async def run():
+        await setup()
+        await publish()
+        monkeypatch.setattr(cd, 'validate_control_changes', slow)
+        task = asyncio.create_task(post())
+        try:
+            assert await asyncio.to_thread(entered.wait, 3)
+            assert (await asyncio.wait_for(sr.get_controls_view(PID, HID), 1))['view_seq'] == 1
+            if mutation == 'new-view':
+                assert (await publish(publication(2)))['ok']
+            elif mutation == 'release':
+                await sr.release_session(PID, TAB, host_id=HID)
+            else:
+                await sr.register_canvas_host(PID, 'editor-1', 'new-canvas', host_id=HID)
+        finally:
+            resume.set()
+        result = await task
+        assert result['code'] in ('stale_view', 'not_owner')
+        assert not sr._controls_relay.get((PID, HID), {}).get('pending')
+    asyncio.run(run())
+
+
+def test_publication_worker_cannot_cross_host_replacement(monkeypatch):
+    entered, resume = threading.Event(), threading.Event()
+    original = sr._prepare_control_publication
+    def slow(body):
+        entered.set()
+        assert resume.wait(5)
+        return original(body)
+    async def run():
+        await setup()
+        monkeypatch.setattr(sr, '_prepare_control_publication', slow)
+        task = asyncio.create_task(publish())
+        try:
+            assert await asyncio.to_thread(entered.wait, 3)
+            await asyncio.wait_for(sr.unregister_canvas_host(PID, 'editor-1', CANVAS, host_id=HID), 1)
+            await sr.register_canvas_host(PID, 'editor-1', CANVAS, host_id=HID)
+        finally:
+            resume.set()
+        assert (await task)['code'] == 'host_changed'
+        assert (await sr.get_controls_view(PID, HID))['view'] is None
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('patch', [
+    {'view_seq': 0}, {'view_seq': True}, {'view_seq': 2**53}, {'prompt_hash': ''},
+    {'view': []}, {'applied': 'rid'}, {'applied': ['r'] * 33}, {'rejected': [{}]},
+    {'view': {'controls': [{}], 'fields': [], 'notes': []}},
+    {'view': {'controls': [{'control_id': 'c', 'status': 'ok', 'kind': 'COMBO', 'options': 7}], 'fields': [], 'notes': []}},
+    {'view': {'controls': [{'control_id': 'c', 'status': 'ok', 'kind': 'COMBO', 'options': ['a'], 'options_truncated': 'false'}], 'fields': [], 'notes': []}},
+])
+def test_malformed_publications_are_refused_without_mutation(patch):
+    async def run():
+        await setup()
+        body = publication()
+        body.update(patch)
+        assert (await publish(body))['code'] == 'invalid_view'
+        assert (await sr.get_controls_view(PID, HID))['view'] is None
+    asyncio.run(run())
+
+
+def client_for(monkeypatch):
+    from server import routes
+    monkeypatch.setattr(server, 'PromptServer', SimpleNamespace(instance=SimpleNamespace(routes=web.RouteTableDef())), raising=False)
+    module = importlib.reload(routes)
+    monkeypatch.setattr(module, 'remember_event_loop', lambda: None)
+    def disk_read(*args, **kwargs):
+        raise AssertionError('Controls relay must not read project storage')
+    monkeypatch.setattr(module, 'load_project', disk_read)
+    app = web.Application(middlewares=[module._sonder_security_middleware], client_max_size=2 * 1024 * 1024)
+    for route in module.routes:
+        if route.path in ('/sonder-editor/project/{project_id}/controls',
+                          '/sonder-editor/project/{project_id}/control_changes',
+                          '/sonder-editor/project/{project_id}/controls_visibility', '/sonder-editor/ws'):
+            app.router.add_route(route.method, route.path, route.handler)
+    return TestClient(TestServer(app))
+
+
+def test_real_http_roundtrip_caps_security_and_raw_folder_identity(monkeypatch):
+    async def run():
+        await setup()
+        async with client_for(monkeypatch) as client:
+            path = f'/sonder-editor/project/{PID}'
+            body = dict(publication(), host_id=HID, session_id=CANVAS)
+            response = await client.put(path + '/controls', json=body)
+            assert response.status == 200
+            response = await client.get(path + '/controls', params={'host_id': HID})
+            snapshot = await response.json()
+            assert snapshot['project_id'] == PID and snapshot['view'] == cd.json_safe(describe(prompt()))
+            assert next(d for d in snapshot['view']['controls'] if d['control_id'] == 'seed')['seed'] == '9007199254740993'
+            response = await client.post(path + '/control_changes', json={'host_id': HID, 'session_id': TAB,
+                'changes': {'control:seed:seed': '18446744073709551615'}})
+            rid = (await response.json())['request_id']
+            response = await client.get(path + '/control_changes', params={'host_id': HID, 'session_id': CANVAS})
+            assert (await response.json())['pending'][0]['changes']['control:seed:seed'] == '18446744073709551615'
+            body.update(publication(2, [rid]))
+            assert (await client.put(path + '/controls', json=body)).status == 200
+            assert (await client.put(path + '/controls_visibility', json={'host_id': HID, 'session_id': TAB, 'visible': True, 'seen': [rid]})).status == 200
+            snapshot = await (await client.get(path + '/controls', params={'host_id': HID})).json()
+            assert not snapshot['applied']
+            assert (await client.get(path + '/controls?host_id=host-A&path=X')).status == 400
+            assert (await client.put(path + '/controls', json=body, headers={'Origin': 'https://evil.invalid'})).status == 403
+            for raw in (b'not JSON', b'[]', b'{'):
+                assert (await client.put(path + '/controls', data=raw)).status == 400
+            assert (await client.put(path + '/controls', data=b'x' * (sr.CONTROLS_MAX_BYTES + 1))).status == 413
+            async def chunks():
+                for _ in range(9):
+                    yield b'x' * 65536
+            assert (await client.put(path + '/controls', data=chunks())).status == 413
+    asyncio.run(run())
+
+
+def test_large_pending_response_encodes_off_loop_without_blocking_other_registry_reads(monkeypatch):
+    entered, resume = threading.Event(), threading.Event()
+    original = json.dumps
+    loop_thread = threading.get_ident()
+    threads = []
+    def tracked(value, *args, **kwargs):
+        if isinstance(value, dict) and 'pending' in value:
+            threads.append(threading.get_ident())
+            entered.set()
+            assert resume.wait(5)
+        return original(value, *args, **kwargs)
+    async def run():
+        await setup()
+        body = publication()
+        body['view'] = {'controls': [{'control_id': 'text', 'kind': 'STRING', 'status': 'ok', 'note': ''}],
+                        'fields': [], 'notes': []}
+        assert (await publish(body))['ok']
+        for _ in range(32):
+            assert (await post({'control:text:value': 'x' * (500 * 1024)}))['ok']
+        async with client_for(monkeypatch) as client:
+            monkeypatch.setattr(json, 'dumps', tracked)
+            path = f'/sonder-editor/project/{PID}'
+            task = asyncio.create_task(client.get(path + '/control_changes', params={'host_id': HID, 'session_id': CANVAS}))
+            try:
+                assert await asyncio.to_thread(entered.wait, 3)
+                response = await asyncio.wait_for(client.get(path + '/controls', params={'host_id': HID}), 1)
+                assert response.status == 200
+                assert (await response.json())['view_seq'] == 1
+            finally:
+                resume.set()
+            response = await task
+            assert len(await response.read()) > 16_000_000
+            assert len((await pending())['pending']) == 32
+    asyncio.run(run())
+    assert threads and all(t != loop_thread for t in threads)
+
+
+def test_actual_websocket_close_reconnect_and_same_host_subscribe_preserve_requests(monkeypatch):
+    async def subscribed(ws, hid=HID):
+        await ws.send_json({'type': 'subscribe', 'role': 'canvas_host', 'project_id': PID,
+                            'host_id': hid, 'source_node_id': 'editor-1', 'session_id': CANVAS})
+        while (await ws.receive_json(timeout=2))['type'] != 'subscribed':
+            pass
+    async def run():
+        await setup()
+        async with client_for(monkeypatch) as client:
+            ws = await client.ws_connect('/sonder-editor/ws')
+            await ws.receive_json(timeout=2)  # native sid
+            await subscribed(ws)
+            assert (await publish())['ok']
+            rid = (await post())['request_id']
+            await subscribed(ws)  # a duplicate subscription cannot clear pending writes
+            assert (await pending())['pending'][0]['request_id'] == rid
+            await ws.close()
+            await asyncio.sleep(0)  # server teardown
+            assert (await pending())['pending'][0]['request_id'] == rid
+            assert (await post())['ok']  # tab can enqueue during the canvas socket outage
+            response = await client.get(f'/sonder-editor/project/{PID}/control_changes',
+                                        params={'host_id': HID, 'session_id': CANVAS})
+            assert len((await response.json())['pending']) == 2
+            ws = await client.ws_connect('/sonder-editor/ws')
+            await ws.receive_json(timeout=2)
+            await subscribed(ws)
+            assert len((await pending())['pending']) == 2
+            await subscribed(ws, hid='other-host')  # explicit departure clears this host
+            assert (await sr.get_controls_view(PID, HID))['view'] is None
+            await ws.close()
+    asyncio.run(run())

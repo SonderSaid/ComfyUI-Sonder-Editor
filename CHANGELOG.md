@@ -19,6 +19,7 @@ a fresh `[Unreleased]` block.
 - Render queue: a job that is waiting again or has failed shows why on a second line, such as a run interrupted before the job completed. Hover for the full text.
 
 ### Fixed
+- Mounted editor: a brief websocket interruption no longer drops canvas presence while its HTTP heartbeats continue.
 - Assets: Open Source Workflow is greyed out in the mounted editor tab, where it could not open anything, and for takes saved without a workflow. It used to stay clickable and report the workflow as unavailable.
 - Queue: a save node whose "mark queue complete" is set by a Primitive Boolean or a Sonder Control now completes the job when it is on. It used to be read as off, so the same job re-rendered.
 - Queue: a render that fails or is interrupted after taking a queue job now returns that job to pending right away, even when no editor is open. It used to stay running until an open canvas reset it about five seconds later.

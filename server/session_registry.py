@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import hmac
 import logging
 import os
@@ -9,6 +10,8 @@ from typing import Any, Callable
 
 from aiohttp import web
 
+from . import control_descriptors
+
 logger = logging.getLogger("sonder_editor")
 
 SESSION_TTL_SECONDS = 30.0
@@ -16,6 +19,11 @@ CANVAS_HOST_TTL_SECONDS = 90.0
 HANDOFF_TTL_SECONDS = 30.0
 ORPHAN_TTL_SECONDS = 1800.0
 SWEEP_INTERVAL_SECONDS = 30.0
+
+CONTROLS_MAX_BYTES = 512 * 1024
+CONTROLS_MAX_PENDING = 32
+CONTROLS_ACK_HISTORY = 128
+CONTROLS_MAX_SEQ = 2 ** 53 - 1
 
 _DEBUG_SESSION_ENABLED = os.environ.get("SONDER_DEBUG_SESSION", "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -67,6 +75,9 @@ _subscribers: dict[str, set[web.WebSocketResponse]] = defaultdict(set)
 _widget_state: dict[HostKey, dict[str, Any]] = {}
 _widget_sources: dict[HostKey, str] = {}
 _canvas_hosts: dict[HostKey, dict[str, Any]] = {}
+# Ephemeral transport only. The canvas graph owns the values. Pending requests
+# survive poll/socket interruptions until the canvas acknowledges them.
+_controls_relay: dict[HostKey, dict[str, Any]] = {}
 _debug_events: deque[dict[str, Any]] = deque(maxlen=120)
 _diag_events: deque[dict[str, Any]] = deque(maxlen=2048)
 _diag_boot: dict[str, Any] | None = None
@@ -277,6 +288,7 @@ def _host_presence_event(key: HostKey, host: dict[str, Any] | None) -> dict[str,
     if not source_node_id:
         source_node_id = _widget_sources.get(key, "")
     return {
+        **_controls_presence_locked(key),
         "type": "host_presence_changed",
         "project_id": key[0],
         "host_id": key[1],
@@ -304,6 +316,7 @@ def _widget_state_payload(
         "session_id": str(session_id or ""),
         "values": dict(state if values is None else values),
         "state": state,
+        **_controls_presence_locked(key),
         "canvas_host_connected": bool(host),
         "host": _public_host(host),
     }
@@ -339,6 +352,7 @@ def _release_owner_locked(
     if not owner:
         return None
     _sessions.pop(key, None)
+    _clear_controls_locked(key)
     if clear_widget_state:
         _clear_project_widget_state_locked(key[0], key[1])
     _record_debug_event(
@@ -428,6 +442,7 @@ def _evict_stale_host_locked(key: HostKey, events: list[tuple[str, dict[str, Any
     if host and _is_host_stale(host):
         last_seen = float(host.get("last_seen", 0.0) or 0.0)
         _canvas_hosts.pop(key, None)
+        _clear_controls_locked(key)
         _record_diag_event(
             "canvas_host_evict",
             key,
@@ -511,6 +526,8 @@ async def claim_session(
                 result = {"ok": False, "code": "invalid_handoff", "owner": _public_owner(owner)}
             else:
                 _handoffs.pop(handoff_key, None)
+                if owner.get("session_id") != session_id:
+                    _clear_controls_locked(key)
                 _sessions[key] = _make_owner(project_id, host_id, session_id, host_mode, info)
                 _record_debug_event("claim", key, session_id=session_id, host_mode=host_mode, source_node_id=info.get("source_node_id", ""))
                 _record_diag_event(
@@ -530,6 +547,8 @@ async def claim_session(
             )
             result = {"ok": False, "code": "locked", "owner": _public_owner(owner)}
         else:
+            if not owner:
+                _clear_controls_locked(key)
             _sessions[key] = _make_owner(project_id, host_id, session_id, host_mode, info)
             _record_debug_event("claim", key, session_id=session_id, host_mode=host_mode, source_node_id=info.get("source_node_id", ""))
             _record_diag_event(
@@ -642,6 +661,7 @@ async def release_session(
         else:
             owner = _sessions.get(key)
             if not owner:
+                _clear_controls_locked(key)
                 _record_diag_event("release_noop", key, session_id=session_id, force=force)
                 result = {"ok": True, "owner": None}
             elif not force and owner.get("session_id") != session_id:
@@ -697,6 +717,261 @@ async def create_handoff(project_id: str, session_id: str, host_id: str = "", so
                     "created_at": _now(),
                 }
                 result = {"ok": True, "token": token, "owner": _public_owner(owner)}
+    _schedule_events(events)
+    return result
+
+
+def _clear_controls_locked(key: HostKey) -> None:
+    _controls_relay.pop(key, None)
+
+
+def _new_controls_state() -> dict:
+    return {"view": None, "view_seq": 0, "prompt_hash": "", "visible": False,
+            "pending": [], "outcomes": [], "publication": None}
+
+
+def _controls_presence_locked(key: HostKey) -> dict:
+    state = _controls_relay.get(key, {})
+    owner = _sessions.get(key)
+    host = _canvas_hosts.get(key)
+    visible = bool(state.get("visible") and owner and owner.get("host_mode") == "tab"
+                   and owner.get("status", "active") == "active" and not _is_stale(owner)
+                   and host and not _is_host_stale(host))
+    return {"controls_view_seq": state.get("view_seq", 0), "controls_visible": visible}
+
+
+def _controls_payload_locked(key: HostKey) -> dict:
+    state = _controls_relay.get(key, {})
+    outcomes = state.get("outcomes", [])
+    return {"ok": True, "project_id": key[0], "host_id": key[1],
+            **_controls_presence_locked(key), "view": state.get("view"),
+            "view_seq": state.get("view_seq", 0), "prompt_hash": state.get("prompt_hash", ""),
+            "applied": [o["request_id"] for o in outcomes if not o["rejected"]],
+            "rejected": [row for o in outcomes for row in o["rejected"]]}
+
+
+def _controls_gate_locked(key: HostKey, session_id: str, role: str, events: list) -> str:
+    if not key[0] or not key[1] or not session_id:
+        return "invalid_host"
+    _advance_owner_lifecycle_locked(key, events)
+    _evict_stale_host_locked(key, events, trigger="controls_relay")
+    host, owner = _canvas_hosts.get(key), _sessions.get(key)
+    if _sdk_secret(key[1]) is not None or (owner and owner.get("host_mode") == "sdk"):
+        return "invalid_host"
+    if not host:
+        return "canvas_host_disconnected"
+    if role == "canvas":
+        return "" if host.get("session_id") == session_id else "not_canvas_host"
+    if not owner or owner.get("session_id") != session_id or owner.get("host_mode") != "tab":
+        return "not_owner"
+    return "" if owner.get("status", "active") == "active" else "session_orphaned"
+
+
+def _prepare_control_publication(body: Any) -> dict:
+    """Validate/copy the wire snapshot off the loop; never retain caller objects."""
+    if not isinstance(body, dict):
+        raise ValueError("The publication must be an object.")
+    seq, prompt_hash = body.get("view_seq"), body.get("prompt_hash")
+    if isinstance(seq, bool) or not isinstance(seq, int) or not 1 <= seq <= CONTROLS_MAX_SEQ:
+        raise ValueError("view_seq must be a positive safe integer.")
+    if not isinstance(prompt_hash, str) or not 1 <= len(prompt_hash) <= 128:
+        raise ValueError("A prompt hash is required.")
+    view = body.get("view")
+    if not isinstance(view, dict):
+        raise ValueError("The view must be an object.")
+    for name in ("controls", "fields", "notes"):
+        if not isinstance(view.get(name), list) or not all(isinstance(d, dict) for d in view[name]):
+            raise ValueError(f"{name} must be a list of descriptors.")
+        for descriptor in view[name]:
+            identity = descriptor.get("note_id" if name == "notes" else "control_id") if name != "fields" else None
+            if name != "fields" and not isinstance(identity, str):
+                raise ValueError("Descriptor identities must be text.")
+            if name == "fields" and not all(isinstance(descriptor.get(n), str) for n in ("class_type", "field")):
+                raise ValueError("Field identities must be text.")
+            if not isinstance(descriptor.get("status"), str):
+                raise ValueError("A descriptor status is required.")
+            kind = descriptor.get("kind")
+            if kind is not None and not isinstance(kind, str):
+                raise ValueError("Descriptor kinds must be text.")
+            if name != "notes":
+                if "options" in descriptor and not isinstance(descriptor["options"], (list, tuple)):
+                    raise ValueError("Descriptor options must be a list.")
+                if "options_truncated" in descriptor and not isinstance(descriptor["options_truncated"], bool):
+                    raise ValueError("The options preview flag must be boolean.")
+                for bound in ("min", "max"):
+                    if descriptor.get(bound) is not None:
+                        numeric_kind = "INT" if kind in ("INT", "SEED") else "FLOAT"
+                        control_descriptors.coerce_control_value(numeric_kind, descriptor[bound])
+    view = control_descriptors.json_safe(view)
+    for name, field in (("controls", "note"), ("notes", "text")):
+        for descriptor in view[name]:
+            text = descriptor.get(field)
+            if text is not None and not isinstance(text, str):
+                raise ValueError("Notes must be text.")
+            if isinstance(text, str) and len(text) > control_descriptors.PANEL_NOTE_MAX_CHARS:
+                descriptor[field] = text[:control_descriptors.PANEL_NOTE_MAX_CHARS]
+                descriptor["note_truncated"] = True
+    applied, rejected = body.get("applied", []), body.get("rejected", [])
+    if not isinstance(applied, list) or len(applied) > CONTROLS_MAX_PENDING or not all(isinstance(r, str) for r in applied):
+        raise ValueError("applied must list up to 32 request ids.")
+    if not isinstance(rejected, list) or len(rejected) > CONTROLS_MAX_PENDING * control_descriptors.MAX_CONTROL_CHANGES:
+        raise ValueError("Too many request refusals.")
+    for row in rejected:
+        if not isinstance(row, dict) or not all(isinstance(row.get(n), str) for n in ("request_id", "target", "reason")):
+            raise ValueError("A refusal needs a request id, target and reason.")
+    return {"view": view, "view_seq": seq, "prompt_hash": prompt_hash,
+            "applied": list(dict.fromkeys(applied)),
+            "rejected": [{"request_id": r["request_id"], "target": r["target"], "reason": r["reason"][:500]} for r in rejected]}
+
+
+async def get_controls_view(project_id: str, host_id: str) -> dict:
+    key, events = _host_key(project_id, host_id), []
+    async with _lock:
+        if not all(key):
+            return {"ok": False, "code": "invalid_host"}
+        _advance_owner_lifecycle_locked(key, events)
+        _evict_stale_host_locked(key, events, trigger="get_controls_view")
+        payload = _controls_payload_locked(key)
+    _schedule_events(events)
+    return await asyncio.to_thread(copy.deepcopy, payload)
+
+
+async def publish_controls_view(project_id: str, host_id: str, session_id: str, body: Any) -> dict:
+    key, events = _host_key(project_id, host_id), []
+    async with _lock:
+        code = _controls_gate_locked(key, session_id, "canvas", events)
+        host_before, owner_before = _canvas_hosts.get(key), _sessions.get(key)
+    _schedule_events(events)
+    if code:
+        return {"ok": False, "code": code}
+    try:
+        publication = await asyncio.to_thread(_prepare_control_publication, body)
+    except (ValueError, OverflowError, TypeError, RecursionError) as exc:
+        return {"ok": False, "code": "invalid_view", "error": str(exc)}
+    key, events = _host_key(project_id, host_id), []
+    async with _lock:
+        code = _controls_gate_locked(key, session_id, "canvas", events)
+        if not code and (_canvas_hosts.get(key) is not host_before or _sessions.get(key) is not owner_before):
+            code = "host_changed"
+        state = _controls_relay.get(key)
+        if not code and state and publication["view_seq"] <= state["view_seq"]:
+            if publication == state.get("publication"):
+                result = {"ok": True, "view_seq": state["view_seq"], "duplicate": True}
+            else:
+                result = {"ok": False, "code": "stale_view", "view_seq": state["view_seq"]}
+        elif code:
+            result = {"ok": False, "code": code}
+        else:
+            state = state or _new_controls_state()
+            pending = {r["request_id"]: r for r in state["pending"]}
+            known = {o["request_id"]: o for o in state["outcomes"]}
+            applied = set(publication["applied"])
+            refusals = {}
+            for row in publication["rejected"]:
+                refusals.setdefault(row["request_id"], []).append(row)
+            acknowledged = applied | set(refusals)
+            invalid = applied & set(refusals) or acknowledged - pending.keys() - known.keys()
+            for rid, rows in refusals.items():
+                changes = pending.get(rid, {}).get("changes")
+                if changes is not None and any(row["target"] not in changes for row in rows):
+                    invalid.add(rid)
+            for rid in acknowledged & known.keys():
+                if known[rid]["rejected"] != refusals.get(rid, []):
+                    invalid.add(rid)
+            if invalid:
+                result = {"ok": False, "code": "invalid_ack"}
+            else:
+                outcomes = list(state["outcomes"])
+                for request in state["pending"]:
+                    rid = request["request_id"]
+                    if rid in acknowledged:
+                        outcomes.append({"request_id": rid, "rejected": refusals.get(rid, [])})
+                state.update(view=publication["view"], view_seq=publication["view_seq"],
+                             prompt_hash=publication["prompt_hash"], publication=publication,
+                             pending=[r for r in state["pending"] if r["request_id"] not in acknowledged],
+                             outcomes=outcomes)
+                _controls_relay[key] = state
+                result = {"ok": True, "view_seq": state["view_seq"]}
+                events.append((key[0], {"type": "controls_changed", "project_id": key[0],
+                                       "host_id": key[1], "view_seq": state["view_seq"]}))
+    _schedule_events(events)
+    return result
+
+
+async def post_control_changes(project_id: str, host_id: str, session_id: str, changes: Any) -> dict:
+    key, events = _host_key(project_id, host_id), []
+    async with _lock:
+        code = _controls_gate_locked(key, session_id, "tab", events)
+        state = _controls_relay.get(key)
+        view = state.get("view") if state else None
+        seq = state.get("view_seq", 0) if state else 0
+    _schedule_events(events)
+    if code:
+        return {"ok": False, "code": code}
+    if view is None:
+        return {"ok": False, "code": "view_unavailable"}
+    cleaned, rejected = await asyncio.to_thread(control_descriptors.validate_control_changes, view, changes)
+    events = []
+    async with _lock:
+        code = _controls_gate_locked(key, session_id, "tab", events)
+        current = _controls_relay.get(key)
+        if code:
+            result = {"ok": False, "code": code}
+        elif current is not state or current.get("view_seq") != seq:
+            result = {"ok": False, "code": "stale_view"}
+        elif rejected:
+            result = {"ok": False, "code": "invalid_change", "rejected": rejected}
+        elif (len(state["pending"]) >= CONTROLS_MAX_PENDING
+              or len(state["pending"]) + len(state["outcomes"]) >= CONTROLS_ACK_HISTORY):
+            # Reserve one outcome slot at enqueue. Never forget an unseen result
+            # to make room: the owner confirms receipts via controls_visibility.
+            result = {"ok": False, "code": "queue_full"}
+        else:
+            rid = uuid.uuid4().hex
+            state["pending"].append({"request_id": rid, "session_id": session_id,
+                                     "view_seq": seq, "prompt_hash": state["prompt_hash"], "changes": cleaned})
+            result = {"ok": True, "request_id": rid}
+            events.append((key[0], {"type": "control_changes_pending", "project_id": key[0], "host_id": key[1]}))
+    _schedule_events(events)
+    return result
+
+
+async def get_control_changes(project_id: str, host_id: str, session_id: str) -> dict:
+    key, events = _host_key(project_id, host_id), []
+    async with _lock:
+        code = _controls_gate_locked(key, session_id, "canvas", events)
+        state = _controls_relay.get(key, {})
+        result = {"ok": False, "code": code} if code else {
+            "ok": True, "project_id": key[0], "host_id": key[1],
+            **_controls_presence_locked(key), "pending": list(state.get("pending", []))}
+    _schedule_events(events)
+    return await asyncio.to_thread(control_descriptors.json_safe, result)
+
+
+async def set_controls_visibility(project_id: str, host_id: str, session_id: str,
+                                  visible: Any, seen: Any = None) -> dict:
+    if not isinstance(visible, bool):
+        return {"ok": False, "code": "invalid_visibility"}
+    if seen is not None and (not isinstance(seen, list) or len(seen) > CONTROLS_ACK_HISTORY
+                             or not all(isinstance(rid, str) for rid in seen)):
+        return {"ok": False, "code": "invalid_receipts"}
+    receipts = set(seen or [])
+    key, events = _host_key(project_id, host_id), []
+    async with _lock:
+        code = _controls_gate_locked(key, session_id, "tab", events)
+        if code:
+            result = {"ok": False, "code": code}
+        else:
+            state = _controls_relay.setdefault(key, _new_controls_state())
+            # Only terminal outcomes can be confirmed. Unknown ids and repeated
+            # receipts are harmless; early receipts never remove pending writes.
+            state["outcomes"] = [o for o in state["outcomes"] if o["request_id"] not in receipts]
+            changed = state["visible"] != visible
+            state["visible"] = visible
+            result = {"ok": True, **_controls_presence_locked(key)}
+            if changed:
+                events.append((key[0], {"type": "controls_visibility_changed", "project_id": key[0],
+                                       "host_id": key[1], **_controls_presence_locked(key)}))
     _schedule_events(events)
     return result
 
@@ -833,9 +1108,14 @@ async def register_canvas_host(
     host_id: str = "",
 ) -> dict[str, Any]:
     key = _host_key(project_id, host_id, source_node_id)
+    events: list[tuple[str, dict[str, Any]]] = []
     async with _lock:
         if not key[0] or not key[1]:
             return {"ok": False, "code": "invalid_host", "canvas_host_connected": False}
+        _evict_stale_host_locked(key, events, trigger="register_canvas_host")
+        previous = _canvas_hosts.get(key)
+        if previous and previous.get("session_id") != session_id:
+            _clear_controls_locked(key)
         _widget_sources[key] = _clean_id(source_node_id)
         host = _make_host(key[0], key[1], source_node_id, session_id, workflow_id, workflow_label)
         _canvas_hosts[key] = host
@@ -848,7 +1128,8 @@ async def register_canvas_host(
             workflow_label=workflow_label,
         )
         event = _host_presence_event(key, host)
-    schedule_project_event(key[0], event)
+    events.append((key[0], event))
+    _schedule_events(events)
     return {"ok": True, **event}
 
 
@@ -888,6 +1169,7 @@ async def unregister_canvas_host(project_id: str, source_node_id: str, session_i
         host = _canvas_hosts.get(key)
         if host and (not session_id or host.get("session_id") == session_id):
             _canvas_hosts.pop(key, None)
+            _clear_controls_locked(key)
             _record_debug_event("canvas_host_unregister", key, session_id=session_id, source_node_id=source_node_id)
             _record_diag_event(
                 "canvas_host_unregister", key,
@@ -1063,6 +1345,7 @@ async def sweep_stale_sessions_once() -> int:
                 continue
             last_seen = float(host.get("last_seen", 0.0) or 0.0)
             _canvas_hosts.pop(key, None)
+            _clear_controls_locked(key)
             _record_diag_event(
                 "canvas_host_evict",
                 key,

@@ -741,6 +741,10 @@ def json_safe(view: dict) -> dict:
                 integer_field = integer_field or name == "seed" or (
                     value.get("source") == "field" and name in ("default", "min", "max")
                     and isinstance(item, int))
+                # Coerced relay changes retain exact integers on the wire too.
+                integer_field = integer_field or (isinstance(item, int) and not isinstance(item, bool)
+                    and isinstance(name, str) and (name.startswith("field:") or
+                    (name.startswith("control:") and name.endswith((":value", ":seed")))))
                 if isinstance(item, float) and not math.isfinite(item):
                     result[name] = None
                 elif integer_field and isinstance(item, (int, float)) and not isinstance(item, bool):

@@ -103,6 +103,12 @@ from .session_registry import (
     get_diag_state,
     get_project_debug_state,
     get_widget_state,
+    CONTROLS_MAX_BYTES,
+    get_controls_view,
+    publish_controls_view,
+    post_control_changes,
+    get_control_changes,
+    set_controls_visibility,
     get_owner,
     heartbeat_session,
     record_diag_event,
@@ -11403,6 +11409,91 @@ if routes is not None:
         status = 200 if result.get("ok") else 409
         return web.json_response(result, status=status)
 
+    def _control_relay_status(payload: dict) -> int:
+        if payload.get("ok"):
+            return 200
+        return 400 if payload.get("code") in ("invalid_view", "invalid_ack", "invalid_change", "invalid_visibility", "invalid_receipts", "invalid_host") else 409
+
+    async def _control_relay_response(payload: dict) -> web.Response:
+        # A bounded queue can still contain 16 MiB of text. Encode on a worker,
+        # including its UTF-8 bytes; web.json_response would dump on this loop.
+        encoded = await asyncio.to_thread(lambda: json.dumps(payload).encode("utf-8"))
+        return web.Response(body=encoded, content_type="application/json", status=_control_relay_status(payload))
+
+    async def _control_relay_body(request: web.Request) -> dict:
+        # Cap before parsing; content_length alone misses chunked uploads.
+        limit = CONTROLS_MAX_BYTES
+        data = bytearray()
+        async for chunk in request.content.iter_chunked(64 * 1024):
+            data.extend(chunk)
+            if len(data) > limit:
+                raise web.HTTPRequestEntityTooLarge(max_size=limit, actual_size=len(data))
+        try:
+            body = await asyncio.to_thread(json.loads, bytes(data))
+        except (ValueError, UnicodeError, RecursionError):
+            raise web.HTTPBadRequest(text="The request body must be a JSON object.") from None
+        if not isinstance(body, dict):
+            raise web.HTTPBadRequest(text="The request body must be a JSON object.")
+        return body
+
+    @routes.get("/sonder-editor/project/{project_id}/controls")
+    async def api_get_controls_view(request: web.Request) -> web.Response:
+        remember_event_loop()
+        try:
+            project_id = _session_relay_project_id(request)
+        except FileNotFoundError as exc:
+            return _json_error(str(exc), 404)
+        payload = await get_controls_view(project_id, str(request.query.get("host_id") or ""))
+        payload = await asyncio.to_thread(control_descriptors.json_safe, payload)
+        return await _control_relay_response(payload)
+
+    @routes.put("/sonder-editor/project/{project_id}/controls")
+    async def api_publish_controls_view(request: web.Request) -> web.Response:
+        remember_event_loop()
+        try:
+            project_id = _session_relay_project_id(request)
+        except FileNotFoundError as exc:
+            return _json_error(str(exc), 404)
+        body = await _control_relay_body(request)
+        payload = await publish_controls_view(project_id, str(body.get("host_id") or ""),
+                                              str(body.get("session_id") or ""), body)
+        return await _control_relay_response(payload)
+
+    @routes.post("/sonder-editor/project/{project_id}/control_changes")
+    async def api_post_control_changes(request: web.Request) -> web.Response:
+        remember_event_loop()
+        try:
+            project_id = _session_relay_project_id(request)
+        except FileNotFoundError as exc:
+            return _json_error(str(exc), 404)
+        body = await _control_relay_body(request)
+        payload = await post_control_changes(project_id, str(body.get("host_id") or ""),
+                                            str(body.get("session_id") or ""), body.get("changes"))
+        return await _control_relay_response(payload)
+
+    @routes.get("/sonder-editor/project/{project_id}/control_changes")
+    async def api_get_control_changes(request: web.Request) -> web.Response:
+        remember_event_loop()
+        try:
+            project_id = _session_relay_project_id(request)
+        except FileNotFoundError as exc:
+            return _json_error(str(exc), 404)
+        payload = await get_control_changes(project_id, str(request.query.get("host_id") or ""),
+                                            str(request.query.get("session_id") or ""))
+        return await _control_relay_response(payload)
+
+    @routes.put("/sonder-editor/project/{project_id}/controls_visibility")
+    async def api_controls_visibility(request: web.Request) -> web.Response:
+        remember_event_loop()
+        try:
+            project_id = _session_relay_project_id(request)
+        except FileNotFoundError as exc:
+            return _json_error(str(exc), 404)
+        body = await _control_relay_body(request)
+        payload = await set_controls_visibility(project_id, str(body.get("host_id") or ""),
+                                               str(body.get("session_id") or ""), body.get("visible"), body.get("seen"))
+        return await _control_relay_response(payload)
+
     @routes.get("/sonder-editor/project/{project_id}/widget_state")
     async def api_get_editor_widget_state(request: web.Request) -> web.Response:
         remember_event_loop()
@@ -15339,7 +15430,12 @@ if routes is not None:
                             next_project_id = str(data.get("project_id") or "")
                             source_node_id = str(data.get("source_node_id") or "")
                             host_id = str(data.get("host_id") or "")
-                            await clear_host_registration()
+                            same_host = bool(host_registration and data.get("role") == "canvas_host"
+                                and next_project_id == host_registration.get("project_id")
+                                and (host_id or source_node_id) == host_registration.get("host_id")
+                                and str(data.get("session_id") or "") == host_registration.get("session_id"))
+                            if not same_host:
+                                await clear_host_registration()
                             if subscribed_project_id:
                                 await unsubscribe(subscribed_project_id, ws)
                             subscribed_project_id = next_project_id
@@ -15401,7 +15497,10 @@ if routes is not None:
                 elif msg.type == web.WSMsgType.ERROR:
                     logger.error("WebSocket error: %s", ws.exception())
         finally:
-            await clear_host_registration()
+            # A transport close is not a canvas lifetime change. The existing
+            # host TTL and HTTP fallback heartbeats own its liveness; keeping
+            # registration here lets pending Controls requests survive an outage.
+            # Deliberate subscription switches still unregister above.
             if subscribed_project_id:
                 await unsubscribe(subscribed_project_id, ws)
         return ws
