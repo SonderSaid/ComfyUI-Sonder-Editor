@@ -15,15 +15,11 @@ import {
     DEFAULT_SAVE_PRESET,
     SAVE_PRESET_OPTIONS,
     getTemplateById,
-    getTemplateFpsValues,
-    snapFpsToAllowed,
     getEditorSettings,
-    getPromptChannelTemplateById,
     notificationCoreConfig,
-    resolveFrameConstraintForTemplate,
     subscribeEditorSettings,
 } from "./editor_settings.js";
-import { projectTemplateValue } from "./prompt_channel_templates.js";
+import { createSonderProject, snapFpsToTemplate } from "./project_create.js";
 import { FONT, THEME, chromeInputCss, injectSonderFontFaces } from "./editor_theme.js";
 import { mountToastStack } from "./editor_toast_stack.js";
 import { notifyProgress, notifyInfo, notifyWarning, configureNotifications } from "./editor_notifications.js";
@@ -114,15 +110,6 @@ function style(el, cssText) {
     return el;
 }
 
-function snapFpsToTemplate(fps, template) {
-    const numeric = Math.max(0, Number(fps) || 0);
-    const values = getTemplateFpsValues(template);
-    if (template?.id === "free" || !values.length) {
-        return numeric;
-    }
-    return Number(snapFpsToAllowed(numeric, values).toFixed(3));
-}
-
 // ── Widget hide/show helpers ───────────────────────────────────────────
 // ── Utility: get project directory from project dropdown value ─────────
 async function getProjectDir(projectValue) {
@@ -152,12 +139,16 @@ async function listProjects() {
     return data.projects || [];
 }
 
-async function syncProjectWidgetChoices(projectWidget) {
-    if (!projectWidget) return [];
-    const projects = await listProjects();
+function applyProjectWidgetChoices(projectWidget, projects) {
     const values = ["+ Create New", ...projects.map((project) => project.path.split(/[/\\]/).pop())];
     projectWidget.options = projectWidget.options || {};
     projectWidget.options.values = values;
+}
+
+async function syncProjectWidgetChoices(projectWidget) {
+    if (!projectWidget) return [];
+    const projects = await listProjects();
+    applyProjectWidgetChoices(projectWidget, projects);
     return projects;
 }
 
@@ -260,69 +251,27 @@ async function createProjectFromNode(node, projectWidget, { isCurrent = () => tr
     const fpsWidget = node.widgets.find((widget) => widget.name === "fps");
     const widthWidget = node.widgets.find((widget) => widget.name === "width");
     const heightWidget = node.widgets.find((widget) => widget.name === "height");
-    const settings = getEditorSettings();
     const defaults = DEFAULT_EDITOR_SETTINGS.projectDefaults;
-    const defaultSceneDuration = Math.max(1, Number(settings?.projectDefaults?.newSceneDuration || defaults.newSceneDuration));
-    const templateId = settings.projectDefaults.defaultTemplateId || "free";
-    const template = getTemplateById(templateId, settings);
-    const channelTemplate = getPromptChannelTemplateById(
-        settings.projectDefaults.defaultChannelTemplateId, settings);
 
-    const projectName = String(projectNameWidget?.value || "").trim();
-    if (!projectName) {
-        throw new Error("Project name is required");
-    }
-
-    const resp = await fetch(api.apiURL("/sonder-editor/project"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-            name: projectName,
-            fps: snapFpsToTemplate(Number(fpsWidget?.value || defaults.fps), template),
+    // Shared with the Sonder App Launcher (project_create.js).
+    let created;
+    try {
+        created = await createSonderProject({
+            name: projectNameWidget?.value,
+            fps: Number(fpsWidget?.value || defaults.fps),
             width: Number(widthWidget?.value || defaults.width),
             height: Number(heightWidget?.value || defaults.height),
-            template_id: templateId,
-            frame_constraint: resolveFrameConstraintForTemplate(templateId, settings),
-            prompt_channel_template: projectTemplateValue(channelTemplate),
-        }),
-    });
-    if (!resp.ok) {
-        let message = `Project creation failed: ${resp.status}`;
-        try {
-            const data = await resp.json();
-            if (data?.error) message = data.error;
-        } catch {}
-        throw new Error(message);
-    }
-
-    const created = await resp.json();
-    const projects = await syncProjectWidgetChoices(projectWidget);
-    const createdProject = projects.find((project) => project.project_id === created.project_id)
-        || projects.find((project) => project.name === created.name);
-    const nextValue = createdProject?.path?.split(/[/\\]/).pop();
-
-    if (!nextValue) {
-        throw new Error("Created project was not found after refreshing the project list");
-    }
-
-    if ((Number(createdProject.scene_count) || 0) <= 0) {
-        const sceneResp = await fetch(api.apiURL(`/sonder-editor/project/${encodeURIComponent(nextValue)}/scenes`), {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                name: "Scene 1",
-                duration_frames: defaultSceneDuration,
-            }),
+            settings: getEditorSettings(),
+            apiURL: (path) => api.apiURL(path),
+            fetchImpl: (...args) => fetch(...args),
         });
-        if (!sceneResp.ok) {
-            let message = `Initial scene creation failed: ${sceneResp.status}`;
-            try {
-                const data = await sceneResp.json();
-                if (data?.error) message = data.error;
-            } catch {}
-            throw new Error(message);
-        }
+    } catch (error) {
+        // The project may exist even though a later step failed: list it.
+        if (Array.isArray(error?.projects)) applyProjectWidgetChoices(projectWidget, error.projects);
+        throw error;
     }
+    const { folder: nextValue, projects } = created;
+    applyProjectWidgetChoices(projectWidget, projects);
 
     if (!isCurrent()) return false;
 

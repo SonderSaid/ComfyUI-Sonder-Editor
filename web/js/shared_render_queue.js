@@ -349,6 +349,34 @@ function createActionsRow(current, completedCount) {
     return actions;
 }
 
+// Why a job is waiting again or failed (a returned claim, a skipped run, a
+// sampler error), as written by the server. Muted and one line; the full text
+// is the tooltip.
+export function queueJobErrorText(job) {
+    const status = String(job?.status || "").trim().toLowerCase();
+    if (status !== "pending" && status !== "failed") return "";
+    return String(job?.error || "").trim();
+}
+
+function queueJobErrorLine(job) {
+    const message = queueJobErrorText(job);
+    if (!message) return null;
+    const line = style(document.createElement("div"), `
+        color: ${CHROME.textDim};
+        font-size: 10px;
+        font-style: italic;
+        line-height: 1.35;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        min-width: 0;
+    `);
+    line.dataset.sonderQueueError = "true";
+    line.textContent = message;
+    line.title = message;
+    return line;
+}
+
 function createQueueRow(current, job, { title = "", nested = false } = {}) {
     const statusState = statusStateForQueue(job?.status);
     const showDelete = !!current.showDeleteJob && typeof current.onDeleteJob === "function";
@@ -429,6 +457,8 @@ function createQueueRow(current, job, { title = "", nested = false } = {}) {
 
     headingRow.append(heading, status);
     text.append(headingRow, selectionSummary);
+    const errorLine = queueJobErrorLine(job);
+    if (errorLine) text.appendChild(errorLine);
     row.appendChild(text);
 
     if (showDelete) {

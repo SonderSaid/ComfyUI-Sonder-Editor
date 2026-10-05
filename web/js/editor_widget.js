@@ -924,6 +924,10 @@ export class EditorWidget {
         this.onFullscreenExit = options.onFullscreenExit || null;
         this.onMountInTab = options.onMountInTab || null;
         this.hostMode = options.hostMode || "node";
+        // A host that runs the workflow itself (Sonder App): the toolbar shows
+        // Generate ×N for it (generate_controls.js). Absent on the canvas modes.
+        this._generationHost = options.generationHost || null;
+        this._generateControls = null;
         this.onWidgetValueChange = options.onWidgetValueChange || null;
         this.onWidgetStateApplied = options.onWidgetStateApplied || null;
         this.widgetHost = options.host || this._createNodeWidgetHost(node);
@@ -1684,6 +1688,9 @@ export class EditorWidget {
                 const handled = await window.__SONDER_OPEN_SOURCE_WORKFLOW__?.(this.projectDir, asset);
                 if (!handled) this._showToast?.("Source workflow unavailable");
             },
+            // Asked when the menu opens: only the ComfyUI page installs the
+            // handler, so the mounted tab and the Sonder App show it disabled.
+            canOpenSourceWorkflow: () => typeof window.__SONDER_OPEN_SOURCE_WORKFLOW__ === "function",
             onRefresh: async () => {
                 // Indeterminate progress only when the refresh is slow (>500ms);
                 // a fast refresh stays silent (result is visible inline).
@@ -29328,6 +29335,10 @@ export class EditorWidget {
         if (this._foregroundPillUnsub) {
             this._foregroundPillUnsub();
             this._foregroundPillUnsub = null;
+        }
+        if (this._generateControls) {
+            this._generateControls.destroy();
+            this._generateControls = null;
         }
         if (this._fullscreenPlaceholder) {
             this._fullscreenPlaceholder.remove();

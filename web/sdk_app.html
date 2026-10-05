@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Sonder App</title>
+    <style>
+        html,
+        body {
+            margin: 0;
+            min-width: 0;
+            min-height: 100%;
+            background: #0c1015;
+            color: #e7ecf2;
+            font-family: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+        }
+
+        #status {
+            padding: 48px 16px;
+            text-align: center;
+            color: #7e8896;
+            font-size: 13px;
+        }
+
+        body.ready #status {
+            display: none;
+        }
+    </style>
+</head>
+<body data-sonder-launcher="true">
+    <div id="status">Loading the Sonder App…</div>
+    <div id="app"></div>
+    <script type="module" src="static/js/sdk_landing.js"></script>
+</body>
+</html>

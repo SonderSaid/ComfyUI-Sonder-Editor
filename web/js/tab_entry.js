@@ -1,5 +1,5 @@
 import { installComfyApiShim } from "./comfy_api_shim.js";
-import { FONT, THEME, applyNativeControlTheme, injectSonderFontFaces, statusPillCss } from "./editor_theme.js";
+import { FONT, THEME, applyNativeControlTheme, chromeButtonCss, injectSonderFontFaces, setButtonDisabled, statusPillCss } from "./editor_theme.js";
 import { mountToastStack } from "./editor_toast_stack.js";
 import { configureNotifications } from "./editor_notifications.js";
 import { notificationCoreConfig, subscribeEditorSettings } from "./editor_settings.js";
@@ -59,6 +59,9 @@ const handoffToken = params.get("handoff") || "";
 const hostId = params.get("host_id") || "";
 const sourceNodeId = params.get("source_node_id") || "";
 const sessionWindowName = params.get("session_name") || "";
+// Sonder App (SDK mode): `?mode=sdk&session=<sdk session id>`; its secret is in sessionStorage.
+const tabMode = params.get("mode") || "";
+const sdkSessionId = params.get("session") || "";
 const statusEl = document.getElementById("status");
 const sessionId = `tab-${globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
 
@@ -244,9 +247,356 @@ class TabWidgetHost {
     }
 }
 
+// Debounced self-echo guard (mutation-integrity F4): mirrors
+// editor_node_controller._handleProjectUpdatedFromSync — the WS echo of an
+// own save beats the response that records the new version, so re-check
+// 250 ms later with the latest stashed event (re-armed per event). Shared by
+// the mounted tab and the Sonder App, whose takes arrive this way.
+function createProjectUpdatedHandler(editor, getProjectVersion) {
+    let projectUpdatedDebounceTimer = null;
+    let pendingProjectUpdatedEvent = null;
+    return (event) => {
+        pendingProjectUpdatedEvent = event;
+        clearTimeout(projectUpdatedDebounceTimer);
+        projectUpdatedDebounceTimer = setTimeout(() => {
+            projectUpdatedDebounceTimer = null;
+            const pending = pendingProjectUpdatedEvent;
+            pendingProjectUpdatedEvent = null;
+            if (!pending) return;
+            const currentVersion = getProjectVersion(projectId);
+            const shouldRefresh = !!(pending.modified_at && pending.modified_at !== currentVersion);
+            tabDiagRecord("project_updated_recv", {
+                event_modified_at: pending.modified_at || "",
+                current_version: currentVersion || "",
+                refresh: shouldRefresh,
+            });
+            if (shouldRefresh) {
+                editor.refresh(["project", "assets", "scenes", "queue", "references"]);
+            }
+        }, 250);
+    };
+}
+
+function mountToastsOnce() {
+    // Page-level notification toast stack, mounted once.
+    if (!document.querySelector("[data-sonder-toast-stack]")) {
+        mountToastStack(document.body);
+    }
+    configureNotifications(notificationCoreConfig());
+    subscribeEditorSettings(() => configureNotifications(notificationCoreConfig()));
+}
+
+// A full-page message over the editor (or in place of it), with an optional
+// action: a button (Take over) or a link (back to the Launcher).
+function createPageBlocker() {
+    const blocker = document.createElement("div");
+    blocker.style.cssText = `
+        position: fixed;
+        inset: 0;
+        z-index: 10010;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        flex-direction: column;
+        gap: 12px;
+        background: ${THEME.bg0}cc;
+        color: ${THEME.fg1};
+        font: 13px ${FONT.sans};
+        pointer-events: auto;
+        text-align: center;
+        padding: 16px;
+        box-sizing: border-box;
+    `;
+    const message = document.createElement("div");
+    message.style.cssText = `color:${THEME.fg0}; font-size:14px;`;
+    const detail = document.createElement("div");
+    detail.style.cssText = `color:${THEME.fg2}; font-size:12px; max-width:min(520px, 90vw); line-height:1.45;`;
+    const actions = document.createElement("div");
+    actions.style.cssText = "display:flex; gap:8px; flex-wrap:wrap; justify-content:center;";
+    blocker.append(message, detail, actions);
+    document.body.appendChild(blocker);
+    return {
+        show({ text, more = "", action = null, link = null }) {
+            message.textContent = text;
+            detail.textContent = more;
+            detail.style.display = more ? "" : "none";
+            actions.replaceChildren();
+            if (action) {
+                const button = document.createElement("button");
+                button.type = "button";
+                button.textContent = action.label;
+                button.style.cssText = chromeButtonCss({ variant: "primary", padding: "6px 14px" });
+                button.addEventListener("click", () => action.onClick(button));
+                actions.appendChild(button);
+            }
+            if (link) {
+                const anchor = document.createElement("a");
+                anchor.href = link.href;
+                anchor.textContent = link.label;
+                anchor.style.cssText = `${chromeButtonCss({ variant: "secondary", padding: "6px 14px" })} text-decoration:none; display:inline-block;`;
+                actions.appendChild(anchor);
+            }
+            blocker.style.display = "flex";
+        },
+        hide() {
+            blocker.style.display = "none";
+        },
+    };
+}
+
+// ── Sonder App (SDK mode) ─────────────────────────────────────────────────
+// Opened by the Launcher at `/sonder-editor/tab/<project folder>?mode=sdk&session=<id>`
+// with the session secret in this tab's sessionStorage. The same editor as the
+// mounted tab; the host differs: it runs the workflow itself (Generate) and
+// keeps its position on the server. Every claim with the secret takes the
+// session over (reload, duplicated tab, Take over); a displaced tab never
+// re-claims on its own.
+async function runSdkTab() {
+    const [
+        { connectProjectSync },
+        { EditorWidget },
+        { installProjectVersionFetchPatch, rememberProjectVersionFromPayload, getProjectVersion },
+        { claimEditorSession, heartbeatEditorSession, releaseEditorSession },
+        sdk,
+    ] = await Promise.all([
+        import("./cross_tab_sync.js"),
+        import("./editor_widget.js"),
+        import("./api_client.js"),
+        import("./editor_session_client.js"),
+        import("./sdk_host.js"),
+    ]);
+
+    const launcherHref = api.apiURL("/sonder-editor/app");
+    const blocker = createPageBlocker();
+    const showEnded = (more = "") => {
+        document.body.classList.add("ready");
+        blocker.show({
+            text: "This session has ended",
+            more: more || "Open the workflow and project again from the Launcher.",
+            link: { href: launcherHref, label: "Back to the Launcher" },
+        });
+    };
+
+    const secret = sdk.readSdkSecret(sdkSessionId);
+    if (!sdkSessionId || !secret) {
+        showEnded("This tab doesn't hold that session. Open it from the Launcher.");
+        return;
+    }
+    tabDiagBootIfNeeded(sessionId);
+    tabDiagRecord("sdk_tab_start", { project_id: projectId, sdk_session_id: sdkSessionId });
+
+    installProjectVersionFetchPatch();
+
+    const stateResp = await fetchJson(`/sonder-editor/sdk/session/${encodeURIComponent(sdkSessionId)}/state`, {
+        headers: { [sdk.SDK_SECRET_HEADER]: secret },
+    });
+    if (!stateResp.ok) {
+        sdk.forgetSdkSecret(sdkSessionId);
+        showEnded();
+        return;
+    }
+    // The session's own project key: an edited URL would claim under one key
+    // while the server checks ownership under another.
+    const sessionProject = String(stateResp.payload.project || "");
+    if (sessionProject && sessionProject !== projectId) {
+        window.location.replace(api.apiURL(
+            `/sonder-editor/tab/${encodeURIComponent(sessionProject)}?mode=sdk&session=${encodeURIComponent(sdkSessionId)}`));
+        return;
+    }
+    const templateName = String(stateResp.payload.template_name || "");
+    document.title = templateName ? `${templateName} · Sonder App` : "Sonder App";
+
+    const projectResp = await fetchJson(`/sonder-editor/project/${encodeURIComponent(projectId)}`);
+    if (!projectResp.ok) {
+        setStatus(`Project load failed (${projectResp.status}).`);
+        return;
+    }
+    rememberProjectVersionFromPayload(projectResp.payload, projectId);
+
+    const host = new sdk.SdkWidgetHost({
+        sessionId: sdkSessionId,
+        secret,
+        projectId,
+        tabSessionId: sessionId,
+        defaults: DEFAULT_WIDGET_VALUES,
+        initialValues: stateResp.payload.values || {},
+        fetchImpl: (...args) => fetch(...args),
+        apiURL: (path) => api.apiURL(path),
+    });
+
+    const claim = () => claimEditorSession(projectId, sessionId, "sdk", {
+        host_id: sdkSessionId,
+        browser_instance_id: sessionId,
+        workflow_label: templateName ? `Sonder App · ${templateName}` : "Sonder App",
+        sdk_secret: secret,
+    }, "", sdkSessionId);
+
+    const firstClaim = await claim();
+    if (!firstClaim.ok) {
+        sdk.forgetSdkSecret(sdkSessionId);
+        showEnded();
+        return;
+    }
+
+    const node = projectWidgetNode();
+    const editor = new EditorWidget(node, {
+        host,
+        hostMode: "sdk",
+        generationHost: host,
+        // Exit returns to the Launcher; takes still generating keep going and
+        // the Launcher says so.
+        onFullscreenExit: async () => {
+            await host.flushValues();
+            sdk.writeSdkExitFlag({
+                session_id: sdkSessionId,
+                project: projectId,
+                template_id: String(stateResp.payload.template_id || ""),
+                template_name: templateName,
+            });
+            window.location.assign(launcherHref);
+        },
+    });
+    editor.updateProject(projectId);
+    editor.applyWidgetState(host.values);
+    editor._enterFullscreen();
+    document.body.classList.add("ready");
+    mountToastsOnce();
+
+    const statusPill = makeStatusPill();
+    let transportState = "open";
+    let socketOpenedOnce = false;
+
+    const render = () => {
+        let label = "Connected";
+        let pillState = "running";
+        if (host.ownerState === "ended") {
+            label = "Session ended";
+            pillState = "failed";
+        } else if (host.ownerState === "displaced") {
+            label = "Opened in another tab";
+            pillState = "pending";
+        } else if (transportState === "reconnecting" || transportState === "closed" || host.ownerState === "reconnecting") {
+            label = "Reconnecting";
+            pillState = "pending";
+        } else if (host.ownerState === "orphaned") {
+            label = "Reconnecting session";
+            pillState = "pending";
+        }
+        setStatusPillState(statusPill, label, pillState);
+        if (host.ownerState === "ended") {
+            showEnded();
+        } else if (host.ownerState === "displaced") {
+            blocker.show({
+                text: "Opened in another tab",
+                more: "This workflow and project are open in another tab. Take over to continue here.",
+                action: { label: "Take over", onClick: takeOver },
+                link: { href: launcherHref, label: "Back to the Launcher" },
+            });
+        } else {
+            blocker.hide();
+        }
+    };
+
+    // The state machine lives in sdk_host.js (createSdkOwnership); this page
+    // only draws it.
+    const ownership = sdk.createSdkOwnership({
+        host,
+        tabSessionId: sessionId,
+        claim,
+        heartbeat: () => heartbeatEditorSession(projectId, sessionId, sdkSessionId, ""),
+        onChange: (state, previous) => {
+            tabDiagRecord("sdk_owner_state", { previous, state });
+            if (state === "ended") sdk.forgetSdkSecret(sdkSessionId);
+            render();
+        },
+        onReclaimed: () => void host.refreshStatus(),
+    });
+
+    async function takeOver(button) {
+        setButtonDisabled(button, true);
+        try {
+            await ownership.takeOver();
+        } finally {
+            setButtonDisabled(button, false);
+        }
+    }
+
+    host.onOwnershipLost = (code) => void ownership.handleOwnershipLost(code);
+    ownership.start(firstClaim.owner?.status || "active");
+
+    const sync = connectProjectSync(projectId, {
+        onProjectUpdated: createProjectUpdatedHandler(editor, getProjectVersion),
+        onGenerationStatus: (event) => {
+            host.applyStatus(event);
+        },
+        onSessionChanged: (event) => {
+            if (String(event.host_id || "") !== sdkSessionId) return;
+            ownership.handleSessionChanged(event);
+        },
+        onConnectionState: (state) => {
+            const reconnected = state === "open" && socketOpenedOnce;
+            if (state === "open") socketOpenedOnce = true;
+            transportState = state;
+            tabDiagRecord("transport_state", { state });
+            render();
+            // Snapshots sent while the socket was down are gone; fetch the latest.
+            if (reconnected) void host.refreshStatus();
+        },
+    }, {
+        clientId: sessionId,
+        hostId: sdkSessionId,
+        sessionId,
+        workflowLabel: "Sonder App",
+    });
+
+    // Runs still generating from an earlier visit (reattach, reload).
+    void host.refreshStatus();
+
+    // Save the position while the page can still finish a request.
+    document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "hidden") void host.flushValues();
+    });
+
+    // Restored from the back/forward cache: pagehide already released the
+    // claim and stopped the host, so start afresh (the reload re-claims).
+    window.addEventListener("pageshow", (event) => {
+        if (event.persisted) window.location.reload();
+    });
+
+    window.addEventListener("pagehide", () => {
+        ownership.stop();
+        const savingValues = host.hasUnsavedValues();
+        void host.flushValues({ keepalive: true });
+        try {
+            editor?._drainProjectMutations?.("sdk_tab_pagehide").catch(() => {});
+        } catch (_err) {}
+        sync.close();
+        host.destroy();
+        // Released like a closing mounted tab, so housekeeping can drop an
+        // abandoned session; reopening from the Launcher reattaches. Not while
+        // a last save is in flight: a release processed first would refuse it
+        // (not_owner). The owner then lapses to orphaned, which housekeeping
+        // also drops, and a reopen takes it over.
+        if (host.ownerState === "displaced" || host.ownerState === "ended" || savingValues) return;
+        try {
+            const queued = navigator.sendBeacon(
+                api.apiURL(`/sonder-editor/session/${encodeURIComponent(projectId)}/release`),
+                new Blob([JSON.stringify({ host_id: sdkSessionId, source_node_id: "", session_id: sessionId })], { type: "application/json" })
+            );
+            if (!queued) releaseEditorSession(projectId, sessionId, false, sdkSessionId, "").catch(() => {});
+        } catch (_err) {
+            releaseEditorSession(projectId, sessionId, false, sdkSessionId, "").catch(() => {});
+        }
+    });
+}
+
 async function main() {
     if (!projectId) {
         setStatus("Missing project id.");
+        return;
+    }
+    if (tabMode === "sdk") {
+        await runSdkTab();
         return;
     }
     if (!handoffToken) {
@@ -311,12 +661,7 @@ async function main() {
     editor.applyWidgetState(host.values);
     editor._enterFullscreen();
     document.body.classList.add("ready");
-    // Page-level notification toast stack (tab page), mounted once.
-    if (!document.querySelector("[data-sonder-toast-stack]")) {
-        mountToastStack(document.body);
-    }
-    configureNotifications(notificationCoreConfig());
-    subscribeEditorSettings(() => configureNotifications(notificationCoreConfig()));
+    mountToastsOnce();
     if (sessionWindowName) {
         try {
             window.name = sessionWindowName;
@@ -545,33 +890,8 @@ async function main() {
         tabDiagRecord("visibilitychange", { state: document.visibilityState });
     });
 
-    // Debounced self-echo guard (mutation-integrity F4): mirrors
-    // editor_node_controller._handleProjectUpdatedFromSync — the WS echo of an
-    // own save beats the response that records the new version, so re-check
-    // 250 ms later with the latest stashed event (re-armed per event).
-    let projectUpdatedDebounceTimer = null;
-    let pendingProjectUpdatedEvent = null;
     const sync = connectProjectSync(projectId, {
-        onProjectUpdated: (event) => {
-            pendingProjectUpdatedEvent = event;
-            clearTimeout(projectUpdatedDebounceTimer);
-            projectUpdatedDebounceTimer = setTimeout(() => {
-                projectUpdatedDebounceTimer = null;
-                const pending = pendingProjectUpdatedEvent;
-                pendingProjectUpdatedEvent = null;
-                if (!pending) return;
-                const currentVersion = getProjectVersion(projectId);
-                const shouldRefresh = !!(pending.modified_at && pending.modified_at !== currentVersion);
-                tabDiagRecord("project_updated_recv", {
-                    event_modified_at: pending.modified_at || "",
-                    current_version: currentVersion || "",
-                    refresh: shouldRefresh,
-                });
-                if (shouldRefresh) {
-                    editor.refresh(["project", "assets", "scenes", "queue", "references"]);
-                }
-            }, 250);
-        },
+        onProjectUpdated: createProjectUpdatedHandler(editor, getProjectVersion),
         onWidgetStateChanged: (event) => {
             if (String(event.host_id || "") !== hostId) return;
             if (String(event.source_node_id || "") !== sourceNodeId) return;

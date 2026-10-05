@@ -109,6 +109,15 @@ def register_sdk_routes(
         wrapper.__name__ = func.__name__
         return wrapper
 
+    # ── Launcher page ────────────────────────────────────────────────────────
+
+    @routes.get("/sonder-editor/app")
+    async def api_sdk_launcher(request: web.Request) -> web.StreamResponse:
+        page = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "web", "sdk_app.html"))
+        if not os.path.isfile(page):
+            return web.json_response({"ok": False, "error": "Launcher page not found"}, status=404)
+        return web.FileResponse(page)
+
     # ── Status ───────────────────────────────────────────────────────────────
 
     @routes.get("/sonder-editor/sdk/status")

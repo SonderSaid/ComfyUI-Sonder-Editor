@@ -612,8 +612,19 @@ function trackedFieldMatches(entries, name, value) {
 }
 
 function canOpenWorkflowFor(asset) {
-    if (embeddedWorkflowFlag(asset) === true) return true;
+    const flag = embeddedWorkflowFlag(asset);
+    if (flag === true) return true;
+    // Recorded as not embedded (a Sonder App take carries no UI workflow).
+    if (flag === false) return false;
     return new Set(["png", "mp4", "m4v", "mov", "mkv"]).has(assetExtension(asset));
+}
+
+// Asked when the menu opens: the host must have a handler (only the ComfyUI
+// page installs one) and the take must be able to carry a workflow.
+export function sourceWorkflowMenuDisabled(options, asset) {
+    return !options?.onOpenSourceWorkflow
+        || options.canOpenSourceWorkflow?.() === false
+        || !canOpenWorkflowFor(asset);
 }
 
 function compareStrings(a, b) {
@@ -7309,7 +7320,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             },
             {
                 label: "Open Source Workflow",
-                disabled: !options.onOpenSourceWorkflow || !canOpenWorkflowFor(asset),
+                disabled: sourceWorkflowMenuDisabled(options, asset),
                 action: async () => {
                     selectAsset(asset.asset_id, { focusList: true });
                     await options.onOpenSourceWorkflow?.(asset);

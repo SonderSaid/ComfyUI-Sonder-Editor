@@ -14,7 +14,11 @@ a fresh `[Unreleased]` block.
 ### Added
 - Sonder Control node: one named value you wire to the inputs it should drive, such as steps, CFG, a sampler, a LoRA or a seed. Its type follows what it is connected to (you pick it when the input accepts any type), and a value outside an input's range or options stops the run with a message naming the Control.
 
+### Changed
+- Render queue: a job that is waiting again or has failed shows why on a second line, such as a run interrupted before the job completed. Hover for the full text.
+
 ### Fixed
+- Assets: Open Source Workflow is greyed out in the mounted editor tab, where it could not open anything, and for takes saved without a workflow. It used to stay clickable and report the workflow as unavailable.
 - Queue: a save node whose "mark queue complete" is set by a Primitive Boolean or a Sonder Control now completes the job when it is on. It used to be read as off, so the same job re-rendered.
 - Queue: a render that fails or is interrupted after taking a queue job now returns that job to pending right away, even when no editor is open. It used to stay running until an open canvas reset it about five seconds later.
 - Save Bridge: the "bridge asset saved" notice and the final refresh now wait until the bridge has finished saving its files. A slow finalization used to be cut short after five seconds.

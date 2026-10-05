@@ -1,5 +1,6 @@
-import { ASPECT_RATIO_PRESETS, MAX_SCENE_DURATION_FRAMES } from "./editor_settings.js";
+import { ASPECT_RATIO_PRESETS, MAX_SCENE_DURATION_FRAMES, getEditorSettings, renderCacheMaxBytes } from "./editor_settings.js";
 import { subscribeForeground, formatProgress } from "./editor_notifications.js";
+import { createGenerateControls } from "./generate_controls.js";
 import {
     EDITOR_COLORS as COLORS,
     FONT,
@@ -604,6 +605,23 @@ export function buildEditorToolbar(widget) {
     widget._exportBtn = makeButton("Export", "Export the current scene timeline", BUTTON_OPTIONS.primary, "white-space:nowrap;");
     widget._exportBtn.addEventListener("click", () => widget._showExportPanel());
 
+    // Only a host that runs the workflow itself (Sonder App) brings Generate;
+    // the canvas modes use ComfyUI's own Run.
+    widget._generateControls?.destroy?.();
+    widget._generateControls = widget._generationHost
+        ? createGenerateControls({
+            host: widget._generationHost,
+            makeButton,
+            setVariant: (button, variant) => applyTopButtonVariant(
+                button, variant, BUTTON_OPTIONS[variant] || BUTTON_OPTIONS.secondary, "white-space:nowrap;"),
+            makeStepButtons,
+            buttonOptions: BUTTON_OPTIONS,
+            // Pending timeline edits must be saved before the run reads the project.
+            beforeGenerate: () => widget._drainProjectMutations?.("sdk_generate"),
+            renderCacheMaxBytes: () => renderCacheMaxBytes(widget._settings || getEditorSettings()),
+        })
+        : null;
+
     widget._toolBtnAnimatic = makeToolButton("\ud83d\udc41 Anim", "A", "Toggle animatic mode (hide all video)", () => {
         widget._toggleAnimatic();
     });
@@ -681,7 +699,10 @@ export function buildEditorToolbar(widget) {
         widget._genWindowGroup,
         makeToolCluster(widget._toolBtnSnap, widget._toolBtnRazor, cutHereBtn),
         makeToolCluster(fitBtn, widget._toolBtnTimecode, widget._toolBtnAnimatic, zoomOut, zoomIn),
-        makeToolCluster(widget._queueBtn, widget._batchQueueBtn, widget._queueStatusWrap, widget._foregroundPill, widget._exportBtn)
+        makeToolCluster(
+            ...(widget._generateControls ? [widget._generateControls.element] : []),
+            widget._queueBtn, widget._batchQueueBtn, widget._queueStatusWrap, widget._foregroundPill, widget._exportBtn
+        )
     );
 
     // Scene geometry is its own group, pushed to the right edge (with utilities) via margin-left:auto.
