@@ -22,6 +22,7 @@ import assert from 'node:assert/strict';
 import { webcrypto } from 'node:crypto';
 const visibility = await import(VISIBILITY_URL);
 const resolver = await import(RESOLVER_URL);
+const controlWidgets = await import(CONTROL_WIDGETS_URL);
 
 const timers = [];
 const flush = () => { while (timers.length) timers.shift()(); };
@@ -63,6 +64,7 @@ vm.runInNewContext(source, {
     setWidgetHidden: visibility.setWidgetHidden,
     commitWidgetVisibility: visibility.commitWidgetVisibility,
     getGraphLink: resolver.getGraphLink, getGraphNode: resolver.getGraphNode,
+    seedModeWidget: controlWidgets.seedModeWidget,
     window: { setTimeout(fn) { timers.push(fn); return timers.length; }, clearTimeout() {} },
 });
 
@@ -432,6 +434,7 @@ def test_sonder_control_canvas_hook():
         HARNESS.replace("SOURCE_PATH", json.dumps(str(ROOT / "web/js/sonder_control.js")))
         .replace("VISIBILITY_URL", json.dumps((ROOT / "web/js/widget_visibility.js").as_uri()))
         .replace("RESOLVER_URL", json.dumps((ROOT / "web/js/project_source_resolver.js").as_uri()))
+        .replace("CONTROL_WIDGETS_URL", json.dumps((ROOT / "web/js/control_widgets.js").as_uri()))
     )
     result = subprocess.run([node, "--input-type=module", "-e", script], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr

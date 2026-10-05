@@ -1045,7 +1045,7 @@ app.registerExtension({
                     widget._origType = widget.type;
                 }
 
-                const controller = new EditorNodeController(node, projectWidget);
+                const controller = new EditorNodeController(node, projectWidget, { app });
                 node._sonderController = controller;
                 controller.onRunFinished = () => handleRunFinished(node);
                 node.resizable = true;

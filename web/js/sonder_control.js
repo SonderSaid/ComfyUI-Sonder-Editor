@@ -11,6 +11,7 @@ import { app } from "/scripts/app.js";
 import { api } from "/scripts/api.js";
 import { commitWidgetVisibility, setWidgetHidden } from "./widget_visibility.js";
 import { getGraphLink, getGraphNode } from "./project_source_resolver.js";
+import { seedModeWidget } from "./control_widgets.js";
 
 const EXT_NAME = "sonder.control";
 const CONTROL_CLASS = "SonderControl";
@@ -166,13 +167,6 @@ function controlTargets(node, linkIds = null) {
 
 const targetWidget = (target) => inputWidget(target.node, target.input);
 const targetValue = (target) => (target.promoted || targetWidget(target))?.value;
-const seedModeWidget = (seed) => {
-    const linked = seed?.linkedWidgets;
-    // ComfyUI names a mode widget after the schema's initial mode ("fixed"
-    // here), while older shapes use "control_after_generate".
-    return Array.isArray(linked) ? linked.find((w) =>
-        w?.name === "control_after_generate" || SEED_MODES.has(w?.value)) : undefined;
-};
 const targetSeedMode = (target) => seedModeWidget(target.promoted || targetWidget(target))?.value;
 
 // Every target accepts any type, so nothing tells the Control its kind.

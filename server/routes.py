@@ -233,7 +233,23 @@ def _describe_controls_body(raw: bytes) -> dict:
     prompt = body.get("prompt") if isinstance(body, dict) else None
     if not isinstance(prompt, dict):
         raise _ControlsRequestError("The request must carry an API-format prompt object.")
-    return control_descriptors.json_safe(control_descriptors.describe_controls(prompt))
+    view = control_descriptors.describe_controls(prompt)
+    # Optional canvas scope/validation shares the full descriptor authority.
+    # Default describe callers keep their existing wire shape. Filtering happens
+    # before validation and before json_safe caps display-only COMBO previews.
+    if "editor_key" in body:
+        editor_key = body["editor_key"]
+        if editor_key is not None and not isinstance(editor_key, str):
+            raise _ControlsRequestError("The editor key must be text or null.")
+        if editor_key in view.get("editors", []):
+            view["fields"] = [f for f in view["fields"] if f.get("editor_key") == editor_key]
+        else:
+            view["fields"] = [dict(f, status="unsupported",
+                reason="Fields require an unambiguous root-level editor.") for f in view["fields"]]
+    if "changes" in body:
+        cleaned, rejected = control_descriptors.validate_control_changes(view, body["changes"])
+        view.update(ok=not bool(rejected), changes={} if rejected else cleaned, rejected=rejected)
+    return control_descriptors.json_safe(view)
 
 
 def _json_error(msg: str, status: int = 400) -> web.Response:
@@ -15339,7 +15355,10 @@ if routes is not None:
         except Exception:
             logger.exception("Describing Sonder Controls failed")
             return _json_error("The controls could not be described.", 500)
-        return web.json_response(payload)
+        # Validated changes may include long STRING values. Encoding belongs on
+        # the same worker boundary as parsing/coercion, never the heartbeat loop.
+        encoded = await asyncio.to_thread(lambda: json.dumps(payload).encode("utf-8"))
+        return web.Response(body=encoded, content_type="application/json")
 
     # -----------------------------------------------------------------------
     # Sonder App (SDK mode): status, templates, sessions (server/sdk_routes.py)

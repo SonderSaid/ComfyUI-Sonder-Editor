@@ -30,6 +30,7 @@ import {
     releaseEditorSession,
 } from "./editor_session_client.js";
 import { connectProjectSync } from "./cross_tab_sync.js";
+import { createCanvasControlsHost } from "./controls_host_canvas.js";
 import { EditorWidget, buildProjectAssetViewURL, importFileIntoProject, replaceAssetInProject, importFailureMessage } from "./editor_widget.js";
 import { loadMediaAsBlob, mountSharedAssetGallery } from "./shared_asset_gallery.js";
 import { deriveCurrentSceneAssetIds } from "./current_scene_assets.js";
@@ -1291,7 +1292,9 @@ function assetWriteError(message, response) {
 }
 
 export class EditorNodeController {
-    constructor(node, projectWidget) {
+    constructor(node, projectWidget, { app = null } = {}) {
+        this._controlsApp = app;
+        this._controlsHost = null;
         installProjectVersionFetchPatch();
         this.node = node;
         this.projectWidget = projectWidget;
@@ -1510,6 +1513,9 @@ export class EditorNodeController {
     destroy() {
         if (this._destroyed) return;
         this._destroyed = true;
+        this._controlsHost?.destroy();
+        this._controlsHost = null;
+        this._controlsApp = null;
         this._resetBridgeAssetTracking({ clearKnown: true });
         this._releaseGraphPreviewSuppression();
 
@@ -1544,6 +1550,21 @@ export class EditorNodeController {
         }
 
         this.state._projectReadyQueue.length = 0;
+    }
+
+    getControlsHost() {
+        if (this._destroyed) return null;
+        if (!this._controlsHost) {
+            this._controlsHost = createCanvasControlsHost({
+                app: this._controlsApp, api, getEditorNode: () => this.node,
+                setEditorSetting: (key, value) => {
+                    if (["render.takePlacementMuted", "render.linkedTakePlacement"].includes(key)) {
+                        updateEditorSettings({ render: { [key.split(".")[1]]: !!value } });
+                    }
+                },
+            });
+        }
+        return this._controlsHost;
     }
 
     getElement() {
