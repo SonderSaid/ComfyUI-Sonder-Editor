@@ -195,6 +195,16 @@ try:
         from .project_storage_lifecycle import start_storage_maintenance, stop_storage_maintenance
         app.on_startup.append(start_storage_maintenance)
         app.on_cleanup.append(stop_storage_maintenance)
+        # Stop the SDK proxy this server started, at cleanup and at interpreter exit
+        # (standalone ComfyUI skips cleanup on Ctrl-C). Optional: a failure here
+        # must not disable the editor's routes.
+        try:
+            import atexit
+            from . import sdk_proxy
+            app.on_cleanup.append(sdk_proxy.on_cleanup)
+            atexit.register(sdk_proxy.stop_owned_proxy)
+        except Exception:
+            logger.exception("Sonder App proxy cleanup hooks unavailable")
 except Exception:
     routes = None
     logger.warning("PromptServer not available — Sonder Editor API routes disabled")
@@ -11315,6 +11325,7 @@ if routes is not None:
             body.get("owner") if isinstance(body.get("owner"), dict) else body,
             str(body.get("handoff_token") or ""),
             host_id=str(body.get("host_id") or ""),
+            sdk_secret=str(body.get("sdk_secret") or ""),
         )
         status = 200 if result.get("ok") else 409
         return web.json_response(result, status=status)
@@ -15238,6 +15249,47 @@ if routes is not None:
             logger.exception("Describing Sonder Controls failed")
             return _json_error("The controls could not be described.", 500)
         return web.json_response(payload)
+
+    # -----------------------------------------------------------------------
+    # Sonder App (SDK mode): status, templates, sessions (server/sdk_routes.py)
+    # -----------------------------------------------------------------------
+
+    async def _sdk_resolve_project(folder: str) -> tuple[str, list]:
+        """A project folder name to its directory and event aliases, or ("", []).
+
+        SDK mode names projects by folder, the editor's `project` choice: so only a
+        folder the editor would list (a linked one only while links are trusted).
+        """
+        try:
+            token = _safe_route_token(folder, "project")
+        except ValueError:
+            return "", []
+
+        def locate() -> str:
+            base_dir = _configured_base_dir()
+            if not base_dir:
+                return ""
+            project_dir = _project_dir_under_base(base_dir, token)
+            if not _path_within(base_dir, project_dir) or not os.path.isfile(os.path.join(project_dir, "project.json")):
+                return ""
+            if not external_links.is_enabled() and external_links.is_reparse_child(base_dir, token):
+                return ""
+            return project_dir
+
+        project_dir = await asyncio.to_thread(locate)
+        if not project_dir:
+            return "", []
+        project = await run_project_io(load_project, project_dir)
+        return project_dir, project_event_aliases(project)
+
+    # Optional feature: an import failure in the SDK modules must not take the
+    # editor's other routes down with it.
+    try:
+        from .sdk_routes import register_sdk_routes
+
+        register_sdk_routes(routes, resolve_project=_sdk_resolve_project, remember_event_loop=remember_event_loop)
+    except Exception:
+        logger.exception("Sonder App (SDK) routes unavailable")
 
     # -----------------------------------------------------------------------
     # WebSocket stub

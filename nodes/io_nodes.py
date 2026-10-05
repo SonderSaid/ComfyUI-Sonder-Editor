@@ -1091,6 +1091,7 @@ def _release_prompt_run(prompt_key: str, status) -> None:
     if returned:
         logger.info("Run %s ended %s; returned leased job(s) %s to pending", prompt_key, outcome, returned)
     announced = set()
+    run_token = sdk_runs.run_token_of(record)
 
     def announce(alias, job_ids):
         announced.add(alias)
@@ -1101,18 +1102,33 @@ def _release_prompt_run(prompt_key: str, status) -> None:
             "outcome": outcome,
             "leased_job_ids": job_ids,
             "returned_job_ids": [job_id for job_id in returned if job_id in job_ids],
-            "run_token": record.get("token", ""),
+            "run_token": run_token,
         })
 
-    for project_dir, aliases in record["projects"].items():
-        job_ids = [lease["job_id"] for lease in record["leases"] if lease["project_dir"] == project_dir]
-        for alias in aliases:
-            announce(alias, job_ids)
-    # An SDK run that ended before its editor executed (an upstream failure, a
-    # cancel) is still announced to the projects its token was registered for.
-    for alias in record.get("token_project_ids", []):
-        if alias not in announced:
-            announce(alias, [])
+    try:
+        for project_dir, aliases in record["projects"].items():
+            job_ids = [lease["job_id"] for lease in record["leases"] if lease["project_dir"] == project_dir]
+            for alias in aliases:
+                announce(alias, job_ids)
+        # An SDK run that ended before its editor executed (an upstream failure, a
+        # cancel) is still announced to the projects its token was registered for.
+        for alias in record.get("token_project_ids", []):
+            if alias not in announced:
+                announce(alias, [])
+    except Exception:
+        logger.exception("Announcing run_finished for %s failed", prompt_key)
+    # In-process listeners (the SDK runner) get one payload per run, on this
+    # prompt-worker thread, even if announcing failed; notify_run_finished
+    # isolates their own failures.
+    sdk_runs.notify_run_finished({
+        "prompt_id": record.get("prompt_id", ""),
+        "outcome": outcome,
+        "note": note,
+        "leased_job_ids": [lease["job_id"] for lease in record["leases"]],
+        "claimed_job_id": record.get("claimed_job_id", ""),
+        "returned_job_ids": returned,
+        "run_token": run_token,
+    })
 
 
 def _install_bridge_prompt_queue_hooks() -> bool:

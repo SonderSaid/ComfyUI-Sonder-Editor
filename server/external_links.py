@@ -16,7 +16,7 @@ mechanics for that workflow:
 - ``is_reparse_child`` — child-level reparse detection that stays correct even when the scan
   root itself sits behind a symlink (as it does under Stability Matrix's output→Images link).
 
-Import discipline: stdlib + ``atomic_io`` at module level; ``folder_paths`` and
+Import discipline: stdlib + ``atomic_io`` + ``sdk_paths`` at module level; ``folder_paths`` and
 ``path_security`` are imported lazily inside functions (``path_security`` lazily imports
 ``is_enabled`` from here, so a module-level import back would be a cycle).
 """
@@ -30,6 +30,7 @@ import time
 import uuid
 
 from .atomic_io import atomic_replace
+from .sdk_paths import sonder_user_dir
 
 logger = logging.getLogger("sonder_editor")
 
@@ -63,15 +64,8 @@ class LinkError(ValueError):
 
 
 def _settings_path() -> str:
-    try:
-        import folder_paths
-
-        user_dir = folder_paths.get_user_directory()
-    except Exception:
-        return ""
-    if not user_dir:
-        return ""
-    return os.path.join(user_dir, "sonder-editor", "settings.json")
+    root = sonder_user_dir()
+    return os.path.join(root, "settings.json") if root else ""
 
 
 def _read_settings() -> dict:

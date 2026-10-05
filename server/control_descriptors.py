@@ -265,6 +265,10 @@ def _comfy_class_lookup(class_type: str):
     return nodes.NODE_CLASS_MAPPINGS.get(class_type)
 
 
+# Public name for other modules (template validation) that need the same lookup.
+comfy_class_lookup = _comfy_class_lookup
+
+
 def _is_v3_class(class_def) -> bool:
     try:
         from comfy_api.internal import _ComfyNodeInternal

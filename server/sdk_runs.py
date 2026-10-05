@@ -22,14 +22,27 @@ routes run on the event loop. Everything here is ephemeral by design; ComfyUI's
 queue does not survive a restart either.
 """
 
+import logging
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
+
+logger = logging.getLogger(__name__)
 
 _LOCK = threading.RLock()
 _RELEASES: dict[str, dict[str, Any]] = {}
 _KEY_BY_PROMPT_OBJECT: dict[int, str] = {}
 _TOKENS: dict[str, dict[str, Any]] = {}
+# prompt_id -> ("open" | "closed", when). Lets the SDK runner tell a prompt that
+# ComfyUI never took off its queue (deleted, cleared) from one that is running or
+# finalizing after ComfyUI's history was wiped. Closed entries are pruned.
+_RELEASE_STATE_BY_PROMPT: dict[str, tuple[str, float]] = {}
+_RUN_FINISHED_LISTENERS: list[Callable[[dict[str, Any]], None]] = []
+
+RELEASE_OPEN = "open"
+RELEASE_CLOSED = "closed"
+RELEASE_UNKNOWN = "unknown"
+CLOSED_RELEASE_RETENTION_SEC = 30 * 60
 
 # A registered token whose run never executes (canceled while queued, or lost to a
 # restart of the proxy) is refused after this long, so a replay cannot use it. The
@@ -80,14 +93,21 @@ def open_release(key: Any, prompt_id: Any = "", prompt: Any = None) -> bool:
             "projects": {},
             "leases": [],
             "token": "",
+            "hinted_token": "",
             "token_project_ids": [],
         }
-        hinted = _TOKENS.get(_prompt_run_token(prompt))
+        hinted_token = _prompt_run_token(prompt)
+        hinted = _TOKENS.get(hinted_token)
         if hinted is not None:
+            # Kept so a run that ends before its editor executes still reports its
+            # token, and so closing the record retires it (no later replay).
+            record["hinted_token"] = hinted_token
             record["token_project_ids"] = list(hinted["project_ids"])
         _RELEASES[key] = record
         if record["prompt_object_id"] is not None:
             _KEY_BY_PROMPT_OBJECT[record["prompt_object_id"]] = key
+        if record["prompt_id"]:
+            _RELEASE_STATE_BY_PROMPT[record["prompt_id"]] = (RELEASE_OPEN, time.time())
     return True
 
 
@@ -162,15 +182,66 @@ def close_release(key: Any) -> dict[str, Any] | None:
         if record is None:
             return None
         _KEY_BY_PROMPT_OBJECT.pop(record.get("prompt_object_id"), None)
-        token = record.get("token")
-        if token:
-            _TOKENS.pop(token, None)
+        for token in (record.get("token"), record.get("hinted_token")):
+            if token:
+                _TOKENS.pop(token, None)
+        now = time.time()
+        if record.get("prompt_id"):
+            _RELEASE_STATE_BY_PROMPT[record["prompt_id"]] = (RELEASE_CLOSED, now)
+        _prune_release_states_locked(now)
     return record
+
+
+def run_token_of(record: dict[str, Any]) -> str:
+    """The token a closed record reports: the claimed one, else the queue-time hint."""
+    return str(record.get("token") or record.get("hinted_token") or "")
+
+
+def _prune_release_states_locked(now: float) -> None:
+    for prompt_id, (state, when) in list(_RELEASE_STATE_BY_PROMPT.items()):
+        if state == RELEASE_CLOSED and now - when > CLOSED_RELEASE_RETENTION_SEC:
+            del _RELEASE_STATE_BY_PROMPT[prompt_id]
+
+
+def release_state_for_prompt(prompt_id: Any) -> str:
+    """``open`` while ComfyUI runs or finalizes the prompt, ``closed`` after, else ``unknown``."""
+    with _LOCK:
+        entry = _RELEASE_STATE_BY_PROMPT.get(str(prompt_id or ""))
+        return entry[0] if entry else RELEASE_UNKNOWN
 
 
 def open_release_count() -> int:
     with _LOCK:
         return len(_RELEASES)
+
+
+# --- run_finished listeners ----------------------------------------------------
+
+def add_run_finished_listener(listener: Callable[[dict[str, Any]], None]) -> Callable[[], None]:
+    """Call ``listener(payload)`` once per closed run. Returns a remover.
+
+    Listeners run on ComfyUI's prompt-worker thread, inside ``task_done``'s
+    ``finally``: they must only hand the payload to their own thread or loop.
+    """
+    with _LOCK:
+        _RUN_FINISHED_LISTENERS.append(listener)
+
+    def remove() -> None:
+        with _LOCK:
+            if listener in _RUN_FINISHED_LISTENERS:
+                _RUN_FINISHED_LISTENERS.remove(listener)
+
+    return remove
+
+
+def notify_run_finished(payload: dict[str, Any]) -> None:
+    with _LOCK:
+        listeners = list(_RUN_FINISHED_LISTENERS)
+    for listener in listeners:
+        try:
+            listener(dict(payload))
+        except Exception:
+            logger.exception("run_finished listener failed")
 
 
 # --- Run tokens ----------------------------------------------------------------
@@ -220,10 +291,18 @@ def claim_token(token: str, project_ids, key: Any = "") -> str:
 
 
 def note_token_job(token: str, job_id: str) -> None:
+    """Record the job an SDK run's editor claimed, on the token and on its release.
+
+    The release keeps it because a save node that completes the job settles (drops)
+    the lease, so ``run_finished`` could otherwise not say which job the run took.
+    """
     with _LOCK:
         entry = _TOKENS.get(str(token or "").strip())
         if entry is not None:
             entry["job_id"] = str(job_id or "")
+            record = _RELEASES.get(entry.get("key", ""))
+            if record is not None:
+                record["claimed_job_id"] = str(job_id or "")
 
 
 def token_state(token: str) -> dict[str, Any] | None:
@@ -242,3 +321,5 @@ def reset_for_tests() -> None:
         _RELEASES.clear()
         _KEY_BY_PROMPT_OBJECT.clear()
         _TOKENS.clear()
+        _RELEASE_STATE_BY_PROMPT.clear()
+        _RUN_FINISHED_LISTENERS.clear()

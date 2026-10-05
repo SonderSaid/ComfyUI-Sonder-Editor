@@ -22,6 +22,7 @@ from ..server import prompt_channel_templates
 from ..server import prompt_graph
 from ..server import prompt_payload
 from ..server import sdk_runs
+from ..server.editor_inputs import editor_optional_inputs
 from ..server.session_registry import project_event_aliases
 from ..server.timeline_state import (
     ClipReference, GuideFrame, TimelineProject, Scene, effective_scene_fps,
@@ -172,67 +173,7 @@ class SonderEditor:
                     "tooltip": "Video height. Only used when creating a new project.",
                 }),
             },
-            "optional": {
-                # Hidden widgets — populated by the frontend JS
-                "scene_id": ("STRING", {
-                    "default": "",
-                    "tooltip": "Active scene ID (set by editor UI).",
-                }),
-                "selection_start": ("INT", {
-                    "default": 0, "min": 0, "max": 999999,
-                    "tooltip": "Start frame of timeline selection (set by editor UI).",
-                }),
-                "selection_end": ("INT", {
-                    "default": 0, "min": 0, "max": 999999,
-                    "tooltip": "End frame of timeline selection (set by editor UI).",
-                }),
-                "pre_context_frames": ("INT", {
-                    "default": 0, "min": 0, "max": 256, "step": 1,
-                    "tooltip": "Context frames BEFORE selection. Included in render but not denoised (use mask outputs). Clamped to available frames.",
-                }),
-                "post_context_frames": ("INT", {
-                    "default": 0, "min": 0, "max": 256, "step": 1,
-                    "tooltip": "Context frames AFTER selection. Included in render but not denoised (use mask outputs). Clamped to available frames.",
-                }),
-                "mask_pre_offset": ("INT", {
-                    "default": 0, "min": 0, "max": 256, "step": 1,
-                    "tooltip": "Extra pre-context frames to exclude from denoise mask start. Clamped to actual pre-context.",
-                }),
-                "mask_post_offset": ("INT", {
-                    "default": 0, "min": 0, "max": 256, "step": 1,
-                    "tooltip": "Extra post-context frames to include in denoise mask end. Clamped to actual post-context.",
-                }),
-                "take_placement_mode": ("STRING", {
-                    "default": "trimmed",
-                    "tooltip": "Take placement mode for non-queued renders. Set by editor settings.",
-                }),
-                "take_placement_linked": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Whether take video/audio siblings are linked when placed on the timeline.",
-                }),
-                "take_placement_muted": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Whether newly placed takes enter the timeline muted.",
-                }),
-                "render_cache_max_bytes": ("INT", {
-                    "default": 0, "min": -1, "max": 9007199254740991,
-                    "tooltip": "Project render-cache budget in bytes. 0 disables caching; -1 is unlimited.",
-                }),
-                "render_queue_active": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "When enabled, queue jobs drive editor execution. Disable to render the live selection without consuming queue jobs.",
-                }),
-                # Append new hidden widgets so existing workflow widget_values keep
-                # their established positional mapping.
-                "take_fit_mode": ("STRING", {
-                    "default": DEFAULT_FIT_MODE,
-                    "tooltip": "Fit mode stamped on newly placed takes (set by editor settings).",
-                }),
-                "take_crop_position": ("STRING", {
-                    "default": DEFAULT_CROP_POSITION,
-                    "tooltip": "Crop anchor stamped on newly placed takes (set by editor settings).",
-                }),
-            },
+            "optional": editor_optional_inputs(),
             "hidden": {
                 "prompt": "PROMPT",
                 "unique_id": "UNIQUE_ID",

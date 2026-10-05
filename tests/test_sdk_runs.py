@@ -87,3 +87,59 @@ def test_a_release_learns_its_token_projects_when_it_opens():
 def test_an_empty_token_cannot_be_registered():
     with pytest.raises(ValueError):
         sdk_runs.register_token("  ", ["proj"])
+
+
+def test_a_run_that_ends_before_its_editor_executes_reports_and_retires_its_token():
+    # The editor never ran, so claim_token never set record["token"]; the
+    # queue-time hint is what the run reports, and closing retires it so the
+    # proxy's stored workflow cannot be replayed with it.
+    sdk_runs.register_token("tok-early", ["proj"])
+    prompt = {"1": {"class_type": "SonderEditor", "inputs": {}, "_meta": {"sonder_run": "tok-early"}}}
+    sdk_runs.open_release("8", "prompt-8", prompt)
+    record = sdk_runs.close_release("8")
+    assert record["token"] == ""
+    assert sdk_runs.run_token_of(record) == "tok-early"
+    assert sdk_runs.claim_token("tok-early", ["proj"]) == sdk_runs.TOKEN_UNKNOWN
+
+
+def test_release_state_tells_never_taken_from_taken(monkeypatch):
+    now = [5000.0]
+    monkeypatch.setattr(sdk_runs, "time", types.SimpleNamespace(time=lambda: now[0]))
+    assert sdk_runs.release_state_for_prompt("prompt-x") == sdk_runs.RELEASE_UNKNOWN
+    sdk_runs.open_release("11", "prompt-x")
+    assert sdk_runs.release_state_for_prompt("prompt-x") == sdk_runs.RELEASE_OPEN
+    sdk_runs.close_release("11")
+    assert sdk_runs.release_state_for_prompt("prompt-x") == sdk_runs.RELEASE_CLOSED
+    # Closed states are kept for a while, then pruned at a later close.
+    now[0] += sdk_runs.CLOSED_RELEASE_RETENTION_SEC + 1
+    sdk_runs.open_release("12", "prompt-y")
+    sdk_runs.close_release("12")
+    assert sdk_runs.release_state_for_prompt("prompt-x") == sdk_runs.RELEASE_UNKNOWN
+    assert sdk_runs.release_state_for_prompt("prompt-y") == sdk_runs.RELEASE_CLOSED
+
+
+def test_the_claimed_job_is_kept_on_the_release_even_after_its_lease_settles():
+    sdk_runs.register_token("tok-c", ["proj"])
+    sdk_runs.open_release("13", "prompt-13")
+    assert sdk_runs.claim_token("tok-c", ["proj"], key="13") == sdk_runs.TOKEN_OK
+    sdk_runs.take_lease("13", "dir-a", "job-c")
+    sdk_runs.note_token_job("tok-c", "job-c")
+    sdk_runs.settle_lease("dir-a", "job-c")  # the save completed it
+    record = sdk_runs.close_release("13")
+    assert record["leases"] == [] and record["claimed_job_id"] == "job-c"
+
+
+def test_run_finished_listeners_are_isolated_and_removable():
+    seen = []
+
+    def broken(payload):
+        raise RuntimeError("listener bug")
+
+    remove_broken = sdk_runs.add_run_finished_listener(broken)
+    remove_seen = sdk_runs.add_run_finished_listener(seen.append)
+    sdk_runs.notify_run_finished({"prompt_id": "p"})
+    assert seen == [{"prompt_id": "p"}]
+    remove_broken()
+    remove_seen()
+    sdk_runs.notify_run_finished({"prompt_id": "q"})
+    assert seen == [{"prompt_id": "p"}]

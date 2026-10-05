@@ -1,10 +1,11 @@
 import asyncio
+import hmac
 import logging
 import os
 import time
 import uuid
 from collections import defaultdict, deque
-from typing import Any
+from typing import Any, Callable
 
 from aiohttp import web
 
@@ -35,6 +36,30 @@ WIDGET_FIELD_NAMES = {
 }
 
 HostKey = tuple[str, str]
+
+# Host modes whose stale owner is orphaned (kept for ORPHAN_TTL_SECONDS) rather than
+# released: a standalone page that a background-throttled browser tab may starve.
+ORPHANING_HOST_MODES = frozenset({"tab", "sdk"})
+
+# Set by the SDK runner: maps an SDK session's host id to its secret, or None when
+# the host id is not an SDK session. Injected so this module never imports the runner.
+_sdk_secret_for_host: Callable[[str], str | None] | None = None
+
+
+def set_sdk_secret_resolver(resolver: Callable[[str], str | None] | None) -> None:
+    global _sdk_secret_for_host
+    _sdk_secret_for_host = resolver
+
+
+def _sdk_secret(host_id: str) -> str | None:
+    resolver = _sdk_secret_for_host
+    if resolver is None:
+        return None
+    try:
+        return resolver(host_id)
+    except Exception:
+        logger.exception("SDK secret resolver failed")
+        return None
 
 _sessions: dict[HostKey, dict[str, Any]] = {}
 _handoffs: dict[str, dict[str, Any]] = {}
@@ -391,7 +416,7 @@ def _advance_owner_lifecycle_locked(key: HostKey, events: list[tuple[str, dict[s
         return 0
     if not _is_stale(owner):
         return 0
-    if owner.get("host_mode") == "tab":
+    if owner.get("host_mode") in ORPHANING_HOST_MODES:
         _orphan_owner_locked(key, owner, events)
     else:
         _release_owner_locked(key, events, clear_widget_state=True, reason="stale_fullscreen")
@@ -432,6 +457,7 @@ async def claim_session(
     info: dict[str, Any] | None = None,
     handoff_token: str = "",
     host_id: str = "",
+    sdk_secret: str = "",
 ) -> dict[str, Any]:
     project_id = _clean_id(project_id)
     session_id = _clean_id(session_id)
@@ -441,6 +467,15 @@ async def claim_session(
     if not project_id or not session_id:
         _record_diag_event("claim_reject", None, code="invalid_session", project_id=project_id, session_id=session_id)
         return {"ok": False, "code": "invalid_session", "owner": None}
+    # An SDK session's host id is claimable only with its secret, whatever mode the
+    # claim names; with it, the claim takes over the current owner (reload,
+    # duplicated tab, Take over). The secret is tab identity, not network auth.
+    expected_secret = _sdk_secret(host_id) if host_id else None
+    if host_mode == "sdk" or expected_secret is not None:
+        if expected_secret is None or not hmac.compare_digest(str(sdk_secret or ""), expected_secret):
+            _record_diag_event("claim_reject", None, code="invalid_sdk_session", project_id=project_id, session_id=session_id, host_mode=host_mode)
+            return {"ok": False, "code": "invalid_sdk_session", "owner": None}
+        return await _claim_sdk_session(project_id, session_id, host_id, info)
     if host_mode == "tab" and not handoff_token:
         _record_diag_event("claim_reject", None, code="invalid_handoff_token", project_id=project_id, session_id=session_id, host_mode=host_mode)
         return {"ok": False, "code": "invalid_handoff", "owner": None}
@@ -510,6 +545,28 @@ async def claim_session(
     return result
 
 
+async def _claim_sdk_session(project_id: str, session_id: str, host_id: str, info: dict[str, Any]) -> dict[str, Any]:
+    key = _host_key(project_id, host_id)
+    events: list[tuple[str, dict[str, Any]]] = []
+    async with _lock:
+        _advance_owner_lifecycle_locked(key, events)
+        previous = _sessions.get(key)
+        _sessions[key] = _make_owner(project_id, host_id, session_id, "sdk", info)
+        took_over = bool(previous) and previous.get("session_id") != session_id
+        _record_diag_event(
+            "claim_ok", key,
+            source="sdk", session_id=session_id, host_mode="sdk",
+            replaced_owner=bool(previous), took_over=took_over,
+        )
+        event = _session_changed_event(key, _sessions[key])
+        if took_over:
+            event["reason"] = "taken_over"
+        events.append((project_id, event))
+        result = {"ok": True, "owner": _public_owner(_sessions[key]), "took_over": took_over}
+    _schedule_events(events)
+    return result
+
+
 async def heartbeat_session(project_id: str, session_id: str, host_id: str = "", source_node_id: str = "") -> dict[str, Any]:
     events: list[tuple[str, dict[str, Any]]] = []
     async with _lock:
@@ -529,7 +586,7 @@ async def heartbeat_session(project_id: str, session_id: str, host_id: str = "",
                     _release_owner_locked(key, events, clear_widget_state=True, reason="orphan_expired")
                     owner = None
             if owner and owner.get("status", "active") != "orphaned" and _is_stale(owner):
-                if owner.get("host_mode") == "tab" and owner.get("session_id") == session_id:
+                if owner.get("host_mode") in ORPHANING_HOST_MODES and owner.get("session_id") == session_id:
                     owner["last_seen"] = _now()
                 else:
                     _advance_owner_lifecycle_locked(key, events)
@@ -932,19 +989,26 @@ async def unsubscribe(project_id: str, ws: web.WebSocketResponse) -> None:
             _subscribers.pop(project_id, None)
 
 
+# High-rate status events kept out of the ws_broadcast diagnostic ring, which
+# would otherwise be flooded by progress and lose the events it exists to trace.
+_UNRECORDED_BROADCAST_TYPES = frozenset({"generation_status"})
+
+
 async def broadcast_project_event(project_id: str, event: dict[str, Any]) -> None:
     async with _lock:
         subscribers = list(_subscribers.get(project_id, set()))
     # #36 diagnostic: every fan-out of a project/widget event to WS subscribers.
     # Pairs with `project_saved` events to trace writer -> broadcast -> client refresh.
+    event_type = str(event.get("type", "") if isinstance(event, dict) else "")
     try:
-        record_diag_event(
-            "ws_broadcast",
-            project_id=project_id,
-            event_type=str(event.get("type", "") if isinstance(event, dict) else ""),
-            subscriber_count=len(subscribers),
-            event_modified_at=str(event.get("modified_at", "") if isinstance(event, dict) else ""),
-        )
+        if event_type not in _UNRECORDED_BROADCAST_TYPES:
+            record_diag_event(
+                "ws_broadcast",
+                project_id=project_id,
+                event_type=event_type,
+                subscriber_count=len(subscribers),
+                event_modified_at=str(event.get("modified_at", "") if isinstance(event, dict) else ""),
+            )
     except Exception:
         logger.debug("broadcast_project_event failed to emit diag event", exc_info=True)
     if not subscribers:

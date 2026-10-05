@@ -4374,6 +4374,28 @@ def test_release_after_an_interrupt_says_so(tmp_path, monkeypatch):
     assert events[0][1]["outcome"] == "interrupted"
 
 
+def test_a_run_that_fails_before_its_editor_reports_its_token_once_in_process(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    runs = _fresh_sdk_runs(io_nodes)
+    _job, _loads, _saves, events = _release_fixture(io_nodes, monkeypatch, "pending")
+    runs.register_token("tok-early", ["proj-id", "Folder"])
+    prompt = {"1": {"class_type": "SonderEditor", "inputs": {}, "_meta": {"sonder_run": "tok-early"}}}
+    runs.open_release("5", "prompt-5", prompt)
+    payloads = []
+    runs.add_run_finished_listener(payloads.append)
+
+    io_nodes._release_prompt_run("5", types.SimpleNamespace(status_str="error", messages=[
+        ("execution_error", {"node_type": "CheckpointLoaderSimple"}),
+    ]))
+
+    assert sorted(alias for alias, _ in events) == ["Folder", "proj-id"]
+    assert all(event["run_token"] == "tok-early" for _, event in events)
+    assert len(payloads) == 1
+    assert payloads[0]["run_token"] == "tok-early" and payloads[0]["outcome"] == "error"
+    assert payloads[0]["prompt_id"] == "prompt-5"
+    assert runs.claim_token("tok-early", ["proj-id"]) == runs.TOKEN_UNKNOWN
+
+
 def test_release_leaves_a_job_that_is_no_longer_running_alone(tmp_path, monkeypatch):
     io_nodes = _import_io_nodes(tmp_path, monkeypatch)
     runs = _fresh_sdk_runs(io_nodes)

@@ -133,6 +133,8 @@ def test_cache_budget_settings_ui_and_sweep_contract():
     panel = (root / "web" / "js" / "editor_settings_panel.js").read_text(encoding="utf-8")
     editor_widget = (root / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
     editor_node = (root / "nodes" / "editor_node.py").read_text(encoding="utf-8")
+    # The editor's optional inputs live in the shared spec module it reads.
+    editor_inputs = (root / "server" / "editor_inputs.py").read_text(encoding="utf-8")
 
     for label in ["Off", "5 GB", "10 GB", "25 GB", "50 GB", "100 GB", "Unlimited"]:
         assert f'label: "{label}"' in panel
@@ -147,7 +149,8 @@ def test_cache_budget_settings_ui_and_sweep_contract():
     assert "max_size_bytes: maxSizeBytes" in editor_widget
     assert "this._renderCacheSweepPending" in editor_widget
     assert "queue_remaining" in editor_widget
-    assert '"render_cache_max_bytes"' in editor_node
+    assert "editor_optional_inputs()" in editor_node
+    assert '"render_cache_max_bytes"' in editor_inputs
     assert "render_cache_enabled" not in editor_node
     assert "maxRenderCacheEntries" not in panel
 
