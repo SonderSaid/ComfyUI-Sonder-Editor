@@ -196,8 +196,20 @@ def check_value_for_target(value: Any, spec: dict) -> None:
             raise ControlValueError(f"{value!r} is not one of the options.")
 
 
+PANEL_ORDER_LIMIT = 9999
 MAX_CONTROL_CHANGES = 64
 SEED_MAX = 0xFFFFFFFFFFFFFFFF
+
+
+def coerce_panel_layout(field: str, raw: Any):
+    if field == "order":
+        value = coerce_control_value("INT", raw)
+        if not -PANEL_ORDER_LIMIT <= value <= PANEL_ORDER_LIMIT:
+            raise ControlValueError("Panel order must be between -9999 and 9999.")
+        return value
+    if not isinstance(raw, str):
+        raise ControlValueError("A panel group must be text.")
+    return raw.strip()
 
 
 def validate_control_changes(view: dict, changes: Any) -> tuple[dict, list[dict]]:
@@ -223,6 +235,8 @@ def validate_control_changes(view: dict, changes: Any) -> tuple[dict, list[dict]
             continue
         base = f"control:{identity}"
         add(f"{base}:note", control, "note")
+        add(f"{base}:order", control, "order")
+        add(f"{base}:group", control, "group")
         if control.get("status") not in (STATUS_OK, STATUS_UNLINKED):
             continue
         if control.get("kind") == "SEED":
@@ -232,7 +246,8 @@ def validate_control_changes(view: dict, changes: Any) -> tuple[dict, list[dict]
             add(f"{base}:value", control, "value")
     for note in view.get("notes", []):
         if note.get("note_id") and note.get("status") == STATUS_OK:
-            add(f"note:{note['note_id']}:text", note, "text")
+            for field in ("text", "order", "group"):
+                add(f"note:{note['note_id']}:{field}", note, field)
     fields = {}
     for descriptor in view.get("fields", []):
         target = f"field:{descriptor.get('class_type')}/{descriptor.get('field')}"
@@ -254,6 +269,8 @@ def validate_control_changes(view: dict, changes: Any) -> tuple[dict, list[dict]
                 if not isinstance(raw, str) or len(raw) > PANEL_NOTE_MAX_CHARS:
                     raise ControlValueError("A note must be text of at most 4000 characters.")
                 value = raw
+            elif field in ("order", "group"):
+                value = coerce_panel_layout(field, raw)
             elif field == "seed_mode":
                 if not isinstance(raw, str) or raw not in SEED_MODES:
                     raise ControlValueError("Choose fixed, increment, decrement or randomize.")

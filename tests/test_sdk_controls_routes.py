@@ -113,6 +113,8 @@ def test_http_auth_atomic_refusal_and_saved_values_reach_generate_but_notes_do_n
 
 
 @pytest.mark.parametrize('changes', [
+    {'control:steps:order': 10000}, {'note:intro:order': True}, {'note:intro:order': '1.5'},
+    {'control:seed:group': []}, {'field:SonderSaveVideo/mark_queue_complete:order': 2},
     {}, [], {'control:steps:value': 0}, {'control:steps:value': '1.5'},
     {'control:seed:seed': True}, {'control:seed:seed': -1},
     {'control:seed:seed': '18446744073709551616'}, {'control:seed:seed': '1.5'},
@@ -425,4 +427,41 @@ def test_cancelled_generate_finishes_its_seed_advance_before_a_later_control_sav
         result = await saving
         assert next(c for c in result['view']['controls'] if c['control_id'] == 'seed')['seed'] == 44
         assert sdk_templates.read_control_values(world.template_id)['controls']['seed']['seed'] == 44
+    asyncio.run(run())
+
+
+def test_layout_is_atomic_view_only_preserves_unknown_storage_and_resets_on_reimport(world, monkeypatch):
+    async def run():
+        session = await world.open()
+        changes = {'control:steps:order': '-5', 'control:steps:group': ' Advanced ',
+                   'note:intro:order': 10, 'note:intro:group': 'Instructions'}
+        path = f'/sonder-editor/sdk/session/{session.session_id}/controls'
+        async with client_for(world, monkeypatch) as client:
+            response = await client.put(path, headers=headers(session), json={'changes': changes})
+            assert response.status == 200, await response.text()
+            view = (await response.json())['view']
+            steps = next(c for c in view['controls'] if c['control_id'] == 'steps')
+            assert (steps['order'], steps['group']) == (-5, 'Advanced')
+            assert (view['notes'][0]['order'], view['notes'][0]['group']) == (10, 'Instructions')
+        before = sdk_templates.read_control_values(world.template_id)
+        with pytest.raises(SdkError):
+            await world.runner.change_controls(session.session_id, session.secret, 'tab-1',
+                {'control:steps:order': 8, 'note:intro:order': 10000})
+        assert sdk_templates.read_control_values(world.template_id) == before
+        def unknown(data):
+            data['layout']['control:steps']['future'] = {'keep': True}
+            data['layout']['note:removed'] = {'order': 50000, 'group': 'Old'}
+        sdk_templates.update_control_values(world.template_id, unknown)
+        await world.runner.change_controls(session.session_id, session.secret, 'tab-1', {'control:steps:value': 31})
+        assert sdk_templates.read_control_values(world.template_id)['layout']['control:steps']['future'] == {'keep': True}
+        await world.runner.generate(session, count=1)
+        submitted = world.client.submitted[-1]
+        assert submitted['3']['inputs']['panel_order'] == 0 and submitted['3']['inputs']['panel_group'] == ''
+        assert 'panel_order' not in submitted['7']['inputs']
+        replaced = sdk_templates.replace_template(world.template_id, json.dumps(prompt()).encode(), validate=lambda p: {'ok': True})
+        assert replaced['layout_reset'] == 3
+        view = (await world.runner.controls_view(session))['view']
+        steps = next(c for c in view['controls'] if c['control_id'] == 'steps')
+        assert (steps['order'], steps['group'], steps['value']) == (0, '', 31)
+        assert sdk_templates.read_control_values(world.template_id)['layout'] == {}
     asyncio.run(run())

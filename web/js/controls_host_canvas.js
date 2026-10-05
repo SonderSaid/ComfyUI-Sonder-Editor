@@ -195,7 +195,7 @@ export function createCanvasControlsHost({app, api, getEditorNode, setEditorSett
                 }
                 continue;
             }
-            const match = /^(control|note):(.+):(value|seed|seed_mode|note|text)$/.exec(target);
+            const match = /^(control|note):(.+):(value|seed|seed_mode|note|text|order|group)$/.exec(target);
             if (!match) throw new Error("This target is unavailable.");
             const [, source, id, field] = match;
             const d = (source === "control" ? raw.controls : raw.notes).find(d =>
@@ -208,7 +208,7 @@ export function createCanvasControlsHost({app, api, getEditorNode, setEditorSett
             for (const key of d.keys || [d.key]) {
                 const path = resolvePath(root, key);
                 if (!path || path.node !== matches[0]) throw new Error("The control instance changed.");
-                const name = {value: "value_text", seed: "seed", seed_mode: "seed", note: "panel_note", text: "text"}[field];
+                const name = {value: "value_text", seed: "seed", seed_mode: "seed", note: "panel_note", text: "text", order: "panel_order", group: "panel_group"}[field];
                 if (field === "seed_mode") {
                     const native = nativeWidget(path, name);
                     const promotedMode = seedModeWidget(native?.widget);

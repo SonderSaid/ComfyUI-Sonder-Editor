@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 class El {
     constructor(tag,text=''){this.tagName=tag.toUpperCase();this._text=text;this.children=[];this.parentElement=null;this.style={};this.dataset={};this.listeners={};this.attributes={};this.value='';this.type='';}
     append(...items){for(const n of items){if(n.tagName==='#FRAGMENT'){this.append(...[...n.children]);continue;}n.remove?.();n.parentElement=this;this.children.push(n);}}
+    prepend(n){n.remove?.();n.parentElement=this;this.children.unshift(n);}
     appendChild(n){this.append(n);return n;}
     remove(){if(this.parentElement){const a=this.parentElement.children;a.splice(a.indexOf(this),1);this.parentElement=null;}}
     replaceChildren(...n){for(const c of [...this.children])c.remove();this._text='';this.append(...n);}
@@ -22,8 +23,8 @@ class El {
     removeEventListener(k,f){this.listeners[k]=(this.listeners[k]||[]).filter(x=>x!==f);}
     dispatch(k,e={}){for(const f of this.listeners[k]||[])f({target:this,preventDefault(){},...e});}
     contains(n){return n===this||this.children.some(c=>c.contains?.(n));}
-    focus(){if(document.activeElement!==this){document.activeElement?.blur?.();document.activeElement=this;this.dispatch('focus');}}
-    blur(){if(document.activeElement===this){document.activeElement=document.body;this.dispatch('blur');}}
+    focus(){if(document.activeElement!==this){document.activeElement?.blur?.(this);document.activeElement=this;this.dispatch('focus');}}
+    blur(next=document.body){if(document.activeElement===this){const parents=[];for(let n=this.parentElement;n;n=n.parentElement)parents.push(n);document.activeElement=document.body;this.dispatch('blur',{relatedTarget:next});for(const p of parents)p.dispatch('focusout',{target:this,relatedTarget:next});}}
 }
 const events={};globalThis.window={addEventListener(k,f){(events[k]||=[]).push(f);},removeEventListener(k,f){events[k]=(events[k]||[]).filter(x=>x!==f);}};
 globalThis.localStorage={getItem(){return null;},setItem(){}};
@@ -63,7 +64,7 @@ if(SCENARIO==='markdown'){
     if(SCENARIO==='grouping'){
         assert.equal(container.children[0].tagName,'DETAILS');assert.equal(container.children[0].open,true);
         const advanced=walk(container).find(n=>n.tagName==='SUMMARY'&&n.textContent==='Advanced').parentElement;assert.equal(advanced.open,false);
-        const items=container.children[2].children;assert.equal(items[0].dataset.controlTarget,'note:intro:text');assert.equal(items[1].dataset.controlTarget,'control:steps:value');
+        const items=container.children[2].children.filter(n=>n.dataset.controlTarget);assert.equal(items[0].dataset.controlTarget,'note:intro:text');assert.equal(items[1].dataset.controlTarget,'control:steps:value');
         assert.equal(input('field:Save/advance').indeterminate,true);
         const muted=walk(container.children[0]).find(n=>n.tagName==='INPUT');muted.checked=true;muted.dispatch('change');assert.equal(settings.render.takePlacementMuted,true);
     }
@@ -126,12 +127,61 @@ if(SCENARIO==='markdown'){
     if(SCENARIO==='truncated'){
         publish({...view,notes:view.notes.map(d=>({...d,note_truncated:true}))});note('note:intro:text').dispatch('dblclick');assert.ok(!walk(note('note:intro:text')).some(n=>n.tagName==='TEXTAREA'));assert.equal(calls.length,0);
     }
+    if(['layout','layout-refusal','layout-stale','layout-editor'].includes(SCENARIO)){
+        const row=byTarget('control:steps:value'),grip=walk(row).find(n=>n.dataset.panelDragHandle==='true');
+        const advanced=walk(container).find(n=>n.tagName==='SUMMARY'&&n.textContent==='Advanced');
+        const data={};const transfer={setData(k,v){data[k]=v;},getData(k){return data[k];}};
+        if(SCENARIO==='layout-editor')input('control:steps:value').focus();
+        container.dispatch('dragstart',{target:grip,dataTransfer:transfer});
+        if(SCENARIO==='layout-stale')publish({...view,notes:view.notes.map(d=>({...d,order:8}))});
+        refuse=SCENARIO==='layout-refusal';container.dispatch('drop',{target:advanced,dataTransfer:transfer});await settle();
+        if(SCENARIO==='layout-stale'||SCENARIO==='layout-editor'){assert.equal(calls.length,0);assert.equal(notices.length,1);}
+        else{assert.equal(calls.length,1);assert.equal(calls[0]['control:steps:group'],'Advanced');assert.ok(Number.isInteger(calls[0]['control:steps:order']));
+            if(refuse){assert.equal(row.parentElement.dataset.panelDropGroup,'');assert.equal(await panel.flushPending(),false);}}
+    }
+    if(SCENARIO==='combo'||SCENARIO==='combo-capped'||SCENARIO==='combo-ime'||SCENARIO==='combo-query'||SCENARIO==='combo-capped-filter'){
+        const options=Array.from({length:30},(_,i)=>'option-'+i);
+        publish({...view,controls:[{source:'control',control_id:'combo',kind:'COMBO',label:'Long options',options,options_truncated:SCENARIO.startsWith('combo-capped'),value:'option-0',status:'ok',order:0}]});
+        const el=input('control:combo:value');el.focus();el.value=SCENARIO==='combo-capped'?'option-999':SCENARIO==='combo-capped-filter'?'27':'option-27';el.dispatch('input');
+        if(SCENARIO==='combo-ime'){el.dispatch('compositionstart');const e=key('Enter',{isComposing:true});assert.equal(e.prevented,false);assert.equal(calls.length,0);el.dispatch('compositionend');}
+        if(SCENARIO==='combo-query'){
+            el.value='option-2';el.dispatch('input');el.dispatch('change');assert.equal(await panel.flushPending(),true);assert.equal(calls.length,0);el.blur();assert.equal(el.value,'option-0');
+        }else{
+        const list=walk(byTarget('control:combo:value')).find(n=>n.tagName==='SELECT');
+        if(SCENARIO!=='combo-capped')assert.deepEqual(list.options.map(o=>o.value),['option-27']);
+        key('Enter');await settle();assert.deepEqual(calls,[{'control:combo:value':SCENARIO==='combo-capped'?'option-999':'option-27'}]);
+        el.focus();el.value='draft';el.dispatch('input');key('Escape');assert.equal(el.value,SCENARIO==='combo-capped'?'option-999':'option-27');assert.equal(calls.length,1);
+        }
+    }
+    if(SCENARIO==='combo-capped-exact'||SCENARIO==='combo-capped-current'||SCENARIO==='combo-capped-keyboard'){
+        const value=SCENARIO==='combo-capped-current'?'model-27.ckpt':'model-0.ckpt';
+        publish({...view,controls:[{source:'control',control_id:'combo',kind:'COMBO',label:'Models',options:['model-27.ckpt.backup','model-0.ckpt'],options_truncated:true,value,status:'ok',order:0}]});
+        const el=input('control:combo:value');el.focus();
+        if(SCENARIO==='combo-capped-current'){key('Enter');await settle();assert.equal(calls.length,0);assert.equal(el.value,'model-27.ckpt');}
+        else{el.value='model-27.ckpt';el.dispatch('input');
+            const button=walk(byTarget('control:combo:value')).find(n=>n.tagName==='BUTTON'&&n.textContent==='Use typed value');
+            if(SCENARIO==='combo-capped-keyboard'){button.focus();assert.equal(el.value,'model-27.ckpt');key('Enter');}else{button.dispatch('mousedown');button.dispatch('click');}await settle();assert.deepEqual(calls,[{'control:combo:value':'model-27.ckpt'}]);}
+    }
+    if(SCENARIO==='combo-focus-return'){
+        publish({...view,controls:[{source:'control',control_id:'combo',kind:'COMBO',label:'Models',options:['model-27.ckpt','model-0.ckpt'],options_truncated:true,value:'model-0.ckpt',status:'ok',order:0}]});
+        const el=input('control:combo:value');el.focus();el.value='27';el.dispatch('input');
+        const button=walk(byTarget('control:combo:value')).find(n=>n.tagName==='BUTTON');button.focus();el.focus();
+        const list=walk(byTarget('control:combo:value')).find(n=>n.tagName==='SELECT');assert.deepEqual(list.options.map(o=>o.value),['model-27.ckpt']);
+        key('Enter');await settle();assert.deepEqual(calls,[{'control:combo:value':'model-27.ckpt'}]);
+    }
+    if(SCENARIO==='combo-select-focus'){
+        publish({...view,controls:[{source:'control',control_id:'combo',kind:'COMBO',label:'Models',options:Array.from({length:30},(_,i)=>'model-'+i),value:'model-0',status:'ok',order:0}]});
+        const el=input('control:combo:value');el.focus();const list=walk(byTarget('control:combo:value')).find(n=>n.tagName==='SELECT');
+        // Browsers blur a focused native list synchronously when it is hidden.
+        let hidden=false;Object.defineProperty(list,'hidden',{get:()=>hidden,set(v){hidden=v;if(v&&document.activeElement===list)list.blur();}});
+        list.focus();key('ArrowDown');key('Enter');await settle();assert.deepEqual(calls,[{'control:combo:value':'model-1'}]);
+    }
     panel.destroy();assert.equal(listeners.size,0);assert.equal(container.children.length,0);
 }
 console.log('ok');
 '''
 
-@pytest.mark.parametrize('scenario',['markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated'])
+@pytest.mark.parametrize('scenario',['combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated'])
 def test_controls_panel(scenario):
     node=shutil.which('node')
     if not node:pytest.skip('node required for Controls renderer boundary tests')

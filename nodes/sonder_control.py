@@ -17,13 +17,12 @@ except ImportError as exc:  # pragma: no cover - depends on installed ComfyUI ve
         raise
     from comfy_api.latest import io
 
-from ..server.control_descriptors import CONTROL_CLASS_TYPE, CONTROL_KINDS, resolve_control_value
+from ..server.control_descriptors import CONTROL_CLASS_TYPE, CONTROL_KINDS, PANEL_ORDER_LIMIT, resolve_control_value
 
 
 NODE_ID = CONTROL_CLASS_TYPE
 DISPLAY_NAME = "Sonder Control"
 SEED_MAX = 0xFFFFFFFFFFFFFFFF
-PANEL_ORDER_LIMIT = 9999
 
 
 def _hidden_value(cls, name: str):

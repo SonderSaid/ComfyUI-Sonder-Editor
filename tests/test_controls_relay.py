@@ -94,7 +94,7 @@ def test_acknowledgement_survives_poll_retry_socket_loss_and_later_publication(r
     {'control:steps:value': -1}, {'control:steps:value': 10001},
     {'control:seed:seed': '18446744073709551616'}, {'control:seed:seed': -1},
     {'control:seed:seed_mode': 'surprise'}, {'note:intro:text': 'x' * 4001},
-    {'control:steps:note': 2}, {'control:steps:order': 2},
+    {'control:steps:note': 2}, {'control:steps:order': 10000},
     {'field:SonderSaveVideo/mark_queue_complete': 'maybe'},
     {f'note:n{i}:text': '' for i in range(65)},
 ])

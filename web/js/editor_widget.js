@@ -22480,7 +22480,9 @@ export class EditorWidget {
                 ["Arrow keys / Enter", "Move through the menu and choose"],
                 ["Shift+Enter", "Line break (Enter commits a single-field box; a line break in the Writing draft)"],
             ]) +
-            this._shortcutSection("Controls notes", [
+            this._shortcutSection("Controls", [
+                ["Drag row handle", "Reorder or move into another section"],
+                ["Filter options + Enter", "Choose a long-list option without queuing a run"],
                 ["Double-click note", "Edit panel Markdown"],
                 ["Ctrl+Enter", "Save the focused note without queuing a run"],
                 ["Esc", "Cancel the focused note without leaving fullscreen"],

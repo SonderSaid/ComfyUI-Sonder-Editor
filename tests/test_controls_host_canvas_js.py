@@ -48,6 +48,16 @@ const host = createCanvasControlsHost({app,api,getEditorNode:()=>editor,debounce
 const settle=()=>new Promise(r=>setTimeout(r,15));
 const deferred=async()=>{for(let i=0;i<40&&!release;i++)await settle();assert.ok(release);};
 
+if(SCENARIO==='layout'||SCENARIO==='layout-rollback') {
+    ctl.widgets.push(widget('panel_order',0),widget('panel_group',''));
+    note.widgets.push(widget('panel_order',0),widget('panel_group',''));
+    if(SCENARIO==='layout-rollback')note.widgets.at(-1).callback=()=>{throw Error('callback failed');};
+    const result=await host.applyChanges({'control:steps:order':-10,'control:steps:group':'Advanced','note:intro:order':5,'note:intro:group':'Guide'});
+    assert.equal(result.ok,SCENARIO==='layout');
+    assert.equal(ctl.widgets.at(-2).value,SCENARIO==='layout'?-10:0);
+    assert.equal(note.widgets.at(-1).value,SCENARIO==='layout'?'Guide':'');
+    if(result.ok)assert.equal(captures,2);
+}
 if(SCENARIO==='root') {
     const result=await host.applyChanges({'control:steps:value':'31','control:seed:seed':'9007199254740993',
         'control:seed:seed_mode':'decrement','control:steps:note':'**Hint**','note:intro:text':'# New',
@@ -141,7 +151,7 @@ host.destroy();assert.equal(listeners.size,0);
 console.log('ok');
 '''
 
-@pytest.mark.parametrize('scenario', ['root','shared','promoted','promoted-seed','hidden-hash','refusal','stale-write','stale-view','destroy','rollback','serial','history-failure','precision-refusal'])
+@pytest.mark.parametrize('scenario', ['layout','layout-rollback','root','shared','promoted','promoted-seed','hidden-hash','refusal','stale-write','stale-view','destroy','rollback','serial','history-failure','precision-refusal'])
 def test_canvas_adapter(scenario):
     node = shutil.which('node')
     if not node:

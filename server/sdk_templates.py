@@ -407,9 +407,11 @@ def _normalized_controls(data: dict, presentation_hash: str) -> dict:
         data["fields"] = {}
     if not isinstance(data.get("notes"), dict):
         data["notes"] = {}
+    if not isinstance(data.get("layout"), dict):
+        data["layout"] = {}
     if data.get("presentation_hash") != presentation_hash:
         data["notes"] = {}
-        data.pop("layout", None)
+        data["layout"] = {}
     data["presentation_hash"] = presentation_hash
     seq = data.get("seq")
     data["seq"] = seq if isinstance(seq, int) and not isinstance(seq, bool) and seq >= 0 else 0
@@ -501,7 +503,17 @@ def apply_stored_values(prompt: dict, described: dict, stored: dict, *, describe
         for descriptor in descriptors:
             if not descriptor.get(identity_key) or descriptor.get("status") in (cd.STATUS_DUPLICATE, cd.STATUS_MISSING_ID):
                 continue
-            text = stored.get("notes", {}).get(f"{prefix}:{descriptor[identity_key]}")
+            base = f"{prefix}:{descriptor[identity_key]}"
+            layout = stored.get("layout", {}).get(base)
+            if isinstance(layout, dict):
+                # Preserve unknown/over-cap storage, consume only modeled values.
+                for field in ("order", "group"):
+                    if field in layout:
+                        try:
+                            descriptor[field] = cd.coerce_panel_layout(field, layout[field])
+                        except cd.ControlValueError:
+                            pass
+            text = stored.get("notes", {}).get(base)
             if isinstance(text, str) and not descriptor.get("note_truncated"):
                 descriptor[text_key] = text[:cd.PANEL_NOTE_MAX_CHARS]
                 if len(text) > cd.PANEL_NOTE_MAX_CHARS:
@@ -519,6 +531,12 @@ def store_control_changes(template_id: str, changes: dict) -> dict:
             base, field = target.rsplit(":", 1)
             if field in ("note", "text"):
                 data["notes"][base] = value
+                continue
+            if field in ("order", "group"):
+                entry = data["layout"].get(base)
+                if not isinstance(entry, dict):
+                    entry = data["layout"][base] = {}
+                entry[field] = value
                 continue
             identity = base[len("control:"):]
             entry = data["controls"].get(identity)
