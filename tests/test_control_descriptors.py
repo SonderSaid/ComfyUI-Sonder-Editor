@@ -548,6 +548,118 @@ def test_describe_refuses_a_non_object_prompt():
         cd.describe_controls(["not", "a", "prompt"], class_lookup=CLASSES.get, validator_runner=direct_runner)
 
 
+# ── Panel metadata and HTTP transport ──────────────────────────────────────
+
+def test_control_notes_and_seed_mode_are_optional_metadata():
+    prompt = {"1": _control("20", "INT"), "2": _node("KSampler", {"steps": ["1", 0]})}
+    before = only_control(prompt)
+    assert before["note"] == "" and before["seed_mode"] is None
+    prompt["1"]["inputs"].update(panel_note="**Recommended** 10–20", seed_mode="decrement")
+    after = only_control(prompt)
+    assert after["note"] == "**Recommended** 10–20" and after["seed_mode"] == "decrement"
+    assert after["value"] == before["value"] == 20
+    prompt["1"]["inputs"]["seed_mode"] = "unknown"
+    assert only_control(prompt)["seed_mode"] is None
+
+
+def test_notes_merge_shared_instances_and_keep_order_and_group():
+    note = _node("SonderPanelNote", {"text": "# Instructions", "note_id": "shared01",
+                                   "panel_order": -5, "panel_group": "  Advanced  "})
+    result = describe({"733:5": note, "734:5": note, "9": _node("SonderPanelNote", {})})
+    first, missing = result["notes"]
+    assert first["keys"] == ["733:5", "734:5"] and first["text"] == "# Instructions"
+    assert first["order"] == -5 and first["group"] == "Advanced" and first["status"] == "ok"
+    assert missing["status"] == "missing_id" and missing["reason"]
+
+
+@pytest.mark.parametrize("source, text_field, id_field", [
+    ("SonderPanelNote", "text", "note_id"), ("SonderControl", "panel_note", "control_id"),
+])
+def test_note_truncation_is_read_only_and_different_tails_do_not_merge(source, text_field, id_field):
+    import copy
+    node = _control("20", "INT") if source == "SonderControl" else _node(source)
+    node["inputs"].update({id_field: "shared01", text_field: "x" * 4001})
+    prompt = {"733:5": node, "734:5": copy.deepcopy(node)}
+    prompt["734:5"]["inputs"][text_field] += "different tail"
+    before = copy.deepcopy(prompt)
+    descriptor = describe(prompt)["controls" if source == "SonderControl" else "notes"][0]
+    assert descriptor["status"] == "duplicate_id" and descriptor["note_truncated"] is True
+    assert descriptor["note" if source == "SonderControl" else "text"] == "x" * 4000
+    assert prompt == before
+
+
+def test_note_at_limit_is_editable_and_missing_control_id_is_not():
+    prompt = {"1": _control("20", "INT", control_id=""),
+              "2": _node("SonderPanelNote", {"text": "x" * 4000, "note_id": "n1"})}
+    result = describe(prompt)
+    assert result["controls"][0]["status"] == "missing_id"
+    assert "note_truncated" not in result["notes"][0]
+
+
+def test_duplicate_control_panel_metadata_is_not_silently_chosen():
+    import copy
+    first = _control("20", "INT")
+    second = copy.deepcopy(first)
+    second["inputs"]["seed_mode"] = "fixed"
+    assert only_control({"1": first, "2": second})["status"] == "duplicate_id"
+
+
+def test_json_safe_copies_exact_integers_field_defaults_and_nonfinite_values():
+    import json
+    large = 2**63 + 123
+    raw = {"controls": [{"source": "control", "kind": "SEED", "seed": large,
+                          "value": large, "min": 0, "max": 2**64 - 1, "step": 1},
+                         {"source": "control", "kind": "FLOAT", "value": 0.5,
+                          "min": -math.inf, "max": math.inf}],
+           "fields": [{"source": "field", "kind": "INT", "value": large,
+                       "default": large, "min": 0, "max": large},
+                      {"source": "field", "kind": "FLOAT", "default": 1, "min": 0,
+                       "value": math.nan}], "other": [math.inf, {"n": math.nan, "enabled": True}]}
+    safe = cd.json_safe(raw)
+    encoded = json.loads(json.dumps(safe, allow_nan=False))
+    seed = encoded["controls"][0]
+    assert seed == {"source": "control", "kind": "SEED", "seed": str(large),
+                    "value": str(large), "min": "0", "max": str(2**64 - 1), "step": "1"}
+    assert encoded["controls"][1]["value"] == 0.5
+    assert encoded["controls"][1]["min"] is None and encoded["controls"][1]["max"] is None
+    assert encoded["fields"][0]["default"] == str(large)
+    assert encoded["fields"][1]["default"] == "1" and encoded["fields"][1]["value"] is None
+    assert encoded["other"] == [None, {"n": None, "enabled": True}]
+    safe["controls"][0]["seed"] = "changed"
+    assert raw["controls"][0]["seed"] == large and raw["controls"][0]["max"] == 2**64 - 1
+
+
+@pytest.mark.parametrize("count", [2000, 2001])
+def test_combo_transport_cap_preserves_full_runtime_validation(count):
+    class LongCombo:
+        @classmethod
+        def INPUT_TYPES(cls):
+            return {"required": {"option": ([f"opt-{i}" for i in range(count)],)}}
+    classes = dict(CLASSES, LongCombo=LongCombo)
+    prompt = {"1": _control(f"opt-{count-1}", "COMBO"),
+              "2": _node("LongCombo", {"option": ["1", 0]})}
+    raw = cd.describe_controls(prompt, class_lookup=classes.get, validator_runner=direct_runner)
+    assert raw["controls"][0]["error"] is None and len(raw["controls"][0]["options"]) == count
+    safe = cd.json_safe(raw)
+    assert len(safe["controls"][0]["options"]) == 2000
+    assert safe["controls"][0].get("options_truncated", False) == (count > 2000)
+    assert cd.resolve_control_value(prompt, "1", kind="COMBO", value_text=f"opt-{count-1}",
+                                    seed=0, class_lookup=classes.get) == f"opt-{count-1}"
+
+
+def test_describe_route_uses_json_safe_without_changing_python_authority(monkeypatch):
+    import json
+    from server import routes
+    original = cd.describe_controls
+    monkeypatch.setattr(cd, "describe_controls", lambda prompt: original(prompt, class_lookup=CLASSES.get, validator_runner=direct_runner))
+    prompt = {"1": _control("", "SEED", seed=2**63 + 7),
+              "2": _node("KSampler", {"seed": ["1", 0]})}
+    result = routes._describe_controls_body(json.dumps({"prompt": prompt}).encode("utf-8"))
+    assert result["controls"][0]["seed"] == str(2**63 + 7)
+    assert result["controls"][0]["value"] == str(2**63 + 7)
+    assert result["controls"][0]["max"] == str(2**64 - 1)
+
+
 # ── Registry fields ──────────────────────────────────────────────────────────
 
 def test_registry_fields_only_for_nodes_reaching_an_editor():

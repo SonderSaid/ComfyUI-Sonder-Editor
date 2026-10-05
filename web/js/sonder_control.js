@@ -14,12 +14,14 @@ import { getGraphLink, getGraphNode } from "./project_source_resolver.js";
 
 const EXT_NAME = "sonder.control";
 const CONTROL_CLASS = "SonderControl";
+const NOTE_CLASS = "SonderPanelNote";
 const OUTPUT_SIDE = 2;
 // Frontend 1.53.10 subgraph boundary node ids; the input id arrives as a string.
 const SUBGRAPH_INPUT_ID = -10;
 const SUBGRAPH_OUTPUT_ID = -20;
 const ANY_KIND = "*";
 const CONTROL_KINDS = new Set(["STRING", "INT", "FLOAT", "BOOLEAN", "COMBO", "SEED"]);
+const SEED_MODES = new Set(["fixed", "increment", "decrement", "randomize"]);
 // The `seed` widget's schema range (nodes/sonder_control.py SEED_MAX).
 const SEED_MAX = 0xFFFFFFFFFFFFFFFF;
 const VALUE_TYPES = new Set(["INT", "FLOAT", "BOOLEAN", "STRING"]);
@@ -37,6 +39,8 @@ const NODE_STATE = Symbol("sonderControlState");
 
 const nodeTypeName = (node) => String(node?.comfyClass || node?.type || "");
 const isControl = (node) => nodeTypeName(node) === CONTROL_CLASS;
+const isPanelNote = (node) => nodeTypeName(node) === NOTE_CLASS;
+const identityWidgetName = (node) => isControl(node) ? "control_id" : isPanelNote(node) ? "note_id" : null;
 const findWidget = (node, name) => (node?.widgets || []).find((widget) => widget?.name === name) || null;
 const rootGraph = () => app.rootGraph || app.graph || null;
 const graphNodes = (graph) => graph?._nodes || graph?.nodes || [];
@@ -162,11 +166,14 @@ function controlTargets(node, linkIds = null) {
 
 const targetWidget = (target) => inputWidget(target.node, target.input);
 const targetValue = (target) => (target.promoted || targetWidget(target))?.value;
-const targetSeedMode = (target) => {
-    const linked = (target.promoted || targetWidget(target))?.linkedWidgets;
-    const mode = Array.isArray(linked) ? linked.find((w) => w?.name === "control_after_generate")?.value : undefined;
-    return typeof mode === "string" ? mode : undefined;
+const seedModeWidget = (seed) => {
+    const linked = seed?.linkedWidgets;
+    // ComfyUI names a mode widget after the schema's initial mode ("fixed"
+    // here), while older shapes use "control_after_generate".
+    return Array.isArray(linked) ? linked.find((w) =>
+        w?.name === "control_after_generate" || SEED_MODES.has(w?.value)) : undefined;
 };
+const targetSeedMode = (target) => seedModeWidget(target.promoted || targetWidget(target))?.value;
 
 // Every target accepts any type, so nothing tells the Control its kind.
 function feedsOnlyWildcards(node) {
@@ -187,6 +194,7 @@ function refreshVisibility(node, choosesKind = feedsOnlyWildcards(node)) {
     let changed = false;
     changed = setWidgetHidden(findWidget(node, "kind"), !choosesKind) || changed;
     changed = setWidgetHidden(findWidget(node, "control_id"), true) || changed;
+    changed = setWidgetHidden(findWidget(node, "seed_mode"), true) || changed;
     changed = setWidgetHidden(findWidget(node, "value_text"), isSeed) || changed;
     changed = setWidgetHidden(findWidget(node, "seed"), !isSeed) || changed;
     for (const control of seedControlWidgets(node)) {
@@ -262,16 +270,17 @@ function recomputeKind(node) {
 
 // ── Identity ─────────────────────────────────────────────────────────────────
 
-function mintControlId() {
+function mintPanelId() {
     const bytes = new Uint8Array(ID_LENGTH);
     globalThis.crypto.getRandomValues(bytes);
     return Array.from(bytes, (byte) => ID_ALPHABET[byte % ID_ALPHABET.length]).join("");
 }
 
-function controlIdTaken(node, id) {
+function panelIdTaken(node, id) {
+    const name = identityWidgetName(node);
     for (const graph of allGraphs()) {
         for (const other of graphNodes(graph)) {
-            if (other !== node && isControl(other) && findWidget(other, "control_id")?.value === id) return true;
+            if (other !== node && identityWidgetName(other) === name && findWidget(other, name)?.value === id) return true;
         }
     }
     return false;
@@ -284,19 +293,25 @@ function controlIdTaken(node, id) {
 function resolveSubgraphCollisions(instance, depth = 0) {
     if (!instance?.subgraph || depth > MAX_WALK_DEPTH) return;
     for (const inner of graphNodes(instance.subgraph)) {
-        if (isControl(inner)) ensureControlId(inner, { resolveCollision: true });
+        if (identityWidgetName(inner)) ensurePanelId(inner, { resolveCollision: true });
         else if (inner?.subgraph) resolveSubgraphCollisions(inner, depth + 1);
     }
 }
 
-function ensureControlId(node, { resolveCollision }) {
-    const widget = findWidget(node, "control_id");
+function ensurePanelId(node, { resolveCollision }) {
+    const widget = findWidget(node, identityWidgetName(node));
     if (!widget) return;
     const current = typeof widget.value === "string" ? widget.value.trim() : "";
-    if (current && !(resolveCollision && controlIdTaken(node, current))) return;
-    let next = mintControlId();
-    while (controlIdTaken(node, next)) next = mintControlId();
+    if (current && !(resolveCollision && panelIdTaken(node, current))) return;
+    let next = mintPanelId();
+    while (panelIdTaken(node, next)) next = mintPanelId();
     widget.value = next;
+}
+
+function refreshNoteVisibility(node) {
+    if (setWidgetHidden(findWidget(node, "note_id"), true)) {
+        commitWidgetVisibility(node, { resize: !app.configuringGraph });
+    }
 }
 
 // ── Unsupported links ────────────────────────────────────────────────────────
@@ -382,6 +397,10 @@ function scheduleLinkCheck(node, linkId) {
 // ── Install ──────────────────────────────────────────────────────────────────
 
 function install(node) {
+    if (isPanelNote(node)) {
+        refreshNoteVisibility(node);
+        return;
+    }
     if (!isControl(node)) return;
     const state = stateOf(node);
     if (state.installed) return;
@@ -423,6 +442,16 @@ function install(node) {
         };
     }
 
+    const seedMode = findWidget(node, "seed_mode");
+    if (seedMode) {
+        // Export (API) serializes widgets but does not call beforeQueued.
+        // The real ComfyUI seed-mode widget remains the canvas authority.
+        seedMode.serializeValue = function () {
+            this.value = seedModeWidget(findWidget(node, "seed"))?.value || "fixed";
+            return this.value;
+        };
+    }
+
     const originalConnections = node.onConnectionsChange;
     node.onConnectionsChange = function (side, slot, connected, linkInfo, ...rest) {
         const result = originalConnections?.call(this, side, slot, connected, linkInfo, ...rest);
@@ -460,17 +489,18 @@ app.registerExtension({
             window.setTimeout(() => resolveSubgraphCollisions(node), 0);
             return;
         }
-        if (!isControl(node)) return;
+        if (!identityWidgetName(node)) return;
         install(node);
         if (app.configuringGraph) return;
         // A paste or clone configures the node after creation, so its copied
         // id is visible only on the next tick.
-        window.setTimeout(() => ensureControlId(node, { resolveCollision: true }), 0);
+        window.setTimeout(() => ensurePanelId(node, { resolveCollision: true }), 0);
     },
     loadedGraphNode(node) {
-        if (!isControl(node)) return;
+        if (!identityWidgetName(node)) return;
         install(node);
-        ensureControlId(node, { resolveCollision: false });
-        refreshVisibility(node);
+        ensurePanelId(node, { resolveCollision: false });
+        if (isControl(node)) refreshVisibility(node);
+        else refreshNoteVisibility(node);
     },
 });

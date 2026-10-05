@@ -43,7 +43,7 @@ class SonderControl(io.ComfyNode):
             description=(
                 "One value you can change from the Sonder Controls panel. Connect its output to "
                 "the inputs it should drive; its type follows what it is connected to. The node's "
-                "title is the control's label."
+                "title is the control's label. Add a Markdown panel note to explain the value."
             ),
             inputs=[
                 io.String.Input(
@@ -97,6 +97,22 @@ class SonderControl(io.ComfyNode):
                     socketless=True,
                     tooltip="Stable identity, set automatically.",
                 ),
+                io.String.Input(
+                    "panel_note",
+                    display_name="Panel note",
+                    default="",
+                    multiline=True,
+                    socketless=True,
+                    optional=True,
+                    tooltip="Markdown explanation shown below this Control in the panel.",
+                ),
+                io.String.Input(
+                    "seed_mode",
+                    default="",
+                    socketless=True,
+                    optional=True,
+                    tooltip="Seed mode, mirrored automatically for API export.",
+                ),
             ],
             outputs=[
                 io.AnyType.Output(
@@ -117,8 +133,10 @@ class SonderControl(io.ComfyNode):
         panel_order: int = 0,
         panel_group: str = "",
         control_id: str = "",
+        panel_note: str = "",
+        seed_mode: str = "",
     ) -> io.NodeOutput:
-        del panel_order, panel_group, control_id
+        del panel_order, panel_group, control_id, panel_note, seed_mode
         value = resolve_control_value(
             _hidden_value(cls, "prompt"),
             _hidden_value(cls, "unique_id"),

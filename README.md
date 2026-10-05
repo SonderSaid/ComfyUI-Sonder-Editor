@@ -241,10 +241,11 @@ adapters, grouped under the `Sonder`, `Sonder/IO`, `Sonder/Logic`, and
 
 | Node | What it does |
 |------|--------------|
-| **Sonder Control** | One named value, wired to the widget inputs it should drive (steps, CFG, a sampler or LoRA name, a seed). The node's title is its label. Its type follows what it is connected to (you pick it when the input accepts any type), and it checks its value against each input's range and options, because ComfyUI skips those checks for a linked input. Inputs that check their value before the run, such as Load Image, refuse the link. |
+| **Sonder Control** | One named value, wired to the widget inputs it should drive (steps, CFG, a sampler or LoRA name, a seed). The node's title is its label; Panel note adds a Markdown explanation. Its type follows what it is connected to (you pick it when the input accepts any type), and it checks its value against each input's range and options, because ComfyUI skips those checks for a linked input. Inputs that check their value before the run, such as Load Image, refuse the link. |
+| **Sonder Panel Note** | Markdown text for a Controls panel title, introduction or instructions. Panel order and group place it among the Controls. It has no connections and travels with an Export (API) workflow. |
 
 > **Sonder Switch**, **Sonder Cluster**, **Sonder Gate**, **Sonder Reference Selector**, the three
-> **Sonder Reference Bridges**, **Sonder Control**, and
+> **Sonder Reference Bridges**, **Sonder Control**, **Sonder Panel Note**, and
 > **Sonder Metadata Collector Nodes 2.0** use ComfyUI's
 > newer V3 node API and load only on recent ComfyUI builds.
 > V3 registration is schema-validated before it changes discovery:

@@ -31,6 +31,9 @@ from . import prompt_graph
 logger = logging.getLogger(__name__)
 
 CONTROL_CLASS_TYPE = prompt_graph.SONDER_CONTROL_CLASS_TYPE
+PANEL_NOTE_CLASS_TYPE = "SonderPanelNote"
+PANEL_NOTE_MAX_CHARS = 4000
+PANEL_OPTIONS_LIMIT = 2000
 CONTROL_KINDS = ("STRING", "INT", "FLOAT", "BOOLEAN", "COMBO", "SEED")
 ANY_KIND = "*"
 # Input types that accept any value, so they add no kind of their own.
@@ -42,6 +45,7 @@ STATUS_MIXED = "mixed_targets"
 STATUS_UNSUPPORTED = "unsupported"
 STATUS_STALE = "stale_kind"
 STATUS_DUPLICATE = "duplicate_id"
+STATUS_MISSING_ID = "missing_id"
 
 # Shown to the user; the validator's own message goes in the target's ``detail``.
 VALIDATOR_REFUSAL = "This input checks its value before the run, so a Control can't set it."
@@ -415,10 +419,10 @@ def _control_targets(prompt: dict, control_key: str) -> list[tuple[str, str]]:
     return targets
 
 
-def _node_title(node: dict) -> str:
+def _node_title(node: dict, default: str = DEFAULT_CONTROL_LABEL) -> str:
     meta = node.get("_meta")
     title = meta.get("title") if isinstance(meta, dict) else None
-    return title.strip() if isinstance(title, str) and title.strip() else DEFAULT_CONTROL_LABEL
+    return title.strip() if isinstance(title, str) and title.strip() else default
 
 
 def _received_types(prompt: dict, inputs: dict, class_lookup: Callable) -> dict:
@@ -509,6 +513,8 @@ def _describe_one_control(prompt: dict, key: str, node: dict, class_lookup: Call
         "kind": declared,
         "value_text": inputs.get("value_text") if isinstance(inputs.get("value_text"), str) else "",
         "seed": seed if isinstance(seed, int) and not isinstance(seed, bool) else None,
+        "seed_mode": inputs.get("seed_mode") if inputs.get("seed_mode") in SEED_MODES else None,
+        "note": inputs.get("panel_note") if isinstance(inputs.get("panel_note"), str) else "",
         "order": order if isinstance(order, int) and not isinstance(order, bool) else 0,
         "group": group.strip() if isinstance(group, str) else "",
     }
@@ -560,6 +566,9 @@ def _group_duplicates(controls: list[dict]) -> list[dict]:
     result = []
     for descriptor in controls:
         control_id = descriptor["control_id"]
+        if not control_id:
+            descriptor["status"] = STATUS_MISSING_ID
+            descriptor["error"] = "This Control has no id. Open the workflow on the canvas to assign one."
         first = grouped.get(control_id) if control_id else None
         if first is None:
             if control_id:
@@ -568,13 +577,89 @@ def _group_duplicates(controls: list[dict]) -> list[dict]:
             continue
         first["keys"].append(descriptor["key"])
         first["targets"].extend(descriptor["targets"])
-        same = all(first[name] == descriptor[name] for name in ("kind", "value_text", "seed"))
+        same = all(first[name] == descriptor[name] for name in ("kind", "value_text", "seed", "seed_mode", "note", "label", "order", "group"))
         if not same:
             first["status"] = STATUS_DUPLICATE
             first["error"] = "Two different Controls share one id. Delete one and add it again."
         elif descriptor["status"] != STATUS_OK and first["status"] == STATUS_OK:
             first["status"] = descriptor["status"]
     return result
+
+
+def _truncate_note(descriptor: dict, field: str) -> None:
+    if len(descriptor[field]) > PANEL_NOTE_MAX_CHARS:
+        descriptor[field] = descriptor[field][:PANEL_NOTE_MAX_CHARS]
+        descriptor["note_truncated"] = True
+
+
+def _describe_notes(prompt: dict) -> list[dict]:
+    grouped: dict[str, dict] = {}
+    notes = []
+    for key, node in prompt.items():
+        if not isinstance(node, dict) or node.get("class_type") != PANEL_NOTE_CLASS_TYPE:
+            continue
+        inputs = prompt_graph.node_inputs(prompt, key)
+        note_id = inputs.get("note_id") if isinstance(inputs.get("note_id"), str) else ""
+        order, group = inputs.get("panel_order"), inputs.get("panel_group")
+        descriptor = {
+            "source": "note", "key": str(key), "keys": [str(key)], "note_id": note_id,
+            "label": _node_title(node, "Sonder Panel Note"),
+            "text": inputs.get("text") if isinstance(inputs.get("text"), str) else "",
+            "order": order if isinstance(order, int) and not isinstance(order, bool) else 0,
+            "group": group.strip() if isinstance(group, str) else "",
+            "status": STATUS_OK if note_id else STATUS_MISSING_ID,
+            "reason": None if note_id else "This note has no id. Open the workflow on the canvas to assign one.",
+        }
+        first = grouped.get(note_id) if note_id else None
+        if first is None:
+            notes.append(descriptor)
+            if note_id:
+                grouped[note_id] = descriptor
+        else:
+            first["keys"].append(str(key))
+            if any(first[name] != descriptor[name] for name in ("text", "label", "order", "group")):
+                first.update(status=STATUS_DUPLICATE,
+                             reason="Two different Panel Notes share one id. Delete one and add it again.")
+    # Compare full authored text before truncating so different tails never merge.
+    for descriptor in notes:
+        _truncate_note(descriptor, "text")
+    notes.sort(key=lambda d: (d["order"], d["label"].lower(), d["key"]))
+    return notes
+
+
+def json_safe(view: dict) -> dict:
+    """Copy a descriptor view at the HTTP edge, preserving integer precision.
+
+    Internal consumers keep exact numbers and complete option lists for validation.
+    The transport preview limits never change their source or a submitted prompt.
+    """
+    def copy(value):
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        if isinstance(value, dict):
+            result = {}
+            for name, item in value.items():
+                integer_field = value.get("kind") in ("INT", "SEED") and name in (
+                    "seed", "value", "min", "max", "step", "default")
+                integer_field = integer_field or name == "seed" or (
+                    value.get("source") == "field" and name in ("default", "min", "max")
+                    and isinstance(item, int))
+                if isinstance(item, float) and not math.isfinite(item):
+                    result[name] = None
+                elif integer_field and isinstance(item, (int, float)) and not isinstance(item, bool):
+                    result[name] = str(int(item)) if isinstance(item, int) or item.is_integer() else str(item)
+                elif name == "options" and isinstance(item, (list, tuple)):
+                    result[name] = [copy(option) for option in item[:PANEL_OPTIONS_LIMIT]]
+                    if len(item) > PANEL_OPTIONS_LIMIT:
+                        result["options_truncated"] = True
+                else:
+                    result[name] = copy(item)
+            return result
+        if isinstance(value, (list, tuple)):
+            return [copy(item) for item in value]
+        return value
+
+    return copy(view)
 
 
 def _describe_fields(prompt: dict, class_lookup: Callable, cache: dict) -> list[dict]:
@@ -734,9 +819,12 @@ def describe_controls(
 
     controls = [_finish_control(descriptor, targets, reasons) for descriptor, targets in pending]
     controls = _group_duplicates(controls)
+    for descriptor in controls:
+        _truncate_note(descriptor, "note")
     controls.sort(key=lambda d: (d["order"], d["label"].lower(), d["key"]))
     return {
         "controls": controls,
+        "notes": _describe_notes(prompt),
         "fields": _describe_fields(prompt, class_lookup, cache),
         "editors": prompt_graph.editor_keys(prompt),
     }

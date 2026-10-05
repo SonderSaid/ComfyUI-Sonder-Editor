@@ -51,6 +51,8 @@ from comfy_api.latest import io
 
 out = {"errors": {}}
 SonderControl = control_module.SonderControl
+SonderPanelNote = importlib.import_module("sonder_pkg.nodes.panel_note").SonderPanelNote
+nodes.NODE_CLASS_MAPPINGS["SonderPanelNote"] = SonderPanelNote
 nodes.NODE_CLASS_MAPPINGS["SonderControl"] = SonderControl
 nodes.NODE_CLASS_MAPPINGS["SonderLazySwitch"] = lazy.SonderLazySwitch
 nodes.NODE_CLASS_MAPPINGS["SonderMetadataCollectorV3"] = collector.SonderMetadataCollectorV3
@@ -109,6 +111,7 @@ out["schema"] = {
     "name": info["name"],
     "display_name": info["display_name"],
     "inputs": list(required),
+    "optional": info["input"].get("optional", {}),
     "kind_options": required["kind"][0] if isinstance(required["kind"][0], list) else required["kind"][1].get("options"),
     "seed_control": required["seed"][1].get("control_after_generate"),
     "socketless": sorted(name for name, spec in required.items() if spec[1].get("socketless")),
@@ -214,6 +217,24 @@ try:
 except Exception as exc:
     executed["3-stale-kind"] = ["raised", f"{type(exc).__name__}: {exc}"]
 out["executed"] = executed
+note_info = SonderPanelNote.GET_NODE_INFO_V1()
+out["note_schema"] = {"optional": note_info["input"].get("optional", {}),
+                      "output": note_info["output"], "output_node": note_info.get("output_node", False)}
+
+class ControlSink:
+    OUTPUT_NODE = True
+    RETURN_TYPES = ()
+    FUNCTION = "run"
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"amount": ("INT", {"min": 0, "max": 100})}}
+nodes.NODE_CLASS_MAPPINGS["ControlSink"] = ControlSink
+compat_prompt = {"1": control("30", "INT"),
+                 "2": {"class_type": "ControlSink", "inputs": {"amount": ["1", 0]}},
+                 "3": {"class_type": "SonderPanelNote", "inputs": {}}}
+out["old_export_validation"] = asyncio.run(execution.validate_prompt("phase3-old-export", compat_prompt, None))[0]
+out["old_export_note"] = cd.describe_controls(compat_prompt)["notes"][0]
+out["note_exec"] = len(SonderPanelNote.execute(text="# Title").args)
 print("@@RESULT@@" + json.dumps(out, default=repr))
 '''
 
@@ -248,6 +269,18 @@ def test_schema_is_the_published_contract(runtime):
     assert schema["socketless"] == sorted(schema["inputs"])  # no linked inputs
     assert schema["output"] == ["*"] and schema["output_name"] == ["value"]
     assert schema["hidden"] == ["prompt", "unique_id"]
+    assert list(schema["optional"]) == ["panel_note", "seed_mode"]
+    assert all(spec[1]["socketless"] for spec in schema["optional"].values())
+
+
+def test_panel_note_schema_and_old_export_validation(runtime):
+    schema = runtime["note_schema"]
+    assert list(schema["optional"]) == ["text", "panel_order", "panel_group", "note_id"]
+    assert all(spec[1]["socketless"] for spec in schema["optional"].values())
+    assert schema["output"] == [] and schema["output_node"] is False
+    assert runtime["note_exec"] == 0
+    assert runtime["old_export_validation"] is True
+    assert runtime["old_export_note"]["text"] == ""
 
 
 def test_validator_dry_run_matches_prompt_validation(runtime):

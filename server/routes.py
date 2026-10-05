@@ -227,7 +227,7 @@ def _describe_controls_body(raw: bytes) -> dict:
     prompt = body.get("prompt") if isinstance(body, dict) else None
     if not isinstance(prompt, dict):
         raise _ControlsRequestError("The request must carry an API-format prompt object.")
-    return control_descriptors.describe_controls(prompt)
+    return control_descriptors.json_safe(control_descriptors.describe_controls(prompt))
 
 
 def _json_error(msg: str, status: int = 400) -> web.Response:

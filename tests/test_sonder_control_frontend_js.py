@@ -86,7 +86,8 @@ const makeControl = (graph = root) => {
     return add(graph, {
         id: nextId++, comfyClass: 'SonderControl', inputs: [], outputs: [{ name: 'value', type: '*', links: [] }],
         widgets: [widget('value_text', ''), seed, control, widget('kind', 'STRING'),
-                  widget('panel_order', 0), widget('panel_group', ''), widget('control_id', '')],
+                  widget('panel_order', 0), widget('panel_group', ''), widget('control_id', ''),
+                  widget('panel_note', ''), widget('seed_mode', '')],
         setDirtyCanvas() {}, computeSize() { return [200, 100]; }, setSize() {},
     });
 };
@@ -369,6 +370,56 @@ const shared = add(root, { id: nextId++, comfyClass: 'def-uuid', subgraph: inner
 extension.nodeCreated(shared);
 flush();
 assert.equal(value(innerCtl, 'control_id'), original);
+// Panel Notes mint and retain identities, re-mint colliding pastes and copied definitions.
+const makeNote = (graph = root) => add(graph, {
+    id: nextId++, comfyClass: 'SonderPanelNote', inputs: [], outputs: [],
+    widgets: [widget('text', '# Guide'), widget('panel_order', 0), widget('panel_group', ''), widget('note_id', '')],
+    setDirtyCanvas() {}, computeSize() { return [200, 100]; }, setSize() {},
+});
+const note = makeNote();
+extension.nodeCreated(note);
+flush();
+const noteId = value(note, 'note_id');
+assert.match(noteId, /^[a-z0-9]{8}$/);
+assert.ok(hidden(note, 'note_id') && !hidden(note, 'text'));
+extension.loadedGraphNode(note);
+assert.equal(value(note, 'note_id'), noteId);
+const pastedNote = makeNote();
+extension.nodeCreated(pastedNote);
+pastedNote.widgets.find(w => w.name === 'note_id').value = noteId;
+flush();
+assert.notEqual(value(pastedNote, 'note_id'), noteId);
+const innerNote = makeNote(inner);
+extension.nodeCreated(innerNote);
+flush();
+const innerNoteId = value(innerNote, 'note_id');
+const copiedNote = makeNote(copyDef);
+copiedNote.widgets.find(w => w.name === 'note_id').value = innerNoteId;
+app.configuringGraph = true;
+extension.nodeCreated(copiedNote);
+app.configuringGraph = false;
+extension.loadedGraphNode(copiedNote);
+assert.equal(value(copiedNote, 'note_id'), innerNoteId);
+extension.nodeCreated(pastedInstance);
+flush();
+assert.notEqual(value(copiedNote, 'note_id'), innerNoteId);
+extension.nodeCreated(shared);
+flush();
+assert.equal(value(innerNote, 'note_id'), innerNoteId);
+assert.ok(hidden(copiedNote, 'note_id'));
+
+// Every export sees the actual seed mode, without beforeQueued.
+assert.ok(hidden(ctl, 'seed_mode'));
+const mirror = ctl.widgets.find(w => w.name === 'seed_mode');
+const modeWidget = ctl.widgets.find(w => w.name === 'control_after_generate');
+// The real V3 schema names this widget after its initial mode.
+modeWidget.name = 'fixed';
+for (const mode of ['fixed', 'increment', 'decrement', 'randomize']) {
+    modeWidget.value = mode;
+    mirror.value = 'stale';
+    assert.equal(await mirror.serializeValue(), mode);
+    assert.equal(mirror.value, mode);
+}
 console.log('ok');
 """
 
@@ -401,6 +452,8 @@ def test_frontend_kind_rules_mirror_the_server():
     assert js_set("SEED_INPUT_NAMES") == py_set("_SEED_INPUT_NAMES")
     py_kinds = re.search(r"CONTROL_KINDS = \((.*?)\)", py).group(1)
     assert js_set("CONTROL_KINDS") == set(re.findall(r'"([^"]+)"', py_kinds))
+    py_modes = re.search(r"SEED_MODES = \((.*?)\)", py).group(1)
+    assert js_set("SEED_MODES") == set(re.findall(r'"([^"]+)"', py_modes))
     # Both sides let an explicit control_after_generate win over the name
     # (behavior is pinned by scenario 17 here and the spec test server-side).
     assert "control_after_generate ?? SEED_INPUT_NAMES" in js
