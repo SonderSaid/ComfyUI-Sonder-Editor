@@ -196,6 +196,92 @@ def check_value_for_target(value: Any, spec: dict) -> None:
             raise ControlValueError(f"{value!r} is not one of the options.")
 
 
+MAX_CONTROL_CHANGES = 64
+SEED_MAX = 0xFFFFFFFFFFFFFFFF
+
+
+def validate_control_changes(view: dict, changes: Any) -> tuple[dict, list[dict]]:
+    """Whitelist and coerce panel writes against the current descriptor view.
+
+    Returns canonical values, or target/reason refusals. Callers reject the whole
+    batch on any refusal. The relay can pass JSON-safe bounds; SDK callers keep
+    the full COMBO options and exact Python integers.
+    """
+    if not isinstance(changes, dict) or not changes or len(changes) > MAX_CONTROL_CHANGES:
+        return {}, [{"target": "", "reason": "Send 1 to 64 changes."}]
+    targets = {}
+    ambiguous = set()
+
+    def add(target, descriptor, field):
+        if target in targets:
+            ambiguous.add(target)
+        targets[target] = (descriptor, field)
+
+    for control in view.get("controls", []):
+        identity = control.get("control_id")
+        if not identity or control.get("status") in (STATUS_DUPLICATE, STATUS_MISSING_ID):
+            continue
+        base = f"control:{identity}"
+        add(f"{base}:note", control, "note")
+        if control.get("status") not in (STATUS_OK, STATUS_UNLINKED):
+            continue
+        if control.get("kind") == "SEED":
+            add(f"{base}:seed", control, "seed")
+            add(f"{base}:seed_mode", control, "seed_mode")
+        elif control.get("kind") in CONTROL_KINDS:
+            add(f"{base}:value", control, "value")
+    for note in view.get("notes", []):
+        if note.get("note_id") and note.get("status") == STATUS_OK:
+            add(f"note:{note['note_id']}:text", note, "text")
+    fields = {}
+    for descriptor in view.get("fields", []):
+        target = f"field:{descriptor.get('class_type')}/{descriptor.get('field')}"
+        fields.setdefault(target, []).append(descriptor)
+    for target, descriptors in fields.items():
+        # A merged field writes every exposed instance, never a linked one.
+        if all(d.get("status") == STATUS_OK for d in descriptors):
+            targets[target] = (descriptors, "field")
+
+    cleaned, rejected = {}, []
+    for target, raw in changes.items():
+        try:
+            if target not in targets or target in ambiguous:
+                raise ControlValueError("This target is unavailable. Refresh the Controls panel.")
+            descriptor, field = targets[target]
+            if field in ("note", "text"):
+                if descriptor.get("note_truncated"):
+                    raise ControlValueError("Edit this note on the canvas.")
+                if not isinstance(raw, str) or len(raw) > PANEL_NOTE_MAX_CHARS:
+                    raise ControlValueError("A note must be text of at most 4000 characters.")
+                value = raw
+            elif field == "seed_mode":
+                if not isinstance(raw, str) or raw not in SEED_MODES:
+                    raise ControlValueError("Choose fixed, increment, decrement or randomize.")
+                value = raw
+            else:
+                specs = descriptor if field == "field" else [descriptor]
+                kind = "INT" if field == "seed" else specs[0].get("kind")
+                value = coerce_control_value(kind, raw)
+                if field == "seed" and not 0 <= value <= SEED_MAX:
+                    raise ControlValueError("The seed must be between 0 and 18446744073709551615.")
+                for spec in specs:
+                    if spec.get("kind") != specs[0].get("kind"):
+                        raise ControlValueError("These fields have different types.")
+                    bounded = dict(spec)
+                    for name in ("min", "max"):
+                        if isinstance(bounded.get(name), str):
+                            bounded[name] = coerce_control_value(kind, bounded[name])
+                    # A capped relay view cannot prove membership beyond its
+                    # preview; its canvas writer validates against the full view.
+                    if bounded.get("options_truncated"):
+                        bounded.pop("options", None)
+                    check_value_for_target(value, bounded)
+            cleaned[target] = value
+        except (ControlValueError, OverflowError) as exc:
+            rejected.append({"target": target, "reason": str(exc)})
+    return cleaned, rejected
+
+
 # ── Kinds ────────────────────────────────────────────────────────────────────
 
 def derive_kind(target_kinds: Iterable[str]) -> str | None:
@@ -581,8 +667,19 @@ def _group_duplicates(controls: list[dict]) -> list[dict]:
         if not same:
             first["status"] = STATUS_DUPLICATE
             first["error"] = "Two different Controls share one id. Delete one and add it again."
-        elif descriptor["status"] != STATUS_OK and first["status"] == STATUS_OK:
-            first["status"] = descriptor["status"]
+        else:
+            # Every instance of a shared definition constrains the same value.
+            # Preserve all bounds/options and every validation refusal.
+            first.update(_merge_bounds([first, descriptor]))
+            if descriptor["status"] != STATUS_OK and first["status"] == STATUS_OK:
+                first["status"] = descriptor["status"]
+            if descriptor.get("error") and not first.get("error"):
+                first["error"] = descriptor["error"]
+            if first.get("value") is not None:
+                try:
+                    check_value_for_target(first["value"], first)
+                except ControlValueError as exc:
+                    first["error"] = str(exc)
     return result
 
 

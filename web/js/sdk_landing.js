@@ -249,7 +249,15 @@ async function replaceWorkflow(template, file) {
     }
     state.importProblems = null;
     await loadTemplates();
-    notifySuccess("Workflow replaced; its Control values were kept", { source: "launcher-import" });
+    const notesReset = Number(result.payload.template?.notes_reset) || 0;
+    const layoutReset = Number(result.payload.template?.layout_reset) || 0;
+    const resets = [];
+    if (notesReset) resets.push(`${notesReset} panel ${notesReset === 1 ? "note" : "notes"} reset`);
+    if (layoutReset) resets.push("layout reset");
+    notifySuccess("Workflow replaced", {
+        detail: `Control values kept.${resets.length ? ` ${resets.join("; ")}.` : ""}`,
+        source: "launcher-import",
+    });
     render();
 }
 

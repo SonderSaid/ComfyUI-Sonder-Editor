@@ -51,6 +51,31 @@ from .sdk_install import install_state, uninstall_running
 
 logger = logging.getLogger("sonder_editor")
 
+async def await_template_io(func, *args, **kwargs):
+    """Finish a disk mutation before its caller releases the template lock.
+
+    to_thread cannot stop a running worker. Shield it and drain even repeated
+    cancellation, then propagate cancellation after the file operation ends.
+    """
+    task = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+    canceled = False
+    while True:
+        try:
+            result = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.cancelled():
+                raise
+            canceled = True
+            continue
+        except Exception:
+            if canceled:
+                raise asyncio.CancelledError from None
+            raise
+        if canceled:
+            raise asyncio.CancelledError
+        return result
+
+
 MAX_SESSIONS = 8
 MAX_COUNT = 8
 MAX_UNFINISHED_PER_SESSION = 16
@@ -454,6 +479,30 @@ class SdkRunner:
     def status(self, session: SdkSession) -> dict:
         return {"ok": True, **session.public(self.template_name(session))}
 
+    def _controls_snapshot(self, session: SdkSession) -> dict:
+        with sdk_templates.template_lock(session.template_id):
+            prompt, _ = sdk_templates.load_template(session.template_id)
+            stored = sdk_templates.read_control_values(session.template_id)
+            view = sdk_templates.apply_stored_values(prompt, self._describe(prompt), stored, describe=self._describe)
+            return {"view": view, "seq": stored["seq"]}
+
+    async def controls_view(self, session: SdkSession) -> dict:
+        async with self.template_lock(session.template_id):
+            return await asyncio.to_thread(self._controls_snapshot, session)
+
+    async def change_controls(self, session_id: str, secret: str, tab_session_id: str, changes: Any) -> dict:
+        session = await self.authorized(session_id, secret, tab_session_id)
+        async with self.template_lock(session.template_id):
+            # Ownership may change while waiting behind a Generate batch.
+            await self.authorized(session_id, secret, tab_session_id)
+            snapshot = await asyncio.to_thread(self._controls_snapshot, session)
+            cleaned, rejected = await asyncio.to_thread(control_descriptors.validate_control_changes, snapshot["view"], changes)
+            if rejected:
+                raise SdkError("Some changes could not be saved.", "invalid_change", 400, rejected=rejected)
+            await self.authorized(session_id, secret, tab_session_id)
+            await await_template_io(sdk_templates.store_control_changes, session.template_id, cleaned)
+            return await asyncio.to_thread(self._controls_snapshot, session)
+
     # ── Generate ─────────────────────────────────────────────────────────────
 
     def template_lock(self, template_id: str) -> asyncio.Lock:
@@ -526,7 +575,11 @@ class SdkRunner:
             client = await self._client(target)
             return await self._submit_runs(session, client, build, count)
 
-    def _build_base(self, session: SdkSession, editor_values: Any, render_cache_max_bytes: int) -> dict:
+    def _build_base(self, session: SdkSession, editor_values: Any, render_cache_max_bytes: Any) -> dict:
+        with sdk_templates.template_lock(session.template_id):
+            return self._build_base_locked(session, editor_values, render_cache_max_bytes)
+
+    def _build_base_locked(self, session: SdkSession, editor_values: Any, render_cache_max_bytes: int) -> dict:
         """The prompt every run of this Generate shares, plus its Control descriptors."""
         if editor_values is not None:
             values = sdk_templates.write_editor_state(session.project, editor_values)
@@ -547,22 +600,15 @@ class SdkRunner:
         editor_inputs.update(values)
         editor_inputs["project"] = session.project
         editor_inputs["render_cache_max_bytes"] = render_cache_max_bytes
-        described = self._describe(prompt)
+        described = sdk_templates.apply_stored_values(prompt, self._describe(prompt), stored, describe=self._describe)
         controls = described.get("controls", [])
         seed_controls = []
         for control in controls:
-            entry = stored["controls"].get(control.get("control_id") or "")
-            if not isinstance(entry, dict):
-                entry = {}
-            for key in control.get("keys", []):
-                inputs = prompt[key]["inputs"]
-                if isinstance(entry.get("value_text"), str):
-                    inputs["value_text"] = entry["value_text"]
             if control.get("kind") == "SEED" and control.get("control_id"):
-                seed = entry.get("seed")
+                seed = control.get("seed")
                 if isinstance(seed, bool) or not isinstance(seed, int):
-                    seed = control.get("seed") if isinstance(control.get("seed"), int) else 0
-                mode = entry.get("seed_mode") if entry.get("seed_mode") in control_descriptors.SEED_MODES else "randomize"
+                    seed = 0
+                mode = control["seed_mode"]
                 seed_controls.append({
                     "control_id": control["control_id"],
                     "keys": list(control.get("keys", [])),
@@ -572,18 +618,6 @@ class SdkRunner:
                     "max": control.get("max", SEED_MAX),
                     "step": control.get("step") or 1,
                 })
-        for field_descriptor in described.get("fields", []):
-            if field_descriptor.get("status") != control_descriptors.STATUS_OK:
-                continue
-            name = f"{field_descriptor.get('class_type')}/{field_descriptor.get('field')}"
-            if name in stored["fields"]:
-                try:
-                    value = control_descriptors.coerce_control_value(field_descriptor["kind"], stored["fields"][name])
-                except control_descriptors.ControlValueError:
-                    continue
-                prompt[field_descriptor["key"]]["inputs"][field_descriptor["field"]] = value
-        if any(stored["controls"].get(c.get("control_id") or "", {}).get("value_text") is not None for c in controls):
-            controls = self._describe(prompt).get("controls", [])  # re-check with the stored values applied
         return {"prompt": prompt, "editor_key": editors[0], "controls": controls, "seed_controls": seed_controls}
 
     async def _submit_runs(self, session: SdkSession, client, build: dict, count: int) -> dict:
@@ -681,7 +715,7 @@ class SdkRunner:
                 entry["seed"] = seed
 
         try:
-            await asyncio.to_thread(sdk_templates.update_control_values, session.template_id, mutate)
+            await await_template_io(sdk_templates.update_control_values, session.template_id, mutate)
         except sdk_templates.TemplateError:
             logger.info("Workflow %s was deleted during Generate; seeds not saved.", session.template_id)
         except Exception:

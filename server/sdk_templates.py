@@ -9,6 +9,9 @@ Install-level files under ``<comfy user dir>/sonder-editor`` (``sdk_paths``):
   projects: ``{"version": 1, "controls": {<control_id>: {...}}, "fields":
   {"<class_type>/<field>": value}}``. Keyed by ``control_id`` so values survive
   re-import. Values of Controls a re-import removed are kept but ignored.
+  ``notes`` stores view-only Markdown by ``control:<id>`` or ``note:<id>``;
+  ``seq`` orders changes and seed advances. Notes/layout reset on re-import,
+  bound to the export's SHA-256 ``presentation_hash`` for crash recovery.
 - ``sdk_state/<project folder>.json`` — the SDK editor position (the 13 relayed
   editor values) per project, shared across workflows; last writer wins.
 
@@ -17,7 +20,10 @@ Everything here blocks on disk or on describe: call it off the event loop.
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -35,6 +41,7 @@ MAX_TEMPLATE_BYTES = 8 * 1024 * 1024
 MAX_TEMPLATES = 200
 MAX_NAME_LENGTH = 120
 CONTROLS_VERSION = 1
+logger = logging.getLogger(__name__)
 
 # The 13 editor values a mounted host relays (``session_registry.WIDGET_FIELD_NAMES``),
 # which are also what the SDK host stores. Kept as a literal list here so this module
@@ -284,7 +291,7 @@ def import_template(raw: bytes, *, source_name: str = "", name: str = "", valida
 
 def replace_template(template_id: str, raw: bytes, *, source_name: str = "", validate=validate_template) -> dict:
     """Re-import over an existing workflow, keeping its id and Control values."""
-    json_path, meta_path, _ = _template_paths(template_id)
+    json_path, meta_path, controls_path = _template_paths(template_id)
     prompt = parse_template_bytes(raw)
     validation = validate(prompt)
     if not validation["ok"]:
@@ -299,9 +306,43 @@ def replace_template(template_id: str, raw: bytes, *, source_name: str = "", val
             "validation": validation,
         })
         meta.setdefault("name", _name_from_source(source_name))
-        _write_bytes_atomic(json_path, raw)
-        write_json_atomic(meta_path, meta)
-    return _public_meta(template_id, meta)
+        data = read_control_values(template_id)
+        notes_reset = len(data["notes"])
+        layout_reset = len(data.get("layout", {})) if isinstance(data.get("layout"), dict) else 0
+        data.update(notes={}, layout={}, presentation_hash=hashlib.sha256(raw).hexdigest(), seq=data["seq"] + 1)
+        # The file lock makes the three writes one transaction for live readers.
+        # Restore exact bytes on a failed write. The hash binding below also
+        # prevents old notes appearing over a new export after a process crash.
+        paths = (json_path, controls_path, meta_path)
+        before = {}
+        for path in paths:
+            before[path] = _read_bytes(path)
+        written = []
+        try:
+            _write_bytes_atomic(json_path, raw)
+            written.append(json_path)
+            write_json_atomic(controls_path, data)
+            written.append(controls_path)
+            write_json_atomic(meta_path, meta)
+        except BaseException:
+            for path in reversed(written):
+                try:
+                    if before[path] is None:
+                        os.remove(path)
+                    else:
+                        _write_bytes_atomic(path, before[path])
+                except OSError:
+                    logger.exception("Could not restore workflow file %s", path)
+            raise
+    return {**_public_meta(template_id, meta), "notes_reset": notes_reset, "layout_reset": layout_reset}
+
+
+def _read_bytes(path: str) -> bytes | None:
+    try:
+        with open(path, "rb") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return None
 
 
 def rename_template(template_id: str, name: Any) -> dict:
@@ -357,20 +398,34 @@ def _write_bytes_atomic(path: str, data: bytes) -> None:
 
 # ── Control values ───────────────────────────────────────────────────────────
 
-def _normalized_controls(data: dict) -> dict:
+def _normalized_controls(data: dict, presentation_hash: str) -> dict:
     data = dict(data)
     data["version"] = CONTROLS_VERSION
     if not isinstance(data.get("controls"), dict):
         data["controls"] = {}
     if not isinstance(data.get("fields"), dict):
         data["fields"] = {}
+    if not isinstance(data.get("notes"), dict):
+        data["notes"] = {}
+    if data.get("presentation_hash") != presentation_hash:
+        data["notes"] = {}
+        data.pop("layout", None)
+    data["presentation_hash"] = presentation_hash
+    seq = data.get("seq")
+    data["seq"] = seq if isinstance(seq, int) and not isinstance(seq, bool) and seq >= 0 else 0
     return data
+
+
+def _presentation_hash(template_id: str) -> str:
+    json_path, _, _ = _template_paths(template_id)
+    with open(json_path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
 
 
 def read_control_values(template_id: str) -> dict:
     _, _, controls_path = _template_paths(template_id)
     with template_lock(template_id):
-        return _normalized_controls(read_json_sidecar(controls_path))
+        return _normalized_controls(read_json_sidecar(controls_path), _presentation_hash(template_id))
 
 
 def update_control_values(template_id: str, mutate: Callable[[dict], None]) -> dict:
@@ -383,10 +438,97 @@ def update_control_values(template_id: str, mutate: Callable[[dict], None]) -> d
     with template_lock(template_id):
         if not os.path.isfile(json_path):
             raise TemplateError("Unknown workflow.", "unknown_template", 404)
-        data = _normalized_controls(read_json_sidecar(controls_path))
+        data = _normalized_controls(read_json_sidecar(controls_path), _presentation_hash(template_id))
         mutate(data)
+        data["seq"] += 1
         write_json_atomic(controls_path, data)
         return data
+
+
+def apply_stored_values(prompt: dict, described: dict, stored: dict, *, describe=None) -> dict:
+    """Apply execution values to the prompt and presentation edits to a view only.
+
+    Generate and Controls GET share this authority. Re-describing the resulting
+    prompt rechecks bounds/errors, including a stored seed. Notes never alter a
+    prompt input or its execution-cache identity.
+    """
+    cd = control_descriptors
+    stored_controls, stored_fields = stored.get("controls", {}), stored.get("fields", {})
+    changed = False
+    for control in described.get("controls", []):
+        identity = control.get("control_id")
+        if not identity or control.get("status") in (cd.STATUS_DUPLICATE, cd.STATUS_MISSING_ID):
+            continue
+        entry = stored_controls.get(identity, {})
+        if not isinstance(entry, dict):
+            continue
+        for key in control.get("keys", []):
+            inputs = prompt[key]["inputs"]
+            if isinstance(entry.get("value_text"), str):
+                inputs["value_text"] = entry["value_text"]
+                changed = True
+            seed = entry.get("seed")
+            if control.get("kind") == "SEED" and isinstance(seed, int) and not isinstance(seed, bool):
+                inputs["seed"] = seed
+                changed = True
+    for field in described.get("fields", []):
+        name = f"{field.get('class_type')}/{field.get('field')}"
+        if field.get("status") != cd.STATUS_OK or name not in stored_fields:
+            continue
+        try:
+            value = cd.coerce_control_value(field["kind"], stored_fields[name])
+            cd.check_value_for_target(value, field)
+        except cd.ControlValueError:
+            continue
+        prompt[field["key"]]["inputs"][field["field"]] = value
+        changed = True
+    view = copy.deepcopy((describe or cd.describe_controls)(prompt) if changed else described)
+    for control in view.get("controls", []):
+        entry = stored_controls.get(control.get("control_id"), {})
+        entry = entry if isinstance(entry, dict) else {}
+        if control.get("kind") != "SEED":
+            continue
+        seed = entry.get("seed")
+        if isinstance(seed, int) and not isinstance(seed, bool) and control.get("status") not in (cd.STATUS_DUPLICATE, cd.STATUS_MISSING_ID):
+            control["seed"] = seed
+        mode = entry.get("seed_mode")
+        control["seed_mode"] = mode if mode in cd.SEED_MODES else (
+            control.get("seed_mode") if control.get("seed_mode") in cd.SEED_MODES else "randomize")
+    for descriptors, identity_key, text_key, prefix in (
+        (view.get("controls", []), "control_id", "note", "control"),
+        (view.get("notes", []), "note_id", "text", "note"),
+    ):
+        for descriptor in descriptors:
+            if not descriptor.get(identity_key) or descriptor.get("status") in (cd.STATUS_DUPLICATE, cd.STATUS_MISSING_ID):
+                continue
+            text = stored.get("notes", {}).get(f"{prefix}:{descriptor[identity_key]}")
+            if isinstance(text, str) and not descriptor.get("note_truncated"):
+                descriptor[text_key] = text[:cd.PANEL_NOTE_MAX_CHARS]
+                if len(text) > cd.PANEL_NOTE_MAX_CHARS:
+                    descriptor["note_truncated"] = True
+    return view
+
+
+def store_control_changes(template_id: str, changes: dict) -> dict:
+    """Persist already validated targets through the canonical sidecar mutator."""
+    def mutate(data):
+        for target, value in changes.items():
+            if target.startswith("field:"):
+                data["fields"][target[6:]] = value
+                continue
+            base, field = target.rsplit(":", 1)
+            if field in ("note", "text"):
+                data["notes"][base] = value
+                continue
+            identity = base[len("control:"):]
+            entry = data["controls"].get(identity)
+            if not isinstance(entry, dict):
+                entry = data["controls"][identity] = {}
+            if field == "value":
+                entry["value_text"] = str(value).lower() if isinstance(value, bool) else str(value)
+            else:
+                entry[field] = value
+    return update_control_values(template_id, mutate)
 
 
 # ── SDK editor position ──────────────────────────────────────────────────────

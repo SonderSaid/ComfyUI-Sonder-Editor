@@ -13,15 +13,16 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import logging
 import os
 from typing import Any, Awaitable, Callable
 
 from aiohttp import web
 
-from . import sdk_install, sdk_proxy, sdk_templates
+from . import control_descriptors, sdk_install, sdk_proxy, sdk_templates
 from .sdk_install import install_state
-from .sdk_runner import SdkError, get_runner
+from .sdk_runner import SdkError, await_template_io, get_runner
 
 logger = logging.getLogger("sonder_editor")
 
@@ -273,7 +274,7 @@ def register_sdk_routes(
         template_id = sdk_templates.check_template_id(request.match_info.get("template_id"))
         raw = await _read_capped(request, sdk_templates.MAX_TEMPLATE_BYTES)
         async with runner.template_lock(template_id):  # never mid-Generate
-            template = await asyncio.to_thread(
+            template = await await_template_io(
                 sdk_templates.replace_template, template_id, raw, source_name=request.query.get("source_name", ""),
             )
         return web.json_response({"ok": True, "template": template})
@@ -291,7 +292,7 @@ def register_sdk_routes(
     async def api_sdk_delete_template(request: web.Request) -> web.Response:
         template_id = sdk_templates.check_template_id(request.match_info.get("template_id"))
         async with runner.template_lock(template_id):  # never mid-Generate
-            await asyncio.to_thread(sdk_templates.delete_template, template_id)
+            await await_template_io(sdk_templates.delete_template, template_id)
         return web.json_response({"ok": True})
 
     # ── Sessions ─────────────────────────────────────────────────────────────
@@ -322,6 +323,29 @@ def register_sdk_routes(
             "template_name": runner.template_name(session),
             "values": values,
         })
+
+    @routes.get("/sonder-editor/sdk/session/{session_id}/controls")
+    @handle
+    async def api_sdk_controls(request: web.Request) -> web.Response:
+        session = runner.session_for(request.match_info.get("session_id", ""), _secret(request))
+        snapshot = await runner.controls_view(session)
+        view = await asyncio.to_thread(control_descriptors.json_safe, snapshot["view"])
+        return web.json_response({"ok": True, "view": view, "seq": snapshot["seq"]})
+
+    @routes.put("/sonder-editor/sdk/session/{session_id}/controls")
+    @handle
+    async def api_sdk_change_controls(request: web.Request) -> web.Response:
+        session_id = request.match_info.get("session_id", "")
+        await runner.authorized(session_id, _secret(request), _tab(request))
+        raw = await _read_capped(request, 512 * 1024)
+        try:
+            body = await asyncio.to_thread(json.loads, raw)
+        except (ValueError, UnicodeError):
+            body = None
+        snapshot = await runner.change_controls(
+            session_id, _secret(request), _tab(request), body.get("changes") if isinstance(body, dict) else None)
+        view = await asyncio.to_thread(control_descriptors.json_safe, snapshot["view"])
+        return web.json_response({"ok": True, "view": view, "seq": snapshot["seq"]})
 
     @routes.get("/sonder-editor/sdk/session/{session_id}/status")
     @handle
