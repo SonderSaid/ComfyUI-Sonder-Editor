@@ -477,7 +477,7 @@ const VALID_CLIP_LABEL_MODES = new Set(CLIP_LABEL_MODE_OPTIONS.map((entry) => en
 const VALID_CLIP_LABEL_VERTICAL_ALIGNS = new Set(CLIP_LABEL_VERTICAL_ALIGN_OPTIONS.map((entry) => entry.value));
 const VALID_CLIP_LABEL_HORIZONTAL_ALIGNS = new Set(CLIP_LABEL_HORIZONTAL_ALIGN_OPTIONS.map((entry) => entry.value));
 const VALID_TIMECODE_MODES = new Set(TIMECODE_MODE_OPTIONS.map((entry) => entry.value));
-const VALID_FULLSCREEN_SIDEBAR_CONTENT = new Set(["assets", "references"]);
+const VALID_FULLSCREEN_SIDEBAR_CONTENT = new Set(["assets", "references", "controls"]);
 const VALID_SAVE_PRESETS = new Set(SAVE_PRESET_OPTIONS.map((entry) => entry.value));
 const VALID_SNAP_TARGETS = new Set(SNAP_TARGET_OPTIONS.map((entry) => entry.key));
 const BUILTIN_MODEL_TEMPLATE_IDS = new Set(BUILTIN_MODEL_TEMPLATES.map((entry) => entry.id));

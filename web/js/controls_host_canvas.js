@@ -10,6 +10,22 @@ const valuesOf = map => map?.values ? [...map.values()] : Object.values(map || {
 const refused = (changes, reason) => ({ok: false,
     rejected: Object.keys(changes || {}).map(target => ({target, reason}))});
 
+async function promptHash(text) {
+    if (globalThis.crypto?.subtle) {
+        const bytes = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+        return [...new Uint8Array(bytes)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+    }
+    // HTTP LAN origins lack Web Crypto. This bounded fingerprint only detects
+    // stale views; registry ownership and fresh graph comparison gate writes.
+    let a = 0x811c9dc5, b = 0x9e3779b9;
+    for (let i = 0; i < text.length; i++) {
+        const c = text.charCodeAt(i);
+        a = Math.imul(a ^ c, 0x01000193);
+        b = Math.imul(b ^ c, 0x85ebca6b);
+    }
+    return `local:${(a >>> 0).toString(16).padStart(8, "0")}${(b >>> 0).toString(16).padStart(8, "0")}`;
+}
+
 function graphsOf(root) {
     const seen = new Set(), pending = [root];
     while (pending.length) {
@@ -108,7 +124,11 @@ export function createCanvasControlsHost({app, api, getEditorNode, setEditorSett
 
     async function refresh(force = false) {
         if (destroyed || (!needed() && !force)) return view;
-        if (active) { trailing = true; return active; }
+        if (active) {
+            if (!force) { trailing = true; return active; }
+            await active;
+            return refresh(true);
+        }
         const id = identity(), stamp = epoch;
         active = (async () => {
             try {
@@ -210,17 +230,25 @@ export function createCanvasControlsHost({app, api, getEditorNode, setEditorSett
         return [...byWidget.values()];
     }
 
-    async function write(changes) {
+    async function write(changes, { expectedPromptHash = null, canApply = () => true } = {}) {
         if (destroyed) return refused(changes, "The Controls panel has closed.");
         const id = identity(), stamp = ++epoch;
         try {
             const shot = await snapshot(id);
             if (!isCurrent(id, stamp)) return refused(changes, "The workflow changed. Try again.");
+            if (!await canApply() || !isCurrent(id, stamp) || (expectedPromptHash && await promptHash(shot.hash) !== expectedPromptHash)) {
+                return refused(changes, "The workflow changed. Try again.");
+            }
             const raw = await describe(shot, changes);
             if (!isCurrent(id, stamp) || (await snapshot(id)).hash !== shot.hash || !isCurrent(id, stamp)) {
                 return refused(changes, "The workflow changed. Try again.");
             }
             if (!raw.ok) return {ok: false, rejected: raw.rejected || []};
+            if (!await canApply()) return refused(changes, "This tab no longer owns the editor.");
+            // An asynchronous permission check can overlap a native graph edit.
+            if (!isCurrent(id, stamp) || (await snapshot(id)).hash !== shot.hash || !isCurrent(id, stamp)) {
+                return refused(changes, "The workflow changed. Try again.");
+            }
             const writes = operations(raw, raw.changes, id.root);
             const tracker = getChangeTracker();
             if (typeof tracker?.captureCanvasState !== "function") throw new Error("Workflow history is unavailable.");
@@ -254,8 +282,10 @@ export function createCanvasControlsHost({app, api, getEditorNode, setEditorSett
         setVisible: value => visibility("local", value),
         setMountedVisible: value => visibility("mounted", value),
         refresh,
-        applyChanges(changes) {
-            const run = writeTail.then(() => write(changes));
+        getPromptHash: async () => promptHash((await snapshot(identity())).hash),
+        applyChanges(changes, options) {
+            const owned = { ...changes };
+            const run = writeTail.then(() => write(owned, options));
             writeTail = run.catch(() => {});
             return run;
         },

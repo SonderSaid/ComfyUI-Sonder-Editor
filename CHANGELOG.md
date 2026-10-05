@@ -12,6 +12,7 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Added
+- Controls sidebar in fullscreen, mounted tabs and the Sonder App: edit workflow values, seed modes and Markdown notes beside shared take settings.
 - Sonder Panel Note node and a Markdown Panel note field on Sonder Control let workflow authors include titles, instructions and explanations in API exports.
 - Sonder Control node: one named value you wire to the inputs it should drive, such as steps, CFG, a sampler, a LoRA or a seed. Its type follows what it is connected to (you pick it when the input accepts any type), and a value outside an input's range or options stops the run with a message naming the Control.
 

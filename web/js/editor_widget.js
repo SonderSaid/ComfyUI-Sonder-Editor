@@ -366,6 +366,7 @@ function sessionDiagEndLoad(kind, markerId, payload) {
 
 import { INSPECT_OVERLAY_SHORTCUTS, mountSharedAssetGallery, getActiveDragAsset } from "./shared_asset_gallery.js";
 import { getActiveReferenceDrag, mountReferenceLibrary, referenceMemberMediaKind, SONDER_REFERENCE_MIME } from "./editor_reference_library.js";
+import { mountControlsPanel } from "./editor_controls_panel.js";
 import { openReferenceMediaEditor, REFERENCE_MEDIA_EDITOR_SHORTCUTS } from "./reference_media_editor.js";
 import {
     applyPendingRecipeOverlays,
@@ -933,6 +934,9 @@ export class EditorWidget {
         this.onWidgetValueChange = options.onWidgetValueChange || null;
         this.onWidgetStateApplied = options.onWidgetStateApplied || null;
         this.widgetHost = options.host || this._createNodeWidgetHost(node);
+        this._controlsHost = options.controlsHost || this.widgetHost.getControlsHost?.() || node?._sonderController?.getControlsHost?.() || null;
+        this._controlsPanelHandle = null;
+        if (this._generationHost) this._generationHost.flushControlsPanel = () => this._controlsPanelHandle?.flushPending() ?? true;
         this.projectDir = "";
         this.projectId = "";
         this._frameConstraintHealedFor = "";
@@ -4504,6 +4508,19 @@ export class EditorWidget {
         this._referenceMediaEditorHandle = handle;
     }
 
+    _ensureControlsPanelMounted() {
+        if (!this._fsSidebar || this._controlsPanelHandle) return;
+        this._controlsPanelEl = document.createElement("div");
+        this._fsSidebar.append(this._controlsPanelEl);
+        const adapter = this._controlsHost || { getView: () => ({ controls: [], fields: [], notes: [], error: "Open a connected workflow to edit its controls." }), subscribe: () => () => {}, applyChanges: async () => ({ ok: false }) };
+        this._controlsPanelHandle = mountControlsPanel(this._controlsPanelEl, {
+            ...adapter,
+            getEditorSettings: () => this._settings,
+            setEditorSetting: (key, value) => this._updateSettings({ render: { [key.split(".")[1]]: !!value } }),
+            notify: message => notifyWarning(message, { source: "controls-save" }),
+        });
+    }
+
     _ensureReferenceLibraryMounted() {
         if (!this._fsSidebar || this._referenceLibraryHandle) return;
         this._referenceLibraryEl = document.createElement("div");
@@ -4578,7 +4595,12 @@ export class EditorWidget {
     }
 
     _showFullscreenSidebarContent(value, { persist = true } = {}) {
-        const mode = value === "references" ? "references" : "assets";
+        const mode = ["references", "controls"].includes(value) ? value : "assets";
+        if (mode === "controls") this._ensureControlsPanelMounted();
+        else void this._controlsPanelHandle?.flushPending();
+        this._controlsHost?.setVisible(mode === "controls" && this.isFullscreen);
+        if (this._controlsPanelEl) this._controlsPanelEl.style.display = mode === "controls" ? "flex" : "none";
+        if (this._fsControlsTab) this._fsControlsTab.dataset.active = mode === "controls" ? "true" : "false";
         this._ensureReferenceLibraryMounted();
         if (this.galleryEl) this.galleryEl.style.display = mode === "assets" ? "flex" : "none";
         if (this._referenceLibraryEl) this._referenceLibraryEl.style.display = mode === "references" ? "flex" : "none";
@@ -4587,7 +4609,7 @@ export class EditorWidget {
         }
         if (this._fsAssetsTab) this._fsAssetsTab.dataset.active = mode === "assets" ? "true" : "false";
         if (this._fsReferencesTab) this._fsReferencesTab.dataset.active = mode === "references" ? "true" : "false";
-        for (const button of [this._fsAssetsTab, this._fsReferencesTab]) {
+        for (const button of [this._fsAssetsTab, this._fsReferencesTab, this._fsControlsTab]) {
             if (!button) continue;
             const active = button.dataset.active === "true";
             button.style.color = active ? COLORS.text : COLORS.textMuted;
@@ -10478,6 +10500,7 @@ export class EditorWidget {
         const nextMarginSignature = JSON.stringify(nextSettings?.appearance?.editorMargins || {});
         const marginsChanged = prevMarginSignature !== nextMarginSignature;
         this._settings = nextSettings;
+        this._controlsPanelHandle?.render();
         this._syncTakePlacementModeWidget(nextSettings);
         const resolvedTemplateId = getTemplateById(this._templateId, nextSettings).id;
         const templateChanged = resolvedTemplateId !== this._templateId;
@@ -22457,6 +22480,11 @@ export class EditorWidget {
                 ["Arrow keys / Enter", "Move through the menu and choose"],
                 ["Shift+Enter", "Line break (Enter commits a single-field box; a line break in the Writing draft)"],
             ]) +
+            this._shortcutSection("Controls notes", [
+                ["Double-click note", "Edit panel Markdown"],
+                ["Ctrl+Enter", "Save the focused note without queuing a run"],
+                ["Esc", "Cancel the focused note without leaving fullscreen"],
+            ]) +
             this._shortcutSection("Asset Gallery", [
                 ["Arrow keys", "Move asset focus / selection"],
                 ["Space", "Open inspect overlay for focused asset"],
@@ -23309,7 +23337,8 @@ export class EditorWidget {
         };
         this._fsAssetsTab = makeSidebarTab("Assets", "assets");
         this._fsReferencesTab = makeSidebarTab("References", "references");
-        this._fsSidebarHeader.append(this._fsAssetsTab, this._fsReferencesTab);
+        this._fsControlsTab = makeSidebarTab("Controls", "controls");
+        this._fsSidebarHeader.append(this._fsAssetsTab, this._fsReferencesTab, this._fsControlsTab);
         this._fsSidebar.appendChild(this._fsSidebarHeader);
 
         // Sidebar resize handle
@@ -23599,6 +23628,7 @@ export class EditorWidget {
 
         // Set fullscreen state + recalc
         this.isFullscreen = true;
+        this._controlsHost?.setVisible(this._settings?.layout?.fullscreenSidebarContent === "controls");
         EditorWidget._activeFullscreen = this;
         // Initial entry and project load share a wave; explicit events do not.
         this._sweepRenderCache(undefined, { generation: this._renderCacheSweepGeneration });
@@ -23646,6 +23676,8 @@ export class EditorWidget {
         this._renderCacheSweepSeq += 1;
         this._renderCacheSweepInFlight = null;
         if (!this.isFullscreen) return;
+        void this._controlsPanelHandle?.flushPending();
+        this._controlsHost?.setVisible(false);
 
         // Stop playback before exiting
         this._stopPlayback();
@@ -29368,6 +29400,10 @@ export class EditorWidget {
             this._assetGallery.destroy();
             this._assetGallery = null;
         }
+        this._controlsPanelHandle?.destroy();
+        this._controlsPanelHandle = null;
+        this._controlsHost?.setVisible(false);
+        if (this._generationHost) this._generationHost.flushControlsPanel = null;
         if (this._referenceLibraryHandle) {
             this._referenceLibraryHandle.destroy();
             this._referenceLibraryHandle = null;

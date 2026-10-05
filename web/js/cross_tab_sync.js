@@ -45,6 +45,9 @@ export function connectProjectSync(projectId, handlers = {}, options = {}) {
             // Sonder App run status, about 5 Hz while takes generate. Ordered by
             // the session's `seq`; the host drops stale snapshots (sdk_host.js).
             else if (event.type === "generation_status") handlers.onGenerationStatus?.(event);
+            else if (event.type === "controls_changed") handlers.onControlsChanged?.(event);
+            else if (event.type === "control_changes_pending") handlers.onControlChangesPending?.(event);
+            else if (event.type === "controls_visibility_changed") handlers.onControlsVisibilityChanged?.(event);
         } catch (err) {
             console.warn("[Sonder] sync event handler failed:", err);
         }

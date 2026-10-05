@@ -31,6 +31,7 @@ import {
 } from "./editor_session_client.js";
 import { connectProjectSync } from "./cross_tab_sync.js";
 import { createCanvasControlsHost } from "./controls_host_canvas.js";
+import { createCanvasControlsRelay } from "./controls_canvas_relay.js";
 import { EditorWidget, buildProjectAssetViewURL, importFileIntoProject, replaceAssetInProject, importFailureMessage } from "./editor_widget.js";
 import { loadMediaAsBlob, mountSharedAssetGallery } from "./shared_asset_gallery.js";
 import { deriveCurrentSceneAssetIds } from "./current_scene_assets.js";
@@ -781,6 +782,7 @@ class FullscreenEditorSession {
 
         const state = this.controller.state;
         const editor = new EditorWidget(this.controller.node, {
+            controlsHost: this.controller.getControlsHost(),
             onFullscreenExit: () => this._handleEditorClosed(),
             onMountInTab: () => this.controller.mountFullscreenInTab(),
             onWidgetValueChange: (name, value) => this.controller.onEditorWidgetValueChange(name, value),
@@ -1816,6 +1818,9 @@ export class EditorNodeController {
     }
 
     _teardownProjectSync({ preserveRetry = false } = {}) {
+        this._controlsRelay?.destroy();
+        this._controlsRelay = null;
+        this._controlsHost?.setMountedVisible(false);
         if (!preserveRetry) {
             clearTimeout(this._syncRetryTimer);
             this._syncRetryTimer = null;
@@ -1914,14 +1919,21 @@ export class EditorNodeController {
         this._syncHostId = hostId;
         this._syncSourceNodeId = sourceNodeId;
         this._syncSubscribed = false;
+        this._controlsRelay = createCanvasControlsRelay({
+            host: this.getControlsHost(), api,
+            identity: () => ({ projectId: this._projectId(), hostId: this._hostId(), sessionId: this._editorSessionId }),
+            connected: () => this._syncSubscribed && this.state.syncConnectionState === "open",
+        });
         this._startCanvasHostHeartbeat(projectId, hostId, sourceNodeId);
         this._syncConnection = connectProjectSync(projectId, {
             onProjectUpdated: (event) => this._handleProjectUpdatedFromSync(event),
             onWidgetStateChanged: (event) => this._handleWidgetStateChanged(event),
             onSessionChanged: (event) => this._handleSessionChanged(event),
             onHostPresenceChanged: (event) => this._handleHostPresenceChanged(event),
-            onSubscribed: (event) => this._handleSyncSubscribed(event),
+            onSubscribed: (event) => { this._handleSyncSubscribed(event); void this._controlsRelay?.cycle(); },
             onRunFinished: (event) => this._handleRunFinished(event),
+            onControlChangesPending: (event) => { if (event.host_id === this._hostId()) void this._controlsRelay?.cycle(); },
+            onControlsVisibilityChanged: (event) => { if (event.host_id === this._hostId()) void this._controlsRelay?.cycle(); },
             onConnectionState: (state, details = {}) => {
                 if (state !== "open") this._syncSubscribed = false;
                 this._recordDiagEvent("sync_transport_state", { state, url: details.url || "" });
@@ -2186,7 +2198,9 @@ export class EditorNodeController {
             same_session: normalized?.session_id === this._editorSessionId,
         });
         this.state.lastOwnerSignature = signature;
+        // Registry queue membership gates writes; delayed owner reads cannot erase ACK deduplication.
         this.state.activeOwner = normalized;
+        void this._controlsRelay?.cycle();
         this.state.sessionStatus = normalized?.status || "";
 
         this._reconcileOwnerStateEffects(normalized, source);

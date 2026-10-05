@@ -627,7 +627,10 @@ export function buildEditorToolbar(widget) {
             makeStepButtons,
             buttonOptions: BUTTON_OPTIONS,
             // Pending timeline edits must be saved before the run reads the project.
-            beforeGenerate: () => widget._drainProjectMutations?.("sdk_generate"),
+            beforeGenerate: async () => {
+                if (widget._controlsPanelHandle && !await widget._controlsPanelHandle.flushPending()) throw new Error("A control edit was not saved.");
+                await widget._drainProjectMutations?.("sdk_generate");
+            },
             renderCacheMaxBytes: () => renderCacheMaxBytes(widget._settings || getEditorSettings()),
         })
         : null;

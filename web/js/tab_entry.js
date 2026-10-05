@@ -4,6 +4,7 @@ import { mountToastStack } from "./editor_toast_stack.js";
 import { configureNotifications } from "./editor_notifications.js";
 import { notificationCoreConfig, subscribeEditorSettings } from "./editor_settings.js";
 import { LAUNCHER_WINDOW_NAME } from "./sdk_setup_client.js";
+import { createMountedControlsHost } from "./controls_host_remote.js";
 
 installComfyApiShim();
 injectSonderFontFaces();
@@ -655,9 +656,11 @@ async function main() {
     host.setSessionStatus(claim.owner?.status || "active");
     host.setPublishingEnabled(true);
 
+    const controlsHost = createMountedControlsHost({ projectId, hostId, sessionId,
+        apiURL: path => api.apiURL(path), canWrite: () => host.sessionStatus === "active" && host.canvasHostConnected });
     const node = projectWidgetNode();
     const editor = new EditorWidget(node, {
-        host,
+        host, controlsHost,
         hostMode: "tab",
         onFullscreenExit: () => window.close(),
     });
@@ -828,6 +831,7 @@ async function main() {
             });
             if (String(state.host_id || hostId) !== hostId) return;
             if (state.source_node_id && String(state.source_node_id) !== sourceNodeId) return;
+            controlsHost.presence(state);
             const changed = setCanvasConnected(!!state.canvas_host_connected);
             if (changed) updatePill();
             if (state.canvas_host_connected || !tabDebugEnabled) return;
@@ -904,12 +908,15 @@ async function main() {
             host.apply(values);
             editor.applyWidgetState(values);
         },
+        onControlsChanged: (event) => controlsHost.changed(event),
         onHostPresenceChanged: (event) => {
+            controlsHost.presence(event);
             if (String(event.host_id || "") !== hostId) return;
             if (String(event.source_node_id || "") !== sourceNodeId) return;
             if (setCanvasConnected(!!event.canvas_host_connected)) updatePill();
         },
         onSubscribed: (event) => {
+            void controlsHost.refresh(true);
             if (event.host_id && String(event.host_id) !== hostId) return;
             if (event.source_node_id && String(event.source_node_id) !== sourceNodeId) return;
             if (Object.prototype.hasOwnProperty.call(event, "canvas_host_connected")) {
@@ -1018,6 +1025,7 @@ async function main() {
         }
         clearInterval(heartbeat);
         clearInterval(hostPresencePoll);
+        controlsHost.destroy();
         try {
             editor?._drainProjectMutations?.("tab_pagehide").catch(() => {});
         } catch (_err) {}

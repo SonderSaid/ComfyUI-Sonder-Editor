@@ -244,6 +244,8 @@ adapters, grouped under the `Sonder`, `Sonder/IO`, `Sonder/Logic`, and
 | **Sonder Control** | One named value, wired to the widget inputs it should drive (steps, CFG, a sampler or LoRA name, a seed). The node's title is its label; Panel note adds a Markdown explanation. Its type follows what it is connected to (you pick it when the input accepts any type), and it checks its value against each input's range and options, because ComfyUI skips those checks for a linked input. Inputs that check their value before the run, such as Load Image, refuse the link. |
 | **Sonder Panel Note** | Markdown text for a Controls panel title, introduction or instructions. Panel order and group place it among the Controls. It has no connections and travels with an Export (API) workflow. |
 
+Open the **Controls** sidebar in fullscreen, a mounted tab or the Sonder App to edit those values and seed modes alongside take settings. Double-click a note to edit its Markdown; Ctrl+Enter saves and Esc cancels. Canvas edits live in the workflow. Sonder App edits are saved per imported workflow; re-import keeps values and seed modes while resetting notes and layout.
+
 > **Sonder Switch**, **Sonder Cluster**, **Sonder Gate**, **Sonder Reference Selector**, the three
 > **Sonder Reference Bridges**, **Sonder Control**, **Sonder Panel Note**, and
 > **Sonder Metadata Collector Nodes 2.0** use ComfyUI's

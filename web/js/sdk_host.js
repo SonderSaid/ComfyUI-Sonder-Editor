@@ -9,6 +9,8 @@
 //
 // No DOM here: tab_entry.js owns the page, generate_controls.js the toolbar.
 
+import { createSdkControlsHost } from "./controls_host_remote.js";
+
 export const SDK_SECRET_KEY_PREFIX = "sonder-sdk-session:";
 export const SDK_EXIT_FLAG_KEY = "sonder-sdk-exit";
 export const SDK_SECRET_HEADER = "X-Sonder-SDK-Session";
@@ -128,10 +130,17 @@ export class SdkWidgetHost {
         this._flushTimer = null;
         this._inflightFlush = null;
         this._listeners = new Set();
+        this._controlsHost = null;
+        this.flushControlsPanel = null;
         this._destroyed = false;
     }
 
     // ── EditorWidget host contract ─────────────────────────────────────────
+
+    getControlsHost() {
+        if (!this._controlsHost) this._controlsHost = createSdkControlsHost(this);
+        return this._controlsHost;
+    }
 
     getValue(name, defaultValue = 0) {
         return Object.prototype.hasOwnProperty.call(this.values, name) ? this.values[name] : defaultValue;
@@ -346,6 +355,13 @@ export class SdkWidgetHost {
     // (`generate_refused`) or submit; any earlier refusal saved nothing, so the
     // pending edits are put back for the next save.
     async generate(count, { renderCacheMaxBytes = 0 } = {}) {
+        if (this.flushControlsPanel && !await this.flushControlsPanel()) {
+            return { ok: false, status: 409, payload: { code: "controls_not_saved", error: "A control edit was not saved." } };
+        }
+        const controlsSaved = await this._controlsHost?.flush();
+        if (controlsSaved?.ok === false) {
+            return { ok: false, status: 409, payload: { code: "controls_not_saved", error: controlsSaved.rejected?.[0]?.reason } };
+        }
         const n = Math.max(1, Math.min(SDK_MAX_COUNT, Math.round(Number(count) || 1)));
         // An older save still in flight must not land after this one.
         if (this._inflightFlush) await this._inflightFlush.catch(() => {});
@@ -373,6 +389,7 @@ export class SdkWidgetHost {
         const code = String(result.payload.code || "");
         if (!saved) this._restoreDirty(dirty, { schedule: !["not_owner", "session_ended", "network"].includes(code) });
         if (!result.ok) this._noteRefusal(result);
+        await this._controlsHost?.refresh();
         return result;
     }
 
@@ -392,6 +409,8 @@ export class SdkWidgetHost {
 
     destroy() {
         this._destroyed = true;
+        this._controlsHost?.destroy();
+        this.flushControlsPanel = null;
         if (this._flushTimer != null) this._clearTimeout(this._flushTimer);
         this._flushTimer = null;
         this._listeners.clear();
