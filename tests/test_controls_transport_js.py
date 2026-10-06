@@ -34,14 +34,18 @@ if(SCENARIO.startsWith('sdk')){
         const put=calls.find(c=>c.method==='PUT');assert.equal(put.headers['X-Sonder-SDK-Session'],'secret');assert.equal(put.headers['X-Sonder-Tab-Session'],'tab');
     }
     if(SCENARIO==='sdk-refusal'){fail=true;assert.equal((await host.applyChanges({'control:n:value':'bad'})).ok,false);
-        assert.equal((await owner.generate(1)).payload.code,'controls_not_saved');assert.equal(calls.some(c=>c.path.endsWith('/generate')),false);}
+        // A settled refusal saved nothing; Generate runs the stored values instead
+        // of repeating that old answer (the panel decides on saves still in flight).
+        const result=await owner.generate(1);assert.equal(result.ok,true);assert.equal(result.payload.observed,'20');
+        assert.equal(calls.filter(c=>c.path.endsWith('/generate')).length,1);}
     if(SCENARIO==='sdk-flush'){owner.flushControlsPanel=async()=>false;assert.equal((await owner.generate(1)).payload.code,'controls_not_saved');assert.equal(calls.some(c=>c.path.endsWith('/generate')),false);}
     owner.destroy();
 }
 if(SCENARIO.startsWith('mounted')){
     let seq=1,pending=[],applied=[],rejected=[],savedSeen=[],gets=0,postingResolve=null,delayHide=false,releaseHide=null,remoteVisible=false;
     const host=remote.createMountedControlsHost({projectId:'P',hostId:'h',sessionId:'tab',apiURL:p=>p,canWrite:()=>true,fetchImpl:async(path,init={})=>{
-        if(path.includes('/controls?')){gets++;return{ok:true,json:async()=>({view:controlsView,view_seq:seq,applied:[...applied],rejected:[...rejected]})};}
+        if(path.includes('/controls?')){gets++;if(controlsView.cleared)return{ok:true,json:async()=>({view:null,view_seq:0,applied:[],rejected:[]})};
+            return{ok:true,json:async()=>({view:controlsView,view_seq:seq,applied:[...applied],rejected:[...rejected]})};}
         const body=JSON.parse(init.body);
         if(path.endsWith('/control_changes')){
             if(SCENARIO==='mounted-order'&&body.changes['control:n:value']==='30')await new Promise(r=>postingResolve=r);
@@ -55,6 +59,22 @@ if(SCENARIO.startsWith('mounted')){
     }});
     host.setVisible(true);await settle();assert.equal(gets,1);
     host.presence({controls_view_seq:1});await settle();assert.equal(gets,1);
+    if(SCENARIO==='mounted-abandon-restart'||SCENARIO==='mounted-abandon-cleared'){
+        host.presence({host:{session_id:'canvas-1'}});await settle();
+        const work=host.applyChanges({'control:n:value':'31'});await settle();
+        if(SCENARIO==='mounted-abandon-restart')host.presence({host:{session_id:'canvas-2'}});
+        else{controlsView.cleared=true;intervalFns.at(-1)();}
+        // The server dropped the relay; the request settles instead of polling forever.
+        const result=await work;assert.equal(result.ok,false);assert.match(result.rejected[0].reason,/canvas (restarted|closed)/);
+        delete controlsView.cleared;const before=gets;intervalFns.at(-1)();await settle();assert.equal(gets,before);
+    }
+    if(SCENARIO==='mounted-abandon-recreated'){
+        host.presence({host:{session_id:'canvas-1'}});seq=5;host.changed({host_id:'h'});await settle();
+        const work=host.applyChanges({'control:n:value':'31'});await settle();
+        // Same canvas session, but its relay was cleared and published afresh.
+        seq=1;host.changed({host_id:'h'});
+        const result=await work;assert.equal(result.ok,false);assert.match(result.rejected[0].reason,/reconnected/);
+    }
     if(SCENARIO==='mounted-ack'){
         let finished=false;const work=host.applyChanges({'control:n:value':'31'}).then(r=>{finished=true;return r;});await settle();assert.equal(finished,false);
         applied=['r'];seq=2;host.changed({host_id:'h'});assert.equal((await work).ok,true);await settle();assert.ok(savedSeen.includes('r'));
@@ -92,6 +112,9 @@ if(SCENARIO.startsWith('relay')){
         if(init.method==='GET')return{ok:true,json:async()=>queue};
         puts++;published=JSON.parse(init.body);
         if(failPut){failPut=false;throw Error('lost response');}
+        // aiohttp refuses an oversized body with plain text, not JSON.
+        if(SCENARIO==='relay-too-large'&&puts===1)return{ok:false,status:413,json:async()=>{throw new SyntaxError('not JSON');}};
+        if(SCENARIO==='relay-invalid-view'&&puts===1)return{ok:false,status:400,json:async()=>({ok:false,code:'invalid_view'})};
         queue={...queue,pending:[],controls_view_seq:published.view_seq};return{ok:true,json:async()=>({ok:true})};
     }}});
     // getView needs ready to publish; raw renderer flags are not durable state.
@@ -108,7 +131,39 @@ if(SCENARIO.startsWith('relay')){
     }
     if(SCENARIO==='relay-stale'){assert.equal(writes,0);assert.equal(published.rejected[0].request_id,'r');}
     if(SCENARIO==='relay-ack'){assert.equal(writes,1);assert.deepEqual(published.applied,['r']);assert.equal(published.view_seq,2);}
+    if(SCENARIO==='relay-invalid-view'){
+        assert.equal(puts,2);assert.deepEqual(published.applied,['r']);assert.match(published.view.error,/could not be shown/);
+    }
+    if(SCENARIO==='relay-too-large'){
+        // The acknowledgement still reaches the tab, with a view saying why.
+        assert.equal(puts,2);assert.deepEqual(published.applied,['r']);assert.match(published.view.error,/too large/);
+        assert.deepEqual(published.view.controls,[]);
+        await relay.cycle();assert.equal(puts,2);
+    }
     relay.destroy();assert.equal(callbacks.size,0);
+}
+if(SCENARIO==='relay-fit'){
+    const {fitPublicationView}=await import(RELAY_URL);
+    const envelope={host_id:'h',session_id:'s',view_seq:1,prompt_hash:'x',applied:[],rejected:[]};
+    const small={controls:[{control_id:'a',status:'ok',kind:'COMBO',options:['x','y'],value:'x'}],fields:[],notes:[]};
+    assert.equal(fitPublicationView(small,envelope),small);
+    const option=i=>'loras/'+'x'.repeat(80)+i+'.safetensors';
+    const combo=id=>({control_id:id,status:'ok',kind:'COMBO',options:Array.from({length:2000},(_,i)=>option(i)),value:option(0)});
+    const capped=fitPublicationView({controls:['a','b','c','d','e'].map(combo),fields:[],notes:[]},envelope);
+    assert.ok(capped.controls.every(d=>d.options.length===200&&d.options_truncated===true));
+    const noted=fitPublicationView({controls:[],fields:[],notes:Array.from({length:140},(_,i)=>({note_id:'n'+i,status:'ok',text:'z'.repeat(4000)}))},envelope);
+    assert.ok(noted.notes.every(d=>d.text.length===500&&d.note_truncated===true));
+    const huge=fitPublicationView({controls:[{control_id:'s',status:'ok',kind:'STRING',value:'v'.repeat(600000)}],fields:[],notes:[]},envelope);
+    assert.match(huge.error,/too large/);
+    // Bytes, not characters: 400 notes of 600 three-byte characters keep their
+    // controls usable by shortening notes further before giving up.
+    const wide=fitPublicationView({controls:[{control_id:'a',status:'ok',kind:'INT',value:'1'}],fields:[],notes:Array.from({length:400},(_,i)=>({note_id:'n'+i,status:'ok',text:'日'.repeat(600)}))},envelope);
+    assert.ok(!wide.error);assert.equal(wide.controls.length,1);assert.ok(wide.notes.every(d=>d.text.length===80&&d.note_truncated));
+    // 180,000 ASCII characters fit by character count but not once a 3-byte character is involved.
+    const ascii={controls:[],fields:[],notes:[{note_id:'x',status:'ok',text:'a'.repeat(180000)}]};
+    assert.equal(fitPublicationView(ascii,envelope),ascii);
+    const multibyte=fitPublicationView({controls:[],fields:[],notes:[{note_id:'x',status:'ok',text:'日'.repeat(180000)}]},envelope);
+    assert.equal(multibyte.notes[0].text.length,500);
 }
 if(SCENARIO==='canvas-http'||SCENARIO==='relay-error-recovery'||SCENARIO==='canvas-revoked'){
     const editor={id:1,type:'SonderEditor'},ctl={id:2,type:'SonderControl',widgets:[{name:'control_id',value:'n'},{name:'value_text',value:'20'}]};
@@ -138,7 +193,7 @@ if(SCENARIO==='canvas-http'||SCENARIO==='relay-error-recovery'||SCENARIO==='canv
 }
 console.log('ok');
 '''
-@pytest.mark.parametrize('scenario',['sdk-order','sdk-refusal','sdk-flush','mounted-ack','mounted-post-race','mounted-refusal','mounted-visibility','mounted-order','relay-ack','relay-retry','relay-stale','relay-owner-observation','canvas-http','canvas-revoked','relay-error-recovery'])
+@pytest.mark.parametrize('scenario',['sdk-order','sdk-refusal','sdk-flush','mounted-ack','mounted-post-race','mounted-refusal','mounted-visibility','mounted-order','relay-ack','relay-retry','relay-stale','relay-owner-observation','canvas-http','canvas-revoked','relay-error-recovery','relay-too-large','relay-fit','mounted-abandon-restart','mounted-abandon-cleared','mounted-abandon-recreated','relay-invalid-view'])
 def test_controls_transport(scenario):
     node=shutil.which('node')
     if not node:pytest.skip('node required for host adapter tests')

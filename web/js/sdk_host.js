@@ -358,10 +358,9 @@ export class SdkWidgetHost {
         if (this.flushControlsPanel && !await this.flushControlsPanel()) {
             return { ok: false, status: 409, payload: { code: "controls_not_saved", error: "A control edit was not saved." } };
         }
-        const controlsSaved = await this._controlsHost?.flush();
-        if (controlsSaved?.ok === false) {
-            return { ok: false, status: 409, payload: { code: "controls_not_saved", error: controlsSaved.rejected?.[0]?.reason } };
-        }
+        // The panel decided above whether a save refuses this run; this only
+        // keeps Generate from overtaking a Controls save still in flight.
+        await this._controlsHost?.flush();
         const n = Math.max(1, Math.min(SDK_MAX_COUNT, Math.round(Number(count) || 1)));
         // An older save still in flight must not land after this one.
         if (this._inflightFlush) await this._inflightFlush.catch(() => {});

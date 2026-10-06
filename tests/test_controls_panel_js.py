@@ -116,7 +116,58 @@ if(SCENARIO==='markdown'){
         };
         const el=input('control:seed:seed');el.focus();el.value='bad';el.dispatch('change');await settle();
         const mode=walk(byTarget('control:seed:seed')).find(n=>n.tagName==='SELECT');mode.focus();mode.value='increment';mode.dispatch('change');await settle();
-        rejectSeed();await settle();assert.equal(el.value,'9');assert.equal(notices[0],'invalid seed');assert.equal(await panel.flushPending(),false);assert.equal(mode.value,'increment');
+        rejectSeed();await settle();assert.equal(el.value,'9');assert.equal(notices[0],'invalid seed');assert.equal(mode.value,'increment');
+        // The row keeps the reason visible; the settled refusal does not block a later run.
+        assert.match(byTarget('control:seed:seed').textContent,/Not saved: invalid seed/);assert.equal(await panel.flushPending(),true);
+    }
+    if(SCENARIO==='refusal-then-generate'){
+        refuse=true;const el=input('control:steps:value');el.focus();el.value='99999';key('Enter');await settle();
+        assert.equal(el.value,'20');assert.equal(notices.length,1);assert.match(byTarget('control:steps:value').textContent,/Not saved: server refusal/);
+        // An edit of another row that saves does not inherit the old refusal.
+        refuse=false;const seed=input('control:seed:seed');seed.focus();seed.value='11';assert.equal(await panel.flushPending(),true);
+        assert.equal(await panel.flushPending(),true);
+        // Fresh stored values retire the warning.
+        publish({...view});await settle();assert.doesNotMatch(byTarget('control:steps:value').textContent,/Not saved/);
+    }
+    if(SCENARIO==='late-success'){
+        defer=true;const el=input('control:steps:value');el.focus();el.value='33';key('Enter');await settle();
+        timeoutCalls.at(-1)();await settle();assert.match(byTarget('control:steps:value').textContent,/Not saved: The change was not confirmed/);
+        // The save lands after its warning: it is saved, and nothing blocks a run.
+        resolveWrite();await settle();assert.doesNotMatch(byTarget('control:steps:value').textContent,/Not saved/);
+        assert.equal(await panel.flushPending(),true);
+    }
+    if(SCENARIO==='note-refusal'){
+        note('note:intro:text').dispatch('dblclick');walk(note('note:intro:text')).find(n=>n.tagName==='TEXTAREA').value='# Edited';
+        refuse=true;defer=true;const flush=panel.flushPending();await settle();resolveWrite();
+        // Notes never reach a run, so a refused note save warns but does not refuse it.
+        assert.equal(await flush,true);assert.equal(notices.length,1);
+    }
+    if(SCENARIO==='note-then-value'){
+        // A run save in flight when Generate is asked must decide it, even if it
+        // settles while the open note is still saving.
+        let refuseSteps,saveNote;
+        host.applyChanges=async changes=>{calls.push(changes);
+            if('control:steps:value' in changes){await new Promise(r=>refuseSteps=r);return{ok:false,rejected:[{reason:'steps refused'}]};}
+            await new Promise(r=>saveNote=r);return{ok:true,rejected:[]};};
+        const steps=input('control:steps:value');steps.focus();steps.value='33';key('Enter');await settle();
+        note('note:intro:text').dispatch('dblclick');walk(note('note:intro:text')).find(n=>n.tagName==='TEXTAREA').value='# Edited';
+        const flush=panel.flushPending();await settle();refuseSteps();await settle();saveNote();
+        assert.equal(await flush,false);
+    }
+    if(SCENARIO==='missing-ids'){
+        publish({...view,controls:[{source:'control',key:'7',control_id:'',label:'A',kind:'INT',value:'1',status:'missing_id',order:0},
+            {source:'control',key:'8',control_id:'',label:'B',kind:'INT',value:'2',status:'missing_id',order:0},
+            {source:'control',key:'9',control_id:'dup',label:'C',kind:'INT',value:'3',status:'duplicate_id',order:0},
+            {source:'control',key:'10',control_id:'dup',label:'D',kind:'INT',value:'4',status:'duplicate_id',order:0}],
+            notes:[{source:'note',key:'11',note_id:'',text:'one',status:'missing_id',order:0},{source:'note',key:'12',note_id:'',text:'two',status:'missing_id',order:0}]});
+        const keyed=walk(container).filter(n=>n.dataset.controlTarget?.includes('-key:')).map(n=>n.dataset.controlTarget);
+        assert.deepEqual(keyed.sort(),['control-key:10','control-key:7','control-key:8','control-key:9','note-key:11','note-key:12']);
+        assert.ok(walk(container).filter(n=>n.dataset.controlTarget?.startsWith('control-key:')).every(row=>walk(row).find(n=>n.tagName==='INPUT').disabled));
+    }
+    if(SCENARIO==='loading'){
+        publish({state:'loading',controls:[],fields:[],notes:[],error:null});assert.ok(container.textContent.includes('Loading controls'));
+        assert.ok(!container.textContent.includes('Add a Sonder Control'));
+        publish({state:'ready',controls:[],fields:[],notes:[],error:null});assert.ok(container.textContent.includes('Add a Sonder Control'));
     }
     if(SCENARIO==='removed-failure'||SCENARIO==='removed-pending'){
         refuse=true;defer=SCENARIO==='removed-pending';const seed=input('control:seed:seed');seed.focus();seed.value='bad';key('Enter');await settle();
@@ -137,7 +188,8 @@ if(SCENARIO==='markdown'){
         refuse=SCENARIO==='layout-refusal';container.dispatch('drop',{target:advanced,dataTransfer:transfer});await settle();
         if(SCENARIO==='layout-stale'||SCENARIO==='layout-editor'){assert.equal(calls.length,0);assert.equal(notices.length,1);}
         else{assert.equal(calls.length,1);assert.equal(calls[0]['control:steps:group'],'Advanced');assert.ok(Number.isInteger(calls[0]['control:steps:order']));
-            if(refuse){assert.equal(row.parentElement.dataset.panelDropGroup,'');assert.equal(await panel.flushPending(),false);}}
+            // A refused arrangement leaves the row in place and never blocks a run.
+            if(refuse){assert.equal(row.parentElement.dataset.panelDropGroup,'');assert.equal(notices.length,1);assert.equal(await panel.flushPending(),true);}}
     }
     if(SCENARIO==='combo'||SCENARIO==='combo-capped'||SCENARIO==='combo-ime'||SCENARIO==='combo-query'||SCENARIO==='combo-capped-filter'){
         const options=Array.from({length:30},(_,i)=>'option-'+i);
@@ -181,7 +233,7 @@ if(SCENARIO==='markdown'){
 console.log('ok');
 '''
 
-@pytest.mark.parametrize('scenario',['combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated'])
+@pytest.mark.parametrize('scenario',['combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','note-refusal','missing-ids','loading','note-then-value'])
 def test_controls_panel(scenario):
     node=shutil.which('node')
     if not node:pytest.skip('node required for Controls renderer boundary tests')

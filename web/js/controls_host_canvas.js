@@ -92,8 +92,11 @@ export function createCanvasControlsHost({app, api, getEditorNode, setEditorSett
     const needed = () => visible || mountedVisible;
     const notify = () => { for (const cb of subscribers) cb(view); };
     const identity = () => ({root: rootGraph(), editor: getEditorNode()});
-    const isCurrent = (id, stamp) => !destroyed && epoch === stamp
-        && id.root === rootGraph() && id.editor === getEditorNode() && !app.configuringGraph;
+    const sameGraph = id => !destroyed && id.root === rootGraph() && id.editor === getEditorNode() && !app.configuringGraph;
+    // Visibility and graph events retire passive reads (epoch) but never a write
+    // in flight: its fresh-export comparisons already refuse a changed workflow,
+    // and hiding the panel right after an edit must not discard it.
+    const isCurrent = (id, stamp) => epoch === stamp && sameGraph(id);
     const editorKey = (id, prompt) => nodesOf(id.root).includes(id.editor)
         && prompt[String(id.editor?.id)]?.class_type === "SonderEditor" ? String(id.editor.id) : null;
     const snapshot = async id => {
@@ -232,21 +235,22 @@ export function createCanvasControlsHost({app, api, getEditorNode, setEditorSett
 
     async function write(changes, { expectedPromptHash = null, canApply = () => true } = {}) {
         if (destroyed) return refused(changes, "The Controls panel has closed.");
-        const id = identity(), stamp = ++epoch;
+        const id = identity();
+        epoch++; // a passive read in flight must not land a pre-write view
         try {
             const shot = await snapshot(id);
-            if (!isCurrent(id, stamp)) return refused(changes, "The workflow changed. Try again.");
-            if (!await canApply() || !isCurrent(id, stamp) || (expectedPromptHash && await promptHash(shot.hash) !== expectedPromptHash)) {
+            if (!sameGraph(id)) return refused(changes, "The workflow changed. Try again.");
+            if (!await canApply() || !sameGraph(id) || (expectedPromptHash && await promptHash(shot.hash) !== expectedPromptHash)) {
                 return refused(changes, "The workflow changed. Try again.");
             }
             const raw = await describe(shot, changes);
-            if (!isCurrent(id, stamp) || (await snapshot(id)).hash !== shot.hash || !isCurrent(id, stamp)) {
+            if (!sameGraph(id) || (await snapshot(id)).hash !== shot.hash || !sameGraph(id)) {
                 return refused(changes, "The workflow changed. Try again.");
             }
             if (!raw.ok) return {ok: false, rejected: raw.rejected || []};
             if (!await canApply()) return refused(changes, "This tab no longer owns the editor.");
             // An asynchronous permission check can overlap a native graph edit.
-            if (!isCurrent(id, stamp) || (await snapshot(id)).hash !== shot.hash || !isCurrent(id, stamp)) {
+            if (!sameGraph(id) || (await snapshot(id)).hash !== shot.hash || !sameGraph(id)) {
                 return refused(changes, "The workflow changed. Try again.");
             }
             const writes = operations(raw, raw.changes, id.root);
@@ -290,7 +294,6 @@ export function createCanvasControlsHost({app, api, getEditorNode, setEditorSett
             return run;
         },
         setEditorSetting,
-        reset() { epoch++; lastHash = null; view = {state: "idle", controls: [], fields: [], notes: [], error: null}; notify(); schedule(); },
         destroy() { destroyed = true; epoch++; clearTimeout(timer); syncListeners(); subscribers.clear(); },
     };
 }

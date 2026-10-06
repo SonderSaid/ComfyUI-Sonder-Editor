@@ -14,7 +14,7 @@ import uuid
 from datetime import datetime, timedelta
 from urllib.parse import urlsplit
 
-from aiohttp import web
+from aiohttp import WSCloseCode, web
 
 from .media_helpers import (
     CROP_POSITIONS,
@@ -121,6 +121,7 @@ from .session_registry import (
     seed_widget_state,
     subscribe,
     unregister_canvas_host,
+    unregister_departed_canvas_host,
     unsubscribe,
     update_widget_state,
 )
@@ -167,6 +168,8 @@ from .guide_collision import resolve_execution_window, resolve_guide_collisions
 logger = logging.getLogger("sonder_editor")
 _TIMELINE_EXPORTS = TimelineExportManager()
 _SCENE_RESTORE_RECEIPTS = SceneRestoreReceiptStore()
+# Deferred canvas-host departures; held so the loop cannot collect them early.
+_DEPARTURE_TASKS: set[asyncio.Task] = set()
 _ASSET_DERIVED_CACHE_HEADERS = {
     "Cache-Control": "public, max-age=0, must-revalidate",
 }
@@ -15435,6 +15438,22 @@ if routes is not None:
             )
             host_registration = None
 
+        def depart_host() -> None:
+            # The canvas is leaving on purpose; unregister after a short grace
+            # so a graph reconfigure that re-registers it does not flash its tab.
+            nonlocal host_registration
+            if not host_registration:
+                return
+            task = asyncio.create_task(unregister_departed_canvas_host(
+                host_registration.get("project_id", ""),
+                host_registration.get("source_node_id", ""),
+                host_registration.get("session_id", ""),
+                host_id=host_registration.get("host_id", ""),
+            ))
+            _DEPARTURE_TASKS.add(task)
+            task.add_done_callback(_DEPARTURE_TASKS.discard)
+            host_registration = None
+
         if subscribed_project_id:
             await subscribe(subscribed_project_id, ws)
             await ws.send_json({"type": "subscribed", "project_id": subscribed_project_id})
@@ -15509,6 +15528,10 @@ if routes is not None:
                                 })
                             else:
                                 await ws.send_json({"type": "host_heartbeat", "ok": False, "code": "no_canvas_host"})
+                        elif message_type == "unregister_host":
+                            # The canvas is leaving on purpose (node removed, project
+                            # or workflow switched); its tab must not wait for the TTL.
+                            depart_host()
                         else:
                             await ws.send_json({"type": "ack", "received": message_type})
                     except json.JSONDecodeError:
@@ -15516,10 +15539,14 @@ if routes is not None:
                 elif msg.type == web.WSMsgType.ERROR:
                     logger.error("WebSocket error: %s", ws.exception())
         finally:
-            # A transport close is not a canvas lifetime change. The existing
+            # A transport loss is not a canvas lifetime change. The existing
             # host TTL and HTTP fallback heartbeats own its liveness; keeping
             # registration here lets pending Controls requests survive an outage.
-            # Deliberate subscription switches still unregister above.
+            # Deliberate departures unregister: an explicit unregister_host or a
+            # subscription switch above, or the browser's 1001 "going away"
+            # close when the canvas page reloads, navigates or closes.
+            if ws.close_code == WSCloseCode.GOING_AWAY:
+                depart_host()
             if subscribed_project_id:
                 await unsubscribe(subscribed_project_id, ws)
         return ws

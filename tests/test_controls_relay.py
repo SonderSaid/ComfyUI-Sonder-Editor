@@ -4,7 +4,9 @@ import asyncio
 import copy
 import importlib
 import json
+import re
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +18,7 @@ from server import control_descriptors as cd, session_registry as sr
 from test_control_descriptors import describe
 from test_sdk_controls_routes import prompt
 
+ROOT = Path(__file__).resolve().parents[1]
 PID, HID, CANVAS, TAB = 'ZZ-controls-relay-20261005', 'host-A', 'canvas-A', 'tab-A'
 
 
@@ -273,8 +276,38 @@ def test_validation_worker_does_not_hold_registry_lock_and_cannot_cross_lifecycl
         finally:
             resume.set()
         result = await task
-        assert result['code'] in ('stale_view', 'not_owner')
-        assert not sr._controls_relay.get((PID, HID), {}).get('pending')
+        if mutation == 'new-view':
+            # A publication that lands during validation is revalidated against,
+            # never answered with a refusal the tab could not have avoided.
+            assert result['ok']
+            [request] = sr._controls_relay[(PID, HID)]['pending']
+            assert request['request_id'] == result['request_id'] and request['view_seq'] == 2
+        else:
+            # A cleared relay never accepts the request; the retry sees no view.
+            assert result['code'] in ('not_owner', 'view_unavailable')
+            assert not sr._controls_relay.get((PID, HID), {}).get('pending')
+    asyncio.run(run())
+
+
+def test_post_revalidation_is_bounded_when_every_attempt_goes_stale(monkeypatch):
+    original = cd.validate_control_changes
+    calls = []
+    async def run():
+        await setup()
+        await publish()
+        seq = iter(range(2, 10))
+        def racing(*args):
+            # Each validation sees a newer publication land before it finishes.
+            calls.append(1)
+            result = original(*args)
+            asyncio.run_coroutine_threadsafe(publish(publication(next(seq))), loop).result(3)
+            return result
+        loop = asyncio.get_running_loop()
+        monkeypatch.setattr(cd, 'validate_control_changes', racing)
+        result = await post()
+        assert result['code'] == 'stale_view'
+        assert len(calls) == sr.CONTROLS_POST_ATTEMPTS
+        assert not sr._controls_relay[(PID, HID)]['pending']
     asyncio.run(run())
 
 
@@ -436,3 +469,55 @@ def test_actual_websocket_close_reconnect_and_same_host_subscribe_preserve_reque
             assert (await sr.get_controls_view(PID, HID))['view'] is None
             await ws.close()
     asyncio.run(run())
+
+
+@pytest.mark.parametrize('departure', ['unregister_host', 'going_away', 'reconfigure', 'plain_close'])
+def test_deliberate_canvas_departure_unregisters_after_grace_but_a_plain_close_waits_for_ttl(departure, monkeypatch):
+    from aiohttp import WSCloseCode
+    monkeypatch.setattr(sr, 'CANVAS_HOST_DEPARTURE_GRACE_SECONDS', 0.05)
+    async def run():
+        await setup()
+        async with client_for(monkeypatch) as client:
+            ws = await client.ws_connect('/sonder-editor/ws')
+            await ws.receive_json(timeout=2)  # native sid
+            await ws.send_json({'type': 'subscribe', 'role': 'canvas_host', 'project_id': PID,
+                                'host_id': HID, 'source_node_id': 'editor-1', 'session_id': CANVAS})
+            while (await ws.receive_json(timeout=2))['type'] != 'subscribed':
+                pass
+            assert (await publish())['ok']
+            assert (await post())['ok']
+            if departure in ('unregister_host', 'reconfigure'):
+                # cross_tab_sync.close(): node removed, project or workflow switched.
+                await ws.send_json({'type': 'unregister_host'})
+                await ws.close()
+            elif departure == 'going_away':
+                # The browser closes with 1001 when the canvas page reloads or closes.
+                await ws.close(code=WSCloseCode.GOING_AWAY)
+            else:
+                await ws.close()  # a close without the departure signal
+            await asyncio.sleep(0.01)
+            # Within the grace the tab still sees the canvas.
+            assert (await sr.get_widget_state(PID, 'editor-1', host_id=HID))['canvas_host_connected'] is True
+            if departure == 'reconfigure':
+                # Native Undo/Redo or a workflow reload rebuilds the controller,
+                # which registers the same host with a new session at once.
+                await sr.register_canvas_host(PID, 'editor-1', 'canvas-B', host_id=HID)
+            for _ in range(20):
+                await asyncio.sleep(0.01)  # grace elapses
+            state = await sr.get_widget_state(PID, 'editor-1', host_id=HID)
+            if departure in ('plain_close', 'reconfigure'):
+                assert state['canvas_host_connected'] is True
+                if departure == 'plain_close':
+                    assert (await sr.get_controls_view(PID, HID))['view'] is not None
+            else:
+                assert state['canvas_host_connected'] is False
+                assert (await sr.get_controls_view(PID, HID))['view'] is None
+    asyncio.run(run())
+
+
+def test_canvas_publication_budget_mirrors_registry_cap():
+    source = (ROOT / 'web/js/controls_canvas_relay.js').read_text(encoding='utf-8')
+    match = re.search(r'const MAX_PUBLICATION_BYTES = (\d+) \* (\d+) - (\d+);', source)
+    assert match, 'controls_canvas_relay.js must state its publication budget'
+    a, b, margin = map(int, match.groups())
+    assert a * b == sr.CONTROLS_MAX_BYTES and 0 < margin < 4096

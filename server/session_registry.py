@@ -16,6 +16,7 @@ logger = logging.getLogger("sonder_editor")
 
 SESSION_TTL_SECONDS = 30.0
 CANVAS_HOST_TTL_SECONDS = 90.0
+CANVAS_HOST_DEPARTURE_GRACE_SECONDS = 1.5
 HANDOFF_TTL_SECONDS = 30.0
 ORPHAN_TTL_SECONDS = 1800.0
 SWEEP_INTERVAL_SECONDS = 30.0
@@ -24,6 +25,7 @@ CONTROLS_MAX_BYTES = 512 * 1024
 CONTROLS_MAX_PENDING = 32
 CONTROLS_ACK_HISTORY = 128
 CONTROLS_MAX_SEQ = 2 ** 53 - 1
+CONTROLS_POST_ATTEMPTS = 3
 
 _DEBUG_SESSION_ENABLED = os.environ.get("SONDER_DEBUG_SESSION", "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -899,6 +901,17 @@ async def publish_controls_view(project_id: str, host_id: str, session_id: str, 
 
 
 async def post_control_changes(project_id: str, host_id: str, session_id: str, changes: Any) -> dict:
+    # Validation runs off the loop, so a publication (often the previous edit's
+    # acknowledgement) can land meanwhile. Revalidate against the newer view a
+    # few times rather than refusing an edit the tab could not have avoided.
+    for _attempt in range(CONTROLS_POST_ATTEMPTS):
+        result = await _post_control_changes_once(project_id, host_id, session_id, changes)
+        if result.get("code") != "stale_view":
+            return result
+    return result
+
+
+async def _post_control_changes_once(project_id: str, host_id: str, session_id: str, changes: Any) -> dict:
     key, events = _host_key(project_id, host_id), []
     async with _lock:
         code = _controls_gate_locked(key, session_id, "tab", events)
@@ -1161,6 +1174,19 @@ async def refresh_canvas_host(project_id: str, host_id: str, source_node_id: str
             result = {"ok": True, **_host_presence_event(key, host)}
     _schedule_events(events)
     return result
+
+
+async def unregister_departed_canvas_host(project_id: str, source_node_id: str, session_id: str = "",
+                                          host_id: str = "") -> dict[str, Any]:
+    """Unregister a canvas that left on purpose, after a short grace.
+
+    A graph reconfigure (native Undo/Redo, a workflow reload) destroys the
+    controller and registers the same host again with a new session moments
+    later. Unregistering matches on session, so a re-registration within the
+    grace survives and the mounted tab never flashes "Canvas not connected".
+    """
+    await asyncio.sleep(CANVAS_HOST_DEPARTURE_GRACE_SECONDS)
+    return await unregister_canvas_host(project_id, source_node_id, session_id, host_id=host_id)
 
 
 async def unregister_canvas_host(project_id: str, source_node_id: str, session_id: str = "", host_id: str = "") -> dict[str, Any]:

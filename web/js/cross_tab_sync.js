@@ -132,6 +132,11 @@ export function connectProjectSync(projectId, handlers = {}, options = {}) {
             reconnectTimer = null;
             stopHostHeartbeat();
             try {
+                // A deliberate departure ends the canvas host now. A bare transport
+                // loss keeps it until its TTL, so pending Controls survive an outage.
+                if (options.role === "canvas_host" && ws?.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: "unregister_host" }));
+                }
                 ws?.close();
             } catch (_err) {}
             ws = null;

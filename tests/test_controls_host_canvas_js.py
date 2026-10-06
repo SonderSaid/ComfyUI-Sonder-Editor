@@ -119,6 +119,15 @@ if(SCENARIO==='stale-write') {
     wait=true;const task=host.applyChanges({'control:steps:value':'30'});await deferred();
     ctl.widgets[1].value='45';release();assert.equal((await task).ok,false);assert.equal(ctl.widgets[1].value,'45');assert.equal(captures,0);
 }
+if(SCENARIO==='hide-during-write'||SCENARIO==='event-during-write') {
+    // Clicking another sidebar tab or exiting fullscreen hides the panel, and
+    // unrelated graph events fire, while an edit is still being validated.
+    host.setVisible(true);await settle();
+    wait=true;const task=host.applyChanges({'control:steps:value':'30'});await deferred();
+    if(SCENARIO==='hide-during-write')host.setVisible(false);else listeners.get('graphChanged')();
+    release();const result=await task;
+    assert.equal(result.ok,true,JSON.stringify(result));assert.equal(ctl.widgets[1].value,'30');assert.equal(captures,2);
+}
 if(SCENARIO==='stale-view') {
     wait=true;host.setVisible(true);await deferred();host.setVisible(false);release();await settle();
     assert.equal(host.getView().state,'idle');assert.equal(listeners.size,0);
@@ -151,7 +160,7 @@ host.destroy();assert.equal(listeners.size,0);
 console.log('ok');
 '''
 
-@pytest.mark.parametrize('scenario', ['layout','layout-rollback','root','shared','promoted','promoted-seed','hidden-hash','refusal','stale-write','stale-view','destroy','rollback','serial','history-failure','precision-refusal'])
+@pytest.mark.parametrize('scenario', ['layout','layout-rollback','root','shared','promoted','promoted-seed','hidden-hash','refusal','stale-write','stale-view','destroy','rollback','serial','history-failure','precision-refusal','hide-during-write','event-during-write'])
 def test_canvas_adapter(scenario):
     node = shutil.which('node')
     if not node:
