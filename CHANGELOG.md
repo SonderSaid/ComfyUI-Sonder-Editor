@@ -12,6 +12,7 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Added
+- Projects carry a stamp of the Sonder Editor version that saved them (this version onward), so a later version can name the update a newer project needs.
 - Arrange Controls and Panel Notes by dragging between sections, and filter long option lists with an exact-value choice for capped previews.
 - Controls sidebar in fullscreen, mounted tabs and the Sonder App: edit workflow values, seed modes and Markdown notes beside shared take settings.
 - Sonder Panel Note node and a Markdown Panel note field on Sonder Control let workflow authors include titles, instructions and explanations in API exports.

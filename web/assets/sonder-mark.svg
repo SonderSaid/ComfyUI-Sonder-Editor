@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="400" height="400" role="img" aria-labelledby="title">
+  <title id="title">Sonder Editor</title>
+  <!-- The Sonder S: a timeline ruler, three animation poses and an audio waveform,
+       crossed by a playhead. Source: the Registry icon's vector, recoloured to the
+       editor theme (editor_theme.js THEME.fg0 / accent / bg0) with no background. -->
+  <rect fill="#6686a3" x="194" y="34" width="12" height="332" rx="6"/>
+  <path id="sonder-s-curve" fill="#e7ecf2" d="M 318 48 H 155 C 100 48, 68 80, 68 128 C 68 148, 75 161, 88 170 H 133 C 117 160, 108 145, 108 128 C 108 101, 126 88, 155 88 H 318 Q 332 88, 332 74 V 62 Q 332 48, 318 48 Z"/>
+  <use href="#sonder-s-curve" transform="rotate(180 200 200)"/>
+  <g fill="#0c1015">
+    <rect x="137" y="58" width="6" height="20" rx="3"/>
+    <rect x="167" y="58" width="6" height="20" rx="3"/>
+    <rect x="197" y="58" width="6" height="20" rx="3"/>
+    <rect x="227" y="58" width="6" height="20" rx="3"/>
+    <rect x="257" y="58" width="6" height="20" rx="3"/>
+  </g>
+  <path fill="#6686a3" d="M 70 168 H 154 V 232 H 82 Q 70 232, 70 220 Z"/>
+  <rect fill="#6686a3" x="158" y="168" width="84" height="64"/>
+  <path fill="#6686a3" d="M 246 168 H 318 Q 330 168, 330 180 V 232 H 246 Z"/>
+  <g fill="none" stroke="#0c1015" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M 112 190 L 110 207 M 111 194 L 101 202 M 113 194 L 123 201 L 116 207 M 110 207 L 103 225 M 110 207 L 121 225"/>
+    <path d="M 199 190 L 203 206 M 198 194 L 184 205 M 200 193 L 218 180 M 203 206 L 191 224 M 203 206 L 216 224"/>
+    <path d="M 287 190 L 287 207 M 286 194 L 271 181 M 288 194 L 303 181 M 287 207 L 278 225 M 287 207 L 297 225"/>
+  </g>
+  <g fill="#0c1015">
+    <circle cx="112" cy="181" r="6"/>
+    <circle cx="199" cy="181" r="6"/>
+    <circle cx="287" cy="181" r="6"/>
+  </g>
+  <path fill="#e7ecf2" stroke="#0c1015" stroke-width="3" stroke-linejoin="round" d="M 200 225 L 207 232 L 200 239 L 193 232 Z"/>
+  <g fill="#0c1015">
+    <rect x="149" y="327" width="6" height="10" rx="3"/>
+    <rect x="164" y="323" width="6" height="18" rx="3"/>
+    <rect x="179" y="319" width="6" height="26" rx="3"/>
+    <rect x="197" y="315" width="6" height="34" rx="3"/>
+    <rect x="215" y="319" width="6" height="26" rx="3"/>
+    <rect x="230" y="323" width="6" height="18" rx="3"/>
+    <rect x="245" y="327" width="6" height="10" rx="3"/>
+  </g>
+</svg>

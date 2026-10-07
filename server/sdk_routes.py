@@ -12,7 +12,6 @@ owner tab.
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import json
 import logging
 import os
@@ -21,6 +20,7 @@ from typing import Any, Awaitable, Callable
 from aiohttp import web
 
 from . import control_descriptors, sdk_install, sdk_proxy, sdk_templates
+from .request_locality import is_loopback_request, local_only_response
 from .sdk_install import install_state
 from .sdk_runner import SdkError, await_template_io, get_runner
 
@@ -28,46 +28,7 @@ logger = logging.getLogger("sonder_editor")
 
 SECRET_HEADER = "X-Sonder-SDK-Session"
 TAB_HEADER = "X-Sonder-Tab-Session"
-_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
-# Headers a relaying proxy or tunnel adds; any of them means the peer is not the user.
-_FORWARDING_HEADERS = (
-    "Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Real-IP",
-    "Via", "CF-Connecting-IP", "True-Client-IP",
-)
 UNINSTALL_DRAIN_SEC = 30.0
-
-
-def is_loopback_request(request: web.Request) -> bool:
-    """A request made on this machine, to this machine, not relayed.
-
-    The peer must be loopback, the ``Host`` header must name a loopback host (a
-    DNS-rebound page reaches 127.0.0.1 under a foreign Host), and no forwarding
-    header may be present (a reverse proxy on this machine makes every peer
-    look local).
-
-    Residual: a forwarder that adds none of these headers and sends a loopback
-    Host (a raw TCP tunnel such as ``ssh -R``, or a bare nginx ``proxy_pass``)
-    is indistinguishable from a local browser. Such a setup already exposes
-    ComfyUI's own unauthenticated routes; this gate only adds install/uninstall
-    of the two pinned packages.
-    """
-    remote = str(request.remote or "")
-    try:
-        address = ipaddress.ip_address(remote)
-    except ValueError:
-        return False
-    if getattr(address, "ipv4_mapped", None) is not None:
-        address = address.ipv4_mapped
-    if not address.is_loopback:
-        return False
-    if any(request.headers.get(name) for name in _FORWARDING_HEADERS):
-        return False
-    host = request.headers.get("Host", "")
-    if host.startswith("["):
-        host_name = host[1:].split("]", 1)[0]
-    else:
-        host_name = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
-    return host_name.lower() in _LOOPBACK_HOSTS
 
 
 async def _read_capped(request: web.Request, limit: int) -> bytes:
@@ -196,8 +157,7 @@ def register_sdk_routes(
     def _local_only(request: web.Request) -> web.Response | None:
         if is_loopback_request(request):
             return None
-        return web.json_response(
-            {"ok": False, "code": "not_local", "error": "Install from the ComfyUI machine."}, status=403)
+        return local_only_response("Install from the ComfyUI machine.")
 
     def _refused(exc: sdk_install.InstallRefused) -> web.Response:
         status = 409 if exc.code in ("busy", "runs_active") else 400
@@ -243,13 +203,6 @@ def register_sdk_routes(
             if not launched:
                 sdk_install.release_job(previous)
         return web.json_response({"ok": True, "job": job}, status=202)
-
-    # The Launcher shortcut's probe. It is a file:// page, so the response must
-    # allow cross-origin reads: a no-cors fetch of any other Sonder route fails
-    # on its same-origin Cross-Origin-Resource-Policy, ComfyUI up or not.
-    @routes.get("/sonder-editor/sdk/ping")
-    async def api_sdk_ping(request: web.Request) -> web.Response:
-        return web.Response(status=204, headers={"Cross-Origin-Resource-Policy": "cross-origin"})
 
     # ── Templates ────────────────────────────────────────────────────────────
 

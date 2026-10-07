@@ -15409,6 +15409,12 @@ if routes is not None:
         )
     except Exception:
         logger.exception("Sonder App (SDK) routes unavailable")
+    try:
+        from .launcher_routes import register_launcher_routes
+
+        register_launcher_routes(routes, projects_dir=_configured_base_dir)
+    except Exception:
+        logger.exception("Sonder Launcher routes unavailable")
 
     # -----------------------------------------------------------------------
     # WebSocket stub

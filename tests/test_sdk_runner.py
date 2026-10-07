@@ -568,6 +568,60 @@ def test_only_the_owner_tab_may_change_a_session(world):
     asyncio.run(go())
 
 
+def test_opening_records_the_launchers_last_workflow_even_on_reattach(world, user_dir, monkeypatch):
+    from server import launcher_state
+
+    ticks = iter([100.0, 200.0])
+    original = launcher_state.record_open
+    monkeypatch.setattr(launcher_state, "record_open",
+                        lambda folder, template_id: original(folder, template_id, clock=lambda: next(ticks)))
+
+    async def go():
+        await world.open()
+        recorded = launcher_state.read_state()["last_workflow"]
+        assert recorded["by_project"][PROJECT] == {"template_id": world.template_id, "at": 100.0}
+        assert recorded["any"]["template_id"] == world.template_id
+        await world.runner.open_session(world.template_id, PROJECT)  # reattach
+        assert launcher_state.read_state()["last_workflow"]["by_template"][world.template_id] == 200.0
+
+    asyncio.run(go())
+
+
+def test_an_open_refused_for_capacity_is_not_recorded(world, monkeypatch):
+    from server import launcher_state
+
+    recorded = []
+    monkeypatch.setattr(launcher_state, "record_open", lambda *args: recorded.append(args))
+
+    async def refuse():
+        raise SdkError("Too many sessions.", "sdk_sessions_busy", 429)
+
+    monkeypatch.setattr(sdk_runner, "MAX_SESSIONS", 0)
+    monkeypatch.setattr(world.runner, "_evict_one", refuse)
+
+    async def go():
+        with pytest.raises(SdkError):
+            await world.runner.open_session(world.template_id, PROJECT)
+
+    asyncio.run(go())
+    assert recorded == []
+
+
+def test_a_failed_launcher_note_never_fails_an_open(world, monkeypatch):
+    from server import launcher_state
+
+    def broken(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(launcher_state, "record_open", broken)
+
+    async def go():
+        session = await world.open()
+        assert session.project == PROJECT
+
+    asyncio.run(go())
+
+
 def test_eviction_takes_an_idle_ownerless_session_and_never_a_busy_one(world, monkeypatch):
     monkeypatch.setattr(sdk_runner, "MAX_SESSIONS", 2)
 

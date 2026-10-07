@@ -26,10 +26,12 @@ installed and needed by no other installed distribution. The route reserves the
 job first, which stops new Generates (``uninstall_running``), and refuses while
 any SDK run is unfinished; the job stops the proxy Sonder started.
 
-**The Launcher shortcut** (``<sonder-projects>/Sonder Launcher.html``) exists
-only while Sonder's install does: written on install, refreshed at startup when
-both packages are present and Sonder installed one or the file exists, deleted
-when Uninstall leaves nothing recorded.
+**The Launcher shortcut** (``<sonder-projects>/Sonder Launcher.url``, Windows
+only) exists only while Sonder's install does: written on install, refreshed at
+startup when both packages are present and Sonder installed one or the file
+exists, deleted when Uninstall leaves nothing recorded. It is a Windows Internet
+Shortcut, which the shell opens as a direct navigation: ComfyUI's origin
+middleware refuses the cross-site navigation a ``file://`` page would make.
 """
 
 from __future__ import annotations
@@ -56,7 +58,11 @@ logger = logging.getLogger("sonder_editor")
 PINNED = {"comfy-sdk": "0.4.0", "comfy-api-proxy": "0.1.6"}
 RECORD_NAME = "sdk_install.json"
 INTENT_NAME = "sdk_install.intent.json"
-SHORTCUT_NAME = "Sonder Launcher.html"
+SHORTCUT_NAME = "Sonder Launcher.url"
+# The unreleased HTML shortcut it replaced; deleted wherever it is found. Remove this
+# name and its cleanup once a release that ships the .url has been published.
+LEGACY_SHORTCUT_NAME = "Sonder Launcher.html"
+SHORTCUT_ICON = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "web", "assets", "sonder.ico"))
 STILL_RUNNING_AFTER_SEC = 600.0
 # Top-level modules of each package: loaded ones stay in memory after an
 # uninstall until ComfyUI restarts. comfy_api_proxy only ever runs as a subprocess.
@@ -337,91 +343,73 @@ def reconcile_intent(installed: Callable[[str], str] | None = None) -> list[tupl
 
 # ── Launcher shortcut ────────────────────────────────────────────────────────
 
-_SHORTCUT_TEMPLATE = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sonder Launcher</title>
-<style>
-  html, body { margin: 0; min-height: 100%; background: #0c1015; color: #e7ecf2;
-    font: 14px "Inter", ui-sans-serif, system-ui, "Segoe UI", sans-serif; }
-  main { max-width: 420px; margin: 18vh auto 0; padding: 0 16px; text-align: center; }
-  h1 { font-size: 18px; font-weight: 600; margin: 0 0 12px; }
-  p { color: #b6bfcb; line-height: 1.5; margin: 0 0 16px; }
-  .where { color: #7e8896; font-size: 12px; }
-  button { background: #6686a3; color: #0c1015; border: 1px solid #6686a3; border-radius: 4px;
-    padding: 6px 14px; font-family: inherit; font-size: 12px; font-weight: 600; cursor: pointer; }
-</style>
-</head>
-<body>
-<main>
-  <h1>Sonder App</h1>
-  <p id="message">Connecting to ComfyUI…</p>
-  <p><button id="retry" type="button" hidden>Retry</button></p>
-  <p class="where">ComfyUI at __UPSTREAM_TEXT__</p>
-</main>
-<script>
-  // Written by the Sonder Editor while the Sonder App packages are installed.
-  // The probe route allows cross-origin reads (this page is file://); other
-  // Sonder routes are same-origin only, and a no-cors fetch of one fails.
-  const LAUNCHER = __LAUNCHER__;
-  const PING = __PING__;
-  const message = document.getElementById("message");
-  const retry = document.getElementById("retry");
-  async function go() {
-    message.textContent = "Connecting to ComfyUI…";
-    retry.hidden = true;
-    try {
-      await fetch(PING, { mode: "no-cors", cache: "no-store" });
-      location.replace(LAUNCHER);
-    } catch (_err) {
-      message.textContent = "Start ComfyUI first, then try again.";
-      retry.hidden = false;
-    }
-  }
-  retry.addEventListener("click", go);
-  go();
-</script>
-</body>
-</html>
-"""
+def shortcuts_supported() -> bool:
+    """Internet Shortcut files are a Windows format; other systems get a bookmark hint instead."""
+    return os.name == "nt"
 
 
-def _script_literal(value: str) -> str:
-    return json.dumps(value).replace("</", "<\\/")
+def shortcut_bytes(upstream: str, icon_path: str = SHORTCUT_ICON) -> bytes:
+    """The ``.url`` file: an INI the Windows shell reads in the ANSI code page.
 
-
-def shortcut_html(upstream: str) -> str:
+    Only ASCII is written, so it reads the same in every code page. An icon path
+    that is not ASCII is left out and the shell shows the browser's icon instead.
+    """
     base = str(upstream or "").rstrip("/")
-    text = base.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    return (_SHORTCUT_TEMPLATE
-            .replace("__UPSTREAM_TEXT__", text)
-            .replace("__LAUNCHER__", _script_literal(f"{base}/sonder-editor/app"))
-            .replace("__PING__", _script_literal(f"{base}/sonder-editor/sdk/ping")))
+    lines = ["[InternetShortcut]", f"URL={base}/sonder-editor/app"]
+    if icon_path and icon_path.isascii() and os.path.isfile(icon_path):
+        lines += [f"IconFile={icon_path}", "IconIndex=0"]
+    return ("\r\n".join(lines) + "\r\n").encode("ascii")
 
 
 def shortcut_path(projects_dir: str) -> str:
     return os.path.join(projects_dir, SHORTCUT_NAME) if projects_dir else ""
 
 
-def write_shortcut(projects_dir: str, upstream: str) -> str:
-    """Write the shortcut, unless it already says exactly this."""
-    path = shortcut_path(projects_dir)
-    if not path or not upstream:
-        return ""
-    html = shortcut_html(upstream)
+def _remove(path: str) -> bool:
     try:
-        with open(path, encoding="utf-8", newline="") as handle:
-            if handle.read() == html:
+        os.remove(path)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def remove_legacy_shortcut(projects_dir: str) -> bool:
+    """Delete the unreleased HTML shortcut. It never worked (ComfyUI refuses its cross-site
+    navigation) and nothing but Sonder wrote that name, so finding it is enough.
+
+    Only a regular file is removed, and a failure is logged rather than raised, so a
+    locked or odd entry never stops the install or uninstall that called this.
+    """
+    path = os.path.join(projects_dir, LEGACY_SHORTCUT_NAME) if projects_dir else ""
+    if not path or not os.path.isfile(path) or os.path.islink(path):
+        return False
+    try:
+        return _remove(path)
+    except OSError as exc:
+        logger.warning("Couldn't delete the old Launcher shortcut %s: %s", LEGACY_SHORTCUT_NAME, exc)
+        return False
+
+
+def write_shortcut(projects_dir: str, upstream: str, *, icon_path: str = SHORTCUT_ICON,
+                   supported: Callable[[], bool] = shortcuts_supported) -> str:
+    """Write the shortcut, unless it already says exactly this. "" where none is written."""
+    path = shortcut_path(projects_dir)
+    if path:
+        remove_legacy_shortcut(projects_dir)
+    if not path or not upstream or not supported():
+        return ""
+    data = shortcut_bytes(upstream, icon_path)
+    try:
+        with open(path, "rb") as handle:
+            if handle.read() == data:
                 return path
     except OSError:
         pass
     os.makedirs(projects_dir, exist_ok=True)
     tmp = f"{path}.{uuid.uuid4().hex}.tmp"
     try:
-        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(html)
+        with open(tmp, "wb") as handle:
+            handle.write(data)
         atomic_replace(tmp, path)
     except BaseException:
         try:
@@ -433,29 +421,28 @@ def write_shortcut(projects_dir: str, upstream: str) -> str:
 
 
 def delete_shortcut(projects_dir: str) -> bool:
-    path = shortcut_path(projects_dir)
-    if not path:
+    if not projects_dir:
         return False
-    try:
-        os.remove(path)
-        return True
-    except FileNotFoundError:
-        return False
+    legacy = remove_legacy_shortcut(projects_dir)
+    return _remove(shortcut_path(projects_dir)) or legacy
 
 
 def refresh_shortcut(projects_dir: str, upstream: str, *, state: Callable[[], dict] = install_state,
-                     record: Callable[[], dict] = read_record) -> str:
-    """At startup: rewrite the shortcut (the port may have changed) while it is Sonder's to keep.
+                     record: Callable[[], dict] = read_record, icon_path: str = SHORTCUT_ICON,
+                     supported: Callable[[], bool] = shortcuts_supported) -> str:
+    """At startup: rewrite the shortcut (the port or icon path may have changed) while it is Sonder's.
 
-    That is while both packages are present and either Sonder installed one or
-    the file already exists; packages a user installed alone get no file.
+    That is while both packages are present and either Sonder installed one, the
+    file already exists, or the legacy HTML shortcut did; packages a user
+    installed alone get no file. The legacy file is deleted in every case.
     """
+    had_legacy = remove_legacy_shortcut(projects_dir)
     if not state().get("ready"):
         return ""
     path = shortcut_path(projects_dir)
-    if not path or not (os.path.isfile(path) or record()["installed_by_sonder"]):
+    if not path or not (os.path.isfile(path) or had_legacy or record()["installed_by_sonder"]):
         return ""
-    return write_shortcut(projects_dir, upstream)
+    return write_shortcut(projects_dir, upstream, icon_path=icon_path, supported=supported)
 
 
 # ── Jobs ─────────────────────────────────────────────────────────────────────

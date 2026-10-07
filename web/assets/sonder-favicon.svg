@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="400" height="400" role="img" aria-labelledby="title">
+  <title id="title">Sonder Editor</title>
+  <!-- Browser tab and Windows shortcut icon: sonder-mark-small.svg on a dark tile, so
+       the light S stays visible on light tab strips and desktops. -->
+  <rect x="2" y="2" width="396" height="396" rx="88" fill="#0c1015" stroke="#2c3744" stroke-width="6"/>
+  <g transform="translate(32 32) scale(0.84)">
+    <rect fill="#6686a3" x="186" y="26" width="28" height="348" rx="14"/>
+    <path id="sonder-s-curve" fill="#e7ecf2" d="M 318 40 H 155 C 96 40, 60 76, 60 128 C 60 150, 68 164, 82 172 H 140 C 121 162, 112 146, 112 128 C 112 106, 128 96, 155 96 H 318 Q 340 96, 340 74 V 62 Q 340 40, 318 40 Z"/>
+    <use href="#sonder-s-curve" transform="rotate(180 200 200)"/>
+    <rect fill="#6686a3" x="62" y="164" width="276" height="72" rx="14"/>
+  </g>
+</svg>

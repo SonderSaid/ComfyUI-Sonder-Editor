@@ -97,6 +97,18 @@ ComfyUI process. Do not toggle the setting while a render or Save Bridge job is
 in flight; its finalization safely remains pending until the matching path is
 trusted again.
 
+## Sonder App
+
+### Where is the Launcher shortcut, and why does it stop working after a port change?
+
+On Windows, installing the Sonder App saves **Sonder Launcher.url** in your
+Sonder projects folder (`ComfyUI/output/sonder-projects/` unless you changed it). Copy it wherever you like; double-clicking it
+opens the Launcher in your default browser while ComfyUI is running. Sonder
+rewrites the file each time ComfyUI starts, so it follows a new `--port`, but a
+copy you made elsewhere keeps the old address: copy it again after changing the
+port. On macOS and Linux there is no shortcut file; bookmark the Launcher page
+(`http://127.0.0.1:<port>/sonder-editor/app`) instead.
+
 ## Playback
 
 ### Video does not play in the editor when ComfyUI runs with `--disable-api-nodes`

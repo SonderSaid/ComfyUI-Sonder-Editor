@@ -23,6 +23,71 @@ INLINE_GENERATION_PARAM_KEYS = frozenset((
     "fps", "selection_start", "scene_id",
 ))
 
+# Storage formats this version reads, and the one a split save writes. A project
+# without a ``storage`` block is the legacy single-document layout (reported as 0).
+READABLE_FORMAT_VERSIONS = (1, 2, 3)
+CURRENT_FORMAT_VERSION = 3
+# The first Sonder release that reads each format (from the git tags). The Launcher
+# names it when an edit would upgrade a project past what older versions can open.
+FORMAT_FIRST_RELEASE = {1: "0.4.0", 2: "0.4.0", 3: "0.6.0"}
+
+
+def stored_format_version(data):
+    """The project's storage format from its raw document: 0 for legacy, else the
+    stored number, which may be one this version cannot read. -1 when malformed."""
+    if not isinstance(data, dict) or "storage" not in data:
+        return 0
+    storage = data["storage"]
+    version = storage.get("format_version") if isinstance(storage, dict) else None
+    return version if type(version) is int and version > 0 else -1
+
+
+def _has_inline_payloads(data):
+    has_history = isinstance(data.get("metadata"), dict) and "prompt_history" in data["metadata"]
+    has_provenance = any(asset.get("generation_params") for asset in data.get("assets", []))
+    return has_history or bool(data.get("generation_queue")) or has_provenance
+
+
+def saved_format_version(old, data, staged_names, bump_modified_at):
+    """The storage format a save writes, or None when a legacy document stays legacy.
+
+    The one authority for when a save upgrades a project's format: ``assemble_for_save``
+    decides migration with it, and ``next_edit_upgrade`` predicts from it. ``old`` is
+    the on-disk ``storage_of`` result, ``staged_names`` the components the save stages.
+    """
+    if old is None:
+        migrates = bump_modified_at and (bool(staged_names) or _has_inline_payloads(data))
+        return CURRENT_FORMAT_VERSION if migrates else None
+    version = old["format_version"]
+    if staged_names:
+        version = max(version, 2)
+    if old["format_version"] == 2 and bump_modified_at:
+        version = 3
+    return version
+
+
+def next_edit_upgrade(data):
+    """What the next authoring edit would do to this project's storage format.
+
+    ``{"from", "to", "when"}``, None when no edit changes the format. ``when`` is:
+
+    - ``"edit"``: any edit that saves;
+    - ``"generation"``: a legacy project, on the first edit that records prompt
+      history (applying a prompt) or stores a generated take or queue job;
+    - ``"prompt_history"``: format 1, only on an edit that records prompt history.
+
+    Raises ``ProjectStorageError`` for a format this version cannot read.
+    """
+    old = storage_of(data)
+    current = old["format_version"] if old else 0
+    for when, staged in (("edit", ()), ("prompt_history", ("prompt_history",))):
+        target = saved_format_version(old, data, staged, True)
+        if target is not None and target != current:
+            if when == "prompt_history" and old is None:
+                when = "generation"
+            return {"from": current, "to": target, "when": when}
+    return None
+
 
 def asset_component_name(asset_id):
     return "provenance_" + hashlib.sha256(str(asset_id).encode("utf-8")).hexdigest()
@@ -167,7 +232,7 @@ def storage_of(data):
     storage = data["storage"]
     if (not isinstance(storage, dict)
             or type(storage.get("format_version")) is not int
-            or storage["format_version"] not in (1, 2, 3)
+            or storage["format_version"] not in READABLE_FORMAT_VERSIONS
             or not isinstance(storage.get("components"), dict)):
         raise ProjectStorageError("Unsupported or malformed project storage format")
     if "prompt_history" not in storage["components"]:
@@ -267,7 +332,7 @@ def publish_bytes(path, payload):
 
 
 def component_relative_path(name, digest, format_version):
-    if format_version not in (1, 2, 3):
+    if format_version not in READABLE_FORMAT_VERSIONS:
         raise ProjectStorageError("Unsupported component publication format")
     return f"state/{digest}.json" if format_version == 3 else f"state/{name}-{digest}.json"
 
@@ -474,9 +539,10 @@ def assemble_for_save(project, data, current, *, bump_modified_at):
     if staged and not bump_modified_at:
         raise ProjectStorageError("A no-bump save cannot stage a frozen component")
     has_history = isinstance(data.get("metadata"), dict) and "prompt_history" in data["metadata"]
-    has_provenance = any(asset.get("generation_params") for asset in data.get("assets", []))
-    migrate = old is None and bump_modified_at and (has_history or bool(staged) or bool(data.get("generation_queue")) or has_provenance)
-    repack = old is not None and old["format_version"] == 2 and bump_modified_at
+    # The one rule for format changes; the steps below must arrive at it (checked at the end).
+    target = saved_format_version(old, data, tuple(staged), bump_modified_at)
+    migrate = old is None and target is not None
+    repack = old is not None and old["format_version"] == 2 and target == 3
     if old is None and not migrate:
         return data
     job_ids = [job.get("job_id") for job in data.get("generation_queue", [])]
@@ -487,7 +553,7 @@ def assemble_for_save(project, data, current, *, bump_modified_at):
         raise ProjectStorageError("Provenance storage requires unique nonempty asset ids")
     if old:
         validate_storage(project.project_dir, current)
-    storage = copy.deepcopy(old) if old else {"format_version": 3, "components": {}}
+    storage = copy.deepcopy(old) if old else {"format_version": target, "components": {}}
     components = storage["components"]
     for name, (base, value) in staged.items():
         if components.get(name) != base:
@@ -613,10 +679,14 @@ def assemble_for_save(project, data, current, *, bump_modified_at):
         data["metadata"].pop("prompt_history", None)
     if repack:
         _repack_components(project.project_dir, components)
-        storage["format_version"] = 3
+        storage["format_version"] = target
     storage["recovery_previous"] = previous
     if bump_modified_at:
         storage["authoring_previous"] = previous
+    if storage["format_version"] != target:
+        # The Launcher predicts upgrades from saved_format_version; never let a save drift from it.
+        raise ProjectStorageError(
+            f"Save would write storage format {storage['format_version']}, expected {target}")
     data["storage"] = storage
     if repack:
         validate_storage(project.project_dir, data)

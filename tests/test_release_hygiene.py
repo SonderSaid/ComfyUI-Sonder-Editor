@@ -106,6 +106,54 @@ def test_install_metadata_does_not_install_comfy_owned_torch_packages():
     assert declared.isdisjoint(COMFY_OWNED_PACKAGES)
 
 
+def _comfyignore_excludes(relative_path: str, patterns: list[str]) -> bool:
+    """gitignore semantics for the patterns this file can hold (no negations).
+
+    A pattern containing a slash is anchored at the root; one without matches any
+    path component. A trailing slash matches directories, so it excludes everything
+    under one.
+    """
+    import fnmatch
+
+    parts = relative_path.split("/")
+    for raw in patterns:
+        pattern = raw.strip()
+        if not pattern or pattern.startswith("#") or pattern.startswith("!"):
+            continue
+        directory_only = pattern.endswith("/")
+        pattern = pattern.strip("/")
+        anchored = "/" in pattern
+        # Every leading prefix is a directory except the full path itself.
+        for depth in range(1, len(parts) + 1):
+            is_dir = depth < len(parts)
+            if directory_only and not is_dir:
+                continue
+            prefix = "/".join(parts[:depth])
+            candidate = prefix if anchored else parts[depth - 1]
+            if fnmatch.fnmatchcase(candidate, pattern) or (anchored and fnmatch.fnmatchcase(prefix, pattern.replace("**", "*"))):
+                return True
+    return False
+
+
+def test_comfyignore_keeps_dev_tools_out_and_shipped_assets_in():
+    patterns = (ROOT / ".comfyignore").read_text(encoding="utf-8").splitlines()
+    for dev in ("tests/test_release_hygiene.py", "tools/icons/build_icons.py", ".github/workflows/publish.yml"):
+        assert _comfyignore_excludes(dev, patterns), dev
+    # The Launcher icon and favicons, and pack-shipped starter workflows, are runtime files.
+    for shipped in ("web/assets/sonder.ico", "web/assets/sonder-favicon.svg", "web/sdk_app.html",
+                    "sdk_starters/example.json", "server/sdk_install.py"):
+        assert not _comfyignore_excludes(shipped, patterns), shipped
+    assert (ROOT / "web" / "assets" / "sonder.ico").is_file()
+
+
+def test_the_comfyignore_matcher_honours_globs():
+    assert _comfyignore_excludes("web/assets/sonder.ico", ["*.ico"])
+    assert _comfyignore_excludes("web/assets/sonder.ico", ["assets/"])
+    assert _comfyignore_excludes("web/assets/sonder.ico", ["web/**"])
+    assert not _comfyignore_excludes("web/assets/sonder.ico", ["tools/", "tests/"])
+    assert not _comfyignore_excludes("web/assets", ["assets/"])  # a file named assets is not a directory
+
+
 def test_gitignore_excludes_local_release_noise_and_secret_files():
     ignored = {
         line.strip()

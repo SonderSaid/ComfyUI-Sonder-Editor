@@ -14,7 +14,8 @@
   shortcut and record once nothing recorded is left.
 * One job at a time; a reservation stops new Generates; the "still running"
   flag past ten minutes.
-* The shortcut page probes the cross-origin ping route, and the routes:
+* The shortcut is a Windows .url (Windows only, ASCII, icon left out when it
+  can't be written) that replaces the legacy HTML file, and the routes:
   loopback only (forwarding headers refuse), LAN status without commands,
   uninstall refused while a run is unfinished or a Generate is in flight.
 
@@ -194,7 +195,7 @@ def test_install_adds_only_the_reported_set_and_records_what_it_added(user_dir):
     pip.on_install = lambda: seen_intent.append(json.loads(intent_path(user_dir).read_text(encoding="utf-8")))
     shortcut_calls = []
     result = sdk_install.install(runner=pip, installed=pip.version,
-                                 shortcut=lambda: shortcut_calls.append(1) or "X:/Sonder Launcher.html")
+                                 shortcut=lambda: shortcut_calls.append(1) or "X:/Sonder Launcher.url")
     assert pip.calls[-1] == ["install", "--no-deps", "--no-input", "comfy-api-proxy==0.1.6", "some-dep==1.2"]
     assert seen_intent and seen_intent[0]["packages"] == ["comfy-api-proxy==0.1.6", "some-dep==1.2"]
     assert not intent_path(user_dir).exists()
@@ -205,7 +206,7 @@ def test_install_adds_only_the_reported_set_and_records_what_it_added(user_dir):
     assert saved["added_dependencies"] == [{"name": "some-dep", "version": "1.2"}]
     assert result["ok"] is True and result["added"] == ["comfy-api-proxy 0.1.6", "some-dep 1.2"]
     assert shortcut_calls == [1]
-    assert result["notes"] == ["Saved the Launcher shortcut, Sonder Launcher.html, in the sonder-projects folder."]
+    assert result["notes"] == ["Saved the Launcher shortcut, Sonder Launcher.url, in the sonder-projects folder."]
 
 
 def test_install_with_nothing_to_add_writes_no_record(user_dir):
@@ -430,52 +431,104 @@ def test_a_long_job_says_it_is_still_running(user_dir, monkeypatch):
 
 # ── Shortcut ─────────────────────────────────────────────────────────────────
 
-def test_the_shortcut_probes_comfyui_then_opens_the_launcher(tmp_path):
+WINDOWS = lambda: True
+OTHER_OS = lambda: False
+
+
+def _icon(tmp_path):
+    icon = tmp_path / "assets" / "sonder.ico"
+    icon.parent.mkdir(parents=True, exist_ok=True)
+    icon.write_bytes(b"ico")
+    return str(icon)
+
+
+def test_the_shortcut_is_a_windows_internet_shortcut_to_the_launcher(tmp_path):
     projects = tmp_path / "sonder-projects"
-    path = sdk_install.write_shortcut(str(projects), "http://127.0.0.1:8888")
-    html = (projects / "Sonder Launcher.html").read_text(encoding="utf-8")
-    assert path.endswith("Sonder Launcher.html")
-    assert 'const LAUNCHER = "http://127.0.0.1:8888/sonder-editor/app";' in html
-    # The ping route, whose CORP allows a file:// page's no-cors fetch.
-    assert 'const PING = "http://127.0.0.1:8888/sonder-editor/sdk/ping";' in html
-    assert 'mode: "no-cors"' in html and "location.replace(LAUNCHER)" in html
-    assert "Start ComfyUI first" in html
+    icon = _icon(tmp_path)
+    path = sdk_install.write_shortcut(str(projects), "http://127.0.0.1:8888/", icon_path=icon, supported=WINDOWS)
+    assert path.endswith("Sonder Launcher.url")
+    data = (projects / "Sonder Launcher.url").read_bytes()
+    # CRLF, ASCII: the shell reads it as an INI in the ANSI code page.
+    assert data == ("[InternetShortcut]\r\nURL=http://127.0.0.1:8888/sonder-editor/app\r\n"
+                    f"IconFile={icon}\r\nIconIndex=0\r\n").encode("ascii")
     assert sdk_install.delete_shortcut(str(projects)) is True
-    assert not (projects / "Sonder Launcher.html").exists()
+    assert not (projects / "Sonder Launcher.url").exists()
     assert sdk_install.delete_shortcut(str(projects)) is False
 
 
-def test_the_shortcut_escapes_what_it_embeds():
-    html = sdk_install.shortcut_html('http://h:1/</script><b>')
-    assert "</script><b>" not in html.split("<script>", 1)[1].split("</script>", 1)[0]
-    assert "&lt;/script&gt;&lt;b&gt;" in html
+def test_the_shortcut_leaves_out_an_icon_it_cannot_write_or_find(tmp_path):
+    projects = str(tmp_path / "p")
+    unicode_dir = tmp_path / "Vidéo"
+    unicode_icon = _icon(unicode_dir)
+    for icon in (unicode_icon, str(tmp_path / "missing.ico"), ""):
+        path = sdk_install.write_shortcut(projects, "http://127.0.0.1:9000", icon_path=icon, supported=WINDOWS)
+        data = open(path, "rb").read()
+        assert data == b"[InternetShortcut]\r\nURL=http://127.0.0.1:9000/sonder-editor/app\r\n"
+
+
+def test_no_shortcut_is_written_off_windows(tmp_path):
+    projects = tmp_path / "p"
+    assert sdk_install.write_shortcut(str(projects), "http://127.0.0.1:9000", supported=OTHER_OS) == ""
+    assert not (projects / "Sonder Launcher.url").exists()
+
+
+def test_the_legacy_html_shortcut_is_deleted_and_replaced(tmp_path):
+    projects = tmp_path / "p"
+    projects.mkdir()
+    legacy = projects / "Sonder Launcher.html"
+    theirs = lambda: {"installed_by_sonder": []}
+    ready, missing = (lambda: {"ready": True}), (lambda: {"ready": False})
+    # Deleted even while the packages are missing, and even off Windows.
+    legacy.write_text("old", encoding="utf-8")
+    assert sdk_install.refresh_shortcut(str(projects), "http://127.0.0.1:9000", state=missing, record=theirs,
+                                        supported=WINDOWS) == ""
+    assert not legacy.exists()
+    legacy.write_text("old", encoding="utf-8")
+    assert sdk_install.write_shortcut(str(projects), "http://127.0.0.1:9000", supported=OTHER_OS) == ""
+    assert not legacy.exists()
+    # Its presence counts as Sonder's ownership: the .url takes its place without a record.
+    legacy.write_text("old", encoding="utf-8")
+    path = sdk_install.refresh_shortcut(str(projects), "http://127.0.0.1:9000", state=ready, record=theirs,
+                                        supported=WINDOWS)
+    assert path.endswith("Sonder Launcher.url") and not legacy.exists()
+    # Uninstall deletes either file.
+    legacy.write_text("old", encoding="utf-8")
+    os.remove(path)
+    assert sdk_install.delete_shortcut(str(projects)) is True and not legacy.exists()
 
 
 def test_startup_refreshes_the_shortcut_only_while_it_is_sonders(tmp_path):
     projects = str(tmp_path / "p")
-    page = tmp_path / "p" / "Sonder Launcher.html"
+    page = tmp_path / "p" / "Sonder Launcher.url"
     ours = lambda: {"installed_by_sonder": ["comfy-api-proxy"]}
     theirs = lambda: {"installed_by_sonder": []}
     ready, missing = (lambda: {"ready": True}), (lambda: {"ready": False})
-    assert sdk_install.refresh_shortcut(projects, "http://127.0.0.1:9000", state=missing, record=ours) == ""
+    kw = {"supported": WINDOWS, "icon_path": ""}
+    assert sdk_install.refresh_shortcut(projects, "http://127.0.0.1:9000", state=missing, record=ours, **kw) == ""
     # Packages the user installed alone get no file.
-    assert sdk_install.refresh_shortcut(projects, "http://127.0.0.1:9000", state=ready, record=theirs) == ""
+    assert sdk_install.refresh_shortcut(projects, "http://127.0.0.1:9000", state=ready, record=theirs, **kw) == ""
     assert not page.exists()
-    sdk_install.refresh_shortcut(projects, "http://127.0.0.1:9000", state=ready, record=ours)
-    assert "127.0.0.1:9000/sonder-editor/app" in page.read_text(encoding="utf-8")
+    sdk_install.refresh_shortcut(projects, "http://127.0.0.1:9000", state=ready, record=ours, **kw)
+    assert b"127.0.0.1:9000/sonder-editor/app" in page.read_bytes()
     # An existing file follows the port even without a record.
-    sdk_install.refresh_shortcut(projects, "http://127.0.0.1:9100", state=ready, record=theirs)
-    assert "127.0.0.1:9100/sonder-editor/app" in page.read_text(encoding="utf-8")
-    assert sdk_install.write_shortcut("", "http://x") == "" and sdk_install.write_shortcut(projects, "") == ""
+    sdk_install.refresh_shortcut(projects, "http://127.0.0.1:9100", state=ready, record=theirs, **kw)
+    assert b"127.0.0.1:9100/sonder-editor/app" in page.read_bytes()
+    assert sdk_install.write_shortcut("", "http://x", supported=WINDOWS) == ""
+    assert sdk_install.write_shortcut(projects, "", supported=WINDOWS) == ""
 
 
 def test_an_unchanged_shortcut_is_not_rewritten(tmp_path):
     projects = str(tmp_path / "p")
-    path = sdk_install.write_shortcut(projects, "http://127.0.0.1:9000")
+    path = sdk_install.write_shortcut(projects, "http://127.0.0.1:9000", supported=WINDOWS)
     os.utime(path, (1000, 1000))
-    sdk_install.write_shortcut(projects, "http://127.0.0.1:9000")
+    sdk_install.write_shortcut(projects, "http://127.0.0.1:9000", supported=WINDOWS)
     assert os.stat(path).st_mtime == 1000
-    assert [p.name for p in (tmp_path / "p").iterdir()] == ["Sonder Launcher.html"]
+    assert [p.name for p in (tmp_path / "p").iterdir()] == ["Sonder Launcher.url"]
+
+
+def test_the_shipped_icon_exists_and_is_an_ico():
+    with open(sdk_install.SHORTCUT_ICON, "rb") as handle:
+        assert handle.read(4) == b"\x00\x00\x01\x00"
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────
@@ -605,17 +658,6 @@ def test_lan_status_carries_no_commands_or_pip_output(user_dir, monkeypatch):
     asyncio.run(run())
 
 
-def test_the_ping_route_allows_a_cross_origin_probe(user_dir, monkeypatch):
-    async def run():
-        client, _ = _client(user_dir, monkeypatch)
-        async with client:
-            resp = await client.get("/sonder-editor/sdk/ping")
-        assert resp.status == 204
-        assert resp.headers["Cross-Origin-Resource-Policy"] == "cross-origin"
-
-    asyncio.run(run())
-
-
 def test_startup_refreshes_the_shortcut_through_the_app(user_dir, monkeypatch):
     from server import sdk_routes, sdk_runner
 
@@ -647,34 +689,12 @@ def test_status_reports_the_installer(user_dir, monkeypatch):
     asyncio.run(run())
 
 
-def test_the_shortcut_script_opens_the_launcher_or_asks_to_start_comfyui(tmp_path):
-    """Runs the page's own script under Node with ComfyUI answering, then down."""
-    import shutil
+def test_the_ping_route_is_gone(user_dir, monkeypatch):
+    """Only the HTML shortcut probed it; the .url opens the Launcher directly."""
+    async def run():
+        client, _ = _client(user_dir, monkeypatch)
+        async with client:
+            resp = await client.get("/sonder-editor/sdk/ping")
+        assert resp.status == 404
 
-    node = shutil.which("node")
-    if not node:
-        pytest.skip("node is required to run the shortcut's script")
-    html = sdk_install.shortcut_html("http://127.0.0.1:8888")
-    script = html.split("<script>", 1)[1].split("</script>", 1)[0]
-    harness = """
-const make = () => ({ textContent: "", hidden: true, listeners: [], addEventListener(t, f) { this.listeners.push(f); } });
-async function run(up) {
-  const els = { message: make(), retry: make() };
-  const replaced = [];
-  const fetched = [];
-  globalThis.document = { getElementById: (id) => els[id] };
-  globalThis.location = { replace: (u) => replaced.push(u) };
-  globalThis.fetch = async (url, init) => { fetched.push([url, init.mode]); if (!up) throw new TypeError("Failed to fetch"); return {}; };
-  new Function(SCRIPT)();
-  for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
-  return { replaced, fetched, message: els.message.textContent, retryHidden: els.retry.hidden };
-}
-console.log(JSON.stringify({ up: await run(true), down: await run(false) }));
-""".replace("SCRIPT", json.dumps(script))
-    result = subprocess.run([node, "--input-type=module"], input=harness, capture_output=True, text=True, timeout=60)
-    assert result.returncode == 0, result.stderr
-    out = json.loads(result.stdout.strip().splitlines()[-1])
-    assert out["up"]["fetched"] == [["http://127.0.0.1:8888/sonder-editor/sdk/ping", "no-cors"]]
-    assert out["up"]["replaced"] == ["http://127.0.0.1:8888/sonder-editor/app"]
-    assert out["down"]["replaced"] == []
-    assert out["down"]["message"] == "Start ComfyUI first, then try again." and out["down"]["retryHidden"] is False
+    asyncio.run(run())

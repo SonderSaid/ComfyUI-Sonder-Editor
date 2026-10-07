@@ -13,6 +13,7 @@ from typing import Callable
 from .atomic_io import atomic_replace
 from . import external_links
 from . import project_storage
+from .pack_version import pack_version
 from .path_security import path_within
 from .timeline_state import TimelineProject, project_prompt_fields_with_unknowns
 
@@ -313,6 +314,13 @@ def save_project(
             current_data = _read_project_json(project_file) if os.path.isfile(project_file) else {}
             data = project_storage.assemble_for_save(
                 project, data, current_data, bump_modified_at=bump_modified_at)
+        # The Sonder version that wrote these bytes (every save, repair saves
+        # included). Older versions keep the key as an unknown field, so after an
+        # older save it can name a newer version; only a too-new-format message
+        # reads it, and an older version cannot write a format it cannot read.
+        written_with = pack_version()
+        if written_with:
+            data["written_with"] = written_with
         # One authoritative encode owns both persistence and compatibility
         # shadow normalization. Pretty printing is deliberately retained; the
         # incidents this path protects were diagnosed from readable files.
@@ -486,10 +494,49 @@ def load_project(project_dir: str) -> TimelineProject:
     return project
 
 
-def list_projects(base_dir: str) -> list[dict]:
-    results = []
+def _unreadable_reason(exc: Exception) -> str:
+    """A code for why a project could not be listed. Never the exception text: it can hold paths."""
+    if isinstance(exc, (json.JSONDecodeError, UnicodeDecodeError)):
+        return "invalid_json"
+    if isinstance(exc, OSError):
+        return "unreadable"
+    return "not_a_project"
+
+
+def _project_detail(data: dict) -> dict:
+    """The Launcher's extra fields, from the document the scan already parsed."""
+    version = project_storage.stored_format_version(data)
+    detail = {
+        "format_version": version,
+        "written_with": data.get("written_with", "") if isinstance(data.get("written_with"), str) else "",
+        "scenes": [
+            {"scene_id": str(scene.get("scene_id", "")), "name": str(scene.get("name", "")),
+             "order": scene.get("order", 0) if isinstance(scene.get("order"), (int, float)) else 0}
+            for scene in data.get("scenes", []) if isinstance(scene, dict)
+        ],
+        "too_new": version > project_storage.CURRENT_FORMAT_VERSION,
+        "upgrade": None,
+    }
+    if not detail["too_new"]:
+        # Raises ProjectStorageError for a storage block this version can't load.
+        detail["upgrade"] = project_storage.next_edit_upgrade(data)
+    return detail
+
+
+def scan_projects(base_dir: str, *, detail: bool = False) -> tuple[list[dict], list[dict], int]:
+    """Every listable project, the ones that could not be read, and how many linked
+    folders were skipped because external links are off (counted without following
+    the link, so a linked folder that holds no project counts too).
+
+    ``unreadable`` entries are ``{"folder", "reason"}`` with a reason code only.
+    ``detail`` adds the Launcher's fields to each entry; with it, a project whose
+    storage block cannot be loaded is reported unreadable (``"storage"``) instead.
+    """
+    results: list[dict] = []
+    unreadable: list[dict] = []
+    linked_hidden = 0
     if not os.path.isdir(base_dir):
-        return results
+        return results, unreadable, linked_hidden
 
     base_real = os.path.realpath(base_dir)
     trust_links = external_links.is_enabled()
@@ -498,6 +545,7 @@ def list_projects(base_dir: str) -> list[dict]:
         linked = external_links.is_reparse_child(base_real, entry)
         if linked and not trust_links:
             logger.warning("Skipping linked project while external links are disabled: %s", entry_path)
+            linked_hidden += 1
             continue
         # Trust-on paths retain the scan-root anchor plus the lexical entry name. A
         # realpath here would turn a junction-backed project into its external target
@@ -511,13 +559,15 @@ def list_projects(base_dir: str) -> list[dict]:
             try:
                 with _project_write_lock(resolved_entry):
                     data = _read_project_json(project_file)
+                if not isinstance(data, dict):
+                    raise TypeError("project.json is not an object")
                 scenes = data.get("scenes", [])
                 assets = data.get("assets", [])
                 # Backward compat: count clips from old flat format or from scenes
                 clip_count = len(data.get("clips", []))
                 if not clip_count:
                     clip_count = sum(len(s.get("clips", [])) for s in scenes)
-                results.append({
+                item = {
                     "project_id": data.get("project_id", ""),
                     "name": data.get("name", entry),
                     "path": resolved_entry,
@@ -528,10 +578,29 @@ def list_projects(base_dir: str) -> list[dict]:
                     "clip_count": clip_count,
                     "asset_count": len(assets),
                     "modified_at": data.get("modified_at", ""),
-                })
-            except (json.JSONDecodeError, OSError) as e:
+                }
+            # A project that fails to parse used to fail the whole list with a 500
+            # (a non-UTF-8 file, a root that is not an object); now it is reported.
+            except (ValueError, OSError, TypeError, AttributeError) as e:
                 logger.warning("Skipping invalid project at %s: %s", entry_path, e)
-    return results
+                unreadable.append({"folder": entry, "reason": _unreadable_reason(e), "linked": linked})
+                continue
+            if detail:
+                # Outside the parse guard: a fault in this code must fail loudly, not
+                # turn every project into an unreadable tile.
+                try:
+                    item.update(_project_detail(data))
+                except project_storage.ProjectStorageError as e:
+                    logger.warning("Project storage at %s can't be loaded: %s", entry_path, e)
+                    unreadable.append({"folder": entry, "reason": "storage", "linked": linked})
+                    continue
+                item["folder"] = entry
+            results.append(item)
+    return results, unreadable, linked_hidden
+
+
+def list_projects(base_dir: str) -> list[dict]:
+    return scan_projects(base_dir)[0]
 
 
 def _safe_dirname(name: str) -> str:

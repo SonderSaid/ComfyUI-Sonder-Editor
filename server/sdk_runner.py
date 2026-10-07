@@ -45,7 +45,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from . import control_descriptors, sdk_proxy, sdk_runs, sdk_templates, session_registry
+from . import control_descriptors, launcher_state, sdk_proxy, sdk_runs, sdk_templates, session_registry
 from .editor_inputs import clean_editor_value, editor_optional_inputs
 from .sdk_install import install_state, uninstall_running
 
@@ -396,6 +396,7 @@ class SdkRunner:
             if session.template_id == template_id and session.project == project:
                 session.last_activity = now
                 session.project_dir, session.aliases = project_dir, list(aliases)
+                await self._record_open(session)
                 return self._open_result(session)
         if len(self._sessions) >= MAX_SESSIONS:
             await self._evict_one()
@@ -412,7 +413,16 @@ class SdkRunner:
         self._sessions[session.session_id] = session
         self._idle_since = 0.0
         asyncio.ensure_future(self._warm_proxy())
+        await self._record_open(session)
         return self._open_result(session)
+
+    async def _record_open(self, session: SdkSession) -> None:
+        """The Launcher preselects this workflow for this project next time. Only an open
+        that succeeded is recorded, and a failed note never fails the open."""
+        try:
+            await asyncio.to_thread(launcher_state.record_open, session.project, session.template_id)
+        except Exception:
+            logger.warning("Recording the Launcher's last workflow failed", exc_info=True)
 
     def _open_result(self, session: SdkSession) -> dict:
         return {
