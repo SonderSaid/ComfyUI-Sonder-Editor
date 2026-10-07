@@ -4,7 +4,7 @@ import {
     lightenColor,
     setButtonDisabled,
 } from "./editor_theme.js";
-import { describeSdkSetup } from "./sdk_setup_client.js";
+import { describeSdkSetup, MACHINE_ONLY_MESSAGE } from "./sdk_setup_client.js";
 import {
     register as registerKeyboardConsumer,
     PRIORITY as KEY_PRIORITY,
@@ -360,11 +360,14 @@ function syncSettingsPanelControls() {
     }
     if (controls.allowExternalProjectLinks) {
         const resolved = this._serverSettingsLoaded === true;
-        controls.allowExternalProjectLinks.disabled = !resolved;
-        controls.allowExternalProjectLinks.checked = this._serverSettings?.allow_external_project_links === true;
-        controls.allowExternalProjectLinks.title = resolved
-            ? ""
-            : "Loading server setting…";
+        const enabled = this._serverSettings?.allow_external_project_links === true;
+        // Turning links on is machine-only; turning them off removes trust and stays open.
+        const refused = resolved && this._serverSettings?.can_manage === false && !enabled;
+        controls.allowExternalProjectLinks.disabled = !resolved || refused;
+        controls.allowExternalProjectLinks.checked = enabled;
+        controls.allowExternalProjectLinks.title = !resolved
+            ? "Loading server setting…"
+            : refused ? MACHINE_ONLY_MESSAGE : "";
     }
     if (controls.sdkShowLauncherButton) controls.sdkShowLauncherButton.checked = !!this._settings.sdk?.showLauncherButton;
     syncSdkSetupControls.call(this, controls);

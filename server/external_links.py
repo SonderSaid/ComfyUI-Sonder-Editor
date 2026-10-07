@@ -53,11 +53,13 @@ WINDOWS_RESERVED_BASENAMES = frozenset(
 
 
 class LinkError(ValueError):
-    """A link/unlink request that must be refused with a specific HTTP status."""
+    """A link/unlink request that must be refused with a specific HTTP status and a
+    machine code, which the Launcher's link preview reports exactly as Link does."""
 
-    def __init__(self, message: str, status: int = 400):
+    def __init__(self, message: str, status: int = 400, code: str = "invalid"):
         super().__init__(message)
         self.status = status
+        self.code = code
 
 
 # ── Flag store ────────────────────────────────────────────────────────────────
@@ -168,19 +170,21 @@ def _validate_link_name(name: str) -> str:
     # Check these before safe_route_token: trust-mode path validation also rejects
     # device names, but this link-specific route should retain a clear repair hint.
     if name != name.rstrip(". "):
-        raise LinkError("Folder names ending in a dot or space are not usable on Windows")
+        raise LinkError("Folder names ending in a dot or space are not usable on Windows", code="bad_name")
     stem = name.split(".", 1)[0].strip().upper()
     if stem in WINDOWS_RESERVED_BASENAMES:
-        raise LinkError(f"'{name}' is a reserved Windows device name")
+        raise LinkError(f"'{name}' is a reserved Windows device name", code="bad_name")
     try:
         safe_route_token(name, "link name")
     except PathSecurityError as exc:
-        raise LinkError(f"Folder name '{name}' cannot be used as a project id ({exc}) — rename the folder first") from exc
+        raise LinkError(f"Folder name '{name}' cannot be used as a project id ({exc}) — rename the folder first",
+                        code="bad_name") from exc
     if name != name.rstrip(". "):
-        raise LinkError("Folder names ending in a dot or space are not usable on Windows — rename the folder first")
+        raise LinkError("Folder names ending in a dot or space are not usable on Windows — rename the folder first",
+                        code="bad_name")
     stem = name.split(".", 1)[0].strip().upper()
     if stem in WINDOWS_RESERVED_BASENAMES:
-        raise LinkError(f"'{name}' is a reserved Windows device name — rename the folder first")
+        raise LinkError(f"'{name}' is a reserved Windows device name — rename the folder first", code="bad_name")
     return name
 
 
@@ -202,50 +206,96 @@ def _create_dir_link(link_path: str, target: str) -> None:
                     "Could not create the link. Junctions only work for local drives "
                     f"(error: {junction_exc}); a symlink needs Windows Developer Mode or an "
                     f"elevated ComfyUI (error: {symlink_exc}).",
-                    500,
+                    500, code="link_failed",
                 ) from symlink_exc
     try:
         os.symlink(target, link_path, target_is_directory=True)
     except OSError as exc:
-        raise LinkError(f"Could not create the link: {exc}", 500) from exc
+        raise LinkError(f"Could not create the link: {exc}", 500, code="link_failed") from exc
+
+
+PREVIEW_MAX_BYTES = 64 * 1024 * 1024
+
+
+def validate_link_target(raw_path: str) -> tuple[str, str]:
+    """``(target, name)`` for a folder that Link would accept, or the ``LinkError`` it
+    would refuse with. The one validation behind both Link and the Launcher's preview;
+    the trust flag is checked separately, by ``create_project_link``.
+    """
+    raw = str(raw_path or "").strip().strip('"')
+    if not raw or "\x00" in raw:
+        raise LinkError("A folder path is required", code="path_required")
+
+    target = os.path.realpath(raw)
+    if not os.path.isdir(target):
+        raise LinkError("That path is not a folder on the server", 404, code="not_found")
+    if not os.path.isfile(os.path.join(target, "project.json")):
+        raise LinkError("That folder is not a Sonder project (no project.json inside)", code="not_a_project")
+
+    root = scan_root()
+    if not root:
+        raise LinkError("Projects folder unavailable", 500, code="unavailable")
+    try:
+        inside = os.path.commonpath([os.path.normcase(root), os.path.normcase(target)]) == os.path.normcase(root)
+    except ValueError:
+        inside = False  # different drives — definitely not inside the scan root
+    # Raised outside the try: LinkError is a ValueError, which the try used to swallow.
+    if inside:
+        raise LinkError("That project is already in the projects folder", code="already_inside")
+
+    name = os.path.basename(os.path.normpath(target))
+    _validate_link_name(name)
+    if os.path.lexists(os.path.join(root, name)):
+        raise LinkError(f"'{name}' already exists in the projects folder — rename one of them first", 409,
+                        code="name_taken")
+    return target, name
+
+
+def preview_link_target(raw_path: str) -> dict:
+    """What Link would add, read only: the folder name and, when ``project.json`` is at
+    most ``PREVIEW_MAX_BYTES`` and parses, the project's name, scene count and storage
+    format. Refuses exactly what Link refuses (``validate_link_target``); never writes.
+    """
+    from . import project_storage
+
+    _target, name = validate_link_target(raw_path)
+    preview = {"folder": name, "readable": False}
+    project_file = os.path.join(_target, "project.json")
+    try:
+        if os.path.getsize(project_file) > PREVIEW_MAX_BYTES:
+            return preview
+        with open(project_file, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return preview
+    if not isinstance(data, dict):
+        return preview
+    version = project_storage.stored_format_version(data)
+    scenes = data.get("scenes")
+    preview.update({
+        "readable": True,
+        "name": str(data.get("name") or name),
+        "scene_count": len(scenes) if isinstance(scenes, list) else 0,
+        "format_version": version,
+        "too_new": version > project_storage.CURRENT_FORMAT_VERSION,
+    })
+    return preview
 
 
 def create_project_link(raw_path: str) -> dict:
     """Create ``<sonder-projects>/<basename(target)>`` as a junction/symlink to ``target``.
 
-    Refusals carry an HTTP status via ``LinkError``: flag OFF (403), target missing (404),
-    not a project / bad name (400), name collision (409).
+    Refusals carry an HTTP status and a code via ``LinkError``: flag OFF (403), target
+    missing (404), not a project / bad name (400), name collision (409).
     """
     if not is_enabled():
         raise LinkError(
             "External project links are disabled. Enable 'Allow external project links' in Settings first.",
-            403,
+            403, code="links_disabled",
         )
-    raw = str(raw_path or "").strip().strip('"')
-    if not raw or "\x00" in raw:
-        raise LinkError("A folder path is required")
-
-    target = os.path.realpath(raw)
-    if not os.path.isdir(target):
-        raise LinkError("That path is not a folder on the server", 404)
-    if not os.path.isfile(os.path.join(target, "project.json")):
-        raise LinkError("That folder is not a Sonder project (no project.json inside)")
-
+    target, name = validate_link_target(raw_path)
     root = scan_root()
-    if not root:
-        raise LinkError("Projects folder unavailable", 500)
-    try:
-        if os.path.commonpath([os.path.normcase(root), os.path.normcase(target)]) == os.path.normcase(root):
-            raise LinkError("That project is already in the projects folder")
-    except ValueError:
-        pass  # different drives — definitely not inside the scan root
-
-    name = os.path.basename(os.path.normpath(target))
-    _validate_link_name(name)
     link_path = os.path.join(root, name)
-    if os.path.lexists(link_path):
-        raise LinkError(f"'{name}' already exists in the projects folder — rename one of them first", 409)
-
     os.makedirs(root, exist_ok=True)
     _create_dir_link(link_path, target)
     logger.info("external_links: linked %s -> %s", link_path, target)

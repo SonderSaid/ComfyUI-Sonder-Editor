@@ -11,6 +11,39 @@ export function visibleProjects(state) {
             return cmp * (state.prefs.view === 'list' ? state.sort.direction : -1) || a.folder.localeCompare(b.folder);
         });
 }
+// What a tile shows: Off nothing, Still the poster, Animated the poster plus a clip on
+// hover. Reduced motion turns Animated into Still.
+export function thumbnailMode(prefs, reducedMotion = globalThis.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches) {
+    const mode = prefs?.thumbnails || 'animated';
+    return mode === 'animated' && reducedMotion ? 'still' : mode;
+}
+// Fill a poster with the project's published thumbnail, or the placeholder mark.
+function paintPoster(poster, p, state, actions) {
+    const shown = thumbnailMode(state.prefs) === 'off' ? '' : state.thumbnails?.[p.folder]?.shown || '';
+    if (poster.dataset.shown === shown && poster.firstChild) return;
+    poster.dataset.shown = shown; poster.querySelectorAll('img.sl-thumb,.sl-placeholder').forEach(n => n.remove());
+    let media;
+    if (shown) { media = el('img', 'sl-thumb'); media.src = actions.thumbnailURL(p.folder, shown, 'jpg'); media.loading = 'lazy'; }
+    else { media = el('img', 'sl-placeholder'); media.src = 'static/assets/sonder-mark-small.svg'; }
+    media.alt = ''; media.draggable = false; poster.prepend(media);
+}
+function hoverClip(poster, p, state, actions) {
+    let video = null;
+    const enter = () => {
+        const shown = poster.dataset.shown;
+        if (!shown || thumbnailMode(state.prefs) !== 'animated') return;
+        if (!video || video.dataset.key !== shown) {
+            video?.remove(); video = el('video', 'sl-thumb'); video.dataset.key = shown;
+            Object.assign(video, { muted: true, loop: true, playsInline: true, preload: 'none' });
+            video.setAttribute('muted', ''); video.setAttribute('playsinline', ''); video.src = actions.thumbnailURL(p.folder, shown, 'mp4');
+            poster.querySelector('.sl-project-badges')?.before(video);
+        }
+        video.hidden = false; void video.play().catch(() => {});
+    };
+    const leave = () => { if (video) { video.pause(); video.hidden = true; } };
+    poster.addEventListener('mouseenter', enter); poster.addEventListener('mouseleave', leave);
+    return () => { leave(); video?.removeAttribute('src'); video?.load?.(); };
+}
 export function mountProjects(state, actions) {
     const section = el('section', 'sl-projects'), toolbar = el('div', 'sl-project-toolbar');
     toolbar.append(el('h2', 'sl-title', 'Projects'), input('Search projects', state.projectSearch, actions.searchProjects, 'project-search'));
@@ -25,7 +58,7 @@ export function mountProjects(state, actions) {
     }
     toolbar.append(sizes); section.append(toolbar);
     const scroll = el('div', 'sl-project-scroll'); scroll.dataset.scrollKey = 'projects';
-    const rows = visibleProjects(state), counts = new Map();
+    const rows = visibleProjects(state), counts = new Map(), posters = new Map(), disposers = [];
     for (const p of state.projects) counts.set(p.name, (counts.get(p.name) || 0) + 1);
     const wire = (node, p) => {
         node.tabIndex = 0; node.dataset.projectFolder = p.folder; node.dataset.focusKey = `project:${p.folder}`;
@@ -56,7 +89,7 @@ export function mountProjects(state, actions) {
             const tile = el('div', 'sl-project'); tile.setAttribute('role', 'option'); tile.title = p.folder; wire(tile, p);
             const poster = el('div', 'sl-poster');
             if (p.unreadable || p.too_new) poster.append(el('span', 'sl-dim', p.unreadable ? 'Can’t be read' : '🔒 Newer project format'));
-            else { const mark = el('img', 'sl-placeholder'); mark.src = 'static/assets/sonder-mark-small.svg'; mark.alt = ''; poster.append(mark); }
+            else { paintPoster(poster, p, state, actions); posters.set(p.folder, { poster, p }); disposers.push(hoverClip(poster, p, state, actions)); }
             const badges = el('div', 'sl-project-badges');
             if (p.linked) badges.append(badge('Linked'));
             if (p.hidden) badges.append(badge('Hidden'));
@@ -70,6 +103,7 @@ export function mountProjects(state, actions) {
     } else {
         scroll.append(button('+ New project', actions.create));
         const table = el('table', 'sl-table'), head = el('thead'), tr = el('tr');
+        const posterHead = el('th'); posterHead.setAttribute('aria-label', 'Poster'); tr.append(posterHead);
         for (const [label, key] of [['Name', 'name'], ['Scenes', 'scene_count'], ['Resolution', 'resolution'], ['fps', 'fps'], ['Last edited', 'modified_at'], ['Folder', 'folder']]) {
             const th = el('th'); th.setAttribute('aria-sort', state.sort.key === key ? (state.sort.direction === 1 ? 'ascending' : 'descending') : 'none');
             th.append(button(label + (state.sort.key === key ? (state.sort.direction === 1 ? ' ↑' : ' ↓') : ''), () => actions.sort(key))); tr.append(th);
@@ -77,6 +111,9 @@ export function mountProjects(state, actions) {
         head.append(tr); table.append(head); const body = el('tbody');
         for (const p of rows) {
             const row = el('tr'); wire(row, p);
+            const cell = el('td', 'sl-list-poster'), poster = el('div', 'sl-poster');
+            if (!p.unreadable && !p.too_new) { paintPoster(poster, p, state, actions); posters.set(p.folder, { poster, p }); }
+            cell.append(poster); row.append(cell);
             for (const value of [p.name + (p.linked ? ' · Linked' : '') + (p.too_new ? ' · 🔒' : '') + (p.unreadable ? ' · Can’t be read' : ''), p.scene_count ?? '', (p.resolution || []).join('×'), p.fps || '', date(p.modified_at), p.folder]) row.append(el('td', '', String(value)));
             body.append(row);
         }
@@ -92,5 +129,25 @@ export function mountProjects(state, actions) {
         if (state.projectData.can_manage) note.append(button('Turn on…', actions.enableLinks));
         scroll.append(note);
     }
-    section.append(scroll); return component(section);
+    section.append(scroll);
+    // Ask the host for thumbnails of the tiles in view only (never with Thumbnails off).
+    let observer = null;
+    if (thumbnailMode(state.prefs) !== 'off' && posters.size && globalThis.IntersectionObserver) {
+        const seen = new Set();
+        observer = new IntersectionObserver(entries => {
+            for (const entry of entries) { const folder = entry.target.closest('[data-project-folder]')?.dataset.projectFolder; if (folder) entry.isIntersecting ? seen.add(folder) : seen.delete(folder); }
+            actions.thumbnailsVisible([...seen]);
+        }, { root: scroll, rootMargin: '200px 0px' });
+        for (const { poster } of posters.values()) observer.observe(poster);
+    }
+    const view = component(section, () => { observer?.disconnect(); for (const dispose of disposers) dispose(); });
+    // Update selection and posters in place, so polling never rebuilds the grid.
+    view.sync = next => {
+        for (const node of section.querySelectorAll('[data-project-folder]')) {
+            const selected = node.dataset.projectFolder === next.selectedProject;
+            node.classList.toggle('selected', selected); node.setAttribute('aria-selected', String(selected));
+        }
+        for (const { poster, p } of posters.values()) paintPoster(poster, p, next, actions);
+    };
+    return view;
 }

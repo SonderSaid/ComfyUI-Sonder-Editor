@@ -7,19 +7,21 @@ import { configureNotifications, notifyError, notifySuccess } from './editor_not
 import { getEditorSettings, updateEditorSettings, notificationCoreConfig, subscribeEditorSettings } from './editor_settings.js';
 import { createSonderProject } from './project_create.js';
 import { SDK_SECRET_HEADER, isUnfinishedRun, readSdkSecret, storeSdkSecret, takeSdkExitFlag } from './sdk_host.js';
-import { LAUNCHER_WINDOW_NAME } from './sdk_setup_client.js';
+import { LAUNCHER_WINDOW_NAME, MACHINE_ONLY_MESSAGE } from './sdk_setup_client.js';
 import { register, PRIORITY } from './keyboard_ownership.js';
 import { el, button, mountLauncherStyle, date } from './launcher_view.js';
 import { mountHeader, environmentState } from './launcher_header.js';
 import { mountWorkflows } from './launcher_workflows.js';
-import { mountProjects } from './launcher_projects.js';
+import { mountProjects, thumbnailMode } from './launcher_projects.js';
 import { mountOpenBar } from './launcher_open_bar.js';
-import { mountDialog, mountPopup } from './launcher_dialog.js';
+import { mountDialog, mountPopup, mountProjectDialog } from './launcher_dialog.js';
+import { mountProjectFormatControls } from './project_format_controls.js';
 
 let api, root, views = [], popup = null, popupAnchor = null, dialog = null, exitPollTimer = null, exitFlag = null;
-let active = true, refreshSerial = 0, requirementsSerial = 0;
+let active = true, refreshSerial = 0, requirementsSerial = 0, thumbTimer = null, thumbPollTimer = null, thumbWanted = [];
+const thumbRequested = new Map(); // folder -> the key already asked for
 const state = {
-    status: null, templates: [], projects: [], memory: {},
+    status: null, templates: [], projects: [], memory: {}, thumbnails: {},
     projectData: { workflow_order: [], unreadable: [], linked_hidden_count: 0 },
     selectedProject: '', selectedTemplateId: '', projectSearch: '', workflowSearch: '', workflowExpanded: false,
     prefs: null, sort: { key: 'modified_at', direction: -1 }, opening: false, openError: null, importProblems: null, exitNotice: null,
@@ -63,7 +65,10 @@ async function refresh() {
     if (!active || serial !== refreshSerial) return;
     state.status = results[0].status === 'fulfilled' ? results[0].value : { error: results[0].reason.message };
     if (results[1].status === 'fulfilled') state.templates = results[1].value.templates || [];
-    if (results[2].status === 'fulfilled') { state.projectData = results[2].value; state.projects = results[2].value.projects || []; }
+    if (results[2].status === 'fulfilled') {
+        state.projectData = results[2].value; state.projects = results[2].value.projects || [];
+        state.thumbnails = Object.fromEntries(state.projects.filter(p => p.thumbnail).map(p => [p.folder, p.thumbnail]));
+    }
     if (results[3].status === 'fulfilled') state.memory = results[3].value;
     for (const result of results.slice(1)) if (result.status === 'rejected') notifyError(result.reason.message, { source: 'launcher-refresh' });
     const allowed = state.projects.filter(p => state.prefs.showHidden || !p.hidden), previous = state.selectedProject;
@@ -76,6 +81,50 @@ async function refresh() {
     }
     render();
     void checkRequirements();
+    scheduleThumbnailPoll();
+}
+// Thumbnails: the page asks only for tiles in view, newest first, and polls while any
+// are queued or rendering. Off asks for nothing.
+const THUMB_PENDING = ['queued', 'rendering'], THUMB_BATCH = 50;
+const batches = list => Array.from({ length: Math.ceil(list.length / THUMB_BATCH) }, (_, i) => list.slice(i * THUMB_BATCH, (i + 1) * THUMB_BATCH));
+// Polling covers the pending tiles in view; others update when they scroll back in.
+const visiblePending = () => thumbWanted.filter(f => THUMB_PENDING.includes(state.thumbnails[f]?.state));
+function thumbnailsVisible(folders) {
+    thumbWanted = folders; clearTimeout(thumbTimer);
+    thumbTimer = setTimeout(() => { void run(requestThumbnails); scheduleThumbnailPoll(); }, 250);
+}
+async function requestThumbnails() {
+    if (!active || thumbnailMode(state.prefs) === 'off') return;
+    const modified = new Map(state.projects.map(p => [p.folder, String(p.modified_at || '')]));
+    const folders = thumbWanted.filter(folder => {
+        const thumb = state.thumbnails[folder];
+        return thumb && ['stale', 'missing'].includes(thumb.state) && thumbRequested.get(folder) !== thumb.key;
+    }).sort((a, b) => modified.get(b).localeCompare(modified.get(a), undefined, { numeric: true }));
+    if (!folders.length) return;
+    for (const folder of folders) { thumbRequested.set(folder, state.thumbnails[folder].key); state.thumbnails[folder] = { ...state.thumbnails[folder], state: 'queued' }; }
+    for (const batch of batches(folders)) await call('/sonder-editor/launcher/thumbnails/request', { method: 'POST', ...json({ folders: batch }) });
+    scheduleThumbnailPoll();
+}
+function scheduleThumbnailPoll() {
+    clearTimeout(thumbPollTimer);
+    if (active && thumbnailMode(state.prefs) !== 'off' && visiblePending().length) thumbPollTimer = setTimeout(() => void pollThumbnails(), 3000);
+}
+async function pollThumbnails() {
+    const folders = visiblePending();
+    if (!active || !folders.length) return;
+    try {
+        for (const batch of batches(folders)) {
+            const payload = await call('/sonder-editor/launcher/thumbnails/status', { method: 'POST', ...json({ folders: batch }) });
+            if (!active) return;
+            for (const folder of batch) {
+                const next = payload.thumbnails?.[folder];
+                // A folder that no longer resolves stops polling; the next refresh decides.
+                state.thumbnails[folder] = next ? { ...state.thumbnails[folder], state: next.state, shown: next.shown } : { ...state.thumbnails[folder], state: 'missing' };
+            }
+        }
+        views[2]?.sync?.(state);
+    } catch (err) { if (!active) return; }
+    scheduleThumbnailPoll();
 }
 function preference(patch) {
     updateEditorSettings({ sdk: { launcher: patch } }); state.prefs = getEditorSettings().sdk.launcher;
@@ -147,21 +196,38 @@ function projectMenu(project, anchor) {
                 menu.append(button(template.name, () => { close(); state.selectedProject = project.folder; state.selectedTemplateId = id; void openEditor(); }));
             }
         }, { disabled: project.too_new || project.unreadable }));
-        menu.append(button('Show in folder', () => { close(); void run(() => call(`/sonder-editor/project/${encodeURIComponent(project.folder)}/reveal`, { method: 'POST' })); }, { disabled: !state.projectData.can_manage, title: state.projectData.can_manage ? 'Show in folder' : 'Change this on the ComfyUI machine.' }));
+        menu.append(button('Show in folder', () => { close(); void run(() => call(`/sonder-editor/project/${encodeURIComponent(project.folder)}/reveal`, { method: 'POST' })); }, { disabled: !state.projectData.can_manage, title: state.projectData.can_manage ? 'Show in folder' : MACHINE_ONLY_MESSAGE }));
         menu.append(button(project.hidden ? 'Unhide' : 'Hide', () => { close(); void run(() => setHidden('project', project.folder, !project.hidden)); }));
         if (project.linked) menu.append(button('Unlink…', () => showDialog({ title: 'Unlink project', help: `Remove the link to “${project.name}”? The project’s files stay in place.`, accept: 'Unlink', submit: async () => {
             await call('/sonder-editor/projects/unlink', { method: 'POST', ...json({ project_id: project.folder }) }); await refresh();
         } })));
     });
 }
+// New project: prefilled from the selected workflow's size and rate, else the editor's
+// project defaults; template and channels from the editor's defaults.
 function createProject() {
     const workflow = chosenTemplate(), settings = getEditorSettings(), defaults = workflow?.validation?.editor_defaults || {};
     const size = Object.fromEntries(['fps', 'width', 'height'].map(k => [k, Number(defaults[k]) > 0 ? Number(defaults[k]) : settings.projectDefaults[k]]));
-    showDialog({ title: 'New project', initial: '', label: 'Project name', accept: 'Create and open', help: `${size.width}×${size.height} at ${size.fps} fps. ${workflow ? `Opens with ${workflow.name}.` : 'Choose a workflow to open the editor after creation.'}`, submit: async name => {
-        const { folder } = await createSonderProject({ name, ...size, settings, apiURL: path => api.apiURL(path) });
-        await refresh(); state.selectedProject = folder; state.selectedTemplateId = workflow?.template_id || state.selectedTemplateId;
-        if (state.selectedTemplateId) await openEditor(); else render();
-    } });
+    popup?.(); dialog?.();
+    const view = mountProjectDialog({
+        workflowName: workflow?.name || '', canManage: !!state.projectData.can_manage,
+        formatControls: () => mountProjectFormatControls({ settings, initial: { ...size, templateId: settings.projectDefaults.defaultTemplateId, channelTemplateId: settings.projectDefaults.defaultChannelTemplateId } }),
+        create: async choice => {
+            const { folder } = await createSonderProject({ ...choice, settings, apiURL: path => api.apiURL(path) });
+            await refresh(); state.selectedProject = folder; state.selectedTemplateId = workflow?.template_id || state.selectedTemplateId;
+            if (state.selectedTemplateId) void openEditor(); else render();
+        },
+        linksEnabled: async () => (await call('/sonder-editor/server-settings')).allow_external_project_links === true,
+        preview: path => call('/sonder-editor/launcher/link-preview', { method: 'POST', ...json({ path }) }),
+        link: async (path, turnOn) => {
+            if (turnOn) await call('/sonder-editor/server-settings', { method: 'PUT', ...json({ allow_external_project_links: true }) });
+            const { project } = await call('/sonder-editor/projects/link', { method: 'POST', ...json({ path }) });
+            await refresh(); if (project?.name) selectProject(project.name);
+            notifySuccess('Project folder linked', { source: 'launcher-link', detail: 'Its files stay where they are.' });
+        },
+        onClose: () => { dialog = null; },
+    });
+    dialog = view.close;
 }
 async function openEditor() {
     const project = chosenProject(), template = chosenTemplate();
@@ -221,7 +287,8 @@ async function pollExitSession() {
     } catch (err) { if (active && err.payload?.code !== 'session_ended') exitPollTimer = setTimeout(() => void pollExitSession(), 5000); }
 }
 const actions = {
-    statusMenu, settingsMenu, preference, workflowMenu, projectMenu, create: createProject,
+    statusMenu, settingsMenu, preference, workflowMenu, projectMenu, create: createProject, thumbnailsVisible,
+    thumbnailURL: (folder, key, ext) => api.apiURL(`/sonder-editor/launcher/thumbnail/${encodeURIComponent(folder)}/${key}.${ext}`),
     import: () => pickFile(importFile), importFile: file => void run(() => importFile(file)),
     searchProjects: value => { state.projectSearch = value; render(); }, searchWorkflows: value => { state.workflowSearch = value; render(); },
     toggleWorkflows: () => { state.workflowExpanded = !state.workflowExpanded; render(); },
@@ -239,10 +306,7 @@ function render(preserveProjects = false) {
     popup?.(); for (const view of views) if (view !== retained) view.cleanup(); views = [];
     const main = el('main', 'sl-main');
     const header = mountHeader(state, actions), workflows = mountWorkflows(state, actions), projects = retained || mountProjects(state, actions), bar = mountOpenBar(state, actions);
-    if (retained) for (const node of retained.element.querySelectorAll('[data-project-folder]')) {
-        const selected = node.dataset.projectFolder === state.selectedProject;
-        node.classList.toggle('selected', selected); node.setAttribute('aria-selected', String(selected));
-    }
+    retained?.sync?.(state);
     views.push(header, workflows, projects, bar); main.append(workflows.element, projects.element);
     const env = environmentState(state.status), nodes = [header.element];
     if (env.message) nodes.push(el('div', `sl-notice sl-${env.kind}`, env.message));
@@ -264,7 +328,7 @@ function boot() {
     } });
     exitFlag = takeSdkExitFlag(); if (exitFlag) { state.selectedProject = exitFlag.project || ''; state.selectedTemplateId = exitFlag.template_id || ''; }
     window.addEventListener('pageshow', event => { if (event.persisted) window.location.reload(); });
-    window.addEventListener('pagehide', () => { active = false; clearTimeout(exitPollTimer); popup?.(); dialog?.(); offKeys(); unsubscribe(); removeStyle(); for (const view of views) view.cleanup(); }, { once: true });
+    window.addEventListener('pagehide', () => { active = false; clearTimeout(exitPollTimer); clearTimeout(thumbTimer); clearTimeout(thumbPollTimer); popup?.(); dialog?.(); offKeys(); unsubscribe(); removeStyle(); for (const view of views) view.cleanup(); }, { once: true });
     document.body.classList.add('ready'); render(); void run(async () => { await refresh(); if (exitFlag) void pollExitSession(); });
 }
 if (isLauncherPage()) boot();

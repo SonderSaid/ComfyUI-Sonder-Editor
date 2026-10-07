@@ -95,7 +95,18 @@ path. Local Windows drives use a junction without elevated privileges; UNC
 paths need a true symlink, which requires Windows Developer Mode or an elevated
 ComfyUI process. Do not toggle the setting while a render or Save Bridge job is
 in flight; its finalization safely remains pending until the matching path is
-trusted again.
+trusted again. The Launcher's **New project → Link existing** does the same and
+shows the project before you link it.
+
+### Link project folder and the external links switch are greyed out
+
+Both work only in a browser on the ComfyUI machine itself, because they let the
+server read and write folders outside its projects folder. From another
+computer, through a reverse proxy, or on a headless server, either open the
+editor on that machine, or stop ComfyUI and set
+`"allow_external_project_links": true` in `ComfyUI/user/sonder-editor/settings.json`,
+then link the folder by creating a junction or symlink to it inside the
+Sonder projects folder. Turning links off and unlinking work from anywhere.
 
 ## Sonder App
 

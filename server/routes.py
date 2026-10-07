@@ -155,6 +155,7 @@ from .lane_registry import (
 from .thumbnail_service import ensure_thumbnail, generate_thumbnail_strip, generate_waveform_data
 from .timeline_export import ExportAlreadyRunning, TimelineExportManager
 from . import external_links
+from .request_locality import MACHINE_ONLY_MESSAGE, is_loopback_request, local_only_response
 from . import prompt_channel_templates
 from . import prompt_context
 from . import frozen_prompt
@@ -8854,8 +8855,15 @@ def _direct_project_dir_for_cached_asset(request: web.Request) -> str | None:
 def _direct_project_dir_from_request(request: web.Request) -> str | None:
     if "path" in request.query:
         return None
+    return _project_dir_for_folder(request.match_info.get("project_id", ""))
+
+
+def _project_dir_for_folder(folder: str) -> str | None:
+    """A project folder directly under the configured base that holds a ``project.json``,
+    resolved the way every project route resolves it (a linked folder only while
+    external links are trusted), or ``None``."""
     try:
-        project_id = _safe_route_token(request.match_info.get("project_id", ""), "project id")
+        project_id = _safe_route_token(folder, "project id")
     except ValueError:
         return None
     base_dir = _get_base_dir()
@@ -11569,10 +11577,15 @@ if routes is not None:
     # Install-level server settings and external project links
     # -----------------------------------------------------------------------
 
+    # Trusting a folder outside the projects folder is decided on the ComfyUI machine:
+    # linking one and turning links on. Removing trust (turning links off, unlinking)
+    # stays allowed from anywhere. `can_manage` lets every editor mode and the Launcher
+    # disable those controls up front with the same sentence.
     @routes.get("/sonder-editor/server-settings")
-    async def api_get_server_settings(_request: web.Request) -> web.Response:
+    async def api_get_server_settings(request: web.Request) -> web.Response:
         return web.json_response({
             "allow_external_project_links": external_links.is_enabled(),
+            "can_manage": is_loopback_request(request),
         })
 
     @routes.put("/sonder-editor/server-settings")
@@ -11584,6 +11597,8 @@ if routes is not None:
 
         if not isinstance(body, dict) or not isinstance(body.get("allow_external_project_links"), bool):
             return _json_error("allow_external_project_links must be a boolean", 400)
+        if body["allow_external_project_links"] and not is_loopback_request(request):
+            return local_only_response(MACHINE_ONLY_MESSAGE)
         try:
             await asyncio.to_thread(external_links.set_enabled, body["allow_external_project_links"])
         except external_links.LinkError as exc:
@@ -11593,10 +11608,13 @@ if routes is not None:
             return _json_error(f"Could not save server settings: {exc}", 500)
         return web.json_response({
             "allow_external_project_links": external_links.is_enabled(),
+            "can_manage": is_loopback_request(request),
         })
 
     @routes.post("/sonder-editor/projects/link")
     async def api_link_project(request: web.Request) -> web.Response:
+        if not is_loopback_request(request):
+            return local_only_response(MACHINE_ONLY_MESSAGE)
         try:
             body = await request.json()
         except json.JSONDecodeError:
@@ -11606,7 +11624,7 @@ if routes is not None:
         try:
             linked = await asyncio.to_thread(external_links.create_project_link, body.get("path", ""))
         except external_links.LinkError as exc:
-            return _json_error(str(exc), exc.status)
+            return web.json_response({"error": str(exc), "code": exc.code}, status=exc.status)
         return web.json_response({"project": linked}, status=201)
 
     @routes.post("/sonder-editor/projects/unlink")
@@ -15412,7 +15430,8 @@ if routes is not None:
     try:
         from .launcher_routes import register_launcher_routes
 
-        register_launcher_routes(routes, projects_dir=_configured_base_dir)
+        register_launcher_routes(routes, projects_dir=_configured_base_dir,
+                                 project_dir_for_folder=_project_dir_for_folder)
     except Exception:
         logger.exception("Sonder Launcher routes unavailable")
 

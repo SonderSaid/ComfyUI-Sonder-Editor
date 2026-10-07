@@ -13,6 +13,9 @@ export const SDK_SETUP_POLL_MS = 1500;
 // claims it; an SDK editor tab, which the Launcher navigates into, gives it up,
 // so the button never navigates an open editor away.
 export const LAUNCHER_WINDOW_NAME = "sonder-launcher";
+// Why trust changes (linking a folder, turning links on) are unavailable in a browser on
+// another machine. Equal to server/request_locality.py MACHINE_ONLY_MESSAGE (tested).
+export const MACHINE_ONLY_MESSAGE = "Change this on the ComfyUI machine.";
 // While a job this page started or saw is running, a failed status read backs
 // off to this, and keeps trying: the job's end must still be announced.
 export const SDK_SETUP_POLL_MAX_MS = 12000;

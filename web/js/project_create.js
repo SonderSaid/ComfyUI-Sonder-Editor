@@ -8,20 +8,12 @@ import {
     getEditorSettings,
     getPromptChannelTemplateById,
     getTemplateById,
-    getTemplateFpsValues,
     resolveFrameConstraintForTemplate,
-    snapFpsToAllowed,
 } from "./editor_settings.js";
+import { snapFpsToTemplate } from "./project_format_controls.js";
 import { projectTemplateValue } from "./prompt_channel_templates.js";
 
-export function snapFpsToTemplate(fps, template) {
-    const numeric = Math.max(0, Number(fps) || 0);
-    const values = getTemplateFpsValues(template);
-    if (template?.id === "free" || !values.length) {
-        return numeric;
-    }
-    return Number(snapFpsToAllowed(numeric, values).toFixed(3));
-}
+export { snapFpsToTemplate };
 
 // The project key everywhere a project is named in a URL, the session
 // registry and the editor's `project` choice.
@@ -61,6 +53,7 @@ function afterCreateError(message, projects, folder = "") {
 
 /**
  * Create a project and its first scene.
+ * `templateId` and `channelTemplateId` default to the browser's project defaults.
  * Resolves to `{ created, project, folder, projects }`: the created payload,
  * its list entry, its folder name, and the refreshed project list.
  */
@@ -69,6 +62,8 @@ export async function createSonderProject({
     fps,
     width,
     height,
+    templateId: chosenTemplateId,
+    channelTemplateId,
     settings = getEditorSettings(),
     apiURL = defaultApiURL,
     fetchImpl = (...args) => globalThis.fetch(...args),
@@ -79,10 +74,10 @@ export async function createSonderProject({
         throw new Error("Project name is required");
     }
     const defaultSceneDuration = Math.max(1, Number(settings?.projectDefaults?.newSceneDuration || defaults.newSceneDuration));
-    const templateId = settings.projectDefaults.defaultTemplateId || "free";
+    const templateId = chosenTemplateId || settings.projectDefaults.defaultTemplateId || "free";
     const template = getTemplateById(templateId, settings);
     const channelTemplate = getPromptChannelTemplateById(
-        settings.projectDefaults.defaultChannelTemplateId, settings);
+        channelTemplateId || settings.projectDefaults.defaultChannelTemplateId, settings);
 
     const resp = await fetchImpl(apiURL("/sonder-editor/project"), {
         method: "POST",

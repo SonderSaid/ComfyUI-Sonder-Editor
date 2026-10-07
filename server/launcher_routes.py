@@ -16,34 +16,21 @@ from typing import Callable
 
 from aiohttp import web
 
-from . import launcher_state, project_storage, sdk_templates
+from . import external_links, launcher_state, launcher_thumbnails, project_storage, sdk_templates
 from .project_manager import scan_projects
 from .project_storage_lifecycle import run_project_io
-from .request_locality import is_loopback_request
+from .request_locality import MACHINE_ONLY_MESSAGE, is_loopback_request, local_only_response
 
 logger = logging.getLogger("sonder_editor")
 
 MAX_BODY_BYTES = 16 * 1024
 
 
-def _scene_for(project: dict, editor_scene_id: str) -> dict:
-    """The scene the editor opens on: the SDK editor's last one if it still exists,
-    else the first by order. ``{}`` for a project without scenes."""
-    scenes = project.get("scenes") or []
-    if not scenes:
-        return {}
-    chosen = next((scene for scene in scenes if editor_scene_id and scene["scene_id"] == editor_scene_id), None)
-    if chosen is None:
-        chosen = min(scenes, key=lambda scene: scene["order"])
-    return {"id": chosen["scene_id"], "name": chosen["name"]}
-
-
-def _editor_scene_id(folder: str) -> str:
-    try:
-        return str(sdk_templates.read_editor_state(folder).get("scene_id") or "")
-    except Exception:  # an unreadable position only loses the preselected scene
-        logger.debug("SDK editor state for %s unreadable", folder, exc_info=True)
-        return ""
+def _scene_for(project: dict, folder: str) -> dict:
+    """The scene the editor opens on (``launcher_thumbnails.opening_scene``); ``{}`` for a
+    project without scenes."""
+    chosen = launcher_thumbnails.opening_scene(project.get("scenes") or [], launcher_thumbnails.editor_scene_id(folder))
+    return {"id": chosen["scene_id"], "name": chosen["name"]} if chosen else {}
 
 
 def workflow_order(state: dict, templates: list[dict]) -> list[str]:
@@ -73,6 +60,8 @@ def launcher_projects(base_dir: str) -> dict:
     projects = []
     for entry in entries:
         folder = entry["folder"]
+        scene = _scene_for(entry, folder)
+        key = launcher_thumbnails.thumbnail_key(entry["modified_at"], scene.get("id", ""))
         projects.append({
             "folder": folder,
             "project_id": entry["project_id"],
@@ -86,7 +75,8 @@ def launcher_projects(base_dir: str) -> dict:
             "written_with": entry["written_with"],
             "too_new": entry["too_new"],
             "upgrade": entry["upgrade"],
-            "scene": _scene_for(entry, _editor_scene_id(folder)),
+            "scene": scene,
+            "thumbnail": launcher_thumbnails.worker().describe(folder, entry["path"], key),
             "hidden": folder in hidden,
             "last_workflow": by_project.get(folder, {}).get("template_id", ""),
             # What to preselect: its last workflow, else the last used anywhere, else
@@ -128,7 +118,23 @@ async def _json_body(request: web.Request) -> dict:
     return body
 
 
-def register_launcher_routes(routes, *, projects_dir: Callable[[], str]) -> None:
+MAX_THUMBNAIL_FOLDERS = 200
+THUMBNAIL_CACHE_SECONDS = 31536000  # the key changes with the content, so a file never does
+
+
+def _folders(values) -> list[str]:
+    if not isinstance(values, list) or len(values) > MAX_THUMBNAIL_FOLDERS:
+        raise launcher_state.LauncherStateError(f"folders must be a list of at most {MAX_THUMBNAIL_FOLDERS} names.")
+    if not all(isinstance(value, str) for value in values):
+        raise launcher_state.LauncherStateError("folders must be names.")
+    return list(dict.fromkeys(values))
+
+
+def register_launcher_routes(routes, *, projects_dir: Callable[[], str],
+                             project_dir_for_folder: Callable[[str], str | None]) -> None:
+    """``project_dir_for_folder`` is the project routes' resolver: a contained folder with a
+    ``project.json``, following a linked folder only while external links are on."""
+    launcher_thumbnails.configure(project_dir_for_folder)
     def handle(func):
         async def wrapper(request: web.Request) -> web.StreamResponse:
             try:
@@ -174,3 +180,65 @@ def register_launcher_routes(routes, *, projects_dir: Callable[[], str]) -> None
             raise launcher_state.LauncherStateError("hidden must be true or false.")
         state = await asyncio.to_thread(launcher_state.set_hidden, str(body.get("kind") or ""), body.get("id"), hidden)
         return web.json_response({"ok": True, **launcher_state.public_state(state)})
+
+    @routes.post("/sonder-editor/launcher/link-preview")
+    @handle
+    async def api_launcher_link_preview(request: web.Request) -> web.Response:
+        """What Link would add, read only, refused exactly as Link refuses. Machine-only,
+        like Link itself: it reports on any folder of the server's file system."""
+        if not is_loopback_request(request):
+            return local_only_response(MACHINE_ONLY_MESSAGE)
+        body = await _json_body(request)
+        try:
+            preview = await asyncio.to_thread(external_links.preview_link_target, body.get("path", ""))
+        except external_links.LinkError as exc:
+            return web.json_response({"ok": False, "code": exc.code, "error": str(exc)}, status=exc.status)
+        return web.json_response({"ok": True, "preview": preview, "links_enabled": external_links.is_enabled()})
+
+    def resolve(folders: list[str]) -> list[tuple[str, str]]:
+        resolved = []
+        for folder in folders:
+            project_dir = project_dir_for_folder(folder)
+            if project_dir:
+                resolved.append((project_dir, folder))
+        return resolved
+
+    @routes.post("/sonder-editor/launcher/thumbnails/request")
+    @handle
+    async def api_launcher_thumbnails_request(request: web.Request) -> web.Response:
+        """Queue the tiles the page shows, in the order given (the page sends newest first)."""
+        folders = _folders((await _json_body(request)).get("folders"))
+        jobs = await asyncio.to_thread(resolve, folders)
+        # Folders, not paths: the worker resolves each again when it runs.
+        launcher_thumbnails.worker().request([folder for _project_dir, folder in jobs])
+        return web.json_response({"ok": True, "queued": len(jobs)})
+
+    @routes.post("/sonder-editor/launcher/thumbnails/status")
+    @handle
+    async def api_launcher_thumbnails(request: web.Request) -> web.Response:
+        """Each folder's ``{state, key, shown}``. Directory listings and stats only. A POST
+        so a long list of folder names never meets the request-line limit."""
+        folders = _folders((await _json_body(request)).get("folders"))
+
+        def describe():
+            return {folder: launcher_thumbnails.worker().describe(folder, project_dir)
+                    for project_dir, folder in resolve(folders)}
+
+        return web.json_response({"ok": True, "thumbnails": await asyncio.to_thread(describe)})
+
+    @routes.get("/sonder-editor/launcher/thumbnail/{folder}/{name}")
+    @handle
+    async def api_launcher_thumbnail_file(request: web.Request) -> web.StreamResponse:
+        key, _, ext = request.match_info["name"].partition(".")
+
+        def find():
+            project_dir = project_dir_for_folder(request.match_info["folder"])
+            return launcher_thumbnails.media_path(project_dir, key, ext) if project_dir else ""
+
+        path = await asyncio.to_thread(find)
+        if not path:
+            return web.json_response({"ok": False, "code": "not_found", "error": "No such thumbnail."}, status=404)
+        return web.FileResponse(path, headers={
+            "Cache-Control": f"private, max-age={THUMBNAIL_CACHE_SECONDS}, immutable",
+            "Content-Type": "video/mp4" if ext == "mp4" else "image/jpeg",
+        })

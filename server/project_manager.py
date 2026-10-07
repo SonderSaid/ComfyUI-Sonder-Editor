@@ -469,7 +469,9 @@ def save_project(
                 logger.exception("Project save hook failed")
 
 
-def load_project(project_dir: str) -> TimelineProject:
+def load_project(project_dir: str, *, ensure_subdirs: bool = True) -> TimelineProject:
+    """``ensure_subdirs=False`` is a read that leaves the folder as it is: the
+    Launcher's thumbnails must never create folders in a project, linked ones included."""
     project_file = os.path.join(project_dir, "project.json")
     if not os.path.isfile(project_file):
         raise FileNotFoundError(f"No project.json found in {project_dir}")
@@ -487,11 +489,22 @@ def load_project(project_dir: str) -> TimelineProject:
         pin_project(project)
 
     # Ensure subdirectories exist (in case of manual moves)
-    for subdir in PROJECT_SUBDIRS:
+    for subdir in PROJECT_SUBDIRS if ensure_subdirs else ():
         os.makedirs(os.path.join(project_dir, subdir), exist_ok=True)
 
     logger.debug("Loaded project '%s' from %s", project.name, project_dir)
     return project
+
+
+def read_project_document(project_dir: str) -> dict:
+    """The parsed ``project.json`` under the project lock, without building a model,
+    validating storage or touching the folder. Raises like ``json.load`` and ``open``;
+    a root that is not an object raises ``TypeError``."""
+    with _project_write_lock(project_dir):
+        data = _read_project_json(os.path.join(project_dir, "project.json"))
+    if not isinstance(data, dict):
+        raise TypeError("project.json is not an object")
+    return data
 
 
 def _unreadable_reason(exc: Exception) -> str:

@@ -52,6 +52,12 @@ def is_loopback_request(request: web.Request) -> bool:
     return host_name.lower() in _LOOPBACK_HOSTS
 
 
+# The refusal for trust changes (linking, turning links on). The browser shows the same
+# sentence up front from `MACHINE_ONLY_MESSAGE` in web/js/sdk_setup_client.js; a test
+# keeps the two equal.
+MACHINE_ONLY_MESSAGE = "Change this on the ComfyUI machine."
+
+
 def local_only_response(message: str, code: str = "not_local") -> web.Response:
     """The 403 a machine-only route answers to any other caller."""
     return web.json_response({"ok": False, "code": code, "error": message}, status=403)

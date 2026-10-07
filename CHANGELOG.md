@@ -19,9 +19,11 @@ a fresh `[Unreleased]` block.
 - Sonder Control node: one named value you wire to the inputs it should drive, such as steps, CFG, a sampler, a LoRA or a seed. Its type follows what it is connected to (you pick it when the input accepts any type), and a value outside an input's range or options stops the run with a message naming the Control.
 
 ### Changed
+- Linking a project folder and turning on external project links now work only in a browser on the ComfyUI machine. Elsewhere, Link project folder and the Settings switch are greyed out and say so. Turning links off and unlinking still work from anywhere.
 - Render queue: a job that is waiting again or has failed shows why on a second line, such as a run interrupted before the job completed. Hover for the full text.
 
 ### Fixed
+- Link project folder: a project that is already in the projects folder is now refused with that reason. It used to be reported as a name collision.
 - Mounted editor: a brief websocket interruption no longer drops canvas presence while its HTTP heartbeats continue.
 - Assets: Open Source Workflow is greyed out in the mounted editor tab, where it could not open anything, and for takes saved without a workflow. It used to stay clickable and report the workflow as unavailable.
 - Queue: a save node whose "mark queue complete" is set by a Primitive Boolean or a Sonder Control now completes the job when it is on. It used to be read as off, so the same job re-rendered.

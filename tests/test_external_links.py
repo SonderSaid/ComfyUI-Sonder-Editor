@@ -40,10 +40,14 @@ def _make_symlink(link_path, target):
 
 
 class _DummyRequest:
-    def __init__(self, *, match_info=None, query=None, body=None):
+    """A browser on the ComfyUI machine unless ``remote`` says otherwise."""
+
+    def __init__(self, *, match_info=None, query=None, body=None, remote="127.0.0.1"):
         self.match_info = match_info or {}
         self.query = query or {}
         self._body = body
+        self.remote = remote
+        self.headers = {"Host": "127.0.0.1:8188"}
 
     async def json(self):
         return self._body
@@ -101,14 +105,95 @@ def test_server_settings_and_link_routes_enforce_opt_in(tmp_path, monkeypatch):
 
     assert _response_json(asyncio.run(get_settings(_DummyRequest()))) == {
         "allow_external_project_links": False,
+        "can_manage": True,
     }
     blocked = asyncio.run(link_project(_DummyRequest(body={"path": str(tmp_path / "missing")})))
     assert blocked.status == 403
     assert "Enable 'Allow external project links'" in _response_json(blocked)["error"]
+    assert _response_json(blocked)["code"] == "links_disabled"
 
     updated = asyncio.run(update_settings(_DummyRequest(body={"allow_external_project_links": True})))
     assert updated.status == 200
-    assert _response_json(updated) == {"allow_external_project_links": True}
+    assert _response_json(updated) == {"allow_external_project_links": True, "can_manage": True}
+
+
+def test_trusting_a_folder_is_machine_only_and_removing_trust_is_not(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    user_dir = tmp_path / "user"
+    output_dir = tmp_path / "output"
+    monkeypatch.setitem(sys.modules, "folder_paths", SimpleNamespace(
+        get_user_directory=lambda: str(user_dir), get_output_directory=lambda: str(output_dir)))
+    get_settings = _route_handler(route_module, "GET", "/sonder-editor/server-settings")
+    update_settings = _route_handler(route_module, "PUT", "/sonder-editor/server-settings")
+    link_project = _route_handler(route_module, "POST", "/sonder-editor/projects/link")
+    unlink_project = _route_handler(route_module, "POST", "/sonder-editor/projects/unlink")
+    lan = "192.168.1.20"
+
+    assert _response_json(asyncio.run(get_settings(_DummyRequest(remote=lan))))["can_manage"] is False
+    refused_on = asyncio.run(update_settings(_DummyRequest(body={"allow_external_project_links": True}, remote=lan)))
+    assert refused_on.status == 403
+    assert _response_json(refused_on) == {"ok": False, "code": "not_local", "error": "Change this on the ComfyUI machine."}
+    assert external_links.is_enabled() is False
+
+    external_links.set_enabled(True)
+    refused_link = asyncio.run(link_project(_DummyRequest(body={"path": str(tmp_path)}, remote=lan)))
+    assert refused_link.status == 403 and _response_json(refused_link)["code"] == "not_local"
+    assert not (output_dir / "sonder-projects").exists()
+    # Unlinking a missing link answers 404, not 403: removing trust is open to anyone.
+    assert asyncio.run(unlink_project(_DummyRequest(body={"project_id": "gone"}, remote=lan))).status == 404
+    turned_off = asyncio.run(update_settings(_DummyRequest(body={"allow_external_project_links": False}, remote=lan)))
+    assert turned_off.status == 200
+    assert external_links.is_enabled() is False
+
+
+def test_link_preview_refuses_what_link_refuses_and_never_writes(tmp_path, monkeypatch):
+    output_dir = tmp_path / "output"
+    root = output_dir / "sonder-projects"
+    monkeypatch.setitem(sys.modules, "folder_paths", SimpleNamespace(
+        get_output_directory=lambda: str(output_dir), get_user_directory=lambda: str(tmp_path / "user")))
+    monkeypatch.setattr(external_links, "is_enabled", lambda: True)
+    outside = create_project("Outside", base_dir=str(tmp_path / "external"))
+    not_project = tmp_path / "plain"
+    not_project.mkdir()
+    inside = create_project("Inside", base_dir=str(root))
+    (tmp_path / "taken" / "Outside").mkdir(parents=True)
+    (tmp_path / "taken" / "Outside" / "project.json").write_text("{}", encoding="utf-8")
+    before = sorted(str(p) for p in tmp_path.rglob("*"))
+
+    preview = external_links.preview_link_target(outside.project_dir)
+    assert preview == {"folder": "Outside", "readable": True, "name": "Outside", "scene_count": 0,
+                       "format_version": preview["format_version"], "too_new": False}
+
+    def code(call, value):
+        try:
+            call(value)
+        except external_links.LinkError as exc:
+            return exc.code, exc.status
+        return None
+
+    cases = ["", str(tmp_path / "missing"), str(not_project), inside.project_dir]
+    expected = [("path_required", 400), ("not_found", 404), ("not_a_project", 400), ("already_inside", 400)]
+    assert [code(external_links.preview_link_target, c) for c in cases] == expected
+    assert sorted(str(p) for p in tmp_path.rglob("*")) == before
+    assert [code(external_links.create_project_link, c) for c in cases] == expected
+
+    external_links.create_project_link(outside.project_dir)
+    collision = str(tmp_path / "taken" / "Outside")
+    assert code(external_links.preview_link_target, collision) == ("name_taken", 409)
+    assert code(external_links.create_project_link, collision) == ("name_taken", 409)
+
+
+def test_link_preview_reads_a_capped_document_only(tmp_path, monkeypatch):
+    output_dir = tmp_path / "output"
+    monkeypatch.setitem(sys.modules, "folder_paths", SimpleNamespace(get_output_directory=lambda: str(output_dir)))
+    project = tmp_path / "Big"
+    project.mkdir()
+    (project / "project.json").write_text(json.dumps({"name": "Big", "scenes": [{}, {}],
+                                                      "storage": {"format_version": 9}}), encoding="utf-8")
+    preview = external_links.preview_link_target(str(project))
+    assert (preview["name"], preview["scene_count"], preview["too_new"]) == ("Big", 2, True)
+    monkeypatch.setattr(external_links, "PREVIEW_MAX_BYTES", 10)
+    assert external_links.preview_link_target(str(project)) == {"folder": "Big", "readable": False}
 
 
 def test_trust_mode_keeps_junction_spelling_and_off_remains_strict(tmp_path, monkeypatch):

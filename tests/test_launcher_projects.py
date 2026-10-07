@@ -257,6 +257,21 @@ def test_every_save_records_the_writing_version_and_replaces_an_older_stamp(base
 
 # ── Routes ───────────────────────────────────────────────────────────────────
 
+def folder_resolver(base):
+    """Stands in for ``routes._project_dir_for_folder``: a safe name with a project.json."""
+    from server.path_security import PathSecurityError, safe_route_token
+
+    def resolve(folder):
+        try:
+            safe_route_token(folder, "project id")
+        except PathSecurityError:
+            return None
+        path = base / folder
+        return str(path) if (path / "project.json").is_file() else None
+
+    return resolve
+
+
 def _client(base):
     from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
@@ -266,7 +281,7 @@ def _client(base):
     from server import routes as route_module
 
     routes = web.RouteTableDef()
-    register_launcher_routes(routes, projects_dir=lambda: str(base))
+    register_launcher_routes(routes, projects_dir=lambda: str(base), project_dir_for_folder=folder_resolver(base))
     # The editor's real Origin check and security headers, as ComfyUI mounts them.
     app = web.Application(middlewares=[route_module._sonder_security_middleware])
     app.add_routes(routes)

@@ -521,7 +521,7 @@ import {
     updateEditorToolbar,
     updateQueueChromeStatus,
 } from "./editor_top_chrome.js";
-import { getSdkSetupClient, LAUNCHER_WINDOW_NAME } from "./sdk_setup_client.js";
+import { getSdkSetupClient, LAUNCHER_WINDOW_NAME, MACHINE_ONLY_MESSAGE } from "./sdk_setup_client.js";
 import {
     _debugListConsumers as debugKeyboardConsumers,
     isKeyboardDebugEnabled,
@@ -530,12 +530,10 @@ import {
     PRESERVE_DEFAULT,
 } from "./keyboard_ownership.js";
 import {
-    ASPECT_RATIO_PRESETS,
     CROP_POSITION_OPTIONS,
     CUSTOM_OUTPUT_KIND_VIDEO,
     DEFAULT_EDITOR_SETTINGS,
     FIT_MODE_OPTIONS,
-    RESOLUTION_TIERS,
     VALID_CROP_POSITIONS,
     VALID_FIT_MODES,
     DEFAULT_REFERENCE_FIT_MODE,
@@ -550,10 +548,8 @@ import {
     getTemplateById,
     getDimensionConstraint,
     getTemplateFpsValues,
-    snapFpsToAllowed,
     templateFpsIsFixed,
     getRecommendedDurationSec,
-    getRecommendedResolutions,
     getMaxRes,
     MAX_SCENE_DURATION_FRAMES,
     resolveBatchChunkSizes,
@@ -564,6 +560,20 @@ import {
     subscribeEditorSettings,
     updateEditorSettings,
 } from "./editor_settings.js";
+import {
+    aspectOptionValue,
+    findMatchingAspectPreset,
+    findNearestResolutionTier,
+    fpsChoices,
+    matchesAspectRatio,
+    parseAspectValue,
+    recommendedTierValue,
+    resolutionControlMode,
+    resolveAspectCustomResolution,
+    snapFpsToTemplate,
+    templateChangeResolution,
+    templateResolutionTiers,
+} from "./project_format_controls.js";
 import {
     certifiedUnchanged,
     createStaleReplayGovernor,
@@ -8480,12 +8490,7 @@ export class EditorWidget {
     }
 
     _snapSceneFpsToTemplate(fps, template = this._getActiveTemplate()) {
-        const numeric = Math.max(0, Number(fps) || 0);
-        const values = getTemplateFpsValues(template);
-        if (template?.id === "free" || !values.length) {
-            return numeric;
-        }
-        return Number(snapFpsToAllowed(numeric, values).toFixed(3));
+        return snapFpsToTemplate(fps, template);
     }
 
     async _applyActiveTemplateFpsConstraint(diagnostics = null) {
@@ -8610,15 +8615,11 @@ export class EditorWidget {
     }
 
     _aspectRatioOptionValue(a, b) {
-        return `${a},${b}`;
+        return aspectOptionValue(a, b);
     }
 
     _parseAspectRatioValue(value) {
-        const [a, b] = String(value || "").split(",").map(Number);
-        return {
-            a: Number.isFinite(a) ? a : 0,
-            b: Number.isFinite(b) ? b : 0,
-        };
+        return parseAspectValue(value);
     }
 
     _readSelectedAspectRatio() {
@@ -8642,19 +8643,11 @@ export class EditorWidget {
     }
 
     _resolutionControlMode() {
-        const hasAspectPreset = !this._isFreeAspectSelected();
-        const hasResolutionTier = !this._isCustomTierSelected();
-        if (hasAspectPreset && hasResolutionTier) return "locked";
-        if (hasAspectPreset) return "aspect-custom";
-        if (hasResolutionTier) return "tier-custom-aspect";
-        return "free-custom";
+        return resolutionControlMode({ ...this._readSelectedAspectRatio(), tier: this._readSelectedResolutionTier() });
     }
 
     _matchesAspectRatio(width, height, a, b, tolerance = 0.01) {
-        if (!(width > 0 && height > 0 && a > 0 && b > 0)) return false;
-        const actualRatio = width / height;
-        const targetRatio = a / b;
-        return Math.abs(actualRatio - targetRatio) / targetRatio <= tolerance;
+        return matchesAspectRatio(width, height, a, b, tolerance);
     }
 
     _detectResolutionPresetSelections(width, height, options = {}) {
@@ -8662,28 +8655,11 @@ export class EditorWidget {
     }
 
     _findMatchingAspectPreset(width, height, tolerance = 0.03) {
-        return this._detectResolutionPresetSelections(width, height, { aspectTolerance: tolerance })?.aspectPreset
-            || ASPECT_RATIO_PRESETS.find(
-                (preset) => preset.a > 0 && preset.b > 0 && this._matchesAspectRatio(width, height, preset.a, preset.b, tolerance)
-            )
-            || null;
+        return findMatchingAspectPreset(width, height, this._getActiveTemplate(), tolerance);
     }
 
     _findNearestResolutionTier(width, height, tolerance = 0.10) {
-        const snappedDetection = this._detectResolutionPresetSelections(width, height, { tierTolerance: tolerance });
-        if (snappedDetection?.tier) return snappedDetection.tier;
-        if (!(width > 0 && height > 0)) return null;
-        const c = Math.sqrt(width * height);
-        let bestTier = null;
-        let bestDiff = Infinity;
-        for (const tier of RESOLUTION_TIERS) {
-            const diff = Math.abs(tier.c - c) / tier.c;
-            if (diff < bestDiff) {
-                bestTier = tier;
-                bestDiff = diff;
-            }
-        }
-        return bestDiff <= tolerance ? bestTier : null;
+        return findNearestResolutionTier(width, height, this._getActiveTemplate(), tolerance);
     }
 
     _clearCustomAspectRatioOption() {
@@ -8844,38 +8820,10 @@ export class EditorWidget {
     }
 
     _resolveAspectCustomResolution(axis = this._resolutionEditAxis || "w") {
-        const { a, b } = this._readSelectedAspectRatio();
-        if (!(a > 0 && b > 0)) return null;
-        let { width, height } = this._readResolutionInputs();
-        const template = this._getActiveTemplate();
-        if (axis === "h" && height > 0) {
-            if (template.id !== "free") {
-                height = Math.round(snapToConstraint(height, getDimensionConstraint(template)));
-            }
-            width = Math.max(1, Math.round(height * a / b));
-            if (template.id !== "free") {
-                width = Math.round(snapToConstraint(width, getDimensionConstraint(template)));
-            }
-        } else if (width > 0) {
-            if (template.id !== "free") {
-                width = Math.round(snapToConstraint(width, getDimensionConstraint(template)));
-            }
-            height = Math.max(1, Math.round(width * b / a));
-            if (template.id !== "free") {
-                height = Math.round(snapToConstraint(height, getDimensionConstraint(template)));
-            }
-        } else if (height > 0) {
-            if (template.id !== "free") {
-                height = Math.round(snapToConstraint(height, getDimensionConstraint(template)));
-            }
-            width = Math.max(1, Math.round(height * a / b));
-            if (template.id !== "free") {
-                width = Math.round(snapToConstraint(width, getDimensionConstraint(template)));
-            }
-        } else {
-            return null;
-        }
-        return template.id === "free" ? { width, height } : snapResolution(width, height, template);
+        const { width, height } = this._readResolutionInputs();
+        return resolveAspectCustomResolution({
+            ...this._readSelectedAspectRatio(), width, height, axis, template: this._getActiveTemplate(),
+        });
     }
 
     _resolveFreeAspectTierResolution({ requireDraftComplete = false } = {}) {
@@ -8902,43 +8850,12 @@ export class EditorWidget {
         this._templateSelect.value = this._templateId;
     }
 
-    // Resolution tiers offered for a template: the global RESOLUTION_TIERS plus a
-    // template-specific option for any recommended resolution that NO standard tier
-    // approximates (within 5% on the total-pixel / geometric-mean basis). This is how
-    // an unconventional native res (e.g. CogVideoX 1360×768) becomes directly selectable.
     _templateResolutionTiers(template) {
-        const TOL = 0.05;
-        const tiers = RESOLUTION_TIERS.map((tier) => ({ value: String(tier.c), label: tier.label, c: tier.c }));
-        for (const [w, h] of getRecommendedResolutions(template)) {
-            const c = Math.sqrt(w * h);
-            if (RESOLUTION_TIERS.some((tier) => Math.abs(tier.c - c) / tier.c <= TOL)) continue;
-            const value = String(Math.round(c));
-            if (tiers.some((tier) => tier.value === value)) continue;
-            tiers.push({ value, label: `${w}×${h}`, c });
-        }
-        return tiers;
+        return templateResolutionTiers(template);
     }
 
-    // Tier value (a number matching a tier's option value) to mark with the ★. Stars
-    // the exact template-specific tier when the primary recommended res has no near
-    // standard tier; otherwise the nearest standard tier.
     _recommendedTierValue(template) {
-        const recommended = getRecommendedResolutions(template);
-        if (!recommended.length) return null;
-        const [w, h] = recommended[0];
-        const c = Math.sqrt(w * h);
-        const TOL = 0.05;
-        let nearest = null;
-        let nearestDiff = Infinity;
-        for (const tier of RESOLUTION_TIERS) {
-            const diff = Math.abs(tier.c - c);
-            if (diff < nearestDiff) {
-                nearest = tier.c;
-                nearestDiff = diff;
-            }
-        }
-        if (nearest != null && nearestDiff / nearest <= TOL) return nearest;
-        return Math.round(c);
+        return recommendedTierValue(template);
     }
 
     _rebuildResolutionTierOptions(selectedValue = this._resTierSelect?.value || "custom") {
@@ -8998,8 +8915,7 @@ export class EditorWidget {
     // (single value = effectively locked); `free` keeps the free-entry number input.
     _rebuildFpsControl() {
         const template = this._getActiveTemplate();
-        const values = getTemplateFpsValues(template);
-        const constrained = template.id !== "free" && values.length > 0;
+        const { constrained, values } = fpsChoices(template);
         if (this._fpsSelect) {
             this._fpsSelect.style.display = constrained ? "" : "none";
             if (constrained) {
@@ -9108,9 +9024,7 @@ export class EditorWidget {
             const template = this._getActiveTemplate();
             const width = parseInt(this._resWInput?.value, 10) || this.activeScene?.width || 0;
             const height = parseInt(this._resHInput?.value, 10) || this.activeScene?.height || 0;
-            const nextResolution = template.id === "free"
-                ? { width, height }
-                : snapResolution(width, height, template);
+            const nextResolution = templateChangeResolution(width, height, template);
             this._setResolutionInputs(nextResolution.width, nextResolution.height);
             await this._updateSceneResolution(nextResolution.width, nextResolution.height, { detectSelections: false, diagnostics });
         } else {
@@ -22940,12 +22854,17 @@ export class EditorWidget {
         } catch (_) {
             // Keep the existing project actions available when the list request fails.
         }
+        if (!this._serverSettingsLoaded) await this._loadServerSettings();
+        // Linking trusts a folder outside the projects folder: only from the ComfyUI
+        // machine. An unknown answer leaves it enabled and the server decides.
+        const linkRefused = this._serverSettings?.can_manage === false;
         const rect = anchorEl.getBoundingClientRect();
         const items = [
             { label: "Reveal projects folder", action: () => this._revealProjectFolder() },
             { label: "Copy folder path", action: () => this._copyProjectPath() },
             { type: "separator" },
-            { label: "Link project folder\u2026", action: () => this._linkProjectFolder() },
+            { label: "Link project folder\u2026", action: () => this._linkProjectFolder(),
+              disabled: linkRefused, hint: linkRefused ? MACHINE_ONLY_MESSAGE : "" },
         ];
         if (this._activeProjectLinked) {
             items.push({ label: "Unlink this project", action: () => this._unlinkActiveProject(), danger: true });
