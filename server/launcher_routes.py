@@ -50,8 +50,9 @@ def workflow_order(state: dict, templates: list[dict]) -> list[str]:
     """The sidebar's order for your workflows: last used first, then never-used ones by
     newest import. The Launcher's one authority for it, and for the fallback below."""
     by_template = state["last_workflow"]["by_template"]
-    ranked = sorted(templates, key=lambda t: (-by_template.get(t["template_id"], 0.0),
+    ranked = sorted((t for t in templates if not t.get("starter")), key=lambda t: (-by_template.get(t["template_id"], 0.0),
                                               -(t.get("imported_at") or 0), t.get("name", "").lower()))
+    ranked.extend(sorted((t for t in templates if t.get("starter")), key=lambda t: (t.get("order", 0), t["template_id"])))
     return [t["template_id"] for t in ranked]
 
 

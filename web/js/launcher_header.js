@@ -1,0 +1,30 @@
+import { el, button, component } from './launcher_view.js';
+
+export function environmentState(status) {
+    if (!status || status.error) return { label: 'Unreachable', kind: 'bad', message: status?.error || 'Checking the connection…' };
+    const install = status.install || {};
+    if ([install.sdk, install.proxy].some(p => p?.installed && !p.supported)) return { label: 'Unsupported', kind: 'bad', message: 'A generation package has an unsupported version. Open Settings → Sonder App in the editor.' };
+    if (status.proxy?.error) return { label: 'Connection problem', kind: 'bad', message: status.proxy.error };
+    if (!install.ready) return { label: 'Generate unavailable', kind: 'warn', message: 'Generate needs comfy-sdk and comfy-api-proxy. You can still open and edit projects.' };
+    return { label: 'Ready', kind: 'good', message: '' };
+}
+function logo(url, cls, fallback) {
+    const image = el('img', cls); image.src = url; image.alt = fallback;
+    image.addEventListener('error', () => image.replaceWith(el('span', '', fallback)), { once: true });
+    return image;
+}
+export function mountHeader(state, actions) {
+    const header = el('header', 'sl-header');
+    const brand = el('div', 'sl-brand');
+    const wordmark = el('div', 'sl-wordmark', 'SONDER'); wordmark.append(el('small', '', 'EDITOR'));
+    const attribution = el('div', 'sl-attribution', 'powered by');
+    attribution.append(logo('../assets/images/comfy-logo-wordmark.svg', '', 'Comfy'));
+    brand.append(logo('static/assets/sonder-mark.svg', 'sl-mark', 'S'), wordmark, attribution);
+    const env = environmentState(state.status), right = el('div', 'sl-row');
+    const status = button('', e => actions.statusMenu(e.currentTarget), { title: 'ComfyUI connection and package versions' });
+    status.classList.add('sl-status', `sl-${env.kind}`);
+    status.append(logo('../assets/images/comfy-logo-mono.svg', 'sl-status-icon', ''), el('span', '', 'ComfyUI'), el('span', `sl-status-dot sl-${env.kind}`), el('span', `sl-${env.kind}`, env.label));
+    right.append(status, button('⚙', e => actions.settingsMenu(e.currentTarget), { title: 'Launcher preferences' }));
+    header.append(brand, right);
+    return component(header);
+}

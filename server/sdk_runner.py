@@ -576,6 +576,9 @@ class SdkRunner:
                 raise SdkError("Too many takes are already waiting. Wait or cancel some.", "too_many_runs", 429)
             build = await asyncio.to_thread(self._build_base, session, editor_values, render_cache_max_bytes)
             refusals = [problem for problem in map(sdk_templates.generate_refusal, build["controls"]) if problem]
+            from .model_requirements import missing_models, missing_model_message
+            missing = await asyncio.to_thread(missing_models, build["prompt"], executable_only=True)
+            refusals.extend(map(missing_model_message, missing))
             if refusals:
                 raise SdkError("This workflow can't generate yet.", "generate_refused", 409, problems=refusals)
             try:
@@ -754,6 +757,17 @@ class SdkRunner:
             await self._cancel_run(run)
         self._ensure_presence_loop()
         return {"ok": True, "canceling": [run.run_id for run in pending]}
+
+    async def cancel_by_secret(self, session_id: str, secret: str) -> dict:
+        """Launcher departure cancellation: a secret never displaces a live tab."""
+        self._remember_loop()
+        session = self.session_for(session_id, secret)
+        owner = await self._get_owner(session.project, host_id=session.session_id)
+        if owner and owner.get("status") in ("active", "orphaned"):
+            raise SdkError("This session is open in another tab.", "not_owner", 409)
+        # cancel marks the epoch/runs before its first await. An owner arriving
+        # later cannot race the authorization and cancellation decision.
+        return await self.cancel(session)
 
     async def _cancel_run(self, run: SdkRun) -> None:
         if run.final or not run.prompt_id:

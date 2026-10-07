@@ -461,6 +461,7 @@ export const DEFAULT_EDITOR_SETTINGS = {
     // editor mode. Off by default; the entry is meant to be discreet.
     sdk: {
         showLauncherButton: false,
+        launcher: { thumbnails: "animated", view: "grid", tileSize: "M", showHidden: false },
     },
 };
 
@@ -1578,6 +1579,12 @@ export function normalizeEditorSettings(source = null) {
                 : defaults.inspector.referenceMediaViewMode,
         },
         sdk: {
+            launcher: {
+                thumbnails: ["animated", "still", "off"].includes(stored?.sdk?.launcher?.thumbnails) ? stored.sdk.launcher.thumbnails : defaults.sdk.launcher.thumbnails,
+                view: ["grid", "list"].includes(stored?.sdk?.launcher?.view) ? stored.sdk.launcher.view : defaults.sdk.launcher.view,
+                tileSize: ["S", "M", "L"].includes(stored?.sdk?.launcher?.tileSize) ? stored.sdk.launcher.tileSize : defaults.sdk.launcher.tileSize,
+                showHidden: typeof stored?.sdk?.launcher?.showHidden === "boolean" ? stored.sdk.launcher.showHidden : defaults.sdk.launcher.showHidden,
+            },
             showLauncherButton: stored?.sdk?.showLauncherButton == null
                 ? defaults.sdk.showLauncherButton
                 : !!stored.sdk.showLauncherButton,

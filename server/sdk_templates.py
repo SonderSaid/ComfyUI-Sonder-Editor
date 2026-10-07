@@ -30,7 +30,7 @@ import secrets
 import time
 from typing import Any, Callable
 
-from . import control_descriptors, prompt_graph
+from . import control_descriptors, prompt_graph, model_requirements
 from .external_links import WINDOWS_RESERVED_BASENAMES
 from .editor_inputs import clean_editor_values
 from .path_security import PathSecurityError, safe_route_token
@@ -42,6 +42,28 @@ MAX_TEMPLATES = 200
 MAX_NAME_LENGTH = 120
 CONTROLS_VERSION = 1
 logger = logging.getLogger(__name__)
+STARTERS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "sdk_starters")
+_starter_validation_cache = {}
+
+
+def starter_sources() -> dict[str, str]:
+    if not os.path.isdir(STARTERS_DIR):
+        return {}
+    return {hashlib.sha256(("sonder-starter:" + name[:-5]).encode()).hexdigest()[:16]:
+            os.path.join(STARTERS_DIR, name)
+            for name in sorted(os.listdir(STARTERS_DIR))
+            if name.endswith(".json") and not name.endswith(".meta.json")
+            and os.path.isfile(os.path.join(STARTERS_DIR, name))}
+
+
+def template_source_path(template_id: str) -> str:
+    identity = check_template_id(template_id)
+    return starter_sources().get(identity) or os.path.join(templates_dir(), identity + ".json")
+
+
+def _require_writable(template_id: str) -> None:
+    if check_template_id(template_id) in starter_sources():
+        raise TemplateError("Bundled workflows are read-only.", "starter_read_only", 409)
 
 # The 13 editor values a mounted host relays (``session_registry.WIDGET_FIELD_NAMES``),
 # which are also what the SDK host stores. Kept as a literal list here so this module
@@ -87,12 +109,13 @@ def check_template_id(template_id: Any) -> str:
 
 def _template_paths(template_id: str) -> tuple[str, str, str]:
     base = os.path.join(templates_dir(), check_template_id(template_id))
-    return f"{base}.json", f"{base}.meta.json", f"{base}.controls.json"
+    return template_source_path(template_id), f"{base}.meta.json", f"{base}.controls.json"
 
 
 def template_lock(template_id: str):
     """The lock every write to one template's files takes (Generate holds it too)."""
-    return json_sidecar_lock(_template_paths(template_id)[0])
+    # Stable install-level lock, regardless of whether the source is bundled.
+    return json_sidecar_lock(os.path.join(templates_dir(), check_template_id(template_id) + ".json"))
 
 
 # ── Parsing and validation ───────────────────────────────────────────────────
@@ -240,19 +263,23 @@ def _public_meta(template_id: str, meta: dict) -> dict:
         "imported_at": meta.get("imported_at", 0),
         "replaced_at": meta.get("replaced_at", 0),
         "validation": meta.get("validation", {}),
+        "starter": bool(meta.get("starter")),
+        "model_family": meta.get("model_family", ""),
+        "order": meta.get("order", 0),
     }
 
 
-def list_templates() -> list[dict]:
+def list_templates(*, requirements: bool = False) -> list[dict]:
     folder = templates_dir()
-    if not os.path.isdir(folder):
-        return []
     result = []
-    for entry in sorted(os.listdir(folder)):
+    starters = starter_sources()
+    for entry in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
         if not entry.endswith(".meta.json"):
             continue
         template_id = entry[: -len(".meta.json")]
         if not TEMPLATE_ID_RE.match(template_id):
+            continue
+        if template_id in starters:
             continue
         json_path, meta_path, _ = _template_paths(template_id)
         if not os.path.isfile(json_path):
@@ -260,8 +287,38 @@ def list_templates() -> list[dict]:
         with template_lock(template_id):
             meta = read_json_sidecar(meta_path)
         result.append(_public_meta(template_id, meta))
+    for template_id in starters:
+        try:
+            _, meta = load_template(template_id)
+            result.append(meta)
+        except (TemplateError, OSError):
+            logger.warning("Cannot read bundled workflow %s", template_id, exc_info=True)
+    if requirements:
+        input_cache = {}
+        for meta in result:
+            try:
+                with template_lock(meta["template_id"]):
+                    prompt, _ = load_template(meta["template_id"])
+                    stored = read_control_values(meta["template_id"])
+                    # Only direct field overrides can change a literal model
+                    # input. Control links keep their existing Generate gate.
+                    if stored.get("fields"):
+                        apply_stored_values(prompt, control_descriptors.describe_controls(prompt), stored)
+                    meta["missing_models"] = model_requirements.missing_models(prompt, input_cache=input_cache)
+            except (TemplateError, OSError):
+                meta["requirements_error"] = "Model requirements could not be checked. Check again."
     result.sort(key=lambda item: (item["name"].lower(), item["template_id"]))
     return result
+
+
+def template_requirements(template_id: str) -> dict:
+    """Selected-row fallback: avoid inspecting every schema in a large library."""
+    with template_lock(template_id):
+        prompt, _ = load_template(template_id)
+        stored = read_control_values(template_id)
+        if stored.get("fields"):
+            apply_stored_values(prompt, control_descriptors.describe_controls(prompt), stored)
+        return {"ok": True, "template_id": template_id, "missing_models": model_requirements.missing_models(prompt)}
 
 
 def import_template(raw: bytes, *, source_name: str = "", name: str = "", validate=validate_template) -> dict:
@@ -270,7 +327,7 @@ def import_template(raw: bytes, *, source_name: str = "", name: str = "", valida
     if not validation["ok"]:
         raise TemplateError(" ".join(validation["errors"]), "invalid_template", 400, validation=validation)
     folder = templates_dir()
-    if len(list_templates()) >= MAX_TEMPLATES:
+    if sum(not t.get("starter") for t in list_templates()) >= MAX_TEMPLATES:
         raise TemplateError("Too many workflows. Delete one first.", "too_many_templates", 409)
     template_id = secrets.token_hex(8)
     json_path, meta_path, _ = _template_paths(template_id)
@@ -291,6 +348,7 @@ def import_template(raw: bytes, *, source_name: str = "", name: str = "", valida
 
 def replace_template(template_id: str, raw: bytes, *, source_name: str = "", validate=validate_template) -> dict:
     """Re-import over an existing workflow, keeping its id and Control values."""
+    _require_writable(template_id)
     json_path, meta_path, controls_path = _template_paths(template_id)
     prompt = parse_template_bytes(raw)
     validation = validate(prompt)
@@ -346,6 +404,7 @@ def _read_bytes(path: str) -> bytes | None:
 
 
 def rename_template(template_id: str, name: Any) -> dict:
+    _require_writable(template_id)
     json_path, meta_path, _ = _template_paths(template_id)
     with template_lock(template_id):
         if not os.path.isfile(json_path):
@@ -357,6 +416,7 @@ def rename_template(template_id: str, name: Any) -> dict:
 
 
 def delete_template(template_id: str) -> None:
+    _require_writable(template_id)
     paths = _template_paths(template_id)
     with template_lock(template_id):
         if not os.path.isfile(paths[0]):
@@ -375,8 +435,23 @@ def load_template(template_id: str) -> tuple[dict, dict]:
         raise TemplateError("Unknown workflow.", "unknown_template", 404)
     with template_lock(template_id):
         with open(json_path, "rb") as handle:
-            prompt = parse_template_bytes(handle.read())
-        meta = read_json_sidecar(meta_path)
+            raw = handle.read()
+            prompt = parse_template_bytes(raw)
+        if template_id in starter_sources():
+            digest = hashlib.sha256(raw).hexdigest()
+            cached = _starter_validation_cache.get(template_id)
+            if not cached or cached[0] != digest:
+                cached = (digest, validate_template(prompt))
+                _starter_validation_cache[template_id] = cached
+            shipped = read_json_sidecar(json_path[:-5] + ".meta.json")
+            order = shipped.get("order", 0)
+            meta = {"name": _clean_name(shipped.get("name"), _name_from_source(os.path.basename(json_path))),
+                    "source_name": os.path.basename(json_path), "starter": True,
+                    "model_family": str(shipped.get("model_family") or ""),
+                    "order": order if isinstance(order, (int, float)) else 0,
+                    "validation": copy.deepcopy(cached[1])}
+        else:
+            meta = read_json_sidecar(meta_path)
     return prompt, _public_meta(template_id, meta)
 
 

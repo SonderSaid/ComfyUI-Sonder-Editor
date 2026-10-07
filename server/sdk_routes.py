@@ -211,6 +211,12 @@ def register_sdk_routes(
     async def api_sdk_list_templates(request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "templates": await asyncio.to_thread(sdk_templates.list_templates)})
 
+    @routes.get("/sonder-editor/sdk/templates/{template_id}/requirements")
+    @handle
+    async def api_sdk_template_requirements(request: web.Request) -> web.Response:
+        template_id = sdk_templates.check_template_id(request.match_info.get("template_id"))
+        return web.json_response(await asyncio.to_thread(sdk_templates.template_requirements, template_id))
+
     @routes.post("/sonder-editor/sdk/templates")
     @handle
     async def api_sdk_import_template(request: web.Request) -> web.Response:
@@ -330,5 +336,7 @@ def register_sdk_routes(
     @routes.post("/sonder-editor/sdk/session/{session_id}/cancel")
     @handle
     async def api_sdk_cancel(request: web.Request) -> web.Response:
+        if not _tab(request):
+            return web.json_response(await runner.cancel_by_secret(request.match_info.get("session_id", ""), _secret(request)))
         session = await runner.authorized(request.match_info.get("session_id", ""), _secret(request), _tab(request))
         return web.json_response(await runner.cancel(session))
