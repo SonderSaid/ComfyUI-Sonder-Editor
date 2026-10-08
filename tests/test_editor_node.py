@@ -4347,7 +4347,12 @@ def test_release_returns_a_failed_runs_job_to_pending_and_announces_it(tmp_path,
         ("execution_error", {"node_type": "KSampler", "exception_message": "C:\\secret\\path failed"}),
     ])
 
+    payloads = []
+    remove = runs.add_run_finished_listener(payloads.append)
     io_nodes._release_prompt_run("5", status)
+    remove()
+    assert "secret" in payloads[0]["detail"]
+    assert "secret" not in str(events)
 
     assert (job.status, job.progress) == ("pending", 0.0)
     assert job.error == "The run failed in KSampler before this job completed."

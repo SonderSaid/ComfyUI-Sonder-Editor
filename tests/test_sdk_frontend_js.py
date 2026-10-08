@@ -250,6 +250,35 @@ out.generate_restore = {
     out.ended_status = { seen, late };
 }
 
+{
+    const releases = [];
+    const { h, calls } = harness(call => call.method === "PUT"
+        ? new Promise(resolve => releases.push(resolve)) : { status: 202, body: { run_ids: ["r"] } });
+    h.setValue("selection_start", 20); void h.flushValues();
+    h.setValue("selection_start", 30); void h.flushValues();
+    await settle();
+    releases[1]({status: 200, body: {stale: false}}); await settle();
+    h.setValue("selection_start", 40);
+    const pending = h.generate(1); await settle();
+    const before = calls.map(c => c.method);
+    releases[0]({status: 200, body: {stale: true}}); await pending;
+    h.setValue("selection_start", 50); void h.flushValues({keepalive: true}); await settle();
+    const draining = h.drainSaves({timeoutMs: 10});
+    let drained = false; draining.then(() => drained = true); await settle();
+    const exitWaited = !drained;
+    releases[2]({status: 200, body: {stale: true}}); await draining;
+    out.all_saves = { before, exitWaited, sequences: calls.map(c => c.body.seq ?? c.body.editor_values_seq),
+        keepalive: calls.at(-1).keepalive, unsaved: h.hasUnsavedValues() };
+}
+{
+    const { h, timers } = harness(() => new Promise(() => {}));
+    h.setValue("selection_start", 1); void h.flushValues();
+    const draining = h.drainSaves({timeoutMs: 10});
+    [...timers.values()].find(t => t.ms === 10).fn();
+    out.drain_timeout = await draining;
+    h.destroy();
+}
+
 // ── Session ownership state machine ───────────────────────────────────────
 function ownershipHarness({ claimResults = [], heartbeatResults = [] } = {}) {
     const { h } = harness();
@@ -388,7 +417,7 @@ out.faces = {
 };
 out.progress = {
     queued: gc.describeBatchProgress([{ state: "queued" }, { state: "submitting" }]),
-    running: gc.describeBatchProgress([{ state: "landed" }, { state: "running", progress: 0.25 }, { state: "queued" }]),
+    running: gc.describeBatchProgress([{ state: "landed" }, { state: "running", progress_node: "Sampler", progress_count: {value: 2, max: 8} }, { state: "queued" }]),
     finishing: gc.describeBatchProgress([{ state: "finishing" }]),
     null_progress: gc.describeBatchProgress([{ state: "running", progress: null }]),
     empty: gc.describeBatchProgress([]),
@@ -411,6 +440,33 @@ out.notices = {
 };
 out.clamp = [gc.clampGenerateCount(0), gc.clampGenerateCount(3.4), gc.clampGenerateCount(99), gc.clampGenerateCount("x")];
 
+{
+    const { h } = harness(() => ({status: 409, body: {code: "canceled_before_submit"}}));
+    h.setValue("selection_start", 12);
+    await h.generate(1);
+    out.canceled_saved = !h.hasUnsavedValues();
+    out.canceled_notice = gc.generateResultNotice({ok:false,payload:{code:"canceled_before_submit"}},1);
+    h.applyStatus({session_id:"sdk-1",seq:9,runs:[{run_id:"f",state:"failed"}]});
+    const older = h.applyStatus({session_id:"sdk-1",seq:8,runs:[{run_id:"f",state:"failed"}],details:{f:"ValueError: detail"}},{fetched:true});
+    out.old_details = {older,seq:h.status.seq,detail:h.details.get("f")};
+    h.applyStatus({session_id:"sdk-1",seq:10,runs:[{run_id:"f",state:"failed"}]});
+    out.details_after_ws = h.details.get("f");
+}
+
+{
+    let release;
+    const { h, calls } = harness();
+    h.flushControlsPanel = () => new Promise(resolve => release = resolve);
+    h.setValue("selection_start", 42);
+    const pending = h.generate(1);
+    await settle();
+    await h.cancelAll();
+    release(true);
+    const result = await pending;
+    out.cancel_during_host_drain = {code:result.payload.code, methods:calls.map(c=>c.method),
+        generated:calls.some(c=>c.url.endsWith("/generate")), saved:calls.find(c=>c.method==="PUT")?.body.values.selection_start};
+}
+
 // ── Generate controls: fake DOM ───────────────────────────────────────────
 const captured = [];
 const seenIds = new Set();
@@ -428,18 +484,18 @@ function fakeGenerationHost(initial = { seq: -1, runs: [] }) {
         listeners: new Set(), status: initial, generated: [], cancels: 0,
         subscribe(fn) { this.listeners.add(fn); fn(this.status); return () => this.listeners.delete(fn); },
         emit(status) { this.status = status; for (const fn of [...this.listeners]) fn(status); },
-        async generate(count, opts) { this.generated.push([count, opts]); return { ok: true, status: 202, payload: { run_ids: ["r"], error: null } }; },
+        async generate(count, opts) { this.generated.push([count, {renderCacheMaxBytes: opts.renderCacheMaxBytes}]); return { ok: true, status: 202, payload: { run_ids: ["r"], error: null } }; },
         async cancelAll() { this.cancels += 1; return { ok: true, status: 200, payload: { canceling: [] } }; },
     };
 }
-function mount(fake, order) {
+function mount(fake, order, before = null) {
     return gc.createGenerateControls({
         host: fake,
         makeButton: (text, title) => { const b = document.createElement("button"); b.textContent = text; b.title = title; return b; },
         setVariant: (b, variant) => { b.dataset.variant = variant; },
         makeStepButtons: (title, onStep) => { const w = document.createElement("span"); w.onStep = onStep; return w; },
         buttonOptions: { primary: {}, secondary: {} },
-        beforeGenerate: async () => { order.push("drain"); },
+        beforeGenerate: before || (async () => { order.push("drain"); }),
         renderCacheMaxBytes: () => 123,
     });
 }
@@ -447,7 +503,7 @@ function mount(fake, order) {
     const fake = fakeGenerationHost();
     const order = [];
     const controls = mount(fake, order);
-    const [button, countGroup] = controls.element.children;
+    const [button, countGroup, cancelButton] = controls.element.children;
     const [countLabel, steps] = countGroup.children;
     const faces = [];
     faces.push([button.textContent, button.dataset.variant, countLabel.textContent]);
@@ -462,14 +518,14 @@ function mount(fake, order) {
     out.dom_generate = { order, generated: fake.generated };
 
     fake.emit({ seq: 0, runs: [{ run_id: "a", state: "queued", index: 1, count: 2 }, { run_id: "b", state: "submitting", index: 2, count: 2 }] });
-    faces.push([button.textContent, button.dataset.variant, countGroup.style.display]);
+    faces.push([button.textContent, cancelButton.textContent, countGroup.style.display]);
     const progress = live.find((n) => n.source === "sdk-generate");
     out.dom_progress = progress && { tier: progress.tier, foreground: progress.foreground, message: progress.message };
-    button.click();
+    cancelButton.click();
     await settle();
     out.dom_cancels = fake.cancels;
     fake.emit({ seq: 1, runs: [{ run_id: "a", state: "running", canceling: true, progress: 0.5 }, { run_id: "b", state: "queued", canceling: true }] });
-    faces.push(button.textContent);
+    faces.push(cancelButton.textContent);
     fake.emit({ seq: 2, runs: [{ run_id: "a", state: "landed", index: 1, count: 2 }, { run_id: "b", state: "canceled", index: 2, count: 2, note: "Canceled before it started." }] });
     faces.push([button.textContent, countGroup.style.display]);
     out.dom_faces = faces;
@@ -479,13 +535,69 @@ function mount(fake, order) {
     out.dom_listeners_after_destroy = fake.listeners.size;
 }
 {
+    const fake = fakeGenerationHost({seq:0,runs:[]});
+    const controls = mount(fake, []);
+    const [button, countGroup, cancelButton] = controls.element.children;
+    let release;
+    fake.generate = () => new Promise(resolve => release = resolve);
+    fake.emit({seq:1,runs:[{run_id:"a",state:"running",progress_node:"Sampler"}]});
+    button.click(); await settle();
+    const sending = {disabled:button.disabled,label:button.textContent,cancel:cancelButton.textContent,count:countGroup.children[0].textContent};
+    cancelButton.click(); await settle();
+    release({ok:true,payload:{run_ids:["b"]}}); await settle();
+    const sixteen = Array.from({length:16},(_,i)=>({run_id:`cap${i}`,state:"queued"}));
+    fake.emit({seq:2,runs:sixteen});
+    out.side_by_side = {sending,cancels:fake.cancels,capacityDisabled:button.disabled,reason:button.title};
+    controls.destroy();
+}
+{
+    const fake = fakeGenerationHost({seq:0,runs:[]});
+    const controls = mount(fake, []);
+    for(let i=0;i<50;i++) {
+        const runs = Array.from({length:i+1},(_,n)=>({run_id:`long${n}`,state:n===i?"running":"landed"})).slice(-25);
+        fake.emit({seq:i+1,runs});
+    }
+    out.trimmed_line = live.find(n=>n.source === "sdk-generate")?.message;
+    controls.destroy();
+}
+{
+    const fake = fakeGenerationHost({seq:0,runs:[]});
+    let reads=0;
+    fake.details=new Map();
+    fake.refreshStatus=async()=>{
+        reads++;
+        fake.details.set("detail-run","ValueError: private detail");
+        fake.emit(fake.status);
+    };
+    const controls=mount(fake,[]);
+    fake.emit({seq:1,runs:[{run_id:"detail-run",state:"failed",note:"The run failed."}]});
+    await settle();
+    out.failure_detail={reads,detail:live.find(n=>n.source === "sdk-generate-failed")?.detail};
+    controls.destroy();
+}
+{
+    let release;
+    const { h, calls } = harness();
+    h.applyStatus({session_id:"sdk-1",seq:0,runs:[{run_id:"old",state:"running"}]});
+    h.setValue("selection_start",43);
+    const controls = mount(h, [], () => new Promise(resolve => release = resolve));
+    const [button, count, cancel] = controls.element.children;
+    button.click(); await settle();
+    cancel.click(); await settle();
+    release(); await settle();
+    out.cancel_before_host = {methods:calls.map(c=>c.method),generated:calls.some(c=>c.url.endsWith("/generate")),saved:calls.find(c=>c.method==="PUT")?.body.values.selection_start};
+    controls.destroy();
+}
+{
     // The real order: the host starts at seq -1, a fetched snapshot primes the
     // controls silently, then live snapshots announce new outcomes only.
+    for (const n of [...live]) notes.dismiss(n.id);
     const before = captured.length;
     const { h } = harness();
     const controls = mount(h, []);
     h.applyStatus({ session_id: "sdk-1", seq: 7, runs: [{ run_id: "x", state: "landed" }, { run_id: "y", state: "failed", note: "boom" }] }, { fetched: true });
     h.applyStatus({ session_id: "sdk-1", seq: 8, runs: [{ run_id: "x", state: "landed" }, { run_id: "y", state: "failed", note: "boom" }, { run_id: "z", state: "failed", note: "new" }] });
+    await settle();
     out.primed_toasts = captured.slice(before).map((n) => [n.tier, n.message]);
     // An ended session ends the progress line too.
     h.applyStatus({ session_id: "sdk-1", seq: 9, runs: [{ run_id: "w", state: "running", progress: 0.1 }] });
@@ -629,7 +741,7 @@ def test_position_saves_are_debounced_and_carry_the_session_headers(results):
         "method": "PUT",
         "headers": {"X-Sonder-SDK-Session": "s3cret", "X-Sonder-Tab-Session": "tab-1",
                     "Content-Type": "application/json"},
-        "body": {"values": {"scene_id": "", "selection_start": 2, "selection_end": 9}},
+        "body": {"values": {"scene_id": "", "selection_start": 2, "selection_end": 9}, "seq": 1},
     }]
     assert results["noop_timers"] == 0
     assert results["node_id"] == "sdk-1"
@@ -686,9 +798,10 @@ def test_session_storage_holds_the_secret_by_id_and_the_exit_flag_once(results):
 
 def test_generate_button_faces(results):
     assert results["faces"] == {
-        "idle": "idle", "finished": "idle", "submitting": "submitting",
-        "active": "active", "active_while_sending": "active",
-        "canceling": "canceling", "partly_canceling": "active",
+        "idle": {"generate": "idle", "cancel": "hidden"}, "finished": {"generate": "idle", "cancel": "hidden"},
+        "submitting": {"generate": "sending", "cancel": "hidden"},
+        "active": {"generate": "idle", "cancel": "active"}, "active_while_sending": {"generate": "sending", "cancel": "active"},
+        "canceling": {"generate": "idle", "cancel": "canceling"}, "partly_canceling": {"generate": "idle", "cancel": "active"},
     }
     assert results["clamp"] == [1, 3, 8, 1]
 
@@ -696,7 +809,7 @@ def test_generate_button_faces(results):
 def test_progress_line(results):
     progress = results["progress"]
     assert progress["queued"] == {"message": "Generating 1 of 2 · waiting in ComfyUI's queue", "progress": None}
-    assert progress["running"] == {"message": "Generating 2 of 3", "progress": 0.25}
+    assert progress["running"] == {"message": "Generating 2 of 3 · Sampler 2/8", "progress": 0.25}
     assert progress["finishing"] == {"message": "Generating 1 of 1 · saving the take", "progress": None}
     assert progress["null_progress"]["progress"] is None
     assert progress["empty"] is None
@@ -738,9 +851,9 @@ def test_generate_controls_drive_the_host(results):
     assert faces[0] == ["Generate", "primary", "×1"]
     assert faces[1] == "×3"
     assert faces[2] == "×8"
-    assert faces[3] == ["Cancel all", "secondary", "none"]  # the ×N stepper hides while takes run
+    assert faces[3] == ["Generate", "Cancel all", ""]  # count remains visible
     assert faces[4] == "Canceling…"
-    assert faces[5] == ["Generate", "inline-flex"]
+    assert faces[5] == ["Generate", ""]
     assert results["dom_cancels"] == 1
     assert results["dom_progress"] == {"tier": "progress", "foreground": True,
                                        "message": "Generating 1 of 2 · waiting in ComfyUI's queue"}
@@ -890,3 +1003,32 @@ def test_the_canvas_create_new_uses_the_shared_helper():
     assert 'fetch(api.apiURL("/sonder-editor/project")' not in body
     landing = (JS / "sdk_landing.js").read_text(encoding="utf-8")
     assert "createSonderProject(" in landing
+
+
+def test_every_save_is_drained_and_sequence_protects_keepalive(results):
+    assert results["all_saves"] == {"before": ["PUT", "PUT"], "exitWaited": True,
+        "sequences": [1, 2, 3, 4], "keepalive": True, "unsaved": False}
+    assert results["drain_timeout"] is False
+    source = (ROOT / "web/js/tab_entry.js").read_text(encoding="utf-8")
+    assert "await host.drainSaves()" in source
+
+
+def test_failure_details_survive_newer_snapshots_and_fetch_once(results):
+    assert results["old_details"] == {"older": False, "seq": 9, "detail": "ValueError: detail"}
+    assert results["details_after_ws"] == "ValueError: detail"
+    assert results["failure_detail"] == {"reads": 1, "detail": "The run failed.\n\nValueError: private detail"}
+
+
+def test_generate_and_cancel_are_independent_with_capacity_feedback(results):
+    assert results["side_by_side"]["sending"] == {"disabled": True, "label": "Sending…", "cancel": "Cancel all", "count": "×1"}
+    assert results["side_by_side"]["cancels"] == 1
+    assert results["side_by_side"]["capacityDisabled"] is True
+    assert "16" in results["side_by_side"]["reason"]
+    assert results["trimmed_line"] == "Generating 50 of 50"
+    assert results["canceled_saved"] is True
+    assert results["canceled_notice"] == {"tier": "info", "message": "Canceled before it was sent."}
+
+
+def test_cancel_invalidates_generate_during_each_client_barrier(results):
+    assert results["cancel_during_host_drain"] == {"code": "canceled_before_submit", "methods": ["POST", "PUT"], "generated": False, "saved": 42}
+    assert results["cancel_before_host"] == {"methods": ["POST", "PUT"], "generated": False, "saved": 43}

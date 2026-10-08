@@ -173,7 +173,7 @@ def test_generate_n_submits_n_runs_with_tokens_values_and_advancing_seeds(world)
 
     async def go():
         session = await world.open()
-        return session, await world.runner.generate(session, count=3, editor_values=editor_values(),
+        return session, await world.runner.generate(session, tab_session_id="tab-1", count=3, editor_values=editor_values(), editor_values_seq=1,
                                                     render_cache_max_bytes=-1)
 
     session, result = asyncio.run(go())
@@ -203,9 +203,9 @@ def test_seeds_default_to_randomize_and_fixed_never_changes(world, monkeypatch):
 
     async def go():
         session = await world.open()
-        await world.runner.generate(session, count=2)
+        await world.runner.generate(session, tab_session_id="tab-1", count=2)
         sdk_templates.update_control_values(world.template_id, lambda d: d["controls"]["abcd1234"].update(seed_mode="fixed"))
-        await world.runner.generate(session, count=2)
+        await world.runner.generate(session, tab_session_id="tab-1", count=2)
 
     asyncio.run(go())
     assert modes == ["randomize", "randomize"]
@@ -220,7 +220,7 @@ def test_generate_refuses_a_control_that_is_not_ok(world, status):
     async def go():
         session = await world.open()
         with pytest.raises(SdkError) as exc:
-            await world.runner.generate(session)
+            await world.runner.generate(session, tab_session_id="tab-1")
         return exc.value
 
     error = asyncio.run(go())
@@ -233,7 +233,7 @@ def test_an_unlinked_control_does_not_block_generate(world):
 
     async def go():
         session = await world.open()
-        return await world.runner.generate(session)
+        return await world.runner.generate(session, tab_session_id="tab-1")
 
     assert len(asyncio.run(go())["run_ids"]) == 1
 
@@ -243,7 +243,7 @@ def test_a_refused_submit_stops_the_batch_and_forgets_its_token(world):
 
     async def go():
         session = await world.open()
-        return session, await world.runner.generate(session, count=3)
+        return session, await world.runner.generate(session, tab_session_id="tab-1", count=3)
 
     session, result = asyncio.run(go())
     assert len(result["run_ids"]) == 1 and result["error"]["code"] == "submit_failed"
@@ -267,7 +267,7 @@ def test_run_finished_inside_submit_is_not_lost(world):
 
     async def go():
         session = await world.open()
-        await world.runner.generate(session)
+        await world.runner.generate(session, tab_session_id="tab-1")
         return session
 
     session = asyncio.run(go())
@@ -279,7 +279,7 @@ def test_run_finished_inside_submit_is_not_lost(world):
 def test_the_listener_hands_off_from_the_worker_thread(world):
     async def go():
         session = await world.open()
-        await world.runner.generate(session)
+        await world.runner.generate(session, tab_session_id="tab-1")
         run = session.runs[0]
         payload = {"run_token": run.token, "prompt_id": run.prompt_id, "outcome": "success",
                    "leased_job_ids": ["job-1"], "returned_job_ids": []}
@@ -298,7 +298,7 @@ def test_the_listener_hands_off_from_the_worker_thread(world):
 def test_a_consumed_job_is_reported_from_the_claim_not_the_settled_lease(world):
     async def go():
         session = await world.open()
-        await world.runner.generate(session)
+        await world.runner.generate(session, tab_session_id="tab-1")
         run = session.runs[0]
         world.runner.apply_run_finished({"run_token": run.token, "prompt_id": run.prompt_id, "outcome": "success",
                                          "leased_job_ids": [], "claimed_job_id": "job-7", "returned_job_ids": []})
@@ -311,7 +311,7 @@ def test_a_consumed_job_is_reported_from_the_claim_not_the_settled_lease(world):
 def test_presence_tracks_queue_running_and_finishing_and_ignores_sdk_status(world):
     async def go():
         session = await world.open()
-        await world.runner.generate(session, count=2)
+        await world.runner.generate(session, tab_session_id="tab-1", count=2)
         first, second = session.runs
         first.job.status = "expired"  # the proxy's completion race; the runner never reads SDK status
         world.queue.running = [(1, first.prompt_id, {}, {}, [])]
@@ -336,7 +336,7 @@ def test_presence_tracks_queue_running_and_finishing_and_ignores_sdk_status(worl
 def test_absent_and_never_taken_means_canceled_after_the_grace(world):
     async def go():
         session = await world.open()
-        await world.runner.generate(session)
+        await world.runner.generate(session, tab_session_id="tab-1")
         run = session.runs[0]
         await world.runner.presence_tick()
         assert run.state == QUEUED  # just absent: grace period
@@ -354,7 +354,7 @@ def test_absent_and_never_taken_means_canceled_after_the_grace(world):
 def test_cancel_all_requests_cancel_and_an_interrupt_reads_as_canceled(world):
     async def go():
         session = await world.open()
-        await world.runner.generate(session, count=2)
+        await world.runner.generate(session, tab_session_id="tab-1", count=2)
         result = await world.runner.cancel(session)
         assert len(result["canceling"]) == 2
         assert all(run.job.canceled and run.cancel_requested for run in session.runs)
@@ -368,18 +368,18 @@ def test_cancel_all_requests_cancel_and_an_interrupt_reads_as_canceled(world):
     asyncio.run(go())
 
 
-def test_a_failing_progress_stream_degrades_quietly(world):
+def test_missing_progress_observer_keeps_state_only_status(world):
     async def go():
         session = await world.open()
-        await world.runner.generate(session)
+        await world.runner.generate(session, tab_session_id="tab-1")
         run = session.runs[0]
         run.job._events = [RuntimeError("429 too_many_streams")]
         world.queue.running = [(1, run.prompt_id, {}, {}, [])]
         await world.runner.presence_tick()
         await asyncio.sleep(0)
         await asyncio.sleep(0)
-        assert run.state == RUNNING and run.progress is None
-        assert session.stream_task is None or session.stream_task.done()
+        assert run.state == RUNNING and run.progress_count is None
+        assert run.progress_node == ""
 
     asyncio.run(go())
 
@@ -390,7 +390,7 @@ def test_a_submit_with_an_unknown_outcome_waits_and_is_adopted_from_the_queue(wo
 
     async def go():
         session = await world.open()
-        result = await world.runner.generate(session, count=2)
+        result = await world.runner.generate(session, tab_session_id="tab-1", count=2)
         run = session.runs[0]
         assert result["error"]["code"] == "submit_unconfirmed" and len(session.runs) == 1
         assert run.state == UNCONFIRMED and sdk_runs.token_state(run.token) is not None
@@ -409,7 +409,7 @@ def test_an_unconfirmed_submit_that_never_appears_fails_after_a_grace(world):
 
     async def go():
         session = await world.open()
-        await world.runner.generate(session)
+        await world.runner.generate(session, tab_session_id="tab-1")
         run = session.runs[0]
         await world.runner.presence_tick()
         assert run.state == UNCONFIRMED
@@ -430,7 +430,7 @@ def test_a_seed_save_failure_does_not_lose_the_runs(world, monkeypatch):
     async def go():
         session = await world.open()
         world.events.clear()
-        result = await world.runner.generate(session, count=2)
+        result = await world.runner.generate(session, tab_session_id="tab-1", count=2)
         return session, result
 
     session, result = asyncio.run(go())
@@ -447,7 +447,7 @@ def test_cancel_all_during_a_batch_stops_further_submits_and_cancels_the_accepte
                 await world.runner.cancel(session)
 
         world.client.on_submit = cancel_now
-        result = await world.runner.generate(session, count=4)
+        result = await world.runner.generate(session, tab_session_id="tab-1", count=4)
         return session, result
 
     session, result = asyncio.run(go())
@@ -459,7 +459,7 @@ def test_cancel_all_during_a_batch_stops_further_submits_and_cancels_the_accepte
 def test_run_finished_from_another_prompt_with_the_same_token_is_ignored(world):
     async def go():
         session = await world.open()
-        await world.runner.generate(session)
+        await world.runner.generate(session, tab_session_id="tab-1")
         run = session.runs[0]
         world.runner.apply_run_finished({"run_token": run.token, "prompt_id": run.prompt_id, "outcome": "success",
                                          "leased_job_ids": [], "returned_job_ids": []})
@@ -474,7 +474,7 @@ def test_run_finished_from_another_prompt_with_the_same_token_is_ignored(world):
 def test_success_that_returned_its_job_is_not_reported_as_a_landed_take(world):
     async def go():
         session = await world.open()
-        await world.runner.generate(session)
+        await world.runner.generate(session, tab_session_id="tab-1")
         run = session.runs[0]
         world.runner.apply_run_finished({"run_token": run.token, "prompt_id": run.prompt_id, "outcome": "success",
                                          "note": "The run finished without completing this job.",
@@ -488,7 +488,7 @@ def test_success_that_returned_its_job_is_not_reported_as_a_landed_take(world):
 def test_a_released_run_whose_run_finished_never_comes_ends_after_a_while(world):
     async def go():
         session = await world.open()
-        await world.runner.generate(session)
+        await world.runner.generate(session, tab_session_id="tab-1")
         run = session.runs[0]
         sdk_runs.open_release("k9", run.prompt_id)
         sdk_runs.close_release("k9")
@@ -504,7 +504,7 @@ def test_a_released_run_whose_run_finished_never_comes_ends_after_a_while(world)
 def test_generate_starts_from_editor_defaults_not_the_authors_position(world):
     async def go():
         session = await world.open()
-        await world.runner.generate(session)  # no editor values, no stored position
+        await world.runner.generate(session, tab_session_id="tab-1")  # no editor values, no stored position
 
     asyncio.run(go())
     editor = world.client.submitted[0]["1"]["inputs"]
@@ -524,7 +524,7 @@ def test_stored_values_and_fields_are_applied_and_rechecked(world):
 
     async def go():
         session = await world.open()
-        await world.runner.generate(session, render_cache_max_bytes=-5)  # out of range: Off
+        await world.runner.generate(session, tab_session_id="tab-1", render_cache_max_bytes=-5)  # out of range: Off
 
     asyncio.run(go())
     graph = world.client.submitted[0]
@@ -670,7 +670,7 @@ def test_a_session_with_a_run_in_flight_is_never_evicted_even_without_a_tab(worl
 
     async def go():
         session = await world.open()
-        await world.runner.generate(session)
+        await world.runner.generate(session, tab_session_id="tab-1")
         world.owners.pop(session.session_id)  # its tab is gone, its run is not
         other = sdk_templates.import_template(json.dumps(template_prompt()).encode(),
                                               validate=lambda p: {"ok": True, "errors": []})["template_id"]
@@ -712,3 +712,107 @@ def test_the_client_is_built_without_touching_the_environment(monkeypatch):
         assert client._http._trust_env is False
     finally:
         asyncio.run(client.aclose())
+
+
+def test_stale_generate_keeps_newer_position_but_runs_click_snapshot(world):
+    async def go():
+        session = await world.open()
+        sdk_templates.write_editor_state(PROJECT, {"selection_start": 80}, writer={"tab": "tab-1", "seq": 2})
+        result = await world.runner.generate(session, tab_session_id="tab-1", editor_values={"selection_start": 40}, editor_values_seq=1)
+        assert result["stale"] is True
+        assert sdk_templates.read_editor_state(PROJECT)["selection_start"] == 80
+        assert world.client.submitted[0]["1"]["inputs"]["selection_start"] == 40
+    asyncio.run(go())
+
+
+def test_generate_rechecks_owner_after_template_lock(world):
+    async def go():
+        session = await world.open()
+        async with world.runner.template_lock(session.template_id):
+            pending = asyncio.create_task(world.runner.generate(session, tab_session_id="tab-1", editor_values={"selection_start": 40}, editor_values_seq=1))
+            await asyncio.sleep(.03)
+            world.owners[session.session_id] = {"session_id": "tab-2"}
+        with pytest.raises(SdkError) as exc:
+            await pending
+        assert exc.value.code == "not_owner"
+        assert not world.client.submitted
+        assert not sdk_templates.read_editor_state(PROJECT)
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("node,display,expected", [
+    ("12:5", "12", "Sampler"), ("12.0.1.inner", "9", "Bridge"),
+    ("unknown", "12:5", "Sampler"), ("unknown", "other", "")])
+def test_progress_resolves_labels(node, display, expected):
+    assert SdkRunner._progress_label({"12:5": "Sampler", "12": "Bridge"}, node, display) == expected
+
+
+def test_run_detail_is_memory_only_and_progress_ignores_late_events(world):
+    async def go():
+        session = await world.open()
+        await world.runner.generate(session, tab_session_id="tab-1")
+        run = session.runs[0]
+        snapshot = {"run_token": run.token, "prompt_id": run.prompt_id, "node_id": "6", "display_node_id": "6", "count": {"value": 1, "max": 4}}
+        world.runner.apply_progress(snapshot)
+        assert run.public()["progress_node"] == "KSampler"
+        assert run.public()["progress_count"] == {"value": 1, "max": 4}
+        world.runner.apply_run_finished({"run_token": run.token, "prompt_id": run.prompt_id, "outcome": "error", "detail": "ValueError: private/path"})
+        assert run.detail == "ValueError: private/path"
+        assert "private/path" not in json.dumps(world.runner.status(session))
+        assert "private/path" not in json.dumps(world.events)
+        world.runner.apply_progress(snapshot)
+        assert run.state == FAILED and run.progress_node == ""
+    asyncio.run(go())
+
+
+def test_cancel_while_generate_waits_saves_position_without_submitting(world):
+    async def go():
+        session = await world.open()
+        async with world.runner.template_lock(session.template_id):
+            pending = asyncio.create_task(world.runner.generate(session, tab_session_id="tab-1", editor_values={"selection_start": 40}, editor_values_seq=1))
+            await asyncio.sleep(.03)
+            await world.runner.cancel(session)
+        with pytest.raises(SdkError) as exc:
+            await pending
+        assert exc.value.code == "canceled_before_submit"
+        assert sdk_templates.read_editor_state(PROJECT)["selection_start"] == 40
+        assert not world.client.submitted
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("count", [0, 9, -1, True, 1.5, "2", None])
+def test_generate_invalid_count(world, count):
+    async def go():
+        session = await world.open()
+        with pytest.raises(SdkError) as exc:
+            await world.runner.generate(session, tab_session_id="tab-1", count=count)
+        assert exc.value.code == "invalid_count" and not world.client.submitted
+    asyncio.run(go())
+
+
+def test_capacity_across_generate_requests(world):
+    async def go():
+        session = await world.open()
+        for _ in range(2):
+            await world.runner.generate(session, tab_session_id="tab-1", count=8)
+        with pytest.raises(SdkError) as exc:
+            await world.runner.generate(session, tab_session_id="tab-1")
+        assert exc.value.code == "too_many_runs" and exc.value.status == 429
+        assert len(world.client.submitted) == 16
+        world.runner._finish(session.runs[0], LANDED)
+        await world.runner.generate(session, tab_session_id="tab-1")
+        assert len(world.client.submitted) == 17
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("meta", [None, "bad", {"title": "   "}, {"title": 42}])
+def test_progress_metadata_cannot_prevent_generate(world, meta):
+    graph = template_prompt()
+    graph["6"]["_meta"] = meta
+    sdk_templates.replace_template(world.template_id, json.dumps(graph).encode(), validate=lambda p: {"ok": True})
+    async def go():
+        session = await world.open()
+        result = await world.runner.generate(session, tab_session_id="tab-1")
+        assert result["run_ids"]
+        assert session.runs[0].node_labels["6"] == "KSampler"
+    asyncio.run(go())

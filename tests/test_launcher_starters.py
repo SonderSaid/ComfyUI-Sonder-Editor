@@ -59,7 +59,7 @@ def test_starter_opens_controls_reads_changes_seed_advances_and_generates(starte
         view = world.runner._controls_snapshot(session)
         assert view
         st.store_control_changes(identity, {'control:abcd1234:seed': 27, 'control:abcd1234:seed_mode': 'increment'})
-        result = await world.runner.generate(session, count=2)
+        result = await world.runner.generate(session, tab_session_id="tab-1", count=2)
         assert len(result['run_ids']) == 2
         assert [p['5']['inputs']['seed'] for p in world.client.submitted] == [27, 28]
         assert st.read_control_values(identity)['controls']['abcd1234']['seed'] == 29
@@ -81,7 +81,7 @@ def test_secret_cancel_refuses_live_owner_and_wrong_secret_then_cancels_after_de
     monkeypatch.setitem(sys.modules, 'folder_paths', types.SimpleNamespace(get_user_directory=lambda: str(tmp_path)))
     world = World()
     async def scenario():
-        session = await world.open(); await world.runner.generate(session)
+        session = await world.open(); await world.runner.generate(session, tab_session_id="tab-1")
         with pytest.raises(SdkError) as exc:
             await world.runner.cancel_by_secret(session.session_id, session.secret)
         assert exc.value.code == 'not_owner' and not session.runs[0].cancel_requested

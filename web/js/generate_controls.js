@@ -9,13 +9,15 @@
 
 import {
     notifyError,
+    notifyInfo,
     notifyProgress,
     notifySuccess,
     notifyWarning,
 } from "./editor_notifications.js";
-import { EDITOR_COLORS as COLORS, FONT, TYPE } from "./editor_theme.js";
+import { EDITOR_COLORS as COLORS, FONT, TYPE, setButtonDisabled } from "./editor_theme.js";
 
 export const GENERATE_MAX_COUNT = 8;
+export const GENERATE_MAX_UNFINISHED = 16;
 
 const FINAL_STATES = new Set(["landed", "failed", "canceled", "ended"]);
 const UNFINISHED_STATES = new Set(["submitting", "unconfirmed", "queued", "running", "finishing"]);
@@ -25,20 +27,20 @@ export function clampGenerateCount(value) {
 }
 
 // Pure: which face the button shows for a status snapshot.
-export function generateButtonState(runs, { submitting = false } = {}) {
+export function generateButtonState(runs, { submitting = false, count = 1 } = {}) {
     const active = (runs || []).filter((run) => UNFINISHED_STATES.has(String(run?.state || "")));
-    if (active.length && active.every((run) => run.canceling)) return "canceling";
-    if (active.length) return "active";
-    if (submitting) return "submitting";
-    return "idle";
+    return {
+        generate: submitting ? "sending" : active.length + count > GENERATE_MAX_UNFINISHED ? "full" : "idle",
+        cancel: !active.length ? "hidden" : active.every(run => run.canceling) ? "canceling" : "active",
+    };
 }
 
 // Pure: the progress line for the runs of the current batch.
-export function describeBatchProgress(batchRuns) {
+export function describeBatchProgress(batchRuns, completedTrimmed = 0) {
     const runs = batchRuns || [];
-    const total = runs.length;
+    const total = runs.length + completedTrimmed;
     if (!total) return null;
-    const done = runs.filter((run) => FINAL_STATES.has(String(run?.state || ""))).length;
+    const done = completedTrimmed + runs.filter((run) => FINAL_STATES.has(String(run?.state || ""))).length;
     const current = runs.find((run) => run?.state === "running")
         || runs.find((run) => UNFINISHED_STATES.has(String(run?.state || "")));
     const index = Math.min(total, done + 1);
@@ -46,22 +48,28 @@ export function describeBatchProgress(batchRuns) {
     if (current?.state === "queued") suffix = " · waiting in ComfyUI's queue";
     else if (current?.state === "finishing") suffix = " · saving the take";
     else if (current?.state === "submitting" || current?.state === "unconfirmed") suffix = " · sending";
-    const progress = current?.state === "running" && Number.isFinite(Number(current.progress)) && current.progress !== null
-        ? Math.max(0, Math.min(1, Number(current.progress)))
-        : null;
+    let progress = null;
+    if (current?.state === "running" && current.progress_node) {
+        suffix = ` · ${current.progress_node}`;
+        const count = current.progress_count;
+        if (count && Number.isFinite(count.value) && Number.isFinite(count.max) && count.max > 1) {
+            suffix += ` ${count.value}/${count.max}`;
+            progress = count.value / count.max;
+        }
+    }
     return { message: `Generating ${index} of ${total}${suffix}`, progress };
 }
 
 // Pure: the toast for a run that just became final, or null. Messages carry no
 // take index: same-source toasts coalesce into one with a count ("×3"), which
 // would otherwise show only the last index.
-export function outcomeToast(run) {
+export function outcomeToast(run, detail = "") {
     const note = String(run?.note || "").trim();
     switch (run?.state) {
         case "landed":
             return { tier: "success", message: "Take landed on the timeline", source: "sdk-generate-landed" };
         case "failed":
-            return { tier: "error", message: "Take failed", detail: note || null, source: "sdk-generate-failed" };
+            return { tier: "error", message: "Take failed", detail: [note, detail].filter(Boolean).join("\n\n") || null, source: "sdk-generate-failed" };
         case "canceled":
             return { tier: "warning", message: "Take canceled", detail: note || null, source: "sdk-generate-canceled" };
         case "ended":
@@ -88,6 +96,7 @@ export function generateResultNotice(result, requested) {
         return null;
     }
     if (code === "not_owner" || code === "session_ended") return null; // the page blocker says it
+    if (code === "canceled_before_submit") return { tier: "info", message: "Canceled before it was sent." };
     if (code === "generate_refused") {
         const problems = Array.isArray(payload.problems) ? payload.problems : [];
         return { tier: "error", message: "This workflow can't generate yet.", detail: problems.join("\n") || null };
@@ -119,6 +128,7 @@ function notifyTier(notice, opts = {}) {
     if (!notice) return;
     const extra = { detail: notice.detail ?? null, source: notice.source || opts.source || "sdk-generate-request" };
     if (notice.tier === "success") notifySuccess(notice.message, extra);
+    else if (notice.tier === "info") notifyInfo(notice.message, extra);
     else if (notice.tier === "warning") notifyWarning(notice.message, extra);
     else notifyError(notice.message, extra);
 }
@@ -144,10 +154,12 @@ export function createGenerateControls({
 }) {
     let count = 1;
     let submitting = false;
-    let face = "";
+    let pendingGenerate = null;
     let destroyed = false;
     let progressHandle = null;
-    let batchIds = [];
+    const batchIds = new Set();
+    let completedTrimmed = 0;
+    let previouslySeen = new Set();
     let latestRuns = [];
     let primed = false;
     const announced = new Set();
@@ -158,6 +170,10 @@ export function createGenerateControls({
 
     const button = makeButton("Generate", "", buttonOptions.primary, "white-space:nowrap;");
     button.type = "button";
+    setVariant(button, "primary");
+    const cancelButton = makeButton("Cancel all", "Stop every take that is still queued or running", buttonOptions.secondary, "white-space:nowrap;");
+    cancelButton.type = "button";
+    setVariant(cancelButton, "secondary");
 
     const countLabel = document.createElement("span");
     countLabel.style.cssText = `
@@ -182,54 +198,48 @@ export function createGenerateControls({
         count = clampGenerateCount(count + (event.deltaY < 0 ? 1 : -1));
         render();
     }, { passive: false });
-    element.append(button, countGroup);
+    element.append(button, countGroup, cancelButton);
 
     function render() {
         if (destroyed) return;
         countLabel.textContent = `×${count}`;
-        const next = generateButtonState(latestRuns, { submitting });
+        const state = generateButtonState(latestRuns, { submitting, count });
+        button.textContent = state.generate === "sending" ? "Sending…" : "Generate";
+        setButtonDisabled(button, state.generate !== "idle");
         const takes = count === 1 ? "one take" : `${count} takes`;
-        if (next !== face) {
-            face = next;
-            if (next === "active") {
-                button.textContent = "Cancel all";
-                setVariant(button, "secondary");
-            } else if (next === "canceling") {
-                button.textContent = "Canceling…";
-                setVariant(button, "secondary");
-            } else if (next === "submitting") {
-                button.textContent = "Sending…";
-                setVariant(button, "primary");
-            } else {
-                button.textContent = "Generate";
-                setVariant(button, "primary");
-            }
-            countGroup.style.display = next === "idle" || next === "submitting" ? "inline-flex" : "none";
-        }
-        button.title = {
-            active: "Stop every take that is still queued or running",
-            canceling: "Waiting for ComfyUI to stop the takes",
-            submitting: "Sending the takes to ComfyUI",
-            idle: `Run this workflow for ${takes} of the current selection`,
-        }[next];
+        button.title = state.generate === "sending" ? "Sending the takes to ComfyUI"
+            : state.generate === "full" ? `Only ${GENERATE_MAX_UNFINISHED} takes may be unfinished. Lower the count, wait, or cancel some.`
+            : `Run this workflow for ${takes} of the current selection`;
+        cancelButton.style.display = state.cancel === "hidden" ? "none" : "";
+        cancelButton.textContent = state.cancel === "canceling" ? "Canceling…" : "Cancel all";
+        cancelButton.title = state.cancel === "canceling" ? "Waiting for ComfyUI to stop the takes"
+            : "Stop every take that is still queued or running";
     }
 
     function updateProgress(runs) {
+        const byId = new Map(runs.map((run) => [run.run_id, run]));
+        const hadBatch = batchIds.size > 0;
         for (const run of runs) {
-            if (UNFINISHED_STATES.has(String(run?.state || "")) && !batchIds.includes(run.run_id)) {
-                batchIds.push(run.run_id);
+            if (UNFINISHED_STATES.has(String(run?.state || "")) || (hadBatch && !previouslySeen.has(run.run_id))) {
+                batchIds.add(run.run_id);
             }
         }
-        const byId = new Map(runs.map((run) => [run.run_id, run]));
-        const batchRuns = batchIds.map((id) => byId.get(id)).filter(Boolean);
+        // The server trims finished runs past 24. Fold missing ids into a
+        // counter so the line grows across batches without an unbounded id set.
+        for (const id of batchIds) {
+            if (!byId.has(id)) { batchIds.delete(id); completedTrimmed++; }
+        }
+        previouslySeen = new Set(byId.keys());
+        const batchRuns = [...batchIds].map(id => byId.get(id));
         const stillActive = batchRuns.some((run) => UNFINISHED_STATES.has(String(run.state || "")));
         if (!stillActive) {
             progressHandle?.dismiss();
             progressHandle = null;
-            batchIds = [];
+            batchIds.clear();
+            completedTrimmed = 0;
             return;
         }
-        const line = describeBatchProgress(batchRuns);
+        const line = describeBatchProgress(batchRuns, completedTrimmed);
         if (!progressHandle) {
             progressHandle = notifyProgress({
                 source: "sdk-generate",
@@ -248,7 +258,15 @@ export function createGenerateControls({
             announced.add(run.run_id);
             // The first snapshot (a reload, a reopen) reports finished runs that
             // were already announced, or that ended while nobody was looking.
-            if (primed) notifyTier(outcomeToast(run));
+            if (primed) {
+                if (run.state === "failed") {
+                    // Mark announced before fetching: refreshStatus publishes
+                    // another snapshot and must never start a second fetch/toast.
+                    Promise.resolve(host.refreshStatus?.()).catch(() => {}).then(() => {
+                        if (!destroyed) notifyTier(outcomeToast(run, host.details?.get(run.run_id)));
+                    });
+                } else notifyTier(outcomeToast(run));
+            }
         }
     }
 
@@ -263,10 +281,32 @@ export function createGenerateControls({
 
     button.addEventListener("click", async () => {
         if (destroyed) return;
-        const state = generateButtonState(latestRuns, { submitting });
-        // Cancel all is live while a batch is still being sent: the server
-        // stops submitting the rest.
-        if (state === "active" || state === "canceling") {
+        const state = generateButtonState(latestRuns, { submitting, count });
+        if (state.generate !== "idle") return;
+        submitting = true;
+        pendingGenerate = new AbortController();
+        render();
+        const requested = count;
+        try {
+            await beforeGenerate?.();
+            const result = await host.generate(requested, { renderCacheMaxBytes: renderCacheMaxBytes(), signal: pendingGenerate.signal });
+            notifyTier(generateResultNotice(result, requested));
+        } catch (err) {
+            notifyError("Generate failed.", { detail: String(err?.message || err), source: "sdk-generate-request" });
+        } finally {
+            submitting = false;
+            pendingGenerate = null;
+            render();
+        }
+    });
+
+    cancelButton.addEventListener("click", async () => {
+        if (destroyed) return;
+        // Invalidate the click even when beforeGenerate has not yet entered
+        // host.generate. HTTP cancellation owns already dispatched requests.
+        pendingGenerate?.abort();
+        // Cancel remains live while a Generate request is still sending.
+        try {
             const result = await host.cancelAll();
             const code = String(result?.payload?.code || "");
             if (!result?.ok && code !== "not_owner" && code !== "session_ended") {
@@ -275,21 +315,8 @@ export function createGenerateControls({
                     source: "sdk-cancel",
                 });
             }
-            return;
-        }
-        if (submitting) return;
-        submitting = true;
-        render();
-        const requested = count;
-        try {
-            await beforeGenerate?.();
-            const result = await host.generate(requested, { renderCacheMaxBytes: renderCacheMaxBytes() });
-            notifyTier(generateResultNotice(result, requested));
         } catch (err) {
-            notifyError("Generate failed.", { detail: String(err?.message || err), source: "sdk-generate-request" });
-        } finally {
-            submitting = false;
-            render();
+            notifyError("Couldn't cancel the takes.", { detail: String(err?.message || err), source: "sdk-cancel" });
         }
     });
 

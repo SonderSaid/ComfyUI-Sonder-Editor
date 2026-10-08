@@ -1032,7 +1032,7 @@ def _status_from_task_done_call(args, kwargs):
     return status
 
 
-def _run_outcome(status) -> tuple[str, str]:
+def _run_outcome(status) -> tuple[str, str, str]:
     """Classify a finished run and word the note a returned job carries.
 
     The note is written into ``project.json``, so it names only the node type,
@@ -1041,16 +1041,18 @@ def _run_outcome(status) -> tuple[str, str]:
     messages = getattr(status, "messages", None) or []
     kinds = [message[0] for message in messages if isinstance(message, (list, tuple)) and message]
     if "execution_interrupted" in kinds:
-        return "interrupted", "The run was interrupted before this job completed."
+        return "interrupted", "The run was interrupted before this job completed.", ""
     if str(getattr(status, "status_str", "") or "") == "error":
-        node_type = ""
+        node_type, detail = "", ""
         for message in messages:
             if (isinstance(message, (list, tuple)) and len(message) >= 2
                     and message[0] == "execution_error" and isinstance(message[1], dict)):
                 node_type = str(message[1].get("node_type") or "")
+                detail = ": ".join(str(message[1].get(key) or "").strip()
+                                   for key in ("exception_type", "exception_message")).strip(": ")[:2000]
         where = f" in {node_type}" if node_type else ""
-        return "error", f"The run failed{where} before this job completed."
-    return "success", "The run finished without completing this job."
+        return "error", f"The run failed{where} before this job completed.", detail
+    return "success", "The run finished without completing this job.", ""
 
 
 def _return_leased_job_to_pending(project_dir: str, job_id: str, note: str) -> bool:
@@ -1080,7 +1082,7 @@ def _release_prompt_run(prompt_key: str, status) -> None:
     record = sdk_runs.close_release(prompt_key)
     if record is None:
         return
-    outcome, note = _run_outcome(status)
+    outcome, note, detail = _run_outcome(status)
     returned = []
     for lease in record["leases"]:
         try:
@@ -1124,6 +1126,7 @@ def _release_prompt_run(prompt_key: str, status) -> None:
         "prompt_id": record.get("prompt_id", ""),
         "outcome": outcome,
         "note": note,
+        "detail": detail,
         "leased_job_ids": [lease["job_id"] for lease in record["leases"]],
         "claimed_job_id": record.get("claimed_job_id", ""),
         "returned_job_ids": returned,
@@ -1135,6 +1138,10 @@ def _install_bridge_prompt_queue_hooks() -> bool:
     global _BRIDGE_HOOKED_PROMPT_QUEUE_ID
 
     prompt_server = _load_prompt_server_instance()
+    # The observer never changes ComfyUI's messages. Failure leaves state-only
+    # SDK progress; the queue hooks and generated take authority stay intact.
+    from ..server import sdk_progress
+    sdk_progress.install(prompt_server)
     prompt_queue = getattr(prompt_server, "prompt_queue", None) if prompt_server else None
     if prompt_queue is None:
         return False
@@ -1155,7 +1162,16 @@ def _install_bridge_prompt_queue_hooks() -> bool:
                     prompt_key, prompt = _extract_prompt_key_from_queue_get_result(result)
                     _set_bridge_prompt_key_for_object(prompt_key, prompt)
                     if prompt_key:
-                        sdk_runs.open_release(prompt_key, _prompt_id_from_queue_get_result(result), prompt)
+                        prompt_id = _prompt_id_from_queue_get_result(result)
+                        sdk_runs.open_release(prompt_key, prompt_id, prompt)
+                        # A run may start before the proxy acknowledges submit.
+                        # Only registered SDK tokens can opt into observation.
+                        for node in (prompt or {}).values():
+                            meta = node.get("_meta") if isinstance(node, dict) else None
+                            token = meta.get("sonder_run") if isinstance(meta, dict) else None
+                            if isinstance(token, str) and sdk_runs.token_state(token):
+                                sdk_progress.watch(prompt_id, token)
+                                break
                 except Exception:
                     logger.exception("Failed to capture bridge prompt identity from prompt queue get()")
                 return result

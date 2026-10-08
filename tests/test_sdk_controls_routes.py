@@ -98,7 +98,7 @@ def test_http_auth_atomic_refusal_and_saved_values_reach_generate_but_notes_do_n
             assert response.status == 200 and result['seq'] == before['seq'] + 1
             reloaded = await client.get(path, headers=headers(session))
             assert (await reloaded.json()) == result
-            await world.runner.generate(session, count=2)
+            await world.runner.generate(session, tab_session_id="tab-1", count=2)
         return result
     result = asyncio.run(run())
     seed = next(c for c in result['view']['controls'] if c['control_id'] == 'seed')
@@ -155,7 +155,7 @@ def test_generate_holds_control_writes_until_the_batch_finishes(world):
             entered.set()
             await release.wait()
         world.client.on_submit = submit
-        generating = asyncio.create_task(world.runner.generate(session, count=2))
+        generating = asyncio.create_task(world.runner.generate(session, tab_session_id="tab-1", count=2))
         await asyncio.wait_for(entered.wait(), 3)
         saving = asyncio.create_task(world.runner.change_controls(session.session_id, session.secret, 'tab-1',
                                                                  {'control:steps:value': 44}))
@@ -197,7 +197,7 @@ def test_seed_mode_fallback_precedence_and_corrupt_stored_seed_revalidated(world
         seed = next(c for c in (await world.runner.controls_view(session))['view']['controls'] if c['control_id'] == 'seed')
         assert seed['seed_mode'] == 'increment' and seed['error']
         with pytest.raises(SdkError) as exc:
-            await world.runner.generate(session)
+            await world.runner.generate(session, tab_session_id="tab-1")
         assert exc.value.code == 'generate_refused'
     asyncio.run(run())
 
@@ -321,11 +321,11 @@ def test_shared_control_preserves_every_instances_bounds_and_errors(world):
             await world.runner.change_controls(session.session_id, session.secret, 'tab-1', {'control:steps:value': 31})
         sdk_templates.store_control_changes(world.template_id, {'control:steps:value': 35})
         with pytest.raises(SdkError) as exc:
-            await world.runner.generate(session)
+            await world.runner.generate(session, tab_session_id="tab-1")
         assert exc.value.code == 'generate_refused'
         result = await world.runner.change_controls(session.session_id, session.secret, 'tab-1', {'control:steps:value': 30})
         assert next(c for c in result['view']['controls'] if c['control_id'] == 'steps')['error'] is None
-        await world.runner.generate(session)
+        await world.runner.generate(session, tab_session_id="tab-1")
     asyncio.run(run())
     assert world.client.submitted[0]['3']['inputs']['value_text'] == world.client.submitted[0]['8']['inputs']['value_text'] == '30'
 
@@ -337,7 +337,7 @@ def test_merged_field_writes_every_instance_and_refuses_a_linked_instance(world)
     async def run():
         session = await world.open()
         await world.runner.change_controls(session.session_id, session.secret, 'tab-1', {'field:SonderSaveVideo/mark_queue_complete': True})
-        await world.runner.generate(session)
+        await world.runner.generate(session, tab_session_id="tab-1")
         graph['10']['inputs']['mark_queue_complete'] = ['6', 0]
         sdk_templates.replace_template(world.template_id, json.dumps(graph).encode(), validate=lambda p: {'ok': True})
         with pytest.raises(SdkError):
@@ -412,7 +412,7 @@ def test_cancelled_generate_finishes_its_seed_advance_before_a_later_control_sav
     monkeypatch.setattr(sdk_templates, 'update_control_values', paused_advance)
     async def run():
         session = await world.open()
-        generating = asyncio.create_task(world.runner.generate(session))
+        generating = asyncio.create_task(world.runner.generate(session, tab_session_id="tab-1"))
         assert await asyncio.to_thread(entered.wait, 5)
         generating.cancel()
         saving = asyncio.create_task(world.runner.change_controls(session.session_id, session.secret, 'tab-1',
@@ -454,7 +454,7 @@ def test_layout_is_atomic_view_only_preserves_unknown_storage_and_resets_on_reim
         sdk_templates.update_control_values(world.template_id, unknown)
         await world.runner.change_controls(session.session_id, session.secret, 'tab-1', {'control:steps:value': 31})
         assert sdk_templates.read_control_values(world.template_id)['layout']['control:steps']['future'] == {'keep': True}
-        await world.runner.generate(session, count=1)
+        await world.runner.generate(session, tab_session_id="tab-1", count=1)
         submitted = world.client.submitted[-1]
         assert submitted['3']['inputs']['panel_order'] == 0 and submitted['3']['inputs']['panel_group'] == ''
         assert 'panel_order' not in submitted['7']['inputs']
@@ -465,3 +465,47 @@ def test_layout_is_atomic_view_only_preserves_unknown_storage_and_resets_on_reim
         assert (steps['order'], steps['group'], steps['value']) == (0, '', 31)
         assert sdk_templates.read_control_values(world.template_id)['layout'] == {}
     asyncio.run(run())
+
+
+def test_values_route_rejects_older_save_after_server_delay(world, monkeypatch):
+    import threading
+    entered, release = threading.Event(), threading.Event()
+    original = sdk_templates.write_editor_state
+    def delayed(project, values, *, writer):
+        if writer["seq"] == 1:
+            entered.set()
+            assert release.wait(5)
+        return original(project, values, writer=writer)
+    monkeypatch.setattr(sdk_templates, "write_editor_state", delayed)
+    async def go():
+        session = await world.open()
+        async with client_for(world, monkeypatch) as client:
+            url = f"/sonder-editor/sdk/session/{session.session_id}/values"
+            old = asyncio.create_task(client.put(url, headers=headers(session), json={"values": {"selection_start": 20}, "seq": 1}))
+            try:
+                assert await asyncio.to_thread(entered.wait, 5)
+                new = await client.put(url, headers=headers(session), json={"values": {"selection_start": 40}, "seq": 2})
+                assert new.status == 200 and (await new.json())["stale"] is False
+            finally:
+                release.set()
+            result = await old
+            assert result.status == 200
+            assert (await result.json()) == {"ok": True, "values": {"selection_start": 40}, "stale": True}
+    asyncio.run(go())
+
+
+def test_status_details_only_for_owner_tab(world, monkeypatch):
+    async def go():
+        session = await world.open()
+        await world.runner.generate(session, tab_session_id="tab-1")
+        run = session.runs[0]
+        run.detail = "ValueError: private/path"
+        async with client_for(world, monkeypatch) as client:
+            url = f"/sonder-editor/sdk/session/{session.session_id}/status"
+            owner = await client.get(url, headers=headers(session))
+            assert (await owner.json())["details"] == {run.run_id: run.detail}
+            launcher = await client.get(url, headers={sdk_routes.SECRET_HEADER: session.secret})
+            assert "private/path" not in await launcher.text()
+            displaced = await client.get(url, headers=headers(session, owner=False))
+            assert displaced.status == 409 and "private/path" not in await displaced.text()
+    asyncio.run(go())

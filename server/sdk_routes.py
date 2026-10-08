@@ -310,15 +310,20 @@ def register_sdk_routes(
     @handle
     async def api_sdk_session_status(request: web.Request) -> web.Response:
         session = runner.session_for(request.match_info.get("session_id", ""), _secret(request))
-        return web.json_response(runner.status(session))
+        snapshot = runner.status(session)
+        if _tab(request):
+            await runner.authorized(session.session_id, _secret(request), _tab(request))
+            snapshot["details"] = {run.run_id: run.detail for run in session.runs if run.detail}
+        return web.json_response(snapshot)
 
     @routes.put("/sonder-editor/sdk/session/{session_id}/values")
     @handle
     async def api_sdk_session_values(request: web.Request) -> web.Response:
         session = await runner.authorized(request.match_info.get("session_id", ""), _secret(request), _tab(request))
         body = await _json_body(request)
-        values = await asyncio.to_thread(sdk_templates.write_editor_state, session.project, body.get("values"))
-        return web.json_response({"ok": True, "values": values})
+        writer = sdk_templates.clean_editor_writer({"tab": _tab(request), "seq": body.get("seq")})
+        result = await asyncio.to_thread(sdk_templates.write_editor_state, session.project, body.get("values"), writer=writer)
+        return web.json_response({"ok": True, **result})
 
     @routes.post("/sonder-editor/sdk/session/{session_id}/generate")
     @handle
@@ -329,6 +334,8 @@ def register_sdk_routes(
             session,
             count=body.get("count", 1),
             editor_values=body.get("editor_values"),
+            tab_session_id=_tab(request),
+            editor_values_seq=body.get("editor_values_seq"),
             render_cache_max_bytes=body.get("render_cache_max_bytes", 0),
         )
         return web.json_response(result, status=202 if result.get("run_ids") else 502)

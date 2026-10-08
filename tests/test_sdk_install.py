@@ -633,7 +633,7 @@ def test_uninstall_waits_out_a_generate_in_flight_and_refuses_new_ones(user_dir,
             assert started == [] and not sdk_install._busy.locked()
             sdk_install.reserve_job("uninstall")
             with pytest.raises(sdk_runner.SdkError) as exc:
-                await runner.generate(None, count=1)
+                await runner.generate(types.SimpleNamespace(cancel_epoch=0), tab_session_id="tab-1", count=1)
             assert exc.value.code == "sdk_uninstalling" and runner._generating == 0
 
     asyncio.run(run())

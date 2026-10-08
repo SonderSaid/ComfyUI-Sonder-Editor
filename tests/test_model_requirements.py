@@ -88,11 +88,11 @@ def test_generate_checks_effective_prompt_and_fixed_override_is_allowed(tmp_path
     async def scenario():
         session = await world.open()
         with pytest.raises(SdkError) as exc:
-            await world.runner.generate(session)
+            await world.runner.generate(session, tab_session_id="tab-1")
         assert "missing.ckpt" in str(exc.value.details)
         assert not world.client.submitted
         sdk_templates.update_control_values(world.template_id, lambda data: data['fields'].update({'Loader/ckpt_name': 'installed.ckpt'}))
-        result = await world.runner.generate(session)
+        result = await world.runner.generate(session, tab_session_id="tab-1")
         assert result['run_ids'] and world.client.submitted[0]['3']['inputs']['ckpt_name'] == 'installed.ckpt'
     try: asyncio.run(scenario())
     finally: world.runner.close()

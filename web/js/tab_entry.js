@@ -451,7 +451,8 @@ async function runSdkTab() {
         // Exit returns to the Launcher; takes still generating keep going and
         // the Launcher says so.
         onFullscreenExit: async () => {
-            await host.flushValues();
+            void host.flushValues();
+            await host.drainSaves();
             sdk.writeSdkExitFlag({
                 session_id: sdkSessionId,
                 project: projectId,

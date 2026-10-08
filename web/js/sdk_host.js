@@ -120,6 +120,7 @@ export class SdkWidgetHost {
         this.values = { ...(defaults || {}), ...(initialValues || {}) };
         this.ownerState = "active";
         this.status = { seq: -1, runs: [] };
+        this.details = new Map();
         this.onOwnershipLost = null;
         this._fetch = fetchImpl;
         this._apiURL = apiURL;
@@ -128,7 +129,9 @@ export class SdkWidgetHost {
         this._debounceMs = debounceMs;
         this._dirty = {};
         this._flushTimer = null;
-        this._inflightFlush = null;
+        this._inflightSaves = new Set();
+        this._seq = 0;
+        this._cancelEpoch = 0;
         this._listeners = new Set();
         this._controlsHost = null;
         this.flushControlsPanel = null;
@@ -187,6 +190,7 @@ export class SdkWidgetHost {
     setOwnerState(state) {
         const previous = this.ownerState;
         this.ownerState = String(state || "");
+        if (!this.canWrite()) this.details.clear();
         if (this.canWrite() && Object.keys(this._dirty).length) this._scheduleFlush();
         // The server no longer knows this session, so no snapshot will ever
         // finish its runs: publish a terminal one so progress stops.
@@ -268,7 +272,7 @@ export class SdkWidgetHost {
                 const result = await readResponse(await this._fetch(this._sessionPath("values"), {
                     method: "PUT",
                     headers: this.headers(),
-                    body: JSON.stringify({ values: { ...this.values } }),
+                    body: JSON.stringify({ values: { ...this.values }, seq: ++this._seq }),
                     ...(keepalive ? { keepalive: true } : {}),
                 }));
                 if (!result.ok) {
@@ -283,11 +287,31 @@ export class SdkWidgetHost {
                 return false;
             }
         })();
-        this._inflightFlush = request;
+        this._inflightSaves.add(request);
         try {
             return await request;
         } finally {
-            if (this._inflightFlush === request) this._inflightFlush = null;
+            this._inflightSaves.delete(request);
+        }
+    }
+
+    // Bound navigation/Generate waiting, while server sequences protect even
+    // a save that outlives the timeout. Recheck the set as saves can start while
+    // another request is settling. Pending dirty values remain the caller's.
+    async drainSaves({ timeoutMs = 10000 } = {}) {
+        let timer;
+        let expired = false;
+        const timeout = new Promise((resolve) => {
+            timer = this._setTimeout(() => { expired = true; resolve(false); }, timeoutMs);
+        });
+        try {
+            while (this._inflightSaves.size && !expired) {
+                const settled = Promise.allSettled([...this._inflightSaves]).then(() => true);
+                if (!await Promise.race([settled, timeout])) return false;
+            }
+            return !expired;
+        } finally {
+            this._clearTimeout(timer);
         }
     }
 
@@ -311,7 +335,16 @@ export class SdkWidgetHost {
         if (String(snapshot.session_id || "") !== this.sessionId) return false;
         const seq = Number(snapshot.seq);
         if (!Number.isFinite(seq)) return false;
+        // Failure details are immutable and arrive only on owner-gated reads.
+        // A newer websocket snapshot must not discard this fetched detail.
+        if (fetched && this.canWrite() && snapshot.details && typeof snapshot.details === "object") {
+            for (const [id, detail] of Object.entries(snapshot.details)) {
+                if (typeof detail === "string") this.details.set(id, detail);
+            }
+        }
         if (fetched ? seq < this.status.seq : seq <= this.status.seq) return false;
+        const ids = new Set((snapshot.runs || []).map(run => run.run_id));
+        for (const id of this.details.keys()) if (!ids.has(id)) this.details.delete(id);
         if (this.ownerState === "ended") return false;
         this._publish({
             seq,
@@ -354,7 +387,8 @@ export class SdkWidgetHost {
     // Generate saves the values it is sent before it can refuse a workflow
     // (`generate_refused`) or submit; any earlier refusal saved nothing, so the
     // pending edits are put back for the next save.
-    async generate(count, { renderCacheMaxBytes = 0 } = {}) {
+    async generate(count, { renderCacheMaxBytes = 0, signal = null } = {}) {
+        const cancelEpoch = this._cancelEpoch;
         if (this.flushControlsPanel && !await this.flushControlsPanel()) {
             return { ok: false, status: 409, payload: { code: "controls_not_saved", error: "A control edit was not saved." } };
         }
@@ -363,7 +397,15 @@ export class SdkWidgetHost {
         await this._controlsHost?.flush();
         const n = Math.max(1, Math.min(SDK_MAX_COUNT, Math.round(Number(count) || 1)));
         // An older save still in flight must not land after this one.
-        if (this._inflightFlush) await this._inflightFlush.catch(() => {});
+        await this.drainSaves();
+        // Cancel can reach the server before Generate when client edits are
+        // still draining. The click's signal also covers beforeGenerate in the
+        // toolbar, before this method is entered. Do not submit a new epoch.
+        if (signal?.aborted || cancelEpoch !== this._cancelEpoch) {
+            void this.flushValues();
+            await this.drainSaves();
+            return { ok: false, status: 409, payload: { code: "canceled_before_submit" } };
+        }
         const dirty = this._takeDirty();
         let result;
         try {
@@ -373,6 +415,7 @@ export class SdkWidgetHost {
                 body: JSON.stringify({
                     count: n,
                     editor_values: { ...this.values },
+                    editor_values_seq: ++this._seq,
                     // -1 is unlimited, 0 disables the cache (renderCacheMaxBytes).
                     render_cache_max_bytes: Math.max(-1, Math.round(Number(renderCacheMaxBytes) || 0)),
                 }),
@@ -382,6 +425,7 @@ export class SdkWidgetHost {
         }
         const saved = result.ok
             || result.payload.code === "generate_refused"
+            || result.payload.code === "canceled_before_submit"
             || Array.isArray(result.payload.run_ids);
         // Retried shortly unless another tab owns the session, it has ended, or
         // ComfyUI is unreachable (the next edit, Take over or Exit sends it).
@@ -393,6 +437,7 @@ export class SdkWidgetHost {
     }
 
     async cancelAll() {
+        this._cancelEpoch++;
         try {
             const result = await readResponse(await this._fetch(this._sessionPath("cancel"), {
                 method: "POST",
@@ -413,6 +458,7 @@ export class SdkWidgetHost {
         if (this._flushTimer != null) this._clearTimeout(this._flushTimer);
         this._flushTimer = null;
         this._listeners.clear();
+        this.details.clear();
     }
 }
 

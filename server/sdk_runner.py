@@ -20,8 +20,8 @@ can report a spurious ``expired`` at completion). A run is final when:
 A prompt whose release record is open or closed without ``run_finished`` yet is
 *finishing* (bridges are finalizing), even if ComfyUI's history was wiped.
 
-The SDK's own event stream is used for progress only, one stream per session,
-because the proxy serves at most eight streams in total.
+ComfyUI's in-process send_sync observer supplies node progress for registered
+SDK prompts; the proxy remains the submit/cancel transport.
 
 **A submit whose outcome is unknown** (the proxy's 503 ``upstream_unreachable``,
 a timeout, a dropped connection) may still have reached ComfyUI's queue. Such a
@@ -45,8 +45,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from . import control_descriptors, launcher_state, sdk_proxy, sdk_runs, sdk_templates, session_registry
-from .editor_inputs import clean_editor_value, editor_optional_inputs
+from . import control_descriptors, launcher_state, sdk_proxy, sdk_progress, sdk_runs, sdk_templates, session_registry
+from .editor_inputs import clean_editor_value, clean_editor_values, editor_optional_inputs
 from .sdk_install import install_state, uninstall_running
 
 logger = logging.getLogger("sonder_editor")
@@ -119,8 +119,10 @@ class SdkRun:
     prompt_id: str = ""
     job: Any = None
     position: int | None = None
-    progress: float | None = None
-    progress_message: str = ""
+    progress_node: str = ""
+    progress_count: dict | None = None
+    node_labels: dict = field(default_factory=dict)
+    detail: str = ""
     cancel_requested: bool = False
     job_id: str = ""
     outcome: str = ""
@@ -147,8 +149,8 @@ class SdkRun:
             "state": self.state,
             "canceling": self.cancel_requested and not self.final,
             "position": self.position,
-            "progress": self.progress,
-            "progress_message": self.progress_message,
+            "progress_node": self.progress_node,
+            **({"progress_count": dict(self.progress_count)} if self.progress_count else {}),
             "prompt_id": self.prompt_id,
             "job_id": self.job_id,
             "outcome": self.outcome,
@@ -170,8 +172,6 @@ class SdkSession:
     seq: int = 0
     last_emit: float = 0.0
     emit_scheduled: bool = False
-    stream_task: Any = None
-    stream_run_id: str = ""
     cancel_epoch: int = 0
 
     def unfinished(self) -> list:
@@ -324,10 +324,14 @@ class SdkRunner:
         self._open_lock = asyncio.Lock()
         self._idle_since = self._clock()
         self._remove_listener = sdk_runs.add_run_finished_listener(self._on_run_finished_threadsafe)
+        self._remove_progress_listener = sdk_progress.add_listener(self._on_progress_threadsafe)
         session_registry.set_sdk_secret_resolver(self.secret_for_host)
 
     def close(self) -> None:
         self._remove_listener()
+        self._remove_progress_listener()
+        for run in self._runs_by_token.values():
+            sdk_progress.unwatch(run.prompt_id, run.token)
         session_registry.set_sdk_secret_resolver(None)
 
     # ── Registry hook ────────────────────────────────────────────────────────
@@ -461,8 +465,8 @@ class SdkRunner:
 
     def _drop_session(self, session: SdkSession) -> None:
         self._sessions.pop(session.session_id, None)
-        self._cancel_stream(session)
         for run in session.runs:
+            sdk_progress.unwatch(run.prompt_id, run.token)
             self._runs_by_token.pop(run.token, None)
         if not self._sessions:
             self._idle_since = self._clock()
@@ -535,10 +539,13 @@ class SdkRunner:
         self,
         session: SdkSession,
         *,
+        tab_session_id: str,
         count: Any = 1,
         editor_values: Any = None,
+        editor_values_seq: Any = None,
         render_cache_max_bytes: Any = 0,
     ) -> dict:
+        epoch = session.cancel_epoch
         self._remember_loop()
         if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= MAX_COUNT:
             raise SdkError(f"Generate count must be 1 to {MAX_COUNT}.", "invalid_count")
@@ -547,7 +554,7 @@ class SdkRunner:
         self._check_not_uninstalling()
         self._generating += 1
         try:
-            return await self._generate(session, count, editor_values, render_cache_max_bytes)
+            return await self._generate(session, count, editor_values, render_cache_max_bytes, tab_session_id, editor_values_seq, epoch)
         finally:
             self._generating -= 1
 
@@ -564,38 +571,52 @@ class SdkRunner:
             await asyncio.sleep(0.05)
         return True
 
-    async def _generate(self, session: SdkSession, count: int, editor_values: Any, render_cache_max_bytes: Any) -> dict:
+    async def _generate(self, session: SdkSession, count: int, editor_values: Any, render_cache_max_bytes: Any, tab_session_id: str, editor_values_seq: Any, epoch: int) -> dict:
         if not await asyncio.to_thread(self._sdk_ready):
             raise SdkError("The comfy-sdk package is not installed.", "sdk_not_installed", 409)
         valid, render_cache_max_bytes = clean_editor_value("render_cache_max_bytes", render_cache_max_bytes)
         if not valid:
             render_cache_max_bytes = 0
 
+        writer = sdk_templates.clean_editor_writer({"tab": tab_session_id, "seq": editor_values_seq}) if editor_values is not None else None
         async with self.template_lock(session.template_id):
+            await self.authorized(session.session_id, session.secret, tab_session_id)
             if len(session.unfinished()) + count > MAX_UNFINISHED_PER_SESSION:
                 raise SdkError("Too many takes are already waiting. Wait or cancel some.", "too_many_runs", 429)
-            build = await asyncio.to_thread(self._build_base, session, editor_values, render_cache_max_bytes)
+            build = await asyncio.to_thread(self._build_base, session, editor_values, render_cache_max_bytes, writer)
+            self._check_submit_epoch(session, epoch, build)
             refusals = [problem for problem in map(sdk_templates.generate_refusal, build["controls"]) if problem]
             from .model_requirements import missing_models, missing_model_message
             missing = await asyncio.to_thread(missing_models, build["prompt"], executable_only=True)
             refusals.extend(map(missing_model_message, missing))
             if refusals:
-                raise SdkError("This workflow can't generate yet.", "generate_refused", 409, problems=refusals)
+                raise SdkError("This workflow can't generate yet.", "generate_refused", 409, problems=refusals, stale=build["stale"])
             try:
                 target = await self._ensure_proxy()
             except sdk_proxy.ProxyUnavailable as exc:
                 raise SdkError(str(exc), exc.code, 503) from exc
             client = await self._client(target)
-            return await self._submit_runs(session, client, build, count)
+            self._check_submit_epoch(session, epoch, build)
+            return {**await self._submit_runs(session, client, build, count, epoch), "stale": build["stale"]}
 
-    def _build_base(self, session: SdkSession, editor_values: Any, render_cache_max_bytes: Any) -> dict:
+    @staticmethod
+    def _check_submit_epoch(session, epoch, build):
+        if session.cancel_epoch != epoch:
+            raise SdkError("Canceled before it was sent.", "canceled_before_submit", 409, stale=build["stale"])
+
+    def _build_base(self, session: SdkSession, editor_values: Any, render_cache_max_bytes: Any, writer) -> dict:
         with sdk_templates.template_lock(session.template_id):
-            return self._build_base_locked(session, editor_values, render_cache_max_bytes)
+            return self._build_base_locked(session, editor_values, render_cache_max_bytes, writer)
 
-    def _build_base_locked(self, session: SdkSession, editor_values: Any, render_cache_max_bytes: int) -> dict:
+    def _build_base_locked(self, session: SdkSession, editor_values: Any, render_cache_max_bytes: int, writer) -> dict:
         """The prompt every run of this Generate shares, plus its Control descriptors."""
+        stale = False
         if editor_values is not None:
-            values = sdk_templates.write_editor_state(session.project, editor_values)
+            result = sdk_templates.write_editor_state(session.project, editor_values, writer=writer)
+            stale = result["stale"]
+            # The click's snapshot still drives its run, even when a newer save
+            # already owns the stored position.
+            values = {**result["values"], **clean_editor_values(editor_values, sdk_templates.EDITOR_STATE_FIELDS)}
         else:
             values = sdk_templates.read_editor_state(session.project)
         prompt, meta = sdk_templates.load_template(session.template_id)
@@ -631,22 +652,29 @@ class SdkRunner:
                     "max": control.get("max", SEED_MAX),
                     "step": control.get("step") or 1,
                 })
-        return {"prompt": prompt, "editor_key": editors[0], "controls": controls, "seed_controls": seed_controls}
+        return {"prompt": prompt, "editor_key": editors[0], "controls": controls, "seed_controls": seed_controls, "stale": stale}
 
-    async def _submit_runs(self, session: SdkSession, client, build: dict, count: int) -> dict:
+    async def _submit_runs(self, session: SdkSession, client, build: dict, count: int, epoch: int) -> dict:
+        labels = {str(key): control_descriptors._node_title(node, str(node.get("class_type") or ""))
+                  for key, node in build["prompt"].items()}
         seed_controls = build["seed_controls"]
         run_ids, seeds_used, failure = [], [], None
-        epoch = session.cancel_epoch
         try:
             for index in range(1, count + 1):
                 if session.cancel_epoch != epoch:
+                    if not run_ids:
+                        self._check_submit_epoch(session, epoch, build)
                     break  # Cancel all arrived during this batch: submit no more.
                 seeds = {c["control_id"]: c["seed"] for c in seed_controls}
                 graph = await asyncio.to_thread(self._graph_for_run, build, seeds)
+                if session.cancel_epoch != epoch:
+                    if not run_ids:
+                        self._check_submit_epoch(session, epoch, build)
+                    break
                 token = secrets.token_urlsafe(24)
                 run = SdkRun(
                     run_id=f"run-{uuid.uuid4().hex[:12]}", token=token, session_id=session.session_id,
-                    index=index, count=count, seeds=seeds, submitted_at=self._clock(), client=client,
+                    index=index, count=count, seeds=seeds, submitted_at=self._clock(), client=client, node_labels=labels,
                 )
                 graph[build["editor_key"]].setdefault("_meta", {})["sonder_run"] = token
                 # The run exists before the submit: ComfyUI can finish (or fail) a
@@ -682,7 +710,9 @@ class SdkRunner:
                 run.prompt_id = str(getattr(job, "id", "") or "")
                 run.accepted_at = self._clock()
                 if not run.final:
-                    run.state = QUEUED
+                    sdk_progress.watch(run.prompt_id, run.token)
+                    if run.state != RUNNING:
+                        run.state = QUEUED
                 run_ids.append(run.run_id)
                 seeds_used.append({cid: str(value) for cid, value in seeds.items()})
                 if run.cancel_requested or session.cancel_epoch != epoch:
@@ -818,6 +848,7 @@ class SdkRunner:
         else:
             state = FAILED
             run.note = str(payload.get("note") or "The run failed.")
+        run.detail = str(payload.get("detail") or "")[:2000]
         self._finish(run, state)
 
     def _finish(self, run: SdkRun, state: str) -> None:
@@ -825,10 +856,10 @@ class SdkRunner:
         run.position = None
         run.finished_at = self._clock()
         sdk_runs.forget_token(run.token)
+        sdk_progress.unwatch(run.prompt_id, run.token)
+        run.progress_node, run.progress_count = "", None
         session = self._sessions.get(run.session_id)
         if session is not None:
-            if session.stream_run_id == run.run_id:
-                self._cancel_stream(session)
             self._emit(session, force=True)
 
     def _ensure_presence_loop(self) -> None:
@@ -865,6 +896,7 @@ class SdkRunner:
             if run.token in adopted:
                 # The submit did reach ComfyUI: track it like any accepted run.
                 run.prompt_id, run.accepted_at, run.note = adopted[run.token], now, ""
+                sdk_progress.watch(run.prompt_id, run.token)
                 accepted.append(run)
                 if run.cancel_requested:
                     asyncio.ensure_future(self._cancel_run(run))
@@ -910,46 +942,36 @@ class SdkRunner:
             if (run.state, run.position) != before:
                 changed.add(run.session_id)
         for session in self._sessions.values():
-            self._manage_stream(session)
             if session.session_id in changed:
                 self._emit(session)
 
-    # ── Progress stream (one per session) ────────────────────────────────────
+    # ── In-process node progress ────────────────────────────────────────────
 
-    def _manage_stream(self, session: SdkSession) -> None:
-        running = next((run for run in session.runs if run.state == RUNNING and run.job is not None), None)
-        if running is None:
-            if session.stream_task is not None and not any(r.run_id == session.stream_run_id and not r.final for r in session.runs):
-                self._cancel_stream(session)
+    def _on_progress_threadsafe(self, snapshot: dict) -> None:
+        if self._loop is not None and not self._loop.is_closed():
+            self._loop.call_soon_threadsafe(self.apply_progress, snapshot)
+
+    @staticmethod
+    def _progress_label(labels: dict, node: str, display: str) -> str:
+        for key in (node, node.split(".", 1)[0], display):
+            if key in labels:
+                return labels[key]
+        return ""
+
+    def apply_progress(self, snapshot: dict) -> None:
+        run = self._runs_by_token.get(snapshot["run_token"])
+        if run is None or run.final:
             return
-        if session.stream_run_id == running.run_id and session.stream_task is not None and not session.stream_task.done():
+        prompt_id = snapshot["prompt_id"]
+        if run.prompt_id and run.prompt_id != prompt_id:
             return
-        self._cancel_stream(session)
-        session.stream_run_id = running.run_id
-        session.stream_task = asyncio.ensure_future(self._stream_progress(session, running))
-
-    def _cancel_stream(self, session: SdkSession) -> None:
-        task = session.stream_task
-        session.stream_task, session.stream_run_id = None, ""
-        if task is not None and not task.done():
-            task.cancel()
-
-    async def _stream_progress(self, session: SdkSession, run: SdkRun) -> None:
-        try:
-            from comfy_sdk import Progress
-
-            async for event in run.job.events():
-                if run.final:
-                    return
-                if isinstance(event, Progress):
-                    value = event.value if isinstance(event.value, (int, float)) else None
-                    run.progress = max(0.0, min(1.0, float(value))) if value is not None else None
-                    run.progress_message = str(event.message or "")
-                    self._emit(session)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # progress is optional: 429, disconnects, anything
-            logger.debug("SDK progress stream ended for %s: %s", run.prompt_id, exc)
+        run.prompt_id = prompt_id
+        run.state, run.position = RUNNING, None
+        run.progress_node = self._progress_label(run.node_labels, snapshot["node_id"], snapshot["display_node_id"])
+        run.progress_count = snapshot["count"] if run.progress_node else None
+        session = self._sessions.get(run.session_id)
+        if session is not None:
+            self._emit(session)
 
     # ── Status events ────────────────────────────────────────────────────────
 

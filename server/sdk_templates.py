@@ -643,14 +643,46 @@ def read_editor_state(project_folder: str) -> dict:
     return clean_editor_values(data.get("values"), EDITOR_STATE_FIELDS)
 
 
-def write_editor_state(project_folder: str, values: Any) -> dict:
-    """Merge valid values into the stored position (invalid ones are dropped)."""
+def clean_editor_writer(writer: Any) -> dict:
+    """Validate the per-page freshness stamp; a runtime write must supply one."""
+    if not isinstance(writer, dict):
+        raise TemplateError("Editor position needs a page and sequence.", "invalid_writer", 400)
+    tab, seq = writer.get("tab"), writer.get("seq")
+    if (not isinstance(tab, str) or not tab or len(tab) > 128
+            or isinstance(seq, bool) or not isinstance(seq, int) or not 1 <= seq <= 9007199254740991):
+        raise TemplateError("Editor position needs a valid page and sequence.", "invalid_writer", 400)
+    return {"tab": tab, "seq": seq}
+
+
+def write_editor_state(project_folder: str, values: Any, *, writer=None) -> dict:
+    """Merge valid values, refusing older writes from the same page.
+
+    Runtime callers must pass ``writer={tab, seq}``. The no-writer form exists
+    only for test fixture setup and returns the same {values, stale} envelope.
+    """
+    writer = clean_editor_writer(writer) if writer is not None else None
     path = _state_path(project_folder)
     cleaned = clean_editor_values(values, EDITOR_STATE_FIELDS)
     with json_sidecar_lock(path):
         data = read_json_sidecar(path)
         merged = clean_editor_values(data.get("values"), EDITOR_STATE_FIELDS)
+        if writer is not None:
+            writers = data.get("writers")
+            if not isinstance(writers, dict) or len(writers) > 16:
+                writers = {}
+            try:
+                for tab, seq in writers.items():
+                    clean_editor_writer({"tab": tab, "seq": seq})
+            except TemplateError:
+                writers = {}
+            if writer["seq"] <= writers.get(writer["tab"], 0):
+                return {"values": merged, "stale": True}
+            writers.pop(writer["tab"], None)
+            writers[writer["tab"]] = writer["seq"]
+            while len(writers) > 16:
+                writers.pop(next(iter(writers)))
+            data["writers"] = writers
         merged.update(cleaned)
         data.update({"version": 1, "values": merged, "updated_at": time.time()})
         write_json_atomic(path, data)
-    return merged
+    return {"values": merged, "stale": False}

@@ -239,11 +239,13 @@ def test_editor_state_keeps_valid_values_and_drops_the_rest(user_dir):
         "render_cache_max_bytes": 5,  # not an SDK editor value
         "unknown": 1,
     })
-    assert stored == {
+    assert stored["stale"] is False
+    assert stored["values"] == {
         "scene_id": "scene-a", "selection_start": 40, "selection_end": 79,
         "pre_context_frames": 17, "render_queue_active": False,
     }
     merged = sdk_templates.write_editor_state("My Project", {"selection_start": 41})
+    merged = merged["values"]
     assert merged["selection_start"] == 41 and merged["scene_id"] == "scene-a"
     assert sdk_templates.read_editor_state("My Project") == merged
     assert sdk_templates.read_editor_state("Other Project") == {}
@@ -253,3 +255,39 @@ def test_editor_state_keeps_valid_values_and_drops_the_rest(user_dir):
 def test_editor_state_refuses_unsafe_project_names(bad):
     with pytest.raises(TemplateError):
         sdk_templates.write_editor_state(bad, {"selection_start": 1})
+
+
+def test_editor_writer_orders_one_page_and_preserves_other_sidecar_keys():
+    path = sdk_templates._state_path("P")
+    sdk_templates.write_json_atomic(path, {"future": {"keep": True}})
+    write = lambda tab, seq, pos: sdk_templates.write_editor_state(
+        "P", {"selection_start": pos}, writer={"tab": tab, "seq": seq})
+    assert write("a", 2, 40) == {"values": {"selection_start": 40}, "stale": False}
+    before = open(path, "rb").read()
+    assert write("a", 1, 20) == {"values": {"selection_start": 40}, "stale": True}
+    assert write("a", 2, 30)["stale"] is True
+    assert open(path, "rb").read() == before
+    assert write("b", 1, 50)["stale"] is False
+    assert sdk_templates.read_json_sidecar(path)["future"] == {"keep": True}
+
+
+def test_editor_writer_cap_keeps_most_recent_pages():
+    for i in range(17):
+        sdk_templates.write_editor_state("P", {}, writer={"tab": str(i), "seq": 1})
+    data = sdk_templates.read_json_sidecar(sdk_templates._state_path("P"))
+    assert len(data["writers"]) == 16 and "0" not in data["writers"]
+    assert "16" in data["writers"]
+
+
+@pytest.mark.parametrize("writers", [None, [], {"a": False}, {"a": -1}, {"a": "2"}, {str(i): 2 for i in range(17)}])
+def test_junk_editor_writers_are_tolerated(writers):
+    path = sdk_templates._state_path("P")
+    sdk_templates.write_json_atomic(path, {"values": {"selection_end": 99}, "writers": writers})
+    result = sdk_templates.write_editor_state("P", {"selection_start": 40}, writer={"tab": "a", "seq": 1})
+    assert result == {"values": {"selection_start": 40, "selection_end": 99}, "stale": False}
+
+
+@pytest.mark.parametrize("writer", [{}, {"tab": "", "seq": 1}, {"tab": "a", "seq": True}, {"tab": "a", "seq": 0}])
+def test_invalid_editor_writer_is_refused(writer):
+    with pytest.raises(TemplateError, match="page and sequence"):
+        sdk_templates.write_editor_state("P", {}, writer=writer)
