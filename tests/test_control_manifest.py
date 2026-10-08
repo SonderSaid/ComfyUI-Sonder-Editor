@@ -156,6 +156,14 @@ def test_manifest_caps_mirror_the_frontend():
     assert int(constant("LABEL_MAX")) == cm.LABEL_MAX and int(constant("NOTE_MAX")) == cm.NOTE_MAX
     assert constant("ID_RE") == "/" + cm.ID_RE.pattern + "/"
     assert constant("RELAY_CLASS") == json.dumps(cm.RELAY_CLASS_TYPE)
+    # Manage's candidate mirrors (control_descriptors / binding_policy).
+    from server import control_descriptors as cd
+    assert constant("LEGACY_PRIMITIVE") == json.dumps(bp.LEGACY_PRIMITIVE_CLASS)
+    assert int(constant("MAX_CANDIDATES")) == cd.MAX_CANDIDATES
+    manage = (ROOT / "web/js/controls_manage.js").read_text(encoding="utf-8")
+    assert int(re.search(r"const MAX_BATCH = (\d+);", manage).group(1)) == cd.MAX_CONTROL_CHANGES
+    assert re.search(r'const ID_ALPHABET = "([^"]+)"', manage).group(1) == re.search(
+        r'const ID_ALPHABET = "([^"]+)"', source).group(1)
 
 
 def test_selector_choice_list_parsing_matches_the_node():

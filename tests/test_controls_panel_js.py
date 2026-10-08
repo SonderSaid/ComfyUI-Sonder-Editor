@@ -13,6 +13,10 @@ class El {
     prepend(n){n.remove?.();n.parentElement=this;this.children.unshift(n);}
     appendChild(n){this.append(n);return n;}
     remove(){if(this.parentElement){const a=this.parentElement.children;a.splice(a.indexOf(this),1);this.parentElement=null;}}
+    after(n){const p=this.parentElement;n.remove?.();n.parentElement=p;p.children.splice(p.children.indexOf(this)+1,0,n);}
+    replaceWith(n){const p=this.parentElement;n.remove?.();n.parentElement=p;p.children.splice(p.children.indexOf(this),1,n);this.parentElement=null;}
+    select(){}
+    dispatchEvent(e){this.dispatch(e.type);}
     replaceChildren(...n){for(const c of [...this.children])c.remove();this._text='';this.append(...n);}
     get textContent(){return this._text+this.children.map(c=>c.textContent).join('');}
     set textContent(t){this.replaceChildren();this._text=String(t);}
@@ -31,6 +35,7 @@ globalThis.localStorage={getItem(){return null;},setItem(){}};
 globalThis.document={createElement:t=>new El(t),createTextNode:t=>new El('#TEXT',String(t)),createDocumentFragment:()=>new El('#FRAGMENT'),body:new El('body'),activeElement:null};
 document.activeElement=document.body;
 globalThis.Option=class extends El{constructor(text,value){super('option',text);this.value=value;}};
+globalThis.Event=class{constructor(type){this.type=type;}};
 const timeoutCalls=[];const nativeTimeout=setTimeout;
 globalThis.setTimeout=(f,ms)=>ms===5000?(timeoutCalls.push(f),timeoutCalls.length):nativeTimeout(f,ms);
 const {renderPanelMarkdown}=await import(MARKDOWN_URL);
@@ -61,16 +66,20 @@ if(SCENARIO==='markdown'){
     const key=(value,extra={})=>{const e={key:value,keyCode:0,isComposing:false,ctrlKey:false,metaKey:false,prevented:false,stopped:false,target:document.activeElement,
         preventDefault(){this.prevented=true;},stopImmediatePropagation(){this.stopped=true;},...extra};for(const f of events.keydown||[]){f(e);if(e.stopped)break;}return e;};
     const publish=next=>{view=next;for(const cb of listeners)cb(view);};
+    const toggleManage=()=>walk(container).find(n=>n.dataset.controlsManageToggle==='true').dispatch('click');
+    const button=(within,text)=>walk(within).find(n=>n.tagName==='BUTTON'&&n.textContent===text);
+    if(['layout','layout-refusal','layout-stale','layout-editor','cancel','note-save','ime','note-refusal','note-then-value','problem-statuses','truncated'].includes(SCENARIO))toggleManage();
     if(SCENARIO==='grouping'){
-        assert.equal(container.children[0].tagName,'DETAILS');assert.equal(container.children[0].open,true);
+        assert.equal(container.children[0].children[0].dataset.controlsManageToggle,'true');
+        assert.equal(container.children[1].tagName,'DETAILS');assert.equal(container.children[1].open,true);
         const advanced=walk(container).find(n=>n.tagName==='SUMMARY'&&n.textContent==='Advanced').parentElement;assert.equal(advanced.open,false);
-        const items=container.children[2].children.filter(n=>n.dataset.controlTarget);assert.equal(items[0].dataset.controlTarget,'note:intro:text');assert.equal(items[1].dataset.controlTarget,'binding:steps:value');
+        const items=container.children[3].children.filter(n=>n.dataset.controlTarget);assert.equal(items[0].dataset.controlTarget,'note:intro:text');assert.equal(items[1].dataset.controlTarget,'binding:steps:value');
         // Editor-section bindings sit in the fixed Editor section, without a drag handle.
-        const adv=byTarget('binding:adv:value');assert.ok(container.children[0].contains(adv));
+        const adv=byTarget('binding:adv:value');assert.ok(container.children[1].contains(adv));
         assert.ok(!walk(adv).some(n=>n.dataset.panelDragHandle==='true'));assert.equal(input('binding:adv:value').checked,false);
         input('binding:adv:value').checked=true;input('binding:adv:value').dispatch('change');await settle();
         assert.deepEqual(calls,[{'binding:adv:value':true}]);
-        const muted=walk(container.children[0]).find(n=>n.tagName==='INPUT');muted.checked=true;muted.dispatch('change');assert.equal(settings.render.takePlacementMuted,true);
+        const muted=walk(container.children[1]).find(n=>n.tagName==='INPUT');muted.checked=true;muted.dispatch('change');assert.equal(settings.render.takePlacementMuted,true);
     }
     if(SCENARIO==='focus'){
         const el=input('binding:steps:value');el.focus();el.value='35';
@@ -177,13 +186,87 @@ if(SCENARIO==='markdown'){
     }
     if(SCENARIO==='loading'){
         publish({state:'loading',bindings:[],notes:[],error:null});assert.ok(container.textContent.includes('Loading controls'));
-        assert.ok(!container.textContent.includes('Add a Sonder Control Relay'));
-        publish({state:'ready',bindings:[],notes:[],error:null});assert.ok(container.textContent.includes('Add a Sonder Control Relay'));
+        assert.ok(!container.textContent.includes('No Controls yet'));
+        publish({state:'ready',bindings:[],notes:[],error:null});assert.ok(container.textContent.includes('No Controls yet. Choose Manage'));
         publish({state:'ready',bindings:[],notes:[],relay:{status:'error',error:'The workflow has more than one Sonder Control Relay. Keep one.'},error:null});
         assert.ok(container.textContent.includes('more than one Sonder Control Relay'));
         host.emptyMessage='This workflow exposes no Controls.';
         publish({state:'ready',bindings:[],notes:[],error:null});assert.ok(container.textContent.includes('This workflow exposes no Controls.'));
-        assert.ok(!container.textContent.includes('Add a Sonder Control Relay'));
+        assert.ok(!container.textContent.includes('No Controls yet'));
+    }
+    if(SCENARIO==='normal-view'){
+        // Normal view: values and rendered notes only (SR-004).
+        const grip=walk(byTarget('binding:steps:value')).find(n=>n.dataset.panelDragHandle==='true');assert.equal(grip.hidden,true);
+        note('note:intro:text').dispatch('dblclick');assert.ok(!walk(note('note:intro:text')).some(n=>n.tagName==='TEXTAREA'));
+        assert.ok(!container.textContent.includes('Double-click'));
+        assert.equal(walk(byTarget('binding:steps:value')).find(n=>n.dataset.controlsRowActions).style.display,'none');
+        publish({...view,bindings:view.bindings.map(d=>d.binding_id==='seed'?{...d,hidden:true}:d)});
+        assert.equal(byTarget('binding:seed:value'),undefined);
+        toggleManage();assert.ok(byTarget('binding:seed:value'));assert.match(byTarget('binding:seed:value').textContent,/Hidden/);
+        assert.equal(walk(byTarget('binding:steps:value')).find(n=>n.dataset.panelDragHandle==='true').hidden,false);
+    }
+    if(SCENARIO==='manage-flush'||SCENARIO==='hide-flush'){
+        host.capabilities={hide:true,removeAuthored:false};
+        publish({...view,candidates:[{path:'6',input:'cfg',node_title:'Sampler',kind:'FLOAT'}]});
+        toggleManage();defer=true;refuse=true;
+        if(SCENARIO==='manage-flush'){
+            const section=walk(container).find(n=>n.dataset.controlsManage==='true');
+            button(section,'Add').dispatch('click');
+        }else button(byTarget('binding:steps:value'),'Hide').dispatch('click');
+        let done=false;const flushed=panel.flushPending().then(value=>{done=true;return value;});
+        await settle();assert.equal(done,false);
+        resolveWrite();assert.equal(await flushed,false);
+        assert.equal(await panel.flushPending(),true); // a settled refusal no longer blocks
+    }
+    if(SCENARIO==='manage'||SCENARIO==='manage-sdk'){
+        const manageCalls=[];host.setManage=(on,filter)=>manageCalls.push([on,filter]);
+        if(SCENARIO==='manage-sdk')host.capabilities={hide:true,removeAuthored:false};
+        const candidates=[{path:'2',input:'mark_queue_complete',label:'Advance queue after take',node_title:'Save',kind:'BOOLEAN',recommended:true,section:'editor'},
+            {path:'2',input:'place_audio_on_timeline',label:'Place take audio on timeline',node_title:'Save',kind:'BOOLEAN',recommended:true,section:'editor'},
+            {path:'6',input:'cfg',label:'Sampler · cfg',node_title:'Sampler',kind:'FLOAT',recommended:false,section:'workflow'}];
+        publish({...view,candidates:[],suggestions:[{binding_id:'old',label:'Sampler · denoise',targets:[]}],
+            bindings:[...view.bindings,{source:'binding',binding_id:'lost',label:'Lost',kind:null,status:'missing',reason:'gone',order:9,origin:SCENARIO==='manage-sdk'?'local':'authored'}]});
+        toggleManage();assert.deepEqual(manageCalls,[[true,'']]);
+        const section=walk(container).find(n=>n.dataset.controlsManage==='true');assert.ok(section);
+        publish({...view,candidates,suggestions:[{binding_id:'old',label:'Sampler · denoise',targets:[]}],candidates_truncated:true,
+            bindings:[...view.bindings,{source:'binding',binding_id:'lost',label:'Lost',kind:null,status:'missing',reason:'gone',order:9,origin:SCENARIO==='manage-sdk'?'local':'authored'}]});
+        assert.match(section.textContent,/Recommended/);assert.match(section.textContent,/Narrow the filter/);
+        // The Sonder App lists top-level settings only, and says so.
+        assert.equal(/Settings inside subgraphs are exposed from ComfyUI/.test(section.textContent),SCENARIO==='manage-sdk');
+        // Nothing greyed out: every listed candidate has an enabled action.
+        for(const row of walk(section).filter(n=>n.dataset.candidate))assert.ok(!walk(row).find(n=>n.tagName==='BUTTON').disabled);
+        button(walk(section).find(n=>n.dataset.candidate==='6/cfg'),'Add').dispatch('click');await settle();
+        const [exposeTarget,expose]=Object.entries(calls.at(-1))[0];
+        assert.match(exposeTarget,/^binding:[A-Za-z0-9_-]{12}:expose$/);assert.deepEqual(expose,{candidate:{path:'6',input:'cfg'},section:'workflow'});
+        button(section,'Add all recommended').dispatch('click');await settle();
+        assert.deepEqual(Object.values(calls.at(-1)).map(v=>[v.candidate.input,v.section]),[['mark_queue_complete','editor'],['place_audio_on_timeline','editor']]);
+        button(section,'Restore').dispatch('click');await settle();assert.deepEqual(calls.at(-1),{'binding:old:expose':{section:'workflow'}});
+        // Rename in place.
+        const steps=byTarget('binding:steps:value');button(steps,'Rename').dispatch('click');
+        const rename=walk(steps).find(n=>n.tagName==='INPUT'&&n.attributes['aria-label']==='Control name');rename.value='Sampling steps';
+        key('Enter');await settle();assert.deepEqual(calls.at(-1),{'binding:steps:label':'Sampling steps'});
+        assert.match(byTarget('binding:steps:value').textContent,/Sampling steps/);
+        // Rebind a missing binding, keeping its id.
+        button(byTarget('binding:lost:value'),'Rebind').dispatch('click');assert.match(section.textContent,/Choose a new setting for “Lost”/);
+        button(walk(section).find(n=>n.dataset.candidate==='6/cfg'),'Use').dispatch('click');await settle();
+        assert.deepEqual(calls.at(-1),{'binding:lost:rebind':{candidate:{path:'6',input:'cfg'}}});
+        assert.doesNotMatch(section.textContent,/Choose a new setting/);
+        if(SCENARIO==='manage'){
+            button(byTarget('binding:steps:value'),'Remove').dispatch('click');await settle();assert.deepEqual(calls.at(-1),{'binding:steps:remove':true});
+            assert.ok(!button(byTarget('binding:steps:value'),'Hide'));
+        }else{
+            assert.ok(!button(byTarget('binding:steps:value'),'Remove'));assert.match(byTarget('binding:lost:value').textContent,/App only/);
+            button(byTarget('binding:steps:value'),'Hide').dispatch('click');await settle();assert.deepEqual(calls.at(-1),{'binding:steps:hide':true});
+            button(byTarget('binding:lost:value'),'Remove').dispatch('click');await settle();assert.deepEqual(calls.at(-1),{'binding:lost:remove':true});
+        }
+        // A new standalone note.
+        button(section,'Add note').dispatch('click');const area=walk(section).find(n=>n.tagName==='TEXTAREA');area.value='**Tip**';
+        key('Enter',{ctrlKey:true});await settle();const [noteTarget,noteValue]=Object.entries(calls.at(-1))[0];
+        assert.match(noteTarget,/^note:[A-Za-z0-9_-]{12}:create$/);assert.deepEqual(noteValue,{text:'**Tip**',group:''});
+        // The filter reaches the host, debounced; Escape clears it.
+        const filter=walk(section).find(n=>n.attributes['aria-label']==='Filter settings to add');filter.focus();filter.value='cfg';filter.dispatch('input');
+        await new Promise(r=>nativeTimeout(r,300));assert.deepEqual(manageCalls.at(-1),[true,'cfg']);
+        toggleManage();assert.deepEqual(manageCalls.at(-1),[false,'']);assert.ok(!walk(container).some(n=>n.dataset.controlsManage==='true'));
     }
     if(SCENARIO==='removed-failure'||SCENARIO==='removed-pending'){
         refuse=true;defer=SCENARIO==='removed-pending';const seed=input('binding:seed:value');seed.focus();seed.value='bad';key('Enter');await settle();
@@ -249,7 +332,7 @@ if(SCENARIO==='markdown'){
 console.log('ok');
 '''
 
-@pytest.mark.parametrize('scenario',['combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','note-refusal','problem-statuses','loading','note-then-value'])
+@pytest.mark.parametrize('scenario',['normal-view','manage','manage-sdk','manage-flush','hide-flush','combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','note-refusal','problem-statuses','loading','note-then-value'])
 def test_controls_panel(scenario):
     node=shutil.which('node')
     if not node:pytest.skip('node required for Controls renderer boundary tests')

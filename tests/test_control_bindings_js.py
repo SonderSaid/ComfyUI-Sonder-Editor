@@ -168,8 +168,12 @@ let extension;
 const app = { rootGraph: root, graph: root, configuringGraph: false, registerExtension(e) { extension = e; } };
 const hidden = [];
 const source = fs.readFileSync(RELAY_PATH, 'utf8').replace(/^import [\s\S]*?;\r?\n/gm, '');
+const intervals = [];
 vm.runInNewContext(source, {
-    app, console, Symbol,
+    app, console, Symbol, Set, document: { hidden: false },
+    api: { addEventListener() {} },
+    setInterval: (fn, ms) => { intervals.push([fn, ms]); return intervals.length; }, clearInterval: () => {},
+    syncRelayRows: () => false,
     setWidgetHidden: (w, h) => { hidden.push([w.name, h]); return true; },
     commitWidgetVisibility: () => {},
     exportManifest: B.exportManifest, installAnchorCopyRule: B.installAnchorCopyRule, isRelay: B.isRelay,
@@ -190,6 +194,13 @@ relay.widgets[0].value = 7; // junk reads as an empty manifest, never a throw
 assert.deepEqual(JSON.parse(relay.widgets[0].serializeValue()).bindings, {});
 extension.loadedGraphNode(relay); // idempotent
 assert.deepEqual(hidden, [['manifest', true]]);
+// Nodes 2.0 reads the widget's own state: its `hidden` accessor is set too.
+class StateWidget { constructor() { this.name = 'manifest'; this.value = ''; this._state = { options: {} }; }
+    get hidden() { return this._state.options.hidden; } set hidden(v) { this._state.options.hidden = v; } }
+const domManifest = new StateWidget();
+const relay2 = node(root, 'SonderControlRelay', [domManifest]);
+extension.nodeCreated(relay2);
+assert.equal(domManifest._state.options.hidden, true);
 console.log('ok');
 """
 
@@ -205,8 +216,59 @@ def run(script):
     assert result.stdout.strip() == "ok"
 
 
+CANDIDATES = PRELUDE + r"""
+// Manage's candidates: root widgets and promoted host inputs, never anchored,
+// linked, denied, companion, muted, virtual or legacy-Primitive ones.
+anchor(sampler, 'seed', 'seed1');
+const editor = node(root, 'SonderEditor', [widget('selection_start', 0), widget('fps', 24)]);
+const muted = node(root, 'KSampler', [widget('steps', 1)], [], { mode: 2 });
+const primitive = node(root, 'PrimitiveNode', [widget('value', 3)]);
+const reroute = node(root, 'Reroute', [widget('x', 1)], [], { isVirtualNode: true });
+const frontOnly = node(root, 'KSampler', [widget('preview', 1, { options: { serialize: false } })]);
+host.isVirtualNode = true; // as frontend 1.53.10 reports subgraph hosts
+const { candidates, truncated } = B.listCandidates(root);
+const keys = candidates.map(c => `${c.path}/${c.input}`);
+assert.ok(!truncated);
+assert.ok(keys.includes(`${sampler.id}/steps`) && keys.includes(`${sampler.id}/sampler_name`));
+for (const gone of [`${sampler.id}/seed`, `${sampler.id}/model`, `${sampler.id}/control_after_generate`, `${relay.id}/manifest`,
+    `${editor.id}/selection_start`, `${muted.id}/steps`, `${primitive.id}/value`, `${reroute.id}/x`, `${frontOnly.id}/preview`]) {
+    assert.ok(!keys.includes(gone), gone);
+}
+assert.ok(keys.includes(`${editor.id}/fps`));
+const promoted = candidates.find(c => c.path === String(host.id));
+assert.deepEqual(promoted.targets, [{ path: `${host.id}:${innerA.id}`, input: 'steps' }, { path: `${host.id}:${innerB.id}`, input: 'steps' }]);
+assert.deepEqual(B.listCandidates(root, { filter: 'SAMPLER_n' }).candidates.map(c => c.input), ['sampler_name']);
+assert.deepEqual(B.listCandidates(root, {filter:'friendly choice', labels:[
+    {path:String(sampler.id),input:'sampler_name',label:'Friendly choice'}
+]}).candidates.map(c=>c.input),['sampler_name']);
+const capped = B.listCandidates(root, { limit: 2 });
+assert.equal(capped.candidates.length, 2); assert.ok(capped.truncated);
+// A structural write resolves the same candidate on the live graph.
+const live = B.resolveCandidate(root, { path: String(host.id), input: 'steps' });
+assert.equal(live.node, host); assert.deepEqual(live.targets, promoted.targets);
+assert.equal(B.resolveCandidate(root, { path: String(sampler.id), input: 'model' }), null); // linked
+// Anchor helpers keep other entries and restore exactly.
+sampler.properties.sonderBindings = { seed: 'seed1', junk: 7 };
+const snap = B.anchorSnapshot(sampler);
+B.setAnchor(sampler, 'steps', 'new1');
+assert.deepEqual(sampler.properties.sonderBindings, { seed: 'seed1', junk: 7, steps: 'new1' });
+assert.deepEqual(B.dropAnchors(root, 'seed1'), [sampler]);
+assert.deepEqual(sampler.properties.sonderBindings, { junk: 7, steps: 'new1' });
+B.restoreAnchors(sampler, snap); assert.deepEqual(sampler.properties.sonderBindings, { seed: 'seed1', junk: 7 });
+B.restoreAnchors(save, undefined); assert.ok(!('sonderBindings' in save.properties));
+// Nodes 2.0 hands out reactive proxies; a snapshot must not structuredClone them.
+sampler.properties.sonderBindings = new Proxy({ seed: 'seed1' }, {});
+assert.deepEqual(B.anchorSnapshot(sampler), { seed: 'seed1' });
+console.log('ok');
+"""
+
+
 def test_resolve_export_hygiene_and_census():
     run(BINDINGS)
+
+
+def test_manage_candidates_and_anchor_helpers():
+    run(CANDIDATES)
 
 
 def test_copy_rule_and_relay_extension():

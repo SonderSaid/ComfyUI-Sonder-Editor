@@ -15,6 +15,8 @@ const clone = x => JSON.parse(JSON.stringify(x));
 class Graph {
     constructor(){this._nodes=[];this.links=new Map();this.subgraphs=new Map();this.inputs=[];this.dirty=0;}
     setDirtyCanvas(){this.dirty++;}
+    add(n){n.graph=this;this._nodes.push(n);}
+    remove(n){this._nodes.splice(this._nodes.indexOf(n),1);n.graph=null;}
     getLink(id){return this.links.get(id)??null;}
 }
 const root = new Graph();
@@ -26,7 +28,7 @@ const manifestText = () => JSON.stringify({v:1, bindings:{steps:{label:'Steps',o
     adv:{section:'editor'}}, notes:{intro:{text:'# Intro',order:0,group:''}}, future:{keep:true}});
 const relay = add(root,'SonderControlRelay',2,[widget('manifest',manifestText())]);
 const mode = widget('control_after_generate','increment');
-const sampler = add(root,'KSampler',3,[widget('steps',20),widget('seed',7,{linkedWidgets:[mode]})],['steps','seed']);
+const sampler = add(root,'KSampler',3,[widget('steps',20),widget('seed',7,{linkedWidgets:[mode]}),widget('cfg',7.5,{type:'number'})],['steps','seed']);
 sampler.properties.sonderBindings={steps:'steps',seed:'seed'};
 const save = add(root,'SonderSaveVideo',5,[widget('mark_queue_complete',false)],['mark_queue_complete']);
 save.properties.sonderBindings={mark_queue_complete:'adv'};
@@ -44,7 +46,7 @@ const api = {addEventListener(t,cb){listeners.set(t,cb);},removeEventListener(t,
         const body=JSON.parse(init.body);calls.push(body);
         const answer=clone(raw);
         if(wait)await new Promise(r=>release=r);
-        if(body.changes){ answer.ok=!reject;answer.changes=reject?{}:body.changes;
+        if(body.changes){ answer.ok=!reject;answer.changes=reject?{}:(globalThis.canon?globalThis.canon(body.changes):body.changes);
             answer.rejected=reject?[{target:Object.keys(body.changes)[0],reason:'server refusal'}]:[]; }
         return {ok:true,json:async()=>answer};
     }};
@@ -56,6 +58,84 @@ const host = createCanvasControlsHost({app,api,getEditorNode:()=>editor,debounce
 const settle=()=>new Promise(r=>setTimeout(r,15));
 const deferred=async()=>{for(let i=0;i<40&&!release;i++)await settle();assert.ok(release);};
 
+// The server's canonical structural values (control_descriptors._StructuralBatch).
+const exposed = (candidate, extra={}) => ({candidate, targets:[{...candidate}], kind:'FLOAT', section:'workflow', label:'Sampler · cfg', order:4, ...extra});
+const cfg = {path:'3', input:'cfg'};
+if(SCENARIO==='expose'||SCENARIO==='expose-rollback'||SCENARIO==='expose-new-relay'||SCENARIO==='expose-new-relay-rollback') {
+    let created=null;
+    if(SCENARIO.startsWith('expose-new-relay')){
+        root._nodes.splice(root._nodes.indexOf(relay),1);
+        raw={...raw,relay:{status:'none',key:null,error:null},bindings:[],notes:[]};
+        globalThis.LiteGraph={createNode(type){created={id:9,type,comfyClass:type,mode:0,properties:{},inputs:[],size:[200,40],
+            addCustomWidget(w){this.widgets.push(w);return w;},removeWidget(w){this.widgets.splice(this.widgets.indexOf(w),1);},
+            computeSize(){return [200,20*this.widgets.length];},setSize(s){this.size=s;},
+            widgets:[widget('manifest','',SCENARIO.endsWith('rollback')?{callback(){throw Error('manifest failed');}}:{})]};return created;}};
+    }
+    if(SCENARIO==='expose-rollback')relay.widgets[0].callback=()=>{throw Error('manifest failed');};
+    globalThis.canon=changes=>Object.fromEntries(Object.entries(changes).map(([t,v])=>
+        [t, t.endsWith(':expose')?exposed(v.candidate,{section:v.section}):t.endsWith(':create')?{text:v.text,group:'',order:5}:v]));
+    const before=JSON.stringify(sampler.properties);
+    const result=await host.applyChanges({'binding:newCfg:expose':{candidate:cfg,section:'workflow'},'note:tip:create':{text:'Hi'}});
+    const ok=!SCENARIO.endsWith('rollback');
+    assert.equal(result.ok,ok,JSON.stringify(result));
+    // The server saw exactly the live candidate the writer will anchor.
+    assert.deepEqual(calls.at(-1).candidates,[{path:'3',input:'cfg',targets:[cfg],node_title:'KSampler'}]);
+    if(ok){
+        assert.equal(sampler.properties.sonderBindings.cfg,'newCfg');
+        const m=JSON.parse((created||relay).widgets[0].value);
+        assert.deepEqual(m.bindings.newCfg,{label:'Sampler · cfg',section:'workflow',group:'',order:4,advanced:false,note:''});
+        assert.deepEqual(m.notes.tip,{text:'Hi',group:'',order:5});
+        // Anchors, a new Relay and the manifest land in one history step.
+        assert.equal(captures,2);
+        if(created){assert.ok(root._nodes.includes(created));assert.deepEqual(created.pos,[40,0]);
+            // Its rows, and the size they need, exist before the closing capture.
+            assert.deepEqual(created.widgets.filter(w=>w.name.startsWith('sonder_row:')).map(w=>[w.name,w.value]),[['sonder_row:newCfg',7.5]]);
+            assert.deepEqual(created.size,[280,40]);}
+    } else {
+        assert.equal(JSON.stringify(sampler.properties),before);
+        if(created)assert.ok(!root._nodes.includes(created));
+        else assert.equal(relay.widgets[0].value,manifestText());
+    }
+}
+if(SCENARIO==='expose-noop'||SCENARIO==='expose-taken') {
+    globalThis.canon=changes=>Object.fromEntries(Object.keys(changes).map(t=>[t,SCENARIO==='expose-noop'?{noop:true}:exposed(cfg)]));
+    if(SCENARIO==='expose-taken')sampler.properties.sonderBindings.cfg='other';
+    const result=await host.applyChanges({'binding:steps:expose':{candidate:cfg,section:'workflow'}});
+    if(SCENARIO==='expose-noop'){assert.equal(result.ok,true);assert.equal(relay.widgets[0].value,manifestText());}
+    else{assert.equal(result.ok,false);assert.match(result.rejected[0].reason,/already a Control/);assert.equal(sampler.properties.sonderBindings.cfg,'other');}
+}
+if(SCENARIO==='remove-rebind') {
+    // A binding whose node was deleted, rebound to cfg, keeping its id; steps removed.
+    relay.widgets[0].value=JSON.stringify({...JSON.parse(manifestText()),bindings:{...JSON.parse(manifestText()).bindings,lost:{label:'Lost'}}});
+    globalThis.canon=changes=>Object.fromEntries(Object.entries(changes).map(([t,v])=>[t,t.endsWith(':rebind')?{candidate:v.candidate,targets:[v.candidate],kind:'FLOAT'}:v.remove?{remove:true}:v]));
+    const result=await host.applyChanges({'binding:lost:rebind':{candidate:cfg},'binding:steps:remove':true,'note:intro:remove':true});
+    assert.equal(result.ok,true,JSON.stringify(result));
+    assert.deepEqual(sampler.properties.sonderBindings,{seed:'seed',cfg:'lost'});
+    const m=manifest();assert.ok(!m.bindings.steps&&m.bindings.lost&&!m.notes.intro);assert.equal(captures,2);
+    // Rebinding a setting that is on is refused by the writer too.
+    const again=await host.applyChanges({'binding:seed:rebind':{candidate:{path:'3',input:'steps'}}});
+    assert.equal(again.ok,false);assert.match(again.rejected[0].reason,/off can be rebound/);
+}
+if(SCENARIO==='filter-during-write') {
+    host.setVisible(true);await settle();host.setManage(true,'');await host.refresh(true);
+    const hash=await host.getPromptHash();wait=true;
+    const saving=host.applyChanges({'binding:steps:value':'31'},{expectedPromptHash:hash});
+    await deferred();host.setManage(true,'cfg');
+    wait=false;release();release=null;
+    assert.equal((await saving).ok,true);assert.equal(sampler.widgets[0].value,31);
+}
+if(SCENARIO==='manage-listing') {
+    host.setVisible(true);await host.refresh(true);
+    assert.equal(calls.at(-1).manage,undefined);assert.equal(calls.at(-1).candidates,undefined);
+    host.setManage(true,'');await host.refresh(true);
+    const listed=calls.at(-1).candidates.map(c=>`${c.path}/${c.input}`);
+    // Anchored, denied and Relay widgets are never offered.
+    assert.deepEqual(listed,['3/cfg']);assert.equal(calls.at(-1).manage,true);assert.equal(calls.at(-1).candidates_truncated,false);
+    host.setManage(true,'nothing');await host.refresh(true);assert.deepEqual(calls.at(-1).candidates,[]);
+    host.setManage(false,'');await host.refresh(true);assert.equal(calls.at(-1).candidates,undefined);
+    host.setMountedVisible(true);host.setMountedManage(true,'cfg');host.setVisible(false);await host.refresh(true);
+    assert.deepEqual(calls.at(-1).candidates.map(c=>c.input),['cfg']);
+}
 if(SCENARIO==='presentation'||SCENARIO==='presentation-rollback') {
     if(SCENARIO==='presentation-rollback')relay.widgets[0].callback=()=>{throw Error('callback failed');};
     // Many presentation targets become ONE manifest write and one history step.
@@ -223,7 +303,8 @@ host.destroy();assert.equal(listeners.size,0);
 console.log('ok');
 '''
 
-SCENARIOS = ['unsafe-seed', 'moved', 'rollback-callbacks', 'presentation', 'presentation-rollback', 'root', 'promoted', 'promoted-seed', 'no-relay', 'two-relays',
+SCENARIOS = ['expose', 'expose-rollback', 'expose-new-relay', 'expose-new-relay-rollback', 'expose-noop', 'expose-taken',
+             'remove-rebind', 'manage-listing', 'filter-during-write', 'unsafe-seed', 'moved', 'rollback-callbacks', 'presentation', 'presentation-rollback', 'root', 'promoted', 'promoted-seed', 'no-relay', 'two-relays',
              'linked-or-gone', 'manifest-cap', 'hidden-hash', 'relay-error-view', 'refusal', 'stale-write', 'stale-view',
              'destroy', 'rollback', 'serial', 'history-failure', 'precision-refusal', 'hide-during-write',
              'event-during-write']

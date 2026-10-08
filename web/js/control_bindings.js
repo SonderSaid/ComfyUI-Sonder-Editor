@@ -35,6 +35,12 @@ export const DENIED_INPUTS = {
     SonderSaveBridge: ["target_folder"],
 };
 export const DENIED_PREFIXES = { SonderMetadataCollector: "label_", SonderMetadataCollectorV3: "label_" };
+// Mirrors server/binding_policy.py LEGACY_PRIMITIVE_CLASS: virtual, never in a prompt.
+export const LEGACY_PRIMITIVE = "PrimitiveNode";
+// Mirrors server/control_descriptors.py MAX_CANDIDATES.
+export const MAX_CANDIDATES = 500;
+// Widgets the frontend adds beside a value; they never reach a prompt.
+const COMPANION_WIDGETS = new Set(["control_after_generate", "control_filter_list"]);
 
 const MUTED = 2;
 const BYPASS = 4;
@@ -207,7 +213,7 @@ function hostInput(host, name) {
 
 // One binding on the live graph: its status, its native widget and its API
 // targets. Never writes.
-function resolveAnchor(node, name) {
+export function resolveAnchor(node, name) {
     if (isOff(node)) return { status: "missing", targets: [] };
     if (isHost(node)) {
         const input = hostInput(node, name);
@@ -259,6 +265,102 @@ export function resolveBindings(root, manifest) {
         suggestions.push({ binding_id: anchor.id, targets: resolveAnchor(anchor.node, anchor.name).targets });
     }
     return { bindings, suggestions };
+}
+
+// ── Candidates (Manage) ──────────────────────────────────────────────────────
+
+const rawAnchors = node => (isPlainObject(node?.properties?.[ANCHOR_PROPERTY]) ? node.properties[ANCHOR_PROPERTY] : null);
+const hostInputName = input => input?._subgraphSlot?.name ?? input?.name;
+
+// What Manage may expose on the live graph: root widgets and subgraph-host
+// promoted inputs, each as {path, input} (the anchor's node and name) plus the
+// API targets it sets. Anchored, linked, denied, muted and virtual ones are
+// left out here; the server checks the rest (server/control_descriptors.py
+// candidate_inventory) and never lists what it refuses.
+export function listCandidates(root, { filter = "", limit = MAX_CANDIDATES, labels = [] } = {}) {
+    const query = String(filter || "").trim().toLowerCase();
+    const found = [];
+    const recommendedLabels = new Map(labels.map(field => [`${field.path}/${field.input}`, field.label]));
+    let truncated = false;
+    const push = (node, name, targets, label) => {
+        const title = String(node.title || nodeType(node));
+        const recommended = targets.map(target => recommendedLabels.get(`${target.path}/${target.input}`) || "");
+        if (query && ![title, nodeType(node), name, label || "", ...recommended].some(text => String(text).toLowerCase().includes(query))) return;
+        if (found.length >= limit) { truncated = true; return; }
+        found.push({ path: String(node.id), input: name, targets: publicTargets(targets), node_title: title });
+    };
+    for (const node of nodesOf(root)) {
+        if (truncated) break;
+        if (!node || isRelay(node) || isOff(node) || nodeType(node) === LEGACY_PRIMITIVE) continue;
+        const anchored = readAnchors(node);
+        // A subgraph host reports isVirtualNode (frontend 1.53.10) yet its
+        // promoted inputs reach the prompt through the inner consumers.
+        if (isHost(node)) {
+            for (const input of node.inputs || []) {
+                const name = hostInputName(input);
+                if (!name || Object.hasOwn(anchored, name) || input.link != null) continue;
+                const resolved = resolveAnchor(node, name);
+                if (resolved.status === "ok") push(node, name, resolved.targets, input.label);
+            }
+            continue;
+        }
+        if (node.isVirtualNode) continue; // Reroute, Note, legacy Primitive: never in a prompt
+        const linked = new Set((node.inputs || []).filter(input => input?.link != null).map(input => input.widget?.name ?? input.name));
+        for (const widget of node.widgets || []) {
+            const name = widget?.name;
+            if (!name || Object.hasOwn(anchored, name) || linked.has(name) || COMPANION_WIDGETS.has(name)) continue;
+            if (widget.options?.serialize === false || widget.serialize === false || isDenied(nodeType(node), name)) continue;
+            push(node, name, [{ path: String(node.id), input: name }], widget.label);
+        }
+    }
+    return { candidates: found, truncated };
+}
+
+// One candidate resolved on the live graph, for a structural write: the node
+// that will carry the anchor and the targets it sets now.
+export function resolveCandidate(root, candidate) {
+    const node = nodesOf(root).find(n => String(n?.id) === String(candidate?.path));
+    if (!node || !candidate?.input) return null;
+    const resolved = resolveAnchor(node, candidate.input);
+    if (resolved.status !== "ok") return null;
+    return { node, name: candidate.input, targets: publicTargets(resolved.targets),
+        node_title: String(node.title || nodeType(node)) };
+}
+
+// Anchor writes keep any other entry the node carries, valid or not.
+export function setAnchor(node, name, id) {
+    node.properties ||= {};
+    node.properties[ANCHOR_PROPERTY] = { ...(rawAnchors(node) || {}), [name]: id };
+}
+
+// Removes every root anchor carrying `id`; returns the nodes it changed.
+export function dropAnchors(root, id) {
+    const changed = [];
+    for (const node of nodesOf(root)) {
+        const raw = rawAnchors(node);
+        if (!raw || !Object.values(raw).includes(id)) continue;
+        const next = Object.fromEntries(Object.entries(raw).filter(([, value]) => value !== id));
+        if (Object.keys(next).length) node.properties[ANCHOR_PROPERTY] = next;
+        else delete node.properties[ANCHOR_PROPERTY];
+        changed.push(node);
+    }
+    return changed;
+}
+
+// A JSON copy, not structuredClone: Nodes 2.0 makes `node.properties` a
+// reactive proxy, which structuredClone refuses. Anchor maps hold only text.
+export const anchorSnapshot = node => {
+    const raw = rawAnchors(node);
+    return raw ? JSON.parse(JSON.stringify(raw)) : undefined;
+};
+
+export function restoreAnchors(node, snapshot) {
+    if (snapshot === undefined) {
+        if (node.properties) delete node.properties[ANCHOR_PROPERTY];
+    } else {
+        node.properties ||= {};
+        node.properties[ANCHOR_PROPERTY] = snapshot;
+    }
 }
 
 export const publicTargets = targets =>

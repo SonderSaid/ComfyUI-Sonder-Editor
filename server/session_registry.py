@@ -728,7 +728,7 @@ def _clear_controls_locked(key: HostKey) -> None:
 
 
 def _new_controls_state() -> dict:
-    return {"view": None, "view_seq": 0, "prompt_hash": "", "visible": False,
+    return {"view": None, "view_seq": 0, "prompt_hash": "", "visible": False, "manage": False, "filter": "",
             "pending": [], "outcomes": [], "publication": None}
 
 
@@ -739,7 +739,11 @@ def _controls_presence_locked(key: HostKey) -> dict:
     visible = bool(state.get("visible") and owner and owner.get("host_mode") == "tab"
                    and owner.get("status", "active") == "active" and not _is_stale(owner)
                    and host and not _is_host_stale(host))
-    return {"controls_view_seq": state.get("view_seq", 0), "controls_visible": visible}
+    # Manage is open in the tab: the canvas lists candidates, filtered here
+    # first, so a large graph never publishes every widget it has.
+    return {"controls_view_seq": state.get("view_seq", 0), "controls_visible": visible,
+            "controls_manage": bool(visible and state.get("manage")),
+            "controls_filter": state.get("filter", "") if visible and state.get("manage") else ""}
 
 
 def _controls_payload_locked(key: HostKey) -> dict:
@@ -804,9 +808,13 @@ def _prepare_control_publication(body: Any) -> dict:
                     if descriptor.get(bound) is not None:
                         numeric_kind = "INT" if kind in ("INT", "SEED") else "FLOAT"
                         control_descriptors.coerce_control_value(numeric_kind, descriptor[bound])
-    if "suggestions" in view and (not isinstance(view["suggestions"], list)
-                                  or not all(isinstance(d, dict) for d in view["suggestions"])):
-        raise ValueError("suggestions must be a list.")
+    for name in ("suggestions", "candidates"):
+        if name in view and (not isinstance(view[name], list) or not all(isinstance(d, dict) for d in view[name])):
+            raise ValueError(f"{name} must be a list.")
+    if len(view.get("candidates") or []) > control_descriptors.MAX_CANDIDATES:
+        raise ValueError("Too many candidates.")
+    if "candidates_truncated" in view and not isinstance(view["candidates_truncated"], bool):
+        raise ValueError("The candidates flag must be boolean.")
     view = control_descriptors.json_safe(view)
     for name, field in (("bindings", "note"), ("notes", "text")):
         for descriptor in view[name]:
@@ -926,7 +934,14 @@ async def _post_control_changes_once(project_id: str, host_id: str, session_id: 
         return {"ok": False, "code": code}
     if view is None:
         return {"ok": False, "code": "view_unavailable"}
-    cleaned, rejected = await asyncio.to_thread(control_descriptors.validate_binding_changes, view, changes)
+    cleaned, rejected = await asyncio.to_thread(
+        control_descriptors.validate_binding_changes, view, changes, structural="relay")
+    if not rejected:
+        # Structural results are internal write plans, not request grammar.
+        # Forward intent for fresh canvas validation, including no-op retries.
+        cleaned = {target: copy.deepcopy(changes[target])
+                   if target.rsplit(":", 1)[-1] in {"expose", "remove", "rebind", "create", "hide", "unhide"}
+                   else value for target, value in cleaned.items()}
     events = []
     async with _lock:
         code = _controls_gate_locked(key, session_id, "tab", events)
@@ -965,8 +980,12 @@ async def get_control_changes(project_id: str, host_id: str, session_id: str) ->
 
 
 async def set_controls_visibility(project_id: str, host_id: str, session_id: str,
-                                  visible: Any, seen: Any = None) -> dict:
+                                  visible: Any, seen: Any = None, manage: Any = None, filter: Any = None) -> dict:
     if not isinstance(visible, bool):
+        return {"ok": False, "code": "invalid_visibility"}
+    if manage is not None and not isinstance(manage, bool):
+        return {"ok": False, "code": "invalid_visibility"}
+    if filter is not None and (not isinstance(filter, str) or len(filter) > control_descriptors.FILTER_MAX_CHARS):
         return {"ok": False, "code": "invalid_visibility"}
     if seen is not None and (not isinstance(seen, list) or len(seen) > CONTROLS_ACK_HISTORY
                              or not all(isinstance(rid, str) for rid in seen)):
@@ -982,8 +1001,13 @@ async def set_controls_visibility(project_id: str, host_id: str, session_id: str
             # Only terminal outcomes can be confirmed. Unknown ids and repeated
             # receipts are harmless; early receipts never remove pending writes.
             state["outcomes"] = [o for o in state["outcomes"] if o["request_id"] not in receipts]
-            changed = state["visible"] != visible
+            before = _controls_presence_locked(key)
             state["visible"] = visible
+            if manage is not None:
+                state["manage"] = manage
+            if filter is not None:
+                state["filter"] = filter
+            changed = before != _controls_presence_locked(key)
             result = {"ok": True, **_controls_presence_locked(key)}
             if changed:
                 events.append((key[0], {"type": "controls_visibility_changed", "project_id": key[0],

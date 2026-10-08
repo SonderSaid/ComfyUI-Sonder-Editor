@@ -152,6 +152,9 @@ async function importFile(file, template = null) {
         const reset = [];
         if (payload.template.notes_reset) reset.push(`${payload.template.notes_reset} panel notes reset`);
         if (payload.template.layout_reset) reset.push('layout reset');
+        // App-only Controls survive a replace; say which ones now need a look in Manage.
+        const offline = (payload.template.local_missing || 0) + (payload.template.local_shadowed || 0);
+        if (offline) reset.push(`${offline} app-only Control${offline === 1 ? '' : 's'} off (see Manage)`);
         notifySuccess(template ? 'Workflow replaced' : 'Workflow imported', {
             source: 'launcher-import', detail: template ? `Control values kept.${reset.length ? ` ${reset.join('; ')}.` : ''}` : undefined,
         });

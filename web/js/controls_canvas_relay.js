@@ -27,9 +27,20 @@ const shorten = (descriptor, field, limit) =>
 // and a truncated note keep their existing rules: the canvas writer validates
 // full option membership, and a truncated note is edited on the canvas.
 export function fitPublicationView(view, envelope) {
+    // Server-owned labels only help the canvas filter its candidate inventory.
+    // They are not part of a mounted tab's display or transport budget.
+    if (view.candidate_labels) {
+        view = { ...view };
+        delete view.candidate_labels;
+    }
     const fits = candidate => publicationBytes({ ...envelope, view: candidate }) <= MAX_PUBLICATION_BYTES;
     if (fits(view)) return view;
-    // Unlisted anchors are for Manage only; they go first.
+    // Manage's candidates go first: a narrower filter shows the rest.
+    while (view.candidates?.length && !fits(view)) {
+        view = { ...view, candidates: view.candidates.slice(0, Math.floor(view.candidates.length / 2)), candidates_truncated: true };
+    }
+    if (fits(view)) return view;
+    // Unlisted anchors are for Manage only; they go next.
     view = { ...view, suggestions: [] };
     if (fits(view)) return view;
     const capped = {
@@ -167,6 +178,7 @@ export function createCanvasControlsRelay({ host, identity, api, connected = () 
                 const queue = await request("GET", "control_changes");
                 if (!queue.ok || !current(stamp, id)) return;
                 mountedVisible = !!queue.payload.controls_visible;
+                host.setMountedManage?.(!!queue.payload.controls_manage, queue.payload.controls_filter || "");
                 host.setMountedVisible(mountedVisible);
                 // The GET preceded this retry. Once its ACK succeeds that pending
                 // snapshot is stale; fetch again before considering any writes.
@@ -252,6 +264,7 @@ export function createCanvasControlsRelay({ host, identity, api, connected = () 
             epoch++;
             clearInterval(timer);
             unsubscribe();
+            host.setMountedManage?.(false, "");
             host.setMountedVisible(false);
             processed.clear();
         },

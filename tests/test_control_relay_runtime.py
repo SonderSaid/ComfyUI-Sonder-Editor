@@ -98,6 +98,7 @@ manifest = {"v": 1, "bindings": {
     "choice": binding("20", "choice"),
     "list": binding("20", "choice_list"),
     "select": binding("8", "select"),
+    "text": binding("10", "text"),
 }}
 prompt = {
     "1": {"class_type": "SonderControlRelay", "inputs": {"manifest": json.dumps(manifest)}},
@@ -107,6 +108,7 @@ prompt = {
           "latent_image": ["99", 0], "denoise": 1.0}},
     "8": {"class_type": "SonderLazySwitch", "inputs": {"select": 1, "branches.item0": ["99", 0], "branches.item1": ["99", 0]}},
     "20": {"class_type": "SonderSelector", "inputs": {"choice": "Decompression", "choice_list": "Base\nDecompression\nDetail"}},
+    "10": {"class_type": "CLIPTextEncode", "inputs": {"text": "before", "clip": ["99", 1]}},
     "99": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "none.safetensors"}},
 }
 if "SonderGuidesBridgeStart" in nodes.NODE_CLASS_MAPPINGS:
@@ -122,6 +124,10 @@ try:
     out["relay"] = view["relay"]
     cleaned, rejected = cd.validate_binding_changes(view, {"binding:list:value": "Base\nGlow", "binding:choice:value": "Glow"}, prompt=prompt)
     out["batch"] = {"cleaned": cleaned, "rejected": rejected}
+    text_changes, text_rejected = cd.validate_binding_changes(view, {"binding:text:value": "after"}, prompt=prompt)
+    out["text_write"] = {"changes": text_changes, "rejected": text_rejected}
+    out["text_candidates"] = [c for c in cd.candidate_inventory(prompt, cd.sdk_candidates(prompt))
+                              if c["path"] == "10" and c["input"] == "text"]
 except Exception:
     out["errors"]["describe"] = traceback.format_exc()
 
@@ -188,6 +194,10 @@ def test_bindings_read_real_node_classes(runtime):
     assert choice["options"] == ["Base", "Decompression", "Detail"] and choice["provider"] is True
     assert choice["value"] == "Decompression" and choice["error"] is None
     assert bindings["list"]["kind"] == "STRING"
+    assert bindings["text"]["kind"] == "STRING" and bindings["text"]["value"] == "before"
+    assert runtime["text_write"] == {"changes": {"binding:text:value": "after"}, "rejected": []}
+    assert runtime["text_candidates"][0]["kind"] == "STRING"
+    assert runtime["text_candidates"][0]["status"] == "ok"
     assert bindings["select"]["status"] == "ok"
     if "guides" in bindings:
         assert bindings["guides"]["status"] == "denied"

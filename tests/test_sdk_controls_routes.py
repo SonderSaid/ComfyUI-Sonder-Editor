@@ -324,7 +324,7 @@ def test_full_combo_options_are_validated_beyond_the_wire_preview(world):
             return {'required': {'choice': ([f'option{i}' for i in range(2100)],)}}
     graph = prompt({'pick': _binding('9', 'choice', label='Pick')})
     graph['9'] = _node('Combo', {'choice': 'option0'})
-    world.runner._describe = lambda p: cd.describe_bindings(p, class_lookup={**CLASSES, 'Combo': Combo}.get)
+    world.runner._describe = lambda p, **kw: cd.describe_bindings(p, class_lookup={**CLASSES, 'Combo': Combo}.get, **kw)
     install(world, graph)
     async def run():
         session = await world.open()
@@ -343,7 +343,7 @@ def test_a_promoted_input_keeps_every_consumers_bounds_and_an_out_of_range_value
     graph = prompt({'steps': {'label': 'Steps', 'status': 'ok',
                               'targets': [{'path': '6', 'input': 'steps'}, {'path': '9', 'input': 'steps'}]}})
     graph['9'] = _node('Limited', {'steps': 20})
-    world.runner._describe = lambda p: cd.describe_bindings(p, class_lookup={**CLASSES, 'Limited': Limited}.get)
+    world.runner._describe = lambda p, **kw: cd.describe_bindings(p, class_lookup={**CLASSES, 'Limited': Limited}.get, **kw)
     install(world, graph)
     async def run():
         session = await world.open()
@@ -550,7 +550,7 @@ def test_more_than_64_stored_values_apply_and_a_refused_one_resets_alone(world):
         def INPUT_TYPES(cls):
             return {'required': {f'v{i}': ('INT', {'min': 0, 'max': 100}) for i in range(70)}}
     graph['9'] = _node('Wide', {f'v{i}': 1 for i in range(70)})
-    world.runner._describe = lambda p: cd.describe_bindings(p, class_lookup={**CLASSES, 'Wide': Wide}.get)
+    world.runner._describe = lambda p, **kw: cd.describe_bindings(p, class_lookup={**CLASSES, 'Wide': Wide}.get, **kw)
     install(world, graph)
     sig = lambda i: {'class_type': 'Wide', 'input': f'v{i}', 'kind': 'INT'}
     sdk_templates.update_control_values(world.template_id, lambda d: d['bindings'].update(

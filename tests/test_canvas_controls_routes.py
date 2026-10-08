@@ -13,7 +13,7 @@ from test_control_descriptors import CLASSES, _binding, _node, _relay
 @pytest.fixture
 def prompt(monkeypatch):
     original=cd.describe_bindings
-    monkeypatch.setattr(cd,'describe_bindings',lambda p, relay_census=None: original(p,relay_census=relay_census,class_lookup=CLASSES.get))
+    monkeypatch.setattr(cd,'describe_bindings',lambda p, relay_census=None, **kw: original(p,relay_census=relay_census,class_lookup=CLASSES.get,**kw))
     return {'1':_node('SonderEditor'),
         '3':_node('SonderSaveVideo',{'project':['1',0],'mark_queue_complete':False,'place_audio_on_timeline':True}),
         '4':_node('SonderSaveVideo',{'project':['1',0],'mark_queue_complete':True,'place_audio_on_timeline':False}),

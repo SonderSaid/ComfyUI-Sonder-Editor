@@ -256,10 +256,10 @@ def test_same_host_reconnect_keeps_requests_and_ack_history_is_bounded():
 def test_validation_worker_does_not_hold_registry_lock_and_cannot_cross_lifecycle(mutation, monkeypatch):
     entered, resume = threading.Event(), threading.Event()
     original = cd.validate_binding_changes
-    def slow(*args):
+    def slow(*args, **kwargs):
         entered.set()
         assert resume.wait(5)
-        return original(*args)
+        return original(*args, **kwargs)
     async def run():
         await setup()
         await publish()
@@ -297,10 +297,10 @@ def test_post_revalidation_is_bounded_when_every_attempt_goes_stale(monkeypatch)
         await setup()
         await publish()
         seq = iter(range(2, 10))
-        def racing(*args):
+        def racing(*args, **kwargs):
             # Each validation sees a newer publication land before it finishes.
             calls.append(1)
-            result = original(*args)
+            result = original(*args, **kwargs)
             asyncio.run_coroutine_threadsafe(publish(publication(next(seq))), loop).result(3)
             return result
         loop = asyncio.get_running_loop()

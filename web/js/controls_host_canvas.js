@@ -1,10 +1,16 @@
 // Canvas graph authority for the shared Controls panel. No app/DOM at import.
 import {
-    MAX_MANIFEST_BYTES, editManifest, exportManifest, nodesOf, parseManifest, relayCensus, resolveBindings,
+    MAX_MANIFEST_BYTES, RELAY_CLASS, anchorSnapshot, dropAnchors, editManifest, exportManifest, listCandidates,
+    nodesOf, parseManifest, readAnchors, relayCensus, resolveBindings, resolveCandidate, restoreAnchors, setAnchor,
 } from "./control_bindings.js";
+import { syncRelayRows } from "./control_relay_rows.js";
 
 const DESCRIBE_URL = "/sonder-editor/controls/describe";
 const DEBOUNCE_MS = 400;
+const TARGET_RE = /^(binding|note):([A-Za-z0-9_-]{1,64}):(value|seed_mode|label|note|text|order|group|expose|remove|rebind|create)$/;
+const STRUCTURAL = new Set(["expose", "remove", "rebind", "create"]);
+const sameTargets = (a, b) => JSON.stringify((a || []).map(t => [String(t.path), t.input]).sort())
+    === JSON.stringify((b || []).map(t => [String(t.path), t.input]).sort());
 const refused = (changes, reason) => ({ok: false,
     rejected: Object.keys(changes || {}).map(target => ({target, reason}))});
 
@@ -24,9 +30,20 @@ async function promptHash(text) {
     return `local:${(a >>> 0).toString(16).padStart(8, "0")}${(b >>> 0).toString(16).padStart(8, "0")}`;
 }
 
+// The first expose in a workflow without a Relay adds one at the root, beside
+// the editor node, in the same history step.
+function defaultCreateRelay(app, root, editor) {
+    const node = globalThis.LiteGraph?.createNode?.(RELAY_CLASS);
+    if (!node) throw new Error("The Sonder Control Relay node is not available. Update the Sonder nodes.");
+    const [x, y] = editor?.pos || [0, 0];
+    node.pos = [x + (editor?.size?.[0] || 0) + 40, y];
+    root.add(node);
+    return node;
+}
+
 export function createCanvasControlsHost({app, api, getEditorNode, setEditorSetting = () => {},
     getChangeTracker = () => app?.extensionManager?.workflow?.activeWorkflow?.changeTracker,
-    debounceMs = DEBOUNCE_MS} = {}) {
+    createRelay = defaultCreateRelay, debounceMs = DEBOUNCE_MS} = {}) {
     if (!app || typeof app.graphToPrompt !== "function" || typeof getEditorNode !== "function") {
         throw new TypeError("Canvas Controls needs an injected app and editor node getter.");
     }
@@ -34,6 +51,11 @@ export function createCanvasControlsHost({app, api, getEditorNode, setEditorSett
     let visible = false, mountedVisible = false, destroyed = false, listening = false;
     let epoch = 0, timer = null, active = null, trailing = false, lastHash = null;
     let writeTail = Promise.resolve();
+    // Manage is open in this page's panel (local) or a mounted tab (mounted);
+    // candidates are listed only then, filtered before they are sent.
+    const manage = {local: {on: false, filter: ""}, mounted: {on: false, filter: ""}};
+    const activeManage = () => (mountedVisible && manage.mounted.on ? manage.mounted
+        : visible && manage.local.on ? manage.local : null);
     const subscribers = new Set();
     const rootGraph = () => app.rootGraph || app.graph;
     const needed = () => visible || mountedVisible;
@@ -50,10 +72,21 @@ export function createCanvasControlsHost({app, api, getEditorNode, setEditorSett
         const {output} = await app.graphToPrompt();
         if (!output || typeof output !== "object") throw new Error("The workflow could not be exported.");
         const key = editorKey(id, output);
-        return {prompt: output, editor_key: key, hash: JSON.stringify([key, output])};
+        const listing = activeManage();
+        // Graph identity is independent of the ephemeral Manage query. Anchors
+        // and census still guard writes, including Restore after Relay deletion.
+        const anchors = nodesOf(id.root).map(node => [node?.id, readAnchors(node)]);
+        const graphHash = JSON.stringify([key, output, anchors, relayCensus(id.root).census]);
+        return {prompt: output, editor_key: key, graphHash, hash: JSON.stringify([graphHash, listing])};
     };
-    const describe = async (shot, changes) => {
-        const body = {prompt: shot.prompt, relay_census: relayCensus(rootGraph()).census};
+    const describe = async (shot, changes, extra = {}) => {
+        const body = {prompt: shot.prompt, relay_census: relayCensus(rootGraph()).census, ...extra};
+        if (!body.relay_census.active) body.orphan_manifest = exportManifest("", rootGraph());
+        const listing = activeManage();
+        if (listing && changes === undefined) {
+            const {candidates, truncated} = listCandidates(rootGraph(), {filter: listing.filter, labels: view.candidate_labels || []});
+            Object.assign(body, {manage: true, candidates, candidates_truncated: truncated});
+        }
         if (changes !== undefined) body.changes = changes;
         const response = await api.fetchApi(DESCRIBE_URL, {method: "POST",
             headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
@@ -119,27 +152,57 @@ export function createCanvasControlsHost({app, api, getEditorNode, setEditorSett
         if (!needed()) { epoch++; clearTimeout(timer); timer = null; trailing = false; }
         else if (!was) { lastHash = null; void refresh(true); }
     }
+    function setManage(which, on, filter = "") {
+        const next = {on: !!on, filter: String(filter || "").slice(0, 120)};
+        if (manage[which].on === next.on && manage[which].filter === next.filter) return;
+        manage[which] = next;
+        if (needed()) { epoch++; lastHash = null; schedule(); }
+    }
+
+    // The candidates a batch names, resolved on the live graph, so the server
+    // validates exactly what the writer will anchor.
+    function batchCandidates(changes, root) {
+        const found = new Map();
+        for (const [target, value] of Object.entries(changes || {})) {
+            const op = target.split(":")[2];
+            if (!["expose", "rebind"].includes(op) || !value?.candidate) continue;
+            const live = resolveCandidate(root, value.candidate);
+            if (live) found.set(`${live.node.id}/${live.name}`, {path: String(live.node.id), input: live.name,
+                targets: live.targets, node_title: live.node_title});
+        }
+        return [...found.values()];
+    }
 
     // Native widget writes for value targets, and one merged manifest write for
     // every presentation target in the batch (one widget, one history step).
     function operations(raw, changes, root) {
-        const {active} = relayCensus(root);
-        if (active.length !== 1) throw new Error("Keep exactly one active Sonder Control Relay in the workflow.");
-        const relay = active[0];
-        const manifestWidget = (relay.widgets || []).find(w => w?.name === "manifest");
-        if (!manifestWidget) throw new Error("The Sonder Control Relay has no manifest.");
-        const saved = typeof manifestWidget.value === "string" ? manifestWidget.value : "";
-        const {bindings} = resolveBindings(root, parseManifest(saved));
-        const byWidget = new Map(), presentation = [];
+        const {active, census} = relayCensus(root);
+        const structural = Object.entries(changes).filter(([target, value]) =>
+            STRUCTURAL.has(target.split(":")[2]) && !value?.noop);
+        // A first expose may add the Relay; everything else needs the one Relay.
+        const addsRelay = !active.length && !census.muted && !census.bypassed && !census.nested
+            && structural.length > 0 && structural.every(([target]) => /:(expose|create)$/.test(target));
+        if (!structural.length && Object.values(changes).every(value => value?.noop)) return {writes: [], anchors: []};
+        if (active.length !== 1 && !addsRelay) throw new Error("Keep exactly one active Sonder Control Relay in the workflow.");
+        const relay = active[0] || null;
+        const manifestWidget = relay ? (relay.widgets || []).find(w => w?.name === "manifest") : null;
+        if (relay && !manifestWidget) throw new Error("The Sonder Control Relay has no manifest.");
+        const saved = typeof manifestWidget?.value === "string" ? manifestWidget.value : "";
+        const {bindings, suggestions} = resolveBindings(root, parseManifest(saved));
+        const byWidget = new Map(), presentation = [], anchors = [], manifestOps = [];
         const add = (node, widget, value, target) => {
             const existing = byWidget.get(widget);
             if (existing && existing.value !== value) throw new Error("Two changes address the same widget differently.");
             byWidget.set(widget, {node, widget, value, target});
         };
         for (const [target, value] of Object.entries(changes)) {
-            const match = /^(binding|note):([A-Za-z0-9_-]{1,64}):(value|seed_mode|label|note|text|order|group)$/.exec(target);
+            const match = TARGET_RE.exec(target);
             if (!match) throw new Error("This target is unavailable.");
             const [, source, id, field] = match;
+            if (STRUCTURAL.has(field)) {
+                if (!value?.noop) structuralOp(root, {source, id, field, value}, {bindings, suggestions, anchors, manifestOps});
+                continue;
+            }
             if (source === "note" || !["value", "seed_mode"].includes(field)) {
                 presentation.push({source, id, field, value});
                 continue;
@@ -172,8 +235,9 @@ export function createCanvasControlsHost({app, api, getEditorNode, setEditorSett
             else if (d.kind !== "BOOLEAN") next = String(value);
             add(resolved.node, resolved.widget, next, target);
         }
-        if (presentation.length) {
+        if (presentation.length || manifestOps.length) {
             const text = editManifest(saved, manifest => {
+                for (const edit of manifestOps) edit(manifest);
                 for (const {source, id, field, value} of presentation) {
                     const table = source === "binding" ? manifest.bindings : manifest.notes;
                     if (!table[id] || typeof table[id] !== "object") throw new Error("This Control is no longer in the workflow.");
@@ -183,9 +247,45 @@ export function createCanvasControlsHost({app, api, getEditorNode, setEditorSett
             if (new TextEncoder().encode(exportManifest(text, root)).length > MAX_MANIFEST_BYTES) {
                 throw new Error("The Controls would exceed 128 KiB. Shorten a note first.");
             }
-            add(relay, manifestWidget, text, "manifest");
+            if (relay) add(relay, manifestWidget, text, "manifest");
+            else byWidget.set("relay", {createRelay: true, value: text, target: "manifest"});
         }
-        return [...byWidget.values()];
+        return {writes: [...byWidget.values()], anchors};
+    }
+
+    // Anchor and manifest edits for one structural target. The server already
+    // validated it against this graph's export; the live graph must agree.
+    function structuralOp(root, {source, id, field, value}, {bindings, suggestions, anchors, manifestOps}) {
+        if (source === "note") {
+            if (field === "create") manifestOps.push(m => { m.notes[id] = {text: value.text, group: value.group, order: value.order}; });
+            else manifestOps.push(m => { delete m.notes[id]; });
+            return;
+        }
+        if (field === "remove") {
+            manifestOps.push(m => { delete m.bindings[id]; });
+            anchors.push(() => dropAnchors(root, id));
+            return;
+        }
+        let live = null;
+        if (value.candidate) {
+            live = resolveCandidate(root, value.candidate);
+            if (!live || !sameTargets(live.targets, value.targets)) throw new Error("This setting moved. Refresh the Controls panel.");
+            const owner = readAnchors(live.node)[live.name];
+            if (owner && owner !== id) throw new Error("This setting is already a Control.");
+        } else if (!suggestions.some(s => s.binding_id === id)) {
+            throw new Error("This setting is no longer in the workflow. Refresh the Controls panel.");
+        }
+        if (field === "rebind") {
+            if (!bindings[id] || bindings[id].status === "ok") throw new Error("Only a setting that is off can be rebound.");
+            anchors.push(() => dropAnchors(root, id));
+            anchors.push(() => { setAnchor(live.node, live.name, id); return [live.node]; });
+            return;
+        }
+        if (bindings[id]) throw new Error("This Control id is already in use.");
+        manifestOps.push(m => {
+            m.bindings[id] = {label: value.label, section: value.section, group: "", order: value.order, advanced: false, note: ""};
+        });
+        if (live) anchors.push(() => { setAnchor(live.node, live.name, id); return [live.node]; });
     }
 
     async function write(changes, { expectedPromptHash = null, canApply = () => true } = {}) {
@@ -195,43 +295,65 @@ export function createCanvasControlsHost({app, api, getEditorNode, setEditorSett
         try {
             const shot = await snapshot(id);
             if (!sameGraph(id)) return refused(changes, "The workflow changed. Try again.");
-            if (!await canApply() || !sameGraph(id) || (expectedPromptHash && await promptHash(shot.hash) !== expectedPromptHash)) {
+            if (!await canApply() || !sameGraph(id) || (expectedPromptHash && await promptHash(shot.graphHash) !== expectedPromptHash)) {
                 return refused(changes, "The workflow changed. Try again.");
             }
-            const raw = await describe(shot, changes);
-            if (!sameGraph(id) || (await snapshot(id)).hash !== shot.hash || !sameGraph(id)) {
+            const raw = await describe(shot, changes, {candidates: batchCandidates(changes, id.root)});
+            if (!sameGraph(id) || (await snapshot(id)).graphHash !== shot.graphHash || !sameGraph(id)) {
                 return refused(changes, "The workflow changed. Try again.");
             }
             if (!raw.ok) return {ok: false, rejected: raw.rejected || []};
             if (!await canApply()) return refused(changes, "This tab no longer owns the editor.");
             // An asynchronous permission check can overlap a native graph edit.
-            if (!sameGraph(id) || (await snapshot(id)).hash !== shot.hash || !sameGraph(id)) {
+            if (!sameGraph(id) || (await snapshot(id)).graphHash !== shot.graphHash || !sameGraph(id)) {
                 return refused(changes, "The workflow changed. Try again.");
             }
-            const writes = operations(raw, raw.changes, id.root);
+            const {writes, anchors} = operations(raw, raw.changes, id.root);
             const tracker = getChangeTracker();
             if (typeof tracker?.captureCanvasState !== "function") throw new Error("Workflow history is unavailable.");
             // Native history remains the owner; establish the pre-write state.
             tracker.captureCanvasState();
-            const before = writes.map(({widget}) => widget.value);
+            const before = writes.map(({widget}) => widget?.value);
+            const touched = new Map();
+            let created = null;
             try {
-                for (const {node, widget, value} of writes) {
+                // Anchors first, so the export a created Relay makes sees them.
+                for (const apply of anchors) {
+                    const prior = new Map(nodesOf(id.root).map(node => [node, anchorSnapshot(node)]));
+                    for (const node of apply()) if (!touched.has(node)) touched.set(node, prior.get(node));
+                }
+                for (const write of writes) {
+                    if (write.createRelay) {
+                        created = createRelay(app, id.root, id.editor);
+                        write.node = created;
+                        write.widget = (created?.widgets || []).find(w => w?.name === "manifest");
+                        if (!write.widget) throw new Error("The new Sonder Control Relay has no manifest.");
+                    }
+                    const {node, widget, value} = write;
                     widget.value = value;
                     widget.callback?.(value, app.canvas, node);
                     if (widget.value !== value && String(widget.value) !== String(value)) {
                         throw new Error(`The canvas widget changed ${value} to ${widget.value} (its step or precision), so nothing was saved.`);
                     }
                 }
+                // The Relay's rows (and the size they need) follow now, inside
+                // this history step rather than as one of their own.
+                for (const relay of relayCensus(id.root).active) {
+                    try { syncRelayRows(relay, {root: id.root, canvas: app.canvas, resize: true}); } catch { /* rows refresh on their own tick */ }
+                }
                 id.root.setDirtyCanvas?.(true, true);
                 tracker.captureCanvasState();
             } catch (error) {
                 // Restore values and replay callbacks, so state a callback
                 // derives (a Selector's options, its rewritten choice) follows.
-                writes.forEach(({widget}, i) => { widget.value = before[i]; });
-                writes.forEach(({node, widget}, i) => {
-                    try { widget.callback?.(before[i], app.canvas, node); } catch { /* restored value stands */ }
-                    widget.value = before[i];
-                });
+                const restorable = writes.map((write, i) => [write, before[i]]).filter(([write]) => !write.createRelay);
+                for (const [{widget}, value] of restorable) widget.value = value;
+                for (const [{node, widget}, value] of restorable) {
+                    try { widget.callback?.(value, app.canvas, node); } catch { /* restored value stands */ }
+                    widget.value = value;
+                }
+                for (const [node, snap] of touched) restoreAnchors(node, snap);
+                if (created) id.root.remove?.(created);
                 id.root.setDirtyCanvas?.(true, true);
                 throw error;
             }
@@ -246,8 +368,12 @@ export function createCanvasControlsHost({app, api, getEditorNode, setEditorSett
         subscribe(cb) { subscribers.add(cb); return () => subscribers.delete(cb); },
         setVisible: value => visibility("local", value),
         setMountedVisible: value => visibility("mounted", value),
+        setManage: (on, filter) => setManage("local", on, filter),
+        setMountedManage: (on, filter) => setManage("mounted", on, filter),
+        // The workflow owns its Controls here: remove, never hide.
+        capabilities: {hide: false, removeAuthored: true},
         refresh,
-        getPromptHash: async () => promptHash((await snapshot(identity())).hash),
+        getPromptHash: async () => promptHash((await snapshot(identity())).graphHash),
         applyChanges(changes, options) {
             const owned = { ...changes };
             const run = writeTail.then(() => write(owned, options));

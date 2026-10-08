@@ -38,6 +38,15 @@ if(SCENARIO.startsWith('sdk')){
         // of repeating that old answer (the panel decides on saves still in flight).
         const result=await owner.generate(1);assert.equal(result.ok,true);assert.equal(result.payload.observed,'20');
         assert.equal(calls.filter(c=>c.path.endsWith('/generate')).length,1);}
+    if(SCENARIO==='sdk-manage'){
+        // Candidates are asked for only while Manage is open, with the filter.
+        assert.ok(!calls.at(-1).path.includes('manage'));
+        host.setManage(true,'cfg & seed');await settle();
+        assert.ok(calls.at(-1).path.endsWith('/controls?manage=1&filter=cfg%20%26%20seed'),calls.at(-1).path);
+        await host.applyChanges({'binding:n:label':'x'});assert.ok(calls.at(-1).path.includes('manage=1'));
+        host.setManage(false,'');await settle();assert.ok(calls.at(-1).path.endsWith('/controls'));
+        assert.deepEqual(host.capabilities,{hide:true,removeAuthored:false});
+    }
     if(SCENARIO==='sdk-flush'){owner.flushControlsPanel=async()=>false;assert.equal((await owner.generate(1)).payload.code,'controls_not_saved');assert.equal(calls.some(c=>c.path.endsWith('/generate')),false);}
     owner.destroy();
 }
@@ -54,7 +63,7 @@ if(SCENARIO.startsWith('mounted')){
             return{ok:true,json:async()=>({request_id:rid})};
         }
         if(delayHide&&!body.visible)await new Promise(r=>releaseHide=r);
-        remoteVisible=body.visible;savedSeen.push(...body.seen);applied=applied.filter(r=>!body.seen.includes(r));
+        remoteVisible=body.visible;globalThis.lastReport=body;savedSeen.push(...body.seen);applied=applied.filter(r=>!body.seen.includes(r));
         return{ok:true,json:async()=>({ok:true})};
     }});
     host.setVisible(true);await settle();assert.equal(gets,1);
@@ -88,6 +97,12 @@ if(SCENARIO.startsWith('mounted')){
         const work=host.applyChanges({'binding:n:value':'31'});await settle();rejected=[{request_id:'r',target:'binding:n:value',reason:'canvas refused'}];seq=2;
         host.changed({host_id:'h'});assert.equal((await work).rejected[0].reason,'canvas refused');
     }
+    if(SCENARIO==='mounted-manage'){
+        // Manage and its filter travel with the visibility report; the canvas lists.
+        host.setManage(true,'seed');await settle();assert.deepEqual([lastReport.manage,lastReport.filter],[true,'seed']);
+        host.setManage(false,'');await settle();assert.deepEqual([lastReport.manage,lastReport.filter],[false,'']);
+        assert.deepEqual(host.capabilities,{hide:false,removeAuthored:true});
+    }
     if(SCENARIO==='mounted-visibility'){
         delayHide=true;host.setVisible(false);host.setVisible(true);await settle();assert.ok(releaseHide);
         releaseHide();await settle();assert.equal(remoteVisible,true);
@@ -101,10 +116,12 @@ if(SCENARIO.startsWith('mounted')){
     host.destroy();
 }
 if(SCENARIO.startsWith('relay')){
-    let queue={ok:true,pending:[{request_id:'r',prompt_hash:'before',changes:{'binding:n:value':'31'}}],controls_visible:true,controls_view_seq:1};
+    let queue={ok:true,pending:[{request_id:'r',prompt_hash:'before',changes:{'binding:n:value':'31'}}],controls_visible:true,controls_view_seq:1,
+        controls_manage:SCENARIO==='relay-manage',controls_filter:SCENARIO==='relay-manage'?'cfg':''};
     let hash='before',writes=0,puts=0,failPut=['relay-retry','relay-owner-observation'].includes(SCENARIO),published=null;
     const callbacks=new Set();
-    const host={getView:()=>controlsView,setMountedVisible(){},refresh:async()=>controlsView,getPromptHash:async()=>hash,
+    const managed=[];
+    const host={getView:()=>controlsView,setMountedVisible(){},setMountedManage(on,filter){managed.push([on,filter]);},refresh:async()=>controlsView,getPromptHash:async()=>hash,
         subscribe(cb){callbacks.add(cb);return()=>callbacks.delete(cb);},async applyChanges(changes,options){assert.equal(await options.canApply(),true);assert.equal(options.expectedPromptHash,hash);writes++;hash='after';return{ok:true,rejected:[]};}};
     if(SCENARIO==='relay-stale')hash='external';
     const relay=createCanvasControlsRelay({host,identity:()=>({projectId:'P',hostId:'h',sessionId:'canvas'}),connected:()=>true,api:{fetchApi:async(path,init)=>{
@@ -130,6 +147,7 @@ if(SCENARIO.startsWith('relay')){
         assert.equal(writes,1);assert.deepEqual(published.applied,['r']);
     }
     if(SCENARIO==='relay-stale'){assert.equal(writes,0);assert.equal(published.rejected[0].request_id,'r');}
+    if(SCENARIO==='relay-manage'){assert.deepEqual(managed[0],[true,'cfg']);relay.destroy();assert.deepEqual(managed.at(-1),[false,'']);}
     if(SCENARIO==='relay-ack'){assert.equal(writes,1);assert.deepEqual(published.applied,['r']);assert.equal(published.view_seq,2);}
     if(SCENARIO==='relay-invalid-view'){
         assert.equal(puts,2);assert.deepEqual(published.applied,['r']);assert.match(published.view.error,/could not be shown/);
@@ -140,13 +158,19 @@ if(SCENARIO.startsWith('relay')){
         assert.deepEqual(published.view.bindings,[]);
         await relay.cycle();assert.equal(puts,2);
     }
-    relay.destroy();assert.equal(callbacks.size,0);
+    if(SCENARIO!=='relay-manage')relay.destroy();assert.equal(callbacks.size,0);
 }
 if(SCENARIO==='relay-fit'){
     const {fitPublicationView}=await import(RELAY_URL);
     const envelope={host_id:'h',session_id:'s',view_seq:1,prompt_hash:'x',applied:[],rejected:[]};
     const small={bindings:[{binding_id:'a',status:'ok',kind:'COMBO',options:['x','y'],value:'x'}],notes:[]};
     assert.equal(fitPublicationView(small,envelope),small);
+    // Manage's candidates shrink first, and say so.
+    const listing={bindings:[{binding_id:'a',status:'ok',kind:'INT',value:'1'}],notes:[],suggestions:[{binding_id:'s',targets:[]}],
+        candidates:Array.from({length:500},(_,i)=>({path:String(i),input:'w'.repeat(1200),targets:[],label:'x'}))};
+    const fitted=fitPublicationView(listing,envelope);
+    assert.ok(fitted.candidates.length<500&&fitted.candidates.length>0);assert.equal(fitted.candidates_truncated,true);
+    assert.deepEqual(fitted.suggestions,listing.suggestions);assert.deepEqual(fitted.bindings,listing.bindings);
     const option=i=>'loras/'+'x'.repeat(80)+i+'.safetensors';
     const combo=id=>({binding_id:id,status:'ok',kind:'COMBO',options:Array.from({length:2000},(_,i)=>option(i)),value:option(0)});
     const capped=fitPublicationView({bindings:['a','b','c','d','e'].map(combo),notes:[]},envelope);
@@ -193,7 +217,7 @@ if(SCENARIO==='canvas-http'||SCENARIO==='relay-error-recovery'||SCENARIO==='canv
 }
 console.log('ok');
 '''
-@pytest.mark.parametrize('scenario',['sdk-order','sdk-refusal','sdk-flush','mounted-ack','mounted-post-race','mounted-refusal','mounted-visibility','mounted-order','relay-ack','relay-retry','relay-stale','relay-owner-observation','canvas-http','canvas-revoked','relay-error-recovery','relay-too-large','relay-fit','mounted-abandon-restart','mounted-abandon-cleared','mounted-abandon-recreated','relay-invalid-view'])
+@pytest.mark.parametrize('scenario',['sdk-manage','mounted-manage','relay-manage','sdk-order','sdk-refusal','sdk-flush','mounted-ack','mounted-post-race','mounted-refusal','mounted-visibility','mounted-order','relay-ack','relay-retry','relay-stale','relay-owner-observation','canvas-http','canvas-revoked','relay-error-recovery','relay-too-large','relay-fit','mounted-abandon-restart','mounted-abandon-cleared','mounted-abandon-recreated','relay-invalid-view'])
 def test_controls_transport(scenario):
     node=shutil.which('node')
     if not node:pytest.skip('node required for host adapter tests')

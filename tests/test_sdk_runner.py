@@ -144,7 +144,7 @@ class World:
             validate=lambda prompt: validation,
         )["template_id"]
 
-    def describe(self, prompt):
+    def describe(self, prompt, **_local):
         """Fake bindings whose values read the prompt, as the real describe does."""
         bindings = []
         for binding in self.bindings:
@@ -544,7 +544,7 @@ def test_stored_values_are_applied_and_rechecked(world):
                            "targets": [{"path": "2", "input": "mark_queue_complete", "class_type": "SonderSaveVideo",
                                         "status": "ok"}]})
     real = world.runner._describe
-    world.runner._describe = lambda prompt: describes.append(json.loads(json.dumps(prompt))) or real(prompt)
+    world.runner._describe = lambda prompt, **kw: describes.append(json.loads(json.dumps(prompt))) or real(prompt, **kw)
     sdk_templates.update_control_values(world.template_id, lambda d: d["bindings"].update({
         "abcd1234": stored_seed(3, seed_mode="fixed"),
         "advance1": {"value": True, "sig": {"class_type": "SonderSaveVideo", "input": "mark_queue_complete",

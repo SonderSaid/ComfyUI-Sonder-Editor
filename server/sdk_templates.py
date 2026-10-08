@@ -7,12 +7,18 @@ Install-level files under ``<comfy user dir>/sonder-editor`` (``sdk_paths``):
 - ``templates/<id>.meta.json`` — name, times and the validation summary.
 - ``templates/<id>.controls.json`` — Control values per workflow, shared across
   projects: ``{"version": 1, "bindings": {<binding_id>: {"value", "seed_mode",
-  "sig"}}, "labels", "notes", "layout", "seq", "presentation_hash"}``. Values
-  are keyed by the Relay's ``binding_id`` so they survive re-import; ``sig``
-  (target class, input and kind) resets a value whose binding now points at a
-  different setting. ``labels``/``notes``/``layout`` are view-only overlays
+  "sig"}}, "local", "local_notes", "hidden", "labels", "notes", "layout",
+  "seq", "presentation_hash"}``. Values are keyed by ``binding_id`` so they
+  survive re-import; ``sig`` (target class, input and kind) resets a value
+  whose binding now points at a different setting. ``labels``/``notes``/
+  ``layout`` are view-only overlays on the workflow's own bindings and notes,
   keyed ``binding:<id>`` or ``note:<id>``; they reset on re-import, bound to
-  the export's SHA-256 ``presentation_hash`` for crash recovery. ``seq`` orders
+  the export's SHA-256 ``presentation_hash`` for crash recovery.
+  App-only curation (contract amendment A1) survives re-import: ``local``
+  holds app-only bindings ``{<id>: {targets: [{path, input, class_type}],
+  section, label, group, order, note}}``, ``local_notes`` app-only notes
+  ``{<id>: {text, group, order}}``, and ``hidden`` the workflow's own bindings
+  and notes hidden here (``{"binding:<id>"|"note:<id>": true}``). ``seq`` orders
   changes and seed advances. Unknown keys (the retired ``controls``/``fields``
   sections included) are preserved and ignored.
 - ``sdk_state/<project folder>.json`` — the SDK editor position (the 13 relayed
@@ -186,26 +192,8 @@ def validate_template(
     if not errors:
         described = describe(prompt)
         blocking.extend(generate_refusals(described))
-        has_seed = False
-        for binding in described.get("bindings", []):
-            label = binding.get("label") or control_descriptors.DEFAULT_LABEL
-            controls_summary.append({
-                "binding_id": binding.get("binding_id", ""),
-                "label": label,
-                "kind": binding.get("kind") or "",
-                "status": binding.get("status", ""),
-                "section": binding.get("section", "workflow"),
-                "group": binding.get("group", ""),
-            })
-            if binding.get("kind") == "SEED" and binding.get("status") == control_descriptors.STATUS_OK:
-                has_seed = True
-            if binding.get("status") != control_descriptors.STATUS_OK:
-                warnings.append(f"“{label}” is off: {binding.get('reason') or 'it cannot be set.'}")
-        if not has_seed:
-            warnings.append(
-                "No seed exposed: every Generate of the same job uses the workflow's fixed seed. "
-                "Expose the seed through the workflow's Sonder Control Relay and export again to get new takes."
-            )
+        controls_summary, control_warnings = controls_summary_of(described)
+        warnings.extend(control_warnings)
     return {
         "ok": not errors,
         "errors": errors,
@@ -215,6 +203,39 @@ def validate_template(
         "editor_defaults": editor_defaults,
         "controls": controls_summary,
     }
+
+
+def controls_summary_of(view: dict) -> tuple[list[dict], list[str]]:
+    """The Launcher's Controls line and warnings for one effective view.
+
+    Hidden bindings are not exposed, so they are left out; app-only ones count.
+    These are every warning ``validate_template`` gives, so the Launcher may
+    replace them wholesale when it recomputes them on read.
+    """
+    summary, warnings, has_seed = [], [], False
+    for binding in view.get("bindings", []):
+        if binding.get("hidden"):
+            continue
+        label = binding.get("label") or control_descriptors.DEFAULT_LABEL
+        summary.append({
+            "binding_id": binding.get("binding_id", ""),
+            "label": label,
+            "kind": binding.get("kind") or "",
+            "status": binding.get("status", ""),
+            "section": binding.get("section", "workflow"),
+            "group": binding.get("group", ""),
+            "origin": binding.get("origin", "authored"),
+        })
+        if binding.get("kind") == "SEED" and binding.get("status") == control_descriptors.STATUS_OK:
+            has_seed = True
+        if binding.get("status") != control_descriptors.STATUS_OK:
+            warnings.append(f"“{label}” is off: {binding.get('reason') or 'it cannot be set.'}")
+    if not has_seed:
+        warnings.append(
+            "No seed exposed: every Generate of the same job uses the workflow's fixed seed. "
+            "Expose the seed in Controls → Manage, or through the workflow's Sonder Control Relay, to get new takes."
+        )
+    return summary, warnings
 
 
 def generate_refusals(view: dict) -> list[str]:
@@ -281,6 +302,8 @@ def list_templates(*, requirements: bool = False) -> list[dict]:
             result.append(meta)
         except (TemplateError, OSError):
             logger.warning("Cannot read bundled workflow %s", template_id, exc_info=True)
+    for meta in result:
+        _overlay_summary(meta)
     if requirements:
         input_cache = {}
         for meta in result:
@@ -290,8 +313,8 @@ def list_templates(*, requirements: bool = False) -> list[dict]:
                     stored = read_control_values(meta["template_id"])
                     # A stored binding value (a checkpoint, say) changes which
                     # model files the run needs.
-                    if stored.get("bindings"):
-                        apply_stored_values(prompt, control_descriptors.describe_bindings(prompt), stored)
+                    if _has_curation(stored):
+                        apply_stored_values(prompt, describe_stored(prompt, stored), stored)
                     meta["missing_models"] = model_requirements.missing_models(prompt, input_cache=input_cache)
             except Exception:  # one workflow's problem must not hide the whole list
                 logger.warning("Model requirements failed for workflow %s", meta.get("template_id"), exc_info=True)
@@ -300,13 +323,50 @@ def list_templates(*, requirements: bool = False) -> list[dict]:
     return result
 
 
+# (template_id) -> (sidecar seq, presentation hash, summary, warnings)
+_summary_cache: dict[str, tuple] = {}
+
+
+def _has_curation(stored: dict) -> bool:
+    return any(stored.get(name) for name in ("bindings", "local", "local_notes", "hidden", "labels"))
+
+
+def _overlay_summary(meta: dict) -> None:
+    """Recompute the Controls summary and its warnings from the sidecar, on read.
+
+    The import-time summary cannot see app-only bindings, hidden ones or
+    renames. Untouched workflows keep it; others are recomputed once per
+    sidecar change. A failure keeps the stored summary.
+    """
+    template_id = meta.get("template_id")
+    validation = meta.get("validation")
+    if not isinstance(validation, dict) or not validation.get("ok", True) or validation.get("errors"):
+        return
+    try:
+        with template_lock(template_id):
+            stored = read_control_values(template_id)
+            if not _has_curation(stored):
+                return
+            key = (stored["seq"], stored["presentation_hash"])
+            cached = _summary_cache.get(template_id)
+            if not cached or cached[0] != key:
+                prompt, _ = load_template(template_id)
+                view = apply_stored_values(prompt, describe_stored(prompt, stored), stored)
+                cached = (key, *controls_summary_of(view))
+                _summary_cache[template_id] = cached
+    except Exception:
+        logger.warning("Controls summary failed for workflow %s", template_id, exc_info=True)
+        return
+    meta["validation"] = {**validation, "controls": copy.deepcopy(cached[1]), "warnings": list(cached[2])}
+
+
 def template_requirements(template_id: str) -> dict:
     """Selected-row fallback: avoid inspecting every schema in a large library."""
     with template_lock(template_id):
         prompt, _ = load_template(template_id)
         stored = read_control_values(template_id)
-        if stored.get("bindings"):
-            apply_stored_values(prompt, control_descriptors.describe_bindings(prompt), stored)
+        if _has_curation(stored):
+            apply_stored_values(prompt, describe_stored(prompt, stored), stored)
         return {"ok": True, "template_id": template_id, "missing_models": model_requirements.missing_models(prompt)}
 
 
@@ -335,8 +395,10 @@ def import_template(raw: bytes, *, source_name: str = "", name: str = "", valida
     return _public_meta(template_id, meta)
 
 
-def replace_template(template_id: str, raw: bytes, *, source_name: str = "", validate=validate_template) -> dict:
-    """Re-import over an existing workflow, keeping its id and Control values."""
+def replace_template(template_id: str, raw: bytes, *, source_name: str = "", validate=validate_template,
+                     describe=None) -> dict:
+    """Re-import over an existing workflow, keeping its id, Control values and
+    app-only curation; authored overlays (labels, notes, layout) reset."""
     _require_writable(template_id)
     json_path, meta_path, controls_path = _template_paths(template_id)
     prompt = parse_template_bytes(raw)
@@ -381,7 +443,18 @@ def replace_template(template_id: str, raw: bytes, *, source_name: str = "", val
                 except OSError:
                     logger.exception("Could not restore workflow file %s", path)
             raise
-    return {**_public_meta(template_id, meta), "notes_reset": notes_reset, "layout_reset": layout_reset}
+    local_missing = local_shadowed = 0
+    if data.get("local"):
+        try:
+            view = describe_stored(prompt, data, describe)
+            for binding in view.get("bindings", []):
+                if binding.get("origin") == "local":
+                    local_missing += binding.get("status") == control_descriptors.STATUS_MISSING
+                    local_shadowed += binding.get("status") == control_descriptors.STATUS_SHADOWED
+        except Exception:
+            logger.warning("Could not check app-only Controls of workflow %s", template_id, exc_info=True)
+    return {**_public_meta(template_id, meta), "notes_reset": notes_reset, "layout_reset": layout_reset,
+            "local_missing": local_missing, "local_shadowed": local_shadowed}
 
 
 def _read_bytes(path: str) -> bytes | None:
@@ -465,7 +538,7 @@ def _write_bytes_atomic(path: str, data: bytes) -> None:
 def _normalized_controls(data: dict, presentation_hash: str) -> dict:
     data = dict(data)
     data["version"] = CONTROLS_VERSION
-    for name in ("bindings", "labels", "notes", "layout"):
+    for name in ("bindings", "labels", "notes", "layout", "local", "local_notes", "hidden"):
         if not isinstance(data.get(name), dict):
             data[name] = {}
     if data.get("presentation_hash") != presentation_hash:
@@ -507,22 +580,38 @@ def update_control_values(template_id: str, mutate: Callable[[dict], None]) -> d
         return data
 
 
+def describe_stored(prompt: dict, stored: dict, describe=None) -> dict:
+    """Describe a template with its sidecar's app-only bindings and notes."""
+    describe = describe or control_descriptors.describe_bindings
+    return describe(prompt, local=stored.get("local"), local_notes=stored.get("local_notes"))
+
+
+def hidden_keys(stored: dict) -> set:
+    hidden = stored.get("hidden") if isinstance(stored.get("hidden"), dict) else {}
+    return {key for key, value in hidden.items() if value is True and isinstance(key, str)}
+
+
 def apply_stored_values(prompt: dict, described: dict, stored: dict, *, describe=None) -> dict:
     """Apply stored values to the prompt and presentation overlays to a view only.
 
     Generate, Controls GET and the Launcher's model check share this authority.
-    A value applies only to an ``ok`` binding whose target still matches the
-    signature it was saved for; anything else is skipped and the binding shows
-    ``reset``. Re-describing the resulting prompt rechecks bounds and options.
+    ``described`` comes from ``describe_stored``. A value applies only to an
+    ``ok`` binding whose target still matches the signature it was saved for;
+    anything else is skipped and the binding shows ``reset``. A hidden binding
+    is not exposed: its stored value is kept but skipped, so the workflow's own
+    value runs. Re-describing the resulting prompt rechecks bounds and options.
     Labels, notes and layout never alter a prompt input or its cache identity.
     """
     cd = control_descriptors
     stored_bindings = stored.get("bindings") if isinstance(stored.get("bindings"), dict) else {}
+    hidden = hidden_keys(stored)
     by_id = {d.get("binding_id"): d for d in described.get("bindings", [])}
     batch, resets = {}, set()
     for binding_id, descriptor in by_id.items():
         entry = stored_bindings.get(binding_id)
         if descriptor.get("status") != cd.STATUS_OK or not isinstance(entry, dict) or "value" not in entry:
+            continue
+        if f"binding:{binding_id}" in hidden:
             continue
         if entry.get("sig") != cd.binding_signature(descriptor):
             resets.add(binding_id)
@@ -539,7 +628,7 @@ def apply_stored_values(prompt: dict, described: dict, stored: dict, *, describe
     for target, value in cleaned.items():
         for item in by_id[target.split(":")[1]].get("targets", []):
             prompt[item["path"]]["inputs"][item["input"]] = value
-    view = copy.deepcopy((describe or cd.describe_bindings)(prompt) if cleaned else described)
+    view = copy.deepcopy(describe_stored(prompt, stored, describe) if cleaned else described)
     layouts = stored.get("layout") if isinstance(stored.get("layout"), dict) else {}
     notes = stored.get("notes") if isinstance(stored.get("notes"), dict) else {}
     labels = stored.get("labels") if isinstance(stored.get("labels"), dict) else {}
@@ -561,6 +650,10 @@ def apply_stored_values(prompt: dict, described: dict, stored: dict, *, describe
     ):
         for descriptor in descriptors:
             base = f"{prefix}:{descriptor.get(identity_key)}"
+            if base in hidden and descriptor.get("origin") != "local":
+                descriptor["hidden"] = True
+            if descriptor.get("origin") == "local":
+                continue  # app-only presentation lives in its own entry
             layout = layouts.get(base)
             if isinstance(layout, dict):
                 # Preserve unknown/over-cap storage, consume only modeled values.
@@ -579,18 +672,42 @@ def apply_stored_values(prompt: dict, described: dict, stored: dict, *, describe
     return view
 
 
-def store_binding_changes(template_id: str, changes: dict, view: dict) -> dict:
+def _class_of(prompt: dict | None, path: str) -> str | None:
+    node = (prompt or {}).get(path)
+    return node.get("class_type") if isinstance(node, dict) else None
+
+
+def store_binding_changes(template_id: str, changes: dict, view: dict, prompt: dict | None = None) -> dict:
     """Persist already validated targets through the canonical sidecar mutator.
 
     ``view`` is the view the changes were validated against: a value is saved
-    with its binding's target signature.
+    with its binding's target signature, and an app-only binding's or note's
+    presentation goes to its own ``local`` entry rather than the overlays.
+    ``prompt`` names the node classes an app-only binding remembers.
     """
     signatures = {d.get("binding_id"): control_descriptors.binding_signature(d) for d in view.get("bindings", [])}
+    origins = {("binding", d.get("binding_id")): d.get("origin") for d in view.get("bindings", [])}
+    origins.update({("note", d.get("note_id")): d.get("origin") for d in view.get("notes", [])})
+
+    def locator(target: dict) -> dict:
+        return {"path": target["path"], "input": target["input"],
+                "class_type": target.get("class_type") or _class_of(prompt, target["path"])}
 
     def mutate(data):
         for target, value in changes.items():
             source, identity, field = target.split(":", 2)
             base = f"{source}:{identity}"
+            if isinstance(value, dict) and value.get("noop"):
+                continue
+            if field in ("expose", "rebind", "create", "remove", "hide", "unhide"):
+                _store_structural(data, source, identity, field, value, locator)
+                continue
+            if origins.get((source, identity)) == "local":
+                table = data["local"] if source == "binding" else data["local_notes"]
+                entry = table.get(identity)
+                if isinstance(entry, dict) and field in ("label", "note", "text", "order", "group"):
+                    entry[field] = value
+                    continue
             if field in ("note", "text"):
                 data["notes"][base] = value
             elif field == "label":
@@ -610,6 +727,30 @@ def store_binding_changes(template_id: str, changes: dict, view: dict) -> dict:
                 else:
                     entry[field] = value
     return update_control_values(template_id, mutate)
+
+
+def _store_structural(data: dict, source: str, identity: str, op: str, value: dict, locator) -> None:
+    base = f"{source}:{identity}"
+    if op == "hide":
+        data["hidden"][base] = True
+    elif op == "unhide":
+        data["hidden"].pop(base, None)
+    elif source == "note" and op == "create":
+        data["local_notes"][identity] = {"text": value["text"], "group": value["group"], "order": value["order"]}
+    elif source == "note" and op == "remove":
+        data["local_notes"].pop(identity, None)
+    elif op == "expose":
+        data["local"][identity] = {"targets": [locator(t) for t in value["targets"]], "section": value["section"],
+                                   "label": value["label"], "group": "", "order": value["order"], "note": ""}
+    elif op == "rebind":
+        entry = data["local"].get(identity)
+        if isinstance(entry, dict):
+            entry["targets"] = [locator(t) for t in value["targets"]]
+    elif op == "remove":
+        data["local"].pop(identity, None)
+        data["bindings"].pop(identity, None)
+        for table in ("labels", "notes", "layout"):
+            data[table].pop(base, None)
 
 
 # ── SDK editor position ──────────────────────────────────────────────────────

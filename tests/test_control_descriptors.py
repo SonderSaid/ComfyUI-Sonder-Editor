@@ -157,7 +157,7 @@ def binding(prompt, binding_id, **kwargs):
 
 def test_module_level_imports_are_standard_library_and_pure_siblings_only():
     tree = ast.parse((REPO_ROOT / "server" / "control_descriptors.py").read_text(encoding="utf-8"))
-    allowed = {"__future__", "inspect", "logging", "math", "random", "dataclasses", "decimal", "typing"}
+    allowed = {"copy", "threading", "__future__", "hashlib", "inspect", "json", "logging", "math", "random", "re", "dataclasses", "decimal", "typing"}
     for node in tree.body:
         if isinstance(node, ast.Import):
             assert {alias.name.split(".")[0] for alias in node.names} <= allowed
@@ -452,9 +452,9 @@ def test_bindings_and_notes_sort_and_notes_and_suggestions_are_listed():
     view = describe(prompt)
     assert [b["binding_id"] for b in view["bindings"]] == ["y", "x", "z"]
     assert [n["note_id"] for n in view["notes"]] == ["n1", "n2"]
-    assert view["notes"][0] == {"source": "note", "note_id": "n1", "text": "# One", "group": "Intro", "order": -2, "status": "ok"}
+    assert view["notes"][0] == {"source": "note", "note_id": "n1", "origin": "authored", "text": "# One", "group": "Intro", "order": -2, "status": "ok"}
     assert view["suggestions"] == [{"binding_id": "orphan1", "targets": [{"path": "9", "input": "scheduler"}],
-                                    "label": "Sampler · scheduler"}]
+                                    "label": "Sampler · scheduler", "section": "workflow"}]
 
 
 @pytest.mark.parametrize("prompt, error", [
@@ -615,8 +615,8 @@ def test_combo_transport_cap_preserves_full_validation(count):
 def test_describe_route_validates_with_the_prompt_and_returns_json_safe(monkeypatch):
     from server import routes
     original = cd.describe_bindings
-    monkeypatch.setattr(cd, "describe_bindings", lambda prompt, relay_census=None: original(
-        prompt, relay_census=relay_census, class_lookup=CLASSES.get))
+    monkeypatch.setattr(cd, "describe_bindings", lambda prompt, relay_census=None, **kw: original(
+        prompt, relay_census=relay_census, class_lookup=CLASSES.get, **kw))
     prompt = _selector_prompt()
     prompt["9"]["inputs"]["seed"] = 2**63 + 7
     body = {"prompt": prompt, "relay_census": {"active": 1}, "changes": {
@@ -636,6 +636,7 @@ def test_recommended_editor_fields_are_data():
         ("SonderSaveVideo", "place_audio_on_timeline"),
         ("SonderMasksBridge", "edit_video"),
         ("SonderMasksBridge", "edit_audio"),
+        ("SonderSaveVideo", "mode"),
     }
 
 

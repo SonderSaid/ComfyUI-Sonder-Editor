@@ -23,10 +23,15 @@ running ComfyUI, and tests inject fakes instead.
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import inspect
+import json
 import logging
 import math
 import random
+import re
+import threading
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Iterable
@@ -50,8 +55,11 @@ STATUS_LINKED = "linked"
 STATUS_NO_WIDGET = "no_widget"
 STATUS_UNSUPPORTED = "unsupported"
 STATUS_DENIED = "denied"
+# Sonder App only: an app-only binding whose input the workflow now exposes itself.
+STATUS_SHADOWED = "shadowed"
 
 STATUS_REASONS = {
+    STATUS_SHADOWED: "The workflow now exposes this setting itself, so this app-only Control is off. Remove it.",
     STATUS_MISSING: "This setting is no longer in the workflow, moved into a subgraph, or its node is muted or bypassed.",
     STATUS_DUPLICATE: "Two nodes carry this Control. Remove one of them.",
     STATUS_LINKED: "Another node is connected to this input, so the Control can't set it.",
@@ -88,17 +96,22 @@ class FieldControl:
     class_type: str
     field: str
     label: str
+    hint: str = ""
 
 
 # Entries, not conditionals: add a row to recommend another Sonder-node field.
-# Exposure is opt-in (maintainer decision 2026-10-06); Manage lists these first.
+# Exposure is opt-in (maintainer decision 2026-10-06); Manage lists these first
+# as Recommended and exposes them to the Editor section.
 FIELD_CONTROLS: tuple[FieldControl, ...] = (
     FieldControl("SonderSaveVideo", "mark_queue_complete", "Advance queue after take"),
     FieldControl("SonderSaveBridge", "mark_queue_complete", "Advance queue after take"),
     FieldControl("SonderSaveVideo", "place_audio_on_timeline", "Place take audio on timeline"),
     FieldControl("SonderMasksBridge", "edit_video", "Edit video"),
     FieldControl("SonderMasksBridge", "edit_audio", "Edit audio"),
+    # io_nodes.SonderSaveVideo refuses a custom PNG sequence in Take mode.
+    FieldControl("SonderSaveVideo", "mode", "Save as", "Take can't save a PNG sequence."),
 )
+_RECOMMENDED = {(entry.class_type, entry.field): entry for entry in FIELD_CONTROLS}
 
 # ── Coercion ─────────────────────────────────────────────────────────────────
 
@@ -249,6 +262,10 @@ def spec_from_input_info(input_type: Any, extra: Any, input_name: str = "") -> d
     INT is a SEED when the frontend would give it a seed control.
     """
     extra = extra if isinstance(extra, dict) else {}
+    # ComfyUI str enums overload comparisons for wildcard compatibility.
+    # Descriptors need literal type identity, not socket-connection semantics.
+    if isinstance(input_type, str):
+        input_type = str(input_type)
     spec: dict[str, Any] = {"type": input_type if isinstance(input_type, str) else "COMBO"}
     if isinstance(input_type, (list, tuple)):
         spec.update(kind="COMBO", options=list(input_type))
@@ -468,6 +485,11 @@ def _check_targets(prompt: dict, targets: list[dict], class_lookup: Callable, ca
             read.append({"key": path, "class_type": None, "input": name, "status": STATUS_MISSING})
             continue
         class_type = node.get("class_type")
+        # An app-only binding remembers its node's class: a re-import that
+        # reuses the id for another node must not inherit the binding.
+        if target.get("class_type") is not None and target["class_type"] != class_type:
+            read.append({"key": path, "class_type": class_type, "input": name, "status": STATUS_MISSING})
+            continue
         value = prompt_graph.node_inputs(prompt, path).get(name)
         if binding_policy.is_denied(class_type, name):
             read.append({"key": path, "class_type": class_type, "input": name, "status": STATUS_DENIED})
@@ -493,11 +515,12 @@ def _check_targets(prompt: dict, targets: list[dict], class_lookup: Callable, ca
     return STATUS_OK, None, read
 
 
-def _describe_one(prompt: dict, binding_id: str, entry: dict, class_lookup: Callable, cache: dict) -> dict:
+def _describe_one(prompt: dict, binding_id: str, entry: dict, class_lookup: Callable, cache: dict,
+                  origin: str = "authored") -> dict:
     descriptor: dict[str, Any] = {
         "source": "binding",
         "binding_id": binding_id,
-        "origin": "authored",
+        "origin": origin,
         "label": entry["label"],
         "section": entry["section"],
         "group": entry["group"],
@@ -576,12 +599,18 @@ def describe_bindings(
     *,
     relay_census: Any = None,
     class_lookup: Callable[[str], Any] | None = None,
+    local: Any = None,
+    local_notes: Any = None,
+    orphan_manifest: Any = None,
 ) -> dict:
     """Describe the Relay's bindings and notes in an API prompt.
 
     ``relay_census`` is the canvas count of active, muted, bypassed and nested
-    Relays, which an export cannot show. Blocking only through ``INPUT_TYPES``;
-    callers run it off the event loop like any prompt walk.
+    Relays, which an export cannot show. ``local`` and ``local_notes`` are the
+    Sonder App's app-only bindings and notes (contract amendment A1, from the
+    template's sidecar); they describe with ``origin: "local"``, also when the
+    workflow has no Relay. Blocking only through ``INPUT_TYPES``; callers run it
+    off the event loop like any prompt walk.
     """
     if not isinstance(prompt, dict):
         raise ValueError("A prompt must be an object of nodes.")
@@ -598,25 +627,259 @@ def describe_bindings(
         "suggestions": [],
         "editors": prompt_graph.editor_keys(prompt),
     }
-    if relay["status"] != "ok":
-        if relay["error"]:
-            view["error"] = relay["error"]
+    if relay["status"] == "error":
+        view["error"] = relay["error"]
         return view
     manifest = relay["manifest"]
+    if relay["status"] == "none" and orphan_manifest is not None:
+        # A deleted Relay leaves workflow anchors. Accept only their suggestions,
+        # through the same hygiene checks; they confer no exposure or value state.
+        manifest = {**manifest, "suggestions": control_manifest.parse_manifest(orphan_manifest)["suggestions"]}
     for binding_id, entry in manifest["bindings"].items():
         view["bindings"].append(_describe_one(prompt, binding_id, entry, class_lookup, cache))
     for note_id, entry in manifest["notes"].items():
-        view["notes"].append({"source": "note", "note_id": note_id, "text": entry["text"],
+        view["notes"].append({"source": "note", "note_id": note_id, "origin": "authored", "text": entry["text"],
                               "group": entry["group"], "order": entry["order"], "status": STATUS_OK})
     for suggestion in manifest["suggestions"]:
         if suggestion["binding_id"] in manifest["bindings"]:
             continue
-        view["suggestions"].append({**suggestion, "label": _default_label(prompt, suggestion["targets"])})
+        fields = {((prompt[t["path"]].get("class_type") if isinstance(prompt.get(t["path"]), dict) else None),
+                   t["input"]) for t in suggestion["targets"]}
+        recommended = bool(fields) and all(field in _RECOMMENDED for field in fields)
+        view["suggestions"].append({**suggestion, "label": _default_label(prompt, suggestion["targets"]),
+                                    "section": "editor" if recommended else "workflow"})
+    authored = {(t["path"], t["input"]) for d in view["bindings"] if d["status"] == STATUS_OK for t in d["targets"]}
+    for binding_id, entry in clean_local_bindings(local).items():
+        if binding_id in manifest["bindings"]:
+            continue  # the workflow's own binding wins; the sidecar entry stays for Replace
+        descriptor = _describe_one(prompt, binding_id, entry, class_lookup, cache, origin="local")
+        if descriptor["status"] == STATUS_OK and any((t["path"], t["input"]) in authored for t in descriptor["targets"]):
+            descriptor.update(status=STATUS_SHADOWED, kind=None, value=None, reason=STATUS_REASONS[STATUS_SHADOWED])
+        view["bindings"].append(descriptor)
+    for note_id, entry in clean_local_notes(local_notes).items():
+        if note_id not in manifest["notes"]:
+            view["notes"].append({"source": "note", "note_id": note_id, "origin": "local", **entry, "status": STATUS_OK})
+    exposed = {d["binding_id"] for d in view["bindings"]}
+    view["suggestions"] = [s for s in view["suggestions"] if s["binding_id"] not in exposed]
     _flag_shared_targets(view["bindings"])
     view["groups"] = manifest["groups"]
     view["bindings"].sort(key=lambda d: (d["order"], d["label"].lower(), d["binding_id"]))
     view["notes"].sort(key=lambda d: (d["order"], d["note_id"]))
     return view
+
+
+# ── App-only bindings (Sonder App, contract amendment A1) ─────────────────────
+
+def _clean_text(value: Any, limit: int) -> str:
+    return value[:limit] if isinstance(value, str) else ""
+
+
+def _clean_order(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return max(-PANEL_ORDER_LIMIT, min(PANEL_ORDER_LIMIT, value))
+
+
+def _clean_locator(value: Any, *, with_class: bool) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    path, name = value.get("path"), value.get("input")
+    if not (isinstance(path, str) and 0 < len(path) <= 256 and isinstance(name, str) and 0 < len(name) <= 256):
+        return None
+    locator = {"path": path, "input": name}
+    if with_class:
+        class_type = value.get("class_type")
+        if not isinstance(class_type, str) or not class_type:
+            return None
+        locator["class_type"] = class_type
+    return locator
+
+
+def clean_local_bindings(local: Any) -> dict:
+    """The sidecar's app-only bindings as describe entries; invalid ones are skipped.
+
+    Storage keeps every entry as written (unknown keys and invalid entries are
+    preserved and ignored), so this never feeds back into the file.
+    """
+    entries = {}
+    for binding_id, raw in (local.items() if isinstance(local, dict) else []):
+        if not (isinstance(binding_id, str) and control_manifest.ID_RE.match(binding_id)
+                and binding_id not in control_manifest.FORBIDDEN_KEYS and isinstance(raw, dict)):
+            continue
+        targets = [_clean_locator(t, with_class=True) for t in raw.get("targets") or []]
+        if not targets or len(targets) > control_manifest.MAX_TARGETS or None in targets:
+            continue
+        section = raw.get("section")
+        entries[binding_id] = {
+            "label": _clean_text(raw.get("label"), PANEL_LABEL_MAX_CHARS).strip(),
+            "section": section if section in control_manifest.SECTIONS else "workflow",
+            "group": _clean_text(raw.get("group"), PANEL_LABEL_MAX_CHARS).strip(),
+            "order": _clean_order(raw.get("order")),
+            "advanced": False,
+            "note": _clean_text(raw.get("note"), PANEL_NOTE_MAX_CHARS),
+            "targets": targets,
+            "seed_mode": None,
+        }
+        if len(entries) >= control_manifest.MAX_BINDINGS:
+            break
+    return entries
+
+
+def clean_local_notes(local_notes: Any) -> dict:
+    notes = {}
+    for note_id, raw in (local_notes.items() if isinstance(local_notes, dict) else []):
+        if not (isinstance(note_id, str) and control_manifest.ID_RE.match(note_id)
+                and note_id not in control_manifest.FORBIDDEN_KEYS and isinstance(raw, dict)):
+            continue
+        notes[note_id] = {"text": _clean_text(raw.get("text"), PANEL_NOTE_MAX_CHARS),
+                          "group": _clean_text(raw.get("group"), PANEL_LABEL_MAX_CHARS).strip(),
+                          "order": _clean_order(raw.get("order"))}
+        if len(notes) >= control_manifest.MAX_NOTES:
+            break
+    return notes
+
+
+# ── Candidates (Manage) ──────────────────────────────────────────────────────
+
+MAX_CANDIDATES = 500
+FILTER_MAX_CHARS = 120
+_INVENTORY_CACHE: dict[tuple, list] = {}
+_INVENTORY_LOCK = threading.Lock()
+_INVENTORY_CACHE_SIZE = 8
+
+
+def clean_candidates(raw: Any, limit: int = MAX_CANDIDATES * 4) -> list[dict]:
+    """Candidate locators from a request: ``{path, input, targets?, node_title?}``.
+
+    ``path``/``input`` locate the anchor (a root node and its widget, or a
+    subgraph host and its input name); ``targets`` are the API inputs it sets.
+    """
+    if not isinstance(raw, list) or len(raw) > limit:
+        raise ControlValueError(f"Send at most {limit} candidates.")
+    cleaned = []
+    for item in raw:
+        locator = _clean_locator(item, with_class=False)
+        if locator is None or ":" in locator["path"]:
+            raise ControlValueError("A candidate is invalid.")
+        targets = item.get("targets")
+        if targets is None:
+            targets = [dict(locator)]
+        if not isinstance(targets, list) or not 1 <= len(targets) <= control_manifest.MAX_TARGETS:
+            raise ControlValueError("A candidate's targets are invalid.")
+        targets = [_clean_locator(t, with_class=False) for t in targets]
+        if None in targets:
+            raise ControlValueError("A candidate's targets are invalid.")
+        title = item.get("node_title")
+        cleaned.append({**locator, "targets": targets,
+                        "node_title": title[:PANEL_LABEL_MAX_CHARS] if isinstance(title, str) else ""})
+    return cleaned
+
+
+def sdk_candidates(prompt: dict) -> list[dict]:
+    """Root-level literal inputs of an API workflow (amendment A1).
+
+    Settings inside subgraphs flatten to ``host:inner`` paths and are exposed
+    from ComfyUI instead; links and the legacy PrimitiveNode never qualify.
+    """
+    found = []
+    for key, node in prompt.items():
+        if ":" in str(key) or not isinstance(node, dict):
+            continue
+        if node.get("class_type") == binding_policy.LEGACY_PRIMITIVE_CLASS:
+            continue
+        for name, value in prompt_graph.node_inputs(prompt, key).items():
+            if not _is_link(value) and isinstance(name, str):
+                found.append({"path": str(key), "input": name, "targets": [{"path": str(key), "input": name}],
+                              "node_title": ""})
+    return found
+
+
+def bound_targets(view: dict) -> dict:
+    """(path, input) -> binding_id for every target a binding claims, whatever its status."""
+    owners = {}
+    for descriptor in view.get("bindings", []):
+        if descriptor.get("status") == STATUS_SHADOWED:
+            continue
+        for target in descriptor.get("targets") or []:
+            owners.setdefault((target.get("path"), target.get("input")), descriptor.get("binding_id"))
+    return owners
+
+
+def _inventory_key(prompt: dict, candidates: list) -> str:
+    text = json.dumps([prompt, candidates], sort_keys=True, default=str)
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def candidate_inventory(prompt: dict, candidates: list[dict], *,
+                        class_lookup: Callable[[str], Any] | None = None) -> list[dict]:
+    """Check every candidate against the prompt: kind, status and recommendation.
+
+    Returns one entry per candidate, in the given order, with ``status`` from the
+    same target checks describe uses. Callers drop what is not ``ok`` or is
+    already bound; nothing greyed out is ever listed. Cached per prompt and
+    candidate list, because Manage re-reads on every graph change.
+    """
+    class_lookup = class_lookup or _comfy_class_lookup
+    key = (class_lookup, _inventory_key(prompt, candidates))
+    with _INVENTORY_LOCK:
+        cached = _INVENTORY_CACHE.get(key)
+        if cached is not None:
+            return copy.deepcopy(cached)
+    cache: dict = {}
+    inventory = []
+    for candidate in candidates:
+        status, reason, read = _check_targets(prompt, candidate["targets"], class_lookup, cache)
+        kind = derive_kind(t.get("kind") for t in read) if status == STATUS_OK else None
+        if status == STATUS_OK and kind not in CONTROL_KINDS:
+            status = STATUS_UNSUPPORTED
+        first = read[0] if read else {}
+        node = prompt.get(candidate["path"]) if isinstance(prompt.get(candidate["path"]), dict) else None
+        title = candidate.get("node_title") or (
+            _node_title(node, str(node.get("class_type") or "")) if node else str(first.get("class_type") or ""))
+        # A promoted input is recommended when every consumer is the same field.
+        fields = {(t.get("class_type"), t.get("input")) for t in read}
+        recommended = _RECOMMENDED.get(next(iter(fields))) if len(fields) == 1 else None
+        entry = {
+            "path": candidate["path"],
+            "input": candidate["input"],
+            "targets": [{"path": t["key"], "input": t["input"], "class_type": t.get("class_type")} for t in read],
+            "node_title": title,
+            "class_type": (node or {}).get("class_type") or first.get("class_type"),
+            "label": recommended.label if recommended else (f"{title} · {candidate['input']}" if title else candidate["input"]),
+            "kind": kind,
+            "status": status,
+            "recommended": bool(recommended),
+            "section": "editor" if recommended else "workflow",
+        }
+        if reason:
+            entry["reason"] = reason
+        if recommended and recommended.hint:
+            entry["hint"] = recommended.hint
+        inventory.append(entry)
+    with _INVENTORY_LOCK:
+        _INVENTORY_CACHE[key] = inventory
+        while len(_INVENTORY_CACHE) > _INVENTORY_CACHE_SIZE:
+            _INVENTORY_CACHE.pop(next(iter(_INVENTORY_CACHE)))
+    return copy.deepcopy(inventory)
+
+
+def _matches(entry: dict, query: str) -> bool:
+    haystack = " ".join(str(entry.get(name) or "") for name in ("node_title", "class_type", "input", "label"))
+    return query in haystack.lower()
+
+
+def manage_candidates(inventory: list[dict], view: dict, *, query: str = "",
+                      limit: int = MAX_CANDIDATES) -> tuple[list[dict], bool]:
+    """What Manage lists: ``ok`` and unbound candidates matching the filter,
+    Recommended first. Returns (candidates, truncated)."""
+    owners = bound_targets(view)
+    query = (query or "").strip().lower()[:FILTER_MAX_CHARS]
+    listed = [entry for entry in inventory
+              if entry["status"] == STATUS_OK
+              and not any((t["path"], t["input"]) in owners for t in entry["targets"])
+              and (not query or _matches(entry, query))]
+    listed.sort(key=lambda entry: not entry["recommended"])  # stable: node order otherwise
+    return listed[:limit], len(listed) > limit
 
 
 # ── Changes ──────────────────────────────────────────────────────────────────
@@ -664,7 +927,9 @@ def _shares_node(descriptor: dict, others: list[dict]) -> bool:
 
 
 def validate_binding_changes(view: dict, changes: Any, *, prompt: dict | None = None,
-                             max_changes: int | None = MAX_CONTROL_CHANGES) -> tuple[dict, list[dict]]:
+                             max_changes: int | None = MAX_CONTROL_CHANGES,
+                             structural: str | None = None,
+                             inventory: list[dict] | None = None) -> tuple[dict, list[dict]]:
     """Whitelist and coerce panel writes against the current descriptor view.
 
     Returns canonical values and target/reason refusals. Callers reject the whole
@@ -674,10 +939,17 @@ def validate_binding_changes(view: dict, changes: Any, *, prompt: dict | None = 
     pre-check), such a batch defers that check to the canvas writer, which
     validates against the fresh full view. ``max_changes=None`` lifts the 64-change
     request cap for the SDK's own stored values, which may hold up to 256.
+
+    ``structural`` admits Manage's structural targets for one host: ``"canvas"``
+    (the writer edits anchors and the manifest), ``"sdk"`` (app-only bindings,
+    amendment A1) or ``"relay"`` (the mounted pre-check: shape only, because the
+    canvas writer re-validates against the live graph). ``inventory`` is the
+    ``candidate_inventory`` of the candidates the batch names.
     """
     if not isinstance(changes, dict) or not changes or (max_changes is not None and len(changes) > max_changes):
         return {}, [{"target": "", "reason": "Send 1 to 64 changes."}]
     table = _target_table(view)
+    batch = _StructuralBatch(view, structural, inventory)
     value_changes = [table[t][0] for t in changes if t in table and table[t][1] == "value"]
     overrides: dict[tuple[str, str], Any] = {}
     for target, raw in changes.items():
@@ -688,6 +960,10 @@ def validate_binding_changes(view: dict, changes: Any, *, prompt: dict | None = 
     cleaned, rejected = {}, []
     for target, raw in changes.items():
         try:
+            match = _STRUCTURAL_RE.match(target) if isinstance(target, str) else None
+            if match:
+                cleaned[target] = batch.validate(*match.groups(), raw)
+                continue
             if target not in table:
                 raise ControlValueError("This target is unavailable. Refresh the Controls panel.")
             descriptor, field = table[target]
@@ -738,6 +1014,181 @@ def validate_binding_changes(view: dict, changes: Any, *, prompt: dict | None = 
         if rejected:
             cleaned = {}
     return cleaned, rejected
+
+
+_STRUCTURAL_RE = re.compile(r"^(binding|note):([A-Za-z0-9_-]{1,64}):(expose|remove|rebind|hide|unhide|create)$")
+_NOOP = {"noop": True}
+
+
+class _StructuralBatch:
+    """Validation of Manage's structural targets within one batch.
+
+    Every op is idempotent: re-sending a landed expose, rebind, create, remove or
+    hide is a no-op success (``{"noop": true}``), so a retry after a lost
+    acknowledgement changes nothing. A candidate already bound is refused.
+    """
+
+    def __init__(self, view: dict, mode: str | None, inventory: list[dict] | None):
+        self.view, self.mode = view, mode
+        self.bindings = {d.get("binding_id"): d for d in view.get("bindings", [])}
+        self.notes = {d.get("note_id"): d for d in view.get("notes", [])}
+        self.suggestions = {s.get("binding_id"): s for s in view.get("suggestions", [])}
+        self.inventory = None if inventory is None else {(c["path"], c["input"]): c for c in inventory}
+        self.owners = bound_targets(view)
+        self.claimed: set = set()
+        self.binding_count, self.note_count = len(self.bindings), len(self.notes)
+        orders = [d.get("order") for d in [*view.get("bindings", []), *view.get("notes", [])]
+                  if not d.get("group") and isinstance(d.get("order"), int) and not isinstance(d.get("order"), bool)]
+        self.next_order = max(orders, default=0)
+
+    def _order(self) -> int:
+        self.next_order = min(self.next_order + 1, PANEL_ORDER_LIMIT)
+        return self.next_order
+
+    def _candidate(self, raw: Any, binding_id: str) -> dict:
+        locator = _clean_locator(raw, with_class=False)
+        if locator is None or ":" in locator["path"]:
+            raise ControlValueError("Choose a setting to expose.")
+        if self.inventory is None:  # mounted pre-check: the canvas writer checks the graph
+            return {"candidate": locator}
+        entry = self.inventory.get((locator["path"], locator["input"]))
+        if entry is None:
+            raise ControlValueError("This setting is no longer in the workflow. Refresh the Controls panel.")
+        if entry["status"] != STATUS_OK:
+            raise ControlValueError(entry.get("reason") or STATUS_REASONS.get(entry["status"]) or "This setting can't be a Control.")
+        keys = {(t["path"], t["input"]) for t in entry["targets"]}
+        owner = next((self.owners[k] for k in keys if k in self.owners), None)
+        if owner is not None and owner != binding_id:
+            raise ControlValueError("This setting is already a Control.")
+        if keys & self.claimed:
+            raise ControlValueError("Two changes expose the same setting.")
+        self.claimed |= keys
+        return {"candidate": locator, "targets": entry["targets"], "kind": entry["kind"],
+                "default_label": entry["label"]}
+
+    @staticmethod
+    def _same_targets(descriptor: dict, chosen: dict) -> bool:
+        if "targets" not in chosen:
+            return False
+        have = {(t.get("path"), t.get("input")) for t in descriptor.get("targets") or []}
+        return bool(have) and have == {(t["path"], t["input"]) for t in chosen["targets"]}
+
+    def validate(self, source: str, identity: str, op: str, raw: Any) -> dict:
+        if self.mode not in ("canvas", "sdk", "relay"):
+            raise ControlValueError("This target is unavailable. Refresh the Controls panel.")
+        if identity in control_manifest.FORBIDDEN_KEYS:
+            raise ControlValueError("This Control id is invalid.")
+        relay = self.view.get("relay") or {}
+        if relay.get("status") == "error":
+            raise ControlValueError(f"Fix the Sonder Control Relay first: {relay.get('error') or 'it cannot be read.'}")
+        if source == "note":
+            return self._note(identity, op, raw)
+        existing = self.bindings.get(identity)
+        sdk = self.mode == "sdk"
+        if op in ("hide", "unhide"):
+            return self._hide(existing, op, raw)
+        if op == "expose":
+            if not isinstance(raw, dict):
+                raise ControlValueError("An expose needs a section.")
+            section = raw.get("section", "workflow")
+            if section not in control_manifest.SECTIONS:
+                raise ControlValueError("Choose the Workflow or Editor section.")
+            label = raw.get("label")
+            if label is not None and (not isinstance(label, str) or len(label.strip()) > PANEL_LABEL_MAX_CHARS):
+                raise ControlValueError("A label must be text of at most 120 characters.")
+            if raw.get("candidate") is None:
+                # Restore an unlisted anchor (a suggestion), keeping its id.
+                if existing is not None:
+                    return dict(_NOOP)
+                suggestion = self.suggestions.get(identity)
+                if suggestion is None and self.mode != "relay":  # a mounted view may drop suggestions to fit
+                    raise ControlValueError("This setting is no longer in the workflow. Refresh the Controls panel.")
+                chosen = {"candidate": None, "targets": (suggestion or {}).get("targets") or []}
+            else:
+                chosen = self._candidate(raw["candidate"], identity)
+                if existing is not None and self.mode == "relay":
+                    return {**chosen, "section": section, "label": (label or "").strip()}
+                if existing is not None:
+                    if self._same_targets(existing, chosen):
+                        return dict(_NOOP)
+                    raise ControlValueError("This Control id is already in use.")
+            if self.binding_count >= control_manifest.MAX_BINDINGS:
+                raise ControlValueError(f"At most {control_manifest.MAX_BINDINGS} Controls fit in one workflow.")
+            self.binding_count += 1
+            text = (label or "").strip() or chosen.pop("default_label", "")
+            chosen.pop("default_label", None)
+            return {**chosen, "section": section, "label": text, "order": self._order()}
+        if op == "remove":
+            if raw is not True:
+                raise ControlValueError("Send true to remove.")
+            if existing is None:
+                return dict(_NOOP)
+            if sdk and existing.get("origin") != "local":
+                raise ControlValueError("The workflow's own Controls can be hidden here, not removed.")
+            return {"remove": True}
+        if op == "rebind":
+            if not isinstance(raw, dict):
+                raise ControlValueError("Choose a setting to rebind to.")
+            if existing is None:
+                raise ControlValueError("This Control is no longer in the workflow.")
+            if sdk and existing.get("origin") != "local":
+                raise ControlValueError("Rebind the workflow's own Controls in ComfyUI.")
+            chosen = self._candidate(raw.get("candidate"), identity)
+            if self.mode == "relay":
+                # Only the canvas knows the current anchor locator and can
+                # distinguish a landed retry from a rebind of an active item.
+                return chosen
+            if self._same_targets(existing, chosen):
+                return dict(_NOOP)
+            if existing.get("status") == STATUS_OK:
+                raise ControlValueError("Only a setting that is off can be rebound.")
+            chosen.pop("default_label", None)
+            return chosen
+        raise ControlValueError("This target is unavailable. Refresh the Controls panel.")
+
+    def _hide(self, existing: dict | None, op: str, raw: Any, *, base: str | None = None) -> dict:
+        if self.mode != "sdk":
+            raise ControlValueError("Hiding is for the Sonder App. Remove the Control instead.")
+        if raw is not True:
+            raise ControlValueError(f"Send true to {op}.")
+        if existing is None:
+            raise ControlValueError("This Control is no longer in the workflow.")
+        if existing.get("origin") == "local":
+            raise ControlValueError("Remove an app-only item instead of hiding it.")
+        return dict(_NOOP) if bool(existing.get("hidden")) == (op == "hide") else {op: True}
+
+    def _note(self, identity: str, op: str, raw: Any) -> dict:
+        existing = self.notes.get(identity)
+        sdk = self.mode == "sdk"
+        if op in ("hide", "unhide"):
+            return self._hide(existing, op, raw)
+        if op == "create":
+            if not isinstance(raw, dict):
+                raise ControlValueError("A note needs text.")
+            text, group = raw.get("text", ""), raw.get("group", "")
+            if not isinstance(text, str) or len(text) > PANEL_NOTE_MAX_CHARS:
+                raise ControlValueError("A note must be text of at most 4000 characters.")
+            if not isinstance(group, str) or len(group.strip()) > PANEL_LABEL_MAX_CHARS:
+                raise ControlValueError("A group name must be at most 120 characters.")
+            if existing is not None:
+                if existing.get("text") == text:
+                    return dict(_NOOP)
+                raise ControlValueError("This note id is already in use.")
+            if self.note_count >= control_manifest.MAX_NOTES:
+                raise ControlValueError(f"At most {control_manifest.MAX_NOTES} notes fit in one workflow.")
+            self.note_count += 1
+            order = raw.get("order")
+            order = coerce_panel_layout("order", order) if order is not None else self._order()
+            return {"text": text, "group": group.strip(), "order": order}
+        if op == "remove":
+            if raw is not True:
+                raise ControlValueError("Send true to remove.")
+            if existing is None:
+                return dict(_NOOP)
+            if sdk and existing.get("origin") != "local":
+                raise ControlValueError("The workflow's own notes can be hidden here, not removed.")
+            return {"remove": True}
+        raise ControlValueError("This target is unavailable. Refresh the Controls panel.")
 
 
 def _batch_options(prompt: dict, descriptor: dict, overrides: dict) -> list | None:

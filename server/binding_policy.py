@@ -91,6 +91,12 @@ DEPENDENTS: dict[tuple[str, str], str] = {
 }
 
 
+# The legacy frontend PrimitiveNode is virtual: it never reaches an API prompt,
+# and its widget mirrors the input it feeds. Binding it waits for a later
+# phase (Feature Suggestions); the core ``Primitive*`` nodes are ordinary.
+LEGACY_PRIMITIVE_CLASS = "PrimitiveNode"
+
+
 def provider_for(class_type: Any, input_name: Any):
     return OPTION_PROVIDERS.get((class_type, input_name))
 

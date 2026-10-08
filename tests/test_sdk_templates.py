@@ -89,7 +89,7 @@ def test_validation_reports_editor_defaults_and_binding_summary():
     assert result["editor_key"] == "1"
     assert result["editor_defaults"] == {"fps": 24.0, "width": 960, "height": 544}
     assert result["controls"] == [{"binding_id": "seed1", "label": "Seed", "kind": "SEED", "status": "ok",
-                                   "section": "workflow", "group": ""}]
+                                   "section": "workflow", "group": "", "origin": "authored"}]
     assert result["blocking"] == [] and result["warnings"] == []
 
 

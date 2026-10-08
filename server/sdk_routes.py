@@ -262,6 +262,11 @@ def register_sdk_routes(
     def _tab(request: web.Request) -> str:
         return request.headers.get(TAB_HEADER, "")
 
+    def _manage_query(request: web.Request) -> tuple[bool, str]:
+        """``?manage=1&filter=`` asks for Manage's candidates (only while it is open)."""
+        query = request.query.get("filter", "")[:control_descriptors.FILTER_MAX_CHARS]
+        return request.query.get("manage") == "1", query
+
     @routes.post("/sonder-editor/sdk/session/open")
     @handle
     async def api_sdk_open_session(request: web.Request) -> web.Response:
@@ -287,7 +292,8 @@ def register_sdk_routes(
     @handle
     async def api_sdk_controls(request: web.Request) -> web.Response:
         session = runner.session_for(request.match_info.get("session_id", ""), _secret(request))
-        snapshot = await runner.controls_view(session)
+        manage, query = _manage_query(request)
+        snapshot = await runner.controls_view(session, manage=manage, query=query)
         view = await asyncio.to_thread(control_descriptors.json_safe, snapshot["view"])
         return web.json_response({"ok": True, "view": view, "seq": snapshot["seq"]})
 
@@ -301,8 +307,10 @@ def register_sdk_routes(
             body = await asyncio.to_thread(json.loads, raw)
         except (ValueError, UnicodeError):
             body = None
+        manage, query = _manage_query(request)
         snapshot = await runner.change_controls(
-            session_id, _secret(request), _tab(request), body.get("changes") if isinstance(body, dict) else None)
+            session_id, _secret(request), _tab(request), body.get("changes") if isinstance(body, dict) else None,
+            manage=manage, query=query)
         view = await asyncio.to_thread(control_descriptors.json_safe, snapshot["view"])
         return web.json_response({"ok": True, "view": view, "seq": snapshot["seq"]})
 

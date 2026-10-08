@@ -119,7 +119,7 @@ def test_launcher_checks_stored_binding_values(tmp_path, monkeypatch):
     monkeypatch.setattr(cd, 'comfy_class_lookup', lambda name: loader(['installed.ckpt']))
     binding = {'binding_id': 'ckpt', 'kind': 'COMBO', 'status': 'ok', 'options': ['installed.ckpt'],
                'targets': [{'path': '3', 'input': 'ckpt_name', 'class_type': 'Loader', 'status': 'ok'}]}
-    monkeypatch.setattr(cd, 'describe_bindings', lambda p: {'relay': {'status': 'ok'}, 'bindings': [binding], 'notes': []})
+    monkeypatch.setattr(cd, 'describe_bindings', lambda p, **kw: {'relay': {'status': 'ok'}, 'bindings': [binding], 'notes': []})
     assert sdk_templates.list_templates(requirements=True)[0]['missing_models']
     assert sdk_templates.template_requirements(meta['template_id'])['missing_models']
     sig = {'class_type': 'Loader', 'input': 'ckpt_name', 'kind': 'COMBO'}

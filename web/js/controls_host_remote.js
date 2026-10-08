@@ -1,7 +1,7 @@
 // Standalone host adapters; callers own identity and connection lifecycle.
 const idle = () => ({ state: "idle", bindings: [], notes: [], error: null });
-// The Sonder App has no graph to add a Relay to; the workflow decides.
-const SDK_EMPTY = "This workflow exposes no Controls.";
+// The Sonder App has no graph to add a Relay to: Manage adds app-only Controls.
+const SDK_EMPTY = "This workflow exposes no Controls. Choose Manage to add some for this app.";
 const failure = (changes, reason) => ({
     ok: false,
     rejected: Object.keys(changes || {}).map(target => ({ target, reason })),
@@ -14,6 +14,8 @@ export function createSdkControlsHost(owner) {
         epoch = 0,
         seq = -1,
         read = null,
+        reread = false,
+        manage = { on: false, filter: "" },
         tail = Promise.resolve();
     const listeners = new Set();
     const emit = () => {
@@ -26,8 +28,12 @@ export function createSdkControlsHost(owner) {
             emit();
         }
     };
+    // Manage's candidates are fetched only while it is open (amendment A1).
+    const controlsPath = () =>
+        owner._sessionPath("controls") +
+        (manage.on ? `?manage=1&filter=${encodeURIComponent(manage.filter)}` : "");
     const request = async (method, changes) => {
-        const response = await owner._fetch(owner._sessionPath("controls"), {
+        const response = await owner._fetch(controlsPath(), {
             method,
             headers: owner.headers(method !== "GET"),
             ...(changes ? { body: JSON.stringify({ changes }) } : {}),
@@ -39,7 +45,10 @@ export function createSdkControlsHost(owner) {
     };
     async function refresh() {
         if (destroyed || !visible) return view;
-        if (read) return read;
+        if (read) {
+            reread = true; // a Manage change during a read needs a fresh one
+            return read;
+        }
         const stamp = epoch;
         read = (async () => {
             try {
@@ -63,11 +72,24 @@ export function createSdkControlsHost(owner) {
             return await read;
         } finally {
             read = null;
+            if (reread && !destroyed) {
+                reread = false;
+                void refresh();
+            }
         }
     }
     return {
         getView: () => view,
         emptyMessage: SDK_EMPTY,
+        // Sonder App curation (A1): hide the workflow's own items, remove only app-only ones.
+        capabilities: { hide: true, removeAuthored: false },
+        setManage(on, filter = "") {
+            const next = { on: !!on, filter: String(filter || "").slice(0, 120) };
+            if (next.on === manage.on && next.filter === manage.filter) return;
+            manage = next;
+            epoch++;
+            if (visible) void refresh();
+        },
         subscribe(cb) {
             listeners.add(cb);
             return () => listeners.delete(cb);
@@ -123,6 +145,7 @@ export function createMountedControlsHost({
 }) {
     let view = idle(),
         visible = false,
+        manage = { on: false, filter: "" },
         destroyed = false,
         seq = -1,
         hostSession = "",
@@ -163,7 +186,12 @@ export function createMountedControlsHost({
                 const receipts = [...seen].slice(0, 128),
                     sentVisible = visible;
                 try {
-                    const result = await mutation("controls_visibility", { visible: sentVisible, seen: receipts });
+                    const result = await mutation("controls_visibility", {
+                        visible: sentVisible,
+                        seen: receipts,
+                        manage: manage.on,
+                        filter: manage.filter,
+                    });
                     if (!result.ok) {
                         reportRequested = true;
                         break;
@@ -250,6 +278,14 @@ export function createMountedControlsHost({
             visible = !!value;
             void report();
             if (visible) void refresh(true);
+        },
+        // The canvas lists candidates, filtered, while Manage is open here.
+        capabilities: { hide: false, removeAuthored: true },
+        setManage(on, filter = "") {
+            const next = { on: !!on, filter: String(filter || "").slice(0, 120) };
+            if (next.on === manage.on && next.filter === manage.filter) return;
+            manage = next;
+            void report();
         },
         refresh,
         presence(payload = {}) {

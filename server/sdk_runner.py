@@ -49,6 +49,10 @@ from . import control_descriptors, launcher_state, sdk_proxy, sdk_progress, sdk_
 from .editor_inputs import clean_editor_value, clean_editor_values, editor_optional_inputs
 from .sdk_install import install_state, uninstall_running
 
+# Manage's structural targets (``binding:<id>:expose`` ...); a batch naming one
+# needs the template's candidate inventory to validate.
+STRUCTURAL_OPS = frozenset({"expose", "remove", "rebind", "hide", "unhide", "create"})
+
 logger = logging.getLogger("sonder_editor")
 
 async def await_template_io(func, *args, **kwargs):
@@ -299,8 +303,9 @@ class SdkRunner:
         get_owner: Callable[..., Any] = session_registry.get_owner,
         sdk_ready: Callable[[], bool] = lambda: bool(install_state()["sdk"]["supported"]),
         uninstalling: Callable[[], bool] = uninstall_running,
-        describe: Callable[[dict], dict] | None = None,
+        describe: Callable[..., dict] | None = None,
         clock: Callable[[], float] = time.time,
+        class_lookup: Callable[[str], Any] | None = None,
     ) -> None:
         self._resolve_project = resolve_project
         self._client_factory = client_factory
@@ -312,6 +317,7 @@ class SdkRunner:
         self._uninstalling = uninstalling
         self._generating = 0  # Generates between their gate and their submit
         self._describe = describe or control_descriptors.describe_bindings
+        self._class_lookup = class_lookup
         self._clock = clock
         self._sessions: dict[str, SdkSession] = {}
         self._runs_by_token: dict[str, SdkRun] = {}
@@ -493,32 +499,49 @@ class SdkRunner:
     def status(self, session: SdkSession) -> dict:
         return {"ok": True, **session.public(self.template_name(session))}
 
-    def _controls_snapshot(self, session: SdkSession) -> dict:
+    def _controls_snapshot(self, session: SdkSession, manage: bool = False, query: str = "") -> dict:
         with sdk_templates.template_lock(session.template_id):
             prompt, _ = sdk_templates.load_template(session.template_id)
             stored = sdk_templates.read_control_values(session.template_id)
-            view = sdk_templates.apply_stored_values(prompt, self._describe(prompt), stored, describe=self._describe)
+            view = sdk_templates.apply_stored_values(
+                prompt, sdk_templates.describe_stored(prompt, stored, self._describe), stored, describe=self._describe)
             # ``prompt`` now carries the stored values: changes are validated
             # against it, so a new choice list and a choice in it agree.
-            return {"view": view, "seq": stored["seq"], "prompt": prompt}
+            snapshot = {"view": view, "seq": stored["seq"], "prompt": prompt}
+            if manage:
+                # Amendment A1: root-level literal inputs only, never greyed out.
+                listed, truncated = control_descriptors.manage_candidates(
+                    self._inventory(prompt), view, query=query)
+                view.update(candidates=listed, candidates_truncated=truncated)
+            return snapshot
 
-    async def controls_view(self, session: SdkSession) -> dict:
+    def _inventory(self, prompt: dict) -> list:
+        return control_descriptors.candidate_inventory(
+            prompt, control_descriptors.sdk_candidates(prompt), class_lookup=self._class_lookup)
+
+    async def controls_view(self, session: SdkSession, *, manage: bool = False, query: str = "") -> dict:
         async with self.template_lock(session.template_id):
-            return await asyncio.to_thread(self._controls_snapshot, session)
+            return await asyncio.to_thread(self._controls_snapshot, session, manage, query)
 
-    async def change_controls(self, session_id: str, secret: str, tab_session_id: str, changes: Any) -> dict:
+    async def change_controls(self, session_id: str, secret: str, tab_session_id: str, changes: Any, *,
+                              manage: bool = False, query: str = "") -> dict:
         session = await self.authorized(session_id, secret, tab_session_id)
         async with self.template_lock(session.template_id):
             # Ownership may change while waiting behind a Generate batch.
             await self.authorized(session_id, secret, tab_session_id)
             snapshot = await asyncio.to_thread(self._controls_snapshot, session)
+            structural = isinstance(changes, dict) and any(
+                isinstance(t, str) and t.rsplit(":", 1)[-1] in STRUCTURAL_OPS for t in changes)
+            inventory = await asyncio.to_thread(self._inventory, snapshot["prompt"]) if structural else None
             cleaned, rejected = await asyncio.to_thread(
-                control_descriptors.validate_binding_changes, snapshot["view"], changes, prompt=snapshot["prompt"])
+                control_descriptors.validate_binding_changes, snapshot["view"], changes, prompt=snapshot["prompt"],
+                structural="sdk", inventory=inventory)
             if rejected:
                 raise SdkError("Some changes could not be saved.", "invalid_change", 400, rejected=rejected)
             await self.authorized(session_id, secret, tab_session_id)
-            await await_template_io(sdk_templates.store_binding_changes, session.template_id, cleaned, snapshot["view"])
-            return await asyncio.to_thread(self._controls_snapshot, session)
+            await await_template_io(sdk_templates.store_binding_changes, session.template_id, cleaned,
+                                    snapshot["view"], snapshot["prompt"])
+            return await asyncio.to_thread(self._controls_snapshot, session, manage, query)
 
     # ── Generate ─────────────────────────────────────────────────────────────
 
@@ -637,12 +660,16 @@ class SdkRunner:
         editor_inputs.update(values)
         editor_inputs["project"] = session.project
         editor_inputs["render_cache_max_bytes"] = render_cache_max_bytes
-        view = sdk_templates.apply_stored_values(prompt, self._describe(prompt), stored, describe=self._describe)
+        view = sdk_templates.apply_stored_values(
+            prompt, sdk_templates.describe_stored(prompt, stored, self._describe), stored, describe=self._describe)
         # Seeds are keyed by binding; each target (one per consumer of a
-        # promoted seed) is only the address a run writes.
+        # promoted seed) is only the address a run writes. A hidden seed is
+        # not exposed: the workflow's own value runs and nothing advances.
         seed_bindings = []
         for binding in view.get("bindings", []):
             if binding.get("kind") != "SEED" or binding.get("status") != control_descriptors.STATUS_OK:
+                continue
+            if binding.get("hidden"):
                 continue
             seed = binding.get("value")
             if isinstance(seed, bool) or not isinstance(seed, int):

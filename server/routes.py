@@ -240,10 +240,31 @@ def _describe_controls_body(raw: bytes) -> dict:
     census = body.get("relay_census")
     if census is not None and not isinstance(census, dict):
         raise _ControlsRequestError("The Relay census must be an object.")
-    view = control_descriptors.describe_bindings(prompt, relay_census=census)
+    # Manage's candidates come from the live graph (root widgets and promoted
+    # subgraph inputs, already filtered by the canvas); the server checks them.
+    inventory = None
+    if body.get("candidates") is not None:
+        try:
+            candidates = control_descriptors.clean_candidates(body["candidates"])
+        except control_descriptors.ControlValueError as exc:
+            raise _ControlsRequestError(str(exc)) from None
+        inventory = control_descriptors.candidate_inventory(prompt, candidates)
+    try:
+        view = control_descriptors.describe_bindings(prompt, relay_census=census,
+                                                    orphan_manifest=body.get("orphan_manifest"))
+    except control_descriptors.control_manifest.ManifestError as exc:
+        raise _ControlsRequestError(str(exc)) from None
+    if body.get("manage") is True:
+        view["candidate_labels"] = [{"path": str(path), "input": f.field, "label": f.label}
+                                    for path, node in prompt.items() if isinstance(node, dict)
+                                    for f in control_descriptors.FIELD_CONTROLS
+                                    if node.get("class_type") == f.class_type]
+        listed, truncated = control_descriptors.manage_candidates(inventory or [], view)
+        view.update(candidates=listed, candidates_truncated=truncated or body.get("candidates_truncated") is True)
     # Validation uses the full view, before json_safe caps display-only previews.
     if "changes" in body:
-        cleaned, rejected = control_descriptors.validate_binding_changes(view, body["changes"], prompt=prompt)
+        cleaned, rejected = control_descriptors.validate_binding_changes(
+            view, body["changes"], prompt=prompt, structural="canvas", inventory=inventory or [])
         view.update(ok=not bool(rejected), changes={} if rejected else cleaned, rejected=rejected)
     return control_descriptors.json_safe(view)
 
@@ -11510,7 +11531,8 @@ if routes is not None:
             return _json_error(str(exc), 404)
         body = await _control_relay_body(request)
         payload = await set_controls_visibility(project_id, str(body.get("host_id") or ""),
-                                               str(body.get("session_id") or ""), body.get("visible"), body.get("seen"))
+                                               str(body.get("session_id") or ""), body.get("visible"), body.get("seen"),
+                                               body.get("manage"), body.get("filter"))
         return await _control_relay_response(payload)
 
     @routes.get("/sonder-editor/project/{project_id}/widget_state")
