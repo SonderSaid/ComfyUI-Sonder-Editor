@@ -45,7 +45,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from . import control_descriptors, launcher_state, sdk_proxy, sdk_progress, sdk_runs, sdk_templates, session_registry
+from . import control_descriptors, controls_snapshot, launcher_state, sdk_proxy, sdk_progress, sdk_runs, sdk_templates, session_registry
 from .editor_inputs import clean_editor_value, clean_editor_values, editor_optional_inputs
 from .sdk_install import install_state, uninstall_running
 
@@ -684,7 +684,10 @@ class SdkRunner:
                 "max": binding.get("max", SEED_MAX),
                 "step": binding.get("step") or 1,
             })
-        return {"prompt": prompt, "editor_key": editors[0], "view": view, "seed_bindings": seed_bindings, "stale": stale}
+        return {"prompt": prompt, "editor_key": editors[0], "view": view, "seed_bindings": seed_bindings, "stale": stale,
+                # What this app's curation changes about the workflow's Controls,
+                # for the provenance each saved take records (controls_snapshot).
+                "controls_delta": controls_snapshot.sdk_overlay_delta(view, prompt)}
 
     async def _submit_runs(self, session: SdkSession, client, build: dict, count: int, epoch: int) -> dict:
         labels = {str(key): control_descriptors._node_title(node, str(node.get("class_type") or ""))
@@ -767,6 +770,18 @@ class SdkRunner:
         for binding in build["seed_bindings"]:
             for path, name in binding["targets"]:
                 graph[path]["inputs"][name] = seeds[binding["binding_id"]]
+        # ComfyUI reads only ``_meta.title``, so this never affects caching. A
+        # delta already in the template (one built from a take's prompt) is
+        # dropped: provenance must describe this app's curation only.
+        editor = graph[build["editor_key"]]
+        meta = editor.get("_meta")
+        if isinstance(meta, dict):
+            meta.pop(controls_snapshot.SDK_META_KEY, None)
+        delta = build.get("controls_delta")
+        if delta:
+            if not isinstance(meta, dict):
+                meta = editor["_meta"] = {}
+            meta[controls_snapshot.SDK_META_KEY] = copy.deepcopy(delta)
         return graph
 
     async def _advance_seeds(self, session: SdkSession, seed_bindings: list) -> None:

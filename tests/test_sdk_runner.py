@@ -898,3 +898,25 @@ def test_progress_metadata_cannot_prevent_generate(world, meta):
         assert result["run_ids"]
         assert session.runs[0].node_labels["5"] == "KSampler"
     asyncio.run(go())
+
+
+def test_generate_stamps_the_apps_controls_delta_for_provenance(world):
+    # An app-only seed with the app's own mode, and an authored binding hidden here.
+    world.bindings = [seed_binding(origin="local"),
+                      {"binding_id": "steps001", "label": "Steps", "kind": "INT", "status": "ok", "error": None,
+                       "value": 1, "targets": [{"path": "5", "input": "steps", "class_type": "KSampler",
+                                                "status": "ok"}]}]
+    sdk_templates.update_control_values(world.template_id, lambda d: (
+        d["bindings"].update({"abcd1234": stored_seed(seed_mode="fixed")}),
+        d["hidden"].update({"binding:steps001": True})))
+
+    async def go():
+        session = await world.open()
+        await world.runner.generate(session, tab_session_id="tab-1", count=2)
+
+    asyncio.run(go())
+    for graph in world.client.submitted:
+        delta = graph["1"]["_meta"]["sonder_controls"]
+        assert delta["hidden"] == ["steps001"]
+        assert delta["seed_modes"] == {"abcd1234": "fixed"}
+        assert delta["local"]["abcd1234"]["targets"] == [{"path": "5", "input": "seed", "class_type": "KSampler"}]

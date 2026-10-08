@@ -94,6 +94,52 @@ def upstream_reaches(prompt: Any, source_id: Any, target_id: Any) -> bool:
     return False
 
 
+def upstream_set(prompt: Any, sources: Any) -> set[str]:
+    """Prompt keys reachable upstream from any of ``sources``, the sources included.
+
+    One walk answers ``upstream_reaches`` for many targets at once. A source
+    absent from the prompt contributes nothing.
+    """
+    if not isinstance(prompt, dict):
+        return set()
+    stack = [str(key) for key in sources or () if str(key) in prompt]
+    seen: set[str] = set()
+    while stack:
+        current_id = stack.pop()
+        if current_id in seen:
+            continue
+        seen.add(current_id)
+        for upstream in node_inputs(prompt, current_id).values():
+            upstream_id = linked_node_id(upstream)
+            if upstream_id and upstream_id not in seen:
+                stack.append(upstream_id)
+    return seen
+
+
+def downstream_set(prompt: Any, source_id: Any) -> set[str]:
+    """Prompt keys that take any input, directly or through other nodes, from ``source_id``.
+
+    The source itself is excluded. One pass builds the reverse links.
+    """
+    if not isinstance(prompt, dict) or source_id in {None, ""}:
+        return set()
+    consumers: dict[str, list[str]] = {}
+    for key in prompt:
+        for value in node_inputs(prompt, key).values():
+            upstream = linked_node_id(value)
+            if upstream is not None:
+                consumers.setdefault(upstream, []).append(str(key))
+    source = str(source_id)
+    stack, seen = list(consumers.get(source, ())), set()
+    while stack:
+        current = stack.pop()
+        if current in seen or current == source:
+            continue
+        seen.add(current)
+        stack.extend(consumers.get(current, ()))
+    return seen
+
+
 def resolve_literal(prompt: Any, value: Any) -> Any:
     """Read an input as the literal it will carry at execution.
 

@@ -22,6 +22,7 @@ import {
     subscribeThumbnailRepairs,
 } from "./thumbnail_repair_manager.js";
 import {
+    controlsSuppliedLookup,
     renderTrackedSectionBody,
     trackedFieldMatchForEntry,
     TRACKED_RENDERERS,
@@ -3755,7 +3756,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     function trackedRenderContext(surface) {
-        return {
+        const ctx = {
             style,
             CHROME,
             formatGenerationValue,
@@ -3771,7 +3772,18 @@ export function mountSharedAssetGallery(container, options = {}) {
             // Same rule as attachCopyToElement: hover shows Copy only in Compare.
             copyOnHover: () => compareModeActive(),
             onFieldCopy: (copy) => { if (copy.kind !== "unavailable") copyToClipboardSafe(copy.text); },
+            // A grid of the gallery's own field cells for a subset of keys, so a
+            // structured renderer keeps pins, filters and Copy (Controls at run).
+            renderFieldGrid: (entry, keys, decorate) => renderGenericTrackedFields(
+                entry, ctx, surface, null, { includeKeys: keys, decorate }),
         };
+        return ctx;
+    }
+
+    function withControlsLookup(ctx, entries) {
+        const lookup = controlsSuppliedLookup(entries);
+        ctx.controlSupplied = lookup.supplied;
+        return ctx;
     }
 
     function trackedSectionPinKey(entry) {
@@ -3848,7 +3860,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         }
         wrap.appendChild(headerRow);
 
-        const ctx = trackedRenderContext(surface);
+        const ctx = withControlsLookup(trackedRenderContext(surface), entries);
         // #16: pinned fields lift to a "Pinned Fields" group at the very top of
         // the inspector (above any pinned sections). They also stay in their
         // natural section with a glyph (see renderGenericTrackedFields below),
@@ -3884,7 +3896,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         }
         if (!pinnedByEntry.length) return null;
 
-        const ctx = trackedRenderContext(surface);
+        const ctx = withControlsLookup(trackedRenderContext(surface), entries);
 
         const section = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;padding:8px;border-radius:8px;background:rgba(143,192,240,0.06);border:1px solid rgba(143,192,240,0.32);`);
         const titleBar = style(document.createElement("div"), `color:#dce8f2;font-size:11px;font-weight:700;text-transform:uppercase;display:flex;align-items:center;gap:6px;min-width:0;`);
@@ -3910,7 +3922,9 @@ export function mountSharedAssetGallery(container, options = {}) {
             if (bodyResult) {
                 if (typeof bodyResult === "object" && "dom" in bodyResult) {
                     structuredDom = bodyResult.dom;
-                    consumedFields = new Set((Array.isArray(bodyResult.consumedFields) ? bodyResult.consumedFields : []).map(String));
+                    // A renderer drawn from generic cells lifts a pinned field as a cell.
+                    consumedFields = new Set((Array.isArray(bodyResult.consumedFields) && !bodyResult.pinnedFieldsGeneric
+                        ? bodyResult.consumedFields : []).map(String));
                 } else {
                     structuredDom = bodyResult;
                     consumedFields = new Set(Object.keys(entry?.fields || {}).map(String));
@@ -4034,10 +4048,14 @@ export function mountSharedAssetGallery(container, options = {}) {
         return wrap;
     }
 
-    function renderGenericTrackedFields(entry, ctx, surface, excludeKeys = null) {
+    function renderGenericTrackedFields(entry, ctx, surface, excludeKeys = null, options = {}) {
         const fields = entry?.fields && typeof entry.fields === "object" ? entry.fields : {};
         const exclude = new Set((excludeKeys || []).map((key) => String(key)));
-        const fieldEntries = Object.entries(fields).filter(([key]) => !exclude.has(String(key)));
+        const include = Array.isArray(options.includeKeys) ? options.includeKeys.map(String) : null;
+        const fieldEntries = (include
+            ? include.filter((key) => Object.prototype.hasOwnProperty.call(fields, key)).map((key) => [key, fields[key]])
+            : Object.entries(fields))
+            .filter(([key]) => !exclude.has(String(key)));
         if (!fieldEntries.length) return null;
         // #16: pinned field rows float to the top of the section's grid in their
         // existing natural order; unpinned rows follow. Section bubble is handled
@@ -4072,6 +4090,14 @@ export function mountSharedAssetGallery(container, options = {}) {
                 }
                 cell.title = "Pinned to top — right-click to unpin";
             }
+            const supplied = ctx?.controlSupplied?.(entry, key);
+            if (supplied && cell.firstChild) {
+                const chip = style(document.createElement("span"), `margin-left:6px;padding:0 4px;border-radius:3px;border:1px solid rgba(143,192,240,0.4);color:#8fc0f0;font-size:9px;`);
+                chip.textContent = "Control";
+                chip.title = `Set by the Control “${supplied.label}”`;
+                cell.firstChild.appendChild(chip);
+            }
+            if (typeof options.decorate === "function") options.decorate(cell, String(key));
             cell.addEventListener("click", (event) => handleTrackedFieldClick(event, cellInfo, surface));
             grid.appendChild(cell);
         }

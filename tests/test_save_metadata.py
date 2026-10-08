@@ -338,3 +338,136 @@ def test_png_sequence_runs_prediction_gated_frame_check_before_return(tmp_path, 
         1,
         "save_video_tensor",
     )]
+
+
+# ── Controls at run (Phase 3C) ───────────────────────────────────────────────
+
+class _FakeSampler:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "seed": ("INT", {"min": 0, "max": 0xFFFFFFFFFFFFFFFF, "control_after_generate": True}),
+            "steps": ("INT", {"min": 1, "max": 100}),
+        }}
+
+
+def _controls_prompt(consumer="S", consumer_class="SonderSaveVideo"):
+    manifest = {"v": 1, "bindings": {
+        "seedB": {"label": "Seed", "status": "ok", "seed_mode": "increment", "targets": [{"path": "K", "input": "seed"}]},
+        "stepsB": {"label": "Steps", "status": "ok", "targets": [{"path": "K", "input": "steps"}]},
+    }}
+    return {
+        "C": {"class_type": "SonderMetadataCollector", "inputs": {}},
+        "K": {"class_type": "FakeSampler", "inputs": {"seed": 2 ** 60 + 1, "steps": 12}},
+        "D": {"class_type": "VAEDecode", "inputs": {"samples": ["K", 0]}},
+        consumer: {"class_type": consumer_class, "inputs": {"project": ["C", 0], "images": ["D", 0]}},
+        "R": {"class_type": "SonderControlRelay", "inputs": {"manifest": json.dumps(manifest)}},
+    }
+
+
+def _fake_classes(monkeypatch):
+    descriptors = importlib.import_module(f"{TEST_PACKAGE}.server.control_descriptors")
+    monkeypatch.setattr(descriptors, "_comfy_class_lookup", {"FakeSampler": _FakeSampler}.get)
+
+
+def _controls_section(tracked):
+    sections = [section for section in tracked if section.get("display_type") == "controls"]
+    assert len(sections) == 1
+    return sections[0]
+
+
+def test_save_video_records_controls_at_run(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    _fake_classes(monkeypatch)
+    torch = importlib.import_module("torch")
+    _patch_save_deps(io_nodes, monkeypatch, [])
+    project = _project(tmp_path)
+    context = {io_nodes.TRACKED_METADATA_CONTEXT_KEY: {"C": [
+        {"label": "Sampler", "source_node_id": "K", "display_type": None, "fields": {"steps": 12}}]}}
+    project._execution_context = context
+    before = json.dumps(context, sort_keys=True)
+
+    io_nodes.SonderSaveVideo().save_video(project, torch.zeros(1, 2, 2, 3), embed_metadata=False,
+                                         prompt=_controls_prompt(), unique_id="S")
+
+    tracked = project.assets[0].generation_params["editor_export"]["tracked_metadata"]
+    assert tracked[0]["label"] == "Sampler"
+    section = _controls_section(tracked)
+    assert section["fields"] == {"Seed": str(2 ** 60 + 1), "Steps": "12"}
+    assert section["supplied"] == [{"section_index": 0, "field": "steps", "binding_id": "stepsB"}]
+    # Nothing new enters the execution context or its public copy.
+    assert json.dumps(context, sort_keys=True) == before
+    assert "controls" not in json.dumps(io_nodes._public_execution_context(context))
+
+
+def test_save_video_without_a_relay_records_no_controls(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    _fake_classes(monkeypatch)
+    torch = importlib.import_module("torch")
+    _patch_save_deps(io_nodes, monkeypatch, [])
+    project = _project(tmp_path)
+    prompt = _controls_prompt()
+    del prompt["R"]
+
+    io_nodes.SonderSaveVideo().save_video(project, torch.zeros(1, 2, 2, 3), embed_metadata=False,
+                                         prompt=prompt, unique_id="S")
+
+    assert project.assets[0].generation_params["editor_export"]["tracked_metadata"] == []
+
+
+def test_a_failing_snapshot_never_fails_the_save(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+    _patch_save_deps(io_nodes, monkeypatch, [])
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("describe failed")
+
+    monkeypatch.setattr(io_nodes, "controls_snapshot", boom)
+    project = _project(tmp_path)
+    io_nodes.SonderSaveVideo().save_video(project, torch.zeros(1, 2, 2, 3), embed_metadata=False,
+                                         prompt=_controls_prompt(), unique_id="S")
+    assert project.assets[0].generation_params["editor_export"]["tracked_metadata"] == []
+
+
+def test_take_copies_and_png_sequence_carry_controls(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    _fake_classes(monkeypatch)
+    torch = importlib.import_module("torch")
+    _patch_save_deps(io_nodes, monkeypatch, [])
+    project = _project(tmp_path, with_scene=True)
+    project._execution_context = {"scene_id": "scene-1", "scene_name": "Scene 1", "selection_start": 0, "selection_end": 1}
+
+    io_nodes.SonderSaveVideo().save_video(project, torch.zeros(1, 2, 2, 3), mode="Take", embed_metadata=False,
+                                         prompt=_controls_prompt(), unique_id="S")
+
+    clip = project.scenes[0].clips[0]
+    for params in (project.assets[0].generation_params, clip.generation_params, clip.take_metadata):
+        assert _controls_section(params["editor_export"]["tracked_metadata"])["fields"]["Steps"] == "12"
+
+    sequence = _project(tmp_path / "seq")
+    io_nodes.SonderSaveVideo().save_video(
+        sequence, torch.zeros(2, 2, 2, 3), embed_metadata=False,
+        save_preset=io_nodes.CUSTOM_SAVE_VIDEO_PRESET, custom_output_kind=io_nodes.CUSTOM_OUTPUT_KIND_PNG_SEQUENCE,
+        prompt=_controls_prompt(), unique_id="S")
+    assert len(sequence.assets) == 2
+    for asset in sequence.assets:
+        assert _controls_section(asset.generation_params["editor_export"]["tracked_metadata"])["fields"]["Seed"]
+
+
+def test_save_bridge_controls_follow_its_consumers(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    _fake_classes(monkeypatch)
+    _clear_bridge_state(io_nodes)
+    project = _project(tmp_path)
+    project._execution_context = {"scene_id": "scene-1", "scene_name": "Scene 1"}
+    prompt = _controls_prompt(consumer="B", consumer_class="SonderSaveBridge")
+    # The generation branch reaches a native save wired from the Bridge, not the Bridge.
+    prompt["B"]["inputs"] = {"project": ["C", 0]}
+    prompt["I"] = {"class_type": "SaveImage", "inputs": {"images": ["D", 0], "filename_prefix": ["B", 1]}}
+
+    io_nodes.SonderSaveBridge().prepare_output(project, prompt=prompt, unique_id="B")
+    entry = next(value for key, value in io_nodes._BRIDGE_REGISTRY.items() if key[1] == "B")
+    section = _controls_section(entry["generation_params"]["editor_export"]["tracked_metadata"])
+    assert section["fields"] == {"Seed": str(2 ** 60 + 1), "Steps": "12"}
+    _clear_bridge_state(io_nodes)

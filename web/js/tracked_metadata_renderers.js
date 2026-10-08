@@ -297,3 +297,116 @@ function renderSubgraphBody(entry, ctx) {
 registerTrackedRenderer("subgraph", {
     render: renderSubgraphBody,
 });
+
+// ---------- Controls at run (server/controls_snapshot.py) ----------
+//
+// One section per asset: the Controls in effect for its run, keyed in `fields` by
+// label so search, pins and Copy treat it like any collector section. `controls`
+// carries the detail (group, seed mode, binding id) and `supplied` names the
+// generic collector fields a Control set: those stay in their own section and
+// carry a Control chip (maintainer choice at the Phase 3C gate, 2026-10-08).
+
+function controlsOf(entry) {
+    return Array.isArray(entry?.controls)
+        ? entry.controls.filter((control) => control && typeof control === "object"
+            && typeof control.field === "string")
+        : [];
+}
+
+// Map<collector entry, Map<field, {binding_id, label}>>. Indices refer to the
+// stored tracked_metadata list; an index whose section no longer names the
+// target is ignored.
+export function controlsSuppliedLookup(entries) {
+    const list = Array.isArray(entries) ? entries : [];
+    const byEntry = new Map();
+    for (const controlsEntry of list) {
+        if (controlsEntry?.display_type !== "controls" || !Array.isArray(controlsEntry.supplied)) continue;
+        const byId = new Map(controlsOf(controlsEntry).map((control) => [control.binding_id, control]));
+        for (const item of controlsEntry.supplied) {
+            const target = list[item?.section_index];
+            const control = byId.get(item?.binding_id);
+            if (!target || target === controlsEntry || target.display_type || !control) continue;
+            const field = String(item.field ?? "");
+            const fields = target.fields && typeof target.fields === "object" ? target.fields : {};
+            if (!Object.prototype.hasOwnProperty.call(fields, field)) continue;
+            if (!control.targets?.some?.((t) => t?.path === target.source_node_id && t?.input === field)) continue;
+            if (!byEntry.has(target)) byEntry.set(target, new Map());
+            byEntry.get(target).set(field, {
+                binding_id: control.binding_id,
+                label: String(control.label || control.field),
+            });
+        }
+    }
+    return {
+        supplied: (entry, field) => byEntry.get(entry)?.get(String(field)) || null,
+    };
+}
+
+const SEED_MODE_TEXT = {
+    fixed: "fixed",
+    increment: "increment",
+    decrement: "decrement",
+    randomize: "randomize",
+};
+
+function renderControlsBody(entry, ctx) {
+    const { style, CHROME } = ctx;
+    const controls = controlsOf(entry);
+    const wrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;min-width:0;`);
+    const help = style(document.createElement("div"), `color:${CHROME.textDim};font-size:10px;line-height:1.4;`);
+    const truncated = Number.isSafeInteger(entry?.truncated) && entry.truncated > 0 ? entry.truncated : 0;
+    help.textContent = "The Controls' values when this run started. A Control on a connected branch "
+        + "that was switched off during the run is still listed."
+        + (truncated ? ` ${truncated} more Control${truncated === 1 ? " was" : "s were"} not recorded.` : "");
+    wrap.appendChild(help);
+    if (!controls.length || typeof ctx.renderFieldGrid !== "function") {
+        return { dom: wrap, consumedFields: [] };
+    }
+    const groups = [];
+    const bySection = new Map();
+    for (const control of controls) {
+        const section = control.section === "editor" ? "Editor" : "";
+        const group = String(control.group || "");
+        const name = section && group ? `${section} › ${group}` : (section || group);
+        if (!bySection.has(name)) {
+            bySection.set(name, []);
+            groups.push(name);
+        }
+        bySection.get(name).push(control);
+    }
+    for (const name of groups) {
+        if (name) {
+            const heading = style(document.createElement("div"), `color:#8fa4b6;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;margin-top:2px;`);
+            heading.textContent = name;
+            wrap.appendChild(heading);
+        }
+        const members = bySection.get(name);
+        const byField = new Map(members.map((control) => [control.field, control]));
+        const grid = ctx.renderFieldGrid(entry, members.map((control) => control.field), (cell, field) => {
+            const control = byField.get(field);
+            if (!control) return;
+            const parts = [`Control ${control.binding_id || ""}`.trim()];
+            if (control.origin === "local") parts.push("App only");
+            const mode = SEED_MODE_TEXT[control.seed_mode];
+            if (mode) parts.push(`seed ${mode}`);
+            cell.title = [cell.title, parts.join(" · ")].filter(Boolean).join("\n");
+            const titleEl = cell.firstChild;
+            if (titleEl && mode) {
+                const note = style(document.createElement("span"), `color:#8fa4b6;margin-left:6px;`);
+                note.textContent = `· ${mode}`;
+                titleEl.appendChild(note);
+            }
+        });
+        if (grid) wrap.appendChild(grid);
+    }
+    // Every field is drawn above through the gallery's own cells, so pins,
+    // filters and Copy behave as in any section; a pinned field lifts as a cell.
+    const fields = entry?.fields && typeof entry.fields === "object" ? entry.fields : {};
+    const consumed = controls.map((control) => control.field)
+        .filter((field) => Object.prototype.hasOwnProperty.call(fields, field));
+    return { dom: wrap, consumedFields: consumed, pinnedFieldsGeneric: true };
+}
+
+registerTrackedRenderer("controls", {
+    render: renderControlsBody,
+});

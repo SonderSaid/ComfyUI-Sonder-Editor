@@ -2,6 +2,9 @@
 // search/filter authority; these optional sources only supply complete clipboard text.
 
 export const TRUNCATED_MARKER = "... [truncated, full in raw_widget_text]";
+// Controls at run (server/controls_snapshot.py) caps long text values. The full
+// value exists only in the run's source prompt, never in this section.
+export const CONTROLS_TRUNCATED_MARKER = "… [truncated, full value in the source prompt]";
 
 const hasOwn = (value, key) => !!value && Object.prototype.hasOwnProperty.call(value, key);
 const full = (text, label = "Copy value") => ({ kind: "value", label, text });
@@ -77,6 +80,12 @@ function rawSpanText(entry, key) {
 export function resolveTrackedFieldCopy(entry, fieldKey) {
     const key = String(fieldKey);
     const preview = entry?.fields?.[key];
+    if (entry?.display_type === "controls") {
+        if (preview == null) return unavailable();
+        return typeof preview === "string" && preview.endsWith(CONTROLS_TRUNCATED_MARKER)
+            ? { kind: "unavailable", label: "Full value is only in the run's source prompt", text: "" }
+            : full(copyTextForValue(preview));
+    }
     if (hasOwn(entry?.full_fields, key) && entry.full_fields[key] !== undefined) {
         return full(copyTextForValue(entry.full_fields[key]));
     }

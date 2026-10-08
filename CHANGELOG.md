@@ -12,6 +12,7 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Added
+- Assets: a take, video, PNG sequence or Save Bridge file made from a workflow with Controls records the values its run used. They show as **Controls at run** in the asset details, with labels, groups and seed modes, and `tracked:` and `field:` search finds them.
 - Manage Controls in fullscreen, mounted tabs and the Sonder App: expose, restore, rebind, rename and annotate settings, with editable Relay rows on the canvas and app-only curation in the Sonder App.
 - Projects carry a stamp of the Sonder Editor version that saved them (this version onward), so a later version can name the update a newer project needs.
 - Arrange Controls and their notes by dragging between sections, and filter long option lists with an exact-value choice for capped previews.

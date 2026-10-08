@@ -45,6 +45,8 @@ from ..server.project_commit import (
     snapshot_item_ids,
 )
 from .metadata_collector import TRACKED_METADATA_CONTEXT_KEY, collector_chain_for_consumer
+from ..server.controls_snapshot import controls_snapshot
+from ..server.prompt_graph import downstream_set
 from ..server.color_correction import (
     COLOR_DRIFT_METADATA_KEY,
     fit_drift_correction,
@@ -193,9 +195,23 @@ def _produced_by_metadata() -> dict:
     }
 
 
-def _tracked_metadata_from_context(context: dict, prompt=None, consumer_unique_id=None) -> list:
+def _tracked_metadata_from_context(context: dict, prompt=None, consumer_unique_id=None, controls_consumers=None) -> list:
     chain = collector_chain_for_consumer(context, prompt, consumer_unique_id)
-    return [_json_clone(item) for item in chain if isinstance(item, dict)]
+    tracked = [_json_clone(item) for item in chain if isinstance(item, dict)]
+    consumers = controls_consumers if controls_consumers is not None else (
+        [consumer_unique_id] if consumer_unique_id not in (None, "") else [])
+    if isinstance(prompt, dict) and consumers and not any(str(key) in prompt for key in consumers):
+        # A save created by node expansion has a UNIQUE_ID outside the submitted prompt.
+        logger.debug("Controls provenance skipped: consumer %s is not in the prompt", consumers[0])
+    try:
+        snapshot = controls_snapshot(prompt, consumers, tracked=tracked)
+    except Exception:
+        # Provenance must never fail a save.
+        logger.warning("Could not record the run's Controls in provenance", exc_info=True)
+        snapshot = None
+    if snapshot is not None:
+        tracked.append(snapshot)
+    return tracked
 
 
 def _workflow_from_extra_pnginfo(extra_pnginfo):
@@ -214,7 +230,7 @@ def _workflow_digest(workflow) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _compact_editor_export(project, context: dict, *, has_embedded_workflow=False, workflow=None, prompt=None, consumer_unique_id=None) -> dict:
+def _compact_editor_export(project, context: dict, *, has_embedded_workflow=False, workflow=None, prompt=None, consumer_unique_id=None, controls_consumers=None) -> dict:
     export = {
         "schema_version": EDITOR_EXPORT_SCHEMA_VERSION,
         # Additive fields stay at schema 1.0; bump only for shape-breaking changes.
@@ -223,7 +239,7 @@ def _compact_editor_export(project, context: dict, *, has_embedded_workflow=Fals
         "project_name": getattr(project, "name", ""),
         "scene_id": str(context.get("scene_id") or ""),
         "scene_name": str(context.get("scene_name") or ""),
-        "tracked_metadata": _tracked_metadata_from_context(context, prompt, consumer_unique_id),
+        "tracked_metadata": _tracked_metadata_from_context(context, prompt, consumer_unique_id, controls_consumers),
         "has_embedded_workflow": bool(has_embedded_workflow),
     }
     digest = _workflow_digest(workflow) if has_embedded_workflow else ""
@@ -301,6 +317,12 @@ def _record_guide_bleed_if_needed(check: dict, actual_frame_count: int, path: st
 
 
 def _bridge_generation_params(project, context: dict, prompt=None, consumer_unique_id=None) -> dict:
+    # The Bridge's generation branch feeds the external save nodes that take
+    # its outputs, directly or through other nodes, not the Bridge itself:
+    # Controls relevance starts from all of them. Files are registered without
+    # saying which save wrote them, so several saves give every file the union.
+    bridge_key = str(consumer_unique_id or "")
+    controls_consumers = [bridge_key, *sorted(downstream_set(prompt, bridge_key))] if bridge_key else []
     return {
         "scene_id": str((context or {}).get("scene_id") or ""),
         "scene_name": str((context or {}).get("scene_name") or ""),
@@ -311,6 +333,7 @@ def _bridge_generation_params(project, context: dict, prompt=None, consumer_uniq
             workflow=None,
             prompt=prompt,
             consumer_unique_id=consumer_unique_id,
+            controls_consumers=controls_consumers,
         ),
     }
 
