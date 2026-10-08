@@ -3,7 +3,7 @@
 An API prompt maps node ids to ``{"class_type", "inputs"}``; a linked input is an
 ``[upstream_node_id, output_slot]`` pair. These helpers answer which node an input
 links to, which nodes take their project from a given editor, and what literal a
-widget input carries when a Sonder Control or a core Primitive feeds it.
+widget input carries when a core Primitive feeds it.
 
 The module itself imports only the standard library, so it can be read without
 the editor node (torch, cv2). Importing it through the ``server`` package still
@@ -20,7 +20,6 @@ from typing import Any
 
 SONDER_SAVE_CLASS_TYPES = frozenset({"SonderSaveVideo", "SonderSaveBridge"})
 SONDER_EDITOR_CLASS_TYPE = "SonderEditor"
-SONDER_CONTROL_CLASS_TYPE = "SonderControl"
 # ComfyUI's core Primitive nodes hold their value in one ``value`` input.
 PRIMITIVE_CLASS_TYPES = frozenset({
     "PrimitiveBoolean",
@@ -99,9 +98,10 @@ def resolve_literal(prompt: Any, value: Any) -> Any:
     """Read an input as the literal it will carry at execution.
 
     A literal is returned as is. A link is followed only through sources whose
-    output is their own widget value: a Sonder Control (its ``value_text``) and
-    ComfyUI's core Primitive nodes (their ``value``). Any other link returns
-    ``UNRESOLVED``, because its value exists only at execution.
+    output is their own widget value: ComfyUI's core Primitive nodes (their
+    ``value``). Any other link returns ``UNRESOLVED``, because its value exists
+    only at execution. A Sonder Controls binding is never a link: its value is
+    the literal itself.
     """
     for _ in range(_LITERAL_LINK_DEPTH):
         source_id = linked_node_id(value)
@@ -112,9 +112,7 @@ def resolve_literal(prompt: Any, value: Any) -> Any:
             return UNRESOLVED
         inputs = node_inputs(prompt, source_id)
         class_type = node.get("class_type")
-        if class_type == SONDER_CONTROL_CLASS_TYPE:
-            value = inputs.get("value_text")
-        elif class_type in PRIMITIVE_CLASS_TYPES:
+        if class_type in PRIMITIVE_CLASS_TYPES:
             value = inputs.get("value")
         else:
             return UNRESOLVED
@@ -153,8 +151,8 @@ def execution_reaches_save_with_mark(prompt: Any, editor_id: Any, expected_mark_
     """Whether a Sonder save whose ``mark_queue_complete`` equals the expected value
     takes its project from this editor.
 
-    A mark fed by a Sonder Control or a core Primitive reads as that node's
-    value. Any other link is unknown until execution and reads as unmarked.
+    A mark fed by a core Primitive reads as that node's value. Any other link
+    is unknown until execution and reads as unmarked.
     """
     if not isinstance(prompt, dict) or editor_id in {None, ""}:
         return False

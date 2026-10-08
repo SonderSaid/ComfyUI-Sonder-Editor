@@ -8,11 +8,14 @@ import { EDITOR_COLORS as COLORS, FONT, RADIUS, SPACE, TYPE } from "./editor_the
 
 let nextPanel = 0;
 const SEED_MODES = ["fixed", "increment", "decrement", "randomize"];
-const editable = d => ["ok", "unlinked"].includes(d.status);
-const identified = d => !!(d.control_id || d.note_id) && !["missing_id", "duplicate_id"].includes(d.status);
-// Values, seeds, modes and editor fields change what a run submits; notes and
+const editable = d => d.status === "ok";
+const identified = d => !!(d.binding_id || d.note_id);
+const baseOf = d => (d.binding_id ? "binding:" + d.binding_id : d.note_id ? "note:" + d.note_id : "");
+const inEditor = d => d.source === "binding" && d.section === "editor";
+// Values and seed modes change what a run submits; labels, notes and
 // arrangement do not, so only these saves can refuse a Generate.
-const changesRun = target => target.startsWith("field:") || /:(value|seed|seed_mode)$/.test(target);
+const changesRun = target => /^binding:.+:(value|seed_mode)$/.test(target);
+const CANVAS_EMPTY = "Add a Sonder Control Relay to the workflow to show its settings here.";
 const same = (a, b) => String(a ?? "") === String(b ?? "");
 const make = (tag, text) => {
     const el = document.createElement(tag);
@@ -101,10 +104,10 @@ export function mountControlsPanel(container, host) {
     }
     function layoutEntries() {
         const view = host.getView();
-        return [...(view.controls || []), ...(view.notes || [])].map(d => ({
-            ...d,
-            base: d.control_id ? "control:" + d.control_id : d.note_id ? "note:" + d.note_id : "",
-        }));
+        // Editor-section settings stay fixed at the bottom; only Workflow rows arrange.
+        return [...(view.bindings || []).map(d => ({ ...d, source: "binding" })), ...(view.notes || [])]
+            .filter(d => !inEditor(d))
+            .map(d => ({ ...d, base: baseOf(d) }));
     }
     async function saveLayout(changes) {
         layoutSaving = true;
@@ -194,7 +197,7 @@ export function mountControlsPanel(container, host) {
                 failed.set(target, result.rejected?.[0]?.reason || "The change could not be saved.");
                 row[optimisticKey] = undefined;
                 if (row.input && target === row.target && (!row.editing || same(readInput(row), value))) {
-                    setInput(row, row.spec.value ?? row.spec.seed ?? before);
+                    setInput(row, row.spec.value ?? before);
                     row.editStart = readInput(row);
                 }
                 if (row.mode && target.endsWith(":seed_mode") && same(row.mode.value, value)) {
@@ -309,7 +312,7 @@ export function mountControlsPanel(container, host) {
         row.el = make("div");
         row.el.dataset.controlTarget = target;
         row.el.style.cssText = `display:flex;flex-direction:column;gap:${SPACE.s1}px;padding:${SPACE.s2}px 0;border-bottom:1px solid ${COLORS.border};min-width:0;`;
-        if (spec.source !== "field") {
+        if (!inEditor(spec)) {
             row.grip = make("span", "⋮⋮");
             row.grip.dataset.panelDragHandle = "true";
             row.grip.draggable = true;
@@ -397,14 +400,14 @@ export function mountControlsPanel(container, host) {
                 });
                 row.mode.addEventListener("change", () => {
                     row.modeEditStart = row.mode.value;
-                    void commit(row, `control:${spec.control_id}:seed_mode`, row.mode.value, row.spec.seed_mode);
+                    void commit(row, `binding:${spec.binding_id}:seed_mode`, row.mode.value, row.spec.seed_mode);
                 });
                 row.el.append(row.mode);
             }
-            if (spec.source === "control") {
+            if (spec.source === "binding") {
                 row.note = noteBox(
                     row,
-                    `control:${spec.control_id}:note`,
+                    `binding:${spec.binding_id}:note`,
                     spec.note,
                     identified(spec) && !spec.note_truncated,
                 );
@@ -419,7 +422,7 @@ export function mountControlsPanel(container, host) {
     function update(row, spec, fresh) {
         row.spec = spec;
         if (row.grip) {
-            const base = spec.control_id ? "control:" + spec.control_id : spec.note_id ? "note:" + spec.note_id : "";
+            const base = baseOf(spec);
             const allowed = canArrange({ ...spec, base });
             row.grip.draggable = allowed;
             row.grip.hidden = !allowed;
@@ -432,20 +435,23 @@ export function mountControlsPanel(container, host) {
         }
         if (row.mode) row.mode.setAttribute("aria-label", (spec.label || "Seed") + " mode");
         // The status line is not an input, so it stays current while the row is edited.
-        const noteTarget = spec.source === "note" ? row.target : `control:${spec.control_id}:note`;
-        const failure = [row.target, `control:${spec.control_id}:seed_mode`, noteTarget]
+        const noteTarget = spec.source === "note" ? row.target : `binding:${spec.binding_id}:note`;
+        const modeTarget = `binding:${spec.binding_id}:seed_mode`;
+        const failure = [row.target, modeTarget, noteTarget]
             .map(target => failed.get(target))
             .find(Boolean);
         row.status.textContent = failure
             ? `Not saved: ${failure}`
             : spec.note_truncated
               ? "Edit this longer note on the canvas."
-              : spec.reason || spec.error || "";
+              : spec.reason ||
+                spec.error ||
+                (spec.checked_at_run ? "Checked by the node when the run starts." : "");
         row.status.style.color = failure ? COLORS.warningText : COLORS.textDim;
         if (row.editing) return;
         if (fresh) {
             if (!row.mutations.get(row.target)?.pending) row.optimistic = undefined;
-            if (!row.mutations.get(`control:${spec.control_id}:seed_mode`)?.pending) row.modeOptimistic = undefined;
+            if (!row.mutations.get(modeTarget)?.pending) row.modeOptimistic = undefined;
             if (!row.mutations.get(noteTarget)?.pending) row.noteOptimistic = undefined;
         }
         if (row.input) {
@@ -457,7 +463,7 @@ export function mountControlsPanel(container, host) {
             }
             row.input.min = spec.min == null ? "" : String(spec.min);
             row.input.max = spec.max == null ? "" : String(spec.max);
-            setInput(row, row.optimistic ?? (spec.kind === "SEED" ? spec.seed : spec.value));
+            setInput(row, row.optimistic ?? spec.value);
         }
         if (row.mode) {
             row.mode.disabled = !editable(spec);
@@ -479,50 +485,32 @@ export function mountControlsPanel(container, host) {
         const fresh = view !== lastView;
         lastView = view;
         for (const { key, input } of settingsRows) input.checked = !!settingValues()[key];
-        const empty = !view.controls?.length && !view.notes?.length;
+        const empty = !view.bindings?.length && !view.notes?.length;
         message.textContent =
             view.error ||
-            (!empty
-                ? ""
-                : view.state === "ready"
-                  ? "Add a Sonder Control to a widget and a Sonder Panel Note for instructions."
-                  : "Loading controls…");
-        const fieldMap = new Map();
-        for (const d of view.fields || []) {
-            const target = `field:${d.class_type}/${d.field}`;
-            const first = fieldMap.get(target);
-            if (!first) fieldMap.set(target, { ...d, source: "field" });
-            else {
-                first.mixed = first.mixed || !same(first.value, d.value);
-                if (!editable(d)) Object.assign(first, { status: d.status, reason: d.reason });
-            }
-        }
-        const entries = [...fieldMap].map(([target, spec]) => ({ target, spec, group: "Editor" }));
-        for (const spec of [...(view.controls || []), ...(view.notes || [])]) {
-            const source = spec.source || ("note_id" in spec ? "note" : "control");
-            // A row without a usable identity is display-only; key it by its
-            // prompt path so several of them do not collapse into one row.
-            const target = !identified(spec)
-                ? `${source}-key:${spec.key ?? (spec.keys || []).join(",")}`
-                : source === "note"
-                  ? `note:${spec.note_id}:text`
-                  : `control:${spec.control_id}:${spec.kind === "SEED" ? "seed" : "value"}`;
+            view.relay?.error ||
+            (!empty ? "" : view.state === "ready" ? host.emptyMessage || CANVAS_EMPTY : "Loading controls…");
+        const entries = [];
+        for (const spec of [...(view.bindings || []), ...(view.notes || [])]) {
+            const source = spec.source || ("note_id" in spec ? "note" : "binding");
+            const id = source === "note" ? spec.note_id : spec.binding_id;
+            if (!id) continue;
+            const target = source === "note" ? `note:${id}:text` : `binding:${id}:value`;
             entries.push({ target, spec: { ...spec, source }, group: spec.group || "" });
         }
         if (view.state === "ready") {
             validTargets = new Set(
-                entries.flatMap(({ target, spec }) => [
-                    target,
-                    ...(spec.source !== "field" && canArrange({ ...spec, base: spec.control_id || spec.note_id })
-                        ? [target.replace(/:[^:]+$/, ":order"), target.replace(/:[^:]+$/, ":group")]
-                        : []),
-                    ...(spec.source === "control"
-                        ? [
-                              `control:${spec.control_id}:note`,
-                              ...(spec.kind === "SEED" ? [`control:${spec.control_id}:seed_mode`] : []),
-                          ]
-                        : []),
-                ]),
+                entries.flatMap(({ target, spec }) => {
+                    const base = baseOf(spec);
+                    return [
+                        target,
+                        `${base}:order`,
+                        `${base}:group`,
+                        ...(spec.source === "binding"
+                            ? [`${base}:note`, `${base}:label`, ...(spec.kind === "SEED" ? [`${base}:seed_mode`] : [])]
+                            : []),
+                    ];
+                }),
             );
             // An authoritative view shows the stored values the row now holds,
             // so it retires every failure no save is still working on.
@@ -555,8 +543,8 @@ export function mountControlsPanel(container, host) {
                 rows.set(target, row);
             }
             update(row, spec, fresh);
-            let body = spec.source === "field" ? fieldsBody : workflowBody;
-            if (group && spec.source !== "field") {
+            let body = inEditor(spec) ? fieldsBody : workflowBody;
+            if (group && !inEditor(spec)) {
                 if (!groups.has(group)) {
                     const detail = make("details"),
                         summary = make("summary", group),

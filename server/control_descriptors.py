@@ -1,23 +1,28 @@
-"""Sonder Control descriptors and the one coercion authority.
+"""Controls descriptors and the one coercion authority.
 
-``describe_controls(prompt)`` reads an API-format prompt graph and returns what a
-Controls panel shows: one descriptor per Sonder Control (its kind, value, bounds,
-options and the inputs it feeds), plus the Sonder-node fields a registry exposes
-for nodes that take their project from an editor. It reads the *graph*, never a
-project, so the change-certificate rule does not apply to it.
+``describe_bindings(prompt)`` reads an API-format prompt and returns what the
+Controls panel shows: one descriptor per binding of the workflow's Sonder
+Control Relay (its kind, value, bounds, options and the inputs it sets), plus
+the Relay's notes. It reads the *graph*, never a project, so the
+change-certificate rule does not apply to it.
+
+The Relay's exported manifest names each binding's targets. They are never
+trusted: every target is checked against the prompt here (present, a literal,
+declared by its node, not owned by Sonder). Bindings never link into an input,
+so no validator dry run is needed: a value is a literal, and ComfyUI validates
+literals at ``/prompt``.
 
 ``coerce_control_value`` and ``check_value_for_target`` are the only conversion
-and validation rules for a Control value. The node's ``execute``, the descriptor
-and (later) the SDK's stored values and timeline lanes all go through them.
+and validation rules for a Control value. The panel, the mounted relay and the
+SDK's stored values all go through them.
 
-The module imports only the standard library and ``prompt_graph`` at module
-level. ComfyUI's ``nodes``, ``execution`` and ``comfy_api`` are imported lazily,
-inside a running ComfyUI, and tests inject fakes instead.
+The module imports only the standard library and sibling pure modules at module
+level. ComfyUI's ``nodes`` and ``comfy_api`` are imported lazily, inside a
+running ComfyUI, and tests inject fakes instead.
 """
 
 from __future__ import annotations
 
-import asyncio
 import inspect
 import logging
 import math
@@ -26,13 +31,12 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Iterable
 
-from . import prompt_graph
+from . import binding_policy, control_manifest, prompt_graph
 
 logger = logging.getLogger(__name__)
 
-CONTROL_CLASS_TYPE = prompt_graph.SONDER_CONTROL_CLASS_TYPE
-PANEL_NOTE_CLASS_TYPE = "SonderPanelNote"
-PANEL_NOTE_MAX_CHARS = 4000
+PANEL_NOTE_MAX_CHARS = control_manifest.NOTE_MAX
+PANEL_LABEL_MAX_CHARS = control_manifest.LABEL_MAX
 PANEL_OPTIONS_LIMIT = 2000
 CONTROL_KINDS = ("STRING", "INT", "FLOAT", "BOOLEAN", "COMBO", "SEED")
 ANY_KIND = "*"
@@ -40,21 +44,27 @@ ANY_KIND = "*"
 _WILDCARD_TYPES = frozenset({"*", "COMFY_MATCHTYPE_V3"})
 
 STATUS_OK = "ok"
-STATUS_UNLINKED = "unlinked"
-STATUS_MIXED = "mixed_targets"
+STATUS_MISSING = "missing"
+STATUS_DUPLICATE = "duplicate"
+STATUS_LINKED = "linked"
+STATUS_NO_WIDGET = "no_widget"
 STATUS_UNSUPPORTED = "unsupported"
-STATUS_STALE = "stale_kind"
-STATUS_DUPLICATE = "duplicate_id"
-STATUS_MISSING_ID = "missing_id"
+STATUS_DENIED = "denied"
 
-# Shown to the user; the validator's own message goes in the target's ``detail``.
-VALIDATOR_REFUSAL = "This input checks its value before the run, so a Control can't set it."
+STATUS_REASONS = {
+    STATUS_MISSING: "This setting is no longer in the workflow, moved into a subgraph, or its node is muted or bypassed.",
+    STATUS_DUPLICATE: "Two nodes carry this Control. Remove one of them.",
+    STATUS_LINKED: "Another node is connected to this input, so the Control can't set it.",
+    STATUS_NO_WIDGET: "This input has no editable value right now.",
+    STATUS_UNSUPPORTED: "This setting can't be a Control.",
+    STATUS_DENIED: binding_policy.DENIED_REASON,
+}
 
-DEFAULT_CONTROL_LABEL = "Sonder Control"
+DEFAULT_LABEL = "Setting"
 
 # Mirrors the frontend 1.53.10 number control (`computeNextNumberValue`), which
 # keeps randomized values inside +-2^50.
-SEED_MODES = ("fixed", "increment", "decrement", "randomize")
+SEED_MODES = control_manifest.SEED_MODES
 _SEED_LIMIT = 2 ** 50
 
 # Bounds on numeric text, checked before conversion: ``int(Decimal("1e1000000"))``
@@ -73,15 +83,15 @@ class ControlValueError(ValueError):
 
 @dataclass(frozen=True)
 class FieldControl:
-    """A Sonder-node widget the Controls panel shows without a Control node."""
+    """A Sonder-node widget Manage recommends exposing in the Editor section."""
 
     class_type: str
     field: str
     label: str
 
 
-# Entries, not conditionals: add a row to expose another Sonder-node field. Only
-# nodes whose ``project`` input reaches an editor are described.
+# Entries, not conditionals: add a row to recommend another Sonder-node field.
+# Exposure is opt-in (maintainer decision 2026-10-06); Manage lists these first.
 FIELD_CONTROLS: tuple[FieldControl, ...] = (
     FieldControl("SonderSaveVideo", "mark_queue_complete", "Advance queue after take"),
     FieldControl("SonderSaveBridge", "mark_queue_complete", "Advance queue after take"),
@@ -89,7 +99,6 @@ FIELD_CONTROLS: tuple[FieldControl, ...] = (
     FieldControl("SonderMasksBridge", "edit_video", "Edit video"),
     FieldControl("SonderMasksBridge", "edit_audio", "Edit audio"),
 )
-
 
 # ── Coercion ─────────────────────────────────────────────────────────────────
 
@@ -103,8 +112,7 @@ def _empty(kind: str) -> ControlValueError:
 def coerce_control_value(kind: str, raw: Any, *, seed: Any = None) -> Any:
     """Convert a stored Control value to the type its kind delivers.
 
-    Raises ``ControlValueError`` rather than guessing: a Control must never feed
-    a silently wrong value, because ComfyUI does not check a linked input.
+    Raises ``ControlValueError`` rather than guessing.
     """
     if kind == "SEED":
         if isinstance(seed, bool) or not isinstance(seed, int):
@@ -180,8 +188,8 @@ def coerce_control_value(kind: str, raw: Any, *, seed: Any = None) -> Any:
 def check_value_for_target(value: Any, spec: dict) -> None:
     """Raise when a target input would refuse this value as a literal.
 
-    ComfyUI checks min, max and COMBO membership only for literals; a linked
-    input skips all three, so the Control applies them itself.
+    The panel and the SDK check before saving, so a refused value never waits
+    for ``/prompt`` to fail.
     """
     kind = spec.get("kind")
     if kind in ("INT", "SEED", "FLOAT") and isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -197,7 +205,6 @@ def check_value_for_target(value: Any, spec: dict) -> None:
 
 
 PANEL_ORDER_LIMIT = 9999
-MAX_CONTROL_CHANGES = 64
 SEED_MAX = 0xFFFFFFFFFFFFFFFF
 
 
@@ -212,97 +219,10 @@ def coerce_panel_layout(field: str, raw: Any):
     return raw.strip()
 
 
-def validate_control_changes(view: dict, changes: Any) -> tuple[dict, list[dict]]:
-    """Whitelist and coerce panel writes against the current descriptor view.
-
-    Returns canonical values, or target/reason refusals. Callers reject the whole
-    batch on any refusal. The relay can pass JSON-safe bounds; SDK callers keep
-    the full COMBO options and exact Python integers.
-    """
-    if not isinstance(changes, dict) or not changes or len(changes) > MAX_CONTROL_CHANGES:
-        return {}, [{"target": "", "reason": "Send 1 to 64 changes."}]
-    targets = {}
-    ambiguous = set()
-
-    def add(target, descriptor, field):
-        if target in targets:
-            ambiguous.add(target)
-        targets[target] = (descriptor, field)
-
-    for control in view.get("controls", []):
-        identity = control.get("control_id")
-        if not identity or control.get("status") in (STATUS_DUPLICATE, STATUS_MISSING_ID):
-            continue
-        base = f"control:{identity}"
-        add(f"{base}:note", control, "note")
-        add(f"{base}:order", control, "order")
-        add(f"{base}:group", control, "group")
-        if control.get("status") not in (STATUS_OK, STATUS_UNLINKED):
-            continue
-        if control.get("kind") == "SEED":
-            add(f"{base}:seed", control, "seed")
-            add(f"{base}:seed_mode", control, "seed_mode")
-        elif control.get("kind") in CONTROL_KINDS:
-            add(f"{base}:value", control, "value")
-    for note in view.get("notes", []):
-        if note.get("note_id") and note.get("status") == STATUS_OK:
-            for field in ("text", "order", "group"):
-                add(f"note:{note['note_id']}:{field}", note, field)
-    fields = {}
-    for descriptor in view.get("fields", []):
-        target = f"field:{descriptor.get('class_type')}/{descriptor.get('field')}"
-        fields.setdefault(target, []).append(descriptor)
-    for target, descriptors in fields.items():
-        # A merged field writes every exposed instance, never a linked one.
-        if all(d.get("status") == STATUS_OK for d in descriptors):
-            targets[target] = (descriptors, "field")
-
-    cleaned, rejected = {}, []
-    for target, raw in changes.items():
-        try:
-            if target not in targets or target in ambiguous:
-                raise ControlValueError("This target is unavailable. Refresh the Controls panel.")
-            descriptor, field = targets[target]
-            if field in ("note", "text"):
-                if descriptor.get("note_truncated"):
-                    raise ControlValueError("Edit this note on the canvas.")
-                if not isinstance(raw, str) or len(raw) > PANEL_NOTE_MAX_CHARS:
-                    raise ControlValueError("A note must be text of at most 4000 characters.")
-                value = raw
-            elif field in ("order", "group"):
-                value = coerce_panel_layout(field, raw)
-            elif field == "seed_mode":
-                if not isinstance(raw, str) or raw not in SEED_MODES:
-                    raise ControlValueError("Choose fixed, increment, decrement or randomize.")
-                value = raw
-            else:
-                specs = descriptor if field == "field" else [descriptor]
-                kind = "INT" if field == "seed" else specs[0].get("kind")
-                value = coerce_control_value(kind, raw)
-                if field == "seed" and not 0 <= value <= SEED_MAX:
-                    raise ControlValueError("The seed must be between 0 and 18446744073709551615.")
-                for spec in specs:
-                    if spec.get("kind") != specs[0].get("kind"):
-                        raise ControlValueError("These fields have different types.")
-                    bounded = dict(spec)
-                    for name in ("min", "max"):
-                        if isinstance(bounded.get(name), str):
-                            bounded[name] = coerce_control_value(kind, bounded[name])
-                    # A capped relay view cannot prove membership beyond its
-                    # preview; its canvas writer validates against the full view.
-                    if bounded.get("options_truncated"):
-                        bounded.pop("options", None)
-                    check_value_for_target(value, bounded)
-            cleaned[target] = value
-        except (ControlValueError, OverflowError) as exc:
-            rejected.append({"target": target, "reason": str(exc)})
-    return cleaned, rejected
-
-
 # ── Kinds ────────────────────────────────────────────────────────────────────
 
 def derive_kind(target_kinds: Iterable[str]) -> str | None:
-    """The kind a Control should have for these targets.
+    """The kind a binding has for these targets.
 
     ``ANY_KIND`` when every target accepts anything, ``None`` when the targets
     disagree. INT and SEED targets agree, and SEED wins when one is present.
@@ -315,17 +235,6 @@ def derive_kind(target_kinds: Iterable[str]) -> str | None:
     if len(kinds) == 1:
         return next(iter(kinds))
     return None
-
-
-def kind_compatible(declared: str, target_kind: str) -> bool:
-    """Whether a Control of ``declared`` kind may feed a ``target_kind`` input."""
-    if declared not in CONTROL_KINDS:
-        return False
-    if target_kind == ANY_KIND:
-        return True
-    if target_kind in ("INT", "SEED"):
-        return declared in ("INT", "SEED")
-    return declared == target_kind
 
 
 # The frontend gives these INT inputs a seed control even without the flag.
@@ -434,112 +343,12 @@ def validator_covers(class_def, input_name: str) -> bool:
     return input_name in spec.args or spec.varkw is not None
 
 
-def _literal_for_validation(value: Any, input_type: Any) -> Any:
-    """Apply the cast ``/prompt`` applies to a literal before validators run."""
-    if isinstance(value, dict) and "__value__" in value:
-        value = value["__value__"]
-    casts = {"INT": int, "FLOAT": float, "STRING": str, "BOOLEAN": bool}
-    cast = casts.get(input_type) if isinstance(input_type, str) else None
-    if cast is not None:
-        try:
-            return cast(value)
-        except Exception:
-            return value
-    return value
+# ── Targets ──────────────────────────────────────────────────────────────────
 
-
-async def _comfy_dry_run(class_def, key: str, inputs: dict, received_types: dict) -> tuple[bool, str | None]:
-    """Call the target's validator the way ``execution.validate_inputs`` does.
-
-    Every linked input reaches the validator as ``None`` at ``/prompt`` (there is
-    no execution list yet), so this reproduces the call exactly by using
-    ComfyUI's own ``get_input_data`` and node-mapping helpers.
-    """
-    import execution
-    from comfy_execution.graph import ExecutionBlocker
-
-    found = _validator_for(class_def)
-    if found is None:
-        return True, None
-    function_name, function = found
-    spec = inspect.getfullargspec(function)
-    if not spec.args and spec.varkw is None:
-        return True, None
-    input_data, _, v3_data = execution.get_input_data(inputs, class_def, key)
-    filtered = {
-        name: value
-        for name, value in input_data.items()
-        if name in spec.args or spec.varkw is not None
-    }
-    if "input_types" in spec.args:
-        filtered["input_types"] = [received_types]
-    results = await execution._async_map_node_over_list(
-        None, key, class_def, filtered, function_name, v3_data=v3_data
-    )
-    results = await execution.resolve_map_node_over_list_results(results)
-    for result in results:
-        if result is not True and not isinstance(result, ExecutionBlocker):
-            return False, None if result is False else str(result)
-    return True, None
-
-
-def comfy_validator_runner(requests: list[dict]) -> list[tuple[bool, str | None]]:
-    """Run dry-run requests in a private event loop (call off the server loop)."""
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        pass
-    else:
-        raise RuntimeError("describe_controls blocks; call it through asyncio.to_thread.")
-
-    async def run_all():
-        outcomes = []
-        for request in requests:
-            try:
-                outcomes.append(await _comfy_dry_run(
-                    request["class_def"], request["key"], request["inputs"], request["received_types"]
-                ))
-            except Exception as exc:  # the validator itself raised, as at /prompt
-                outcomes.append((False, f"{type(exc).__name__}: {exc}"))
-        return outcomes
-
-    return asyncio.run(run_all())
-
-
-# ── Describe ─────────────────────────────────────────────────────────────────
-
-def _control_targets(prompt: dict, control_key: str) -> list[tuple[str, str]]:
-    targets = []
-    for key, node in prompt.items():
-        if not isinstance(node, dict):
-            continue
-        inputs = node.get("inputs")
-        if not isinstance(inputs, dict):
-            continue
-        for input_name, value in inputs.items():
-            if prompt_graph.linked_node_id(value) == control_key:
-                targets.append((str(key), str(input_name)))
-    return targets
-
-
-def _node_title(node: dict, default: str = DEFAULT_CONTROL_LABEL) -> str:
+def _node_title(node: dict, default: str = DEFAULT_LABEL) -> str:
     meta = node.get("_meta")
     title = meta.get("title") if isinstance(meta, dict) else None
     return title.strip() if isinstance(title, str) and title.strip() else default
-
-
-def _received_types(prompt: dict, inputs: dict, class_lookup: Callable) -> dict:
-    received = {}
-    for name, value in inputs.items():
-        source = prompt_graph.linked_node_id(value)
-        if source is None or not isinstance(prompt.get(source), dict):
-            continue
-        source_class = class_lookup(prompt[source].get("class_type"))
-        try:
-            received[name] = source_class.RETURN_TYPES[int(value[1])]
-        except Exception:
-            continue
-    return received
 
 
 def _read_target(prompt: dict, target_key: str, input_name: str, class_lookup: Callable, cache: dict) -> dict:
@@ -591,161 +400,406 @@ def _merge_bounds(targets: list[dict]) -> dict:
     return merged
 
 
-def _public_target(target: dict) -> dict:
-    keys = ("key", "class_type", "input", "kind", "status", "reason", "detail")
-    return {key: target[key] for key in keys if key in target}
+# ── Describe ─────────────────────────────────────────────────────────────────
+
+def _is_link(value: Any) -> bool:
+    """An API-prompt link ``[node_id, slot]``. A multiselect value is a list too."""
+    return (isinstance(value, list) and len(value) == 2 and isinstance(value[0], (str, int))
+            and not isinstance(value[0], bool) and isinstance(value[1], int) and not isinstance(value[1], bool))
 
 
-def _describe_one_control(prompt: dict, key: str, node: dict, class_lookup: Callable, cache: dict) -> tuple[dict, list[dict]]:
-    inputs = prompt_graph.node_inputs(prompt, key)
-    declared = inputs.get("kind")
-    declared = declared if isinstance(declared, str) else ""
-    seed = inputs.get("seed")
-    targets = [
-        _read_target(prompt, target_key, input_name, class_lookup, cache)
-        for target_key, input_name in _control_targets(prompt, key)
-    ]
-    order = inputs.get("panel_order")
-    group = inputs.get("panel_group")
-    descriptor: dict[str, Any] = {
-        "source": "control",
-        "key": key,
-        "keys": [key],
-        "control_id": inputs.get("control_id") if isinstance(inputs.get("control_id"), str) else "",
-        "label": _node_title(node),
-        "kind": declared,
-        "value_text": inputs.get("value_text") if isinstance(inputs.get("value_text"), str) else "",
-        "seed": seed if isinstance(seed, int) and not isinstance(seed, bool) else None,
-        "seed_mode": inputs.get("seed_mode") if inputs.get("seed_mode") in SEED_MODES else None,
-        "note": inputs.get("panel_note") if isinstance(inputs.get("panel_note"), str) else "",
-        "order": order if isinstance(order, int) and not isinstance(order, bool) else 0,
-        "group": group.strip() if isinstance(group, str) else "",
-    }
-    return descriptor, targets
-
-
-def _finish_control(descriptor: dict, targets: list[dict], pending_reasons: dict) -> dict:
-    declared = descriptor["kind"]
-    usable = [t for t in targets if t.get("status") == STATUS_OK]
-    target_kind = derive_kind(t["kind"] for t in usable)
-    descriptor["target_kind"] = target_kind
-    descriptor.update(_merge_bounds(usable))
-    for target in targets:
-        refusal = pending_reasons.get((target["key"], target["input"]))
-        if refusal is not None:
-            target["status"] = STATUS_UNSUPPORTED
-            target["reason"] = VALIDATOR_REFUSAL
-            if refusal:
-                target["detail"] = refusal
+def _default_label(prompt: dict, targets: list[dict]) -> str:
     if not targets:
-        status = STATUS_UNLINKED
-    elif any(t.get("status") == STATUS_UNSUPPORTED for t in targets):
-        status = STATUS_UNSUPPORTED
-    elif target_kind is None:
-        status = STATUS_MIXED
-    elif not all(kind_compatible(declared, t["kind"]) for t in usable):
-        status = STATUS_STALE
+        return DEFAULT_LABEL
+    node = prompt.get(targets[0]["path"])
+    title = _node_title(node, str(node.get("class_type") or "")) if isinstance(node, dict) else ""
+    return f"{title} · {targets[0]['input']}" if title else targets[0]["input"]
+
+
+def _effective_inputs(prompt: dict, path: str, overrides: dict | None) -> dict:
+    inputs = dict(prompt_graph.node_inputs(prompt, path))
+    for (key, name), value in (overrides or {}).items():
+        if key == path:
+            inputs[name] = value
+    return inputs
+
+
+def _bounds_for(prompt: dict, read: list[dict], overrides: dict | None = None) -> tuple[dict, bool, bool, list | None]:
+    """Range and options from the targets whose checks Sonder can apply itself.
+
+    Per target: an options provider supplies options from the node's effective
+    inputs; an input a validator covers adds no check (native skips its range
+    and option checks, execution.py:1029); any other target adds its declared
+    spec. Returns (bounds, any target checked only at run, any provider,
+    the static option list when a provider also applies).
+    """
+    static, dynamic, unknown, provider = [], [], False, False
+    for target in read:
+        fn = binding_policy.provider_for(target.get("class_type"), target.get("input"))
+        if fn is not None:
+            provider = True
+            options = fn(_effective_inputs(prompt, target["key"], overrides))
+            if options is None:
+                unknown = True
+            else:
+                dynamic.append(options)
+        elif target.get("class_def") is not None and validator_covers(target["class_def"], target["input"]):
+            unknown = True
+        else:
+            static.append(target)
+    merged = _merge_bounds(static)
+    merged.pop("multiline", None)
+    static_options = merged.pop("options", None)
+    lists = ([static_options] if static_options is not None else []) + dynamic
+    if lists:
+        merged["options"] = [option for option in lists[0] if all(option in other for other in lists[1:])]
+    return merged, unknown, provider, static_options if provider else None
+
+
+def _check_targets(prompt: dict, targets: list[dict], class_lookup: Callable, cache: dict) -> tuple[str, str | None, list[dict]]:
+    """Read every exported target from the prompt; return (status, reason, read targets)."""
+    if not targets:
+        return STATUS_MISSING, None, []
+    read = []
+    for target in targets:
+        path, name = target["path"], target["input"]
+        node = prompt.get(path)
+        if not isinstance(node, dict):
+            read.append({"key": path, "class_type": None, "input": name, "status": STATUS_MISSING})
+            continue
+        class_type = node.get("class_type")
+        value = prompt_graph.node_inputs(prompt, path).get(name)
+        if binding_policy.is_denied(class_type, name):
+            read.append({"key": path, "class_type": class_type, "input": name, "status": STATUS_DENIED})
+            continue
+        if _is_link(value):
+            read.append({"key": path, "class_type": class_type, "input": name, "status": STATUS_LINKED})
+            continue
+        entry = _read_target(prompt, path, name, class_lookup, cache)
+        if entry["status"] == STATUS_OK and isinstance(value, (list, dict)):
+            entry.update(status=STATUS_UNSUPPORTED, reason="Lists of choices can't be Controls yet.")
+        if entry["status"] == STATUS_OK and entry.get("kind") == ANY_KIND:
+            entry.update(status=STATUS_UNSUPPORTED, reason="This input accepts any type, so it can't be a Control.")
+        if entry["status"] == STATUS_OK and name not in prompt_graph.node_inputs(prompt, path):
+            entry.update(status=STATUS_MISSING)
+        entry["literal"] = value
+        read.append(entry)
+    for status in (STATUS_MISSING, STATUS_DENIED, STATUS_LINKED, STATUS_UNSUPPORTED):
+        bad = next((t for t in read if t["status"] == status), None)
+        if bad is not None:
+            return status, bad.get("reason"), read
+    if derive_kind(t["kind"] for t in read) is None:
+        return STATUS_UNSUPPORTED, "Its inputs take different types.", read
+    return STATUS_OK, None, read
+
+
+def _describe_one(prompt: dict, binding_id: str, entry: dict, class_lookup: Callable, cache: dict) -> dict:
+    descriptor: dict[str, Any] = {
+        "source": "binding",
+        "binding_id": binding_id,
+        "origin": "authored",
+        "label": entry["label"],
+        "section": entry["section"],
+        "group": entry["group"],
+        "order": entry["order"],
+        "advanced": entry["advanced"],
+        "note": entry["note"],
+        "kind": None,
+        "value": None,
+        "error": None,
+    }
+    exported = entry.get("status")
+    if exported is not None and exported != STATUS_OK:
+        status, reason, read = exported, None, []
     else:
-        status = STATUS_OK
+        status, reason, read = _check_targets(prompt, entry.get("targets") or [], class_lookup, cache)
+    descriptor["targets"] = [{"path": t["key"], "input": t["input"], "class_type": t.get("class_type"),
+                              "status": t["status"]} for t in read] or [
+        {"path": t["path"], "input": t["input"], "class_type": None, "status": status}
+        for t in entry.get("targets") or []]
+    if not descriptor["label"]:
+        descriptor["label"] = _default_label(prompt, entry.get("targets") or [])
     descriptor["status"] = status
-    descriptor["targets"] = [_public_target(t) for t in targets]
-    descriptor["value"] = None
-    descriptor["error"] = None
-    if declared in CONTROL_KINDS:
-        try:
-            value = coerce_control_value(declared, descriptor["value_text"], seed=descriptor["seed"])
-            for target in usable:
-                check_value_for_target(value, target)
-            descriptor["value"] = value
-        except ControlValueError as exc:
-            descriptor["error"] = str(exc)
+    descriptor["reason"] = reason or STATUS_REASONS.get(status) if status != STATUS_OK else None
+    if status != STATUS_OK:
+        return descriptor
+    kind = derive_kind(t["kind"] for t in read)
+    descriptor["kind"] = kind
+    bounds, unknown, provider, static_options = _bounds_for(prompt, read)
+    descriptor.update(bounds)
+    if any(t.get("multiline") for t in read):
+        descriptor["multiline"] = True
+    for name in ("default", "label_on", "label_off"):
+        if name in read[0]:
+            descriptor[name] = read[0][name]
+    if provider:
+        descriptor["provider"] = True
+        if static_options is not None:
+            descriptor["static_options"] = static_options
+    if unknown:
+        # Some target is checked only by its node at run time; the bounds and
+        # options shown are the ones every other target declares.
+        descriptor["checked_at_run"] = True
+    literal = read[0].get("literal")
+    try:
+        if kind == "BOOLEAN" and not isinstance(literal, bool):
+            raise ControlValueError(f"{literal!r} is not true or false.")
+        value = coerce_control_value("INT" if kind == "SEED" else kind, literal)
+        check_value_for_target(value, descriptor)
+        descriptor["value"] = value
+    except (ControlValueError, OverflowError) as exc:
+        descriptor["value"] = literal if isinstance(literal, (str, int, float, bool)) else None
+        descriptor["error"] = str(exc)
+    if kind == "SEED":
+        descriptor["seed_mode"] = entry.get("seed_mode")
     return descriptor
 
 
-def _group_duplicates(controls: list[dict]) -> list[dict]:
-    """One descriptor per ``control_id``: two instances of one subgraph
-    definition carry the same inner Control and drive it together."""
-    grouped: dict[str, dict] = {}
-    result = []
-    for descriptor in controls:
-        control_id = descriptor["control_id"]
-        if not control_id:
-            descriptor["status"] = STATUS_MISSING_ID
-            descriptor["error"] = "This Control has no id. Open the workflow on the canvas to assign one."
-        first = grouped.get(control_id) if control_id else None
-        if first is None:
-            if control_id:
-                grouped[control_id] = descriptor
-            result.append(descriptor)
+def _flag_shared_targets(bindings: list[dict]) -> None:
+    """Two bindings may not set one input: whichever wrote last would win, and
+    two seeds would advance it twice. The export is untrusted, so check here."""
+    owners: dict[tuple, list[dict]] = {}
+    for descriptor in bindings:
+        if descriptor["status"] != STATUS_OK:
             continue
-        first["keys"].append(descriptor["key"])
-        first["targets"].extend(descriptor["targets"])
-        same = all(first[name] == descriptor[name] for name in ("kind", "value_text", "seed", "seed_mode", "note", "label", "order", "group"))
-        if not same:
-            first["status"] = STATUS_DUPLICATE
-            first["error"] = "Two different Controls share one id. Delete one and add it again."
-        else:
-            # Every instance of a shared definition constrains the same value.
-            # Preserve all bounds/options and every validation refusal.
-            first.update(_merge_bounds([first, descriptor]))
-            if descriptor["status"] != STATUS_OK and first["status"] == STATUS_OK:
-                first["status"] = descriptor["status"]
-            if descriptor.get("error") and not first.get("error"):
-                first["error"] = descriptor["error"]
-            if first.get("value") is not None:
-                try:
-                    check_value_for_target(first["value"], first)
-                except ControlValueError as exc:
-                    first["error"] = str(exc)
-    return result
+        for target in descriptor["targets"]:
+            owners.setdefault((target["path"], target["input"]), []).append(descriptor)
+    for shared in owners.values():
+        if len(shared) > 1:
+            for descriptor in shared:
+                descriptor.update(status=STATUS_DUPLICATE, kind=None, value=None,
+                                  reason="Another Control sets the same input. Remove one of them.")
 
 
-def _truncate_note(descriptor: dict, field: str) -> None:
-    if len(descriptor[field]) > PANEL_NOTE_MAX_CHARS:
-        descriptor[field] = descriptor[field][:PANEL_NOTE_MAX_CHARS]
-        descriptor["note_truncated"] = True
+def describe_bindings(
+    prompt: Any,
+    *,
+    relay_census: Any = None,
+    class_lookup: Callable[[str], Any] | None = None,
+) -> dict:
+    """Describe the Relay's bindings and notes in an API prompt.
 
-
-def _describe_notes(prompt: dict) -> list[dict]:
-    grouped: dict[str, dict] = {}
-    notes = []
-    for key, node in prompt.items():
-        if not isinstance(node, dict) or node.get("class_type") != PANEL_NOTE_CLASS_TYPE:
+    ``relay_census`` is the canvas count of active, muted, bypassed and nested
+    Relays, which an export cannot show. Blocking only through ``INPUT_TYPES``;
+    callers run it off the event loop like any prompt walk.
+    """
+    if not isinstance(prompt, dict):
+        raise ValueError("A prompt must be an object of nodes.")
+    class_lookup = class_lookup or _comfy_class_lookup
+    cache: dict = {}
+    relay = control_manifest.find_relay(prompt)
+    census_error = control_manifest.census_error(relay_census)
+    if census_error and relay["status"] != "error":
+        relay = {**relay, "status": "error", "error": census_error}
+    view: dict[str, Any] = {
+        "relay": {"status": relay["status"], "key": relay["key"], "error": relay["error"]},
+        "bindings": [],
+        "notes": [],
+        "suggestions": [],
+        "editors": prompt_graph.editor_keys(prompt),
+    }
+    if relay["status"] != "ok":
+        if relay["error"]:
+            view["error"] = relay["error"]
+        return view
+    manifest = relay["manifest"]
+    for binding_id, entry in manifest["bindings"].items():
+        view["bindings"].append(_describe_one(prompt, binding_id, entry, class_lookup, cache))
+    for note_id, entry in manifest["notes"].items():
+        view["notes"].append({"source": "note", "note_id": note_id, "text": entry["text"],
+                              "group": entry["group"], "order": entry["order"], "status": STATUS_OK})
+    for suggestion in manifest["suggestions"]:
+        if suggestion["binding_id"] in manifest["bindings"]:
             continue
-        inputs = prompt_graph.node_inputs(prompt, key)
-        note_id = inputs.get("note_id") if isinstance(inputs.get("note_id"), str) else ""
-        order, group = inputs.get("panel_order"), inputs.get("panel_group")
-        descriptor = {
-            "source": "note", "key": str(key), "keys": [str(key)], "note_id": note_id,
-            "label": _node_title(node, "Sonder Panel Note"),
-            "text": inputs.get("text") if isinstance(inputs.get("text"), str) else "",
-            "order": order if isinstance(order, int) and not isinstance(order, bool) else 0,
-            "group": group.strip() if isinstance(group, str) else "",
-            "status": STATUS_OK if note_id else STATUS_MISSING_ID,
-            "reason": None if note_id else "This note has no id. Open the workflow on the canvas to assign one.",
-        }
-        first = grouped.get(note_id) if note_id else None
-        if first is None:
-            notes.append(descriptor)
-            if note_id:
-                grouped[note_id] = descriptor
-        else:
-            first["keys"].append(str(key))
-            if any(first[name] != descriptor[name] for name in ("text", "label", "order", "group")):
-                first.update(status=STATUS_DUPLICATE,
-                             reason="Two different Panel Notes share one id. Delete one and add it again.")
-    # Compare full authored text before truncating so different tails never merge.
-    for descriptor in notes:
-        _truncate_note(descriptor, "text")
-    notes.sort(key=lambda d: (d["order"], d["label"].lower(), d["key"]))
-    return notes
+        view["suggestions"].append({**suggestion, "label": _default_label(prompt, suggestion["targets"])})
+    _flag_shared_targets(view["bindings"])
+    view["groups"] = manifest["groups"]
+    view["bindings"].sort(key=lambda d: (d["order"], d["label"].lower(), d["binding_id"]))
+    view["notes"].sort(key=lambda d: (d["order"], d["note_id"]))
+    return view
+
+
+# ── Changes ──────────────────────────────────────────────────────────────────
+
+MAX_CONTROL_CHANGES = 64
+VALUE_FIELDS = ("value", "seed_mode")
+PRESENTATION_FIELDS = ("label", "note", "order", "group")
+
+
+def _target_table(view: dict) -> dict:
+    table: dict[str, tuple[dict, str]] = {}
+    for descriptor in view.get("bindings", []):
+        identity = descriptor.get("binding_id")
+        if not isinstance(identity, str) or not identity:
+            continue
+        base = f"binding:{identity}"
+        for field in PRESENTATION_FIELDS:
+            table[f"{base}:{field}"] = (descriptor, field)
+        if descriptor.get("status") != STATUS_OK or descriptor.get("kind") not in CONTROL_KINDS:
+            continue
+        table[f"{base}:value"] = (descriptor, "value")
+        if descriptor.get("kind") == "SEED":
+            table[f"{base}:seed_mode"] = (descriptor, "seed_mode")
+    for note in view.get("notes", []):
+        identity = note.get("note_id")
+        if isinstance(identity, str) and identity and note.get("status") == STATUS_OK:
+            for field in ("text", "order", "group"):
+                table[f"note:{identity}:{field}"] = (note, field)
+    return table
+
+
+def coerce_binding_value(descriptor: dict, raw: Any) -> Any:
+    """A binding's value in its kind; BOOLEAN takes only JSON true/false."""
+    kind = descriptor.get("kind")
+    if kind == "BOOLEAN":
+        if not isinstance(raw, bool):
+            raise ControlValueError("Choose on or off.")
+        return raw
+    return coerce_control_value("INT" if kind == "SEED" else kind, raw)
+
+
+def _shares_node(descriptor: dict, others: list[dict]) -> bool:
+    paths = {t.get("path") for t in descriptor.get("targets", [])}
+    return any(paths & {t.get("path") for t in other.get("targets", [])} for other in others)
+
+
+def validate_binding_changes(view: dict, changes: Any, *, prompt: dict | None = None,
+                             max_changes: int | None = MAX_CONTROL_CHANGES) -> tuple[dict, list[dict]]:
+    """Whitelist and coerce panel writes against the current descriptor view.
+
+    Returns canonical values and target/reason refusals. Callers reject the whole
+    batch on any refusal. With ``prompt``, provider options (a Selector's
+    ``choice``) come from the same batch's other changes, so a new choice list
+    and a choice in it are accepted together. Without it (the mounted relay's
+    pre-check), such a batch defers that check to the canvas writer, which
+    validates against the fresh full view. ``max_changes=None`` lifts the 64-change
+    request cap for the SDK's own stored values, which may hold up to 256.
+    """
+    if not isinstance(changes, dict) or not changes or (max_changes is not None and len(changes) > max_changes):
+        return {}, [{"target": "", "reason": "Send 1 to 64 changes."}]
+    table = _target_table(view)
+    value_changes = [table[t][0] for t in changes if t in table and table[t][1] == "value"]
+    overrides: dict[tuple[str, str], Any] = {}
+    for target, raw in changes.items():
+        if target in table and table[target][1] == "value":
+            for item in table[target][0].get("targets", []):
+                overrides[(item.get("path"), item.get("input"))] = raw
+
+    cleaned, rejected = {}, []
+    for target, raw in changes.items():
+        try:
+            if target not in table:
+                raise ControlValueError("This target is unavailable. Refresh the Controls panel.")
+            descriptor, field = table[target]
+            if field in ("note", "text"):
+                if descriptor.get("note_truncated"):
+                    raise ControlValueError("Edit this note on the canvas.")
+                if not isinstance(raw, str) or len(raw) > PANEL_NOTE_MAX_CHARS:
+                    raise ControlValueError("A note must be text of at most 4000 characters.")
+                value = raw
+            elif field == "label":
+                if not isinstance(raw, str) or len(raw.strip()) > PANEL_LABEL_MAX_CHARS:
+                    raise ControlValueError("A label must be text of at most 120 characters.")
+                value = raw.strip()
+            elif field in ("order", "group"):
+                value = coerce_panel_layout(field, raw)
+                if field == "group" and len(value) > PANEL_LABEL_MAX_CHARS:
+                    raise ControlValueError("A group name must be at most 120 characters.")
+            elif field == "seed_mode":
+                if not isinstance(raw, str) or raw not in SEED_MODES:
+                    raise ControlValueError("Choose fixed, increment, decrement or randomize.")
+                value = raw
+            else:
+                value = coerce_binding_value(descriptor, raw)
+                bounded = dict(descriptor)
+                kind = "INT" if descriptor.get("kind") == "SEED" else descriptor.get("kind")
+                for name in ("min", "max"):
+                    if isinstance(bounded.get(name), str):
+                        bounded[name] = coerce_control_value(kind, bounded[name])
+                if descriptor.get("provider"):
+                    others = [d for d in value_changes if d is not descriptor]
+                    if prompt is not None and descriptor.get("targets"):
+                        options = _batch_options(prompt, descriptor, overrides)
+                        bounded.pop("options", None)
+                        if options is not None:
+                            bounded["options"] = options
+                    elif _shares_node(descriptor, others):
+                        bounded.pop("options", None)
+                # A capped relay view cannot prove membership beyond its
+                # preview; its canvas writer validates against the full view.
+                if bounded.get("options_truncated"):
+                    bounded.pop("options", None)
+                check_value_for_target(value, bounded)
+            cleaned[target] = value
+        except (ControlValueError, OverflowError) as exc:
+            rejected.append({"target": target, "reason": str(exc)})
+    if prompt is not None and not rejected:
+        rejected.extend(_orphaned_dependents(prompt, table, changes, overrides))
+        if rejected:
+            cleaned = {}
+    return cleaned, rejected
+
+
+def _batch_options(prompt: dict, descriptor: dict, overrides: dict) -> list | None:
+    """A provider-backed binding's options with this batch applied, intersected
+    across its targets; None when any target is known only at run time."""
+    lists = [descriptor["static_options"]] if isinstance(descriptor.get("static_options"), list) else []
+    for target in descriptor.get("targets", []):
+        fn = binding_policy.provider_for(target.get("class_type"), target.get("input"))
+        if fn is None:
+            continue
+        options = fn(_effective_inputs(prompt, target["path"], overrides))
+        if options is None:
+            return None
+        lists.append(options)
+    if not lists:
+        return None
+    return [option for option in lists[0] if all(option in other for other in lists[1:])]
+
+
+def _orphaned_dependents(prompt: dict, table: dict, changes: dict, overrides: dict) -> list[dict]:
+    """Refuse a source change (a Selector's list) that drops the node's current
+    choice: on the canvas the Selector would silently reset it, and a Sonder App
+    run would fail at /prompt. Choosing from the new list in the same batch is fine."""
+    refusals = []
+    for target in changes:
+        entry = table.get(target)
+        if not entry or entry[1] != "value":
+            continue
+        for row in entry[0].get("targets", []):
+            dependent = binding_policy.dependent_of(row.get("class_type"), row.get("input"))
+            if dependent is None:
+                continue
+            path = row["path"]
+            fn = binding_policy.provider_for(row.get("class_type"), dependent)
+            effective = _effective_inputs(prompt, path, overrides)
+            current = effective.get(dependent)
+            options = fn(effective) if fn else None
+            if options is None or _is_link(current) or not isinstance(current, str):
+                continue
+            if current not in options:
+                refusals.append({"target": target, "reason": (
+                    f"The current choice {current!r} is not in the new list. "
+                    "Choose one from it in the same change.")})
+    return refusals
+
+
+def binding_signature(descriptor: dict) -> dict | None:
+    """What a stored SDK value was saved for. A different target resets it."""
+    targets = descriptor.get("targets") or []
+    if not targets or descriptor.get("kind") not in CONTROL_KINDS:
+        return None
+    return {"class_type": targets[0].get("class_type"), "input": targets[0].get("input"),
+            "kind": descriptor.get("kind")}
 
 
 def json_safe(view: dict) -> dict:
     """Copy a descriptor view at the HTTP edge, preserving integer precision.
 
-    Internal consumers keep exact numbers and complete option lists for validation.
-    The transport preview limits never change their source or a submitted prompt.
+    INT and SEED values and bounds, and coerced ``binding:<id>:value`` changes,
+    travel as decimal strings: a seed above 2^53 must never become a JS number.
+    Non-finite numbers become null and option lists are capped for display;
+    internal consumers keep exact numbers and complete lists for validation.
     """
     def copy(value):
         if isinstance(value, float) and not math.isfinite(value):
@@ -754,14 +808,9 @@ def json_safe(view: dict) -> dict:
             result = {}
             for name, item in value.items():
                 integer_field = value.get("kind") in ("INT", "SEED") and name in (
-                    "seed", "value", "min", "max", "step", "default")
-                integer_field = integer_field or name == "seed" or (
-                    value.get("source") == "field" and name in ("default", "min", "max")
-                    and isinstance(item, int))
-                # Coerced relay changes retain exact integers on the wire too.
-                integer_field = integer_field or (isinstance(item, int) and not isinstance(item, bool)
-                    and isinstance(name, str) and (name.startswith("field:") or
-                    (name.startswith("control:") and name.endswith((":value", ":seed")))))
+                    "value", "min", "max", "step", "default")
+                integer_field = integer_field or (isinstance(name, str) and name.startswith("binding:")
+                                                  and name.endswith(":value"))
                 if isinstance(item, float) and not math.isfinite(item):
                     result[name] = None
                 elif integer_field and isinstance(item, (int, float)) and not isinstance(item, bool):
@@ -778,229 +827,6 @@ def json_safe(view: dict) -> dict:
         return value
 
     return copy(view)
-
-
-def _describe_fields(prompt: dict, class_lookup: Callable, cache: dict) -> list[dict]:
-    fields = []
-    by_class: dict[str, list[FieldControl]] = {}
-    for entry in FIELD_CONTROLS:
-        by_class.setdefault(entry.class_type, []).append(entry)
-    seen = set()
-    for editor_key in prompt_graph.editor_keys(prompt):
-        for key in prompt_graph.nodes_reaching(prompt, editor_key, by_class):
-            node = prompt[key]
-            inputs = prompt_graph.node_inputs(prompt, key)
-            class_def = class_lookup(node.get("class_type"))
-            for entry in by_class[node.get("class_type")]:
-                if (key, entry.field) in seen:
-                    continue
-                seen.add((key, entry.field))
-                raw = inputs.get(entry.field)
-                source = prompt_graph.linked_node_id(raw)
-                if source is not None and (prompt.get(source) or {}).get("class_type") == CONTROL_CLASS_TYPE:
-                    continue  # the Control's own descriptor drives this field
-                info = None
-                if class_def is not None:
-                    try:
-                        info = _input_info(_class_inputs(class_def, inputs, cache), entry.field)
-                    except Exception:
-                        info = None
-                spec = spec_from_input_info(*info, entry.field) if info else {"kind": None}
-                descriptor = {
-                    "source": "field",
-                    "key": key,
-                    "class_type": node.get("class_type"),
-                    "field": entry.field,
-                    "label": entry.label,
-                    "editor_key": editor_key,
-                    "kind": spec.get("kind"),
-                    "value": None,
-                    "status": STATUS_OK,
-                    "reason": None,
-                }
-                for name in ("label_on", "label_off", "default", "options", "min", "max"):
-                    if name in spec:
-                        descriptor[name] = spec[name]
-                if spec.get("kind") not in CONTROL_KINDS:
-                    descriptor.update(status=STATUS_UNSUPPORTED, reason="This field could not be read.")
-                elif source is not None:
-                    descriptor.update(status=STATUS_UNSUPPORTED, reason="Another node sets this field.")
-                else:
-                    try:
-                        descriptor["value"] = coerce_control_value(spec["kind"], raw)
-                    except ControlValueError as exc:
-                        descriptor.update(status=STATUS_UNSUPPORTED, reason=f"Its value can't be read. {exc}")
-                fields.append(descriptor)
-    return fields
-
-
-_NO_LITERAL = object()
-
-
-def _dry_run_request(prompt: dict, target: dict, class_lookup: Callable, cache: dict, *, literal: Any = _NO_LITERAL) -> dict:
-    """A validator call for ``target``'s node: literals cast as /prompt casts
-    them, links kept (they reach the validator as None). With ``literal``, the
-    Control's link on the target input is replaced by that value."""
-    class_def = target["class_def"]
-    node_inputs = dict(prompt_graph.node_inputs(prompt, target["key"]))
-    if literal is not _NO_LITERAL:
-        node_inputs[target["input"]] = literal
-    class_inputs = _class_inputs(class_def, node_inputs, cache)
-    inputs = {}
-    for name, value in node_inputs.items():
-        info = _input_info(class_inputs, name)
-        inputs[name] = value if prompt_graph.linked_node_id(value) else _literal_for_validation(
-            value, info[0] if info else None
-        )
-    return {
-        "class_def": class_def,
-        "key": target["key"],
-        "inputs": inputs,
-        "received_types": _received_types(prompt, node_inputs, class_lookup),
-    }
-
-
-def _baseline_literals(descriptor: dict, target: dict) -> list:
-    """Literals that could stand where the Control's link is: its own value,
-    then the input's default, then its first option."""
-    candidates = []
-    try:
-        candidates.append(coerce_control_value(descriptor["kind"], descriptor["value_text"], seed=descriptor["seed"]))
-    except ControlValueError:
-        pass
-    candidates.append(target.get("default"))
-    options = target.get("options")
-    if isinstance(options, list) and options:
-        candidates.append(options[0])
-    unique = []
-    for value in candidates:
-        if value is not None and not isinstance(value, (list, dict)) and value not in unique:
-            unique.append(value)
-    return unique
-
-
-def describe_controls(
-    prompt: Any,
-    *,
-    class_lookup: Callable[[str], Any] | None = None,
-    validator_runner: Callable[[list[dict]], list[tuple[bool, str | None]]] | None = None,
-) -> dict:
-    """Describe every Sonder Control and registry field in an API prompt.
-
-    Blocking: it may call target validators. Run it off the event loop.
-    """
-    if not isinstance(prompt, dict):
-        raise ValueError("A prompt must be an object of nodes.")
-    class_lookup = class_lookup or _comfy_class_lookup
-    validator_runner = validator_runner or comfy_validator_runner
-    cache: dict = {}
-
-    pending = []
-    for key, node in prompt.items():
-        if isinstance(node, dict) and node.get("class_type") == CONTROL_CLASS_TYPE:
-            pending.append(_describe_one_control(prompt, str(key), node, class_lookup, cache))
-
-    # Dry-run each covered target's validator with every link as None, exactly
-    # as /prompt will. A failure is blamed on the Control only when the same
-    # call passes with a literal in place of its link; otherwise the node fails
-    # for its own reasons and /prompt will say so.
-    requests, failing_candidates = [], []
-    for descriptor, targets in pending:
-        for target in targets:
-            class_def = target.get("class_def")
-            if target.get("status") != STATUS_OK or class_def is None:
-                continue
-            if not validator_covers(class_def, target["input"]):
-                continue
-            requests.append(_dry_run_request(prompt, target, class_lookup, cache))
-            failing_candidates.append((target, _baseline_literals(descriptor, target)))
-    reasons: dict[tuple[str, str], str] = {}
-    if requests:
-        failed = [
-            (target, candidates, message or "")
-            for (target, candidates), (ok, message) in zip(failing_candidates, validator_runner(requests))
-            if not ok
-        ]
-        baselines, owners = [], []
-        for index, (target, candidates, _) in enumerate(failed):
-            for literal in candidates:
-                baselines.append(_dry_run_request(prompt, target, class_lookup, cache, literal=literal))
-                owners.append(index)
-        passing = set()
-        if baselines:
-            for index, (ok, _) in zip(owners, validator_runner(baselines)):
-                if ok:
-                    passing.add(index)
-        for index, (target, _, message) in enumerate(failed):
-            if index in passing:
-                reasons[(target["key"], target["input"])] = message
-
-    controls = [_finish_control(descriptor, targets, reasons) for descriptor, targets in pending]
-    controls = _group_duplicates(controls)
-    for descriptor in controls:
-        _truncate_note(descriptor, "note")
-    controls.sort(key=lambda d: (d["order"], d["label"].lower(), d["key"]))
-    return {
-        "controls": controls,
-        "notes": _describe_notes(prompt),
-        "fields": _describe_fields(prompt, class_lookup, cache),
-        "editors": prompt_graph.editor_keys(prompt),
-    }
-
-
-# ── Execute-time self-check ──────────────────────────────────────────────────
-
-def resolve_control_value(
-    prompt: Any,
-    unique_id: Any,
-    *,
-    kind: str,
-    value_text: Any,
-    seed: Any,
-    label: str | None = None,
-    class_lookup: Callable[[str], Any] | None = None,
-) -> Any:
-    """The typed value a Control delivers, checked against every input it feeds.
-
-    Raises ``ControlValueError`` with a message naming the Control and target.
-    Validators are not dry-run here: ``/prompt`` already ran them.
-    """
-    class_lookup = class_lookup or _comfy_class_lookup
-    key = str(unique_id) if unique_id is not None else ""
-    name = label
-    if name is None:
-        node = prompt.get(key) if isinstance(prompt, dict) else None
-        name = _node_title(node) if isinstance(node, dict) else DEFAULT_CONTROL_LABEL
-
-    def fail(message: str) -> ControlValueError:
-        return ControlValueError(f"Sonder Control '{name}': {message}")
-
-    targets = []
-    if isinstance(prompt, dict) and key in prompt:
-        cache: dict = {}
-        targets = [
-            _read_target(prompt, target_key, input_name, class_lookup, cache)
-            for target_key, input_name in _control_targets(prompt, key)
-        ]
-    for target in targets:
-        where = f"{target['class_type']} {target['input']}"
-        if target["status"] != STATUS_OK:
-            raise fail(f"It cannot feed {where}. {target.get('reason') or ''}".rstrip())
-        if not kind_compatible(kind, target["kind"]):
-            raise fail(
-                f"It is set up for {kind or 'no type'} but feeds {where}, which takes {target['kind']}. "
-                "Reconnect the Control to update its type."
-            )
-    try:
-        value = coerce_control_value(kind, value_text, seed=seed)
-    except ControlValueError as exc:
-        raise fail(str(exc)) from None
-    for target in targets:
-        try:
-            check_value_for_target(value, target)
-        except ControlValueError as exc:
-            raise fail(f"{str(exc).rstrip('.')} for {target['class_type']} {target['input']}.") from None
-    return value
 
 
 # ── Seeds ────────────────────────────────────────────────────────────────────

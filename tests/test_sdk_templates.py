@@ -18,7 +18,7 @@ def user_dir(tmp_path, monkeypatch):
     return tmp_path
 
 
-INSTALLED = {"SonderEditor", "SonderSaveVideo", "SonderControl", "KSampler"}
+INSTALLED = {"SonderEditor", "SonderSaveVideo", "SonderControlRelay", "KSampler"}
 
 
 def lookup(class_type):
@@ -34,15 +34,17 @@ def api_prompt(**extra_nodes):
     return prompt
 
 
-def describe_with(controls=(), fields=()):
-    return lambda prompt: {"controls": list(controls), "fields": list(fields), "editors": ["1"]}
+def describe_with(bindings=(), relay=None):
+    return lambda prompt: {"relay": relay or {"status": "ok", "key": "9", "error": None},
+                           "bindings": list(bindings), "notes": [], "editors": ["1"]}
 
 
-SEED_CONTROL = {"control_id": "abcd1234", "label": "Seed", "kind": "SEED", "status": "ok", "error": None, "keys": ["5"]}
+SEED_BINDING = {"binding_id": "seed1", "label": "Seed", "kind": "SEED", "status": "ok", "section": "workflow",
+                "group": "", "targets": [{"path": "5", "input": "seed", "class_type": "KSampler", "status": "ok"}]}
 
 
-def validate(prompt, controls=(SEED_CONTROL,), fields=()):
-    return sdk_templates.validate_template(prompt, class_lookup=lookup, describe=describe_with(controls, fields))
+def validate(prompt, bindings=(SEED_BINDING,), relay=None):
+    return sdk_templates.validate_template(prompt, class_lookup=lookup, describe=describe_with(bindings, relay))
 
 
 def raw(prompt):
@@ -77,36 +79,43 @@ def test_validation_requires_one_editor_a_reachable_save_and_installed_nodes():
     assert "no Sonder Editor" in " ".join(validate(none)["errors"])
 
 
-def test_validation_reports_editor_defaults_and_control_warnings():
+def test_a_retired_sonder_control_workflow_names_the_missing_node():
+    result = validate(api_prompt(**{"5": {"class_type": "SonderControl", "inputs": {}}}))
+    assert not result["ok"] and "SonderControl" in " ".join(result["errors"])
+
+
+def test_validation_reports_editor_defaults_and_binding_summary():
     result = validate(api_prompt())
     assert result["editor_key"] == "1"
     assert result["editor_defaults"] == {"fps": 24.0, "width": 960, "height": 544}
-    assert result["controls"][0]["control_id"] == "abcd1234"
+    assert result["controls"] == [{"binding_id": "seed1", "label": "Seed", "kind": "SEED", "status": "ok",
+                                   "section": "workflow", "group": ""}]
     assert result["blocking"] == [] and result["warnings"] == []
 
-    unlinked = dict(SEED_CONTROL, kind="INT", status="unlinked", label="Steps")
-    result = validate(api_prompt(), controls=[unlinked])
+
+def test_problem_bindings_warn_but_never_block():
+    off = dict(SEED_BINDING, binding_id="s2", kind=None, status="missing", label="Steps",
+               reason="This setting is no longer in the workflow, or its node is muted or bypassed.")
+    result = validate(api_prompt(), bindings=[off])
     assert result["blocking"] == []
-    assert any("not connected" in w for w in result["warnings"])
-    assert any("No Seed Control" in w for w in result["warnings"])
+    assert any("“Steps” is off" in w for w in result["warnings"])
+    # A seed that is off does not count as an exposed seed.
+    assert any("No seed exposed" in w for w in result["warnings"])
+    assert sdk_templates.generate_refusals({"relay": {"status": "ok"}, "bindings": [off]}) == []
 
 
-@pytest.mark.parametrize("change, phrase", [
-    ({"status": "stale_kind"}, "type no longer matches"),
-    ({"status": "duplicate_id"}, "share its id"),
-    ({"status": "unsupported"}, "can't set"),
-    ({"status": "mixed_targets"}, "different types"),
-    ({"error": "Value 9 is above the maximum 8."}, "above the maximum"),
-    ({"control_id": ""}, "has no id"),
+@pytest.mark.parametrize("relay, refused", [
+    ({"status": "ok", "key": "9", "error": None}, False),
+    ({"status": "none", "key": None, "error": None}, False),
+    ({"status": "error", "key": "9", "error": "The workflow has more than one Sonder Control Relay. Keep one."}, True),
 ])
-def test_generate_refusals_follow_the_umbrella_list(change, phrase):
-    control = dict(SEED_CONTROL, **change)
-    assert phrase in sdk_templates.generate_refusal(control)
-    assert phrase in " ".join(validate(api_prompt(), controls=[control])["blocking"])
-
-
-def test_unlinked_is_not_refused():
-    assert sdk_templates.generate_refusal(dict(SEED_CONTROL, status="unlinked")) == ""
+def test_only_a_relay_error_refuses_generate(relay, refused):
+    view = {"relay": relay, "bindings": []}
+    assert bool(sdk_templates.generate_refusals(view)) == refused
+    result = validate(api_prompt(), bindings=[], relay=relay)
+    assert bool(result["blocking"]) == refused
+    if refused:
+        assert "more than one" in result["blocking"][0]
 
 
 # ── Store ────────────────────────────────────────────────────────────────────
@@ -145,26 +154,33 @@ def test_template_ids_are_validated_before_any_path(bad):
     assert exc.value.code == "unknown_template"
 
 
-def test_replace_keeps_the_id_and_control_values(user_dir):
+def test_replace_keeps_the_id_and_binding_values_and_resets_overlays(user_dir):
     template_id = sdk_templates.import_template(raw(api_prompt()), validate=lambda p: validate(p))["template_id"]
-    sdk_templates.update_control_values(template_id, lambda d: d["controls"].update({
-        "abcd1234": {"seed": 7}, "gone0000": {"seed": 3},
-    }))
+
+    def seed(data):
+        data["bindings"].update({"seed1": {"value": 7, "sig": None}, "gone": {"value": 3}})
+        data["labels"]["binding:seed1"] = "My seed"
+        data["notes"]["binding:seed1"] = "note"
+        data["layout"]["binding:seed1"] = {"order": 2}
+    sdk_templates.update_control_values(template_id, seed)
     replaced = sdk_templates.replace_template(template_id, raw(api_prompt()), source_name="v2.json", validate=lambda p: validate(p))
     assert replaced["template_id"] == template_id and replaced["replaced_at"] > 0
+    assert (replaced["notes_reset"], replaced["layout_reset"]) == (1, 2)
     values = sdk_templates.read_control_values(template_id)
-    # Present and removed Controls keep their values (removed ones are ignored at Generate).
-    assert values["controls"] == {"abcd1234": {"seed": 7}, "gone0000": {"seed": 3}}
-    assert values["fields"] == {} and values["version"] == 1
+    # Present and removed bindings keep their values (removed ones are ignored at Generate).
+    assert values["bindings"] == {"seed1": {"value": 7, "sig": None}, "gone": {"value": 3}}
+    assert values["labels"] == {} and values["notes"] == {} and values["layout"] == {} and values["version"] == 1
 
 
-def test_control_values_preserve_unknown_keys_and_refuse_a_deleted_template(user_dir):
+def test_control_values_preserve_unknown_and_retired_keys_and_refuse_a_deleted_template(user_dir):
     template_id = sdk_templates.import_template(raw(api_prompt()), validate=lambda p: validate(p))["template_id"]
     path = user_dir / "sonder-editor" / "templates" / f"{template_id}.controls.json"
-    path.write_text(json.dumps({"version": 1, "controls": {}, "fields": {}, "future": {"keep": True}}), encoding="utf-8")
-    sdk_templates.update_control_values(template_id, lambda d: d["controls"].update({"abcd1234": {"seed": 1}}))
+    path.write_text(json.dumps({"version": 1, "controls": {"abcd1234": {"seed": 4}}, "fields": {"A/b": 1},
+                                "future": {"keep": True}}), encoding="utf-8")
+    sdk_templates.update_control_values(template_id, lambda d: d["bindings"].update({"seed1": {"value": 1}}))
     stored = json.loads(path.read_text(encoding="utf-8"))
     assert stored["future"] == {"keep": True}
+    assert stored["controls"] == {"abcd1234": {"seed": 4}} and stored["fields"] == {"A/b": 1}
 
     sdk_templates.delete_template(template_id)
     with pytest.raises(TemplateError):
@@ -177,7 +193,7 @@ def test_a_corrupt_control_values_file_is_moved_aside_not_overwritten(user_dir):
     folder = user_dir / "sonder-editor" / "templates"
     path = folder / f"{template_id}.controls.json"
     path.write_text("{not json", encoding="utf-8")
-    assert sdk_templates.read_control_values(template_id)["controls"] == {}
+    assert sdk_templates.read_control_values(template_id)["bindings"] == {}
     aside = [name for name in os.listdir(folder) if ".controls.json.corrupt-" in name]
     assert len(aside) == 1
     assert (folder / aside[0]).read_text(encoding="utf-8") == "{not json"
@@ -189,7 +205,7 @@ def test_a_transient_read_error_is_raised_not_quarantined(user_dir, monkeypatch)
     template_id = sdk_templates.import_template(raw(api_prompt()), validate=lambda p: validate(p))["template_id"]
     folder = user_dir / "sonder-editor" / "templates"
     path = folder / f"{template_id}.controls.json"
-    path.write_text(json.dumps({"version": 1, "controls": {"abcd1234": {"seed": 4}}, "fields": {}}), encoding="utf-8")
+    path.write_text(json.dumps({"version": 1, "bindings": {"seed1": {"value": 4}}}), encoding="utf-8")
 
     def busy(*args, **kwargs):
         raise PermissionError("sharing violation")
@@ -198,7 +214,7 @@ def test_a_transient_read_error_is_raised_not_quarantined(user_dir, monkeypatch)
         patch.setattr(sdk_paths, "open", busy, raising=False)
         with pytest.raises(PermissionError):
             sdk_templates.read_control_values(template_id)
-    assert sdk_templates.read_control_values(template_id)["controls"] == {"abcd1234": {"seed": 4}}
+    assert sdk_templates.read_control_values(template_id)["bindings"] == {"seed1": {"value": 4}}
     assert not [name for name in os.listdir(folder) if ".corrupt-" in name]
 
 
@@ -208,8 +224,8 @@ def test_concurrent_control_value_writes_do_not_lose_updates(user_dir):
     def bump(_):
         for _ in range(20):
             def mutate(data):
-                entry = data["controls"].setdefault("abcd1234", {"seed": 0})
-                entry["seed"] += 1
+                entry = data["bindings"].setdefault("seed1", {"value": 0})
+                entry["value"] += 1
             sdk_templates.update_control_values(template_id, mutate)
 
     threads = [threading.Thread(target=bump, args=(i,)) for i in range(4)]
@@ -217,7 +233,7 @@ def test_concurrent_control_value_writes_do_not_lose_updates(user_dir):
         thread.start()
     for thread in threads:
         thread.join()
-    assert sdk_templates.read_control_values(template_id)["controls"]["abcd1234"]["seed"] == 80
+    assert sdk_templates.read_control_values(template_id)["bindings"]["seed1"]["value"] == 80
 
 
 # ── SDK editor position ──────────────────────────────────────────────────────

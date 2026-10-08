@@ -13,20 +13,20 @@ a fresh `[Unreleased]` block.
 
 ### Added
 - Projects carry a stamp of the Sonder Editor version that saved them (this version onward), so a later version can name the update a newer project needs.
-- Arrange Controls and Panel Notes by dragging between sections, and filter long option lists with an exact-value choice for capped previews.
+- Arrange Controls and their notes by dragging between sections, and filter long option lists with an exact-value choice for capped previews.
 - Controls sidebar in fullscreen, mounted tabs and the Sonder App: edit workflow values, seed modes and Markdown notes beside shared take settings.
-- Sonder Panel Note node and a Markdown Panel note field on Sonder Control let workflow authors include titles, instructions and explanations in API exports.
-- Sonder Control node: one named value you wire to the inputs it should drive, such as steps, CFG, a sampler, a LoRA or a seed. Its type follows what it is connected to (you pick it when the input accepts any type), and a value outside an input's range or options stops the run with a message naming the Control.
+- Sonder Control Relay node: a workflow's Controls menu. It exposes existing node settings, a Sonder Selector's feature list included, in the Controls sidebar with labels, groups and Markdown notes, and the Sonder App reads the same menu from an Export (API) workflow. The settings stay on their own nodes, and a copied node is never exposed twice.
 
 ### Changed
 - Linking a project folder and turning on external project links now work only in a browser on the ComfyUI machine. Elsewhere, Link project folder and the Settings switch are greyed out and say so. Turning links off and unlinking still work from anywhere.
 - Render queue: a job that is waiting again or has failed shows why on a second line, such as a run interrupted before the job completed. Hover for the full text.
 
 ### Fixed
+- Sonder Selector: a choice or choice list fed by a link no longer fails ComfyUI's check before the run; the node checks the value when it runs.
 - Link project folder: a project that is already in the projects folder is now refused with that reason. It used to be reported as a name collision.
 - Mounted editor: a brief websocket interruption no longer drops canvas presence while its HTTP heartbeats continue.
 - Assets: Open Source Workflow is greyed out in the mounted editor tab, where it could not open anything, and for takes saved without a workflow. It used to stay clickable and report the workflow as unavailable.
-- Queue: a save node whose "mark queue complete" is set by a Primitive Boolean or a Sonder Control now completes the job when it is on. It used to be read as off, so the same job re-rendered.
+- Queue: a save node whose "mark queue complete" is set by a Primitive Boolean now completes the job when it is on. It used to be read as off, so the same job re-rendered.
 - Queue: a render that fails or is interrupted after taking a queue job now returns that job to pending right away, even when no editor is open. It used to stay running until an open canvas reset it about five seconds later.
 - Save Bridge: the "bridge asset saved" notice and the final refresh now wait until the bridge has finished saving its files. A slow finalization used to be cut short after five seconds.
 

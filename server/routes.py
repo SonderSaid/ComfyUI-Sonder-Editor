@@ -237,21 +237,13 @@ def _describe_controls_body(raw: bytes) -> dict:
     prompt = body.get("prompt") if isinstance(body, dict) else None
     if not isinstance(prompt, dict):
         raise _ControlsRequestError("The request must carry an API-format prompt object.")
-    view = control_descriptors.describe_controls(prompt)
-    # Optional canvas scope/validation shares the full descriptor authority.
-    # Default describe callers keep their existing wire shape. Filtering happens
-    # before validation and before json_safe caps display-only COMBO previews.
-    if "editor_key" in body:
-        editor_key = body["editor_key"]
-        if editor_key is not None and not isinstance(editor_key, str):
-            raise _ControlsRequestError("The editor key must be text or null.")
-        if editor_key in view.get("editors", []):
-            view["fields"] = [f for f in view["fields"] if f.get("editor_key") == editor_key]
-        else:
-            view["fields"] = [dict(f, status="unsupported",
-                reason="Fields require an unambiguous root-level editor.") for f in view["fields"]]
+    census = body.get("relay_census")
+    if census is not None and not isinstance(census, dict):
+        raise _ControlsRequestError("The Relay census must be an object.")
+    view = control_descriptors.describe_bindings(prompt, relay_census=census)
+    # Validation uses the full view, before json_safe caps display-only previews.
     if "changes" in body:
-        cleaned, rejected = control_descriptors.validate_control_changes(view, body["changes"])
+        cleaned, rejected = control_descriptors.validate_binding_changes(view, body["changes"], prompt=prompt)
         view.update(ok=not bool(rejected), changes={} if rejected else cleaned, rejected=rejected)
     return control_descriptors.json_safe(view)
 
@@ -15354,11 +15346,11 @@ if routes is not None:
 
     @routes.post("/sonder-editor/controls/describe")
     async def api_describe_controls(request: web.Request) -> web.Response:
-        """Describe the Sonder Controls and registry fields in an API prompt.
+        """Describe the Sonder Control Relay's bindings and notes in an API prompt.
 
         Reads the posted graph only, never a project, so it is outside the
-        change-certificate contract. Parsing and target validator dry runs run
-        off the event loop.
+        change-certificate contract. Parsing and describing run off the event
+        loop.
         """
         limit = CONTROLS_DESCRIBE_MAX_BYTES
         if request.content_length is not None and request.content_length > limit:

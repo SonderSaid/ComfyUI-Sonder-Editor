@@ -9,7 +9,7 @@ const NOTE_PREVIEWS = [500, 80];
 // The registry refuses these for good; resending the same publication cannot help.
 const RETIRED_CODES = ["stale_view", "invalid_ack", "host_changed"];
 const UNSENDABLE_CODES = ["too_large", "invalid_view"];
-const unavailableView = error => Object.freeze({ controls: [], fields: [], notes: [], error });
+const unavailableView = error => Object.freeze({ bindings: [], notes: [], error });
 const TOO_LARGE_VIEW = unavailableView(
     "This workflow's Controls are too large to show in a mounted tab. Edit them on the canvas.",
 );
@@ -29,9 +29,12 @@ const shorten = (descriptor, field, limit) =>
 export function fitPublicationView(view, envelope) {
     const fits = candidate => publicationBytes({ ...envelope, view: candidate }) <= MAX_PUBLICATION_BYTES;
     if (fits(view)) return view;
+    // Unlisted anchors are for Manage only; they go first.
+    view = { ...view, suggestions: [] };
+    if (fits(view)) return view;
     const capped = {
         ...view,
-        controls: (view.controls || []).map(d =>
+        bindings: (view.bindings || []).map(d =>
             Array.isArray(d.options) && d.options.length > OPTION_PREVIEW
                 ? { ...d, options: d.options.slice(0, OPTION_PREVIEW), options_truncated: true }
                 : d,
@@ -41,7 +44,7 @@ export function fitPublicationView(view, envelope) {
     for (const limit of NOTE_PREVIEWS) {
         const trimmed = {
             ...capped,
-            controls: capped.controls.map(d => shorten(d, "note", limit)),
+            bindings: capped.bindings.map(d => shorten(d, "note", limit)),
             notes: (capped.notes || []).map(d => shorten(d, "text", limit)),
         };
         if (fits(trimmed)) return trimmed;

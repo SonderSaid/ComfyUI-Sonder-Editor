@@ -781,31 +781,34 @@ def _prepare_control_publication(body: Any) -> dict:
     view = body.get("view")
     if not isinstance(view, dict):
         raise ValueError("The view must be an object.")
-    for name in ("controls", "fields", "notes"):
+    for name in ("bindings", "notes"):
         if not isinstance(view.get(name), list) or not all(isinstance(d, dict) for d in view[name]):
             raise ValueError(f"{name} must be a list of descriptors.")
         for descriptor in view[name]:
-            identity = descriptor.get("note_id" if name == "notes" else "control_id") if name != "fields" else None
-            if name != "fields" and not isinstance(identity, str):
+            identity = descriptor.get("note_id" if name == "notes" else "binding_id")
+            if not isinstance(identity, str):
                 raise ValueError("Descriptor identities must be text.")
-            if name == "fields" and not all(isinstance(descriptor.get(n), str) for n in ("class_type", "field")):
-                raise ValueError("Field identities must be text.")
             if not isinstance(descriptor.get("status"), str):
                 raise ValueError("A descriptor status is required.")
             kind = descriptor.get("kind")
             if kind is not None and not isinstance(kind, str):
                 raise ValueError("Descriptor kinds must be text.")
-            if name != "notes":
+            if name == "bindings":
                 if "options" in descriptor and not isinstance(descriptor["options"], (list, tuple)):
                     raise ValueError("Descriptor options must be a list.")
                 if "options_truncated" in descriptor and not isinstance(descriptor["options_truncated"], bool):
                     raise ValueError("The options preview flag must be boolean.")
+                if not isinstance(descriptor.get("targets", []), list):
+                    raise ValueError("Descriptor targets must be a list.")
                 for bound in ("min", "max"):
                     if descriptor.get(bound) is not None:
                         numeric_kind = "INT" if kind in ("INT", "SEED") else "FLOAT"
                         control_descriptors.coerce_control_value(numeric_kind, descriptor[bound])
+    if "suggestions" in view and (not isinstance(view["suggestions"], list)
+                                  or not all(isinstance(d, dict) for d in view["suggestions"])):
+        raise ValueError("suggestions must be a list.")
     view = control_descriptors.json_safe(view)
-    for name, field in (("controls", "note"), ("notes", "text")):
+    for name, field in (("bindings", "note"), ("notes", "text")):
         for descriptor in view[name]:
             text = descriptor.get(field)
             if text is not None and not isinstance(text, str):
@@ -923,7 +926,7 @@ async def _post_control_changes_once(project_id: str, host_id: str, session_id: 
         return {"ok": False, "code": code}
     if view is None:
         return {"ok": False, "code": "view_unavailable"}
-    cleaned, rejected = await asyncio.to_thread(control_descriptors.validate_control_changes, view, changes)
+    cleaned, rejected = await asyncio.to_thread(control_descriptors.validate_binding_changes, view, changes)
     events = []
     async with _lock:
         code = _controls_gate_locked(key, session_id, "tab", events)

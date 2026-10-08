@@ -1,5 +1,7 @@
 // Standalone host adapters; callers own identity and connection lifecycle.
-const idle = () => ({ state: "idle", controls: [], fields: [], notes: [], error: null });
+const idle = () => ({ state: "idle", bindings: [], notes: [], error: null });
+// The Sonder App has no graph to add a Relay to; the workflow decides.
+const SDK_EMPTY = "This workflow exposes no Controls.";
 const failure = (changes, reason) => ({
     ok: false,
     rejected: Object.keys(changes || {}).map(target => ({ target, reason })),
@@ -20,7 +22,7 @@ export function createSdkControlsHost(owner) {
     const adopt = payload => {
         if (Number(payload.seq) >= seq) {
             seq = Number(payload.seq);
-            view = { ...payload.view, state: "ready", error: null };
+            view = { ...payload.view, state: "ready", error: payload.view?.error || null };
             emit();
         }
     };
@@ -65,6 +67,7 @@ export function createSdkControlsHost(owner) {
     }
     return {
         getView: () => view,
+        emptyMessage: SDK_EMPTY,
         subscribe(cb) {
             listeners.add(cb);
             return () => listeners.delete(cb);

@@ -32,16 +32,23 @@ def template_prompt():
         "1": {"class_type": "SonderEditor", "inputs": {"project": "Other", "project_name": "x", "fps": 24.0,
                                                         "width": 64, "height": 64, "scene_id": "old-scene"}},
         "2": {"class_type": "SonderSaveVideo", "inputs": {"project": ["1", 0], "mark_queue_complete": False}},
-        "5": {"class_type": "SonderControl", "inputs": {"seed": 10, "kind": "SEED", "value_text": "", "control_id": "abcd1234"}},
-        "6": {"class_type": "KSampler", "inputs": {"seed": ["5", 0]}},
+        "5": {"class_type": "KSampler", "inputs": {"seed": 10}},
     }
 
 
-def seed_control(**changes):
-    control = {"control_id": "abcd1234", "label": "Seed", "kind": "SEED", "status": "ok", "error": None,
-               "keys": ["5"], "seed": 10, "min": 0, "max": 100, "step": 1}
-    control.update(changes)
-    return control
+def seed_binding(**changes):
+    binding = {"binding_id": "abcd1234", "label": "Seed", "kind": "SEED", "status": "ok", "error": None,
+               "targets": [{"path": "5", "input": "seed", "class_type": "KSampler", "status": "ok"}],
+               "value": 10, "min": 0, "max": 100, "step": 1}
+    binding.update(changes)
+    return binding
+
+
+def stored_seed(value=None, **entry):
+    """A sidecar entry saved for the seed binding's current target."""
+    if value is not None:
+        entry["value"] = value
+    return {**entry, "sig": {"class_type": "KSampler", "input": "seed", "kind": "SEED"}}
 
 
 class FakeJob:
@@ -118,8 +125,8 @@ class World:
         self.events = []
         self.owners = {}
         self.now = [1000.0]
-        self.controls = [seed_control()]
-        self.fields = []
+        self.bindings = [seed_binding()]
+        self.relay = {"status": "ok", "key": "9", "error": None}
         self.runner = SdkRunner(
             resolve_project=self.resolve,
             client_factory=lambda url, token: self.client,
@@ -128,7 +135,7 @@ class World:
             emit=lambda alias, event: self.events.append((alias, event)),
             get_owner=self.get_owner,
             sdk_ready=lambda: True,
-            describe=lambda prompt: {"controls": [dict(c) for c in self.controls], "fields": list(self.fields)},
+            describe=self.describe,
             clock=lambda: self.now[0],
         )
         validation = {"ok": True, "errors": [], "blocking": [], "warnings": []}
@@ -136,6 +143,17 @@ class World:
             json.dumps(template_prompt()).encode(), source_name="i2va.json",
             validate=lambda prompt: validation,
         )["template_id"]
+
+    def describe(self, prompt):
+        """Fake bindings whose values read the prompt, as the real describe does."""
+        bindings = []
+        for binding in self.bindings:
+            binding = json.loads(json.dumps(binding))
+            target = (binding.get("targets") or [None])[0]
+            if binding["status"] == "ok" and target and target["path"] in prompt:
+                binding["value"] = prompt[target["path"]]["inputs"].get(target["input"], binding.get("value"))
+            bindings.append(binding)
+        return {"relay": dict(self.relay), "bindings": bindings, "notes": []}
 
     async def resolve(self, project):
         return (f"C:/projects/{project}", list(ALIASES)) if project == PROJECT else ("", [])
@@ -168,8 +186,8 @@ def editor_values():
 # ── Generate ─────────────────────────────────────────────────────────────────
 
 def test_generate_n_submits_n_runs_with_tokens_values_and_advancing_seeds(world):
-    sdk_templates.update_control_values(world.template_id, lambda d: d["controls"].update(
-        {"abcd1234": {"seed_mode": "increment"}}))
+    sdk_templates.update_control_values(world.template_id, lambda d: d["bindings"].update(
+        {"abcd1234": stored_seed(seed_mode="increment")}))
 
     async def go():
         session = await world.open()
@@ -189,7 +207,8 @@ def test_generate_n_submits_n_runs_with_tokens_values_and_advancing_seeds(world)
         assert sdk_runs.token_state(token)["project_ids"] == sorted(ALIASES)
         tokens.add(token)
     assert len(tokens) == 3
-    assert sdk_templates.read_control_values(world.template_id)["controls"]["abcd1234"]["seed"] == 13
+    stored = sdk_templates.read_control_values(world.template_id)["bindings"]["abcd1234"]
+    assert stored["value"] == 13 and stored["sig"] == stored_seed()["sig"]
     assert sdk_templates.read_editor_state(PROJECT)["pre_context_frames"] == 17
     assert [run.state for run in session.runs] == [QUEUED] * 3
     assert {alias for alias, _ in world.events} == set(ALIASES)
@@ -204,7 +223,7 @@ def test_seeds_default_to_randomize_and_fixed_never_changes(world, monkeypatch):
     async def go():
         session = await world.open()
         await world.runner.generate(session, tab_session_id="tab-1", count=2)
-        sdk_templates.update_control_values(world.template_id, lambda d: d["controls"]["abcd1234"].update(seed_mode="fixed"))
+        sdk_templates.update_control_values(world.template_id, lambda d: d["bindings"]["abcd1234"].update(seed_mode="fixed"))
         await world.runner.generate(session, tab_session_id="tab-1", count=2)
 
     asyncio.run(go())
@@ -213,9 +232,8 @@ def test_seeds_default_to_randomize_and_fixed_never_changes(world, monkeypatch):
     assert fixed_seeds[0] == fixed_seeds[1]
 
 
-@pytest.mark.parametrize("status", ["stale_kind", "duplicate_id", "unsupported", "mixed_targets"])
-def test_generate_refuses_a_control_that_is_not_ok(world, status):
-    world.controls = [seed_control(status=status)]
+def test_generate_refuses_a_relay_that_cannot_be_read(world):
+    world.relay = {"status": "error", "key": "9", "error": "The workflow has more than one Sonder Control Relay. Keep one."}
 
     async def go():
         session = await world.open()
@@ -224,18 +242,26 @@ def test_generate_refuses_a_control_that_is_not_ok(world, status):
         return exc.value
 
     error = asyncio.run(go())
-    assert error.code == "generate_refused" and error.details["problems"]
+    assert error.code == "generate_refused" and "more than one" in error.details["problems"][0]
     assert world.client.submitted == []
 
 
-def test_an_unlinked_control_does_not_block_generate(world):
-    world.controls = [seed_control(status="unlinked", kind="INT", control_id="ffff0000")]
+@pytest.mark.parametrize("status", ["missing", "duplicate", "linked", "no_widget", "unsupported", "denied"])
+def test_a_binding_that_is_off_skips_its_override_and_never_blocks_generate(world, status):
+    # A settled problem never blocks a run: the workflow's own value runs, as
+    # a native Run would, and the seed is neither applied nor advanced.
+    world.bindings = [seed_binding(status=status, kind=None)]
+    sdk_templates.update_control_values(world.template_id, lambda d: d["bindings"].update(
+        {"abcd1234": stored_seed(3, seed_mode="increment")}))
 
     async def go():
         session = await world.open()
-        return await world.runner.generate(session, tab_session_id="tab-1")
+        return await world.runner.generate(session, tab_session_id="tab-1", count=2)
 
-    assert len(asyncio.run(go())["run_ids"]) == 1
+    result = asyncio.run(go())
+    assert len(result["run_ids"]) == 2 and result["seeds_used"] == [{}, {}]
+    assert [g["5"]["inputs"]["seed"] for g in world.client.submitted] == [10, 10]
+    assert sdk_templates.read_control_values(world.template_id)["bindings"]["abcd1234"]["value"] == 3
 
 
 def test_a_refused_submit_stops_the_batch_and_forgets_its_token(world):
@@ -511,16 +537,19 @@ def test_generate_starts_from_editor_defaults_not_the_authors_position(world):
     assert editor["scene_id"] == "" and editor["selection_start"] == 0
 
 
-def test_stored_values_and_fields_are_applied_and_rechecked(world):
+def test_stored_values_are_applied_and_rechecked(world):
     describes = []
-    world.fields = [{"source": "field", "key": "2", "class_type": "SonderSaveVideo", "field": "mark_queue_complete",
-                     "kind": "BOOLEAN", "status": "ok"}]
+    world.bindings.append({"binding_id": "advance1", "label": "Advance", "kind": "BOOLEAN", "status": "ok",
+                           "error": None, "value": False,
+                           "targets": [{"path": "2", "input": "mark_queue_complete", "class_type": "SonderSaveVideo",
+                                        "status": "ok"}]})
     real = world.runner._describe
     world.runner._describe = lambda prompt: describes.append(json.loads(json.dumps(prompt))) or real(prompt)
-    sdk_templates.update_control_values(world.template_id, lambda d: (
-        d["controls"].update({"abcd1234": {"value_text": "ignored for a seed", "seed": 3}}),
-        d["fields"].update({"SonderSaveVideo/mark_queue_complete": True}),
-    ))
+    sdk_templates.update_control_values(world.template_id, lambda d: d["bindings"].update({
+        "abcd1234": stored_seed(3, seed_mode="fixed"),
+        "advance1": {"value": True, "sig": {"class_type": "SonderSaveVideo", "input": "mark_queue_complete",
+                                            "kind": "BOOLEAN"}},
+    }))
 
     async def go():
         session = await world.open()
@@ -529,9 +558,62 @@ def test_stored_values_and_fields_are_applied_and_rechecked(world):
     asyncio.run(go())
     graph = world.client.submitted[0]
     assert graph["2"]["inputs"]["mark_queue_complete"] is True
-    assert graph["5"]["inputs"]["value_text"] == "ignored for a seed" and graph["5"]["inputs"]["seed"] == 3
+    assert graph["5"]["inputs"]["seed"] == 3
     assert graph["1"]["inputs"]["render_cache_max_bytes"] == 0
-    assert len(describes) == 2 and describes[1]["5"]["inputs"]["value_text"] == "ignored for a seed"
+    assert len(describes) == 2 and describes[1]["5"]["inputs"]["seed"] == 3
+
+
+def test_a_value_saved_for_another_target_resets_instead_of_applying(world):
+    # A rebind or a re-export can point the same binding id at a different
+    # setting with compatible bounds; its old value must not follow it.
+    sdk_templates.update_control_values(world.template_id, lambda d: d["bindings"].update({
+        "abcd1234": {"value": 3, "seed_mode": "fixed", "sig": {"class_type": "KSampler", "input": "noise_seed",
+                                                              "kind": "SEED"}}}))
+
+    async def go():
+        session = await world.open()
+        view = (await world.runner.controls_view(session))["view"]
+        await world.runner.generate(session, tab_session_id="tab-1")
+        return view
+
+    view = asyncio.run(go())
+    assert view["bindings"][0]["reset"] is True and "Reset" in view["bindings"][0]["reason"]
+    assert world.client.submitted[0]["5"]["inputs"]["seed"] == 10
+
+
+def test_an_out_of_range_stored_value_resets_and_is_not_applied(world):
+    sdk_templates.update_control_values(world.template_id, lambda d: d["bindings"].update(
+        {"abcd1234": stored_seed(500, seed_mode="fixed")}))
+
+    async def go():
+        session = await world.open()
+        view = (await world.runner.controls_view(session))["view"]
+        await world.runner.generate(session, tab_session_id="tab-1")
+        return view
+
+    view = asyncio.run(go())
+    assert view["bindings"][0]["reset"] is True
+    assert world.client.submitted[0]["5"]["inputs"]["seed"] == 10
+
+
+def test_a_promoted_seed_writes_every_consumer_from_one_binding(world):
+    prompt = json.loads(json.dumps(sdk_templates.load_template(world.template_id)[0]))
+    prompt["7:5"] = {"class_type": "KSampler", "inputs": {"seed": 10}}
+    sdk_templates.replace_template(world.template_id, json.dumps(prompt).encode(), validate=lambda p: {"ok": True})
+    world.bindings = [seed_binding(targets=[
+        {"path": "5", "input": "seed", "class_type": "KSampler", "status": "ok"},
+        {"path": "7:5", "input": "seed", "class_type": "KSampler", "status": "ok"}])]
+    sdk_templates.update_control_values(world.template_id, lambda d: d["bindings"].update(
+        {"abcd1234": stored_seed(20, seed_mode="increment")}))
+
+    async def go():
+        session = await world.open()
+        return await world.runner.generate(session, tab_session_id="tab-1", count=2)
+
+    result = asyncio.run(go())
+    assert result["seeds_used"] == [{"abcd1234": "20"}, {"abcd1234": "21"}]
+    assert [(g["5"]["inputs"]["seed"], g["7:5"]["inputs"]["seed"]) for g in world.client.submitted] == [(20, 20), (21, 21)]
+    assert sdk_templates.read_control_values(world.template_id)["bindings"]["abcd1234"]["value"] == 22
 
 
 def test_open_uses_the_folders_own_spelling_and_quotes_the_tab_url(world):
@@ -752,7 +834,7 @@ def test_run_detail_is_memory_only_and_progress_ignores_late_events(world):
         session = await world.open()
         await world.runner.generate(session, tab_session_id="tab-1")
         run = session.runs[0]
-        snapshot = {"run_token": run.token, "prompt_id": run.prompt_id, "node_id": "6", "display_node_id": "6", "count": {"value": 1, "max": 4}}
+        snapshot = {"run_token": run.token, "prompt_id": run.prompt_id, "node_id": "5", "display_node_id": "5", "count": {"value": 1, "max": 4}}
         world.runner.apply_progress(snapshot)
         assert run.public()["progress_node"] == "KSampler"
         assert run.public()["progress_count"] == {"value": 1, "max": 4}
@@ -808,11 +890,11 @@ def test_capacity_across_generate_requests(world):
 @pytest.mark.parametrize("meta", [None, "bad", {"title": "   "}, {"title": 42}])
 def test_progress_metadata_cannot_prevent_generate(world, meta):
     graph = template_prompt()
-    graph["6"]["_meta"] = meta
+    graph["5"]["_meta"] = meta
     sdk_templates.replace_template(world.template_id, json.dumps(graph).encode(), validate=lambda p: {"ok": True})
     async def go():
         session = await world.open()
         result = await world.runner.generate(session, tab_session_id="tab-1")
         assert result["run_ids"]
-        assert session.runs[0].node_labels["6"] == "KSampler"
+        assert session.runs[0].node_labels["5"] == "KSampler"
     asyncio.run(go())

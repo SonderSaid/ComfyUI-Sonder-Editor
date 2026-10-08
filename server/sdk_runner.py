@@ -311,7 +311,7 @@ class SdkRunner:
         self._sdk_ready = sdk_ready
         self._uninstalling = uninstalling
         self._generating = 0  # Generates between their gate and their submit
-        self._describe = describe or control_descriptors.describe_controls
+        self._describe = describe or control_descriptors.describe_bindings
         self._clock = clock
         self._sessions: dict[str, SdkSession] = {}
         self._runs_by_token: dict[str, SdkRun] = {}
@@ -498,7 +498,9 @@ class SdkRunner:
             prompt, _ = sdk_templates.load_template(session.template_id)
             stored = sdk_templates.read_control_values(session.template_id)
             view = sdk_templates.apply_stored_values(prompt, self._describe(prompt), stored, describe=self._describe)
-            return {"view": view, "seq": stored["seq"]}
+            # ``prompt`` now carries the stored values: changes are validated
+            # against it, so a new choice list and a choice in it agree.
+            return {"view": view, "seq": stored["seq"], "prompt": prompt}
 
     async def controls_view(self, session: SdkSession) -> dict:
         async with self.template_lock(session.template_id):
@@ -510,11 +512,12 @@ class SdkRunner:
             # Ownership may change while waiting behind a Generate batch.
             await self.authorized(session_id, secret, tab_session_id)
             snapshot = await asyncio.to_thread(self._controls_snapshot, session)
-            cleaned, rejected = await asyncio.to_thread(control_descriptors.validate_control_changes, snapshot["view"], changes)
+            cleaned, rejected = await asyncio.to_thread(
+                control_descriptors.validate_binding_changes, snapshot["view"], changes, prompt=snapshot["prompt"])
             if rejected:
                 raise SdkError("Some changes could not be saved.", "invalid_change", 400, rejected=rejected)
             await self.authorized(session_id, secret, tab_session_id)
-            await await_template_io(sdk_templates.store_control_changes, session.template_id, cleaned)
+            await await_template_io(sdk_templates.store_binding_changes, session.template_id, cleaned, snapshot["view"])
             return await asyncio.to_thread(self._controls_snapshot, session)
 
     # ── Generate ─────────────────────────────────────────────────────────────
@@ -585,7 +588,7 @@ class SdkRunner:
                 raise SdkError("Too many takes are already waiting. Wait or cancel some.", "too_many_runs", 429)
             build = await asyncio.to_thread(self._build_base, session, editor_values, render_cache_max_bytes, writer)
             self._check_submit_epoch(session, epoch, build)
-            refusals = [problem for problem in map(sdk_templates.generate_refusal, build["controls"]) if problem]
+            refusals = sdk_templates.generate_refusals(build["view"])
             from .model_requirements import missing_models, missing_model_message
             missing = await asyncio.to_thread(missing_models, build["prompt"], executable_only=True)
             refusals.extend(map(missing_model_message, missing))
@@ -609,7 +612,7 @@ class SdkRunner:
             return self._build_base_locked(session, editor_values, render_cache_max_bytes, writer)
 
     def _build_base_locked(self, session: SdkSession, editor_values: Any, render_cache_max_bytes: int, writer) -> dict:
-        """The prompt every run of this Generate shares, plus its Control descriptors."""
+        """The prompt every run of this Generate shares, plus its Controls view."""
         stale = False
         if editor_values is not None:
             result = sdk_templates.write_editor_state(session.project, editor_values, writer=writer)
@@ -634,30 +637,32 @@ class SdkRunner:
         editor_inputs.update(values)
         editor_inputs["project"] = session.project
         editor_inputs["render_cache_max_bytes"] = render_cache_max_bytes
-        described = sdk_templates.apply_stored_values(prompt, self._describe(prompt), stored, describe=self._describe)
-        controls = described.get("controls", [])
-        seed_controls = []
-        for control in controls:
-            if control.get("kind") == "SEED" and control.get("control_id"):
-                seed = control.get("seed")
-                if isinstance(seed, bool) or not isinstance(seed, int):
-                    seed = 0
-                mode = control["seed_mode"]
-                seed_controls.append({
-                    "control_id": control["control_id"],
-                    "keys": list(control.get("keys", [])),
-                    "seed": seed,
-                    "mode": mode,
-                    "min": control.get("min", 0),
-                    "max": control.get("max", SEED_MAX),
-                    "step": control.get("step") or 1,
-                })
-        return {"prompt": prompt, "editor_key": editors[0], "controls": controls, "seed_controls": seed_controls, "stale": stale}
+        view = sdk_templates.apply_stored_values(prompt, self._describe(prompt), stored, describe=self._describe)
+        # Seeds are keyed by binding; each target (one per consumer of a
+        # promoted seed) is only the address a run writes.
+        seed_bindings = []
+        for binding in view.get("bindings", []):
+            if binding.get("kind") != "SEED" or binding.get("status") != control_descriptors.STATUS_OK:
+                continue
+            seed = binding.get("value")
+            if isinstance(seed, bool) or not isinstance(seed, int):
+                seed = 0
+            seed_bindings.append({
+                "binding_id": binding["binding_id"],
+                "targets": [(t["path"], t["input"]) for t in binding.get("targets", [])],
+                "sig": control_descriptors.binding_signature(binding),
+                "seed": seed,
+                "mode": binding["seed_mode"],
+                "min": binding.get("min", 0),
+                "max": binding.get("max", SEED_MAX),
+                "step": binding.get("step") or 1,
+            })
+        return {"prompt": prompt, "editor_key": editors[0], "view": view, "seed_bindings": seed_bindings, "stale": stale}
 
     async def _submit_runs(self, session: SdkSession, client, build: dict, count: int, epoch: int) -> dict:
         labels = {str(key): control_descriptors._node_title(node, str(node.get("class_type") or ""))
                   for key, node in build["prompt"].items()}
-        seed_controls = build["seed_controls"]
+        seed_bindings = build["seed_bindings"]
         run_ids, seeds_used, failure = [], [], None
         try:
             for index in range(1, count + 1):
@@ -665,7 +670,7 @@ class SdkRunner:
                     if not run_ids:
                         self._check_submit_epoch(session, epoch, build)
                     break  # Cancel all arrived during this batch: submit no more.
-                seeds = {c["control_id"]: c["seed"] for c in seed_controls}
+                seeds = {b["binding_id"]: b["seed"] for b in seed_bindings}
                 graph = await asyncio.to_thread(self._graph_for_run, build, seeds)
                 if session.cancel_epoch != epoch:
                     if not run_ids:
@@ -699,7 +704,7 @@ class SdkRunner:
                         self._mark_unconfirmed(run)
                         run_ids.append(run.run_id)
                         seeds_used.append({cid: str(value) for cid, value in seeds.items()})
-                        await self._advance_seeds(session, seed_controls)
+                        await self._advance_seeds(session, seed_bindings)
                         failure = SdkError(
                             "ComfyUI did not confirm this run. It will show here if it started.",
                             "submit_unconfirmed", 502,
@@ -717,7 +722,7 @@ class SdkRunner:
                 seeds_used.append({cid: str(value) for cid, value in seeds.items()})
                 if run.cancel_requested or session.cancel_epoch != epoch:
                     await self._cancel_run(run)
-                await self._advance_seeds(session, seed_controls)
+                await self._advance_seeds(session, seed_bindings)
         finally:
             self._trim_finished(session)
             self._ensure_presence_loop()
@@ -732,30 +737,31 @@ class SdkRunner:
     @staticmethod
     def _graph_for_run(build: dict, seeds: dict) -> dict:
         graph = copy.deepcopy(build["prompt"])
-        for control in build["seed_controls"]:
-            for key in control["keys"]:
-                graph[key]["inputs"]["seed"] = seeds[control["control_id"]]
+        for binding in build["seed_bindings"]:
+            for path, name in binding["targets"]:
+                graph[path]["inputs"][name] = seeds[binding["binding_id"]]
         return graph
 
-    async def _advance_seeds(self, session: SdkSession, seed_controls: list) -> None:
+    async def _advance_seeds(self, session: SdkSession, seed_bindings: list) -> None:
         changed = {}
-        for control in seed_controls:
-            if control["mode"] == "fixed":
+        for binding in seed_bindings:
+            if binding["mode"] == "fixed":
                 continue
-            control["seed"] = control_descriptors.next_seed_value(
-                control["mode"], control["seed"],
-                minimum=control["min"], maximum=control["max"], step=control["step"],
+            binding["seed"] = control_descriptors.next_seed_value(
+                binding["mode"], binding["seed"],
+                minimum=binding["min"], maximum=binding["max"], step=binding["step"],
             )
-            changed[control["control_id"]] = control["seed"]
+            changed[binding["binding_id"]] = (binding["seed"], binding["sig"])
         if not changed:
             return
 
         def mutate(data: dict) -> None:
-            for control_id, seed in changed.items():
-                entry = data["controls"].get(control_id)
+            for binding_id, (seed, sig) in changed.items():
+                entry = data["bindings"].get(binding_id)
                 if not isinstance(entry, dict):
-                    entry = data["controls"][control_id] = {}
-                entry["seed"] = seed
+                    entry = data["bindings"][binding_id] = {}
+                entry["value"] = seed
+                entry["sig"] = sig
 
         try:
             await await_template_io(sdk_templates.update_control_values, session.template_id, mutate)

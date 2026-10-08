@@ -64,6 +64,10 @@ class SonderSelector:
 
     @classmethod
     def VALIDATE_INPUTS(cls, choice="", choice_list="", **kwargs):
+        # A linked input reaches /prompt validation as None; its value exists
+        # only at run time, where execute checks it (as lazy_switches does).
+        if choice is None or choice_list is None:
+            return True
         return _validate_choice(choice, choice_list)
 
     def execute(self, choice, choice_list):

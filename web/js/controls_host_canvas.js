@@ -1,12 +1,10 @@
 // Canvas graph authority for the shared Controls panel. No app/DOM at import.
-import { getGraphLink, getGraphNode } from "./project_source_resolver.js";
-import { findControlWidget, seedModeWidget } from "./control_widgets.js";
+import {
+    MAX_MANIFEST_BYTES, editManifest, exportManifest, nodesOf, parseManifest, relayCensus, resolveBindings,
+} from "./control_bindings.js";
 
 const DESCRIBE_URL = "/sonder-editor/controls/describe";
 const DEBOUNCE_MS = 400;
-const nodeType = node => String(node?.comfyClass || node?.type || "");
-const nodesOf = graph => graph?._nodes || graph?.nodes || [];
-const valuesOf = map => map?.values ? [...map.values()] : Object.values(map || {});
 const refused = (changes, reason) => ({ok: false,
     rejected: Object.keys(changes || {}).map(target => ({target, reason}))});
 
@@ -26,64 +24,13 @@ async function promptHash(text) {
     return `local:${(a >>> 0).toString(16).padStart(8, "0")}${(b >>> 0).toString(16).padStart(8, "0")}`;
 }
 
-function graphsOf(root) {
-    const seen = new Set(), pending = [root];
-    while (pending.length) {
-        const graph = pending.pop();
-        if (!graph || seen.has(graph)) continue;
-        seen.add(graph);
-        pending.push(...valuesOf(graph.subgraphs));
-        for (const node of nodesOf(graph)) if (node?.subgraph) pending.push(node.subgraph);
-    }
-    return [...seen];
-}
-
-// API keys identify instance paths. A shared definition node may be reached
-// through several keys, with a separate native promoted widget on each path.
-function resolvePath(root, key) {
-    const parts = String(key).split(":"), parents = [];
-    let graph = root, node = null;
-    for (let i = 0; i < parts.length; i++) {
-        node = getGraphNode(graph, parts[i]);
-        if (!node) return null;
-        if (i < parts.length - 1) {
-            if (!node.subgraph) return null;
-            parents.push(node);
-            graph = node.subgraph;
-        }
-    }
-    return {node, parents};
-}
-
-function nativeWidget(path, name) {
-    let node = path.node, widget = findControlWidget(node, name);
-    const parents = [...path.parents];
-    const seen = new Set();
-    // An input boundary is a native promoted override; walk to the outermost
-    // wrapper. String "-10" is what frontend 1.53.10 puts on that boundary.
-    while (node && !seen.has(node)) {
-        seen.add(node);
-        const input = (node.inputs || []).find(i => (i.widget?.name || i.name) === name);
-        if (!input || input.link == null) break;
-        const link = getGraphLink(node.graph, input.link);
-        if (!link || Number(link.origin_id) !== -10) return null; // linked by another node
-        const parent = parents.pop();
-        const outer = parent?.inputs?.[Number(link.origin_slot)];
-        if (!outer) return null;
-        widget = parent.getWidgetFromSlot?.(outer) || findControlWidget(parent, outer.widget?.name || outer.name);
-        node = parent;
-        name = outer.widget?.name || outer.name;
-    }
-    return widget ? {node, widget} : null;
-}
-
 export function createCanvasControlsHost({app, api, getEditorNode, setEditorSetting = () => {},
     getChangeTracker = () => app?.extensionManager?.workflow?.activeWorkflow?.changeTracker,
     debounceMs = DEBOUNCE_MS} = {}) {
     if (!app || typeof app.graphToPrompt !== "function" || typeof getEditorNode !== "function") {
         throw new TypeError("Canvas Controls needs an injected app and editor node getter.");
     }
-    let view = {state: "idle", controls: [], fields: [], notes: [], error: null};
+    let view = {state: "idle", bindings: [], notes: [], error: null};
     let visible = false, mountedVisible = false, destroyed = false, listening = false;
     let epoch = 0, timer = null, active = null, trailing = false, lastHash = null;
     let writeTail = Promise.resolve();
@@ -106,7 +53,7 @@ export function createCanvasControlsHost({app, api, getEditorNode, setEditorSett
         return {prompt: output, editor_key: key, hash: JSON.stringify([key, output])};
     };
     const describe = async (shot, changes) => {
-        const body = {prompt: shot.prompt, editor_key: shot.editor_key};
+        const body = {prompt: shot.prompt, relay_census: relayCensus(rootGraph()).census};
         if (changes !== undefined) body.changes = changes;
         const response = await api.fetchApi(DESCRIBE_URL, {method: "POST",
             headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
@@ -114,14 +61,9 @@ export function createCanvasControlsHost({app, api, getEditorNode, setEditorSett
         return response.json();
     };
     const adopt = raw => {
-        const controls = (raw.controls || []).map(d => {
-            if (d.kind !== "SEED") return d;
-            const matches = graphsOf(rootGraph()).flatMap(g => nodesOf(g)).filter(n =>
-                nodeType(n) === "SonderControl" && findControlWidget(n, "control_id")?.value === d.control_id);
-            const mode = matches.length === 1 ? seedModeWidget(findControlWidget(matches[0], "seed"))?.value : null;
-            return {...d, seed_mode: mode || d.seed_mode || "fixed"};
-        });
-        view = {...raw, controls, state: "ready", error: null};
+        // Canvas seeds follow the native mode; the export mirrored it.
+        const bindings = (raw.bindings || []).map(d => d.kind === "SEED" ? {...d, seed_mode: d.seed_mode || "fixed"} : d);
+        view = {...raw, bindings, state: "ready", error: raw.error || null};
         notify();
     };
 
@@ -178,57 +120,70 @@ export function createCanvasControlsHost({app, api, getEditorNode, setEditorSett
         else if (!was) { lastHash = null; void refresh(true); }
     }
 
+    // Native widget writes for value targets, and one merged manifest write for
+    // every presentation target in the batch (one widget, one history step).
     function operations(raw, changes, root) {
-        const byWidget = new Map();
-        const add = (path, name, value, target) => {
-            const resolved = nativeWidget(path, name);
-            if (!resolved) throw new Error("This widget is unavailable or linked by another node.");
-            const existing = byWidget.get(resolved.widget);
+        const {active} = relayCensus(root);
+        if (active.length !== 1) throw new Error("Keep exactly one active Sonder Control Relay in the workflow.");
+        const relay = active[0];
+        const manifestWidget = (relay.widgets || []).find(w => w?.name === "manifest");
+        if (!manifestWidget) throw new Error("The Sonder Control Relay has no manifest.");
+        const saved = typeof manifestWidget.value === "string" ? manifestWidget.value : "";
+        const {bindings} = resolveBindings(root, parseManifest(saved));
+        const byWidget = new Map(), presentation = [];
+        const add = (node, widget, value, target) => {
+            const existing = byWidget.get(widget);
             if (existing && existing.value !== value) throw new Error("Two changes address the same widget differently.");
-            byWidget.set(resolved.widget, {...resolved, value, target});
+            byWidget.set(widget, {node, widget, value, target});
         };
         for (const [target, value] of Object.entries(changes)) {
-            if (target.startsWith("field:")) {
-                const descriptors = raw.fields.filter(d => `field:${d.class_type}/${d.field}` === target);
-                if (!descriptors.length) throw new Error("This editor field is unavailable.");
-                for (const d of descriptors) {
-                    const path = resolvePath(root, d.key);
-                    if (!path || nodeType(path.node) !== d.class_type) throw new Error("The field node changed.");
-                    add(path, d.field, value, target);
-                }
-                continue;
-            }
-            const match = /^(control|note):(.+):(value|seed|seed_mode|note|text|order|group)$/.exec(target);
+            const match = /^(binding|note):([A-Za-z0-9_-]{1,64}):(value|seed_mode|label|note|text|order|group)$/.exec(target);
             if (!match) throw new Error("This target is unavailable.");
             const [, source, id, field] = match;
-            const d = (source === "control" ? raw.controls : raw.notes).find(d =>
-                (source === "control" ? d.control_id : d.note_id) === id);
-            if (!d) throw new Error("This control is unavailable.");
-            const type = source === "control" ? "SonderControl" : "SonderPanelNote";
-            const matches = graphsOf(root).flatMap(g => nodesOf(g)).filter(n => nodeType(n) === type
-                && findControlWidget(n, source === "control" ? "control_id" : "note_id")?.value === id);
-            if (matches.length !== 1) throw new Error("This identity no longer names one shared definition.");
-            for (const key of d.keys || [d.key]) {
-                const path = resolvePath(root, key);
-                if (!path || path.node !== matches[0]) throw new Error("The control instance changed.");
-                const name = {value: "value_text", seed: "seed", seed_mode: "seed", note: "panel_note", text: "text", order: "panel_order", group: "panel_group"}[field];
-                if (field === "seed_mode") {
-                    const native = nativeWidget(path, name);
-                    const promotedMode = seedModeWidget(native?.widget);
-                    // Native promotions expose a numeric value wrapper but keep
-                    // the after-generate mode on the definition's seed widget.
-                    const mode = promotedMode || seedModeWidget(findControlWidget(path.node, "seed"));
-                    if (!mode) throw new Error("This seed has no native mode widget.");
-                    byWidget.set(mode, {node: promotedMode ? native.node : path.node, widget: mode, value, target});
-                } else {
-                    let next = field === "value" ? String(value) : value;
-                    if (field === "seed") {
-                        const number = Number(value);
-                        next = Number.isSafeInteger(number) ? number : String(value);
-                    }
-                    add(path, name, next, target);
-                }
+            if (source === "note" || !["value", "seed_mode"].includes(field)) {
+                presentation.push({source, id, field, value});
+                continue;
             }
+            const d = (raw.bindings || []).find(b => b.binding_id === id);
+            const resolved = bindings[id];
+            if (!d || !resolved || resolved.status !== "ok" || !resolved.widget) {
+                throw new Error("This setting is unavailable. Refresh the Controls panel.");
+            }
+            // The graph must still route this binding to the inputs the server
+            // validated; an anchor that moved since the export is refused.
+            const same = (a, b) => JSON.stringify((a || []).map(t => [String(t.path), t.input]).sort())
+                === JSON.stringify((b || []).map(t => [String(t.path), t.input]).sort());
+            if (!same(resolved.targets, d.targets)) throw new Error("This setting moved. Refresh the Controls panel.");
+            if (field === "seed_mode") {
+                if (!resolved.modeWidget) throw new Error("This seed has no native mode widget.");
+                add(resolved.node, resolved.modeWidget, value, target);
+                continue;
+            }
+            let next = value;
+            if (d.kind === "INT" || d.kind === "SEED") {
+                const number = Number(value);
+                // A canvas widget holds a JS number: refuse, never round, a
+                // whole number beyond 2^53 (the Sonder App keeps it exact).
+                if (!Number.isSafeInteger(number) || String(number) !== String(value).trim()) {
+                    throw new Error(`${value} is too large for the canvas widget to hold exactly. Use at most 9007199254740991.`);
+                }
+                next = number;
+            } else if (d.kind === "FLOAT") next = Number(value);
+            else if (d.kind !== "BOOLEAN") next = String(value);
+            add(resolved.node, resolved.widget, next, target);
+        }
+        if (presentation.length) {
+            const text = editManifest(saved, manifest => {
+                for (const {source, id, field, value} of presentation) {
+                    const table = source === "binding" ? manifest.bindings : manifest.notes;
+                    if (!table[id] || typeof table[id] !== "object") throw new Error("This Control is no longer in the workflow.");
+                    table[id][field === "text" ? "text" : field] = value;
+                }
+            });
+            if (new TextEncoder().encode(exportManifest(text, root)).length > MAX_MANIFEST_BYTES) {
+                throw new Error("The Controls would exceed 128 KiB. Shorten a note first.");
+            }
+            add(relay, manifestWidget, text, "manifest");
         }
         return [...byWidget.values()];
     }
@@ -264,13 +219,19 @@ export function createCanvasControlsHost({app, api, getEditorNode, setEditorSett
                     widget.value = value;
                     widget.callback?.(value, app.canvas, node);
                     if (widget.value !== value && String(widget.value) !== String(value)) {
-                        throw new Error("The native widget could not preserve this value.");
+                        throw new Error(`The canvas widget changed ${value} to ${widget.value} (its step or precision), so nothing was saved.`);
                     }
                 }
                 id.root.setDirtyCanvas?.(true, true);
                 tracker.captureCanvasState();
             } catch (error) {
+                // Restore values and replay callbacks, so state a callback
+                // derives (a Selector's options, its rewritten choice) follows.
                 writes.forEach(({widget}, i) => { widget.value = before[i]; });
+                writes.forEach(({node, widget}, i) => {
+                    try { widget.callback?.(before[i], app.canvas, node); } catch { /* restored value stands */ }
+                    widget.value = before[i];
+                });
                 id.root.setDirtyCanvas?.(true, true);
                 throw error;
             }

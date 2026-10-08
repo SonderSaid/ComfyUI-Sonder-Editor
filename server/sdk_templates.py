@@ -6,12 +6,15 @@ Install-level files under ``<comfy user dir>/sonder-editor`` (``sdk_paths``):
   Never rewritten: a re-import replaces it whole.
 - ``templates/<id>.meta.json`` — name, times and the validation summary.
 - ``templates/<id>.controls.json`` — Control values per workflow, shared across
-  projects: ``{"version": 1, "controls": {<control_id>: {...}}, "fields":
-  {"<class_type>/<field>": value}}``. Keyed by ``control_id`` so values survive
-  re-import. Values of Controls a re-import removed are kept but ignored.
-  ``notes`` stores view-only Markdown by ``control:<id>`` or ``note:<id>``;
-  ``seq`` orders changes and seed advances. Notes/layout reset on re-import,
-  bound to the export's SHA-256 ``presentation_hash`` for crash recovery.
+  projects: ``{"version": 1, "bindings": {<binding_id>: {"value", "seed_mode",
+  "sig"}}, "labels", "notes", "layout", "seq", "presentation_hash"}``. Values
+  are keyed by the Relay's ``binding_id`` so they survive re-import; ``sig``
+  (target class, input and kind) resets a value whose binding now points at a
+  different setting. ``labels``/``notes``/``layout`` are view-only overlays
+  keyed ``binding:<id>`` or ``note:<id>``; they reset on re-import, bound to
+  the export's SHA-256 ``presentation_hash`` for crash recovery. ``seq`` orders
+  changes and seed advances. Unknown keys (the retired ``controls``/``fields``
+  sections included) are preserved and ignored.
 - ``sdk_state/<project folder>.json`` — the SDK editor position (the 13 relayed
   editor values) per project, shared across workflows; last writer wins.
 
@@ -157,7 +160,7 @@ def validate_template(
     until the workflow is fixed; ``warnings`` are informational.
     """
     class_lookup = class_lookup or control_descriptors.comfy_class_lookup
-    describe = describe or (lambda p: control_descriptors.describe_controls(p, class_lookup=class_lookup))
+    describe = describe or (lambda p: control_descriptors.describe_bindings(p, class_lookup=class_lookup))
     errors: list[str] = []
     blocking: list[str] = []
     warnings: list[str] = []
@@ -182,30 +185,26 @@ def validate_template(
     controls_summary: list[dict] = []
     if not errors:
         described = describe(prompt)
+        blocking.extend(generate_refusals(described))
         has_seed = False
-        for control in described.get("controls", []):
-            label = control.get("label") or control_descriptors.DEFAULT_CONTROL_LABEL
+        for binding in described.get("bindings", []):
+            label = binding.get("label") or control_descriptors.DEFAULT_LABEL
             controls_summary.append({
-                "control_id": control.get("control_id", ""),
+                "binding_id": binding.get("binding_id", ""),
                 "label": label,
-                "kind": control.get("kind", ""),
-                "status": control.get("status", ""),
-                "group": control.get("group", ""),
+                "kind": binding.get("kind") or "",
+                "status": binding.get("status", ""),
+                "section": binding.get("section", "workflow"),
+                "group": binding.get("group", ""),
             })
-            if control.get("kind") == "SEED":
+            if binding.get("kind") == "SEED" and binding.get("status") == control_descriptors.STATUS_OK:
                 has_seed = True
-            problem = generate_refusal(control)
-            if problem:
-                blocking.append(problem)
-            elif control.get("status") == control_descriptors.STATUS_UNLINKED:
-                warnings.append(f"“{label}” is not connected to anything.")
-        for field in described.get("fields", []):
-            if field.get("status") != control_descriptors.STATUS_OK:
-                warnings.append(f"“{field.get('label')}” can't be set from here: {field.get('reason')}")
+            if binding.get("status") != control_descriptors.STATUS_OK:
+                warnings.append(f"“{label}” is off: {binding.get('reason') or 'it cannot be set.'}")
         if not has_seed:
             warnings.append(
-                "No Seed Control: every Generate of the same job uses the workflow's fixed seed. "
-                "Add a Sonder Control on the seed and export again to get new takes."
+                "No seed exposed: every Generate of the same job uses the workflow's fixed seed. "
+                "Expose the seed through the workflow's Sonder Control Relay and export again to get new takes."
             )
     return {
         "ok": not errors,
@@ -218,28 +217,17 @@ def validate_template(
     }
 
 
-_REFUSED_STATUSES = {
-    control_descriptors.STATUS_STALE: "its type no longer matches what it is connected to",
-    control_descriptors.STATUS_DUPLICATE: "two different Controls share its id",
-    control_descriptors.STATUS_UNSUPPORTED: "it is connected to an input it can't set",
-    control_descriptors.STATUS_MIXED: "it is connected to inputs of different types",
-}
+def generate_refusals(view: dict) -> list[str]:
+    """Why Generate refuses this Controls view; empty when it may run.
 
-
-def generate_refusal(control: dict) -> str:
-    """Why Generate refuses this Control descriptor, or "" when it may run.
-
-    ``unlinked`` is not refused: an unconnected Control changes nothing.
+    Only a Relay that cannot be read refuses. A binding that is missing, linked
+    or otherwise off skips its override and the workflow's own value runs, as a
+    native Run would: a settled problem never blocks a run.
     """
-    label = control.get("label") or control_descriptors.DEFAULT_CONTROL_LABEL
-    reason = _REFUSED_STATUSES.get(control.get("status"))
-    if reason:
-        return f"“{label}”: {reason}."
-    if control.get("error"):
-        return f"“{label}”: {control['error']}"
-    if not control.get("control_id"):
-        return f"“{label}” has no id. Open the workflow in ComfyUI, save it, and export again."
-    return ""
+    relay = view.get("relay") or {}
+    if relay.get("status") == "error":
+        return [f"Controls: {relay.get('error') or 'the Sonder Control Relay cannot be read.'}"]
+    return []
 
 
 # ── Store ────────────────────────────────────────────────────────────────────
@@ -300,12 +288,13 @@ def list_templates(*, requirements: bool = False) -> list[dict]:
                 with template_lock(meta["template_id"]):
                     prompt, _ = load_template(meta["template_id"])
                     stored = read_control_values(meta["template_id"])
-                    # Only direct field overrides can change a literal model
-                    # input. Control links keep their existing Generate gate.
-                    if stored.get("fields"):
-                        apply_stored_values(prompt, control_descriptors.describe_controls(prompt), stored)
+                    # A stored binding value (a checkpoint, say) changes which
+                    # model files the run needs.
+                    if stored.get("bindings"):
+                        apply_stored_values(prompt, control_descriptors.describe_bindings(prompt), stored)
                     meta["missing_models"] = model_requirements.missing_models(prompt, input_cache=input_cache)
-            except (TemplateError, OSError):
+            except Exception:  # one workflow's problem must not hide the whole list
+                logger.warning("Model requirements failed for workflow %s", meta.get("template_id"), exc_info=True)
                 meta["requirements_error"] = "Model requirements could not be checked. Check again."
     result.sort(key=lambda item: (item["name"].lower(), item["template_id"]))
     return result
@@ -316,8 +305,8 @@ def template_requirements(template_id: str) -> dict:
     with template_lock(template_id):
         prompt, _ = load_template(template_id)
         stored = read_control_values(template_id)
-        if stored.get("fields"):
-            apply_stored_values(prompt, control_descriptors.describe_controls(prompt), stored)
+        if stored.get("bindings"):
+            apply_stored_values(prompt, control_descriptors.describe_bindings(prompt), stored)
         return {"ok": True, "template_id": template_id, "missing_models": model_requirements.missing_models(prompt)}
 
 
@@ -366,8 +355,8 @@ def replace_template(template_id: str, raw: bytes, *, source_name: str = "", val
         meta.setdefault("name", _name_from_source(source_name))
         data = read_control_values(template_id)
         notes_reset = len(data["notes"])
-        layout_reset = len(data.get("layout", {})) if isinstance(data.get("layout"), dict) else 0
-        data.update(notes={}, layout={}, presentation_hash=hashlib.sha256(raw).hexdigest(), seq=data["seq"] + 1)
+        layout_reset = len(data["layout"]) + len(data["labels"])
+        data.update(notes={}, layout={}, labels={}, presentation_hash=hashlib.sha256(raw).hexdigest(), seq=data["seq"] + 1)
         # The file lock makes the three writes one transaction for live readers.
         # Restore exact bytes on a failed write. The hash binding below also
         # prevents old notes appearing over a new export after a process crash.
@@ -476,15 +465,11 @@ def _write_bytes_atomic(path: str, data: bytes) -> None:
 def _normalized_controls(data: dict, presentation_hash: str) -> dict:
     data = dict(data)
     data["version"] = CONTROLS_VERSION
-    if not isinstance(data.get("controls"), dict):
-        data["controls"] = {}
-    if not isinstance(data.get("fields"), dict):
-        data["fields"] = {}
-    if not isinstance(data.get("notes"), dict):
-        data["notes"] = {}
-    if not isinstance(data.get("layout"), dict):
-        data["layout"] = {}
+    for name in ("bindings", "labels", "notes", "layout"):
+        if not isinstance(data.get(name), dict):
+            data[name] = {}
     if data.get("presentation_hash") != presentation_hash:
+        data["labels"] = {}
         data["notes"] = {}
         data["layout"] = {}
     data["presentation_hash"] = presentation_hash
@@ -523,63 +508,60 @@ def update_control_values(template_id: str, mutate: Callable[[dict], None]) -> d
 
 
 def apply_stored_values(prompt: dict, described: dict, stored: dict, *, describe=None) -> dict:
-    """Apply execution values to the prompt and presentation edits to a view only.
+    """Apply stored values to the prompt and presentation overlays to a view only.
 
-    Generate and Controls GET share this authority. Re-describing the resulting
-    prompt rechecks bounds/errors, including a stored seed. Notes never alter a
-    prompt input or its execution-cache identity.
+    Generate, Controls GET and the Launcher's model check share this authority.
+    A value applies only to an ``ok`` binding whose target still matches the
+    signature it was saved for; anything else is skipped and the binding shows
+    ``reset``. Re-describing the resulting prompt rechecks bounds and options.
+    Labels, notes and layout never alter a prompt input or its cache identity.
     """
     cd = control_descriptors
-    stored_controls, stored_fields = stored.get("controls", {}), stored.get("fields", {})
-    changed = False
-    for control in described.get("controls", []):
-        identity = control.get("control_id")
-        if not identity or control.get("status") in (cd.STATUS_DUPLICATE, cd.STATUS_MISSING_ID):
+    stored_bindings = stored.get("bindings") if isinstance(stored.get("bindings"), dict) else {}
+    by_id = {d.get("binding_id"): d for d in described.get("bindings", [])}
+    batch, resets = {}, set()
+    for binding_id, descriptor in by_id.items():
+        entry = stored_bindings.get(binding_id)
+        if descriptor.get("status") != cd.STATUS_OK or not isinstance(entry, dict) or "value" not in entry:
             continue
-        entry = stored_controls.get(identity, {})
-        if not isinstance(entry, dict):
+        if entry.get("sig") != cd.binding_signature(descriptor):
+            resets.add(binding_id)
             continue
-        for key in control.get("keys", []):
-            inputs = prompt[key]["inputs"]
-            if isinstance(entry.get("value_text"), str):
-                inputs["value_text"] = entry["value_text"]
-                changed = True
-            seed = entry.get("seed")
-            if control.get("kind") == "SEED" and isinstance(seed, int) and not isinstance(seed, bool):
-                inputs["seed"] = seed
-                changed = True
-    for field in described.get("fields", []):
-        name = f"{field.get('class_type')}/{field.get('field')}"
-        if field.get("status") != cd.STATUS_OK or name not in stored_fields:
-            continue
-        try:
-            value = cd.coerce_control_value(field["kind"], stored_fields[name])
-            cd.check_value_for_target(value, field)
-        except cd.ControlValueError:
-            continue
-        prompt[field["key"]]["inputs"][field["field"]] = value
-        changed = True
-    view = copy.deepcopy((describe or cd.describe_controls)(prompt) if changed else described)
-    for control in view.get("controls", []):
-        entry = stored_controls.get(control.get("control_id"), {})
+        batch[f"binding:{binding_id}:value"] = entry["value"]
+    # One batch (uncapped: up to 256 stored values) so a stored choice list and
+    # choice agree. Validation reports every refusal, so reject only those.
+    cleaned, rejected = cd.validate_binding_changes(described, batch, prompt=prompt, max_changes=None) if batch else ({}, [])
+    if rejected:
+        refused = {row.get("target") for row in rejected}
+        resets.update(target.split(":")[1] for target in batch if target in refused)
+        cleaned = {target: value for target, value in batch.items() if target not in refused}
+        cleaned, _ = cd.validate_binding_changes(described, cleaned, prompt=prompt, max_changes=None) if cleaned else ({}, [])
+    for target, value in cleaned.items():
+        for item in by_id[target.split(":")[1]].get("targets", []):
+            prompt[item["path"]]["inputs"][item["input"]] = value
+    view = copy.deepcopy((describe or cd.describe_bindings)(prompt) if cleaned else described)
+    layouts = stored.get("layout") if isinstance(stored.get("layout"), dict) else {}
+    notes = stored.get("notes") if isinstance(stored.get("notes"), dict) else {}
+    labels = stored.get("labels") if isinstance(stored.get("labels"), dict) else {}
+    for descriptor in view.get("bindings", []):
+        binding_id = descriptor.get("binding_id")
+        entry = stored_bindings.get(binding_id)
         entry = entry if isinstance(entry, dict) else {}
-        if control.get("kind") != "SEED":
-            continue
-        seed = entry.get("seed")
-        if isinstance(seed, int) and not isinstance(seed, bool) and control.get("status") not in (cd.STATUS_DUPLICATE, cd.STATUS_MISSING_ID):
-            control["seed"] = seed
-        mode = entry.get("seed_mode")
-        control["seed_mode"] = mode if mode in cd.SEED_MODES else (
-            control.get("seed_mode") if control.get("seed_mode") in cd.SEED_MODES else "randomize")
-    for descriptors, identity_key, text_key, prefix in (
-        (view.get("controls", []), "control_id", "note", "control"),
-        (view.get("notes", []), "note_id", "text", "note"),
+        if binding_id in resets:
+            descriptor["reset"] = True
+            descriptor["reason"] = "Reset to the workflow's value: this setting changed since its value was saved."
+        if descriptor.get("kind") == "SEED":
+            mode = entry.get("seed_mode")
+            exported = descriptor.get("seed_mode")
+            descriptor["seed_mode"] = mode if mode in cd.SEED_MODES else (
+                exported if exported in cd.SEED_MODES else "randomize")
+    for descriptors, prefix, identity_key, text_key in (
+        (view.get("bindings", []), "binding", "binding_id", "note"),
+        (view.get("notes", []), "note", "note_id", "text"),
     ):
         for descriptor in descriptors:
-            if not descriptor.get(identity_key) or descriptor.get("status") in (cd.STATUS_DUPLICATE, cd.STATUS_MISSING_ID):
-                continue
-            base = f"{prefix}:{descriptor[identity_key]}"
-            layout = stored.get("layout", {}).get(base)
+            base = f"{prefix}:{descriptor.get(identity_key)}"
+            layout = layouts.get(base)
             if isinstance(layout, dict):
                 # Preserve unknown/over-cap storage, consume only modeled values.
                 for field in ("order", "group"):
@@ -588,39 +570,45 @@ def apply_stored_values(prompt: dict, described: dict, stored: dict, *, describe
                             descriptor[field] = cd.coerce_panel_layout(field, layout[field])
                         except cd.ControlValueError:
                             pass
-            text = stored.get("notes", {}).get(base)
-            if isinstance(text, str) and not descriptor.get("note_truncated"):
+            text = notes.get(base)
+            if isinstance(text, str):
                 descriptor[text_key] = text[:cd.PANEL_NOTE_MAX_CHARS]
-                if len(text) > cd.PANEL_NOTE_MAX_CHARS:
-                    descriptor["note_truncated"] = True
+            label = labels.get(base)
+            if prefix == "binding" and isinstance(label, str) and label.strip():
+                descriptor["label"] = label.strip()[:cd.PANEL_LABEL_MAX_CHARS]
     return view
 
 
-def store_control_changes(template_id: str, changes: dict) -> dict:
-    """Persist already validated targets through the canonical sidecar mutator."""
+def store_binding_changes(template_id: str, changes: dict, view: dict) -> dict:
+    """Persist already validated targets through the canonical sidecar mutator.
+
+    ``view`` is the view the changes were validated against: a value is saved
+    with its binding's target signature.
+    """
+    signatures = {d.get("binding_id"): control_descriptors.binding_signature(d) for d in view.get("bindings", [])}
+
     def mutate(data):
         for target, value in changes.items():
-            if target.startswith("field:"):
-                data["fields"][target[6:]] = value
-                continue
-            base, field = target.rsplit(":", 1)
+            source, identity, field = target.split(":", 2)
+            base = f"{source}:{identity}"
             if field in ("note", "text"):
                 data["notes"][base] = value
-                continue
-            if field in ("order", "group"):
+            elif field == "label":
+                data["labels"][base] = value
+            elif field in ("order", "group"):
                 entry = data["layout"].get(base)
                 if not isinstance(entry, dict):
                     entry = data["layout"][base] = {}
                 entry[field] = value
-                continue
-            identity = base[len("control:"):]
-            entry = data["controls"].get(identity)
-            if not isinstance(entry, dict):
-                entry = data["controls"][identity] = {}
-            if field == "value":
-                entry["value_text"] = str(value).lower() if isinstance(value, bool) else str(value)
             else:
-                entry[field] = value
+                entry = data["bindings"].get(identity)
+                if not isinstance(entry, dict):
+                    entry = data["bindings"][identity] = {}
+                if field == "value":
+                    entry["value"] = value
+                    entry["sig"] = signatures.get(identity)
+                else:
+                    entry[field] = value
     return update_control_values(template_id, mutate)
 
 

@@ -46,7 +46,7 @@ export function mountWorkflows(state, actions) {
                 for (const item of t.missing_models || []) details.append(el('p', 'sl-warn', modelMessage(item)));
                 for (const note of t.validation?.warnings || []) details.append(el('p', 'sl-dim', note));
                 const controls = t.validation?.controls || [];
-                details.append(el('p', '', controls.length ? `Controls: ${controls.map(c => c.label).join(', ')}` : 'No Sonder Controls in this workflow.'));
+                details.append(el('p', '', controls.length ? `Controls: ${controls.map(c => c.label).join(', ')}` : 'No Controls exposed in this workflow.'));
                 row.append(details);
             }
             row.addEventListener('click', () => actions.selectWorkflow(t.template_id));

@@ -58,11 +58,12 @@ def test_starter_opens_controls_reads_changes_seed_advances_and_generates(starte
         assert session.template_id == identity
         view = world.runner._controls_snapshot(session)
         assert view
-        st.store_control_changes(identity, {'control:abcd1234:seed': 27, 'control:abcd1234:seed_mode': 'increment'})
+        st.store_binding_changes(identity, {'binding:abcd1234:value': 27, 'binding:abcd1234:seed_mode': 'increment'},
+                                 view['view'])
         result = await world.runner.generate(session, tab_session_id="tab-1", count=2)
         assert len(result['run_ids']) == 2
         assert [p['5']['inputs']['seed'] for p in world.client.submitted] == [27, 28]
-        assert st.read_control_values(identity)['controls']['abcd1234']['seed'] == 29
+        assert st.read_control_values(identity)['bindings']['abcd1234']['value'] == 29
     try: asyncio.run(scenario())
     finally: world.runner.close()
     assert source.read_bytes() == before

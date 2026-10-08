@@ -94,12 +94,12 @@ def test_execution_reaches_save_with_mark_matches_mark_and_editor():
     assert reaches("not a prompt", "1", True) is False
 
 
-def test_mark_fed_by_a_control_or_primitive_reads_as_its_value():
+def test_mark_fed_by_a_primitive_reads_as_its_value():
     # The editor decides consume versus peek from the prompt before the save
     # runs, so a linked advance toggle must read as the value it will carry.
+    # A Controls binding is never a link: it sets the literal itself.
     reaches = prompt_graph.execution_reaches_save_with_mark
     for source, on, off in (
-        ("SonderControl", {"value_text": "true", "kind": "BOOLEAN"}, {"value_text": "false"}),
         ("PrimitiveBoolean", {"value": True}, {"value": False}),
     ):
         for inputs, expected in ((on, True), (off, False)):
@@ -128,7 +128,7 @@ def test_resolve_literal_follows_value_sources_only():
     prompt = {
         "1": _node("PrimitiveInt", {"value": 7}),
         "2": _node("PrimitiveInt", {"value": ["1", 0]}),
-        "3": _node("SonderControl", {"value_text": "beta"}),
+        "3": _node("SonderControl", {"value_text": "beta"}),  # retired: no longer a value source
         "4": _node("KSampler", {"seed": 1}),
         "5": _node("PrimitiveInt", {"value": ["6", 0]}),
         "6": _node("PrimitiveInt", {"value": ["5", 0]}),
@@ -137,7 +137,7 @@ def test_resolve_literal_follows_value_sources_only():
     assert resolve(prompt, 3) == 3
     assert resolve(prompt, ["1", 0]) == 7
     assert resolve(prompt, ["2", 0]) == 7
-    assert resolve(prompt, ["3", 0]) == "beta"
+    assert resolve(prompt, ["3", 0]) is prompt_graph.UNRESOLVED
     assert resolve(prompt, ["4", 0]) is prompt_graph.UNRESOLVED
     assert resolve(prompt, ["missing", 0]) is prompt_graph.UNRESOLVED
     assert resolve(prompt, ["5", 0]) is prompt_graph.UNRESOLVED  # a cycle ends unresolved

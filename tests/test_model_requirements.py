@@ -83,15 +83,18 @@ def test_generate_checks_effective_prompt_and_fixed_override_is_allowed(tmp_path
     world = World()
     p = template_prompt(); p.update(prompt("missing.ckpt")); p['2']['inputs']['model'] = ['3', 0]
     sdk_templates.replace_template(world.template_id, __import__('json').dumps(p).encode(), validate=lambda p: {"ok": True})
-    field = {"key": "3", "class_type": "Loader", "field": "ckpt_name", "kind": "COMBO", "status": "ok", "options": ["installed.ckpt"]}
-    world.fields = [field]
+    world.bindings = [{"binding_id": "ckpt", "label": "Checkpoint", "kind": "COMBO", "status": "ok", "error": None,
+                       "value": "missing.ckpt", "options": ["installed.ckpt"],
+                       "targets": [{"path": "3", "input": "ckpt_name", "class_type": "Loader", "status": "ok"}]}]
+    sig = {"class_type": "Loader", "input": "ckpt_name", "kind": "COMBO"}
     async def scenario():
         session = await world.open()
         with pytest.raises(SdkError) as exc:
             await world.runner.generate(session, tab_session_id="tab-1")
         assert "missing.ckpt" in str(exc.value.details)
         assert not world.client.submitted
-        sdk_templates.update_control_values(world.template_id, lambda data: data['fields'].update({'Loader/ckpt_name': 'installed.ckpt'}))
+        sdk_templates.update_control_values(world.template_id, lambda data: data['bindings'].update(
+            {'ckpt': {'value': 'installed.ckpt', 'sig': sig}}))
         result = await world.runner.generate(session, tab_session_id="tab-1")
         assert result['run_ids'] and world.client.submitted[0]['3']['inputs']['ckpt_name'] == 'installed.ckpt'
     try: asyncio.run(scenario())
@@ -109,15 +112,18 @@ def test_disconnected_missing_model_does_not_refuse_executable_graph():
     assert mr.missing_models(graph, lookup, executable_only=True)
 
 
-def test_launcher_checks_stored_field_overrides(tmp_path, monkeypatch):
+def test_launcher_checks_stored_binding_values(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, 'folder_paths', types.SimpleNamespace(get_user_directory=lambda: str(tmp_path)))
     p = prompt('missing.ckpt')
     meta = sdk_templates.import_template(__import__('json').dumps(p).encode(), validate=lambda p: {'ok': True})
     monkeypatch.setattr(cd, 'comfy_class_lookup', lambda name: loader(['installed.ckpt']))
-    field = {'key': '3', 'class_type': 'Loader', 'field': 'ckpt_name', 'kind': 'COMBO', 'status': 'ok', 'options': ['installed.ckpt']}
-    monkeypatch.setattr(cd, 'describe_controls', lambda p: {'controls': [], 'fields': [field]})
+    binding = {'binding_id': 'ckpt', 'kind': 'COMBO', 'status': 'ok', 'options': ['installed.ckpt'],
+               'targets': [{'path': '3', 'input': 'ckpt_name', 'class_type': 'Loader', 'status': 'ok'}]}
+    monkeypatch.setattr(cd, 'describe_bindings', lambda p: {'relay': {'status': 'ok'}, 'bindings': [binding], 'notes': []})
     assert sdk_templates.list_templates(requirements=True)[0]['missing_models']
     assert sdk_templates.template_requirements(meta['template_id'])['missing_models']
-    sdk_templates.update_control_values(meta['template_id'], lambda data: data['fields'].update({'Loader/ckpt_name': 'installed.ckpt'}))
+    sig = {'class_type': 'Loader', 'input': 'ckpt_name', 'kind': 'COMBO'}
+    sdk_templates.update_control_values(meta['template_id'], lambda data: data['bindings'].update(
+        {'ckpt': {'value': 'installed.ckpt', 'sig': sig}}))
     assert not sdk_templates.list_templates(requirements=True)[0]['missing_models']
     assert not sdk_templates.template_requirements(meta['template_id'])['missing_models']

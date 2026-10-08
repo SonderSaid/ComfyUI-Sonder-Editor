@@ -14,18 +14,18 @@ def test_layout_orders_and_atomic_batch_bound():
 import assert from 'node:assert/strict';
 const {planPanelMove,comparePanelRows,PANEL_ORDER_LIMIT}=await import(URL);
 assert.equal(PANEL_ORDER_LIMIT,EXPECTED_BOUND);
-const row=(i,order,group='')=>({base:'control:'+i,label:'Row '+i,order,group,status:'ok'});
+const row=(i,order,group='')=>({base:'binding:'+i,label:'Row '+i,order,group,status:'ok'});
 const apply=(rows,c)=>rows.map(d=>({...d,order:c[d.base+':order']??d.order,group:c[d.base+':group']??d.group}));
 const initial=[row(0,0),row(1,0),row(2,0),row(3,9999)];
-const moved=planPanelMove(initial,'control:2','','control:1');
-assert.deepEqual(apply(initial,moved).sort(comparePanelRows).map(d=>d.base),['control:0','control:2','control:1','control:3']);
-assert.deepEqual(planPanelMove(initial,'control:2','','control:3'),{});
+const moved=planPanelMove(initial,'binding:2','','binding:1');
+assert.deepEqual(apply(initial,moved).sort(comparePanelRows).map(d=>d.base),['binding:0','binding:2','binding:1','binding:3']);
+assert.deepEqual(planPanelMove(initial,'binding:2','','binding:3'),{});
 const big=Array.from({length:200},(_,i)=>row(i,i*10));
-assert.equal(Object.keys(planPanelMove(big,'control:199','','control:20')).length,1);
-assert.throws(()=>planPanelMove(big.map(d=>({...d,order:0,label:'Row'+d.base.split(':')[1].padStart(3,'0')})),'control:199','','control:100'),/Too many/);
+assert.equal(Object.keys(planPanelMove(big,'binding:199','','binding:20')).length,1);
+assert.throws(()=>planPanelMove(big.map(d=>({...d,order:0,label:'Row'+d.base.split(':')[1].padStart(3,'0')})),'binding:199','','binding:100'),/Too many/);
 const crowded=Array.from({length:100},(_,i)=>({...row(i,0),label:'Row'+String(i).padStart(3,'0')}));
-const feasible=planPanelMove(crowded,'control:99','','control:40');assert.equal(Object.keys(feasible).length,41);
-const expected=crowded.filter(d=>d.base!=='control:99');expected.splice(40,0,crowded[99]);
+const feasible=planPanelMove(crowded,'binding:99','','binding:40');assert.equal(Object.keys(feasible).length,41);
+const expected=crowded.filter(d=>d.base!=='binding:99');expected.splice(40,0,crowded[99]);
 assert.deepEqual(apply(crowded,feasible).sort(comparePanelRows).map(d=>d.base),expected.map(d=>d.base));
 let state=1234567;const rnd=()=>{state=(Math.imul(state,1664525)+1013904223)>>>0;return state;};
 for(let trial=0;trial<300;trial++){

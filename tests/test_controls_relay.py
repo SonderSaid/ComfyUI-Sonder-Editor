@@ -54,7 +54,7 @@ async def publish(body=None, canvas=CANVAS):
 
 
 async def post(changes=None, tab=TAB):
-    return await sr.post_control_changes(PID, HID, tab, changes or {'control:steps:value': '30'})
+    return await sr.post_control_changes(PID, HID, tab, changes or {'binding:steps:value': '30'})
 
 
 async def pending():
@@ -66,14 +66,14 @@ def test_acknowledgement_survives_poll_retry_socket_loss_and_later_publication(r
         await setup()
         body = publication()
         assert (await publish(body))['ok']
-        body['view']['controls'].clear()  # published state does not alias the caller
-        changes = {'control:steps:value': '30', 'control:seed:seed': '18446744073709551615',
-                   'control:seed:seed_mode': 'decrement', 'note:intro:text': '# Updated',
-                   'field:SonderSaveVideo/mark_queue_complete': 'true'}
+        body['view']['bindings'].clear()  # published state does not alias the caller
+        changes = {'binding:steps:value': '30', 'binding:seed:value': '18446744073709551615',
+                   'binding:seed:seed_mode': 'decrement', 'note:intro:text': '# Updated',
+                   'binding:advance:value': True, 'binding:seed:label': 'Seed (tab)'}
         rid = (await post(changes))['request_id']
         first = await pending()
         assert first == await pending()  # polling cannot drain before an acknowledgement
-        assert first['pending'][0]['changes'] == dict(changes, **{'field:SonderSaveVideo/mark_queue_complete': True})
+        assert first['pending'][0]['changes'] == changes
         first['pending'].clear()
         assert len((await pending())['pending']) == 1
         ack = publication(2, [rid])
@@ -84,8 +84,8 @@ def test_acknowledgement_survives_poll_retry_socket_loss_and_later_publication(r
         assert (await publish(publication(3)))['ok']
         fetched = await sr.get_controls_view(PID, HID)
         assert fetched['applied'] == [rid]  # an outage does not lose the prior outcome
-        fetched['view']['controls'].clear()
-        assert (await sr.get_controls_view(PID, HID))['view']['controls']
+        fetched['view']['bindings'].clear()
+        assert (await sr.get_controls_view(PID, HID))['view']['bindings']
     asyncio.run(run())
     announced = [e for p, e in registry if e['type'] == 'controls_changed']
     assert [e['view_seq'] for e in announced] == [1, 2, 3]
@@ -93,12 +93,13 @@ def test_acknowledgement_survives_poll_retry_socket_loss_and_later_publication(r
 
 
 @pytest.mark.parametrize('changes', [
-    {}, [], {'anything': True}, {'control:steps:value': 'bad'},
-    {'control:steps:value': -1}, {'control:steps:value': 10001},
-    {'control:seed:seed': '18446744073709551616'}, {'control:seed:seed': -1},
-    {'control:seed:seed_mode': 'surprise'}, {'note:intro:text': 'x' * 4001},
-    {'control:steps:note': 2}, {'control:steps:order': 10000},
-    {'field:SonderSaveVideo/mark_queue_complete': 'maybe'},
+    {}, [], {'anything': True}, {'binding:steps:value': 'bad'},
+    {'binding:steps:value': -1}, {'binding:steps:value': 10001},
+    {'binding:seed:value': '18446744073709551616'}, {'binding:seed:value': -1},
+    {'binding:seed:seed_mode': 'surprise'}, {'note:intro:text': 'x' * 4001},
+    {'binding:steps:note': 2}, {'binding:steps:order': 10000},
+    {'binding:advance:value': 'maybe'}, {'binding:advance:value': 'true'},
+    {'control:steps:value': '30'}, {'field:SonderSaveVideo/mark_queue_complete': True},
     {f'note:n{i}:text': '' for i in range(65)},
 ])
 def test_invalid_batches_never_partially_enqueue(changes):
@@ -108,7 +109,7 @@ def test_invalid_batches_never_partially_enqueue(changes):
         result = await sr.post_control_changes(PID, HID, TAB, changes)
         assert result['code'] == 'invalid_change' and result['rejected']
         assert not (await pending())['pending']
-        result = await post({'control:steps:value': 3, 'unknown': 2})
+        result = await post({'binding:steps:value': 3, 'unknown': 2})
         assert result['code'] == 'invalid_change'
         assert not (await pending())['pending']
     asyncio.run(run())
@@ -135,12 +136,12 @@ def test_refused_ack_unknown_target_contradictions_and_sequence_are_atomic():
         await publish()
         rid = (await post())['request_id']
         for body in (publication(2, ['unknown']), publication(2, [rid], [
-            {'request_id': rid, 'target': 'control:steps:value', 'reason': 'refused'}]),
+            {'request_id': rid, 'target': 'binding:steps:value', 'reason': 'refused'}]),
             publication(2, rejected=[{'request_id': rid, 'target': 'other', 'reason': 'refused'}])):
             assert (await publish(body))['code'] == 'invalid_ack'
             assert (await sr.get_controls_view(PID, HID))['view_seq'] == 1
             assert len((await pending())['pending']) == 1
-        rows = [{'request_id': rid, 'target': 'control:steps:value', 'reason': 'Target changed'}]
+        rows = [{'request_id': rid, 'target': 'binding:steps:value', 'reason': 'Target changed'}]
         assert (await publish(publication(2, rejected=rows)))['ok']
         assert (await sr.get_controls_view(PID, HID))['rejected'] == rows
         assert (await publish(publication(3, [rid])))['code'] == 'invalid_ack'
@@ -254,7 +255,7 @@ def test_same_host_reconnect_keeps_requests_and_ack_history_is_bounded():
 @pytest.mark.parametrize('mutation', ['new-view', 'release', 'host-replace'])
 def test_validation_worker_does_not_hold_registry_lock_and_cannot_cross_lifecycle(mutation, monkeypatch):
     entered, resume = threading.Event(), threading.Event()
-    original = cd.validate_control_changes
+    original = cd.validate_binding_changes
     def slow(*args):
         entered.set()
         assert resume.wait(5)
@@ -262,7 +263,7 @@ def test_validation_worker_does_not_hold_registry_lock_and_cannot_cross_lifecycl
     async def run():
         await setup()
         await publish()
-        monkeypatch.setattr(cd, 'validate_control_changes', slow)
+        monkeypatch.setattr(cd, 'validate_binding_changes', slow)
         task = asyncio.create_task(post())
         try:
             assert await asyncio.to_thread(entered.wait, 3)
@@ -290,7 +291,7 @@ def test_validation_worker_does_not_hold_registry_lock_and_cannot_cross_lifecycl
 
 
 def test_post_revalidation_is_bounded_when_every_attempt_goes_stale(monkeypatch):
-    original = cd.validate_control_changes
+    original = cd.validate_binding_changes
     calls = []
     async def run():
         await setup()
@@ -303,7 +304,7 @@ def test_post_revalidation_is_bounded_when_every_attempt_goes_stale(monkeypatch)
             asyncio.run_coroutine_threadsafe(publish(publication(next(seq))), loop).result(3)
             return result
         loop = asyncio.get_running_loop()
-        monkeypatch.setattr(cd, 'validate_control_changes', racing)
+        monkeypatch.setattr(cd, 'validate_binding_changes', racing)
         result = await post()
         assert result['code'] == 'stale_view'
         assert len(calls) == sr.CONTROLS_POST_ATTEMPTS
@@ -336,9 +337,14 @@ def test_publication_worker_cannot_cross_host_replacement(monkeypatch):
 @pytest.mark.parametrize('patch', [
     {'view_seq': 0}, {'view_seq': True}, {'view_seq': 2**53}, {'prompt_hash': ''},
     {'view': []}, {'applied': 'rid'}, {'applied': ['r'] * 33}, {'rejected': [{}]},
-    {'view': {'controls': [{}], 'fields': [], 'notes': []}},
-    {'view': {'controls': [{'control_id': 'c', 'status': 'ok', 'kind': 'COMBO', 'options': 7}], 'fields': [], 'notes': []}},
-    {'view': {'controls': [{'control_id': 'c', 'status': 'ok', 'kind': 'COMBO', 'options': ['a'], 'options_truncated': 'false'}], 'fields': [], 'notes': []}},
+    {'view': {'bindings': [{}], 'notes': []}},
+    {'view': {'bindings': [{'binding_id': 'c', 'status': 'ok'}]}},
+    {'view': {'bindings': [{'binding_id': 'c', 'status': 'ok', 'kind': 'COMBO', 'options': 7}], 'notes': []}},
+    {'view': {'bindings': [{'binding_id': 'c', 'status': 'ok', 'kind': 'COMBO', 'options': ['a'], 'options_truncated': 'false'}], 'notes': []}},
+    {'view': {'bindings': [{'binding_id': 'c', 'status': 'ok', 'targets': 'x'}], 'notes': []}},
+    {'view': {'bindings': [], 'notes': [{'note_id': 3, 'status': 'ok'}]}},
+    {'view': {'bindings': [], 'notes': [], 'suggestions': 'x'}},
+    {'view': {'controls': [{'control_id': 'c', 'status': 'ok'}], 'fields': [], 'notes': []}},
 ])
 def test_malformed_publications_are_refused_without_mutation(patch):
     async def run():
@@ -378,12 +384,13 @@ def test_real_http_roundtrip_caps_security_and_raw_folder_identity(monkeypatch):
             response = await client.get(path + '/controls', params={'host_id': HID})
             snapshot = await response.json()
             assert snapshot['project_id'] == PID and snapshot['view'] == cd.json_safe(describe(prompt()))
-            assert next(d for d in snapshot['view']['controls'] if d['control_id'] == 'seed')['seed'] == '9007199254740993'
+            assert next(d for d in snapshot['view']['bindings'] if d['binding_id'] == 'seed')['value'] == '9007199254740993'
             response = await client.post(path + '/control_changes', json={'host_id': HID, 'session_id': TAB,
-                'changes': {'control:seed:seed': '18446744073709551615'}})
+                'changes': {'binding:seed:value': '18446744073709551615'}})
             rid = (await response.json())['request_id']
             response = await client.get(path + '/control_changes', params={'host_id': HID, 'session_id': CANVAS})
-            assert (await response.json())['pending'][0]['changes']['control:seed:seed'] == '18446744073709551615'
+            # An exact 64-bit seed crosses the relay as a decimal string, never a rounded number.
+            assert (await response.json())['pending'][0]['changes']['binding:seed:value'] == '18446744073709551615'
             body.update(publication(2, [rid]))
             assert (await client.put(path + '/controls', json=body)).status == 200
             assert (await client.put(path + '/controls_visibility', json={'host_id': HID, 'session_id': TAB, 'visible': True, 'seen': [rid]})).status == 200
@@ -415,11 +422,11 @@ def test_large_pending_response_encodes_off_loop_without_blocking_other_registry
     async def run():
         await setup()
         body = publication()
-        body['view'] = {'controls': [{'control_id': 'text', 'kind': 'STRING', 'status': 'ok', 'note': ''}],
-                        'fields': [], 'notes': []}
+        body['view'] = {'bindings': [{'binding_id': 'text', 'kind': 'STRING', 'status': 'ok', 'note': '',
+                                      'targets': [{'path': '7', 'input': 'text'}]}], 'notes': []}
         assert (await publish(body))['ok']
         for _ in range(32):
-            assert (await post({'control:text:value': 'x' * (500 * 1024)}))['ok']
+            assert (await post({'binding:text:value': 'x' * (500 * 1024)}))['ok']
         async with client_for(monkeypatch) as client:
             monkeypatch.setattr(json, 'dumps', tracked)
             path = f'/sonder-editor/project/{PID}'

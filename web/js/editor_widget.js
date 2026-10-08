@@ -4522,7 +4522,7 @@ export class EditorWidget {
         if (!this._fsSidebar || this._controlsPanelHandle) return;
         this._controlsPanelEl = document.createElement("div");
         this._fsSidebar.append(this._controlsPanelEl);
-        const adapter = this._controlsHost || { getView: () => ({ controls: [], fields: [], notes: [], error: "Open a connected workflow to edit its controls." }), subscribe: () => () => {}, applyChanges: async () => ({ ok: false }) };
+        const adapter = this._controlsHost || { getView: () => ({ bindings: [], notes: [], error: "Open a connected workflow to edit its controls." }), subscribe: () => () => {}, applyChanges: async () => ({ ok: false }) };
         this._controlsPanelHandle = mountControlsPanel(this._controlsPanelEl, {
             ...adapter,
             getEditorSettings: () => this._settings,

@@ -44,10 +44,10 @@ if(SCENARIO==='markdown'){
     assert.ok(!tags.includes('SCRIPT'));assert.ok(doc.textContent.includes('<script>evil</script>'));
     const links=nodes.filter(n=>n.tagName==='A');assert.equal(links.length,1);assert.equal(links[0].href,'https://example.com/a');assert.equal(links[0].rel,'noopener noreferrer');
 }else{
-    let view={state:'ready',controls:[{source:'control',key:'2',control_id:'steps',label:'Steps',kind:'INT',value:'20',note:'**Recommended**',status:'ok',order:1,group:''},
-        {source:'control',key:'3',control_id:'seed',label:'Seed',kind:'SEED',seed:'9',seed_mode:'fixed',note:'',status:'ok',order:3,group:'Advanced'}],
-        notes:[{source:'note',key:'4',note_id:'intro',text:'# Intro',status:'ok',order:0,group:''}],
-        fields:[{class_type:'Save',field:'advance',label:'Advance',kind:'BOOLEAN',status:'ok',value:false},{class_type:'Save',field:'advance',label:'Advance',kind:'BOOLEAN',status:'ok',value:true}]};
+    let view={state:'ready',bindings:[{source:'binding',binding_id:'steps',label:'Steps',kind:'INT',value:'20',note:'**Recommended**',status:'ok',order:1,group:'',section:'workflow'},
+        {source:'binding',binding_id:'seed',label:'Seed',kind:'SEED',value:'9',seed_mode:'fixed',note:'',status:'ok',order:3,group:'Advanced',section:'workflow'},
+        {source:'binding',binding_id:'adv',label:'Advance',kind:'BOOLEAN',value:false,note:'',status:'ok',order:0,group:'',section:'editor'}],
+        notes:[{source:'note',note_id:'intro',text:'# Intro',status:'ok',order:0,group:''}]};
     const calls=[],notices=[],settings={render:{takePlacementMuted:false,linkedTakePlacement:true}},listeners=new Set();
     let refuse=false,defer=false,resolveWrite=null;
     const host={getView:()=>view,subscribe(cb){listeners.add(cb);return()=>listeners.delete(cb);},getEditorSettings:()=>settings,
@@ -64,29 +64,33 @@ if(SCENARIO==='markdown'){
     if(SCENARIO==='grouping'){
         assert.equal(container.children[0].tagName,'DETAILS');assert.equal(container.children[0].open,true);
         const advanced=walk(container).find(n=>n.tagName==='SUMMARY'&&n.textContent==='Advanced').parentElement;assert.equal(advanced.open,false);
-        const items=container.children[2].children.filter(n=>n.dataset.controlTarget);assert.equal(items[0].dataset.controlTarget,'note:intro:text');assert.equal(items[1].dataset.controlTarget,'control:steps:value');
-        assert.equal(input('field:Save/advance').indeterminate,true);
+        const items=container.children[2].children.filter(n=>n.dataset.controlTarget);assert.equal(items[0].dataset.controlTarget,'note:intro:text');assert.equal(items[1].dataset.controlTarget,'binding:steps:value');
+        // Editor-section bindings sit in the fixed Editor section, without a drag handle.
+        const adv=byTarget('binding:adv:value');assert.ok(container.children[0].contains(adv));
+        assert.ok(!walk(adv).some(n=>n.dataset.panelDragHandle==='true'));assert.equal(input('binding:adv:value').checked,false);
+        input('binding:adv:value').checked=true;input('binding:adv:value').dispatch('change');await settle();
+        assert.deepEqual(calls,[{'binding:adv:value':true}]);
         const muted=walk(container.children[0]).find(n=>n.tagName==='INPUT');muted.checked=true;muted.dispatch('change');assert.equal(settings.render.takePlacementMuted,true);
     }
     if(SCENARIO==='focus'){
-        const el=input('control:steps:value');el.focus();el.value='35';
-        publish({...view,controls:view.controls.map(d=>d.control_id==='steps'?{...d,value:'24',group:'Changed'}:d)});
-        assert.equal(input('control:steps:value'),el);assert.equal(document.activeElement,el);assert.equal(el.value,'35');
-        const event=key('Enter');assert.ok(event.prevented);await settle();assert.deepEqual(calls,[{'control:steps:value':'35'}]);
+        const el=input('binding:steps:value');el.focus();el.value='35';
+        publish({...view,bindings:view.bindings.map(d=>d.binding_id==='steps'?{...d,value:'24',group:'Changed'}:d)});
+        assert.equal(input('binding:steps:value'),el);assert.equal(document.activeElement,el);assert.equal(el.value,'35');
+        const event=key('Enter');assert.ok(event.prevented);await settle();assert.deepEqual(calls,[{'binding:steps:value':'35'}]);
     }
     if(SCENARIO==='focus-after-change'){
-        const el=input('control:steps:value');el.focus();el.value='30';el.dispatch('change');await settle();el.value='31';
-        publish({...view,controls:view.controls.map(d=>d.control_id==='steps'?{...d,value:'30'}:d)});
+        const el=input('binding:steps:value');el.focus();el.value='30';el.dispatch('change');await settle();el.value='31';
+        publish({...view,bindings:view.bindings.map(d=>d.binding_id==='steps'?{...d,value:'30'}:d)});
         assert.equal(document.activeElement,el);assert.equal(el.value,'31');
     }
     if(SCENARIO==='focus-after-refusal'){
-        defer=true;refuse=true;const el=input('control:steps:value');el.focus();el.value='30';el.dispatch('change');await settle();
+        defer=true;refuse=true;const el=input('binding:steps:value');el.focus();el.value='30';el.dispatch('change');await settle();
         el.value='31';resolveWrite();await settle();assert.equal(document.activeElement,el);assert.equal(el.value,'31');
     }
     if(SCENARIO==='metadata'){
-        publish({...view,controls:view.controls.map(d=>d.control_id==='steps'?{...d,label:'Renamed steps',min:'4',max:'40'}:d)});
-        let el=input('control:steps:value');assert.equal(el.min,'4');assert.equal(el.attributes['aria-label'],'Renamed steps');
-        publish({...view,controls:view.controls.map(d=>d.control_id==='steps'?{...d,min:null,max:null}:d)});
+        publish({...view,bindings:view.bindings.map(d=>d.binding_id==='steps'?{...d,label:'Renamed steps',min:'4',max:'40'}:d)});
+        let el=input('binding:steps:value');assert.equal(el.min,'4');assert.equal(el.attributes['aria-label'],'Renamed steps');
+        publish({...view,bindings:view.bindings.map(d=>d.binding_id==='steps'?{...d,min:null,max:null}:d)});
         assert.equal(el.min,'');assert.equal(el.max,'');
     }
     if(SCENARIO==='cancel'||SCENARIO==='note-save'||SCENARIO==='ime'){
@@ -97,43 +101,43 @@ if(SCENARIO==='markdown'){
         else assert.deepEqual(calls,[{'note:intro:text':'# Edited'}]);
     }
     if(SCENARIO==='refusal'||SCENARIO==='timeout'||SCENARIO==='initial-error'){
-        refuse=SCENARIO!=='timeout';defer=SCENARIO==='timeout';const el=input('control:steps:value');el.focus();el.value='33';
+        refuse=SCENARIO!=='timeout';defer=SCENARIO==='timeout';const el=input('binding:steps:value');el.focus();el.value='33';
         const flush=panel.flushPending();await settle();if(defer)timeoutCalls.at(-1)();assert.equal(await flush,false);assert.equal(el.value,'20');assert.equal(notices.length,1);resolveWrite?.();
     }
     if(SCENARIO==='flush'){
-        const el=input('control:steps:value');el.focus();el.value='32';assert.equal(await panel.flushPending(),true);assert.deepEqual(calls,[{'control:steps:value':'32'}]);
+        const el=input('binding:steps:value');el.focus();el.value='32';assert.equal(await panel.flushPending(),true);assert.deepEqual(calls,[{'binding:steps:value':'32'}]);
     }
     if(SCENARIO==='mode'){
-        const row=byTarget('control:seed:seed'),mode=walk(row).find(n=>n.tagName==='SELECT');mode.value='increment';mode.dispatch('change');await settle();
-        assert.deepEqual(calls,[{'control:seed:seed_mode':'increment'}]);assert.equal(input('control:seed:seed').value,'9');
+        const row=byTarget('binding:seed:value'),mode=walk(row).find(n=>n.tagName==='SELECT');mode.value='increment';mode.dispatch('change');await settle();
+        assert.deepEqual(calls,[{'binding:seed:seed_mode':'increment'}]);assert.equal(input('binding:seed:value').value,'9');
     }
     if(SCENARIO==='cross-target-refusal'){
         let rejectSeed;
         host.applyChanges=async changes=>{
             calls.push(changes);
-            if('control:seed:seed' in changes){await new Promise(r=>rejectSeed=r);return{ok:false,rejected:[{target:'control:seed:seed',reason:'invalid seed'}]};}
-            publish({...view,controls:view.controls.map(d=>d.control_id==='seed'?{...d,seed_mode:'increment'}:d)});return{ok:true,rejected:[]};
+            if('binding:seed:value' in changes){await new Promise(r=>rejectSeed=r);return{ok:false,rejected:[{target:'binding:seed:value',reason:'invalid seed'}]};}
+            publish({...view,bindings:view.bindings.map(d=>d.binding_id==='seed'?{...d,seed_mode:'increment'}:d)});return{ok:true,rejected:[]};
         };
-        const el=input('control:seed:seed');el.focus();el.value='bad';el.dispatch('change');await settle();
-        const mode=walk(byTarget('control:seed:seed')).find(n=>n.tagName==='SELECT');mode.focus();mode.value='increment';mode.dispatch('change');await settle();
+        const el=input('binding:seed:value');el.focus();el.value='bad';el.dispatch('change');await settle();
+        const mode=walk(byTarget('binding:seed:value')).find(n=>n.tagName==='SELECT');mode.focus();mode.value='increment';mode.dispatch('change');await settle();
         rejectSeed();await settle();assert.equal(el.value,'9');assert.equal(notices[0],'invalid seed');assert.equal(mode.value,'increment');
         // The row keeps the reason visible; the settled refusal does not block a later run.
-        assert.match(byTarget('control:seed:seed').textContent,/Not saved: invalid seed/);assert.equal(await panel.flushPending(),true);
+        assert.match(byTarget('binding:seed:value').textContent,/Not saved: invalid seed/);assert.equal(await panel.flushPending(),true);
     }
     if(SCENARIO==='refusal-then-generate'){
-        refuse=true;const el=input('control:steps:value');el.focus();el.value='99999';key('Enter');await settle();
-        assert.equal(el.value,'20');assert.equal(notices.length,1);assert.match(byTarget('control:steps:value').textContent,/Not saved: server refusal/);
+        refuse=true;const el=input('binding:steps:value');el.focus();el.value='99999';key('Enter');await settle();
+        assert.equal(el.value,'20');assert.equal(notices.length,1);assert.match(byTarget('binding:steps:value').textContent,/Not saved: server refusal/);
         // An edit of another row that saves does not inherit the old refusal.
-        refuse=false;const seed=input('control:seed:seed');seed.focus();seed.value='11';assert.equal(await panel.flushPending(),true);
+        refuse=false;const seed=input('binding:seed:value');seed.focus();seed.value='11';assert.equal(await panel.flushPending(),true);
         assert.equal(await panel.flushPending(),true);
         // Fresh stored values retire the warning.
-        publish({...view});await settle();assert.doesNotMatch(byTarget('control:steps:value').textContent,/Not saved/);
+        publish({...view});await settle();assert.doesNotMatch(byTarget('binding:steps:value').textContent,/Not saved/);
     }
     if(SCENARIO==='late-success'){
-        defer=true;const el=input('control:steps:value');el.focus();el.value='33';key('Enter');await settle();
-        timeoutCalls.at(-1)();await settle();assert.match(byTarget('control:steps:value').textContent,/Not saved: The change was not confirmed/);
+        defer=true;const el=input('binding:steps:value');el.focus();el.value='33';key('Enter');await settle();
+        timeoutCalls.at(-1)();await settle();assert.match(byTarget('binding:steps:value').textContent,/Not saved: The change was not confirmed/);
         // The save lands after its warning: it is saved, and nothing blocks a run.
-        resolveWrite();await settle();assert.doesNotMatch(byTarget('control:steps:value').textContent,/Not saved/);
+        resolveWrite();await settle();assert.doesNotMatch(byTarget('binding:steps:value').textContent,/Not saved/);
         assert.equal(await panel.flushPending(),true);
     }
     if(SCENARIO==='note-refusal'){
@@ -147,93 +151,105 @@ if(SCENARIO==='markdown'){
         // settles while the open note is still saving.
         let refuseSteps,saveNote;
         host.applyChanges=async changes=>{calls.push(changes);
-            if('control:steps:value' in changes){await new Promise(r=>refuseSteps=r);return{ok:false,rejected:[{reason:'steps refused'}]};}
+            if('binding:steps:value' in changes){await new Promise(r=>refuseSteps=r);return{ok:false,rejected:[{reason:'steps refused'}]};}
             await new Promise(r=>saveNote=r);return{ok:true,rejected:[]};};
-        const steps=input('control:steps:value');steps.focus();steps.value='33';key('Enter');await settle();
+        const steps=input('binding:steps:value');steps.focus();steps.value='33';key('Enter');await settle();
         note('note:intro:text').dispatch('dblclick');walk(note('note:intro:text')).find(n=>n.tagName==='TEXTAREA').value='# Edited';
         const flush=panel.flushPending();await settle();refuseSteps();await settle();saveNote();
         assert.equal(await flush,false);
     }
-    if(SCENARIO==='missing-ids'){
-        publish({...view,controls:[{source:'control',key:'7',control_id:'',label:'A',kind:'INT',value:'1',status:'missing_id',order:0},
-            {source:'control',key:'8',control_id:'',label:'B',kind:'INT',value:'2',status:'missing_id',order:0},
-            {source:'control',key:'9',control_id:'dup',label:'C',kind:'INT',value:'3',status:'duplicate_id',order:0},
-            {source:'control',key:'10',control_id:'dup',label:'D',kind:'INT',value:'4',status:'duplicate_id',order:0}],
-            notes:[{source:'note',key:'11',note_id:'',text:'one',status:'missing_id',order:0},{source:'note',key:'12',note_id:'',text:'two',status:'missing_id',order:0}]});
-        const keyed=walk(container).filter(n=>n.dataset.controlTarget?.includes('-key:')).map(n=>n.dataset.controlTarget);
-        assert.deepEqual(keyed.sort(),['control-key:10','control-key:7','control-key:8','control-key:9','note-key:11','note-key:12']);
-        assert.ok(walk(container).filter(n=>n.dataset.controlTarget?.startsWith('control-key:')).every(row=>walk(row).find(n=>n.tagName==='INPUT').disabled));
+    if(SCENARIO==='problem-statuses'){
+        publish({...view,bindings:[{source:'binding',binding_id:'gone',label:'Gone',kind:null,value:null,status:'missing',reason:'This setting is no longer in the workflow.',order:0},
+            {source:'binding',binding_id:'dup',label:'Dup',kind:null,value:null,status:'duplicate',reason:'Two nodes carry this Control.',order:1},
+            {source:'binding',binding_id:'run',label:'Folder',kind:'STRING',value:'out',status:'ok',checked_at_run:true,order:2},
+            {source:'binding',binding_id:'reset',label:'Steps',kind:'INT',value:'20',status:'ok',reset:true,reason:"Reset to the workflow's value: this setting changed since its value was saved.",order:3},
+            {source:'binding',binding_id:'bad'},{source:'binding',label:'no id'}],notes:[]});
+        for(const id of ['gone','dup'])assert.ok(walk(byTarget(`binding:${id}:value`)).find(n=>n.tagName==='INPUT').disabled);
+        assert.match(byTarget('binding:gone:value').textContent,/no longer in the workflow/);
+        assert.match(byTarget('binding:run:value').textContent,/Checked by the node when the run starts/);
+        assert.ok(!input('binding:run:value').disabled);
+        assert.match(byTarget('binding:reset:value').textContent,/Reset to the workflow's value/);
+        // A row without an id is never rendered: it has no target to save.
+        assert.equal(walk(container).filter(n=>n.dataset.controlTarget).length,5);
+        // Presentation still saves for a binding that is off.
+        note('binding:gone:note').dispatch('dblclick');walk(note('binding:gone:note')).find(n=>n.tagName==='TEXTAREA').value='Why it is off';
+        key('Enter',{ctrlKey:true});await settle();assert.deepEqual(calls,[{'binding:gone:note':'Why it is off'}]);
     }
     if(SCENARIO==='loading'){
-        publish({state:'loading',controls:[],fields:[],notes:[],error:null});assert.ok(container.textContent.includes('Loading controls'));
-        assert.ok(!container.textContent.includes('Add a Sonder Control'));
-        publish({state:'ready',controls:[],fields:[],notes:[],error:null});assert.ok(container.textContent.includes('Add a Sonder Control'));
+        publish({state:'loading',bindings:[],notes:[],error:null});assert.ok(container.textContent.includes('Loading controls'));
+        assert.ok(!container.textContent.includes('Add a Sonder Control Relay'));
+        publish({state:'ready',bindings:[],notes:[],error:null});assert.ok(container.textContent.includes('Add a Sonder Control Relay'));
+        publish({state:'ready',bindings:[],notes:[],relay:{status:'error',error:'The workflow has more than one Sonder Control Relay. Keep one.'},error:null});
+        assert.ok(container.textContent.includes('more than one Sonder Control Relay'));
+        host.emptyMessage='This workflow exposes no Controls.';
+        publish({state:'ready',bindings:[],notes:[],error:null});assert.ok(container.textContent.includes('This workflow exposes no Controls.'));
+        assert.ok(!container.textContent.includes('Add a Sonder Control Relay'));
     }
     if(SCENARIO==='removed-failure'||SCENARIO==='removed-pending'){
-        refuse=true;defer=SCENARIO==='removed-pending';const seed=input('control:seed:seed');seed.focus();seed.value='bad';key('Enter');await settle();
-        publish({...view,controls:view.controls.filter(d=>d.control_id!=='seed')});
+        refuse=true;defer=SCENARIO==='removed-pending';const seed=input('binding:seed:value');seed.focus();seed.value='bad';key('Enter');await settle();
+        publish({...view,bindings:view.bindings.filter(d=>d.binding_id!=='seed')});
         if(defer){resolveWrite();await settle();}refuse=false;defer=false;
-        const steps=input('control:steps:value');steps.focus();steps.value='31';assert.equal(await panel.flushPending(),true);
+        const steps=input('binding:steps:value');steps.focus();steps.value='31';assert.equal(await panel.flushPending(),true);
     }
     if(SCENARIO==='truncated'){
         publish({...view,notes:view.notes.map(d=>({...d,note_truncated:true}))});note('note:intro:text').dispatch('dblclick');assert.ok(!walk(note('note:intro:text')).some(n=>n.tagName==='TEXTAREA'));assert.equal(calls.length,0);
     }
     if(['layout','layout-refusal','layout-stale','layout-editor'].includes(SCENARIO)){
-        const row=byTarget('control:steps:value'),grip=walk(row).find(n=>n.dataset.panelDragHandle==='true');
+        const row=byTarget('binding:steps:value'),grip=walk(row).find(n=>n.dataset.panelDragHandle==='true');
         const advanced=walk(container).find(n=>n.tagName==='SUMMARY'&&n.textContent==='Advanced');
         const data={};const transfer={setData(k,v){data[k]=v;},getData(k){return data[k];}};
-        if(SCENARIO==='layout-editor')input('control:steps:value').focus();
+        if(SCENARIO==='layout-editor')input('binding:steps:value').focus();
         container.dispatch('dragstart',{target:grip,dataTransfer:transfer});
         if(SCENARIO==='layout-stale')publish({...view,notes:view.notes.map(d=>({...d,order:8}))});
         refuse=SCENARIO==='layout-refusal';container.dispatch('drop',{target:advanced,dataTransfer:transfer});await settle();
         if(SCENARIO==='layout-stale'||SCENARIO==='layout-editor'){assert.equal(calls.length,0);assert.equal(notices.length,1);}
-        else{assert.equal(calls.length,1);assert.equal(calls[0]['control:steps:group'],'Advanced');assert.ok(Number.isInteger(calls[0]['control:steps:order']));
+        else{assert.equal(calls.length,1);assert.equal(calls[0]['binding:steps:group'],'Advanced');assert.ok(Number.isInteger(calls[0]['binding:steps:order']));
             // A refused arrangement leaves the row in place and never blocks a run.
             if(refuse){assert.equal(row.parentElement.dataset.panelDropGroup,'');assert.equal(notices.length,1);assert.equal(await panel.flushPending(),true);}}
     }
     if(SCENARIO==='combo'||SCENARIO==='combo-capped'||SCENARIO==='combo-ime'||SCENARIO==='combo-query'||SCENARIO==='combo-capped-filter'){
         const options=Array.from({length:30},(_,i)=>'option-'+i);
-        publish({...view,controls:[{source:'control',control_id:'combo',kind:'COMBO',label:'Long options',options,options_truncated:SCENARIO.startsWith('combo-capped'),value:'option-0',status:'ok',order:0}]});
-        const el=input('control:combo:value');el.focus();el.value=SCENARIO==='combo-capped'?'option-999':SCENARIO==='combo-capped-filter'?'27':'option-27';el.dispatch('input');
+        publish({...view,bindings:[{source:'binding',binding_id:'combo',kind:'COMBO',label:'Long options',options,options_truncated:SCENARIO.startsWith('combo-capped'),value:'option-0',status:'ok',order:0}]});
+        const el=input('binding:combo:value');el.focus();el.value=SCENARIO==='combo-capped'?'option-999':SCENARIO==='combo-capped-filter'?'27':'option-27';el.dispatch('input');
         if(SCENARIO==='combo-ime'){el.dispatch('compositionstart');const e=key('Enter',{isComposing:true});assert.equal(e.prevented,false);assert.equal(calls.length,0);el.dispatch('compositionend');}
         if(SCENARIO==='combo-query'){
             el.value='option-2';el.dispatch('input');el.dispatch('change');assert.equal(await panel.flushPending(),true);assert.equal(calls.length,0);el.blur();assert.equal(el.value,'option-0');
         }else{
-        const list=walk(byTarget('control:combo:value')).find(n=>n.tagName==='SELECT');
+        const list=walk(byTarget('binding:combo:value')).find(n=>n.tagName==='SELECT');
         if(SCENARIO!=='combo-capped')assert.deepEqual(list.options.map(o=>o.value),['option-27']);
-        key('Enter');await settle();assert.deepEqual(calls,[{'control:combo:value':SCENARIO==='combo-capped'?'option-999':'option-27'}]);
+        key('Enter');await settle();assert.deepEqual(calls,[{'binding:combo:value':SCENARIO==='combo-capped'?'option-999':'option-27'}]);
         el.focus();el.value='draft';el.dispatch('input');key('Escape');assert.equal(el.value,SCENARIO==='combo-capped'?'option-999':'option-27');assert.equal(calls.length,1);
         }
     }
     if(SCENARIO==='combo-capped-exact'||SCENARIO==='combo-capped-current'||SCENARIO==='combo-capped-keyboard'){
         const value=SCENARIO==='combo-capped-current'?'model-27.ckpt':'model-0.ckpt';
-        publish({...view,controls:[{source:'control',control_id:'combo',kind:'COMBO',label:'Models',options:['model-27.ckpt.backup','model-0.ckpt'],options_truncated:true,value,status:'ok',order:0}]});
-        const el=input('control:combo:value');el.focus();
+        publish({...view,bindings:[{source:'binding',binding_id:'combo',kind:'COMBO',label:'Models',options:['model-27.ckpt.backup','model-0.ckpt'],options_truncated:true,value,status:'ok',order:0}]});
+        const el=input('binding:combo:value');el.focus();
         if(SCENARIO==='combo-capped-current'){key('Enter');await settle();assert.equal(calls.length,0);assert.equal(el.value,'model-27.ckpt');}
         else{el.value='model-27.ckpt';el.dispatch('input');
-            const button=walk(byTarget('control:combo:value')).find(n=>n.tagName==='BUTTON'&&n.textContent==='Use typed value');
-            if(SCENARIO==='combo-capped-keyboard'){button.focus();assert.equal(el.value,'model-27.ckpt');key('Enter');}else{button.dispatch('mousedown');button.dispatch('click');}await settle();assert.deepEqual(calls,[{'control:combo:value':'model-27.ckpt'}]);}
+            const button=walk(byTarget('binding:combo:value')).find(n=>n.tagName==='BUTTON'&&n.textContent==='Use typed value');
+            if(SCENARIO==='combo-capped-keyboard'){button.focus();assert.equal(el.value,'model-27.ckpt');key('Enter');}else{button.dispatch('mousedown');button.dispatch('click');}await settle();assert.deepEqual(calls,[{'binding:combo:value':'model-27.ckpt'}]);}
     }
     if(SCENARIO==='combo-focus-return'){
-        publish({...view,controls:[{source:'control',control_id:'combo',kind:'COMBO',label:'Models',options:['model-27.ckpt','model-0.ckpt'],options_truncated:true,value:'model-0.ckpt',status:'ok',order:0}]});
-        const el=input('control:combo:value');el.focus();el.value='27';el.dispatch('input');
-        const button=walk(byTarget('control:combo:value')).find(n=>n.tagName==='BUTTON');button.focus();el.focus();
-        const list=walk(byTarget('control:combo:value')).find(n=>n.tagName==='SELECT');assert.deepEqual(list.options.map(o=>o.value),['model-27.ckpt']);
-        key('Enter');await settle();assert.deepEqual(calls,[{'control:combo:value':'model-27.ckpt'}]);
+        publish({...view,bindings:[{source:'binding',binding_id:'combo',kind:'COMBO',label:'Models',options:['model-27.ckpt','model-0.ckpt'],options_truncated:true,value:'model-0.ckpt',status:'ok',order:0}]});
+        const el=input('binding:combo:value');el.focus();el.value='27';el.dispatch('input');
+        const button=walk(byTarget('binding:combo:value')).find(n=>n.tagName==='BUTTON');button.focus();el.focus();
+        const list=walk(byTarget('binding:combo:value')).find(n=>n.tagName==='SELECT');assert.deepEqual(list.options.map(o=>o.value),['model-27.ckpt']);
+        key('Enter');await settle();assert.deepEqual(calls,[{'binding:combo:value':'model-27.ckpt'}]);
     }
     if(SCENARIO==='combo-select-focus'){
-        publish({...view,controls:[{source:'control',control_id:'combo',kind:'COMBO',label:'Models',options:Array.from({length:30},(_,i)=>'model-'+i),value:'model-0',status:'ok',order:0}]});
-        const el=input('control:combo:value');el.focus();const list=walk(byTarget('control:combo:value')).find(n=>n.tagName==='SELECT');
+        publish({...view,bindings:[{source:'binding',binding_id:'combo',kind:'COMBO',label:'Models',options:Array.from({length:30},(_,i)=>'model-'+i),value:'model-0',status:'ok',order:0}]});
+        const el=input('binding:combo:value');el.focus();const list=walk(byTarget('binding:combo:value')).find(n=>n.tagName==='SELECT');
         // Browsers blur a focused native list synchronously when it is hidden.
         let hidden=false;Object.defineProperty(list,'hidden',{get:()=>hidden,set(v){hidden=v;if(v&&document.activeElement===list)list.blur();}});
-        list.focus();key('ArrowDown');key('Enter');await settle();assert.deepEqual(calls,[{'control:combo:value':'model-1'}]);
+        list.focus();key('ArrowDown');key('Enter');await settle();assert.deepEqual(calls,[{'binding:combo:value':'model-1'}]);
     }
     panel.destroy();assert.equal(listeners.size,0);assert.equal(container.children.length,0);
 }
 console.log('ok');
 '''
 
-@pytest.mark.parametrize('scenario',['combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','note-refusal','missing-ids','loading','note-then-value'])
+@pytest.mark.parametrize('scenario',['combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','note-refusal','problem-statuses','loading','note-then-value'])
 def test_controls_panel(scenario):
     node=shutil.which('node')
     if not node:pytest.skip('node required for Controls renderer boundary tests')

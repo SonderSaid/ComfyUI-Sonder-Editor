@@ -1,10 +1,11 @@
-"""Sonder Control coercion, kinds, descriptors and the seed policy.
+"""Controls coercion, kinds, binding descriptors, change validation and seeds.
 
-Pure tests with fake node classes. The real ComfyUI validation path and the
-real node run in `test_sonder_control_runtime.py` against the test install.
+Pure tests with fake node classes and hand-built API prompts carrying a Sonder
+Control Relay manifest in its export form (what ``control_relay.js`` emits).
 """
 
 import ast
+import json
 import math
 import random
 from pathlib import Path
@@ -23,19 +24,19 @@ def _node(class_type, inputs=None, title=None):
     return node
 
 
-def _control(value_text="", kind="STRING", seed=0, control_id="c0000001", order=0, group="", title=None):
-    return _node(
-        "SonderControl",
-        {
-            "value_text": value_text,
-            "seed": seed,
-            "kind": kind,
-            "panel_order": order,
-            "panel_group": group,
-            "control_id": control_id,
-        },
-        title=title,
-    )
+def _binding(path, name, *, label="", status="ok", seed_mode=None, **presentation):
+    entry = {"label": label, "status": status, "targets": [{"path": path, "input": name}] if path else []}
+    if seed_mode:
+        entry["seed_mode"] = seed_mode
+    entry.update(presentation)
+    return entry
+
+
+def _relay(bindings=None, notes=None, suggestions=None, **extra):
+    manifest = {"v": 1, "bindings": bindings or {}, "notes": notes or {}, **extra}
+    if suggestions is not None:
+        manifest["suggestions"] = suggestions
+    return _node("SonderControlRelay", {"manifest": json.dumps(manifest)})
 
 
 class KSampler:
@@ -71,19 +72,9 @@ class AnySink:
         return {"optional": {"value_1": ("*",), "lane": ("COMFY_MATCHTYPE_V3", {})}}
 
 
-class ImageLoader:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {"required": {"image": (["a.png", "b.png"], {"image_upload": True})}}
-
-    @classmethod
-    def VALIDATE_INPUTS(cls, image):
-        if not image.endswith(".png"):  # raises AttributeError for a linked None
-            return "Invalid image file"
-        return True
-
-
 class KwargsValidated:
+    """A third-party node whose combo options a frontend fills: native skips its checks."""
+
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {"folder": (["out"],), "count": ("INT", {"min": 0, "max": 9})}}
@@ -103,6 +94,16 @@ class OtherInputValidated:
         return mode in ("a", "b")
 
 
+class SonderSelector:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"choice": (["Option 1", "Option 2"],), "choice_list": ("STRING", {"multiline": True})}}
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, choice="", choice_list="", **kwargs):
+        return True
+
+
 class SonderSaveVideo:
     @classmethod
     def INPUT_TYPES(cls):
@@ -115,87 +116,55 @@ class SonderSaveVideo:
         }
 
 
-class SonderMasksBridge:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "project": ("SONDER_PROJECT",),
-                "edit_video": ("BOOLEAN", {"default": True, "label_on": "Edit", "label_off": "Freeze"}),
-                "edit_audio": ("BOOLEAN", {"default": True, "label_on": "Edit", "label_off": "Freeze"}),
-            }
-        }
-
-
 class SonderEditor:
     RETURN_TYPES = ("SONDER_PROJECT",)
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {}}
+        return {"required": {}, "optional": {"selection_start": ("INT", {"default": 0})}}
 
 
-class SonderControl:
-    RETURN_TYPES = ("*",)
-
+class SonderControlRelay:
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {}}
+        return {"optional": {"manifest": ("STRING", {"multiline": True})}}
+
+
+class Multi:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"tags": ("COMBO", {"options": ["a", "b", "c"], "multi_select": True})}}
 
 
 CLASSES = {
     cls.__name__: cls
     for cls in (
-        KSampler, TextNode, AnySink, ImageLoader, KwargsValidated, OtherInputValidated,
-        SonderSaveVideo, SonderMasksBridge, SonderEditor, SonderControl,
+        KSampler, TextNode, AnySink, KwargsValidated, OtherInputValidated, SonderSelector,
+        SonderSaveVideo, SonderEditor, SonderControlRelay, Multi,
     )
 }
 
 
-def direct_runner(requests):
-    """Call V1 validators the way /prompt does: linked inputs arrive as None."""
-    outcomes = []
-    for request in requests:
-        validator = request["class_def"].VALIDATE_INPUTS
-        kwargs = {
-            name: (None if isinstance(value, list) else value)
-            for name, value in request["inputs"].items()
-        }
-        import inspect
-
-        spec = inspect.getfullargspec(validator)
-        if spec.varkw is None:
-            kwargs = {name: value for name, value in kwargs.items() if name in spec.args}
-        try:
-            result = validator(**kwargs)
-        except Exception as exc:
-            outcomes.append((False, f"{type(exc).__name__}: {exc}"))
-            continue
-        outcomes.append((result is True, None if result in (True, False) else str(result)))
-    return outcomes
+def describe(prompt, **kwargs):
+    return cd.describe_bindings(prompt, class_lookup=CLASSES.get, **kwargs)
 
 
-def describe(prompt, runner=direct_runner):
-    return cd.describe_controls(prompt, class_lookup=CLASSES.get, validator_runner=runner)
-
-
-def only_control(prompt, **kwargs):
-    controls = describe(prompt, **kwargs)["controls"]
-    assert len(controls) == 1, controls
-    return controls[0]
+def binding(prompt, binding_id, **kwargs):
+    return next(b for b in describe(prompt, **kwargs)["bindings"] if b["binding_id"] == binding_id)
 
 
 # ── Module shape ─────────────────────────────────────────────────────────────
 
-def test_module_level_imports_are_standard_library_and_prompt_graph_only():
+def test_module_level_imports_are_standard_library_and_pure_siblings_only():
     tree = ast.parse((REPO_ROOT / "server" / "control_descriptors.py").read_text(encoding="utf-8"))
-    allowed = {"__future__", "asyncio", "inspect", "logging", "math", "random", "dataclasses", "decimal", "typing"}
+    allowed = {"__future__", "inspect", "logging", "math", "random", "dataclasses", "decimal", "typing"}
     for node in tree.body:
         if isinstance(node, ast.Import):
             assert {alias.name.split(".")[0] for alias in node.names} <= allowed
         elif isinstance(node, ast.ImportFrom):
             if node.level:
-                assert node.module is None and [a.name for a in node.names] == ["prompt_graph"]
+                assert node.module is None
+                assert {a.name for a in node.names} <= {"binding_policy", "control_manifest", "prompt_graph"}
             else:
                 assert (node.module or "").split(".")[0] in allowed, node.module
 
@@ -287,7 +256,7 @@ def test_target_checks_apply_range_and_options():
 
 # ── Kinds and specs ──────────────────────────────────────────────────────────
 
-def test_derive_kind_and_compatibility():
+def test_derive_kind():
     assert cd.derive_kind([]) == cd.ANY_KIND
     assert cd.derive_kind(["*", "*"]) == cd.ANY_KIND
     assert cd.derive_kind(["INT", "*"]) == "INT"
@@ -295,13 +264,6 @@ def test_derive_kind_and_compatibility():
     assert cd.derive_kind(["COMBO", "COMBO"]) == "COMBO"
     assert cd.derive_kind(["INT", "FLOAT"]) is None
     assert cd.derive_kind(["STRING", "COMBO"]) is None
-
-    assert cd.kind_compatible("SEED", "INT") and cd.kind_compatible("INT", "SEED")
-    assert cd.kind_compatible("FLOAT", cd.ANY_KIND)
-    assert not cd.kind_compatible("INT", "FLOAT")
-    assert not cd.kind_compatible("STRING", "COMBO")
-    assert not cd.kind_compatible("", "STRING")
-    assert not cd.kind_compatible("BOGUS", cd.ANY_KIND)
 
 
 def test_spec_reads_both_combo_shapes_seeds_and_wildcards():
@@ -321,383 +283,353 @@ def test_spec_reads_both_combo_shapes_seeds_and_wildcards():
     assert multiline["multiline"] is True and multiline["default"] == "x"
 
 
+
 # ── Describe ─────────────────────────────────────────────────────────────────
 
-def test_control_ok_with_typed_value_bounds_and_label():
+def test_binding_ok_with_typed_value_bounds_label_and_targets():
     prompt = {
-        "5": _control("30", kind="INT", title="Steps", order=2),
-        "9": _node("KSampler", {"steps": ["5", 0], "model": ["1", 0]}),
+        "1": _relay({"b_steps": _binding("9", "steps", label="Steps", order=2, group="Sampling", note="**More** detail")}),
+        "9": _node("KSampler", {"steps": 30, "model": ["4", 0]}, title="Sampler"),
     }
-    control = only_control(prompt)
-    assert control["status"] == cd.STATUS_OK
-    assert control["label"] == "Steps"
-    assert control["value"] == 30 and control["error"] is None
-    assert control["target_kind"] == "INT"
-    assert (control["min"], control["max"]) == (1, 100)
-    assert control["order"] == 2 and control["group"] == ""
-    assert control["control_id"] == "c0000001"
-    assert control["targets"] == [
-        {"key": "9", "class_type": "KSampler", "input": "steps", "kind": "INT", "status": "ok"},
-    ]
-    assert "class_def" not in str(control)
+    view = describe(prompt)
+    assert view["relay"] == {"status": "ok", "key": "1", "error": None}
+    b = view["bindings"][0]
+    assert b["status"] == cd.STATUS_OK and b["reason"] is None
+    assert (b["label"], b["order"], b["group"], b["note"], b["section"]) == ("Steps", 2, "Sampling", "**More** detail", "workflow")
+    assert b["kind"] == "INT" and b["value"] == 30 and b["error"] is None
+    assert (b["min"], b["max"]) == (1, 100)
+    assert b["targets"] == [{"path": "9", "input": "steps", "class_type": "KSampler", "status": "ok"}]
+    assert "class_def" not in str(view) and "literal" not in str(b)
 
 
-def test_control_value_error_is_reported_not_raised():
+def test_default_label_names_the_node_and_input():
+    prompt = {"1": _relay({"b": _binding("9", "cfg")}), "9": _node("KSampler", {"cfg": 7.5}, title="Sampler")}
+    assert binding(prompt, "b")["label"] == "Sampler · cfg"
+
+
+def test_value_out_of_range_is_reported_not_raised():
+    prompt = {"1": _relay({"b": _binding("9", "steps"), "c": _binding("9", "sampler_name")}),
+              "9": _node("KSampler", {"steps": 500, "sampler_name": "delta"})}
+    view = {b["binding_id"]: b for b in describe(prompt)["bindings"]}
+    assert view["b"]["status"] == cd.STATUS_OK and "above the maximum of 100" in view["b"]["error"]
+    assert view["b"]["value"] == 500
+    assert "not one of the options" in view["c"]["error"]
+
+
+@pytest.mark.parametrize("inputs, status", [
+    ({"steps": ["4", 0]}, cd.STATUS_LINKED),
+    ({}, cd.STATUS_MISSING),
+])
+def test_linked_and_absent_inputs(inputs, status):
+    prompt = {"1": _relay({"b": _binding("9", "steps")}), "9": _node("KSampler", inputs)}
+    b = binding(prompt, "b")
+    assert b["status"] == status and b["reason"] and b["kind"] is None and b["value"] is None
+
+
+def test_a_forged_ok_is_checked_against_the_prompt():
+    # The export claims ok for a node the prompt lacks, a linked input and an
+    # input Sonder owns: every one is refused by the server's own reading.
     prompt = {
-        "5": _control("500", kind="INT"),
-        "9": _node("KSampler", {"steps": ["5", 0]}),
-        "6": _control("delta", kind="COMBO", control_id="c0000002"),
-        "10": _node("KSampler", {"sampler_name": ["6", 0]}),
+        "1": _relay({
+            "gone": _binding("77", "steps"),
+            "linked": _binding("9", "model"),
+            "denied": _binding("2", "selection_start"),
+            "nowidget": _binding("9", "model_name"),
+        }),
+        "2": _node("SonderEditor", {"selection_start": 3}),
+        "9": _node("KSampler", {"model": ["4", 0], "model_name": "x"}),
     }
-    controls = {c["key"]: c for c in describe(prompt)["controls"]}
-    assert controls["5"]["status"] == cd.STATUS_OK
-    assert controls["5"]["value"] is None
-    assert "above the maximum of 100" in controls["5"]["error"]
-    assert "not one of the options" in controls["6"]["error"]
-    assert controls["6"]["options"] == ["euler", "dpmpp_2m"]
+    view = {b["binding_id"]: b for b in describe(prompt)["bindings"]}
+    assert view["gone"]["status"] == cd.STATUS_MISSING
+    assert view["linked"]["status"] == cd.STATUS_LINKED
+    assert view["denied"]["status"] == cd.STATUS_DENIED
+    assert view["nowidget"]["status"] == cd.STATUS_UNSUPPORTED
+    assert "no input named" in view["nowidget"]["reason"]
 
 
-def test_combo_options_intersect_across_targets():
+@pytest.mark.parametrize("status", ["missing", "duplicate", "linked", "no_widget", "unsupported"])
+def test_exported_problem_statuses_are_kept_with_a_reason(status):
+    prompt = {"1": _relay({"b": _binding(None, "steps", status=status)}), "9": _node("KSampler", {"steps": 3})}
+    b = binding(prompt, "b")
+    assert b["status"] == status and b["reason"] == cd.STATUS_REASONS[status]
+
+
+def test_wildcards_non_values_and_multiselect_are_unsupported():
+    prompt = {"1": _relay({"any": _binding("5", "value_1"), "model": _binding("9", "model"),
+                           "multi": _binding("6", "tags")}),
+              "5": _node("AnySink", {"value_1": 3}), "9": _node("KSampler", {"model": "x"}),
+              "6": _node("Multi", {"tags": ["a", "b", "c"]})}
+    view = {b["binding_id"]: b for b in describe(prompt)["bindings"]}
+    assert view["any"]["status"] == cd.STATUS_UNSUPPORTED and "any type" in view["any"]["reason"]
+    assert view["model"]["status"] == cd.STATUS_UNSUPPORTED and "not a value" in view["model"]["reason"]
+    assert view["multi"]["status"] == cd.STATUS_UNSUPPORTED and "Lists of choices" in view["multi"]["reason"]
+
+
+def test_promoted_input_with_two_consumers_merges_bounds_and_options():
     class OtherSampler:
         @classmethod
         def INPUT_TYPES(cls):
-            return {"required": {"sampler_name": ("COMBO", {"options": ["dpmpp_2m", "euler", "lcm"]})}}
+            return {"required": {"sampler_name": ("COMBO", {"options": ["dpmpp_2m", "euler", "lcm"]}),
+                                 "steps": ("INT", {"min": 5, "max": 50})}}
 
     classes = dict(CLASSES, OtherSampler=OtherSampler)
-    prompt = {
-        "5": _control("euler", kind="COMBO"),
-        "9": _node("KSampler", {"sampler_name": ["5", 0]}),
-        "10": _node("OtherSampler", {"sampler_name": ["5", 0]}),
-    }
-    control = cd.describe_controls(prompt, class_lookup=classes.get, validator_runner=direct_runner)["controls"][0]
-    assert control["status"] == cd.STATUS_OK
-    assert control["options"] == ["euler", "dpmpp_2m"]
+    prompt = {"1": _relay({"s": {"label": "Sampler", "status": "ok",
+                                  "targets": [{"path": "7:3", "input": "sampler_name"}, {"path": "7:4", "input": "sampler_name"}]},
+                           "n": {"label": "Steps", "status": "ok",
+                                  "targets": [{"path": "7:3", "input": "steps"}, {"path": "7:4", "input": "steps"}]}}),
+              "7:3": _node("KSampler", {"sampler_name": "euler", "steps": 20}),
+              "7:4": _node("OtherSampler", {"sampler_name": "euler", "steps": 20})}
+    view = {b["binding_id"]: b for b in cd.describe_bindings(prompt, class_lookup=classes.get)["bindings"]}
+    assert view["s"]["options"] == ["euler", "dpmpp_2m"] and view["s"]["status"] == "ok"
+    assert (view["n"]["min"], view["n"]["max"]) == (5, 50)
+    assert len(view["n"]["targets"]) == 2
 
 
-def test_statuses_unlinked_mixed_stale_and_wildcard():
-    prompt = {
-        "1": _control("x", control_id="unlinked"),
-        "2": _control("3", kind="INT", control_id="mixed"),
-        "20": _node("KSampler", {"steps": ["2", 0], "cfg": ["2", 0]}),
-        "3": _control("3", kind="INT", control_id="stale"),
-        "30": _node("KSampler", {"cfg": ["3", 0]}),
-        "4": _control("anything", kind="STRING", control_id="wild"),
-        "40": _node("AnySink", {"value_1": ["4", 0], "lane": ["4", 0]}),
-        "5": _control("", kind="SEED", seed=777, control_id="seedint"),
-        "50": _node("KSampler", {"seed": ["5", 0], "steps": ["5", 0]}),
-    }
-    by_id = {c["control_id"]: c for c in describe(prompt)["controls"]}
-    assert by_id["unlinked"]["status"] == cd.STATUS_UNLINKED
-    assert by_id["mixed"]["status"] == cd.STATUS_MIXED and by_id["mixed"]["target_kind"] is None
-    assert by_id["stale"]["status"] == cd.STATUS_STALE and by_id["stale"]["target_kind"] == "FLOAT"
-    assert by_id["wild"]["status"] == cd.STATUS_OK and by_id["wild"]["target_kind"] == cd.ANY_KIND
-    # SEED drives a seed and an INT together; the value must fit both ranges.
-    assert by_id["seedint"]["status"] == cd.STATUS_OK
-    assert by_id["seedint"]["target_kind"] == "SEED"
-    assert "above the maximum of 100" in by_id["seedint"]["error"]
+def test_mixed_target_kinds_are_unsupported():
+    prompt = {"1": _relay({"m": {"label": "M", "status": "ok", "targets": [{"path": "9", "input": "steps"},
+                                                                          {"path": "9", "input": "cfg"}]}}),
+              "9": _node("KSampler", {"steps": 3, "cfg": 2.0})}
+    assert binding(prompt, "m")["status"] == cd.STATUS_UNSUPPORTED
 
 
-def test_unsupported_targets_name_their_reason():
-    prompt = {
-        "1": _control("x", control_id="image"),
-        "10": _node("KSampler", {"model": ["1", 0]}),
-        "2": _control("x", control_id="missing"),
-        "20": _node("NotInstalled", {"a": ["2", 0]}),
-        "3": _control("x", control_id="noinput"),
-        "30": _node("TextNode", {"nope": ["3", 0]}),
-    }
-    by_id = {c["control_id"]: c for c in describe(prompt)["controls"]}
-    assert by_id["image"]["status"] == cd.STATUS_UNSUPPORTED
-    assert "takes MODEL" in by_id["image"]["targets"][0]["reason"]
-    assert "NotInstalled is not installed" in by_id["missing"]["targets"][0]["reason"]
-    assert "no input named nope" in by_id["noinput"]["targets"][0]["reason"]
+def test_seed_binding_reads_exact_value_and_mirrored_mode():
+    large = 2 ** 64 - 1
+    prompt = {"1": _relay({"seed": _binding("9", "seed", seed_mode="increment")}),
+              "9": _node("KSampler", {"seed": large})}
+    b = binding(prompt, "seed")
+    assert b["kind"] == "SEED" and b["value"] == large and b["seed_mode"] == "increment"
+    assert cd.json_safe({"bindings": [b]})["bindings"][0]["value"] == str(large)
 
 
-def test_validator_dry_run_marks_only_refusing_targets():
-    calls = []
-
-    def recording_runner(requests):
-        calls.extend((r["key"], sorted(r["inputs"])) for r in requests)
-        return direct_runner(requests)
-
-    prompt = {
-        "1": _control("a.png", kind="COMBO", control_id="loader"),
-        "10": _node("ImageLoader", {"image": ["1", 0]}),
-        "2": _control("out", kind="COMBO", control_id="kwargs"),
-        "20": _node("KwargsValidated", {"folder": ["2", 0], "count": 3}),
-        "3": _control("1.5", kind="FLOAT", control_id="uncovered"),
-        "30": _node("OtherInputValidated", {"mode": "a", "amount": ["3", 0]}),
-    }
-    by_id = {c["control_id"]: c for c in describe(prompt, runner=recording_runner)["controls"]}
-    assert by_id["loader"]["status"] == cd.STATUS_UNSUPPORTED
-    assert by_id["loader"]["targets"][0]["reason"] == cd.VALIDATOR_REFUSAL
-    assert "AttributeError" in by_id["loader"]["targets"][0]["detail"]
-    assert "detail" not in by_id["kwargs"]["targets"][0]
-    assert by_id["kwargs"]["status"] == cd.STATUS_OK
-    # A validator that never receives the linked input is not dry-run.
-    assert by_id["uncovered"]["status"] == cd.STATUS_OK
-    assert {key for key, _ in calls} == {"10", "20"}
+def test_boolean_reads_only_a_real_boolean():
+    prompt = {"1": _relay({"on": _binding("5", "enabled"), "word": _binding("6", "enabled")}),
+              "5": _node("TextNode", {"text": "", "enabled": False}), "6": _node("TextNode", {"text": "", "enabled": "false"})}
+    view = {b["binding_id"]: b for b in describe(prompt)["bindings"]}
+    assert view["on"]["value"] is False and view["on"]["error"] is None
+    assert view["on"]["label_on"] == "On"
+    assert view["word"]["error"]
 
 
-def test_a_node_failing_for_its_own_reasons_does_not_refuse_the_control():
-    class NodeWide:
-        @classmethod
-        def INPUT_TYPES(cls):
-            return {"required": {"mode": (["a", "b"],), "text": ("STRING", {})}}
-
-        @classmethod
-        def VALIDATE_INPUTS(cls, mode, text):
-            return mode == "a"  # never looks at the linked input
-
-    classes = dict(CLASSES, NodeWide=NodeWide)
-    prompt = {
-        "1": _control("hello", control_id="wide"),
-        "10": _node("NodeWide", {"mode": "z", "text": ["1", 0]}),
-        "2": _control("", kind="COMBO", control_id="loader"),
-        "20": _node("ImageLoader", {"image": ["2", 0]}),
-    }
-    by_id = {
-        c["control_id"]: c
-        for c in cd.describe_controls(prompt, class_lookup=classes.get, validator_runner=direct_runner)["controls"]
-    }
-    # The node fails with or without the link, so the link is not to blame.
-    assert by_id["wide"]["status"] == cd.STATUS_OK
-    # An empty Control value fails too, but the first option passes: refused.
-    assert by_id["loader"]["status"] == cd.STATUS_UNSUPPORTED
+def test_selector_options_come_from_its_effective_choice_list():
+    prompt = {"1": _relay({"c": _binding("5", "choice")}),
+              "5": _node("SonderSelector", {"choice": "Detail", "choice_list": "Base\nDecompression\n\nDetail\n"})}
+    b = binding(prompt, "c")
+    assert b["options"] == ["Base", "Decompression", "Detail"] and b["provider"] is True
+    assert b["value"] == "Detail" and b["error"] is None and not b.get("checked_at_run")
 
 
-def test_comfy_runner_refuses_a_running_event_loop():
-    import asyncio
-
-    async def on_loop():
-        cd.comfy_validator_runner([])
-
-    with pytest.raises(RuntimeError, match="to_thread"):
-        asyncio.run(on_loop())
+def test_selector_with_a_linked_choice_list_is_checked_at_run():
+    prompt = {"1": _relay({"c": _binding("5", "choice")}),
+              "5": _node("SonderSelector", {"choice": "Detail", "choice_list": ["8", 0]})}
+    b = binding(prompt, "c")
+    assert b["checked_at_run"] is True and "options" not in b and b["status"] == cd.STATUS_OK
 
 
-def test_validator_runner_gets_literals_cast_and_links_kept():
-    seen = {}
-
-    def runner(requests):
-        for request in requests:
-            seen[request["key"]] = request["inputs"]
-        return [(True, None)] * len(requests)
-
-    class Casting:
-        @classmethod
-        def INPUT_TYPES(cls):
-            return {"required": {"n": ("INT", {}), "s": ("STRING", {}), "v": ("*",)}}
-
-        @classmethod
-        def VALIDATE_INPUTS(cls, **_kwargs):
-            return True
-
-    classes = dict(CLASSES, Casting=Casting)
-    prompt = {
-        "1": _control("x"),
-        "10": _node("Casting", {"n": "4", "s": {"__value__": ["a", "b"]}, "v": ["1", 0]}),
-    }
-    cd.describe_controls(prompt, class_lookup=classes.get, validator_runner=runner)
-    assert seen["10"] == {"n": 4, "s": "['a', 'b']", "v": ["1", 0]}
+def test_validator_covered_inputs_skip_server_bounds_and_options():
+    # Native validation skips min/max/combo for inputs a validator covers
+    # (execution.py:1029), so the panel must not refuse what a run accepts.
+    prompt = {"1": _relay({"f": _binding("5", "folder"), "n": _binding("5", "count"),
+                           "a": _binding("6", "amount"), "m": _binding("6", "mode")}),
+              "5": _node("KwargsValidated", {"folder": "renders/today", "count": 99}),
+              "6": _node("OtherInputValidated", {"mode": "a", "amount": 1.0})}
+    view = {b["binding_id"]: b for b in describe(prompt)["bindings"]}
+    for name in ("f", "n"):
+        assert view[name]["checked_at_run"] is True and view[name]["error"] is None
+        assert "options" not in view[name] and "max" not in view[name]
+    assert view["f"]["value"] == "renders/today"
+    assert view["m"]["checked_at_run"] is True
+    assert not view["a"].get("checked_at_run") and view["a"]["max"] == 2.0
 
 
-def test_one_descriptor_per_control_id_for_shared_subgraph_definitions():
-    prompt = {
-        "733:5": _control("20", kind="INT", control_id="shared01", title="Steps"),
-        "733:9": _node("KSampler", {"steps": ["733:5", 0]}),
-        "734:5": _control("20", kind="INT", control_id="shared01", title="Steps"),
-        "734:9": _node("KSampler", {"steps": ["734:5", 0]}),
-    }
-    control = only_control(prompt)
-    assert control["keys"] == ["733:5", "734:5"]
-    assert [t["key"] for t in control["targets"]] == ["733:9", "734:9"]
-    assert control["status"] == cd.STATUS_OK
+def test_bindings_and_notes_sort_and_notes_and_suggestions_are_listed():
+    prompt = {"1": _relay(
+        {"z": _binding("9", "steps", label="Alpha", order=5), "y": _binding("9", "cfg", label="beta", order=-1),
+         "x": _binding("9", "denoise", label="Gamma", order=-1)},
+        notes={"n2": {"text": "Two", "order": 3}, "n1": {"text": "# One", "group": "Intro", "order": -2}},
+        suggestions=[{"binding_id": "orphan1", "targets": [{"path": "9", "input": "scheduler"}]},
+                     {"binding_id": "z", "targets": []}]),
+        "9": _node("KSampler", {"steps": 3, "cfg": 2.0, "denoise": 1.0, "scheduler": "normal"}, title="Sampler")}
+    view = describe(prompt)
+    assert [b["binding_id"] for b in view["bindings"]] == ["y", "x", "z"]
+    assert [n["note_id"] for n in view["notes"]] == ["n1", "n2"]
+    assert view["notes"][0] == {"source": "note", "note_id": "n1", "text": "# One", "group": "Intro", "order": -2, "status": "ok"}
+    assert view["suggestions"] == [{"binding_id": "orphan1", "targets": [{"path": "9", "input": "scheduler"}],
+                                    "label": "Sampler · scheduler"}]
 
 
-def test_two_different_controls_sharing_an_id_are_flagged():
-    prompt = {
-        "1": _control("20", kind="INT", control_id="same0001"),
-        "10": _node("KSampler", {"steps": ["1", 0]}),
-        "2": _control("30", kind="INT", control_id="same0001"),
-        "20": _node("KSampler", {"steps": ["2", 0]}),
-    }
-    control = only_control(prompt)
-    assert control["status"] == cd.STATUS_DUPLICATE
-    assert control["error"]
+@pytest.mark.parametrize("prompt, error", [
+    ({"9": _node("KSampler")}, None),
+    ({"1": _relay(), "2": _relay()}, "more than one"),
+    ({"4:1": _relay()}, "inside a subgraph"),
+    ({"1": _node("SonderControlRelay", {"manifest": "{nope"})}, "not valid JSON"),
+    ({"1": _relay(error="resolver failed")}, "resolver failed"),
+])
+def test_relay_problems_are_view_errors(prompt, error):
+    view = describe(prompt)
+    if error is None:
+        assert view["relay"]["status"] == "none" and "error" not in view
+    else:
+        assert view["relay"]["status"] == "error" and error in view["error"]
+    assert view["bindings"] == [] and view["notes"] == []
 
 
-def test_controls_sort_by_panel_order_then_label():
-    prompt = {
-        "1": _control("a", control_id="c1", order=5, title="Zeta"),
-        "2": _control("b", control_id="c2", order=0, title="beta"),
-        "3": _control("c", control_id="c3", order=0, title="Alpha"),
-    }
-    assert [c["label"] for c in describe(prompt)["controls"]] == ["Alpha", "beta", "Zeta"]
-
-
-def test_label_falls_back_and_group_is_trimmed():
-    prompt = {"1": _control("a", group="  Advanced ")}
-    control = only_control(prompt)
-    assert control["label"] == cd.DEFAULT_CONTROL_LABEL
-    assert control["group"] == "Advanced"
+@pytest.mark.parametrize("census, error", [
+    ({"active": 0, "muted": 1, "bypassed": 0, "nested": 0}, "muted or bypassed"),
+    ({"active": 2, "muted": 0, "bypassed": 0, "nested": 0}, "more than one"),
+    ({"active": 1, "muted": 0, "bypassed": 0, "nested": 1}, "inside a subgraph"),
+    ({"active": 1, "muted": 1, "bypassed": 0, "nested": 0}, None),
+])
+def test_canvas_census_reports_what_an_export_cannot_show(census, error):
+    prompt = {"1": _relay({"b": _binding("9", "steps")}), "9": _node("KSampler", {"steps": 3})}
+    view = describe(prompt, relay_census=census)
+    assert (view["relay"]["status"] == "error") == (error is not None)
+    if error:
+        assert error in view["error"]
 
 
 def test_describe_refuses_a_non_object_prompt():
     with pytest.raises(ValueError):
-        cd.describe_controls(["not", "a", "prompt"], class_lookup=CLASSES.get, validator_runner=direct_runner)
+        cd.describe_bindings([1, 2])
 
 
-# ── Panel metadata and HTTP transport ──────────────────────────────────────
+# ── Change validation ────────────────────────────────────────────────────────
 
-def test_control_notes_and_seed_mode_are_optional_metadata():
-    prompt = {"1": _control("20", "INT"), "2": _node("KSampler", {"steps": ["1", 0]})}
-    before = only_control(prompt)
-    assert before["note"] == "" and before["seed_mode"] is None
-    prompt["1"]["inputs"].update(panel_note="**Recommended** 10–20", seed_mode="decrement")
-    after = only_control(prompt)
-    assert after["note"] == "**Recommended** 10–20" and after["seed_mode"] == "decrement"
-    assert after["value"] == before["value"] == 20
-    prompt["1"]["inputs"]["seed_mode"] = "unknown"
-    assert only_control(prompt)["seed_mode"] is None
+def _selector_prompt():
+    return {"1": _relay({"c": _binding("5", "choice"), "l": _binding("5", "choice_list"),
+                         "s": _binding("9", "steps"), "seed": _binding("9", "seed"),
+                         "on": _binding("6", "enabled"), "gone": _binding("77", "steps")},
+                        notes={"n": {"text": "x"}}),
+            "5": _node("SonderSelector", {"choice": "Detail", "choice_list": "Base\nDecompression\nDetail"}),
+            "6": _node("TextNode", {"text": "", "enabled": True}),
+            "9": _node("KSampler", {"steps": 20, "seed": 5})}
 
 
-def test_notes_merge_shared_instances_and_keep_order_and_group():
-    note = _node("SonderPanelNote", {"text": "# Instructions", "note_id": "shared01",
-                                   "panel_order": -5, "panel_group": "  Advanced  "})
-    result = describe({"733:5": note, "734:5": note, "9": _node("SonderPanelNote", {})})
-    first, missing = result["notes"]
-    assert first["keys"] == ["733:5", "734:5"] and first["text"] == "# Instructions"
-    assert first["order"] == -5 and first["group"] == "Advanced" and first["status"] == "ok"
-    assert missing["status"] == "missing_id" and missing["reason"]
+def test_change_grammar_and_coercion():
+    prompt = _selector_prompt()
+    view = describe(prompt)
+    cleaned, rejected = cd.validate_binding_changes(view, {
+        "binding:s:value": "30", "binding:seed:value": str(2 ** 64 - 1), "binding:seed:seed_mode": "fixed",
+        "binding:on:value": False, "binding:c:label": "  Feature  ", "binding:c:note": "Pick one",
+        "binding:c:order": "4", "binding:c:group": " Look ", "note:n:text": "# New", "binding:gone:label": "Kept",
+    }, prompt=prompt)
+    assert rejected == []
+    assert cleaned == {"binding:s:value": 30, "binding:seed:value": 2 ** 64 - 1, "binding:seed:seed_mode": "fixed",
+                       "binding:on:value": False, "binding:c:label": "Feature", "binding:c:note": "Pick one",
+                       "binding:c:order": 4, "binding:c:group": "Look", "note:n:text": "# New",
+                       "binding:gone:label": "Kept"}
 
 
-@pytest.mark.parametrize("source, text_field, id_field", [
-    ("SonderPanelNote", "text", "note_id"), ("SonderControl", "panel_note", "control_id"),
+@pytest.mark.parametrize("changes, reason", [
+    ({"binding:s:value": "300"}, "above the maximum"),
+    ({"binding:on:value": "false"}, "on or off"),
+    ({"binding:gone:value": 3}, "unavailable"),
+    ({"binding:s:seed_mode": "fixed"}, "unavailable"),
+    ({"binding:seed:seed_mode": "sideways"}, "Choose fixed"),
+    ({"binding:c:label": "x" * 121}, "120 characters"),
+    ({"binding:c:note": "x" * 4001}, "4000"),
+    ({"binding:c:order": 10000}, "-9999 and 9999"),
+    ({"control:abc:value": "1"}, "unavailable"),
+    ({"field:SonderSaveVideo/mark_queue_complete": True}, "unavailable"),
+    ({"binding:c:value": "Gamma"}, "not one of the options"),
 ])
-def test_note_truncation_is_read_only_and_different_tails_do_not_merge(source, text_field, id_field):
-    import copy
-    node = _control("20", "INT") if source == "SonderControl" else _node(source)
-    node["inputs"].update({id_field: "shared01", text_field: "x" * 4001})
-    prompt = {"733:5": node, "734:5": copy.deepcopy(node)}
-    prompt["734:5"]["inputs"][text_field] += "different tail"
-    before = copy.deepcopy(prompt)
-    descriptor = describe(prompt)["controls" if source == "SonderControl" else "notes"][0]
-    assert descriptor["status"] == "duplicate_id" and descriptor["note_truncated"] is True
-    assert descriptor["note" if source == "SonderControl" else "text"] == "x" * 4000
-    assert prompt == before
+def test_change_refusals(changes, reason):
+    prompt = _selector_prompt()
+    cleaned, rejected = cd.validate_binding_changes(describe(prompt), changes, prompt=prompt)
+    assert reason in rejected[0]["reason"]
 
 
-def test_note_at_limit_is_editable_and_missing_control_id_is_not():
-    prompt = {"1": _control("20", "INT", control_id=""),
-              "2": _node("SonderPanelNote", {"text": "x" * 4000, "note_id": "n1"})}
-    result = describe(prompt)
-    assert result["controls"][0]["status"] == "missing_id"
-    assert "note_truncated" not in result["notes"][0]
+def test_batch_size_limits():
+    view = describe(_selector_prompt())
+    assert cd.validate_binding_changes(view, {})[1][0]["reason"] == "Send 1 to 64 changes."
+    many = {f"binding:x{i}:label": "a" for i in range(65)}
+    assert cd.validate_binding_changes(view, many)[1][0]["reason"] == "Send 1 to 64 changes."
 
 
-def test_duplicate_control_panel_metadata_is_not_silently_chosen():
-    import copy
-    first = _control("20", "INT")
-    second = copy.deepcopy(first)
-    second["inputs"]["seed_mode"] = "fixed"
-    assert only_control({"1": first, "2": second})["status"] == "duplicate_id"
+def test_a_new_choice_list_and_a_choice_in_it_are_accepted_together():
+    prompt = _selector_prompt()
+    view = describe(prompt)
+    cleaned, rejected = cd.validate_binding_changes(
+        view, {"binding:l:value": "Alpha\nGamma", "binding:c:value": "Gamma"}, prompt=prompt)
+    assert rejected == [] and cleaned["binding:c:value"] == "Gamma"
+    # Without the prompt (the mounted relay's pre-check) the same batch defers
+    # the option check to the canvas writer instead of refusing it.
+    safe = cd.json_safe(view)
+    _, rejected = cd.validate_binding_changes(safe, {"binding:l:value": "Alpha\nGamma", "binding:c:value": "Gamma"})
+    assert rejected == []
+    _, rejected = cd.validate_binding_changes(safe, {"binding:c:value": "Gamma"})
+    assert "not one of the options" in rejected[0]["reason"]
 
 
-def test_json_safe_copies_exact_integers_field_defaults_and_nonfinite_values():
-    import json
+def test_validation_accepts_json_safe_bounds_and_capped_previews():
+    prompt = _selector_prompt()
+    safe = cd.json_safe(describe(prompt))
+    cleaned, rejected = cd.validate_binding_changes(safe, {"binding:s:value": "100"})
+    assert rejected == [] and cleaned["binding:s:value"] == 100
+    _, rejected = cd.validate_binding_changes(safe, {"binding:s:value": "101"})
+    assert "above the maximum" in rejected[0]["reason"]
+
+
+def test_binding_signature_tracks_target_class_input_and_kind():
+    prompt = _selector_prompt()
+    b = binding(prompt, "s")
+    assert cd.binding_signature(b) == {"class_type": "KSampler", "input": "steps", "kind": "INT"}
+    assert cd.binding_signature(binding(prompt, "gone")) is None
+
+
+def test_json_safe_copies_exact_integers_and_nonfinite_values():
     large = 2**63 + 123
-    raw = {"controls": [{"source": "control", "kind": "SEED", "seed": large,
-                          "value": large, "min": 0, "max": 2**64 - 1, "step": 1},
-                         {"source": "control", "kind": "FLOAT", "value": 0.5,
-                          "min": -math.inf, "max": math.inf}],
-           "fields": [{"source": "field", "kind": "INT", "value": large,
-                       "default": large, "min": 0, "max": large},
-                      {"source": "field", "kind": "FLOAT", "default": 1, "min": 0,
-                       "value": math.nan}], "other": [math.inf, {"n": math.nan, "enabled": True}]}
+    raw = {"bindings": [{"kind": "SEED", "value": large, "min": 0, "max": 2**64 - 1, "step": 1, "default": large},
+                        {"kind": "FLOAT", "value": 0.5, "min": -math.inf, "max": math.inf}],
+           "changes": {"binding:a:value": large, "binding:a:label": "x"},
+           "other": [math.inf, {"n": math.nan, "enabled": True}]}
     safe = cd.json_safe(raw)
     encoded = json.loads(json.dumps(safe, allow_nan=False))
-    seed = encoded["controls"][0]
-    assert seed == {"source": "control", "kind": "SEED", "seed": str(large),
-                    "value": str(large), "min": "0", "max": str(2**64 - 1), "step": "1"}
-    assert encoded["controls"][1]["value"] == 0.5
-    assert encoded["controls"][1]["min"] is None and encoded["controls"][1]["max"] is None
-    assert encoded["fields"][0]["default"] == str(large)
-    assert encoded["fields"][1]["default"] == "1" and encoded["fields"][1]["value"] is None
+    assert encoded["bindings"][0] == {"kind": "SEED", "value": str(large), "min": "0", "max": str(2**64 - 1),
+                                      "step": "1", "default": str(large)}
+    assert encoded["bindings"][1] == {"kind": "FLOAT", "value": 0.5, "min": None, "max": None}
+    assert encoded["changes"] == {"binding:a:value": str(large), "binding:a:label": "x"}
     assert encoded["other"] == [None, {"n": None, "enabled": True}]
-    safe["controls"][0]["seed"] = "changed"
-    assert raw["controls"][0]["seed"] == large and raw["controls"][0]["max"] == 2**64 - 1
+    safe["bindings"][0]["value"] = "changed"
+    assert raw["bindings"][0]["value"] == large
 
 
 @pytest.mark.parametrize("count", [2000, 2001])
-def test_combo_transport_cap_preserves_full_runtime_validation(count):
+def test_combo_transport_cap_preserves_full_validation(count):
     class LongCombo:
         @classmethod
         def INPUT_TYPES(cls):
             return {"required": {"option": ([f"opt-{i}" for i in range(count)],)}}
+
     classes = dict(CLASSES, LongCombo=LongCombo)
-    prompt = {"1": _control(f"opt-{count-1}", "COMBO"),
-              "2": _node("LongCombo", {"option": ["1", 0]})}
-    raw = cd.describe_controls(prompt, class_lookup=classes.get, validator_runner=direct_runner)
-    assert raw["controls"][0]["error"] is None and len(raw["controls"][0]["options"]) == count
+    prompt = {"1": _relay({"o": _binding("2", "option")}), "2": _node("LongCombo", {"option": f"opt-{count - 1}"})}
+    raw = cd.describe_bindings(prompt, class_lookup=classes.get)
+    assert raw["bindings"][0]["error"] is None and len(raw["bindings"][0]["options"]) == count
     safe = cd.json_safe(raw)
-    assert len(safe["controls"][0]["options"]) == 2000
-    assert safe["controls"][0].get("options_truncated", False) == (count > 2000)
-    assert cd.resolve_control_value(prompt, "1", kind="COMBO", value_text=f"opt-{count-1}",
-                                    seed=0, class_lookup=classes.get) == f"opt-{count-1}"
+    assert len(safe["bindings"][0]["options"]) == 2000
+    assert safe["bindings"][0].get("options_truncated", False) == (count > 2000)
+    # A capped preview defers membership to the full view instead of refusing.
+    cleaned, rejected = cd.validate_binding_changes(safe, {"binding:o:value": f"opt-{count - 1}"})
+    assert rejected == []
 
 
-def test_describe_route_uses_json_safe_without_changing_python_authority(monkeypatch):
-    import json
+def test_describe_route_validates_with_the_prompt_and_returns_json_safe(monkeypatch):
     from server import routes
-    original = cd.describe_controls
-    monkeypatch.setattr(cd, "describe_controls", lambda prompt: original(prompt, class_lookup=CLASSES.get, validator_runner=direct_runner))
-    prompt = {"1": _control("", "SEED", seed=2**63 + 7),
-              "2": _node("KSampler", {"seed": ["1", 0]})}
-    result = routes._describe_controls_body(json.dumps({"prompt": prompt}).encode("utf-8"))
-    assert result["controls"][0]["seed"] == str(2**63 + 7)
-    assert result["controls"][0]["value"] == str(2**63 + 7)
-    assert result["controls"][0]["max"] == str(2**64 - 1)
+    original = cd.describe_bindings
+    monkeypatch.setattr(cd, "describe_bindings", lambda prompt, relay_census=None: original(
+        prompt, relay_census=relay_census, class_lookup=CLASSES.get))
+    prompt = _selector_prompt()
+    prompt["9"]["inputs"]["seed"] = 2**63 + 7
+    body = {"prompt": prompt, "relay_census": {"active": 1}, "changes": {
+        "binding:l:value": "A\nB", "binding:c:value": "B", "binding:seed:value": str(2**63 + 9)}}
+    result = routes._describe_controls_body(json.dumps(body).encode("utf-8"))
+    seed = next(b for b in result["bindings"] if b["binding_id"] == "seed")
+    assert seed["value"] == str(2**63 + 7) and seed["max"] == str(2**64 - 1)
+    assert result["ok"] is True and result["changes"]["binding:seed:value"] == str(2**63 + 9)
+    with pytest.raises(routes._ControlsRequestError):
+        routes._describe_controls_body(json.dumps({"prompt": prompt, "relay_census": [1]}).encode("utf-8"))
 
 
-# ── Registry fields ──────────────────────────────────────────────────────────
-
-def test_registry_fields_only_for_nodes_reaching_an_editor():
-    prompt = {
-        "1": _node("SonderEditor"),
-        "2": _node("SonderSaveVideo", {"project": ["1", 0], "mark_queue_complete": True, "place_audio_on_timeline": False}),
-        "3": _node("SonderMasksBridge", {"project": ["1", 0], "edit_video": True, "edit_audio": False}),
-        "4": _node("SonderSaveVideo", {"mark_queue_complete": True, "place_audio_on_timeline": True}),
-    }
-    result = describe(prompt)
-    fields = {(f["key"], f["field"]): f for f in result["fields"]}
-    assert set(fields) == {
-        ("2", "mark_queue_complete"), ("2", "place_audio_on_timeline"),
-        ("3", "edit_video"), ("3", "edit_audio"),
-    }
-    assert fields[("2", "mark_queue_complete")]["label"] == "Advance queue after take"
-    assert fields[("2", "mark_queue_complete")]["value"] is True
-    assert fields[("2", "place_audio_on_timeline")]["value"] is False
-    assert fields[("3", "edit_audio")]["label_off"] == "Freeze"
-    assert all(f["editor_key"] == "1" and f["status"] == cd.STATUS_OK for f in fields.values())
-    assert result["editors"] == ["1"]
-
-
-def test_linked_registry_field_defers_to_its_control_or_is_unsupported():
-    prompt = {
-        "1": _node("SonderEditor"),
-        "5": _control("true", kind="BOOLEAN", title="Advance"),
-        "2": _node("SonderSaveVideo", {"project": ["1", 0], "mark_queue_complete": ["5", 0], "place_audio_on_timeline": ["7", 0]}),
-        "7": _node("SomeLogic"),
-    }
-    result = describe(prompt)
-    fields = {f["field"]: f for f in result["fields"]}
-    assert "mark_queue_complete" not in fields  # the Control describes it
-    assert fields["place_audio_on_timeline"]["status"] == cd.STATUS_UNSUPPORTED
-    assert result["controls"][0]["value"] is True
-
-
-def test_registry_entries_are_data():
+def test_recommended_editor_fields_are_data():
     assert {(e.class_type, e.field) for e in cd.FIELD_CONTROLS} == {
         ("SonderSaveVideo", "mark_queue_complete"),
         ("SonderSaveBridge", "mark_queue_complete"),
@@ -705,31 +637,6 @@ def test_registry_entries_are_data():
         ("SonderMasksBridge", "edit_video"),
         ("SonderMasksBridge", "edit_audio"),
     }
-
-
-# ── Execute-time self-check ──────────────────────────────────────────────────
-
-def test_resolve_value_checks_kind_range_and_options_against_the_prompt():
-    prompt = {
-        "5": _control("30", kind="INT", title="Steps"),
-        "9": _node("KSampler", {"steps": ["5", 0]}),
-    }
-    resolve = cd.resolve_control_value
-    assert resolve(prompt, "5", kind="INT", value_text="30", seed=0, class_lookup=CLASSES.get) == 30
-    with pytest.raises(cd.ControlValueError, match=r"Sonder Control 'Steps': 101 is above the maximum of 100 for KSampler steps\."):
-        resolve(prompt, "5", kind="INT", value_text="101", seed=0, class_lookup=CLASSES.get)
-    with pytest.raises(cd.ControlValueError, match="'Steps': It is set up for FLOAT but feeds KSampler steps, which takes INT"):
-        resolve(prompt, "5", kind="FLOAT", value_text="3", seed=0, class_lookup=CLASSES.get)
-    with pytest.raises(cd.ControlValueError, match="'Steps': The value is empty. Set a whole number."):
-        resolve(prompt, "5", kind="INT", value_text="", seed=0, class_lookup=CLASSES.get)
-
-
-def test_resolve_value_refuses_a_non_value_target_and_passes_unknown_ids():
-    prompt = {"5": _control("x"), "9": _node("KSampler", {"model": ["5", 0]})}
-    with pytest.raises(cd.ControlValueError, match="It cannot feed KSampler model"):
-        cd.resolve_control_value(prompt, "5", kind="STRING", value_text="x", seed=0, class_lookup=CLASSES.get)
-    # An id absent from the prompt (an expanded node) still converts its value.
-    assert cd.resolve_control_value({}, "77", kind="BOOLEAN", value_text="on", seed=0, class_lookup=CLASSES.get) is True
 
 
 # ── Seeds ────────────────────────────────────────────────────────────────────
@@ -794,3 +701,61 @@ def test_next_seed_leaves_unknown_modes_and_non_numbers_alone():
     assert cd.next_seed_value("sideways", 5, minimum=0, maximum=9) == 5
     assert cd.next_seed_value("increment", "5", minimum=0, maximum=9) == "5"
     assert cd.next_seed_value("increment", True, minimum=0, maximum=9) is True
+
+
+# ── Audit follow-ups (Phase 3A) ──────────────────────────────────────────────
+
+class Encoder:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"prompt": ("STRING", {"multiline": True})}, "hidden": {"unique_id": "UNIQUE_ID"}}
+
+
+def test_a_widget_named_prompt_is_bindable_and_a_hidden_input_is_unsupported():
+    classes = dict(CLASSES, Encoder=Encoder)
+    prompt = {"1": _relay({"p": _binding("5", "prompt"), "h": _binding("5", "unique_id")}),
+              "5": _node("Encoder", {"prompt": "a cat", "unique_id": "5"})}
+    view = {b["binding_id"]: b for b in cd.describe_bindings(prompt, class_lookup=classes.get)["bindings"]}
+    assert view["p"]["status"] == cd.STATUS_OK and view["p"]["value"] == "a cat"
+    assert view["h"]["status"] == cd.STATUS_UNSUPPORTED
+
+
+def test_coverage_is_per_target_so_an_uncovered_consumer_keeps_its_checks():
+    # One promoted value feeds a covered node and an ordinary one: the ordinary
+    # node's range still applies, while the covered one is checked at run.
+    prompt = {"1": _relay({"n": {"label": "Count", "status": "ok",
+                                 "targets": [{"path": "5", "input": "count"}, {"path": "9", "input": "steps"}]}}),
+              "5": _node("KwargsValidated", {"folder": "out", "count": 50}),
+              "9": _node("KSampler", {"steps": 50})}
+    b = binding(prompt, "n")
+    assert b["checked_at_run"] is True and (b["min"], b["max"]) == (1, 100)
+    _, rejected = cd.validate_binding_changes(describe(prompt), {"binding:n:value": 101}, prompt=prompt)
+    assert "above the maximum of 100" in rejected[0]["reason"]
+
+
+def test_two_bindings_on_one_input_are_duplicates():
+    prompt = {"1": _relay({"a": _binding("9", "steps"), "b": _binding("9", "steps"), "c": _binding("9", "cfg")}),
+              "9": _node("KSampler", {"steps": 3, "cfg": 2.0})}
+    view = {b["binding_id"]: b for b in describe(prompt)["bindings"]}
+    assert view["a"]["status"] == view["b"]["status"] == cd.STATUS_DUPLICATE
+    assert view["c"]["status"] == cd.STATUS_OK
+
+
+def test_a_new_list_that_drops_the_current_choice_is_refused_unless_the_choice_moves_too():
+    prompt = _selector_prompt()  # choice "Detail"
+    view = describe(prompt)
+    _, rejected = cd.validate_binding_changes(view, {"binding:l:value": "Alpha\nGamma"}, prompt=prompt)
+    assert rejected[0]["target"] == "binding:l:value" and "'Detail' is not in the new list" in rejected[0]["reason"]
+    cleaned, rejected = cd.validate_binding_changes(view, {"binding:l:value": "Alpha\nDetail"}, prompt=prompt)
+    assert rejected == [] and cleaned == {"binding:l:value": "Alpha\nDetail"}
+    cleaned, rejected = cd.validate_binding_changes(
+        view, {"binding:l:value": "Alpha\nGamma", "binding:c:value": "Gamma"}, prompt=prompt)
+    assert rejected == []
+
+
+def test_stored_values_beyond_the_request_cap_validate_in_one_batch():
+    many = {f"binding:x{i}:label": "a" for i in range(200)}
+    view = {"bindings": [{"binding_id": f"x{i}", "status": "ok"} for i in range(200)], "notes": []}
+    assert cd.validate_binding_changes(view, many)[1][0]["reason"] == "Send 1 to 64 changes."
+    cleaned, rejected = cd.validate_binding_changes(view, many, max_changes=None)
+    assert rejected == [] and len(cleaned) == 200
