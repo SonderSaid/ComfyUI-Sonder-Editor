@@ -255,7 +255,8 @@ def _describe_controls_body(raw: bytes) -> dict:
     except control_descriptors.control_manifest.ManifestError as exc:
         raise _ControlsRequestError(str(exc)) from None
     if body.get("manage") is True:
-        view["candidate_labels"] = [{"path": str(path), "input": f.field, "label": f.label}
+        view["candidate_labels"] = [{"path": str(path), "input": f.field,
+                                     "label": control_descriptors.recommended_label(f, node)}
                                     for path, node in prompt.items() if isinstance(node, dict)
                                     for f in control_descriptors.FIELD_CONTROLS
                                     if node.get("class_type") == f.class_type]

@@ -54,7 +54,7 @@ const app = {rootGraph:root,graph:root,canvas:{},
     async graphToPrompt(){exports++;return {output:{'1':{class_type:'SonderEditor'},data:root._nodes.map(n=>n.widgets.map(w=>[w.name,w.value]))}};}};
 let settings=[];
 const host = createCanvasControlsHost({app,api,getEditorNode:()=>editor,debounceMs:1,
-    getChangeTracker:()=>({captureCanvasState(){captures++;}}),setEditorSetting:(k,v)=>settings.push([k,v])});
+    getChangeTracker:()=>({captureCanvasState(){captures++;}})});
 const settle=()=>new Promise(r=>setTimeout(r,15));
 const deferred=async()=>{for(let i=0;i<40&&!release;i++)await settle();assert.ok(release);};
 
@@ -83,7 +83,8 @@ if(SCENARIO==='expose'||SCENARIO==='expose-rollback'||SCENARIO==='expose-new-rel
     if(ok){
         assert.equal(sampler.properties.sonderBindings.cfg,'newCfg');
         const m=JSON.parse((created||relay).widgets[0].value);
-        assert.deepEqual(m.bindings.newCfg,{label:'Sampler · cfg',section:'workflow',group:'',order:4,advanced:false,note:''});
+        // No section is stored: the server derives it from the node class.
+        assert.deepEqual(m.bindings.newCfg,{label:'Sampler · cfg',group:'',order:4,advanced:false,note:''});
         assert.deepEqual(m.notes.tip,{text:'Hi',group:'',order:5});
         // Anchors, a new Relay and the manifest land in one history step.
         assert.equal(captures,2);
@@ -141,12 +142,12 @@ if(SCENARIO==='presentation'||SCENARIO==='presentation-rollback') {
     // Many presentation targets become ONE manifest write and one history step.
     const result=await host.applyChanges({'binding:steps:order':-10,'binding:steps:group':'Advanced',
         'binding:steps:label':'Quality','binding:seed:note':'**Hint**','note:intro:order':5,'note:intro:group':'Guide',
-        'note:intro:text':'# New'});
+        'note:intro:text':'# New','binding:seed:advanced':true});
     assert.equal(result.ok,SCENARIO==='presentation',JSON.stringify(result));
     const m=manifest();
     if(result.ok){
         assert.deepEqual([m.bindings.steps.order,m.bindings.steps.group,m.bindings.steps.label],[-10,'Advanced','Quality']);
-        assert.equal(m.bindings.seed.note,'**Hint**');
+        assert.equal(m.bindings.seed.note,'**Hint**');assert.equal(m.bindings.seed.advanced,true);
         assert.deepEqual(m.notes.intro,{text:'# New',order:5,group:'Guide'});
         assert.deepEqual(m.future,{keep:true});
         assert.equal(relay.widgets[0].callbacks,1);assert.equal(captures,2);
@@ -162,7 +163,7 @@ if(SCENARIO==='root') {
     assert.equal(captures,2);assert.equal(root.dirty,1);assert.equal(sampler.widgets[0].callbacks,1);
     assert.deepEqual(calls.at(-1).relay_census,{active:1,muted:0,bypassed:0,nested:0});
     await host.refresh(true);assert.equal(host.getView().bindings[1].seed_mode,'increment');
-    host.setEditorSetting('render.takePlacementMuted',true);assert.deepEqual(settings,[['render.takePlacementMuted',true]]);
+    assert.equal(host.setEditorSetting,undefined);
 }
 if(SCENARIO==='promoted'||SCENARIO==='promoted-seed') {
     // One promoted input feeding two inner consumers: one write to the host widget.

@@ -9,6 +9,13 @@ export function workflowBadge(template) {
     if (!Array.isArray(template.missing_models)) return ['Select to check models', ''];
     return ['Ready', 'good'];
 }
+// The selected workflow's Controls line. Advanced Controls stay out of it (it
+// shows the curated menu) but are counted; their warnings still show above.
+export function controlsLine(controls) {
+    if (!controls.length) return 'No Controls exposed in this workflow.';
+    const shown = controls.filter(c => !c.advanced), advanced = controls.length - shown.length;
+    return `Controls: ${[...shown.map(c => c.label), ...(advanced ? [`+${advanced} advanced`] : [])].join(', ')}`;
+}
 export function mountWorkflows(state, actions) {
     const sidebar = el('aside', `sl-sidebar${state.workflowExpanded ? ' expanded' : ''}`);
     sidebar.setAttribute('aria-label', 'Workflows');
@@ -45,8 +52,7 @@ export function mountWorkflows(state, actions) {
                 for (const problem of [...(t.validation?.errors || []), ...(t.validation?.blocking || [])]) details.append(el('p', 'sl-bad', problem));
                 for (const item of t.missing_models || []) details.append(el('p', 'sl-warn', modelMessage(item)));
                 for (const note of t.validation?.warnings || []) details.append(el('p', 'sl-dim', note));
-                const controls = t.validation?.controls || [];
-                details.append(el('p', '', controls.length ? `Controls: ${controls.map(c => c.label).join(', ')}` : 'No Controls exposed in this workflow.'));
+                details.append(el('p', '', controlsLine(t.validation?.controls || [])));
                 row.append(details);
             }
             row.addEventListener('click', () => actions.selectWorkflow(t.template_id));

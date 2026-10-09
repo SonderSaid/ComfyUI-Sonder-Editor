@@ -631,13 +631,47 @@ def test_describe_route_validates_with_the_prompt_and_returns_json_safe(monkeypa
 
 def test_recommended_editor_fields_are_data():
     assert {(e.class_type, e.field) for e in cd.FIELD_CONTROLS} == {
+        ("SonderSaveVideo", "mode"),
+        ("SonderSaveVideo", "filename_prefix"),
+        ("SonderSaveVideo", "save_preset"),
         ("SonderSaveVideo", "mark_queue_complete"),
-        ("SonderSaveBridge", "mark_queue_complete"),
         ("SonderSaveVideo", "place_audio_on_timeline"),
+        ("SonderSaveBridge", "prefix"),
+        ("SonderSaveBridge", "mark_queue_complete"),
         ("SonderMasksBridge", "edit_video"),
         ("SonderMasksBridge", "edit_audio"),
-        ("SonderSaveVideo", "mode"),
+        ("SonderSelector", "choice"),
     }
+    # A Selector is named after its node (it says which feature it picks).
+    selector = next(e for e in cd.FIELD_CONTROLS if e.class_type == "SonderSelector")
+    assert cd.recommended_label(selector, {"class_type": "SonderSelector", "_meta": {"title": "Style"}}) == "Style"
+    assert cd.recommended_label(selector, {"class_type": "SonderSelector"}) == "SonderSelector"
+
+
+@pytest.mark.parametrize("classes,stored,expected", [
+    (["SonderSaveVideo"], "workflow", "editor"),
+    (["SonderSaveBridge", "SonderMasksBridge"], "workflow", "editor"),
+    (["SonderSaveVideo", "KSampler"], "editor", "workflow"),
+    (["SonderSelector"], "editor", "workflow"),
+    (["SonderEditor"], "editor", "workflow"),
+    ([None], "editor", "editor"),  # node gone: the stored section is the fallback
+    ([], "sidebar", "workflow"),
+])
+def test_section_follows_the_target_node_class(classes, stored, expected):
+    prompt = {str(i): {"class_type": c, "inputs": {}} for i, c in enumerate(classes) if c}
+    targets = [{"path": str(i), "input": "x"} for i in range(len(classes))]
+    assert cd.section_for(prompt, targets, stored) == expected
+
+
+def test_section_ignores_the_target_status():
+    # A linked Save Video setting keeps Editor: the class comes from the prompt
+    # node, not from the per-status read.
+    prompt = {"9": {"class_type": "SonderSaveVideo", "inputs": {"filename_prefix": ["3", 0]}},
+              "20": {"class_type": "SonderControlRelay", "inputs": {"manifest": json.dumps(
+                  {"v": 1, "bindings": {"p": {"label": "", "targets": [{"path": "9", "input": "filename_prefix"}]}}})}}}
+    view = cd.describe_bindings(prompt, class_lookup=lambda c: None)
+    assert view["bindings"][0]["status"] != "ok"
+    assert view["bindings"][0]["section"] == "editor"
 
 
 # ── Seeds ────────────────────────────────────────────────────────────────────
@@ -760,3 +794,22 @@ def test_stored_values_beyond_the_request_cap_validate_in_one_batch():
     assert cd.validate_binding_changes(view, many)[1][0]["reason"] == "Send 1 to 64 changes."
     cleaned, rejected = cd.validate_binding_changes(view, many, max_changes=None)
     assert rejected == [] and len(cleaned) == 200
+
+
+def test_group_order_puts_explicit_groups_first_then_first_appearance():
+    view = {"groups": {"Output": {"order": 2}, "Models": {"order": -1}},
+            "bindings": [{"binding_id": "a", "label": "Steps", "order": 1, "group": "Sampling"},
+                         {"binding_id": "b", "label": "Seed", "order": 0, "group": ""},
+                         {"binding_id": "c", "label": "Model", "order": 5, "group": "Models"}],
+            "notes": [{"note_id": "n", "order": 0, "group": "Intro"}]}
+    assert cd.group_order(view) == ["Models", "Output", "Intro", "Sampling"]
+
+
+def test_advanced_is_a_flag_validated_on_its_own():
+    view = {"bindings": [{"binding_id": "s", "status": "ok", "kind": "INT", "targets": []},
+                         {"binding_id": "off", "status": "missing", "kind": None, "targets": []}]}
+    cleaned, rejected = cd.validate_binding_changes(view, {"binding:s:advanced": True, "binding:off:advanced": False})
+    assert rejected == [] and cleaned == {"binding:s:advanced": True, "binding:off:advanced": False}
+    for bad in ("true", 1, None):
+        _, rejected = cd.validate_binding_changes(view, {"binding:s:advanced": bad})
+        assert rejected and "true or false" in rejected[0]["reason"]

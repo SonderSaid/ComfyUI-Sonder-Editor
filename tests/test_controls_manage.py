@@ -210,10 +210,19 @@ def test_expose_returns_targets_kind_default_label_and_the_next_order():
         "binding:new2:expose": {"candidate": {"path": "2", "input": "mark_queue_complete"}, "section": "editor",
                                 "label": "  Advance  "}})
     assert rejected == []
+    # Un-renamed: no stored label (derived at describe time) and no section
+    # (derived from the node class), whatever the client sent.
     assert cleaned["binding:new1:expose"] == {
         "candidate": {"path": "6", "input": "seed"}, "targets": [{"path": "6", "input": "seed", "class_type": "KSampler"}],
-        "kind": "SEED", "section": "workflow", "label": "Sampler · seed", "order": 1}
+        "kind": "SEED", "label": "", "order": 1}
     assert cleaned["binding:new2:expose"]["label"] == "Advance" and cleaned["binding:new2:expose"]["order"] == 2
+
+
+def test_an_unrenamed_recommended_expose_keeps_its_curated_label():
+    cleaned, rejected = validate(manage_graph(), {
+        "binding:new2:expose": {"candidate": {"path": "2", "input": "mark_queue_complete"}}})
+    assert rejected == []
+    assert cleaned["binding:new2:expose"]["label"] == "Advance queue after take"
 
 
 @pytest.mark.parametrize("changes, reason", [
@@ -223,7 +232,6 @@ def test_expose_returns_targets_kind_default_label_and_the_next_order():
     ({"binding:steps:expose": {"candidate": {"path": "6", "input": "seed"}, "section": "workflow"}}, "already in use"),
     ({"binding:x:expose": {"candidate": {"path": "1", "input": "selection_start"}, "section": "workflow"}}, "Sonder sets"),
     ({"binding:x:expose": {"candidate": {"path": "6", "input": "nope"}, "section": "workflow"}}, "no longer"),
-    ({"binding:x:expose": {"candidate": {"path": "6", "input": "seed"}, "section": "side"}}, "section"),
     ({"binding:x:expose": {"candidate": {"path": "5:3", "input": "seed"}, "section": "workflow"}}, "Choose a setting"),
     ({"binding:__proto__:expose": {"candidate": {"path": "6", "input": "seed"}}}, "invalid"),
     ({"binding:x:hide": True}, "Sonder App"),

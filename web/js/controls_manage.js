@@ -50,8 +50,24 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
     const el = make("section");
     el.dataset.controlsManage = "true";
     el.style.cssText = `display:flex;flex-direction:column;gap:${SPACE.s2}px;padding:${SPACE.s2}px;border:1px solid ${COLORS.border};border-radius:${RADIUS.r3}px;background:${COLORS.panel};`;
-    const heading = make("div", "Add settings");
-    heading.style.cssText = `font-weight:${TYPE.fwBold};color:${COLORS.text};`;
+    // "Add settings" folds into one bar until opened (ephemeral), so Manage
+    // stays short; a Rebind opens it.
+    let open = false;
+    const heading = make("button");
+    heading.type = "button";
+    heading.dataset.controlsAddSettings = "true";
+    heading.style.cssText = `display:flex;justify-content:space-between;align-items:center;gap:${SPACE.s2}px;width:100%;`
+        + `background:none;border:0;padding:0;cursor:pointer;font:${TYPE.fwBold} ${TYPE.t12}px ${FONT.sans};color:${COLORS.text};text-align:left;`;
+    const headingText = make("span", "Add settings");
+    const headingCount = make("span");
+    headingCount.style.cssText = `font-size:${TYPE.t11}px;font-weight:${TYPE.fwNormal};color:${COLORS.textDim};`;
+    heading.append(headingText, headingCount);
+    heading.addEventListener("click", () => {
+        open = !open;
+        renderedKey = null;
+        render(lastView || host.getView());
+        if (open) filterInput.focus();
+    });
     const filterInput = make("input");
     filterInput.type = "search";
     filterInput.placeholder = "Filter by node or setting";
@@ -67,7 +83,8 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
     list.style.cssText = `display:flex;flex-direction:column;gap:${SPACE.s1}px;max-height:320px;overflow:auto;`;
     const footer = make("div");
     footer.style.cssText = `display:flex;gap:${SPACE.s2}px;align-items:center;flex-wrap:wrap;`;
-    const addNote = smallButton("Add note");
+    const addNote = smallButton("+ Note");
+    addNote.title = "Add a Markdown note to the ungrouped Controls";
     const noteBox = make("div");
     noteBox.style.cssText = `display:none;flex-direction:column;gap:${SPACE.s1}px;`;
     footer.append(addNote);
@@ -95,7 +112,7 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
     }
 
     const expose = (candidate, button) =>
-        apply({ [`binding:${mintId()}:expose`]: { candidate: { path: candidate.path, input: candidate.input }, section: candidate.section || "workflow" } }, button);
+        apply({ [`binding:${mintId()}:expose`]: { candidate: { path: candidate.path, input: candidate.input } } }, button);
 
     function candidateRow(candidate, action) {
         const row = make("div");
@@ -130,13 +147,20 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         lastView = view;
         // Rebuilt only when what it lists changes: the panel renders on every
         // focus change, and a rebuild between a press and its click loses it.
-        const key = JSON.stringify([rebind, filter, view.candidates, view.suggestions, view.candidates_truncated]);
+        const key = JSON.stringify([rebind, filter, open, view.candidates, view.suggestions, view.candidates_truncated]);
         if (key === renderedKey) return;
         renderedKey = key;
         const candidates = view.candidates || [];
+        const showing = open || !!rebind;
         banner.style.display = rebind ? "flex" : "none";
         bannerText.textContent = rebind ? `Choose a new setting for “${rebind.label}”.` : "";
-        heading.textContent = rebind ? "Rebind" : "Add settings";
+        headingText.textContent = `${showing ? "v" : ">"}  ${rebind ? "Rebind" : "Add settings"}`;
+        heading.setAttribute("aria-expanded", String(showing));
+        const recommendedCount = candidates.filter(c => c.recommended).length;
+        headingCount.textContent = view.candidates === undefined ? ""
+            : `${candidates.length}${view.candidates_truncated ? "+" : ""} available${recommendedCount ? ` · ${recommendedCount} recommended` : ""}`;
+        filterInput.style.display = showing ? "" : "none";
+        list.style.display = showing ? "flex" : "none";
         footer.style.display = rebind ? "none" : "flex";
         const nodes = [];
         const action = rebind
@@ -148,7 +172,7 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
             all.addEventListener("click", () => {
                 const changes = {};
                 for (const c of recommended.slice(0, MAX_BATCH)) {
-                    changes[`binding:${mintId()}:expose`] = { candidate: { path: c.path, input: c.input }, section: c.section || "editor" };
+                    changes[`binding:${mintId()}:expose`] = { candidate: { path: c.path, input: c.input } };
                 }
                 void apply(changes, all);
             });
@@ -161,7 +185,7 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
                 nodes.push(candidateRow({ path: "", input: s.label || s.binding_id, kind: "", node_title: "" }, {
                     label: "Restore",
                     title: "Expose it again, keeping its saved values",
-                    run: (_c, b) => apply({ [`binding:${s.binding_id}:expose`]: { section: s.section || "workflow" } }, b),
+                    run: (_c, b) => apply({ [`binding:${s.binding_id}:expose`]: {} }, b),
                 }));
             }
         }
@@ -218,10 +242,10 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         noteBox.replaceChildren();
         setButtonDisabled(addNote, false);
         if (save && edit.area.value.trim()) {
-            void apply({ [`note:${mintId()}:create`]: { text: edit.area.value, group: "" } });
+            void apply({ [`note:${mintId()}:create`]: { text: edit.area.value, group: edit.group } });
         }
     }
-    addNote.addEventListener("click", () => {
+    function openDraft(group = "") {
         if (draft || destroyed) return;
         const area = make("textarea");
         area.maxLength = 4000;
@@ -235,7 +259,8 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         noteBox.replaceChildren(area, actions);
         noteBox.style.display = "flex";
         setButtonDisabled(addNote, true);
-        const edit = { area, composing: false, unregister: () => {} };
+        const edit = { area, group, composing: false, unregister: () => {} };
+        area.placeholder = group ? `Markdown note shown in ${group}` : "Markdown note shown with the Controls";
         area.addEventListener("compositionstart", () => (edit.composing = true));
         area.addEventListener("compositionend", () => (edit.composing = false));
         save.addEventListener("click", () => closeDraft(true));
@@ -253,7 +278,9 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
             },
         });
         area.focus();
-    });
+        noteBox.scrollIntoView?.({ block: "nearest" });
+    }
+    addNote.addEventListener("click", () => openDraft(""));
 
     // The filter keeps its keys: Ctrl+Z edits the query, never the scene.
     const unregister = register({
@@ -278,6 +305,7 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         el,
         render,
         setRebind,
+        addNote: group => openDraft(typeof group === "string" ? group : ""),
         get rebinding() { return rebind?.binding_id || null; },
         get editing() { return !!draft || document.activeElement === filterInput; },
         destroy() {

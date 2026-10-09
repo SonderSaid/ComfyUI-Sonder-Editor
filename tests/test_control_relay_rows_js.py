@@ -43,9 +43,10 @@ const row=name=>rows().find(w=>w.name==='sonder_row:'+name);
 
 if(SCENARIO==='rows'){
     assert.equal(sync(),true);
-    // Ok bindings only, in manifest order; a seed gets its mode row; editor last.
+    // Ok bindings only, in manifest order; a seed gets its mode row. The stored
+    // "editor" on a KSampler binding is ignored: section follows the node class.
     assert.deepEqual(rows().map(w=>[w.name,w.type,w.label]),[
-        ['sonder_row:seed','number','Seed'],['sonder_row:seed:mode','combo','Seed · mode'],['sonder_row:steps','number','Steps'],
+        ['sonder_row:seed','number','Seed'],['sonder_row:seed:mode','combo','↳ mode'],['sonder_row:steps','number','Steps'],
         ['sonder_row:sampler','combo','KSampler · sampler_name'],['sonder_row:text','text','Text']]);
     // Frontend-only: neither widgets_values nor the prompt.
     for(const w of rows()){assert.equal(w.serialize,false);assert.equal(w.options.serialize,false);}
@@ -100,10 +101,35 @@ if(SCENARIO==='status-changes'){
     const r=row('steps');root._nodes.splice(root._nodes.indexOf(sampler),1);r.callback(5);assert.equal(callbacks,0);
     assert.equal(nativeFor(root,{nodeId:3,widgetName:'steps',anchor:'steps'}),null);
 }
+if(SCENARIO==='groups'){
+    // Editor first, then ungrouped, then each group under a separator in group
+    // order; Advanced rows stay and carry a suffix (no Show advanced resize).
+    const save=node('SonderSaveVideo',9,[widget('filename_prefix','take',{type:'text'}),widget('hint','x',{type:'text'})]);
+    save.properties.sonderBindings={filename_prefix:'file',hint:'hint'};
+    relay.widgets[0].value=JSON.stringify({v:1,notes:{},groups:{Late:{order:-5}},bindings:{
+        steps:{label:'Steps',order:1,group:'Sampling',advanced:true},seed:{label:'Seed',order:0},
+        sampler:{label:'Sampler',order:2,group:'Late'},text:{label:'Text',order:3,group:'Sampling'},
+        file:{label:'File name',order:9},hint:{label:'Hint',order:10}}});
+    assert.equal(sync(),true);
+    assert.deepEqual(rows().map(w=>[w.name,w.label]),[
+        ['sonder_row:file','File name'],['sonder_row:hint','Hint'],
+        ['sonder_row:seed','Seed'],['sonder_row:seed:mode','↳ mode'],
+        ['sonder_row:~sep:Late','Late'],['sonder_row:sampler','Sampler'],
+        ['sonder_row:~sep:Sampling','Sampling'],['sonder_row:steps','Steps · Adv'],['sonder_row:text','Text']]);
+    const sep=rows().find(w=>w.name==='sonder_row:~sep:Late');
+    assert.equal(sep.disabled,true);assert.equal(sep.serialize,false);assert.match(String(sep.value),/─/);
+    // A binding id "hint" no longer collides with the empty-state row.
+    assert.equal(row('hint').label,'Hint');
+    // Value-follow skips separators and still follows native edits.
+    sampler.widgets[2].value='dpm';assert.equal(sync(),true);assert.equal(row('sampler').value,'dpm');assert.match(String(sep.value),/─/);
+    // A passive refresh never resizes the saved node.
+    const size=[...relay.size];relay.widgets[0].value=JSON.stringify({v:1,notes:{},groups:{},bindings:{seed:{label:'Seed'}}});
+    sync();assert.deepEqual(relay.size,size);
+}
 console.log('ok');
 '''
 
-SCENARIOS = ['rows', 'editing', 'hint-and-warnings', 'status-changes']
+SCENARIOS = ['rows', 'editing', 'hint-and-warnings', 'status-changes', 'groups']
 
 
 @pytest.mark.parametrize('scenario', SCENARIOS)

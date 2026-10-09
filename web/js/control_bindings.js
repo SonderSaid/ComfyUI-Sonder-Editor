@@ -37,6 +37,9 @@ export const DENIED_INPUTS = {
 export const DENIED_PREFIXES = { SonderMetadataCollector: "label_", SonderMetadataCollectorV3: "label_" };
 // Mirrors server/binding_policy.py LEGACY_PRIMITIVE_CLASS: virtual, never in a prompt.
 export const LEGACY_PRIMITIVE = "PrimitiveNode";
+// Section by node class: mirrors server/control_descriptors.py EDITOR_CLASSES
+// (tests/test_control_manifest.py pins the two equal).
+export const EDITOR_CLASSES = new Set(["SonderSaveVideo", "SonderSaveBridge", "SonderMasksBridge"]);
 // Mirrors server/control_descriptors.py MAX_CANDIDATES.
 export const MAX_CANDIDATES = 500;
 // Widgets the frontend adds beside a value; they never reach a prompt.
@@ -265,6 +268,60 @@ export function resolveBindings(root, manifest) {
         suggestions.push({ binding_id: anchor.id, targets: resolveAnchor(anchor.node, anchor.name).targets });
     }
     return { bindings, suggestions };
+}
+
+// A resolved binding's section: "editor" when every target node is an editor
+// class (server section_for). `fallback` is the stored section, used only when
+// a target's node is unknown.
+export function sectionOf(resolved, fallback = "workflow") {
+    const host = resolved?.anchor?.node || resolved?.node || null;
+    const targets = resolved?.targets || [];
+    const nodes = targets.map(target => target.node || (host && String(host.id) === String(target.path) ? host : null));
+    if (!nodes.length || nodes.some(node => !node)) return fallback === "editor" ? "editor" : "workflow";
+    return nodes.every(node => EDITOR_CLASSES.has(nodeType(node))) ? "editor" : "workflow";
+}
+
+// Match Python's lexical code-point ordering, not the browser's locale.
+const compareCodePoints = (a, b) => {
+    const left = Array.from(a, c => c.codePointAt(0)), right = Array.from(b, c => c.codePointAt(0));
+    for (let i = 0; i < Math.min(left.length, right.length); i++) {
+        if (left[i] !== right[i]) return left[i] - right[i];
+    }
+    return left.length - right.length;
+};
+
+// Mirrors control_descriptors._default_label using the first exported target,
+// including the inner consumer of a promoted widget rather than its host.
+export function defaultBindingLabel(resolved) {
+    const target = resolved?.targets?.[0];
+    if (!target) return "Setting";
+    const host = resolved?.anchor?.node || resolved?.node;
+    const node = target.node || (String(host?.id) === String(target.path) ? host : null);
+    const title = node?.title || (node ? nodeType(node) : "");
+    return title ? `${title} · ${target.input}` : target.input;
+}
+
+const clampOrder = value => (Number.isInteger(value) ? Math.max(-9999, Math.min(9999, value)) : 0);
+
+// The group order of a saved manifest: mirrors server control_descriptors.
+// group_order (a shared fixture pins them): groups in `groups` first, by order
+// then name; then groups only named by bindings or notes, by first appearance.
+export function effectiveGroupOrder(manifest, resolved = {}) {
+    const explicit = isPlainObject(manifest?.groups) ? manifest.groups : {};
+    const ordered = Object.keys(explicit).filter(Boolean)
+        .sort((a, b) => clampOrder(explicit[a]?.order) - clampOrder(explicit[b]?.order) || compareCodePoints(a, b));
+    const rows = [
+        ...Object.entries(manifest?.bindings || {}).map(([id, entry]) => ({ id, ...entry,
+            label: entry.label || defaultBindingLabel(resolved[id]) })),
+        ...Object.entries(manifest?.notes || {}).map(([id, entry]) => ({ id, ...entry, label: "" })),
+    ].sort((a, b) => clampOrder(a.order) - clampOrder(b.order)
+        || compareCodePoints(String(a.label || "").toLowerCase(), String(b.label || "").toLowerCase())
+        || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    for (const row of rows) {
+        const name = typeof row.group === "string" ? row.group : "";
+        if (name && !ordered.includes(name)) ordered.push(name);
+    }
+    return ordered;
 }
 
 // ── Candidates (Manage) ──────────────────────────────────────────────────────

@@ -2,6 +2,8 @@
 
 import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -55,7 +57,6 @@ def test_export_facts_are_read_and_an_unknown_status_reads_as_missing():
     (json.dumps({"bindings": {"a": {"note": "x" * 4001}}}), "longer than 4000"),
     (json.dumps({"bindings": {"a": {"order": 10000}}}), "-9999 to 9999"),
     (json.dumps({"bindings": {"a": {"order": True}}}), "-9999 to 9999"),
-    (json.dumps({"bindings": {"a": {"section": "sidebar"}}}), "unknown section"),
     (json.dumps({"bindings": {"a": {"advanced": "yes"}}}), "true or false"),
     (json.dumps({"bindings": {"a": {"targets": [{"path": 3, "input": "x"}]}}}), "invalid targets"),
     (json.dumps({"bindings": {"a": {"targets": [{"path": "1", "input": "x"}] * 65}}}), "invalid targets"),
@@ -67,6 +68,14 @@ def test_export_facts_are_read_and_an_unknown_status_reads_as_missing():
 def test_hostile_or_oversized_manifests_are_refused(text, reason):
     with pytest.raises(cm.ManifestError, match=reason):
         cm.parse_manifest(text)
+
+
+def test_a_stored_section_is_read_tolerantly_because_it_is_derived():
+    # Phase 4: section_for derives a binding's section from its nodes; the
+    # stored key is only a fallback and never makes the Relay unreadable.
+    parsed = cm.parse_manifest(json.dumps({"bindings": {"a": {"section": "sidebar"}, "b": {"section": "editor"}}}))
+    assert parsed["bindings"]["a"]["section"] == "workflow"
+    assert parsed["bindings"]["b"]["section"] == "editor"
 
 
 def test_the_byte_cap_counts_utf8_before_parsing():
@@ -146,6 +155,42 @@ def test_frontend_denylist_mirrors_the_server():
     assert prefixes == bp.denied_prefixes()
 
 
+def test_editor_classes_mirror_the_frontend():
+    from server import control_descriptors as cd
+    source = (ROOT / "web/js/control_bindings.js").read_text(encoding="utf-8")
+    block = re.search(r"export const EDITOR_CLASSES = new Set\(\[(.*?)\]\);", source).group(1)
+    assert set(re.findall(r'"([^"]+)"', block)) == set(cd.EDITOR_CLASSES)
+
+
+GROUP_ORDER_FIXTURES = [
+    {"groups": {}, "bindings": {"a": {"label": "A", "order": 2, "group": "Late"},
+                                "b": {"label": "B", "order": 1, "group": "Early"}},
+     "notes": {"n": {"text": "x", "order": 0, "group": "Notes"}}},
+    {"groups": {"Models": {"order": 5}, "Output": {"order": -1}, "Zed": {}},
+     "bindings": {"a": {"label": "Steps", "order": 0, "group": "Sampling"},
+                  "b": {"label": "Model", "order": 0, "group": "Models"},
+                  "c": {"label": "alpha", "order": 0, "group": "First"}}, "notes": {}},
+]
+
+
+@pytest.mark.parametrize("fixture", GROUP_ORDER_FIXTURES)
+def test_group_order_mirrors_the_frontend(fixture):
+    # One authority for group order: the server's group_order, mirrored by the
+    # Relay rows' effectiveGroupOrder (no server call on the canvas).
+    from server import control_descriptors as cd
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node required for the frontend mirror")
+    view = {"groups": fixture["groups"],
+            "bindings": [{"binding_id": k, **v} for k, v in fixture["bindings"].items()],
+            "notes": [{"note_id": k, **v} for k, v in fixture["notes"].items()]}
+    script = ("import { effectiveGroupOrder } from " + json.dumps((ROOT / "web/js/control_bindings.js").as_uri())
+              + "; console.log(JSON.stringify(effectiveGroupOrder(" + json.dumps(fixture) + ")));")
+    result = subprocess.run([node, "--input-type=module", "-e", script], capture_output=True, text=True, encoding="utf-8", timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == cd.group_order(view)
+
+
 def test_manifest_caps_mirror_the_frontend():
     source = (ROOT / "web/js/control_bindings.js").read_text(encoding="utf-8")
     def constant(name):
@@ -203,3 +248,26 @@ def test_selector_accepts_a_linked_choice_at_prompt_validation():
     assert check(choice="A", choice_list=None) is True      # linked list: checked at run
     assert check(choice="A", choice_list="A\nB") is True
     assert "not in the choice list" in check(choice="C", choice_list="A\nB")
+
+
+def test_group_order_uses_effective_default_labels_and_codepoint_order():
+    from server import control_descriptors as cd
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('node required for the frontend mirror')
+    titles = ['Z knob', 'A knob', 'é knob', '_ knob', '😀 knob', '\ue000 knob']
+    fixture = {'groups': {}, 'bindings': {}, 'notes': {}}
+    resolved, prompt, bindings = {}, {}, []
+    for i, title in enumerate(titles):
+        identity = str(i)
+        entry = {'label': '', 'order': 0, 'group': title}
+        target = {'path': identity, 'input': 'amount'}
+        fixture['bindings'][identity] = entry
+        prompt[identity] = {'class_type': 'Knob', '_meta': {'title': title}}
+        resolved[identity] = {'node': {'id': identity, 'type': 'Knob', 'title': title}, 'targets': [target]}
+        bindings.append({'binding_id': identity, **entry, 'label': cd._default_label(prompt, [target])})
+    script = ('import { effectiveGroupOrder } from ' + json.dumps((ROOT / 'web/js/control_bindings.js').as_uri())
+              + '; console.log(JSON.stringify(effectiveGroupOrder(' + json.dumps(fixture) + ',' + json.dumps(resolved) + ')));')
+    result = subprocess.run([node, '--input-type=module', '-e', script], capture_output=True, text=True, encoding="utf-8", timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == cd.group_order({'groups': {}, 'bindings': bindings, 'notes': []})

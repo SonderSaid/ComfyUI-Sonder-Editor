@@ -12,7 +12,7 @@ class El {
     append(...items){for(const n of items){if(n.tagName==='#FRAGMENT'){this.append(...[...n.children]);continue;}n.remove?.();n.parentElement=this;this.children.push(n);}}
     prepend(n){n.remove?.();n.parentElement=this;this.children.unshift(n);}
     appendChild(n){this.append(n);return n;}
-    remove(){if(this.parentElement){const a=this.parentElement.children;a.splice(a.indexOf(this),1);this.parentElement=null;}}
+    remove(){if(this.parentElement){if(SCENARIO==='editor-focus-refresh'&&this.contains(document.activeElement))document.activeElement.blur();const a=this.parentElement.children;a.splice(a.indexOf(this),1);this.parentElement=null;}}
     after(n){const p=this.parentElement;n.remove?.();n.parentElement=p;p.children.splice(p.children.indexOf(this)+1,0,n);}
     replaceWith(n){const p=this.parentElement;n.remove?.();n.parentElement=p;p.children.splice(p.children.indexOf(this),1,n);this.parentElement=null;}
     select(){}
@@ -53,10 +53,12 @@ if(SCENARIO==='markdown'){
         {source:'binding',binding_id:'seed',label:'Seed',kind:'SEED',value:'9',seed_mode:'fixed',note:'',status:'ok',order:3,group:'Advanced',section:'workflow'},
         {source:'binding',binding_id:'adv',label:'Advance',kind:'BOOLEAN',value:false,note:'',status:'ok',order:0,group:'',section:'editor'}],
         notes:[{source:'note',note_id:'intro',text:'# Intro',status:'ok',order:0,group:''}]};
-    const calls=[],notices=[],settings={render:{takePlacementMuted:false,linkedTakePlacement:true}},listeners=new Set();
-    let refuse=false,defer=false,resolveWrite=null;
+    const calls=[],notices=[],settingWrites=[],listeners=new Set();
+    const settings={render:{takePlacementMuted:false,linkedTakePlacement:true},batchRender:{maxFramesPerChunk:121},
+        layout:{scaleControls:1},controls:{view:'rows',showAdvanced:false}};
+    let refuse=false,defer=false,resolveWrite=null,refuseSetting=false;
     const host={getView:()=>view,subscribe(cb){listeners.add(cb);return()=>listeners.delete(cb);},getEditorSettings:()=>settings,
-        setEditorSetting(k,v){settings.render[k.split('.')[1]]=v;},notify:m=>notices.push(m),
+        setEditorSetting(k,v){settingWrites.push([k,v]);if(refuseSetting)throw Error('setting refused');const [s,n]=k.split('.');settings[s][n]=v;},notify:m=>notices.push(m),
         async applyChanges(changes){calls.push(changes);if(defer)await new Promise(r=>resolveWrite=r);return refuse?{ok:false,rejected:[{reason:'server refusal'}]}:{ok:true,rejected:[]};}};
     if(SCENARIO==='initial-error')view={...view,state:'error',error:'cached read failed'};
     const container=new El('div'),panel=mountControlsPanel(container,host);
@@ -69,17 +71,110 @@ if(SCENARIO==='markdown'){
     const toggleManage=()=>walk(container).find(n=>n.dataset.controlsManageToggle==='true').dispatch('click');
     const button=(within,text)=>walk(within).find(n=>n.tagName==='BUTTON'&&n.textContent===text);
     if(['layout','layout-refusal','layout-stale','layout-editor','cancel','note-save','ime','note-refusal','note-then-value','problem-statuses','truncated'].includes(SCENARIO))toggleManage();
+    const group=name=>walk(container).find(n=>n.dataset.controlsGroup===name);
+    const mirror=key=>walk(container).find(n=>n.dataset.controlsMirror===key);
     if(SCENARIO==='grouping'){
-        assert.equal(container.children[0].children[0].dataset.controlsManageToggle,'true');
-        assert.equal(container.children[1].tagName,'DETAILS');assert.equal(container.children[1].open,true);
-        const advanced=walk(container).find(n=>n.tagName==='SUMMARY'&&n.textContent==='Advanced').parentElement;assert.equal(advanced.open,false);
+        // Header: search, then Manage. The Editor group comes first (Phase 4).
+        assert.ok(walk(container.children[0]).some(n=>n.dataset.controlsManageToggle==='true'));
+        assert.ok(walk(container.children[0]).some(n=>n.dataset.controlsSearch==='true'));
+        const editor=container.children[2];assert.equal(editor.dataset.controlsGroup,'editor');assert.equal(editor.children[1].hidden,false);
+        // A group named Advanced is an ordinary group now: open like the others.
+        assert.equal(group('Advanced').children[1].hidden,false);
         const items=container.children[3].children.filter(n=>n.dataset.controlTarget);assert.equal(items[0].dataset.controlTarget,'note:intro:text');assert.equal(items[1].dataset.controlTarget,'binding:steps:value');
-        // Editor-section bindings sit in the fixed Editor section, without a drag handle.
-        const adv=byTarget('binding:adv:value');assert.ok(container.children[1].contains(adv));
+        // Editor-section bindings sit in the Editor group after your settings, without a drag handle.
+        const adv=byTarget('binding:adv:value');assert.ok(editor.contains(adv));
+        const editorRows=walk(editor.children[1]).filter(n=>n.dataset.controlsMirror||n.dataset.controlTarget).map(n=>n.dataset.controlsMirror||n.dataset.controlTarget);
+        assert.deepEqual(editorRows,['render.takePlacementMuted','render.linkedTakePlacement','batchRender.maxFramesPerChunk','binding:adv:value']);
         assert.ok(!walk(adv).some(n=>n.dataset.panelDragHandle==='true'));assert.equal(input('binding:adv:value').checked,false);
         input('binding:adv:value').checked=true;input('binding:adv:value').dispatch('change');await settle();
         assert.deepEqual(calls,[{'binding:adv:value':true}]);
-        const muted=walk(container.children[1]).find(n=>n.tagName==='INPUT');muted.checked=true;muted.dispatch('change');assert.equal(settings.render.takePlacementMuted,true);
+        const muted=walk(mirror('render.takePlacementMuted')).find(n=>n.tagName==='INPUT');muted.checked=true;muted.dispatch('change');
+        assert.equal(settings.render.takePlacementMuted,true);assert.deepEqual(settingWrites,[['render.takePlacementMuted',true]]);
+        // Collapsing a group is remembered under a prefixed key; the toggle is a real button.
+        const header=group('Advanced').children[0];header.dispatch('click');assert.equal(group('Advanced').children[1].hidden,true);
+        assert.equal(group('Advanced').children[1].style.display,'none');
+        assert.equal(walk(header).find(n=>n.tagName==='BUTTON').attributes['aria-expanded'],'false');
+    }
+    if(SCENARIO==='editor-focus-refresh'){
+        const el=walk(mirror('batchRender.maxFramesPerChunk')).find(n=>n.tagName==='INPUT');
+        el.focus();el.value='123';panel.render();
+        assert.equal(document.activeElement,el);assert.equal(el.value,'123');
+        el.blur();
+        publish({...view,bindings:[...view.bindings,{source:'binding',binding_id:'filename',label:'File name',kind:'STRING',value:'saved',status:'ok',section:'editor'}]});
+        const filename=input('binding:filename:value');filename.focus();filename.value='draft';
+        publish({...view});
+        assert.equal(document.activeElement,filename);assert.equal(filename.value,'draft');
+        assert.deepEqual(calls,[]);
+    }
+    if(SCENARIO==='batch-mirror'){
+        const el=walk(mirror('batchRender.maxFramesPerChunk')).find(n=>n.tagName==='INPUT');assert.equal(el.value,'121');
+        el.focus();el.value='97';el.dispatch('change');assert.deepEqual(settingWrites.at(-1),['batchRender.maxFramesPerChunk','97']);
+        el.blur();panel.render();assert.equal(el.value,'97');
+        // A refused value warns and shows the stored one again.
+        refuseSetting=true;el.focus();el.value='';el.dispatch('change');el.blur();
+        assert.equal(notices.at(-1),'setting refused');assert.equal(el.value,'97');
+    }
+    if(SCENARIO==='search'){
+        const box=walk(container).find(n=>n.dataset.controlsSearch==='true');box.focus();box.value='see';box.dispatch('input');
+        assert.equal(byTarget('binding:steps:value').hidden,true);assert.equal(byTarget('binding:seed:value').hidden,false);
+        // Notes are not searched; a group with a match opens even if collapsed.
+        assert.equal(byTarget('note:intro:text').hidden,true);
+        group('Advanced').children[0].dispatch('click');assert.equal(group('Advanced').children[1].hidden,false);
+        // Search matches group names and choices too, and your own settings.
+        box.value='batch';box.dispatch('input');assert.equal(mirror('batchRender.maxFramesPerChunk').hidden,false);assert.equal(mirror('render.takePlacementMuted').hidden,true);
+        box.value='zzz';box.dispatch('input');assert.match(container.textContent,/No settings match “zzz”/);
+        const e=key('Escape');assert.ok(e.prevented);assert.equal(box.value,'');assert.equal(byTarget('binding:steps:value').hidden,false);
+    }
+    if(SCENARIO==='advanced'){
+        host.capabilities={hide:true,removeAuthored:false};
+        publish({...view,bindings:view.bindings.map(d=>d.binding_id==='steps'?{...d,advanced:true,overridden:true}:d)});
+        const line=walk(container).find(n=>n.dataset.controlsAdvancedLine==='true');
+        assert.equal(byTarget('binding:steps:value').hidden,true);assert.equal(line.hidden,false);
+        // An inline display outranks `hidden`, so hiding also sets display (live-found, 4A).
+        assert.equal(byTarget('binding:steps:value').style.display,'none');
+        assert.match(line.textContent,/1 advanced hidden · 1 changed/);
+        // Search still finds a hidden Advanced setting, tagged.
+        const box=walk(container).find(n=>n.dataset.controlsSearch==='true');box.value='steps';box.dispatch('input');
+        assert.equal(byTarget('binding:steps:value').hidden,false);assert.match(byTarget('binding:steps:value').textContent,/Adv/);
+        box.value='';box.dispatch('input');
+        line.dispatch('click');assert.deepEqual(settingWrites.at(-1),['controls.showAdvanced',true]);panel.render();
+        assert.equal(byTarget('binding:steps:value').hidden,false);assert.match(line.textContent,/Hide advanced settings/);
+        // Manage shows everything and flags Advanced with a toggle.
+        settings.controls.showAdvanced=false;toggleManage();assert.equal(byTarget('binding:steps:value').hidden,false);assert.equal(line.hidden,true);
+        const flag=walk(byTarget('binding:steps:value')).find(n=>n.dataset.controlsAdvancedToggle==='steps');assert.equal(flag.attributes['aria-pressed'],'true');
+        flag.dispatch('click');await settle();assert.deepEqual(calls.at(-1),{'binding:steps:advanced':false});
+    }
+    if(SCENARIO==='advanced-refusal'){
+        // A refused Advanced save keeps its reason on the row, even when the
+        // row is not displayed while it saves.
+        toggleManage();refuse=true;defer=true;
+        walk(byTarget('binding:steps:value')).find(n=>n.dataset.controlsAdvancedToggle==='steps').dispatch('click');await settle();
+        toggleManage();resolveWrite();await settle();
+        assert.match(byTarget('binding:steps:value').textContent,/Not saved: server refusal/);assert.equal(notices.length,1);
+        assert.equal(byTarget('binding:steps:value').hidden,false); // the refusal reverted it to not Advanced
+    }
+    if(SCENARIO==='hidden-pending'){
+        // Search hides a row whose save is still in flight; its refusal still lands on it.
+        refuse=true;defer=true;const el=input('binding:steps:value');el.focus();el.value='33';key('Enter');await settle();
+        const box=walk(container).find(n=>n.dataset.controlsSearch==='true');box.value='seed';box.dispatch('input');
+        assert.equal(byTarget('binding:steps:value').hidden,true);resolveWrite();await settle();
+        assert.match(byTarget('binding:steps:value').textContent,/Not saved: server refusal/);
+    }
+    if(SCENARIO==='cards-scale'){
+        settings.controls.view='cards';settings.layout.scaleControls=1.2;panel.render();
+        assert.equal(container.style.zoom,'1.2');assert.match(byTarget('binding:steps:value').style.cssText,/border-radius/);
+        assert.match(container.children[3].style.cssText,/grid-template-columns/);
+        assert.match(group('Advanced').style.cssText,/grid-column:1 \/ -1/);
+        // A note makes its card span the row; Manage always uses rows.
+        assert.match(byTarget('binding:steps:value').style.cssText,/grid-column:1 \/ -1/);
+        toggleManage();assert.doesNotMatch(byTarget('binding:seed:value').style.cssText,/border-radius/);
+        settings.layout.scaleControls=1;panel.render();assert.equal(container.style.zoom,'');
+    }
+    if(SCENARIO==='group-note'){
+        toggleManage();const section=walk(container).find(n=>n.dataset.controlsManage==='true');
+        walk(group('Advanced').children[0]).find(n=>n.dataset.groupAction==='note').dispatch('click');
+        const area=walk(section).find(n=>n.tagName==='TEXTAREA');area.value='Seeds';key('Enter',{ctrlKey:true});await settle();
+        const [target,value]=Object.entries(calls.at(-1))[0];assert.match(target,/^note:[A-Za-z0-9_-]{12}:create$/);assert.deepEqual(value,{text:'Seeds',group:'Advanced'});
     }
     if(SCENARIO==='focus'){
         const el=input('binding:steps:value');el.focus();el.value='35';
@@ -201,7 +296,7 @@ if(SCENARIO==='markdown'){
         assert.ok(!container.textContent.includes('Double-click'));
         assert.equal(walk(byTarget('binding:steps:value')).find(n=>n.dataset.controlsRowActions).style.display,'none');
         publish({...view,bindings:view.bindings.map(d=>d.binding_id==='seed'?{...d,hidden:true}:d)});
-        assert.equal(byTarget('binding:seed:value'),undefined);
+        assert.equal(byTarget('binding:seed:value').hidden,true);
         toggleManage();assert.ok(byTarget('binding:seed:value'));assert.match(byTarget('binding:seed:value').textContent,/Hidden/);
         assert.equal(walk(byTarget('binding:steps:value')).find(n=>n.dataset.panelDragHandle==='true').hidden,false);
     }
@@ -231,16 +326,20 @@ if(SCENARIO==='markdown'){
         publish({...view,candidates,suggestions:[{binding_id:'old',label:'Sampler · denoise',targets:[]}],candidates_truncated:true,
             bindings:[...view.bindings,{source:'binding',binding_id:'lost',label:'Lost',kind:null,status:'missing',reason:'gone',order:9,origin:SCENARIO==='manage-sdk'?'local':'authored'}]});
         assert.match(section.textContent,/Recommended/);assert.match(section.textContent,/Narrow the filter/);
+        // Add settings stays folded into one bar, with its counts, until opened.
+        const bar=walk(section).find(n=>n.dataset.controlsAddSettings==='true');assert.equal(bar.attributes['aria-expanded'],'false');
+        assert.match(bar.textContent,/3\+ available · 2 recommended/);bar.dispatch('click');assert.equal(bar.attributes['aria-expanded'],'true');
         // The Sonder App lists top-level settings only, and says so.
         assert.equal(/Settings inside subgraphs are exposed from ComfyUI/.test(section.textContent),SCENARIO==='manage-sdk');
         // Nothing greyed out: every listed candidate has an enabled action.
         for(const row of walk(section).filter(n=>n.dataset.candidate))assert.ok(!walk(row).find(n=>n.tagName==='BUTTON').disabled);
         button(walk(section).find(n=>n.dataset.candidate==='6/cfg'),'Add').dispatch('click');await settle();
         const [exposeTarget,expose]=Object.entries(calls.at(-1))[0];
-        assert.match(exposeTarget,/^binding:[A-Za-z0-9_-]{12}:expose$/);assert.deepEqual(expose,{candidate:{path:'6',input:'cfg'},section:'workflow'});
+        // No section is sent: the server derives it from the node's class.
+        assert.match(exposeTarget,/^binding:[A-Za-z0-9_-]{12}:expose$/);assert.deepEqual(expose,{candidate:{path:'6',input:'cfg'}});
         button(section,'Add all recommended').dispatch('click');await settle();
-        assert.deepEqual(Object.values(calls.at(-1)).map(v=>[v.candidate.input,v.section]),[['mark_queue_complete','editor'],['place_audio_on_timeline','editor']]);
-        button(section,'Restore').dispatch('click');await settle();assert.deepEqual(calls.at(-1),{'binding:old:expose':{section:'workflow'}});
+        assert.deepEqual(Object.values(calls.at(-1)).map(v=>v.candidate.input),['mark_queue_complete','place_audio_on_timeline']);
+        button(section,'Restore').dispatch('click');await settle();assert.deepEqual(calls.at(-1),{'binding:old:expose':{}});
         // Rename in place.
         const steps=byTarget('binding:steps:value');button(steps,'Rename').dispatch('click');
         const rename=walk(steps).find(n=>n.tagName==='INPUT'&&n.attributes['aria-label']==='Control name');rename.value='Sampling steps';
@@ -260,7 +359,7 @@ if(SCENARIO==='markdown'){
             button(byTarget('binding:lost:value'),'Remove').dispatch('click');await settle();assert.deepEqual(calls.at(-1),{'binding:lost:remove':true});
         }
         // A new standalone note.
-        button(section,'Add note').dispatch('click');const area=walk(section).find(n=>n.tagName==='TEXTAREA');area.value='**Tip**';
+        button(section,'+ Note').dispatch('click');const area=walk(section).find(n=>n.tagName==='TEXTAREA');area.value='**Tip**';
         key('Enter',{ctrlKey:true});await settle();const [noteTarget,noteValue]=Object.entries(calls.at(-1))[0];
         assert.match(noteTarget,/^note:[A-Za-z0-9_-]{12}:create$/);assert.deepEqual(noteValue,{text:'**Tip**',group:''});
         // The filter reaches the host, debounced; Escape clears it.
@@ -279,7 +378,7 @@ if(SCENARIO==='markdown'){
     }
     if(['layout','layout-refusal','layout-stale','layout-editor'].includes(SCENARIO)){
         const row=byTarget('binding:steps:value'),grip=walk(row).find(n=>n.dataset.panelDragHandle==='true');
-        const advanced=walk(container).find(n=>n.tagName==='SUMMARY'&&n.textContent==='Advanced');
+        const advanced=group('Advanced').children[0];
         const data={};const transfer={setData(k,v){data[k]=v;},getData(k){return data[k];}};
         if(SCENARIO==='layout-editor')input('binding:steps:value').focus();
         container.dispatch('dragstart',{target:grip,dataTransfer:transfer});
@@ -332,11 +431,13 @@ if(SCENARIO==='markdown'){
 console.log('ok');
 '''
 
-@pytest.mark.parametrize('scenario',['normal-view','manage','manage-sdk','manage-flush','hide-flush','combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','note-refusal','problem-statuses','loading','note-then-value'])
-def test_controls_panel(scenario):
+@pytest.mark.parametrize('scenario',['editor-focus-refresh','normal-view','manage','manage-sdk','manage-flush','hide-flush','combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','note-refusal','problem-statuses','loading','note-then-value','batch-mirror','search','advanced','advanced-refusal','hidden-pending','cards-scale','group-note'])
+def test_controls_panel(scenario, tmp_path):
     node=shutil.which('node')
     if not node:pytest.skip('node required for Controls renderer boundary tests')
     script=SCRIPT.replace('MARKDOWN_URL',json.dumps((ROOT/'web/js/panel_markdown.js').as_uri())).replace('PANEL_URL',json.dumps((ROOT/'web/js/editor_controls_panel.js').as_uri())).replace('SCENARIO',json.dumps(scenario))
-    result=subprocess.run([node,'--input-type=module','-e',script],capture_output=True,text=True,timeout=15)
+    # A file, not `node -e`: the script is longer than a Windows command line.
+    path=tmp_path/'panel_test.mjs';path.write_text(script,encoding='utf-8')
+    result=subprocess.run([node,str(path)],capture_output=True,text=True,timeout=15)
     assert result.returncode==0,result.stderr
     assert result.stdout.strip()=='ok'

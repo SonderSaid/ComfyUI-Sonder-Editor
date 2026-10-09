@@ -111,9 +111,13 @@ def _targets(value: Any) -> list[dict]:
 def _binding(raw: Any) -> dict:
     if not isinstance(raw, dict):
         raise ManifestError("A Controls binding must be an object.")
+    # A binding's section is derived from its target nodes' classes
+    # (control_descriptors.section_for); the stored key is only a fallback for a
+    # binding whose nodes are gone. Read tolerantly and never refused. Expiry:
+    # drop the key from the schema at the first release that ships the Relay.
     section = raw.get("section", "workflow")
     if section not in SECTIONS:
-        raise ManifestError("A Controls binding has an unknown section.")
+        section = "workflow"
     advanced = raw.get("advanced", False)
     if not isinstance(advanced, bool):
         raise ManifestError("A Controls advanced flag must be true or false.")

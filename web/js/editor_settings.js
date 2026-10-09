@@ -47,6 +47,12 @@ export const GALLERY_SCOPE_OPTIONS = [
     { value: "current_scene", label: "Current Scene" },
 ];
 
+// Controls sidebar layout (SDK v2 Phase 4): one line per setting, or cards.
+export const CONTROLS_VIEW_OPTIONS = [
+    { value: "rows", label: "Rows", description: "One line per setting: the most on screen." },
+    { value: "cards", label: "Cards", description: "Each setting on its own card, with room for notes." },
+];
+
 export const GALLERY_VIEW_OPTIONS = [
     { value: "folders", label: "Folders" },
     { value: "flat", label: "Flat" },
@@ -302,6 +308,7 @@ export const DEFAULT_EDITOR_SETTINGS = {
         scaleTrackHeaders: 1.0,
         scaleTimeline: 1.0,
         scaleGallery: 1.0,
+        scaleControls: 1.0,
         queuePanelExpanded: false,
         queueBatchCollapsedByProject: {},
         trackCollapseByScene: {},
@@ -463,9 +470,13 @@ export const DEFAULT_EDITOR_SETTINGS = {
         showLauncherButton: false,
         launcher: { thumbnails: "animated", view: "grid", tileSize: "M", showHidden: false },
     },
+    // Controls sidebar presentation (personal, every editor mode). Show advanced
+    // reveals Controls their workflow marks Advanced; their values apply either way.
+    controls: { view: "rows", showAdvanced: false },
 };
 
 const VALID_SORT_MODES = new Set(GALLERY_SORT_OPTIONS.map((entry) => entry.value));
+const VALID_CONTROLS_VIEWS = new Set(CONTROLS_VIEW_OPTIONS.map((entry) => entry.value));
 const VALID_THUMBNAIL_SIZES = new Set(GALLERY_THUMBNAIL_SIZE_OPTIONS.map((entry) => entry.value));
 const VALID_GALLERY_TABS = new Set(GALLERY_TAB_OPTIONS.map((entry) => entry.value));
 const VALID_GALLERY_SCOPES = new Set(GALLERY_SCOPE_OPTIONS.map((entry) => entry.value));
@@ -1228,6 +1239,8 @@ export function normalizeEditorSettings(source = null) {
                 2.0,
                 defaults.layout.scaleGallery,
             ),
+            // New with Phase 4: no legacy per-surface key to inherit.
+            scaleControls: clampNumber(stored?.layout?.scaleControls, 0.7, 2.0, defaults.layout.scaleControls),
             queuePanelExpanded: stored?.layout?.queuePanelExpanded == null
                 ? defaults.layout.queuePanelExpanded
                 : !!stored.layout.queuePanelExpanded,
@@ -1589,7 +1602,46 @@ export function normalizeEditorSettings(source = null) {
                 ? defaults.sdk.showLauncherButton
                 : !!stored.sdk.showLauncherButton,
         },
+        controls: {
+            view: VALID_CONTROLS_VIEWS.has(stored?.controls?.view) ? stored.controls.view : defaults.controls.view,
+            showAdvanced: typeof stored?.controls?.showAdvanced === "boolean"
+                ? stored.controls.showAdvanced
+                : defaults.controls.showAdvanced,
+        },
     };
+}
+
+// The editor settings the Controls panel may write, and how each value is
+// read. The one authority for every editor mode's panel adapter: an unknown
+// key or an unreadable value is refused, never coerced into something else.
+const BATCH_FRAMES_MAX = 10000;
+const readBool = value => {
+    if (typeof value !== "boolean") throw new Error("Choose on or off.");
+    return value;
+};
+export const CONTROLS_PANEL_SETTINGS = Object.freeze({
+    "render.takePlacementMuted": readBool,
+    "render.linkedTakePlacement": readBool,
+    "batchRender.maxFramesPerChunk": value => {
+        const text = typeof value === "number" ? String(value) : String(value ?? "").trim();
+        if (!/^\d+$/.test(text) || Number(text) > BATCH_FRAMES_MAX) {
+            throw new Error(`Max frames per batch is a whole number from 0 to ${BATCH_FRAMES_MAX}; 0 uses the built-in size.`);
+        }
+        return Number(text);
+    },
+    "controls.showAdvanced": readBool,
+    "controls.view": value => {
+        if (!VALID_CONTROLS_VIEWS.has(value)) throw new Error("Choose Rows or Cards.");
+        return value;
+    },
+});
+
+/** The settings patch for one Controls panel write; throws when it is refused. */
+export function controlsPanelSettingPatch(key, value) {
+    const read = Object.hasOwn(CONTROLS_PANEL_SETTINGS, key) ? CONTROLS_PANEL_SETTINGS[key] : null;
+    if (!read) throw new Error("This setting can't be changed from Controls.");
+    const [section, name] = key.split(".");
+    return { [section]: { [name]: read(value) } };
 }
 
 function mergeIntoSettings(base, patch) {

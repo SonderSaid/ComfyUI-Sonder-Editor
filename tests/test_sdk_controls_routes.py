@@ -564,3 +564,56 @@ def test_more_than_64_stored_values_apply_and_a_refused_one_resets_alone(world):
     inputs = world.client.submitted[0]['9']['inputs']
     assert inputs['v3'] == 1 and inputs['v69'] == 69 and inputs['v64'] == 64
     assert sdk_templates.list_templates(requirements=True)  # the Launcher still lists it
+
+
+def test_advanced_is_view_only_for_authored_and_local_and_marks_changed_values(world):
+    # Phase 4: Advanced is presentation (layout overlay / app-only entry), the
+    # stored value still applies, and the view marks a value that differs from
+    # the template's own literal.
+    async def run():
+        session = await world.open()
+        await world.runner.change_controls(session.session_id, session.secret, 'tab-1',
+                                           {'binding:steps:advanced': True, 'binding:steps:value': 31,
+                                            'binding:seed:group': 'Sampling'})
+        stored = sdk_templates.read_control_values(world.template_id)
+        assert stored['layout']['binding:steps']['advanced'] is True
+        view = (await world.runner.controls_view(session))['view']
+        steps = binding_of(view, 'steps')
+        assert steps['advanced'] is True and steps['overridden'] is True and steps['value'] == 31
+        assert not binding_of(view, 'seed').get('overridden')
+        # Group order follows the overlays, not only the export.
+        assert view['group_order'] == ['Sampling']
+        with pytest.raises(SdkError):
+            await world.runner.change_controls(session.session_id, session.secret, 'tab-1',
+                                               {'binding:steps:advanced': 'yes'})
+        await world.runner.generate(session, tab_session_id='tab-1', count=1)
+        submitted = world.client.submitted[-1]
+        assert submitted['6']['inputs']['steps'] == 31  # an Advanced value still runs
+        assert submitted['8'] == prompt()['8']          # presentation never reaches the prompt
+        # An app-only binding keeps its own flag in its local entry.
+        def add_local(data):
+            data['local']['loc1'] = {'targets': [{'path': '2', 'input': 'place_audio_on_timeline',
+                                                  'class_type': 'SonderSaveVideo'}],
+                                     'label': '', 'group': '', 'order': 3, 'advanced': False, 'note': ''}
+        sdk_templates.update_control_values(world.template_id, add_local)
+        await world.runner.change_controls(session.session_id, session.secret, 'tab-1', {'binding:loc1:advanced': True})
+        local = sdk_templates.read_control_values(world.template_id)['local']['loc1']
+        assert local['advanced'] is True and 'binding:loc1' not in sdk_templates.read_control_values(world.template_id)['layout']
+        view = (await world.runner.controls_view(session))['view']
+        loc = binding_of(view, 'loc1')
+        assert loc['advanced'] is True and loc['section'] == 'editor'  # Save Video: Editor by class
+    asyncio.run(run())
+
+
+def test_empty_authored_label_resets_to_the_derived_default_in_sdk(world):
+    async def run():
+        session = await world.open()
+        await world.runner.change_controls(session.session_id, session.secret, 'tab-1',
+                                           {'binding:steps:label': 'Custom steps'})
+        assert binding_of((await world.runner.controls_view(session))['view'], 'steps')['label'] == 'Custom steps'
+        await world.runner.change_controls(session.session_id, session.secret, 'tab-1',
+                                           {'binding:steps:label': ''})
+        view = (await world.runner.controls_view(session))['view']
+        assert binding_of(view, 'steps')['label'] == cd._default_label(prompt(), [{'path': '6', 'input': 'steps'}])
+        assert sdk_templates.read_control_values(world.template_id)['labels']['binding:steps'] == ''
+    asyncio.run(run())

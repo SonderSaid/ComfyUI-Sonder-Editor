@@ -13,6 +13,7 @@ import {
     CLIP_LABEL_MODE_OPTIONS,
     CLIP_LABEL_HORIZONTAL_ALIGN_OPTIONS,
     CLIP_LABEL_VERTICAL_ALIGN_OPTIONS,
+    CONTROLS_VIEW_OPTIONS,
     CROP_POSITION_OPTIONS,
     DEFAULT_EDITOR_SETTINGS,
     DEFAULT_SAVE_PRESET,
@@ -229,6 +230,9 @@ function syncSettingsPanelControls() {
     if (controls.scaleTrackHeadersLabel) controls.scaleTrackHeadersLabel.textContent = `${Math.round(this._settings.layout.scaleTrackHeaders * 100)}%`;
     if (controls.scaleTimelineLabel) controls.scaleTimelineLabel.textContent = `${Math.round(this._settings.layout.scaleTimeline * 100)}%`;
     if (controls.scaleGalleryLabel) controls.scaleGalleryLabel.textContent = `${Math.round(this._settings.layout.scaleGallery * 100)}%`;
+    if (controls.scaleControlsLabel) controls.scaleControlsLabel.textContent = `${Math.round(this._settings.layout.scaleControls * 100)}%`;
+    if (controls.controlsView) controls.controlsView.value = this._settings.controls.view;
+    if (controls.controlsShowAdvanced) controls.controlsShowAdvanced.checked = !!this._settings.controls.showAdvanced;
     if (controls.linkedVideoAudioDrop) controls.linkedVideoAudioDrop.checked = this._settings.timelineBehavior.linkedVideoAudioDrop !== false;
     if (controls.snappingEnabled) controls.snappingEnabled.checked = !!this._settings.timelineBehavior.snappingEnabled;
     if (controls.snapThreshold) controls.snapThreshold.value = String(this._settings.timelineBehavior.snapThreshold);
@@ -1119,11 +1123,34 @@ function showSettingsPanel() {
     createScaleRow(layoutSection, "TrackHeaders", "Track Headers", "Lane labels, icons, and left-side track controls.", () => this._settings.layout.scaleTrackHeaders);
     createScaleRow(layoutSection, "Timeline", "Timeline", "Ruler, track heights, clip blocks, and inline editors.", () => this._settings.layout.scaleTimeline);
     createScaleRow(layoutSection, "Gallery", "Asset Gallery", "Gallery lists, tabs, metadata text, and inspector chrome.", () => this._settings.layout.scaleGallery);
+    createScaleRow(layoutSection, "Controls", "Controls", "The Controls sidebar: settings, groups and notes.", () => this._settings.layout.scaleControls);
     addSectionReset(
         layoutSection,
         "Reset Layout Section",
         "Clear saved fullscreen widths, label widths, track collapses, and UI scale overrides.",
         () => this._resetEditorLayout()
+    );
+
+    const controlsSection = createSection(
+        "Controls",
+        "How the Controls sidebar shows a workflow's settings. These are yours; the workflow's own layout is unchanged."
+    );
+    createSelect(
+        controlsSection,
+        "controlsView",
+        "Layout",
+        "Rows fit the most on screen; Cards give each setting and its note more room.",
+        CONTROLS_VIEW_OPTIONS,
+        () => this._settings.controls.view,
+        (value) => updateCategory("controls", "view", value)
+    );
+    createCheckbox(
+        controlsSection,
+        "controlsShowAdvanced",
+        "Show advanced settings",
+        "Show Controls the workflow marks Advanced. Hidden ones still apply their values.",
+        () => this._settings.controls.showAdvanced,
+        (checked) => updateCategory("controls", "showAdvanced", checked)
     );
 
     const timelineSection = createSection(
@@ -1455,7 +1482,7 @@ function showSettingsPanel() {
     createNumberInput(
         renderSection,
         "batchRenderMaxFramesPerChunk",
-        "Batch Max Frames",
+        "Max frames per batch",
         "Maximum total frames per chunk including pre/post context. Values above 0 snap up to the active template's frame rule; 0 uses the internal 97-frame budget.",
         {
             min: 0,

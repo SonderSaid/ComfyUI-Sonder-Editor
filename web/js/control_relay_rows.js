@@ -13,10 +13,17 @@
 //   is being edited.
 // Pure on import: the caller (control_relay.js) supplies the canvas and graph.
 import { CONTROL_SEED_MODES, findControlWidget } from "./control_widgets.js";
-import { nodeType, parseManifest, relayCensus, resolveAnchor, resolveBindings } from "./control_bindings.js";
+import {
+    defaultBindingLabel, effectiveGroupOrder, nodeType, parseManifest, relayCensus, resolveAnchor, resolveBindings, sectionOf,
+} from "./control_bindings.js";
 
 export const ROW_PREFIX = "sonder_row:";
-const HINT = `${ROW_PREFIX}hint`;
+// Rows that are not a binding use `~`, which a binding id (ID_RE) cannot hold.
+const HINT = `${ROW_PREFIX}~hint`;
+const SEPARATOR = `${ROW_PREFIX}~sep:`;
+// A separator reads as a heading in both renderers: the group's name as the
+// label and a rule as the read-only value (Phase 4A probe, 2026-10-08).
+export const SEPARATOR_RULE = "────────";
 const SIGNATURE = Symbol("sonderRelayRows");
 const ROW_TYPES = { number: "number", combo: "combo", toggle: "toggle", boolean: "toggle", text: "text",
     string: "text", customtext: "text", textarea: "text" };
@@ -42,7 +49,7 @@ export function nativeFor(root, ref) {
     return mode ? { node, widget: mode } : null;
 }
 
-const byOrder = (a, b) => (a.section === "editor") - (b.section === "editor") || (a.order || 0) - (b.order || 0)
+const byOrder = (a, b) => (a.order || 0) - (b.order || 0)
     || String(a.label).localeCompare(String(b.label)) || a.id.localeCompare(b.id);
 
 // What the Relay should show: rows for `ok` bindings, a warning, or a hint.
@@ -59,17 +66,31 @@ export function planRows(relay, root) {
         return { warning: error.message };
     }
     const { bindings } = resolveBindings(root, manifest);
-    const rows = [];
+    // The panel's order: Editor first, then ungrouped Workflow Controls, then
+    // each group under a separator. Advanced rows stay (a personal Show
+    // advanced toggle must never resize the saved node) and carry a suffix.
+    const editor = [], ungrouped = [], grouped = new Map();
     const entries = Object.entries(manifest.bindings).map(([id, entry]) => ({ id, ...entry }));
     for (const entry of entries.sort(byOrder)) {
         const resolved = bindings[entry.id];
         const type = ROW_TYPES[resolved?.widget?.type];
         if (resolved?.status !== "ok" || !type) continue;
         const anchor = resolved.anchor;
-        const label = entry.label || `${anchor.node.title || nodeType(anchor.node)} · ${anchor.name}`;
+        const name = entry.label || defaultBindingLabel(resolved);
+        const label = entry.advanced ? `${name} · Adv` : name;
         const ref = { id: entry.id, nodeId: anchor.node.id, anchor: anchor.name, widgetName: resolved.widget.name };
-        rows.push({ ...ref, role: "value", type, label, options: rowOptions(resolved.widget, type) });
-        if (resolved.modeWidget) rows.push({ ...ref, role: "mode", type: "combo", label: `${label} · mode` });
+        const own = [{ ...ref, role: "value", type, label, options: rowOptions(resolved.widget, type) }];
+        if (resolved.modeWidget) own.push({ ...ref, role: "mode", type: "combo", label: "↳ mode" });
+        const group = typeof entry.group === "string" ? entry.group : "";
+        if (sectionOf(resolved, entry.section) === "editor") editor.push(...own);
+        else if (!group) ungrouped.push(...own);
+        else grouped.set(group, [...(grouped.get(group) || []), ...own]);
+    }
+    const rows = [...editor, ...ungrouped];
+    for (const group of effectiveGroupOrder(manifest, bindings)) {
+        const own = grouped.get(group);
+        if (!own) continue;
+        rows.push({ id: group, role: "separator", type: "text", label: group }, ...own);
     }
     return rows.length ? { rows } : { hint: EMPTY_HINT };
 }
@@ -84,6 +105,7 @@ function rowOptions(native, type) {
 const signature = plan => JSON.stringify(plan.rows
     ? plan.rows.map(r => [r.id, r.role, r.type, r.label, r.nodeId, r.widgetName, r.options])
     : [plan.warning || plan.hint]);
+const isSeparator = row => row.role === "separator";
 
 function addRow(relay, spec) {
     const options = { ...spec.options, serialize: false };
@@ -114,7 +136,7 @@ export function syncRelayRows(relay, { root, canvas = null, isEditing = () => fa
         let changed = false;
         for (const widget of rowWidgets(relay)) {
             const row = plan.rows.find(r => widget.name === rowName(r));
-            const native = row && nativeFor(root, row);
+            const native = row && !isSeparator(row) && nativeFor(root, row);
             if (native && widget.value !== native.widget.value) {
                 widget.value = native.widget.value;
                 changed = true;
@@ -131,6 +153,11 @@ export function syncRelayRows(relay, { root, canvas = null, isEditing = () => fa
             value: plan.warning || plan.hint, disabled: true, callback: () => {} });
     }
     for (const row of plan.rows || []) {
+        if (isSeparator(row)) {
+            addRow(relay, { type: "text", name: rowName(row), label: row.label, value: SEPARATOR_RULE,
+                disabled: true, callback: () => {} });
+            continue;
+        }
         const native = nativeFor(root, row);
         addRow(relay, {
             ...row,
@@ -157,4 +184,5 @@ export function syncRelayRows(relay, { root, canvas = null, isEditing = () => fa
     return true;
 }
 
-const rowName = row => `${ROW_PREFIX}${row.id}${row.role === "mode" ? ":mode" : ""}`;
+const rowName = row => (isSeparator(row) ? `${SEPARATOR}${row.id}`
+    : `${ROW_PREFIX}${row.id}${row.role === "mode" ? ":mode" : ""}`);

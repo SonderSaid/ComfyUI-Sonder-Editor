@@ -7,7 +7,7 @@ import { syncRelayRows } from "./control_relay_rows.js";
 
 const DESCRIBE_URL = "/sonder-editor/controls/describe";
 const DEBOUNCE_MS = 400;
-const TARGET_RE = /^(binding|note):([A-Za-z0-9_-]{1,64}):(value|seed_mode|label|note|text|order|group|expose|remove|rebind|create)$/;
+const TARGET_RE = /^(binding|note):([A-Za-z0-9_-]{1,64}):(value|seed_mode|label|note|text|order|group|advanced|expose|remove|rebind|create)$/;
 const STRUCTURAL = new Set(["expose", "remove", "rebind", "create"]);
 const sameTargets = (a, b) => JSON.stringify((a || []).map(t => [String(t.path), t.input]).sort())
     === JSON.stringify((b || []).map(t => [String(t.path), t.input]).sort());
@@ -41,7 +41,7 @@ function defaultCreateRelay(app, root, editor) {
     return node;
 }
 
-export function createCanvasControlsHost({app, api, getEditorNode, setEditorSetting = () => {},
+export function createCanvasControlsHost({app, api, getEditorNode,
     getChangeTracker = () => app?.extensionManager?.workflow?.activeWorkflow?.changeTracker,
     createRelay = defaultCreateRelay, debounceMs = DEBOUNCE_MS} = {}) {
     if (!app || typeof app.graphToPrompt !== "function" || typeof getEditorNode !== "function") {
@@ -283,7 +283,8 @@ export function createCanvasControlsHost({app, api, getEditorNode, setEditorSett
         }
         if (bindings[id]) throw new Error("This Control id is already in use.");
         manifestOps.push(m => {
-            m.bindings[id] = {label: value.label, section: value.section, group: "", order: value.order, advanced: false, note: ""};
+            // No section: the server derives it from the target nodes' classes.
+            m.bindings[id] = {label: value.label, group: "", order: value.order, advanced: false, note: ""};
         });
         if (live) anchors.push(() => { setAnchor(live.node, live.name, id); return [live.node]; });
     }
@@ -380,7 +381,6 @@ export function createCanvasControlsHost({app, api, getEditorNode, setEditorSett
             writeTail = run.catch(() => {});
             return run;
         },
-        setEditorSetting,
         destroy() { destroyed = true; epoch++; clearTimeout(timer); syncListeners(); subscribers.clear(); },
     };
 }

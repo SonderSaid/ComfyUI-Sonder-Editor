@@ -543,6 +543,7 @@ import {
     detectResolutionPresetSelections,
     frameConstraintsEqual,
     getEditorSettings,
+    controlsPanelSettingPatch,
     getAllModelTemplates,
     getAllPromptChannelTemplates,
     getTemplateById,
@@ -4526,7 +4527,8 @@ export class EditorWidget {
         this._controlsPanelHandle = mountControlsPanel(this._controlsPanelEl, {
             ...adapter,
             getEditorSettings: () => this._settings,
-            setEditorSetting: (key, value) => this._updateSettings({ render: { [key.split(".")[1]]: !!value } }),
+            // Typed and whitelisted (editor_settings.js): throws on a refused value.
+            setEditorSetting: (key, value) => this._updateSettings(controlsPanelSettingPatch(key, value)),
             notify: message => notifyWarning(message, { source: "controls-save" }),
         });
     }
@@ -10844,6 +10846,7 @@ export class EditorWidget {
                 scaleTrackHeaders: 1.0,
                 scaleTimeline: 1.0,
                 scaleGallery: 1.0,
+                scaleControls: 1.0,
                 queuePanelExpanded: false,
                 queueBatchCollapsedByProject: null,
                 trackCollapseByScene: null,
@@ -23992,6 +23995,7 @@ export class EditorWidget {
             TrackHeaders: "scaleTrackHeaders",
             Timeline: "scaleTimeline",
             Gallery: "scaleGallery",
+            Controls: "scaleControls",
         };
         const layoutKey = keyMap[key];
         if (!layoutKey) return;

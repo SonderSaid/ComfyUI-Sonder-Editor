@@ -91,27 +91,85 @@ class ControlValueError(ValueError):
 
 @dataclass(frozen=True)
 class FieldControl:
-    """A Sonder-node widget Manage recommends exposing in the Editor section."""
+    """A Sonder-node widget Manage recommends exposing.
+
+    ``label`` None names the Control after its node's title (a Selector's title
+    says which feature it picks). Its section follows ``section_for``.
+    """
 
     class_type: str
     field: str
-    label: str
+    label: str | None
     hint: str = ""
 
 
 # Entries, not conditionals: add a row to recommend another Sonder-node field.
-# Exposure is opt-in (maintainer decision 2026-10-06); Manage lists these first
-# as Recommended and exposes them to the Editor section.
+# Exposure is opt-in (maintainer decisions 2026-10-06 and 2026-10-08: no
+# defaults); Manage lists these first as Recommended.
 FIELD_CONTROLS: tuple[FieldControl, ...] = (
-    FieldControl("SonderSaveVideo", "mark_queue_complete", "Advance queue after take"),
-    FieldControl("SonderSaveBridge", "mark_queue_complete", "Advance queue after take"),
-    FieldControl("SonderSaveVideo", "place_audio_on_timeline", "Place take audio on timeline"),
-    FieldControl("SonderMasksBridge", "edit_video", "Edit video"),
-    FieldControl("SonderMasksBridge", "edit_audio", "Edit audio"),
     # io_nodes.SonderSaveVideo refuses a custom PNG sequence in Take mode.
     FieldControl("SonderSaveVideo", "mode", "Save as", "Take can't save a PNG sequence."),
+    FieldControl("SonderSaveVideo", "filename_prefix", "File name"),
+    FieldControl("SonderSaveVideo", "save_preset", "Save preset"),
+    FieldControl("SonderSaveVideo", "mark_queue_complete", "Advance queue after take"),
+    FieldControl("SonderSaveVideo", "place_audio_on_timeline", "Place take audio on timeline"),
+    FieldControl("SonderSaveBridge", "prefix", "Prefix"),
+    FieldControl("SonderSaveBridge", "mark_queue_complete", "Advance queue after take"),
+    FieldControl("SonderMasksBridge", "edit_video", "Edit video"),
+    FieldControl("SonderMasksBridge", "edit_audio", "Edit audio"),
+    FieldControl("SonderSelector", "choice", None),
 )
 _RECOMMENDED = {(entry.class_type, entry.field): entry for entry in FIELD_CONTROLS}
+
+# Section by node class (maintainer, 2026-10-08): every exposed setting of these
+# nodes belongs to the editor's run, so it shows in the Editor section; any other
+# node's setting is a Workflow Control. web/js/control_bindings.js mirrors it.
+EDITOR_CLASSES = frozenset({"SonderSaveVideo", "SonderSaveBridge", "SonderMasksBridge"})
+
+
+def section_for(prompt: Any, targets: Any, fallback: str = "workflow") -> str:
+    """``"editor"`` when every target's node is an editor class, else ``"workflow"``.
+
+    The class comes from the prompt node at each target path, so a linked or
+    widgetless target keeps its section. ``fallback`` (the stored section) is
+    used only when a target's node is gone.
+    """
+    classes = []
+    for target in targets or []:
+        node = prompt.get(target.get("path")) if isinstance(prompt, dict) and isinstance(target, dict) else None
+        if not isinstance(node, dict):
+            return fallback if fallback in control_manifest.SECTIONS else "workflow"
+        classes.append(node.get("class_type"))
+    if not classes:
+        return fallback if fallback in control_manifest.SECTIONS else "workflow"
+    return "editor" if all(c in EDITOR_CLASSES for c in classes) else "workflow"
+
+
+def recommended_label(entry: FieldControl, node: Any) -> str:
+    """The Recommended label: the entry's own, or its node's title."""
+    if entry.label:
+        return entry.label
+    return _node_title(node, str(node.get("class_type") or entry.class_type)) if isinstance(node, dict) else entry.class_type
+
+
+def group_order(view: dict) -> list[str]:
+    """The Controls' group order, one authority for the panel and provenance.
+
+    Groups with an entry in the manifest's ``groups`` come first by their order
+    (then name); groups only named by bindings or notes follow in the order they
+    first appear, which is how the panel ordered every group before Phase 4.
+    """
+    explicit = view.get("groups") if isinstance(view.get("groups"), dict) else {}
+    ordered = sorted((name for name in explicit if isinstance(name, str) and name),
+                     key=lambda name: (_clean_order((explicit.get(name) or {}).get("order")), name))
+    rows = [*(view.get("bindings") or []), *(view.get("notes") or [])]
+    rows.sort(key=lambda d: (_clean_order(d.get("order")), str(d.get("label") or "").lower(),
+                             str(d.get("binding_id") or d.get("note_id") or "")))
+    for row in rows:
+        name = row.get("group")
+        if isinstance(name, str) and name and name not in ordered:
+            ordered.append(name)
+    return ordered
 
 # ── Coercion ─────────────────────────────────────────────────────────────────
 
@@ -522,7 +580,7 @@ def _describe_one(prompt: dict, binding_id: str, entry: dict, class_lookup: Call
         "binding_id": binding_id,
         "origin": origin,
         "label": entry["label"],
-        "section": entry["section"],
+        "section": section_for(prompt, entry.get("targets"), entry.get("section", "workflow")),
         "group": entry["group"],
         "order": entry["order"],
         "advanced": entry["advanced"],
@@ -643,11 +701,8 @@ def describe_bindings(
     for suggestion in manifest["suggestions"]:
         if suggestion["binding_id"] in manifest["bindings"]:
             continue
-        fields = {((prompt[t["path"]].get("class_type") if isinstance(prompt.get(t["path"]), dict) else None),
-                   t["input"]) for t in suggestion["targets"]}
-        recommended = bool(fields) and all(field in _RECOMMENDED for field in fields)
         view["suggestions"].append({**suggestion, "label": _default_label(prompt, suggestion["targets"]),
-                                    "section": "editor" if recommended else "workflow"})
+                                    "section": section_for(prompt, suggestion["targets"])})
     authored = {(t["path"], t["input"]) for d in view["bindings"] if d["status"] == STATUS_OK for t in d["targets"]}
     for binding_id, entry in clean_local_bindings(local).items():
         if binding_id in manifest["bindings"]:
@@ -665,6 +720,7 @@ def describe_bindings(
     view["groups"] = manifest["groups"]
     view["bindings"].sort(key=lambda d: (d["order"], d["label"].lower(), d["binding_id"]))
     view["notes"].sort(key=lambda d: (d["order"], d["note_id"]))
+    view["group_order"] = group_order(view)
     return view
 
 
@@ -715,7 +771,7 @@ def clean_local_bindings(local: Any) -> dict:
             "section": section if section in control_manifest.SECTIONS else "workflow",
             "group": _clean_text(raw.get("group"), PANEL_LABEL_MAX_CHARS).strip(),
             "order": _clean_order(raw.get("order")),
-            "advanced": False,
+            "advanced": raw.get("advanced") is True,
             "note": _clean_text(raw.get("note"), PANEL_NOTE_MAX_CHARS),
             "targets": targets,
             "seed_mode": None,
@@ -839,17 +895,19 @@ def candidate_inventory(prompt: dict, candidates: list[dict], *,
         # A promoted input is recommended when every consumer is the same field.
         fields = {(t.get("class_type"), t.get("input")) for t in read}
         recommended = _RECOMMENDED.get(next(iter(fields))) if len(fields) == 1 else None
+        targets = [{"path": t["key"], "input": t["input"], "class_type": t.get("class_type")} for t in read]
         entry = {
             "path": candidate["path"],
             "input": candidate["input"],
-            "targets": [{"path": t["key"], "input": t["input"], "class_type": t.get("class_type")} for t in read],
+            "targets": targets,
             "node_title": title,
             "class_type": (node or {}).get("class_type") or first.get("class_type"),
-            "label": recommended.label if recommended else (f"{title} · {candidate['input']}" if title else candidate["input"]),
+            "label": (recommended_label(recommended, node or {"class_type": first.get("class_type")}) if recommended
+                      else (f"{title} · {candidate['input']}" if title else candidate["input"])),
             "kind": kind,
             "status": status,
             "recommended": bool(recommended),
-            "section": "editor" if recommended else "workflow",
+            "section": section_for(prompt, targets),
         }
         if reason:
             entry["reason"] = reason
@@ -886,7 +944,7 @@ def manage_candidates(inventory: list[dict], view: dict, *, query: str = "",
 
 MAX_CONTROL_CHANGES = 64
 VALUE_FIELDS = ("value", "seed_mode")
-PRESENTATION_FIELDS = ("label", "note", "order", "group")
+PRESENTATION_FIELDS = ("label", "note", "order", "group", "advanced")
 
 
 def _target_table(view: dict) -> dict:
@@ -977,6 +1035,11 @@ def validate_binding_changes(view: dict, changes: Any, *, prompt: dict | None = 
                 if not isinstance(raw, str) or len(raw.strip()) > PANEL_LABEL_MAX_CHARS:
                     raise ControlValueError("A label must be text of at most 120 characters.")
                 value = raw.strip()
+            elif field == "advanced":
+                # Its own branch: a flag, never coerced through the value's kind.
+                if not isinstance(raw, bool):
+                    raise ControlValueError("Advanced is true or false.")
+                value = raw
             elif field in ("order", "group"):
                 value = coerce_panel_layout(field, raw)
                 if field == "group" and len(value) > PANEL_LABEL_MAX_CHARS:
@@ -1063,8 +1126,10 @@ class _StructuralBatch:
         if keys & self.claimed:
             raise ControlValueError("Two changes expose the same setting.")
         self.claimed |= keys
+        # A Recommended label is curated; any other default is derived at
+        # describe time, so an un-renamed Control stores no label.
         return {"candidate": locator, "targets": entry["targets"], "kind": entry["kind"],
-                "default_label": entry["label"]}
+                "default_label": entry["label"] if entry.get("recommended") else ""}
 
     @staticmethod
     def _same_targets(descriptor: dict, chosen: dict) -> bool:
@@ -1089,10 +1154,8 @@ class _StructuralBatch:
             return self._hide(existing, op, raw)
         if op == "expose":
             if not isinstance(raw, dict):
-                raise ControlValueError("An expose needs a section.")
-            section = raw.get("section", "workflow")
-            if section not in control_manifest.SECTIONS:
-                raise ControlValueError("Choose the Workflow or Editor section.")
+                raise ControlValueError("Choose a setting to expose.")
+            # A client-sent section is ignored: section_for derives it.
             label = raw.get("label")
             if label is not None and (not isinstance(label, str) or len(label.strip()) > PANEL_LABEL_MAX_CHARS):
                 raise ControlValueError("A label must be text of at most 120 characters.")
@@ -1107,7 +1170,7 @@ class _StructuralBatch:
             else:
                 chosen = self._candidate(raw["candidate"], identity)
                 if existing is not None and self.mode == "relay":
-                    return {**chosen, "section": section, "label": (label or "").strip()}
+                    return {**chosen, "label": (label or "").strip()}
                 if existing is not None:
                     if self._same_targets(existing, chosen):
                         return dict(_NOOP)
@@ -1117,7 +1180,7 @@ class _StructuralBatch:
             self.binding_count += 1
             text = (label or "").strip() or chosen.pop("default_label", "")
             chosen.pop("default_label", None)
-            return {**chosen, "section": section, "label": text, "order": self._order()}
+            return {**chosen, "label": text, "order": self._order()}
         if op == "remove":
             if raw is not True:
                 raise ControlValueError("Send true to remove.")

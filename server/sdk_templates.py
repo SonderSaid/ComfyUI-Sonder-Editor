@@ -225,6 +225,7 @@ def controls_summary_of(view: dict) -> tuple[list[dict], list[str]]:
             "section": binding.get("section", "workflow"),
             "group": binding.get("group", ""),
             "origin": binding.get("origin", "authored"),
+            "advanced": binding.get("advanced") is True,
         })
         if binding.get("kind") == "SEED" and binding.get("status") == control_descriptors.STATUS_OK:
             has_seed = True
@@ -328,7 +329,9 @@ _summary_cache: dict[str, tuple] = {}
 
 
 def _has_curation(stored: dict) -> bool:
-    return any(stored.get(name) for name in ("bindings", "local", "local_notes", "hidden", "labels"))
+    # Notes and layout count too: the summary carries groups and Advanced.
+    return any(stored.get(name) for name in ("bindings", "local", "local_notes", "hidden", "labels",
+                                             "notes", "layout"))
 
 
 def _overlay_summary(meta: dict) -> None:
@@ -628,6 +631,10 @@ def apply_stored_values(prompt: dict, described: dict, stored: dict, *, describe
     for target, value in cleaned.items():
         for item in by_id[target.split(":")[1]].get("targets", []):
             prompt[item["path"]]["inputs"][item["input"]] = value
+    # A stored value that differs from the template's own literal: the panel
+    # marks it where an Advanced row hides it ("N changed").
+    overridden = {target.split(":")[1] for target, value in cleaned.items()
+                  if str(value) != str(by_id[target.split(":")[1]].get("value"))}
     view = copy.deepcopy(describe_stored(prompt, stored, describe) if cleaned else described)
     layouts = stored.get("layout") if isinstance(stored.get("layout"), dict) else {}
     notes = stored.get("notes") if isinstance(stored.get("notes"), dict) else {}
@@ -636,6 +643,8 @@ def apply_stored_values(prompt: dict, described: dict, stored: dict, *, describe
         binding_id = descriptor.get("binding_id")
         entry = stored_bindings.get(binding_id)
         entry = entry if isinstance(entry, dict) else {}
+        if binding_id in overridden:
+            descriptor["overridden"] = True
         if binding_id in resets:
             descriptor["reset"] = True
             descriptor["reason"] = "Reset to the workflow's value: this setting changed since its value was saved."
@@ -663,12 +672,17 @@ def apply_stored_values(prompt: dict, described: dict, stored: dict, *, describe
                             descriptor[field] = cd.coerce_panel_layout(field, layout[field])
                         except cd.ControlValueError:
                             pass
+                if prefix == "binding" and isinstance(layout.get("advanced"), bool):
+                    descriptor["advanced"] = layout["advanced"]
             text = notes.get(base)
             if isinstance(text, str):
                 descriptor[text_key] = text[:cd.PANEL_NOTE_MAX_CHARS]
             label = labels.get(base)
-            if prefix == "binding" and isinstance(label, str) and label.strip():
-                descriptor["label"] = label.strip()[:cd.PANEL_LABEL_MAX_CHARS]
+            if prefix == "binding" and isinstance(label, str):
+                descriptor["label"] = (label.strip()[:cd.PANEL_LABEL_MAX_CHARS]
+                                       or cd._default_label(prompt, descriptor.get("targets") or []))
+    if "relay" in view and not view.get("error"):
+        view["group_order"] = cd.group_order(view)  # the overlays may regroup
     return view
 
 
@@ -705,14 +719,14 @@ def store_binding_changes(template_id: str, changes: dict, view: dict, prompt: d
             if origins.get((source, identity)) == "local":
                 table = data["local"] if source == "binding" else data["local_notes"]
                 entry = table.get(identity)
-                if isinstance(entry, dict) and field in ("label", "note", "text", "order", "group"):
+                if isinstance(entry, dict) and field in ("label", "note", "text", "order", "group", "advanced"):
                     entry[field] = value
                     continue
             if field in ("note", "text"):
                 data["notes"][base] = value
             elif field == "label":
                 data["labels"][base] = value
-            elif field in ("order", "group"):
+            elif field in ("order", "group", "advanced"):
                 entry = data["layout"].get(base)
                 if not isinstance(entry, dict):
                     entry = data["layout"][base] = {}
@@ -740,8 +754,8 @@ def _store_structural(data: dict, source: str, identity: str, op: str, value: di
     elif source == "note" and op == "remove":
         data["local_notes"].pop(identity, None)
     elif op == "expose":
-        data["local"][identity] = {"targets": [locator(t) for t in value["targets"]], "section": value["section"],
-                                   "label": value["label"], "group": "", "order": value["order"], "note": ""}
+        data["local"][identity] = {"targets": [locator(t) for t in value["targets"]], "label": value["label"],
+                                   "group": "", "order": value["order"], "advanced": False, "note": ""}
     elif op == "rebind":
         entry = data["local"].get(identity)
         if isinstance(entry, dict):

@@ -88,7 +88,7 @@ def test_validation_reports_editor_defaults_and_binding_summary():
     result = validate(api_prompt())
     assert result["editor_key"] == "1"
     assert result["editor_defaults"] == {"fps": 24.0, "width": 960, "height": 544}
-    assert result["controls"] == [{"binding_id": "seed1", "label": "Seed", "kind": "SEED", "status": "ok",
+    assert result["controls"] == [{"binding_id": "seed1", "label": "Seed", "kind": "SEED", "status": "ok", "advanced": False,
                                    "section": "workflow", "group": "", "origin": "authored"}]
     assert result["blocking"] == [] and result["warnings"] == []
 
@@ -307,3 +307,10 @@ def test_junk_editor_writers_are_tolerated(writers):
 def test_invalid_editor_writer_is_refused(writer):
     with pytest.raises(TemplateError, match="page and sequence"):
         sdk_templates.write_editor_state("P", {}, writer=writer)
+
+
+def test_layout_or_notes_alone_count_as_curation_for_the_launcher_summary():
+    # The summary carries groups and Advanced, which live in layout overlays.
+    assert not sdk_templates._has_curation({})
+    assert sdk_templates._has_curation({"layout": {"binding:steps": {"advanced": True}}})
+    assert sdk_templates._has_curation({"notes": {"note:intro": "x"}})

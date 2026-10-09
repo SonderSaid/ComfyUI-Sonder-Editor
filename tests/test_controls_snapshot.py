@@ -86,14 +86,17 @@ def _prompt(bindings=None, **extra):
         "5": _node("KSampler", {"model": ["6", 0], "seed": 7, "steps": 5, "cfg": 1.0, "sampler_name": "euler"}),
         "6": _node("CheckpointLoaderSimple", {"ckpt_name": "x"}),
         "8": _node("SaveImage", {"images": ["5", 0]}),
-        "9": _node("SonderSaveVideo", {"project": ["1", 0], "images": ["4", 0]}),
+        "9": _node("SonderSaveVideo", {"project": ["1", 0], "images": ["4", 0], "filename_prefix": "take"}),
     }
     prompt["20"] = _relay(bindings if bindings is not None else {
         "steps": _binding("3", "steps", label="Steps", group="Sampling", order=1),
         "cfg": _binding("3", "cfg", label="CFG", group="Sampling", order=2),
         "seed": _binding("3", "seed", label="Seed", seed_mode="increment"),
         "text": _binding("2", "text", label="Prompt"),
+        # Stored "editor", but SonderEditor is not an editor class: Workflow.
         "fps": _binding("1", "fps", label="Frame rate", section="editor"),
+        # Save Video is: Editor, whatever was stored (section by node class).
+        "save": _binding("9", "filename_prefix", label="File name"),
         "other": _binding("5", "steps", label="Other steps"),
     }, **extra)
     return prompt
@@ -116,23 +119,26 @@ def test_records_relevant_bindings_with_values_labels_and_seed_mode():
     assert section["display_type"] == "controls"
     controls = by_id(section)
     # "other" sets a sampler that cannot reach Save Video 9.
-    assert set(controls) == {"steps", "cfg", "seed", "text", "fps"}
+    assert set(controls) == {"steps", "cfg", "seed", "text", "fps", "save"}
     assert controls["seed"]["value"] == "41" and controls["seed"]["seed_mode"] == "increment"
     assert controls["steps"]["value"] == "20" and controls["steps"]["kind"] == "INT"
     assert controls["cfg"]["value"] == 7.5
     assert controls["text"]["value"] == "a red fox"
-    assert controls["fps"]["section"] == "editor"
+    assert controls["fps"]["section"] == "workflow"
+    assert controls["save"]["section"] == "editor"
     assert controls["steps"]["targets"] == [{"path": "3", "input": "steps"}]
-    assert section["fields"] == {"Prompt": "a red fox", "Seed": "41", "Steps": "20", "CFG": 7.5, "Frame rate": 24.0}
+    assert section["fields"] == {"Prompt": "a red fox", "Seed": "41", "Steps": "20", "CFG": 7.5, "Frame rate": 24.0,
+                                 "File name": "take"}
     # Workflow before Editor, ungrouped before groups, then order.
-    assert [c["binding_id"] for c in section["controls"]] == ["text", "seed", "steps", "cfg", "fps"]
+    assert [c["binding_id"] for c in section["controls"]] == ["fps", "text", "seed", "steps", "cfg", "save"]
     assert "raw_widget_text" not in section
     assert "note" not in json.dumps(section["controls"])
     # Defaults and values are not repeated in the detail records.
     raw = {control["binding_id"]: control for control in section["controls"]}
     assert raw["steps"] == {"binding_id": "steps", "field": "Steps", "kind": "INT", "group": "Sampling",
                             "targets": [{"path": "3", "input": "steps"}]}
-    assert raw["fps"]["section"] == "editor" and "value" not in raw["fps"]
+    assert raw["save"]["section"] == "editor" and "value" not in raw["save"]
+    assert "section" not in raw["fps"]  # the default (workflow) is not repeated
 
 
 def test_snapshot_is_pure():
@@ -303,7 +309,7 @@ def test_sdk_seed_modes_and_order_come_from_the_app():
     section = snap(stamped)
     controls = by_id(section)
     assert controls["seed"]["seed_mode"] == "fixed"
-    assert [c["binding_id"] for c in section["controls"]] == ["seed", "text", "steps", "cfg", "fps"]
+    assert [c["binding_id"] for c in section["controls"]] == ["fps", "seed", "text", "steps", "cfg", "save"]
     # "Other seed" sets sampler 5, which cannot reach Save Video 9.
     assert "loc1" not in controls
 

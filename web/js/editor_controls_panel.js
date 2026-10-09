@@ -2,10 +2,12 @@ import { mountComboPicker, wantsComboPicker } from "./controls_combo_picker.js";
 import { mountManageSection, smallButton } from "./controls_manage.js";
 import { mountPanelArrangement } from "./controls_panel_arrangement.js";
 import { comparePanelRows, canArrange } from "./controls_panel_layout.js";
+import { disclosureKey, entryVisible, groupPlan, hasAdvanced, hiddenAdvanced, matchEntry } from "./controls_panel_view.js";
+import * as S from "./controls_panel_style.js";
 import { renderPanelMarkdown } from "./panel_markdown.js";
 import { createDisclosureMemory } from "./disclosure_memory.js";
 import { register, PRIORITY, PRESERVE_DEFAULT } from "./keyboard_ownership.js";
-import { EDITOR_COLORS as COLORS, FONT, RADIUS, SPACE, TYPE, setButtonVariant } from "./editor_theme.js";
+import { EDITOR_COLORS as COLORS, FONT, RADIUS, SPACE, TYPE, applyNativeControlTheme, setButtonVariant } from "./editor_theme.js";
 
 let nextPanel = 0;
 const SEED_MODES = ["fixed", "increment", "decrement", "randomize"];
@@ -13,15 +15,32 @@ const editable = d => d.status === "ok";
 const identified = d => !!(d.binding_id || d.note_id);
 const baseOf = d => (d.binding_id ? "binding:" + d.binding_id : d.note_id ? "note:" + d.note_id : "");
 const inEditor = d => d.source === "binding" && d.section === "editor";
-// Values, modes and exposure change what a run submits; labels, notes and
-// arrangement do not, so only run-affecting saves can refuse a Generate.
+// Values, modes and exposure change what a run submits; labels, notes,
+// Advanced and arrangement do not, so only run-affecting saves can refuse a Generate.
 const changesRun = target => /^binding:.+:(value|seed_mode|expose|remove|rebind|hide|unhide)$/.test(target);
 const CANVAS_EMPTY = "No Controls yet. Choose Manage to expose this workflow's settings here.";
+const LONG_VALUE = 18; // a choice longer than this gets a wide card
+// Your own editor settings, shown first in the Editor group in every mode. They
+// write through the host's typed setter (editor_settings.js controlsPanelSettingPatch).
+const MIRRORS = [
+    { key: "render.takePlacementMuted", label: "Takes start muted", kind: "BOOLEAN" },
+    { key: "render.linkedTakePlacement", label: "Link take video + audio", kind: "BOOLEAN" },
+    { key: "batchRender.maxFramesPerChunk", label: "Max frames per batch", kind: "INT",
+        title: "Total frames per + Batch job, context included; 0 uses the built-in size. Snaps up to the model's frame rule." },
+];
 const same = (a, b) => String(a ?? "") === String(b ?? "");
 const make = (tag, text) => {
     const el = document.createElement(tag);
     if (text !== undefined) el.textContent = text;
     return el;
+};
+const settingAt = (settings, key) => key.split(".").reduce((value, name) => value?.[name], settings);
+// Rows and groups carry an inline `display`, which outranks the `hidden`
+// attribute, so showing and hiding sets both. Call it after any cssText write.
+const setShown = (el, shown) => {
+    el.hidden = !shown;
+    if (!shown) el.style.display = "none";
+    else if (el.style.display === "none") el.style.display = "";
 };
 
 export function mountControlsPanel(container, host) {
@@ -35,58 +54,180 @@ export function mountControlsPanel(container, host) {
         lastView = null,
         noteEditor = null,
         manageOn = false,
-        manage = null;
+        manage = null,
+        query = "";
     const capabilities = () => host.capabilities || { hide: false, removeAuthored: true };
+    const settings = () => host.getEditorSettings?.() || {};
+    const cards = () => !manageOn && settings().controls?.view === "cards";
+    const showAdvanced = () => settings().controls?.showAdvanced === true;
     // Target -> reason of its latest refused or unconfirmed save, shown on the row
     // until a newer save of it succeeds or an authoritative view arrives.
     const failed = new Map();
     let validTargets = null,
         layoutSaving = false;
     container.dataset.sonderControlsPanel = "true";
-    container.style.cssText = `display:flex;flex-direction:column;flex:1;min-height:0;overflow:auto;padding:${SPACE.s4}px;gap:${SPACE.s3}px;font:${TYPE.t12}px ${FONT.sans};color:${COLORS.text};`;
-    // A discreet Manage toggle: normal view keeps values and rendered notes;
-    // exposing, renaming, notes and arranging happen in Manage.
+    container.style.cssText = `display:flex;flex-direction:column;flex:1;min-height:0;overflow:auto;padding:${SPACE.s3}px;gap:${SPACE.s2}px;font:${TYPE.t12}px ${FONT.sans};color:${COLORS.text};`;
+    applyNativeControlTheme(container);
+
+    // Header: search, a discreet Manage toggle, and the hidden-Advanced line.
     const header = make("div");
-    header.style.cssText = `display:flex;justify-content:flex-end;align-items:center;gap:${SPACE.s2}px;`;
+    // Sticky, so search and Manage stay in reach in a long list.
+    header.style.cssText = `display:flex;flex-direction:column;gap:${SPACE.s1}px;position:sticky;top:-${SPACE.s3}px;z-index:1;`
+        + `margin-top:-${SPACE.s3}px;padding-top:${SPACE.s3}px;padding-bottom:${SPACE.s1}px;background:${COLORS.panel};`;
+    const headerTop = make("div");
+    headerTop.style.cssText = `display:flex;align-items:center;gap:${SPACE.s2}px;`;
+    const search = make("input");
+    search.type = "search";
+    search.placeholder = "Search settings";
+    search.setAttribute("aria-label", "Search settings");
+    search.dataset.controlsSearch = "true";
+    search.dataset.sonderTextUndo = "true";
+    search.style.cssText = S.searchCss;
     const manageButton = smallButton("Manage");
     manageButton.dataset.controlsManageToggle = "true";
     manageButton.setAttribute("aria-pressed", "false");
     manageButton.title = "Expose, rename, annotate and arrange Controls";
-    header.append(manageButton);
+    headerTop.append(search, manageButton);
+    const quietLine = make("button");
+    quietLine.type = "button";
+    quietLine.dataset.controlsAdvancedLine = "true";
+    quietLine.style.cssText = S.quietLineCss;
+    quietLine.addEventListener("click", () => writeSetting("controls.showAdvanced", !showAdvanced()));
+    header.append(headerTop, quietLine);
     const message = make("div");
     message.style.cssText = `color:${COLORS.textSecondary};line-height:1.5;`;
-    const editorSection = make("details");
-    editorSection.open = true;
-    editorSection.append(make("summary", "Editor"));
-    const editorBody = make("div");
-    editorBody.style.cssText = `display:flex;flex-direction:column;gap:${SPACE.s2}px;padding-top:${SPACE.s2}px;`;
-    editorSection.append(editorBody);
-    const settingsRows = [];
-    for (const [key, label] of [
-        ["takePlacementMuted", "Takes start muted"],
-        ["linkedTakePlacement", "Link take video + audio"],
-    ]) {
-        const row = make("label"),
-            input = make("input");
-        input.type = "checkbox";
-        row.style.cssText = `display:flex;gap:${SPACE.s2}px;align-items:center;`;
-        row.append(input, make("span", label));
-        input.addEventListener("change", () => host.setEditorSetting("render." + key, input.checked));
-        editorBody.append(row);
-        settingsRows.push({ key, input });
-    }
-    const fieldsBody = make("div"),
-        workflowBody = make("div");
-    fieldsBody.style.cssText = workflowBody.style.cssText = `display:flex;flex-direction:column;gap:${SPACE.s2}px;`;
+    const editorGroup = makeGroup(null, "Editor");
+    const fieldsBody = make("div");
+    const workflowBody = make("div");
     workflowBody.dataset.panelDropGroup = "";
     const mainDrop = make("div", "Main section");
     mainDrop.dataset.panelDropGroup = "";
-    mainDrop.style.cssText = `font-size:${TYPE.t11}px;color:${COLORS.textSecondary};padding:${SPACE.s2}px 0;`;
-    editorBody.append(fieldsBody);
-    container.append(header, editorSection, message, workflowBody);
+    mainDrop.style.cssText = `font-size:${TYPE.t11}px;color:${COLORS.textSecondary};padding:${SPACE.s1}px 0;grid-column:1 / -1;`;
+    container.append(header, message, editorGroup.el, workflowBody);
     const warning = reason => host.notify?.(reason || "The change could not be saved.");
-    const inputCss = `width:100%;min-width:0;box-sizing:border-box;border:1px solid ${COLORS.border};border-radius:${RADIUS.r2}px;background:${COLORS.panelMuted};color:${COLORS.text};font:${TYPE.t12}px ${FONT.sans};padding:${SPACE.s2}px;`;
-    const settingValues = () => host.getEditorSettings?.()?.render || {};
+
+    function writeSetting(key, value) {
+        try {
+            host.setEditorSetting?.(key, value);
+            return true;
+        } catch (error) {
+            warning(error?.message);
+            render();
+            return false;
+        }
+    }
+
+    // ── Groups ──────────────────────────────────────────────────────────────
+    // `name` null is the Editor section. The header is clickable; its toggle is
+    // a real button, so the keyboard opens and closes it natively.
+    function makeGroup(name, title) {
+        const key = disclosureKey(name);
+        const group = { name, key, el: make("section"), header: make("div"), toggle: make("button"), title: make("span"),
+            count: make("span"), actions: make("span"), content: make("div"), open: disclosure.isOpen(key, true) };
+        group.el.dataset.controlsGroup = name === null ? "editor" : name;
+        group.el.style.cssText = S.groupCss;
+        group.header.style.cssText = S.groupHeaderCss;
+        group.toggle.type = "button";
+        group.toggle.style.cssText = S.groupToggleCss;
+        group.title.textContent = title;
+        group.title.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;letter-spacing:0.02em;";
+        group.count.style.cssText = S.countCss;
+        group.actions.style.cssText = `display:flex;align-items:center;gap:${SPACE.s2}px;`;
+        const left = make("span");
+        left.style.cssText = `display:flex;align-items:center;gap:${SPACE.s1 + 2}px;min-width:0;`;
+        left.append(group.toggle, group.title);
+        const right = make("span");
+        right.style.cssText = `display:flex;align-items:center;gap:${SPACE.s2}px;flex:0 0 auto;`;
+        right.append(group.actions, group.count);
+        group.header.append(left, right);
+        if (name !== null) {
+            group.header.dataset.panelDropGroup = name;
+            group.content.dataset.panelDropGroup = name;
+        }
+        group.el.append(group.header, group.content);
+        const flip = event => {
+            if (event.target.closest?.("[data-group-action]")) return;
+            event.preventDefault?.();
+            if (query) return; // a search keeps every group open
+            group.open = !group.open;
+            disclosure.remember(key, group.open);
+            render();
+        };
+        group.header.addEventListener("click", flip);
+        return group;
+    }
+    // Manage adds a note to a group from its header.
+    function paintGroupActions(group) {
+        const key = String(manageOn);
+        if (group.actionsKey === key) return;
+        group.actionsKey = key;
+        if (!manageOn) {
+            group.actions.replaceChildren();
+            return;
+        }
+        const note = make("button", "+ Note");
+        note.type = "button";
+        note.dataset.groupAction = "note";
+        note.title = `Add a Markdown note to ${group.name}`;
+        note.style.cssText = S.linkCss;
+        note.addEventListener("click", event => {
+            event.stopPropagation?.();
+            manage?.addNote(group.name);
+        });
+        group.actions.replaceChildren(note);
+    }
+    function paintGroup(group, visibleCount) {
+        const open = !!query || group.open;
+        group.toggle.textContent = open ? "v" : ">";
+        group.toggle.title = `${open ? "Collapse" : "Expand"} ${group.title.textContent}`;
+        group.toggle.setAttribute("aria-expanded", String(open));
+        group.content.style.cssText = S.groupContentCss(cards());
+        setShown(group.content, open);
+        group.count.textContent = String(visibleCount);
+    }
+
+    // ── Your editor settings (the Editor group's first rows) ────────────────
+    const mirrors = MIRRORS.map(spec => {
+        const row = { spec: { ...spec, source: "mirror" }, el: make("div"), line: make("div"), label: make("label"),
+            labelText: make("span"), control: make("div"), input: make("input") };
+        row.el.dataset.controlsMirror = spec.key;
+        row.input.type = spec.kind === "BOOLEAN" ? "checkbox" : "number";
+        row.input.id = `controls-${panelId}-mirror-${spec.key.replace(/\W/g, "-")}`;
+        row.label.htmlFor = row.input.id;
+        row.labelText.textContent = spec.label;
+        row.labelText.style.cssText = S.labelTextCss;
+        row.label.append(row.labelText);
+        if (spec.title) row.el.title = spec.title;
+        row.input.setAttribute("aria-label", spec.label);
+        if (spec.kind === "INT") {
+            row.input.min = "0";
+            row.input.max = "10000";
+            row.input.step = "1";
+            row.input.dataset.sonderTextUndo = "true";
+        }
+        row.control.append(row.input);
+        row.line.append(row.label, row.control);
+        row.el.append(row.line);
+        row.input.addEventListener("change", () => {
+            const value = spec.kind === "BOOLEAN" ? row.input.checked : row.input.value;
+            if (!writeSetting(spec.key, value)) paintMirror(row);
+        });
+        row.input.addEventListener("focus", () => (row.editing = true));
+        row.input.addEventListener("blur", () => {
+            row.editing = false;
+            paintMirror(row);
+        });
+        return row;
+    });
+    // These children have a fixed order. Moving them on refresh blurs an
+    // active input and discards its unfinished draft in a real browser.
+    editorGroup.content.append(...mirrors.map(row => row.el), fieldsBody);
+    function paintMirror(row) {
+        const value = settingAt(settings(), row.spec.key);
+        if (row.spec.kind === "BOOLEAN") row.input.checked = !!value;
+        else if (!row.editing) row.input.value = String(value ?? "");
+        row.spec.value = value;
+    }
 
     function readInput(row) {
         return row.input.type === "checkbox" ? row.input.checked : row.input.value;
@@ -117,7 +258,7 @@ export function mountControlsPanel(container, host) {
     }
     function layoutEntries() {
         const view = host.getView();
-        // Editor-section settings stay fixed at the bottom; only Workflow rows arrange.
+        // Editor-section settings stay fixed; only Workflow rows arrange.
         return [...(view.bindings || []).map(d => ({ ...d, source: "binding" })), ...(view.notes || [])]
             .filter(d => !inEditor(d))
             .map(d => ({ ...d, base: baseOf(d) }));
@@ -175,7 +316,9 @@ export function mountControlsPanel(container, host) {
                   ? "modeOptimistic"
                   : target.endsWith(":label")
                     ? "labelOptimistic"
-                    : "noteOptimistic";
+                    : target.endsWith(":advanced")
+                      ? "advancedOptimistic"
+                      : "noteOptimistic";
         row[optimisticKey] = value;
         let timer;
         const actual = Promise.resolve().then(() => host.applyChanges({ [target]: value }));
@@ -270,7 +413,8 @@ export function mountControlsPanel(container, host) {
         const next = input.value.trim(),
             before = row.labelOptimistic ?? row.spec.label ?? "";
         input.replaceWith(row.label);
-        if (save && next && next !== before) void commit(row, `binding:${row.spec.binding_id}:label`, next, before);
+        // An empty name goes back to the default one (node title and setting).
+        if (save && next !== before) void commit(row, `binding:${row.spec.binding_id}:label`, next, before);
         render();
     }
     function openRename(row) {
@@ -279,9 +423,10 @@ export function mountControlsPanel(container, host) {
         input.type = "text";
         input.maxLength = 120;
         input.value = row.labelOptimistic ?? row.spec.label ?? "";
+        input.placeholder = "Default name";
         input.setAttribute("aria-label", "Control name");
         input.dataset.sonderTextUndo = "true";
-        input.style.cssText = inputCss;
+        input.style.cssText = S.inputCss;
         row.renameInput = input;
         row.editing = true;
         row.label.replaceWith(input);
@@ -289,6 +434,7 @@ export function mountControlsPanel(container, host) {
         input.focus();
         input.select?.();
     }
+    const effectiveAdvanced = row => (row.advancedOptimistic ?? row.spec.advanced) === true;
     function rowActions(row) {
         const spec = row.spec,
             box = row.actions;
@@ -297,7 +443,8 @@ export function mountControlsPanel(container, host) {
         // Rebuilt only when what it offers changes: a refresh between a
         // press and its click must not swap the button out from under it.
         const caps = capabilities();
-        const key = JSON.stringify([manageOn, local, !!spec.hidden, spec.status, spec.source, caps]);
+        const advanced = spec.source === "binding" && effectiveAdvanced(row);
+        const key = JSON.stringify([manageOn, local, !!spec.hidden, spec.status, spec.source, caps, advanced, !!row.noteText]);
         if (row.actionsKey === key) return;
         row.actionsKey = key;
         const items = [];
@@ -307,6 +454,23 @@ export function mountControlsPanel(container, host) {
             const rename = smallButton("Rename");
             rename.addEventListener("click", () => openRename(row));
             items.push(rename);
+            const note = smallButton(row.noteText ? "Edit note" : "Note");
+            note.title = "A Markdown note shown under this setting";
+            note.addEventListener("click", () =>
+                openNote(row, row.note, `binding:${spec.binding_id}:note`, row.noteText, identified(spec) && !spec.note_truncated));
+            items.push(note);
+            const flag = smallButton(advanced ? "Advanced ✓" : "Advanced", advanced ? "accentSoft" : "secondary");
+            flag.dataset.controlsAdvancedToggle = spec.binding_id;
+            flag.setAttribute("aria-pressed", String(advanced));
+            flag.title = advanced
+                ? "Shown only when Show advanced is on; its value still applies"
+                : "Hide it unless Show advanced is on; its value still applies";
+            flag.addEventListener("click", () => {
+                const next = !effectiveAdvanced(row);
+                void commit(row, `binding:${spec.binding_id}:advanced`, next, !next);
+                render();
+            });
+            items.push(flag);
             if (spec.status !== "ok" && spec.status !== "shadowed" && (caps.removeAuthored || local)) {
                 const rebind = smallButton("Rebind");
                 rebind.title = "Bind this Control to another setting, keeping its id";
@@ -355,16 +519,17 @@ export function mountControlsPanel(container, host) {
         });
     }
     function openNote(row, box, target, text, canEdit) {
-        if (!canEdit || destroyed) return;
+        if (!canEdit || destroyed || !box) return;
         if (noteEditor) void closeNote(true);
         const area = make("textarea"),
             done = make("button", "Done");
         area.value = String(text ?? "");
         area.maxLength = 4000;
         area.dataset.sonderTextUndo = "true";
-        area.style.cssText = inputCss + "min-height:100px;resize:vertical;";
+        area.style.cssText = S.inputCss + "min-height:100px;resize:vertical;";
         done.type = "button";
         done.style.cssText = `border:1px solid ${COLORS.border};background:${COLORS.accentSoft};color:${COLORS.text};border-radius:${RADIUS.r2}px;padding:${SPACE.s1}px ${SPACE.s2}px;align-self:flex-end;cursor:pointer;`;
+        box.style.display = "";
         box.replaceChildren(area, done);
         row.editing = true;
         const edit = { row, box, target, area, before: String(text ?? ""), composing: false, unregister: null };
@@ -395,10 +560,10 @@ export function mountControlsPanel(container, host) {
         done.addEventListener("click", () => void closeNote(true));
         area.focus();
     }
-    function noteBox(row, target, text, canEdit) {
+    function noteBox(row, target, standalone) {
         const box = make("div");
         box.dataset.noteTarget = target;
-        box.style.cssText = `line-height:1.5;color:${COLORS.textSecondary};overflow-wrap:anywhere;cursor:${canEdit ? "text" : "default"};`;
+        box.style.cssText = standalone ? S.standaloneNoteCss : S.noteCss;
         // Notes are authored in Manage; normal view shows them rendered.
         box.addEventListener("dblclick", () =>
             openNote(row, box, target, row.noteText, manageOn && identified(row.spec) && !row.spec.note_truncated),
@@ -416,31 +581,34 @@ export function mountControlsPanel(container, host) {
             optimistic: undefined,
             noteOptimistic: undefined,
             labelOptimistic: undefined,
+            advancedOptimistic: undefined,
         };
         row.el = make("div");
         row.el.dataset.controlTarget = target;
-        row.el.style.cssText = `display:flex;flex-direction:column;gap:${SPACE.s1}px;padding:${SPACE.s2}px 0;border-bottom:1px solid ${COLORS.border};min-width:0;`;
         if (!inEditor(spec)) {
             row.grip = make("span", "⋮⋮");
             row.grip.dataset.panelDragHandle = "true";
             row.grip.draggable = true;
-            row.grip.title = "Drag to reorder or move to another section";
+            row.grip.title = "Drag to reorder or move to another group";
             row.grip.setAttribute("aria-label", "Drag to arrange");
-            row.el.style.position = "relative";
-            row.el.style.paddingRight = `${SPACE.s5}px`;
-            row.grip.style.cssText = `position:absolute;right:0;top:${SPACE.s2}px;cursor:grab;color:${COLORS.textSecondary};user-select:none;font-size:${TYPE.t14}px;`;
+            row.grip.style.cssText = `position:absolute;right:${SPACE.s1}px;top:${SPACE.s1}px;cursor:grab;color:${COLORS.textMuted};user-select:none;font-size:${TYPE.t12}px;letter-spacing:-2px;`;
             row.el.append(row.grip);
         }
         if (spec.source === "note") {
-            row.note = noteBox(row, target, spec.text, spec.status === "ok" && !spec.note_truncated);
+            row.note = noteBox(row, target, true);
             row.el.append(row.note);
         } else {
-            row.label = make("label", spec.label);
-            row.label.style.fontWeight = String(TYPE.fwBold);
-            row.el.append(row.label);
+            row.line = make("div");
+            row.label = make("label");
+            row.labelText = make("span", spec.label);
+            row.labelText.style.cssText = S.labelTextCss;
+            row.tags = make("span");
+            row.tags.style.cssText = `display:inline-flex;align-items:center;gap:${SPACE.s1}px;flex:0 0 auto;`;
+            row.label.append(row.labelText, row.tags);
+            row.control = make("div");
             if (spec.kind === "COMBO" && wantsComboPicker(spec)) {
                 row.picker = mountComboPicker({
-                    inputCss,
+                    inputCss: S.inputCss,
                     onLeave: () => {
                         row.editing = false;
                         render();
@@ -464,7 +632,6 @@ export function mountControlsPanel(container, host) {
                     spec.kind === "BOOLEAN" ? "checkbox" : ["INT", "FLOAT"].includes(spec.kind) ? "number" : "text";
             }
             if (spec.kind === "SEED") row.input.inputMode = "numeric";
-            row.input.style.cssText = spec.kind === "BOOLEAN" ? "align-self:flex-start;" : inputCss;
             row.input.dataset.sonderTextUndo = "true";
             row.input.setAttribute("aria-label", spec.label || "Control value");
             row.input.id = `controls-${panelId}-${rows.size}`;
@@ -476,7 +643,7 @@ export function mountControlsPanel(container, host) {
             if (spec.max != null) row.input.max = String(spec.max);
             if (spec.kind === "INT") row.input.step = "1";
             if (spec.kind === "FLOAT") row.input.step = String(spec.step || "any");
-            row.el.append(row.picker?.box || row.input);
+            row.control.append(row.picker?.box || row.input);
             row.input.addEventListener("focus", () => {
                 if (!row.editing) row.editStart = readInput(row);
                 row.editing = true;
@@ -496,7 +663,7 @@ export function mountControlsPanel(container, host) {
             if (spec.kind === "SEED") {
                 row.mode = make("select");
                 row.mode.setAttribute("aria-label", (spec.label || "Seed") + " mode");
-                row.mode.style.cssText = inputCss;
+                row.mode.style.cssText = S.modeSelectCss;
                 for (const mode of SEED_MODES) row.mode.append(new Option(mode[0].toUpperCase() + mode.slice(1), mode));
                 row.mode.addEventListener("focus", () => {
                     row.editing = true;
@@ -510,17 +677,12 @@ export function mountControlsPanel(container, host) {
                     row.modeEditStart = row.mode.value;
                     void commit(row, `binding:${spec.binding_id}:seed_mode`, row.mode.value, row.spec.seed_mode);
                 });
-                row.el.append(row.mode);
+                row.control.append(row.mode);
             }
-            if (spec.source === "binding") {
-                row.note = noteBox(
-                    row,
-                    `binding:${spec.binding_id}:note`,
-                    spec.note,
-                    identified(spec) && !spec.note_truncated,
-                );
-                row.el.append(row.note);
-            }
+            row.line.append(row.label, row.control);
+            row.el.append(row.line);
+            row.note = noteBox(row, `binding:${spec.binding_id}:note`, false);
+            row.el.append(row.note);
         }
         row.status = make("div");
         row.status.style.cssText = `font-size:${TYPE.t11}px;color:${COLORS.textDim};line-height:1.4;`;
@@ -529,6 +691,51 @@ export function mountControlsPanel(container, host) {
         row.actions.style.cssText = `display:none;gap:${SPACE.s1}px;flex-wrap:wrap;align-items:center;`;
         row.el.append(row.status, row.actions);
         return row;
+    }
+    // Rows or Cards, applied on every render so a settings change restyles in place.
+    function styleRow(row, spec) {
+        const isCards = cards();
+        const value = row.optimistic ?? spec.value;
+        const stacked = spec.kind === "STRING" && !!spec.multiline;
+        const wide = spec.source === "note" || stacked || !!row.noteText
+            || (spec.kind === "COMBO" && String(value ?? "").length > LONG_VALUE);
+        row.el.style.cssText = S.rowCss({ cards: isCards, wide });
+        if (manageOn && row.grip) row.el.style.paddingRight = `${SPACE.s5}px`;
+        if (!row.line) return;
+        const inline = spec.kind === "BOOLEAN";
+        row.line.style.cssText = S.lineCss({ cards: isCards, stacked, inline });
+        row.label.style.cssText = S.labelCss(isCards);
+        row.control.style.cssText = S.controlCss({ cards: isCards, alignEnd: true });
+        if (spec.kind === "BOOLEAN") row.input.style.cssText = "margin:0;cursor:pointer;";
+        else if (["INT", "FLOAT"].includes(spec.kind)) row.input.style.cssText = S.numberInputCss(isCards);
+        else if (spec.kind === "SEED") row.input.style.cssText = S.seedInputCss;
+        else row.input.style.cssText = S.inputCss + (row.input.tagName === "SELECT" ? "cursor:pointer;" : "")
+            + (stacked ? "min-height:60px;resize:vertical;" : "");
+    }
+    function styleMirror(row) {
+        const isCards = cards();
+        row.el.style.cssText = S.rowCss({ cards: isCards, wide: false });
+        row.line.style.cssText = S.lineCss({ cards: isCards, stacked: false, inline: row.spec.kind === "BOOLEAN" });
+        row.label.style.cssText = S.labelCss(isCards);
+        row.control.style.cssText = S.controlCss({ cards: isCards, alignEnd: true });
+        row.input.style.cssText = row.spec.kind === "BOOLEAN" ? "margin:0;cursor:pointer;" : S.numberInputCss(isCards);
+    }
+    function paintTags(row, spec) {
+        const tags = [];
+        const advanced = effectiveAdvanced(row);
+        if (advanced && (showAdvanced() || query || manageOn)) {
+            const tag = make("span", "Adv");
+            tag.title = "Advanced: shown only when Show advanced is on; its value still applies";
+            tag.style.cssText = S.tagCss;
+            tags.push(tag);
+        }
+        if (advanced && spec.overridden) {
+            const dot = make("span");
+            dot.title = "Differs from the workflow's own value";
+            dot.style.cssText = S.changedDotCss;
+            tags.push(dot);
+        }
+        row.tags.replaceChildren(...tags);
     }
     function update(row, spec, fresh) {
         row.spec = spec;
@@ -540,17 +747,21 @@ export function mountControlsPanel(container, host) {
             if (allowed) row.el.dataset.panelBase = base;
             else delete row.el.dataset.panelBase;
         }
-        if (row.label) {
-            const label = row.labelOptimistic ?? spec.label ?? "";
-            row.label.textContent = label;
-            row.input.setAttribute("aria-label", label || "Control value");
-        }
-        if (row.mode) row.mode.setAttribute("aria-label", (spec.label || "Seed") + " mode");
         // The status line is not an input, so it stays current while the row is edited.
         const noteTarget = spec.source === "note" ? row.target : `binding:${spec.binding_id}:note`;
         const modeTarget = `binding:${spec.binding_id}:seed_mode`;
         const labelTarget = `binding:${spec.binding_id}:label`;
-        const failure = [row.target, modeTarget, noteTarget, labelTarget]
+        const advancedTarget = `binding:${spec.binding_id}:advanced`;
+        if (fresh && !row.mutations.get(advancedTarget)?.pending) row.advancedOptimistic = undefined;
+        if (row.label) {
+            const label = row.labelOptimistic || spec.label || "";
+            row.labelText.textContent = label;
+            row.label.title = label;
+            row.input.setAttribute("aria-label", label || "Control value");
+            paintTags(row, spec);
+        }
+        if (row.mode) row.mode.setAttribute("aria-label", (spec.label || "Seed") + " mode");
+        const failure = [row.target, modeTarget, noteTarget, labelTarget, advancedTarget]
             .map(target => failed.get(target))
             .find(Boolean);
         row.status.textContent = failure
@@ -561,8 +772,11 @@ export function mountControlsPanel(container, host) {
                 spec.error ||
                 (spec.checked_at_run ? "Checked by the node when the run starts." : "");
         row.status.style.color = failure ? COLORS.warningText : COLORS.textDim;
-        rowActions(row);
-        if (row.editing) return;
+        row.status.style.display = row.status.textContent ? "" : "none";
+        if (row.editing) {
+            rowActions(row);
+            return;
+        }
         if (fresh) {
             if (!row.mutations.get(row.target)?.pending) row.optimistic = undefined;
             if (!row.mutations.get(modeTarget)?.pending) row.modeOptimistic = undefined;
@@ -590,38 +804,41 @@ export function mountControlsPanel(container, host) {
             row.note.style.cursor = manageOn ? "text" : "default";
             row.note.title = manageOn ? "Double-click to edit" : "";
             if (!row.noteText) {
-                // The Add note prompt belongs to Manage (SR-004).
-                row.note.textContent = manageOn ? (spec.source === "note" ? "Double-click to write this note." : "Double-click to add a note.") : "";
+                // A standalone note is never empty in practice; a binding's empty
+                // note takes no space (Manage adds one through its Note action).
+                row.note.textContent = manageOn && spec.source === "note" ? "Double-click to write this note." : "";
                 row.note.style.fontStyle = "italic";
-                row.note.style.display = manageOn || spec.source === "note" ? "" : "none";
+                row.note.style.display = manageOn && spec.source === "note" ? "" : "none";
             } else {
                 row.note.style.fontStyle = "normal";
                 row.note.style.display = "";
             }
         }
+        rowActions(row);
+        styleRow(row, spec);
     }
     function render(view = host.getView()) {
         if (destroyed) return;
         const fresh = view !== lastView;
         lastView = view;
-        for (const { key, input } of settingsRows) input.checked = !!settingValues()[key];
-        const empty = ![...(view.bindings || []), ...(view.notes || [])].some(d => manageOn || !d.hidden);
-        message.textContent =
-            view.error ||
-            view.relay?.error ||
-            (!empty ? "" : view.state === "ready" ? host.emptyMessage || CANVAS_EMPTY : "Loading controls…");
+        const current = settings();
+        const scale = Number(current.layout?.scaleControls) || 1;
+        container.style.zoom = scale !== 1 ? String(scale) : "";
+        const filter = { query, showAdvanced: showAdvanced(), manage: manageOn };
+        const allSpecs = [...(view.bindings || []).map(d => ({ ...d, source: "binding" })), ...(view.notes || []).map(d => ({ ...d, source: "note" }))];
+        const empty = !allSpecs.some(d => manageOn || !d.hidden);
         manage?.render(view);
         const entries = [];
         for (const spec of [...(view.bindings || []), ...(view.notes || [])]) {
             const source = spec.source || ("note_id" in spec ? "note" : "binding");
             const id = source === "note" ? spec.note_id : spec.binding_id;
             if (!id) continue;
-            // Hidden in the Sonder App: not exposed, so only Manage lists it.
-            if (spec.hidden && !manageOn) continue;
             const target = source === "note" ? `note:${id}:text` : `binding:${id}:value`;
             entries.push({ target, spec: { ...spec, source }, group: spec.group || "" });
         }
         if (view.state === "ready") {
+            // Every row of the view, displayed or not: a save on a row a search
+            // or Advanced hides still reports its outcome.
             validTargets = new Set(
                 entries.flatMap(({ target, spec }) => {
                     const base = baseOf(spec);
@@ -630,7 +847,8 @@ export function mountControlsPanel(container, host) {
                         `${base}:order`,
                         `${base}:group`,
                         ...(spec.source === "binding"
-                            ? [`${base}:note`, `${base}:label`, ...(spec.kind === "SEED" ? [`${base}:seed_mode`] : [])]
+                            ? [`${base}:note`, `${base}:label`, `${base}:advanced`,
+                                ...(spec.kind === "SEED" ? [`${base}:seed_mode`] : [])]
                             : []),
                     ];
                 }),
@@ -645,11 +863,47 @@ export function mountControlsPanel(container, host) {
             }
         }
         entries.sort((a, b) => comparePanelRows({ ...a.spec, base: a.target }, { ...b.spec, base: b.target }));
+
+        // Header: search (normal view only), the hidden-Advanced line.
+        search.style.display = manageOn ? "none" : "";
+        const hidden = hiddenAdvanced(allSpecs, filter);
+        const anyAdvanced = hasAdvanced(allSpecs);
+        quietLine.textContent = "";
+        if (filter.showAdvanced) quietLine.textContent = "Hide advanced settings";
+        else if (hidden.count) {
+            quietLine.append(make("span", `${hidden.count} advanced hidden`));
+            if (hidden.changed) {
+                const changed = make("span", ` · ${hidden.changed} changed`);
+                changed.style.color = COLORS.warningBorder;
+                quietLine.append(changed);
+            }
+        }
+        setShown(quietLine, !manageOn && anyAdvanced && (filter.showAdvanced || hidden.count > 0));
+        quietLine.title = filter.showAdvanced
+            ? "Hide the settings this workflow marks Advanced (their values still apply)"
+            : "Show the settings this workflow marks Advanced";
+        quietLine.setAttribute("aria-pressed", String(filter.showAdvanced));
+
+        // The Editor group: your settings first, then the workflow's Editor settings.
+        const editorBody = editorGroup.content;
+        let editorVisible = 0;
+        for (const mirror of mirrors) {
+            paintMirror(mirror);
+            styleMirror(mirror);
+            const shown = manageOn || matchEntry(mirror.spec, query);
+            setShown(mirror.el, shown);
+            if (shown) editorVisible++;
+        }
+        fieldsBody.style.cssText = cards() ? "display:contents;" : "display:flex;flex-direction:column;";
+
+        workflowBody.style.cssText = S.bodyCss(cards());
         workflowBody.prepend(mainDrop);
         // The Main drop zone belongs to arranging, which is Manage only.
         mainDrop.style.display = manageOn ? "" : "none";
         const alive = new Set(),
-            groupOrder = [];
+            counts = new Map(),
+            used = new Set();
+        let shownTotal = 0;
         for (const { target, spec, group } of entries) {
             alive.add(target);
             let row = rows.get(target);
@@ -668,22 +922,19 @@ export function mountControlsPanel(container, host) {
                 rows.set(target, row);
             }
             update(row, spec, fresh);
-            let body = inEditor(spec) ? fieldsBody : workflowBody;
-            if (group && !inEditor(spec)) {
-                if (!groups.has(group)) {
-                    const detail = make("details"),
-                        summary = make("summary", group),
-                        content = make("div");
-                    summary.dataset.panelDropGroup = group;
-                    content.dataset.panelDropGroup = group;
-                    detail.open = disclosure.isOpen(group, group.toLowerCase() !== "advanced");
-                    content.style.cssText = `display:flex;flex-direction:column;gap:${SPACE.s2}px;padding-top:${SPACE.s1}px;`;
-                    detail.append(summary, content);
-                    detail.addEventListener("toggle", () => disclosure.remember(group, detail.open));
-                    groups.set(group, { detail, content });
-                }
+            const visible = entryVisible({ ...spec, advanced: effectiveAdvanced(row) }, filter);
+            setShown(row.el, visible || row.editing);
+            if (visible) shownTotal++;
+            let body = workflowBody;
+            if (inEditor(spec)) {
+                body = fieldsBody;
+                if (visible) editorVisible++;
+            } else if (group) {
+                if (!groups.has(group)) groups.set(group, makeGroup(group, group));
                 body = groups.get(group).content;
-                if (!groupOrder.includes(group)) groupOrder.push(group);
+                used.add(group);
+                if (visible && spec.source === "binding") counts.set(group, (counts.get(group) || 0) + 1);
+                if (visible) counts.set(`${group}\u0000any`, true);
             }
             if (!row.editing) body.append(row.el);
         }
@@ -693,12 +944,29 @@ export function mountControlsPanel(container, host) {
                 row.el.remove();
                 rows.delete(target);
             }
-        for (const group of groupOrder) workflowBody.append(groups.get(group).detail);
-        for (const [group, obj] of groups)
-            if (!groupOrder.includes(group) && ![...rows.values()].some(r => r.editing && obj.detail.contains(r.el))) {
-                obj.detail.remove();
-                groups.delete(group);
+        paintGroup(editorGroup, editorVisible);
+        setShown(editorGroup.el, manageOn || editorVisible > 0);
+        const order = groupPlan(view, entries.map(e => e.spec));
+        for (const name of order) {
+            const group = groups.get(name);
+            if (!group || !used.has(name)) continue;
+            paintGroup(group, counts.get(name) || 0);
+            paintGroupActions(group);
+            // Empty groups show only in Manage.
+            setShown(group.el, manageOn || !!counts.get(`${name}\u0000any`));
+            if (!group.el.contains(document.activeElement)) workflowBody.append(group.el);
+        }
+        for (const [name, group] of groups)
+            if (!used.has(name) && ![...rows.values()].some(r => r.editing && group.el.contains(r.el))) {
+                group.el.remove();
+                groups.delete(name);
             }
+        message.textContent =
+            view.error ||
+            view.relay?.error ||
+            (!empty
+                ? query && !shownTotal && !editorVisible ? `No settings match “${query.trim()}”. Search looks at names, groups and choices.` : ""
+                : view.state === "ready" ? host.emptyMessage || CANVAS_EMPTY : "Loading controls…");
     }
     function setManage(on) {
         if (destroyed || on === manageOn) return;
@@ -722,10 +990,40 @@ export function mountControlsPanel(container, host) {
         render();
     }
     manageButton.addEventListener("click", () => setManage(!manageOn));
+    search.addEventListener("input", () => {
+        query = search.value;
+        render();
+    });
     const unregister = register({
         id: `controls-values:${panelId}`,
         priority: PRIORITY.TEXT_EDITOR,
         keydown: e => {
+            if (document.activeElement === search) {
+                if (e.isComposing || e.keyCode === 229) return PRESERVE_DEFAULT;
+                if (e.key === "Escape") {
+                    if (search.value) {
+                        search.value = "";
+                        query = "";
+                        render();
+                    } else search.blur();
+                    return true;
+                }
+                return PRESERVE_DEFAULT;
+            }
+            const mirror = mirrors.find(m => m.input === document.activeElement && m.input.type !== "checkbox");
+            if (mirror) {
+                if (e.key === "Escape") {
+                    mirror.editing = false;
+                    paintMirror(mirror);
+                    mirror.input.blur();
+                    return true;
+                }
+                if (e.key === "Enter") {
+                    mirror.input.blur();
+                    return true;
+                }
+                return PRESERVE_DEFAULT;
+            }
             const renaming = [...rows.values()].find(row => row.renameInput && row.renameInput === document.activeElement);
             if (renaming) {
                 if (e.isComposing || e.keyCode === 229) return PRESERVE_DEFAULT;
@@ -775,6 +1073,8 @@ export function mountControlsPanel(container, host) {
                 const saving = commitValue(row);
                 if (changesRun(row.target)) blocking.add(saving);
             }
+            const mirror = mirrors.find(m => m.input === document.activeElement);
+            if (mirror) mirror.input.blur();
             await closing;
             await Promise.all([...pending]);
             return (await Promise.all(blocking)).every(Boolean);

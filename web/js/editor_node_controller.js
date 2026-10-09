@@ -1557,13 +1557,10 @@ export class EditorNodeController {
     getControlsHost() {
         if (this._destroyed) return null;
         if (!this._controlsHost) {
+            // Editor settings are written by EditorWidget's panel adapter
+            // (editor_settings.js controlsPanelSettingPatch), not by the host.
             this._controlsHost = createCanvasControlsHost({
                 app: this._controlsApp, api, getEditorNode: () => this.node,
-                setEditorSetting: (key, value) => {
-                    if (["render.takePlacementMuted", "render.linkedTakePlacement"].includes(key)) {
-                        updateEditorSettings({ render: { [key.split(".")[1]]: !!value } });
-                    }
-                },
             });
         }
         return this._controlsHost;
