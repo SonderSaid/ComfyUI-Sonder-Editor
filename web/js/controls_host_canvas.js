@@ -1,14 +1,16 @@
 // Canvas graph authority for the shared Controls panel. No app/DOM at import.
 import {
-    MAX_MANIFEST_BYTES, RELAY_CLASS, anchorSnapshot, dropAnchors, editManifest, exportManifest, listCandidates,
-    nodesOf, parseManifest, readAnchors, relayCensus, resolveBindings, resolveCandidate, restoreAnchors, setAnchor,
+    MAX_MANIFEST_BYTES, RELAY_CLASS, anchorSnapshot, applyGroupPlan, dropAnchors, editManifest, exportManifest,
+    isStructuralTarget, listCandidates, nodesOf, parseManifest, parseTarget, readAnchors, relayCensus, resolveBindings,
+    resolveCandidate, restoreAnchors, setAnchor,
 } from "./control_bindings.js";
 import { syncRelayRows } from "./control_relay_rows.js";
 
 const DESCRIBE_URL = "/sonder-editor/controls/describe";
 const DEBOUNCE_MS = 400;
-const TARGET_RE = /^(binding|note):([A-Za-z0-9_-]{1,64}):(value|seed_mode|label|note|text|order|group|advanced|expose|remove|rebind|create)$/;
-const STRUCTURAL = new Set(["expose", "remove", "rebind", "create"]);
+// Fields this writer lands; hide/unhide and the description are not canvas targets.
+const FIELDS = new Set(["value", "seed_mode", "label", "note", "text", "order", "group", "advanced",
+    "expose", "remove", "rebind", "create", "rename", "ungroup", "move"]);
 const sameTargets = (a, b) => JSON.stringify((a || []).map(t => [String(t.path), t.input]).sort())
     === JSON.stringify((b || []).map(t => [String(t.path), t.input]).sort());
 const refused = (changes, reason) => ({ok: false,
@@ -164,8 +166,8 @@ export function createCanvasControlsHost({app, api, getEditorNode,
     function batchCandidates(changes, root) {
         const found = new Map();
         for (const [target, value] of Object.entries(changes || {})) {
-            const op = target.split(":")[2];
-            if (!["expose", "rebind"].includes(op) || !value?.candidate) continue;
+            const parsed = parseTarget(target);
+            if (parsed?.source === "group" || !["expose", "rebind"].includes(parsed?.field) || !value?.candidate) continue;
             const live = resolveCandidate(root, value.candidate);
             if (live) found.set(`${live.node.id}/${live.name}`, {path: String(live.node.id), input: live.name,
                 targets: live.targets, node_title: live.node_title});
@@ -177,11 +179,10 @@ export function createCanvasControlsHost({app, api, getEditorNode,
     // every presentation target in the batch (one widget, one history step).
     function operations(raw, changes, root) {
         const {active, census} = relayCensus(root);
-        const structural = Object.entries(changes).filter(([target, value]) =>
-            STRUCTURAL.has(target.split(":")[2]) && !value?.noop);
-        // A first expose may add the Relay; everything else needs the one Relay.
+        const structural = Object.entries(changes).filter(([target, value]) => isStructuralTarget(target) && !value?.noop);
+        // A first expose, note or group may add the Relay; everything else needs the one Relay.
         const addsRelay = !active.length && !census.muted && !census.bypassed && !census.nested
-            && structural.length > 0 && structural.every(([target]) => /:(expose|create)$/.test(target));
+            && structural.length > 0 && structural.every(([target]) => ["expose", "create"].includes(parseTarget(target).field));
         if (!structural.length && Object.values(changes).every(value => value?.noop)) return {writes: [], anchors: []};
         if (active.length !== 1 && !addsRelay) throw new Error("Keep exactly one active Sonder Control Relay in the workflow.");
         const relay = active[0] || null;
@@ -189,22 +190,33 @@ export function createCanvasControlsHost({app, api, getEditorNode,
         if (relay && !manifestWidget) throw new Error("The Sonder Control Relay has no manifest.");
         const saved = typeof manifestWidget?.value === "string" ? manifestWidget.value : "";
         const {bindings, suggestions} = resolveBindings(root, parseManifest(saved));
-        const byWidget = new Map(), presentation = [], anchors = [], manifestOps = [];
+        const byWidget = new Map(), anchors = [], manifestOps = [];
         const add = (node, widget, value, target) => {
             const existing = byWidget.get(widget);
             if (existing && existing.value !== value) throw new Error("Two changes address the same widget differently.");
             byWidget.set(widget, {node, widget, value, target});
         };
         for (const [target, value] of Object.entries(changes)) {
-            const match = TARGET_RE.exec(target);
-            if (!match) throw new Error("This target is unavailable.");
-            const [, source, id, field] = match;
-            if (STRUCTURAL.has(field)) {
+            const parsed = parseTarget(target);
+            if (!parsed || parsed.source === "workflow" || !FIELDS.has(parsed.field)) throw new Error("This target is unavailable.");
+            const { source, id, field } = parsed;
+            if (source === "group") {
+                // One unexpanded plan, expanded against this saved manifest.
+                if (!value?.noop) manifestOps.push(m => applyGroupPlan(m, id, value, bindings));
+                continue;
+            }
+            if (isStructuralTarget(target)) {
                 if (!value?.noop) structuralOp(root, {source, id, field, value}, {bindings, suggestions, anchors, manifestOps});
                 continue;
             }
             if (source === "note" || !["value", "seed_mode"].includes(field)) {
-                presentation.push({source, id, field, value});
+                // Preserve batch order: a subsequent group rename must see
+                // this member move, just as the SDK sidecar writer does.
+                manifestOps.push(manifest => {
+                    const table = source === "binding" ? manifest.bindings : manifest.notes;
+                    if (!table[id] || typeof table[id] !== "object") throw new Error("This Control is no longer in the workflow.");
+                    table[id][field] = value;
+                });
                 continue;
             }
             const d = (raw.bindings || []).find(b => b.binding_id === id);
@@ -235,15 +247,12 @@ export function createCanvasControlsHost({app, api, getEditorNode,
             else if (d.kind !== "BOOLEAN") next = String(value);
             add(resolved.node, resolved.widget, next, target);
         }
-        if (presentation.length || manifestOps.length) {
+        if (manifestOps.length) {
             const text = editManifest(saved, manifest => {
                 for (const edit of manifestOps) edit(manifest);
-                for (const {source, id, field, value} of presentation) {
-                    const table = source === "binding" ? manifest.bindings : manifest.notes;
-                    if (!table[id] || typeof table[id] !== "object") throw new Error("This Control is no longer in the workflow.");
-                    table[id][field === "text" ? "text" : field] = value;
-                }
             });
+            // The writer never saves text its own parser refuses.
+            parseManifest(text);
             if (new TextEncoder().encode(exportManifest(text, root)).length > MAX_MANIFEST_BYTES) {
                 throw new Error("The Controls would exceed 128 KiB. Shorten a note first.");
             }

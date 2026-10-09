@@ -8,6 +8,9 @@
 // server/control_manifest.py and server/control_descriptors.py are the authority.
 import { getGraphLink, getGraphNode } from "./project_source_resolver.js";
 import { findControlWidget, seedModeWidget } from "./control_widgets.js";
+import { cleanGroup } from "./control_targets.js";
+
+export { cleanGroup, groupNameError, isStructuralTarget, parseTarget } from "./control_targets.js";
 
 export const RELAY_CLASS = "SonderControlRelay";
 export const ANCHOR_PROPERTY = "sonderBindings";
@@ -18,6 +21,7 @@ export const MAX_BINDINGS = 256;
 export const MAX_NOTES = 256;
 export const MAX_SUGGESTIONS = 256;
 export const MAX_TARGETS = 64;
+export const MAX_GROUPS = 256;
 export const MAX_DEPTH = 6;
 export const LABEL_MAX = 120;
 export const NOTE_MAX = 4000;
@@ -156,10 +160,12 @@ export function parseManifest(text) {
     if (!isPlainObject(raw)) throw new Error("The Controls manifest must be an object.");
     checkShape(raw);
     if ((raw.v ?? MANIFEST_VERSION) !== MANIFEST_VERSION) throw new Error("This Controls manifest comes from a newer Sonder version.");
-    for (const name of ["bindings", "notes", "groups"]) {
+    for (const name of ["bindings", "notes"]) {
         if (raw[name] == null) raw[name] = {};
         if (!isPlainObject(raw[name])) throw new Error("The Controls manifest is malformed.");
     }
+    // Cosmetic group damage must not hide valid Controls or break API export.
+    if (!isPlainObject(raw.groups)) raw.groups = {};
     if (Object.keys(raw.bindings).length > MAX_BINDINGS) throw new Error(`At most ${MAX_BINDINGS} Controls fit in one workflow.`);
     if (Object.keys(raw.notes).length > MAX_NOTES) throw new Error(`At most ${MAX_NOTES} notes fit in one workflow.`);
     for (const id of [...Object.keys(raw.bindings), ...Object.keys(raw.notes)]) {
@@ -302,26 +308,79 @@ export function defaultBindingLabel(resolved) {
 }
 
 const clampOrder = value => (Number.isInteger(value) ? Math.max(-9999, Math.min(9999, value)) : 0);
+const validOrder = value => value === undefined || (Number.isInteger(value) && Math.abs(value) <= 9999);
+
+// The explicit groups as the server parses them: valid names, stripped, the
+// first of colliding names kept, an entry with an invalid order dropped.
+// Map: name -> [raw key, entry].
+function explicitGroups(manifest) {
+    const found = new Map();
+    for (const [key, entry] of Object.entries(isPlainObject(manifest?.groups) ? manifest.groups : {})) {
+        const name = cleanGroup(key);
+        if (!name || found.has(name) || !isPlainObject(entry) || !validOrder(entry.order)) continue;
+        if (found.size >= MAX_GROUPS) break;
+        found.set(name, [key, entry]);
+    }
+    return found;
+}
 
 // The group order of a saved manifest: mirrors server control_descriptors.
 // group_order (a shared fixture pins them): groups in `groups` first, by order
-// then name; then groups only named by bindings or notes, by first appearance.
+// then name; then groups only named by Workflow bindings or notes, by first
+// appearance. An Editor-section binding's group shows nowhere, so it adds none.
 export function effectiveGroupOrder(manifest, resolved = {}) {
-    const explicit = isPlainObject(manifest?.groups) ? manifest.groups : {};
-    const ordered = Object.keys(explicit).filter(Boolean)
-        .sort((a, b) => clampOrder(explicit[a]?.order) - clampOrder(explicit[b]?.order) || compareCodePoints(a, b));
+    const explicit = explicitGroups(manifest);
+    const ordered = [...explicit.keys()]
+        .sort((a, b) => clampOrder(explicit.get(a)[1].order) - clampOrder(explicit.get(b)[1].order) || compareCodePoints(a, b));
     const rows = [
-        ...Object.entries(manifest?.bindings || {}).map(([id, entry]) => ({ id, ...entry,
-            label: entry.label || defaultBindingLabel(resolved[id]) })),
+        ...Object.entries(manifest?.bindings || {})
+            .filter(([id, entry]) => sectionOf(resolved[id], entry?.section) !== "editor")
+            .map(([id, entry]) => ({ id, ...entry, label: entry?.label || defaultBindingLabel(resolved[id]) })),
         ...Object.entries(manifest?.notes || {}).map(([id, entry]) => ({ id, ...entry, label: "" })),
     ].sort((a, b) => clampOrder(a.order) - clampOrder(b.order)
         || compareCodePoints(String(a.label || "").toLowerCase(), String(b.label || "").toLowerCase())
         || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     for (const row of rows) {
-        const name = typeof row.group === "string" ? row.group : "";
+        const name = cleanGroup(row.group);
         if (name && !ordered.includes(name)) ordered.push(name);
     }
     return ordered;
+}
+
+// Expand one validated group plan (server _StructuralBatch.group) on a saved
+// manifest copy, inside the canvas writer's single editManifest call. Members
+// are re-keyed in place; `groups` is rewritten in display order, so implied
+// groups keep their place and unknown keys of an entry survive.
+export function applyGroupPlan(manifest, name, plan, resolved = {}) {
+    const order = effectiveGroupOrder(manifest, resolved);
+    const members = [...Object.values(manifest.bindings || {}), ...Object.values(manifest.notes || {})].filter(isPlainObject);
+    const regroup = (from, to) => { for (const entry of members) if (cleanGroup(entry.group) === from) entry.group = to; };
+    const explicit = explicitGroups(manifest);
+    const place = names => {
+        // Null prototype: a "__proto__" name becomes an own key the writer's
+        // re-parse refuses, never a prototype swap that hides it.
+        const groups = Object.create(null);
+        names.forEach((group, index) => {
+            groups[group] = { ...(explicit.get(group)?.[1] || {}), order: index + 1 };
+        });
+        manifest.groups = groups;
+    };
+    if (plan?.create) place([...order.filter(group => group !== name), name]);
+    else if (plan?.rename) {
+        if (explicit.has(name)) explicit.set(plan.rename, explicit.get(name));
+        regroup(name, plan.rename);
+        place(order.map(group => (group === name ? plan.rename : group)));
+    } else if (plan?.ungroup) {
+        regroup(name, "");
+        place(order.filter(group => group !== name));
+    } else if (plan?.move) {
+        const rest = order.filter(group => group !== name);
+        if (!order.includes(name) || (plan.before != null && !rest.includes(plan.before))) {
+            throw new Error("The group order changed. Refresh the Controls panel.");
+        }
+        const index = plan.before == null ? rest.length : rest.indexOf(plan.before);
+        place([...rest.slice(0, index), name, ...rest.slice(index)]);
+    } else throw new Error("This group change is unavailable. Refresh the Controls panel.");
 }
 
 // ── Candidates (Manage) ──────────────────────────────────────────────────────

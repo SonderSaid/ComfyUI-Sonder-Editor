@@ -1,7 +1,10 @@
 import { mountComboPicker, wantsComboPicker } from "./controls_combo_picker.js";
 import { mountManageSection, smallButton } from "./controls_manage.js";
 import { mountPanelArrangement } from "./controls_panel_arrangement.js";
-import { comparePanelRows, canArrange } from "./controls_panel_layout.js";
+import { comparePanelRows, canArrange, planPanelMove } from "./controls_panel_layout.js";
+import { moveToGroupItems, openGroupMenu, startGroupRename } from "./controls_panel_groups.js";
+import { changesRun } from "./control_targets.js";
+import { openContextMenu } from "./editor_context_menu.js";
 import { disclosureKey, entryVisible, groupPlan, hasAdvanced, hiddenAdvanced, matchEntry } from "./controls_panel_view.js";
 import * as S from "./controls_panel_style.js";
 import { renderPanelMarkdown } from "./panel_markdown.js";
@@ -15,9 +18,6 @@ const editable = d => d.status === "ok";
 const identified = d => !!(d.binding_id || d.note_id);
 const baseOf = d => (d.binding_id ? "binding:" + d.binding_id : d.note_id ? "note:" + d.note_id : "");
 const inEditor = d => d.source === "binding" && d.section === "editor";
-// Values, modes and exposure change what a run submits; labels, notes,
-// Advanced and arrangement do not, so only run-affecting saves can refuse a Generate.
-const changesRun = target => /^binding:.+:(value|seed_mode|expose|remove|rebind|hide|unhide)$/.test(target);
 const CANVAS_EMPTY = "No Controls yet. Choose Manage to expose this workflow's settings here.";
 const LONG_VALUE = 18; // a choice longer than this gets a wide card
 // Your own editor settings, shown first in the Editor group in every mode. They
@@ -43,6 +43,25 @@ const setShown = (el, shown) => {
     else if (el.style.display === "none") el.style.display = "";
 };
 
+// Puts `wanted` in order inside `body` without moving the element that holds
+// focus: moving it blurs it, which ends a rename or discards a draft. Its
+// siblings move around it instead.
+function placeInOrder(body, wanted) {
+    const active = document.activeElement;
+    const anchor = wanted.find(el => el.parentElement === body && el.contains(active));
+    if (!anchor) {
+        for (const el of wanted) body.append(el);
+        return;
+    }
+    const at = wanted.indexOf(anchor);
+    for (const el of wanted.slice(0, at)) anchor.before(el);
+    let previous = anchor;
+    for (const el of wanted.slice(at + 1)) {
+        previous.after(el);
+        previous = el;
+    }
+}
+
 export function mountControlsPanel(container, host) {
     const panelId = ++nextPanel,
         rows = new Map(),
@@ -55,7 +74,8 @@ export function mountControlsPanel(container, host) {
         noteEditor = null,
         manageOn = false,
         manage = null,
-        query = "";
+        query = "",
+        groupOrder = []; // every workflow group, in display order (Manage shows empty ones)
     const capabilities = () => host.capabilities || { hide: false, removeAuthored: true };
     const settings = () => host.getEditorSettings?.() || {};
     const cards = () => !manageOn && settings().controls?.view === "cards";
@@ -125,17 +145,27 @@ export function mountControlsPanel(container, host) {
         const group = { name, key, el: make("section"), header: make("div"), toggle: make("button"), title: make("span"),
             count: make("span"), actions: make("span"), content: make("div"), open: disclosure.isOpen(key, true) };
         group.el.dataset.controlsGroup = name === null ? "editor" : name;
+        group.el.dataset.controlsSection = name === null ? "editor" : "workflow";
         group.el.style.cssText = S.groupCss;
         group.header.style.cssText = S.groupHeaderCss;
         group.toggle.type = "button";
         group.toggle.style.cssText = S.groupToggleCss;
         group.title.textContent = title;
         group.title.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;letter-spacing:0.02em;";
+        if (name !== null) {
+            // Manage drags a group by this grip (controls_panel_arrangement.js).
+            group.grip = make("span", "⋮⋮");
+            group.grip.dataset.panelGroupHandle = name;
+            group.grip.dataset.groupAction = "drag";
+            group.grip.title = "Drag to reorder groups";
+            group.grip.setAttribute("aria-hidden", "true");
+            group.grip.style.cssText = `cursor:grab;color:${COLORS.textMuted};user-select:none;font-size:${TYPE.t12}px;letter-spacing:-2px;`;
+        }
         group.count.style.cssText = S.countCss;
         group.actions.style.cssText = `display:flex;align-items:center;gap:${SPACE.s2}px;`;
         const left = make("span");
         left.style.cssText = `display:flex;align-items:center;gap:${SPACE.s1 + 2}px;min-width:0;`;
-        left.append(group.toggle, group.title);
+        left.append(...(group.grip ? [group.grip] : []), group.toggle, group.title);
         const right = make("span");
         right.style.cssText = `display:flex;align-items:center;gap:${SPACE.s2}px;flex:0 0 auto;`;
         right.append(group.actions, group.count);
@@ -146,7 +176,7 @@ export function mountControlsPanel(container, host) {
         }
         group.el.append(group.header, group.content);
         const flip = event => {
-            if (event.target.closest?.("[data-group-action]")) return;
+            if (event.target.closest?.("[data-group-action]") || group.renaming) return;
             event.preventDefault?.();
             if (query) return; // a search keeps every group open
             group.open = !group.open;
@@ -156,8 +186,13 @@ export function mountControlsPanel(container, host) {
         group.header.addEventListener("click", flip);
         return group;
     }
-    // Manage adds a note to a group from its header.
+    // Manage adds a note to a group from its header, and opens its menu:
+    // rename, move up or down, Mark all / Clear Advanced, Ungroup.
     function paintGroupActions(group) {
+        if (group.grip) {
+            group.grip.draggable = manageOn && !group.renaming;
+            setShown(group.grip, manageOn);
+        }
         const key = String(manageOn);
         if (group.actionsKey === key) return;
         group.actionsKey = key;
@@ -174,7 +209,78 @@ export function mountControlsPanel(container, host) {
             event.stopPropagation?.();
             manage?.addNote(group.name);
         });
-        group.actions.replaceChildren(note);
+        const menu = make("button", "⋯");
+        menu.type = "button";
+        menu.dataset.groupAction = "menu";
+        menu.title = `Rename, reorder or ungroup ${group.name}`;
+        menu.setAttribute("aria-label", `Group ${group.name} actions`);
+        menu.setAttribute("aria-haspopup", "menu");
+        menu.style.cssText = S.groupMenuCss;
+        menu.addEventListener("click", event => {
+            event.stopPropagation?.();
+            openGroupMenu(menu, {
+                name: group.name,
+                order: groupOrder,
+                members: groupMembers(group.name),
+                apply: changes => void structural(changes),
+                rename: () => renameGroup(group),
+                notify: warning,
+            });
+        });
+        group.actions.replaceChildren(note, menu);
+    }
+    // A group's rows as the panel shows them, with any unsaved Advanced flag.
+    function groupMembers(name) {
+        return [...rows.values()]
+            .filter(row => !inEditor(row.spec) && (row.spec.group || "") === name)
+            .map(row => ({ ...row.spec, advanced: effectiveAdvanced(row) }));
+    }
+    function renameGroup(group) {
+        if (!manageOn || group.renaming || destroyed) return;
+        const name = group.name;
+        group.renaming = startGroupRename(group.title, {
+            name,
+            css: S.inputCss + "min-width:0;",
+            notify: warning,
+            save: next => {
+                // The renamed group keeps its open or closed state.
+                disclosure.remember(disclosureKey(next), group.open);
+                void structural({ [`group:${name}:rename`]: next });
+            },
+            onClose: () => {
+                group.renaming = null;
+                render();
+            },
+        });
+        paintGroupActions(group);
+    }
+    // "Move to group" for one Workflow row: its group and order in one save.
+    function openMoveMenu(row, anchor) {
+        const base = baseOf(row.spec);
+        const current = row.spec.group || "";
+        const planMove = group => planPanelMove(layoutEntries(), base, group, null);
+        const rect = anchor.getBoundingClientRect?.() || { left: 0, bottom: 0 };
+        openContextMenu({
+            x: rect.left,
+            y: rect.bottom,
+            focusFirst: true,
+            closeOnScroll: true,
+            items: moveToGroupItems({
+                order: groupOrder,
+                current,
+                planMove,
+                notify: warning,
+                apply: changes => void structural(changes),
+                newGroup: () => manage?.addGroup(name => {
+                    try {
+                        return planPanelMove(layoutEntries(), base, name, null);
+                    } catch (error) {
+                        warning(error.message);
+                        return {};
+                    }
+                }),
+            }),
+        });
     }
     function paintGroup(group, visibleCount) {
         const open = !!query || group.open;
@@ -301,7 +407,9 @@ export function mountControlsPanel(container, host) {
     }
     const arrangement = mountPanelArrangement(container, {
         getEntries: layoutEntries,
-        isBusy: () => layoutSaving || pending.size > 0 || !!noteEditor || !!manage?.editing || [...rows.values()].some(r => r.editing),
+        getGroups: () => groupOrder,
+        isBusy: () => layoutSaving || pending.size > 0 || !!noteEditor || !!manage?.editing || [...rows.values()].some(r => r.editing)
+            || [...groups.values()].some(group => group.renaming),
         apply: saveLayout,
         notify: warning,
     });
@@ -444,7 +552,7 @@ export function mountControlsPanel(container, host) {
         // press and its click must not swap the button out from under it.
         const caps = capabilities();
         const advanced = spec.source === "binding" && effectiveAdvanced(row);
-        const key = JSON.stringify([manageOn, local, !!spec.hidden, spec.status, spec.source, caps, advanced, !!row.noteText]);
+        const key = JSON.stringify([manageOn, local, !!spec.hidden, spec.status, spec.source, spec.section, caps, advanced, !!row.noteText]);
         if (row.actionsKey === key) return;
         row.actionsKey = key;
         const items = [];
@@ -471,6 +579,7 @@ export function mountControlsPanel(container, host) {
                 render();
             });
             items.push(flag);
+            if (!inEditor(spec)) items.push(groupButton(row));
             if (spec.status !== "ok" && spec.status !== "shadowed" && (caps.removeAuthored || local)) {
                 const rebind = smallButton("Rebind");
                 rebind.title = "Bind this Control to another setting, keeping its id";
@@ -478,6 +587,7 @@ export function mountControlsPanel(container, host) {
                 items.push(rebind);
             }
         }
+        if (spec.source === "note") items.push(groupButton(row));
         const base = baseOf(spec);
         if (caps.removeAuthored || local) {
             const remove = smallButton("Remove");
@@ -491,6 +601,14 @@ export function mountControlsPanel(container, host) {
             items.push(toggle);
         }
         box.replaceChildren(...items);
+    }
+    function groupButton(row) {
+        const button = smallButton("Group ▸");
+        button.dataset.controlsMoveGroup = baseOf(row.spec);
+        button.title = "Move to another group";
+        button.setAttribute("aria-haspopup", "menu");
+        button.addEventListener("click", () => openMoveMenu(row, button));
+        return button;
     }
     function marker(text, title) {
         const tag = make("span", text);
@@ -897,12 +1015,12 @@ export function mountControlsPanel(container, host) {
         fieldsBody.style.cssText = cards() ? "display:contents;" : "display:flex;flex-direction:column;";
 
         workflowBody.style.cssText = S.bodyCss(cards());
-        workflowBody.prepend(mainDrop);
         // The Main drop zone belongs to arranging, which is Manage only.
         mainDrop.style.display = manageOn ? "" : "none";
         const alive = new Set(),
             counts = new Map(),
-            used = new Set();
+            used = new Set(),
+            placements = new Map(); // body -> its rows, in display order
         let shownTotal = 0;
         for (const { target, spec, group } of entries) {
             alive.add(target);
@@ -936,7 +1054,11 @@ export function mountControlsPanel(container, host) {
                 if (visible && spec.source === "binding") counts.set(group, (counts.get(group) || 0) + 1);
                 if (visible) counts.set(`${group}\u0000any`, true);
             }
-            if (!row.editing) body.append(row.el);
+            // A row being edited keeps its parent until the edit ends.
+            if (!row.editing || row.el.parentElement === body) {
+                if (!placements.has(body)) placements.set(body, []);
+                placements.get(body).push(row.el);
+            }
         }
         for (const [target, row] of rows)
             if (!alive.has(target) && !row.editing) {
@@ -946,18 +1068,22 @@ export function mountControlsPanel(container, host) {
             }
         paintGroup(editorGroup, editorVisible);
         setShown(editorGroup.el, manageOn || editorVisible > 0);
-        const order = groupPlan(view, entries.map(e => e.spec));
-        for (const name of order) {
+        groupOrder = groupPlan(view, entries.map(e => e.spec));
+        // Empty groups exist only to be filled, so they show only in Manage.
+        const displayed = new Set(groupOrder.filter(name => manageOn || used.has(name)));
+        for (const name of groupOrder) {
+            if (!displayed.has(name)) continue;
+            if (!groups.has(name)) groups.set(name, makeGroup(name, name));
             const group = groups.get(name);
-            if (!group || !used.has(name)) continue;
             paintGroup(group, counts.get(name) || 0);
             paintGroupActions(group);
-            // Empty groups show only in Manage.
             setShown(group.el, manageOn || !!counts.get(`${name}\u0000any`));
-            if (!group.el.contains(document.activeElement)) workflowBody.append(group.el);
         }
+        for (const [body, els] of placements) if (body !== workflowBody) placeInOrder(body, els);
+        placeInOrder(workflowBody, [mainDrop, ...(placements.get(workflowBody) || []),
+            ...groupOrder.filter(name => displayed.has(name)).map(name => groups.get(name).el)]);
         for (const [name, group] of groups)
-            if (!used.has(name) && ![...rows.values()].some(r => r.editing && group.el.contains(r.el))) {
+            if (!displayed.has(name) && !group.renaming && ![...rows.values()].some(r => r.editing && group.el.contains(r.el))) {
                 group.el.remove();
                 groups.delete(name);
             }
@@ -1081,6 +1207,7 @@ export function mountControlsPanel(container, host) {
         },
         destroy() {
             if (noteEditor) void closeNote(false);
+            for (const group of groups.values()) group.renaming?.close(false);
             if (manageOn) host.setManage?.(false, "");
             manage?.destroy();
             destroyed = true;

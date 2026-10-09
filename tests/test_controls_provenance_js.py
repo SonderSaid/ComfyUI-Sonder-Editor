@@ -15,7 +15,7 @@ GALLERY = ROOT / "web" / "js" / "shared_asset_gallery.js"
 
 FAKE_DOM = r"""
 class El {
-  constructor(tag) { this.tag = tag; this.children = []; this.style = {}; this.textContent = ''; this.title = ''; }
+  constructor(tag) { this.tag = tag; this.children = []; this.style = {}; this.dataset = {}; this.textContent = ''; this.title = ''; }
   get firstChild() { return this.children[0] || null; }
   append(...nodes) { this.children.push(...nodes); }
   appendChild(node) { this.children.push(node); return node; }
@@ -33,7 +33,7 @@ SECTION = {
     "controls": [
         {"binding_id": "s1", "field": "Seed", "kind": "SEED", "seed_mode": "increment",
          "targets": [{"path": "3", "input": "seed"}]},
-        {"binding_id": "st", "field": "Steps", "kind": "INT", "origin": "local", "group": "Sampling",
+        {"binding_id": "st", "field": "Steps", "kind": "INT", "origin": "local", "group": "Sampling", "advanced": True,
          "targets": [{"path": "3", "input": "steps"}]},
         {"binding_id": "pr", "field": "Prompt", "kind": "STRING", "targets": [{"path": "2", "input": "text"}]},
         {"binding_id": "fr", "field": "Frame rate", "kind": "FLOAT", "section": "editor",
@@ -133,7 +133,9 @@ console.log(JSON.stringify({{ consumed: tagged.consumedFields, generic: tagged.p
     seed_grid = result["tagGrids"][0]
     assert seed_grid["titles"][0] == "Control s1 · seed increment"
     assert seed_grid["heads"][0] == "Seed · increment"
-    assert result["tagGrids"][1]["titles"][0] == "Control st · App only"
+    # An Advanced Control carries the panel's Adv tag (Phase 4B).
+    assert result["tagGrids"][1]["titles"][0] == "Control st · App only · Advanced"
+    assert "Adv" in result["tagGrids"][1]["heads"][0] and "Adv" not in seed_grid["heads"][0]
     assert result["tagGrids"][0]["titles"][1] == "Pinned to top\nControl pr"
 
 

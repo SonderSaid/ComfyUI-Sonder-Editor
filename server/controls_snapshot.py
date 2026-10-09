@@ -9,8 +9,8 @@ so Video, PNG sequence, every Take copy and Save Bridge registrations carry it.
 Presentation comes from the Relay's exported manifest. A Sonder App run adds
 what its sidecar changes (contract amendment A1) as a small delta on the
 editor node's ``_meta.sonder_controls``, stamped by ``sdk_runner``: label,
-group, order and seed-mode overrides, app-only bindings, and hidden ids to
-drop. Values never come from either: each binding's value is its first target's literal in the prompt,
+group, order, seed-mode and Advanced overrides, app-only bindings, and hidden
+ids to drop. Values never come from either: each binding's value is its first target's literal in the prompt,
 which already carries every stored value and the seed this run used.
 
 Only bindings ``describe_bindings`` reports ``ok`` are recorded, and only those
@@ -66,7 +66,7 @@ def sdk_overlay_delta(view: dict, prompt: dict) -> dict | None:
     """
     manifest = control_manifest.find_relay(prompt).get("manifest") or control_manifest.empty_manifest()
     authored = manifest.get("bindings") or {}
-    labels, groups, orders, seed_modes, local, hidden = {}, {}, {}, {}, {}, []
+    labels, groups, orders, seed_modes, advanced, local, hidden = {}, {}, {}, {}, {}, {}, []
     for descriptor in view.get("bindings", []) if isinstance(view, dict) else []:
         binding_id = descriptor.get("binding_id")
         if not isinstance(binding_id, str):
@@ -88,6 +88,8 @@ def sdk_overlay_delta(view: dict, prompt: dict) -> dict | None:
                 "group": descriptor.get("group", ""),
                 "order": descriptor.get("order", 0),
             }
+            if descriptor.get("advanced") is True:
+                local[binding_id]["advanced"] = True
             continue
         entry = authored.get(binding_id)
         if not isinstance(entry, dict):
@@ -99,13 +101,15 @@ def sdk_overlay_delta(view: dict, prompt: dict) -> dict | None:
             groups[binding_id] = descriptor.get("group", "")
         if descriptor.get("order", 0) != entry.get("order", 0):
             orders[binding_id] = descriptor.get("order", 0)
+        if (descriptor.get("advanced") is True) != (entry.get("advanced") is True):
+            advanced[binding_id] = descriptor.get("advanced") is True
         if mode in control_manifest.SEED_MODES and mode != entry.get("seed_mode"):
             seed_modes[binding_id] = mode
-    if not (labels or groups or orders or seed_modes or local or hidden):
+    if not (labels or groups or orders or seed_modes or advanced or local or hidden):
         return None
     delta: dict[str, Any] = {"v": SDK_DELTA_VERSION}
     for name, value in (("labels", labels), ("groups", groups), ("orders", orders), ("seed_modes", seed_modes),
-                        ("local", local), ("hidden", hidden)):
+                        ("advanced", advanced), ("local", local), ("hidden", hidden)):
         if value:
             delta[name] = value
     return delta
@@ -148,6 +152,16 @@ def _clean_modes(raw: Any) -> dict:
     return modes
 
 
+def _clean_flags(raw: Any) -> dict:
+    flags = {}
+    for key, value in (raw.items() if isinstance(raw, dict) else []):
+        if _clean_id(key) and isinstance(value, bool):
+            flags[key] = value
+        if len(flags) >= control_manifest.MAX_BINDINGS:
+            break
+    return flags
+
+
 def _small_local(raw: Any) -> dict | None:
     """At most ``MAX_LOCAL_BINDINGS`` app-only bindings of at most ``MAX_TARGETS``
     targets each; ``describe_bindings`` checks the rest."""
@@ -180,10 +194,11 @@ def read_sdk_delta(prompt: dict) -> dict:
             "groups": _clean_texts(raw.get("groups"), control_manifest.LABEL_MAX),
             "orders": _clean_orders(raw.get("orders")),
             "seed_modes": _clean_modes(raw.get("seed_modes")),
+            "advanced": _clean_flags(raw.get("advanced")),
             "local": _small_local(raw.get("local")),
             "hidden": {item for item in hidden[:control_manifest.MAX_BINDINGS] if _clean_id(item)},
         }
-    return {"labels": {}, "groups": {}, "orders": {}, "seed_modes": {}, "local": None, "hidden": set()}
+    return {"labels": {}, "groups": {}, "orders": {}, "seed_modes": {}, "advanced": {}, "local": None, "hidden": set()}
 
 
 # ── Snapshot ─────────────────────────────────────────────────────────────────
@@ -207,9 +222,9 @@ def _recorded_value(descriptor: dict, prompt: dict) -> Any:
     return None  # describe never reports a container as ``ok``
 
 
-def _sort_key(entry: dict, group_order: dict) -> tuple:
+def _sort_key(entry: dict, positions: dict) -> tuple:
     group = entry["group"]
-    return (entry["section"] != "workflow", group != "", group_order.get(group, 0), group.lower(),
+    return (entry["section"] != "workflow", group != "", positions.get(group, len(positions)),
             entry["order"], entry["label"].lower(), entry["binding_id"])
 
 
@@ -262,6 +277,8 @@ def _record(entry: dict, field: str) -> dict:
         record["section"] = entry["section"]
     if entry["origin"] != "authored":
         record["origin"] = entry["origin"]
+    if entry["advanced"]:
+        record["advanced"] = True
     for name in ("seed_mode", "targets_truncated"):
         if name in entry:
             record[name] = entry[name]
@@ -331,10 +348,12 @@ def controls_snapshot(
         label = descriptor.get("label") or control_descriptors.DEFAULT_LABEL
         group = descriptor.get("group", "")
         order = descriptor.get("order", 0)
+        advanced = descriptor.get("advanced") is True
         if origin != "local":
             label = delta["labels"].get(binding_id) or label
-            group = delta["groups"].get(binding_id, group)
+            group = control_manifest.clean_group(delta["groups"].get(binding_id, group))
             order = delta["orders"].get(binding_id, order)
+            advanced = delta["advanced"].get(binding_id, advanced)
         entry = {
             "binding_id": binding_id,
             "origin": origin,
@@ -342,6 +361,7 @@ def controls_snapshot(
             "group": group,
             "section": descriptor.get("section", "workflow"),
             "order": order,
+            "advanced": advanced,
             "kind": descriptor.get("kind"),
             "value": _recorded_value(descriptor, prompt),
             "targets": targets[:MAX_TARGETS],
@@ -354,9 +374,11 @@ def controls_snapshot(
         entries.append(entry)
     if not entries:
         return None
-    group_order = {name: value.get("order", 0) for name, value in (view.get("groups") or {}).items()
-                   if isinstance(value, dict)}
-    entries.sort(key=lambda entry: _sort_key(entry, group_order))
+    # The panel's group order (one authority), over the groups this run used.
+    # The order itself is not recorded: it is presentation, not the run.
+    order = control_descriptors.group_order({"groups": view.get("groups"), "bindings": entries, "notes": []})
+    positions = {name: index for index, name in enumerate(order)}
+    entries.sort(key=lambda entry: _sort_key(entry, positions))
     truncated = max(0, len(entries) - MAX_BINDINGS)
     kept = entries[:MAX_BINDINGS]
     section = _assemble(kept, tracked, truncated)

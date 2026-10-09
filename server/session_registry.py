@@ -939,8 +939,7 @@ async def _post_control_changes_once(project_id: str, host_id: str, session_id: 
     if not rejected:
         # Structural results are internal write plans, not request grammar.
         # Forward intent for fresh canvas validation, including no-op retries.
-        cleaned = {target: copy.deepcopy(changes[target])
-                   if target.rsplit(":", 1)[-1] in {"expose", "remove", "rebind", "create", "hide", "unhide"}
+        cleaned = {target: copy.deepcopy(changes[target]) if control_descriptors.is_structural(target)
                    else value for target, value in cleaned.items()}
     events = []
     async with _lock:

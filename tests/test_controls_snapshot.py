@@ -371,3 +371,44 @@ def test_graph_for_run_stamps_the_delta_only_when_present():
     graph = SdkRunner._graph_for_run(build, {})
     assert graph["1"]["_meta"]["sonder_controls"] == {"v": 1, "hidden": ["text"]}
     assert "_meta" not in prompt["1"]
+
+
+# ── Phase 4B: Advanced and group order ───────────────────────────────────────
+
+def test_advanced_is_recorded_only_when_set():
+    prompt = _prompt({"steps": _binding("3", "steps", label="Steps", advanced=True),
+                      "cfg": _binding("3", "cfg", label="CFG")})
+    raw = {control["binding_id"]: control for control in snap(prompt)["controls"]}
+    assert raw["steps"]["advanced"] is True
+    assert "advanced" not in raw["cfg"]  # the default is not repeated
+
+
+def test_sdk_advanced_overrides_and_app_only_flags_reach_provenance():
+    prompt = _prompt({"steps": _binding("3", "steps", label="Steps", advanced=True),
+                      "cfg": _binding("3", "cfg", label="CFG")})
+    view = _sdk_view(prompt, layout={"binding:steps": {"advanced": False}, "binding:cfg": {"advanced": True}},
+                     local={"loc1": {"targets": [{"path": "3", "input": "sampler_name", "class_type": "KSampler"}],
+                                     "label": "Sampler", "advanced": True}})
+    delta = cs.sdk_overlay_delta(view, prompt)
+    assert delta["advanced"] == {"steps": False, "cfg": True}
+    assert delta["local"]["loc1"]["advanced"] is True
+    stamped = copy.deepcopy(prompt)
+    stamped["1"]["_meta"] = {"sonder_controls": delta}
+    raw = {control["binding_id"]: control for control in snap(stamped)["controls"]}
+    assert "advanced" not in raw["steps"] and raw["cfg"]["advanced"] is True and raw["loc1"]["advanced"] is True
+    # Hostile flags are ignored, never fatal.
+    stamped["1"]["_meta"]["sonder_controls"]["advanced"] = {"steps": "yes", "bad id": True, "cfg": 1}
+    raw = {control["binding_id"]: control for control in snap(stamped)["controls"]}
+    assert raw["steps"]["advanced"] is True and "advanced" not in raw["cfg"]
+
+
+def test_groups_follow_the_panel_order_but_the_order_is_not_recorded():
+    bindings = {"a": _binding("3", "steps", label="A", group="Late", order=0),
+                "b": _binding("3", "cfg", label="B", group="Early", order=5),
+                "c": _binding("3", "seed", label="C", group="", order=9)}
+    section = snap(_prompt(bindings, groups={"Early": {"order": 1}, "Late": {"order": 2}}))
+    assert [c["binding_id"] for c in section["controls"]] == ["c", "b", "a"]
+    assert "groups" not in section and "group_order" not in section
+    # Without explicit orders, groups keep the order they first appear in.
+    section = snap(_prompt(bindings))
+    assert [c["binding_id"] for c in section["controls"]] == ["c", "a", "b"]

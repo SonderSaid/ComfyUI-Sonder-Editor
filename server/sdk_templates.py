@@ -623,18 +623,19 @@ def apply_stored_values(prompt: dict, described: dict, stored: dict, *, describe
     # One batch (uncapped: up to 256 stored values) so a stored choice list and
     # choice agree. Validation reports every refusal, so reject only those.
     cleaned, rejected = cd.validate_binding_changes(described, batch, prompt=prompt, max_changes=None) if batch else ({}, [])
+    binding_of = lambda target: cd.parse_target(target)[1]  # noqa: E731 - every key here is binding:<id>:value
     if rejected:
         refused = {row.get("target") for row in rejected}
-        resets.update(target.split(":")[1] for target in batch if target in refused)
+        resets.update(binding_of(target) for target in batch if target in refused)
         cleaned = {target: value for target, value in batch.items() if target not in refused}
         cleaned, _ = cd.validate_binding_changes(described, cleaned, prompt=prompt, max_changes=None) if cleaned else ({}, [])
     for target, value in cleaned.items():
-        for item in by_id[target.split(":")[1]].get("targets", []):
+        for item in by_id[binding_of(target)].get("targets", []):
             prompt[item["path"]]["inputs"][item["input"]] = value
     # A stored value that differs from the template's own literal: the panel
     # marks it where an Advanced row hides it ("N changed").
-    overridden = {target.split(":")[1] for target, value in cleaned.items()
-                  if str(value) != str(by_id[target.split(":")[1]].get("value"))}
+    overridden = {binding_of(target) for target, value in cleaned.items()
+                  if str(value) != str(by_id[binding_of(target)].get("value"))}
     view = copy.deepcopy(describe_stored(prompt, stored, describe) if cleaned else described)
     layouts = stored.get("layout") if isinstance(stored.get("layout"), dict) else {}
     notes = stored.get("notes") if isinstance(stored.get("notes"), dict) else {}
@@ -666,12 +667,13 @@ def apply_stored_values(prompt: dict, described: dict, stored: dict, *, describe
             layout = layouts.get(base)
             if isinstance(layout, dict):
                 # Preserve unknown/over-cap storage, consume only modeled values.
-                for field in ("order", "group"):
-                    if field in layout:
-                        try:
-                            descriptor[field] = cd.coerce_panel_layout(field, layout[field])
-                        except cd.ControlValueError:
-                            pass
+                if "order" in layout:
+                    try:
+                        descriptor["order"] = cd.coerce_panel_layout("order", layout["order"])
+                    except cd.ControlValueError:
+                        pass
+                if isinstance(layout.get("group"), str):
+                    descriptor["group"] = cd.control_manifest.clean_group(layout["group"])
                 if prefix == "binding" and isinstance(layout.get("advanced"), bool):
                     descriptor["advanced"] = layout["advanced"]
             text = notes.get(base)
@@ -682,8 +684,36 @@ def apply_stored_values(prompt: dict, described: dict, stored: dict, *, describe
                 descriptor["label"] = (label.strip()[:cd.PANEL_LABEL_MAX_CHARS]
                                        or cd._default_label(prompt, descriptor.get("targets") or []))
     if "relay" in view and not view.get("error"):
+        view["groups"] = _overlay_groups(view.get("groups"), layouts)
         view["group_order"] = cd.group_order(view)  # the overlays may regroup
     return view
+
+
+GROUP_LAYOUT_PREFIX = "group:"
+
+
+def _layout_groups(layouts: dict):
+    """``(name, entry)`` for each valid ``layout["group:<name>"]`` overlay."""
+    for key, entry in layouts.items():
+        if not (isinstance(key, str) and key.startswith(GROUP_LAYOUT_PREFIX) and isinstance(entry, dict)):
+            continue
+        name = key[len(GROUP_LAYOUT_PREFIX):]
+        if name == name.strip() and not control_descriptors.control_manifest.group_name_error(name):
+            yield name, entry
+
+
+def _overlay_groups(authored: Any, layouts: dict) -> dict:
+    """The groups map the app shows: the workflow's own, with the app's group
+    order applied, app-only groups added and groups it renamed away suppressed."""
+    groups = {name: dict(entry) for name, entry in (authored or {}).items() if isinstance(entry, dict)}
+    for name, entry in _layout_groups(layouts):
+        if entry.get("suppressed") is True:
+            groups.pop(name, None)
+            continue
+        order = entry.get("order")
+        if isinstance(order, int) and not isinstance(order, bool) and abs(order) <= control_descriptors.PANEL_ORDER_LIMIT:
+            groups[name] = {**groups.get(name, {}), "order": order}
+    return groups
 
 
 def _class_of(prompt: dict | None, path: str) -> str | None:
@@ -707,15 +737,34 @@ def store_binding_changes(template_id: str, changes: dict, view: dict, prompt: d
         return {"path": target["path"], "input": target["input"],
                 "class_type": target.get("class_type") or _class_of(prompt, target["path"])}
 
+    authored_groups = set(control_manifest_of(prompt).get("groups") or {})
+
     def mutate(data):
+        # Ephemeral batch projection: later group expansion sees earlier member
+        # moves/creation and group edits, while disk still receives one write.
+        current = copy.deepcopy(view)
         for target, value in changes.items():
-            source, identity, field = target.split(":", 2)
+            source, identity, field = control_descriptors.parse_target(target)
             base = f"{source}:{identity}"
             if isinstance(value, dict) and value.get("noop"):
                 continue
+            if source == "group":
+                _store_group(data, current, authored_groups, identity, value)
+                continue
             if field in ("expose", "rebind", "create", "remove", "hide", "unhide"):
                 _store_structural(data, source, identity, field, value, locator)
+                if field == "remove" or (source == "note" and field == "create"):
+                    rows_key, id_key = ("bindings", "binding_id") if source == "binding" else ("notes", "note_id")
+                    rows = current.setdefault(rows_key, [])
+                    rows[:] = [d for d in rows if d.get(id_key) != identity]
+                    if field == "create":
+                        rows.append({"note_id": identity, "origin": "local", **data["local_notes"][identity]})
                 continue
+            if field in ("group", "order"):
+                rows, key = ("bindings", "binding_id") if source == "binding" else ("notes", "note_id")
+                for descriptor in current.get(rows, []):
+                    if descriptor.get(key) == identity:
+                        descriptor[field] = value
             if origins.get((source, identity)) == "local":
                 table = data["local"] if source == "binding" else data["local_notes"]
                 entry = table.get(identity)
@@ -741,6 +790,72 @@ def store_binding_changes(template_id: str, changes: dict, view: dict, prompt: d
                 else:
                     entry[field] = value
     return update_control_values(template_id, mutate)
+
+
+def control_manifest_of(prompt: dict | None) -> dict:
+    """The template's own saved manifest (empty without a usable Relay)."""
+    return control_descriptors.control_manifest.find_relay(prompt or {})["manifest"]
+
+
+def _store_group(data: dict, view: dict, authored_groups: set, name: str, plan: dict) -> None:
+    """Expand one validated group plan against the app's current view, in the
+    same sidecar mutation (one ``seq``). Members move through their own overlay:
+    ``layout`` for the workflow's items, ``local``/``local_notes`` for app-only
+    ones. Group order is written for every group, so implied groups keep their
+    place; a workflow group renamed or ungrouped away is suppressed."""
+    layout = data["layout"]
+    order = control_descriptors.group_order(view)
+
+    def regroup(old: str, new: str) -> None:
+        for kind, rows, identity_key, local_table in (
+                ("binding", view.get("bindings", []), "binding_id", "local"),
+                ("note", view.get("notes", []), "note_id", "local_notes")):
+            for descriptor in rows:
+                if descriptor.get("group") != old:
+                    continue
+                descriptor["group"] = new
+                identity = descriptor.get(identity_key)
+                if descriptor.get("origin") == "local":
+                    entry = data[local_table].get(identity)
+                    if isinstance(entry, dict):
+                        entry["group"] = new
+                    continue
+                entry = layout.get(f"{kind}:{identity}")
+                if not isinstance(entry, dict):
+                    entry = layout[f"{kind}:{identity}"] = {}
+                entry["group"] = new
+
+    def place(names: list[str]) -> None:
+        view["groups"] = {group: {"order": i + 1} for i, group in enumerate(names)}
+        for index, group in enumerate(names):
+            entry = layout.get(GROUP_LAYOUT_PREFIX + group)
+            entry = dict(entry) if isinstance(entry, dict) else {}
+            entry.pop("suppressed", None)
+            entry["order"] = index + 1
+            layout[GROUP_LAYOUT_PREFIX + group] = entry
+
+    def retire(group: str) -> None:
+        view.get("groups", {}).pop(group, None)
+        if group in authored_groups:
+            layout[GROUP_LAYOUT_PREFIX + group] = {"suppressed": True}
+        else:
+            layout.pop(GROUP_LAYOUT_PREFIX + group, None)
+
+    if plan.get("create"):
+        place([g for g in order if g != name] + [name])
+    elif plan.get("rename"):
+        new = plan["rename"]
+        regroup(name, new)
+        place([new if g == name else g for g in order])
+        retire(name)
+    elif plan.get("ungroup"):
+        regroup(name, "")
+        retire(name)
+    elif plan.get("move"):
+        rest = [g for g in order if g != name]
+        before = plan.get("before")
+        index = rest.index(before) if before in rest else len(rest)
+        place(rest[:index] + [name] + rest[index:])
 
 
 def _store_structural(data: dict, source: str, identity: str, op: str, value: dict, locator) -> None:

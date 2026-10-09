@@ -49,6 +49,7 @@ export const hasAdvanced = specs => (specs || []).some(spec => isAdvanced(spec) 
 export function groupPlan(view, sortedSpecs) {
     const order = Array.isArray(view?.group_order) ? view.group_order.filter(name => typeof name === "string" && name) : [];
     for (const spec of sortedSpecs || []) {
+        if (spec.source === "binding" && spec.section === "editor") continue; // shown in Editor, not a group
         const group = typeof spec.group === "string" ? spec.group : "";
         if (group && !order.includes(group)) order.push(group);
     }

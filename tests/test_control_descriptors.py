@@ -813,3 +813,127 @@ def test_advanced_is_a_flag_validated_on_its_own():
     for bad in ("true", 1, None):
         _, rejected = cd.validate_binding_changes(view, {"binding:s:advanced": bad})
         assert rejected and "true or false" in rejected[0]["reason"]
+
+
+# ── Phase 4B: group grammar ──────────────────────────────────────────────────
+
+@pytest.mark.parametrize("target, parsed", [
+    ("binding:aB-_9:value", ("binding", "aB-_9", "value")),
+    ("note:n1:create", ("note", "n1", "create")),
+    ("group:Look and feel:rename", ("group", "Look and feel", "rename")),
+    ("group:Ünïcode 😀:move", ("group", "Ünïcode 😀", "move")),
+    ("workflow:description", ("workflow", "", "description")),
+    ("group::rename", None), ("group:a:b:rename", None), ("binding:bad id:value", None),
+    ("binding:a", None), ("workflow:other", None), (3, None), ("control:a:value", None),
+])
+def test_parse_target_is_the_one_grammar(target, parsed):
+    assert cd.parse_target(target) == parsed
+
+
+def test_structural_targets_include_every_group_op():
+    assert all(cd.is_structural(f"group:G:{op}") for op in ("create", "rename", "ungroup", "move"))
+    assert not cd.is_structural("group:G:order") and not cd.is_structural("binding:a:group")
+    assert cd.is_structural("note:n:create") and cd.is_structural("binding:a:hide")
+    assert not cd.is_structural("workflow:description")
+
+
+def _grouped_view():
+    return {"relay": {"status": "ok"}, "groups": {"Look": {"order": 1}},
+            "bindings": [{"binding_id": f"b{i}", "status": "ok", "kind": "INT", "label": f"B{i}", "order": i,
+                          "group": "Look" if i < 70 else "Speed", "section": "workflow", "targets": []} for i in range(72)]
+            + [{"binding_id": "e", "status": "ok", "kind": "INT", "label": "E", "order": 0, "group": "Hidden",
+                "section": "editor", "targets": []}],
+            "notes": [{"note_id": "n", "status": "ok", "text": "x", "order": 0, "group": "Guide"}]}
+
+
+def test_group_ops_validate_to_one_unexpanded_plan_each():
+    view = _grouped_view()
+    view["group_order"] = cd.group_order(view)
+    # An Editor-section binding's group shows nowhere, so it is not a group.
+    assert view["group_order"] == ["Look", "Guide", "Speed"]
+    for mode in ("canvas", "sdk"):
+        # Renaming a 70-member group is one target: no 64-change cap applies.
+        cleaned, rejected = cd.validate_binding_changes(view, {"group:Look:rename": " Style "}, structural=mode)
+        assert rejected == [] and cleaned == {"group:Look:rename": {"rename": "Style"}}
+        cleaned, rejected = cd.validate_binding_changes(view, {"group:Guide:ungroup": True}, structural=mode)
+        assert cleaned == {"group:Guide:ungroup": {"ungroup": True}}
+        cleaned, rejected = cd.validate_binding_changes(view, {"group:Speed:move": {"before": "Look"}}, structural=mode)
+        assert cleaned == {"group:Speed:move": {"move": True, "before": "Look"}}
+        cleaned, rejected = cd.validate_binding_changes(view, {"group:New:create": {}}, structural=mode)
+        assert cleaned == {"group:New:create": {"create": True}}
+
+
+@pytest.mark.parametrize("changes", [
+    {"group:Look:create": {}},                 # already there: a retry
+    {"group:Gone:rename": "Look"},             # landed rename retried
+    {"group:Gone:ungroup": True},              # landed ungroup retried
+    {"group:Look:move": {"before": "Guide"}},  # already in place
+    {"group:Speed:move": {"before": None}},    # already last
+    {"group:Look:rename": "Look"},
+])
+def test_landed_group_ops_retry_as_no_ops(changes):
+    view = _grouped_view()
+    cleaned, rejected = cd.validate_binding_changes(view, changes, structural="canvas")
+    assert rejected == [] and list(cleaned.values()) == [{"noop": True}]
+
+
+@pytest.mark.parametrize("changes, reason", [
+    ({"group:Look:rename": "Guide"}, "already exists"),
+    ({"group:Gone:rename": "Other"}, "no longer in the Controls"),
+    ({"group:Look:move": {"before": "Gone"}}, "order changed"),
+    ({"group:Gone:move": {"before": None}}, "no longer in the Controls"),
+    ({"group:Look:move": {"before": "Look"}}, "before itself"),
+    ({"group:Look:move": "Guide"}, "where to move"),
+    ({"group:Look:rename": "a:b"}, "colon"),
+    ({"group:Look:rename": "constructor"}, "reserved"),
+    ({"group:Look:rename": "x" * 121}, "at most 120"),
+    ({"group:Look:rename": "   "}, "needs a name"),
+    ({"group:Look:rename": 5}, "must be text"),
+    ({"group:Look:ungroup": False}, "Send true"),
+    ({"group:New:create": True}, "Send {}"),
+    ({"group: Look:ungroup": True}, "invalid"),
+    ({"group:Bell\x07:create": {}}, "control characters"),
+    ({"group:Look:rename": "Style", "group:Style:create": {}}, "same group"),
+    ({"group:Look:order": 3}, "unavailable"),
+    ({"binding:b0:group": "Tab\tName"}, "control characters"),
+    ({"binding:b0:group": "a:b"}, "colon"),
+    ({"note:x:create": {"text": "t", "group": "__proto__"}}, "reserved"),
+])
+def test_group_names_and_ops_are_refused_with_a_reason(changes, reason):
+    view = _grouped_view()
+    _, rejected = cd.validate_binding_changes(view, changes, structural="canvas")
+    assert rejected and reason in rejected[-1]["reason"], rejected
+
+
+def test_group_ops_need_a_structural_host_and_a_readable_relay():
+    view = _grouped_view()
+    _, rejected = cd.validate_binding_changes(view, {"group:New:create": {}})
+    assert "unavailable" in rejected[0]["reason"]
+    view["relay"] = {"status": "error", "error": "Two Relays."}
+    _, rejected = cd.validate_binding_changes(view, {"group:New:create": {}}, structural="sdk")
+    assert "Fix the Sonder Control Relay first: Two Relays." in rejected[0]["reason"]
+
+
+def test_the_mounted_precheck_checks_group_shape_only():
+    # The canvas validates existence against its fresh view; a stale mounted view must not refuse.
+    view = _grouped_view()
+    cleaned, rejected = cd.validate_binding_changes(
+        view, {"group:Gone:rename": "Guide", "group:Other:move": {"before": "Nowhere"}}, structural="relay")
+    assert rejected == [] and cleaned["group:Gone:rename"] == {"rename": "Guide"}
+    _, rejected = cd.validate_binding_changes(view, {"group:Gone:rename": "a:b"}, structural="relay")
+    assert "colon" in rejected[0]["reason"]
+
+
+def test_writes_refuse_a_group_past_max_groups():
+    names = [f"g{i}" for i in range(cd.control_manifest.MAX_GROUPS)]
+    view = {"relay": {"status": "ok"}, "groups": {name: {"order": 0} for name in names},
+            "bindings": [{"binding_id": "a", "status": "ok", "kind": "INT", "label": "A", "order": 0, "group": "",
+                          "targets": []}], "notes": []}
+    for changes in ({"group:extra:create": {}}, {"binding:a:group": "extra"},
+                    {"note:n:create": {"text": "t", "group": "extra"}}):
+        _, rejected = cd.validate_binding_changes(view, changes, structural="canvas")
+        assert rejected and "At most 256 groups" in rejected[0]["reason"], changes
+    # Moving into an existing group, or renaming, never adds one.
+    cleaned, rejected = cd.validate_binding_changes(
+        view, {"binding:a:group": "g3", "group:g4:rename": "fresh"}, structural="canvas")
+    assert rejected == []

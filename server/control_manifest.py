@@ -51,6 +51,39 @@ class ManifestError(ValueError):
     """A manifest the Relay cannot use. The message is shown to the user."""
 
 
+# Group names are keys in the manifest, the Sonder App sidecar (``group:<name>``)
+# and change targets (``group:<name>:<op>``), so one rule serves every writer:
+# stripped, 1-120 code points, not a prototype name, no ``:`` and no control
+# characters. web/js/control_bindings.js mirrors it.
+# Checked before stripping, with U+FEFF, so Python's strip() and JS trim()
+# (whose whitespace sets differ only in these) strip a valid name alike.
+_GROUP_FORBIDDEN_CHARS = re.compile(r"[:\x00-\x1f\x7f-\x9f﻿]")
+
+
+def group_name_error(name: Any) -> str | None:
+    """Why ``name`` cannot be a group name, or None. Writers refuse with it."""
+    if not isinstance(name, str):
+        return "A group name must be text."
+    if _GROUP_FORBIDDEN_CHARS.search(name):
+        return "A group name can't contain a colon or control characters."
+    name = name.strip()
+    if not name:
+        return "A group needs a name."
+    if len(name) > LABEL_MAX:
+        return f"A group name must be at most {LABEL_MAX} characters."
+    if name in FORBIDDEN_KEYS:
+        return "This group name is reserved. Choose another."
+    return None
+
+
+def clean_group(value: Any) -> str:
+    """A stored group read tolerantly: its stripped name, or ungrouped (``""``)
+    when it breaks the name rule. A cosmetic problem never blocks Generate."""
+    if not isinstance(value, str) or group_name_error(value) is not None:
+        return ""
+    return value.strip()
+
+
 def empty_manifest() -> dict:
     return {"v": MANIFEST_VERSION, "bindings": {}, "notes": {}, "groups": {}, "suggestions": []}
 
@@ -124,7 +157,7 @@ def _binding(raw: Any) -> dict:
     entry = {
         "label": _text(raw.get("label"), LABEL_MAX, "label").strip(),
         "section": section,
-        "group": _text(raw.get("group"), LABEL_MAX, "group").strip(),
+        "group": clean_group(raw.get("group")),
         "order": _order(raw.get("order")),
         "advanced": advanced,
         "note": _text(raw.get("note"), NOTE_MAX, "note"),
@@ -167,8 +200,8 @@ def parse_manifest(text: Any) -> dict:
         raise ManifestError(f"The Controls manifest may hold at most {MAX_BINDINGS} Controls.")
     if not isinstance(notes_raw, dict) or len(notes_raw) > MAX_NOTES:
         raise ManifestError(f"The Controls manifest may hold at most {MAX_NOTES} notes.")
-    if not isinstance(groups_raw, dict) or len(groups_raw) > MAX_GROUPS:
-        raise ManifestError("The Controls manifest has too many groups.")
+    if not isinstance(groups_raw, dict):
+        groups_raw = {}  # cosmetic: read as no explicit group order
     if not isinstance(suggestions_raw, list) or len(suggestions_raw) > MAX_SUGGESTIONS:
         raise ManifestError("The Controls manifest has too many unlisted anchors.")
 
@@ -180,14 +213,21 @@ def parse_manifest(text: Any) -> dict:
             raise ManifestError("A Controls note must be an object.")
         manifest["notes"][_check_id(note_id, "note")] = {
             "text": _text(entry.get("text"), NOTE_MAX, "note"),
-            "group": _text(entry.get("group"), LABEL_MAX, "group").strip(),
+            "group": clean_group(entry.get("group")),
             "order": _order(entry.get("order")),
         }
+    # Tolerant: an invalid entry is dropped, names that collide once stripped
+    # merge (the first entry's order wins) and at most MAX_GROUPS are read.
+    # Writers refuse what this drops (control_descriptors.validate_binding_changes).
     for name, entry in groups_raw.items():
-        _text(name, LABEL_MAX, "group")
-        if not isinstance(entry, dict):
-            raise ManifestError("A Controls group entry must be an object.")
-        manifest["groups"][name] = {"order": _order(entry.get("order"))}
+        clean = clean_group(name)
+        order = entry.get("order", 0) if isinstance(entry, dict) else None
+        if (not clean or clean in manifest["groups"] or isinstance(order, bool) or not isinstance(order, int)
+                or not -ORDER_LIMIT <= order <= ORDER_LIMIT):
+            continue
+        if len(manifest["groups"]) >= MAX_GROUPS:
+            break
+        manifest["groups"][clean] = {"order": order}
     for entry in suggestions_raw:
         if not isinstance(entry, dict):
             raise ManifestError("An unlisted anchor must be an object.")

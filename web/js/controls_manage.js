@@ -6,6 +6,7 @@
 // the host lists them from the live graph (canvas, mounted) or the template
 // (Sonder App), already filtered and never greyed out.
 import { register, PRIORITY, PRESERVE_DEFAULT } from "./keyboard_ownership.js";
+import { groupNameError } from "./control_targets.js";
 import { EDITOR_COLORS as COLORS, FONT, RADIUS, SPACE, TYPE, chromeInputCss, setButtonDisabled, setButtonVariant } from "./editor_theme.js";
 
 const ID_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
@@ -45,7 +46,7 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         filter = "",
         filterTimer = null,
         busy = false,
-        draft = null, // the new-note editor
+        draft = null, // the new-note or new-group editor
         lastView = null;
     const el = make("section");
     el.dataset.controlsManage = "true";
@@ -85,9 +86,12 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
     footer.style.cssText = `display:flex;gap:${SPACE.s2}px;align-items:center;flex-wrap:wrap;`;
     const addNote = smallButton("+ Note");
     addNote.title = "Add a Markdown note to the ungrouped Controls";
+    const addGroup = smallButton("+ Group");
+    addGroup.dataset.controlsAddGroup = "true";
+    addGroup.title = "Add an empty group; move Controls into it from their Group menu";
     const noteBox = make("div");
     noteBox.style.cssText = `display:none;flex-direction:column;gap:${SPACE.s1}px;`;
-    footer.append(addNote);
+    footer.append(addNote, addGroup);
     el.append(heading, filterInput, banner, list, footer, noteBox);
 
     function apply(changes, button) {
@@ -236,14 +240,35 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
     function closeDraft(save) {
         const edit = draft;
         if (!edit) return;
+        if (save && edit.kind === "group") {
+            const name = edit.area.value.trim();
+            const error = groupNameError(name);
+            if (error) {
+                notify(error);
+                return; // keep the field open to fix the name
+            }
+            const exists = (lastView || host.getView()).group_order?.includes?.(name);
+            if (exists && !edit.then) {
+                notify(`A group named “${name}” already exists. Choose another name.`);
+                return;
+            }
+            const changes = { ...(exists ? {} : { [`group:${name}:create`]: {} }), ...(edit.then?.(name) || {}) };
+            finishDraft(edit);
+            void apply(changes);
+            return;
+        }
+        finishDraft(edit);
+        if (save && edit.area.value.trim()) {
+            void apply({ [`note:${mintId()}:create`]: { text: edit.area.value, group: edit.group } });
+        }
+    }
+    function finishDraft(edit) {
         draft = null;
         edit.unregister();
         noteBox.style.display = "none";
         noteBox.replaceChildren();
         setButtonDisabled(addNote, false);
-        if (save && edit.area.value.trim()) {
-            void apply({ [`note:${mintId()}:create`]: { text: edit.area.value, group: edit.group } });
-        }
+        setButtonDisabled(addGroup, false);
     }
     function openDraft(group = "") {
         if (draft || destroyed) return;
@@ -259,7 +284,8 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         noteBox.replaceChildren(area, actions);
         noteBox.style.display = "flex";
         setButtonDisabled(addNote, true);
-        const edit = { area, group, composing: false, unregister: () => {} };
+        setButtonDisabled(addGroup, true);
+        const edit = { kind: "note", area, group, composing: false, unregister: () => {} };
         area.placeholder = group ? `Markdown note shown in ${group}` : "Markdown note shown with the Controls";
         area.addEventListener("compositionstart", () => (edit.composing = true));
         area.addEventListener("compositionend", () => (edit.composing = false));
@@ -281,6 +307,55 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         noteBox.scrollIntoView?.({ block: "nearest" });
     }
     addNote.addEventListener("click", () => openDraft(""));
+
+    // A new group's name, in the panel (never prompt()). `then(name)` adds
+    // changes to the same batch: "New group…" moves a Control into it.
+    function openGroupDraft(then = null) {
+        if (destroyed) return;
+        if (draft) {
+            // Never discard an open draft's text to make room.
+            notify("Save or cancel the open note or group first.");
+            draft.area.focus();
+            return;
+        }
+        const area = make("input");
+        area.type = "text";
+        area.maxLength = 240; // the rule counts code points; the server refuses past 120
+        area.placeholder = "Group name";
+        area.setAttribute("aria-label", "New group name");
+        area.dataset.controlsNewGroup = "true";
+        area.dataset.sonderTextUndo = "true";
+        area.style.cssText = chromeInputCss({ minWidth: "0" }) + "width:100%;box-sizing:border-box;";
+        const actions = make("div");
+        actions.style.cssText = `display:flex;gap:${SPACE.s2}px;justify-content:flex-end;`;
+        const save = smallButton(then ? "Create and move" : "Create group", "accentSoft"), cancel = smallButton("Cancel");
+        actions.append(cancel, save);
+        noteBox.replaceChildren(area, actions);
+        noteBox.style.display = "flex";
+        setButtonDisabled(addNote, true);
+        setButtonDisabled(addGroup, true);
+        const edit = { kind: "group", area, then, composing: false, unregister: () => {} };
+        area.addEventListener("compositionstart", () => (edit.composing = true));
+        area.addEventListener("compositionend", () => (edit.composing = false));
+        save.addEventListener("mousedown", event => event.preventDefault());
+        save.addEventListener("click", () => closeDraft(true));
+        cancel.addEventListener("click", () => closeDraft(false));
+        draft = edit;
+        edit.unregister = register({
+            id: `controls-manage-group:${id}`,
+            priority: PRIORITY.OVERLAY,
+            keydown: e => {
+                if (draft !== edit || document.activeElement !== area) return false;
+                if (edit.composing || e.isComposing || e.keyCode === 229) return PRESERVE_DEFAULT;
+                if (e.key === "Escape") { closeDraft(false); return true; }
+                if (e.key === "Enter") { closeDraft(true); return true; }
+                return PRESERVE_DEFAULT;
+            },
+        });
+        area.focus();
+        noteBox.scrollIntoView?.({ block: "nearest" });
+    }
+    addGroup.addEventListener("click", () => openGroupDraft());
 
     // The filter keeps its keys: Ctrl+Z edits the query, never the scene.
     const unregister = register({
@@ -306,6 +381,7 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         render,
         setRebind,
         addNote: group => openDraft(typeof group === "string" ? group : ""),
+        addGroup: then => openGroupDraft(typeof then === "function" ? then : null),
         get rebinding() { return rebind?.binding_id || null; },
         get editing() { return !!draft || document.activeElement === filterInput; },
         destroy() {

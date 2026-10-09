@@ -617,3 +617,132 @@ def test_empty_authored_label_resets_to_the_derived_default_in_sdk(world):
         assert binding_of(view, 'steps')['label'] == cd._default_label(prompt(), [{'path': '6', 'input': 'steps'}])
         assert sdk_templates.read_control_values(world.template_id)['labels']['binding:steps'] == ''
     asyncio.run(run())
+
+
+def grouped_prompt():
+    # An authored group with an explicit order and one implied by a note.
+    graph = prompt()
+    graph['8'] = _relay({'steps': _binding('6', 'steps', label='Steps', group='Sampling', order=1),
+                         'seed': _binding('6', 'seed', label='Seed', seed_mode='increment', group='Sampling', order=2),
+                         'advance': _binding('2', 'mark_queue_complete', label='Advance', section='editor')},
+                        notes={'intro': {'text': '# Intro', 'group': 'Guide', 'order': 0}},
+                        groups={'Sampling': {'order': 5}, 'Guide': {'order': 1}})
+    return graph
+
+
+def test_sdk_group_authoring_lands_in_one_mutation_and_survives_reread(world):
+    install(world, grouped_prompt())
+
+    async def change(session, changes):
+        return await world.runner.change_controls(session.session_id, session.secret, 'tab-1', changes)
+
+    async def run():
+        session = await world.open()
+        view = (await world.runner.controls_view(session))['view']
+        assert view['group_order'] == ['Guide', 'Sampling']
+
+        def add_local(data):
+            data['local_notes']['tip'] = {'text': 'App tip', 'group': 'Sampling', 'order': 9}
+        sdk_templates.update_control_values(world.template_id, add_local)
+        seq = sdk_templates.read_control_values(world.template_id)['seq']
+        # Rename re-keys authored members (layout overlays) and app-only ones
+        # (their own entry), suppresses the authored name and keeps the place.
+        await change(session, {'group:Sampling:rename': 'Look'})
+        stored = sdk_templates.read_control_values(world.template_id)
+        assert stored['seq'] == seq + 1
+        assert stored['layout']['binding:steps']['group'] == 'Look' and stored['layout']['binding:seed']['group'] == 'Look'
+        assert stored['local_notes']['tip']['group'] == 'Look'
+        assert stored['layout']['group:Sampling'] == {'suppressed': True}
+        view = (await world.runner.controls_view(session))['view']
+        assert view['group_order'] == ['Guide', 'Look'] and 'Sampling' not in view['groups']
+        assert binding_of(view, 'seed')['group'] == 'Look'
+        # A retried rename after a lost acknowledgement lands nothing new.
+        await change(session, {'group:Sampling:rename': 'Look'})
+        assert sdk_templates.read_control_values(world.template_id)['layout'] == stored['layout']
+        # Create (app-only, empty), move it first, then ungroup Guide.
+        await change(session, {'group:Empty:create': {}})
+        await change(session, {'group:Empty:move': {'before': 'Guide'}})
+        view = (await world.runner.controls_view(session))['view']
+        assert view['group_order'] == ['Empty', 'Guide', 'Look']
+        await change(session, {'group:Guide:ungroup': True})
+        view = (await world.runner.controls_view(session))['view']
+        assert view['group_order'] == ['Empty', 'Look']
+        assert next(n for n in view['notes'] if n['note_id'] == 'intro')['group'] == ''
+        # Recreating a name the app renamed away lifts its suppression.
+        await change(session, {'group:Sampling:create': {}})
+        view = (await world.runner.controls_view(session))['view']
+        assert view['group_order'] == ['Empty', 'Look', 'Sampling']
+        with pytest.raises(SdkError) as refused:
+            await change(session, {'group:Look:rename': 'Empty'})
+        assert 'already exists' in refused.value.details['rejected'][0]['reason']
+        # Group authoring is presentation: the submitted prompt is the export's.
+        await world.runner.generate(session, tab_session_id='tab-1', count=1)
+        assert world.client.submitted[-1]['8'] == grouped_prompt()['8']
+        # Replace resets the app's group overlays (counted) but keeps app-only membership.
+        before = sdk_templates.read_control_values(world.template_id)
+        group_entries = sum(key.startswith('group:') for key in before['layout'])
+        replaced = sdk_templates.replace_template(world.template_id, json.dumps(grouped_prompt()).encode(),
+                                                  validate=lambda p: {'ok': True})
+        assert replaced['layout_reset'] == len(before['layout']) + len(before['labels']) and group_entries >= 3
+        after = sdk_templates.read_control_values(world.template_id)
+        assert after['local_notes']['tip']['group'] == 'Look'
+        view = (await world.runner.controls_view(session))['view']
+        assert view['group_order'] == ['Guide', 'Sampling', 'Look']
+    asyncio.run(run())
+
+
+def test_sdk_group_overlays_follow_the_presentation_hash(world):
+    install(world, grouped_prompt())
+
+    async def run():
+        session = await world.open()
+        await world.runner.change_controls(session.session_id, session.secret, 'tab-1', {'group:Guide:move': {'before': None}})
+        assert (await world.runner.controls_view(session))['view']['group_order'] == ['Sampling', 'Guide']
+        # A workflow file changed behind the sidecar: its overlays no longer apply.
+        json_path = sdk_templates._template_paths(world.template_id)[0]
+        with open(json_path, 'ab') as handle:
+            handle.write(b' ')
+        assert (await world.runner.controls_view(session))['view']['group_order'] == ['Guide', 'Sampling']
+    asyncio.run(run())
+
+
+def test_invalid_stored_group_overlays_are_ignored_not_fatal(world):
+    install(world, grouped_prompt())
+
+    def junk(data):
+        data['layout'].update({'group:bad:name': {'order': 1}, 'group: Spaced': {'order': 1},
+                               'group:Guide': {'order': 'first'}, 'group:Late': [],
+                               'binding:steps': {'group': 'a:b'}})
+    sdk_templates.update_control_values(world.template_id, junk)
+
+    async def run():
+        session = await world.open()
+        view = (await world.runner.controls_view(session))['view']
+        assert view['group_order'] == ['Guide', 'Sampling']
+        assert binding_of(view, 'steps')['group'] == ''
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('changes, order, steps_group, note_group', [
+    ({'group:Guide:rename': 'Info', 'group:Sampling:rename': 'Look'}, ['Info', 'Look'], 'Look', 'Info'),
+    ({'group:Guide:ungroup': True, 'group:New:create': {}}, ['Sampling', 'New'], 'Sampling', ''),
+    ({'binding:steps:group': 'Guide', 'group:Guide:rename': 'Info'}, ['Info', 'Sampling'], 'Info', 'Info'),
+    ({'group:Guide:rename': 'Info', 'binding:steps:group': 'Info'}, ['Info', 'Sampling'], 'Info', 'Info'),
+    ({'note:local:create': {'text': 'New', 'group': 'Sampling'}, 'group:Sampling:rename': 'Look'}, ['Guide', 'Look'], 'Look', 'Guide'),
+    ({'group:New:create': {}, 'group:Sampling:move': {'before': 'New'}}, ['Guide', 'Sampling', 'New'], 'Sampling', 'Guide'),
+])
+def test_sdk_group_batch_uses_preceding_writes(world, changes, order, steps_group, note_group):
+    install(world, grouped_prompt())
+    async def run():
+        session = await world.open()
+        seq = sdk_templates.read_control_values(world.template_id)['seq']
+        await world.runner.change_controls(session.session_id, session.secret, 'tab-1', changes)
+        stored = sdk_templates.read_control_values(world.template_id)
+        assert stored['seq'] == seq + 1  # one durable write for the entire batch
+        view = (await world.runner.controls_view(session))['view']
+        assert view['group_order'] == order
+        assert binding_of(view, 'steps')['group'] == steps_group
+        assert next(n for n in view['notes'] if n['note_id'] == 'intro')['group'] == note_group
+        if 'note:local:create' in changes:
+            assert stored['local_notes']['local']['group'] == 'Look'
+    asyncio.run(run())

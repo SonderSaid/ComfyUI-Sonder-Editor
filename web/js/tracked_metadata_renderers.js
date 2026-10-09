@@ -387,6 +387,7 @@ function renderControlsBody(entry, ctx) {
             if (!control) return;
             const parts = [`Control ${control.binding_id || ""}`.trim()];
             if (control.origin === "local") parts.push("App only");
+            if (control.advanced === true) parts.push("Advanced");
             const mode = SEED_MODE_TEXT[control.seed_mode];
             if (mode) parts.push(`seed ${mode}`);
             cell.title = [cell.title, parts.join(" · ")].filter(Boolean).join("\n");
@@ -395,6 +396,14 @@ function renderControlsBody(entry, ctx) {
                 const note = style(document.createElement("span"), `color:#8fa4b6;margin-left:6px;`);
                 note.textContent = `· ${mode}`;
                 titleEl.appendChild(note);
+            }
+            if (titleEl && control.advanced === true) {
+                // The panel's "Adv" tag: the Control was marked Advanced for this run.
+                const tag = style(document.createElement("span"),
+                    `margin-left:6px;padding:0 4px;border:1px solid ${CHROME.border};border-radius:3px;color:${CHROME.textDim};font-size:9px;`);
+                tag.textContent = "Adv";
+                tag.dataset.controlsAdvanced = "true";
+                titleEl.appendChild(tag);
             }
         });
         if (grid) wrap.appendChild(grid);

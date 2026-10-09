@@ -49,10 +49,6 @@ from . import control_descriptors, controls_snapshot, launcher_state, sdk_proxy,
 from .editor_inputs import clean_editor_value, clean_editor_values, editor_optional_inputs
 from .sdk_install import install_state, uninstall_running
 
-# Manage's structural targets (``binding:<id>:expose`` ...); a batch naming one
-# needs the template's candidate inventory to validate.
-STRUCTURAL_OPS = frozenset({"expose", "remove", "rebind", "hide", "unhide", "create"})
-
 logger = logging.getLogger("sonder_editor")
 
 async def await_template_io(func, *args, **kwargs):
@@ -530,8 +526,10 @@ class SdkRunner:
             # Ownership may change while waiting behind a Generate batch.
             await self.authorized(session_id, secret, tab_session_id)
             snapshot = await asyncio.to_thread(self._controls_snapshot, session)
+            # An expose or rebind needs the template's candidate inventory to validate.
             structural = isinstance(changes, dict) and any(
-                isinstance(t, str) and t.rsplit(":", 1)[-1] in STRUCTURAL_OPS for t in changes)
+                (parsed := control_descriptors.parse_target(t)) and parsed[0] != "group"
+                and parsed[2] in ("expose", "rebind") for t in changes)
             inventory = await asyncio.to_thread(self._inventory, snapshot["prompt"]) if structural else None
             cleaned, rejected = await asyncio.to_thread(
                 control_descriptors.validate_binding_changes, snapshot["view"], changes, prompt=snapshot["prompt"],

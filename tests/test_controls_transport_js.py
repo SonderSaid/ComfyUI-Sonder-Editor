@@ -188,6 +188,18 @@ if(SCENARIO==='relay-fit'){
     assert.equal(fitPublicationView(ascii,envelope),ascii);
     const multibyte=fitPublicationView({bindings:[],notes:[{note_id:'x',status:'ok',text:'日'.repeat(180000)}]},envelope);
     assert.equal(multibyte.notes[0].text.length,500);
+    // R6: maximum count/length UTF-8 group names, metadata and ACKs survive
+    // publication fitting; only cosmetic previews may be shortened.
+    const names=Array.from({length:256},(_,i)=>String(i).padStart(3,'0')+'😀'.repeat(117));
+    const groups=Object.fromEntries(names.map((n,i)=>[n,{order:i}]));
+    const grouped={groups,group_order:names,bindings:names.map((n,i)=>({binding_id:'g'+i,group:n,status:'ok',kind:'INT',value:'1'})),
+        notes:Array.from({length:100},(_,i)=>({note_id:'n'+i,group:names[i],text:'日'.repeat(4000)}))};
+    const ack={...envelope,applied:Array.from({length:32},(_,i)=>'request-'+i)};
+    const budgeted=fitPublicationView(grouped,ack);
+    assert.ok(!budgeted.error);assert.deepEqual(budgeted.group_order,names);assert.deepEqual(budgeted.groups,groups);
+    assert.deepEqual(budgeted.bindings,grouped.bindings);
+    assert.ok(new TextEncoder().encode(JSON.stringify({...ack,view:budgeted})).length<512*1024);
+    assert.ok(budgeted.notes.every(n=>n.note_truncated));
 }
 if(SCENARIO==='canvas-http'||SCENARIO==='relay-error-recovery'||SCENARIO==='canvas-revoked'){
     const editor={id:1,type:'SonderEditor'},ctl={id:2,type:'KSampler',widgets:[{name:'steps',value:'20'}]};

@@ -126,10 +126,25 @@ if(SCENARIO==='groups'){
     const size=[...relay.size];relay.widgets[0].value=JSON.stringify({v:1,notes:{},groups:{},bindings:{seed:{label:'Seed'}}});
     sync();assert.deepEqual(relay.size,size);
 }
+if(SCENARIO==='group-tolerance'){
+    for(const [raw, expected] of [[' Look ','Look'],['bad:name',''],['',''],['constructor','']]){
+        relay.widgets[0].value=JSON.stringify({bindings:{steps:{label:'Steps',group:raw}},groups:{}});
+        sync();assert.equal(row('steps').value,20);
+        assert.deepEqual(rows().filter(w=>w.name.startsWith('sonder_row:~sep:')).map(w=>w.label),expected?[expected]:[]);
+    }
+    for(const groups of [[],42,'bad',null]){
+        relay.widgets[0].value=JSON.stringify({bindings:{steps:{label:'Steps'}},groups});
+        sync();assert.equal(row('steps').value,20);
+        const {exportManifest}=await import(BINDINGS_URL);
+        const exported=JSON.parse(exportManifest(relay.widgets[0].value,root));
+        assert.deepEqual(exported.bindings.steps.targets,[{path:'3',input:'steps'}]);
+        assert.ok(!exported.error);
+    }
+}
 console.log('ok');
 '''
 
-SCENARIOS = ['rows', 'editing', 'hint-and-warnings', 'status-changes', 'groups']
+SCENARIOS = ['group-tolerance', 'rows', 'editing', 'hint-and-warnings', 'status-changes', 'groups']
 
 
 @pytest.mark.parametrize('scenario', SCENARIOS)
@@ -138,7 +153,7 @@ def test_relay_rows(scenario):
     if not node:
         pytest.skip('node required for the Relay rows harness')
     script = HARNESS.replace('MODULE_URL', json.dumps((ROOT/'web/js/control_relay_rows.js').as_uri()))
-    script = script.replace('SCENARIO', json.dumps(scenario))
+    script = script.replace('SCENARIO', json.dumps(scenario)).replace('BINDINGS_URL', json.dumps((ROOT/'web/js/control_bindings.js').as_uri()))
     result = subprocess.run([node, '--input-type=module', '-e', script], capture_output=True, text=True, timeout=15)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == 'ok'

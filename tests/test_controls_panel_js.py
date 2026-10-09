@@ -12,10 +12,13 @@ class El {
     append(...items){for(const n of items){if(n.tagName==='#FRAGMENT'){this.append(...[...n.children]);continue;}n.remove?.();n.parentElement=this;this.children.push(n);}}
     prepend(n){n.remove?.();n.parentElement=this;this.children.unshift(n);}
     appendChild(n){this.append(n);return n;}
-    remove(){if(this.parentElement){if(SCENARIO==='editor-focus-refresh'&&this.contains(document.activeElement))document.activeElement.blur();const a=this.parentElement.children;a.splice(a.indexOf(this),1);this.parentElement=null;}}
+    remove(){if(this.parentElement){if((SCENARIO==='editor-focus-refresh'||SCENARIO==='groups-manage')&&this.contains(document.activeElement))document.activeElement.blur();const a=this.parentElement.children;a.splice(a.indexOf(this),1);this.parentElement=null;}}
     after(n){const p=this.parentElement;n.remove?.();n.parentElement=p;p.children.splice(p.children.indexOf(this)+1,0,n);}
+    before(n){const p=this.parentElement;n.remove?.();n.parentElement=p;p.children.splice(p.children.indexOf(this),0,n);}
     replaceWith(n){const p=this.parentElement;n.remove?.();n.parentElement=p;p.children.splice(p.children.indexOf(this),1,n);this.parentElement=null;}
     select(){}
+    getBoundingClientRect(){return {left:0,top:0,right:0,bottom:0,width:0,height:0};}
+    get isConnected(){let n=this;while(n.parentElement)n=n.parentElement;return n===document.body;}
     dispatchEvent(e){this.dispatch(e.type);}
     replaceChildren(...n){for(const c of [...this.children])c.remove();this._text='';this.append(...n);}
     get textContent(){return this._text+this.children.map(c=>c.textContent).join('');}
@@ -30,9 +33,11 @@ class El {
     focus(){if(document.activeElement!==this){document.activeElement?.blur?.(this);document.activeElement=this;this.dispatch('focus');}}
     blur(next=document.body){if(document.activeElement===this){const parents=[];for(let n=this.parentElement;n;n=n.parentElement)parents.push(n);document.activeElement=document.body;this.dispatch('blur',{relatedTarget:next});for(const p of parents)p.dispatch('focusout',{target:this,relatedTarget:next});}}
 }
-const events={};globalThis.window={addEventListener(k,f){(events[k]||=[]).push(f);},removeEventListener(k,f){events[k]=(events[k]||[]).filter(x=>x!==f);}};
+const events={};globalThis.window={innerWidth:1366,innerHeight:900,addEventListener(k,f){(events[k]||=[]).push(f);},removeEventListener(k,f){events[k]=(events[k]||[]).filter(x=>x!==f);}};
+globalThis.requestAnimationFrame=f=>f();
 globalThis.localStorage={getItem(){return null;},setItem(){}};
-globalThis.document={createElement:t=>new El(t),createTextNode:t=>new El('#TEXT',String(t)),createDocumentFragment:()=>new El('#FRAGMENT'),body:new El('body'),activeElement:null};
+globalThis.document={createElement:t=>new El(t),createTextNode:t=>new El('#TEXT',String(t)),createDocumentFragment:()=>new El('#FRAGMENT'),body:new El('body'),activeElement:null,
+    addEventListener(){},removeEventListener(){}};
 document.activeElement=document.body;
 globalThis.Option=class extends El{constructor(text,value){super('option',text);this.value=value;}};
 globalThis.Event=class{constructor(type){this.type=type;}};
@@ -426,12 +431,91 @@ if(SCENARIO==='markdown'){
         let hidden=false;Object.defineProperty(list,'hidden',{get:()=>hidden,set(v){hidden=v;if(v&&document.activeElement===list)list.blur();}});
         list.focus();key('ArrowDown');key('Enter');await settle();assert.deepEqual(calls,[{'binding:combo:value':'model-1'}]);
     }
+    if(SCENARIO==='group-editor-name'){
+        publish({...view,groups:{editor:{order:1},Empty:{order:2}},group_order:['editor','Empty','Advanced']});
+        toggleManage();
+        const fixed=walk(container).find(n=>n.dataset.controlsSection==='editor');
+        const named=walk(container).find(n=>n.dataset.controlsGroup==='editor'&&n.dataset.controlsSection==='workflow');
+        assert.ok(fixed&&named&&fixed!==named);
+        const grip=walk(group('Empty')).find(n=>n.dataset.panelGroupHandle==='Empty');
+        const values=new Map(), transfer={setData:(k,v)=>values.set(k,v),getData:k=>values.get(k)};
+        container.dispatch('dragstart',{target:grip,dataTransfer:transfer});
+        container.dispatch('drop',{target:fixed.children[0],dataTransfer:transfer,clientY:0});await settle();
+        assert.equal(calls.length,0);
+        container.dispatch('dragstart',{target:grip,dataTransfer:transfer});
+        container.dispatch('drop',{target:named.children[0],dataTransfer:transfer,clientY:0});await settle();
+        assert.deepEqual(calls.at(-1),{'group:Empty:move':{before:'editor'}});
+    }
+    if(SCENARIO==='groups-manage'||SCENARIO==='groups-cap'){
+        // An explicit empty group, and Advanced holding seed (Phase 4B).
+        publish({...view,groups:{Empty:{order:1}},group_order:['Empty','Advanced']});
+        const menuRow=label=>walk(document.body).find(n=>n.attributes?.role==='menuitem'&&n.textContent.startsWith(label));
+        const openMenu=name=>walk(group(name).children[0]).find(n=>n.dataset.groupAction==='menu').dispatch('click');
+        if(SCENARIO==='groups-cap'){
+            const many=Array.from({length:65},(_,i)=>({source:'binding',binding_id:'m'+i,label:'M'+i,kind:'INT',value:'1',status:'ok',order:i,group:'Big',section:'workflow'}));
+            publish({...view,bindings:[...view.bindings,...many],group_order:['Advanced','Big']});
+            toggleManage();openMenu('Big');menuRow('Mark all Advanced').dispatch('click');await settle();
+            assert.equal(calls.length,0);assert.match(notices.at(-1),/more than 64 Controls/);
+        }else{
+        // Empty groups exist only to be filled: shown in Manage, never in normal view.
+        assert.equal(group('Empty'),undefined);
+        toggleManage();
+        assert.ok(group('Empty'));assert.equal(group('Empty').hidden,false);
+        const order=container.children.flatMap(c=>walk(c)).filter(n=>n.dataset.controlsGroup&&n.dataset.controlsGroup!=='editor').map(n=>n.dataset.controlsGroup);
+        assert.deepEqual(order,['Empty','Advanced']);
+        // Header: a drag grip and a menu; the Editor group has neither.
+        assert.ok(walk(group('Advanced').children[0]).some(n=>n.dataset.panelGroupHandle==='Advanced'&&n.draggable));
+        assert.ok(!walk(group('editor').children[0]).some(n=>n.dataset.groupAction==='menu'||n.dataset.panelGroupHandle));
+        openMenu('Advanced');assert.equal(menuRow('Move down').attributes['aria-disabled'],'true');
+        menuRow('Move up').dispatch('click');await settle();
+        assert.deepEqual(calls.at(-1),{'group:Advanced:move':{before:'Empty'}});
+        openMenu('Advanced');menuRow('Mark all Advanced').dispatch('click');await settle();
+        assert.deepEqual(calls.at(-1),{'binding:seed:advanced':true});
+        openMenu('Advanced');menuRow('Ungroup').dispatch('click');await settle();
+        assert.deepEqual(calls.at(-1),{'group:Advanced:ungroup':true});
+        // Rename in place: Enter saves, an invalid name warns, Escape cancels.
+        openMenu('Advanced');menuRow('Rename').dispatch('click');
+        let field=walk(group('Advanced')).find(n=>n.dataset.groupRename==='Advanced');
+        assert.equal(document.activeElement,field);field.value='a:b';key('Enter');await settle();
+        assert.equal(calls.length,3);assert.match(notices.at(-1),/colon/);
+        openMenu('Advanced');menuRow('Rename').dispatch('click');
+        field=walk(group('Advanced')).find(n=>n.dataset.groupRename==='Advanced');field.value='Look';key('Escape');await settle();
+        assert.equal(calls.length,3);assert.ok(!walk(container).some(n=>n.dataset.groupRename));
+        openMenu('Advanced');menuRow('Rename').dispatch('click');
+        field=walk(group('Advanced')).find(n=>n.dataset.groupRename==='Advanced');field.value=' Look ';publish({...view});assert.equal(document.activeElement,field);assert.deepEqual(group('Empty').parentElement.children.map(c=>c.dataset.controlsGroup||c.dataset.controlTarget||c.textContent),['Main section','note:intro:text','binding:steps:value','Empty','Advanced']);key('Enter');await settle();
+        assert.deepEqual(calls.at(-1),{'group:Advanced:rename':'Look'});
+        // Move to group: an existing group, or a new one in the same batch.
+        assert.ok(!walk(byTarget('binding:adv:value')).some(n=>n.dataset.controlsMoveGroup));
+        const moveButton=()=>walk(byTarget('binding:steps:value')).find(n=>n.dataset.controlsMoveGroup==='binding:steps');
+        moveButton().dispatch('click');assert.ok(menuRow('Empty'));assert.equal(menuRow('Ungrouped'),undefined);
+        menuRow('Empty').dispatch('click');await settle();
+        assert.deepEqual(calls.at(-1),{'binding:steps:group':'Empty','binding:steps:order':0});
+        moveButton().dispatch('click');menuRow('New group').dispatch('click');
+        const draft=walk(container).find(n=>n.dataset.controlsNewGroup==='true');assert.equal(document.activeElement,draft);
+        draft.value='Fresh';key('Enter');await settle();
+        assert.deepEqual(calls.at(-1),{'group:Fresh:create':{},'binding:steps:group':'Fresh','binding:steps:order':0});
+        // + Group: an in-panel name field; an existing name is refused and the field stays.
+        walk(container).find(n=>n.dataset.controlsAddGroup==='true').dispatch('click');
+        const name=walk(container).find(n=>n.dataset.controlsNewGroup==='true');
+        name.value='Empty';key('Enter');await settle();assert.match(notices.at(-1),/already exists/);
+        assert.equal(walk(container).find(n=>n.dataset.controlsNewGroup==='true'),name);
+        name.value='New';key('Enter');await settle();assert.deepEqual(calls.at(-1),{'group:New:create':{}});
+        // Dragging a group header onto another reorders groups in one save.
+        const data={};const transfer={setData(k,v){data[k]=v;},getData(k){return data[k];}};
+        const grip=walk(group('Advanced').children[0]).find(n=>n.dataset.panelGroupHandle==='Advanced');
+        container.dispatch('dragstart',{target:grip,dataTransfer:transfer});
+        container.dispatch('drop',{target:group('Empty').children[0],dataTransfer:transfer,clientY:0});await settle();
+        assert.deepEqual(calls.at(-1),{'group:Advanced:move':{before:'Empty'}});
+        // Group saves never block a run.
+        assert.equal(await panel.flushPending(),true);
+        }
+    }
     panel.destroy();assert.equal(listeners.size,0);assert.equal(container.children.length,0);
 }
 console.log('ok');
 '''
 
-@pytest.mark.parametrize('scenario',['editor-focus-refresh','normal-view','manage','manage-sdk','manage-flush','hide-flush','combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','note-refusal','problem-statuses','loading','note-then-value','batch-mirror','search','advanced','advanced-refusal','hidden-pending','cards-scale','group-note'])
+@pytest.mark.parametrize('scenario',['group-editor-name','editor-focus-refresh','normal-view','manage','manage-sdk','manage-flush','hide-flush','combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','note-refusal','problem-statuses','loading','note-then-value','batch-mirror','search','advanced','advanced-refusal','hidden-pending','cards-scale','group-note','groups-manage','groups-cap'])
 def test_controls_panel(scenario, tmp_path):
     node=shutil.which('node')
     if not node:pytest.skip('node required for Controls renderer boundary tests')

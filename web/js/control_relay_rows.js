@@ -14,7 +14,7 @@
 // Pure on import: the caller (control_relay.js) supplies the canvas and graph.
 import { CONTROL_SEED_MODES, findControlWidget } from "./control_widgets.js";
 import {
-    defaultBindingLabel, effectiveGroupOrder, nodeType, parseManifest, relayCensus, resolveAnchor, resolveBindings, sectionOf,
+    cleanGroup, defaultBindingLabel, effectiveGroupOrder, nodeType, parseManifest, relayCensus, resolveAnchor, resolveBindings, sectionOf,
 } from "./control_bindings.js";
 
 export const ROW_PREFIX = "sonder_row:";
@@ -81,7 +81,7 @@ export function planRows(relay, root) {
         const ref = { id: entry.id, nodeId: anchor.node.id, anchor: anchor.name, widgetName: resolved.widget.name };
         const own = [{ ...ref, role: "value", type, label, options: rowOptions(resolved.widget, type) }];
         if (resolved.modeWidget) own.push({ ...ref, role: "mode", type: "combo", label: "↳ mode" });
-        const group = typeof entry.group === "string" ? entry.group : "";
+        const group = cleanGroup(entry.group);
         if (sectionOf(resolved, entry.section) === "editor") editor.push(...own);
         else if (!group) ungrouped.push(...own);
         else grouped.set(group, [...(grouped.get(group) || []), ...own]);

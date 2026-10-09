@@ -156,13 +156,15 @@ def group_order(view: dict) -> list[str]:
     """The Controls' group order, one authority for the panel and provenance.
 
     Groups with an entry in the manifest's ``groups`` come first by their order
-    (then name); groups only named by bindings or notes follow in the order they
-    first appear, which is how the panel ordered every group before Phase 4.
+    (then name); groups only named by Workflow bindings or notes follow in the
+    order they first appear, which is how the panel ordered every group before
+    Phase 4. An Editor-section binding's group shows nowhere, so it adds none.
+    web/js/control_bindings.js ``effectiveGroupOrder`` mirrors it.
     """
     explicit = view.get("groups") if isinstance(view.get("groups"), dict) else {}
     ordered = sorted((name for name in explicit if isinstance(name, str) and name),
                      key=lambda name: (_clean_order((explicit.get(name) or {}).get("order")), name))
-    rows = [*(view.get("bindings") or []), *(view.get("notes") or [])]
+    rows = [*(d for d in view.get("bindings") or [] if d.get("section") != "editor"), *(view.get("notes") or [])]
     rows.sort(key=lambda d: (_clean_order(d.get("order")), str(d.get("label") or "").lower(),
                              str(d.get("binding_id") or d.get("note_id") or "")))
     for row in rows:
@@ -287,7 +289,45 @@ def coerce_panel_layout(field: str, raw: Any):
         return value
     if not isinstance(raw, str):
         raise ControlValueError("A panel group must be text.")
+    # Empty is ungrouped; any other name follows the one group-name rule.
+    if raw.strip() and (error := control_manifest.group_name_error(raw)):
+        raise ControlValueError(error)
     return raw.strip()
+
+
+# ── Change targets ───────────────────────────────────────────────────────────
+#
+# One grammar for every change target, parsed in one place (the JS mirror is
+# control_bindings.js ``parseTarget``): ``binding:<id>:<field>``,
+# ``note:<id>:<field>``, ``group:<name>:<op>`` (a name holds no ``:``) and the
+# two-part ``workflow:description``.
+_TARGET_RE = re.compile(r"^(?:(binding|note):([A-Za-z0-9_-]{1,64})|(group):([^:]+)):([a-z_]+)$")
+# Manage's structural targets: the validator returns an internal write plan,
+# and the mounted relay forwards the original intent for the canvas to recheck.
+BINDING_STRUCTURAL_OPS = frozenset({"expose", "remove", "rebind", "hide", "unhide", "create"})
+GROUP_OPS = frozenset({"create", "rename", "ungroup", "move"})
+
+
+def parse_target(target: Any) -> tuple[str, str, str] | None:
+    """``(source, identity, field)`` of a change target, or None."""
+    if not isinstance(target, str):
+        return None
+    if target == "workflow:description":
+        return ("workflow", "", "description")
+    match = _TARGET_RE.match(target)
+    if not match:
+        return None
+    if match.group(1):
+        return (match.group(1), match.group(2), match.group(5))
+    return ("group", match.group(4), match.group(5))
+
+
+def is_structural(target: Any) -> bool:
+    parsed = parse_target(target)
+    if parsed is None:
+        return False
+    source, _, field = parsed
+    return field in GROUP_OPS if source == "group" else source != "workflow" and field in BINDING_STRUCTURAL_OPS
 
 
 # ── Kinds ────────────────────────────────────────────────────────────────────
@@ -769,7 +809,7 @@ def clean_local_bindings(local: Any) -> dict:
         entries[binding_id] = {
             "label": _clean_text(raw.get("label"), PANEL_LABEL_MAX_CHARS).strip(),
             "section": section if section in control_manifest.SECTIONS else "workflow",
-            "group": _clean_text(raw.get("group"), PANEL_LABEL_MAX_CHARS).strip(),
+            "group": control_manifest.clean_group(raw.get("group")),
             "order": _clean_order(raw.get("order")),
             "advanced": raw.get("advanced") is True,
             "note": _clean_text(raw.get("note"), PANEL_NOTE_MAX_CHARS),
@@ -788,7 +828,7 @@ def clean_local_notes(local_notes: Any) -> dict:
                 and note_id not in control_manifest.FORBIDDEN_KEYS and isinstance(raw, dict)):
             continue
         notes[note_id] = {"text": _clean_text(raw.get("text"), PANEL_NOTE_MAX_CHARS),
-                          "group": _clean_text(raw.get("group"), PANEL_LABEL_MAX_CHARS).strip(),
+                          "group": control_manifest.clean_group(raw.get("group")),
                           "order": _clean_order(raw.get("order"))}
         if len(notes) >= control_manifest.MAX_NOTES:
             break
@@ -1018,9 +1058,10 @@ def validate_binding_changes(view: dict, changes: Any, *, prompt: dict | None = 
     cleaned, rejected = {}, []
     for target, raw in changes.items():
         try:
-            match = _STRUCTURAL_RE.match(target) if isinstance(target, str) else None
-            if match:
-                cleaned[target] = batch.validate(*match.groups(), raw)
+            if is_structural(target):
+                source, identity, op = parse_target(target)
+                cleaned[target] = (batch.group(identity, op, raw) if source == "group"
+                                   else batch.validate(source, identity, op, raw))
                 continue
             if target not in table:
                 raise ControlValueError("This target is unavailable. Refresh the Controls panel.")
@@ -1042,8 +1083,8 @@ def validate_binding_changes(view: dict, changes: Any, *, prompt: dict | None = 
                 value = raw
             elif field in ("order", "group"):
                 value = coerce_panel_layout(field, raw)
-                if field == "group" and len(value) > PANEL_LABEL_MAX_CHARS:
-                    raise ControlValueError("A group name must be at most 120 characters.")
+                if field == "group" and value:
+                    batch.claim_group(value)
             elif field == "seed_mode":
                 if not isinstance(raw, str) or raw not in SEED_MODES:
                     raise ControlValueError("Choose fixed, increment, decrement or randomize.")
@@ -1079,16 +1120,22 @@ def validate_binding_changes(view: dict, changes: Any, *, prompt: dict | None = 
     return cleaned, rejected
 
 
-_STRUCTURAL_RE = re.compile(r"^(binding|note):([A-Za-z0-9_-]{1,64}):(expose|remove|rebind|hide|unhide|create)$")
 _NOOP = {"noop": True}
 
 
 class _StructuralBatch:
     """Validation of Manage's structural targets within one batch.
 
-    Every op is idempotent: re-sending a landed expose, rebind, create, remove or
-    hide is a no-op success (``{"noop": true}``), so a retry after a lost
-    acknowledgement changes nothing. A candidate already bound is refused.
+    Every op is idempotent: re-sending a landed expose, rebind, create, remove,
+    hide or group op is a no-op success (``{"noop": true}``), so a retry after a
+    lost acknowledgement changes nothing. A candidate already bound is refused.
+
+    A group op validates to one *unexpanded* plan (``{"rename": new}``,
+    ``{"ungroup": true}``, ``{"move": true, "before": name|None}``,
+    ``{"create": true}``) that counts as one target: each writer expands it
+    against its own current state in one write (the canvas inside
+    ``editManifest``, the Sonder App inside one sidecar mutation), so renaming a
+    group of 200 Controls never meets the 64-change cap.
     """
 
     def __init__(self, view: dict, mode: str | None, inventory: list[dict] | None):
@@ -1103,6 +1150,98 @@ class _StructuralBatch:
         orders = [d.get("order") for d in [*view.get("bindings", []), *view.get("notes", [])]
                   if not d.get("group") and isinstance(d.get("order"), int) and not isinstance(d.get("order"), bool)]
         self.next_order = max(orders, default=0)
+        listed = view.get("group_order")
+        self.group_list = [g for g in listed if isinstance(g, str)] if isinstance(listed, list) else group_order(view)
+        self.known_groups = set(self.group_list)
+        self.touched_groups: set = set()
+
+    def claim_group(self, name: str) -> None:
+        """Count a group a change names; refuse past MAX_GROUPS."""
+        if name not in self.known_groups:
+            if len(self.known_groups) >= control_manifest.MAX_GROUPS:
+                raise ControlValueError(f"At most {control_manifest.MAX_GROUPS} groups fit in one workflow.")
+            self.known_groups.add(name)
+            self.group_list.append(name)
+
+    def _require_relay(self) -> None:
+        if self.mode not in ("canvas", "sdk", "relay"):
+            raise ControlValueError("This target is unavailable. Refresh the Controls panel.")
+        relay = self.view.get("relay") or {}
+        if relay.get("status") == "error":
+            raise ControlValueError(f"Fix the Sonder Control Relay first: {relay.get('error') or 'it cannot be read.'}")
+
+    def group(self, name: str, op: str, raw: Any) -> dict:
+        self._require_relay()
+        if name != name.strip() or control_manifest.group_name_error(name):
+            raise ControlValueError(control_manifest.group_name_error(name) or "This group name is invalid.")
+        if name in self.touched_groups:
+            raise ControlValueError("Two changes edit the same group. Send them one at a time.")
+        self.touched_groups.add(name)
+        # The mounted pre-check checks shape only: the canvas writer validates
+        # against its fresh full view, so a stale relay view cannot refuse.
+        shape_only = self.mode == "relay"
+        if op == "create":
+            if not isinstance(raw, dict):
+                raise ControlValueError("Send {} to create a group.")
+            if name in self.known_groups and not shape_only:
+                return dict(_NOOP)
+            self.claim_group(name)
+            return {"create": True}
+        if op == "rename":
+            if not isinstance(raw, str):
+                raise ControlValueError("A group name must be text.")
+            new = raw.strip()
+            if error := control_manifest.group_name_error(new):
+                raise ControlValueError(error)
+            if new != name and new in self.touched_groups:
+                raise ControlValueError("Two changes edit the same group. Send them one at a time.")
+            self.touched_groups.add(new)
+            if new == name:
+                return dict(_NOOP)
+            if shape_only:
+                return {"rename": new}
+            if name not in self.known_groups:
+                if new in self.known_groups:
+                    return dict(_NOOP)  # a retry of a rename that landed
+                raise ControlValueError("This group is no longer in the Controls. Refresh the Controls panel.")
+            if new in self.known_groups:
+                raise ControlValueError(f"A group named “{new}” already exists. Choose another name.")
+            self.known_groups.discard(name)
+            self.known_groups.add(new)
+            self.group_list = [new if g == name else g for g in self.group_list]
+            return {"rename": new}
+        if op == "ungroup":
+            if raw is not True:
+                raise ControlValueError("Send true to ungroup.")
+            if shape_only:
+                return {"ungroup": True}
+            if name not in self.known_groups:
+                return dict(_NOOP)
+            self.known_groups.discard(name)
+            self.group_list = [g for g in self.group_list if g != name]
+            return {"ungroup": True}
+        if op == "move":
+            before = raw.get("before") if isinstance(raw, dict) else None
+            if not isinstance(raw, dict) or (before is not None and (
+                    not isinstance(before, str) or before != before.strip()
+                    or control_manifest.group_name_error(before))):
+                raise ControlValueError("Choose where to move the group.")
+            if before == name:
+                raise ControlValueError("A group can't move before itself.")
+            if shape_only:
+                return {"move": True, "before": before}
+            if name not in self.group_list:
+                raise ControlValueError("This group is no longer in the Controls. Refresh the Controls panel.")
+            if before is not None and before not in self.group_list:
+                raise ControlValueError("The group order changed. Refresh the Controls panel.")
+            following = self.group_list[self.group_list.index(name) + 1:]
+            if following[:1] == ([before] if before is not None else []):
+                return dict(_NOOP)
+            rest = [g for g in self.group_list if g != name]
+            index = rest.index(before) if before is not None else len(rest)
+            self.group_list = rest[:index] + [name] + rest[index:]
+            return {"move": True, "before": before}
+        raise ControlValueError("This target is unavailable. Refresh the Controls panel.")
 
     def _order(self) -> int:
         self.next_order = min(self.next_order + 1, PANEL_ORDER_LIMIT)
@@ -1139,13 +1278,9 @@ class _StructuralBatch:
         return bool(have) and have == {(t["path"], t["input"]) for t in chosen["targets"]}
 
     def validate(self, source: str, identity: str, op: str, raw: Any) -> dict:
-        if self.mode not in ("canvas", "sdk", "relay"):
-            raise ControlValueError("This target is unavailable. Refresh the Controls panel.")
-        if identity in control_manifest.FORBIDDEN_KEYS:
+        if self.mode in ("canvas", "sdk", "relay") and identity in control_manifest.FORBIDDEN_KEYS:
             raise ControlValueError("This Control id is invalid.")
-        relay = self.view.get("relay") or {}
-        if relay.get("status") == "error":
-            raise ControlValueError(f"Fix the Sonder Control Relay first: {relay.get('error') or 'it cannot be read.'}")
+        self._require_relay()
         if source == "note":
             return self._note(identity, op, raw)
         existing = self.bindings.get(identity)
@@ -1231,18 +1366,19 @@ class _StructuralBatch:
             text, group = raw.get("text", ""), raw.get("group", "")
             if not isinstance(text, str) or len(text) > PANEL_NOTE_MAX_CHARS:
                 raise ControlValueError("A note must be text of at most 4000 characters.")
-            if not isinstance(group, str) or len(group.strip()) > PANEL_LABEL_MAX_CHARS:
-                raise ControlValueError("A group name must be at most 120 characters.")
+            group = coerce_panel_layout("group", group)
             if existing is not None:
                 if existing.get("text") == text:
                     return dict(_NOOP)
                 raise ControlValueError("This note id is already in use.")
             if self.note_count >= control_manifest.MAX_NOTES:
                 raise ControlValueError(f"At most {control_manifest.MAX_NOTES} notes fit in one workflow.")
+            if group:
+                self.claim_group(group)
             self.note_count += 1
             order = raw.get("order")
             order = coerce_panel_layout("order", order) if order is not None else self._order()
-            return {"text": text, "group": group.strip(), "order": order}
+            return {"text": text, "group": group, "order": order}
         if op == "remove":
             if raw is not True:
                 raise ControlValueError("Send true to remove.")

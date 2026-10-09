@@ -300,6 +300,67 @@ if(SCENARIO==='precision-refusal') {
     const result=await host.applyChanges({'binding:steps:value':'30','binding:seed:value':'9007199254740993'});
     assert.equal(result.ok,false);assert.equal(sampler.widgets[0].value,20);assert.equal(sampler.widgets[1].value,7);
 }
+if(SCENARIO==='group-batch-order') {
+    relay.widgets[0].value=JSON.stringify({v:1,bindings:{steps:{group:'Sampling'},seed:{group:'Sampling'}},
+        notes:{intro:{text:'Intro',group:'Guide'}},groups:{Guide:{order:1},Sampling:{order:2}}});
+    globalThis.canon=changes=>changes;
+    const result=await host.applyChanges({'binding:steps:group':'Guide','group:Guide:rename':{rename:'Info'},
+        'group:Sampling:rename':{rename:'Look'}});
+    assert.equal(result.ok,true,JSON.stringify(result));
+    const saved=JSON.parse(relay.widgets[0].value);
+    assert.equal(saved.bindings.steps.group,'Info');assert.equal(saved.bindings.seed.group,'Look');
+    assert.equal(saved.notes.intro.group,'Info');assert.deepEqual(Object.keys(saved.groups),['Info','Look']);
+    assert.equal(captures,2); // before and after ONE history step
+}
+if(SCENARIO==='groups'||SCENARIO==='groups-stale'||SCENARIO==='groups-reparse') {
+    // 70 members: one unexpanded plan re-keys them all in ONE manifest write.
+    const many=Object.fromEntries(Array.from({length:70},(_,i)=>[`m${i}`,{label:`M${i}`,group:'Look',order:i}]));
+    relay.widgets[0].value=JSON.stringify({v:1,bindings:{...many,steps:{label:'Steps',group:' Look '},seed:{label:'Seed',group:'Speed'}},
+        notes:{intro:{text:'# Intro',group:'Guide'}},groups:{Guide:{order:7,extra:'keep'},'bad:key':{order:1}},future:{keep:true}});
+    globalThis.canon=changes=>changes;
+    if(SCENARIO==='groups-stale'){
+        const result=await host.applyChanges({'group:Look:move':{move:true,before:'Gone'}});
+        assert.equal(result.ok,false);assert.match(result.rejected[0].reason,/group order changed/);assert.equal(captures,0);
+    } else if(SCENARIO==='groups-reparse'){
+        // A plan the server would refuse still cannot write a reserved key.
+        const before=relay.widgets[0].value;
+        const result=await host.applyChanges({'group:Look:rename':{rename:'__proto__'}});
+        assert.equal(result.ok,false);assert.match(result.rejected[0].reason,/reserved key/);
+        assert.equal(relay.widgets[0].value,before);
+    } else {
+        let result=await host.applyChanges({'group:Look:rename':{rename:'Style'}});
+        assert.equal(result.ok,true,JSON.stringify(result));
+        let m=manifest();
+        assert.ok(Object.keys(many).every(id=>m.bindings[id].group==='Style'));assert.equal(m.bindings.steps.group,'Style');
+        // Explicit groups first, then implied ones by first appearance; unknown entry keys survive.
+        assert.deepEqual(m.groups,{Guide:{order:1,extra:'keep'},Style:{order:2},Speed:{order:3}});
+        assert.deepEqual(m.future,{keep:true});assert.equal(captures,2);assert.equal(relay.widgets[0].callbacks,1);
+        result=await host.applyChanges({'group:Speed:move':{move:true,before:'Guide'}});
+        assert.equal(result.ok,true);
+        assert.deepEqual(Object.entries(manifest().groups).map(([k,v])=>[k,v.order]),[['Speed',1],['Guide',2],['Style',3]]);
+        result=await host.applyChanges({'group:Guide:ungroup':{ungroup:true},'group:Empty:create':{create:true}});
+        assert.equal(result.ok,true);m=manifest();
+        assert.equal(m.notes.intro.group,'');
+        assert.deepEqual(Object.entries(m.groups).map(([k,v])=>[k,v.order]),[['Speed',1],['Style',2],['Empty',3]]);
+        assert.equal(captures,6);
+        // A landed retry is a no-op: nothing is written.
+        const value=relay.widgets[0].value;
+        result=await host.applyChanges({'group:Empty:create':{noop:true}});
+        assert.equal(result.ok,true);assert.equal(relay.widgets[0].value,value);
+    }
+}
+if(SCENARIO==='group-new-relay') {
+    root._nodes.splice(root._nodes.indexOf(relay),1);
+    raw={...raw,relay:{status:'none',key:null,error:null},bindings:[],notes:[]};
+    let created=null;
+    globalThis.LiteGraph={createNode(type){created={id:9,type,comfyClass:type,mode:0,properties:{},inputs:[],size:[200,40],
+        addCustomWidget(w){this.widgets.push(w);return w;},removeWidget(w){this.widgets.splice(this.widgets.indexOf(w),1);},
+        computeSize(){return [200,20];},setSize(s){this.size=s;},widgets:[widget('manifest','')]};return created;}};
+    globalThis.canon=changes=>changes;
+    const result=await host.applyChanges({'group:First:create':{create:true}});
+    assert.equal(result.ok,true,JSON.stringify(result));
+    assert.deepEqual(JSON.parse(created.widgets[0].value).groups,{First:{order:1}});assert.equal(captures,2);
+}
 host.destroy();assert.equal(listeners.size,0);
 console.log('ok');
 '''
@@ -308,7 +369,7 @@ SCENARIOS = ['expose', 'expose-rollback', 'expose-new-relay', 'expose-new-relay-
              'remove-rebind', 'manage-listing', 'filter-during-write', 'unsafe-seed', 'moved', 'rollback-callbacks', 'presentation', 'presentation-rollback', 'root', 'promoted', 'promoted-seed', 'no-relay', 'two-relays',
              'linked-or-gone', 'manifest-cap', 'hidden-hash', 'relay-error-view', 'refusal', 'stale-write', 'stale-view',
              'destroy', 'rollback', 'serial', 'history-failure', 'precision-refusal', 'hide-during-write',
-             'event-during-write']
+             'event-during-write', 'group-batch-order', 'groups', 'groups-stale', 'groups-reparse', 'group-new-relay']
 
 
 @pytest.mark.parametrize('scenario', SCENARIOS)

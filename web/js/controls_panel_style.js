@@ -79,3 +79,6 @@ export const quietLineCss = `align-self:flex-start;background:none;border:0;padd
     + `font:${TYPE.t10}px ${FONT.sans};color:${COLORS.textMuted};text-align:left;`;
 
 export const linkCss = `background:none;border:0;padding:0;cursor:pointer;font:${TYPE.t10}px ${FONT.sans};color:${COLORS.textDim};`;
+// The group header's menu button: a glyph, so it gets a real hit area.
+export const groupMenuCss = `background:none;border:0;border-radius:${RADIUS.r1}px;cursor:pointer;color:${COLORS.textDim};`
+    + `font:${TYPE.fwBold} ${TYPE.t14}px ${FONT.sans};line-height:1;padding:0 ${SPACE.s1}px ${SPACE.s1}px;min-width:${SPACE.s5}px;`;

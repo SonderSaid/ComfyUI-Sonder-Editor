@@ -528,3 +528,44 @@ def test_canvas_publication_budget_mirrors_registry_cap():
     assert match, 'controls_canvas_relay.js must state its publication budget'
     a, b, margin = map(int, match.groups())
     assert a * b == sr.CONTROLS_MAX_BYTES and 0 < margin < 4096
+
+
+def grouped_publication(seq=1):
+    # A group of 70 Controls: renaming it must never meet the 64-change cap.
+    view = describe(prompt())
+    view['bindings'] += [{'binding_id': f'm{i}', 'status': 'ok', 'kind': 'INT', 'label': f'M{i}', 'order': i,
+                          'group': 'Look', 'section': 'workflow', 'targets': []} for i in range(70)]
+    view['groups'] = {'Look': {'order': 1}}
+    view['group_order'] = cd.group_order(view)
+    return {'view': view, 'view_seq': seq, 'prompt_hash': 'hash-' + str(seq), 'applied': [], 'rejected': []}
+
+
+def test_group_ops_are_forwarded_unexpanded_for_the_canvas_to_revalidate():
+    async def run():
+        await setup()
+        assert (await publish(grouped_publication()))['ok']
+        changes = {'group:Look:rename': 'Style', 'group:New:create': {}, 'group:Look2:move': {'before': None}}
+        rid = (await post(changes))['request_id']
+        forwarded = (await pending())['pending'][0]
+        # The original intent, not the validator's plan; one target per op.
+        assert forwarded['request_id'] == rid and forwarded['changes'] == changes
+        # Shape is still checked here.
+        refused = await post({'group:Look:rename': 'a:b'})
+        assert refused['code'] == 'invalid_change' and 'colon' in refused['rejected'][0]['reason']
+    asyncio.run(run())
+
+
+def test_a_publication_with_many_groups_fits_the_mounted_budget():
+    # R6: 256 groups of 120 characters, in both `groups` and `group_order`.
+    body = grouped_publication()
+    names = [f'{i:03d}' + 'g' * 117 for i in range(256)]
+    body['view']['groups'] = {name: {'order': i} for i, name in enumerate(names)}
+    body['view']['group_order'] = names
+    encoded = len(json.dumps(body, ensure_ascii=False).encode('utf-8'))
+    assert encoded < sr.CONTROLS_MAX_BYTES // 4
+
+    async def run():
+        await setup()
+        assert (await publish(body))['ok']
+        assert (await sr.get_controls_view(PID, HID))['view']['group_order'] == names
+    asyncio.run(run())
