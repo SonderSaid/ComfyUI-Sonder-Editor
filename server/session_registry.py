@@ -685,6 +685,20 @@ async def release_session(
     return result
 
 
+async def set_owner_workflow_label(project_id: str, host_id: str, session_id: str, label: str) -> bool:
+    """Rename the workflow an owner shows (a Sonder App switch); only the current owner's."""
+    events: list[tuple[str, dict[str, Any]]] = []
+    async with _lock:
+        key = _matching_session_key_locked(project_id, host_id, "")
+        owner = _sessions.get(key) if key else None
+        if not owner or owner.get("session_id") != session_id:
+            return False
+        owner["workflow_label"] = str(label or "")
+        events.append((key[0], _session_changed_event(key, owner)))
+    _schedule_events(events)
+    return True
+
+
 async def get_owner(project_id: str, host_id: str = "", source_node_id: str = "") -> dict[str, Any] | None:
     events: list[tuple[str, dict[str, Any]]] = []
     async with _lock:

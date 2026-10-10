@@ -1,8 +1,9 @@
-// Shared preset selection. The host owns writes; the panel owns the save gate.
+// Shared preset selection, and the Sonder App's Workflow menu above it. The
+// host owns writes; the panel owns the save gate.
 import { mountComboPicker } from "./controls_combo_picker.js";
 import { renderPanelMarkdown } from "./panel_markdown.js";
 import { register, PRIORITY, PRESERVE_DEFAULT } from "./keyboard_ownership.js";
-import { SPACE, TYPE, EDITOR_COLORS as COLORS } from "./editor_theme.js";
+import { SPACE, TYPE, EDITOR_COLORS as COLORS, setButtonDisabled, setButtonVariant } from "./editor_theme.js";
 import { inputCss, quietLineCss } from "./controls_panel_style.js";
 
 let serial = 0;
@@ -13,20 +14,108 @@ export function selectedPreset(presets, lastApplied) {
         || null;
 }
 
-export function mountPresets(host, { flushPending, track, notify }) {
+// Workflow ▾ (Sonder App only, through the host's `workflows` capability):
+// favorites first, a star for the current workflow. Selecting one saves the
+// panel's edits, asks about Manage drafts, then lets the host switch; on
+// success the editor remounts the panel for the new workflow.
+function mountWorkflowMenu(workflows, { flushPending, notify, canSwitch }) {
+    const row = document.createElement("div"), label = document.createElement("span"),
+        select = document.createElement("select"), star = document.createElement("button");
+    row.dataset.controlsWorkflowMenu = "true";
+    // Wraps the label above the menu in a narrow sidebar, so a name stays readable.
+    row.style.cssText = `display:flex;flex-wrap:wrap;align-items:center;gap:${SPACE.s1}px ${SPACE.s2}px;`;
+    label.textContent = "Workflow";
+    select.style.cssText = `${inputCss}flex:1 1 110px;min-width:0;`;
+    select.setAttribute("aria-label", "Workflow");
+    star.type = "button";
+    setButtonVariant(star, "secondary", { padding: `2px ${SPACE.s2}px`, fontSize: `${TYPE.t11}px` });
+    row.append(label, select, star);
+    let listing = null, switching = false, starring = false, destroyed = false, starred = false;
+    const current = () => workflows.current();
+    const entries = () => {
+        const id = current().template_id;
+        const list = listing?.workflows || [];
+        return list.some(w => w.template_id === id) ? list : [{ template_id: id, name: current().name || "This workflow", ok: true, favorite: false }, ...list];
+    };
+    function paint() {
+        if (destroyed) return;
+        const id = current().template_id, list = entries(), here = list.find(w => w.template_id === id);
+        select.replaceChildren(...list.map(w => {
+            const option = new Option(`${w.favorite ? "★ " : ""}${w.name || "Untitled workflow"}`, w.template_id);
+            option.disabled = !w.ok && w.template_id !== id;
+            option.title = w.ok ? (w.description || "") : "This workflow can't drive the editor.";
+            return option;
+        }));
+        select.value = id;
+        const busy = switching || starring || workflows.busy();
+        select.disabled = busy;
+        select.title = workflows.busy() && !switching ? "Wait for Generate to answer, then switch." : "";
+        const favorite = starred = !!here?.favorite;
+        star.textContent = favorite ? "★" : "☆";
+        star.setAttribute("aria-pressed", String(favorite));
+        star.setAttribute("aria-label", favorite ? "Remove from favorites" : "Add to favorites");
+        star.title = favorite ? "Remove from favorites" : "Add to favorites (they come first here and in the Launcher)";
+        setButtonDisabled(star, busy || !listing);
+    }
+    async function load() {
+        const result = await workflows.list();
+        if (destroyed) return;
+        if (result?.ok) listing = result.payload;
+        paint();
+    }
+    select.addEventListener("change", async () => {
+        const id = select.value;
+        if (switching || !id || id === current().template_id) return;
+        switching = true;
+        paint();
+        try {
+            if (!await flushPending()) {
+                notify("The workflow was not switched because a Control could not be saved.");
+                return;
+            }
+            if (!canSwitch()) return;
+            const result = await workflows.switchTo(id);
+            if (!result?.ok) notify(result?.payload?.error || "The workflow could not be switched.");
+        } finally {
+            switching = false;
+            paint();
+        }
+    });
+    star.addEventListener("click", async () => {
+        const id = current().template_id, favorite = !starred;
+        starring = true;
+        paint();
+        try {
+            const result = await workflows.setFavorite(id, favorite);
+            if (!result?.ok) notify(result?.payload?.error || "The favorite could not be saved.");
+            await load();
+        } finally {
+            starring = false;
+            paint();
+        }
+    });
+    paint();
+    void load();
+    return { el: row, paint, destroy() { destroyed = true; row.remove(); } };
+}
+
+export function mountPresets(host, { flushPending, track, notify, canSwitch = () => true }) {
     const el = document.createElement("section"), description = document.createElement("div"),
         more = document.createElement("button"), row = document.createElement("label"),
         label = document.createElement("span"), control = document.createElement("div"),
-        detail = document.createElement("div");
+        detail = document.createElement("div"), body = document.createElement("div");
     el.dataset.controlsPresets = "true";
     el.style.cssText = `display:flex;flex-direction:column;gap:${SPACE.s1}px;`;
+    body.style.cssText = `display:flex;flex-direction:column;gap:${SPACE.s1}px;`;
+    const workflowMenu = host.workflows ? mountWorkflowMenu(host.workflows, { flushPending, notify, canSwitch }) : null;
     row.style.cssText = `display:grid;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:${SPACE.s2}px;`;
     label.textContent = "Preset";
     more.type = "button";
     more.style.cssText = quietLineCss;
     detail.style.cssText = `color:${COLORS.textSecondary};font-size:${TYPE.t11}px;`;
     row.append(label, control);
-    el.append(description, more, row, detail);
+    body.append(description, more, row, detail);
+    el.append(...(workflowMenu ? [workflowMenu.el] : []), body);
     let lastApplied = null, expanded = false, busy = false, destroyed = false, view = {}, picker = null, select = null, key = "", labels = new Map();
     function clamp() {
         description.style.cssText = expanded ? "" : "display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;";
@@ -61,7 +150,10 @@ export function mountPresets(host, { flushPending, track, notify }) {
 
     function render(next, hidden = false) {
         view = next || {};
-        el.style.display = hidden ? "none" : "flex";
+        // Manage edits the description and presets itself; the Workflow menu stays.
+        body.style.display = hidden ? "none" : "flex";
+        el.style.display = hidden && !workflowMenu ? "none" : "flex";
+        workflowMenu?.paint();
         description.replaceChildren(renderPanelMarkdown(view.description || ""));
         clamp();
         const presets = view.presets || [], selected = selectedPreset(presets, lastApplied);
@@ -102,5 +194,5 @@ export function mountPresets(host, { flushPending, track, notify }) {
         if (picker?.contains(document.activeElement) && picker.keydown(e)) return true;
         return PRESERVE_DEFAULT;
     }});
-    return {el, render, destroy() { destroyed = true; picker?.destroy(); unregister(); el.remove(); }};
+    return {el, render, destroy() { destroyed = true; picker?.destroy(); workflowMenu?.destroy(); unregister(); el.remove(); }};
 }

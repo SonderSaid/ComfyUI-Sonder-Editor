@@ -88,6 +88,9 @@ PRESENCE_INTERVAL_SEC = 1.0
 STATUS_MIN_INTERVAL_SEC = 0.2
 PROXY_IDLE_STOP_SEC = 30 * 60
 SESSION_IDLE_SEC = 30 * 60
+# A session another tab opened this recently may still be loading its page:
+# a switch never takes its (workflow, project) pair away from it.
+SWITCH_PAIR_GRACE_SEC = 120.0
 HOUSEKEEPING_INTERVAL_SEC = 60.0
 SEED_MAX = 2 ** 64 - 1
 
@@ -136,6 +139,10 @@ class SdkRun:
     unconfirmed_since: float = 0.0
     finished_at: float = 0.0
     client: Any = None
+    # The workflow this run was submitted with: a session can switch workflows
+    # while earlier runs are still generating.
+    template_id: str = ""
+    template_name: str = ""
 
     @property
     def final(self) -> bool:
@@ -155,6 +162,8 @@ class SdkRun:
             "job_id": self.job_id,
             "outcome": self.outcome,
             "note": self.note,
+            "template_id": self.template_id,
+            "template_name": self.template_name,
         }
 
 
@@ -297,6 +306,7 @@ class SdkRunner:
         queue_provider: Callable[[], Any] = _default_queue,
         emit: Callable[[str, dict], None] = session_registry.schedule_project_event,
         get_owner: Callable[..., Any] = session_registry.get_owner,
+        set_owner_label: Callable[..., Any] = session_registry.set_owner_workflow_label,
         sdk_ready: Callable[[], bool] = lambda: bool(install_state()["sdk"]["supported"]),
         uninstalling: Callable[[], bool] = uninstall_running,
         describe: Callable[..., dict] | None = None,
@@ -309,6 +319,7 @@ class SdkRunner:
         self._queue_provider = queue_provider
         self._emit_event = emit
         self._get_owner = get_owner
+        self._set_owner_label = set_owner_label
         self._sdk_ready = sdk_ready
         self._uninstalling = uninstalling
         self._generating = 0  # Generates between their gate and their submit
@@ -443,6 +454,61 @@ class SdkRunner:
             ),
         }
 
+    async def switch_workflow(self, session_id: str, secret: str, tab_session_id: str, template_id: Any,
+                              expected_template_id: Any) -> dict:
+        """Point this session at another imported workflow, keeping its project and runs.
+
+        Takes the old workflow's lock first, so a Generate or Controls write
+        already queued on it finishes first and anything queued after is refused
+        as ``workflow_changed``; then ``_open_lock``, held only for the check and
+        the change, so no open creates the same pair meanwhile and a long Generate
+        never stalls other Opens. Only this path takes both locks, always in this
+        order. Earlier runs keep their own workflow. Queued Sonder jobs record
+        none: each renders with the workflow whose Generate takes it.
+        """
+        self._remember_loop()
+        new_id = sdk_templates.check_template_id(template_id)
+        session = await self.authorized(session_id, secret, tab_session_id)
+        old_id = session.template_id
+        self._check_workflow(session, old_id, expected_template_id)
+        async with self.template_lock(old_id), self._open_lock:
+            await self.authorized(session_id, secret, tab_session_id)
+            self._check_workflow(session, old_id, expected_template_id)
+            if new_id != old_id:
+                await self._release_pair(session, new_id)
+                _, meta = await asyncio.to_thread(sdk_templates.load_template, new_id)
+                if not meta.get("validation", {}).get("ok", True):
+                    raise SdkError("This workflow can't drive the editor.", "invalid_template", 409)
+                session.template_id = new_id
+                self._template_names[new_id] = meta.get("name", "")
+                await self._record_open(session)
+                label = self.template_name(session)
+                try:
+                    await self._set_owner_label(session.project, session.session_id, tab_session_id,
+                                                f"Sonder App · {label}" if label else "Sonder App")
+                except Exception:
+                    logger.warning("Updating the Sonder App tab's workflow label failed", exc_info=True)
+                self._emit(session, force=True)
+            return {"ok": True, "template_id": session.template_id, "template_name": self.template_name(session)}
+
+    async def _release_pair(self, session: SdkSession, template_id: str) -> None:
+        """Keep one session per (workflow, project): refuse while another session needs
+        the pair; drop an abandoned one, as housekeeping would."""
+        for other in list(self._sessions.values()):
+            if other is session or other.template_id != template_id or other.project != session.project:
+                continue
+            if other.unfinished():
+                raise SdkError("Takes from an earlier visit are still generating with that workflow on this project. "
+                               "Wait for them to finish, then switch.", "workflow_open_elsewhere", 409)
+            owner = await self._get_owner(other.project, host_id=other.session_id)
+            if owner and owner.get("status") in ("active", "orphaned"):
+                raise SdkError("That workflow is already open on this project in another tab.",
+                               "workflow_open_elsewhere", 409)
+            if self._clock() - other.last_activity < SWITCH_PAIR_GRACE_SEC:
+                raise SdkError("That workflow was just opened on this project in another tab. Try again in a moment.",
+                               "workflow_open_elsewhere", 409)
+            self._drop_session(other)
+
     async def _warm_proxy(self) -> None:
         if self._uninstalling():
             return  # the packages are going; Generate reports it
@@ -495,15 +561,17 @@ class SdkRunner:
     def status(self, session: SdkSession) -> dict:
         return {"ok": True, **session.public(self.template_name(session))}
 
-    def _controls_snapshot(self, session: SdkSession, manage: bool = False, query: str = "") -> dict:
-        with sdk_templates.template_lock(session.template_id):
-            prompt, _ = sdk_templates.load_template(session.template_id)
-            stored = sdk_templates.read_control_values(session.template_id)
+    def _controls_snapshot(self, session: SdkSession, manage: bool = False, query: str = "",
+                           template_id: str | None = None) -> dict:
+        template_id = template_id or session.template_id
+        with sdk_templates.template_lock(template_id):
+            prompt, _ = sdk_templates.load_template(template_id)
+            stored = sdk_templates.read_control_values(template_id)
             view = sdk_templates.apply_stored_values(
                 prompt, sdk_templates.describe_stored(prompt, stored, self._describe), stored, describe=self._describe)
             # ``prompt`` now carries the stored values: changes are validated
             # against it, so a new choice list and a choice in it agree.
-            snapshot = {"view": view, "seq": stored["seq"], "prompt": prompt}
+            snapshot = {"view": view, "seq": stored["seq"], "prompt": prompt, "template_id": template_id}
             if manage:
                 # Amendment A1: root-level literal inputs only, never greyed out.
                 listed, truncated = control_descriptors.manage_candidates(
@@ -516,16 +584,31 @@ class SdkRunner:
             prompt, control_descriptors.sdk_candidates(prompt), class_lookup=self._class_lookup)
 
     async def controls_view(self, session: SdkSession, *, manage: bool = False, query: str = "") -> dict:
-        async with self.template_lock(session.template_id):
-            return await asyncio.to_thread(self._controls_snapshot, session, manage, query)
+        template_id = session.template_id
+        async with self.template_lock(template_id):
+            # The view names its workflow, so a page that has switched since
+            # can drop it.
+            return await asyncio.to_thread(self._controls_snapshot, session, manage, query, template_id)
+
+    @staticmethod
+    def _check_workflow(session: SdkSession, template_id: str, expected: Any = None) -> None:
+        """One workflow per request: the id read when the request arrived, which the
+        page must have meant and the session must still have after any wait."""
+        if (expected is not None and str(expected) != template_id) or session.template_id != template_id:
+            raise SdkError("The workflow changed. Try again.", "workflow_changed", 409,
+                           template_id=session.template_id)
 
     async def change_controls(self, session_id: str, secret: str, tab_session_id: str, changes: Any, *,
-                              manage: bool = False, query: str = "") -> dict:
+                              manage: bool = False, query: str = "", expected_template_id: Any = None) -> dict:
         session = await self.authorized(session_id, secret, tab_session_id)
-        async with self.template_lock(session.template_id):
-            # Ownership may change while waiting behind a Generate batch.
+        template_id = session.template_id
+        self._check_workflow(session, template_id, expected_template_id)
+        async with self.template_lock(template_id):
+            # Ownership and the workflow may change while waiting behind a
+            # Generate batch or a switch.
             await self.authorized(session_id, secret, tab_session_id)
-            snapshot = await asyncio.to_thread(self._controls_snapshot, session)
+            self._check_workflow(session, template_id)
+            snapshot = await asyncio.to_thread(self._controls_snapshot, session, False, "", template_id)
             # An expose or rebind needs the template's candidate inventory to validate.
             structural = isinstance(changes, dict) and any(
                 (parsed := control_descriptors.parse_target(t)) and parsed[0] != "group"
@@ -537,9 +620,9 @@ class SdkRunner:
             if rejected:
                 raise SdkError("Some changes could not be saved.", "invalid_change", 400, rejected=rejected)
             await self.authorized(session_id, secret, tab_session_id)
-            await await_template_io(sdk_templates.store_binding_changes, session.template_id, cleaned,
+            await await_template_io(sdk_templates.store_binding_changes, template_id, cleaned,
                                     snapshot["view"], snapshot["prompt"])
-            return await asyncio.to_thread(self._controls_snapshot, session, manage, query)
+            return await asyncio.to_thread(self._controls_snapshot, session, manage, query, template_id)
 
     # ── Generate ─────────────────────────────────────────────────────────────
 
@@ -568,8 +651,11 @@ class SdkRunner:
         editor_values: Any = None,
         editor_values_seq: Any = None,
         render_cache_max_bytes: Any = 0,
+        expected_template_id: Any = None,
     ) -> dict:
         epoch = session.cancel_epoch
+        # Read once: every later step of this request uses this workflow.
+        template_id = session.template_id
         self._remember_loop()
         if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= MAX_COUNT:
             raise SdkError(f"Generate count must be 1 to {MAX_COUNT}.", "invalid_count")
@@ -578,7 +664,8 @@ class SdkRunner:
         self._check_not_uninstalling()
         self._generating += 1
         try:
-            return await self._generate(session, count, editor_values, render_cache_max_bytes, tab_session_id, editor_values_seq, epoch)
+            return await self._generate(session, template_id, expected_template_id, count, editor_values,
+                                        render_cache_max_bytes, tab_session_id, editor_values_seq, epoch)
         finally:
             self._generating -= 1
 
@@ -595,7 +682,10 @@ class SdkRunner:
             await asyncio.sleep(0.05)
         return True
 
-    async def _generate(self, session: SdkSession, count: int, editor_values: Any, render_cache_max_bytes: Any, tab_session_id: str, editor_values_seq: Any, epoch: int) -> dict:
+    async def _generate(self, session: SdkSession, template_id: str, expected_template_id: Any, count: int,
+                        editor_values: Any, render_cache_max_bytes: Any, tab_session_id: str, editor_values_seq: Any,
+                        epoch: int) -> dict:
+        self._check_workflow(session, template_id, expected_template_id)
         if not await asyncio.to_thread(self._sdk_ready):
             raise SdkError("The comfy-sdk package is not installed.", "sdk_not_installed", 409)
         valid, render_cache_max_bytes = clean_editor_value("render_cache_max_bytes", render_cache_max_bytes)
@@ -603,11 +693,14 @@ class SdkRunner:
             render_cache_max_bytes = 0
 
         writer = sdk_templates.clean_editor_writer({"tab": tab_session_id, "seq": editor_values_seq}) if editor_values is not None else None
-        async with self.template_lock(session.template_id):
+        async with self.template_lock(template_id):
             await self.authorized(session.session_id, session.secret, tab_session_id)
+            # A switch queued ahead of this Generate moved the session on.
+            self._check_workflow(session, template_id)
             if len(session.unfinished()) + count > MAX_UNFINISHED_PER_SESSION:
                 raise SdkError("Too many takes are already waiting. Wait or cancel some.", "too_many_runs", 429)
-            build = await asyncio.to_thread(self._build_base, session, editor_values, render_cache_max_bytes, writer)
+            build = await asyncio.to_thread(self._build_base, session, editor_values, render_cache_max_bytes, writer,
+                                           template_id)
             self._check_submit_epoch(session, epoch, build)
             refusals = sdk_templates.generate_refusals(build["view"])
             from .model_requirements import missing_models, missing_model_message
@@ -628,11 +721,14 @@ class SdkRunner:
         if session.cancel_epoch != epoch:
             raise SdkError("Canceled before it was sent.", "canceled_before_submit", 409, stale=build["stale"])
 
-    def _build_base(self, session: SdkSession, editor_values: Any, render_cache_max_bytes: Any, writer) -> dict:
-        with sdk_templates.template_lock(session.template_id):
-            return self._build_base_locked(session, editor_values, render_cache_max_bytes, writer)
+    def _build_base(self, session: SdkSession, editor_values: Any, render_cache_max_bytes: Any, writer,
+                    template_id: str | None = None) -> dict:
+        template_id = template_id or session.template_id
+        with sdk_templates.template_lock(template_id):
+            return self._build_base_locked(session, editor_values, render_cache_max_bytes, writer, template_id)
 
-    def _build_base_locked(self, session: SdkSession, editor_values: Any, render_cache_max_bytes: int, writer) -> dict:
+    def _build_base_locked(self, session: SdkSession, editor_values: Any, render_cache_max_bytes: int, writer,
+                           template_id: str) -> dict:
         """The prompt every run of this Generate shares, plus its Controls view."""
         stale = False
         if editor_values is not None:
@@ -643,9 +739,9 @@ class SdkRunner:
             values = {**result["values"], **clean_editor_values(editor_values, sdk_templates.EDITOR_STATE_FIELDS)}
         else:
             values = sdk_templates.read_editor_state(session.project)
-        prompt, meta = sdk_templates.load_template(session.template_id)
-        self._template_names[session.template_id] = meta.get("name", "")
-        stored = sdk_templates.read_control_values(session.template_id)
+        prompt, meta = sdk_templates.load_template(template_id)
+        self._template_names[template_id] = meta.get("name", "")
+        stored = sdk_templates.read_control_values(template_id)
         editors = [key for key, node in prompt.items() if node.get("class_type") == "SonderEditor"]
         if len(editors) != 1:
             raise SdkError("The workflow needs exactly one Sonder Editor.", "invalid_template", 409)
@@ -683,6 +779,7 @@ class SdkRunner:
                 "step": binding.get("step") or 1,
             })
         return {"prompt": prompt, "editor_key": editors[0], "view": view, "seed_bindings": seed_bindings, "stale": stale,
+                "template_id": template_id, "template_name": meta.get("name", ""),
                 # What this app's curation changes about the workflow's Controls,
                 # for the provenance each saved take records (controls_snapshot).
                 "controls_delta": controls_snapshot.sdk_overlay_delta(view, prompt)}
@@ -708,6 +805,7 @@ class SdkRunner:
                 run = SdkRun(
                     run_id=f"run-{uuid.uuid4().hex[:12]}", token=token, session_id=session.session_id,
                     index=index, count=count, seeds=seeds, submitted_at=self._clock(), client=client, node_labels=labels,
+                    template_id=build["template_id"], template_name=build["template_name"],
                 )
                 graph[build["editor_key"]].setdefault("_meta", {})["sonder_run"] = token
                 # The run exists before the submit: ComfyUI can finish (or fail) a
@@ -732,7 +830,7 @@ class SdkRunner:
                         self._mark_unconfirmed(run)
                         run_ids.append(run.run_id)
                         seeds_used.append({cid: str(value) for cid, value in seeds.items()})
-                        await self._advance_seeds(session, seed_bindings)
+                        await self._advance_seeds(build["template_id"], seed_bindings)
                         failure = SdkError(
                             "ComfyUI did not confirm this run. It will show here if it started.",
                             "submit_unconfirmed", 502,
@@ -750,7 +848,7 @@ class SdkRunner:
                 seeds_used.append({cid: str(value) for cid, value in seeds.items()})
                 if run.cancel_requested or session.cancel_epoch != epoch:
                     await self._cancel_run(run)
-                await self._advance_seeds(session, seed_bindings)
+                await self._advance_seeds(build["template_id"], seed_bindings)
         finally:
             self._trim_finished(session)
             self._ensure_presence_loop()
@@ -782,7 +880,7 @@ class SdkRunner:
             meta[controls_snapshot.SDK_META_KEY] = copy.deepcopy(delta)
         return graph
 
-    async def _advance_seeds(self, session: SdkSession, seed_bindings: list) -> None:
+    async def _advance_seeds(self, template_id: str, seed_bindings: list) -> None:
         changed = {}
         for binding in seed_bindings:
             if binding["mode"] == "fixed":
@@ -804,13 +902,13 @@ class SdkRunner:
                 entry["sig"] = sig
 
         try:
-            await await_template_io(sdk_templates.update_control_values, session.template_id, mutate)
+            await await_template_io(sdk_templates.update_control_values, template_id, mutate)
         except sdk_templates.TemplateError:
-            logger.info("Workflow %s was deleted during Generate; seeds not saved.", session.template_id)
+            logger.info("Workflow %s was deleted during Generate; seeds not saved.", template_id)
         except Exception:
             # The run is already in ComfyUI's queue: tracking it matters more
             # than this seed write. The next Generate starts from the old seed.
-            logger.exception("Could not save the advanced seeds of workflow %s", session.template_id)
+            logger.exception("Could not save the advanced seeds of workflow %s", template_id)
 
     def _trim_finished(self, session: SdkSession) -> None:
         finished = [run for run in session.runs if run.final]

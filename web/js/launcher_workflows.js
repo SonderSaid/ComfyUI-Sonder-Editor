@@ -17,6 +17,12 @@ export function controlsLine(controls) {
     const shown = controls.filter(c => !c.advanced), advanced = controls.length - shown.length;
     return `Controls: ${[...shown.map(c => c.label), ...(advanced ? [`+${advanced} advanced`] : [])].join(', ')}`;
 }
+// The exit notice's workflow: each take still generating names the workflow it
+// was submitted with, since the session may have switched after it.
+export function generatingWorkflows(runs, fallback = 'the workflow') {
+    const names = [...new Set((runs || []).map(run => run?.template_name).filter(Boolean))];
+    return names.length ? names.join(' and ') : fallback;
+}
 export function mountWorkflows(state, actions) {
     const sidebar = el('aside', `sl-sidebar${state.workflowExpanded ? ' expanded' : ''}`);
     sidebar.setAttribute('aria-label', 'Workflows');
@@ -29,7 +35,7 @@ export function mountWorkflows(state, actions) {
     if (state.importProblems?.length) head.append(el('div', 'sl-bad sl-problem', state.importProblems.join('\n')));
     sidebar.append(head);
     const list = el('div', 'sl-workflow-list'); list.dataset.scrollKey = 'workflows';
-    const hidden = new Set(state.memory.hidden?.workflows || []);
+    const hidden = new Set(state.memory.hidden?.workflows || []), favorites = new Set(state.memory.favorites || []);
     const byId = new Map(state.templates.map(t => [t.template_id, t]));
     const ordered = state.projectData.workflow_order.map(id => byId.get(id)).filter(Boolean);
     const query = state.workflowSearch.toLowerCase();
@@ -41,7 +47,7 @@ export function mountWorkflows(state, actions) {
             const chosen = t.template_id === state.selectedTemplateId;
             const row = el('div', `sl-workflow${chosen ? ' selected' : ''}${hidden.has(t.template_id) ? ' hidden' : ''}`);
             row.tabIndex = 0; row.dataset.workflowId = t.template_id; row.setAttribute('role', 'button'); row.setAttribute('aria-pressed', String(chosen));
-            const line = el('div', 'sl-row'); line.append(el('div', 'sl-workflow-name', t.name));
+            const line = el('div', 'sl-row'); line.append(el('div', 'sl-workflow-name', `${favorites.has(t.template_id) ? '★ ' : ''}${t.name}`));
             const menu = button('⋮', e => { e.stopPropagation(); actions.workflowMenu(t, e.currentTarget); }, { title: `Actions for ${t.name}` });
             line.append(menu);
             const sub = el('div', 'sl-workflow-sub');

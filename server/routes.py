@@ -15429,6 +15429,13 @@ if routes is not None:
         project = await run_project_io(load_project, project_dir)
         return project_dir, project_event_aliases(project)
 
+    async def _sdk_pending_jobs(project_dir: str) -> int:
+        """Sonder queue jobs still waiting. They record no workflow: each renders with
+        the workflow whose Generate takes it, so takes already generating may take
+        some first."""
+        project = await run_project_io(load_project, project_dir)
+        return sum(1 for job in project.generation_queue if (job.status or "pending").lower() == "pending")
+
     # Optional feature: an import failure in the SDK modules must not take the
     # editor's other routes down with it.
     try:
@@ -15437,6 +15444,7 @@ if routes is not None:
         register_sdk_routes(
             routes,
             resolve_project=_sdk_resolve_project,
+            pending_jobs=_sdk_pending_jobs,
             remember_event_loop=remember_event_loop,
             projects_dir=_configured_base_dir,
             app=app,

@@ -5,6 +5,7 @@ opens the Launcher agrees (``<comfy user dir>/sonder-editor/launcher.json``)::
 
     {"version": 1,
      "hidden": {"projects": [<folder>], "workflows": [<template_id>]},
+     "favorites": [<template_id>],
      "last_workflow": {"by_project": {<folder>: {"template_id", "at"}},
                        "by_template": {<template_id>: <at>},
                        "any": {"template_id", "at"}}}
@@ -13,7 +14,8 @@ Projects are keyed by their **folder name**, the key every project route and SDK
 session uses. ``project_id`` cannot be the key: a copied project folder keeps its
 id, so several projects can share one. Renaming a folder therefore forgets that
 project's entries. Times are Unix seconds. Each map keeps its newest
-``MAX_ENTRIES`` entries. Unknown keys are kept, and an unreadable file is moved
+``MAX_ENTRIES`` entries; ``favorites`` keeps the order they were starred in (display
+order is ``launcher_routes.workflow_order``'s). Unknown keys are kept, and an unreadable file is moved
 aside by ``read_json_sidecar`` and the Launcher starts fresh.
 """
 
@@ -113,7 +115,13 @@ def normalize(data: Any) -> dict:
     last["any"] = ({"template_id": any_template, "at": _clean_time(any_entry.get("at"))}
                    if TEMPLATE_ID_RE.match(any_template) else {})
 
-    data.update(version=STATE_VERSION, hidden=hidden, last_workflow=last)
+    raw_favorites = data.get("favorites") if isinstance(data.get("favorites"), list) else []
+    favorites: list[str] = []
+    for item in raw_favorites:
+        if isinstance(item, str) and TEMPLATE_ID_RE.match(item) and item not in favorites:
+            favorites.append(item)
+
+    data.update(version=STATE_VERSION, hidden=hidden, last_workflow=last, favorites=favorites[-MAX_ENTRIES:])
     return data
 
 
@@ -154,6 +162,19 @@ def set_hidden(kind: str, item_id: Any, hidden: bool) -> dict:
     return _update(mutate)
 
 
+def set_favorite(template_id: Any, favorite: bool) -> dict:
+    """Star or unstar a workflow; a new star goes last."""
+    value = check_template_id(template_id)
+
+    def mutate(data: dict) -> None:
+        items = [item for item in data["favorites"] if item != value]
+        if favorite:
+            items.append(value)
+        data["favorites"] = items
+
+    return _update(mutate)
+
+
 def record_open(folder: Any, template_id: Any, *, clock: Callable[[], float] = time.time) -> dict:
     """Remember that ``template_id`` was opened on project ``folder``."""
     folder, template_id = check_folder(folder), check_template_id(template_id)
@@ -183,10 +204,11 @@ def preferred_workflow(state: dict, folder: str, available: list[str]) -> str:
 
 
 def public_state(state: dict) -> dict:
-    """What the Launcher page reads: hidden ids and last-workflow times."""
+    """What the Launcher page reads: hidden ids, favorites and last-workflow times."""
     last = state["last_workflow"]
     return {
         "hidden": {kind: list(state["hidden"][kind]) for kind in KINDS},
+        "favorites": list(state["favorites"]),
         "last_workflow": {
             "by_project": {folder: dict(entry) for folder, entry in last["by_project"].items()},
             "by_template": dict(last["by_template"]),

@@ -516,6 +516,26 @@ function mount(fake, order, before = null) {
     button.click();
     await settle();
     out.dom_generate = { order, generated: fake.generated };
+    {
+        // Sonder App: the click holds its workflow through beforeGenerate and
+        // sends the one on screen at the click; a switch in flight disables it.
+        const app = fakeGenerationHost();
+        const events = [];
+        Object.assign(app, {
+            templateId: "A", switching: false,
+            holdWorkflow() { events.push("hold"); return () => events.push("release"); },
+            async generate(count, opts) { events.push(["generate", opts.templateId]); return { ok: true, status: 202, payload: { run_ids: ["r"], error: null } }; },
+        });
+        const appControls = mount(app, [], async () => { events.push("before"); app.templateId = "B"; });
+        const [appButton] = appControls.element.children;
+        appButton.click();
+        await settle();
+        out.dom_hold = events;
+        app.switching = true;
+        app.emit(app.status);
+        out.dom_switching_disabled = appButton.disabled;
+        appControls.destroy();
+    }
 
     fake.emit({ seq: 0, runs: [{ run_id: "a", state: "queued", index: 1, count: 2 }, { run_id: "b", state: "submitting", index: 2, count: 2 }] });
     faces.push([button.textContent, cancelButton.textContent, countGroup.style.display]);
@@ -847,6 +867,9 @@ def test_refusal_notices_put_the_sentence_in_message_and_the_reason_in_detail(re
 
 def test_generate_controls_drive_the_host(results):
     assert results["dom_generate"] == {"order": ["drain"], "generated": [[3, {"renderCacheMaxBytes": 123}]]}
+    # The Sonder App's workflow is held from the click and sent as it was then.
+    assert results["dom_hold"] == ["hold", "before", ["generate", "A"], "release"]
+    assert results["dom_switching_disabled"] is True
     faces = results["dom_faces"]
     assert faces[0] == ["Generate", "primary", "×1"]
     assert faces[1] == "×3"

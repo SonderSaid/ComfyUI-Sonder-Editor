@@ -141,5 +141,5 @@ export function mountPresetsManage(host, { track, notify, flushPending = async (
         if (e.key === "Enter" && (input === name || e.ctrlKey || e.metaKey)) { input.blur(); return true; }
         return PRESERVE_DEFAULT;
     }});
-    return {el, render, memberControl, canLeave, get editing() { return dirty() || [name, description].includes(document.activeElement); }, destroy() { destroyed = true; unregister(); el.remove(); }};
+    return {el, render, memberControl, canLeave, get busy() { return busy; }, get editing() { return dirty() || [name, description].includes(document.activeElement); }, destroy() { destroyed = true; unregister(); el.remove(); }};
 }

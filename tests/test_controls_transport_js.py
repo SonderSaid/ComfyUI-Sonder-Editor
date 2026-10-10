@@ -13,18 +13,30 @@ const intervalFns=[];globalThis.setInterval=f=>(intervalFns.push(f),intervalFns.
 const settle=async()=>{for(let i=0;i<20;i++)await new Promise(r=>setImmediate(r));};
 const controlsView={bindings:[{source:'binding',binding_id:'n',kind:'INT',status:'ok',value:'20'}],notes:[]};
 if(SCENARIO.startsWith('sdk')){
-    let seq=0,resolveSave=null,fail=false,stored='20';const calls=[];
-    const owner=new SdkWidgetHost({sessionId:'sdk',secret:'secret',projectId:'P',tabSessionId:'tab',fetchImpl:async(path,init={})=>{
+    // Server side: the session's workflow and each workflow's own Controls sequence.
+    let statusSeq=0,current='A',seqs={A:SCENARIO==='sdk-switch'?5:0,B:0},resolveSave=null,resolveGenerate=null,fail=false,stored='20',served=null;const calls=[];
+    const owner=new SdkWidgetHost({sessionId:'sdk',secret:'secret',projectId:'P',tabSessionId:'tab',templateId:'A',templateName:'Alpha',fetchImpl:async(path,init={})=>{
         calls.push({path,method:init.method||'GET',headers:init.headers,body:init.body?JSON.parse(init.body):null});
         if(path.endsWith('/controls')){
             if(init.method==='PUT'){
-                if(SCENARIO==='sdk-order')await new Promise(r=>resolveSave=r);
+                if(SCENARIO==='sdk-order'||SCENARIO==='sdk-switch')await new Promise(r=>resolveSave=r);
                 if(fail)return{ok:false,status:400,json:async()=>({code:'invalid_change',rejected:[{target:'binding:n:value',reason:'refused'}]})};
-                stored=JSON.parse(init.body).changes['binding:n:value'];seq++;
+                stored=JSON.parse(init.body).changes['binding:n:value'];seqs[current]++;
             }
-            return{ok:true,status:200,json:async()=>({view:{...controlsView,bindings:[{...controlsView.bindings[0],value:stored}]},seq})};
+            const template=served||current;
+            return{ok:true,status:200,json:async()=>({view:{...controlsView,bindings:[{...controlsView.bindings[0],value:`${stored}@${template}`.replace(/@A$/,'')}]},seq:seqs[template],template_id:template})};
         }
-        return{ok:true,status:202,json:async()=>({run_ids:['run'],observed:stored})};
+        if(path.endsWith('/workflow')){
+            if(SCENARIO==='sdk-switching')await new Promise(r=>resolveSave=r);
+            current='B';
+            // The server switched, but the answer never reached the page.
+            if(SCENARIO==='sdk-lost-answer')throw new TypeError('Failed to fetch');
+            return{ok:true,status:200,json:async()=>({ok:true,template_id:'B',template_name:'Beta',pending_jobs:2})};
+        }
+        if(path.endsWith('/status'))return{ok:true,status:200,json:async()=>({session_id:'sdk',seq:++statusSeq,template_id:current,template_name:current==='B'?'Beta':'Alpha',runs:[]})};
+        if(SCENARIO==='sdk-busy')await new Promise(r=>resolveGenerate=r);
+        if(current!==JSON.parse(init.body).template_id)return{ok:false,status:409,json:async()=>({ok:false,code:'workflow_changed',template_id:current})};
+        return{ok:true,status:202,json:async()=>({run_ids:['run'],observed:stored,template_id:JSON.parse(init.body).template_id})};
     }});
     const host=owner.getControlsHost();host.setVisible(true);await settle();assert.equal(host.getView().bindings[0].value,'20');
     if(SCENARIO==='sdk-order'){
@@ -48,6 +60,84 @@ if(SCENARIO.startsWith('sdk')){
         assert.deepEqual(host.capabilities,{hide:true,removeAuthored:false});
     }
     if(SCENARIO==='sdk-flush'){owner.flushControlsPanel=async()=>false;assert.equal((await owner.generate(1)).payload.code,'controls_not_saved');assert.equal(calls.some(c=>c.path.endsWith('/generate')),false);}
+    if(SCENARIO==='sdk-switch'){
+        // An edit made on A, still saving, when Workflow ▾ asks for B.
+        const changes=[];owner.onWorkflowChanged(change=>changes.push(change));
+        owner.status={seq:1,runs:[{run_id:'r1',state:'running',template_id:'A',template_name:'Alpha'}]};
+        const save=host.applyChanges({'binding:n:value':'31'});await settle();
+        const switching=owner.switchWorkflow('B');await settle();
+        assert.equal(calls.some(c=>c.path.endsWith('/workflow')),false,'the switch waits for the queued save');
+        resolveSave();assert.equal((await save).ok,true);const result=await switching;assert.equal(result.ok,true);
+        const put=calls.find(c=>c.method==='PUT'),post=calls.find(c=>c.path.endsWith('/workflow'));
+        assert.equal(put.body.template_id,'A');assert.deepEqual(post.body,{template_id:'B',expected_template_id:'A'});
+        assert.ok(calls.indexOf(put)<calls.indexOf(post));
+        assert.deepEqual(changes,[{template_id:'B',name:'Beta',previous:{template_id:'A',name:'Alpha'},pending_jobs:2,still_generating:1}]);
+        assert.equal(owner.templateId,'B');assert.equal(owner.templateName,'Beta');
+        // Runs keep their place: the run list is the session's, not the workflow's.
+        assert.deepEqual(owner.status.runs.map(r=>r.run_id),['r1']);
+        // A fresh host: B's sequence (0) is not dropped as older than A's (6).
+        const next=owner.getControlsHost();assert.notEqual(next,host);next.setVisible(true);await settle();
+        assert.equal(next.getView().state,'ready');assert.equal(next.getView().bindings[0].value,'31@B');
+        // The retired host is quiet: no listener sees a later view.
+        let heard=0;host.subscribe(()=>heard++);await host.refresh();assert.equal(heard,0);
+        const later=next.applyChanges({'binding:n:value':'40'});await settle();resolveSave();await later;
+        assert.equal(calls.filter(c=>c.method==='PUT').at(-1).body.template_id,'B');
+        next.destroy();
+    }
+    if(SCENARIO==='sdk-adopt-status'||SCENARIO==='sdk-adopt-refusal'||SCENARIO==='sdk-lost-answer'){
+        // The session moved to B without this page's own switch answer: another
+        // tab switched it (seen in a status snapshot, or as a refused Generate),
+        // or the answer to this page's switch was lost.
+        const changes=[];owner.onWorkflowChanged(change=>changes.push(change));
+        if(SCENARIO==='sdk-adopt-status'){current='B';assert.equal(owner.applyStatus({session_id:'sdk',seq:5,template_id:'B',template_name:'Beta',runs:[]}),true);}
+        if(SCENARIO==='sdk-adopt-refusal'){current='B';const result=await owner.generate(1);assert.equal(result.payload.code,'workflow_changed');await settle();}
+        if(SCENARIO==='sdk-lost-answer'){const result=await owner.switchWorkflow('B');assert.equal(result.payload.code,'network');await settle();}
+        assert.equal(owner.templateId,'B');assert.equal(owner.templateName,'Beta');
+        assert.equal(changes.length,1);assert.equal(changes[0].adopted,true);assert.deepEqual(changes[0].previous,{template_id:'A',name:'Alpha'});
+        // A fresh host reads B, and the next Generate is not refused again.
+        const next=owner.getControlsHost();assert.notEqual(next,host);next.setVisible(true);await settle();
+        assert.equal(next.getView().state,'ready');
+        const again=await owner.generate(1);assert.equal(again.ok,true);assert.equal(again.payload.template_id,'B');
+        next.destroy();
+    }
+    if(SCENARIO==='sdk-switching'){
+        // While the switch is in flight, edits and Generate are refused, not lost.
+        const switching=owner.switchWorkflow('B');await settle();
+        assert.equal(owner.switching,true);
+        const edit=await host.applyChanges({'binding:n:value':'55'});assert.equal(edit.ok,false);assert.match(edit.rejected[0].reason,/switching/);
+        assert.equal((await owner.generate(1)).payload.code,'workflow_switching');
+        assert.equal(calls.some(c=>c.method==='PUT'),false);
+        resolveSave();assert.equal((await switching).ok,true);assert.equal(owner.switching,false);
+        // A status snapshot of the page's own switch adopts nothing twice.
+        owner.applyStatus({session_id:'sdk',seq:9,template_id:'B',template_name:'Beta',runs:[]});
+    }
+    if(SCENARIO==='sdk-hold'){
+        // The toolbar holds the workflow from the click: the menu is busy before generate() runs.
+        const release=owner.holdWorkflow();assert.equal(owner.busy,true);assert.equal(host.workflows.busy(),true);
+        release();release();assert.equal(owner.busy,false);
+    }
+    if(SCENARIO==='sdk-stale-view'){
+        // A view of a workflow this page has switched away from is not adopted.
+        owner.templateId='B';served='A';stored='99';await host.refresh();assert.equal(host.getView().bindings[0].value,'20');
+        served='B';await host.refresh();assert.equal(host.getView().bindings[0].value,'99@B');
+    }
+    if(SCENARIO==='sdk-captures'){
+        // The click's workflow travels with it, even if the page switches while
+        // the panel flushes.
+        owner.flushControlsPanel=async()=>{owner.templateId='B';return true;};
+        const result=await owner.generate(1);assert.equal(result.payload.template_id,'A');
+        owner.flushControlsPanel=null;owner.templateId='A';
+        const edit=host.applyChanges({'binding:n:value':'41'});owner.templateId='B';await edit;
+        assert.equal(calls.filter(c=>c.method==='PUT').at(-1).body.template_id,'A');
+    }
+    if(SCENARIO==='sdk-busy'){
+        let paints=0;host.subscribe(()=>paints++);
+        const generating=owner.generate(1);await settle();
+        assert.equal(owner.busy,true);assert.equal(host.workflows.busy(),true);assert.ok(paints>=1,'the panel repaints');
+        assert.equal((await owner.switchWorkflow('B')).payload.code,'busy');assert.equal(calls.some(c=>c.path.endsWith('/workflow')),false);
+        resolveGenerate();await generating;assert.equal(owner.busy,false);
+        assert.deepEqual(host.workflows.current(),{template_id:'A',name:'Alpha'});
+    }
     owner.destroy();
 }
 if(SCENARIO.startsWith('mounted')){
@@ -229,7 +319,7 @@ if(SCENARIO==='canvas-http'||SCENARIO==='relay-error-recovery'||SCENARIO==='canv
 }
 console.log('ok');
 '''
-@pytest.mark.parametrize('scenario',['sdk-manage','mounted-manage','relay-manage','sdk-order','sdk-refusal','sdk-flush','mounted-ack','mounted-post-race','mounted-refusal','mounted-visibility','mounted-order','relay-ack','relay-retry','relay-stale','relay-owner-observation','canvas-http','canvas-revoked','relay-error-recovery','relay-too-large','relay-fit','mounted-abandon-restart','mounted-abandon-cleared','mounted-abandon-recreated','relay-invalid-view'])
+@pytest.mark.parametrize('scenario',['sdk-adopt-status','sdk-adopt-refusal','sdk-lost-answer','sdk-switching','sdk-hold','sdk-switch','sdk-stale-view','sdk-captures','sdk-busy','sdk-manage','mounted-manage','relay-manage','sdk-order','sdk-refusal','sdk-flush','mounted-ack','mounted-post-race','mounted-refusal','mounted-visibility','mounted-order','relay-ack','relay-retry','relay-stale','relay-owner-observation','canvas-http','canvas-revoked','relay-error-recovery','relay-too-large','relay-fit','mounted-abandon-restart','mounted-abandon-cleared','mounted-abandon-recreated','relay-invalid-view'])
 def test_controls_transport(scenario):
     node=shutil.which('node')
     if not node:pytest.skip('node required for host adapter tests')

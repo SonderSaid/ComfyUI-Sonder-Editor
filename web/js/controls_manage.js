@@ -393,6 +393,9 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         addNote: group => openDraft(typeof group === "string" ? group : ""),
         addGroup: then => openGroupDraft(typeof then === "function" ? then : null),
         get rebinding() { return rebind?.binding_id || null; },
+        // An unsaved note or description draft (a preset draft asks in canLeave).
+        get hasDraft() { return !!draft || !!description.dirty; },
+        get presetSaving() { return presets.busy; },
         get editing() { return !!draft || presets.editing || description.editing || document.activeElement === filterInput; },
         destroy() {
             destroyed = true;

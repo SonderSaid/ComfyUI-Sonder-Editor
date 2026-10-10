@@ -12,6 +12,7 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Added
+- Sonder App: a Workflow menu at the top of the Controls panel switches to another imported workflow without leaving the project, scene or timeline. Takes already generating finish under their own workflow, and favorites (★, from the menu or the Launcher's ⋮ menu) come first in both places.
 - Controls presets: a workflow can carry named sets of Controls that set up one feature in one choice. Author them in Manage, pick one from the Preset menu in fullscreen, mounted tabs and the Sonder App, and share them in the saved workflow and Export (API).
 - Workflow descriptions in Manage and the Launcher, plus Export as API to share Sonder App values and curated Controls with another Sonder App.
 - Controls: create, rename, reorder and ungroup workflow groups in every editor mode, move settings between them, and mark a group Advanced; recorded Advanced settings show an Adv tag in asset details.

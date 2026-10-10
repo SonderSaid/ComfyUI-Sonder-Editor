@@ -1,7 +1,7 @@
 import { installComfyApiShim } from "./comfy_api_shim.js";
 import { FONT, THEME, applyNativeControlTheme, chromeButtonCss, injectSonderFontFaces, setButtonDisabled, statusPillCss } from "./editor_theme.js";
 import { mountToastStack } from "./editor_toast_stack.js";
-import { configureNotifications } from "./editor_notifications.js";
+import { configureNotifications, notifySuccess, notifyWarning } from "./editor_notifications.js";
 import { notificationCoreConfig, subscribeEditorSettings } from "./editor_settings.js";
 import { LAUNCHER_WINDOW_NAME } from "./sdk_setup_client.js";
 import { createMountedControlsHost } from "./controls_host_remote.js";
@@ -408,8 +408,8 @@ async function runSdkTab() {
             `/sonder-editor/tab/${encodeURIComponent(sessionProject)}?mode=sdk&session=${encodeURIComponent(sdkSessionId)}`));
         return;
     }
-    const templateName = String(stateResp.payload.template_name || "");
-    document.title = templateName ? `${templateName} · Sonder App` : "Sonder App";
+    const workflowTitle = name => (name ? `${name} · Sonder App` : "Sonder App");
+    document.title = workflowTitle(String(stateResp.payload.template_name || ""));
 
     const projectResp = await fetchJson(`/sonder-editor/project/${encodeURIComponent(projectId)}`);
     if (!projectResp.ok) {
@@ -423,16 +423,19 @@ async function runSdkTab() {
         secret,
         projectId,
         tabSessionId: sessionId,
+        templateId: String(stateResp.payload.template_id || ""),
+        templateName: String(stateResp.payload.template_name || ""),
         defaults: DEFAULT_WIDGET_VALUES,
         initialValues: stateResp.payload.values || {},
         fetchImpl: (...args) => fetch(...args),
         apiURL: (path) => api.apiURL(path),
     });
 
+    // Re-claims name the workflow the session runs now (it can switch).
     const claim = () => claimEditorSession(projectId, sessionId, "sdk", {
         host_id: sdkSessionId,
         browser_instance_id: sessionId,
-        workflow_label: templateName ? `Sonder App · ${templateName}` : "Sonder App",
+        workflow_label: host.templateName ? `Sonder App · ${host.templateName}` : "Sonder App",
         sdk_secret: secret,
     }, "", sdkSessionId);
 
@@ -456,8 +459,8 @@ async function runSdkTab() {
             sdk.writeSdkExitFlag({
                 session_id: sdkSessionId,
                 project: projectId,
-                template_id: String(stateResp.payload.template_id || ""),
-                template_name: templateName,
+                template_id: host.templateId,
+                template_name: host.templateName,
             });
             window.location.assign(launcherHref);
         },
@@ -465,6 +468,44 @@ async function runSdkTab() {
     editor.updateProject(projectId);
     editor.applyWidgetState(host.values);
     editor._enterFullscreen();
+
+    // Workflow ▾ switched the session: the project, scene and timeline stay;
+    // the Controls panel remounts for the new workflow.
+    host.onWorkflowChanged((change) => {
+        tabDiagRecord("sdk_workflow_changed", { from: change.previous?.template_id, to: change.template_id });
+        document.title = workflowTitle(change.name);
+        editor.replaceControlsHost(host.getControlsHost());
+        if (change.adopted) {
+            notifyWarning(`This session now runs ${change.name || "another workflow"}`, {
+                source: "sdk-workflow-switch",
+                detail: "It was switched in another tab, or before this page heard back. The Controls now show it.",
+            });
+            return;
+        }
+        const notes = [];
+        if (change.still_generating) {
+            notes.push(`${change.still_generating} ${change.still_generating === 1 ? "take" : "takes"} still generating with ${change.previous?.name || "the previous workflow"}.`);
+        }
+        if (change.pending_jobs) {
+            // Queued jobs record no workflow: each renders with the Generate that takes it.
+            const jobs = `${change.pending_jobs} queued ${change.pending_jobs === 1 ? "job" : "jobs"}`;
+            notes.push(change.still_generating
+                ? `${jobs}: takes already generating may take some first; the rest render with ${change.name || "this workflow"}.`
+                : `${jobs} will render with ${change.name || "this workflow"}.`);
+        }
+        notifySuccess(`Switched to ${change.name || "the workflow"}`, { source: "sdk-workflow-switch", detail: notes.join(" ") || undefined });
+        void (async () => {
+            // A preview only: Generate's own refusal remains the gate.
+            const requirements = await fetchJson(`/sonder-editor/sdk/templates/${encodeURIComponent(change.template_id)}/requirements`);
+            const missing = requirements.ok ? requirements.payload.missing_models || [] : [];
+            if (missing.length) {
+                notifyWarning(`${missing.length} ${missing.length === 1 ? "model is" : "models are"} missing for ${change.name || "this workflow"}`, {
+                    source: "sdk-workflow-switch",
+                    detail: missing.map(item => `${item.file}${item.folder ? ` (models/${item.folder})` : ""}`).join(", "),
+                });
+            }
+        })().catch(() => {});
+    });
     document.body.classList.add("ready");
     mountToastsOnce();
 

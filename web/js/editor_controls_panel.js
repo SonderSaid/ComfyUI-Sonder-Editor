@@ -114,7 +114,16 @@ export function mountControlsPanel(container, host) {
     quietLine.dataset.controlsAdvancedLine = "true";
     quietLine.style.cssText = S.quietLineCss;
     quietLine.addEventListener("click", () => writeSetting("controls.showAdvanced", !showAdvanced()));
-    const presets = mountPresets(host, {flushPending: () => flushPending(), track, notify: reason => warning(reason)});
+    const presets = mountPresets(host, {flushPending: () => flushPending(), track, notify: reason => warning(reason),
+        // Switching workflows remounts the panel: Manage drafts would be lost.
+        canSwitch: () => {
+            if (manage?.presetSaving) {
+                warning("Wait for the preset to save, then switch workflows.");
+                return false;
+            }
+            return !manage || (manage.canLeave() && (!manage.hasDraft
+                || globalThis.confirm("Discard your unsaved Manage edits and switch workflows?")));
+        }});
     header.append(headerTop);
     container.append(header);
     header.after(presets.el);

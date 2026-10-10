@@ -105,6 +105,8 @@ export class SdkWidgetHost {
         secret,
         projectId,
         tabSessionId,
+        templateId = "",
+        templateName = "",
         defaults = {},
         initialValues = {},
         fetchImpl = (...args) => globalThis.fetch(...args),
@@ -117,6 +119,11 @@ export class SdkWidgetHost {
         this.secret = String(secret || "");
         this.projectId = String(projectId || "");
         this.tabSessionId = String(tabSessionId || "");
+        // The workflow this page believes the session runs. Every Generate and
+        // Controls write captures it when called; the server refuses one that
+        // no longer matches (`workflow_changed`).
+        this.templateId = String(templateId || "");
+        this.templateName = String(templateName || "");
         this.values = { ...(defaults || {}), ...(initialValues || {}) };
         this.ownerState = "active";
         this.status = { seq: -1, runs: [] };
@@ -133,6 +140,9 @@ export class SdkWidgetHost {
         this._seq = 0;
         this._cancelEpoch = 0;
         this._listeners = new Set();
+        this._workflowListeners = new Set();
+        this._generating = 0;
+        this._switching = false;
         this._controlsHost = null;
         this.flushControlsPanel = null;
         this._destroyed = false;
@@ -221,6 +231,9 @@ export class SdkWidgetHost {
         if (code === "not_owner" || code === "session_ended") {
             this.onOwnershipLost?.(code);
         }
+        // The session runs another workflow than this page believes (switched
+        // from another tab, or a switch whose answer was lost): read it back.
+        if (code === "workflow_changed" && !this._switching) void this.refreshStatus();
         return code;
     }
 
@@ -346,6 +359,10 @@ export class SdkWidgetHost {
         const ids = new Set((snapshot.runs || []).map(run => run.run_id));
         for (const id of this.details.keys()) if (!ids.has(id)) this.details.delete(id);
         if (this.ownerState === "ended") return false;
+        const templateId = String(snapshot.template_id || "");
+        if (templateId && templateId !== this.templateId && !this._switching) {
+            this._adoptWorkflow(templateId, String(snapshot.template_name || ""));
+        }
         this._publish({
             seq,
             template_name: String(snapshot.template_name || ""),
@@ -387,8 +404,23 @@ export class SdkWidgetHost {
     // Generate saves the values it is sent before it can refuse a workflow
     // (`generate_refused`) or submit; any earlier refusal saved nothing, so the
     // pending edits are put back for the next save.
-    async generate(count, { renderCacheMaxBytes = 0, signal = null } = {}) {
+    async generate(count, { renderCacheMaxBytes = 0, signal = null, templateId: clicked = null } = {}) {
         const cancelEpoch = this._cancelEpoch;
+        // The workflow this click meant: from the click itself when the toolbar
+        // captured it (holdWorkflow), otherwise before anything below can await.
+        const templateId = clicked ?? this.templateId;
+        if (this._switching) {
+            return { ok: false, status: 409, payload: { code: "workflow_switching", error: "Wait for the workflow switch to finish, then Generate." } };
+        }
+        this._setGenerating(1);
+        try {
+            return await this._generate(count, { renderCacheMaxBytes, signal, cancelEpoch, templateId });
+        } finally {
+            this._setGenerating(-1);
+        }
+    }
+
+    async _generate(count, { renderCacheMaxBytes, signal, cancelEpoch, templateId }) {
         if (this.flushControlsPanel && !await this.flushControlsPanel()) {
             return { ok: false, status: 409, payload: { code: "controls_not_saved", error: "A control edit was not saved." } };
         }
@@ -416,6 +448,7 @@ export class SdkWidgetHost {
                     count: n,
                     editor_values: { ...this.values },
                     editor_values_seq: ++this._seq,
+                    template_id: templateId,
                     // -1 is unlimited, 0 disables the cache (renderCacheMaxBytes).
                     render_cache_max_bytes: Math.max(-1, Math.round(Number(renderCacheMaxBytes) || 0)),
                 }),
@@ -434,6 +467,146 @@ export class SdkWidgetHost {
         if (!result.ok) this._noteRefusal(result);
         await this._controlsHost?.refresh();
         return result;
+    }
+
+    // ── Workflow switching (Sonder App only) ────────────────────────────────
+
+    // A Generate between its click and its response keeps the Workflow menu
+    // disabled; the Controls host repaints the panel when this changes.
+    get busy() {
+        return this._generating > 0 || this._switching;
+    }
+
+    get switching() {
+        return this._switching;
+    }
+
+    // From a Generate click until its answer: the toolbar awaits other work
+    // before calling generate(), and a switch then would run the click on the
+    // new workflow. Returns the release.
+    holdWorkflow() {
+        this._setGenerating(1);
+        let held = true;
+        return () => {
+            if (held) this._setGenerating(-1);
+            held = false;
+        };
+    }
+
+    // The server's session runs another workflow than this page believed. Same
+    // effect as a switch made here, without the queued-jobs count.
+    _adoptWorkflow(templateId, name) {
+        const previous = { template_id: this.templateId, name: this.templateName };
+        this.templateId = templateId;
+        this.templateName = name || this.templateName;
+        this._replaceControlsHost();
+        this._announceWorkflow({ template_id: this.templateId, name: this.templateName, previous, pending_jobs: 0,
+            still_generating: this._stillGeneratingWith(), adopted: true });
+    }
+
+    _stillGeneratingWith() {
+        return this.activeRuns().filter(run => run.template_id && run.template_id !== this.templateId).length;
+    }
+
+    _replaceControlsHost() {
+        const retired = this._controlsHost;
+        this._controlsHost = null;
+        retired?.destroy();
+    }
+
+    _announceWorkflow(change) {
+        for (const listener of [...this._workflowListeners]) {
+            try {
+                listener(change);
+            } catch (err) {
+                console.warn("[Sonder] workflow change listener failed:", err);
+            }
+        }
+    }
+
+    _setSwitching(value) {
+        this._switching = value;
+        this._controlsHost?.repaint?.();
+        // The toolbar disables Generate while a switch is in flight.
+        this._publish(this.status);
+    }
+
+    _setGenerating(delta) {
+        this._generating = Math.max(0, this._generating + delta);
+        this._controlsHost?.repaint?.();
+    }
+
+    onWorkflowChanged(listener) {
+        if (typeof listener !== "function") return () => {};
+        this._workflowListeners.add(listener);
+        return () => this._workflowListeners.delete(listener);
+    }
+
+    async listWorkflows() {
+        try {
+            const result = await readResponse(await this._fetch(this._sessionPath("workflows"), { headers: this.headers(false) }));
+            if (!result.ok) this._noteRefusal(result);
+            return result;
+        } catch (err) {
+            return { ok: false, status: 0, payload: { code: "network", error: String(err?.message || err) } };
+        }
+    }
+
+    async setFavorite(templateId, favorite) {
+        try {
+            return await readResponse(await this._fetch(this._apiURL("/sonder-editor/launcher/favorite"), {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ id: String(templateId || ""), favorite: !!favorite }),
+            }));
+        } catch (err) {
+            return { ok: false, status: 0, payload: { code: "network", error: String(err?.message || err) } };
+        }
+    }
+
+    // The panel has already saved or refused its edits. This waits for Controls
+    // writes still queued (each carries the old workflow), then switches. A new
+    // Controls host follows: its views and sequences belong to one workflow.
+    async switchWorkflow(templateId) {
+        if (!this.canWrite()) return { ok: false, status: 409, payload: { code: "not_owner", error: "This tab no longer owns the session." } };
+        if (this.busy) return { ok: false, status: 409, payload: { code: "busy", error: "Wait for Generate to answer, then switch." } };
+        this._setSwitching(true);
+        // Refused or unanswered: the server may already run another workflow.
+        let reread = true;
+        try {
+            await this._controlsHost?.flush();
+            const previous = { template_id: this.templateId, name: this.templateName };
+            let result;
+            try {
+                result = await readResponse(await this._fetch(this._sessionPath("workflow"), {
+                    method: "POST",
+                    headers: this.headers(),
+                    body: JSON.stringify({ template_id: String(templateId || ""), expected_template_id: previous.template_id }),
+                }));
+            } catch (err) {
+                return { ok: false, status: 0, payload: { code: "network", error: String(err?.message || err) } };
+            }
+            if (!result.ok) {
+                this._noteRefusal(result);
+                return result;
+            }
+            reread = false;
+            this.templateId = String(result.payload.template_id || "");
+            this.templateName = String(result.payload.template_name || "");
+            this._replaceControlsHost();
+            this._announceWorkflow({
+                template_id: this.templateId,
+                name: this.templateName,
+                previous,
+                pending_jobs: Number(result.payload.pending_jobs) || 0,
+                // Takes from earlier workflows keep generating; they keep their own.
+                still_generating: this._stillGeneratingWith(),
+            });
+            return result;
+        } finally {
+            this._setSwitching(false);
+            if (reread) void this.refreshStatus();
+        }
     }
 
     async cancelAll() {
@@ -458,6 +631,7 @@ export class SdkWidgetHost {
         if (this._flushTimer != null) this._clearTimeout(this._flushTimer);
         this._flushTimer = null;
         this._listeners.clear();
+        this._workflowListeners.clear();
         this.details.clear();
     }
 }

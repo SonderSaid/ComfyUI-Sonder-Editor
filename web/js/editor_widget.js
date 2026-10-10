@@ -4519,6 +4519,21 @@ export class EditorWidget {
         this._referenceMediaEditorHandle = handle;
     }
 
+    // The Sonder App switched workflows: the panel and its rows, drafts and
+    // last-applied preset belong to the old workflow, so it remounts on the new
+    // host, keeping the sidebar's current tab.
+    replaceControlsHost(controlsHost) {
+        if (this._destroyed || controlsHost === this._controlsHost) return;
+        const mounted = !!this._controlsPanelHandle;
+        this._controlsPanelHandle?.destroy();
+        this._controlsPanelHandle = null;
+        this._controlsPanelEl?.remove();
+        this._controlsPanelEl = null;
+        this._controlsHost?.setVisible(false);
+        this._controlsHost = controlsHost || null;
+        if (mounted) this._showFullscreenSidebarContent(this._settings?.layout?.fullscreenSidebarContent, { persist: false });
+    }
+
     _ensureControlsPanelMounted() {
         if (!this._fsSidebar || this._controlsPanelHandle) return;
         this._controlsPanelEl = document.createElement("div");

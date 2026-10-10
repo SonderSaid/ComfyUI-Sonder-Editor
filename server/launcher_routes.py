@@ -34,12 +34,17 @@ def _scene_for(project: dict, folder: str) -> dict:
 
 
 def workflow_order(state: dict, templates: list[dict]) -> list[str]:
-    """The sidebar's order for your workflows: last used first, then never-used ones by
-    newest import. The Launcher's one authority for it, and for the fallback below."""
+    """The order of your workflows, then starters: favorites first, then last used first,
+    then never-used ones by newest import. Starters keep their bundled order, favorites
+    first. The Launcher's and the Sonder App dropdown's one authority, and the fallback
+    for preselection below."""
     by_template = state["last_workflow"]["by_template"]
-    ranked = sorted((t for t in templates if not t.get("starter")), key=lambda t: (-by_template.get(t["template_id"], 0.0),
-                                              -(t.get("imported_at") or 0), t.get("name", "").lower()))
-    ranked.extend(sorted((t for t in templates if t.get("starter")), key=lambda t: (t.get("order", 0), t["template_id"])))
+    favorites = set(state.get("favorites") or [])
+    ranked = sorted((t for t in templates if not t.get("starter")), key=lambda t: (
+        t["template_id"] not in favorites, -by_template.get(t["template_id"], 0.0),
+        -(t.get("imported_at") or 0), t.get("name", "").lower()))
+    ranked.extend(sorted((t for t in templates if t.get("starter")), key=lambda t: (
+        t["template_id"] not in favorites, t.get("order", 0), t["template_id"])))
     return [t["template_id"] for t in ranked]
 
 
@@ -179,6 +184,16 @@ def register_launcher_routes(routes, *, projects_dir: Callable[[], str],
         if not isinstance(hidden, bool):
             raise launcher_state.LauncherStateError("hidden must be true or false.")
         state = await asyncio.to_thread(launcher_state.set_hidden, str(body.get("kind") or ""), body.get("id"), hidden)
+        return web.json_response({"ok": True, **launcher_state.public_state(state)})
+
+    @routes.put("/sonder-editor/launcher/favorite")
+    @handle
+    async def api_launcher_favorite(request: web.Request) -> web.Response:
+        body = await _json_body(request)
+        favorite = body.get("favorite")
+        if not isinstance(favorite, bool):
+            raise launcher_state.LauncherStateError("favorite must be true or false.")
+        state = await asyncio.to_thread(launcher_state.set_favorite, body.get("id"), favorite)
         return web.json_response({"ok": True, **launcher_state.public_state(state)})
 
     @routes.post("/sonder-editor/launcher/link-preview")

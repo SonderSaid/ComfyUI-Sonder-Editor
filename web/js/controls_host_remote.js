@@ -22,6 +22,8 @@ export function createSdkControlsHost(owner) {
         for (const cb of listeners) cb(view);
     };
     const adopt = payload => {
+        // A view of a workflow this page has switched away from.
+        if (payload.template_id && owner.templateId && payload.template_id !== owner.templateId) return;
         if (Number(payload.seq) >= seq) {
             seq = Number(payload.seq);
             view = { ...payload.view, state: "ready", error: payload.view?.error || null };
@@ -32,11 +34,11 @@ export function createSdkControlsHost(owner) {
     const controlsPath = () =>
         owner._sessionPath("controls") +
         (manage.on ? `?manage=1&filter=${encodeURIComponent(manage.filter)}` : "");
-    const request = async (method, changes) => {
+    const request = async (method, changes, templateId) => {
         const response = await owner._fetch(controlsPath(), {
             method,
             headers: owner.headers(method !== "GET"),
-            ...(changes ? { body: JSON.stringify({ changes }) } : {}),
+            ...(changes ? { body: JSON.stringify({ changes, template_id: templateId }) } : {}),
         });
         const payload = await response.json();
         const result = { ok: response.ok, status: response.status, payload };
@@ -101,11 +103,14 @@ export function createSdkControlsHost(owner) {
         refresh,
         applyChanges(changes) {
             const owned = { ...changes };
+            // The workflow this edit was made on, whatever happens while it queues.
+            const templateId = owner.templateId;
+            if (owner.switching) return Promise.resolve(failure(owned, "The workflow is switching. Make this change after it."));
             const work = tail.then(async () => {
                 if (destroyed || !owner.canWrite()) return failure(owned, "This session no longer owns the editor.");
                 epoch++;
                 try {
-                    const result = await request("PUT", owned);
+                    const result = await request("PUT", owned, templateId);
                     if (destroyed) return failure(owned, "The editor has closed.");
                     if (result.ok) {
                         adopt(result.payload);
@@ -126,6 +131,18 @@ export function createSdkControlsHost(owner) {
         // panel's decision (flushPending); an old refusal here must not linger.
         async flush() {
             await tail;
+        },
+        // The Sonder App's Workflow menu (controls_presets.js renders it).
+        workflows: {
+            current: () => ({ template_id: owner.templateId, name: owner.templateName }),
+            busy: () => !!owner.busy,
+            list: () => owner.listWorkflows(),
+            switchTo: templateId => owner.switchWorkflow(templateId),
+            setFavorite: (templateId, favorite) => owner.setFavorite(templateId, favorite),
+        },
+        // Repaint with the same view (Generate started or answered).
+        repaint() {
+            if (!destroyed) emit();
         },
         destroy() {
             destroyed = true;

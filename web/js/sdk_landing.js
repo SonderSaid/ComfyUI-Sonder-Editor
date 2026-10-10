@@ -12,7 +12,7 @@ import { register, PRIORITY } from './keyboard_ownership.js';
 import { el, button, mountLauncherStyle, date } from './launcher_view.js';
 import { mountHeader, environmentState } from './launcher_header.js';
 import { downloadCuratedWorkflow } from './launcher_export.js';
-import { mountWorkflows } from './launcher_workflows.js';
+import { generatingWorkflows, mountWorkflows } from './launcher_workflows.js';
 import { mountProjects, thumbnailMode } from './launcher_projects.js';
 import { mountOpenBar } from './launcher_open_bar.js';
 import { mountDialog, mountPopup, mountProjectDialog } from './launcher_dialog.js';
@@ -163,6 +163,11 @@ async function importFile(file, template = null) {
         });
     } catch (err) { state.importProblems = err.payload?.validation?.errors || [err.message]; render(); }
 }
+// Favorites come first in the Launcher and in the Sonder App's Workflow menu.
+async function setFavorite(id, favorite) {
+    await call('/sonder-editor/launcher/favorite', { method: 'PUT', ...json({ id, favorite }) });
+    await refresh();
+}
 async function setHidden(kind, id, hidden) {
     await call('/sonder-editor/launcher/hidden', { method: 'PUT', ...json({ kind, id, hidden }) });
     if (hidden && !state.prefs.showHidden) {
@@ -183,6 +188,8 @@ function workflowMenu(template, anchor) {
             } })));
             menu.append(button('Replace…', () => { close(); pickFile(file => importFile(file, template)); }));
         }
+        const favorite = state.memory.favorites?.includes(template.template_id);
+        menu.append(button(favorite ? 'Remove from favorites' : 'Add to favorites', () => { close(); void run(() => setFavorite(template.template_id, !favorite)); }));
         menu.append(el('div', 'sl-dim', `${template.source_name || ''}${template.imported_at ? ` · ${date(template.imported_at)}` : ''}`));
         const hidden = state.memory.hidden?.workflows?.includes(template.template_id);
         menu.append(button(hidden ? 'Unhide' : 'Hide', () => { close(); void run(() => setHidden('workflow', template.template_id, !hidden)); }));
@@ -289,8 +296,9 @@ async function pollExitSession() {
     try {
         const payload = await call(`/sonder-editor/sdk/session/${encodeURIComponent(exitFlag.session_id)}/status`, { headers: { [SDK_SECRET_HEADER]: readSdkSecret(exitFlag.session_id) } });
         if (!active) return;
-        const generating = (payload.runs || []).filter(isUnfinishedRun).length;
-        const next = generating || state.exitNotice ? { generating, project: payload.project || exitFlag.project, workflow: payload.template_name || chosenTemplate()?.name || 'the workflow' } : null;
+        const unfinished = (payload.runs || []).filter(isUnfinishedRun), generating = unfinished.length;
+        const workflow = generatingWorkflows(unfinished, payload.template_name || chosenTemplate()?.name || 'the workflow');
+        const next = generating || state.exitNotice ? { generating, project: payload.project || exitFlag.project, workflow } : null;
         // The first Cancel click must survive an unchanged polling result.
         if (JSON.stringify(next) !== JSON.stringify(state.exitNotice)) { state.exitNotice = next; root.querySelector('[data-sonder-exit-notice]')?.replaceWith(exitNotice()); }
         if (generating) exitPollTimer = setTimeout(() => void pollExitSession(), 2000);

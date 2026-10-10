@@ -29,7 +29,9 @@ const state = {projects:[{folder:'a',name:'Same',modified_at:'2026-10-01',hidden
 const visible = modules.launcher_projects.visibleProjects(state).map(p=>p.folder);
 state.prefs.showHidden=true;state.projectSearch='b';
 const searched = modules.launcher_projects.visibleProjects(state).map(p=>p.folder);
-console.log(JSON.stringify({defaults,invalid,valid,problems,visible,searched,sample:modules.launcher_workflows.SAMPLE_PROJECTS_URL}));
+const names = modules.launcher_workflows.generatingWorkflows;
+const exitNames = [names([{template_name:'Alpha'},{template_name:'Beta'},{template_name:'Alpha'}], 'Now'), names([{}], 'Now'), names([], 'Now')];
+console.log(JSON.stringify({defaults,invalid,valid,problems,visible,searched,exitNames,sample:modules.launcher_workflows.SAMPLE_PROJECTS_URL}));
 '''.replace('__BASE__', json.dumps(JS.as_uri() + '/'))
     result = subprocess.run(['node', '--input-type=module', '-e', script], capture_output=True, text=True, encoding='utf-8', timeout=30)
     assert result.returncode == 0, result.stderr
@@ -40,4 +42,6 @@ console.log(JSON.stringify({defaults,invalid,valid,problems,visible,searched,sam
     assert 'prompt history' in value['problems'][4]['text'] and '0.4.0' in value['problems'][4]['text']
     assert value['visible'] == ['c','a','broken']
     assert value['searched'] == ['b','broken']
+    # The exit notice names each running take's own workflow (a session can switch).
+    assert value['exitNames'] == ['Alpha and Beta', 'Now', 'Now']
     assert f"({value['sample']})" in (ROOT / 'README.md').read_text(encoding='utf-8')

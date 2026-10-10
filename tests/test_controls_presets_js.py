@@ -96,3 +96,59 @@ def test_presets_selection_flush_and_manage(tmp_path):
     path.write_text(script, encoding='utf-8')
     result = subprocess.run(['node', str(path)], capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
+
+
+WORKFLOW_MENU = r'''
+const {mountPresets}=await import(PRESETS_URL);
+const calls=[],notices=[];let flushOk=true,canLeave=true,flushes=0;
+const wf={current:{template_id:'A',name:'Alpha'},busy:false};
+const workflows={current:()=>wf.current,busy:()=>wf.busy,
+    list:async()=>({ok:true,payload:{current:'A',workflows:[
+        {template_id:'B',name:'Beta',ok:true,favorite:true,description:'Detailing'},
+        {template_id:'A',name:'Alpha',ok:true,favorite:false,description:''},
+        {template_id:'C',name:'Broken',ok:false,favorite:false,description:''}]}}),
+    switchTo:async id=>{calls.push(['switch',id,flushes]);return {ok:true};},
+    setFavorite:async(id,favorite)=>{calls.push(['favorite',id,favorite]);return {ok:true};}};
+const view={state:'ready',description:'**Workflow help**',presets:[],bindings:[]};
+const host={getView:()=>view,workflows};
+const section=mountPresets(host,{notify:m=>notices.push(m),track:w=>w,canSwitch:()=>canLeave,
+    flushPending:async()=>{flushes++;return flushOk;}});
+document.body.append(section.el);section.render(view);await settle();
+const menu=walk(section.el).find(n=>n.dataset.controlsWorkflowMenu==='true');
+const select=walk(menu).find(n=>n.tagName==='SELECT'),star=walk(menu).find(n=>n.tagName==='BUTTON');
+// Favorites first (the server's order), the current one selected, a broken one disabled.
+assert.deepEqual(select.children.map(o=>[o.value,o.textContent,!!o.disabled]),[['B','★ Beta',false],['A','Alpha',false],['C','Broken',true]]);
+assert.equal(select.value,'A');assert.equal(star.textContent,'☆');assert.equal(star.attributes['aria-pressed'],'false');
+// Workflow ▾ comes before the workflow's description.
+assert.ok(section.el.children.indexOf(menu)===0);assert.match(section.el.textContent,/Workflow help/);
+// A failed save refuses the switch; a declined Manage draft cancels it.
+flushOk=false;select.value='B';select.dispatch('change');await settle();
+assert.deepEqual(calls,[]);assert.match(notices.at(-1),/not switched/);assert.equal(select.value,'A');
+flushOk=true;canLeave=false;select.value='B';select.dispatch('change');await settle();assert.deepEqual(calls,[]);
+canLeave=true;select.value='B';select.dispatch('change');await settle();
+assert.deepEqual(calls,[['switch','B',3]],'switched only after its own flush');
+// Disabled while a Generate is between click and response.
+wf.busy=true;section.render(view);assert.equal(select.disabled,true);assert.equal(star.disabled,true);
+wf.busy=false;section.render(view);assert.equal(select.disabled,false);
+// The star stars the current workflow.
+star.dispatch('click');await settle();assert.deepEqual(calls.at(-1),['favorite','A',true]);
+// Manage hides the description and presets, never the Workflow menu.
+section.render(view,true);assert.equal(section.el.style.display,'flex');assert.notEqual(menu.style.display,'none');
+section.destroy();
+// Canvas hosts have no workflows capability: no menu.
+const canvas=mountPresets({getView:()=>view},{notify:()=>{},track:w=>w,flushPending:async()=>true});
+canvas.render(view);assert.equal(walk(canvas.el).some(n=>n.dataset.controlsWorkflowMenu==='true'),false);
+canvas.render(view,true);assert.equal(canvas.el.style.display,'none');canvas.destroy();
+'''
+
+
+def test_the_workflow_menu_saves_asks_and_switches(tmp_path):
+    script = PRELUDE + WORKFLOW_MENU
+    for name, path in [('MARKDOWN_URL', 'panel_markdown.js'), ('PANEL_URL', 'editor_controls_panel.js'),
+                       ('PRESETS_URL', 'controls_presets.js'), ('MANAGE_URL', 'controls_presets_manage.js')]:
+        script = script.replace(name, json.dumps((ROOT / 'web/js' / path).as_uri()))
+    script = script.replace('SCENARIO', json.dumps('workflow-menu'))
+    path = tmp_path / 'workflow_menu.mjs'
+    path.write_text(script, encoding='utf-8')
+    result = subprocess.run(['node', str(path)], capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr

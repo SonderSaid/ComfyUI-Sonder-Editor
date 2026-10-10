@@ -111,6 +111,10 @@ export function generateResultNotice(result, requested) {
     if (code === "sdk_uninstalling") {
         return { tier: "warning", message: "The Sonder App packages are being removed.", detail: "Generate is unavailable until they are installed again." };
     }
+    // The Sonder App switched workflows between the click and the server.
+    if (code === "workflow_changed" || code === "workflow_switching") {
+        return { tier: "warning", message: "The workflow changed before this Generate was sent.", detail: "Nothing was generated. Generate again on the workflow now shown." };
+    }
     if (code === "too_many_runs") {
         return { tier: "warning", message: "Too many takes are already waiting.", detail: payload.error || null };
     }
@@ -205,7 +209,8 @@ export function createGenerateControls({
         countLabel.textContent = `×${count}`;
         const state = generateButtonState(latestRuns, { submitting, count });
         button.textContent = state.generate === "sending" ? "Sending…" : "Generate";
-        setButtonDisabled(button, state.generate !== "idle");
+        // A Sonder App workflow switch in flight: the click would land on neither.
+        setButtonDisabled(button, state.generate !== "idle" || !!host.switching);
         const takes = count === 1 ? "one take" : `${count} takes`;
         button.title = state.generate === "sending" ? "Sending the takes to ComfyUI"
             : state.generate === "full" ? `Only ${GENERATE_MAX_UNFINISHED} takes may be unfinished. Lower the count, wait, or cancel some.`
@@ -287,13 +292,17 @@ export function createGenerateControls({
         pendingGenerate = new AbortController();
         render();
         const requested = count;
+        // The Sonder App's workflow is the one on screen at the click.
+        const release = host.holdWorkflow?.();
+        const templateId = host.templateId;
         try {
             await beforeGenerate?.();
-            const result = await host.generate(requested, { renderCacheMaxBytes: renderCacheMaxBytes(), signal: pendingGenerate.signal });
+            const result = await host.generate(requested, { renderCacheMaxBytes: renderCacheMaxBytes(), signal: pendingGenerate.signal, templateId });
             notifyTier(generateResultNotice(result, requested));
         } catch (err) {
             notifyError("Generate failed.", { detail: String(err?.message || err), source: "sdk-generate-request" });
         } finally {
+            release?.();
             submitting = false;
             pendingGenerate = null;
             render();

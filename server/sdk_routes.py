@@ -19,7 +19,7 @@ from typing import Any, Awaitable, Callable
 
 from aiohttp import web
 
-from . import control_descriptors, sdk_install, sdk_proxy, sdk_templates
+from . import control_descriptors, launcher_state, sdk_install, sdk_proxy, sdk_templates
 from .request_locality import is_loopback_request, local_only_response
 from .sdk_install import install_state
 from .sdk_runner import SdkError, await_template_io, get_runner
@@ -78,11 +78,44 @@ def _upstream_or_empty() -> str:
         return ""  # HTTPS ComfyUI: no shortcut
 
 
+def _first_line(text: Any) -> str:
+    return (str(text or "").strip().splitlines() or [""])[0].strip()[:200]
+
+
+def _session_workflows(current: str) -> dict:
+    """``{current, workflows: [{template_id, name, description, starter, ok, favorite}]}``."""
+    from .launcher_routes import workflow_order
+
+    try:
+        templates = sdk_templates.list_templates()
+    except sdk_templates.TemplateError:
+        templates = []
+    state = launcher_state.read_state()
+    hidden, favorites = set(state["hidden"]["workflows"]), set(state["favorites"])
+    by_id = {t["template_id"]: t for t in templates}
+    order = [tid for tid in workflow_order(state, templates) if tid not in hidden or tid == current]
+    order = [tid for tid in order if tid in favorites] + [tid for tid in order if tid not in favorites]
+    workflows = []
+    for tid in order:
+        template = by_id[tid]
+        validation = template.get("validation") or {}
+        workflows.append({
+            "template_id": tid,
+            "name": template.get("name", ""),
+            "description": _first_line(template.get("description")),
+            "starter": bool(template.get("starter")),
+            "ok": bool(validation.get("ok", True)) and not validation.get("blocking"),
+            "favorite": tid in favorites,
+        })
+    return {"ok": True, "current": current, "workflows": workflows}
+
+
 def register_sdk_routes(
     routes,
     *,
     resolve_project: Callable[[str], Awaitable[tuple[str, list]]],
     remember_event_loop: Callable[[], None],
+    pending_jobs: Callable[[str], Awaitable[int]] | None = None,
     projects_dir: Callable[[], str] = lambda: "",
     app=None,
 ) -> None:
@@ -299,6 +332,31 @@ def register_sdk_routes(
             "values": values,
         })
 
+    @routes.get("/sonder-editor/sdk/session/{session_id}/workflows")
+    @handle
+    async def api_sdk_session_workflows(request: web.Request) -> web.Response:
+        """The Workflow menu: favorites first, then the Launcher's order; hidden workflows
+        only when current."""
+        session = runner.session_for(request.match_info.get("session_id", ""), _secret(request))
+        current = session.template_id
+        return web.json_response(await asyncio.to_thread(_session_workflows, current))
+
+    @routes.post("/sonder-editor/sdk/session/{session_id}/workflow")
+    @handle
+    async def api_sdk_switch_workflow(request: web.Request) -> web.Response:
+        body = await _json_body(request)
+        result = await runner.switch_workflow(
+            request.match_info.get("session_id", ""), _secret(request), _tab(request),
+            body.get("template_id"), body.get("expected_template_id"))
+        session = runner.session_for(request.match_info.get("session_id", ""), _secret(request))
+        pending = 0
+        if pending_jobs is not None:
+            try:
+                pending = await pending_jobs(session.project_dir)
+            except Exception:
+                logger.warning("Counting the queued jobs after a workflow switch failed", exc_info=True)
+        return web.json_response({**result, "pending_jobs": pending})
+
     @routes.get("/sonder-editor/sdk/session/{session_id}/controls")
     @handle
     async def api_sdk_controls(request: web.Request) -> web.Response:
@@ -306,7 +364,7 @@ def register_sdk_routes(
         manage, query = _manage_query(request)
         snapshot = await runner.controls_view(session, manage=manage, query=query)
         view = await asyncio.to_thread(control_descriptors.json_safe, snapshot["view"])
-        return web.json_response({"ok": True, "view": view, "seq": snapshot["seq"]})
+        return web.json_response({"ok": True, "view": view, "seq": snapshot["seq"], "template_id": snapshot["template_id"]})
 
     @routes.put("/sonder-editor/sdk/session/{session_id}/controls")
     @handle
@@ -319,11 +377,12 @@ def register_sdk_routes(
         except (ValueError, UnicodeError):
             body = None
         manage, query = _manage_query(request)
+        body = body if isinstance(body, dict) else {}
         snapshot = await runner.change_controls(
-            session_id, _secret(request), _tab(request), body.get("changes") if isinstance(body, dict) else None,
-            manage=manage, query=query)
+            session_id, _secret(request), _tab(request), body.get("changes"),
+            manage=manage, query=query, expected_template_id=body.get("template_id"))
         view = await asyncio.to_thread(control_descriptors.json_safe, snapshot["view"])
-        return web.json_response({"ok": True, "view": view, "seq": snapshot["seq"]})
+        return web.json_response({"ok": True, "view": view, "seq": snapshot["seq"], "template_id": snapshot["template_id"]})
 
     @routes.get("/sonder-editor/sdk/session/{session_id}/status")
     @handle
@@ -356,6 +415,7 @@ def register_sdk_routes(
             tab_session_id=_tab(request),
             editor_values_seq=body.get("editor_values_seq"),
             render_cache_max_bytes=body.get("render_cache_max_bytes", 0),
+            expected_template_id=body.get("template_id"),
         )
         return web.json_response(result, status=202 if result.get("run_ids") else 502)
 

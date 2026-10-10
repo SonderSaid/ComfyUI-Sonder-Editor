@@ -68,6 +68,6 @@ export function mountWorkflowDescription(host, { track = work => work } = {}) {
         return PRESERVE_DEFAULT;
     }});
     render();
-    return { el, render, get editing() { return dirty || document.activeElement === area; },
+    return { el, render, get editing() { return dirty || document.activeElement === area; }, get dirty() { return dirty; },
         destroy() { destroyed = true; unregister(); el.remove(); } };
 }

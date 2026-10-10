@@ -89,3 +89,15 @@ def test_ordinary_hosts_are_unchanged():
         assert tab["code"] == "invalid_handoff"
 
     run(go)
+
+
+def test_a_workflow_switch_relabels_only_the_current_owner():
+    async def go():
+        await claim_session(PROJECT, "tab-a", "sdk", {"host_id": SDK_HOST, "workflow_label": "Sonder App · A"},
+                            sdk_secret=SECRET)
+        assert not await session_registry.set_owner_workflow_label(PROJECT, SDK_HOST, "tab-b", "Sonder App · B")
+        assert (await get_owner(PROJECT, host_id=SDK_HOST))["workflow_label"] == "Sonder App · A"
+        assert await session_registry.set_owner_workflow_label(PROJECT, SDK_HOST, "tab-a", "Sonder App · B")
+        assert (await get_owner(PROJECT, host_id=SDK_HOST))["workflow_label"] == "Sonder App · B"
+        assert not await session_registry.set_owner_workflow_label(PROJECT, "plain-host", "tab-a", "x")
+    run(go)
