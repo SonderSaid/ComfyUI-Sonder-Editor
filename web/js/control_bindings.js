@@ -22,6 +22,8 @@ export const MAX_NOTES = 256;
 export const MAX_SUGGESTIONS = 256;
 export const MAX_TARGETS = 64;
 export const MAX_GROUPS = 256;
+export const MAX_PRESETS = 32;
+export const MAX_PRESET_TARGETS = 64;
 export const MAX_DEPTH = 6;
 export const LABEL_MAX = 120;
 export const NOTE_MAX = 4000;
@@ -89,6 +91,27 @@ export function graphsOf(root) {
         for (const node of nodesOf(graph)) if (node?.subgraph) pending.push(node.subgraph);
     }
     return [...seen];
+}
+
+// ComfyUI's DynamicPrompts extension serializes `{a|b}` text as a fresh random
+// choice on every export. Controls reads an export it never queues, so it puts
+// each widget's template back: otherwise rows, presets and the writer's graph
+// hash see a different workflow on every read. Linked and promoted inputs take
+// their value from elsewhere and are left alone.
+export function restoreDynamicPrompts(graph, output, prefix = "", depth = 0) {
+    if (depth > MAX_NESTING || !isPlainObject(output)) return output;
+    for (const node of nodesOf(graph)) {
+        const key = prefix ? `${prefix}:${node?.id}` : String(node?.id);
+        if (isHost(node)) restoreDynamicPrompts(node.subgraph, output, key, depth + 1);
+        const inputs = output[key]?.inputs;
+        if (!isPlainObject(inputs)) continue;
+        for (const widget of node.widgets || []) {
+            if (!widget?.dynamicPrompts || typeof widget.value !== "string" || typeof inputs[widget.name] !== "string") continue;
+            const linked = (node.inputs || []).some(input => (input?.widget?.name ?? input?.name) === widget.name && input.link != null);
+            if (!linked) inputs[widget.name] = widget.value;
+        }
+    }
+    return output;
 }
 
 // ── Anchors ──────────────────────────────────────────────────────────────────
@@ -189,6 +212,53 @@ export function editManifest(text, mutate) {
     mutate(manifest);
     manifest.v = MANIFEST_VERSION;
     return JSON.stringify(manifest);
+}
+
+// Mirrors control_manifest.read_presets; reads never rewrite saved metadata.
+export function readPresets(raw) {
+    const result = {};
+    if (!isPlainObject(raw)) return result;
+    const validId = id => ID_RE.test(id) && !FORBIDDEN_KEYS.has(id);
+    for (const [id, entry] of Object.entries(raw)) {
+        if (!validId(id) || !isPlainObject(entry)) continue;
+        const {name, description = "", order = 0} = entry;
+        if (typeof name !== "string" || !name.trim() || [...name].length > LABEL_MAX
+            || typeof description !== "string" || [...description].length > DESCRIPTION_MAX
+            || !Number.isInteger(order) || Math.abs(order) > 9999) continue;
+        const members = {};
+        for (const [bid, member] of Object.entries(isPlainObject(entry.members) ? entry.members : {})) {
+            if (!validId(bid) || !isPlainObject(member) || !Object.hasOwn(member, "value")) continue;
+            const value = member.value;
+            if (!(value === null || ["string", "boolean"].includes(typeof value) || (typeof value === "number" && Number.isFinite(value)))) continue;
+            if (Object.hasOwn(member, "seed_mode") && !["fixed", "increment", "decrement", "randomize"].includes(member.seed_mode)) continue;
+            members[bid] = {value, ...(Object.hasOwn(member, "seed_mode") ? {seed_mode: member.seed_mode} : {})};
+        }
+        const entries = Object.values(members);
+        if (!entries.length || entries.reduce((n, m) => n + 1 + Number(Object.hasOwn(m, "seed_mode")), 0) > MAX_PRESET_TARGETS) continue;
+        if (Object.keys(result).length >= MAX_PRESETS) break;
+        result[id] = {name, description, order, members};
+    }
+    return result;
+}
+
+// Explicit edits alone may normalize a malformed presets map. Preserve every
+// untouched entry; assert the edited entry survives the tolerant reader.
+export function applyPresetEdit(manifest, id, field, value) {
+    if (!isPlainObject(manifest.presets)) manifest.presets = {};
+    const presets = manifest.presets;
+    if (field === "create" || field === "capture") presets[id] = structuredClone(value);
+    else if (field === "remove") delete presets[id];
+    else if (field === "name" || field === "description") {
+        if (!readPresets(presets)[id]) throw new Error("This preset no longer exists.");
+        presets[id][field] = value;
+    } else if (field === "move") {
+        const valid = readPresets(presets);
+        const ordered = Object.keys(valid).sort((a, b) => valid[a].order - valid[b].order).filter(key => key !== id);
+        if (!valid[id] || (value.before != null && !ordered.includes(value.before))) throw new Error("This preset moved. Refresh Controls.");
+        ordered.splice(value.before == null ? ordered.length : ordered.indexOf(value.before), 0, id);
+        ordered.forEach((key, order) => { presets[key].order = order; });
+    } else throw new Error("This preset edit is unavailable.");
+    if (field !== "remove" && !readPresets(presets)[id]) throw new Error("The preset would exceed its name, member or 32-preset cap.");
 }
 
 // ── Resolve ──────────────────────────────────────────────────────────────────

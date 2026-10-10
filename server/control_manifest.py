@@ -20,6 +20,7 @@ Pure and standard-library only, so tests and any caller may import it freely.
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import Any
 
@@ -34,6 +35,8 @@ MAX_NOTES = 256
 MAX_SUGGESTIONS = 256
 MAX_TARGETS = 64
 MAX_GROUPS = 256
+MAX_PRESETS = 32
+MAX_PRESET_TARGETS = 64
 # Nesting levels, counting the top object as 1. The export needs 5
 # (manifest > bindings > entry > targets > target); 6 leaves one spare.
 MAX_DEPTH = 6
@@ -86,7 +89,7 @@ def clean_group(value: Any) -> str:
 
 
 def empty_manifest() -> dict:
-    return {"v": MANIFEST_VERSION, "bindings": {}, "notes": {}, "groups": {}, "suggestions": [], "description": ""}
+    return {"v": MANIFEST_VERSION, "bindings": {}, "notes": {}, "groups": {}, "suggestions": [], "description": "", "presets": {}}
 
 
 def _check_shape(value: Any, depth: int = 1) -> None:
@@ -173,6 +176,45 @@ def _binding(raw: Any) -> dict:
     return entry
 
 
+def read_presets(raw: Any, *, limit: int | None = MAX_PRESETS) -> dict:
+    """Tolerant, non-mutating projection. Hygiene is checked by the manifest.
+
+    Invalid members are ignored individually; an empty/over-cap preset is
+    ignored. Only valid entries count toward the preset cap.
+    """
+    result = {}
+    if not isinstance(raw, dict):
+        return result
+    for identity, entry in raw.items():
+        if (not isinstance(identity, str) or not ID_RE.fullmatch(identity)
+                or identity in FORBIDDEN_KEYS or not isinstance(entry, dict)):
+            continue
+        name, description, order = entry.get("name"), entry.get("description", ""), entry.get("order", 0)
+        if (not isinstance(name, str) or not name.strip() or len(name) > LABEL_MAX
+                or not isinstance(description, str) or len(description) > DESCRIPTION_MAX
+                or isinstance(order, bool) or not isinstance(order, int) or abs(order) > ORDER_LIMIT):
+            continue
+        members = {}
+        for bid, member in (entry.get("members", {}).items() if isinstance(entry.get("members"), dict) else []):
+            if (not isinstance(bid, str) or not ID_RE.fullmatch(bid) or bid in FORBIDDEN_KEYS
+                    or not isinstance(member, dict) or "value" not in member):
+                continue
+            value, mode = member["value"], member.get("seed_mode")
+            if not (value is None or isinstance(value, (str, bool, int, float))):
+                continue
+            if isinstance(value, float) and not math.isfinite(value):
+                continue
+            if "seed_mode" in member and mode not in SEED_MODES:
+                continue
+            members[bid] = {"value": value, **({"seed_mode": mode} if "seed_mode" in member else {})}
+        if not members or sum(1 + ("seed_mode" in m) for m in members.values()) > MAX_PRESET_TARGETS:
+            continue
+        if limit is not None and len(result) >= limit:
+            break
+        result[identity] = {"name": name, "description": description, "order": order, "members": members}
+    return result
+
+
 def parse_manifest(text: Any) -> dict:
     """Parse and check a saved or exported manifest; raise ``ManifestError``."""
     if text is None or (isinstance(text, str) and not text.strip()):
@@ -207,6 +249,7 @@ def parse_manifest(text: Any) -> dict:
         raise ManifestError("The Controls manifest has too many unlisted anchors.")
 
     manifest = empty_manifest()
+    manifest["presets"] = read_presets(raw.get("presets"))
     manifest["description"] = _text(raw.get("description"), DESCRIPTION_MAX, "description")
     for binding_id, entry in bindings_raw.items():
         manifest["bindings"][_check_id(binding_id)] = _binding(entry)

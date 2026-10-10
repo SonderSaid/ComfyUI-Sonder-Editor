@@ -262,6 +262,7 @@ def _describe_controls_body(raw: bytes) -> dict:
                                     if node.get("class_type") == f.class_type]
         listed, truncated = control_descriptors.manage_candidates(inventory or [], view)
         view.update(candidates=listed, candidates_truncated=truncated or body.get("candidates_truncated") is True)
+    view["presets"] = control_descriptors.preset_states(view, view.get("_presets", {}), prompt=prompt)
     # Validation uses the full view, before json_safe caps display-only previews.
     if "changes" in body:
         cleaned, rejected = control_descriptors.validate_binding_changes(

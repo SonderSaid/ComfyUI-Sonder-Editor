@@ -6,6 +6,7 @@
 // the host lists them from the live graph (canvas, mounted) or the template
 // (Sonder App), already filtered and never greyed out.
 import { mountWorkflowDescription } from "./controls_workflow_description.js";
+import { mountPresetsManage } from "./controls_presets_manage.js";
 import { register, PRIORITY, PRESERVE_DEFAULT } from "./keyboard_ownership.js";
 import { groupNameError } from "./control_targets.js";
 import { EDITOR_COLORS as COLORS, FONT, RADIUS, SPACE, TYPE, chromeInputCss, setButtonDisabled, setButtonVariant } from "./editor_theme.js";
@@ -40,7 +41,7 @@ export function smallButton(text, variant = "secondary") {
 const KIND_NAMES = { INT: "number", FLOAT: "number", SEED: "seed", BOOLEAN: "on/off", COMBO: "choice", STRING: "text" };
 export const kindName = kind => KIND_NAMES[kind] || "";
 
-export function mountManageSection(host, { notify = () => {}, track = work => work } = {}) {
+export function mountManageSection(host, { notify = () => {}, track = work => work, flushPending = async () => true, changed = () => {} } = {}) {
     const id = ++nextManage;
     let destroyed = false,
         rebind = null, // {binding_id, label} while choosing a new setting for a binding
@@ -94,12 +95,14 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
     noteBox.style.cssText = `display:none;flex-direction:column;gap:${SPACE.s1}px;`;
     footer.append(addNote, addGroup);
     const description = mountWorkflowDescription(host, { track });
-    el.append(description.el, heading, filterInput, banner, list, footer, noteBox);
+    const presets = mountPresetsManage(host, {track, notify, flushPending, changed});
+    el.append(description.el, presets.el, heading, filterInput, banner, list, footer, noteBox);
 
     function apply(changes, button) {
         return track(applyNow(changes, button), changes);
     }
     async function applyNow(changes, button) {
+        const affected = (host.getView().presets || []).filter(p => p.members.some(m => `binding:${m.binding_id}:rebind` in changes));
         if (busy || destroyed) return false;
         busy = true;
         if (button) setButtonDisabled(button, true);
@@ -113,6 +116,7 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         if (destroyed) return false;
         if (button) setButtonDisabled(button, false);
         if (!result?.ok) notify(result?.rejected?.[0]?.reason || "The change could not be saved.");
+        else if (affected.length) notify(`Rebound Control belongs to: ${affected.map(p => p.name).join(", ")}. Review their captured values in Manage.`);
         render();
         return !!result?.ok;
     }
@@ -152,6 +156,7 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         if (destroyed) return;
         lastView = view;
         description.render(view);
+        presets.render(view);
         // Rebuilt only when what it lists changes: the panel renders on every
         // focus change, and a rebuild between a press and its click loses it.
         const key = JSON.stringify([rebind, filter, open, view.candidates, view.suggestions, view.candidates_truncated]);
@@ -383,16 +388,19 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         el,
         render,
         setRebind,
+        memberControl: spec => presets.memberControl(spec),
+        canLeave: () => presets.canLeave(),
         addNote: group => openDraft(typeof group === "string" ? group : ""),
         addGroup: then => openGroupDraft(typeof then === "function" ? then : null),
         get rebinding() { return rebind?.binding_id || null; },
-        get editing() { return !!draft || description.editing || document.activeElement === filterInput; },
+        get editing() { return !!draft || presets.editing || description.editing || document.activeElement === filterInput; },
         destroy() {
             destroyed = true;
             clearTimeout(filterTimer);
             if (draft) closeDraft(false);
             unregister();
             description.destroy();
+            presets.destroy();
             el.remove();
         },
     };

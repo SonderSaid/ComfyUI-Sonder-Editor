@@ -286,3 +286,23 @@ assert.throws(() => B.parseManifest(JSON.stringify({description:description+'x'}
 assert.throws(() => B.parseManifest(JSON.stringify({description:42})), /text/);
 console.log('ok');
 """)
+
+
+def test_dynamic_prompt_templates_replace_random_choices_in_the_controls_export():
+    run(r"""
+import assert from 'node:assert/strict';
+const B = await import(BINDINGS_URL);
+const graph = nodes => ({ _nodes: nodes });
+const text = (id, value, extra = {}) => ({ id, widgets: [{ name: 'text', value, dynamicPrompts: true }], inputs: [], ...extra });
+const plain = { id: 2, widgets: [{ name: 'text', value: '{kept|raw}' }], inputs: [] };
+const linked = text(3, '{inner|template}', { inputs: [{ name: 'text', link: 9, widget: { name: 'text' } }] });
+const inner = text(5, '{x|y}');
+const host = { id: 4, subgraph: graph([inner, linked]), widgets: [], inputs: [] };
+const root = graph([text(1, 'a {red|blue} b'), plain, host]);
+const output = { '1': { inputs: { text: 'a blue b' } }, '2': { inputs: { text: 'kept' } },
+    '4:5': { inputs: { text: 'y' } }, '4:3': { inputs: { text: 'promoted value' } }, '6': { inputs: { text: 'other' } } };
+assert.equal(B.restoreDynamicPrompts(root, output), output);
+assert.deepEqual(output, { '1': { inputs: { text: 'a {red|blue} b' } }, '2': { inputs: { text: 'kept' } },
+    '4:5': { inputs: { text: '{x|y}' } }, '4:3': { inputs: { text: 'promoted value' } }, '6': { inputs: { text: 'other' } } });
+console.log('ok');
+""")

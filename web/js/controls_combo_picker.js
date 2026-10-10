@@ -22,6 +22,7 @@ export function mountComboPicker({ choose, cancel, onLeave, inputCss }) {
     typed.setAttribute("aria-label", "Use exact typed option");
     typed.style.cssText = `border:1px solid ${COLORS.border};background:${COLORS.panelMuted};color:${COLORS.text};font:${TYPE.t12}px ${FONT.sans};border-radius:${RADIUS.r2}px;padding:${SPACE.s2}px;cursor:pointer;`;
     box.append(input, list, hint, typed);
+    let optionDetails = {};
     let options = [],
         truncated = false,
         query = "",
@@ -29,7 +30,7 @@ export function mountComboPicker({ choose, cancel, onLeave, inputCss }) {
         open = false;
     function paint() {
         const matches = options.filter(o => String(o).toLowerCase().includes(query.toLowerCase()));
-        list.replaceChildren(...matches.map(o => new Option(String(o), String(o))));
+        list.replaceChildren(...matches.map(o => { const option = new Option(String(o), String(o)); option.disabled = !!optionDetails[o]?.disabled; option.title = optionDetails[o]?.title || ""; return option; }));
         list.value = matches.some(o => String(o) === input.value) ? input.value : String(matches[0] ?? "");
         list.hidden = !open || !matches.length;
         hint.textContent = truncated
@@ -40,6 +41,7 @@ export function mountComboPicker({ choose, cancel, onLeave, inputCss }) {
     }
     function select(value) {
         const selected = String(value);
+        if (optionDetails[selected]?.disabled) return;
         input.value = current = selected;
         query = "";
         open = false;
@@ -93,6 +95,7 @@ export function mountComboPicker({ choose, cancel, onLeave, inputCss }) {
         contains: el => box.contains(el),
         update(spec) {
             options = spec.options || [];
+            optionDetails = spec.optionDetails || {};
             truncated = !!spec.options_truncated;
             typed.hidden = !truncated;
             input.disabled = list.disabled = typed.disabled = !["ok", "unlinked"].includes(spec.status);

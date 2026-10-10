@@ -27,7 +27,7 @@ export function groupNameError(name) {
 export const cleanGroup = value => (typeof value === "string" && !groupNameError(value) ? value.trim() : "");
 
 // `binding:<id>:<field>`, `note:<id>:<field>`, `group:<name>:<op>` and `workflow:description`.
-const TARGET_RE = /^(?:(binding|note):([A-Za-z0-9_-]{1,64})|(group):([^:]+)):([a-z_]+)$/;
+const TARGET_RE = /^(?:(binding|note|preset):([A-Za-z0-9_-]{1,64})|(group):([^:]+)):([a-z_]+)$/;
 export const BINDING_STRUCTURAL_OPS = new Set(["expose", "remove", "rebind", "hide", "unhide", "create"]);
 export const GROUP_OPS = new Set(["create", "rename", "ungroup", "move"]);
 
@@ -39,11 +39,15 @@ export function parseTarget(target) {
     return match[1] ? { source: match[1], id: match[2], field: match[5] } : { source: "group", id: match[4], field: match[5] };
 }
 
+export const STRUCTURAL_OPS = {
+    binding: BINDING_STRUCTURAL_OPS, note: new Set(["create", "remove", "hide", "unhide"]),
+    group: GROUP_OPS, preset: new Set(["create", "capture", "apply"]), workflow: new Set(),
+};
+
 export function isStructuralTarget(target) {
     const parsed = parseTarget(target);
     if (!parsed) return false;
-    return parsed.source === "group" ? GROUP_OPS.has(parsed.field)
-        : parsed.source !== "workflow" && BINDING_STRUCTURAL_OPS.has(parsed.field);
+    return STRUCTURAL_OPS[parsed.source]?.has(parsed.field) || false;
 }
 
 // Values, modes and exposure change what a run submits; labels, notes,
@@ -51,5 +55,5 @@ export function isStructuralTarget(target) {
 const RUN_FIELDS = new Set(["value", "seed_mode", "expose", "remove", "rebind", "hide", "unhide"]);
 export function changesRun(target) {
     const parsed = parseTarget(target);
-    return parsed?.source === "binding" && RUN_FIELDS.has(parsed.field);
+    return (parsed?.source === "binding" && RUN_FIELDS.has(parsed.field)) || (parsed?.source === "preset" && parsed.field === "apply");
 }

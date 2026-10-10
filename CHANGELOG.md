@@ -12,6 +12,7 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Added
+- Controls presets: a workflow can carry named sets of Controls that set up one feature in one choice. Author them in Manage, pick one from the Preset menu in fullscreen, mounted tabs and the Sonder App, and share them in the saved workflow and Export (API).
 - Workflow descriptions in Manage and the Launcher, plus Export as API to share Sonder App values and curated Controls with another Sonder App.
 - Controls: create, rename, reorder and ungroup workflow groups in every editor mode, move settings between them, and mark a group Advanced; recorded Advanced settings show an Adv tag in asset details.
 - Controls: compact Rows or Cards, search, personal scale and per-setting Advanced flags in fullscreen, mounted tabs and the Sonder App, with a remembered Editor group and Max frames per batch.
@@ -28,6 +29,7 @@ a fresh `[Unreleased]` block.
 - Render queue: a job that is waiting again or has failed shows why on a second line, such as a run interrupted before the job completed. Hover for the full text.
 
 ### Fixed
+- Controls on the canvas: a workflow with `{a|b}` dynamic-prompt text no longer refuses every Controls edit as "The workflow changed", and such text shows and saves as written instead of as one random choice.
 - Sonder Selector: a choice or choice list fed by a link no longer fails ComfyUI's check before the run; the node checks the value when it runs.
 - Link project folder: a project that is already in the projects folder is now refused with that reason. It used to be reported as a name collision.
 - Mounted editor: a brief websocket interruption no longer drops canvas presence while its HTTP heartbeats continue.

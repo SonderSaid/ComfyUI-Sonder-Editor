@@ -376,6 +376,50 @@ if(SCENARIO==='group-new-relay') {
     assert.equal(result.ok,true,JSON.stringify(result));
     assert.deepEqual(JSON.parse(created.widgets[0].value).groups,{First:{order:1}});assert.equal(captures,2);
 }
+if(SCENARIO==='dynamic-prompt') {
+    // ComfyUI's DynamicPrompts picks a fresh choice on each export; the
+    // Controls export must read the template, or the writer's fresh-export check fails.
+    const prompt=add(root,'CLIPTextEncode',7,[widget('text','a {red|blue|green|cyan} b',{dynamicPrompts:true})]);
+    const exportOnce=app.graphToPrompt.bind(app);
+    app.graphToPrompt=async()=>{const result=await exportOnce();
+        result.output['7']={class_type:'CLIPTextEncode',inputs:{text:`a ${['red','blue','green','cyan'][Math.floor(Math.random()*4)]} b ${Math.random()}`}};return result;};
+    const result=await host.applyChanges({'binding:steps:value':'31'});
+    assert.equal(result.ok,true,JSON.stringify(result));assert.equal(sampler.widgets[0].value,31);
+    assert.equal(calls.at(-1).prompt['7'].inputs.text,'a {red|blue|green|cyan} b');assert.equal(prompt.widgets[0].value,'a {red|blue|green|cyan} b');
+}
+if(SCENARIO==='preset'||SCENARIO==='preset-rollback'||SCENARIO==='preset-no-relay') {
+    // The server returns the captured definition, and an apply as its expanded value batch.
+    const entry={name:'Text to video',description:'',order:0,members:{steps:{value:'20'},seed:{value:'7',seed_mode:'increment'}}};
+    globalThis.canon=changes=>'preset:p1:apply' in changes
+        ?{'binding:steps:value':'31','binding:seed:value':'9','binding:seed:seed_mode':'fixed'}
+        :Object.fromEntries(Object.entries(changes).map(([t,v])=>[t,t.endsWith(':create')?entry:v]));
+    if(SCENARIO==='preset-no-relay'){
+        root._nodes.splice(root._nodes.indexOf(relay),1);
+        raw={...raw,relay:{status:'none',key:null,error:null},bindings:[],notes:[]};
+        globalThis.LiteGraph={createNode(){throw Error('a preset must never create a Relay');}};
+        const result=await host.applyChanges({'preset:p1:create':{name:'Text to video',members:['steps','seed']}});
+        assert.equal(result.ok,false);assert.match(result.rejected[0].reason,/exactly one active Sonder Control Relay/);
+        assert.ok(!root._nodes.some(n=>n.type==='SonderControlRelay'));
+    } else if(SCENARIO==='preset-rollback') {
+        relay.widgets[0].callback=()=>{throw Error('manifest failed');};
+        const result=await host.applyChanges({'preset:p1:create':{name:'Text to video',members:['steps','seed']}});
+        assert.equal(result.ok,false);assert.equal(relay.widgets[0].value,manifestText());
+    } else {
+        let result=await host.applyChanges({'preset:p1:create':{name:'Text to video',members:['steps','seed']}});
+        assert.equal(result.ok,true,JSON.stringify(result));
+        assert.deepEqual(manifest().presets,{p1:entry});assert.deepEqual(manifest().future,{keep:true});assert.equal(captures,2);
+        // Apply writes the members' widgets, not the manifest, in one history step.
+        const text=relay.widgets[0].value;
+        result=await host.applyChanges({'preset:p1:apply':true});
+        assert.equal(result.ok,true,JSON.stringify(result));
+        assert.equal(sampler.widgets[0].value,31);assert.equal(sampler.widgets[1].value,9);assert.equal(mode.value,'fixed');
+        assert.equal(relay.widgets[0].value,text);assert.equal(captures,4);
+        result=await host.applyChanges({'preset:p1:name':'Renamed'});
+        assert.equal(result.ok,true);assert.equal(manifest().presets.p1.name,'Renamed');
+        result=await host.applyChanges({'preset:p1:remove':true});
+        assert.equal(result.ok,true);assert.deepEqual(manifest().presets,{});assert.equal(captures,8);
+    }
+}
 host.destroy();assert.equal(listeners.size,0);
 console.log('ok');
 '''
@@ -384,7 +428,8 @@ SCENARIOS = ['description', 'description-new-relay', 'expose', 'expose-rollback'
              'remove-rebind', 'manage-listing', 'filter-during-write', 'unsafe-seed', 'moved', 'rollback-callbacks', 'presentation', 'presentation-rollback', 'root', 'promoted', 'promoted-seed', 'no-relay', 'two-relays',
              'linked-or-gone', 'manifest-cap', 'hidden-hash', 'relay-error-view', 'refusal', 'stale-write', 'stale-view',
              'destroy', 'rollback', 'serial', 'history-failure', 'precision-refusal', 'hide-during-write',
-             'event-during-write', 'group-batch-order', 'groups', 'groups-stale', 'groups-reparse', 'group-new-relay']
+             'event-during-write', 'group-batch-order', 'groups', 'groups-stale', 'groups-reparse', 'group-new-relay',
+             'preset', 'preset-rollback', 'preset-no-relay', 'dynamic-prompt']
 
 
 @pytest.mark.parametrize('scenario', SCENARIOS)

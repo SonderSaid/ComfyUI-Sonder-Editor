@@ -106,10 +106,10 @@ if(SCENARIO==='markdown'){
         // Header: search, then Manage. The Editor group comes first (Phase 4).
         assert.ok(walk(container.children[0]).some(n=>n.dataset.controlsManageToggle==='true'));
         assert.ok(walk(container.children[0]).some(n=>n.dataset.controlsSearch==='true'));
-        const editor=container.children[2];assert.equal(editor.dataset.controlsGroup,'editor');assert.equal(editor.children[1].hidden,false);
+        const editor=container.children.find(n=>n.dataset.controlsGroup==='editor');assert.equal(editor.dataset.controlsGroup,'editor');assert.equal(editor.children[1].hidden,false);
         // A group named Advanced is an ordinary group now: open like the others.
         assert.equal(group('Advanced').children[1].hidden,false);
-        const items=container.children[3].children.filter(n=>n.dataset.controlTarget);assert.equal(items[0].dataset.controlTarget,'note:intro:text');assert.equal(items[1].dataset.controlTarget,'binding:steps:value');
+        const items=container.children.find(n=>n.dataset.panelDropGroup==='').children.filter(n=>n.dataset.controlTarget);assert.equal(items[0].dataset.controlTarget,'note:intro:text');assert.equal(items[1].dataset.controlTarget,'binding:steps:value');
         // Editor-section bindings sit in the Editor group after your settings, without a drag handle.
         const adv=byTarget('binding:adv:value');assert.ok(editor.contains(adv));
         const editorRows=walk(editor.children[1]).filter(n=>n.dataset.controlsMirror||n.dataset.controlTarget).map(n=>n.dataset.controlsMirror||n.dataset.controlTarget);
@@ -192,7 +192,7 @@ if(SCENARIO==='markdown'){
     if(SCENARIO==='cards-scale'){
         settings.controls.view='cards';settings.layout.scaleControls=1.2;panel.render();
         assert.equal(container.style.zoom,'1.2');assert.match(byTarget('binding:steps:value').style.cssText,/border-radius/);
-        assert.match(container.children[3].style.cssText,/grid-template-columns/);
+        assert.match(container.children.find(n=>n.dataset.panelDropGroup==='').style.cssText,/grid-template-columns/);
         assert.match(group('Advanced').style.cssText,/grid-column:1 \/ -1/);
         // A note makes its card span the row; Manage always uses rows.
         assert.match(byTarget('binding:steps:value').style.cssText,/grid-column:1 \/ -1/);
@@ -202,7 +202,7 @@ if(SCENARIO==='markdown'){
     if(SCENARIO==='group-note'){
         toggleManage();const section=walk(container).find(n=>n.dataset.controlsManage==='true');
         walk(group('Advanced').children[0]).find(n=>n.dataset.groupAction==='note').dispatch('click');
-        const area=walk(section).find(n=>n.tagName==='TEXTAREA'&&!n.dataset.workflowDescription);area.value='Seeds';key('Enter',{ctrlKey:true});await settle();
+        const area=walk(section).find(n=>n.tagName==='TEXTAREA'&&!n.dataset.workflowDescription&&!n.dataset.presetDescription);area.value='Seeds';key('Enter',{ctrlKey:true});await settle();
         const [target,value]=Object.entries(calls.at(-1))[0];assert.match(target,/^note:[A-Za-z0-9_-]{12}:create$/);assert.deepEqual(value,{text:'Seeds',group:'Advanced'});
     }
     if(SCENARIO==='focus'){
@@ -388,7 +388,7 @@ if(SCENARIO==='markdown'){
             button(byTarget('binding:lost:value'),'Remove').dispatch('click');await settle();assert.deepEqual(calls.at(-1),{'binding:lost:remove':true});
         }
         // A new standalone note.
-        button(section,'+ Note').dispatch('click');const area=walk(section).find(n=>n.tagName==='TEXTAREA'&&!n.dataset.workflowDescription);area.value='**Tip**';
+        button(section,'+ Note').dispatch('click');const area=walk(section).find(n=>n.tagName==='TEXTAREA'&&!n.dataset.workflowDescription&&!n.dataset.presetDescription);area.value='**Tip**';
         key('Enter',{ctrlKey:true});await settle();const [noteTarget,noteValue]=Object.entries(calls.at(-1))[0];
         assert.match(noteTarget,/^note:[A-Za-z0-9_-]{12}:create$/);assert.deepEqual(noteValue,{text:'**Tip**',group:''});
         // The filter reaches the host, debounced; Escape clears it.

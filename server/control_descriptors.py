@@ -301,11 +301,13 @@ def coerce_panel_layout(field: str, raw: Any):
 # control_bindings.js ``parseTarget``): ``binding:<id>:<field>``,
 # ``note:<id>:<field>``, ``group:<name>:<op>`` (a name holds no ``:``) and the
 # two-part ``workflow:description``.
-_TARGET_RE = re.compile(r"^(?:(binding|note):([A-Za-z0-9_-]{1,64})|(group):([^:]+)):([a-z_]+)$")
+_TARGET_RE = re.compile(r"^(?:(binding|note|preset):([A-Za-z0-9_-]{1,64})|(group):([^:]+)):([a-z_]+)$")
 # Manage's structural targets: the validator returns an internal write plan,
 # and the mounted relay forwards the original intent for the canvas to recheck.
 BINDING_STRUCTURAL_OPS = frozenset({"expose", "remove", "rebind", "hide", "unhide", "create"})
 GROUP_OPS = frozenset({"create", "rename", "ungroup", "move"})
+STRUCTURAL_OPS = {"binding": BINDING_STRUCTURAL_OPS, "note": frozenset({"create", "remove", "hide", "unhide"}),
+                  "group": GROUP_OPS, "preset": frozenset({"create", "capture", "apply"}), "workflow": frozenset()}
 
 
 def parse_target(target: Any) -> tuple[str, str, str] | None:
@@ -327,7 +329,7 @@ def is_structural(target: Any) -> bool:
     if parsed is None:
         return False
     source, _, field = parsed
-    return field in GROUP_OPS if source == "group" else source != "workflow" and field in BINDING_STRUCTURAL_OPS
+    return field in STRUCTURAL_OPS.get(source, ())
 
 
 # ── Kinds ────────────────────────────────────────────────────────────────────
@@ -757,6 +759,7 @@ def describe_bindings(
     exposed = {d["binding_id"] for d in view["bindings"]}
     view["suggestions"] = [s for s in view["suggestions"] if s["binding_id"] not in exposed]
     _flag_shared_targets(view["bindings"])
+    view["_presets"] = manifest["presets"]
     view["description"] = manifest["description"]
     view["groups"] = manifest["groups"]
     view["bindings"].sort(key=lambda d: (d["order"], d["label"].lower(), d["binding_id"]))
@@ -1047,6 +1050,11 @@ def validate_binding_changes(view: dict, changes: Any, *, prompt: dict | None = 
     """
     if not isinstance(changes, dict) or not changes or (max_changes is not None and len(changes) > max_changes):
         return {}, [{"target": "", "reason": "Send 1 to 64 changes."}]
+    # Presets dispatch by source before fields shared with bindings/notes.
+    preset_targets = [target for target in changes if (parse_target(target) or (None,))[0] == "preset"]
+    if preset_targets:
+        from .control_presets import validate_preset_changes
+        return validate_preset_changes(view, changes, prompt=prompt, structural=structural, inventory=inventory)
     table = _target_table(view)
     batch = _StructuralBatch(view, structural, inventory)
     value_changes = [table[t][0] for t in changes if t in table and table[t][1] == "value"]
@@ -1484,7 +1492,7 @@ def json_safe(view: dict) -> dict:
             return [copy(item) for item in value]
         return value
 
-    return copy(view)
+    return copy({key: value for key, value in view.items() if not key.startswith("_presets")})
 
 
 # ── Seeds ────────────────────────────────────────────────────────────────────
@@ -1522,3 +1530,8 @@ def next_seed_value(
     if isinstance(value, int) and isinstance(step, int) and isinstance(lo, int):
         return int(result)
     return result
+
+
+def preset_states(view, presets, **kwargs):
+    from .control_presets import preset_states as project
+    return project(view, presets, **kwargs)

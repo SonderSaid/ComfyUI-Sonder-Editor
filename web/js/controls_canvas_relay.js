@@ -35,6 +35,9 @@ export function fitPublicationView(view, envelope) {
     }
     const fits = candidate => publicationBytes({ ...envelope, view: candidate }) <= MAX_PUBLICATION_BYTES;
     if (fits(view)) return view;
+    // Preset previews are display-only and shrink before candidate inventories.
+    if (!fits(view) && view.presets?.length) view = { ...view, presets: view.presets.map(p => ({...p,
+        members: p.members.map(m => ({...m, preview: ""}))})) };
     // Manage's candidates go first: a narrower filter shows the rest.
     while (view.candidates?.length && !fits(view)) {
         view = { ...view, candidates: view.candidates.slice(0, Math.floor(view.candidates.length / 2)), candidates_truncated: true };

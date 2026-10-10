@@ -1,8 +1,8 @@
 // Canvas graph authority for the shared Controls panel. No app/DOM at import.
 import {
-    MAX_MANIFEST_BYTES, RELAY_CLASS, anchorSnapshot, applyGroupPlan, dropAnchors, editManifest, exportManifest,
+    MAX_MANIFEST_BYTES, RELAY_CLASS, anchorSnapshot, applyGroupPlan, applyPresetEdit, dropAnchors, editManifest, exportManifest,
     isStructuralTarget, listCandidates, nodesOf, parseManifest, parseTarget, readAnchors, relayCensus, resolveBindings,
-    resolveCandidate, restoreAnchors, setAnchor,
+    resolveCandidate, restoreAnchors, restoreDynamicPrompts, setAnchor,
 } from "./control_bindings.js";
 import { syncRelayRows } from "./control_relay_rows.js";
 
@@ -73,6 +73,7 @@ export function createCanvasControlsHost({app, api, getEditorNode,
     const snapshot = async id => {
         const {output} = await app.graphToPrompt();
         if (!output || typeof output !== "object") throw new Error("The workflow could not be exported.");
+        restoreDynamicPrompts(id.root, output);
         const key = editorKey(id, output);
         const listing = activeManage();
         // Graph identity is independent of the ephemeral Manage query. Anchors
@@ -97,7 +98,7 @@ export function createCanvasControlsHost({app, api, getEditorNode,
     };
     const adopt = raw => {
         // Canvas seeds follow the native mode; the export mirrored it.
-        const bindings = (raw.bindings || []).map(d => d.kind === "SEED" ? {...d, seed_mode: d.seed_mode || "fixed"} : d);
+        const bindings = raw.bindings || [];
         view = {...raw, bindings, state: "ready", error: raw.error || null};
         notify();
     };
@@ -183,7 +184,7 @@ export function createCanvasControlsHost({app, api, getEditorNode,
         // A first expose, note or group may add the Relay; everything else needs the one Relay.
         const addsRelay = !active.length && !census.muted && !census.bypassed && !census.nested
             && (structural.length > 0 || "workflow:description" in changes)
-            && structural.every(([target]) => ["expose", "create"].includes(parseTarget(target).field));
+            && structural.every(([target]) => { const p = parseTarget(target); return ["binding", "note", "group"].includes(p.source) && ["expose", "create"].includes(p.field); });
         if (!structural.length && Object.values(changes).every(value => value?.noop)) return {writes: [], anchors: []};
         if (active.length !== 1 && !addsRelay) throw new Error("Keep exactly one active Sonder Control Relay in the workflow.");
         const relay = active[0] || null;
@@ -199,8 +200,12 @@ export function createCanvasControlsHost({app, api, getEditorNode,
         };
         for (const [target, value] of Object.entries(changes)) {
             const parsed = parseTarget(target);
-            if (!parsed || !FIELDS.has(parsed.field)) throw new Error("This target is unavailable.");
+            if (!parsed || (parsed.source !== "preset" && !FIELDS.has(parsed.field))) throw new Error("This target is unavailable.");
             const { source, id, field } = parsed;
+            if (source === "preset") {
+                manifestOps.push(m => applyPresetEdit(m, id, field, value));
+                continue;
+            }
             if (source === "workflow") {
                 manifestOps.push(m => { m.description = value; });
                 continue;

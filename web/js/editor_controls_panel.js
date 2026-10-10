@@ -1,3 +1,4 @@
+import { mountPresets } from "./controls_presets.js";
 import { mountComboPicker, wantsComboPicker } from "./controls_combo_picker.js";
 import { mountManageSection, smallButton } from "./controls_manage.js";
 import { mountPanelArrangement } from "./controls_panel_arrangement.js";
@@ -113,7 +114,11 @@ export function mountControlsPanel(container, host) {
     quietLine.dataset.controlsAdvancedLine = "true";
     quietLine.style.cssText = S.quietLineCss;
     quietLine.addEventListener("click", () => writeSetting("controls.showAdvanced", !showAdvanced()));
-    header.append(headerTop, quietLine);
+    const presets = mountPresets(host, {flushPending: () => flushPending(), track, notify: reason => warning(reason)});
+    header.append(headerTop);
+    container.append(header);
+    header.after(presets.el);
+    presets.el.after(quietLine);
     const message = make("div");
     message.style.cssText = `color:${COLORS.textSecondary};line-height:1.5;`;
     const editorGroup = makeGroup(null, "Editor");
@@ -123,7 +128,7 @@ export function mountControlsPanel(container, host) {
     const mainDrop = make("div", "Main section");
     mainDrop.dataset.panelDropGroup = "";
     mainDrop.style.cssText = `font-size:${TYPE.t11}px;color:${COLORS.textSecondary};padding:${SPACE.s1}px 0;grid-column:1 / -1;`;
-    container.append(header, message, editorGroup.el, workflowBody);
+    container.append(message, editorGroup.el, workflowBody);
     const warning = reason => host.notify?.(reason || "The change could not be saved.");
 
     function writeSetting(key, value) {
@@ -500,6 +505,7 @@ export function mountControlsPanel(container, host) {
     }
     // Structural Manage actions (remove, hide, unhide) on one row.
     function structural(changes, button) {
+        const affected = (host.getView().presets || []).filter(p => p.members.some(m => `binding:${m.binding_id}:remove` in changes));
         if (button) button.disabled = true;
         const work = Promise.resolve()
             .then(() => host.applyChanges(changes))
@@ -508,6 +514,7 @@ export function mountControlsPanel(container, host) {
                 if (destroyed) return false;
                 if (button) button.disabled = false;
                 if (!result?.ok) warning(result?.rejected?.[0]?.reason);
+                else if (affected.length) warning(`Removed Control is still a member of: ${affected.map(p => p.name).join(", ")}. Repair in Manage.`);
                 render();
                 return !!result?.ok;
             });
@@ -857,6 +864,9 @@ export function mountControlsPanel(container, host) {
     }
     function update(row, spec, fresh) {
         row.spec = spec;
+        if (!row.presetMember) { row.presetMember = make("div"); row.el.prepend(row.presetMember); }
+        const membership = manage?.memberControl(spec);
+        row.presetMember.replaceChildren(...(membership ? [membership] : []));
         if (row.grip) {
             const base = baseOf(spec);
             const allowed = manageOn && canArrange({ ...spec, base });
@@ -913,7 +923,8 @@ export function mountControlsPanel(container, host) {
             setInput(row, row.optimistic ?? spec.value);
         }
         if (row.mode) {
-            row.mode.disabled = !editable(spec);
+            row.mode.disabled = !editable(spec) || spec.seed_mode == null;
+            row.mode.title = spec.seed_mode == null ? "This seed has no mode on this host." : "";
             row.mode.value = row.modeOptimistic ?? spec.seed_mode ?? "fixed";
         }
         if (row.note) {
@@ -946,6 +957,7 @@ export function mountControlsPanel(container, host) {
         const allSpecs = [...(view.bindings || []).map(d => ({ ...d, source: "binding" })), ...(view.notes || []).map(d => ({ ...d, source: "note" }))];
         const empty = !allSpecs.some(d => manageOn || !d.hidden);
         manage?.render(view);
+        presets.render(view, manageOn);
         const entries = [];
         for (const spec of [...(view.bindings || []), ...(view.notes || [])]) {
             const source = spec.source || ("note_id" in spec ? "note" : "binding");
@@ -1096,6 +1108,7 @@ export function mountControlsPanel(container, host) {
     }
     function setManage(on) {
         if (destroyed || on === manageOn) return;
+        if (!on && manage?.canLeave && !manage.canLeave()) return;
         if (!on) {
             for (const row of rows.values()) if (row.renameInput) closeRename(row, true);
             if (noteEditor) void closeNote(true);
@@ -1105,7 +1118,7 @@ export function mountControlsPanel(container, host) {
         manageButton.setAttribute("aria-pressed", String(on));
         setButtonVariant(manageButton, on ? "accentSoft" : "secondary", { padding: `2px ${SPACE.s2}px`, fontSize: `${TYPE.t11}px` });
         if (on) {
-            manage = mountManageSection(host, { notify: warning,
+            manage = mountManageSection(host, { notify: warning, flushPending, changed: () => render(),
                 track: (work, changes) => track(work, Object.keys(changes).some(changesRun)) });
             header.after(manage.el);
         } else {
@@ -1182,29 +1195,32 @@ export function mountControlsPanel(container, host) {
             return PRESERVE_DEFAULT;
         },
     });
+    // Saves the focused field or note, then waits for every save. Only a
+    // run-value save still in flight now can refuse the caller's run: an
+    // older refusal already reverted its row to the stored value. Saves
+    // started after the call (a tracked preset apply) are not awaited.
+    async function flushPending() {
+        // Snapshot before awaiting anything: a run save that settles while
+        // the note saves was still in flight when the caller asked.
+        const blocking = new Set(runPending);
+        const closing = noteEditor ? closeNote(true) : null;
+        const row = [...rows.values()].find(row => row.input === document.activeElement);
+        if (row && !row.picker) {
+            const saving = commitValue(row);
+            if (changesRun(row.target)) blocking.add(saving);
+        }
+        const mirror = mirrors.find(m => m.input === document.activeElement);
+        if (mirror) mirror.input.blur();
+        const savingNow = [...pending];
+        await closing;
+        await Promise.all(savingNow);
+        return (await Promise.all(blocking)).every(Boolean);
+    }
     const unsubscribe = host.subscribe(view => render(view));
     render();
     return {
         render,
-        // Saves the focused field or note, then waits for every save. Only a
-        // run-value save still in flight now can refuse the caller's run: an
-        // older refusal already reverted its row to the stored value.
-        async flushPending() {
-            // Snapshot before awaiting anything: a run save that settles while
-            // the note saves was still in flight when the caller asked.
-            const blocking = new Set(runPending);
-            const closing = noteEditor ? closeNote(true) : null;
-            const row = [...rows.values()].find(row => row.input === document.activeElement);
-            if (row && !row.picker) {
-                const saving = commitValue(row);
-                if (changesRun(row.target)) blocking.add(saving);
-            }
-            const mirror = mirrors.find(m => m.input === document.activeElement);
-            if (mirror) mirror.input.blur();
-            await closing;
-            await Promise.all([...pending]);
-            return (await Promise.all(blocking)).every(Boolean);
-        },
+        flushPending,
         destroy() {
             if (noteEditor) void closeNote(false);
             for (const group of groups.values()) group.renaming?.close(false);
@@ -1212,6 +1228,7 @@ export function mountControlsPanel(container, host) {
             manage?.destroy();
             destroyed = true;
             arrangement.destroy();
+            presets.destroy();
             for (const row of rows.values()) row.picker?.destroy();
             unsubscribe?.();
             unregister();
