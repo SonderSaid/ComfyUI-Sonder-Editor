@@ -33,7 +33,7 @@ export const GROUP_OPS = new Set(["create", "rename", "ungroup", "move"]);
 
 export function parseTarget(target) {
     if (typeof target !== "string") return null;
-    if (target === "workflow:description") return { source: "workflow", id: "", field: "description" };
+    if (["workflow:description", "workflow:cleanup"].includes(target)) return { source: "workflow", id: "", field: target.split(":")[1] };
     const match = TARGET_RE.exec(target);
     if (!match) return null;
     return match[1] ? { source: match[1], id: match[2], field: match[5] } : { source: "group", id: match[4], field: match[5] };
@@ -41,7 +41,7 @@ export function parseTarget(target) {
 
 export const STRUCTURAL_OPS = {
     binding: BINDING_STRUCTURAL_OPS, note: new Set(["create", "remove", "hide", "unhide"]),
-    group: GROUP_OPS, preset: new Set(["create", "capture", "apply"]), workflow: new Set(),
+    group: GROUP_OPS, preset: new Set(["create", "capture", "apply"]), workflow: new Set(["cleanup"]),
 };
 
 export function isStructuralTarget(target) {

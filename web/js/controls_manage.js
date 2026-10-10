@@ -6,6 +6,7 @@
 // the host lists them from the live graph (canvas, mounted) or the template
 // (Sonder App), already filtered and never greyed out.
 import { mountWorkflowDescription } from "./controls_workflow_description.js";
+import { mountCleanup } from "./controls_cleanup.js";
 import { mountPresetsManage } from "./controls_presets_manage.js";
 import { register, PRIORITY, PRESERVE_DEFAULT } from "./keyboard_ownership.js";
 import { groupNameError } from "./control_targets.js";
@@ -96,7 +97,8 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
     footer.append(addNote, addGroup);
     const description = mountWorkflowDescription(host, { track });
     const presets = mountPresetsManage(host, {track, notify, flushPending, changed});
-    el.append(description.el, presets.el, heading, filterInput, banner, list, footer, noteBox);
+    const cleanup = mountCleanup(host, {track, notify, flushPending});
+    el.append(description.el, presets.el, heading, filterInput, banner, list, footer, noteBox, cleanup.el);
 
     function apply(changes, button) {
         return track(applyNow(changes, button), changes);
@@ -157,6 +159,7 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         lastView = view;
         description.render(view);
         presets.render(view);
+        cleanup.render(view);
         // Rebuilt only when what it lists changes: the panel renders on every
         // focus change, and a rebuild between a press and its click loses it.
         const key = JSON.stringify([rebind, filter, open, view.candidates, view.suggestions, view.candidates_truncated]);
@@ -389,14 +392,14 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         render,
         setRebind,
         memberControl: spec => presets.memberControl(spec),
-        canLeave: () => presets.canLeave(),
+        canLeave: () => { if (cleanup.busy) { notify("Wait for cleanup to finish."); return false; } return presets.canLeave(); },
         addNote: group => openDraft(typeof group === "string" ? group : ""),
         addGroup: then => openGroupDraft(typeof then === "function" ? then : null),
         get rebinding() { return rebind?.binding_id || null; },
         // An unsaved note or description draft (a preset draft asks in canLeave).
         get hasDraft() { return !!draft || !!description.dirty; },
-        get presetSaving() { return presets.busy; },
-        get editing() { return !!draft || presets.editing || description.editing || document.activeElement === filterInput; },
+        get presetSaving() { return presets.busy || cleanup.busy; },
+        get editing() { return !!draft || cleanup.editing || presets.editing || description.editing || document.activeElement === filterInput; },
         destroy() {
             destroyed = true;
             clearTimeout(filterTimer);
@@ -404,6 +407,7 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
             unregister();
             description.destroy();
             presets.destroy();
+            cleanup.destroy();
             el.remove();
         },
     };

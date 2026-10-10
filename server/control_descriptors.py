@@ -307,15 +307,15 @@ _TARGET_RE = re.compile(r"^(?:(binding|note|preset):([A-Za-z0-9_-]{1,64})|(group
 BINDING_STRUCTURAL_OPS = frozenset({"expose", "remove", "rebind", "hide", "unhide", "create"})
 GROUP_OPS = frozenset({"create", "rename", "ungroup", "move"})
 STRUCTURAL_OPS = {"binding": BINDING_STRUCTURAL_OPS, "note": frozenset({"create", "remove", "hide", "unhide"}),
-                  "group": GROUP_OPS, "preset": frozenset({"create", "capture", "apply"}), "workflow": frozenset()}
+                  "group": GROUP_OPS, "preset": frozenset({"create", "capture", "apply"}), "workflow": frozenset({"cleanup"})}
 
 
 def parse_target(target: Any) -> tuple[str, str, str] | None:
     """``(source, identity, field)`` of a change target, or None."""
     if not isinstance(target, str):
         return None
-    if target == "workflow:description":
-        return ("workflow", "", "description")
+    if target in ("workflow:description", "workflow:cleanup"):
+        return ("workflow", "", target.split(":")[1])
     match = _TARGET_RE.match(target)
     if not match:
         return None
@@ -1050,6 +1050,14 @@ def validate_binding_changes(view: dict, changes: Any, *, prompt: dict | None = 
     """
     if not isinstance(changes, dict) or not changes or (max_changes is not None and len(changes) > max_changes):
         return {}, [{"target": "", "reason": "Send 1 to 64 changes."}]
+    if "workflow:cleanup" in changes:
+        from .control_cleanup import validate
+        try:
+            if len(changes) != 1:
+                raise ControlValueError("Clean up must be the only change in its request.")
+            return {"workflow:cleanup": validate(view, changes["workflow:cleanup"], mode=structural)}, []
+        except ControlValueError as exc:
+            return {}, [{"target": "workflow:cleanup", "reason": str(exc)}]
     # Presets dispatch by source before fields shared with bindings/notes.
     preset_targets = [target for target in changes if (parse_target(target) or (None,))[0] == "preset"]
     if preset_targets:

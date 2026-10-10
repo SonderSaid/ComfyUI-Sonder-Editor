@@ -522,6 +522,27 @@ export function setAnchor(node, name, id) {
     node.properties[ANCHOR_PROPERTY] = { ...(rawAnchors(node) || {}), [name]: id };
 }
 
+// Definition-only orphan ids cannot be restored by resolveBindings, but are
+// still authored recovery state and must appear in the explicit cleanup review.
+export function definitionAnchorIds(root) {
+    return [...new Set(graphsOf(root).filter(g => g !== root)
+        .flatMap(g => nodesOf(g).flatMap(n => Object.values(readAnchors(n)))))];
+}
+
+export function dropAllAnchors(root, id) {
+    return graphsOf(root).flatMap(graph => dropAnchors(graph, id));
+}
+
+export function applyCleanupPlan(manifest, plan) {
+    for (const id of plan.bindings || []) delete manifest.bindings[id];
+    for (const {preset_id, binding_id} of plan.preset_members || []) {
+        const preset = manifest.presets?.[preset_id];
+        if (!isPlainObject(preset?.members)) throw new Error("The preset changed. Reopen the cleanup review.");
+        delete preset.members[binding_id];
+        if (!Object.keys(preset.members).length) delete manifest.presets[preset_id];
+    }
+}
+
 // Removes every root anchor carrying `id`; returns the nodes it changed.
 export function dropAnchors(root, id) {
     const changed = [];

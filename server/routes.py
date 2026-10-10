@@ -254,6 +254,12 @@ def _describe_controls_body(raw: bytes) -> dict:
                                                     orphan_manifest=body.get("orphan_manifest"))
     except control_descriptors.control_manifest.ManifestError as exc:
         raise _ControlsRequestError(str(exc)) from None
+    from . import control_cleanup
+    definition_anchors = body.get("definition_anchors", [])
+    if (not isinstance(definition_anchors, list) or len(definition_anchors) > 4096
+            or not all(control_cleanup.valid_id(bid) for bid in definition_anchors)):
+        raise _ControlsRequestError("Invalid definition anchors.")
+    view["cleanup"] = control_cleanup.inventory(view, definition_anchors=definition_anchors)
     if body.get("manage") is True:
         view["candidate_labels"] = [{"path": str(path), "input": f.field,
                                      "label": control_descriptors.recommended_label(f, node)}

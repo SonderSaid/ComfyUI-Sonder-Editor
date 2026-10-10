@@ -806,6 +806,8 @@ def apply_stored_values(prompt: dict, described: dict, stored: dict, *, describe
     effective, origins = control_presets.effective_presets(control_manifest_of(prompt).get("presets"), stored.get("presets"))
     view["_presets"] = effective
     view["presets"] = cd.preset_states(view, effective, origins=origins, prompt=prompt)
+    from .control_cleanup import inventory
+    view["cleanup"] = inventory(view, stored=stored)
     return view
 
 
@@ -881,6 +883,41 @@ def store_binding_changes(template_id: str, changes: dict, view: dict, prompt: d
                     for key, definition in effective.items():
                         if key == identity or definition != before.get(key):
                             data["presets"][key] = definition
+                continue
+            if source == "workflow" and field == "cleanup":
+                # Re-read under the file lock: even a direct sidecar writer may
+                # have changed eligibility since the runner's snapshot.
+                from . import control_cleanup
+                fresh_prompt, _ = load_template(template_id)
+                fresh = apply_stored_values(fresh_prompt, describe_stored(fresh_prompt, data), data)
+                try:
+                    plan = control_cleanup.validate(fresh, value, mode="sdk")
+                except control_descriptors.ControlValueError as exc:
+                    raise TemplateError(str(exc), "invalid_controls") from None
+                for bid in plan["bindings"]:
+                    _store_structural(data, "binding", bid, "remove", {}, locator)
+                for bid in plan["values"]:
+                    data["bindings"].pop(bid, None)
+                for key in plan["hidden"]:
+                    data["hidden"].pop(key, None)
+                # Edit raw definitions, not the tolerant read projection: future
+                # metadata and unreadable, unselected members remain recoverable.
+                relay = control_descriptors.control_manifest.find_relay(fresh_prompt)
+                raw_manifest = fresh_prompt[relay["key"]]["inputs"].get("manifest") or {}
+                if isinstance(raw_manifest, str):
+                    raw_manifest = json.loads(raw_manifest)
+                authored = raw_manifest.get("presets", {})
+                effective = {}
+                for row in plan["preset_members"]:
+                    pid = row["preset_id"]
+                    overlay = data["presets"].get(pid)
+                    selected = overlay if pid in control_descriptors.control_manifest.read_presets({pid: overlay}) else authored.get(pid)
+                    effective[pid] = copy.deepcopy(selected)
+                changed = control_cleanup.remove_members(effective, plan["preset_members"])
+                for pid in changed:
+                    data["presets"][pid] = effective.get(pid, {"removed": True})
+                if changed:
+                    _check_preset_projection(fresh_prompt, data)
                 continue
             if source == "workflow" and field == "description":
                 data["description"] = value

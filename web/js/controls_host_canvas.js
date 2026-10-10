@@ -1,6 +1,6 @@
 // Canvas graph authority for the shared Controls panel. No app/DOM at import.
 import {
-    MAX_MANIFEST_BYTES, RELAY_CLASS, anchorSnapshot, applyGroupPlan, applyPresetEdit, dropAnchors, editManifest, exportManifest,
+    MAX_MANIFEST_BYTES, RELAY_CLASS, anchorSnapshot, applyCleanupPlan, definitionAnchorIds, dropAllAnchors, graphsOf, applyGroupPlan, applyPresetEdit, dropAnchors, editManifest, exportManifest,
     isStructuralTarget, listCandidates, nodesOf, parseManifest, parseTarget, readAnchors, relayCensus, resolveBindings,
     resolveCandidate, restoreAnchors, restoreDynamicPrompts, setAnchor,
 } from "./control_bindings.js";
@@ -10,7 +10,7 @@ const DESCRIBE_URL = "/sonder-editor/controls/describe";
 const DEBOUNCE_MS = 400;
 // Fields this writer lands; hide/unhide are app-only targets.
 const FIELDS = new Set(["value", "seed_mode", "label", "note", "text", "order", "group", "advanced",
-    "expose", "remove", "rebind", "create", "rename", "ungroup", "move", "description"]);
+    "expose", "remove", "rebind", "create", "rename", "ungroup", "move", "description", "cleanup"]);
 const sameTargets = (a, b) => JSON.stringify((a || []).map(t => [String(t.path), t.input]).sort())
     === JSON.stringify((b || []).map(t => [String(t.path), t.input]).sort());
 const refused = (changes, reason) => ({ok: false,
@@ -78,12 +78,12 @@ export function createCanvasControlsHost({app, api, getEditorNode,
         const listing = activeManage();
         // Graph identity is independent of the ephemeral Manage query. Anchors
         // and census still guard writes, including Restore after Relay deletion.
-        const anchors = nodesOf(id.root).map(node => [node?.id, readAnchors(node)]);
+        const anchors = graphsOf(id.root).map(graph => nodesOf(graph).map(node => [node?.id, readAnchors(node)]));
         const graphHash = JSON.stringify([key, output, anchors, relayCensus(id.root).census]);
         return {prompt: output, editor_key: key, graphHash, hash: JSON.stringify([graphHash, listing])};
     };
     const describe = async (shot, changes, extra = {}) => {
-        const body = {prompt: shot.prompt, relay_census: relayCensus(rootGraph()).census, ...extra};
+        const body = {prompt: shot.prompt, relay_census: relayCensus(rootGraph()).census, definition_anchors: definitionAnchorIds(rootGraph()), ...extra};
         if (!body.relay_census.active) body.orphan_manifest = exportManifest("", rootGraph());
         const listing = activeManage();
         if (listing && changes === undefined) {
@@ -207,7 +207,20 @@ export function createCanvasControlsHost({app, api, getEditorNode,
                 continue;
             }
             if (source === "workflow") {
-                manifestOps.push(m => { m.description = value; });
+                if (field === "cleanup") {
+                    // Re-resolve immediately before touching graph state. The
+                    // server already rechecked the exported descriptor view.
+                    for (const bid of value.bindings) if (bindings[bid]?.status !== "missing")
+                        throw new Error("A Control is no longer missing. Reopen the cleanup review.");
+                    const definitions = new Set(definitionAnchorIds(root));
+                    for (const bid of value.suggestions) if (bindings[bid] || !suggestions.some(s => s.binding_id === bid))
+                        throw new Error("An anchor changed. Reopen the cleanup review.");
+                    for (const bid of value.definition_anchors) if (bindings[bid] || !definitions.has(bid))
+                        throw new Error("A definition anchor changed. Reopen the cleanup review.");
+                    for (const bid of new Set([...value.bindings, ...value.suggestions, ...value.definition_anchors]))
+                        anchors.push(() => dropAllAnchors(root, bid));
+                    manifestOps.push(m => applyCleanupPlan(m, value));
+                } else manifestOps.push(m => { m.description = value; });
                 continue;
             }
             if (source === "group") {
@@ -338,10 +351,9 @@ export function createCanvasControlsHost({app, api, getEditorNode,
             let created = null;
             try {
                 // Anchors first, so the export a created Relay makes sees them.
-                for (const apply of anchors) {
-                    const prior = new Map(nodesOf(id.root).map(node => [node, anchorSnapshot(node)]));
-                    for (const node of apply()) if (!touched.has(node)) touched.set(node, prior.get(node));
-                }
+                if (anchors.length) for (const graph of graphsOf(id.root)) for (const node of nodesOf(graph))
+                    touched.set(node, anchorSnapshot(node));
+                for (const apply of anchors) apply();
                 for (const write of writes) {
                     if (write.createRelay) {
                         created = createRelay(app, id.root, id.editor);

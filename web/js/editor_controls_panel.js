@@ -118,7 +118,7 @@ export function mountControlsPanel(container, host) {
         // Switching workflows remounts the panel: Manage drafts would be lost.
         canSwitch: () => {
             if (manage?.presetSaving) {
-                warning("Wait for the preset to save, then switch workflows.");
+                warning("Wait for the Manage change to save, then switch workflows.");
                 return false;
             }
             return !manage || (manage.canLeave() && (!manage.hasDraft
