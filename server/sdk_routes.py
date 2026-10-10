@@ -217,6 +217,17 @@ def register_sdk_routes(
         template_id = sdk_templates.check_template_id(request.match_info.get("template_id"))
         return web.json_response(await asyncio.to_thread(sdk_templates.template_requirements, template_id))
 
+    @routes.get("/sonder-editor/sdk/templates/{template_id}/export")
+    @handle
+    async def api_sdk_export_template(request: web.Request) -> web.Response:
+        # GET returns the whole workflow; the mutation-only middleware does not guard it.
+        from .routes import _same_origin_request, _cross_origin_blocked_response
+        if not _same_origin_request(request):
+            return _cross_origin_blocked_response(request)
+        template_id = sdk_templates.check_template_id(request.match_info.get("template_id"))
+        raw = await asyncio.to_thread(sdk_templates.export_curated, template_id)
+        return web.Response(body=raw, content_type="application/json", headers={"Cache-Control": "no-store"})
+
     @routes.post("/sonder-editor/sdk/templates")
     @handle
     async def api_sdk_import_template(request: web.Request) -> web.Response:

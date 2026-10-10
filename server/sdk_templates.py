@@ -188,6 +188,7 @@ def validate_template(
         name: _literal_number(editor_inputs.get(name)) for name in ("fps", "width", "height")
     }
 
+    description = control_descriptors.control_manifest.find_relay(prompt)["manifest"].get("description", "")
     controls_summary: list[dict] = []
     if not errors:
         described = describe(prompt)
@@ -202,6 +203,7 @@ def validate_template(
         "editor_key": editor_key,
         "editor_defaults": editor_defaults,
         "controls": controls_summary,
+        "description": description,
     }
 
 
@@ -269,6 +271,7 @@ def _public_meta(template_id: str, meta: dict) -> dict:
     return {
         "template_id": template_id,
         "name": meta.get("name", ""),
+        "description": (meta.get("validation") or {}).get("description", ""),
         "source_name": meta.get("source_name", ""),
         "imported_at": meta.get("imported_at", 0),
         "replaced_at": meta.get("replaced_at", 0),
@@ -331,7 +334,7 @@ _summary_cache: dict[str, tuple] = {}
 def _has_curation(stored: dict) -> bool:
     # Notes and layout count too: the summary carries groups and Advanced.
     return any(stored.get(name) for name in ("bindings", "local", "local_notes", "hidden", "labels",
-                                             "notes", "layout"))
+                                             "notes", "layout")) or "description" in stored
 
 
 def _overlay_summary(meta: dict) -> None:
@@ -355,12 +358,13 @@ def _overlay_summary(meta: dict) -> None:
             if not cached or cached[0] != key:
                 prompt, _ = load_template(template_id)
                 view = apply_stored_values(prompt, describe_stored(prompt, stored), stored)
-                cached = (key, *controls_summary_of(view))
+                cached = (key, *controls_summary_of(view), view.get("description", ""))
                 _summary_cache[template_id] = cached
     except Exception:
         logger.warning("Controls summary failed for workflow %s", template_id, exc_info=True)
         return
-    meta["validation"] = {**validation, "controls": copy.deepcopy(cached[1]), "warnings": list(cached[2])}
+    meta["description"] = cached[3]
+    meta["validation"] = {**validation, "controls": copy.deepcopy(cached[1]), "warnings": list(cached[2]), "description": cached[3]}
 
 
 def template_requirements(template_id: str) -> dict:
@@ -419,6 +423,8 @@ def replace_template(template_id: str, raw: bytes, *, source_name: str = "", val
         })
         meta.setdefault("name", _name_from_source(source_name))
         data = read_control_values(template_id)
+        description_reset = "description" in data
+        data.pop("description", None)
         notes_reset = len(data["notes"])
         layout_reset = len(data["layout"]) + len(data["labels"])
         data.update(notes={}, layout={}, labels={}, presentation_hash=hashlib.sha256(raw).hexdigest(), seq=data["seq"] + 1)
@@ -457,7 +463,94 @@ def replace_template(template_id: str, raw: bytes, *, source_name: str = "", val
         except Exception:
             logger.warning("Could not check app-only Controls of workflow %s", template_id, exc_info=True)
     return {**_public_meta(template_id, meta), "notes_reset": notes_reset, "layout_reset": layout_reset,
-            "local_missing": local_missing, "local_shadowed": local_shadowed}
+            "local_missing": local_missing, "local_shadowed": local_shadowed, "description_reset": description_reset}
+
+
+def export_curated(template_id: str) -> bytes:
+    """A portable snapshot of the app's menu and values, without changing storage.
+
+    The file lock joins source and sidecar reads. No runner lock or full node
+    validation: exporting work must remain possible with uninstalled nodes.
+    """
+    cm = control_descriptors.control_manifest
+    with template_lock(template_id):
+        # Read the source directly: load_template validates bundled starters.
+        raw = _read_bytes(template_source_path(template_id))
+        if raw is None:
+            raise TemplateError("Unknown workflow.", "unknown_template", 404)
+        prompt = parse_template_bytes(raw)
+        relay = cm.find_relay(prompt)
+        if relay["status"] == "error":
+            raise TemplateError(relay["error"], "invalid_controls")
+        stored = read_control_values(template_id)
+        view = apply_stored_values(prompt, describe_stored(prompt, stored), stored)
+        if generate_refusals(view):
+            raise TemplateError(" ".join(generate_refusals(view)), "invalid_controls")
+        # Keep unknown author metadata, but materialize only effective menu rows.
+        saved_text = prompt[relay["key"]]["inputs"].get("manifest") if relay["key"] else ""
+        saved = json.loads(saved_text) if saved_text and saved_text.strip() else {}
+        if len(view.get("group_order", [])) > cm.MAX_GROUPS:
+            raise TemplateError("The exported menu has too many groups.", "invalid_controls")
+        manifest = {**saved, "v": 1, "bindings": {}, "notes": {},
+                    "description": view.get("description", ""),
+                    "groups": {name: {"order": i} for i, name in enumerate(view.get("group_order", []))}}
+        local_bindings = control_descriptors.clean_local_bindings(stored.get("local"))
+        labels = stored.get("labels") or {}
+        for descriptor in view.get("bindings", []):
+            if descriptor.get("hidden") or (descriptor.get("origin") == "local" and descriptor.get("status") != "ok"):
+                continue
+            identity = descriptor["binding_id"]
+            entry = copy.deepcopy((saved.get("bindings") or {}).get(identity, {}))
+            entry.update({key: descriptor.get(key, default) for key, default in
+                          (("label", ""), ("note", ""), ("order", 0), ("group", ""), ("advanced", False))})
+            # A derived label can exceed the authored-label cap. Keep the
+            # empty authored label so the receiving app derives it identically.
+            if descriptor.get("origin") == "local":
+                label = local_bindings.get(identity, {}).get("label", "")
+            else:
+                authored_label = (saved.get("bindings") or {}).get(identity, {}).get("label", "")
+                label = labels.get(f"binding:{identity}", authored_label)
+            entry["label"] = label.strip()[:cm.LABEL_MAX] if isinstance(label, str) else ""
+            if descriptor.get("origin") == "local":
+                entry["targets"] = [{"path": t["path"], "input": t["input"]} for t in descriptor.get("targets", [])]
+            mode = descriptor.get("seed_mode")
+            if mode in cm.SEED_MODES:
+                entry["seed_mode"] = mode
+            for key in ("status", "suggestions", "error"):
+                entry.pop(key, None)
+            # Approved 4C amendment: off authored bindings retain their status.
+            # It is semantic, not a cache: stripping it revives no-widget
+            # bindings and duplicates whose other owner was hidden on export.
+            if descriptor.get("origin") != "local" and descriptor.get("status") != "ok":
+                entry["status"] = descriptor["status"]
+            manifest["bindings"][identity] = entry
+        for descriptor in view.get("notes", []):
+            if descriptor.get("hidden"):
+                continue
+            identity = descriptor["note_id"]
+            entry = copy.deepcopy((saved.get("notes") or {}).get(identity, {}))
+            entry.update({key: descriptor.get(key, default) for key, default in (("text", ""), ("group", ""), ("order", 0))})
+            manifest["notes"][identity] = entry
+        for key in ("status", "suggestions", "error"):
+            manifest.pop(key, None)
+        try:
+            text = json.dumps(manifest, ensure_ascii=False)
+            cm.parse_manifest(text)  # counts and UTF-8 cap, including unknown metadata
+        except (cm.ManifestError, UnicodeError) as exc:
+            raise TemplateError(str(exc), "invalid_controls") from None
+        if relay["key"] or manifest["bindings"] or manifest["notes"] or manifest["groups"] or manifest["description"]:
+            key = relay["key"]
+            if key is None:
+                roots = [int(k) for k in prompt if k.isascii() and k.isdecimal()]
+                key = str(max(roots, default=0) + 1)
+                prompt[key] = {"class_type": cm.RELAY_CLASS_TYPE, "inputs": {}}
+            prompt[key]["inputs"]["manifest"] = text
+        for node in prompt.values():
+            if isinstance(node.get("_meta"), dict):
+                node["_meta"].pop("sonder_controls", None)
+        exported = json.dumps(prompt, ensure_ascii=False).encode("utf-8")
+        parse_template_bytes(exported)
+        return exported
 
 
 def _read_bytes(path: str) -> bytes | None:
@@ -548,6 +641,7 @@ def _normalized_controls(data: dict, presentation_hash: str) -> dict:
         data["labels"] = {}
         data["notes"] = {}
         data["layout"] = {}
+        data.pop("description", None)
     data["presentation_hash"] = presentation_hash
     seq = data.get("seq")
     data["seq"] = seq if isinstance(seq, int) and not isinstance(seq, bool) and seq >= 0 else 0
@@ -683,6 +777,9 @@ def apply_stored_values(prompt: dict, described: dict, stored: dict, *, describe
             if prefix == "binding" and isinstance(label, str):
                 descriptor["label"] = (label.strip()[:cd.PANEL_LABEL_MAX_CHARS]
                                        or cd._default_label(prompt, descriptor.get("targets") or []))
+    description = stored.get("description")
+    if isinstance(description, str) and len(description) <= cd.control_manifest.DESCRIPTION_MAX:
+        view["description"] = description
     if "relay" in view and not view.get("error"):
         view["groups"] = _overlay_groups(view.get("groups"), layouts)
         view["group_order"] = cd.group_order(view)  # the overlays may regroup
@@ -747,6 +844,9 @@ def store_binding_changes(template_id: str, changes: dict, view: dict, prompt: d
             source, identity, field = control_descriptors.parse_target(target)
             base = f"{source}:{identity}"
             if isinstance(value, dict) and value.get("noop"):
+                continue
+            if source == "workflow" and field == "description":
+                data["description"] = value
                 continue
             if source == "group":
                 _store_group(data, current, authored_groups, identity, value)

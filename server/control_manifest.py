@@ -39,6 +39,7 @@ MAX_GROUPS = 256
 MAX_DEPTH = 6
 LABEL_MAX = 120
 NOTE_MAX = 4000
+DESCRIPTION_MAX = 1000
 ORDER_LIMIT = 9999
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 FORBIDDEN_KEYS = frozenset({"__proto__", "constructor", "prototype"})
@@ -85,7 +86,7 @@ def clean_group(value: Any) -> str:
 
 
 def empty_manifest() -> dict:
-    return {"v": MANIFEST_VERSION, "bindings": {}, "notes": {}, "groups": {}, "suggestions": []}
+    return {"v": MANIFEST_VERSION, "bindings": {}, "notes": {}, "groups": {}, "suggestions": [], "description": ""}
 
 
 def _check_shape(value: Any, depth: int = 1) -> None:
@@ -206,6 +207,7 @@ def parse_manifest(text: Any) -> dict:
         raise ManifestError("The Controls manifest has too many unlisted anchors.")
 
     manifest = empty_manifest()
+    manifest["description"] = _text(raw.get("description"), DESCRIPTION_MAX, "description")
     for binding_id, entry in bindings_raw.items():
         manifest["bindings"][_check_id(binding_id)] = _binding(entry)
     for note_id, entry in notes_raw.items():

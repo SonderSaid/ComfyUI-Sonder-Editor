@@ -22401,8 +22401,8 @@ export class EditorWidget {
                 ["Drag row handle", "Reorder or move into another section"],
                 ["Filter options + Enter", "Choose a long-list option without queuing a run"],
                 ["Double-click note", "Edit panel Markdown"],
-                ["Ctrl+Enter", "Save the focused note without queuing a run"],
-                ["Esc", "Cancel the focused note without leaving fullscreen"],
+                ["Ctrl+Enter", "Save the focused note or workflow description without queuing a run"],
+                ["Esc", "Cancel the focused note or workflow description without leaving fullscreen"],
             ]) +
             this._shortcutSection("Asset Gallery", [
                 ["Arrow keys", "Move asset focus / selection"],

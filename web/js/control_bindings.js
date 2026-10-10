@@ -8,9 +8,9 @@
 // server/control_manifest.py and server/control_descriptors.py are the authority.
 import { getGraphLink, getGraphNode } from "./project_source_resolver.js";
 import { findControlWidget, seedModeWidget } from "./control_widgets.js";
-import { cleanGroup } from "./control_targets.js";
+import { cleanGroup, DESCRIPTION_MAX } from "./control_targets.js";
 
-export { cleanGroup, groupNameError, isStructuralTarget, parseTarget } from "./control_targets.js";
+export { DESCRIPTION_MAX, cleanGroup, groupNameError, isStructuralTarget, parseTarget } from "./control_targets.js";
 
 export const RELAY_CLASS = "SonderControlRelay";
 export const ANCHOR_PROPERTY = "sonderBindings";
@@ -133,7 +133,7 @@ export const copyRuleInPlace = node => !!node?.[COPY_RULE] && node.onConfigure =
 
 // ── Manifest ─────────────────────────────────────────────────────────────────
 
-export const emptyManifest = () => ({ v: MANIFEST_VERSION, bindings: {}, notes: {}, groups: {} });
+export const emptyManifest = () => ({ v: MANIFEST_VERSION, bindings: {}, notes: {}, groups: {}, description: "" });
 
 function checkShape(value, depth = 1) {
     if (depth > MAX_DEPTH) throw new Error("The Controls manifest is nested too deeply.");
@@ -171,6 +171,9 @@ export function parseManifest(text) {
     for (const id of [...Object.keys(raw.bindings), ...Object.keys(raw.notes)]) {
         if (!ID_RE.test(id)) throw new Error("A Controls id is invalid.");
     }
+    if (raw.description == null) raw.description = "";
+    if (typeof raw.description !== "string" || [...raw.description].length > DESCRIPTION_MAX)
+        throw new Error("A workflow description must be text of at most 1000 characters.");
     return raw;
 }
 

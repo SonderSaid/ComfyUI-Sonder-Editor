@@ -1,3 +1,4 @@
+import { renderPanelMarkdown } from './panel_markdown.js';
 import { el, button, component, badge, date, input, modelMessage } from './launcher_view.js';
 export const SAMPLE_PROJECTS_URL = 'https://huggingface.co/datasets/SonderSaid/Sonder-Editor-Projects';
 export function workflowBadge(template) {
@@ -47,11 +48,24 @@ export function mountWorkflows(state, actions) {
             const used = state.memory.last_workflow?.by_template?.[t.template_id];
             sub.append(el('span', '', t.starter ? t.model_family : `${used ? 'used' : 'imported'} ${date(used || t.imported_at)}`), badge(...workflowBadge(t)));
             row.append(line, sub);
+            if (t.description) {
+                const firstLine = renderPanelMarkdown(t.description.split(/\r?\n/, 1)[0]).textContent;
+                const summary = el('div', 'sl-dim', firstLine);
+                summary.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+                row.append(summary);
+            }
             if (chosen) {
                 const details = el('div', 'sl-workflow-details');
                 for (const problem of [...(t.validation?.errors || []), ...(t.validation?.blocking || [])]) details.append(el('p', 'sl-bad', problem));
                 for (const item of t.missing_models || []) details.append(el('p', 'sl-warn', modelMessage(item)));
                 for (const note of t.validation?.warnings || []) details.append(el('p', 'sl-dim', note));
+                if (t.description) {
+                    const description = el('div', 'sl-workflow-description');
+                    description.style.cssText = 'overflow-wrap:anywhere;';
+                    description.append(renderPanelMarkdown(t.description));
+                    description.addEventListener('click', e => e.stopPropagation());
+                    details.append(description);
+                }
                 details.append(el('p', '', controlsLine(t.validation?.controls || [])));
                 row.append(details);
             }

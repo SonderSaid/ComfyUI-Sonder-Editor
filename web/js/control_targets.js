@@ -4,6 +4,8 @@
 // server/control_descriptors.py parse_target and server/control_manifest.py
 // group_name_error are the authority (tests pin the mirrors).
 
+export const DESCRIPTION_MAX = 1000;
+
 export const GROUP_NAME_MAX = 120;
 const FORBIDDEN_NAMES = new Set(["__proto__", "constructor", "prototype"]);
 // Checked before trimming, with U+FEFF, so JS trim() and Python's strip()

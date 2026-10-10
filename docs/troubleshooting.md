@@ -110,6 +110,21 @@ Sonder projects folder. Turning links off and unlinking work from anywhere.
 
 ## Sonder App
 
+### How do I share a workflow curated in the Sonder App?
+
+Use the workflow's **⋮ → Export as API** action in the Launcher, then import
+the downloaded JSON into another Sonder App. It includes current Control values
+and seed modes, active app-only Controls, labels, notes, groups, Advanced flags
+and the workflow description. Hidden entries are omitted; disabled authored
+Controls stay disabled. Export reports unreadable Relays or a menu/file that
+exceeds import limits instead of downloading a partial file.
+
+This export is for the Sonder App. Loading API JSON on the ComfyUI canvas is
+unsupported: subgraphs flatten and some custom nodes lose settings. Share the
+saved UI workflow when the recipient needs the canvas. Replacing an existing
+Sonder App import resets its authored presentation overlays, including its app
+description, while retaining app-only curation and saved values.
+
 ### Where is the Launcher shortcut, and why does it stop working after a port change?
 
 On Windows, installing the Sonder App saves **Sonder Launcher.url** in your

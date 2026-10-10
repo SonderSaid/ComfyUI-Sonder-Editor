@@ -757,6 +757,7 @@ def describe_bindings(
     exposed = {d["binding_id"] for d in view["bindings"]}
     view["suggestions"] = [s for s in view["suggestions"] if s["binding_id"] not in exposed]
     _flag_shared_targets(view["bindings"])
+    view["description"] = manifest["description"]
     view["groups"] = manifest["groups"]
     view["bindings"].sort(key=lambda d: (d["order"], d["label"].lower(), d["binding_id"]))
     view["notes"].sort(key=lambda d: (d["order"], d["note_id"]))
@@ -1058,6 +1059,13 @@ def validate_binding_changes(view: dict, changes: Any, *, prompt: dict | None = 
     cleaned, rejected = {}, []
     for target, raw in changes.items():
         try:
+            if target == "workflow:description":
+                if view.get("error") or (view.get("relay") or {}).get("status") == "error":
+                    raise ControlValueError("The Sonder Control Relay cannot be read.")
+                if not isinstance(raw, str) or len(raw) > control_manifest.DESCRIPTION_MAX:
+                    raise ControlValueError("A workflow description must be text of at most 1000 characters.")
+                cleaned[target] = raw
+                continue
             if is_structural(target):
                 source, identity, op = parse_target(target)
                 cleaned[target] = (batch.group(identity, op, raw) if source == "group"

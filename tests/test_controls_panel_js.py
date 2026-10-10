@@ -78,6 +78,30 @@ if(SCENARIO==='markdown'){
     if(['layout','layout-refusal','layout-stale','layout-editor','cancel','note-save','ime','note-refusal','note-then-value','problem-statuses','truncated'].includes(SCENARIO))toggleManage();
     const group=name=>walk(container).find(n=>n.dataset.controlsGroup===name);
     const mirror=key=>walk(container).find(n=>n.dataset.controlsMirror===key);
+    if(SCENARIO==='description'){
+        toggleManage();
+        const area=walk(container).find(n=>n.dataset.workflowDescription);
+        const section=area.parentElement;
+        area.focus(); area.value='😀'.repeat(1000);area.dispatch('input');
+        key('Enter',{ctrlKey:true,isComposing:true});await settle();assert.equal(calls.length,0);
+        key('Enter',{ctrlKey:true});await settle();assert.deepEqual(calls.at(-1),{'workflow:description':'😀'.repeat(1000)});
+        area.value='😀'.repeat(1001);area.dispatch('input');key('Enter',{ctrlKey:true});await settle();assert.equal(calls.length,1);
+        assert.match(section.textContent,/Not saved/);
+        area.value='Draft';area.dispatch('input');publish({...view,description:'Remote'});assert.equal(area.value,'Draft');
+        key('Escape');assert.equal(area.value,'Remote');
+        area.value='**Safe** <img onerror=boom> [bad](javascript:alert)';area.dispatch('input');
+        assert.ok(!walk(section).some(n=>n.tagName==='IMG'));
+        assert.ok(!walk(section).some(n=>n.tagName==='A'));
+        refuse=true;defer=true;key('Enter',{metaKey:true});await settle();
+        const flushed=panel.flushPending();resolveWrite();assert.equal(await flushed,true);
+        await settle();assert.match(section.textContent,/Not saved: server refusal/);
+        assert.equal(area.value,'**Safe** <img onerror=boom> [bad](javascript:alert)');
+        refuse=false;defer=false;key('Enter',{ctrlKey:true});await settle();
+        assert.ok(!section.textContent.includes('Not saved'));
+        defer=true;area.value='Saved new';area.dispatch('input');key('Enter',{ctrlKey:true});await settle();
+        button(section,'Cancel').dispatch('click');publish({...view,description:'Saved new'});resolveWrite();await settle();
+        assert.equal(area.value,'Saved new');assert.equal(button(section,'Save description').disabled,true);
+    }
     if(SCENARIO==='grouping'){
         // Header: search, then Manage. The Editor group comes first (Phase 4).
         assert.ok(walk(container.children[0]).some(n=>n.dataset.controlsManageToggle==='true'));
@@ -178,7 +202,7 @@ if(SCENARIO==='markdown'){
     if(SCENARIO==='group-note'){
         toggleManage();const section=walk(container).find(n=>n.dataset.controlsManage==='true');
         walk(group('Advanced').children[0]).find(n=>n.dataset.groupAction==='note').dispatch('click');
-        const area=walk(section).find(n=>n.tagName==='TEXTAREA');area.value='Seeds';key('Enter',{ctrlKey:true});await settle();
+        const area=walk(section).find(n=>n.tagName==='TEXTAREA'&&!n.dataset.workflowDescription);area.value='Seeds';key('Enter',{ctrlKey:true});await settle();
         const [target,value]=Object.entries(calls.at(-1))[0];assert.match(target,/^note:[A-Za-z0-9_-]{12}:create$/);assert.deepEqual(value,{text:'Seeds',group:'Advanced'});
     }
     if(SCENARIO==='focus'){
@@ -364,7 +388,7 @@ if(SCENARIO==='markdown'){
             button(byTarget('binding:lost:value'),'Remove').dispatch('click');await settle();assert.deepEqual(calls.at(-1),{'binding:lost:remove':true});
         }
         // A new standalone note.
-        button(section,'+ Note').dispatch('click');const area=walk(section).find(n=>n.tagName==='TEXTAREA');area.value='**Tip**';
+        button(section,'+ Note').dispatch('click');const area=walk(section).find(n=>n.tagName==='TEXTAREA'&&!n.dataset.workflowDescription);area.value='**Tip**';
         key('Enter',{ctrlKey:true});await settle();const [noteTarget,noteValue]=Object.entries(calls.at(-1))[0];
         assert.match(noteTarget,/^note:[A-Za-z0-9_-]{12}:create$/);assert.deepEqual(noteValue,{text:'**Tip**',group:''});
         // The filter reaches the host, debounced; Escape clears it.
@@ -515,7 +539,7 @@ if(SCENARIO==='markdown'){
 console.log('ok');
 '''
 
-@pytest.mark.parametrize('scenario',['group-editor-name','editor-focus-refresh','normal-view','manage','manage-sdk','manage-flush','hide-flush','combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','note-refusal','problem-statuses','loading','note-then-value','batch-mirror','search','advanced','advanced-refusal','hidden-pending','cards-scale','group-note','groups-manage','groups-cap'])
+@pytest.mark.parametrize('scenario',['description','group-editor-name','editor-focus-refresh','normal-view','manage','manage-sdk','manage-flush','hide-flush','combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','note-refusal','problem-statuses','loading','note-then-value','batch-mirror','search','advanced','advanced-refusal','hidden-pending','cards-scale','group-note','groups-manage','groups-cap'])
 def test_controls_panel(scenario, tmp_path):
     node=shutil.which('node')
     if not node:pytest.skip('node required for Controls renderer boundary tests')

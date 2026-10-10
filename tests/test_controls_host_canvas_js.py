@@ -61,6 +61,21 @@ const deferred=async()=>{for(let i=0;i<40&&!release;i++)await settle();assert.ok
 // The server's canonical structural values (control_descriptors._StructuralBatch).
 const exposed = (candidate, extra={}) => ({candidate, targets:[{...candidate}], kind:'FLOAT', section:'workflow', label:'Sampler · cfg', order:4, ...extra});
 const cfg = {path:'3', input:'cfg'};
+if(SCENARIO==='description'||SCENARIO==='description-new-relay') {
+    let created;
+    if(SCENARIO==='description-new-relay') {
+        root._nodes.splice(root._nodes.indexOf(relay),1);
+        raw={...raw,relay:{status:'none',key:null,error:null},bindings:[],notes:[]};
+        globalThis.LiteGraph={createNode(type){created={id:9,type,comfyClass:type,mode:0,properties:{},inputs:[],size:[200,40],
+            addCustomWidget(w){this.widgets.push(w);return w;},removeWidget(w){this.widgets.splice(this.widgets.indexOf(w),1);},
+            computeSize(){return [200,40];},setSize(s){this.size=s;},widgets:[widget('manifest','')]};return created;}};
+    }
+    const result=await host.applyChanges({'workflow:description':'**Portable** 😀'});
+    assert.equal(result.ok,true,JSON.stringify(result));
+    assert.equal(JSON.parse((created||relay).widgets[0].value).description,'**Portable** 😀');
+    assert.equal(captures,2);
+    if(created)assert.ok(root._nodes.includes(created));
+}
 if(SCENARIO==='expose'||SCENARIO==='expose-rollback'||SCENARIO==='expose-new-relay'||SCENARIO==='expose-new-relay-rollback') {
     let created=null;
     if(SCENARIO.startsWith('expose-new-relay')){
@@ -365,7 +380,7 @@ host.destroy();assert.equal(listeners.size,0);
 console.log('ok');
 '''
 
-SCENARIOS = ['expose', 'expose-rollback', 'expose-new-relay', 'expose-new-relay-rollback', 'expose-noop', 'expose-taken',
+SCENARIOS = ['description', 'description-new-relay', 'expose', 'expose-rollback', 'expose-new-relay', 'expose-new-relay-rollback', 'expose-noop', 'expose-taken',
              'remove-rebind', 'manage-listing', 'filter-during-write', 'unsafe-seed', 'moved', 'rollback-callbacks', 'presentation', 'presentation-rollback', 'root', 'promoted', 'promoted-seed', 'no-relay', 'two-relays',
              'linked-or-gone', 'manifest-cap', 'hidden-hash', 'relay-error-view', 'refusal', 'stale-write', 'stale-view',
              'destroy', 'rollback', 'serial', 'history-failure', 'precision-refusal', 'hide-during-write',

@@ -8,9 +8,9 @@ import { syncRelayRows } from "./control_relay_rows.js";
 
 const DESCRIBE_URL = "/sonder-editor/controls/describe";
 const DEBOUNCE_MS = 400;
-// Fields this writer lands; hide/unhide and the description are not canvas targets.
+// Fields this writer lands; hide/unhide are app-only targets.
 const FIELDS = new Set(["value", "seed_mode", "label", "note", "text", "order", "group", "advanced",
-    "expose", "remove", "rebind", "create", "rename", "ungroup", "move"]);
+    "expose", "remove", "rebind", "create", "rename", "ungroup", "move", "description"]);
 const sameTargets = (a, b) => JSON.stringify((a || []).map(t => [String(t.path), t.input]).sort())
     === JSON.stringify((b || []).map(t => [String(t.path), t.input]).sort());
 const refused = (changes, reason) => ({ok: false,
@@ -182,7 +182,8 @@ export function createCanvasControlsHost({app, api, getEditorNode,
         const structural = Object.entries(changes).filter(([target, value]) => isStructuralTarget(target) && !value?.noop);
         // A first expose, note or group may add the Relay; everything else needs the one Relay.
         const addsRelay = !active.length && !census.muted && !census.bypassed && !census.nested
-            && structural.length > 0 && structural.every(([target]) => ["expose", "create"].includes(parseTarget(target).field));
+            && (structural.length > 0 || "workflow:description" in changes)
+            && structural.every(([target]) => ["expose", "create"].includes(parseTarget(target).field));
         if (!structural.length && Object.values(changes).every(value => value?.noop)) return {writes: [], anchors: []};
         if (active.length !== 1 && !addsRelay) throw new Error("Keep exactly one active Sonder Control Relay in the workflow.");
         const relay = active[0] || null;
@@ -198,8 +199,12 @@ export function createCanvasControlsHost({app, api, getEditorNode,
         };
         for (const [target, value] of Object.entries(changes)) {
             const parsed = parseTarget(target);
-            if (!parsed || parsed.source === "workflow" || !FIELDS.has(parsed.field)) throw new Error("This target is unavailable.");
+            if (!parsed || !FIELDS.has(parsed.field)) throw new Error("This target is unavailable.");
             const { source, id, field } = parsed;
+            if (source === "workflow") {
+                manifestOps.push(m => { m.description = value; });
+                continue;
+            }
             if (source === "group") {
                 // One unexpanded plan, expanded against this saved manifest.
                 if (!value?.noop) manifestOps.push(m => applyGroupPlan(m, id, value, bindings));

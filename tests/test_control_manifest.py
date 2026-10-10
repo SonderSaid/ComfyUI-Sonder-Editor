@@ -196,11 +196,13 @@ def test_manifest_caps_mirror_the_frontend():
     def constant(name):
         return re.search(rf"export const {name} = ([^;]+);", source).group(1)
     assert eval(constant("MAX_MANIFEST_BYTES")) == cm.MAX_MANIFEST_BYTES
-    for name in ("MAX_BINDINGS", "MAX_NOTES", "MAX_SUGGESTIONS", "MAX_TARGETS", "MAX_DEPTH"):
+    for name in ("MAX_BINDINGS", "MAX_NOTES", "MAX_SUGGESTIONS", "MAX_TARGETS", "MAX_DEPTH", "MAX_GROUPS"):
         assert int(constant(name)) == getattr(cm, name), name
     assert int(constant("LABEL_MAX")) == cm.LABEL_MAX and int(constant("NOTE_MAX")) == cm.NOTE_MAX
     assert constant("ID_RE") == "/" + cm.ID_RE.pattern + "/"
     assert constant("RELAY_CLASS") == json.dumps(cm.RELAY_CLASS_TYPE)
+    targets = (ROOT / "web/js/control_targets.js").read_text(encoding="utf-8")
+    assert int(re.search(r"export const DESCRIPTION_MAX = (\d+);", targets).group(1)) == cm.DESCRIPTION_MAX
     # Manage's candidate mirrors (control_descriptors / binding_policy).
     from server import control_descriptors as cd
     assert constant("LEGACY_PRIMITIVE") == json.dumps(bp.LEGACY_PRIMITIVE_CLASS)

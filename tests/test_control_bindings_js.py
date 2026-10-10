@@ -273,3 +273,16 @@ def test_manage_candidates_and_anchor_helpers():
 
 def test_copy_rule_and_relay_extension():
     run(COPY_RULE)
+
+
+def test_description_survives_manifest_edits_and_api_export_with_code_point_cap():
+    run(PRELUDE + r"""
+const description = '😀'.repeat(1000);
+const descriptionSaved = B.editManifest('', m => { m.description = description; });
+assert.equal(B.parseManifest(descriptionSaved).description, description);
+const edited = B.editManifest(descriptionSaved, m => { m.groups = {Shared:{order:1}}; });
+assert.equal(JSON.parse(B.exportManifest(edited, root)).description, description);
+assert.throws(() => B.parseManifest(JSON.stringify({description:description+'x'})), /1000/);
+assert.throws(() => B.parseManifest(JSON.stringify({description:42})), /text/);
+console.log('ok');
+""")

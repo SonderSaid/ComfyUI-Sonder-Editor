@@ -12,6 +12,7 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Added
+- Workflow descriptions in Manage and the Launcher, plus Export as API to share Sonder App values and curated Controls with another Sonder App.
 - Controls: create, rename, reorder and ungroup workflow groups in every editor mode, move settings between them, and mark a group Advanced; recorded Advanced settings show an Adv tag in asset details.
 - Controls: compact Rows or Cards, search, personal scale and per-setting Advanced flags in fullscreen, mounted tabs and the Sonder App, with a remembered Editor group and Max frames per batch.
 - Assets: a take, video, PNG sequence or Save Bridge file made from a workflow with Controls records the values its run used. They show as **Controls at run** in the asset details, with labels, groups and seed modes, and `tracked:` and `field:` search finds them.

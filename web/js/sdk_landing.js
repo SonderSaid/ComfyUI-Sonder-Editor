@@ -11,6 +11,7 @@ import { LAUNCHER_WINDOW_NAME, MACHINE_ONLY_MESSAGE } from './sdk_setup_client.j
 import { register, PRIORITY } from './keyboard_ownership.js';
 import { el, button, mountLauncherStyle, date } from './launcher_view.js';
 import { mountHeader, environmentState } from './launcher_header.js';
+import { downloadCuratedWorkflow } from './launcher_export.js';
 import { mountWorkflows } from './launcher_workflows.js';
 import { mountProjects, thumbnailMode } from './launcher_projects.js';
 import { mountOpenBar } from './launcher_open_bar.js';
@@ -152,6 +153,7 @@ async function importFile(file, template = null) {
         const reset = [];
         if (payload.template.notes_reset) reset.push(`${payload.template.notes_reset} panel notes reset`);
         if (payload.template.layout_reset) reset.push('layout reset');
+        if (payload.template.description_reset) reset.push('description reset');
         // App-only Controls survive a replace; say which ones now need a look in Manage.
         const offline = (payload.template.local_missing || 0) + (payload.template.local_shadowed || 0);
         if (offline) reset.push(`${offline} app-only Control${offline === 1 ? '' : 's'} off (see Manage)`);
@@ -170,6 +172,10 @@ async function setHidden(kind, id, hidden) {
 }
 function workflowMenu(template, anchor) {
     showPopup(anchor, (menu, close) => {
+        menu.append(button('Export as API', () => { close(); void run(async () => {
+            const filename = await downloadCuratedWorkflow(template, path => api.apiURL(path));
+            notifySuccess('Workflow exported', { source: 'launcher-export', detail: filename });
+        }); }));
         if (!template.starter) {
             menu.append(button('Rename', () => showDialog({ title: 'Rename workflow', initial: template.name, submit: async name => {
                 await call(`/sonder-editor/sdk/templates/${template.template_id}`, { method: 'PATCH', ...json({ name }) }); await refresh();

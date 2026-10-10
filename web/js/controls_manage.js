@@ -5,6 +5,7 @@
 // Candidates arrive in the view (`view.candidates`) only while Manage is open:
 // the host lists them from the live graph (canvas, mounted) or the template
 // (Sonder App), already filtered and never greyed out.
+import { mountWorkflowDescription } from "./controls_workflow_description.js";
 import { register, PRIORITY, PRESERVE_DEFAULT } from "./keyboard_ownership.js";
 import { groupNameError } from "./control_targets.js";
 import { EDITOR_COLORS as COLORS, FONT, RADIUS, SPACE, TYPE, chromeInputCss, setButtonDisabled, setButtonVariant } from "./editor_theme.js";
@@ -92,7 +93,8 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
     const noteBox = make("div");
     noteBox.style.cssText = `display:none;flex-direction:column;gap:${SPACE.s1}px;`;
     footer.append(addNote, addGroup);
-    el.append(heading, filterInput, banner, list, footer, noteBox);
+    const description = mountWorkflowDescription(host, { track });
+    el.append(description.el, heading, filterInput, banner, list, footer, noteBox);
 
     function apply(changes, button) {
         return track(applyNow(changes, button), changes);
@@ -149,6 +151,7 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
     function render(view = host.getView()) {
         if (destroyed) return;
         lastView = view;
+        description.render(view);
         // Rebuilt only when what it lists changes: the panel renders on every
         // focus change, and a rebuild between a press and its click loses it.
         const key = JSON.stringify([rebind, filter, open, view.candidates, view.suggestions, view.candidates_truncated]);
@@ -383,12 +386,13 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         addNote: group => openDraft(typeof group === "string" ? group : ""),
         addGroup: then => openGroupDraft(typeof then === "function" ? then : null),
         get rebinding() { return rebind?.binding_id || null; },
-        get editing() { return !!draft || document.activeElement === filterInput; },
+        get editing() { return !!draft || description.editing || document.activeElement === filterInput; },
         destroy() {
             destroyed = true;
             clearTimeout(filterTimer);
             if (draft) closeDraft(false);
             unregister();
+            description.destroy();
             el.remove();
         },
     };
