@@ -243,13 +243,15 @@ adapters, grouped under the `Sonder`, `Sonder/IO`, `Sonder/Logic`, and
 |------|--------------|
 | **Sonder Control Relay** | The workflow's Controls menu. The settings it exposes (widgets on the main graph, or a subgraph's promoted inputs, such as steps, a sampler, a seed or a Sonder Selector's feature) appear in the Controls sidebar with labels, groups and Markdown notes, in every editor mode and in the Sonder App. The settings stay on their own nodes and the Relay never runs. Each generated asset records the values its run used, shown as Controls at run in the asset details. Keep one per workflow, in the main graph; a copied node is never exposed twice. |
 
-Open the **Controls** sidebar in fullscreen, a mounted tab or the Sonder App to edit the exposed settings and seed modes alongside take settings. Drag a row handle to reorder it within the workflow groups; long option lists include a filter. Double-click a note to edit its Markdown; Ctrl+Enter saves and Esc cancels. Canvas edits live in the workflow, with one Undo step per edit. Sonder App edits are saved per imported workflow; re-import keeps values and seed modes while resetting labels, notes, layout and the app description. A setting that is off (removed, muted or linked to another node) says why and is skipped, so the workflow's own value runs.
+Open the **Controls** sidebar in fullscreen, a mounted tab or the Sonder App to edit the exposed settings and seed modes alongside take settings. Long option lists include a filter. In **Manage**, drag a row handle to reorder it or move it to another group, and double-click a note to edit its Markdown (Ctrl/⌘+Enter or **Done** saves, Esc cancels). Canvas edits live in the workflow, with one Undo step per edit. Sonder App edits are saved per imported workflow; re-import keeps values, seed modes, app-only Controls, hidden settings and your edited presets while resetting labels, notes, layout and the app description. A setting that is off (removed, muted or linked to another node) says why and is skipped, so the workflow's own value runs.
 
-In **Controls → Manage**, author a workflow description (up to 1,000 characters, with a safe Markdown preview); Ctrl/⌘+Enter saves and Esc cancels. The Launcher shows it beside the workflow. To share app curation, use the workflow’s **⋮ → Export as API** menu in the Launcher. Import that JSON into another Sonder App to carry current values, seed modes, labels, notes, group order, Advanced flags and the description, including active app-only Controls. Hidden entries stay out, and disabled authored Controls stay disabled. Bundled starter workflows can be exported too. This file is for the **Sonder App**: loading API JSON onto the ComfyUI canvas is unsupported, flattens subgraphs and can lose custom-node settings. Canvas authors should share their saved UI workflow.
+In **Controls → Manage**, author a workflow description (up to 1,000 characters, with a safe Markdown preview); Ctrl/⌘+Enter saves and Esc cancels. The Launcher shows it beside the workflow. To share app curation, use the workflow’s **⋮ → Export as API** menu in the Launcher. Import that JSON into another Sonder App to carry current values, seed modes, labels, notes, group order, Advanced flags and the description, including active app-only Controls. Hidden entries stay out, and disabled authored Controls stay disabled. This file is for the **Sonder App**: loading API JSON onto the ComfyUI canvas is unsupported, flattens subgraphs and can lose custom-node settings. Canvas authors should share their saved UI workflow.
 
 In the **Sonder App**, the **Workflow** menu at the top of the Controls panel switches the open project to another imported workflow in place: the project, scene and timeline stay, and takes already generating finish with the workflow they started with. Star a workflow there or in the Launcher's **⋮** menu to keep it at the top of both lists.
 
 A workflow can carry **presets**: named sets of Controls with captured values that set up one feature (text-to-video, detailing, and so on) in one choice. In **Manage**, choose **+ Preset**, tick **In preset** on the Controls it should set, then **Create**; **Update from current values** recaptures it later. The **Preset** picker at the top of the Controls panel applies one; Controls outside it are left as they are, and it reads **Custom** once a member changes. Presets travel in the saved workflow and in Export (API), and work the same in fullscreen, mounted tabs and the Sonder App. A preset whose Control is gone or refused is disabled and names it, so it can be repaired in Manage; editing one in the Sonder App keeps your copy across re-import, with **Reset to workflow's version**.
+
+**Clean up unavailable…** in Manage reviews what no longer resolves in the current workflow (a setting whose node was deleted, a leftover exposure marker, saved Sonder App values from an older version of the workflow, preset members pointing at those) and removes only what you leave checked. Preset members are listed one by one, so a kept member leaves its preset repairable. On the canvas the cleanup is one Undo step.
 
 > **Sonder Switch**, **Sonder Cluster**, **Sonder Gate**, **Sonder Reference Selector**, the three
 > **Sonder Reference Bridges**, **Sonder Control Relay**, and
@@ -280,6 +282,10 @@ A workflow can carry **presets**: named sets of Controls with captured values th
   install must be updated or removed from `PATH`.
 - `torch` is provided by ComfyUI and is **not** installed by this pack (see
   [Troubleshooting](docs/troubleshooting.md)).
+- **Optional, for the [Sonder App](#sonder-app-experimental):** `comfy-sdk` 0.4.0 and
+  `comfy-api-proxy` 0.1.6 (any 0.4.x and 0.1.x work). Install them from the
+  editor's Settings, not with `pip install -r requirements.txt`; the editor and
+  every node work without them.
 
 ## Installation
 
@@ -318,6 +324,41 @@ automatically.
 7. **Run the prompt.** The editor renders the selected window (or queued
    snapshots) into your workflow, and outputs return as project assets.
 
+## Sonder App (experimental)
+
+The Sonder App runs a workflow on a project from its own browser page, without
+the ComfyUI canvas. Its **Launcher** lists your projects and imported workflows
+and opens the editor on the pair you choose, with **Generate** (1–8 takes per
+click) beside **+ Queue** and the workflow's settings in the **Controls** panel.
+ComfyUI still does the generating.
+
+Set it up once, on the ComfyUI machine:
+
+1. In the editor, open **Settings → Sonder App (experimental)** and click
+   **Install**. It adds two pinned packages, `comfy-sdk` 0.4.0 and
+   `comfy-api-proxy` 0.1.6, to ComfyUI's Python. It only ever adds packages: if
+   either is already installed at another version, or installing would change
+   something ComfyUI already has, it stops and says so. No restart is needed.
+   Install and Uninstall work only from a browser on the ComfyUI machine, and
+   Uninstall removes only what Sonder installed.
+2. Click **Open Launcher**, or open `http://127.0.0.1:<port>/sonder-editor/app`
+   with your ComfyUI port. On Windows, Install also saves a
+   **Sonder Launcher.url** shortcut in your Sonder projects folder; elsewhere,
+   bookmark the page. **Show Launcher Button In The Editor** adds a Launcher icon
+   beside Settings.
+3. Export your workflow with ComfyUI's **Export (API)** and import the JSON in
+   the Launcher (Import, or drop the file). The workflow needs exactly one
+   **Sonder Editor** and a **Sonder Save Video** or **Sonder Save Bridge** that
+   takes its project from it.
+
+When you open a workflow from the Launcher, Sonder starts a local connection to
+ComfyUI (`comfy-api-proxy`) on a free port from 8189 to 8198, or reuses one
+already serving this ComfyUI. It stops the one it started when ComfyUI exits or
+after half an hour without a Sonder App session. ComfyUI started with its own TLS
+options (`--tls-keyfile`, `--tls-certfile`) isn't supported yet. If setup or
+Generate reports a problem, see
+[Troubleshooting — Sonder App](docs/troubleshooting.md#sonder-app).
+
 ## Example workflows
 
 Two ready-wired generation graphs. Drop either onto the ComfyUI canvas.
@@ -352,7 +393,8 @@ on Hugging Face, and needs Sonder Editor 0.6.0 or newer.
 - **[References](docs/references.md)** — the Reference Library, Reference
   lanes and recipes, derived prompts, and the Reference nodes.
 - **[Troubleshooting](docs/troubleshooting.md)** — installation and
-  environment problems, project storage and Windows path limits, and playback.
+  environment problems, project storage and Windows path limits, the Sonder App,
+  and playback.
 
 ## Example projects
 
@@ -385,7 +427,7 @@ showcase, with its reference assets staged on the timeline; it needs 0.6.0 or ne
 
 ## Troubleshooting
 
-Installation, project storage and playback fixes are in
+Installation, project storage, Sonder App and playback fixes are in
 [Troubleshooting](docs/troubleshooting.md).
 
 ## License

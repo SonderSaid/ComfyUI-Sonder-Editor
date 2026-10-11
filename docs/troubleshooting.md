@@ -110,6 +110,72 @@ Sonder projects folder. Turning links off and unlinking work from anywhere.
 
 ## Sonder App
 
+### Install in Settings → Sonder App is refused or doesn't finish
+
+Install adds `comfy-sdk` and `comfy-api-proxy` at pinned versions to ComfyUI's
+own Python and never changes a package that is already there. What each message
+means:
+
+- **"Install and Uninstall work only in a browser on the ComfyUI machine."**:
+  they work only in a browser on the computer running ComfyUI, opened at `127.0.0.1` or
+  `localhost` and not through a reverse proxy or tunnel. Other browsers can see
+  the status but not change it.
+- **"pip isn't available in ComfyUI's Python"**: run one of the two commands
+  shown (pip or uv) yourself; they target ComfyUI's interpreter.
+- **"… is already installed, and the Sonder App needs …"**: another version of
+  that package is installed, and Install only adds the exact pinned versions.
+  Any `comfy-sdk` 0.4.x and `comfy-api-proxy` 0.1.x already work, so if yours is
+  in that range, install only the missing package by hand. Otherwise update it
+  yourself if nothing else needs that version.
+- **"Installing would change packages ComfyUI already has"**: the packages
+  would upgrade or downgrade something ComfyUI uses, so Sonder stopped. Install
+  them by hand only if you accept that change.
+- **"pip couldn't plan the install."**, **"pip couldn't install the
+  packages."** or **"pip finished, but the installed versions don't match"**:
+  the detail below shows pip's own error, often a network problem or no package
+  build for this Python. Fix that and run Install again, or install by hand.
+- **"An install didn't finish"**: ComfyUI stopped during an install. Run Install
+  again, or use the command shown.
+- **Still running after ten minutes**: pip is slow or waiting on the network.
+  It can't be stopped from the editor; it finishes or fails on its own.
+
+Uninstall removes only the packages Sonder installed, still at the version it
+installed, and only if nothing else needs them. Dependencies it added are kept
+and listed. It refuses while Sonder App takes are still generating (it waits up
+to 30 seconds for them first): wait for them or cancel them, then uninstall. A
+package that was already loaded stays in memory until ComfyUI restarts.
+
+### Generate says "The Sonder App couldn't connect to ComfyUI"
+
+Generate runs through a small local proxy (`comfy-api-proxy`) that Sonder starts
+on demand on the first free port from 8189 to 8198, or reuses if one there
+already serves this ComfyUI. The detail under the message gives the reason:
+
+- **"Could not start the SDK proxy on ports 8189–8198"**: either every port in
+  that range is taken by something else, or the proxy Sonder started didn't
+  come up within 15 seconds. Check the proxy log (below); if the ports are the
+  problem, free one and Generate again.
+- **"Sonder App does not support ComfyUI over HTTPS yet"**: ComfyUI was started
+  with `--tls-keyfile`/`--tls-certfile`. Start it without them to use the
+  Sonder App.
+- Anything else: a proxy that Sonder started logs to your ComfyUI user folder
+  under `sonder-editor/logs/sdk_proxy.log`.
+
+To use a proxy you run yourself, set `SONDER_SDK_PROXY_URL` (and
+`SONDER_SDK_PROXY_TOKEN` if it needs one) before starting ComfyUI. It must be on
+this machine unless you also set `SONDER_SDK_ALLOW_REMOTE=1`, and it must serve
+this same ComfyUI.
+
+### Why do Sonder App takes show no embedded workflow?
+
+The Sonder App submits the workflow's API form, without the canvas workflow that
+ComfyUI normally embeds. So a take's details say the workflow is **Not
+embedded**, and Open Source Workflow is unavailable for it. Metadata Collector
+sections are titled by their wired label, else the node's class name, because
+Sonder reads node titles from the canvas workflow; a value from inside a subgraph is
+listed under the inner node rather than the subgraph. **Controls at run** is
+still recorded, with the Sonder App's labels, groups and seed modes.
+
 ### How do I share a workflow curated in the Sonder App?
 
 Use the workflow's **⋮ → Export as API** action in the Launcher, then import
@@ -121,9 +187,14 @@ exceeds import limits instead of downloading a partial file.
 
 This export is for the Sonder App. Loading API JSON on the ComfyUI canvas is
 unsupported: subgraphs flatten and some custom nodes lose settings. Share the
-saved UI workflow when the recipient needs the canvas. Replacing an existing
-Sonder App import resets its authored presentation overlays, including its app
-description, while retaining app-only curation and saved values.
+saved UI workflow when the recipient needs the canvas.
+
+Replacing an existing Sonder App import keeps your Control values and seed
+modes, app-only Controls, hidden settings and the presets you edited (Reset to
+workflow's version brings back the imported one). A saved value whose setting
+now points somewhere else resets to the workflow's value. It resets your
+labels, notes, order, groups and Advanced flags on the workflow's own Controls,
+and the app description. The Launcher's notice lists what was kept and reset.
 
 ### Where is the Launcher shortcut, and why does it stop working after a port change?
 
