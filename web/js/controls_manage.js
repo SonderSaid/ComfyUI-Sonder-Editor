@@ -195,7 +195,12 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         }
         const suggestions = rebind ? [] : view.suggestions || [];
         if (suggestions.length) {
-            nodes.push(groupHeading("Exposed before"));
+            const all = smallButton(suggestions.length > MAX_BATCH ? "Restore 64" : "Restore all", "accentSoft");
+            all.addEventListener("click", () => {
+                const changes = Object.fromEntries(suggestions.slice(0, MAX_BATCH).map(s => [`binding:${s.binding_id}:expose`, {}]));
+                void apply(changes, all);
+            });
+            nodes.push(groupHeading("Exposed before", all));
             for (const s of suggestions) {
                 nodes.push(candidateRow({ path: "", input: s.label || s.binding_id, kind: "", node_title: "" }, {
                     label: "Restore",

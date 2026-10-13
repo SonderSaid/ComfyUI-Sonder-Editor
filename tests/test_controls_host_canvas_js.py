@@ -2,6 +2,7 @@
 import json
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -420,11 +421,39 @@ if(SCENARIO==='preset'||SCENARIO==='preset-rollback'||SCENARIO==='preset-no-rela
         assert.equal(result.ok,true);assert.deepEqual(manifest().presets,{});assert.equal(captures,8);
     }
 }
+
+if(SCENARIO.startsWith('restore')) {
+    sampler.properties.sonderBindings = {};
+    relay.widgets[0].value=JSON.stringify({v:1,bindings:{steps:{label:'Steps',targets:[{path:'3',input:'steps'}]},
+        seed:{label:'Seed',restore_targets:[{path:'3',input:'seed'}]}},notes:{},presets:{p:{name:'Preset',members:{steps:{value:20}}}}});
+    const before=relay.widgets[0].value;
+    globalThis.canon=changes=>SCENARIO==='restore-rebind'
+        ? {'binding:steps:rebind':{candidate:{path:'3',input:'cfg'},targets:[{path:'3',input:'cfg'}]}}
+        : {'workflow:restore':{bindings:['steps','seed'].map(binding_id=>({binding_id,
+            candidate:{path:'3',input:binding_id},targets:[{path:'3',input:SCENARIO==='restore-stale'?'cfg':binding_id}]}))}};
+    if(SCENARIO==='restore-rollback')relay.widgets[0].callback=()=>{throw Error('callback refused');};
+    const result=await host.applyChanges(SCENARIO==='restore-rebind'?{'binding:steps:rebind':{candidate:cfg}}:{'workflow:restore':{bindings:['steps','seed']}});
+    const failed=['restore-rollback','restore-stale'].includes(SCENARIO);
+    assert.equal(result.ok,!failed,JSON.stringify(result));
+    assert.equal(calls[0].restore_plan.restorable.length,2);
+    assert.ok(calls[0].candidates.some(c=>c.input==='seed'));
+    if(failed){assert.deepEqual(sampler.properties.sonderBindings,{});assert.equal(relay.widgets[0].value,before);}
+    else {
+        assert.equal(captures,2);
+        assert.equal(sampler.properties.sonderBindings[SCENARIO==='restore-rebind'?'cfg':'steps'],'steps');
+        assert.ok(!('restore_targets' in manifest().bindings.steps));
+        assert.ok(!('targets' in manifest().bindings.steps));
+        assert.equal(manifest().presets.p.name,'Preset');
+        if(SCENARIO==='restore')assert.equal(sampler.properties.sonderBindings.seed,'seed');
+        else assert.ok(manifest().bindings.seed.restore_targets);
+        assert.equal(sampler.widgets[0].value,20);assert.equal(sampler.widgets[1].value,7);
+    }
+}
 host.destroy();assert.equal(listeners.size,0);
 console.log('ok');
 '''
 
-SCENARIOS = ['description', 'description-new-relay', 'expose', 'expose-rollback', 'expose-new-relay', 'expose-new-relay-rollback', 'expose-noop', 'expose-taken',
+SCENARIOS = ['restore', 'restore-rollback', 'restore-stale', 'restore-rebind', 'description', 'description-new-relay', 'expose', 'expose-rollback', 'expose-new-relay', 'expose-new-relay-rollback', 'expose-noop', 'expose-taken',
              'remove-rebind', 'manage-listing', 'filter-during-write', 'unsafe-seed', 'moved', 'rollback-callbacks', 'presentation', 'presentation-rollback', 'root', 'promoted', 'promoted-seed', 'no-relay', 'two-relays',
              'linked-or-gone', 'manifest-cap', 'hidden-hash', 'relay-error-view', 'refusal', 'stale-write', 'stale-view',
              'destroy', 'rollback', 'serial', 'history-failure', 'precision-refusal', 'hide-during-write',
@@ -439,6 +468,9 @@ def test_canvas_adapter(scenario):
         pytest.skip('node required for the canvas adapter harness')
     script = HARNESS.replace('MODULE_URL', json.dumps((ROOT/'web/js/controls_host_canvas.js').as_uri()))
     script = script.replace('SCENARIO', json.dumps(scenario))
-    result = subprocess.run([node,'--input-type=module','-e',script],capture_output=True,text=True,timeout=15)
+    with tempfile.TemporaryDirectory() as temp:
+        path = Path(temp) / 'host.mjs'
+        path.write_text(script, encoding='utf-8')
+        result = subprocess.run([node,str(path)],capture_output=True,text=True,timeout=15)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == 'ok'

@@ -83,3 +83,20 @@ def test_canvas_validation_http_encodes_long_values_off_loop(prompt, monkeypatch
             assert result['ok'] and len(result['changes']['binding:text:value'])==500000
     asyncio.run(run())
     assert threads and all(t!=loop_thread for t in threads)
+
+
+def test_restore_route_verifies_candidates_and_publishes_cleanup_exclusion(prompt, monkeypatch):
+    original = cd.candidate_inventory
+    monkeypatch.setattr(cd, "candidate_inventory", lambda p, cs: original(p, cs, class_lookup=CLASSES.get))
+    prompt["9"] = _relay({"steps": {"status": "missing", "targets": [], "restore_targets": [{"path": "6", "input": "steps"}]}})
+    body = {"prompt": prompt, "restore_plan": {"restorable": [{"binding_id": "steps", "path": "6", "input": "steps"}], "unmatched": []},
+            "candidates": [{"path": "6", "input": "steps", "targets": [{"path": "6", "input": "steps"}]}],
+            "changes": {"workflow:restore": {"bindings": ["steps"]}}}
+    result = describe(body)
+    assert result["ok"] and len(result["restore"]["restorable"]) == 1
+    assert result["cleanup"]["bindings"] == []
+    prompt["6"]["inputs"]["steps"] = ["1", 0]
+    result = describe(body)
+    assert not result["ok"] and result["restore"]["unmatched"]
+    assert not result["restore"]["restorable"]
+    assert result["cleanup"]["bindings"]

@@ -18,8 +18,9 @@ def inventory(view, *, stored=None, definition_anchors=()):
         return result
     bindings = {b["binding_id"]: b for b in view.get("bindings", [])}
     sdk = stored is not None
+    restorable = {row["binding_id"] for row in (view.get("restore") or {}).get("restorable", [])}
     for bid, binding in bindings.items():
-        if binding.get("status") == "missing" and (not sdk or binding.get("origin") == "local"):
+        if bid not in restorable and binding.get("status") == "missing" and (not sdk or binding.get("origin") == "local"):
             result["bindings"].append({"id": bid, "label": binding.get("label") or bid})
     if sdk:
         known = {f"binding:{bid}" for bid in bindings}
@@ -85,6 +86,60 @@ def validate(view, raw, *, mode):
         if found is None or (found.get("requires_binding") and found["requires_binding"] not in cleaned["bindings"]):
             raise ControlValueError("A preset member is no longer eligible. Reopen the cleanup review.")
     return cleaned
+
+
+def restore_inventory(view, raw, candidates):
+    """Verify a bounded canvas hint plan with the same candidate authority as Rebind."""
+    from .control_descriptors import ControlValueError, _StructuralBatch
+    result = {"restorable": [], "unmatched": []}
+    if (not isinstance(raw, dict) or set(raw) != set(result)
+            or any(not isinstance(raw[key], list) for key in result)
+            or sum(len(raw[key]) for key in result) > cm.MAX_BINDINGS):
+        raise ControlValueError("Invalid Controls restore plan.")
+    bindings = {b["binding_id"]: b for b in view.get("bindings", [])}
+    batch = _StructuralBatch(view, "canvas", candidates or [])
+    seen = set()
+    for key in result:
+        for row in raw[key]:
+            bid = row.get("binding_id") if isinstance(row, dict) else None
+            if not valid_id(bid) or bid in seen:
+                raise ControlValueError("Invalid Controls restore plan.")
+            seen.add(bid)
+            binding = bindings.get(bid)
+            if not binding or binding.get("status") != "missing":
+                continue
+            common = {"binding_id": bid, "label": (binding.get("label") or bid)[:cm.LABEL_MAX]}
+            if key == "unmatched":
+                reason = row.get("reason")
+                if reason not in ("several_settings", "not_found", "ambiguous", "taken", "unavailable"):
+                    raise ControlValueError("Invalid Controls restore reason.")
+                result[key].append({**common, "reason": reason})
+                continue
+            try:
+                chosen = batch._candidate(row, bid)
+            except ControlValueError as exc:
+                result["unmatched"].append({**common, "reason": str(exc)[:500]})
+            else:
+                result[key].append({**common, **chosen["candidate"]})
+    return result
+
+
+def validate_restore(view, raw, *, mode):
+    from .control_descriptors import ControlValueError
+    if mode == "sdk":
+        raise ControlValueError("Restore applies to canvas workflows.")
+    if mode not in ("canvas", "relay") or view.get("error") or (view.get("relay") or {}).get("status") != "ok":
+        raise ControlValueError("Fix the Sonder Control Relay before restoring Controls.")
+    ids = raw.get("bindings") if isinstance(raw, dict) else None
+    if (not isinstance(raw, dict) or set(raw) != {"bindings"} or not isinstance(ids, list)
+            or not 1 <= len(ids) <= cm.MAX_BINDINGS or not all(valid_id(bid) for bid in ids)
+            or len(set(ids)) != len(ids)):
+        raise ControlValueError("Choose the Controls to restore.")
+    if mode != "relay":
+        eligible = {r["binding_id"] for r in (view.get("restore") or {}).get("restorable", [])}
+        if any(bid not in eligible for bid in ids):
+            raise ControlValueError("A Control can no longer be restored. Refresh the Controls panel.")
+    return {"bindings": list(ids)}
 
 
 def remove_members(presets, members):

@@ -14,7 +14,7 @@
 // Pure on import: the caller (control_relay.js) supplies the canvas and graph.
 import { CONTROL_SEED_MODES, findControlWidget } from "./control_widgets.js";
 import {
-    cleanGroup, defaultBindingLabel, effectiveGroupOrder, nodeType, parseManifest, relayCensus, resolveAnchor, resolveBindings, sectionOf,
+    cleanGroup, defaultBindingLabel, effectiveGroupOrder, nodeType, parseManifest, planRestore, relayCensus, resolveAnchor, resolveBindings, sectionOf,
 } from "./control_bindings.js";
 
 export const ROW_PREFIX = "sonder_row:";
@@ -92,7 +92,12 @@ export function planRows(relay, root) {
         if (!own) continue;
         rows.push({ id: group, role: "separator", type: "text", label: group }, ...own);
     }
-    return rows.length ? { rows } : { hint: EMPTY_HINT };
+    const recovery = planRestore(root, manifest);
+    const restore = {count: recovery.restorable.length, unmatched: recovery.unmatched.length};
+    const missing = Object.values(bindings).filter(b => b.status === "missing").length;
+    const result = rows.length ? {rows} : {hint: missing
+        ? `${missing} Controls aren't connected to settings. Open the Sonder Editor's Controls → Manage to Rebind or Clean up.` : EMPTY_HINT};
+    return restore.count || restore.unmatched ? {...result, restore} : result;
 }
 
 function rowOptions(native, type) {
@@ -102,9 +107,9 @@ function rowOptions(native, type) {
     return options;
 }
 
-const signature = plan => JSON.stringify(plan.rows
+const signature = plan => JSON.stringify([plan.restore, plan.rows
     ? plan.rows.map(r => [r.id, r.role, r.type, r.label, r.nodeId, r.widgetName, r.options])
-    : [plan.warning || plan.hint]);
+    : [plan.warning || plan.hint]]);
 const isSeparator = row => row.role === "separator";
 
 function addRow(relay, spec) {
@@ -148,7 +153,11 @@ export function syncRelayRows(relay, { root, canvas = null, isEditing = () => fa
     if (editing) return false;
     for (const widget of rowWidgets(relay)) relay.removeWidget?.(widget);
     relay[SIGNATURE] = key;
-    if (!plan.rows) {
+    if (plan.restore?.count) {
+        addRow(relay, {type: "button", name: `${ROW_PREFIX}~restore`,
+            label: `Restore ${plan.restore.count} Controls from this file`, value: "",
+            callback: () => relay.onRestoreControls?.()});
+    } else if (!plan.rows) {
         addRow(relay, { type: "text", name: HINT, label: plan.warning ? "Warning" : "Controls",
             value: plan.warning || plan.hint, disabled: true, callback: () => {} });
     }

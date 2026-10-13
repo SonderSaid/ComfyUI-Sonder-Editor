@@ -167,3 +167,63 @@ def test_mounted_forwards_original_cleanup_for_live_revalidation(monkeypatch):
         assert result["ok"], result
         assert (await pending())["pending"][0]["changes"] == changes
     asyncio.run(run())
+
+
+def test_restore_shape_inventory_atomicity_and_cleanup_exclusion():
+    v = canvas_view()
+    candidate = {"path": "7", "input": "steps", "status": "ok", "kind": "INT", "label": "Steps",
+                 "targets": [{"path": "7", "input": "steps"}]}
+    raw = {"restorable": [{"binding_id": "missing", "path": "7", "input": "steps"}], "unmatched": []}
+    v["restore"] = cc.restore_inventory(v, raw, [candidate])
+    assert v["restore"]["restorable"] == [{"binding_id": "missing", "label": "missing", "path": "7", "input": "steps"}]
+    v["cleanup"] = cc.inventory(v)
+    assert not v["cleanup"]["bindings"]
+    assert not validate(v, {"bindings": ["missing"]})[0]
+    intent = {"workflow:restore": {"bindings": ["missing"]}}
+    canonical, refused = cd.validate_binding_changes(v, intent, structural="canvas", inventory=[candidate])
+    assert not refused and canonical["workflow:restore"]["bindings"][0]["targets"] == candidate["targets"]
+    assert cd.validate_binding_changes(v, intent, structural="relay") == (intent, [])
+    assert "canvas workflows" in cd.validate_binding_changes(v, intent, structural="sdk")[1][0]["reason"]
+    assert cd.validate_binding_changes(v, intent | {"workflow:description": "x"}, structural="canvas")[1]
+    for ids in ([], ["missing", "missing"], ["gone"], ["constructor"], ["a"] * 257):
+        assert cd.validate_binding_changes(v, {"workflow:restore": {"bindings": ids}}, structural="canvas", inventory=[candidate])[1]
+    v["bindings"].append({"binding_id": "owner", "status": "ok", "targets": candidate["targets"]})
+    assert not cc.restore_inventory(v, raw, [candidate])["restorable"]
+    assert cd.validate_binding_changes(v, intent, structural="canvas", inventory=[candidate])[1]
+    v["bindings"].pop()
+    candidate["status"] = "linked"
+    assert not cc.restore_inventory(v, raw, [candidate])["restorable"]
+    candidate["status"] = "ok"
+    v["bindings"].append({"binding_id": "other", "status": "missing"})
+    raw["restorable"].append({"binding_id": "other", "path": "7", "input": "steps"})
+    checked = cc.restore_inventory(v, raw, [candidate])
+    assert len(checked["restorable"]) == len(checked["unmatched"]) == 1
+    for bad in ({}, {"restorable": "bad", "unmatched": []}, {"restorable": [{}], "unmatched": []}):
+        with pytest.raises(cd.ControlValueError): cc.restore_inventory(v, bad, [candidate])
+
+
+def test_restore_hints_are_not_claimed_targets_and_are_hygiene_checked():
+    from server import control_manifest as cm
+    from test_control_descriptors import CLASSES, _node, _relay
+    binding = {"status": "missing", "targets": [], "restore_targets": [{"path": "6", "input": "steps"}]}
+    prompt = {"6": _node("KSampler", {"steps": 20}), "9": _relay({"hint": binding})}
+    view = cd.describe_bindings(prompt, class_lookup=CLASSES.get)
+    assert not cd.bound_targets(view)
+    assert "Restore Controls on the canvas" in view["bindings"][0]["reason"]
+    assert view["bindings"][0]["targets"] == []
+    for bad in ("bad", [{"path": 6, "input": "steps"}], [{"path": "6", "input": "steps"}] * 65):
+        with pytest.raises(cm.ManifestError): cm.parse_manifest(json.dumps({"bindings": {"a": {"restore_targets": bad}}}))
+
+
+def test_mounted_publication_keeps_full_restore_inventory():
+    root = Path(__file__).resolve().parents[1]
+    module = (root / "web/js/controls_canvas_relay.js").as_uri()
+    script = "import assert from 'node:assert/strict';import {fitPublicationView} from " + json.dumps(module) + ";" + r"""
+const restore={restorable:Array.from({length:256},(_,i)=>({binding_id:'b'+i,label:'x'.repeat(120),path:String(i),input:'steps'})),unmatched:[]};
+const view={restore,bindings:Array.from({length:256},(_,i)=>({binding_id:'b'+i,note:'a'.repeat(4000)})),notes:[],candidates:Array.from({length:500},()=>({label:'x'.repeat(1000)}))};
+const fitted=fitPublicationView(view,{host_id:'host',applied:[],rejected:[]});
+assert.ok(!fitted.error);assert.deepEqual(fitted.restore,restore);
+assert.ok(new TextEncoder().encode(JSON.stringify({view:fitted})).length<512*1024);
+"""
+    result = subprocess.run(["node", "--input-type=module", "-e", script], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr

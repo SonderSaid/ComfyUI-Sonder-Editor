@@ -306,3 +306,43 @@ assert.deepEqual(output, { '1': { inputs: { text: 'a {red|blue} b' } }, '2': { i
     '4:5': { inputs: { text: '{x|y}' } }, '4:3': { inputs: { text: 'promoted value' } }, '6': { inputs: { text: 'other' } } });
 console.log('ok');
 """)
+
+
+def test_api_restore_mapping_hints_and_no_hint_fast_path():
+    run(PRELUDE + r"""
+const hints = (path, input='steps') => ({restore_targets:[{path, input}]});
+const spec = {bindings:{exact:hints(String(sampler.id)), flat:hints('10:20'), collision:hints('11:21'),
+    plural:{restore_targets:[{path:'3',input:'steps'},{path:'4',input:'steps'}]},
+    lost:hints('999'), linked:hints(String(sampler.id),'model'), denied:hints('100','project'),
+    duplicate:hints(String(sampler.id)), ambiguous:hints('12:22')}};
+node(root,'KSampler',[widget('steps',12)],[],{id:'10_20'});
+node(root,'KSampler',[widget('steps',13)],[],{id:'11_21__'});
+node(root,'KSampler',[widget('steps',14)],[],{id:'12_22'});
+node(root,'KSampler',[widget('steps',14)],[],{id:'12_22_'});
+node(root,'SonderEditor',[widget('project','x')],[],{id:'100'});
+const plan = B.planRestore(root,spec);
+assert.deepEqual(plan.restorable,[{binding_id:'exact',path:String(sampler.id),input:'steps'},
+    {binding_id:'flat',path:'10_20',input:'steps'},{binding_id:'collision',path:'11_21__',input:'steps'}]);
+assert.deepEqual(Object.fromEntries(plan.unmatched.map(r=>[r.binding_id,r.reason])),{
+    plural:'several_settings',lost:'not_found',linked:'unavailable',denied:'unavailable',duplicate:'taken',ambiguous:'ambiguous'});
+anchor(sampler,'steps','owner');
+assert.equal(B.planRestore(root,{bindings:{taken:hints(String(sampler.id))}}).unmatched[0].reason,'taken');
+anchor(innerA,'steps','definition');
+assert.deepEqual(B.planRestore(root,{bindings:{definition:hints('10:20')}}),{restorable:[],unmatched:[]});
+const throwing = new Proxy({}, {get(){throw Error('walked graph');}});
+assert.deepEqual(B.planRestore(throwing,{bindings:{ordinary:{label:'plain'}}}),{restorable:[],unmatched:[]});
+// A not-yet-edited API load uses its raw exported targets; edits move them once.
+const raw = JSON.stringify({bindings:{api:{targets:[{path:'10:20',input:'steps'}],label:'Steps',future:7}}});
+const exported = JSON.parse(B.exportManifest(raw,root)).bindings.api;
+assert.equal(exported.status,'missing');assert.deepEqual(exported.targets,[]);
+assert.deepEqual(exported.restore_targets,[{path:'10:20',input:'steps'}]);
+const edited = B.editManifest(raw,m=>{m.description='Edited before Restore';});
+assert.equal(B.editManifest(edited,()=>{}),edited);
+assert.equal(JSON.parse(edited).bindings.api.future,7);
+assert.deepEqual(B.planRestore(root,JSON.parse(edited)).restorable,[{binding_id:'api',path:'10_20',input:'steps'}]);
+const flattened=root._nodes.find(n=>n.id==='10_20');anchor(flattened,'steps','api');
+assert.ok(!('restore_targets' in JSON.parse(B.exportManifest(edited,root)).bindings.api));
+flattened.mode=2;
+assert.ok(!('restore_targets' in JSON.parse(B.exportManifest(edited,root)).bindings.api));
+console.log('ok');
+""")

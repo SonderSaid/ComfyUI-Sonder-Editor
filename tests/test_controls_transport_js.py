@@ -174,6 +174,14 @@ if(SCENARIO.startsWith('mounted')){
         seq=1;host.changed({host_id:'h'});
         const result=await work;assert.equal(result.ok,false);assert.match(result.rejected[0].reason,/reconnected/);
     }
+    if(SCENARIO==='mounted-restore'){
+        controlsView.restore={restorable:[{binding_id:'n',label:'Steps',path:'1',input:'steps'}],unmatched:[]};
+        seq++;host.changed({host_id:'h'});await settle();
+        assert.deepEqual(host.getView().restore,controlsView.restore);
+        const changes={'workflow:restore':{bindings:['n']}};
+        const work=host.applyChanges(changes);await settle();assert.deepEqual(pending[0].changes,changes);
+        applied=['r'];seq++;host.changed({host_id:'h'});assert.equal((await work).ok,true);
+    }
     if(SCENARIO==='mounted-ack'){
         let finished=false;const work=host.applyChanges({'binding:n:value':'31'}).then(r=>{finished=true;return r;});await settle();assert.equal(finished,false);
         applied=['r'];seq=2;host.changed({host_id:'h'});assert.equal((await work).ok,true);await settle();assert.ok(savedSeen.includes('r'));
@@ -319,7 +327,7 @@ if(SCENARIO==='canvas-http'||SCENARIO==='relay-error-recovery'||SCENARIO==='canv
 }
 console.log('ok');
 '''
-@pytest.mark.parametrize('scenario',['sdk-adopt-status','sdk-adopt-refusal','sdk-lost-answer','sdk-switching','sdk-hold','sdk-switch','sdk-stale-view','sdk-captures','sdk-busy','sdk-manage','mounted-manage','relay-manage','sdk-order','sdk-refusal','sdk-flush','mounted-ack','mounted-post-race','mounted-refusal','mounted-visibility','mounted-order','relay-ack','relay-retry','relay-stale','relay-owner-observation','canvas-http','canvas-revoked','relay-error-recovery','relay-too-large','relay-fit','mounted-abandon-restart','mounted-abandon-cleared','mounted-abandon-recreated','relay-invalid-view'])
+@pytest.mark.parametrize('scenario',['sdk-adopt-status','sdk-adopt-refusal','sdk-lost-answer','sdk-switching','sdk-hold','sdk-switch','sdk-stale-view','sdk-captures','sdk-busy','sdk-manage','mounted-manage','relay-manage','sdk-order','sdk-refusal','sdk-flush','mounted-restore','mounted-ack','mounted-post-race','mounted-refusal','mounted-visibility','mounted-order','relay-ack','relay-retry','relay-stale','relay-owner-observation','canvas-http','canvas-revoked','relay-error-recovery','relay-too-large','relay-fit','mounted-abandon-restart','mounted-abandon-cleared','mounted-abandon-recreated','relay-invalid-view'])
 def test_controls_transport(scenario):
     node=shutil.which('node')
     if not node:pytest.skip('node required for host adapter tests')

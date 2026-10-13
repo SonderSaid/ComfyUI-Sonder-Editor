@@ -307,14 +307,14 @@ _TARGET_RE = re.compile(r"^(?:(binding|note|preset):([A-Za-z0-9_-]{1,64})|(group
 BINDING_STRUCTURAL_OPS = frozenset({"expose", "remove", "rebind", "hide", "unhide", "create"})
 GROUP_OPS = frozenset({"create", "rename", "ungroup", "move"})
 STRUCTURAL_OPS = {"binding": BINDING_STRUCTURAL_OPS, "note": frozenset({"create", "remove", "hide", "unhide"}),
-                  "group": GROUP_OPS, "preset": frozenset({"create", "capture", "apply"}), "workflow": frozenset({"cleanup"})}
+                  "group": GROUP_OPS, "preset": frozenset({"create", "capture", "apply"}), "workflow": frozenset({"cleanup", "restore"})}
 
 
 def parse_target(target: Any) -> tuple[str, str, str] | None:
     """``(source, identity, field)`` of a change target, or None."""
     if not isinstance(target, str):
         return None
-    if target in ("workflow:description", "workflow:cleanup"):
+    if target in ("workflow:description", "workflow:cleanup", "workflow:restore"):
         return ("workflow", "", target.split(":")[1])
     match = _TARGET_RE.match(target)
     if not match:
@@ -642,6 +642,8 @@ def _describe_one(prompt: dict, binding_id: str, entry: dict, class_lookup: Call
         for t in entry.get("targets") or []]
     if not descriptor["label"]:
         descriptor["label"] = _default_label(prompt, entry.get("targets") or [])
+    if status == STATUS_MISSING and entry.get("restorable"):
+        reason = "Reconnect it with Restore Controls on the canvas, then export again."
     descriptor["status"] = status
     descriptor["reason"] = reason or STATUS_REASONS.get(status) if status != STATUS_OK else None
     if status != STATUS_OK:
@@ -1050,6 +1052,19 @@ def validate_binding_changes(view: dict, changes: Any, *, prompt: dict | None = 
     """
     if not isinstance(changes, dict) or not changes or (max_changes is not None and len(changes) > max_changes):
         return {}, [{"target": "", "reason": "Send 1 to 64 changes."}]
+    if "workflow:restore" in changes:
+        from .control_cleanup import validate_restore
+        try:
+            if len(changes) != 1:
+                raise ControlValueError("Restore must be the only change in its request.")
+            plan = validate_restore(view, changes["workflow:restore"], mode=structural)
+            if structural != "relay":
+                batch = _StructuralBatch(view, structural, inventory or [])
+                available = {r["binding_id"]: r for r in view["restore"]["restorable"]}
+                plan = {"bindings": [{"binding_id": bid, **batch._candidate(available[bid], bid)} for bid in plan["bindings"]]}
+            return {"workflow:restore": plan}, []
+        except ControlValueError as exc:
+            return {}, [{"target": "workflow:restore", "reason": str(exc)}]
     if "workflow:cleanup" in changes:
         from .control_cleanup import validate
         try:

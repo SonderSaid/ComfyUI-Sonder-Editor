@@ -43,7 +43,7 @@ if(FAILURE){
     script = script.replace("MODULE_URL", json.dumps((ROOT / "web/js/controls_host_canvas.js").as_uri()))
     script = script.replace("BINDINGS_URL", json.dumps((ROOT / "web/js/control_bindings.js").as_uri()))
     script = script.replace("SCENARIO", '"cleanup"').replace("FAILURE", str(failure).lower())
-    result = subprocess.run(["node", "--input-type=module", "-e", script], capture_output=True, text=True)
+    result = subprocess.run(["node", "--input-type=module"], input=script, capture_output=True, text=True, encoding="utf-8")
     assert result.returncode == 0, result.stderr
 
 

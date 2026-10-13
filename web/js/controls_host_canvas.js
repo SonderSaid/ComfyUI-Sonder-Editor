@@ -2,7 +2,7 @@
 import {
     MAX_MANIFEST_BYTES, RELAY_CLASS, anchorSnapshot, applyCleanupPlan, definitionAnchorIds, dropAllAnchors, graphsOf, applyGroupPlan, applyPresetEdit, dropAnchors, editManifest, exportManifest,
     isStructuralTarget, listCandidates, nodesOf, parseManifest, parseTarget, readAnchors, relayCensus, resolveBindings,
-    resolveCandidate, restoreAnchors, restoreDynamicPrompts, setAnchor,
+    resolveCandidate, planRestore, restoreAnchors, restoreDynamicPrompts, setAnchor,
 } from "./control_bindings.js";
 import { syncRelayRows } from "./control_relay_rows.js";
 
@@ -10,7 +10,7 @@ const DESCRIBE_URL = "/sonder-editor/controls/describe";
 const DEBOUNCE_MS = 400;
 // Fields this writer lands; hide/unhide are app-only targets.
 const FIELDS = new Set(["value", "seed_mode", "label", "note", "text", "order", "group", "advanced",
-    "expose", "remove", "rebind", "create", "rename", "ungroup", "move", "description", "cleanup"]);
+    "expose", "remove", "rebind", "create", "rename", "ungroup", "move", "description", "cleanup", "restore"]);
 const sameTargets = (a, b) => JSON.stringify((a || []).map(t => [String(t.path), t.input]).sort())
     === JSON.stringify((b || []).map(t => [String(t.path), t.input]).sort());
 const refused = (changes, reason) => ({ok: false,
@@ -89,6 +89,17 @@ export function createCanvasControlsHost({app, api, getEditorNode,
         if (listing && changes === undefined) {
             const {candidates, truncated} = listCandidates(rootGraph(), {filter: listing.filter, labels: view.candidate_labels || []});
             Object.assign(body, {manage: true, candidates, candidates_truncated: truncated});
+        }
+        const relay = relayCensus(rootGraph()).active[0];
+        const manifest = parseManifest(relay?.widgets?.find(w => w.name === "manifest")?.value || "");
+        const restore = planRestore(rootGraph(), manifest);
+        body.restore_plan = restore;
+        if (restore.restorable.length) {
+            const candidates = new Map((body.candidates || []).map(c => [`${c.path}/${c.input}`, c]));
+            for (const {path, input} of restore.restorable) {
+                candidates.set(`${path}/${input}`, {path, input, targets: [{path, input}]});
+            }
+            body.candidates = [...candidates.values()];
         }
         if (changes !== undefined) body.changes = changes;
         const response = await api.fetchApi(DESCRIBE_URL, {method: "POST",
@@ -207,7 +218,18 @@ export function createCanvasControlsHost({app, api, getEditorNode,
                 continue;
             }
             if (source === "workflow") {
-                if (field === "cleanup") {
+                if (field === "restore") {
+                    const livePlan = new Map(planRestore(root, parseManifest(saved)).restorable.map(r => [r.binding_id, r]));
+                    for (const row of value.bindings) {
+                        const live = livePlan.get(row.binding_id);
+                        if (!live || !sameTargets([live], row.targets) || !sameTargets([live], [row.candidate]))
+                            throw new Error("A Control moved. Refresh the Controls panel before restoring.");
+                        const candidate = resolveCandidate(root, live);
+                        if (!candidate) throw new Error("A setting is no longer available. Refresh the Controls panel.");
+                        anchors.push(() => setAnchor(candidate.node, candidate.name, row.binding_id));
+                        manifestOps.push(m => { delete m.bindings[row.binding_id].restore_targets; });
+                    }
+                } else if (field === "cleanup") {
                     // Re-resolve immediately before touching graph state. The
                     // server already rechecked the exported descriptor view.
                     for (const bid of value.bindings) if (bindings[bid]?.status !== "missing")
@@ -309,6 +331,7 @@ export function createCanvasControlsHost({app, api, getEditorNode,
         }
         if (field === "rebind") {
             if (!bindings[id] || bindings[id].status === "ok") throw new Error("Only a setting that is off can be rebound.");
+            manifestOps.push(m => { delete m.bindings[id].restore_targets; });
             anchors.push(() => dropAnchors(root, id));
             anchors.push(() => { setAnchor(live.node, live.name, id); return [live.node]; });
             return;

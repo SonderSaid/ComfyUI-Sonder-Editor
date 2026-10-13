@@ -207,7 +207,9 @@ export function editManifest(text, mutate) {
     delete manifest.suggestions;
     delete manifest.error;
     for (const entry of Object.values(manifest.bindings)) {
-        if (isPlainObject(entry)) for (const key of ["status", "targets", "seed_mode"]) delete entry[key];
+        if (!isPlainObject(entry)) continue;
+        if (entry.restore_targets === undefined && entry.targets?.length) entry.restore_targets = entry.targets;
+        for (const key of ["status", "targets", "seed_mode"]) delete entry[key];
     }
     mutate(manifest);
     manifest.v = MANIFEST_VERSION;
@@ -516,6 +518,51 @@ export function resolveCandidate(root, candidate) {
         node_title: String(node.title || nodeType(node)) };
 }
 
+// Hints locate possible recovery only; anchors remain the binding authority.
+// No graph walk on the ordinary (no API hints) passive Relay refresh path.
+export function planRestore(root, manifest) {
+    const result = {restorable: [], unmatched: []};
+    const hinted = Object.entries(manifest?.bindings || {}).filter(([, entry]) =>
+        Array.isArray(entry?.restore_targets ?? entry?.targets) && (entry.restore_targets ?? entry.targets).length);
+    if (!hinted.length) return result;
+    const anchored = new Set(), byId = new Map(), flattened = new Map(), claimed = new Set();
+    for (const graph of graphsOf(root)) for (const node of nodesOf(graph)) {
+        for (const id of Object.values(readAnchors(node))) anchored.add(id);
+        if (graph !== root) continue;
+        const key = String(node.id), base = key.replace(/_+$/, "");
+        if (!byId.has(key)) byId.set(key, []);
+        byId.get(key).push(node);
+        if (!flattened.has(base)) flattened.set(base, []);
+        flattened.get(base).push(node);
+    }
+    for (const [binding_id, entry] of hinted) {
+        if (anchored.has(binding_id)) continue;
+        const hints = entry.restore_targets ?? entry.targets;
+        const miss = reason => result.unmatched.push({binding_id, reason});
+        if (hints.length !== 1) { miss("several_settings"); continue; }
+        const {path, input} = hints[0] || {};
+        if (typeof path !== "string" || !path || typeof input !== "string" || !input) { miss("unavailable"); continue; }
+        const mapped = path.replaceAll(":", "_");
+        const candidates = byId.get(path) || (flattened.get(mapped.replace(/_+$/, "")) || [])
+            .filter(node => String(node.id) === mapped || (String(node.id).startsWith(mapped) && /^_+$/.test(String(node.id).slice(mapped.length))));
+        if (!candidates.length) { miss("not_found"); continue; }
+        if (candidates.length !== 1) { miss("ambiguous"); continue; }
+        const node = candidates[0], key = `${node.id}/${input}`;
+        if (Object.hasOwn(readAnchors(node), input) || claimed.has(key)) { miss("taken"); continue; }
+        // resolveCandidate shares the widget/link resolver; policy and virtual
+        // inputs are rejected here too, then independently by the server.
+        const live = resolveCandidate({_nodes: [node]}, {path: String(node.id), input});
+        if (!live || isDenied(nodeType(node), input) || isHost(node) || node.isVirtualNode
+            || nodeType(node) === LEGACY_PRIMITIVE || COMPANION_WIDGETS.has(input)
+            || findControlWidget(node, input)?.options?.serialize === false || findControlWidget(node, input)?.serialize === false) {
+            miss("unavailable"); continue;
+        }
+        claimed.add(key);
+        result.restorable.push({binding_id, path: String(node.id), input});
+    }
+    return result;
+}
+
 // Anchor writes keep any other entry the node carries, valid or not.
 export function setAnchor(node, name, id) {
     node.properties ||= {};
@@ -598,6 +645,11 @@ export function exportManifest(text, root) {
                 targets: publicTargets(resolved.targets),
                 seed_mode: resolved.modeWidget?.value ?? null,
             };
+            delete out.bindings[id].restore_targets;
+            if (resolved.status === "missing" && !resolved.anchor && !resolved.insideSubgraph) {
+                const hint = entry?.restore_targets ?? entry?.targets;
+                if (hint?.length) out.bindings[id].restore_targets = hint;
+            }
         }
         out.suggestions = suggestions.map(s => ({ binding_id: s.binding_id, targets: publicTargets(s.targets) }));
         return JSON.stringify(out);

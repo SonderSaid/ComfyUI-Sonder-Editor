@@ -1,3 +1,4 @@
+import { mountRestore } from "./controls_restore.js";
 import { mountPresets } from "./controls_presets.js";
 import { mountComboPicker, wantsComboPicker } from "./controls_combo_picker.js";
 import { mountManageSection, smallButton } from "./controls_manage.js";
@@ -117,7 +118,7 @@ export function mountControlsPanel(container, host) {
     const presets = mountPresets(host, {flushPending: () => flushPending(), track, notify: reason => warning(reason),
         // Switching workflows remounts the panel: Manage drafts would be lost.
         canSwitch: () => {
-            if (manage?.presetSaving) {
+            if (restore.busy || manage?.presetSaving) {
                 warning("Wait for the Manage change to save, then switch workflows.");
                 return false;
             }
@@ -128,6 +129,9 @@ export function mountControlsPanel(container, host) {
     container.append(header);
     header.after(presets.el);
     presets.el.after(quietLine);
+    const restore = mountRestore(host, {flushPending: () => flushPending(), track: work => track(work),
+        notify: reason => warning(reason), rebind: row => { setManage(true); manage?.setRebind(row); }});
+    header.after(restore.el);
     const message = make("div");
     message.style.cssText = `color:${COLORS.textSecondary};line-height:1.5;`;
     const editorGroup = makeGroup(null, "Editor");
@@ -965,6 +969,7 @@ export function mountControlsPanel(container, host) {
         const filter = { query, showAdvanced: showAdvanced(), manage: manageOn };
         const allSpecs = [...(view.bindings || []).map(d => ({ ...d, source: "binding" })), ...(view.notes || []).map(d => ({ ...d, source: "note" }))];
         const empty = !allSpecs.some(d => manageOn || !d.hidden);
+        restore.render(view);
         manage?.render(view);
         presets.render(view, manageOn);
         const entries = [];
@@ -1117,6 +1122,7 @@ export function mountControlsPanel(container, host) {
     }
     function setManage(on) {
         if (destroyed || on === manageOn) return;
+        if (restore.busy) return;
         if (!on && manage?.canLeave && !manage.canLeave()) return;
         if (!on) {
             for (const row of rows.values()) if (row.renameInput) closeRename(row, true);
@@ -1129,7 +1135,7 @@ export function mountControlsPanel(container, host) {
         if (on) {
             manage = mountManageSection(host, { notify: warning, flushPending, changed: () => render(),
                 track: (work, changes) => track(work, Object.keys(changes).some(changesRun)) });
-            header.after(manage.el);
+            restore.el.after(manage.el);
         } else {
             manage?.destroy();
             manage = null;
@@ -1238,6 +1244,7 @@ export function mountControlsPanel(container, host) {
             destroyed = true;
             arrangement.destroy();
             presets.destroy();
+            restore.destroy();
             for (const row of rows.values()) row.picker?.destroy();
             unsubscribe?.();
             unregister();

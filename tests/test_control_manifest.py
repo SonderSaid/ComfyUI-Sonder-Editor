@@ -298,7 +298,7 @@ def test_group_problems_are_cosmetic_and_never_make_the_relay_unreadable():
 
 GROUP_NAMES = ["Look", " Look ", "", "   ", "a:b", "x" * 120, "x" * 121, "😀" * 120, "😀" * 121, "constructor",
                " prototype ", "Tab\tName", "Bell\x07", "Del\x7f", "C1\x85", "Ünïcode", "\u2028line ", "\u3000Wide\u3000", "Bom\ufeff", "\x1cSep", 5, None]
-TARGETS = ["binding:aB-_9:value", "note:n1:create", "group:Look and feel:rename", "group:😀:move",
+TARGETS = ["workflow:restore", "binding:aB-_9:value", "note:n1:create", "group:Look and feel:rename", "group:😀:move",
            "workflow:description", "group::rename", "group:a:b:rename", "binding:bad id:value", "binding:a",
            "workflow:other", "control:a:value", "group:Look:order", "binding:a:hide", "note:n:text"]
 

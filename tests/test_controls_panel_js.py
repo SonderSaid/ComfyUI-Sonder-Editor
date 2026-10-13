@@ -78,6 +78,29 @@ if(SCENARIO==='markdown'){
     if(['layout','layout-refusal','layout-stale','layout-editor','cancel','note-save','ime','note-refusal','note-then-value','problem-statuses','truncated'].includes(SCENARIO))toggleManage();
     const group=name=>walk(container).find(n=>n.dataset.controlsGroup===name);
     const mirror=key=>walk(container).find(n=>n.dataset.controlsMirror===key);
+
+    if(SCENARIO==='restore-notice'){
+        publish({...view,relay:{status:'ok'},restore:{restorable:[{binding_id:'steps',path:'3',input:'steps'}],
+            unmatched:[{binding_id:'seed',label:'Seed',reason:'ambiguous'}]}});
+        const notice=walk(container).find(n=>n.dataset.controlsRestore==='true');
+        assert.equal(notice.style.display,'flex');assert.match(notice.textContent,/2 Controls came from an API file/);
+        toggleManage();assert.ok(notice.parentElement===container);toggleManage();
+        defer=true;button(notice,'Restore Controls').dispatch('click');await settle();
+        assert.deepEqual(calls.at(-1),{'workflow:restore':{bindings:['steps']}});
+        const flushed=panel.flushPending();resolveWrite();assert.equal(await flushed,true);await settle();
+        assert.match(notices.at(-1),/Restored 1 Controls.*1 need Rebind/);
+        button(notice,'Rebind').dispatch('click');assert.match(container.textContent,/Choose a new setting for “Seed”/);
+        publish({...view,restore:undefined});assert.equal(notice.style.display,'none');
+    }
+    if(SCENARIO==='restore-all'){
+        publish({...view,candidates:[],suggestions:Array.from({length:70},(_,i)=>({binding_id:'old'+i}))});
+        toggleManage();const manage=walk(container).find(n=>n.dataset.controlsManage==='true');
+        walk(manage).find(n=>n.dataset.controlsAddSettings==='true').dispatch('click');
+        button(manage,'Restore 64').dispatch('click');await settle();
+        assert.equal(Object.keys(calls.at(-1)).length,64);assert.deepEqual(calls.at(-1)['binding:old0:expose'],{});
+        publish({...view,suggestions:[{binding_id:'remaining'}]});button(manage,'Restore all').dispatch('click');await settle();
+        assert.deepEqual(calls.at(-1),{'binding:remaining:expose':{}});
+    }
     if(SCENARIO==='description'){
         toggleManage();
         const area=walk(container).find(n=>n.dataset.workflowDescription);
@@ -539,7 +562,7 @@ if(SCENARIO==='markdown'){
 console.log('ok');
 '''
 
-@pytest.mark.parametrize('scenario',['description','group-editor-name','editor-focus-refresh','normal-view','manage','manage-sdk','manage-flush','hide-flush','combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','note-refusal','problem-statuses','loading','note-then-value','batch-mirror','search','advanced','advanced-refusal','hidden-pending','cards-scale','group-note','groups-manage','groups-cap'])
+@pytest.mark.parametrize('scenario',['restore-notice','restore-all','description','group-editor-name','editor-focus-refresh','normal-view','manage','manage-sdk','manage-flush','hide-flush','combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','note-refusal','problem-statuses','loading','note-then-value','batch-mirror','search','advanced','advanced-refusal','hidden-pending','cards-scale','group-note','groups-manage','groups-cap'])
 def test_controls_panel(scenario, tmp_path):
     node=shutil.which('node')
     if not node:pytest.skip('node required for Controls renderer boundary tests')

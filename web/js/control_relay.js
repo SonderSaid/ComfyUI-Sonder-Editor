@@ -12,6 +12,9 @@ import { api } from "/scripts/api.js";
 import { commitWidgetVisibility, setWidgetHidden } from "./widget_visibility.js";
 import { exportManifest, installAnchorCopyRule, isRelay } from "./control_bindings.js";
 import { syncRelayRows } from "./control_relay_rows.js";
+import { createCanvasControlsHost } from "./controls_host_canvas.js";
+import { restoreSummary } from "./controls_restore.js";
+import { notifySuccess, notifyWarning } from "./editor_notifications.js";
 
 const EXT_NAME = "sonder.control_relay";
 const INSTALLED = Symbol("sonderRelayInstalled");
@@ -83,6 +86,21 @@ function installRelay(node) {
     const manifest = (node.widgets || []).find(widget => widget?.name === "manifest");
     if (!manifest) return;
     node[INSTALLED] = true;
+    let restoring = false;
+    node.onRestoreControls = async () => {
+        if (restoring) return;
+        restoring = true;
+        const host = createCanvasControlsHost({app, api, getEditorNode: () =>
+            (rootGraph()?._nodes || []).find(n => (n.comfyClass || n.type) === "SonderEditor") || null});
+        try {
+            const view = await host.refresh(true), plan = view.restore;
+            if (!plan?.restorable?.length) throw new Error(view.error || "No Controls can be restored automatically. Open Controls → Manage to Rebind.");
+            const result = await host.applyChanges({"workflow:restore": {bindings: plan.restorable.map(r => r.binding_id)}});
+            if (!result.ok) throw new Error(result.rejected?.[0]?.reason || "Open Controls → Manage to Rebind.");
+            notifySuccess(restoreSummary(plan.restorable.length, plan.unmatched));
+        } catch (error) { notifyWarning("Controls could not be restored.", {detail: error.message}); }
+        finally { host.destroy(); restoring = false; }
+    };
     const serialize = manifest.serializeValue;
     // Export (API), Run and the Controls describe all read this; the workflow
     // keeps the saved presentation, because graphToPrompt serializes the

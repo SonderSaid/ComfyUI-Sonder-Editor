@@ -171,6 +171,8 @@ def _binding(raw: Any) -> dict:
     if status is not None:
         entry["status"] = status if status in EXPORT_STATUSES else "missing"
     entry["targets"] = _targets(raw.get("targets"))
+    if _targets(raw.get("restore_targets")):
+        entry["restorable"] = True
     mode = raw.get("seed_mode")
     entry["seed_mode"] = mode if mode in SEED_MODES else None
     return entry

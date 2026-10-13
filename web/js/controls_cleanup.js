@@ -43,7 +43,8 @@ export function mountCleanup(host, {track = work => work, notify = () => {}, flu
     }
     function render(view = host.getView()) {
         if (destroyed) return;
-        const available = Object.values(view.cleanup || {}).some(rows => Array.isArray(rows) && rows.length);
+        const available = Object.values(view.cleanup || {}).some(rows => Array.isArray(rows) && rows.length)
+            || !!view.restore?.restorable?.length;
         setButtonDisabled(trigger, busy || !ready(view) || !available);
         trigger.title = !ready(view) ? "Fix the Sonder Control Relay before cleaning up."
             : available ? "Review unavailable Controls and recovery data before removing them" : "Nothing qualifies for cleanup";
@@ -57,6 +58,8 @@ export function mountCleanup(host, {track = work => work, notify = () => {}, flu
         opened = true;
         const intro = make("div", "Only checked items will be removed. Kept preset members remain repairable in Manage. Removing a preset’s last member also deletes that preset.");
         intro.style.cssText = `font-size:${TYPE.t11}px;color:${COLORS.textSecondary};overflow-wrap:anywhere;`;
+        const restoreCount = view.restore?.restorable?.length || 0;
+        if (restoreCount) intro.textContent += ` ${restoreCount} Controls can be reconnected instead — use Restore Controls.`;
         const list = make("div");
         list.style.cssText = `display:flex;flex-direction:column;gap:${SPACE.s1}px;max-height:360px;overflow:auto;`;
         for (const [key, title] of Object.entries(GROUPS)) {

@@ -12,6 +12,7 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Added
+- Controls loaded from an API file retain recovery hints and can reconnect verified settings from the editor or Relay in one canvas Undo step. Cleanup keeps reconnectable Controls; Manage adds Restore all for previously exposed settings.
 - Manage Controls: review and clean up missing Controls, orphan anchors, stale app recovery values and individually selected preset members for the current workflow. Canvas cleanup is one native Undo step.
 - Sonder App: a Workflow menu at the top of the Controls panel switches to another imported workflow without leaving the project, scene or timeline. Takes already generating finish under their own workflow, and favorites (★, from the menu or the Launcher's ⋮ menu) come first in both places.
 - Controls presets: a workflow can carry named sets of Controls that set up one feature in one choice. Author them in Manage, pick one from the Preset menu in fullscreen, mounted tabs and the Sonder App, and share them in the saved workflow and Export (API).

@@ -884,6 +884,8 @@ def store_binding_changes(template_id: str, changes: dict, view: dict, prompt: d
                         if key == identity or definition != before.get(key):
                             data["presets"][key] = definition
                 continue
+            if source == "workflow" and field == "restore":
+                raise TemplateError("Restore applies to canvas workflows.", "invalid_controls")
             if source == "workflow" and field == "cleanup":
                 # Re-read under the file lock: even a direct sidecar writer may
                 # have changed eligibility since the runner's snapshot.

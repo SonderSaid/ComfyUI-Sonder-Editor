@@ -259,6 +259,11 @@ def _describe_controls_body(raw: bytes) -> dict:
     if (not isinstance(definition_anchors, list) or len(definition_anchors) > 4096
             or not all(control_cleanup.valid_id(bid) for bid in definition_anchors)):
         raise _ControlsRequestError("Invalid definition anchors.")
+    if "restore_plan" in body:
+        try:
+            view["restore"] = control_cleanup.restore_inventory(view, body["restore_plan"], inventory)
+        except control_descriptors.ControlValueError as exc:
+            raise _ControlsRequestError(str(exc)) from None
     view["cleanup"] = control_cleanup.inventory(view, definition_anchors=definition_anchors)
     if body.get("manage") is True:
         view["candidate_labels"] = [{"path": str(path), "input": f.field,

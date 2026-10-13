@@ -185,9 +185,10 @@ and the workflow description. Hidden entries are omitted; disabled authored
 Controls stay disabled. Export reports unreadable Relays or a menu/file that
 exceeds import limits instead of downloading a partial file.
 
-This export is for the Sonder App. Loading API JSON on the ComfyUI canvas is
-unsupported: subgraphs flatten and some custom nodes lose settings. Share the
-saved UI workflow when the recipient needs the canvas.
+Loading API JSON on the ComfyUI canvas flattens subgraphs and can lose some
+custom-node settings. Controls can be reconnected with **Restore Controls**
+using the steps below. Share the saved UI workflow alongside the API JSON when
+the recipient needs the canvas.
 
 Replacing an existing Sonder App import keeps your Control values and seed
 modes, app-only Controls, hidden settings and the presets you edited (Reset to
@@ -195,6 +196,38 @@ workflow's version brings back the imported one). A saved value whose setting
 now points somewhere else resets to the workflow's value. It resets your
 labels, notes, order, groups and Advanced flags on the workflow's own Controls,
 and the app description. The Launcher's notice lists what was kept and reset.
+
+### Reconnect Controls after loading an API file
+
+1. Load the API JSON on the ComfyUI canvas. Find the **Sonder Editor** node,
+   select your project on its card, then click **Open Editor**.
+2. Open the **Controls** tab in the editor's sidebar. In the notice at the top,
+   click **Restore Controls**. The same notice works in a mounted editor tab.
+3. Alternatively, stay on the canvas and find the **Sonder Control Relay** node
+   (search for **Control Relay** if it is off-screen). Click its
+   **Restore N Controls from this file** button. An open editor is not required.
+4. Restore reconnects every setting it can verify, including uniquely matched
+   settings from flattened subgraphs. It leaves values, labels and presets
+   unchanged. To undo the whole restore, return focus to the canvas and press
+   **Ctrl+Z** (**⌘+Z** on macOS) once.
+5. If the message says some Controls **need Rebind**, open **Controls → Manage**.
+   Click **Rebind** beside each remaining item and choose its setting. Ambiguous,
+   unavailable, already-used and multi-setting matches need this explicit choice.
+6. Save the UI workflow for future canvas use. Export (API) again to share the
+   restored Controls and their presets with the Sonder App.
+
+Editing or saving before Restore keeps the recovery hints. An API export made
+before Restore also keeps them, but its Controls honestly remain missing in the
+Sonder App and direct you back to Restore on the canvas. **Clean up unavailable…**
+keeps automatically restorable Controls out of its deletion list; unmatched
+items remain available for explicit cleanup.
+
+**Exposed before** contains saved canvas anchors for Controls removed from the
+menu. Open **Manage → Add settings → Exposed before → Restore all** to expose
+them again; above 64 items the button reads **Restore 64**, and can be repeated.
+An API file's Exposed-before suggestions are not recovery hints: Restore Controls
+recovers listed Controls, not those suggestions. It also does not rebuild
+subgraphs or custom-node settings lost during ComfyUI's API import.
 
 ### Where is the Launcher shortcut, and why does it stop working after a port change?
 

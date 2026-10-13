@@ -41,6 +41,17 @@ const sync=()=>syncRelayRows(relay,{root,canvas:{},isEditing:()=>editing});
 const rows=()=>rowWidgets(relay);
 const row=name=>rows().find(w=>w.name==='sonder_row:'+name);
 
+
+if(SCENARIO==='restore'){
+    sampler.properties.sonderBindings={};
+    relay.widgets[0].value=manifest({steps:{targets:[{path:'3',input:'steps'}]}});
+    let restored=0;relay.onRestoreControls=()=>restored++;
+    sync();assert.equal(rows().length,1);assert.equal(rows()[0].type,'button');
+    assert.equal(rows()[0].label,'Restore 1 Controls from this file');assert.equal(rows()[0].serialize,false);
+    rows()[0].callback();assert.equal(restored,1);assert.deepEqual(relay.size,[200,80]);
+    sampler.mode=2;sync();assert.equal(rows().length,1);assert.equal(rows()[0].type,'text');
+    assert.match(rows()[0].value,/1 Controls aren't connected/);assert.deepEqual(relay.size,[200,80]);
+}
 if(SCENARIO==='rows'){
     assert.equal(sync(),true);
     // Ok bindings only, in manifest order; a seed gets its mode row. The stored
@@ -144,7 +155,7 @@ if(SCENARIO==='group-tolerance'){
 console.log('ok');
 '''
 
-SCENARIOS = ['group-tolerance', 'rows', 'editing', 'hint-and-warnings', 'status-changes', 'groups']
+SCENARIOS = ['restore', 'group-tolerance', 'rows', 'editing', 'hint-and-warnings', 'status-changes', 'groups']
 
 
 @pytest.mark.parametrize('scenario', SCENARIOS)
