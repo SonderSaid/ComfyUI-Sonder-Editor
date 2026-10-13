@@ -351,7 +351,9 @@ Set it up once, on the ComfyUI machine:
 3. Export your workflow with ComfyUI's **Export (API)** and import the JSON in
    the Launcher (Import, or drop the file). The workflow needs exactly one
    **Sonder Editor** and a **Sonder Save Video** or **Sonder Save Bridge** that
-   takes its project from it.
+   takes its project from it. A workflow that needs node packs you don't have
+   is still imported, marked **Missing nodes** with the packs to install; see
+   [The Launcher says *Missing node packs*](docs/troubleshooting.md#the-launcher-says-missing-node-packs).
 
 When you open a workflow from the Launcher, Sonder starts a local connection to
 ComfyUI (`comfy-api-proxy`) on a free port from 8189 to 8198, or reuses one

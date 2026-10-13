@@ -182,6 +182,13 @@ class SdkSession:
     last_emit: float = 0.0
     emit_scheduled: bool = False
     cancel_epoch: int = 0
+    # Absorb bookkeeping. Stamps come from one runner counter, so "claimed since
+    # its last Open" never depends on clock resolution; ``opened_at`` dates the
+    # last Open for the grace a loading page gets.
+    opened_at: float = 0.0
+    opened_stamp: int = 0
+    claimed_stamp: int = 0
+    generating: int = 0  # Generates of this session between arrival and their last submit
 
     def unfinished(self) -> list:
         return [run for run in self.runs if not run.final]
@@ -312,6 +319,9 @@ class SdkRunner:
         describe: Callable[..., dict] | None = None,
         clock: Callable[[], float] = time.time,
         class_lookup: Callable[[str], Any] | None = None,
+        # Which node classes are installed, for the missing-node refusals of Open,
+        # switch and Generate; ComfyUI's registry by default.
+        node_lookup: Callable[[str], Any] | None = None,
     ) -> None:
         self._resolve_project = resolve_project
         self._client_factory = client_factory
@@ -325,6 +335,7 @@ class SdkRunner:
         self._generating = 0  # Generates between their gate and their submit
         self._describe = describe or control_descriptors.describe_bindings
         self._class_lookup = class_lookup
+        self._node_lookup = node_lookup
         self._clock = clock
         self._sessions: dict[str, SdkSession] = {}
         self._runs_by_token: dict[str, SdkRun] = {}
@@ -336,9 +347,11 @@ class SdkRunner:
         self._housekeeping_task: asyncio.Task | None = None
         self._open_lock = asyncio.Lock()
         self._idle_since = self._clock()
+        self._stamp = 0
         self._remove_listener = sdk_runs.add_run_finished_listener(self._on_run_finished_threadsafe)
         self._remove_progress_listener = sdk_progress.add_listener(self._on_progress_threadsafe)
         session_registry.set_sdk_secret_resolver(self.secret_for_host)
+        session_registry.set_sdk_claim_listener(self.note_claim)
 
     def close(self) -> None:
         self._remove_listener()
@@ -346,12 +359,23 @@ class SdkRunner:
         for run in self._runs_by_token.values():
             sdk_progress.unwatch(run.prompt_id, run.token)
         session_registry.set_sdk_secret_resolver(None)
+        session_registry.set_sdk_claim_listener(None)
 
-    # ── Registry hook ────────────────────────────────────────────────────────
+    # ── Registry hooks ───────────────────────────────────────────────────────
 
     def secret_for_host(self, host_id: str) -> str | None:
         session = self._sessions.get(str(host_id or ""))
         return session.secret if session else None
+
+    def _next_stamp(self) -> int:
+        self._stamp += 1
+        return self._stamp
+
+    def note_claim(self, host_id: str) -> None:
+        """A tab claimed this session (registry lock held): it is no longer just opened."""
+        session = self._sessions.get(str(host_id or ""))
+        if session is not None:
+            session.claimed_stamp = self._next_stamp()
 
     # ── Sessions ─────────────────────────────────────────────────────────────
 
@@ -374,18 +398,25 @@ class SdkRunner:
         existed for PROXY_IDLE_STOP_SEC."""
         now = self._clock()
         for session in list(self._sessions.values()):
-            if session.unfinished() or now - session.last_activity < SESSION_IDLE_SEC:
+            if not self._idle(session):
                 continue
             owner = await self._get_owner(session.project, host_id=session.session_id)
             if owner and owner.get("status") in ("active", "orphaned"):
                 continue  # a tab still holds it, perhaps throttled in the background
-            self._drop_session(session)
+            # Rechecked after the owner read: an Open may have reused it, absorbed
+            # takes into it or started a Generate meanwhile.
+            if self._sessions.get(session.session_id) is session and self._idle(session):
+                self._drop_session(session)
         if self._sessions:
             self._idle_since = 0.0
         elif self._idle_since and now - self._idle_since > PROXY_IDLE_STOP_SEC:
             self._idle_since = 0.0
             await asyncio.to_thread(sdk_proxy.stop_owned_proxy)
             await self.aclose_clients()
+
+    def _idle(self, session: SdkSession) -> bool:
+        return (not session.unfinished() and not session.generating
+                and self._clock() - session.last_activity >= SESSION_IDLE_SEC)
 
     async def open_session(self, template_id: str, project: str) -> dict:
         self._remember_loop()
@@ -396,9 +427,7 @@ class SdkRunner:
 
     async def _open_session_locked(self, template_id: str, project: str) -> dict:
         template_id = sdk_templates.check_template_id(template_id)
-        _, meta = await asyncio.to_thread(sdk_templates.load_template, template_id)
-        if not meta.get("validation", {}).get("ok", True):
-            raise SdkError("This workflow can't drive the editor.", "invalid_template", 409)
+        meta = await self._runnable_meta(template_id)
         if self._resolve_project is None:
             raise SdkError("Projects are unavailable.", "projects_unavailable", 500)
         # An async resolver: it loads the project through the project I/O pool.
@@ -408,30 +437,98 @@ class SdkRunner:
         # The folder's own spelling: the editor's project choice must match it exactly.
         project = os.path.basename(os.path.normpath(project_dir))
         self._template_names[template_id] = meta.get("name", "")
+        reused = next((s for s in self._sessions.values()
+                       if s.template_id == template_id and s.project == project), None)
+        if reused is not None:
+            # Before any await: an idle reused session must not look abandoned
+            # to housekeeping while the owners below are read.
+            reused.last_activity = self._clock()
+        candidates = await self._absorb_candidates(project, exclude=reused)
+        if reused is not None and self._sessions.get(reused.session_id) is not reused:
+            reused = None  # dropped meanwhile: open a new one, never a dead one
         now = self._clock()
-        for session in self._sessions.values():
-            if session.template_id == template_id and session.project == project:
-                session.last_activity = now
-                session.project_dir, session.aliases = project_dir, list(aliases)
-                await self._record_open(session)
-                return self._open_result(session)
-        if len(self._sessions) >= MAX_SESSIONS:
-            await self._evict_one()
-        session = SdkSession(
-            session_id=f"sdk-{uuid.uuid4().hex}",
-            secret=secrets.token_urlsafe(32),
-            template_id=template_id,
-            project=project,
-            project_dir=project_dir,
-            aliases=list(aliases),
-            created=now,
-            last_activity=now,
-        )
-        self._sessions[session.session_id] = session
-        self._idle_since = 0.0
-        asyncio.ensure_future(self._warm_proxy())
+        if reused is not None:
+            session = reused
+            session.last_activity = now
+            session.project_dir, session.aliases = project_dir, list(aliases)
+        else:
+            session = SdkSession(
+                session_id=f"sdk-{uuid.uuid4().hex}",
+                secret=secrets.token_urlsafe(32),
+                template_id=template_id,
+                project=project,
+                project_dir=project_dir,
+                aliases=list(aliases),
+                created=now,
+                last_activity=now,
+            )
+        session.opened_at, session.opened_stamp = now, self._next_stamp()
+        # Before the cap check: an absorbed sibling is dropped, freeing its slot.
+        absorbed = self._absorb(session, candidates)
+        if reused is None:
+            # Absorbing dropped at least one session, so the cap cannot be reached
+            # and the moved runs never wait, outside any session, on an eviction.
+            if len(self._sessions) >= MAX_SESSIONS:
+                await self._evict_one()
+            self._sessions[session.session_id] = session
+            self._idle_since = 0.0
+            asyncio.ensure_future(self._warm_proxy())
+        if absorbed:
+            self._emit(session, force=True)
         await self._record_open(session)
         return self._open_result(session)
+
+    # ── Absorbing a sibling session's unfinished takes ───────────────────────
+
+    def _absorbable(self, sibling: SdkSession, claimed_stamp: int) -> bool:
+        """Checked with no await before the move. The owner read (done earlier)
+        found no tab; a claim since that read, a Generate still sending into
+        the sibling, or an Open whose page may still be loading keeps it."""
+        if self._sessions.get(sibling.session_id) is not sibling or not sibling.unfinished():
+            return False
+        if sibling.claimed_stamp != claimed_stamp or sibling.generating:
+            return False
+        return (sibling.claimed_stamp > sibling.opened_stamp
+                or self._clock() - sibling.opened_at > SWITCH_PAIR_GRACE_SEC)
+
+    async def _absorb_candidates(self, project: str, exclude: SdkSession | None = None) -> list:
+        """Sibling sessions on this project with unfinished takes and no live tab,
+        each with the claim stamp seen before its owner read."""
+        found = []
+        for sibling in list(self._sessions.values()):
+            if sibling is exclude or sibling.project != project or not sibling.unfinished():
+                continue
+            claimed_stamp = sibling.claimed_stamp
+            owner = await self._get_owner(sibling.project, host_id=sibling.session_id)
+            if owner and owner.get("status") in ("active", "orphaned"):
+                continue
+            found.append((sibling, claimed_stamp))
+        return found
+
+    def _absorb(self, session: SdkSession, candidates: list) -> int:
+        """Move each absorbable sibling's unfinished runs into ``session`` and drop
+        the sibling. Synchronous: nothing can claim, submit into or open the
+        sibling between the checks and the move. Finished runs stay behind (their
+        outcomes were already announced). The unfinished cap does not apply;
+        Generate stays refused until the count is under it."""
+        moved = 0
+        for sibling, claimed_stamp in candidates:
+            if sibling is session or not self._absorbable(sibling, claimed_stamp):
+                continue
+            moved += self._move_unfinished(session, sibling)
+        return moved
+
+    def _move_unfinished(self, session: SdkSession, sibling: SdkSession) -> int:
+        runs = sibling.unfinished()
+        for run in runs:
+            sibling.runs.remove(run)
+            run.session_id = session.session_id
+            session.runs.append(run)
+        # Only the sibling's finished runs remain for the drop to unwatch.
+        self._drop_session(sibling)
+        logger.info("Sonder App session %s took %d unfinished takes from %s", session.session_id, len(runs),
+                    sibling.session_id)
+        return len(runs)
 
     async def _record_open(self, session: SdkSession) -> None:
         """The Launcher preselects this workflow for this project next time. Only an open
@@ -475,10 +572,9 @@ class SdkRunner:
             await self.authorized(session_id, secret, tab_session_id)
             self._check_workflow(session, old_id, expected_template_id)
             if new_id != old_id:
+                # Refuse before taking anything over from the pair's session.
+                meta = await self._runnable_meta(new_id)
                 await self._release_pair(session, new_id)
-                _, meta = await asyncio.to_thread(sdk_templates.load_template, new_id)
-                if not meta.get("validation", {}).get("ok", True):
-                    raise SdkError("This workflow can't drive the editor.", "invalid_template", 409)
                 session.template_id = new_id
                 self._template_names[new_id] = meta.get("name", "")
                 await self._record_open(session)
@@ -491,22 +587,47 @@ class SdkRunner:
                 self._emit(session, force=True)
             return {"ok": True, "template_id": session.template_id, "template_name": self.template_name(session)}
 
+    async def _runnable_meta(self, template_id: str) -> dict:
+        """An Open or a switch refuses a workflow with nodes missing now (the Launcher
+        lists them) or one that can't drive the editor."""
+        try:
+            _, meta = await asyncio.to_thread(sdk_templates.runnable_template, template_id, self._node_lookup)
+        except sdk_templates.TemplateError as exc:
+            if exc.code == "missing_nodes":
+                raise SdkError(str(exc), exc.code, exc.status, **exc.details) from None
+            if exc.code == "invalid_template":
+                raise SdkError(str(exc), exc.code, exc.status) from None
+            raise
+        return meta
+
     async def _release_pair(self, session: SdkSession, template_id: str) -> None:
-        """Keep one session per (workflow, project): refuse while another session needs
-        the pair; drop an abandoned one, as housekeeping would."""
+        """Keep one session per (workflow, project): refuse while a tab holds the
+        pair; take over the takes still generating in an abandoned one; drop an
+        abandoned one, as housekeeping would."""
         for other in list(self._sessions.values()):
             if other is session or other.template_id != template_id or other.project != session.project:
                 continue
-            if other.unfinished():
-                raise SdkError("Takes from an earlier visit are still generating with that workflow on this project. "
-                               "Wait for them to finish, then switch.", "workflow_open_elsewhere", 409)
+            claimed_stamp = other.claimed_stamp
             owner = await self._get_owner(other.project, host_id=other.session_id)
-            if owner and owner.get("status") in ("active", "orphaned"):
+            live = owner and owner.get("status") in ("active", "orphaned")
+            if live or other.claimed_stamp != claimed_stamp:
                 raise SdkError("That workflow is already open on this project in another tab.",
                                "workflow_open_elsewhere", 409)
-            if self._clock() - other.last_activity < SWITCH_PAIR_GRACE_SEC:
-                raise SdkError("That workflow was just opened on this project in another tab. Try again in a moment.",
+            if self._sessions.get(other.session_id) is not other:
+                continue  # dropped while the owner was read
+            just_opened = SdkError("That workflow was just opened on this project in another tab. "
+                                   "Try again in a moment.", "workflow_open_elsewhere", 409)
+            if other.generating:
+                # Its Generate may still add runs: neither take them nor drop it.
+                raise SdkError("That workflow is still starting takes. Try again in a moment.",
                                "workflow_open_elsewhere", 409)
+            if other.unfinished():
+                if not self._absorbable(other, claimed_stamp):
+                    raise just_opened
+                self._move_unfinished(session, other)
+                continue
+            if self._clock() - other.last_activity < SWITCH_PAIR_GRACE_SEC:
+                raise just_opened
             self._drop_session(other)
 
     async def _warm_proxy(self) -> None:
@@ -519,13 +640,16 @@ class SdkRunner:
 
     async def _evict_one(self) -> None:
         candidates = []
-        for session in self._sessions.values():
-            if session.unfinished():
+        for session in list(self._sessions.values()):
+            if session.unfinished() or session.generating:
                 continue
             owner = await self._get_owner(session.project, host_id=session.session_id)
             if owner and owner.get("status") in ("active", "orphaned"):
                 continue
             candidates.append(session)
+        # Rechecked after the owner reads, with no await before the drop.
+        candidates = [s for s in candidates if self._sessions.get(s.session_id) is s
+                      and not s.unfinished() and not s.generating]
         if not candidates:
             raise SdkError("Too many Sonder App sessions are busy. Close one and try again.", "sdk_sessions_busy", 429)
         oldest = min(candidates, key=lambda s: s.last_activity)
@@ -663,10 +787,14 @@ class SdkRunner:
         # before this point is seen, and one reserved after waits for it.
         self._check_not_uninstalling()
         self._generating += 1
+        # Until its last submit, this Generate may still add runs to the session:
+        # no other session absorbs it meanwhile.
+        session.generating += 1
         try:
             return await self._generate(session, template_id, expected_template_id, count, editor_values,
                                         render_cache_max_bytes, tab_session_id, editor_values_seq, epoch)
         finally:
+            session.generating -= 1
             self._generating -= 1
 
     def _check_not_uninstalling(self) -> None:
@@ -702,6 +830,12 @@ class SdkRunner:
             build = await asyncio.to_thread(self._build_base, session, editor_values, render_cache_max_bytes, writer,
                                            template_id)
             self._check_submit_epoch(session, epoch, build)
+            # A Replace may have brought in nodes this ComfyUI lacks: name them
+            # now rather than let ComfyUI refuse the submit.
+            missing_nodes = sdk_templates.missing_node_classes(build["prompt"], self._node_lookup)
+            if missing_nodes:
+                raise SdkError(sdk_templates.missing_nodes_message(missing_nodes), "missing_nodes", 409,
+                               missing_nodes=missing_nodes, stale=build["stale"])
             refusals = sdk_templates.generate_refusals(build["view"])
             from .model_requirements import missing_models, missing_model_message
             missing = await asyncio.to_thread(missing_models, build["prompt"], executable_only=True)

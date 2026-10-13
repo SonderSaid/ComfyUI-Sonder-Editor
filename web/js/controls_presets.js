@@ -43,7 +43,9 @@ function mountWorkflowMenu(workflows, { flushPending, notify, canSwitch }) {
         select.replaceChildren(...list.map(w => {
             const option = new Option(`${w.favorite ? "★ " : ""}${w.name || "Untitled workflow"}`, w.template_id);
             option.disabled = !w.ok && w.template_id !== id;
-            option.title = w.ok ? (w.description || "") : "This workflow can't drive the editor.";
+            option.title = w.ok ? (w.description || "")
+                : w.missing_nodes?.length ? `Missing nodes: ${w.missing_nodes.join(", ")}. Install them, then restart ComfyUI.`
+                : "This workflow can't drive the editor.";
             return option;
         }));
         select.value = id;

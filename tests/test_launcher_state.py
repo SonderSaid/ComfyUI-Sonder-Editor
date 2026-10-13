@@ -112,6 +112,9 @@ def test_preferred_workflow_falls_back_past_hidden_and_deleted_ones():
     assert launcher_state.preferred_workflow(state, "Fresh", [T1, T2, T3]) == T2
     # Its own was deleted: the last used anywhere.
     assert launcher_state.preferred_workflow(state, "Songs", [T2, T3]) == T2
+    # Its own needs nodes that aren't installed: never preselected.
+    assert launcher_state.preferred_workflow(state, "Songs", [T1, T2, T3], {T1}) == T2
+    assert launcher_state.preferred_workflow(state, "Songs", [T1, T2, T3], {T1, T2}) == T3
     # Both hidden: the first remaining.
     state = launcher_state.set_hidden("workflow", T1, True)
     state = launcher_state.set_hidden("workflow", T2, True)

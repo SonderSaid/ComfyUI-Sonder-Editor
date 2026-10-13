@@ -165,8 +165,11 @@ def validate_template(
 ) -> dict:
     """Check an API workflow can drive the editor, and summarize its Controls.
 
-    ``errors`` refuse the import. ``blocking`` lists what Generate will refuse
-    until the workflow is fixed; ``warnings`` are informational.
+    ``errors`` refuse the import. ``missing_nodes`` (classes this ComfyUI lacks)
+    keep it importable but unusable (``ok`` false) until they are installed;
+    describing its Controls needs them, so that is skipped meanwhile.
+    ``blocking`` lists what Generate will refuse until the workflow is fixed;
+    ``warnings`` are informational.
     """
     class_lookup = class_lookup or control_descriptors.comfy_class_lookup
     describe = describe or (lambda p: control_descriptors.describe_bindings(p, class_lookup=class_lookup))
@@ -174,9 +177,7 @@ def validate_template(
     blocking: list[str] = []
     warnings: list[str] = []
 
-    missing = sorted({node["class_type"] for node in prompt.values() if class_lookup(node["class_type"]) is None})
-    if missing:
-        errors.append("These nodes are not installed: " + ", ".join(missing) + ".")
+    missing = missing_node_classes(prompt, class_lookup)
     editors = prompt_graph.editor_keys(prompt)
     editor_key = editors[0] if len(editors) == 1 else ""
     if not editors:
@@ -193,14 +194,15 @@ def validate_template(
 
     description = control_descriptors.control_manifest.find_relay(prompt)["manifest"].get("description", "")
     controls_summary: list[dict] = []
-    if not errors:
+    if not errors and not missing:
         described = describe(prompt)
         blocking.extend(generate_refusals(described))
         controls_summary, control_warnings = controls_summary_of(described)
         warnings.extend(control_warnings)
     return {
-        "ok": not errors,
+        "ok": not errors and not missing,
         "errors": errors,
+        "missing_nodes": missing,
         "blocking": blocking,
         "warnings": warnings,
         "editor_key": editor_key,
@@ -209,6 +211,82 @@ def validate_template(
         "description": description,
         "preset_count": len(control_manifest_of(prompt).get("presets", {})),
     }
+
+
+def missing_node_classes(prompt: dict, class_lookup: Callable[[str], Any] | None = None) -> list[str]:
+    class_lookup = class_lookup or control_descriptors.comfy_class_lookup
+    return sorted({node["class_type"] for node in prompt.values() if class_lookup(node["class_type"]) is None})
+
+
+def _refuse_import(validation: dict) -> None:
+    """Only ``errors`` refuse an import; missing nodes are stored and listed."""
+    if validation.get("errors") or not (validation.get("ok", True) or validation.get("missing_nodes")):
+        raise TemplateError(" ".join(validation.get("errors") or []) or "This workflow can't drive the editor.",
+                            "invalid_template", 400, validation=validation)
+
+
+def missing_nodes_message(classes: list[str]) -> str:
+    return ("This workflow needs nodes that aren't installed: " + ", ".join(classes)
+            + ". Install them, restart ComfyUI, then try again.")
+
+
+# template_id -> (meta identity, validation): one revalidation per process, even
+# when the meta file cannot be rewritten.
+_revalidated: dict[str, tuple] = {}
+
+
+def _meta_identity(meta: dict) -> tuple:
+    return meta.get("imported_at", 0), meta.get("replaced_at", 0)
+
+
+def _refresh_missing_nodes(template_id: str, meta: dict, prompt: dict | None = None,
+                           class_lookup: Callable[[str], Any] | None = None) -> dict:
+    """The meta with its missing nodes rechecked against this ComfyUI's registry.
+
+    Restart-bound: nodes appear or disappear only with a restart. Only the stored
+    class names are checked, so a listing reads no workflow file while any is
+    still missing. Once all are installed the workflow is validated in full, once
+    per process, and its meta best-effort updated (an install-level cache, not
+    project data).
+    """
+    validation = meta.get("validation") or {}
+    stored = validation.get("missing_nodes") or []
+    if not stored:
+        return meta
+    class_lookup = class_lookup or control_descriptors.comfy_class_lookup
+    live = [name for name in stored if class_lookup(name) is None]
+    if live:
+        return {**meta, "validation": {**validation, "missing_nodes": live}}
+    cached = _revalidated.get(template_id)
+    if not cached or cached[0] != _meta_identity(meta):
+        if prompt is None:
+            prompt, _ = load_template(template_id)
+        cached = (_meta_identity(meta), validate_template(prompt, class_lookup=class_lookup))
+        _revalidated[template_id] = cached
+        if template_id not in starter_sources():
+            _, meta_path, _ = _template_paths(template_id)
+            try:
+                with template_lock(template_id):
+                    current = read_json_sidecar(meta_path)
+                    if _meta_identity(current) == cached[0]:
+                        write_json_atomic(meta_path, {**current, "validation": cached[1]})
+            except Exception:
+                logger.warning("Could not record the revalidation of workflow %s", template_id, exc_info=True)
+    return {**meta, "validation": copy.deepcopy(cached[1])}
+
+
+def runnable_template(template_id: str, class_lookup: Callable[[str], Any] | None = None) -> tuple[dict, dict]:
+    """The workflow and meta an Open or a switch may use, or a refusal: nodes
+    missing now (including ones uninstalled after import), or a workflow that
+    can't drive the editor."""
+    prompt, meta = load_template(template_id)
+    missing = missing_node_classes(prompt, class_lookup)
+    if missing:
+        raise TemplateError(missing_nodes_message(missing), "missing_nodes", 409, missing_nodes=missing)
+    meta = _refresh_missing_nodes(template_id, meta, prompt, class_lookup)
+    if not meta.get("validation", {}).get("ok", True):
+        raise TemplateError("This workflow can't drive the editor.", "invalid_template", 409)
+    return prompt, meta
 
 
 def controls_summary_of(view: dict) -> tuple[list[dict], list[str]]:
@@ -303,6 +381,10 @@ def list_templates(*, requirements: bool = False) -> list[dict]:
             continue
         with template_lock(template_id):
             meta = read_json_sidecar(meta_path)
+        try:
+            meta = _refresh_missing_nodes(template_id, meta)
+        except Exception:  # one workflow's problem must not hide the whole list
+            logger.warning("Rechecking the nodes of workflow %s failed", template_id, exc_info=True)
         result.append(_public_meta(template_id, meta))
     for template_id in starters:
         try:
@@ -384,8 +466,7 @@ def template_requirements(template_id: str) -> dict:
 def import_template(raw: bytes, *, source_name: str = "", name: str = "", validate=validate_template) -> dict:
     prompt = parse_template_bytes(raw)
     validation = validate(prompt)
-    if not validation["ok"]:
-        raise TemplateError(" ".join(validation["errors"]), "invalid_template", 400, validation=validation)
+    _refuse_import(validation)
     folder = templates_dir()
     if sum(not t.get("starter") for t in list_templates()) >= MAX_TEMPLATES:
         raise TemplateError("Too many workflows. Delete one first.", "too_many_templates", 409)
@@ -414,8 +495,7 @@ def replace_template(template_id: str, raw: bytes, *, source_name: str = "", val
     json_path, meta_path, controls_path = _template_paths(template_id)
     prompt = parse_template_bytes(raw)
     validation = validate(prompt)
-    if not validation["ok"]:
-        raise TemplateError(" ".join(validation["errors"]), "invalid_template", 400, validation=validation)
+    _refuse_import(validation)
     with template_lock(template_id):
         if not os.path.isfile(json_path):
             raise TemplateError("Unknown workflow.", "unknown_template", 404)
@@ -438,7 +518,9 @@ def replace_template(template_id: str, raw: bytes, *, source_name: str = "", val
         layout_reset = len(data["layout"]) + len(data["labels"])
         data.update(notes={}, layout={}, labels={}, presentation_hash=hashlib.sha256(raw).hexdigest(), seq=data["seq"] + 1)
         # Preserved app copies and newly authored presets must remain portable.
-        _check_preset_projection(prompt, data, describe)
+        # The check describes the workflow, which needs every node installed.
+        if not validation.get("missing_nodes"):
+            _check_preset_projection(prompt, data, describe)
         # The file lock makes the three writes one transaction for live readers.
         # Restore exact bytes on a failed write. The hash binding below also
         # prevents old notes appearing over a new export after a process crash.
@@ -464,7 +546,7 @@ def replace_template(template_id: str, raw: bytes, *, source_name: str = "", val
                     logger.exception("Could not restore workflow file %s", path)
             raise
     local_missing = local_shadowed = 0
-    if data.get("local"):
+    if data.get("local") and not validation.get("missing_nodes"):
         try:
             view = describe_stored(prompt, data, describe)
             for binding in view.get("bindings", []):

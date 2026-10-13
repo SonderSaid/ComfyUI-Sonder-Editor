@@ -47,6 +47,29 @@ def test_an_sdk_host_is_claimable_only_with_its_secret_whatever_the_mode():
     run(go)
 
 
+def test_only_a_successful_sdk_claim_reaches_the_claim_listener():
+    claims = []
+
+    def listener(host_id):
+        # Told while the registry lock is held: the owner is already recorded.
+        claims.append((host_id, session_registry._sessions[(PROJECT, host_id)]["session_id"]))
+
+    session_registry.set_sdk_claim_listener(listener)
+    try:
+        async def go():
+            await claim_session(PROJECT, "tab-a", "sdk", {"host_id": SDK_HOST}, sdk_secret="nope")
+            await claim_session(PROJECT, "tab-a", "sdk", {"host_id": SDK_HOST}, sdk_secret=SECRET)
+            await claim_session(PROJECT, "tab-b", "sdk", {"host_id": SDK_HOST}, sdk_secret=SECRET)
+
+        run(go)
+        session_registry.set_sdk_claim_listener(lambda host_id: 1 / 0)
+        # A failing listener never fails the claim.
+        assert run(lambda: claim_session(PROJECT, "tab-c", "sdk", {"host_id": SDK_HOST}, sdk_secret=SECRET))["ok"]
+    finally:
+        session_registry.set_sdk_claim_listener(None)
+    assert claims == [(SDK_HOST, "tab-a"), (SDK_HOST, "tab-b")]
+
+
 def test_a_claim_with_the_secret_takes_over_and_announces_it(monkeypatch):
     events = []
     monkeypatch.setattr(session_registry, "schedule_project_event", lambda pid, event: events.append(event))

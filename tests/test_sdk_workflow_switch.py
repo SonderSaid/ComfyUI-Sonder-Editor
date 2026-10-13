@@ -158,18 +158,57 @@ def test_a_pair_live_in_another_tab_is_refused_and_an_abandoned_one_is_replaced(
     assert reopened["session_id"] == session.session_id != other["session_id"]
 
 
-def test_a_pair_with_takes_still_generating_says_so(world):
+async def departed_pair_with_a_take(world):
+    """The other workflow's session on this project: its tab left mid-batch."""
+    other = world.runner.session_for(**{k: v for k, v in (await world.runner.open_session(world.other_id, PROJECT)).items()
+                                        if k in ("session_id", "secret")})
+    run = sdk_runner.SdkRun(run_id="r", token="t", session_id=other.session_id, index=1, count=1)
+    other.runs.append(run)
+    world.runner._runs_by_token[run.token] = run
+    return other, run
+
+
+def test_switching_to_a_departed_pair_takes_over_its_unfinished_takes(world):
     async def go():
         session = await world.open()
-        other = world.runner.session_for(**{k: v for k, v in (await world.runner.open_session(world.other_id, PROJECT)).items()
-                                            if k in ("session_id", "secret")})
-        other.runs.append(sdk_runner.SdkRun(run_id="r", token="t", session_id=other.session_id, index=1, count=1))
-        world.now[0] += sdk_runner.SWITCH_PAIR_GRACE_SEC + 1
-        with pytest.raises(SdkError) as exc:
-            await switch(world, session, world.other_id)
-        assert exc.value.code == "workflow_open_elsewhere" and "still generating" in str(exc.value)
+        other, run = await departed_pair_with_a_take(world)
+        world.runner.note_claim(other.session_id)  # its page loaded, then Exited
+        result = await switch(world, session, world.other_id)
+        canceled = await world.runner.cancel(session)
+        return session, other, run, result, canceled
 
-    asyncio.run(go())
+    session, other, run, result, canceled = asyncio.run(go())
+    assert result["ok"] and session.template_id == world.other_id
+    assert other.session_id not in world.runner._sessions
+    assert run in session.runs and run.session_id == session.session_id
+    assert world.runner._runs_by_token["t"] is run
+    assert canceled["canceling"] == ["r"]  # Cancel all covers it
+
+
+def test_a_departed_pair_still_starting_takes_or_just_opened_is_refused(world):
+    async def go():
+        session = await world.open()
+        other, run = await departed_pair_with_a_take(world)
+        # Opened from the Launcher, its page not loaded yet.
+        with pytest.raises(SdkError) as just_opened:
+            await switch(world, session, world.other_id)
+        world.runner.note_claim(other.session_id)
+        other.generating = 1  # its Generate is still submitting
+        with pytest.raises(SdkError) as busy:
+            await switch(world, session, world.other_id)
+        other.generating = 0
+        world.runner.note_claim(other.session_id)
+        world.owners[other.session_id] = {"session_id": "tab-9", "status": "orphaned"}
+        with pytest.raises(SdkError) as live:
+            await switch(world, session, world.other_id)
+        return session, other, run, just_opened.value, busy.value, live.value
+
+    session, other, run, just_opened, busy, live = asyncio.run(go())
+    assert "just opened" in str(just_opened)
+    assert str(busy) == "That workflow is still starting takes. Try again in a moment."
+    assert "another tab" in str(live)
+    assert {e.code for e in (just_opened, busy, live)} == {"workflow_open_elsewhere"}
+    assert other.runs == [run] and session.template_id == world.template_id
 
 
 def test_a_waiting_switch_never_stalls_other_opens(world):
@@ -207,6 +246,26 @@ def test_a_workflow_that_cannot_drive_the_editor_is_refused(world, monkeypatch):
         return session
 
     assert asyncio.run(go()).template_id == world.template_id
+
+
+def test_open_and_switch_refuse_a_workflow_whose_nodes_are_missing_now(world):
+    world.missing_classes = {"KSampler"}  # uninstalled since the import
+
+    async def go():
+        with pytest.raises(SdkError) as opened:
+            await world.runner.open_session(world.other_id, PROJECT)
+        world.missing_classes = set()
+        session = await world.open()
+        world.missing_classes = {"KSampler"}
+        with pytest.raises(SdkError) as switched:
+            await switch(world, session, world.other_id)
+        return session, opened.value, switched.value
+
+    session, opened, switched = asyncio.run(go())
+    for error in (opened, switched):
+        assert error.code == "missing_nodes" and error.status == 409
+        assert error.details == {"missing_nodes": ["KSampler"]}
+    assert session.template_id == world.template_id
 
 
 def test_controls_read_and_write_the_new_workflow_and_name_it(world):
@@ -270,7 +329,7 @@ def test_the_workflow_menu_puts_favorites_first_and_hides_hidden_unless_current(
     ids = [w["template_id"] for w in listing["workflows"]]
     assert ids[0] == starred and world.template_id in ids and hidden not in ids
     assert listing["workflows"][0] == {"template_id": starred, "name": "Detailing", "description": "",
-                                       "starter": False, "ok": True, "favorite": True}
+                                       "starter": False, "ok": True, "missing_nodes": [], "favorite": True}
     current = sdk_routes._session_workflows(hidden)
     entry = next(w for w in current["workflows"] if w["template_id"] == hidden)
     assert entry["description"] == "First line" and current["current"] == hidden

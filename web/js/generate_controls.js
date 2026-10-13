@@ -35,7 +35,8 @@ export function generateButtonState(runs, { submitting = false, count = 1 } = {}
     };
 }
 
-// Pure: the progress line for the runs of the current batch.
+// Pure: the progress line for the runs of the current batch. ``detail`` names the
+// workflow of the take it describes: takes keep their own after a switch.
 export function describeBatchProgress(batchRuns, completedTrimmed = 0) {
     const runs = batchRuns || [];
     const total = runs.length + completedTrimmed;
@@ -57,7 +58,7 @@ export function describeBatchProgress(batchRuns, completedTrimmed = 0) {
             progress = count.value / count.max;
         }
     }
-    return { message: `Generating ${index} of ${total}${suffix}`, progress };
+    return { message: `Generating ${index} of ${total}${suffix}`, progress, detail: current?.template_name || null };
 }
 
 // Pure: the toast for a run that just became final, or null. Messages carry no
@@ -100,6 +101,9 @@ export function generateResultNotice(result, requested) {
     if (code === "generate_refused") {
         const problems = Array.isArray(payload.problems) ? payload.problems : [];
         return { tier: "error", message: "This workflow can't generate yet.", detail: problems.join("\n") || null };
+    }
+    if (code === "missing_nodes") {
+        return { tier: "error", message: "This workflow needs nodes that aren't installed.", detail: payload.error || null };
     }
     if (code === "sdk_not_installed" || code === "proxy_not_installed") {
         return {
@@ -250,10 +254,11 @@ export function createGenerateControls({
                 source: "sdk-generate",
                 foreground: true,
                 message: line.message,
+                detail: line.detail,
                 progress: line.progress,
             });
         } else {
-            progressHandle.update({ message: line.message, progress: line.progress });
+            progressHandle.update({ message: line.message, detail: line.detail, progress: line.progress });
         }
     }
 

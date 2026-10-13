@@ -74,14 +74,15 @@ def test_validation_requires_one_editor_a_reachable_save_and_installed_nodes():
     assert "more than one" in " ".join(validate(two)["errors"])
     missing = api_prompt(**{"7": {"class_type": "SomePackNode", "inputs": {}}})
     result = validate(missing)
-    assert not result["ok"] and "SomePackNode" in " ".join(result["errors"])
+    # Importable but unusable: listed, not refused (decision H).
+    assert not result["ok"] and result["errors"] == [] and result["missing_nodes"] == ["SomePackNode"]
     none = {"2": {"class_type": "KSampler", "inputs": {}}}
     assert "no Sonder Editor" in " ".join(validate(none)["errors"])
 
 
 def test_a_retired_sonder_control_workflow_names_the_missing_node():
     result = validate(api_prompt(**{"5": {"class_type": "SonderControl", "inputs": {}}}))
-    assert not result["ok"] and "SonderControl" in " ".join(result["errors"])
+    assert not result["ok"] and result["missing_nodes"] == ["SonderControl"]
 
 
 def test_validation_reports_editor_defaults_and_binding_summary():
@@ -314,3 +315,75 @@ def test_layout_or_notes_alone_count_as_curation_for_the_launcher_summary():
     assert not sdk_templates._has_curation({})
     assert sdk_templates._has_curation({"layout": {"binding:steps": {"advanced": True}}})
     assert sdk_templates._has_curation({"notes": {"note:intro": "x"}})
+
+
+# ── Workflows with missing nodes (decision H) ────────────────────────────────
+
+def missing_prompt():
+    return api_prompt(**{"7": {"class_type": "VAELoaderKJ", "inputs": {}},
+                         "8": {"class_type": "Power Lora Loader (rgthree)", "inputs": {}}})
+
+
+def test_a_workflow_with_missing_nodes_is_stored_listed_and_never_described(user_dir):
+    described = []
+
+    def describe(prompt):
+        described.append(True)
+        return describe_with([SEED_BINDING])(prompt)
+
+    check = lambda p: sdk_templates.validate_template(p, class_lookup=lookup, describe=describe)  # noqa: E731
+    template_id = sdk_templates.import_template(raw(missing_prompt()), source_name="kj.json", validate=check)["template_id"]
+    assert not described
+    listed = sdk_templates.list_templates()
+    assert [t["template_id"] for t in listed] == [template_id]
+    validation = listed[0]["validation"]
+    assert validation["ok"] is False and validation["errors"] == []
+    assert validation["missing_nodes"] == ["Power Lora Loader (rgthree)", "VAELoaderKJ"]
+    # Replace accepts it too, and skips the preset check that would describe it.
+    sdk_templates.replace_template(template_id, raw(missing_prompt()), validate=check)
+    assert not described
+
+
+def test_missing_node_workflows_count_toward_the_cap(user_dir, monkeypatch):
+    monkeypatch.setattr(sdk_templates, "MAX_TEMPLATES", 1)
+    sdk_templates.import_template(raw(missing_prompt()), validate=lambda p: validate(p))
+    with pytest.raises(TemplateError) as exc:
+        sdk_templates.import_template(raw(api_prompt()), validate=lambda p: validate(p))
+    assert exc.value.code == "too_many_templates"
+
+
+def test_the_list_rechecks_only_stored_names_and_revalidates_once_when_installed(user_dir, monkeypatch):
+    installed = set(INSTALLED)
+    monkeypatch.setattr(sdk_templates.control_descriptors, "comfy_class_lookup",
+                        lambda name: object() if name in installed else None)
+    monkeypatch.setattr(sdk_templates, "_revalidated", {})
+    describe = describe_with([SEED_BINDING])
+    monkeypatch.setattr(sdk_templates.control_descriptors, "describe_bindings", lambda p, **kw: describe(p))
+    template_id = sdk_templates.import_template(raw(missing_prompt()), validate=lambda p: validate(p))["template_id"]
+    loads = []
+    real_load = sdk_templates.load_template
+    monkeypatch.setattr(sdk_templates, "load_template", lambda tid: loads.append(tid) or real_load(tid))
+
+    installed.add("VAELoaderKJ")  # one of two installed: still unusable, no workflow file read
+    listed = sdk_templates.list_templates()[0]["validation"]
+    assert listed["missing_nodes"] == ["Power Lora Loader (rgthree)"] and not loads
+
+    installed.add("Power Lora Loader (rgthree)")  # restart with both packs installed
+    for _ in range(2):
+        listed = sdk_templates.list_templates()[0]["validation"]
+        assert listed["ok"] is True and listed["missing_nodes"] == [] and listed["controls"]
+    assert loads == [template_id]  # validated once, then recorded in the meta
+    meta = json.loads((user_dir / "sonder-editor" / "templates" / f"{template_id}.meta.json").read_text("utf-8"))
+    assert meta["validation"]["ok"] is True
+
+
+def test_open_refuses_live_missing_nodes_even_ones_uninstalled_after_import(user_dir):
+    template_id = sdk_templates.import_template(raw(api_prompt(**{"5": {"class_type": "KSampler", "inputs": {}}})),
+                                                validate=lambda p: validate(p))["template_id"]
+    assert sdk_templates.runnable_template(template_id, lookup)[1]["validation"]["ok"]
+    gone = lambda name: None if name == "KSampler" else lookup(name)  # noqa: E731
+    with pytest.raises(TemplateError) as exc:
+        sdk_templates.runnable_template(template_id, gone)
+    assert exc.value.code == "missing_nodes" and exc.value.status == 409
+    assert exc.value.details == {"missing_nodes": ["KSampler"]}
+    assert "KSampler" in str(exc.value) and "restart ComfyUI" in str(exc.value)

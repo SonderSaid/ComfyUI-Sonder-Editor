@@ -31,7 +31,30 @@ state.prefs.showHidden=true;state.projectSearch='b';
 const searched = modules.launcher_projects.visibleProjects(state).map(p=>p.folder);
 const names = modules.launcher_workflows.generatingWorkflows;
 const exitNames = [names([{template_name:'Alpha'},{template_name:'Beta'},{template_name:'Alpha'}], 'Now'), names([{}], 'Now'), names([], 'Now')];
-console.log(JSON.stringify({defaults,invalid,valid,problems,visible,searched,exitNames,sample:modules.launcher_workflows.SAMPLE_PROJECTS_URL}));
+const lw = modules.launcher_workflows, mappings = {
+    'comfyui-kjnodes': [['VAELoaderKJ', 'LTXVAudioVideoMask'], {title_aux: 'KJNodes for ComfyUI'}],
+    'rgthree-comfy': [['Seed (rgthree)'], {title_aux: 'rgthree-comfy', nodename_pattern: ' \\(rgthree\\)$'}],
+    'py-only': [[], {title_aux: 'Python only', nodename_pattern: '(?i)never'}],
+    'dup-a': [['Shared'], {title: 'Pack A'}], 'dup-b': [['Shared'], {title_aux: 'Pack B'}],
+};
+const classes = ['LTXVAudioVideoMask', 'Power Lora Loader (rgthree)', 'Shared', 'VAELoaderKJ', 'Unknown'];
+const missingTemplate = {validation: {ok: false, errors: [], missing_nodes: ['VAELoaderKJ']}};
+const missingCases = {
+    packs: lw.missingNodePacks(classes, mappings),
+    withManager: lw.missingNodesMessage(['VAELoaderKJ', 'Power Lora Loader (rgthree)'], mappings),
+    withoutManager: lw.missingNodesMessage(['VAELoaderKJ'], null),
+    badge: lw.workflowBadge(missingTemplate),
+    problems: modules.launcher_open_bar.pairProblems({}, missingTemplate, {}, {}, mappings).map(p => [p.kind, p.text]),
+    models: [
+        modules.launcher_view.modelMessage({file: 'LTX\\IC Lora\\a.safetensors', relative: 'models/loras/LTX/IC Lora/a.safetensors', path: 'D:\\c\\models\\loras\\LTX\\IC Lora\\a.safetensors', node: 'Load LoRA'}),
+        modules.launcher_view.modelMessage({file: 'LTX/a.safetensors', relative: 'models/loras/LTX/a.safetensors', node: 'Load LoRA'}),
+        modules.launcher_view.modelMessage({file: 'm.pt', folder: null, relative: null, node: 'Odd', input: 'model'}),
+    ],
+};
+const next = modules.launcher_workflows.nextExitNotice;
+const generating = {runs:[{state:'running',template_name:'Alpha'},{state:'landed',template_name:'Beta'}],project:'P'};
+const exitNotices = [next(null, generating), next({generating:1}, {runs:[{state:'landed'}]}, {project:'Q'}), next(null, {runs:[]}), next({generating:2,project:'P',workflow:'Alpha'}, null)];
+console.log(JSON.stringify({defaults,invalid,valid,problems,visible,searched,exitNames,exitNotices,missingCases,sample:modules.launcher_workflows.SAMPLE_PROJECTS_URL}));
 '''.replace('__BASE__', json.dumps(JS.as_uri() + '/'))
     result = subprocess.run(['node', '--input-type=module', '-e', script], capture_output=True, text=True, encoding='utf-8', timeout=30)
     assert result.returncode == 0, result.stderr
@@ -44,4 +67,33 @@ console.log(JSON.stringify({defaults,invalid,valid,problems,visible,searched,exi
     assert value['searched'] == ['b','broken']
     # The exit notice names each running take's own workflow (a session can switch).
     assert value['exitNames'] == ['Alpha and Beta', 'Now', 'Now']
+    # A session that ended (or whose takes another Open absorbed) leaves no stale
+    # "still generating… Cancel" notice behind.
+    assert value['exitNotices'] == [{'generating': 1, 'project': 'P', 'workflow': 'Alpha'},
+                                    {'generating': 0, 'project': 'Q', 'workflow': 'the workflow'}, None, None]
     assert f"({value['sample']})" in (ROOT / 'README.md').read_text(encoding='utf-8')
+    missing = value['missingCases']
+    # Packs by exact class list, then by a pack's name pattern; a class several
+    # packs list names them all; a Python-only pattern is skipped, not fatal.
+    assert missing['packs'] == [
+        {'pack': 'KJNodes for ComfyUI', 'classes': ['LTXVAudioVideoMask', 'VAELoaderKJ']},
+        {'pack': 'rgthree-comfy', 'classes': ['Power Lora Loader (rgthree)']},
+        {'pack': 'Pack A or Pack B', 'classes': ['Shared']},
+        {'pack': '', 'classes': ['Unknown']},
+    ]
+    assert missing['withManager'] == ('Missing node packs: KJNodes for ComfyUI (VAELoaderKJ), rgthree-comfy '
+                                      '(Power Lora Loader (rgthree)). Install them, restart ComfyUI, then reload this page.')
+    assert missing['withoutManager'] == ('Missing nodes: VAELoaderKJ. Install the node packs that provide them, '
+                                         'restart ComfyUI, then reload this page.')
+    assert missing['badge'] == ['Missing nodes', 'bad']
+    assert missing['problems'][0] == ['bad', 'Missing node packs: KJNodes for ComfyUI (VAELoaderKJ). Install them, restart ComfyUI, then reload this page.']
+    assert missing['models'] == [
+        r'a.safetensors → D:\c\models\loras\LTX\IC Lora\a.safetensors (Load LoRA)',
+        'a.safetensors → models/loras/LTX/a.safetensors (Load LoRA)',
+        'm.pt → folder unknown (Odd · model)',
+    ]
+    landing = (JS / 'sdk_landing.js').read_text(encoding='utf-8')
+    gate = landing.split('async function loadNodePacks()', 1)[1].split('\n}', 1)[0]
+    # Fetched once, and only when a listed workflow has missing nodes.
+    assert "state.nodePacks !== undefined || !state.templates.some(t => missingNodes(t).length)" in gate
+    assert "'/v2/customnode/getmappings?mode=cache'" in gate

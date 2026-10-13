@@ -4,6 +4,7 @@ import { mountToastStack } from "./editor_toast_stack.js";
 import { configureNotifications, notifySuccess, notifyWarning } from "./editor_notifications.js";
 import { notificationCoreConfig, subscribeEditorSettings } from "./editor_settings.js";
 import { LAUNCHER_WINDOW_NAME } from "./sdk_setup_client.js";
+import { modelMessage } from "./launcher_view.js";
 import { createMountedControlsHost } from "./controls_host_remote.js";
 
 installComfyApiShim();
@@ -501,7 +502,7 @@ async function runSdkTab() {
             if (missing.length) {
                 notifyWarning(`${missing.length} ${missing.length === 1 ? "model is" : "models are"} missing for ${change.name || "this workflow"}`, {
                     source: "sdk-workflow-switch",
-                    detail: missing.map(item => `${item.file}${item.folder ? ` (models/${item.folder})` : ""}`).join(", "),
+                    detail: missing.map(modelMessage).join("; "),
                 });
             }
         })().catch(() => {});

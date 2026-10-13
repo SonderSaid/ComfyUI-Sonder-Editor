@@ -1,7 +1,9 @@
 import { el, button, component, modelMessage } from './launcher_view.js';
+import { missingNodes, missingNodesHelp, missingNodesMessage } from './launcher_workflows.js';
 
-export function pairProblems(project, template, status, formats = {}) {
+export function pairProblems(project, template, status, formats = {}, nodePacks = null) {
     const result = [], add = (kind, text) => result.push({ kind, text });
+    if (missingNodes(template).length) add('bad', missingNodesMessage(missingNodes(template), nodePacks));
     if (project?.too_new) add('bad', `This project uses storage format ${project.format_version}${project.written_with ? `, saved with Sonder ${project.written_with}` : ''}. Update Sonder to open it.`);
     if (project?.unreadable) add('bad', 'This project can’t be read. Check its project.json in the project folder.');
     for (const text of [...(template?.validation?.errors || []), ...(template?.validation?.blocking || [])]) add('bad', text);
@@ -21,14 +23,15 @@ export function mountOpenBar(state, actions) {
     const template = state.templates.find(t => t.template_id === state.selectedTemplateId);
     const bar = el('footer', 'sl-open'), content = el('div', 'sl-open-content');
     content.append(el('div', 'sl-open-summary', project ? `${project.name || project.folder}${project.scene?.name ? ` · ${project.scene.name}` : ''} with ${template?.name || 'a workflow — choose one'}` : 'Choose a project and a workflow.'));
-    for (const p of pairProblems(project, template, state.status, state.projectData.format_first_release)) content.append(el('div', `sl-problem sl-${p.kind}`, p.text));
+    for (const p of pairProblems(project, template, state.status, state.projectData.format_first_release, state.nodePacks)) content.append(el('div', `sl-problem sl-${p.kind}`, p.text));
+    if (missingNodes(template).length) content.append(missingNodesHelp());
     if (state.openError) {
         content.append(el('div', 'sl-problem sl-bad', state.openError.error));
         content.append(button('Details', actions.openDetails));
     }
     const open = button(state.opening ? '' : state.openError ? 'Try again' : 'Open', actions.open, {
         primary: true, title: 'Open the selected project and workflow (Enter)',
-        disabled: state.opening || !project || !template || !!project.too_new || !!project.reason_code,
+        disabled: state.opening || !project || !template || !!project.too_new || !!project.reason_code || !!missingNodes(template).length,
     });
     if (state.opening) { open.append(el('span', 'sl-spinner', '◌'), document.createTextNode(' Opening…')); }
     bar.append(content, open); return component(bar);

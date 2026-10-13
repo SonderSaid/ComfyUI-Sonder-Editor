@@ -61,6 +61,16 @@ def set_sdk_secret_resolver(resolver: Callable[[str], str | None] | None) -> Non
     _sdk_secret_for_host = resolver
 
 
+# Set by the SDK runner: told the host id of every successful SDK claim, while the
+# registry lock is held, so the runner sees a claim no later than its owner read.
+_sdk_claim_listener: Callable[[str], None] | None = None
+
+
+def set_sdk_claim_listener(listener: Callable[[str], None] | None) -> None:
+    global _sdk_claim_listener
+    _sdk_claim_listener = listener
+
+
 def _sdk_secret(host_id: str) -> str | None:
     resolver = _sdk_secret_for_host
     if resolver is None:
@@ -573,6 +583,12 @@ async def _claim_sdk_session(project_id: str, session_id: str, host_id: str, inf
         _advance_owner_lifecycle_locked(key, events)
         previous = _sessions.get(key)
         _sessions[key] = _make_owner(project_id, host_id, session_id, "sdk", info)
+        listener = _sdk_claim_listener
+        if listener is not None:
+            try:
+                listener(host_id)
+            except Exception:
+                logger.exception("SDK claim listener failed")
         took_over = bool(previous) and previous.get("session_id") != session_id
         _record_diag_event(
             "claim_ok", key,

@@ -1,5 +1,6 @@
 """Literal model checks and effective-prompt admission, not filename guessing."""
 import asyncio
+import os
 import sys
 import types
 
@@ -27,7 +28,8 @@ def test_combo_shapes_empty_folder_and_separator_normalization(combo):
     cls = loader([r"nested\good.safetensors"], combo)
     assert mr.missing_models(prompt("nested/good.safetensors"), lambda _: cls) == []
     missing = mr.missing_models(prompt("missing.gguf"), lambda _: cls)
-    assert missing == [{"file": "missing.gguf", "folder": "checkpoints", "node": "My loader", "node_id": "3", "input": "ckpt_name"}]
+    assert missing == [{"file": "missing.gguf", "folder": "checkpoints", "relative": "models/checkpoints/missing.gguf",
+                        "node": "My loader", "node_id": "3", "input": "ckpt_name"}]
     assert mr.missing_models(prompt("absent.pt"), lambda _: loader([], combo))
 
 
@@ -47,7 +49,9 @@ def test_unknown_folder_requires_unique_nonempty_filename_list(monkeypatch):
         INPUT_TYPES = staticmethod(lambda: {"required": {"model": (["a.pt"],)}})
     fp = types.SimpleNamespace(folder_names_and_paths={"one": (), "two": ()}, get_filename_list=lambda key: ["a.pt"])
     monkeypatch.setitem(sys.modules, "folder_paths", fp)
-    assert mr.missing_models(prompt("b.pt", "model"), lambda _: Other)[0]["folder"] == ""
+    unknown = mr.missing_models(prompt("b.pt", "model"), lambda _: Other)[0]
+    assert unknown["folder"] is None and unknown["relative"] is None
+    assert mr.missing_model_message(unknown) == "b.pt is missing (folder unknown: My loader · model)"
     fp.get_filename_list = lambda key: ["a.pt"] if key == "one" else []
     assert mr.missing_models(prompt("b.pt", "model"), lambda _: Other)[0]["folder"] == "one"
 
@@ -127,3 +131,75 @@ def test_launcher_checks_stored_binding_values(tmp_path, monkeypatch):
         {'ckpt': {'value': 'installed.ckpt', 'sig': sig}}))
     assert not sdk_templates.list_templates(requirements=True)[0]['missing_models']
     assert not sdk_templates.template_requirements(meta['template_id'])['missing_models']
+
+
+def test_a_loader_its_input_name_cannot_place_uses_the_class_map():
+    class MoGe:
+        INPUT_TYPES = staticmethod(lambda: {"required": {"model_name": ([],)}})  # a fresh install lists nothing
+    item = mr.missing_models(prompt("moge_2_vitl_normal_fp16.safetensors", "model_name", "LoadMoGeModel"),
+                             lambda _: MoGe)[0]
+    assert item["folder"] == "geometry_estimation"
+    assert item["relative"] == "models/geometry_estimation/moge_2_vitl_normal_fp16.safetensors"
+
+
+def test_subfolders_are_kept_and_the_category_named_folder_is_preferred(monkeypatch):
+    class Unet:
+        INPUT_TYPES = staticmethod(lambda: {"required": {"unet_name": ([],)}})
+    item = mr.missing_models(prompt(r"LTX\IC Lora\edit.safetensors", "unet_name"), lambda _: Unet)[0]
+    assert item["relative"] == "models/diffusion_models/LTX/IC Lora/edit.safetensors"
+    assert mr.missing_model_message(item) == "edit.safetensors is missing: put it at models/diffusion_models/LTX/IC Lora/edit.safetensors (My loader)"
+    folders = {"diffusion_models": ["/c/models/unet", "/c/models/diffusion_models"], "loras": ["/x/shared/lora-pool"]}
+    monkeypatch.setitem(sys.modules, "folder_paths", types.SimpleNamespace(get_folder_paths=lambda key: folders.get(key, [])))
+    assert mr.target_path(item) == os.path.normpath("/c/models/diffusion_models/LTX/IC Lora/edit.safetensors")
+    # No category-named folder: the first one ComfyUI searches.
+    assert mr.target_path({**item, "folder": "loras"}) == os.path.normpath("/x/shared/lora-pool/LTX/IC Lora/edit.safetensors")
+    assert mr.target_path({**item, "folder": None}) is None
+    assert mr.target_path({**item, "folder": "vae"}) is None
+
+
+@pytest.mark.parametrize("remote, headers, absolute", [
+    ("127.0.0.1", {}, True),
+    ("127.0.0.1", {"Origin": "http://evil.example"}, False),
+    ("192.168.1.20", {}, False),
+])
+def test_the_route_shows_absolute_paths_only_to_a_same_origin_page_on_this_machine(tmp_path, monkeypatch, remote, headers, absolute):
+    from aiohttp import web
+    from aiohttp.test_utils import make_mocked_request
+    from server import sdk_routes
+    monkeypatch.setattr(sdk_templates, "template_requirements", lambda template_id: {
+        "ok": True, "template_id": template_id,
+        "missing_models": [{"file": "a.safetensors", "folder": "vae", "relative": "models/vae/a.safetensors",
+                            "node": "VAE", "node_id": "1", "input": "vae_name"}]})
+    monkeypatch.setitem(sys.modules, "folder_paths", types.SimpleNamespace(
+        get_user_directory=lambda: str(tmp_path), get_folder_paths=lambda key: ["/c/models/vae"]))
+    routes = web.RouteTableDef()
+    sdk_routes.register_sdk_routes(routes, resolve_project=None, remember_event_loop=lambda: None)
+    handler = next(r.handler for r in routes if getattr(r, "path", "").endswith("/requirements"))
+    request = make_mocked_request("GET", "/sonder-editor/sdk/templates/0123456789abcdef/requirements",
+                                  headers={"Host": "127.0.0.1:8188", **headers},
+                                  match_info={"template_id": "0123456789abcdef"})
+    monkeypatch.setattr(type(request), "remote", property(lambda self: remote))
+    body = __import__("json").loads(asyncio.run(handler(request)).body)
+    item = body["missing_models"][0]
+    assert ("path" in item) is absolute
+    if absolute:
+        assert item["path"] == os.path.normpath("/c/models/vae/a.safetensors")
+
+
+@pytest.mark.parametrize("class_type, name, folder", [
+    ("CLIPVisionLoader", "clip_name", "clip_vision"),  # not text_encoders, despite clip_name
+    ("LatentUpscaleModelLoader", "model_name", "latent_upscale_models"),  # not upscale_models
+])
+def test_loaders_whose_input_name_misleads_use_their_own_folder(class_type, name, folder):
+    class Loader:
+        INPUT_TYPES = staticmethod(lambda: {"required": {name: ([],)}})
+    assert mr.missing_models(prompt("x.safetensors", name, class_type), lambda _: Loader)[0]["folder"] == folder
+
+
+def test_the_folder_listing_exactly_the_options_beats_the_input_name(monkeypatch):
+    class Loader:
+        INPUT_TYPES = staticmethod(lambda: {"required": {"clip_name": (["a.safetensors"],)}})
+    fp = types.SimpleNamespace(folder_names_and_paths={"text_encoders": (), "clip_vision": ()},
+                               get_filename_list=lambda key: ["a.safetensors"] if key == "clip_vision" else [])
+    monkeypatch.setitem(sys.modules, "folder_paths", fp)
+    assert mr.missing_models(prompt("b.safetensors", "clip_name", "SomeVisionLoader"), lambda _: Loader)[0]["folder"] == "clip_vision"

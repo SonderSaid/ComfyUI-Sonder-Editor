@@ -166,6 +166,45 @@ To use a proxy you run yourself, set `SONDER_SDK_PROXY_URL` (and
 this machine unless you also set `SONDER_SDK_ALLOW_REMOTE=1`, and it must serve
 this same ComfyUI.
 
+### The Launcher says *Missing node packs*
+
+The workflow uses nodes this ComfyUI doesn't have. The Launcher still imports
+it, marks it **Missing nodes**, and lists the node packs that provide them.
+Without ComfyUI-Manager it lists the node names instead. **Open** stays greyed
+out until every pack is installed.
+
+1. Find the workflow's canvas file: the `.json` shipped next to the API file
+   you imported.
+2. Open the ComfyUI page in your browser and drag that file onto it.
+3. A **Missing node** message appears at the top right. Click
+   **View details**. The **Workflow Overview** panel opens on its **Issues**
+   tab.
+4. Click **Install All**, or **Install** beside each pack. Pack names there
+   can differ slightly from the Launcher's.
+5. Restart ComfyUI when asked, then reload the Launcher page. The workflow
+   loses its **Missing nodes** mark, and **Open** works.
+
+A pack the list names as **no known pack** isn't in ComfyUI-Manager's index.
+Search its node name on [registry.comfy.org](https://registry.comfy.org) or
+ask the workflow's author.
+
+If you have only the API file, or your ComfyUI runs without ComfyUI-Manager
+(no **Install** buttons appear), install each listed pack by hand, following
+that pack's own instructions, then restart ComfyUI. To see pack names instead of
+node names, start ComfyUI with its `--enable-manager` option and reload the
+Launcher.
+
+Models are checked only for nodes that are installed. After the packs are in,
+select the workflow again: their loaders may list more missing models.
+
+**Missing models** are listed beside the workflow when you select it, each with
+the place it goes: the full path on the ComfyUI machine, or
+`models/<folder>/…` from another computer. Put each file exactly there,
+including the subfolders shown (`models/loras/LTX/IC Lora/…`), then click the
+**ComfyUI** status at the top right of the Launcher and **Check again**. A model
+whose row says **folder unknown** belongs to a loader Sonder can't place; check
+the node's own documentation.
+
 ### Why do Sonder App takes show no embedded workflow?
 
 The Sonder App submits the workflow's API form, without the canvas workflow that

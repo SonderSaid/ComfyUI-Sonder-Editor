@@ -6,13 +6,13 @@ import { mountToastStack } from './editor_toast_stack.js';
 import { configureNotifications, notifyError, notifySuccess } from './editor_notifications.js';
 import { getEditorSettings, updateEditorSettings, notificationCoreConfig, subscribeEditorSettings } from './editor_settings.js';
 import { createSonderProject } from './project_create.js';
-import { SDK_SECRET_HEADER, isUnfinishedRun, readSdkSecret, storeSdkSecret, takeSdkExitFlag } from './sdk_host.js';
+import { SDK_SECRET_HEADER, readSdkSecret, storeSdkSecret, takeSdkExitFlag } from './sdk_host.js';
 import { LAUNCHER_WINDOW_NAME, MACHINE_ONLY_MESSAGE } from './sdk_setup_client.js';
 import { register, PRIORITY } from './keyboard_ownership.js';
 import { el, button, mountLauncherStyle, date } from './launcher_view.js';
 import { mountHeader, environmentState } from './launcher_header.js';
 import { downloadCuratedWorkflow } from './launcher_export.js';
-import { generatingWorkflows, mountWorkflows } from './launcher_workflows.js';
+import { missingNodes, mountWorkflows, nextExitNotice } from './launcher_workflows.js';
 import { mountProjects, thumbnailMode } from './launcher_projects.js';
 import { mountOpenBar } from './launcher_open_bar.js';
 import { mountDialog, mountPopup, mountProjectDialog } from './launcher_dialog.js';
@@ -26,6 +26,9 @@ const state = {
     projectData: { workflow_order: [], unreadable: [], linked_hidden_count: 0 },
     selectedProject: '', selectedTemplateId: '', projectSearch: '', workflowSearch: '', workflowExpanded: false,
     prefs: null, sort: { key: 'modified_at', direction: -1 }, opening: false, openError: null, importProblems: null, exitNotice: null,
+    // The Manager's node → pack mappings: undefined until a workflow with missing
+    // nodes is listed, then the payload, or null without the Manager.
+    nodePacks: undefined,
 };
 const json = body => ({ headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
 async function call(path, init = {}) {
@@ -53,6 +56,20 @@ async function checkRequirements() {
     }
     render(true);
 }
+// Fetched once per page, and only when a listed workflow has missing nodes: the
+// Manager's mappings are large. Same origin; without the Manager, class names show.
+async function loadNodePacks() {
+    if (state.nodePacks !== undefined || !state.templates.some(t => missingNodes(t).length)) return;
+    state.nodePacks = null;
+    const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 15000);
+    try {
+        const resp = await fetch(api.apiURL('/v2/customnode/getmappings?mode=cache'), { signal: controller.signal });
+        const payload = resp.ok ? await resp.json() : null;
+        if (payload && typeof payload === 'object' && !Array.isArray(payload)) state.nodePacks = payload;
+    } catch { /* no Manager, or it did not answer: class names stand alone */ }
+    finally { clearTimeout(timer); }
+    if (active && state.nodePacks) render(true);
+}
 function selectProject(folder, focus = false) {
     const changed = state.selectedProject !== folder;
     state.selectedProject = folder;
@@ -78,10 +95,12 @@ async function refresh() {
     }
     const hidden = state.memory.hidden?.workflows || [];
     if (previous !== state.selectedProject || !state.templates.some(t => t.template_id === state.selectedTemplateId && (state.prefs.showHidden || !hidden.includes(t.template_id)))) {
-        state.selectedTemplateId = chosenProject()?.workflow || state.projectData.workflow_order.find(id => !hidden.includes(id)) || '';
+        const unusable = new Set(state.templates.filter(t => missingNodes(t).length).map(t => t.template_id));
+        state.selectedTemplateId = chosenProject()?.workflow || state.projectData.workflow_order.find(id => !hidden.includes(id) && !unusable.has(id)) || '';
     }
     render();
     void checkRequirements();
+    void loadNodePacks();
     scheduleThumbnailPoll();
 }
 // Thumbnails: the page asks only for tiles in view, newest first, and polls while any
@@ -296,13 +315,18 @@ async function pollExitSession() {
     try {
         const payload = await call(`/sonder-editor/sdk/session/${encodeURIComponent(exitFlag.session_id)}/status`, { headers: { [SDK_SECRET_HEADER]: readSdkSecret(exitFlag.session_id) } });
         if (!active) return;
-        const unfinished = (payload.runs || []).filter(isUnfinishedRun), generating = unfinished.length;
-        const workflow = generatingWorkflows(unfinished, payload.template_name || chosenTemplate()?.name || 'the workflow');
-        const next = generating || state.exitNotice ? { generating, project: payload.project || exitFlag.project, workflow } : null;
-        // The first Cancel click must survive an unchanged polling result.
-        if (JSON.stringify(next) !== JSON.stringify(state.exitNotice)) { state.exitNotice = next; root.querySelector('[data-sonder-exit-notice]')?.replaceWith(exitNotice()); }
-        if (generating) exitPollTimer = setTimeout(() => void pollExitSession(), 2000);
-    } catch (err) { if (active && err.payload?.code !== 'session_ended') exitPollTimer = setTimeout(() => void pollExitSession(), 5000); }
+        showExitNotice(nextExitNotice(state.exitNotice, payload, { project: exitFlag.project, workflow: chosenTemplate()?.name }));
+        if (state.exitNotice?.generating) exitPollTimer = setTimeout(() => void pollExitSession(), 2000);
+    } catch (err) {
+        if (!active) return;
+        if (err.payload?.code === 'session_ended') showExitNotice(nextExitNotice(state.exitNotice, null));
+        else exitPollTimer = setTimeout(() => void pollExitSession(), 5000);
+    }
+}
+function showExitNotice(next) {
+    // The first Cancel click must survive an unchanged polling result.
+    if (JSON.stringify(next) === JSON.stringify(state.exitNotice)) return;
+    state.exitNotice = next; root.querySelector('[data-sonder-exit-notice]')?.replaceWith(exitNotice());
 }
 const actions = {
     statusMenu, settingsMenu, preference, workflowMenu, projectMenu, create: createProject, thumbnailsVisible,

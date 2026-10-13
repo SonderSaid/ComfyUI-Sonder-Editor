@@ -19,7 +19,7 @@ from typing import Any, Awaitable, Callable
 
 from aiohttp import web
 
-from . import control_descriptors, launcher_state, sdk_install, sdk_proxy, sdk_templates
+from . import control_descriptors, launcher_state, model_requirements, sdk_install, sdk_proxy, sdk_templates
 from .request_locality import is_loopback_request, local_only_response
 from .sdk_install import install_state
 from .sdk_runner import SdkError, await_template_io, get_runner
@@ -105,6 +105,7 @@ def _session_workflows(current: str) -> dict:
             "description": _first_line(template.get("description")),
             "starter": bool(template.get("starter")),
             "ok": bool(validation.get("ok", True)) and not validation.get("blocking"),
+            "missing_nodes": list(validation.get("missing_nodes") or []),
             "favorite": tid in favorites,
         })
     return {"ok": True, "current": current, "workflows": workflows}
@@ -248,7 +249,14 @@ def register_sdk_routes(
     @handle
     async def api_sdk_template_requirements(request: web.Request) -> web.Response:
         template_id = sdk_templates.check_template_id(request.match_info.get("template_id"))
-        return web.json_response(await asyncio.to_thread(sdk_templates.template_requirements, template_id))
+        result = await asyncio.to_thread(sdk_templates.template_requirements, template_id)
+        # Where each file goes on disk is shown only to a browser on the ComfyUI
+        # machine, on a same-origin page; others see the models/... form.
+        from .routes import _same_origin_request
+        if is_loopback_request(request) and _same_origin_request(request):
+            for item in result.get("missing_models", []):
+                item["path"] = model_requirements.target_path(item)
+        return web.json_response(result)
 
     @routes.get("/sonder-editor/sdk/templates/{template_id}/export")
     @handle

@@ -190,11 +190,12 @@ def record_open(folder: Any, template_id: Any, *, clock: Callable[[], float] = t
     return _update(mutate)
 
 
-def preferred_workflow(state: dict, folder: str, available: list[str]) -> str:
+def preferred_workflow(state: dict, folder: str, available: list[str], unusable=()) -> str:
     """The workflow to preselect for ``folder``: its last one, else the last used anywhere,
-    else the first available. Hidden or deleted workflows are skipped; "" when none fits."""
-    hidden = set(state["hidden"]["workflows"])
-    usable = [template_id for template_id in available if template_id not in hidden]
+    else the first available. Hidden, deleted and ``unusable`` workflows (nodes missing)
+    are skipped; "" when none fits."""
+    skipped = set(state["hidden"]["workflows"]) | set(unusable)
+    usable = [template_id for template_id in available if template_id not in skipped]
     last = state["last_workflow"]
     for candidate in (last["by_project"].get(folder, {}).get("template_id", ""),
                       last["any"].get("template_id", "")):

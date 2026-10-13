@@ -31,8 +31,12 @@ export function date(value) {
     const d = new Date(time);
     return time && !Number.isNaN(d.getTime()) ? d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }) : '';
 }
+// Where a missing model goes: the absolute file on the ComfyUI machine, else
+// models/<folder>/<the value's own subfolders>/<file>.
 export function modelMessage(item) {
-    return `${item.file} → ${item.folder ? `models/${item.folder}` : 'model folder'} (${item.node})`;
+    const name = String(item.file || '').split(/[\\/]/).pop();
+    const target = item.path || item.relative;
+    return target ? `${name} → ${target} (${item.node})` : `${name} → folder unknown (${item.node} · ${item.input || ''})`;
 }
 export function badge(label, kind = '') { return el('span', `sl-badge ${kind}`, label); }
 export function mountLauncherStyle() {

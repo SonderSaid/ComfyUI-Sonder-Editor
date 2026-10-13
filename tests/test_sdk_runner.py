@@ -137,7 +137,11 @@ class World:
             sdk_ready=lambda: True,
             describe=self.describe,
             clock=lambda: self.now[0],
+            # Every node of the test workflows counts as installed unless a test
+            # names some in ``missing_classes``.
+            node_lookup=lambda name: None if name in self.missing_classes else object(),
         )
+        self.missing_classes = set()
         validation = {"ok": True, "errors": [], "blocking": [], "warnings": []}
         self.template_id = sdk_templates.import_template(
             json.dumps(template_prompt()).encode(), source_name="i2va.json",
@@ -920,3 +924,272 @@ def test_generate_stamps_the_apps_controls_delta_for_provenance(world):
         assert delta["hidden"] == ["steps001"]
         assert delta["seed_modes"] == {"abcd1234": "fixed"}
         assert delta["local"]["abcd1234"]["targets"] == [{"path": "5", "input": "seed", "class_type": "KSampler"}]
+
+
+# ── Absorbing a sibling session's unfinished takes ───────────────────────────
+
+def import_other(name="Detailing"):
+    return sdk_templates.import_template(json.dumps(template_prompt()).encode(), source_name=f"{name}.json", name=name,
+                                         validate=lambda p: {"ok": True, "errors": []})["template_id"]
+
+
+async def left_mid_batch(world, count=2):
+    """A claimed session whose tab Exited while its takes still generate."""
+    session = await world.open()
+    world.runner.note_claim(session.session_id)
+    await world.runner.generate(session, tab_session_id="tab-1", count=count)
+    world.owners.pop(session.session_id)
+    return session
+
+
+async def open_pair(world, template_id, tab="tab-2"):
+    result = await world.runner.open_session(template_id, PROJECT)
+    session = world.runner.session_for(result["session_id"], result["secret"])
+    world.owners[session.session_id] = {"session_id": tab, "status": "active"}
+    world.runner.note_claim(session.session_id)
+    return session
+
+
+def test_an_open_takes_over_a_departed_sessions_unfinished_takes(world):
+    async def go():
+        old = await left_mid_batch(world, count=3)
+        landed = old.runs[0]
+        world.runner.apply_run_finished({"run_token": landed.token, "prompt_id": landed.prompt_id, "outcome": "success"})
+        moving = old.unfinished()
+        world.events.clear()
+        new = await open_pair(world, import_other())
+        return old, new, landed, moving
+
+    old, new, landed, moving = asyncio.run(go())
+    assert old.session_id not in world.runner._sessions
+    assert new.runs == moving and all(run.session_id == new.session_id for run in moving)
+    assert landed not in new.runs  # already announced where it landed
+    # Still tracked: by token, by progress watch, and in the new session's status.
+    assert all(world.runner._runs_by_token[run.token] is run for run in moving)
+    assert all(sdk_runner.sdk_progress._WATCHED[run.prompt_id]["token"] == run.token for run in moving)
+    snapshot = world.events[-1][1]
+    assert snapshot["session_id"] == new.session_id
+    assert [run["run_id"] for run in snapshot["runs"]] == [run.run_id for run in moving]
+    assert {run["template_name"] for run in snapshot["runs"]} == {"i2va"}
+
+
+@pytest.mark.parametrize("status", ["active", "orphaned"])
+def test_a_session_a_tab_still_holds_is_never_absorbed(world, status):
+    async def go():
+        old = await left_mid_batch(world)
+        world.owners[old.session_id] = {"session_id": "tab-1", "status": status}
+        new = await open_pair(world, import_other())
+        return old, new
+
+    old, new = asyncio.run(go())
+    assert old.session_id in world.runner._sessions and len(old.unfinished()) == 2 and not new.runs
+
+
+def test_a_reopened_pair_keeps_its_takes_until_its_page_claims_or_the_grace_passes(world):
+    async def go():
+        old = await left_mid_batch(world)
+        # The Launcher reopens the same pair; its page has not claimed yet.
+        assert (await world.runner.open_session(world.template_id, PROJECT))["session_id"] == old.session_id
+        other = import_other()
+        first = await open_pair(world, other)
+        kept = (len(old.unfinished()), len(first.runs))
+        world.owners.pop(first.session_id)
+        world.now[0] += sdk_runner.SWITCH_PAIR_GRACE_SEC + 1
+        second = await open_pair(world, other)
+        return old, first, second, kept
+
+    old, first, second, kept = asyncio.run(go())
+    assert kept == (2, 0)
+    assert first is second and len(second.unfinished()) == 2
+    assert old.session_id not in world.runner._sessions
+
+
+def test_a_claim_since_the_reopen_makes_the_takes_absorbable_at_once(world):
+    async def go():
+        old = await left_mid_batch(world)
+        await world.runner.open_session(world.template_id, PROJECT)
+        world.runner.note_claim(old.session_id)  # its page loaded, then Exited again
+        return old, await open_pair(world, import_other())
+
+    old, new = asyncio.run(go())
+    assert len(new.unfinished()) == 2 and old.session_id not in world.runner._sessions
+
+
+def test_a_generate_still_sending_is_never_absorbed(world):
+    async def go():
+        old = await world.open()
+        world.runner.note_claim(old.session_id)
+        gate = asyncio.Event()
+        world.client.on_submit = lambda graph: gate.wait() if len(world.client.submitted) == 1 else None
+        generating = asyncio.create_task(world.runner.generate(old, tab_session_id="tab-1", count=2))
+        for _ in range(500):
+            if old.runs:
+                break
+            await asyncio.sleep(0.005)
+        world.owners.pop(old.session_id)  # Exit while the batch is still submitting
+        world.now[0] += sdk_runner.SWITCH_PAIR_GRACE_SEC + 1
+        other = import_other()
+        new = await open_pair(world, other)
+        during = (old.session_id in world.runner._sessions, len(new.runs))
+        gate.set()
+        await generating
+        world.owners.pop(new.session_id)
+        again = await open_pair(world, other)
+        return old, again, during
+
+    old, again, during = asyncio.run(go())
+    assert during == (True, 0)
+    assert len(again.unfinished()) == 2 and all(run.session_id == again.session_id for run in again.runs)
+    assert old.session_id not in world.runner._sessions
+
+
+def test_absorbed_takes_finish_progress_and_cancel_in_their_new_session(world):
+    async def go():
+        await left_mid_batch(world)
+        new = await open_pair(world, import_other())
+        first, second = new.unfinished()
+        world.queue.running = [(0, first.prompt_id, {})]
+        await asyncio.sleep(sdk_runner.STATUS_MIN_INTERVAL_SEC + 0.05)  # past the open's own snapshot
+        world.events.clear()
+        await world.runner.presence_tick()
+        running = first.state
+        assert world.events and world.events[-1][1]["session_id"] == new.session_id
+        world.runner.apply_run_finished({"run_token": first.token, "prompt_id": first.prompt_id, "outcome": "success"})
+        landed_event = world.events[-1][1]
+        canceled = await world.runner.cancel(new)
+        return new, first, second, running, landed_event, canceled
+
+    new, first, second, running, landed_event, canceled = asyncio.run(go())
+    assert running == RUNNING and first.state == LANDED
+    assert landed_event["session_id"] == new.session_id
+    assert next(r for r in landed_event["runs"] if r["run_id"] == first.run_id)["state"] == LANDED
+    assert canceled["canceling"] == [second.run_id] and second.cancel_requested
+
+
+def test_absorbed_takes_may_exceed_the_cap_and_generate_waits_under_it(world):
+    async def go():
+        old = await world.open()
+        world.runner.note_claim(old.session_id)
+        for _ in range(2):
+            await world.runner.generate(old, tab_session_id="tab-1", count=8)
+        world.owners.pop(old.session_id)
+        new = await open_pair(world, import_other())
+        await world.runner.generate(new, tab_session_id="tab-2")  # 16 + 1 absorbed would be refused
+        return new
+
+    with pytest.raises(SdkError) as exc:
+        asyncio.run(go())
+    assert exc.value.code == "too_many_runs"
+
+
+def test_an_open_absorbs_before_the_session_cap(world, monkeypatch):
+    monkeypatch.setattr(sdk_runner, "MAX_SESSIONS", 1)
+
+    async def go():
+        old = await left_mid_batch(world)
+        new = await open_pair(world, import_other())
+        return old, new
+
+    old, new = asyncio.run(go())
+    assert list(world.runner._sessions) == [new.session_id] and len(new.unfinished()) == 2
+
+
+def test_a_claim_during_the_owner_read_keeps_the_siblings_takes(world):
+    async def go():
+        old = await left_mid_batch(world)
+        real = world.get_owner
+
+        async def owner_then_claim(project, host_id=""):
+            owner = await real(project, host_id=host_id)
+            if host_id == old.session_id:
+                world.runner.note_claim(old.session_id)  # its tab came back meanwhile
+            return owner
+
+        world.runner._get_owner = owner_then_claim
+        new = await open_pair(world, import_other())
+        return old, new
+
+    old, new = asyncio.run(go())
+    assert old.session_id in world.runner._sessions and len(old.unfinished()) == 2 and not new.runs
+
+
+def test_housekeeping_during_a_reopen_never_hands_out_a_dropped_session(world):
+    async def go():
+        held = await left_mid_batch(world)
+        # Its tab is back: the Open reads its owner (and so awaits) but keeps it.
+        world.owners[held.session_id] = {"session_id": "tab-1", "status": "active"}
+        other = import_other()
+        idle = await open_pair(world, other)
+        world.owners.pop(idle.session_id)
+        world.now[0] += sdk_runner.SESSION_IDLE_SEC + 1
+        real = world.get_owner
+        swept = []
+
+        async def owner_with_housekeeping(project, host_id=""):
+            if host_id == held.session_id and not swept:
+                swept.append(True)
+                await world.runner.housekeeping()  # runs while the reopen reads owners
+            return await real(project, host_id=host_id)
+
+        world.runner._get_owner = owner_with_housekeeping
+        result = await world.runner.open_session(other, PROJECT)  # the Launcher reopens the idle pair
+        return idle, result, swept
+
+    idle, result, swept = asyncio.run(go())
+    assert swept and result["session_id"] in world.runner._sessions
+
+
+def test_housekeeping_rechecks_a_session_an_open_reused_and_filled_meanwhile(world):
+    async def go():
+        old = await left_mid_batch(world)
+        idle = await open_pair(world, import_other())  # absorbs old's takes, then sits idle
+        moved = list(idle.runs)
+        for run in moved:
+            run.state = QUEUED
+        world.owners.pop(idle.session_id)
+        idle_runs = idle.runs
+        idle.runs = []  # look idle to the first check only
+        world.now[0] += sdk_runner.SESSION_IDLE_SEC + 1
+        real = world.get_owner
+
+        async def owner_then_fill(project, host_id=""):
+            idle.runs = idle_runs  # an Open absorbed takes into it during the read
+            return await real(project, host_id=host_id)
+
+        world.runner._get_owner = owner_then_fill
+        await world.runner.housekeeping()
+        return idle, moved
+
+    idle, moved = asyncio.run(go())
+    assert idle.session_id in world.runner._sessions
+    assert all(world.runner._runs_by_token.get(run.token) is run for run in moved)
+
+
+def test_a_session_whose_generate_is_still_sending_is_never_dropped(world, monkeypatch):
+    monkeypatch.setattr(sdk_runner, "MAX_SESSIONS", 1)
+
+    async def go():
+        session = await world.open()
+        world.owners.pop(session.session_id)
+        session.generating = 1
+        world.now[0] += sdk_runner.SESSION_IDLE_SEC + 1
+        await world.runner.housekeeping()
+        kept = session.session_id in world.runner._sessions
+        with pytest.raises(SdkError) as exc:
+            await world.runner.open_session(import_other(), PROJECT)  # eviction must skip it
+        return kept, exc.value.code
+
+    assert asyncio.run(go()) == (True, "sdk_sessions_busy")
+
+
+def test_generate_names_nodes_missing_since_a_replace(world):
+    async def go():
+        session = await world.open()
+        world.missing_classes = {"KSampler"}
+        with pytest.raises(SdkError) as exc:
+            await world.runner.generate(session, tab_session_id="tab-1")
+        return exc.value
+
+    error = asyncio.run(go())
+    assert error.code == "missing_nodes" and error.details["missing_nodes"] == ["KSampler"]
+    assert not world.client.submitted

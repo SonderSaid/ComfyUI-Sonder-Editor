@@ -211,7 +211,8 @@ function updateForegroundPill(widget, item) {
     if (item.verb) text = prog ? `${item.verb}: ${prog}` : `${item.verb}…`;
     else text = item.message || "Working…";
     pill._label.textContent = text;
-    pill.title = text;
+    // The detail names what the progress belongs to (a Sonder App take's workflow).
+    pill.title = item.detail ? `${text} — ${item.detail}` : text;
     pill.style.display = "inline-flex";
 }
 

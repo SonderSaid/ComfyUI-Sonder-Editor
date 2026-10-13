@@ -421,6 +421,7 @@ out.progress = {
     finishing: gc.describeBatchProgress([{ state: "finishing" }]),
     null_progress: gc.describeBatchProgress([{ state: "running", progress: null }]),
     empty: gc.describeBatchProgress([]),
+    named: gc.describeBatchProgress([{ state: "landed", template_name: "Upscale" }, { state: "running", template_name: "LTX Edit" }]),
 };
 out.toasts_pure = ["landed", "failed", "canceled", "ended", "running"].map((state) =>
     gc.outcomeToast({ state, index: 2, count: 3, note: state === "landed" ? "" : "Because." }));
@@ -436,6 +437,7 @@ out.notices = {
     busy: gc.generateResultNotice({ ok: false, status: 429, payload: { code: "too_many_runs", error: "Too many takes are already waiting." } }, 1),
     proxy: gc.generateResultNotice({ ok: false, status: 503, payload: { code: "proxy_unavailable", error: "No free port." } }, 1),
     network: gc.generateResultNotice({ ok: false, status: 0, payload: { code: "network", error: "Failed to fetch" } }, 1),
+    missing_nodes: gc.generateResultNotice({ ok: false, status: 409, payload: { code: "missing_nodes", error: "This workflow needs nodes that aren't installed: X." } }, 1),
     submit_failed: gc.generateResultNotice({ ok: false, status: 502, payload: { ok: false, run_ids: [], error: { code: "submit_failed", error: "Invalid prompt." } } }, 1),
 };
 out.clamp = [gc.clampGenerateCount(0), gc.clampGenerateCount(3.4), gc.clampGenerateCount(99), gc.clampGenerateCount("x")];
@@ -828,11 +830,18 @@ def test_generate_button_faces(results):
 
 def test_progress_line(results):
     progress = results["progress"]
-    assert progress["queued"] == {"message": "Generating 1 of 2 · waiting in ComfyUI's queue", "progress": None}
-    assert progress["running"] == {"message": "Generating 2 of 3 · Sampler 2/8", "progress": 0.25}
-    assert progress["finishing"] == {"message": "Generating 1 of 1 · saving the take", "progress": None}
+    assert progress["queued"] == {"message": "Generating 1 of 2 · waiting in ComfyUI's queue", "progress": None, "detail": None}
+    assert progress["running"] == {"message": "Generating 2 of 3 · Sampler 2/8", "progress": 0.25, "detail": None}
+    assert progress["finishing"] == {"message": "Generating 1 of 1 · saving the take", "progress": None, "detail": None}
+    # The line names the workflow of the take it describes (#21).
+    assert progress["named"]["detail"] == "LTX Edit"
     assert progress["null_progress"]["progress"] is None
     assert progress["empty"] is None
+
+
+def test_a_missing_node_refusal_says_so(results):
+    assert results["notices"]["missing_nodes"] == {"tier": "error", "message": "This workflow needs nodes that aren't installed.",
+                                                  "detail": "This workflow needs nodes that aren't installed: X."}
 
 
 def test_outcome_toasts_carry_no_take_index(results):

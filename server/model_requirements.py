@@ -16,6 +16,14 @@ logger = logging.getLogger(__name__)
 MODEL_EXTENSIONS = {".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".gguf", ".sft"}
 INPUT_FOLDERS = {"ckpt_name": "checkpoints", "lora_name": "loras", "vae_name": "vae",
                  "unet_name": "diffusion_models", "clip_name": "text_encoders", "text_encoder": "text_encoders"}
+# Loaders whose input name says nothing about the folder, or says the wrong one
+# (CLIP Vision's ``clip_name``, the latent upscaler's ``model_name``). A fresh
+# install lists no files, so the option-list match below can't infer them either.
+CLASS_INPUT_FOLDERS = {
+    ("LoadMoGeModel", "model_name"): "geometry_estimation",
+    ("CLIPVisionLoader", "clip_name"): "clip_vision",
+    ("LatentUpscaleModelLoader", "model_name"): "latent_upscale_models",
+}
 
 
 def _normal(value):
@@ -30,19 +38,23 @@ def _absent(value: str, options: tuple[str, ...]) -> bool:
 
 
 def _folder(name: str, class_type: str, options: tuple[str, ...]) -> str:
+    if (class_type, name) in CLASS_INPUT_FOLDERS:
+        return CLASS_INPUT_FOLDERS[(class_type, name)]
+    # The folder whose file list is exactly the options beats a name guess.
+    if options:
+        try:
+            import folder_paths
+            matches = [key for key in folder_paths.folder_names_and_paths
+                       if set(map(_normal, folder_paths.get_filename_list(key))) == set(options)]
+            if len(matches) == 1:
+                return matches[0]
+        except (ImportError, AttributeError, OSError):
+            pass
     if name in INPUT_FOLDERS:
         return INPUT_FOLDERS[name]
     if name in {"upscale_model", "model_name"} and "upscale" in class_type.lower():
         return "upscale_models"
-    if not options:
-        return ""
-    try:
-        import folder_paths
-        matches = [key for key in folder_paths.folder_names_and_paths
-                   if set(map(_normal, folder_paths.get_filename_list(key))) == set(options)]
-        return matches[0] if len(matches) == 1 else ""
-    except (ImportError, AttributeError, OSError):
-        return ""
+    return ""
 
 
 def missing_models(prompt: dict, class_lookup=None, *, input_cache=None, executable_only=False) -> list[dict]:
@@ -80,7 +92,11 @@ def missing_models(prompt: dict, class_lookup=None, *, input_cache=None, executa
                     continue
                 options = tuple(map(_normal, spec["options"]))
                 if _absent(_normal(value), options):
-                    missing.append({"file": value, "folder": _folder(name, class_type, options),
+                    folder = _folder(name, class_type, options) or None
+                    missing.append({"file": value, "folder": folder,
+                                    # Where it goes, the value's own subfolders included:
+                                    # the workflow names the file by that path.
+                                    "relative": f"models/{folder}/{_normal(value)}" if folder else None,
                                     "node": str(node.get("_meta", {}).get("title") or class_type),
                                     "node_id": str(key), "input": name})
         except Exception:
@@ -89,5 +105,25 @@ def missing_models(prompt: dict, class_lookup=None, *, input_cache=None, executa
 
 
 def missing_model_message(item: dict) -> str:
-    where = f" from models/{item['folder']}" if item.get("folder") else ""
-    return f"{item['file']} is missing{where} ({item['node']})"
+    name = os.path.basename(_normal(item["file"]))
+    if item.get("relative"):
+        return f"{name} is missing: put it at {item['relative']} ({item['node']})"
+    return f"{name} is missing (folder unknown: {item['node']} · {item.get('input', '')})"
+
+
+def target_path(item: dict) -> str | None:
+    """The absolute file a missing model belongs at: the category's own folder
+    (``models/diffusion_models`` before the legacy ``models/unet``), else its
+    first one. For a browser on the ComfyUI machine only (the route decides)."""
+    folder = item.get("folder")
+    if not folder:
+        return None
+    try:
+        import folder_paths
+        paths = list(folder_paths.get_folder_paths(folder) or [])
+    except (ImportError, AttributeError, KeyError, OSError):
+        return None
+    if not paths:
+        return None
+    base = next((p for p in paths if os.path.basename(os.path.normpath(p)) == folder), paths[0])
+    return os.path.normpath(os.path.join(base, *_normal(item["file"]).split("/")))
