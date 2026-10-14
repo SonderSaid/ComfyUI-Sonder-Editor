@@ -16,6 +16,7 @@ import server
 import server.routes as routes
 from server import prompt_context
 from server.timeline_state import Asset, AudioTrack, ClipReference, GenerationJob, GuideFrame, LaneConfig, PromptSection, ReferenceEntity, ReferenceItem, ReferenceLaneRecipe, ReferenceMember, Scene, TimelineProject
+from legacy_projects import create_legacy_project
 
 
 class DummyRequest(dict):
@@ -98,7 +99,7 @@ def _route_handler(route_module, method, path):
 def test_prompt_history_route_reads_component_without_loading_model(monkeypatch, tmp_path):
     from server.project_manager import create_project, save_project
     route_module = _load_route_module(monkeypatch)
-    project = create_project("History endpoint", base_dir=str(tmp_path))
+    project = create_legacy_project("History endpoint", tmp_path)  # inline history migrates on save
     history = [{"hash": "test", "sections": [{"channels": {"visual": "frozen"}}]}]
     project.metadata["prompt_history"] = copy.deepcopy(history)
     save_project(project, notify=False)

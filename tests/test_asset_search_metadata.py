@@ -18,6 +18,7 @@ from server import project_manager as pm, project_storage as ps
 from server.timeline_state import Asset
 from test_project_mutation_pipeline_backend import _load_route_module, _route_handler
 from test_project_storage_route_policy import _delete_component, _full_stack
+from legacy_projects import create_legacy_project
 
 ROUTE = "/sonder-editor/project/{project_id}/assets/search-metadata"
 
@@ -34,7 +35,7 @@ TRACKED = [
 
 def _project(tmp_path, *, cold=True):
     """Three assets: tracked metadata, provenance without tracked metadata, and none."""
-    created = pm.create_project("Search metadata", base_dir=str(tmp_path))
+    created = create_legacy_project("Search metadata", tmp_path)
     project = pm.load_project(created.project_dir)
     project.assets = [
         Asset(asset_id="tracked", name="t.mp4", asset_type="video", path="media/t.mp4",

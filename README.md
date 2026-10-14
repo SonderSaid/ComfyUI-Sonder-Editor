@@ -97,7 +97,7 @@ and workflow wired underneath it. **Model templates** carry each model's legal
 frame counts, FPS and resolution rules, so the timeline snaps to what your
 graph can actually render.
 
-Built in: **No Model Template (Free)**, **LTX 2.3**, **MiniMax H3**,
+Built in: **No Model Template (Free)**, **LTX 2.3 / 2.5**, **MiniMax H3**,
 **Wan 2.1 / 2.2 (14B)**, **Wan 2.2 (TI2V-5B)**, **HunyuanVideo 1.5**,
 **CogVideoX 1.5 (T2V)** and **CogVideoX 1.5 (I2V)**. Create your own in
 **Settings ▸ Model Templates**, edit any built-in, or pick Free to lift every
@@ -251,7 +251,7 @@ In the **Sonder App**, the **Workflow** menu at the top of the Controls panel sw
 
 A workflow can carry **presets**: named sets of Controls with captured values that set up one feature (text-to-video, detailing, and so on) in one choice. In **Manage**, choose **+ Preset**, tick **In preset** on the Controls it should set, then **Create**; **Update from current values** recaptures it later. The **Preset** picker at the top of the Controls panel applies one; Controls outside it are left as they are, and it reads **Custom** once a member changes. Presets travel in the saved workflow and in Export (API), and work the same in fullscreen, mounted tabs and the Sonder App. A preset whose Control is gone or refused is disabled and names it, so it can be repaired in Manage; editing one in the Sonder App keeps your copy across re-import, with **Reset to workflow's version**.
 
-**Restore all** under **Manage → Add settings → Exposed before** exposes previously removed Controls again (up to 64 per click).
+**Restore all** under **Manage → + Setting** (beside **+ Note** and **+ Group**) **→ Exposed before** exposes previously removed Controls again (up to 64 per click).
 
 **Clean up unavailable…** in Manage reviews what no longer resolves in the current workflow (a setting whose node was deleted, a leftover exposure marker, saved Sonder App values from an older version of the workflow, preset members pointing at those) and removes only what you leave checked. Preset members are listed one by one, so a kept member leaves its preset repairable. Controls that can be reconnected with **Restore Controls** are kept out of cleanup. On the canvas the cleanup is one Undo step.
 
@@ -336,9 +336,13 @@ ComfyUI still does the generating.
 
 Set it up once, on the ComfyUI machine:
 
-1. In the editor, open **Settings → Sonder App (experimental)** and click
-   **Install**. It adds two pinned packages, `comfy-sdk` 0.4.0 and
-   `comfy-api-proxy` 0.1.6, to ComfyUI's Python. It only ever adds packages: if
+1. On the ComfyUI canvas, double-click an empty spot, type **Sonder Editor** and
+   pick it. On its card, type a project name and create it (or pick one), then
+   click **Open Editor**. Open **Settings**: the **gear (⚙)** at the right end of
+   the toolbar just above the timeline, next to **?**. Scroll to the bottom;
+   **Sonder App (experimental)** is the last section. Click **Install**. It adds
+   two pinned packages, `comfy-sdk` 0.4.0 and `comfy-api-proxy` 0.1.6, to
+   ComfyUI's Python. It only ever adds packages: if
    either is already installed at another version, or installing would change
    something ComfyUI already has, it stops and says so. No restart is needed.
    Install and Uninstall work only from a browser on the ComfyUI machine, and
@@ -362,6 +366,32 @@ after half an hour without a Sonder App session. ComfyUI started with its own TL
 options (`--tls-keyfile`, `--tls-certfile`) isn't supported yet. If setup or
 Generate reports a problem, see
 [Troubleshooting — Sonder App](docs/troubleshooting.md#sonder-app).
+
+### First generation in the Sonder App
+
+For a first take on an empty project:
+
+1. In the Launcher, click your project in the grid, then click the workflow in
+   the **Workflows** list on the left. Click **Open** in the bar at the bottom
+   (or press **Enter**).
+2. In the editor's toolbar, choose the **Model template** that matches the
+   workflow's model (for an LTX workflow, **LTX 2.3 / 2.5**).
+3. Double-click the **Global** lane at the bottom of the timeline and write the
+   scene-wide text. Then double-click the **Prompt** lane below it to add a
+   section and describe what happens.
+4. Leave the timeline without an In/Out selection, so the whole scene
+   generates.
+5. Open the **Controls** tab in the sidebar. If the workflow has a **Preset**
+   menu, pick a preset that generates from nothing (text to video), not one
+   that edits an existing video.
+6. An empty timeline is sent as black frames, so the workflow must run a
+   **full denoise (1.0)**. If **Controls** shows a denoise setting, set it
+   to 1.0.
+7. Click **Generate** in the toolbar. The progress message names the take's
+   workflow; when it finishes, the take lands on a new lane of the timeline.
+
+These are the same steps as [Getting Started](docs/getting-started.md), with
+**Generate** in place of ComfyUI's Run.
 
 ## Example workflows
 

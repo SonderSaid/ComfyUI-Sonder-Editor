@@ -23,11 +23,14 @@ a fresh `[Unreleased]` block.
 - Assets: a take, video, PNG sequence or Save Bridge file made from a workflow with Controls records the values its run used. They show as **Controls at run** in the asset details, with labels, groups and seed modes, and `tracked:` and `field:` search finds them.
 - Manage Controls in fullscreen, mounted tabs and the Sonder App: expose, restore, rebind, rename and annotate settings, with editable Relay rows on the canvas and app-only curation in the Sonder App.
 - Projects carry a stamp of the Sonder Editor version that saved them (this version onward), so a later version can name the update a newer project needs.
-- Arrange Controls and their notes by dragging within and between workflow groups, and filter long option lists with an exact-value choice for capped previews.
+- Arrange Controls and their notes by dragging within and between workflow groups, reorder exposed Editor settings among themselves, and filter long option lists with an exact-value choice for capped previews. Manage adds settings from a **+ Setting** button beside + Note and + Group.
+- Controls in Cards: cards in one row share its height, a Control's note stays in its card (two lines, with More), and a value too long for its field shows in full on hover. Manage/Done no longer moves when you switch.
 - Controls sidebar in fullscreen, mounted tabs and the Sonder App: edit workflow values, seed modes and Markdown notes beside shared take settings.
 - Sonder Control Relay node: a workflow's Controls menu. It exposes existing node settings, a Sonder Selector's feature list included, in the Controls sidebar with labels, groups and Markdown notes, and the Sonder App reads the same menu from an Export (API) workflow. The settings stay on their own nodes, and a copied node is never exposed twice.
 
 ### Changed
+- The built-in **LTX 2.3** model template is now labelled **LTX 2.3 / 2.5**: LTX 2.5 uses the same frame and size rules. Projects and workflows that use it are unchanged.
+- New projects are created in the current project storage format, so a new project no longer shows a storage-upgrade notice. Sonder versions before 0.6.0 can't open them. Existing projects upgrade as before, only when an edit needs it.
 - Controls: Save Video, Save Bridge and Masks Bridge settings appear in Editor; Manage offers more Recommended settings, and Relay rows show groups and Advanced labels.
 - Linking a project folder and turning on external project links now work only in a browser on the ComfyUI machine. Elsewhere, Link project folder and the Settings switch are greyed out and say so. Turning links off and unlinking still work from anywhere.
 - Render queue: a job that is waiting again or has failed shows why on a second line, such as a run interrupted before the job completed. Hover for the full text.

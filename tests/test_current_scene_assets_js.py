@@ -236,6 +236,9 @@ console.log(JSON.stringify({
     wanFps: mod.getTemplateFpsValues(mod.getTemplateById("wan", settings)),
     overrideKeys: Object.keys(settings.modelTemplates.builtinOverrides).sort(),
     isBuiltinLtx: mod.isBuiltinModelTemplate("ltx-2.3"),
+    // An edit saved before the relabel kept the old built-in name: it shows the new one (#40).
+    relabelled: mod.getAllModelTemplates({ modelTemplates: { builtinOverrides: { "ltx-2.3": { ...storedSettings.modelTemplates.builtinOverrides["ltx-2.3"], name: "LTX 2.3" } } } })
+        .find((t) => t.id === "ltx-2.3").name,
 }));
 """.replace("__MODULE_URL__", json.dumps(module_url)).replace("__SETTINGS__", json.dumps(stored_settings))
 
@@ -250,6 +253,7 @@ console.log(JSON.stringify({
     # Override is applied over the code default, identity/builtIn flag preserved.
     assert result["ltxFps"] == [30]
     assert result["ltxName"] == "LTX 2.3 (mine)"
+    assert result["relabelled"] == "LTX 2.3 / 2.5"
     assert result["ltxBuiltIn"] is True
     # Null override dropped → wan resolves to its default fps, not present in overrides.
     assert result["wanFps"] == [16]

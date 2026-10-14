@@ -26,6 +26,7 @@ import pytest
 
 from server import external_links, launcher_thumbnails as lt, project_manager as pm, routes, sdk_templates
 from server.timeline_state import Asset, ClipReference, Scene
+from legacy_projects import create_legacy_project
 
 LINKS = {"on": False}
 
@@ -57,7 +58,7 @@ def write_clip(path, frames=30, size=(64, 36)):
 
 
 def project_with_clip(base, name="Film", *, frames=30):
-    project = pm.create_project(name, base_dir=str(base))
+    project = create_legacy_project(name, base)
     write_clip(Path(project.project_dir) / "media" / "clip.mp4", frames)
     project.assets = [Asset(asset_id="clip", asset_type="video", path="media/clip.mp4", fps=24.0,
                             frame_count=frames, width=64, height=36, duration_sec=frames / 24)]

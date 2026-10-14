@@ -48,6 +48,7 @@ out.views = {
     loading: setup.describeSdkSetup(null),
     error: setup.describeSdkSetup(null, { error: "Couldn't read the Sonder App status." }),
     missing: setup.describeSdkSetup(status()),
+    none: setup.describeSdkSetup(status({ install: { sdk: { installed: false, version: "", supported: false }, proxy: { installed: false, version: "", supported: false }, ready: false } })),
     ready_external: setup.describeSdkSetup(status({ install: installed })),
     ready_ours: setup.describeSdkSetup(status({ install: installed, installer: { job: idleJob, installed_by_sonder: ["comfy-api-proxy"], interrupted: null } })),
     remote: setup.describeSdkSetup(status({ can_manage: false })),
@@ -178,6 +179,8 @@ def test_status_line_and_buttons(results):
     assert v["missing"]["install"] == {"disabled": False, "title": "Install comfy-sdk 0.4.0 and comfy-api-proxy 0.1.6 into ComfyUI's Python"}
     assert v["missing"]["uninstall"]["disabled"] is True
     assert "didn't install" in v["missing"]["uninstall"]["title"]
+    # Neither package is installed: nothing to remove, not "Sonder didn't install these" (#28).
+    assert v["none"]["uninstall"] == {"disabled": True, "title": "Nothing to uninstall"}
     assert v["ready_external"]["line"] == "Installed: comfy-sdk 0.4.0, comfy-api-proxy 0.1.6."
     assert v["ready_external"]["install"] == {"disabled": True, "title": "Both packages are installed"}
     assert v["ready_ours"]["uninstall"] == {"disabled": False, "title": "Remove comfy-api-proxy, which Sonder installed"}

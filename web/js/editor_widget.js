@@ -22980,7 +22980,10 @@ export class EditorWidget {
 
     // The Launcher opens in one named window, so repeated clicks reuse it.
     _openSonderLauncher() {
-        window.open(api.apiURL("/sonder-editor/app"), LAUNCHER_WINDOW_NAME);
+        // fileURL keeps ComfyUI's base path without the /api prefix (the README's
+        // and the shortcut's address); the tab pages' shim has only apiURL.
+        const url = typeof api.fileURL === "function" ? api.fileURL("/sonder-editor/app") : api.apiURL("/sonder-editor/app");
+        window.open(url, LAUNCHER_WINDOW_NAME);
     }
 
     async _loadServerSettings() {

@@ -5,10 +5,16 @@ export const comparePanelRows = (a, b) =>
     String(a.label || "").localeCompare(String(b.label || "")) ||
     a.base.localeCompare(b.base);
 export const canArrange = d => !!d.base && !["missing_id", "duplicate_id"].includes(d.status);
+// Exposed Editor settings arrange among themselves: their own partition, keyed by
+// a name no workflow group can have (group names refuse control characters) and
+// never written to a binding. Their section comes from the node's class.
+export const EDITOR_PARTITION = "\u0000editor";
 
 export function planPanelMove(entries, movingBase, group, beforeBase = null) {
     const moving = entries.find(d => d.base === movingBase);
     if (!moving || !canArrange(moving)) throw Error("This row cannot be arranged. Refresh the panel.");
+    if ((moving.group === EDITOR_PARTITION) !== (group === EDITOR_PARTITION))
+        throw Error("Editor settings stay in Editor, and workflow settings stay outside it.");
     const list = entries.filter(d => d.base !== movingBase && (d.group || "") === group).sort(comparePanelRows);
     const index = beforeBase === null ? list.length : list.findIndex(d => d.base === beforeBase);
     if (index < 0) throw Error("The destination changed. Try again.");

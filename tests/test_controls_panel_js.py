@@ -26,6 +26,8 @@ class El {
     set innerHTML(t){throw Error('HTML parsing is forbidden');}
     get options(){return this.children;}
     setAttribute(k,v){this.attributes[k]=String(v);}
+    removeAttribute(k){if(k==='title')delete this.title;delete this.attributes[k];}
+    closest(sel){for(let n=this;n;n=n.parentElement){for(const part of sel.split(',').map(x=>x.trim())){if(part==='[data-control-target]'?n.dataset?.controlTarget!==undefined:n.tagName===part.toUpperCase())return n;}}return null;}
     addEventListener(k,f){(this.listeners[k]||=[]).push(f);}
     removeEventListener(k,f){this.listeners[k]=(this.listeners[k]||[]).filter(x=>x!==f);}
     dispatch(k,e={}){for(const f of this.listeners[k]||[])f({target:this,preventDefault(){},...e});}
@@ -75,7 +77,7 @@ if(SCENARIO==='markdown'){
     const publish=next=>{view=next;for(const cb of listeners)cb(view);};
     const toggleManage=()=>walk(container).find(n=>n.dataset.controlsManageToggle==='true').dispatch('click');
     const button=(within,text)=>walk(within).find(n=>n.tagName==='BUTTON'&&n.textContent===text);
-    if(['layout','layout-refusal','layout-stale','layout-editor','cancel','note-save','ime','note-refusal','note-then-value','problem-statuses','truncated'].includes(SCENARIO))toggleManage();
+    if(['layout','layout-refusal','layout-stale','layout-editor','editor-reorder','cancel','note-save','ime','note-refusal','note-then-value','problem-statuses','truncated'].includes(SCENARIO))toggleManage();
     const group=name=>walk(container).find(n=>n.dataset.controlsGroup===name);
     const mirror=key=>walk(container).find(n=>n.dataset.controlsMirror===key);
 
@@ -133,11 +135,11 @@ if(SCENARIO==='markdown'){
         // A group named Advanced is an ordinary group now: open like the others.
         assert.equal(group('Advanced').children[1].hidden,false);
         const items=container.children.find(n=>n.dataset.panelDropGroup==='').children.filter(n=>n.dataset.controlTarget);assert.equal(items[0].dataset.controlTarget,'note:intro:text');assert.equal(items[1].dataset.controlTarget,'binding:steps:value');
-        // Editor-section bindings sit in the Editor group after your settings, without a drag handle.
+        // Editor-section bindings sit in the Editor group after your settings; their drag handle shows only in Manage (#7).
         const adv=byTarget('binding:adv:value');assert.ok(editor.contains(adv));
         const editorRows=walk(editor.children[1]).filter(n=>n.dataset.controlsMirror||n.dataset.controlTarget).map(n=>n.dataset.controlsMirror||n.dataset.controlTarget);
         assert.deepEqual(editorRows,['render.takePlacementMuted','render.linkedTakePlacement','batchRender.maxFramesPerChunk','binding:adv:value']);
-        assert.ok(!walk(adv).some(n=>n.dataset.panelDragHandle==='true'));assert.equal(input('binding:adv:value').checked,false);
+        assert.equal(walk(adv).find(n=>n.dataset.panelDragHandle==='true').hidden,true);assert.equal(input('binding:adv:value').checked,false);
         input('binding:adv:value').checked=true;input('binding:adv:value').dispatch('change');await settle();
         assert.deepEqual(calls,[{'binding:adv:value':true}]);
         const muted=walk(mirror('render.takePlacementMuted')).find(n=>n.tagName==='INPUT');muted.checked=true;muted.dispatch('change');
@@ -217,9 +219,21 @@ if(SCENARIO==='markdown'){
         assert.equal(container.style.zoom,'1.2');assert.match(byTarget('binding:steps:value').style.cssText,/border-radius/);
         assert.match(container.children.find(n=>n.dataset.panelDropGroup==='').style.cssText,/grid-template-columns/);
         assert.match(group('Advanced').style.cssText,/grid-column:1 \/ -1/);
-        // A note makes its card span the row; Manage always uses rows.
-        assert.match(byTarget('binding:steps:value').style.cssText,/grid-column:1 \/ -1/);
+        // Cards in a grid row share one height (#4). A noted card keeps its column;
+        // its note clamps to two lines with its text as the tooltip (#11). Manage always uses rows.
+        assert.match(container.children.find(n=>n.dataset.panelDropGroup==='').style.cssText,/align-items:stretch/);
+        const noted=byTarget('binding:steps:value');assert.doesNotMatch(noted.style.cssText,/grid-column:1 \/ -1/);
+        const stepsNote=walk(noted).find(n=>n.dataset.noteTarget==='binding:steps:note');
+        assert.equal(stepsNote.style.webkitLineClamp,'2');assert.equal(stepsNote.title,stepsNote.textContent);
+        const more=walk(noted).find(n=>n.dataset.noteMore==='true');assert.equal(more.hidden,true);stepsNote.scrollHeight=60;stepsNote.clientHeight=30;panel.render();assert.equal(more.hidden,false);assert.equal(more.attributes['aria-expanded'],'false');more.dispatch('click');assert.equal(stepsNote.style.webkitLineClamp,'');assert.equal(more.textContent,'Less');
         toggleManage();assert.doesNotMatch(byTarget('binding:seed:value').style.cssText,/border-radius/);
+        // #5: Manage/Done keeps its place: the search hides without collapsing the row,
+        // the toggle sits in a right-aligned slot sized by a hidden "Manage", and the gutter is stable.
+        const search=walk(container).find(n=>n.dataset.controlsSearch==='true');assert.equal(search.style.visibility,'hidden');
+        const toggle=walk(container).find(n=>n.dataset.controlsManageToggle==='true');assert.equal(toggle.textContent,'Done');
+        assert.match(toggle.parentElement.style.cssText,/margin-left:auto/);
+        const sizer=toggle.parentElement.children.find(n=>n!==toggle);assert.equal(sizer.textContent,'Manage');assert.match(sizer.style.cssText,/visibility:hidden/);
+        assert.match(container.style.cssText,/scrollbar-gutter:stable/);
         settings.layout.scaleControls=1;panel.render();assert.equal(container.style.zoom,'');
     }
     if(SCENARIO==='group-note'){
@@ -378,9 +392,12 @@ if(SCENARIO==='markdown'){
         publish({...view,candidates,suggestions:[{binding_id:'old',label:'Sampler · denoise',targets:[]}],candidates_truncated:true,
             bindings:[...view.bindings,{source:'binding',binding_id:'lost',label:'Lost',kind:null,status:'missing',reason:'gone',order:9,origin:SCENARIO==='manage-sdk'?'local':'authored'}]});
         assert.match(section.textContent,/Recommended/);assert.match(section.textContent,/Narrow the filter/);
-        // Add settings stays folded into one bar, with its counts, until opened.
+        // "+ Setting" sits with + Note and + Group and opens the picker, whose header carries the counts (#8).
         const bar=walk(section).find(n=>n.dataset.controlsAddSettings==='true');assert.equal(bar.attributes['aria-expanded'],'false');
-        assert.match(bar.textContent,/3\+ available · 2 recommended/);bar.dispatch('click');assert.equal(bar.attributes['aria-expanded'],'true');
+        assert.equal(bar.textContent,'+ Setting');assert.ok(['+ Note','+ Group'].every(t=>bar.parentElement.children.some(n=>n.textContent===t)));
+        const pickerHead=walk(section).find(n=>n.dataset.controlsPickerHeader==='true');assert.equal(pickerHead.style.display,'none');
+        bar.dispatch('click');assert.equal(bar.attributes['aria-expanded'],'true');assert.equal(pickerHead.style.display,'flex');
+        assert.match(pickerHead.textContent,/3\+ available · 2 recommended/);
         // The Sonder App lists top-level settings only, and says so.
         assert.equal(/Settings inside subgraphs are exposed from ComfyUI/.test(section.textContent),SCENARIO==='manage-sdk');
         // Nothing greyed out: every listed candidate has an enabled action.
@@ -440,6 +457,33 @@ if(SCENARIO==='markdown'){
         else{assert.equal(calls.length,1);assert.equal(calls[0]['binding:steps:group'],'Advanced');assert.ok(Number.isInteger(calls[0]['binding:steps:order']));
             // A refused arrangement leaves the row in place and never blocks a run.
             if(refuse){assert.equal(row.parentElement.dataset.panelDropGroup,'');assert.equal(notices.length,1);assert.equal(await panel.flushPending(),true);}}
+    }
+    if(SCENARIO==='value-title'){
+        // #9: a clipped value shows in full on hover, and only while clipped.
+        const field=input('binding:steps:value');field.value='123456789012';field.scrollWidth=200;field.clientWidth=50;
+        container.dispatch('mouseover',{target:field});assert.equal(field.title,'123456789012');
+        field.scrollWidth=40;container.dispatch('mouseover',{target:field});assert.equal(field.title,undefined);
+        field.title='Its own tooltip';field.scrollWidth=200;container.dispatch('mouseover',{target:field});assert.equal(field.title,'Its own tooltip');
+        // A list (the long-option picker's choices) never takes a value tooltip.
+        const list=document.createElement('select');list.size=6;byTarget('binding:steps:value').append(list);list.scrollWidth=200;list.clientWidth=50;
+        container.dispatch('mouseover',{target:list});assert.equal(list.title,undefined);
+    }
+    if(SCENARIO==='editor-reorder'){
+        // #7: exposed Editor rows reorder among themselves (only :order is written),
+        // and never move into a workflow group or between workflow rows.
+        const second={source:'binding',binding_id:'adv2',label:'Advance 2',kind:'BOOLEAN',value:false,note:'',status:'ok',order:5,group:'',section:'editor'};
+        publish({...view,bindings:[...view.bindings,second]});await settle();
+        const data={};const transfer={setData(k,v){data[k]=v;},getData(k){return data[k];}};
+        const grip=walk(byTarget('binding:adv2:value')).find(n=>n.dataset.panelDragHandle==='true');assert.equal(grip.hidden,false);
+        container.dispatch('dragstart',{target:grip,dataTransfer:transfer});
+        container.dispatch('drop',{target:byTarget('binding:adv:value'),dataTransfer:transfer});await settle();
+        assert.equal(calls.length,1);assert.ok(Object.keys(calls[0]).length&&Object.keys(calls[0]).every(k=>k.endsWith(':order')));
+        const before=calls.length;
+        container.dispatch('dragstart',{target:grip,dataTransfer:transfer});
+        container.dispatch('drop',{target:group('Advanced').children[0],dataTransfer:transfer});await settle();
+        container.dispatch('dragstart',{target:grip,dataTransfer:transfer});
+        container.dispatch('drop',{target:byTarget('binding:steps:value'),dataTransfer:transfer});await settle();
+        assert.equal(calls.length,before);
     }
     if(SCENARIO==='combo'||SCENARIO==='combo-capped'||SCENARIO==='combo-ime'||SCENARIO==='combo-query'||SCENARIO==='combo-capped-filter'){
         const options=Array.from({length:30},(_,i)=>'option-'+i);
@@ -562,7 +606,7 @@ if(SCENARIO==='markdown'){
 console.log('ok');
 '''
 
-@pytest.mark.parametrize('scenario',['restore-notice','restore-all','description','group-editor-name','editor-focus-refresh','normal-view','manage','manage-sdk','manage-flush','hide-flush','combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','note-refusal','problem-statuses','loading','note-then-value','batch-mirror','search','advanced','advanced-refusal','hidden-pending','cards-scale','group-note','groups-manage','groups-cap'])
+@pytest.mark.parametrize('scenario',['value-title','editor-reorder','restore-notice','restore-all','description','group-editor-name','editor-focus-refresh','normal-view','manage','manage-sdk','manage-flush','hide-flush','combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','note-refusal','problem-statuses','loading','note-then-value','batch-mirror','search','advanced','advanced-refusal','hidden-pending','cards-scale','group-note','groups-manage','groups-cap'])
 def test_controls_panel(scenario, tmp_path):
     node=shutil.which('node')
     if not node:pytest.skip('node required for Controls renderer boundary tests')

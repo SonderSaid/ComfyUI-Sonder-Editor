@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from server.project_manager import create_project, load_project, save_project, list_projects
 from server.timeline_state import ClipReference, Scene
+from legacy_projects import create_legacy_project
 
 
 @pytest.mark.parametrize("raw", [{}, {"known": {"old": [1]}},
@@ -33,7 +34,7 @@ def test_unknown_overlay_preserves_output_and_detached_values(raw):
 
 def test_cas_validated_bytes_skip_parse_but_external_edit_is_parsed(tmp_path, monkeypatch):
     from server import project_manager as pm
-    project = create_project("Validated CAS", base_dir=str(tmp_path))
+    project = create_legacy_project("Validated CAS", tmp_path)  # no storage: the parse-skipping path
     project = load_project(project.project_dir)
     original_load = json.load
     calls = []
@@ -180,7 +181,7 @@ def test_save_cas_rejects_malformed_matching_version_without_changing_bytes_or_s
 
 
 def test_save_cas_read_retries_transient_permission_errors(monkeypatch, tmp_path):
-    project = create_project("CAS Read Retry", base_dir=str(tmp_path))
+    project = create_legacy_project("CAS Read Retry", tmp_path)
     project_file = os.path.abspath(os.path.join(project.project_dir, "project.json"))
     expected = project.modified_at
     original_open = builtins.open
@@ -204,7 +205,7 @@ def test_save_uses_one_exact_serialized_string_for_disk_and_shadow(
         monkeypatch, tmp_path):
     from server import project_manager
 
-    project = create_project("Single Encode", base_dir=str(tmp_path))
+    project = create_legacy_project("Single Encode", tmp_path)  # no storage block to assemble
     project._raw_data["future_project"] = {
         7: ("tuple", {"nested": (1, 2)}),
     }

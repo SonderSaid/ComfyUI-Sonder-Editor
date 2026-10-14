@@ -59,9 +59,9 @@ by this growing-input issue.
 
 ### An older Sonder version refuses a project saved by a newer one
 
-Sonder 0.6.0 moves projects to storage format 3 the first time it saves them;
-after that they need 0.6.0 or newer. Keep the whole project folder, including
-`state/`, when moving it.
+Sonder 0.6.0 moves projects to storage format 3 the first time it saves them,
+and this version creates new projects in it; after that they need 0.6.0 or
+newer. Keep the whole project folder, including `state/`, when moving it.
 
 ### A project won't open, save or extract on Windows
 
@@ -262,8 +262,9 @@ keeps automatically restorable Controls out of its deletion list; unmatched
 items remain available for explicit cleanup.
 
 **Exposed before** contains saved canvas anchors for Controls removed from the
-menu. Open **Manage → Add settings → Exposed before → Restore all** to expose
-them again; above 64 items the button reads **Restore 64**, and can be repeated.
+menu. Open **Manage**, click **+ Setting** (beside **+ Note** and **+ Group**),
+then **Exposed before → Restore all** to expose them again; above 64 items the
+button reads **Restore 64**, and can be repeated.
 An API file's Exposed-before suggestions are not recovery hints: Restore Controls
 recovers listed Controls, not those suggestions. It also does not rebuild
 subgraphs or custom-node settings lost during ComfyUI's API import.

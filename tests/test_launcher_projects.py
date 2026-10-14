@@ -23,6 +23,7 @@ import pytest
 from server import external_links, launcher_state, project_manager as pm, project_storage as ps, sdk_templates
 from server.pack_version import pack_version
 from server.timeline_state import GenerationJob
+from legacy_projects import create_legacy_project
 
 LIST_KEYS = {"project_id", "name", "path", "linked", "fps", "resolution", "scene_count", "clip_count",
              "asset_count", "modified_at"}
@@ -44,7 +45,8 @@ def base(tmp_path):
 
 
 def make(base, name):
-    project = pm.create_project(name, base_dir=str(base))
+    # A legacy document: these tests cover format detection and lazy upgrades.
+    project = create_legacy_project(name, base)
     return project, Path(project.project_dir) / "project.json"
 
 
@@ -163,14 +165,30 @@ def test_format_1_upgrades_to_2_only_with_prompt_history():
     assert ps.next_edit_upgrade(data) == {"from": 1, "to": 2, "when": "prompt_history"}
 
 
+def test_a_new_project_is_created_at_the_current_format_and_reports_no_upgrade(base):
+    project = pm.create_project("Fresh", base_dir=str(base))
+    raw = json.loads((Path(project.project_dir) / "project.json").read_text(encoding="utf-8"))
+    assert raw["storage"]["format_version"] == ps.CURRENT_FORMAT_VERSION
+    assert ps.next_edit_upgrade(raw) is None
+    assert ps.read_prompt_history(pm.load_project(project.project_dir)) == []
+    entry = next(p for p in pm.scan_projects(str(base), detail=True)[0] if p["folder"] == "Fresh")
+    assert entry["upgrade"] is None and entry["format_version"] == ps.CURRENT_FORMAT_VERSION
+    # Creating it again loads it; a legacy project is never rewritten at rest.
+    legacy, path = make(base, "Old")
+    before = path.read_bytes()
+    pm.create_project("Old", base_dir=str(base))
+    pm.load_project(legacy.project_dir)
+    assert path.read_bytes() == before and "storage" not in json.loads(before)
+
+
 def test_saved_format_version_is_what_assemble_for_save_uses(monkeypatch):
     """The predicate and the save path share one rule: patching it changes migration."""
     calls = []
     original = ps.saved_format_version
 
-    def spy(*args):
+    def spy(*args, **kwargs):
         calls.append(args[2:])
-        return original(*args)
+        return original(*args, **kwargs)
 
     monkeypatch.setattr(ps, "saved_format_version", spy)
     project = types.SimpleNamespace(_staged_components={}, project_dir="", _raw_data={})
@@ -205,8 +223,8 @@ def test_a_format_2_save_goes_through_the_shared_rule(tmp_path, monkeypatch):
     seen = []
     original = ps.saved_format_version
 
-    def spy(old, data, staged, bump):
-        result = original(old, data, staged, bump)
+    def spy(old, data, staged, bump, **kwargs):
+        result = original(old, data, staged, bump, **kwargs)
         seen.append((old["format_version"] if old else 0, result))
         return result
 
@@ -221,7 +239,7 @@ def test_a_save_that_drifts_from_the_shared_rule_fails_closed(tmp_path, monkeypa
 
     project, path, _ = fixtures.stored_project(tmp_path, version=2)
     before = path.read_bytes()
-    monkeypatch.setattr(ps, "saved_format_version", lambda *args: 4)  # a rule no save step reaches
+    monkeypatch.setattr(ps, "saved_format_version", lambda *args, **kwargs: 4)  # a rule no save step reaches
     with pytest.raises(ps.ProjectStorageError):
         pm.save_project(project, notify=False)
     assert path.read_bytes() == before

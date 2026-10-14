@@ -27,6 +27,15 @@ const crowded=Array.from({length:100},(_,i)=>({...row(i,0),label:'Row'+String(i)
 const feasible=planPanelMove(crowded,'binding:99','','binding:40');assert.equal(Object.keys(feasible).length,41);
 const expected=crowded.filter(d=>d.base!=='binding:99');expected.splice(40,0,crowded[99]);
 assert.deepEqual(apply(crowded,feasible).sort(comparePanelRows).map(d=>d.base),expected.map(d=>d.base));
+// Editor partition (#7): a reorder inside it writes only :order, never a group,
+// and moves across the Editor boundary are refused both ways.
+const {EDITOR_PARTITION}=await import(URL);
+const ed=[row(10,0,EDITOR_PARTITION),row(11,1,EDITOR_PARTITION),row(12,2,EDITOR_PARTITION),row(13,0),row(14,1)];
+const edMove=planPanelMove(ed,'binding:12',EDITOR_PARTITION,'binding:10');
+assert.ok(Object.keys(edMove).length&&Object.keys(edMove).every(k=>k.endsWith(':order')));
+assert.deepEqual(apply(ed,edMove).filter(d=>d.group===EDITOR_PARTITION).sort(comparePanelRows).map(d=>d.base),['binding:12','binding:10','binding:11']);
+assert.throws(()=>planPanelMove(ed,'binding:12','','binding:13'),/stay in Editor/);
+assert.throws(()=>planPanelMove(ed,'binding:13',EDITOR_PARTITION,'binding:10'),/stay in Editor/);
 let state=1234567;const rnd=()=>{state=(Math.imul(state,1664525)+1013904223)>>>0;return state;};
 for(let trial=0;trial<300;trial++){
     const rows=Array.from({length:25},(_,i)=>row(i,(rnd()%60)-30,i%3?'':'Advanced'));

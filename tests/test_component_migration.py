@@ -9,10 +9,12 @@ import pytest
 
 from server import project_manager as pm, project_storage as ps
 from server.timeline_state import Asset, GenerationJob
+from legacy_projects import create_legacy_project
 
 
 def stored_project(tmp_path, version=2):
-    project = pm.create_project("Migration", base_dir=str(tmp_path))
+    # Built on a legacy document: this fixture writes its own storage block.
+    project = create_legacy_project("Migration", tmp_path)
     root = Path(project.project_dir)
     path = root / "project.json"
     raw = json.loads(path.read_bytes())
@@ -220,7 +222,7 @@ def test_existing_shared_destination_corruption_fails_closed(tmp_path):
 def test_first_component_save_at_183_character_directory(tmp_path, monkeypatch):
     name = "p" * (183 - len(str(tmp_path)) - 1)
     assert name
-    project = pm.create_project(name, base_dir=str(tmp_path))
+    project = create_legacy_project(name, tmp_path)  # its first save migrates it
     root = Path(project.project_dir)
     assert len(str(root)) == 183
     original = (root / "project.json").read_bytes()

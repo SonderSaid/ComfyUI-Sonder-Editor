@@ -54,24 +54,28 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
     const el = make("section");
     el.dataset.controlsManage = "true";
     el.style.cssText = `display:flex;flex-direction:column;gap:${SPACE.s2}px;padding:${SPACE.s2}px;border:1px solid ${COLORS.border};border-radius:${RADIUS.r3}px;background:${COLORS.panel};`;
-    // "Add settings" folds into one bar until opened (ephemeral), so Manage
-    // stays short; a Rebind opens it.
+    // The settings picker opens from "+ Setting" beside "+ Note" and "+ Group"
+    // (ephemeral), so Manage stays short; a Rebind opens it too.
     let open = false;
-    const heading = make("button");
-    heading.type = "button";
-    heading.dataset.controlsAddSettings = "true";
-    heading.style.cssText = `display:flex;justify-content:space-between;align-items:center;gap:${SPACE.s2}px;width:100%;`
-        + `background:none;border:0;padding:0;cursor:pointer;font:${TYPE.fwBold} ${TYPE.t12}px ${FONT.sans};color:${COLORS.text};text-align:left;`;
+    const addSetting = smallButton("+ Setting");
+    addSetting.dataset.controlsAddSettings = "true";
+    addSetting.title = "Expose a workflow setting as a Control";
+    addSetting.setAttribute("aria-expanded", "false");
+    const setOpen = next => {
+        open = next;
+        renderedKey = null;
+        render(lastView || host.getView());
+        if (open) filterInput.focus();
+    };
+    addSetting.addEventListener("click", () => setOpen(!open));
+    const heading = make("div");
+    heading.dataset.controlsPickerHeader = "true";
+    heading.style.cssText = `display:flex;justify-content:space-between;align-items:baseline;gap:${SPACE.s2}px;`
+        + `font:${TYPE.fwBold} ${TYPE.t12}px ${FONT.sans};color:${COLORS.text};`;
     const headingText = make("span", "Add settings");
     const headingCount = make("span");
     headingCount.style.cssText = `font-size:${TYPE.t11}px;font-weight:${TYPE.fwNormal};color:${COLORS.textDim};`;
     heading.append(headingText, headingCount);
-    heading.addEventListener("click", () => {
-        open = !open;
-        renderedKey = null;
-        render(lastView || host.getView());
-        if (open) filterInput.focus();
-    });
     const filterInput = make("input");
     filterInput.type = "search";
     filterInput.placeholder = "Filter by node or setting";
@@ -94,11 +98,13 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
     addGroup.title = "Add an empty group; move Controls into it from their Group menu";
     const noteBox = make("div");
     noteBox.style.cssText = `display:none;flex-direction:column;gap:${SPACE.s1}px;`;
-    footer.append(addNote, addGroup);
+    footer.append(addSetting, addNote, addGroup);
     const description = mountWorkflowDescription(host, { track });
     const presets = mountPresetsManage(host, {track, notify, flushPending, changed});
     const cleanup = mountCleanup(host, {track, notify, flushPending});
-    el.append(description.el, presets.el, heading, filterInput, banner, list, footer, noteBox, cleanup.el);
+    // The action row comes first, so "+ Setting" opens its picker below it.
+    // The note editor opens right under its button, above an open picker.
+    el.append(description.el, presets.el, footer, noteBox, heading, filterInput, banner, list, cleanup.el);
 
     function apply(changes, button) {
         return track(applyNow(changes, button), changes);
@@ -169,8 +175,9 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         const showing = open || !!rebind;
         banner.style.display = rebind ? "flex" : "none";
         bannerText.textContent = rebind ? `Choose a new setting for “${rebind.label}”.` : "";
-        headingText.textContent = `${showing ? "v" : ">"}  ${rebind ? "Rebind" : "Add settings"}`;
-        heading.setAttribute("aria-expanded", String(showing));
+        // A Rebind keeps its own banner; the picker header names what it offers.
+        heading.style.display = open && !rebind ? "flex" : "none";
+        addSetting.setAttribute("aria-expanded", String(open && !rebind));
         const recommendedCount = candidates.filter(c => c.recommended).length;
         headingCount.textContent = view.candidates === undefined ? ""
             : `${candidates.length}${view.candidates_truncated ? "+" : ""} available${recommendedCount ? ` · ${recommendedCount} recommended` : ""}`;
@@ -385,6 +392,9 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
                 else if (filterInput.value) {
                     filterInput.value = "";
                     filterInput.dispatchEvent?.(new Event("input"));
+                } else if (open) {
+                    setOpen(false);
+                    addSetting.focus();
                 } else filterInput.blur();
                 return true;
             }

@@ -25,13 +25,14 @@ from test_project_mutation_pipeline_backend import (
     DummyRequest, _load_route_module, _route_handler)
 from server import project_manager as pm
 from server.timeline_state import Asset
+from legacy_projects import create_legacy_project
 
 ASSET_ID = "frozen-asset"
 
 
 def _project_with_frozen_storage(tmp_path):
     """A saved project carrying both a history and an asset-provenance component."""
-    created = pm.create_project("Storage policy", base_dir=str(tmp_path))
+    created = create_legacy_project("Storage policy", tmp_path)
     project = pm.load_project(created.project_dir)
     project.assets = [Asset(asset_id=ASSET_ID, name="clip.mp4", asset_type="video",
                             path="media/clip.mp4",

@@ -84,7 +84,7 @@ in the toolbar's scene-geometry group.
   recommended duration band show a **⚠** hint when exceeded but never clamp
   your values.
 
-Built-in templates: **No Model Template (Free)**, **LTX 2.3**,
+Built-in templates: **No Model Template (Free)**, **LTX 2.3 / 2.5**,
 **MiniMax H3**, **Wan 2.1 / 2.2 (14B)**, **Wan 2.2 (TI2V-5B)**,
 **HunyuanVideo 1.5**, **CogVideoX 1.5 (T2V)**, and **CogVideoX 1.5 (I2V)**. Manage them in
 **Settings ▸ Model Templates**: create custom templates, edit any built-in

@@ -131,6 +131,8 @@ def validate_preset_changes(view, changes, *, prompt=None, structural=None, inve
                 raise cd.ControlValueError("Reset to the workflow's version is available in the Sonder App.")
             if field == "move" and (not isinstance(raw, dict) or (raw.get("before") is not None and not isinstance(raw["before"], str))):
                 raise cd.ControlValueError("Choose a preset to move before.")
+            if field == "name" and isinstance(raw, str):
+                raw = raw.strip()  # stored trimmed; names saved earlier are not rewritten
             if field in ("name", "description"):
                 limit = cm.LABEL_MAX if field == "name" else cm.DESCRIPTION_MAX
                 if not isinstance(raw, str) or len(raw) > limit or (field == "name" and not raw.strip()):
@@ -156,7 +158,8 @@ def validate_preset_changes(view, changes, *, prompt=None, structural=None, inve
                     raise cd.ControlValueError("This preset id is already in use.")
                 if len(definitions) >= cm.MAX_PRESETS:
                     raise cd.ControlValueError("At most 32 presets fit in one workflow.")
-                entry = {"name": raw.get("name"), "description": raw.get("description", ""),
+                name = raw.get("name")
+                entry = {"name": name.strip() if isinstance(name, str) else name, "description": raw.get("description", ""),
                          "order": min(cm.ORDER_LIMIT, max((p["order"] for p in definitions.values()), default=-1) + 1),
                          "members": _capture(view, raw["members"])}
                 if identity not in cm.read_presets({identity: entry}):

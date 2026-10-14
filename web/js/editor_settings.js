@@ -164,8 +164,11 @@ export const MODEL_TEMPLATE_PARAM_KEYS = ["width", "height", "frames", "fps"];
 export const BUILTIN_MODEL_TEMPLATES = [
     { id: "free", name: "No Model Template", builtIn: true, hard: {}, soft: {} },
     {
+        // LTX 2.5 keeps LTX 2.3's rules (official card, 2026-10-13: width and
+        // height divisible by 32, num_frames % 8 == 1), so one template serves
+        // both; the id stays for saved projects and workflows.
         id: "ltx-2.3",
-        name: "LTX 2.3",
+        name: "LTX 2.3 / 2.5",
         builtIn: true,
         hard: {
             dimensionStep: 32, dimensionOffset: 0, evenLatentDimensions: true,
@@ -1726,15 +1729,23 @@ export function isBuiltinModelTemplate(id) {
     return BUILTIN_MODEL_TEMPLATE_IDS.has(normalizeModelTemplateId(id));
 }
 
+// A built-in's earlier name that an edited override saved with its form (the edit
+// form always saves the name): it shows the built-in's current name instead. A
+// name the user typed differently is kept. Expiry: when no browser still holds
+// an override saved before the relabel (it is browser-local; drop at the next
+// settings-schema reset).
+const PREVIOUS_BUILTIN_NAMES = { "ltx-2.3": "LTX 2.3" };
+
 export function getAllModelTemplates(settings) {
     const overrides = settings?.modelTemplates?.builtinOverrides || {};
     const builtins = BUILTIN_MODEL_TEMPLATES.map((template) => {
         const override = overrides[template.id];
         if (!override) return template;
         // Built-in identity + builtIn flag are preserved; hard/soft (and name) are the edit.
+        const savedName = override.name === PREVIOUS_BUILTIN_NAMES[template.id] ? "" : override.name;
         return {
             ...template,
-            name: override.name || template.name,
+            name: savedName || template.name,
             hard: override.hard,
             soft: override.soft,
         };

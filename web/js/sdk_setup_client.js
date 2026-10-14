@@ -203,6 +203,7 @@ export function describeSdkSetup(status, { requesting = "", error = "" } = {}) {
                 : { disabled: false, title: `Install ${Object.entries(pinned).map(([n, v]) => `${n} ${v}`).join(" and ")} into ComfyUI's Python` };
     const uninstallState = !canManage ? { disabled: true, title: notLocal }
         : running ? { disabled: true, title: "An install or uninstall is running" }
+            : !removable.length && !install.sdk?.installed && !install.proxy?.installed ? { disabled: true, title: "Nothing to uninstall" }
             : !removable.length ? { disabled: true, title: "Sonder didn't install these packages, so it won't remove them" }
                 : { disabled: false, title: `Remove ${removable.join(" and ")}, which Sonder installed` };
     const messages = [];

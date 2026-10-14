@@ -51,10 +51,11 @@ const missingCases = {
         modules.launcher_view.modelMessage({file: 'm.pt', folder: null, relative: null, node: 'Odd', input: 'model'}),
     ],
 };
+const roots = ['/sonder-editor/app', '/api/sonder-editor/app', '/comfy/api/sonder-editor/app', '/comfy/sonder-editor/app/'].map(modules.launcher_header.comfyRoot);
 const next = modules.launcher_workflows.nextExitNotice;
 const generating = {runs:[{state:'running',template_name:'Alpha'},{state:'landed',template_name:'Beta'}],project:'P'};
 const exitNotices = [next(null, generating), next({generating:1}, {runs:[{state:'landed'}]}, {project:'Q'}), next(null, {runs:[]}), next({generating:2,project:'P',workflow:'Alpha'}, null)];
-console.log(JSON.stringify({defaults,invalid,valid,problems,visible,searched,exitNames,exitNotices,missingCases,sample:modules.launcher_workflows.SAMPLE_PROJECTS_URL}));
+console.log(JSON.stringify({defaults,invalid,valid,problems,visible,searched,exitNames,exitNotices,missingCases,roots,sample:modules.launcher_workflows.SAMPLE_PROJECTS_URL}));
 '''.replace('__BASE__', json.dumps(JS.as_uri() + '/'))
     result = subprocess.run(['node', '--input-type=module', '-e', script], capture_output=True, text=True, encoding='utf-8', timeout=30)
     assert result.returncode == 0, result.stderr
@@ -72,6 +73,8 @@ console.log(JSON.stringify({defaults,invalid,valid,problems,visible,searched,exi
     assert value['exitNotices'] == [{'generating': 1, 'project': 'P', 'workflow': 'Alpha'},
                                     {'generating': 0, 'project': 'Q', 'workflow': 'the workflow'}, None, None]
     assert f"({value['sample']})" in (ROOT / 'README.md').read_text(encoding='utf-8')
+    # ComfyUI's logos resolve at its root however the Launcher was opened (#29).
+    assert value['roots'] == ['/', '/', '/comfy/', '/comfy/']
     missing = value['missingCases']
     # Packs by exact class list, then by a pack's name pattern; a class several
     # packs list names them all; a Python-only pattern is skipped, not fatal.

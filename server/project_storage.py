@@ -48,13 +48,18 @@ def _has_inline_payloads(data):
     return has_history or bool(data.get("generation_queue")) or has_provenance
 
 
-def saved_format_version(old, data, staged_names, bump_modified_at):
+def saved_format_version(old, data, staged_names, bump_modified_at, new_project=False):
     """The storage format a save writes, or None when a legacy document stays legacy.
 
     The one authority for when a save upgrades a project's format: ``assemble_for_save``
     decides migration with it, and ``next_edit_upgrade`` predicts from it. ``old`` is
     the on-disk ``storage_of`` result, ``staged_names`` the components the save stages.
+    ``new_project`` is the save that creates the project (no ``project.json`` yet): it
+    is written at the current format, so a new project never reports a legacy
+    upgrade. Existing legacy projects are never rewritten at rest.
     """
+    if old is None and new_project:
+        return CURRENT_FORMAT_VERSION
     if old is None:
         migrates = bump_modified_at and (bool(staged_names) or _has_inline_payloads(data))
         return CURRENT_FORMAT_VERSION if migrates else None
@@ -531,7 +536,7 @@ def stage_prompt_history(project, history):
     staged["prompt_history"] = (copy.deepcopy(base), copy.deepcopy(history))
 
 
-def assemble_for_save(project, data, current, *, bump_modified_at):
+def assemble_for_save(project, data, current, *, bump_modified_at, new_project=False):
     """Called only inside the manager's commit lock; never commits the root."""
     from .project_manager import ProjectVersionConflict, project_conflict_projection
     old = storage_of(current)
@@ -540,7 +545,8 @@ def assemble_for_save(project, data, current, *, bump_modified_at):
         raise ProjectStorageError("A no-bump save cannot stage a frozen component")
     has_history = isinstance(data.get("metadata"), dict) and "prompt_history" in data["metadata"]
     # The one rule for format changes; the steps below must arrive at it (checked at the end).
-    target = saved_format_version(old, data, tuple(staged), bump_modified_at)
+    target = saved_format_version(old, data, tuple(staged), bump_modified_at,
+                                  new_project=new_project and not current)
     migrate = old is None and target is not None
     repack = old is not None and old["format_version"] == 2 and target == 3
     if old is None and not migrate:

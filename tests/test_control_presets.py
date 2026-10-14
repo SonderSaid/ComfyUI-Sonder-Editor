@@ -67,6 +67,17 @@ def test_capture_uses_live_values_and_decimal_seed_members():
         assert validate(v, "create", raw)[1]
 
 
+def test_preset_names_are_stored_trimmed_and_blank_ones_refused():
+    v = view()
+    v["_presets"] = {}
+    changes, refused = validate(v, "create", {"name": "  Create a Clean Plate ", "members": ["steps"]})
+    assert not refused and changes["preset:p:create"]["name"] == "Create a Clean Plate"
+    assert validate(view(), "name", " Detailing v2  ") == ({"preset:p:name": "Detailing v2"}, [])
+    assert validate(view(), "name", "   ")[1]
+    # Only a length past the cap after trimming is refused.
+    assert validate(view(), "name", " " + "x" * cm.LABEL_MAX + " ")[0] == {"preset:p:name": "x" * cm.LABEL_MAX}
+
+
 @pytest.mark.parametrize("mode,number,state", [("randomize", 999, "match"), ("increment", 7, "differs"), ("fixed", 7, "differs")])
 def test_advancing_seed_matches_mode_only(mode, number, state):
     v = view(definition({"seed": {"value": "7", "seed_mode": "randomize"}}))

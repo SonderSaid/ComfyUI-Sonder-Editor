@@ -68,6 +68,8 @@ export function mountPresetsManage(host, { track, notify, flushPending = async (
         return track(work, {[target]: value});
     }
     function saveText(field, input) {
+        // Names are stored trimmed: show what is saved.
+        if (field === "name") input.value = input.value.trim();
         if (draft || !selected || input.value === (current()?.[field] || "")) return;
         void write(field, input.value);
     }
@@ -76,7 +78,7 @@ export function mountPresetsManage(host, { track, notify, flushPending = async (
     save.addEventListener("mousedown", e => e.preventDefault());
     save.addEventListener("click", () => {
         saveText("name", name); saveText("description", description);
-        void write(draft ? "create" : "capture", {members: [...members], ...(draft ? {name: name.value, description: description.value} : {})});
+        void write(draft ? "create" : "capture", {members: [...members], ...(draft ? {name: name.value.trim(), description: description.value} : {})});
     });
     remove.addEventListener("click", () => {
         if (host.capabilities?.hide && !globalThis.confirm(`Delete preset “${current()?.name || name.value}”?`)) return;

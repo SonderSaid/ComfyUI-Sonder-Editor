@@ -3,7 +3,7 @@ import { mountPresets } from "./controls_presets.js";
 import { mountComboPicker, wantsComboPicker } from "./controls_combo_picker.js";
 import { mountManageSection, smallButton } from "./controls_manage.js";
 import { mountPanelArrangement } from "./controls_panel_arrangement.js";
-import { comparePanelRows, canArrange, planPanelMove } from "./controls_panel_layout.js";
+import { EDITOR_PARTITION, comparePanelRows, canArrange, planPanelMove } from "./controls_panel_layout.js";
 import { moveToGroupItems, openGroupMenu, startGroupRename } from "./controls_panel_groups.js";
 import { changesRun } from "./control_targets.js";
 import { openContextMenu } from "./editor_context_menu.js";
@@ -85,10 +85,14 @@ export function mountControlsPanel(container, host) {
     // Target -> reason of its latest refused or unconfirmed save, shown on the row
     // until a newer save of it succeeds or an authoritative view arrives.
     const failed = new Map();
+    // Cards whose note needs its More/Less overflow check on the next frame.
+    const noteChecks = new Set();
+    let noteFrame = 0;
     let validTargets = null,
         layoutSaving = false;
     container.dataset.sonderControlsPanel = "true";
-    container.style.cssText = `display:flex;flex-direction:column;flex:1;min-height:0;overflow:auto;padding:${SPACE.s3}px;gap:${SPACE.s2}px;font:${TYPE.t12}px ${FONT.sans};color:${COLORS.text};`;
+    // A stable gutter: Manage's longer list adding a scrollbar never shifts the header.
+    container.style.cssText = `display:flex;flex-direction:column;flex:1;min-height:0;overflow:auto;scrollbar-gutter:stable;padding:${SPACE.s3}px;gap:${SPACE.s2}px;font:${TYPE.t12}px ${FONT.sans};color:${COLORS.text};`;
     applyNativeControlTheme(container);
 
     // Header: search, a discreet Manage toggle, and the hidden-Advanced line.
@@ -109,7 +113,18 @@ export function mountControlsPanel(container, host) {
     manageButton.dataset.controlsManageToggle = "true";
     manageButton.setAttribute("aria-pressed", "false");
     manageButton.title = "Expose, rename, annotate and arrange Controls";
-    headerTop.append(search, manageButton);
+    // Manage and Done keep one place and size: the slot sits at the right end,
+    // and a hidden "Manage" sizer holds its width (setButtonVariant rewrites the
+    // button's own style on every toggle, so the size lives in the slot).
+    const manageSlot = make("span");
+    manageSlot.style.cssText = "display:inline-flex;flex-direction:column;flex:0 0 auto;margin-left:auto;";
+    const manageSizer = smallButton("Manage");
+    manageSizer.tabIndex = -1;
+    manageSizer.setAttribute("aria-hidden", "true");
+    manageSizer.style.cssText += "height:0;padding-top:0;padding-bottom:0;border-top-width:0;border-bottom-width:0;"
+        + "visibility:hidden;overflow:hidden;";
+    manageSlot.append(manageButton, manageSizer);
+    headerTop.append(search, manageSlot);
     const quietLine = make("button");
     quietLine.type = "button";
     quietLine.dataset.controlsAdvancedLine = "true";
@@ -382,10 +397,10 @@ export function mountControlsPanel(container, host) {
     }
     function layoutEntries() {
         const view = host.getView();
-        // Editor-section settings stay fixed; only Workflow rows arrange.
+        // Exposed Editor settings reorder within their own partition (the
+        // built-in mirrors above them are not rows and stay put).
         return [...(view.bindings || []).map(d => ({ ...d, source: "binding" })), ...(view.notes || [])]
-            .filter(d => !inEditor(d))
-            .map(d => ({ ...d, base: baseOf(d) }));
+            .map(d => ({ ...d, ...(inEditor(d) ? { group: EDITOR_PARTITION } : {}), base: baseOf(d) }));
     }
     async function saveLayout(changes) {
         layoutSaving = true;
@@ -423,6 +438,38 @@ export function mountControlsPanel(container, host) {
         actual.catch(() => {});
         return track(work);
     }
+    // A value too long for its field shows in full on hover (#9): set as the
+    // field's title only while clipped, and only on fields that set none.
+    // Text areas are left out: a long prompt would become a screen-sized tooltip,
+    // and the field already shows its text and resizes.
+    let measure = null;
+    const titledBy = new WeakMap(); // field -> the exact title this handler set
+    function textClipped(field, text) {
+        if (field.tagName !== "SELECT") return field.scrollWidth > field.clientWidth;
+        // A select reports no scroll width: measure its chosen text, leaving room for the arrow.
+        measure = measure || globalThis.document?.createElement?.("canvas")?.getContext?.("2d");
+        if (!measure) return false;
+        measure.font = globalThis.getComputedStyle?.(field)?.font || "";
+        return measure.measureText(text).width > field.clientWidth - 24;
+    }
+    function valueTitle(e) {
+        const field = e.target?.closest?.("input, select");
+        if (!field || !field.closest?.("[data-control-target]") || field.type === "checkbox") return;
+        // A list (the long-option picker's choices) is not one value: a title on it
+        // would show over every option it lists.
+        if (field.tagName === "SELECT" && (field.size > 1 || field.multiple)) return;
+        const ours = titledBy.get(field);
+        if (field.title && field.title !== ours) return; // a tooltip the row set wins
+        const text = field.tagName === "SELECT" ? (field.selectedOptions?.[0]?.textContent || "") : String(field.value || "");
+        if (text && textClipped(field, text)) {
+            field.title = text;
+            titledBy.set(field, text);
+        } else if (ours !== undefined) {
+            if (field.title === ours) field.removeAttribute("title");
+            titledBy.delete(field);
+        }
+    }
+    container.addEventListener("mouseover", valueTitle);
     const arrangement = mountPanelArrangement(container, {
         getEntries: layoutEntries,
         getGroups: () => groupOrder,
@@ -723,11 +770,11 @@ export function mountControlsPanel(container, host) {
         };
         row.el = make("div");
         row.el.dataset.controlTarget = target;
-        if (!inEditor(spec)) {
+        {
             row.grip = make("span", "⋮⋮");
             row.grip.dataset.panelDragHandle = "true";
             row.grip.draggable = true;
-            row.grip.title = "Drag to reorder or move to another group";
+            row.grip.title = inEditor(spec) ? "Drag to reorder within Editor" : "Drag to reorder or move to another group";
             row.grip.setAttribute("aria-label", "Drag to arrange");
             row.grip.style.cssText = `position:absolute;right:${SPACE.s1}px;top:${SPACE.s1}px;cursor:grab;color:${COLORS.textMuted};user-select:none;font-size:${TYPE.t12}px;letter-spacing:-2px;`;
             row.el.append(row.grip);
@@ -835,7 +882,8 @@ export function mountControlsPanel(container, host) {
         const isCards = cards();
         const value = row.optimistic ?? spec.value;
         const stacked = spec.kind === "STRING" && !!spec.multiline;
-        const wide = spec.source === "note" || stacked || !!row.noteText
+        // A Control's note no longer widens its card (#11): it clamps inside it.
+        const wide = spec.source === "note" || stacked
             || (spec.kind === "COMBO" && String(value ?? "").length > LONG_VALUE);
         row.el.style.cssText = S.rowCss({ cards: isCards, wide });
         if (manageOn && row.grip) row.el.style.paddingRight = `${SPACE.s5}px`;
@@ -955,9 +1003,54 @@ export function mountControlsPanel(container, host) {
                 row.note.style.fontStyle = "normal";
                 row.note.style.display = "";
             }
+            if (spec.source !== "note") clampNote(row);
         }
         rowActions(row);
         styleRow(row, spec);
+    }
+    // In Cards, a Control's note shows two lines, with More/Less only when it
+    // runs longer, and its plain text as the tooltip (#11). Rows and Manage show
+    // it whole. The expanded state is ephemeral.
+    function clampNote(row) {
+        const note = row.note, style = note.style;
+        const clamp = cards() && !!row.noteText;
+        if (clamp && !row.noteMore) {
+            row.noteMore = make("button");
+            row.noteMore.type = "button";
+            row.noteMore.dataset.noteMore = "true";
+            row.noteMore.style.cssText = S.quietLineCss;
+            row.noteMore.addEventListener("click", () => { row.noteExpanded = !row.noteExpanded; clampNote(row); });
+            note.after(row.noteMore);
+        }
+        const folded = clamp && !row.noteExpanded;
+        if (folded) {
+            style.display = "-webkit-box";
+            style.webkitLineClamp = "2";
+            style.webkitBoxOrient = "vertical";
+            style.overflow = "hidden";
+        } else {
+            if (style.display === "-webkit-box") style.display = "";
+            style.webkitLineClamp = style.webkitBoxOrient = style.overflow = "";
+        }
+        if (clamp && !manageOn) note.title = note.textContent || "";
+        if (!row.noteMore) return;
+        row.noteMore.textContent = row.noteExpanded ? "Less" : "More";
+        row.noteMore.setAttribute("aria-expanded", String(!!row.noteExpanded));
+        row.noteMore.hidden = true;
+        if (!clamp) return;
+        // Shown only when the note overflows its two lines (or is expanded),
+        // measured once per frame for every note: all reads, then all writes.
+        noteChecks.add(row);
+        noteFrame = noteFrame || requestAnimationFrame(checkNotes);
+    }
+    function checkNotes() {
+        noteFrame = 0;
+        const rowsToCheck = [...noteChecks];
+        noteChecks.clear();
+        // Rechecked here: a later render may have left Cards or cleared the note.
+        const shown = rowsToCheck.map(row => !destroyed && cards() && !!row.noteText && !!row.noteMore
+            && (row.noteExpanded || row.note.scrollHeight > row.note.clientHeight + 1));
+        rowsToCheck.forEach((row, i) => { if (row.noteMore) row.noteMore.hidden = !shown[i]; });
     }
     function render(view = host.getView()) {
         if (destroyed) return;
@@ -1009,7 +1102,8 @@ export function mountControlsPanel(container, host) {
         entries.sort((a, b) => comparePanelRows({ ...a.spec, base: a.target }, { ...b.spec, base: b.target }));
 
         // Header: search (normal view only), the hidden-Advanced line.
-        search.style.display = manageOn ? "none" : "";
+        // Hidden, not removed: the header row keeps its height in Manage.
+        search.style.visibility = manageOn ? "hidden" : "";
         const hidden = hiddenAdvanced(allSpecs, filter);
         const anyAdvanced = hasAdvanced(allSpecs);
         quietLine.textContent = "";
@@ -1242,6 +1336,7 @@ export function mountControlsPanel(container, host) {
             if (manageOn) host.setManage?.(false, "");
             manage?.destroy();
             destroyed = true;
+            container.removeEventListener("mouseover", valueTitle);
             arrangement.destroy();
             presets.destroy();
             restore.destroy();

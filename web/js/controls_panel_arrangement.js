@@ -1,4 +1,4 @@
-import { planPanelMove, comparePanelRows } from "./controls_panel_layout.js";
+import { EDITOR_PARTITION, planPanelMove, comparePanelRows } from "./controls_panel_layout.js";
 import { groupDropChanges } from "./controls_panel_groups.js";
 import { EDITOR_COLORS as COLORS } from "./editor_theme.js";
 
@@ -42,6 +42,9 @@ export function mountPanelArrangement(container, { getEntries, getGroups = () =>
         if (row) {
             const d = entries.find(d => d.base === row.dataset.panelBase);
             if (!d || d.base === moving?.base) return null;
+            // Editor rows and workflow rows never trade places.
+            const from = entries.find(x => x.base === moving?.base);
+            if ((from?.group === EDITOR_PARTITION) !== (d.group === EDITOR_PARTITION)) return null;
             const rect = row.getBoundingClientRect?.(),
                 after = rect && e.clientY > rect.top + rect.height / 2;
             const list = entries
@@ -54,6 +57,8 @@ export function mountPanelArrangement(container, { getEntries, getGroups = () =>
             };
         }
         const zone = ancestor(e.target, n => n.dataset?.panelDropGroup !== undefined, container);
+        // Group zones are workflow-only.
+        if (entries.find(x => x.base === moving?.base)?.group === EDITOR_PARTITION) return null;
         return zone ? { el: zone, group: zone.dataset.panelDropGroup, before: null } : null;
     }
     const start = e => {

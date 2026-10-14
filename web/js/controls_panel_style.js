@@ -7,12 +7,14 @@ import { EDITOR_COLORS as COLORS, FONT, RADIUS, SPACE, TYPE } from "./editor_the
 // The gallery's disclosure toggle is an 18px square (shared_asset_gallery.js).
 const TOGGLE_SIZE = SPACE.s4 + 2;
 
+// Cards in one grid row share its height (the tallest card's), their content
+// centred, so a row of cards reads as one band.
 export const bodyCss = cards => (cards
-    ? `display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:${SPACE.s1 + 2}px;align-items:start;`
+    ? `display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:${SPACE.s1 + 2}px;align-items:stretch;`
     : `display:flex;flex-direction:column;gap:0;`);
 
 export const rowCss = ({ cards, wide }) => (cards
-    ? `display:flex;flex-direction:column;gap:${SPACE.s1}px;min-width:0;position:relative;box-sizing:border-box;`
+    ? `display:flex;flex-direction:column;justify-content:center;gap:${SPACE.s1}px;min-width:0;position:relative;box-sizing:border-box;`
         + `padding:${SPACE.s1 + 2}px ${SPACE.s2}px;background:${COLORS.panelRaised};border:1px solid ${COLORS.border};`
         + `border-radius:${RADIUS.r3}px;${wide ? "grid-column:1 / -1;" : ""}`
     : `display:flex;flex-direction:column;gap:2px;min-width:0;position:relative;box-sizing:border-box;`

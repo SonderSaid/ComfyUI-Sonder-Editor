@@ -313,7 +313,8 @@ def save_project(
                 or (current_data and "storage" in current_data)):
             current_data = _read_project_json(project_file) if os.path.isfile(project_file) else {}
             data = project_storage.assemble_for_save(
-                project, data, current_data, bump_modified_at=bump_modified_at)
+                project, data, current_data, bump_modified_at=bump_modified_at,
+                new_project=expected_absent)
         # The Sonder version that wrote these bytes (every save, repair saves
         # included). Older versions keep the key as an unknown field, so after an
         # older save it can name a newer version; only a too-new-format message

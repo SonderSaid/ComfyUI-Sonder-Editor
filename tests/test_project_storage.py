@@ -8,10 +8,11 @@ import pytest
 
 from server import project_manager as pm, project_storage as ps
 from server.timeline_state import GenerationJob, Asset, Scene
+from legacy_projects import create_legacy_project
 
 
 def legacy_project(tmp_path):
-    project = pm.create_project("Legacy", base_dir=str(tmp_path))
+    project = create_legacy_project("Legacy", tmp_path)
     path = Path(project.project_dir) / "project.json"
     data = json.loads(path.read_text(encoding="utf-8"))
     data["metadata"] = {"other": {"future": [7]}, "prompt_history": [
@@ -216,7 +217,7 @@ def test_gc_keeps_current_previous_and_permanent_legacy_backup(tmp_path):
 
 
 def test_staging_alone_persists_history_on_project_without_inline_history(tmp_path):
-    project = pm.create_project("Empty", base_dir=str(tmp_path))
+    project = create_legacy_project("Empty", tmp_path)
     ps.stage_prompt_history(project, [{"hash": "new"}])
     pm.save_project(project, expected_modified_at=project.modified_at, notify=False)
     assert ps.read_prompt_history(project.project_dir) == [{"hash": "new"}]

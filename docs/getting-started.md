@@ -30,7 +30,7 @@ Click **Open Editor** to enter the fullscreen editing surface.
 ## 3. Pick a model template
 
 In the toolbar, choose the **model template** matching the model your
-workflow uses (e.g. **LTX 2.3**) — the editor then snaps frame counts and
+workflow uses (e.g. **LTX 2.3 / 2.5**) — the editor then snaps frame counts and
 dimensions to what that model expects and warns when you exceed its
 comfortable ranges. Set the scene's resolution, FPS, and duration in the
 same toolbar group. No matching template? Use **No Model Template** and
@@ -112,6 +112,9 @@ combine on the same timeline.
 
 ## 9. Where to go next
 
+- **Generate without the canvas** — the experimental
+  [Sonder App](../README.md#first-generation-in-the-sonder-app) runs the same
+  steps from its own page, with a **Generate** button.
 - **Write in more fields** — the default is one plain prompt box. A
   [Channel Template](prompts.md#channel-templates) splits it into Visual /
   Speech / Sound, or into a model's own fields.
