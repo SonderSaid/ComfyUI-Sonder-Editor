@@ -11,6 +11,8 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+## [0.7.8] - 2026-10-14
+
 ### Fixed
 - Sonder Switch: selected branches run correctly on ComfyUI 0.40+, which now honors lazy scheduling for growing inputs; dormant branches are skipped.
 
