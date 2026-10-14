@@ -102,6 +102,39 @@ class _TensorLike:
         raise RuntimeError("Boolean value of Tensor with more than one value is ambiguous")
 
 
+@pytest.mark.parametrize("native", [False, True], ids=["bare", "native-pair"])
+@pytest.mark.parametrize("value", [None, False, 0, "", [], {}, (0, "payload"), _TensorLike()])
+def test_switch_hook_accepts_executor_pairs_and_bare_values(native, value):
+    lazy = _import_lazy_switches()
+    # Use a distinct supplied key to prove native metadata owns the request name.
+    key = "native.input" if native else "branches.item1"
+    entry = (value, key) if native else value
+    needed = lazy.SonderLazySwitch.check_lazy_status(
+        select=1, branches={"item0": (None, "branches.item0"), "item1": entry},
+    )
+    assert needed == ([key] if value is None else [])
+
+
+@pytest.mark.parametrize("select,branches", [
+    (-1, {"item0": None}), (32, {"item32": None}),
+    (1, {"item0": None}), (0, {}), (0, None),
+])
+def test_switch_hook_does_not_request_missing_or_invalid_selection(select, branches, monkeypatch):
+    lazy = _import_lazy_switches()
+    monkeypatch.setattr(lazy, "MAX_BRANCHES", 32)
+    assert lazy.SonderLazySwitch.check_lazy_status(select=select, branches=branches) == []
+
+
+def test_switch_execute_preserves_tuple_payload_identity():
+    lazy = _import_lazy_switches()
+    payload = (None, "branches.item1")
+    assert lazy.SonderLazySwitch.check_lazy_status(
+        select=1, branches={"item1": (payload, "branches.item1")},
+    ) == []
+    output = lazy.SonderLazySwitch.execute(select=1, branches={"item1": payload})
+    assert output.result[0] is payload
+
+
 def test_gate_condition_rule():
     lazy = _import_lazy_switches()
     gate_open = lazy._gate_open

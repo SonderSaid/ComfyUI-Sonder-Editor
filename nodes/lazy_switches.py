@@ -142,7 +142,18 @@ class SonderLazySwitch(io.ComfyNode, _LazySelectionMixin):
             return []
 
         branch_key = cls._branch_key(idx)
-        if isinstance(branches, dict) and branch_key in branches and branches[branch_key] is None:
+        if not isinstance(branches, dict) or branch_key not in branches:
+            return []
+
+        entry = branches[branch_key]
+        # Native Autogrow wraps hook values with their original input key.
+        # Unwrap only this metadata pair; execute receives the payload itself.
+        if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[1], str):
+            value, input_key = entry
+            return [input_key] if value is None else []
+        # Retain bare-None hook compatibility while that shape is supported;
+        # this does not repair eager scheduling in older ComfyUI cores.
+        if entry is None:
             return [cls._flat_key(branch_key)]
         return []
 

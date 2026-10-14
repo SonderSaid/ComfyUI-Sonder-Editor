@@ -36,6 +36,25 @@ precedence over the bundled binary and must be updated or removed from `PATH`. T
 bundled `imageio-ffmpeg` binary is used as a fallback, but a system ffmpeg is
 more capable across formats.
 
+## Logic nodes
+
+### Sonder Switch runs every branch or reports a selected branch unavailable
+
+Sonder Switch's branch skipping requires ComfyUI **0.40.0 or newer**. Older
+ComfyUI cores can evaluate every connected branch before the Switch selects its
+output because their scheduler misses lazy metadata on growing inputs. Sonder
+does not work around that upstream scheduling defect. A branch also used by
+another active consumer may still run independently of the Switch.
+
+If ComfyUI 0.40+ reports `Selected branch 'itemN' is not available (None)`, update
+Sonder Editor as well, then restart ComfyUI. Older Sonder builds did not recognize
+the executor's lazy-input placeholders, a defect exposed by the scheduler fix.
+The fix preserves existing Switch sockets and connections; rewiring is not needed.
+
+This is a Switch-specific scheduling requirement, not a minimum ComfyUI version
+for the entire node pack. Cluster and Gate use fixed inputs and are unaffected
+by this growing-input issue.
+
 ## Projects & storage
 
 ### An older Sonder version refuses a project saved by a newer one
