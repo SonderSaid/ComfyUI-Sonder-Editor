@@ -52,6 +52,10 @@ def _folder(name: str, class_type: str, options: tuple[str, ...]) -> str:
             pass
     if name in INPUT_FOLDERS:
         return INPUT_FOLDERS[name]
+    # A dynamic row field (``loras.0.lora_name``) is named by its last segment.
+    leaf = name.rsplit(".", 1)[-1]
+    if leaf != name and leaf in INPUT_FOLDERS:
+        return INPUT_FOLDERS[leaf]
     if name in {"upscale_model", "model_name"} and "upscale" in class_type.lower():
         return "upscale_models"
     return ""

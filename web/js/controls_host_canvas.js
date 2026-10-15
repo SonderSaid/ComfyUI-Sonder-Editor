@@ -5,6 +5,7 @@ import {
     resolveCandidate, planRestore, restoreAnchors, restoreDynamicPrompts, setAnchor,
 } from "./control_bindings.js";
 import { syncRelayRows } from "./control_relay_rows.js";
+import { canonical, readRows, writeRows } from "./control_rows.js";
 
 const DESCRIBE_URL = "/sonder-editor/controls/describe";
 const DEBOUNCE_MS = 400;
@@ -266,7 +267,7 @@ export function createCanvasControlsHost({app, api, getEditorNode,
             }
             const d = (raw.bindings || []).find(b => b.binding_id === id);
             const resolved = bindings[id];
-            if (!d || !resolved || resolved.status !== "ok" || !resolved.widget) {
+            if (!d || !resolved || resolved.status !== "ok" || (!resolved.widget && !resolved.rows)) {
                 throw new Error("This setting is unavailable. Refresh the Controls panel.");
             }
             // The graph must still route this binding to the inputs the server
@@ -274,6 +275,15 @@ export function createCanvasControlsHost({app, api, getEditorNode,
             const same = (a, b) => JSON.stringify((a || []).map(t => [String(t.path), t.input]).sort())
                 === JSON.stringify((b || []).map(t => [String(t.path), t.input]).sort());
             if (!same(resolved.targets, d.targets)) throw new Error("This setting moved. Refresh the Controls panel.");
+            if (d.kind === "ROWS") {
+                if (field !== "value" || !resolved.rows || !Array.isArray(value)) throw new Error("This setting is unavailable. Refresh the Controls panel.");
+                if (!resolved.rows.ready) throw new Error("This ComfyUI frontend can't show these rows. Update ComfyUI's frontend to 1.57 or newer.");
+                // The server checked the edit's base against this export; one
+                // write per group, keyed so a second change to it is refused.
+                if (byWidget.has(`rows:${resolved.node.id}/${resolved.rows.group}`)) throw new Error("Two changes address the same rows.");
+                byWidget.set(`rows:${resolved.node.id}/${resolved.rows.group}`, {node: resolved.node, rows: resolved.rows, value, target});
+                continue;
+            }
             if (field === "seed_mode") {
                 if (!resolved.modeWidget) throw new Error("This seed has no native mode widget.");
                 add(resolved.node, resolved.modeWidget, value, target);
@@ -358,7 +368,12 @@ export function createCanvasControlsHost({app, api, getEditorNode,
             if (!sameGraph(id) || (await snapshot(id)).graphHash !== shot.graphHash || !sameGraph(id)) {
                 return refused(changes, "The workflow changed. Try again.");
             }
-            if (!raw.ok) return {ok: false, rejected: raw.rejected || []};
+            if (!raw.ok) {
+                // A refusal can mean the panel's view is behind the graph (a
+                // row list changed natively): re-read it so a retry starts there.
+                schedule();
+                return {ok: false, rejected: raw.rejected || []};
+            }
             if (!await canApply()) return refused(changes, "This tab no longer owns the editor.");
             // An asynchronous permission check can overlap a native graph edit.
             if (!sameGraph(id) || (await snapshot(id)).graphHash !== shot.graphHash || !sameGraph(id)) {
@@ -369,7 +384,7 @@ export function createCanvasControlsHost({app, api, getEditorNode,
             if (typeof tracker?.captureCanvasState !== "function") throw new Error("Workflow history is unavailable.");
             // Native history remains the owner; establish the pre-write state.
             tracker.captureCanvasState();
-            const before = writes.map(({widget}) => widget?.value);
+            const before = writes.map(({node, widget, rows}) => (rows ? readRows(node, rows.group, rows.fieldIds) : widget?.value));
             const touched = new Map();
             let created = null;
             try {
@@ -385,6 +400,16 @@ export function createCanvasControlsHost({app, api, getEditorNode,
                         if (!write.widget) throw new Error("The new Sonder Control Relay has no manifest.");
                     }
                     const {node, widget, value} = write;
+                    if (write.rows) {
+                        // Rows change through the frontend's own count path, then
+                        // each field like a native edit; all in this history step.
+                        writeRows(node, write.rows.group, write.rows.fieldIds, value,
+                            (field, next) => field.callback?.(next, app.canvas, node));
+                        if (canonical(readRows(node, write.rows.group, write.rows.fieldIds)) !== canonical(value)) {
+                            throw new Error("The canvas changed a row value (its step or options), so nothing was saved.");
+                        }
+                        continue;
+                    }
                     widget.value = value;
                     widget.callback?.(value, app.canvas, node);
                     if (widget.value !== value && String(widget.value) !== String(value)) {
@@ -402,8 +427,15 @@ export function createCanvasControlsHost({app, api, getEditorNode,
                 // Restore values and replay callbacks, so state a callback
                 // derives (a Selector's options, its rewritten choice) follows.
                 const restorable = writes.map((write, i) => [write, before[i]]).filter(([write]) => !write.createRelay);
-                for (const [{widget}, value] of restorable) widget.value = value;
-                for (const [{node, widget}, value] of restorable) {
+                for (const [{node, rows}, value] of restorable.filter(([write]) => write.rows)) {
+                    try { writeRows(node, rows.group, rows.fieldIds, value, (field, next) => {
+                        try { field.callback?.(next, app.canvas, node); } catch { /* restored value stands */ }
+                        field.value = next;
+                    }); } catch { /* the graph hash check refuses the next write */ }
+                }
+                const scalars = restorable.filter(([write]) => !write.rows);
+                for (const [{widget}, value] of scalars) widget.value = value;
+                for (const [{node, widget}, value] of scalars) {
                     try { widget.callback?.(value, app.canvas, node); } catch { /* restored value stands */ }
                     widget.value = value;
                 }

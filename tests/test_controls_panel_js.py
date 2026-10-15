@@ -32,7 +32,7 @@ class El {
     removeEventListener(k,f){this.listeners[k]=(this.listeners[k]||[]).filter(x=>x!==f);}
     dispatch(k,e={}){for(const f of this.listeners[k]||[])f({target:this,preventDefault(){},...e});}
     contains(n){return n===this||this.children.some(c=>c.contains?.(n));}
-    focus(){if(document.activeElement!==this){document.activeElement?.blur?.(this);document.activeElement=this;this.dispatch('focus');}}
+    focus(){if(document.activeElement!==this){document.activeElement?.blur?.(this);document.activeElement=this;this.dispatch('focus');for(let n=this.parentElement;n;n=n.parentElement)n.dispatch('focusin',{target:this});}}
     blur(next=document.body){if(document.activeElement===this){const parents=[];for(let n=this.parentElement;n;n=n.parentElement)parents.push(n);document.activeElement=document.body;this.dispatch('blur',{relatedTarget:next});for(const p of parents)p.dispatch('focusout',{target:this,relatedTarget:next});}}
 }
 const events={};globalThis.window={innerWidth:1366,innerHeight:900,addEventListener(k,f){(events[k]||=[]).push(f);},removeEventListener(k,f){events[k]=(events[k]||[]).filter(x=>x!==f);}};
@@ -601,12 +601,81 @@ if(SCENARIO==='markdown'){
         assert.equal(await panel.flushPending(),true);
         }
     }
+    if(SCENARIO==='rows'||SCENARIO==='rows-notice'||SCENARIO==='rows-app'){
+        // A row-list Control (a LoRA stack): one Control, edited as a whole list.
+        const lora=(n,s,e)=>({lora_name:n,strength:s,enabled:e});
+        const first=[lora('a.safetensors',1,false),lora('b.safetensors',0.5,true)];
+        const stack={source:'binding',binding_id:'stack',label:'Load LoRA (Model) · LoRAs',kind:'ROWS',status:'ok',order:2,group:'',section:'workflow',
+            note:'',value:first,group_name:'LoRA',min:1,max:3,new_row:lora('a.safetensors',1,true),
+            fields:[{id:'lora_name',label:'lora_name',kind:'COMBO',options:['a.safetensors','b.safetensors']},{id:'strength',label:'strength',kind:'FLOAT',min:-100,max:100,step:0.01},
+                {id:'enabled',label:'enabled',kind:'BOOLEAN'}],...(SCENARIO==='rows'?{}:{rows_unavailable:true,error:'Add at least 1 LoRA.',value:[]})};
+        if(SCENARIO==='rows-app')host.capabilities={hide:true,removeAuthored:false,serverRows:true};
+        publish({...view,bindings:[...view.bindings,stack]});await settle();
+        const row=byTarget('binding:stack:value');
+        const buttons=()=>walk(row).filter(n=>n.tagName==='BUTTON');
+        if(SCENARIO==='rows-notice'){
+            // The canvas can't edit rows its frontend never built: a notice, not the editor.
+            assert.match(row.textContent,/frontend 1\.57 or newer/);
+            assert.ok(!row.textContent.includes('Add at least 1 LoRA'));
+        }else{
+            assert.ok(!row.textContent.includes('frontend 1.57'));
+            const header=buttons().find(n=>/LoRA/.test(n.textContent)&&n.textContent.includes('·')||n.textContent.includes(SCENARIO==='rows'?'2 LoRAs':'0 LoRAs'));
+            assert.ok(header,'summary header');
+            assert.match(header.textContent,SCENARIO==='rows'?/2 LoRAs · 1 on/:/0 LoRAs · 0 on/);
+            header.dispatch('click');await settle();
+            if(SCENARIO==='rows'){
+                const boxes=walk(row).filter(n=>n.tagName==='INPUT'&&n.type==='checkbox');
+                assert.equal(boxes.length,2);
+                boxes[0].checked=true;boxes[0].dispatch('change');await settle();
+                const turnedOn=[lora('a.safetensors',1,true),lora('b.safetensors',0.5,true)];
+                assert.deepEqual(calls.at(-1),{'binding:stack:value':{rows:turnedOn,base:first}});
+                // The next edit starts from the optimistic list, not the stale view.
+                buttons().find(n=>n.textContent==='+ Add LoRA').dispatch('click');await settle();
+                assert.deepEqual(calls.at(-1)['binding:stack:value'],{rows:[...turnedOn,lora('a.safetensors',1,true)],base:turnedOn});
+                // At the maximum, Add is disabled; a row's Remove sends the list without it.
+                assert.equal(buttons().find(n=>n.textContent==='+ Add LoRA').disabled,true);
+                // A click focuses the button first, as a browser does.
+                const removeFirst=buttons().find(n=>n.attributes['aria-label']==='Remove LoRA 1');
+                removeFirst.focus();removeFirst.dispatch('click');await settle();
+                assert.equal(calls.at(-1)['binding:stack:value'].rows.length,2);
+                assert.equal(calls.at(-1)['binding:stack:value'].rows[0].lora_name,'b.safetensors');
+                // The rows repaint at once (two lines now), and focus stays on a Remove,
+                // so a second click removes the row it shows, not a shifted one.
+                const removeButtons=()=>buttons().filter(n=>/^Remove LoRA/.test(n.attributes['aria-label']||''));
+                assert.equal(removeButtons().length,2);
+                assert.equal(document.activeElement,removeButtons()[0]);
+                const afterRemove=calls.at(-1)['binding:stack:value'].rows;
+                removeButtons()[1].focus();removeButtons()[1].dispatch('click');await settle();
+                assert.deepEqual(calls.at(-1)['binding:stack:value'],{rows:[afterRemove[0]],base:afterRemove});
+                // Escape reverts a typed strength instead of committing it (a
+                // browser fires change on blur when the value changed).
+                const strength=()=>walk(row).find(n=>n.tagName==='INPUT'&&n.type==='number');
+                const field=strength(),sent=calls.length,shown=field.value;
+                field.blur=function(next){if(document.activeElement===this)this.dispatch('change');El.prototype.blur.call(this,next);};
+                field.focus();field.value='7';key('Escape');await settle();
+                assert.equal(calls.length,sent);
+                assert.equal(strength().value,shown);
+                // A refused edit resets the list even while a field has focus,
+                // so the next edit's base is the stored rows, not the refused ones.
+                refuse=true;
+                const typed=strength();typed.focus();typed.value='3';typed.dispatch('change');await settle();
+                refuse=false;
+                assert.equal(strength().value,String(row.dataset.controlTarget&&first[0].strength));
+                strength().focus();strength().value='4';strength().dispatch('change');await settle();
+                assert.deepEqual(calls.at(-1)['binding:stack:value'].base,first);
+            }else{
+                // The Sonder App edits rows a frontend never built: Add works from empty.
+                buttons().find(n=>n.textContent==='+ Add LoRA').dispatch('click');await settle();
+                assert.deepEqual(calls.at(-1),{'binding:stack:value':{rows:[lora('a.safetensors',1,true)],base:[]}});
+            }
+        }
+    }
     panel.destroy();assert.equal(listeners.size,0);assert.equal(container.children.length,0);
 }
 console.log('ok');
 '''
 
-@pytest.mark.parametrize('scenario',['value-title','editor-reorder','restore-notice','restore-all','description','group-editor-name','editor-focus-refresh','normal-view','manage','manage-sdk','manage-flush','hide-flush','combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','note-refusal','problem-statuses','loading','note-then-value','batch-mirror','search','advanced','advanced-refusal','hidden-pending','cards-scale','group-note','groups-manage','groups-cap'])
+@pytest.mark.parametrize('scenario',['value-title','editor-reorder','restore-notice','restore-all','description','group-editor-name','editor-focus-refresh','normal-view','manage','manage-sdk','manage-flush','hide-flush','combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','note-refusal','problem-statuses','loading','note-then-value','batch-mirror','search','advanced','advanced-refusal','hidden-pending','cards-scale','group-note','groups-manage','groups-cap','rows','rows-notice','rows-app'])
 def test_controls_panel(scenario, tmp_path):
     node=shutil.which('node')
     if not node:pytest.skip('node required for Controls renderer boundary tests')

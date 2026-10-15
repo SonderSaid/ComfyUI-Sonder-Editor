@@ -211,16 +211,64 @@ def _power_lora_transform(inputs: dict) -> dict | None:
     }
 
 
+# ComfyUI 0.40's native LoRA stack loaders: one dynamic row group ``loras``
+# whose rows reach the prompt as flat ``loras.<i>.<field>`` keys.
+NATIVE_LORA_STACKS = frozenset({"LoadLoraModel", "LoadLoraTextEncoder"})
+_NATIVE_LORA_KEY = re.compile(r"^loras\.(0|[1-9][0-9]*)\.(lora_name|strength|enabled)$")
+
+
+def _native_lora_transform(inputs: dict) -> dict | None:
+    """Native stack rows in the Power LoRA shape, numbered from 1 in prompt order.
+
+    ``skipped`` marks a row the node does not apply (off or strength 0),
+    matching ``LoadLoraModel.execute``; a row without a file is dropped.
+    """
+    grouped: dict[int, dict[str, Any]] = {}
+    for key, value in inputs.items():
+        match = _NATIVE_LORA_KEY.match(str(key))
+        if match:
+            grouped.setdefault(int(match.group(1)), {})[match.group(2)] = value
+    rows = []
+    for index in sorted(grouped):
+        values = grouped[index]
+        name = values.get("lora_name")
+        if name is None or str(name).strip() in {"", "None", "none"}:
+            continue
+        row = {"slot": len(rows) + 1, "name": str(name), "enabled": values.get("enabled") is not False}
+        if "strength" in values:
+            row["strength"] = values["strength"]
+        if not row["enabled"] or values.get("strength") == 0:
+            row["skipped"] = True
+        rows.append(row)
+    if not rows:
+        return None
+    return {
+        "power_loras": rows,
+        # Rows switched on, as the Power LoRA producer counts them; a row at
+        # strength 0 is on but skipped.
+        "enabled_lora_count": sum(1 for row in rows if row["enabled"]),
+        "total_lora_count": len(rows),
+    }
+
+
 # Compatibility registry. Add a new node-pack handler by appending to this list.
 # Each entry: {"display_type", "predicate", "transform"}.
 #   - predicate(class_type: str) -> bool  : matches the node's prompt class_type.
 #   - transform(inputs: dict)    -> dict|None : structured fields dict, or None to fall through to generic dump.
+#   - header (optional dict)     : extra section keys; ``source_group`` names the
+#     input a row-list Control binds, so Controls at run can mark the rows.
 # First match wins. Schema is additive: handlers don't bump editor_export.schema_version.
 COMPAT_HANDLERS: list[dict] = [
     {
         "display_type": "power_loras",
         "predicate": _is_power_lora_loader,
         "transform": _power_lora_transform,
+    },
+    {
+        "display_type": "native_lora_stack",
+        "predicate": lambda class_type: class_type in NATIVE_LORA_STACKS,
+        "transform": _native_lora_transform,
+        "header": {"source_group": "loras"},
     },
 ]
 
@@ -246,6 +294,7 @@ def _section_from_origin(prompt_key: str, prompt_entry: dict, workflow_node: dic
     handler = _resolve_compat_handler(class_type)
     source_fields: dict | None = None
     display_type: str | None = None
+    header_extra: dict = {}
     if handler is not None:
         try:
             transformed = handler["transform"](inputs)
@@ -254,6 +303,7 @@ def _section_from_origin(prompt_key: str, prompt_entry: dict, workflow_node: dic
         if transformed:
             source_fields = transformed
             display_type = handler["display_type"]
+            header_extra = dict(handler.get("header") or {})
     if source_fields is None:
         source_fields = inputs
 
@@ -263,6 +313,7 @@ def _section_from_origin(prompt_key: str, prompt_entry: dict, workflow_node: dic
             "source_node_id": prompt_key,
             "source_node_class": class_type,
             "source_node_title": title,
+            **header_extra,
         },
         inputs,
         source_fields,

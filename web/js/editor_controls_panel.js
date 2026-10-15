@@ -1,6 +1,7 @@
 import { mountRestore } from "./controls_restore.js";
 import { mountPresets } from "./controls_presets.js";
 import { mountComboPicker, wantsComboPicker } from "./controls_combo_picker.js";
+import { mountRowsEditor, NO_ROWS_NOTICE } from "./controls_rows_editor.js";
 import { mountManageSection, smallButton } from "./controls_manage.js";
 import { mountPanelArrangement } from "./controls_panel_arrangement.js";
 import { EDITOR_PARTITION, comparePanelRows, canArrange, planPanelMove } from "./controls_panel_layout.js";
@@ -531,6 +532,9 @@ export function mountControlsPanel(container, host) {
             if (!result.ok) {
                 failed.set(target, result.rejected?.[0]?.reason || "The change could not be saved.");
                 row[optimisticKey] = undefined;
+                // A row list keeps its own copy while a field has focus; the
+                // next edit's base must be the stored rows, not the refused ones.
+                if (row.rows && target === row.target) row.rows.reset(row.spec.value);
                 if (row.input && target === row.target && (!row.editing || same(readInput(row), value))) {
                     setInput(row, row.spec.value ?? before);
                     row.editStart = readInput(row);
@@ -791,7 +795,17 @@ export function mountControlsPanel(container, host) {
             row.tags.style.cssText = `display:inline-flex;align-items:center;gap:${SPACE.s1}px;flex:0 0 auto;`;
             row.label.append(row.labelText, row.tags);
             row.control = make("div");
-            if (spec.kind === "COMBO" && wantsComboPicker(spec)) {
+            if (spec.kind === "ROWS") {
+                // A row list edits as a whole; each edit carries the list it was made from.
+                row.rows = mountRowsEditor({
+                    commit: (next, before) => commit(row, row.target, { rows: next, base: before }, before),
+                    onEditing: on => {
+                        row.editing = on;
+                        if (!on) render();
+                    },
+                });
+                row.control.append(row.rows.el);
+            } else if (spec.kind === "COMBO" && wantsComboPicker(spec)) {
                 row.picker = mountComboPicker({
                     inputCss: S.inputCss,
                     onLeave: () => {
@@ -812,39 +826,42 @@ export function mountControlsPanel(container, host) {
                     spec.kind === "COMBO" ? "select" : spec.kind === "STRING" && spec.multiline ? "textarea" : "input",
                 );
             }
-            if (row.input.tagName === "INPUT" && !row.picker) {
-                row.input.type =
-                    spec.kind === "BOOLEAN" ? "checkbox" : ["INT", "FLOAT"].includes(spec.kind) ? "number" : "text";
+            // A row list has no single input: its editor owns its fields and listeners.
+            if (!row.rows) {
+                if (row.input.tagName === "INPUT" && !row.picker) {
+                    row.input.type =
+                        spec.kind === "BOOLEAN" ? "checkbox" : ["INT", "FLOAT"].includes(spec.kind) ? "number" : "text";
+                }
+                if (spec.kind === "SEED") row.input.inputMode = "numeric";
+                row.input.dataset.sonderTextUndo = "true";
+                row.input.setAttribute("aria-label", spec.label || "Control value");
+                row.input.id = `controls-${panelId}-${rows.size}`;
+                row.label.htmlFor = row.input.id;
+                if (spec.kind === "COMBO" && !row.picker) {
+                    for (const option of spec.options || []) row.input.append(new Option(String(option), String(option)));
+                }
+                if (spec.min != null) row.input.min = String(spec.min);
+                if (spec.max != null) row.input.max = String(spec.max);
+                if (spec.kind === "INT") row.input.step = "1";
+                if (spec.kind === "FLOAT") row.input.step = String(spec.step || "any");
+                row.control.append(row.picker?.box || row.input);
+                row.input.addEventListener("focus", () => {
+                    if (!row.editing) row.editStart = readInput(row);
+                    row.editing = true;
+                });
+                row.input.addEventListener("change", () => {
+                    if (!row.picker) void commitValue(row);
+                });
+                row.input.addEventListener("blur", () => {
+                    if (row.picker) return;
+                    if (row.input.tagName === "TEXTAREA") void commitValue(row);
+                    row.editing = false;
+                    row.picker?.close();
+                    render();
+                });
+                row.input.addEventListener("compositionstart", () => (row.composing = true));
+                row.input.addEventListener("compositionend", () => (row.composing = false));
             }
-            if (spec.kind === "SEED") row.input.inputMode = "numeric";
-            row.input.dataset.sonderTextUndo = "true";
-            row.input.setAttribute("aria-label", spec.label || "Control value");
-            row.input.id = `controls-${panelId}-${rows.size}`;
-            row.label.htmlFor = row.input.id;
-            if (spec.kind === "COMBO" && !row.picker) {
-                for (const option of spec.options || []) row.input.append(new Option(String(option), String(option)));
-            }
-            if (spec.min != null) row.input.min = String(spec.min);
-            if (spec.max != null) row.input.max = String(spec.max);
-            if (spec.kind === "INT") row.input.step = "1";
-            if (spec.kind === "FLOAT") row.input.step = String(spec.step || "any");
-            row.control.append(row.picker?.box || row.input);
-            row.input.addEventListener("focus", () => {
-                if (!row.editing) row.editStart = readInput(row);
-                row.editing = true;
-            });
-            row.input.addEventListener("change", () => {
-                if (!row.picker) void commitValue(row);
-            });
-            row.input.addEventListener("blur", () => {
-                if (row.picker) return;
-                if (row.input.tagName === "TEXTAREA") void commitValue(row);
-                row.editing = false;
-                row.picker?.close();
-                render();
-            });
-            row.input.addEventListener("compositionstart", () => (row.composing = true));
-            row.input.addEventListener("compositionend", () => (row.composing = false));
             if (spec.kind === "SEED") {
                 row.mode = make("select");
                 row.mode.setAttribute("aria-label", (spec.label || "Seed") + " mode");
@@ -881,7 +898,8 @@ export function mountControlsPanel(container, host) {
     function styleRow(row, spec) {
         const isCards = cards();
         const value = row.optimistic ?? spec.value;
-        const stacked = spec.kind === "STRING" && !!spec.multiline;
+        // A row list stacks under its label and takes a full-width card.
+        const stacked = (spec.kind === "STRING" && !!spec.multiline) || spec.kind === "ROWS";
         // A Control's note no longer widens its card (#11): it clamps inside it.
         const wide = spec.source === "note" || stacked
             || (spec.kind === "COMBO" && String(value ?? "").length > LONG_VALUE);
@@ -892,6 +910,7 @@ export function mountControlsPanel(container, host) {
         row.line.style.cssText = S.lineCss({ cards: isCards, stacked, inline });
         row.label.style.cssText = S.labelCss(isCards);
         row.control.style.cssText = S.controlCss({ cards: isCards, alignEnd: true });
+        if (!row.input) return;
         if (spec.kind === "BOOLEAN") row.input.style.cssText = "margin:0;cursor:pointer;";
         else if (["INT", "FLOAT"].includes(spec.kind)) row.input.style.cssText = S.numberInputCss(isCards);
         else if (spec.kind === "SEED") row.input.style.cssText = S.seedInputCss;
@@ -946,10 +965,13 @@ export function mountControlsPanel(container, host) {
             const label = row.labelOptimistic || spec.label || "";
             row.labelText.textContent = label;
             row.label.title = label;
-            row.input.setAttribute("aria-label", label || "Control value");
+            row.input?.setAttribute("aria-label", label || "Control value");
             paintTags(row, spec);
         }
         if (row.mode) row.mode.setAttribute("aria-label", (spec.label || "Seed") + " mode");
+        // A canvas without row widgets shows its notice in place of the rows,
+        // so the server's "add at least 1" error would only repeat it.
+        const rowsNotice = spec.kind === "ROWS" && spec.rows_unavailable && !capabilities().serverRows;
         const failure = [row.target, modeTarget, noteTarget, labelTarget, advancedTarget]
             .map(target => failed.get(target))
             .find(Boolean);
@@ -958,7 +980,7 @@ export function mountControlsPanel(container, host) {
             : spec.note_truncated
               ? "Edit this longer note on the canvas."
               : spec.reason ||
-                spec.error ||
+                (rowsNotice ? "" : spec.error) ||
                 (spec.checked_at_run ? "Checked by the node when the run starts." : "");
         row.status.style.color = failure ? COLORS.warningText : COLORS.textDim;
         row.status.style.display = row.status.textContent ? "" : "none";
@@ -971,6 +993,14 @@ export function mountControlsPanel(container, host) {
             if (!row.mutations.get(modeTarget)?.pending) row.modeOptimistic = undefined;
             if (!row.mutations.get(noteTarget)?.pending) row.noteOptimistic = undefined;
             if (!row.mutations.get(labelTarget)?.pending) row.labelOptimistic = undefined;
+        }
+        if (row.rows) {
+            // The canvas can't edit rows its frontend never built; the Sonder
+            // App builds its prompt on the server, so it edits them anyway.
+            row.rows.update(spec, row.optimistic?.rows ?? spec.value, {
+                canEdit: editable(spec),
+                unavailable: rowsNotice ? NO_ROWS_NOTICE : "",
+            });
         }
         if (row.input) {
             row.input.disabled = !editable(spec);
@@ -1151,6 +1181,7 @@ export function mountControlsPanel(container, host) {
                 !row.editing
             ) {
                 row.picker?.destroy();
+                row.rows?.destroy();
                 row.el.remove();
                 rows.delete(target);
                 row = null;
@@ -1183,6 +1214,7 @@ export function mountControlsPanel(container, host) {
         for (const [target, row] of rows)
             if (!alive.has(target) && !row.editing) {
                 row.picker?.destroy();
+                row.rows?.destroy();
                 row.el.remove();
                 rows.delete(target);
             }
@@ -1279,6 +1311,11 @@ export function mountControlsPanel(container, host) {
                 if (e.key === "Enter") { closeRename(renaming, true); return true; }
                 return PRESERVE_DEFAULT;
             }
+            const listRow = [...rows.values()].find(row => row.rows?.contains(document.activeElement));
+            if (listRow) {
+                if (e.isComposing || e.keyCode === 229) return PRESERVE_DEFAULT;
+                return listRow.rows.keydown(e) || PRESERVE_DEFAULT;
+            }
             const row = [...rows.values()].find(
                 row =>
                     row.input === document.activeElement ||
@@ -1309,6 +1346,8 @@ export function mountControlsPanel(container, host) {
     // older refusal already reverted its row to the stored value. Saves
     // started after the call (a tracked preset apply) are not awaited.
     async function flushPending() {
+        // A focused row-list field commits on blur, before the snapshot.
+        for (const row of rows.values()) row.rows?.flush();
         // Snapshot before awaiting anything: a run save that settles while
         // the note saves was still in flight when the caller asked.
         const blocking = new Set(runPending);
@@ -1340,7 +1379,10 @@ export function mountControlsPanel(container, host) {
             arrangement.destroy();
             presets.destroy();
             restore.destroy();
-            for (const row of rows.values()) row.picker?.destroy();
+            for (const row of rows.values()) {
+                row.picker?.destroy();
+                row.rows?.destroy();
+            }
             unsubscribe?.();
             unregister();
             rows.clear();

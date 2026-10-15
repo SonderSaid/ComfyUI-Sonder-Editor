@@ -39,7 +39,7 @@ import secrets
 import time
 from typing import Any, Callable
 
-from . import control_descriptors, prompt_graph, model_requirements
+from . import control_descriptors, control_rows, prompt_graph, model_requirements
 from .external_links import WINDOWS_RESERVED_BASENAMES
 from .editor_inputs import clean_editor_values
 from .path_security import PathSecurityError, safe_route_token
@@ -790,6 +790,12 @@ def hidden_keys(stored: dict) -> set:
     return {key for key, value in hidden.items() if value is True and isinstance(key, str)}
 
 
+def _stored_differs(descriptor: dict, value) -> bool:
+    if descriptor.get("kind") == control_rows.ROWS_KIND:
+        return control_rows.canonical(value) != control_rows.canonical(descriptor.get("value"))
+    return str(value) != str(descriptor.get("value"))
+
+
 def apply_stored_values(prompt: dict, described: dict, stored: dict, *, describe=None) -> dict:
     """Apply stored values to the prompt and presentation overlays to a view only.
 
@@ -826,12 +832,17 @@ def apply_stored_values(prompt: dict, described: dict, stored: dict, *, describe
         cleaned = {target: value for target, value in batch.items() if target not in refused}
         cleaned, _ = cd.validate_binding_changes(described, cleaned, prompt=prompt, max_changes=None) if cleaned else ({}, [])
     for target, value in cleaned.items():
-        for item in by_id[binding_of(target)].get("targets", []):
-            prompt[item["path"]]["inputs"][item["input"]] = value
+        descriptor = by_id[binding_of(target)]
+        for item in descriptor.get("targets", []):
+            if descriptor.get("kind") == control_rows.ROWS_KIND:
+                # Rows are flat keys: drop the template's, then write 0..n-1.
+                control_rows.apply_rows(prompt[item["path"]]["inputs"], item["input"], value)
+            else:
+                prompt[item["path"]]["inputs"][item["input"]] = value
     # A stored value that differs from the template's own literal: the panel
     # marks it where an Advanced row hides it ("N changed").
     overridden = {binding_of(target) for target, value in cleaned.items()
-                  if str(value) != str(by_id[binding_of(target)].get("value"))}
+                  if _stored_differs(by_id[binding_of(target)], value)}
     view = copy.deepcopy(describe_stored(prompt, stored, describe) if cleaned else described)
     layouts = stored.get("layout") if isinstance(stored.get("layout"), dict) else {}
     notes = stored.get("notes") if isinstance(stored.get("notes"), dict) else {}
@@ -878,7 +889,8 @@ def apply_stored_values(prompt: dict, described: dict, stored: dict, *, describe
             label = labels.get(base)
             if prefix == "binding" and isinstance(label, str):
                 descriptor["label"] = (label.strip()[:cd.PANEL_LABEL_MAX_CHARS]
-                                       or cd._default_label(prompt, descriptor.get("targets") or []))
+                                       or cd._default_label(prompt, descriptor.get("targets") or [],
+                                                         descriptor.get("group_name")))
     description = stored.get("description")
     if isinstance(description, str) and len(description) <= cd.control_manifest.DESCRIPTION_MAX:
         view["description"] = description

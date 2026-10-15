@@ -705,7 +705,7 @@ class SdkRunner:
 
     def _inventory(self, prompt: dict) -> list:
         return control_descriptors.candidate_inventory(
-            prompt, control_descriptors.sdk_candidates(prompt), class_lookup=self._class_lookup)
+            prompt, control_descriptors.sdk_candidates(prompt, self._class_lookup), class_lookup=self._class_lookup)
 
     async def controls_view(self, session: SdkSession, *, manage: bool = False, query: str = "") -> dict:
         template_id = session.template_id

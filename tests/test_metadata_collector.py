@@ -109,6 +109,38 @@ def test_collector_fallback_to_title(tmp_path):
     assert section["source_node_title"] == "Power LoRAs"
 
 
+def test_collector_native_lora_stack_rows_use_the_power_lora_shape(tmp_path):
+    # ComfyUI 0.40 LoadLoraModel: flat `loras.<i>.<field>` keys, a gap and a
+    # row the node skips (strength 0) or that is off.
+    module = _import_collector()
+    project = _project(tmp_path)
+    prompt = _collector_prompt(
+        values={0: ["10", 0]},
+        upstreams={"10": _origin("LoadLoraModel", {
+            "model": ["9", 0],
+            "loras.0.lora_name": "detail_boost.safetensors", "loras.0.strength": 0.8, "loras.0.enabled": True,
+            "loras.2.lora_name": "flux_detail.safetensors", "loras.2.strength": 0, "loras.2.enabled": True,
+            "loras.3.lora_name": "sketch.safetensors", "loras.3.strength": 1.0, "loras.3.enabled": False,
+        })},
+    )
+
+    _run(module, project, prompt, value_0="connected")
+
+    section = _chain(project, module)[0]
+    assert section["display_type"] == "native_lora_stack"
+    assert section["source_group"] == "loras"
+    assert section["fields"] == {
+        "power_loras": [
+            {"slot": 1, "name": "detail_boost.safetensors", "enabled": True, "strength": 0.8},
+            {"slot": 2, "name": "flux_detail.safetensors", "enabled": True, "strength": 0, "skipped": True},
+            {"slot": 3, "name": "sketch.safetensors", "enabled": False, "strength": 1.0, "skipped": True},
+        ],
+        # Switched on, as Power LoRA counts them: the strength-0 row is on but skipped.
+        "enabled_lora_count": 2,
+        "total_lora_count": 3,
+    }
+
+
 def test_collector_power_lora_loader_adds_readable_summary(tmp_path):
     module = _import_collector()
     project = _project(tmp_path)

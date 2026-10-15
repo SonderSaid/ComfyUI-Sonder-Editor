@@ -164,7 +164,7 @@ def test_module_level_imports_are_standard_library_and_pure_siblings_only():
         elif isinstance(node, ast.ImportFrom):
             if node.level:
                 assert node.module is None
-                assert {a.name for a in node.names} <= {"binding_policy", "control_manifest", "prompt_graph"}
+                assert {a.name for a in node.names} <= {"binding_policy", "control_manifest", "control_rows", "prompt_graph"}
             else:
                 assert (node.module or "").split(".")[0] in allowed, node.module
 

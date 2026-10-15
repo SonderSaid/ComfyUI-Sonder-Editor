@@ -2292,7 +2292,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             items.push(copyMenuItem({ kind: "value", label: "Copy raw widget text", text: entry.raw_widget_text || "" }));
         } else {
             // Section header: copy a useful summary depending on display_type.
-            if (entry.display_type === "power_loras") {
+            if (entry.display_type === "power_loras" || entry.display_type === "native_lora_stack") {
                 items.push(copyMenuItem(resolvePowerLoraNamesCopy(entry)));
             } else {
                 items.push({

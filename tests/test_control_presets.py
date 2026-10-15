@@ -35,7 +35,7 @@ def test_tolerant_read_and_raw_hygiene():
     assert cm.parse_manifest(json.dumps({"presets": raw}))["presets"] == {"p": definition()}
     assert cm.read_presets([]) == {}
     for value, message in [({"presets": {"constructor": {}}}, "reserved"),
-                           ({"presets": {"p": definition({"steps": {"value": {"deep": 1}}})}}, "deeply")]:
+                           ({"presets": {"p": definition({"steps": {"value": [{"deep": {"x": 1}}]}})}}, "deeply")]:
         with pytest.raises(cm.ManifestError, match=message):
             cm.parse_manifest(json.dumps(value))
 
@@ -153,7 +153,9 @@ def test_effective_copy_reset_tombstone_and_order():
 def test_python_js_read_parity_and_source_table(tmp_path):
     root = Path(__file__).resolve().parents[1]
     raw = {"p": definition(), "bad": {}, "unicode": definition(name="😀" * 120),
-           "bad_bool": definition(order=True), "partial": definition({"bad": {}, "steps": {"value": "1"}})}
+           "bad_bool": definition(order=True), "partial": definition({"bad": {}, "steps": {"value": "1"}}),
+           "rows": definition({"stack": {"value": [{"lora_name": "sonder_test_a.safetensors", "strength": 0.5, "enabled": True}]},
+                               "deep": {"value": [{"a": [1]}]}, "long": {"value": [{"a": 1}] * 21}})}
     script = f'''import assert from 'node:assert/strict';
     const b = await import({json.dumps((root / 'web/js/control_bindings.js').as_uri())});
     const t = await import({json.dumps((root / 'web/js/control_targets.js').as_uri())});

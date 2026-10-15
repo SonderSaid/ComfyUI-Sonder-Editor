@@ -36,14 +36,15 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Iterable
 
-from . import binding_policy, control_manifest, prompt_graph
+from . import binding_policy, control_manifest, control_rows, prompt_graph
 
 logger = logging.getLogger(__name__)
 
 PANEL_NOTE_MAX_CHARS = control_manifest.NOTE_MAX
 PANEL_LABEL_MAX_CHARS = control_manifest.LABEL_MAX
 PANEL_OPTIONS_LIMIT = 2000
-CONTROL_KINDS = ("STRING", "INT", "FLOAT", "BOOLEAN", "COMBO", "SEED")
+# ROWS is a node's whole dynamic row group as one ordered list (control_rows).
+CONTROL_KINDS = ("STRING", "INT", "FLOAT", "BOOLEAN", "COMBO", "SEED", "ROWS")
 ANY_KIND = "*"
 # Input types that accept any value, so they add no kind of their own.
 _WILDCARD_TYPES = frozenset({"*", "COMFY_MATCHTYPE_V3"})
@@ -410,12 +411,18 @@ def _is_v3_class(class_def) -> bool:
     return isinstance(class_def, type) and issubclass(class_def, _ComfyNodeInternal)
 
 
-def _class_inputs(class_def, target_inputs: dict, cache: dict) -> dict:
-    """``INPUT_TYPES()`` for a class, finalized for its dynamic inputs (V3)."""
+def _class_base_inputs(class_def, cache: dict) -> dict:
+    """``INPUT_TYPES()`` as declared: a dynamic row group is still one input."""
     base = cache.get(class_def)
     if base is None:
         base = class_def.INPUT_TYPES()
         cache[class_def] = base
+    return base
+
+
+def _class_inputs(class_def, target_inputs: dict, cache: dict) -> dict:
+    """``INPUT_TYPES()`` for a class, finalized for its dynamic inputs (V3)."""
+    base = _class_base_inputs(class_def, cache)
     if _is_v3_class(class_def):
         try:
             from comfy_api.latest import _io
@@ -497,6 +504,41 @@ def _read_target(prompt: dict, target_key: str, input_name: str, class_lookup: C
     return target
 
 
+def _read_rows_target(prompt: dict, path: str, input_name: str, class_type: Any, class_lookup: Callable,
+                      cache: dict) -> dict | None:
+    """A dynamic row group, or one of its row fields, read from the base schema.
+
+    None for any other input. A row field is refused: the frontend renames
+    later rows when one is removed, so it has no stable identity.
+    """
+    class_def = class_lookup(class_type) if isinstance(class_type, str) else None
+    if class_def is None:
+        return None
+    try:
+        base = _class_base_inputs(class_def, cache)
+    except Exception:
+        return None
+    target = {"key": path, "class_type": class_type, "input": input_name}
+    group = control_rows.row_field_group(base, input_name)
+    if group is not None:
+        target.update(status=STATUS_UNSUPPORTED, kind=None,
+                      reason=f"Its rows are one Control: expose “{group}” instead of a single row setting.")
+        return target
+    extra = control_rows.group_input(base, input_name)
+    if extra is None:
+        return None
+    spec, reason = control_rows.build_spec(extra, input_name)
+    target["class_def"] = class_def
+    if spec is None:
+        target.update(status=STATUS_UNSUPPORTED, kind=None, reason=reason)
+        return target
+    rows, linked = control_rows.rows_from_inputs(prompt_graph.node_inputs(prompt, path), input_name,
+                                                 [field["id"] for field in spec["fields"]])
+    target.update(spec)
+    target.update(status=STATUS_LINKED if linked else STATUS_OK, literal=rows)
+    return target
+
+
 def _merge_bounds(targets: list[dict]) -> dict:
     merged: dict[str, Any] = {}
     numeric = [t for t in targets if t.get("kind") in ("INT", "SEED", "FLOAT")]
@@ -525,12 +567,15 @@ def _is_link(value: Any) -> bool:
             and not isinstance(value[0], bool) and isinstance(value[1], int) and not isinstance(value[1], bool))
 
 
-def _default_label(prompt: dict, targets: list[dict]) -> str:
+def _default_label(prompt: dict, targets: list[dict], group_name: str | None = None) -> str:
+    """``<node title> · <input>``; a row group names its rows (``· LoRAs``).
+    web/js/control_bindings.js ``defaultBindingLabel`` mirrors it."""
     if not targets:
         return DEFAULT_LABEL
     node = prompt.get(targets[0]["path"])
     title = _node_title(node, str(node.get("class_type") or "")) if isinstance(node, dict) else ""
-    return f"{title} · {targets[0]['input']}" if title else targets[0]["input"]
+    name = control_rows.plural_name(group_name) if group_name else targets[0]["input"]
+    return f"{title} · {name}" if title else name
 
 
 def _effective_inputs(prompt: dict, path: str, overrides: dict | None) -> dict:
@@ -594,6 +639,10 @@ def _check_targets(prompt: dict, targets: list[dict], class_lookup: Callable, ca
         if binding_policy.is_denied(class_type, name):
             read.append({"key": path, "class_type": class_type, "input": name, "status": STATUS_DENIED})
             continue
+        rows_entry = _read_rows_target(prompt, path, name, class_type, class_lookup, cache)
+        if rows_entry is not None:
+            read.append(rows_entry)
+            continue
         if _is_link(value):
             read.append({"key": path, "class_type": class_type, "input": name, "status": STATUS_LINKED})
             continue
@@ -610,6 +659,8 @@ def _check_targets(prompt: dict, targets: list[dict], class_lookup: Callable, ca
         bad = next((t for t in read if t["status"] == status), None)
         if bad is not None:
             return status, bad.get("reason"), read
+    if len(read) > 1 and any(t.get("kind") == control_rows.ROWS_KIND for t in read):
+        return STATUS_UNSUPPORTED, "A list of rows can be one node's Control only.", read
     if derive_kind(t["kind"] for t in read) is None:
         return STATUS_UNSUPPORTED, "Its inputs take different types.", read
     return STATUS_OK, None, read
@@ -634,6 +685,11 @@ def _describe_one(prompt: dict, binding_id: str, entry: dict, class_lookup: Call
     exported = entry.get("status")
     if exported is not None and exported != STATUS_OK:
         status, reason, read = exported, None, []
+        if exported == STATUS_UNSUPPORTED:
+            # The canvas reports a bound row field as unsupported without a
+            # reason; the server's read names the group to expose instead.
+            checked, checked_reason, _ = _check_targets(prompt, entry.get("targets") or [], class_lookup, cache)
+            reason = checked_reason if checked == STATUS_UNSUPPORTED else None
     else:
         status, reason, read = _check_targets(prompt, entry.get("targets") or [], class_lookup, cache)
     descriptor["targets"] = [{"path": t["key"], "input": t["input"], "class_type": t.get("class_type"),
@@ -650,6 +706,8 @@ def _describe_one(prompt: dict, binding_id: str, entry: dict, class_lookup: Call
         return descriptor
     kind = derive_kind(t["kind"] for t in read)
     descriptor["kind"] = kind
+    if kind == control_rows.ROWS_KIND:
+        return _describe_rows(prompt, descriptor, entry, read[0])
     bounds, unknown, provider, static_options = _bounds_for(prompt, read)
     descriptor.update(bounds)
     if any(t.get("multiline") for t in read):
@@ -677,6 +735,31 @@ def _describe_one(prompt: dict, binding_id: str, entry: dict, class_lookup: Call
         descriptor["error"] = str(exc)
     if kind == "SEED":
         descriptor["seed_mode"] = entry.get("seed_mode")
+    return descriptor
+
+
+ROWS_SPEC_KEYS = ("group_name", "min", "max", "fields", "new_row")
+
+
+def _describe_rows(prompt: dict, descriptor: dict, entry: dict, target: dict) -> dict:
+    """A row group's descriptor: its spec and the rows the prompt holds.
+
+    Rows a target would refuse (or none, from a frontend that can't create
+    rows) keep the descriptor ``ok`` with an ``error``, as an out-of-range
+    literal does: the Sonder App can still store a valid list.
+    """
+    for name in ROWS_SPEC_KEYS:
+        descriptor[name] = copy.deepcopy(target[name])
+    if entry.get("rows_unavailable"):
+        descriptor["rows_unavailable"] = True
+    if not entry["label"]:
+        descriptor["label"] = _default_label(prompt, entry.get("targets") or [], target["group_name"])
+    literal = target.get("literal") or []
+    try:
+        descriptor["value"] = control_rows.coerce_rows(literal, descriptor)
+    except (ControlValueError, OverflowError) as exc:
+        descriptor["value"] = copy.deepcopy(literal)
+        descriptor["error"] = str(exc)
     return descriptor
 
 
@@ -877,22 +960,41 @@ def clean_candidates(raw: Any, limit: int = MAX_CANDIDATES * 4) -> list[dict]:
     return cleaned
 
 
-def sdk_candidates(prompt: dict) -> list[dict]:
+def sdk_candidates(prompt: dict, class_lookup: Callable[[str], Any] | None = None) -> list[dict]:
     """Root-level literal inputs of an API workflow (amendment A1).
 
     Settings inside subgraphs flatten to ``host:inner`` paths and are exposed
-    from ComfyUI instead; links and the legacy PrimitiveNode never qualify.
+    from ComfyUI instead; links and the legacy PrimitiveNode never qualify. A
+    dynamic row group is one candidate in place of its row fields, also when
+    the workflow holds none of its rows.
     """
     found = []
+    cache: dict = {}
     for key, node in prompt.items():
         if ":" in str(key) or not isinstance(node, dict):
             continue
         if node.get("class_type") == binding_policy.LEGACY_PRIMITIVE_CLASS:
             continue
-        for name, value in prompt_graph.node_inputs(prompt, key).items():
-            if not _is_link(value) and isinstance(name, str):
-                found.append({"path": str(key), "input": name, "targets": [{"path": str(key), "input": name}],
-                              "node_title": ""})
+        groups: list[str] = []
+        class_def = None
+        if class_lookup is not None and isinstance(node.get("class_type"), str):
+            try:
+                class_def = class_lookup(node["class_type"])
+                groups = control_rows.group_ids(_class_base_inputs(class_def, cache)) if class_def is not None else []
+            except Exception:
+                logger.debug("Could not read inputs of %s", node.get("class_type"), exc_info=True)
+                groups = []
+        names = [name for name, value in prompt_graph.node_inputs(prompt, key).items()
+                 if isinstance(name, str) and not _is_link(value)]
+        listed = set()
+        for name in [*groups, *names]:
+            group = next((g for g in groups if name.startswith(g + ".")), None)
+            name = group or name
+            if name in listed:
+                continue
+            listed.add(name)
+            found.append({"path": str(key), "input": name, "targets": [{"path": str(key), "input": name}],
+                          "node_title": ""})
     return found
 
 
@@ -942,6 +1044,7 @@ def candidate_inventory(prompt: dict, candidates: list[dict], *,
         fields = {(t.get("class_type"), t.get("input")) for t in read}
         recommended = _RECOMMENDED.get(next(iter(fields))) if len(fields) == 1 else None
         targets = [{"path": t["key"], "input": t["input"], "class_type": t.get("class_type")} for t in read]
+        name = control_rows.plural_name(first["group_name"]) if kind == control_rows.ROWS_KIND else candidate["input"]
         entry = {
             "path": candidate["path"],
             "input": candidate["input"],
@@ -949,7 +1052,7 @@ def candidate_inventory(prompt: dict, candidates: list[dict], *,
             "node_title": title,
             "class_type": (node or {}).get("class_type") or first.get("class_type"),
             "label": (recommended_label(recommended, node or {"class_type": first.get("class_type")}) if recommended
-                      else (f"{title} · {candidate['input']}" if title else candidate["input"])),
+                      else (f"{title} · {name}" if title else name)),
             "kind": kind,
             "status": status,
             "recommended": bool(recommended),
@@ -1022,6 +1125,8 @@ def coerce_binding_value(descriptor: dict, raw: Any) -> Any:
         if not isinstance(raw, bool):
             raise ControlValueError("Choose on or off.")
         return raw
+    if kind == control_rows.ROWS_KIND:
+        return control_rows.coerce_change(raw, descriptor)
     return coerce_control_value("INT" if kind == "SEED" else kind, raw)
 
 
@@ -1083,7 +1188,7 @@ def validate_binding_changes(view: dict, changes: Any, *, prompt: dict | None = 
     value_changes = [table[t][0] for t in changes if t in table and table[t][1] == "value"]
     overrides: dict[tuple[str, str], Any] = {}
     for target, raw in changes.items():
-        if target in table and table[target][1] == "value":
+        if target in table and table[target][1] == "value" and table[target][0].get("kind") != control_rows.ROWS_KIND:
             for item in table[target][0].get("targets", []):
                 overrides[(item.get("path"), item.get("input"))] = raw
 
@@ -1128,6 +1233,10 @@ def validate_binding_changes(view: dict, changes: Any, *, prompt: dict | None = 
                 if not isinstance(raw, str) or raw not in SEED_MODES:
                     raise ControlValueError("Choose fixed, increment, decrement or randomize.")
                 value = raw
+            elif descriptor.get("kind") == control_rows.ROWS_KIND:
+                # Per-field bounds and options are checked by the row authority.
+                # The mounted pre-check forwards the base to the canvas writer.
+                value = control_rows.coerce_change(raw, descriptor, defer_base=structural == "relay")
             else:
                 value = coerce_binding_value(descriptor, raw)
                 bounded = dict(descriptor)

@@ -129,7 +129,7 @@ function parsePowerLoraFilterValue(value) {
     return null;
 }
 
-function renderPowerLoraBody(entry, ctx) {
+function renderPowerLoraBody(entry, ctx, heading = "Power LoRAs") {
     const rows = Array.isArray(entry?.fields?.power_loras)
         ? entry.fields.power_loras.map((row, index) => ({ row, index }))
             .filter(({ row }) => row && typeof row === "object")
@@ -141,7 +141,14 @@ function renderPowerLoraBody(entry, ctx) {
 
     const wrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:5px;min-width:0;`);
     const label = style(document.createElement("div"), `color:#8fa4b6;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;`);
-    label.textContent = "Power LoRAs";
+    label.textContent = heading;
+    const supplied = ctx.controlSupplied?.(entry, "power_loras");
+    if (supplied) {
+        const chip = style(document.createElement("span"), `margin-left:6px;padding:0 4px;border-radius:3px;border:1px solid rgba(143,192,240,0.4);color:#8fc0f0;font-size:9px;text-transform:none;letter-spacing:0;`);
+        chip.textContent = "Control";
+        chip.title = `Set by the Control “${supplied.label}”`;
+        label.appendChild(chip);
+    }
     wrap.appendChild(label);
 
     for (const { row, index } of rows) {
@@ -151,6 +158,8 @@ function renderPowerLoraBody(entry, ctx) {
         const activeA = tokenActiveA ? tokenActiveA(token) : false;
         const activeB = tokenActiveB ? tokenActiveB(token) : false;
         const enabled = row.enabled !== false;
+        // A native stack row the node does not apply (off or strength 0).
+        const skipped = row.skipped === true;
         // Two-tone in compare mode (A=blue left half, B=amber right half), single-tone otherwise.
         let bg = "rgba(255,255,255,0.03)";
         let border = CHROME.borderSoft;
@@ -173,7 +182,7 @@ function renderPowerLoraBody(entry, ctx) {
             display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;
             padding:7px 48px 7px 8px;border-radius:6px;border:1px solid ${border};
             background:${bg};
-            color:${enabled ? "#e4edf4" : "#9ca8b2"};cursor:pointer;
+            color:${enabled && !skipped ? "#e4edf4" : "#9ca8b2"};cursor:pointer;
             box-shadow:${shadow};
         `);
         const main = style(document.createElement("div"), `min-width:0;display:flex;flex-direction:column;gap:2px;`);
@@ -191,7 +200,7 @@ function renderPowerLoraBody(entry, ctx) {
         sub.textContent = parts.length ? parts.join(" | ") : "-";
         main.append(title, sub);
         const status = style(document.createElement("div"), `font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:0.05em;color:${enabled ? "#b7e4b4" : "#c0a49a"};`);
-        status.textContent = enabled ? "On" : "Off";
+        status.textContent = !enabled ? "Off" : skipped ? "Skipped" : "On";
         line.append(main, status);
 
         const cellInfo = {
@@ -280,6 +289,13 @@ registerTrackedRenderer("power_loras", {
     matchField: matchPowerLoraField,
 });
 
+// ComfyUI's native LoRA stack (LoadLoraModel / LoadLoraTextEncoder): the same
+// rows, search and Copy as Power LoRA, under its own heading.
+registerTrackedRenderer("native_lora_stack", {
+    render: (entry, ctx) => renderPowerLoraBody(entry, ctx, "LoRAs"),
+    matchField: matchPowerLoraField,
+});
+
 // A subgraph section's fields are its interface values, keyed by input label.
 // The body only says which outputs were tapped; every field stays in the generic
 // grid, so pins, Copy and field search work unchanged.
@@ -325,11 +341,14 @@ export function controlsSuppliedLookup(entries) {
         for (const item of controlsEntry.supplied) {
             const target = list[item?.section_index];
             const control = byId.get(item?.binding_id);
-            if (!target || target === controlsEntry || target.display_type || !control) continue;
+            if (!target || target === controlsEntry || !control) continue;
             const field = String(item.field ?? "");
             const fields = target.fields && typeof target.fields === "object" ? target.fields : {};
             if (!Object.prototype.hasOwnProperty.call(fields, field)) continue;
-            if (!control.targets?.some?.((t) => t?.path === target.source_node_id && t?.input === field)) continue;
+            // A structured section is marked only through its row group (a native
+            // LoRA stack's rows); server controls_snapshot._supplied mirrors it.
+            const input = target.display_type ? (field === "power_loras" ? target.source_group : null) : field;
+            if (!input || !control.targets?.some?.((t) => t?.path === target.source_node_id && t?.input === input)) continue;
             if (!byEntry.has(target)) byEntry.set(target, new Map());
             byEntry.get(target).set(field, {
                 binding_id: control.binding_id,

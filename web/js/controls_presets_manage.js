@@ -94,7 +94,10 @@ export function mountPresetsManage(host, { track, notify, flushPending = async (
         checkbox.setAttribute("aria-label", `Include ${spec.label || bid} in preset`);
         // An absent member has no descriptor to label it, so the line names its id.
         text.textContent = spec.absent ? `${bid} · In preset` : "In preset";
-        if (stored && (stored.preview !== String(spec.value) || (stored.seed_mode && stored.seed_mode !== spec.seed_mode)))
+        // A row list previews as its summary, which two lists can share, so the
+        // server compares the rows themselves (control_presets.preset_states).
+        const differs = spec.kind === "ROWS" ? stored?.differs === true : stored?.preview !== String(spec.value);
+        if (stored && (differs || (stored.seed_mode && stored.seed_mode !== spec.seed_mode)))
             text.textContent += ` · Preset: ${stored.preview}${stored.seed_mode ? ` (${stored.seed_mode})` : ""}`;
         if (stored?.seed_mode && spec.seed_mode == null) text.textContent += " · Seed mode is skipped on this host";
         label.style.cssText = `display:flex;gap:${SPACE.s1}px;align-items:center;color:${COLORS.textSecondary};font-size:${TYPE.t11}px;`;

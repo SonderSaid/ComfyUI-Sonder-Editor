@@ -17,7 +17,12 @@ export function matchEntry(spec, query) {
     const q = String(query ?? "").trim().toLowerCase();
     if (!q) return true;
     if (spec.source === "note") return false; // notes are not searched
-    const haystack = [spec.label, spec.group, spec.value, ...(Array.isArray(spec.options) ? spec.options : [])];
+    const haystack = [spec.label, spec.group, spec.kind === "ROWS" ? "" : spec.value, ...(Array.isArray(spec.options) ? spec.options : [])];
+    // A row list matches its rows' values and its fields' choices.
+    if (spec.kind === "ROWS") {
+        for (const row of Array.isArray(spec.value) ? spec.value : []) haystack.push(...Object.values(row || {}).filter(v => typeof v === "string"));
+        for (const field of spec.fields || []) if (Array.isArray(field?.options)) haystack.push(...field.options);
+    }
     if (spec.kind === "BOOLEAN") haystack.push(spec.value ? "on" : "off");
     return haystack.some(value => text(value).includes(q));
 }

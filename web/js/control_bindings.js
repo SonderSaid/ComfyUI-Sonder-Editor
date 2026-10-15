@@ -9,6 +9,7 @@
 import { getGraphLink, getGraphNode } from "./project_source_resolver.js";
 import { findControlWidget, seedModeWidget } from "./control_widgets.js";
 import { cleanGroup, DESCRIPTION_MAX } from "./control_targets.js";
+import { pluralName, rowFieldGroup, rowGroupOf, rowGroups, rowsLinked, rowWidgetsReady } from "./control_rows.js";
 
 export { DESCRIPTION_MAX, cleanGroup, groupNameError, isStructuralTarget, parseTarget } from "./control_targets.js";
 
@@ -24,7 +25,7 @@ export const MAX_TARGETS = 64;
 export const MAX_GROUPS = 256;
 export const MAX_PRESETS = 32;
 export const MAX_PRESET_TARGETS = 64;
-export const MAX_DEPTH = 6;
+export const MAX_DEPTH = 8;
 export const LABEL_MAX = 120;
 export const NOTE_MAX = 4000;
 export const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -209,11 +210,22 @@ export function editManifest(text, mutate) {
     for (const entry of Object.values(manifest.bindings)) {
         if (!isPlainObject(entry)) continue;
         if (entry.restore_targets === undefined && entry.targets?.length) entry.restore_targets = entry.targets;
-        for (const key of ["status", "targets", "seed_mode"]) delete entry[key];
+        for (const key of ["status", "targets", "seed_mode", "rows_unavailable"]) delete entry[key];
     }
     mutate(manifest);
     manifest.v = MANIFEST_VERSION;
     return JSON.stringify(manifest);
+}
+
+// A row-group Control's preset member: at most 20 flat rows of scalars.
+// Mirrors server control_rows.value_shape_ok, counting code points as Python does.
+function rowListShapeOk(value) {
+    if (!Array.isArray(value) || value.length > 20) return false;
+    const points = text => [...text].length;
+    return value.every(row => isPlainObject(row) && Object.keys(row).length > 0 && Object.keys(row).length <= 32
+        && Object.entries(row).every(([key, item]) => key.length > 0 && points(key) <= 64
+            && (item === null || typeof item === "boolean" || (typeof item === "string" && points(item) <= 4096)
+                || (typeof item === "number" && Number.isFinite(item)))));
 }
 
 // Mirrors control_manifest.read_presets; reads never rewrite saved metadata.
@@ -231,7 +243,8 @@ export function readPresets(raw) {
         for (const [bid, member] of Object.entries(isPlainObject(entry.members) ? entry.members : {})) {
             if (!validId(bid) || !isPlainObject(member) || !Object.hasOwn(member, "value")) continue;
             const value = member.value;
-            if (!(value === null || ["string", "boolean"].includes(typeof value) || (typeof value === "number" && Number.isFinite(value)))) continue;
+            if (!(value === null || ["string", "boolean"].includes(typeof value) || (typeof value === "number" && Number.isFinite(value))
+                || rowListShapeOk(value))) continue;
             if (Object.hasOwn(member, "seed_mode") && !["fixed", "increment", "decrement", "randomize"].includes(member.seed_mode)) continue;
             members[bid] = {value, ...(Object.hasOwn(member, "seed_mode") ? {seed_mode: member.seed_mode} : {})};
         }
@@ -283,6 +296,10 @@ function promotedTargets(host, name, prefix, depth = 0) {
             found.push({ path, input: widgetName, status: "missing" });
         } else if (isHost(inner)) {
             found.push(...promotedTargets(inner, input.name, path, depth + 1));
+        } else if (rowFieldGroup(inner, widgetName) || rowGroupOf(inner, widgetName)) {
+            // A promoted row field has no stable identity (a removed row renames
+            // later ones); a row group is a Control only on its own node.
+            found.push({ path, input: widgetName, status: "unsupported" });
         } else {
             const widget = findControlWidget(inner, widgetName);
             found.push({ path, input: widgetName, status: widget ? "ok" : "no_widget", node: inner, widget });
@@ -315,6 +332,15 @@ export function resolveAnchor(node, name) {
         return { status: "ok", node, widget, modeWidget: mode, targets };
     }
     const targets = [{ path: String(node.id), input: name }];
+    // A dynamic row group is one Control; a single row field has no stable
+    // identity (removing a row renames every later one), so it is refused.
+    const group = rowGroupOf(node, name);
+    if (group) {
+        if (rowsLinked(node, name)) return { status: "linked", targets };
+        return { status: "ok", node, widget: null, modeWidget: null, targets,
+            rows: { group: name, ...group, ready: rowWidgetsReady(node, name) } };
+    }
+    if (rowFieldGroup(node, name)) return { status: "unsupported", targets };
     const linked = (node.inputs || []).some(input => (input?.widget?.name ?? input?.name) === name && input.link != null);
     if (linked) return { status: "linked", targets };
     const widget = findControlWidget(node, name);
@@ -379,7 +405,8 @@ export function defaultBindingLabel(resolved) {
     const host = resolved?.anchor?.node || resolved?.node;
     const node = target.node || (String(host?.id) === String(target.path) ? host : null);
     const title = node?.title || (node ? nodeType(node) : "");
-    return title ? `${title} · ${target.input}` : target.input;
+    const name = resolved?.rows ? pluralName(resolved.rows.groupName) : target.input;
+    return title ? `${title} · ${name}` : name;
 }
 
 const clampOrder = value => (Number.isInteger(value) ? Math.max(-9999, Math.min(9999, value)) : 0);
@@ -497,9 +524,16 @@ export function listCandidates(root, { filter = "", limit = MAX_CANDIDATES, labe
         }
         if (node.isVirtualNode) continue; // Reroute, Note, legacy Primitive: never in a prompt
         const linked = new Set((node.inputs || []).filter(input => input?.link != null).map(input => input.widget?.name ?? input.name));
+        // A row group is listed from the node's definition, also when this
+        // frontend built no row widgets; its row widgets are never listed.
+        for (const group of Object.keys(rowGroups(node))) {
+            if (Object.hasOwn(anchored, group) || isDenied(nodeType(node), group)) continue;
+            if (resolveAnchor(node, group).status === "ok") push(node, group, [{ path: String(node.id), input: group }], "");
+        }
         for (const widget of node.widgets || []) {
             const name = widget?.name;
             if (!name || Object.hasOwn(anchored, name) || linked.has(name) || COMPANION_WIDGETS.has(name)) continue;
+            if (rowGroupOf(node, name) || rowFieldGroup(node, name)) continue;
             if (widget.options?.serialize === false || widget.serialize === false || isDenied(nodeType(node), name)) continue;
             push(node, name, [{ path: String(node.id), input: name }], widget.label);
         }
@@ -552,9 +586,11 @@ export function planRestore(root, manifest) {
         // resolveCandidate shares the widget/link resolver; policy and virtual
         // inputs are rejected here too, then independently by the server.
         const live = resolveCandidate({_nodes: [node]}, {path: String(node.id), input});
+        // A row group's own widget is its hidden, non-serialized row count.
+        const widget = rowGroupOf(node, input) ? null : findControlWidget(node, input);
         if (!live || isDenied(nodeType(node), input) || isHost(node) || node.isVirtualNode
             || nodeType(node) === LEGACY_PRIMITIVE || COMPANION_WIDGETS.has(input)
-            || findControlWidget(node, input)?.options?.serialize === false || findControlWidget(node, input)?.serialize === false) {
+            || widget?.options?.serialize === false || widget?.serialize === false) {
             miss("unavailable"); continue;
         }
         claimed.add(key);
@@ -646,6 +682,8 @@ export function exportManifest(text, root) {
                 seed_mode: resolved.modeWidget?.value ?? null,
             };
             delete out.bindings[id].restore_targets;
+            delete out.bindings[id].rows_unavailable;
+            if (resolved.rows && !resolved.rows.ready) out.bindings[id].rows_unavailable = true;
             if (resolved.status === "missing" && !resolved.anchor && !resolved.insideSubgraph) {
                 const hint = entry?.restore_targets ?? entry?.targets;
                 if (hint?.length) out.bindings[id].restore_targets = hint;

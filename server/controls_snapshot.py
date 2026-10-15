@@ -37,7 +37,7 @@ import json
 import math
 from typing import Any, Callable
 
-from . import control_descriptors, control_manifest, prompt_graph
+from . import control_descriptors, control_manifest, control_rows, prompt_graph
 
 SECTION_LABEL = "Controls at run"
 DISPLAY_TYPE = "controls"
@@ -207,8 +207,13 @@ def _recorded_value(descriptor: dict, prompt: dict) -> Any:
     """The first target's literal, as the run received it; INT/SEED as decimal text."""
     targets = descriptor.get("targets") or []
     first = targets[0] if targets else {}
-    value = prompt_graph.node_inputs(prompt, first.get("path")).get(first.get("input"))
     kind = descriptor.get("kind")
+    if kind == control_rows.ROWS_KIND:
+        # A row list reads as text (``2 LoRAs · 1 on: a, 1, on; …``) so the
+        # generic grid and search stay readable. The full rows are the
+        # collector's own section for that node (``power_loras``).
+        return control_rows.detail(descriptor.get("value"), descriptor, TEXT_VALUE_LIMIT)
+    value = prompt_graph.node_inputs(prompt, first.get("path")).get(first.get("input"))
     if kind in ("INT", "SEED") and isinstance(value, (int, float)) and not isinstance(value, bool):
         if isinstance(value, int):
             return str(value)
@@ -237,10 +242,14 @@ def _field_name(label: str, binding_id: str, used: set) -> str:
 
 
 def _supplied(tracked: Any, controls: list[dict]) -> list[dict]:
-    """Generic collector fields that a recorded binding set.
+    """Collector fields that a recorded binding set.
 
-    Only generic sections (no ``display_type``) are matched: ``power_loras``
-    rows and ``subgraph`` interface fields do not keep the input they came from.
+    Generic sections (no ``display_type``) match field by field. A structured
+    section matches only through its ``source_group``: a native LoRA stack's
+    rows (``power_loras``) are the row list a ROWS Control set. Other
+    structured rows (rgthree's ``power_loras``, ``subgraph`` interface fields)
+    do not keep the input they came from. ``tracked_metadata_renderers.js``
+    ``controlsSuppliedLookup`` mirrors it.
     """
     by_target = {}
     for control in controls:
@@ -248,11 +257,17 @@ def _supplied(tracked: Any, controls: list[dict]) -> list[dict]:
             by_target.setdefault((target["path"], target["input"]), control["binding_id"])
     supplied = []
     for index, section in enumerate(tracked if isinstance(tracked, list) else []):
-        if not isinstance(section, dict) or section.get("display_type"):
+        if not isinstance(section, dict):
             continue
         fields = section.get("fields")
         source = section.get("source_node_id")
         if not isinstance(fields, dict) or not isinstance(source, str):
+            continue
+        if section.get("display_type"):
+            group = section.get("source_group")
+            binding_id = by_target.get((source, group)) if isinstance(group, str) else None
+            if binding_id is not None and "power_loras" in fields:
+                supplied.append({"section_index": index, "field": "power_loras", "binding_id": binding_id})
             continue
         for field in fields:
             binding_id = by_target.get((source, field))

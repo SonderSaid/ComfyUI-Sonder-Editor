@@ -47,7 +47,7 @@ def test_export_facts_are_read_and_an_unknown_status_reads_as_missing():
     ("[]", "must be an object"),
     ("{nope", "not valid JSON"),
     ("[" * 50000 + "]" * 50000, "nested too deeply"),
-    (json.dumps({"bindings": {"a": {"label": {"x": {"y": {"z": {"w": 1}}}}}}}), "nested too deeply"),
+    (json.dumps({"bindings": {"a": {"label": {"x": {"y": {"z": {"w": {"v": 1}}}}}}}}), "nested too deeply"),
     ('{"__proto__": {}}', "reserved key"),
     (json.dumps({"bindings": {"constructor": {}}}), "reserved key"),
     (json.dumps({"bindings": {"bad id!": {}}}), "id is invalid"),

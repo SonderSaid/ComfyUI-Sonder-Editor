@@ -24,6 +24,8 @@ import math
 import re
 from typing import Any
 
+from . import control_rows
+
 RELAY_CLASS_TYPE = "SonderControlRelay"
 MANIFEST_VERSION = 1
 
@@ -37,9 +39,10 @@ MAX_TARGETS = 64
 MAX_GROUPS = 256
 MAX_PRESETS = 32
 MAX_PRESET_TARGETS = 64
-# Nesting levels, counting the top object as 1. The export needs 5
-# (manifest > bindings > entry > targets > target); 6 leaves one spare.
-MAX_DEPTH = 6
+# Nesting levels, counting the top object as 1. A preset holding a row list
+# needs 8 (manifest > presets > preset > members > member > rows > row >
+# value), with no spare; the export needs 5. control_bindings.js mirrors it.
+MAX_DEPTH = 8
 LABEL_MAX = 120
 NOTE_MAX = 4000
 DESCRIPTION_MAX = 1000
@@ -175,6 +178,11 @@ def _binding(raw: Any) -> dict:
         entry["restorable"] = True
     mode = raw.get("seed_mode")
     entry["seed_mode"] = mode if mode in SEED_MODES else None
+    # A canvas whose frontend has no row widgets for a row-group Control
+    # (ComfyUI frontend before 1.57). Presentation only; the Sonder App edits
+    # rows anyway, because its prompt is built on the server.
+    if raw.get("rows_unavailable") is True:
+        entry["rows_unavailable"] = True
     return entry
 
 
@@ -202,7 +210,8 @@ def read_presets(raw: Any, *, limit: int | None = MAX_PRESETS) -> dict:
                     or not isinstance(member, dict) or "value" not in member):
                 continue
             value, mode = member["value"], member.get("seed_mode")
-            if not (value is None or isinstance(value, (str, bool, int, float))):
+            # A row-group Control's member is its row list (control_rows).
+            if not (value is None or isinstance(value, (str, bool, int, float)) or control_rows.value_shape_ok(value)):
                 continue
             if isinstance(value, float) and not math.isfinite(value):
                 continue

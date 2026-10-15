@@ -48,11 +48,12 @@ export function fitPublicationView(view, envelope) {
     if (fits(view)) return view;
     const capped = {
         ...view,
-        bindings: (view.bindings || []).map(d =>
-            Array.isArray(d.options) && d.options.length > OPTION_PREVIEW
-                ? { ...d, options: d.options.slice(0, OPTION_PREVIEW), options_truncated: true }
-                : d,
-        ),
+        bindings: (view.bindings || []).map(d => {
+            const cap = spec => (Array.isArray(spec.options) && spec.options.length > OPTION_PREVIEW
+                ? { ...spec, options: spec.options.slice(0, OPTION_PREVIEW), options_truncated: true } : spec);
+            // A row list carries its choices per field (the LoRA list once, not per row).
+            return Array.isArray(d.fields) ? { ...cap(d), fields: d.fields.map(cap) } : cap(d);
+        }),
     };
     if (fits(capped)) return capped;
     for (const limit of NOTE_PREVIEWS) {

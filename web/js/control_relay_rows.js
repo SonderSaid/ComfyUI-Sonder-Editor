@@ -16,6 +16,7 @@ import { CONTROL_SEED_MODES, findControlWidget } from "./control_widgets.js";
 import {
     cleanGroup, defaultBindingLabel, effectiveGroupOrder, nodeType, parseManifest, planRestore, relayCensus, resolveAnchor, resolveBindings, sectionOf,
 } from "./control_bindings.js";
+import { readRows, summary } from "./control_rows.js";
 
 export const ROW_PREFIX = "sonder_row:";
 // Rows that are not a binding use `~`, which a binding id (ID_RE) cannot hold.
@@ -74,13 +75,20 @@ export function planRows(relay, root) {
     for (const entry of entries.sort(byOrder)) {
         const resolved = bindings[entry.id];
         const type = ROW_TYPES[resolved?.widget?.type];
-        if (resolved?.status !== "ok" || !type) continue;
+        if (resolved?.status !== "ok" || (!type && !resolved.rows)) continue;
         const anchor = resolved.anchor;
         const name = entry.label || defaultBindingLabel(resolved);
         const label = entry.advanced ? `${name} · Adv` : name;
-        const ref = { id: entry.id, nodeId: anchor.node.id, anchor: anchor.name, widgetName: resolved.widget.name };
-        const own = [{ ...ref, role: "value", type, label, options: rowOptions(resolved.widget, type) }];
-        if (resolved.modeWidget) own.push({ ...ref, role: "mode", type: "combo", label: "↳ mode" });
+        const own = [];
+        if (resolved.rows) {
+            // A row list is edited in Controls; the Relay shows its summary.
+            own.push({ id: entry.id, nodeId: anchor.node.id, anchor: anchor.name, widgetName: null,
+                role: "summary", type: "text", label, options: {} });
+        } else {
+            const ref = { id: entry.id, nodeId: anchor.node.id, anchor: anchor.name, widgetName: resolved.widget.name };
+            own.push({ ...ref, role: "value", type, label, options: rowOptions(resolved.widget, type) });
+            if (resolved.modeWidget) own.push({ ...ref, role: "mode", type: "combo", label: "↳ mode" });
+        }
         const group = cleanGroup(entry.group);
         if (sectionOf(resolved, entry.section) === "editor") editor.push(...own);
         else if (!group) ungrouped.push(...own);
@@ -107,10 +115,20 @@ function rowOptions(native, type) {
     return options;
 }
 
+// A row list's Relay text, read live: "3 LoRAs · 2 on — edit in Controls".
+export function summaryText(root, row) {
+    const node = graphNode(root, row.nodeId);
+    const rows = node ? resolveAnchor(node, row.anchor).rows : null;
+    if (!rows) return "";
+    if (!rows.ready) return "Needs ComfyUI frontend 1.57 or newer";
+    return `${summary(readRows(node, rows.group, rows.fieldIds), {group_name: rows.groupName, fields: rows.fields})} — edit in Controls`;
+}
+
 const signature = plan => JSON.stringify([plan.restore, plan.rows
     ? plan.rows.map(r => [r.id, r.role, r.type, r.label, r.nodeId, r.widgetName, r.options])
     : [plan.warning || plan.hint]]);
 const isSeparator = row => row.role === "separator";
+const isSummary = row => row.role === "summary";
 
 function addRow(relay, spec) {
     const options = { ...spec.options, serialize: false };
@@ -141,9 +159,10 @@ export function syncRelayRows(relay, { root, canvas = null, isEditing = () => fa
         let changed = false;
         for (const widget of rowWidgets(relay)) {
             const row = plan.rows.find(r => widget.name === rowName(r));
-            const native = row && !isSeparator(row) && nativeFor(root, row);
-            if (native && widget.value !== native.widget.value) {
-                widget.value = native.widget.value;
+            const live = !row || isSeparator(row) ? null
+                : isSummary(row) ? {value: summaryText(root, row)} : nativeFor(root, row)?.widget || null;
+            if (live && widget.value !== live.value) {
+                widget.value = live.value;
                 changed = true;
             }
         }
@@ -162,9 +181,9 @@ export function syncRelayRows(relay, { root, canvas = null, isEditing = () => fa
             value: plan.warning || plan.hint, disabled: true, callback: () => {} });
     }
     for (const row of plan.rows || []) {
-        if (isSeparator(row)) {
-            addRow(relay, { type: "text", name: rowName(row), label: row.label, value: SEPARATOR_RULE,
-                disabled: true, callback: () => {} });
+        if (isSeparator(row) || isSummary(row)) {
+            addRow(relay, { type: "text", name: rowName(row), label: row.label,
+                value: isSummary(row) ? summaryText(root, row) : SEPARATOR_RULE, disabled: true, callback: () => {} });
             continue;
         }
         const native = nativeFor(root, row);

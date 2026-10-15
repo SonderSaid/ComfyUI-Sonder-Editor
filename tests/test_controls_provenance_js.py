@@ -101,6 +101,48 @@ console.log(JSON.stringify({{
     assert result["none"] is None
 
 
+NATIVE_STACK = {"label": "Load LoRA (Model)", "source_node_id": "2", "display_type": "native_lora_stack",
+                "source_group": "loras", "fields": {"power_loras": [
+                    {"slot": 1, "name": "sonder_test_a.safetensors", "enabled": True, "strength": 1},
+                    {"slot": 2, "name": "sonder_test_b.safetensors", "enabled": True, "strength": 0, "skipped": True},
+                    {"slot": 3, "name": "sonder_test_c.safetensors", "enabled": False, "strength": 1, "skipped": True}]}}
+STACK_CONTROLS = {"label": "Controls at run", "display_type": "controls", "fields": {"Stack": "3 LoRAs · 2 on"},
+                  "controls": [{"binding_id": "stack", "field": "Stack", "kind": "ROWS",
+                                "targets": [{"path": "2", "input": "loras"}]}],
+                  "supplied": [{"section_index": 0, "field": "power_loras", "binding_id": "stack"}]}
+
+
+def test_a_native_lora_stack_is_marked_through_its_row_group():
+    # Mirrors server controls_snapshot._supplied: a structured section matches
+    # only through source_group; rgthree's power_loras keeps no input name.
+    result = _run(_imports() + f"""
+const stack = {json.dumps(NATIVE_STACK)};
+const controls = {json.dumps(STACK_CONTROLS)};
+const rgthree = {{...stack, display_type: 'power_loras', source_group: undefined}};
+console.log(JSON.stringify({{
+  native: controlsSuppliedLookup([stack, controls]).supplied(stack, 'power_loras'),
+  rgthree: controlsSuppliedLookup([rgthree, controls]).supplied(rgthree, 'power_loras'),
+  other: controlsSuppliedLookup([{{...stack, source_group: 'other'}}, controls]).supplied(stack, 'power_loras'),
+}}));
+""")
+    assert result["native"] == {"binding_id": "stack", "label": "Stack"}
+    assert result["rgthree"] is None and result["other"] is None
+
+
+def test_a_native_lora_stack_renders_its_heading_chip_and_skipped_rows():
+    result = _run(FAKE_DOM + _imports() + f"""
+Object.assign(El.prototype, {{ addEventListener() {{}}, setAttribute() {{}}, contains() {{ return false; }} }});
+const stack = {json.dumps(NATIVE_STACK)};
+const lookup = controlsSuppliedLookup([stack, {json.dumps(STACK_CONTROLS)}]);
+const out = renderTrackedSectionBody(stack, {{ style, CHROME, controlSupplied: lookup.supplied,
+  formatGenerationValue: String, fieldSearchToken: () => '' }});
+const statuses = out.dom.children.slice(1).map((wrap) => wrap.children[0].children[1].textContent);
+console.log(JSON.stringify({{ heading: out.dom.children[0].text, statuses }}));
+""")
+    assert result["heading"].startswith("LoRAs") and "Control" in result["heading"]
+    assert result["statuses"] == ["On", "Skipped", "Off"]
+
+
 def test_renderer_groups_fields_and_decorates_through_gallery_cells():
     result = _run(FAKE_DOM + _imports() + f"""
 const entry = {json.dumps(SECTION)};

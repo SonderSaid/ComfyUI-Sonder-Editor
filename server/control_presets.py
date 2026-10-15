@@ -5,6 +5,7 @@ import copy
 
 from . import control_manifest as cm
 from . import control_descriptors as cd
+from . import control_rows
 
 
 def effective_presets(authored, overlays):
@@ -44,6 +45,13 @@ def _refused_reason(view, rejected):
     return " ".join(f"{labels.get((cd.parse_target(r['target']) or ('', '', ''))[1], r['target'])}: {r['reason']}" for r in rejected)
 
 
+def _preview(value, descriptor):
+    """A member's value as text; a row list reads as its summary (``3 LoRAs · 2 on``)."""
+    if isinstance(value, list):
+        return control_rows.summary(value, descriptor if descriptor.get("kind") == control_rows.ROWS_KIND else {})[:200]
+    return ("true" if value is True else "false" if value is False else "null" if value is None else str(value))[:200]
+
+
 def preset_states(view, presets, *, origins=None, prompt=None):
     """One pure match authority, called after each host's effective projection."""
     bindings = {d["binding_id"]: d for d in view.get("bindings", [])}
@@ -56,8 +64,11 @@ def preset_states(view, presets, *, origins=None, prompt=None):
         for bid, member in preset["members"].items():
             descriptor = bindings.get(bid, {})
             status = "unavailable" if bid in unavailable else "ok"
-            members.append({"binding_id": bid, "preview": ("true" if member["value"] is True else "false" if member["value"] is False else "null" if member["value"] is None else str(member["value"]))[:200], "status": status,
-                            **({"seed_mode": member["seed_mode"]} if "seed_mode" in member else {})})
+            members.append({"binding_id": bid, "preview": _preview(member["value"], descriptor), "status": status,
+                            **({"seed_mode": member["seed_mode"]} if "seed_mode" in member else {}),
+                            # Two row lists can share a summary; Manage's hint needs the real comparison.
+                            **({"differs": control_rows.canonical(member["value"]) != control_rows.canonical(descriptor.get("value"))}
+                               if descriptor.get("kind") == control_rows.ROWS_KIND else {})})
             if state != "match":
                 continue
             mode = member.get("seed_mode") if descriptor.get("seed_mode") is not None else None

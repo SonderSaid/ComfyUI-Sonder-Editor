@@ -39,7 +39,7 @@ export function smallButton(text, variant = "secondary") {
     return button;
 }
 
-const KIND_NAMES = { INT: "number", FLOAT: "number", SEED: "seed", BOOLEAN: "on/off", COMBO: "choice", STRING: "text" };
+const KIND_NAMES = { INT: "number", FLOAT: "number", SEED: "seed", BOOLEAN: "on/off", COMBO: "choice", STRING: "text", ROWS: "list" };
 export const kindName = kind => KIND_NAMES[kind] || "";
 
 export function mountManageSection(host, { notify = () => {}, track = work => work, flushPending = async () => true, changed = () => {} } = {}) {

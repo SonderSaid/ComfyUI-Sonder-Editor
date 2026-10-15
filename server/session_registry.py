@@ -10,7 +10,7 @@ from typing import Any, Callable
 
 from aiohttp import web
 
-from . import control_descriptors
+from . import control_descriptors, control_rows
 
 logger = logging.getLogger("sonder_editor")
 
@@ -838,6 +838,8 @@ def _prepare_control_publication(body: Any) -> dict:
                     if descriptor.get(bound) is not None:
                         numeric_kind = "INT" if kind in ("INT", "SEED") else "FLOAT"
                         control_descriptors.coerce_control_value(numeric_kind, descriptor[bound])
+                if kind == control_rows.ROWS_KIND:
+                    control_rows.check_publication(descriptor)
     for name in ("suggestions", "candidates"):
         if name in view and (not isinstance(view[name], list) or not all(isinstance(d, dict) for d in view[name])):
             raise ValueError(f"{name} must be a list.")
