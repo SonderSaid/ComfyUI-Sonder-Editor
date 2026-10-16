@@ -12314,6 +12314,28 @@ if routes is not None:
             "folders": _collect_asset_folders(project),
         })
 
+    @routes.get("/sonder-editor/project/{project_id}/assets/folders")
+    async def api_list_asset_folders(request: web.Request) -> web.Response:
+        """List the project's asset folders alone, for folder pickers.
+
+        Read-only: no repair save and no asset payloads, which the dormant list
+        builds for every asset.
+        """
+        def _load_folders():
+            project = _load_project_from_request(request, repair_missing_frames=False)
+            return project, _collect_asset_folders(project)
+
+        try:
+            project, folders = await run_project_io(_load_folders)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        return web.json_response({
+            "project_id": project.project_id,
+            "modified_at": project.modified_at,
+            "folders": folders,
+        })
+
     @routes.get("/sonder-editor/project/{project_id}/assets/dormant")
     async def api_list_dormant_assets(request: web.Request) -> web.Response:
         """List lightweight asset data without scanning/syncing media folders."""

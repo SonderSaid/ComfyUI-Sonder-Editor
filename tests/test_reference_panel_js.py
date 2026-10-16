@@ -2063,8 +2063,7 @@ export const app = {
 """,
         "api.mjs": "export const api = { apiURL: (value) => value };\n",
         "client.mjs": ("export const onProjectVersionChanged = () => {};\n"
-                       "export const certifiedUnchanged = () => false;\n"
-                       "export const sameProject = (a, b) => a === b;\n"),
+                       "export const versionStillAnswers = (accepted) => ({ refresh: true, accepted });\n"),
         "events.mjs": "export const onEditorRenderWindowChanged = () => {};\n",
         "keyboard.mjs": "export const PRIORITY = { OVERLAY: 100 }; export const register = () => () => {};\n",
         "resolver.mjs": """
@@ -2089,6 +2088,7 @@ export const resolveProjectSource = () => ({ status: 'unresolved' });
         "./reference_bridge_shape.js": shape_url,
         "./consumer_input_requirements.js": (ROOT / "web" / "js" / "consumer_input_requirements.js").as_uri(),
         "./bridge_read_coordinator.js": coordinator_url,
+        "./widget_value_observer.js": (ROOT / "web" / "js" / "widget_value_observer.js").as_uri(),
     }
     for old, new in replacements.items():
         bridge_source = bridge_source.replace(f'"{old}"', json.dumps(new))
@@ -2247,8 +2247,7 @@ export const app = {
 """,
         "api.mjs": "export const api = { apiURL: (value) => value };\n",
         "client.mjs": ("export const onProjectVersionChanged = () => {};\n"
-                       "export const certifiedUnchanged = () => false;\n"
-                       "export const sameProject = (a, b) => a === b;\n"),
+                       "export const versionStillAnswers = (accepted) => ({ refresh: true, accepted });\n"),
         "events.mjs": "export const onEditorRenderWindowChanged = () => {};\n",
         "keyboard.mjs": """
 export const PRIORITY = { OVERLAY: 100 };
@@ -2284,6 +2283,7 @@ export const resolveProjectSource = () => ({
         "./reference_bridge_shape.js": shape_url,
         "./consumer_input_requirements.js": (ROOT / "web" / "js" / "consumer_input_requirements.js").as_uri(),
         "./bridge_read_coordinator.js": coordinator_url,
+        "./widget_value_observer.js": (ROOT / "web" / "js" / "widget_value_observer.js").as_uri(),
     }
     for old, new in replacements.items():
         bridge_source = bridge_source.replace(f'"{old}"', json.dumps(new))

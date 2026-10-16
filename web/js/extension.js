@@ -43,6 +43,7 @@ import {
     createGraphAwareReconciler,
 } from "./editor_graph_lifecycle.js";
 import { createEditorNodeSurface } from "./editor_node_surface.js";
+import { observeWidgetValue } from "./widget_value_observer.js";
 
 injectSonderFontFaces();
 
@@ -176,7 +177,8 @@ function projectIdFromProjectValue(projectValue) {
 
 async function listProjectAssetFolders(projectId) {
     if (!projectId) return [];
-    const resp = await fetch(api.apiURL(`/sonder-editor/project/${encodeURIComponent(projectId)}/assets/dormant`));
+    // Folders only: no asset payloads are built for a suggestion list.
+    const resp = await fetch(api.apiURL(`/sonder-editor/project/${encodeURIComponent(projectId)}/assets/folders`));
     if (!resp.ok) {
         throw new Error(`Failed to list asset folders: ${resp.status}`);
     }
@@ -760,14 +762,45 @@ async function syncBridgeTargetFolderWidget(node) {
     }
     if (syncToken !== node._sonderBridgeFolderSyncToken) return [];
 
-    const currentValue = normalizeFolderValue(input.value || folderWidget.value || "");
+    // The widget is the authority; the box shows a draft only while it is being
+    // edited, so a sync can never put stale box text back over a newer value.
+    // Choices carry the committed value only, never uncommitted draft text.
+    const currentValue = normalizeFolderValue(folderWidget.value);
     const values = setBridgeFolderWidgetChoices(folderWidget, folders, currentValue);
     renderBridgeFolderSuggestions(node, values);
     input.placeholder = projectId
         ? "Root (blank) or folder label"
         : "Connect a Sonder project to load folder suggestions";
-    input.value = currentValue;
+    if (!bridgeFolderDrafting(node)) input.value = currentValue;
     return values;
+}
+
+// Whether the box holds typed text not yet committed to the widget.
+function bridgeFolderDrafting(node) {
+    return !!node?._sonderBridgeFolderEdited;
+}
+
+// Commit the draft on blur/change (Enter), normalized, only when the user typed;
+// otherwise show the widget, which an external writer may have moved meanwhile.
+function commitBridgeFolderDraft(node, folderWidget, input) {
+    if (!bridgeFolderDrafting(node)) {
+        input.value = normalizeFolderValue(folderWidget.value);
+        return false;
+    }
+    node._sonderBridgeFolderEdited = false;
+    const normalized = normalizeFolderValue(input.value);
+    input.value = normalized;
+    if (normalized === String(folderWidget.value ?? "")) return false;
+    folderWidget.value = normalized;
+    folderWidget.callback?.call(folderWidget, normalized);
+    app.graph.setDirtyCanvas?.(true, true);
+    return true;
+}
+
+// Mirror a write from elsewhere (Controls, Relay, load) unless a draft is open.
+function showExternalBridgeFolder(node, folderWidget, input) {
+    if (bridgeFolderDrafting(node)) return;
+    input.value = normalizeFolderValue(folderWidget.value);
 }
 
 function scheduleBridgeTargetFolderRestore(node, folderWidget, input) {
@@ -785,6 +818,7 @@ function scheduleBridgeTargetFolderRestore(node, folderWidget, input) {
             return;
         }
         const restoredValue = normalizeFolderValue(folderWidget.value || "");
+        node._sonderBridgeFolderEdited = false;
         input.value = restoredValue;
         setBridgeFolderWidgetChoices(folderWidget, [], restoredValue);
         void syncBridgeTargetFolderWidget(node);
@@ -849,29 +883,32 @@ function installBridgeFolderPicker(node) {
     });
     folderDomWidget.computeSize = (width) => [width, 56];
 
-    const applyValue = (value, { fireCallback = false } = {}) => {
-        const normalized = normalizeFolderValue(value);
-        folderWidget.value = normalized;
-        input.value = normalized;
-        if (fireCallback) {
-            folderWidget.callback?.call(folderWidget, normalized);
-        }
-        app.graph.setDirtyCanvas?.(true, true);
-    };
-
+    // Typing edits a draft; the widget changes only on commit, as one write.
     input.value = normalizeFolderValue(folderWidget.value || "");
+    node._sonderBridgeFolderEdited = false;
     input.addEventListener("input", () => {
-        folderWidget.value = normalizeFolderValue(input.value);
-        app.graph.setDirtyCanvas?.(true, true);
+        node._sonderBridgeFolderEdited = true;
     });
-    input.addEventListener("change", () => applyValue(input.value, { fireCallback: true }));
-    input.addEventListener("blur", () => applyValue(input.value, { fireCallback: true }));
+    input.addEventListener("change", () => commitBridgeFolderDraft(node, folderWidget, input));
+    // Enter with any modifier commits before ComfyUI's window-level shortcuts
+    // run (Ctrl+Enter queues the prompt from the widget, and its handler stops
+    // the native change). Escape abandons the draft.
+    input.addEventListener("keydown", (event) => {
+        if (event.isComposing) return;
+        if (event.key === "Enter") commitBridgeFolderDraft(node, folderWidget, input);
+        else if (event.key === "Escape" && bridgeFolderDrafting(node)) {
+            node._sonderBridgeFolderEdited = false;
+            showExternalBridgeFolder(node, folderWidget, input);
+        }
+    });
+    input.addEventListener("blur", () => commitBridgeFolderDraft(node, folderWidget, input));
     input.addEventListener("focus", () => {
         void syncBridgeTargetFolderWidget(node);
     });
 
     node._sonderBridgeFolderInput = input;
     node._sonderBridgeFolderDatalist = datalist;
+    observeWidgetValue(node, "target_folder", () => showExternalBridgeFolder(node, folderWidget, input));
 
     const origOnConfigure = node.onConfigure;
     node.onConfigure = function () {

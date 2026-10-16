@@ -1739,6 +1739,18 @@ export class EditorNodeController {
         this.state.renderQueueActive = coerceBoolean(this._getWidgetValue("render_queue_active", true), true);
     }
 
+    // Graph panels that read the active scene (Reference, Guides, Driver) follow
+    // this signal, so a scene cleared by a project switch or adopted from the
+    // summary must announce itself too: neither is a widget-change callback.
+    _announceRenderWindowChanged(field) {
+        emitEditorRenderWindowChanged({
+            sourceNodeId: String(this.node?.id ?? ""),
+            projectDir: String(this.state.projectDir || ""),
+            sceneId: String(this.state.sceneId || ""),
+            field,
+        });
+    }
+
     onEditorWidgetValueChange(name, value, { publish = true, refreshPreview = true } = {}) {
         if (name === "scene_id") this.state.sceneId = value || "";
         if (name === "selection_start") this.state.selectionStart = Math.max(0, parseInt(value, 10) || 0);
@@ -1748,14 +1760,7 @@ export class EditorNodeController {
         if (name === "mask_pre_offset") this.state.maskPreOffset = Math.max(0, parseInt(value, 10) || 0);
         if (name === "mask_post_offset") this.state.maskPostOffset = Math.max(0, parseInt(value, 10) || 0);
         if (name === "render_queue_active") this.state.renderQueueActive = coerceBoolean(value, true);
-        if (isEditorRenderWindowField(name)) {
-            emitEditorRenderWindowChanged({
-                sourceNodeId: String(this.node?.id ?? ""),
-                projectDir: String(this.state.projectDir || ""),
-                sceneId: String(this.state.sceneId || ""),
-                field: name,
-            });
-        }
+        if (isEditorRenderWindowField(name)) this._announceRenderWindowChanged(name);
         if (publish) this._seedWidgetState({ [name]: value }, { seed: false });
         const previewKeys = this._previewInvalidationKeysForWidget(name);
         if (refreshPreview && previewKeys.length) {
@@ -2377,6 +2382,7 @@ export class EditorNodeController {
                 this._setWidgetValue("scene_id", "");
                 this._setWidgetValue("selection_start", 0);
                 this._setWidgetValue("selection_end", 0);
+                this._announceRenderWindowChanged("scene_id");
             }
             this._invalidateModules(["project", "assets", "scene", "queue", "preview"]);
             this.state.expandedModuleId = "";
@@ -2449,6 +2455,7 @@ export class EditorNodeController {
             if (activeScene?.scene_id && !this.state.sceneId && !widgetValue) {
                 this.state.sceneId = activeScene.scene_id;
                 this._setWidgetValue("scene_id", activeScene.scene_id);
+                this._announceRenderWindowChanged("scene_id");
             }
             if (entry.invalidationKeys.size) {
                 const keys = [...entry.invalidationKeys];

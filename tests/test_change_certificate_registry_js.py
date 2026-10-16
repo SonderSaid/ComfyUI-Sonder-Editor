@@ -186,3 +186,37 @@ assert.equal(client.registerChangeCertificateFromEvent({ type: "project_updated"
 client.rememberProjectVersion("Folder", V(4));
 assert.deepEqual(heard, [true, false]);
 """)
+
+
+def test_the_shared_version_gate_keeps_only_what_certificates_prove():
+    # `versionStillAnswers` is the one decision the Reference graph, the Guides
+    # graph and the Controls Reference source share.
+    _run("""
+client.rememberProjectVersion("canon", V(1));
+client.rememberProjectVersion("Folder", V(1));
+client.registerChangeCertificate(cert(1, 2), { projectId: "Folder" });
+client.registerChangeCertificate(cert(2, 3, { bridge: true }), { projectId: "Folder" });
+const context = { url: "/guides", projectId: "Folder", sceneId: "scene" };
+const held = { url: "/guides", version: V(1) };
+const gate = (accepted, notice, dependency = "bridge", ctx = context) =>
+    client.versionStillAnswers(accepted, ctx, notice, dependency);
+
+let answer = gate(held, { projectId: "canon", modifiedAt: V(2) });
+assert.deepEqual(answer, { refresh: false, accepted: { url: "/guides", version: V(2) } },
+    "a certified notice keeps the read and advances it, across the alias");
+assert.deepEqual(gate(answer.accepted, { projectId: "Folder", modifiedAt: V(2) }).refresh, false,
+    "the alias's notice for the same version is already answered");
+assert.equal(gate(answer.accepted, { projectId: "Folder", modifiedAt: V(3) }).refresh, true,
+    "a flagged transition refreshes");
+assert.deepEqual(gate(held, { projectId: "Elsewhere", modifiedAt: V(9) }), { refresh: false, accepted: held },
+    "another project never refreshes and never advances");
+assert.equal(gate(null, { projectId: "Folder", modifiedAt: V(2) }).refresh, true, "nothing held");
+assert.equal(gate({ url: "/other", version: V(1) }, { projectId: "Folder", modifiedAt: V(2) }).refresh, true,
+    "a different URL (scene or window moved)");
+assert.equal(gate(held, { projectId: "Folder", modifiedAt: "" }).refresh, true, "no version");
+assert.equal(gate(held, { projectId: "Folder", modifiedAt: V(2) }, "").refresh, true,
+    "an ungated read always refreshes for its own project");
+assert.equal(gate(held, { projectId: "Elsewhere", modifiedAt: V(2) }, "").refresh, false);
+assert.equal(gate(held, { projectId: "Elsewhere", modifiedAt: V(2) }, "bridge", { ...context, url: "" }).refresh, true,
+    "an unresolved read refreshes, as the Reference graph always has");
+""")

@@ -19,18 +19,34 @@ import {
     setWidgetHidden,
 } from "./widget_visibility.js";
 import {
+    bridgePayloadVersion,
     createBridgeRefreshScheduler,
     requestBridgeGuidePayload,
     requestBridgeDriverPayload,
 } from "./bridge_read_coordinator.js";
+import { onProjectVersionChanged, versionStillAnswers } from "./api_client.js";
+import { onEditorRenderWindowChanged } from "./editor_render_window_events.js";
+import { graphsOf, nodesOf } from "./control_bindings.js";
+import { observeWidgetValue } from "./widget_value_observer.js";
 const { api } = window.comfyAPI.api;
 
+// Every node of the open workflow, subgraph definitions included, so a panel
+// inside a subgraph follows project edits and scene switches too.
+const allGraphNodes = () => graphsOf(app.graph).flatMap((graph) => nodesOf(graph));
+
 const scheduleBridgeGuideRefresh = createBridgeRefreshScheduler({
+    getTargets: () => allGraphNodes().filter(isStart),
     dispatch: (node, meta) => refreshBridgeGuidePanel(node, meta),
 });
 const scheduleBridgeDriverRefresh = createBridgeRefreshScheduler({
+    getTargets: () => allGraphNodes().filter(isDriverSelector),
     dispatch: (node, meta) => refreshBridgeDriverPanel(node, meta),
 });
+
+// Overrides name guides and lanes that may come back (editor Undo, a scene
+// switch back), so automatic refreshes never prune them: only an explicit
+// Refresh click does. Until then the panel counts the stale ones.
+const isManualDispatch = (dispatch) => String(dispatch?.origin || "").split("+").includes("manual");
 
 const EXT_NAME = "sonder.bridge";
 const TARGET_START = "SonderGuidesBridgeStart";
@@ -39,6 +55,10 @@ const TARGET_DRIVER_SELECTOR = "SonderDriverSelector";
 const MAX_PASSTHROUGH = 8; // mirror SONDER_BRIDGE_MAX_PASSTHROUGH default
 const VALUE_RE = /^value_(\d+)$/;
 const NODE_STATE = Symbol("sonderBridgeState");
+// The `{url, version}` of the bridge-guides payload a Start node last applied.
+// Ephemeral: it only decides whether a project-version notice owes the node a
+// re-read, and it is dropped on every dispatch and failed read.
+const GUIDE_ACCEPTED = Symbol("sonderGuideAcceptedRead");
 const OVERRIDES_WIDGET = "bridge_overrides_json";
 const DRIVER_LANE_WIDGET = "driver_lane_index";
 const DRIVER_OVERRIDES_WIDGET = "driver_selector_overrides_json";
@@ -283,11 +303,20 @@ const ensureNodeState = (node) => {
         guideList: null,
         guideStatus: null,
         guideRefreshToken: 0,
+        guideLoading: false,
+        // Set by an explicit Refresh; the next linked render prunes, even when
+        // an automatic dispatch superseded the manual one.
+        guidePrunePending: false,
+        driverPrunePending: false,
         driverPanel: null,
         driverSelect: null,
         driverList: null,
         driverStatus: null,
         driverRefreshToken: 0,
+        driverLoading: false,
+        // The last applied bridge-drivers payload and the URL it answered, so a
+        // lane-widget write re-renders without a read.
+        driverPayload: null,
     };
     node[NODE_STATE] = state;
     return state;
@@ -450,31 +479,42 @@ const mirrorProjectWire = (start) => {
     }
 };
 
-async function loadLinkedEditorGuides(node, dispatch) {
+/**
+ * Where a Guides Start or Driver Selector reads from: the resolved project,
+ * scene and full request URL (`route` is `bridge-guides` or `bridge-drivers`),
+ * or `{resolution}` alone while the project source is unresolved.
+ */
+function bridgeReadContext(node, route) {
     const resolution = resolveProjectSource(node);
-    if (resolution.status !== "resolved") {
+    if (resolution.status !== "resolved") return { resolution, url: "" };
+    const controllerState = resolution.editor?._sonderController?.state || null;
+    const projectDir = String(controllerState?.projectDir || "");
+    const projectId = projectIdFromDir(projectDir);
+    const sceneId = controllerState?.sceneId || controllerState?.dormantSummary?.active_scene?.scene_id || "";
+    const url = projectId && sceneId
+        ? api.apiURL(`/sonder-editor/project/${encodeURIComponent(projectId)}/scenes/${encodeURIComponent(sceneId)}/${route}`)
+        : "";
+    return { resolution, projectDir, projectId, sceneId, url };
+}
+
+async function loadLinkedEditorGuides(node, dispatch) {
+    const context = bridgeReadContext(node, "bridge-guides");
+    if (context.resolution.status !== "resolved") {
         return {
-            status: projectResolutionStatusText(resolution),
+            status: projectResolutionStatusText(context.resolution),
             guides: [],
             linked: false,
         };
     }
-    const editorNode = resolution.editor;
-    const controllerState = editorNode?._sonderController?.state || null;
-    const projectDir = controllerState?.projectDir || "";
-    const projectId = projectIdFromDir(projectDir);
-    if (!projectId) {
+    if (!context.projectId) {
         return { status: "Connect a Sonder Editor project.", guides: [], linked: false };
     }
-
-    const sceneId = controllerState?.sceneId || controllerState?.dormantSummary?.active_scene?.scene_id || "";
-    if (!sceneId) {
+    if (!context.sceneId) {
         return { status: "No active scene.", guides: [], linked: false };
     }
 
-    const url = `/sonder-editor/project/${encodeURIComponent(projectId)}/scenes/${encodeURIComponent(sceneId)}/bridge-guides`;
     const payload = await requestBridgeGuidePayload({
-        url: api.apiURL(url), ...dispatch, nodeId: node.id,
+        url: context.url, ...dispatch, nodeId: node.id,
     });
     const rows = Array.isArray(payload?.guides) ? payload.guides : [];
     const guides = rows.map((row) => ({
@@ -482,7 +522,10 @@ async function loadLinkedEditorGuides(node, dispatch) {
         resolved_frame_index: Math.max(0, parseInt(row.frame_index, 10) || 0),
         muted: !!row.editor_muted,
     }));
-    const allGuideKeys = Array.isArray(payload?.all_guide_keys) ? payload.all_guide_keys : null;
+    // A running job's snapshot holds only its window's guides, so its key set
+    // cannot say what the scene lost: nothing counts as stale against it.
+    const allGuideKeys = payload?.source !== "snapshot" && Array.isArray(payload?.all_guide_keys)
+        ? payload.all_guide_keys : null;
     const sourceLabel = payload?.source === "snapshot" ? "Snapshot guides for running job" : "Live editor guides";
     const sceneName = payload?.scene_name || "Scene";
     const ws = payload?.window_start ?? 0;
@@ -492,31 +535,49 @@ async function loadLinkedEditorGuides(node, dispatch) {
         guides,
         all_guide_keys: allGuideKeys,
         linked: true,
+        read: { url: context.url, payload },
     };
 }
 
-function renderGuidePanel(node, payload = { status: "", guides: [] }) {
+/**
+ * Override keys the scene no longer has, measured against the response's full
+ * scene key set, never the visible rows (temporary window exclusion must not
+ * delete workflow intent). `keep(key, sceneKeys)` spares keys a reader still
+ * honours. Without a key set (older server) nothing is stale.
+ */
+function staleOverrideKeys(overrides, allKeys, keep = () => false) {
+    if (!Array.isArray(allKeys)) return [];
+    const sceneKeys = new Set(allKeys.filter(Boolean));
+    return Object.keys(overrides).filter((key) => !sceneKeys.has(key) && !keep(key, sceneKeys));
+}
+
+function pruneOverrides(node, overrides, stale, write) {
+    const cleaned = { ...overrides };
+    for (const key of stale) delete cleaned[key];
+    write(node, cleaned);
+    return cleaned;
+}
+
+function appendStaleNotice(list, count) {
+    if (!count) return;
+    const notice = style(document.createElement("div"), "color:#c9a46a;font-size:10px;padding:3px 0;");
+    notice.textContent = `${count} stale override${count === 1 ? "" : "s"} — Refresh to clear`;
+    notice.title = "Overrides for guides or lanes no longer in this scene. They stay until you click Refresh, so an Undo that brings them back keeps them.";
+    list.appendChild(notice);
+}
+
+function renderGuidePanel(node, payload = { status: "", guides: [] }, { prune = false, keepStatus = false } = {}) {
     const state = ensureNodeState(node);
     if (!state.guideList || !state.guideStatus) return;
-    state.guideStatus.textContent = payload.status || "";
+    if (!keepStatus) state.guideStatus.textContent = payload.status || "";
     state.guideList.innerHTML = "";
     const guides = payload.guides || [];
 
-    // Prune overrides against the scene's full guide_key set, so a key only gets
-    // dropped when it is genuinely gone from the scene. If the backend did not
-    // supply `all_guide_keys` (older server), skip pruning entirely — leaving
-    // overrides untouched is safer than the old window-scoped prune.
-    const allKeys = Array.isArray(payload.all_guide_keys) ? payload.all_guide_keys : null;
-    const overrides = readGuideOverrides(node);
-    if (allKeys) {
-        const sceneKeys = new Set(allKeys.filter(Boolean));
-        const stale = Object.keys(overrides).filter((k) => !sceneKeys.has(k));
-        if (stale.length) {
-            const cleaned = { ...overrides };
-            for (const k of stale) delete cleaned[k];
-            writeGuideOverrides(node, cleaned);
-            for (const k of stale) delete overrides[k];
-        }
+    let overrides = readGuideOverrides(node);
+    let stale = staleOverrideKeys(overrides, payload.all_guide_keys);
+    if (prune && stale.length) {
+        overrides = pruneOverrides(node, overrides, stale, writeGuideOverrides);
+        stale = [];
     }
 
     if (!guides.length) {
@@ -525,6 +586,7 @@ function renderGuidePanel(node, payload = { status: "", guides: [] }) {
             empty.textContent = "No guides in scene.";
             state.guideList.appendChild(empty);
         }
+        appendStaleNotice(state.guideList, stale.length);
         return;
     }
     for (const guide of guides) {
@@ -580,11 +642,12 @@ function renderGuidePanel(node, payload = { status: "", guides: [] }) {
                 delete nextOverrides[key];                  // Inherit
             }
             writeGuideOverrides(node, nextOverrides);
-            renderGuidePanel(node, payload);
+            renderGuidePanel(node, payload, { keepStatus: state.guideLoading });
         });
         row.append(frame, name, btn);
         state.guideList.appendChild(row);
     }
+    appendStaleNotice(state.guideList, stale.length);
 }
 
 function refreshBridgeGuidePanel(node, dispatch) {
@@ -604,14 +667,27 @@ function refreshBridgeGuidePanel(node, dispatch) {
     }
 
     const token = ++state.guideRefreshToken;
+    // Sticky: a later automatic dispatch that supersedes this one still prunes.
+    if (isManualDispatch(dispatch)) state.guidePrunePending = true;
+    // Revoked on dispatch, never restored by a late certificate: only the read
+    // this dispatch makes can re-establish what the node holds.
+    node[GUIDE_ACCEPTED] = null;
+    state.guideLoading = true;
     state.guideStatus.textContent = "Loading guides...";
     loadLinkedEditorGuides(node, dispatch)
         .then((payload) => {
             if (token !== state.guideRefreshToken) return;
-            renderGuidePanel(node, payload);
+            state.guideLoading = false;
+            if (payload?.read) {
+                node[GUIDE_ACCEPTED] = { url: payload.read.url, version: bridgePayloadVersion(payload.read.payload) };
+            }
+            const prune = !!(state.guidePrunePending && payload?.linked);
+            if (prune) state.guidePrunePending = false;
+            renderGuidePanel(node, payload, { prune });
         })
         .catch((error) => {
             if (token !== state.guideRefreshToken) return;
+            state.guideLoading = false;
             renderGuidePanel(node, {
                 status: error?.message || "Guide panel failed.",
                 guides: [],
@@ -715,30 +791,23 @@ const setDriverLaneWidgetValue = (node, value) => {
 };
 
 async function loadLinkedEditorDrivers(node, dispatch) {
-    const resolution = resolveProjectSource(node);
-    if (resolution.status !== "resolved") {
+    const context = bridgeReadContext(node, "bridge-drivers");
+    if (context.resolution.status !== "resolved") {
         return {
-            status: projectResolutionStatusText(resolution),
+            status: projectResolutionStatusText(context.resolution),
             drivers: [],
             linked: false,
         };
     }
-    const editorNode = resolution.editor;
-    const controllerState = editorNode?._sonderController?.state || null;
-    const projectDir = controllerState?.projectDir || "";
-    const projectId = projectIdFromDir(projectDir);
-    if (!projectId) {
+    if (!context.projectId) {
         return { status: "Connect a Sonder Editor project.", drivers: [], linked: false };
     }
-
-    const sceneId = controllerState?.sceneId || controllerState?.dormantSummary?.active_scene?.scene_id || "";
-    if (!sceneId) {
+    if (!context.sceneId) {
         return { status: "No active scene.", drivers: [], linked: false };
     }
 
-    const url = `/sonder-editor/project/${encodeURIComponent(projectId)}/scenes/${encodeURIComponent(sceneId)}/bridge-drivers`;
     const payload = await requestBridgeDriverPayload({
-        url: api.apiURL(url), ...dispatch, nodeId: node.id,
+        url: context.url, ...dispatch, nodeId: node.id,
     });
     const rows = Array.isArray(payload?.drivers) ? payload.drivers : [];
     const sourceLabel = payload?.source === "snapshot" ? "Snapshot drivers for running job" : "Live editor drivers";
@@ -748,15 +817,23 @@ async function loadLinkedEditorDrivers(node, dispatch) {
     return {
         status: `${sourceLabel} - ${sceneName} f${ws}-${we}`,
         drivers: rows,
-        all_driver_keys: Array.isArray(payload?.all_driver_keys) ? payload.all_driver_keys : null,
+        // A job snapshot predates lanes added since; never judge staleness by it.
+        all_driver_keys: payload?.source !== "snapshot" && Array.isArray(payload?.all_driver_keys)
+            ? payload.all_driver_keys : null,
         linked: true,
+        url: context.url,
     };
 }
 
-function renderDriverPanel(node, payload = { status: "", drivers: [] }) {
+// The Driver Bridge still honours a legacy bare `"N"` key for lane N
+// (`nodes/driver_bridge.py`), so it is not stale while `lane:N` exists.
+// Expiry: when the Driver Bridge stops reading bare keys.
+const keepLegacyDriverKey = (key, sceneKeys) => /^\d+$/.test(key) && sceneKeys.has(`lane:${key}`);
+
+function renderDriverPanel(node, payload = { status: "", drivers: [] }, { prune = false, keepStatus = false } = {}) {
     const state = ensureNodeState(node);
     if (!state.driverList || !state.driverStatus || !state.driverSelect) return;
-    state.driverStatus.textContent = payload.status || "";
+    if (!keepStatus) state.driverStatus.textContent = payload.status || "";
     state.driverList.innerHTML = "";
 
     const drivers = payload.drivers || [];
@@ -776,17 +853,11 @@ function renderDriverPanel(node, payload = { status: "", drivers: [] }) {
     }
     state.driverSelect.value = String(selectedLane);
 
-    const allKeys = Array.isArray(payload.all_driver_keys) ? payload.all_driver_keys : null;
-    const overrides = readDriverOverrides(node);
-    if (allKeys) {
-        const sceneKeys = new Set(allKeys.filter(Boolean));
-        const stale = Object.keys(overrides).filter((k) => !sceneKeys.has(k));
-        if (stale.length) {
-            const cleaned = { ...overrides };
-            for (const k of stale) delete cleaned[k];
-            writeDriverOverrides(node, cleaned);
-            for (const k of stale) delete overrides[k];
-        }
+    let overrides = readDriverOverrides(node);
+    let stale = staleOverrideKeys(overrides, payload.all_driver_keys, keepLegacyDriverKey);
+    if (prune && stale.length) {
+        overrides = pruneOverrides(node, overrides, stale, writeDriverOverrides);
+        stale = [];
     }
 
     if (!drivers.length) {
@@ -795,6 +866,7 @@ function renderDriverPanel(node, payload = { status: "", drivers: [] }) {
             empty.textContent = "No driver lanes in scene.";
             state.driverList.appendChild(empty);
         }
+        appendStaleNotice(state.driverList, stale.length);
         return;
     }
 
@@ -803,6 +875,7 @@ function renderDriverPanel(node, payload = { status: "", drivers: [] }) {
         const missing = style(document.createElement("div"), "color:#8b96a3;font-size:10px;padding:3px 0;");
         missing.textContent = `Selected Driver ${selectedLane + 1} is not available in this scene.`;
         state.driverList.appendChild(missing);
+        appendStaleNotice(state.driverList, stale.length);
         return;
     }
 
@@ -825,10 +898,13 @@ function renderDriverPanel(node, payload = { status: "", drivers: [] }) {
         name.textContent = `${driver.lane_name || `Driver ${driver.lane_index + 1}`} - ${clipLabel}`;
         name.title = name.textContent;
         const key = driver.lane_key || `lane:${driver.lane_index}`;
-        const override = overrides[key];
-        const mode = override && typeof override.muted === "boolean"
-            ? (override.muted ? "off" : "on")
-            : "auto";
+        // Shown as the Driver Bridge resolves it (`_driver_override_state`):
+        // `lane:N` first, then the legacy bare `N`. Cycling rewrites `lane:N` and
+        // drops the bare key, so a kept legacy key is visible and clearable.
+        const legacyKey = String(driver.lane_index);
+        const override = [overrides[key], overrides[legacyKey]]
+            .find((value) => value && typeof value.muted === "boolean");
+        const mode = override ? (override.muted ? "off" : "on") : "auto";
         const inheritedMuted = !!driver.editor_muted || !driver.has_clip;
         const bg = mode === "off"
             ? "rgba(135,52,60,0.85)"
@@ -854,6 +930,7 @@ function renderDriverPanel(node, payload = { status: "", drivers: [] }) {
         btn.addEventListener("click", (event) => {
             event.stopPropagation();
             const nextOverrides = readDriverOverrides(node);
+            delete nextOverrides[legacyKey];
             if (mode === "auto") {
                 nextOverrides[key] = { muted: true };
             } else if (mode === "off") {
@@ -862,11 +939,29 @@ function renderDriverPanel(node, payload = { status: "", drivers: [] }) {
                 delete nextOverrides[key];
             }
             writeDriverOverrides(node, nextOverrides);
-            renderDriverPanel(node, payload);
+            renderDriverPanel(node, payload, { keepStatus: state.driverLoading });
         });
         row.append(lane, name, btn);
         state.driverList.appendChild(row);
     }
+    appendStaleNotice(state.driverList, stale.length);
+}
+
+/**
+ * The lane widget changed (graph dropdown, Controls, Relay or load). Re-render
+ * from the held payload when it answers the node's current URL; otherwise read.
+ * Never writes, never bumps the refresh token, never replaces a "Loading" status.
+ */
+function onDriverLaneChanged(node) {
+    const state = ensureNodeState(node);
+    if (!state.driverPanel) return;
+    const held = state.driverPayload;
+    const { url } = bridgeReadContext(node, "bridge-drivers");
+    if (held && url && held.url === url) {
+        renderDriverPanel(node, held, { keepStatus: state.driverLoading });
+        return;
+    }
+    scheduleBridgeDriverRefresh({ origin: "driver_widget", targets: [node] });
 }
 
 function refreshBridgeDriverPanel(node, dispatch) {
@@ -882,14 +977,22 @@ function refreshBridgeDriverPanel(node, dispatch) {
     }
 
     const token = ++state.driverRefreshToken;
+    if (isManualDispatch(dispatch)) state.driverPrunePending = true;
+    state.driverLoading = true;
     state.driverStatus.textContent = "Loading drivers...";
     loadLinkedEditorDrivers(node, dispatch)
         .then((payload) => {
             if (token !== state.driverRefreshToken) return;
-            renderDriverPanel(node, payload);
+            state.driverLoading = false;
+            state.driverPayload = payload?.url ? payload : null;
+            const prune = !!(state.driverPrunePending && payload?.linked);
+            if (prune) state.driverPrunePending = false;
+            renderDriverPanel(node, payload, { prune });
         })
         .catch((error) => {
             if (token !== state.driverRefreshToken) return;
+            state.driverLoading = false;
+            state.driverPayload = null;
             renderDriverPanel(node, {
                 status: error?.message || "Driver panel failed.",
                 drivers: [],
@@ -944,10 +1047,8 @@ function installDriverPanel(node) {
         padding:3px 5px;
         font-size:10px;
     `);
-    select.addEventListener("change", () => {
-        setDriverLaneWidgetValue(node, select.value);
-        scheduleBridgeDriverRefresh({ origin: "lifecycle", targets: [node] });
-    });
+    // Writes the widget only; its observer re-renders (`onDriverLaneChanged`).
+    select.addEventListener("change", () => setDriverLaneWidgetValue(node, select.value));
     const status = style(document.createElement("div"), "color:#7f8d9b;font-size:10px;line-height:1.25;");
     const list = style(document.createElement("div"), "display:flex;flex-direction:column;max-height:138px;overflow:auto;");
     wrapper.append(header, select, status, list);
@@ -988,6 +1089,7 @@ const installNode = (node) => {
         const overridesWidget = (node.widgets || []).find((w) => w?.name === DRIVER_OVERRIDES_WIDGET);
         visibilityChanged = setWidgetHidden(overridesWidget, true) || visibilityChanged;
         installDriverPanel(node);
+        observeWidgetValue(node, DRIVER_LANE_WIDGET, () => onDriverLaneChanged(node));
     }
 
     if (visibilityChanged) commitWidgetVisibility(node, { resize: false });
@@ -1024,8 +1126,63 @@ const installNode = (node) => {
     }, 0);
 };
 
+/**
+ * A project version moved. Guides Start nodes of that project re-read unless
+ * change certificates prove `bridge-guides` unchanged since the payload they
+ * hold (it reads only `bridge`-projected scene fields plus asset names, and an
+ * asset rename is never certified). Driver Selectors of that project always
+ * re-read: clips and Driver lanes are outside both certificate projections.
+ * Unresolved nodes wait for their own project-ready retry.
+ */
+function refreshBridgesForVersion(projectId, modifiedAt) {
+    const notice = { projectId, modifiedAt };
+    const guides = allGraphNodes().filter(isStart).filter((node) => {
+        const context = bridgeReadContext(node, "bridge-guides");
+        if (!context.url) return false;
+        const { refresh, accepted } = versionStillAnswers(node[GUIDE_ACCEPTED], context, notice, "bridge");
+        node[GUIDE_ACCEPTED] = accepted;
+        return refresh;
+    });
+    const drivers = allGraphNodes().filter(isDriverSelector).filter((node) => {
+        const context = bridgeReadContext(node, "bridge-drivers");
+        return !!context.url && versionStillAnswers(null, context, notice, "").refresh;
+    });
+    const wave = { origin: "project_version", modifiedAt, delayMs: 250 };
+    if (guides.length) scheduleBridgeGuideRefresh({ ...wave, targets: guides });
+    if (drivers.length) scheduleBridgeDriverRefresh({ ...wave, targets: drivers });
+}
+
+// A scene switch is a widget change, not a project version, and both routes
+// read the active scene. Only nodes reading the switching editor's project.
+function refreshBridgesForScene(detail = {}) {
+    if (detail.field !== "scene_id") return;
+    const projectDir = String(detail.projectDir || "");
+    if (!projectDir) return;
+    // A node already holding a settled read of its current URL is unaffected:
+    // another Editor on the same project switched, or a remote widget-state
+    // replay repeated the scene. A read in flight always re-reads, so a quick
+    // A -> B -> A switch cannot leave B's late result on screen.
+    const needs = (node, route, heldUrl) => {
+        const context = bridgeReadContext(node, route);
+        return context.projectDir === projectDir && !(heldUrl && context.url && heldUrl === context.url);
+    };
+    const guides = allGraphNodes().filter((node) => isStart(node)
+        && needs(node, "bridge-guides", node[GUIDE_ACCEPTED]?.url));
+    const drivers = allGraphNodes().filter((node) => {
+        if (!isDriverSelector(node)) return false;
+        const state = ensureNodeState(node);
+        return needs(node, "bridge-drivers", state.driverLoading ? "" : state.driverPayload?.url);
+    });
+    if (guides.length) scheduleBridgeGuideRefresh({ origin: "scene", targets: guides, delayMs: 250 });
+    if (drivers.length) scheduleBridgeDriverRefresh({ origin: "scene", targets: drivers, delayMs: 250 });
+}
+
 app.registerExtension({
     name: EXT_NAME,
+    setup() {
+        onProjectVersionChanged(refreshBridgesForVersion);
+        onEditorRenderWindowChanged(refreshBridgesForScene);
+    },
     async nodeCreated(node) {
         if (!isAnySonderBridge(node)) return;
         installNode(node);

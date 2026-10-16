@@ -225,6 +225,37 @@ export function certifiedUnchanged({ projectId, sceneId, fromVersion, toVersion,
     return false;
 }
 
+/**
+ * Whether a project-version notice owes a held bridge read a re-read.
+ *
+ * `accepted` is the `{url, version}` the consumer last applied, `context` the
+ * `{url, projectId, sceneId}` it would read now, `notice` the
+ * `{projectId, modifiedAt}` announced. Returns `{refresh, accepted}`: store the
+ * returned `accepted`, which advances to the notice's version when certificates
+ * prove `dependency` unchanged, so the next notice needs only later
+ * certificates. Another project's notice never refreshes. Every doubt does:
+ * no held read, a different URL, a missing version, a broken chain, or a
+ * `dependency` no certificate covers (an ungated read).
+ * Lives here, not beside the coordinator, so it shares this module's
+ * certificate store with every consumer.
+ */
+export function versionStillAnswers(accepted, context, notice = {}, dependency = "") {
+    const projectId = String(notice?.projectId || "");
+    const modifiedAt = String(notice?.modifiedAt || "");
+    if (!context?.url) return { refresh: true, accepted };
+    if (projectId && !sameProject(context.projectId, projectId)) {
+        return { refresh: false, accepted };
+    }
+    if (!accepted?.version || accepted.url !== context.url || !modifiedAt) {
+        return { refresh: true, accepted };
+    }
+    if (!certifiedUnchanged({
+        projectId: context.projectId, sceneId: context.sceneId,
+        fromVersion: accepted.version, toVersion: modifiedAt, dependency,
+    })) return { refresh: true, accepted };
+    return { refresh: false, accepted: { ...accepted, version: modifiedAt } };
+}
+
 export function projectIdFromUrl(url) {
     const match = String(url || "").match(/\/sonder-editor\/project\/([^/?#]+)/);
     return match ? decodeURIComponent(match[1]) : "";

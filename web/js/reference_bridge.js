@@ -13,7 +13,8 @@
 import { app } from "/scripts/app.js";
 import { api } from "/scripts/api.js";
 import { resolveProjectSource, getGraphLink, getGraphNode } from "./project_source_resolver.js";
-import { certifiedUnchanged, onProjectVersionChanged, sameProject } from "./api_client.js";
+import { onProjectVersionChanged, versionStillAnswers } from "./api_client.js";
+import { observeWidgetValue } from "./widget_value_observer.js";
 import { onEditorRenderWindowChanged } from "./editor_render_window_events.js";
 import { PRIORITY as KEY_PRIORITY, register as registerKeyboardConsumer } from "./keyboard_ownership.js";
 import {
@@ -173,19 +174,10 @@ function acceptRead(node, url, payload) {
  * node re-reads exactly as it always has.
  */
 function needsVersionRefresh(node, projectId, modifiedAt) {
-    const context = referenceReadContext(node);
-    if (!context || !context.url) return true;
-    if (projectId && !sameProject(context.projectId, projectId)) return false;
-    const accepted = node[ACCEPTED];
-    if (!accepted || !accepted.version || accepted.url !== context.url || !modifiedAt) return true;
-    if (!certifiedUnchanged({
-        projectId: context.projectId, sceneId: context.sceneId,
-        fromVersion: accepted.version, toVersion: modifiedAt, dependency: "bridge",
-    })) return true;
-    // The held payload answers for the newer version too; advance it so the
-    // next notice needs only the certificates after this one.
-    node[ACCEPTED] = { ...accepted, version: String(modifiedAt) };
-    return false;
+    const { refresh, accepted } = versionStillAnswers(
+        node[ACCEPTED], referenceReadContext(node), { projectId, modifiedAt }, "bridge");
+    node[ACCEPTED] = accepted;
+    return refresh;
 }
 
 async function referenceShapeForBridge(node, wave) {
@@ -617,18 +609,10 @@ function installSelector(node) {
     installSelectorPanel(node);
     if (state.installed) return;
     state.installed = true;
-    const laneWidget = findWidget(node, "reference_lanes");
-    if (laneWidget) {
-        const originalCallback = laneWidget.callback;
-        laneWidget.callback = function (...args) {
-            const result = originalCallback?.apply(this, args);
-            scheduleReferenceRefresh({
-                origin: "selector_widget",
-                targets: selectorRefreshTargets(node),
-            });
-            return result;
-        };
-    }
+    observeWidgetValue(node, "reference_lanes", () => scheduleReferenceRefresh({
+        origin: "selector_widget",
+        targets: selectorRefreshTargets(node),
+    }));
     const originalConnections = node.onConnectionsChange;
     node.onConnectionsChange = function (...args) {
         const result = originalConnections?.apply(this, args);

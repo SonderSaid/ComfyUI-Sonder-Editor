@@ -551,6 +551,32 @@ def test_state_the_bridge_projection_omits_never_moves_the_bridge(
         f"bridge-references reads {field}; classify it as a bridge dependency")
 
 
+def _guides(route_module, monkeypatch, project, scene_id):
+    handler = next(route.handler for route in route_module.routes
+                   if route.method == "GET" and route.path.endswith("/bridge-guides"))
+    monkeypatch.setattr(route_module, "_load_scene_for_bridge",
+                        lambda _request, sid: (project, project.get_scene(sid), None))
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": scene_id}, query={})))
+    assert response.status == 200
+    return json.loads(response.body.decode("utf-8"))
+
+
+@pytest.mark.parametrize("field", _unread_by("bridge"))
+def test_state_the_bridge_projection_omits_never_moves_the_guides_read(
+        route_module, monkeypatch, tmp_path, field):
+    # The Guides Start graph panel keeps its bridge-guides payload across versions
+    # the `bridge` flag certifies unchanged (plans/bridge-selections-controls.md),
+    # so that route may read only scene state the bridge projection covers.
+    project = _project(tmp_path)
+    scene = project.get_scene("scene")
+    before = _guides(route_module, monkeypatch, project, "scene")
+    assert before["guides"], "the fixture must have guides"
+    _moves()[field](scene)
+    assert _guides(route_module, monkeypatch, project, "scene") == before, (
+        f"bridge-guides reads {field}; it cannot stay gated on the bridge certificate")
+
+
 def test_a_scene_whose_ids_were_minted_at_load_is_not_certified(route_module, tmp_path):
     data = _project(tmp_path).to_dict(include_internal=True)
     stored = next(scene for scene in data["scenes"] if scene["scene_id"] == "scene")

@@ -116,6 +116,114 @@ console.log(JSON.stringify({{
     }
 
 
+def test_bridge_folder_box_is_a_draft_and_the_widget_stays_the_authority():
+    """The installed folder box never writes an old value back over a newer one.
+
+    Typing edits a draft (no per-keystroke widget write); blur or Enter commits
+    the normalized draft once; focus and blur without typing re-show the widget;
+    an external write (Controls, Relay) shows unless a draft is open; and a
+    suggestion sync shows the widget, so Root beats stale box text.
+    """
+    source = EXTENSION.read_text(encoding="utf-8")
+    normalization = _between(source, "function normalizeFolderValue", "function projectIdFromProjectValue")
+    picker = _between(source, "function buildBridgeFolderOptions", "const pendingBridgeEditorNodeIds")
+    observer = (ROOT / "web" / "js" / "widget_value_observer.js").as_uri()
+    script = f"""
+import assert from 'node:assert/strict';
+const {{ observeWidgetValue }} = await import({json.dumps(observer)});
+{normalization}
+const THEME = {{}}, FONT = {{}};
+const chromeInputCss = () => "";
+const setWidgetHidden = () => false, commitWidgetVisibility = () => {{}};
+function style(el) {{ return el; }}
+const app = {{ graph: {{ setDirtyCanvas() {{}} }} }};
+let folderList = ["Shots"];
+function getSaveBridgeProjectId() {{ return "project-1"; }}
+async function listProjectAssetFolders() {{ return folderList; }}
+class Element {{
+  constructor(tag) {{ this.tagName = tag; this.value = ""; this.handlers = {{}}; this.children = []; this.style = {{}}; }}
+  append(...c) {{ this.children.push(...c); }}
+  appendChild(c) {{ this.children.push(c); }}
+  setAttribute() {{}}
+  set innerHTML(v) {{ this.children = []; }}
+  addEventListener(name, fn) {{ (this.handlers[name] ||= []).push(fn); }}
+  fire(name, event = {{}}) {{ for (const fn of this.handlers[name] || []) fn(event); }}
+}}
+const document = {{ createElement: (tag) => new Element(tag) }};
+{picker}
+const writes = [];
+const folderWidget = {{ name: "target_folder", value: "Old", options: {{}},
+  callback(value) {{ writes.push(value); }} }};
+const node = {{ widgets: [folderWidget], addDOMWidget() {{ return {{}}; }} }};
+installBridgeFolderPicker(node);
+const input = node._sonderBridgeFolderInput;
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+await tick();
+const log = {{ installed: input.value }};
+
+// An external write while the box is idle shows at once.
+folderWidget.value = "From/Controls"; folderWidget.callback("From/Controls");
+log.external = input.value;
+
+// Focus then blur without typing keeps the newer widget value.
+input.fire("focus"); await tick();
+folderWidget.value = "Newer"; folderWidget.callback("Newer");
+input.fire("blur");
+log.focusBlur = {{ widget: folderWidget.value, box: input.value }};
+
+// Typing is a draft: no widget write per keystroke, external writes do not clobber it.
+const before = writes.length;
+input.fire("focus");
+input.value = " typed\\\\new/ "; input.fire("input");
+input.value = " typed\\\\new/folder/ "; input.fire("input");
+log.keystrokeWrites = writes.length - before;
+log.widgetWhileTyping = folderWidget.value;
+folderWidget.value = "Remote"; folderWidget.callback("Remote");
+log.draftKept = input.value;
+await (async () => {{ input.fire("focus"); await tick(); }})();
+log.syncKeptDraft = input.value;
+// Enter (change) then blur commit once, normalized.
+input.fire("change"); input.fire("blur");
+log.committed = {{ widget: folderWidget.value, box: input.value,
+  writes: writes.slice(before).filter((value) => value === "typed/new/folder").length }};
+
+// Root beats stale box text: the widget is Root, the box shows stale text, a sync runs.
+folderWidget.value = ""; input.value = "stale-text";
+await syncBridgeTargetFolderWidget(node);
+log.root = {{ widget: folderWidget.value, box: input.value }};
+
+// Ctrl+Enter queues from the widget and suppresses the native change: the
+// keydown commits first. Suggestions never carry the uncommitted draft.
+input.fire("focus");
+input.value = "Queued/Now"; input.fire("input");
+await syncBridgeTargetFolderWidget(node);
+log.draftNotOffered = folderWidget.options.values.includes("Queued/Now");
+input.fire("keydown", {{ key: "Enter", ctrlKey: true }});
+log.ctrlEnter = folderWidget.value;
+// Escape abandons a draft and shows the widget again.
+input.value = "Abandoned"; input.fire("input");
+input.fire("keydown", {{ key: "Escape" }});
+input.fire("blur");
+log.escape = {{ widget: folderWidget.value, box: input.value }};
+console.log(JSON.stringify(log));
+"""
+    result = _run_node(script)
+    assert result == {
+        "installed": "Old",
+        "external": "From/Controls",
+        "focusBlur": {"widget": "Newer", "box": "Newer"},
+        "keystrokeWrites": 0,
+        "widgetWhileTyping": "Newer",
+        "draftKept": " typed\\new/folder/ ",
+        "syncKeptDraft": " typed\\new/folder/ ",
+        "committed": {"widget": "typed/new/folder", "box": "typed/new/folder", "writes": 1},
+        "root": {"widget": "", "box": ""},
+        "draftNotOffered": False,
+        "ctrlEnter": "Queued/Now",
+        "escape": {"widget": "Queued/Now", "box": "Queued/Now"},
+    }
+
+
 def test_bridge_asset_id_helpers_detect_equal_count_replacement():
     source = CONTROLLER.read_text(encoding="utf-8")
     helpers = _between(

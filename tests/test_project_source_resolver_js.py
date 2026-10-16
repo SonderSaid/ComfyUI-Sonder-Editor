@@ -290,8 +290,14 @@ def test_named_consumers_use_shared_resolver_without_upstream_scanning():
     extension_source = EXTENSION.read_text(encoding="utf-8")
 
     assert 'from "./project_source_resolver.js"' in bridge_source
-    assert bridge_source.count("resolveProjectSource(node)") >= 4
-    assert "projectResolutionStatusText(resolution)" in bridge_source
+    # Guide and Driver reads resolve through one shared context helper; the two
+    # project-ready retries resolve directly.
+    context = bridge_source.split("function bridgeReadContext(node, route) {", 1)[1].split("\n}\n", 1)[0]
+    assert "resolveProjectSource(node)" in context
+    assert bridge_source.count('bridgeReadContext(node, "bridge-guides")') >= 1
+    assert bridge_source.count('bridgeReadContext(node, "bridge-drivers")') >= 1
+    assert bridge_source.count("resolveProjectSource(node)") >= 3
+    assert "projectResolutionStatusText(context.resolution)" in bridge_source
     assert "linkedNodeFromInput" not in bridge_source
 
     assert 'from "./project_source_resolver.js"' in extension_source
