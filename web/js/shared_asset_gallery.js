@@ -1561,12 +1561,20 @@ export function mountSharedAssetGallery(container, options = {}) {
         }
     }
 
+    let announcedFolders = null;
     function updateFolderOptions() {
         folderList.innerHTML = "";
-        for (const folder of allFolders().filter(Boolean)) {
+        const folders = allFolders().filter(Boolean);
+        for (const folder of folders) {
             const option = document.createElement("option");
             option.value = folder;
             folderList.appendChild(option);
+        }
+        // Folder pickers outside the gallery (Controls) follow the same list.
+        const signature = folders.join("\n");
+        if (signature !== announcedFolders) {
+            announcedFolders = signature;
+            options.onFoldersChanged?.(folders);
         }
     }
 
@@ -8588,6 +8596,10 @@ export function mountSharedAssetGallery(container, options = {}) {
             cancelThumbnailRepairOwners();
         },
         isInspectOverlayOpen: () => !!state.overlayState.open,
+        // Read-only: the project's asset folders as this gallery holds them now
+        // (kept current through its own writes and rollbacks), Root excluded.
+        // Nothing until the current project's list has loaded, never the previous one's.
+        getFolders: () => (dataProjectDir === currentProjectDir() ? allFolders().filter(Boolean) : []),
         hasSelectionOwnership,
         refreshCurrentScene,
         inspectAsset,

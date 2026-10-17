@@ -779,6 +779,36 @@ def _flag_shared_targets(bindings: list[dict]) -> None:
                                   reason="Another Control sets the same input. Remove one of them.")
 
 
+# ``describe_bindings(host_editor=)`` default: the prompt's only Editor hosts the
+# panel (every Sonder App path). ``None`` says no host is known (a canvas whose
+# Editor is muted, bypassed or inside a subgraph), so no hint is ``host``.
+SOLE_EDITOR = object()
+
+
+def _picker_hint(prompt: dict, descriptor: dict, host_editor: Any) -> dict | None:
+    """``{kind, source}`` for an ``ok`` binding whose targets share one picker.
+
+    A presentation hint (``binding_policy.PICKERS``); kind and value stay the
+    input's own. ``source`` is ``host`` when every target's project comes from
+    the Editor hosting the panel, so the panel may show that project's current
+    scene; ``other`` when one comes from another Editor or none; ``unknown`` when
+    no host Editor is known. Mixed picker kinds get no hint.
+    """
+    if descriptor.get("status") != STATUS_OK:
+        return None
+    targets = descriptor.get("targets") or []
+    kinds = {binding_policy.picker_for(t.get("class_type"), t.get("input")) for t in targets}
+    if len(kinds) != 1 or None in kinds:
+        return None
+    if host_editor is None or str(host_editor) not in prompt:
+        source = "unknown"
+    elif all(prompt_graph.project_editor(prompt, t["path"]) == str(host_editor) for t in targets):
+        source = "host"
+    else:
+        source = "other"
+    return {"kind": kinds.pop(), "source": source}
+
+
 def describe_bindings(
     prompt: Any,
     *,
@@ -787,8 +817,14 @@ def describe_bindings(
     local: Any = None,
     local_notes: Any = None,
     orphan_manifest: Any = None,
+    host_editor: Any = SOLE_EDITOR,
 ) -> dict:
     """Describe the Relay's bindings and notes in an API prompt.
+
+    ``host_editor`` is the prompt key of the Sonder Editor hosting the panel
+    (the canvas posts its node, or ``None`` when it is not in the prompt); by
+    default the only Editor when there is exactly one, which covers every Sonder
+    App path. It decides each picker hint's ``source`` (``_picker_hint``).
 
     ``relay_census`` is the canvas count of active, muted, bypassed and nested
     Relays, which an export cannot show. ``local`` and ``local_notes`` are the
@@ -844,6 +880,12 @@ def describe_bindings(
     exposed = {d["binding_id"] for d in view["bindings"]}
     view["suggestions"] = [s for s in view["suggestions"] if s["binding_id"] not in exposed]
     _flag_shared_targets(view["bindings"])
+    if host_editor is SOLE_EDITOR:
+        host_editor = view["editors"][0] if len(view["editors"]) == 1 else None
+    for descriptor in view["bindings"]:
+        picker = _picker_hint(prompt, descriptor, host_editor)
+        if picker is not None:
+            descriptor["picker"] = picker
     view["_presets"] = manifest["presets"]
     view["description"] = manifest["description"]
     view["groups"] = manifest["groups"]

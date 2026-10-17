@@ -21,14 +21,27 @@ _RUNNER_OWNED = {
 }
 
 # Inputs a Sonder frontend hides and drives. The SDK cannot see frontend hiding,
-# so the server denies them by class.
+# so the server denies them by class. The Reference lanes, Driver lane and Save
+# Bridge folder are hidden too, but they are plain user choices: they are
+# Controls with pickers (``PICKERS``).
 _FRONTEND_OWNED = {
     "SonderGuidesBridgeStart": frozenset({"iteration_index", "bridge_overrides_json"}),
-    "SonderDriverSelector": frozenset({"driver_lane_index", "driver_selector_overrides_json"}),
-    "SonderSaveBridge": frozenset({"target_folder"}),
-    "SonderReferenceSelector": frozenset({"reference_lanes"}),
+    "SonderDriverSelector": frozenset({"driver_selector_overrides_json"}),
     RELAY_CLASS_TYPE: frozenset({"manifest"}),
 }
+
+# (class_type, input) -> the picker the Controls panel shows instead of a plain
+# field. A presentation hint only: the kind, signature, presets and stored values
+# are the input's own. ``web/js/control_bindings.js`` mirrors it (parity-tested).
+PICKERS: dict[tuple[str, str], str] = {
+    ("SonderReferenceSelector", "reference_lanes"): "reference_lanes",
+    ("SonderDriverSelector", "driver_lane_index"): "driver_lane",
+    ("SonderSaveBridge", "target_folder"): "asset_folder",
+}
+
+
+def picker_for(class_type: Any, input_name: Any) -> str | None:
+    return PICKERS.get((class_type, input_name))
 
 # Provenance label widgets of the Metadata Collectors (``label_1``...).
 _DENIED_PREFIXES = {

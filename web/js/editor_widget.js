@@ -367,6 +367,7 @@ function sessionDiagEndLoad(kind, markerId, payload) {
 import { INSPECT_OVERLAY_SHORTCUTS, mountSharedAssetGallery, getActiveDragAsset } from "./shared_asset_gallery.js";
 import { getActiveReferenceDrag, mountReferenceLibrary, referenceMemberMediaKind, SONDER_REFERENCE_MIME } from "./editor_reference_library.js";
 import { mountControlsPanel } from "./editor_controls_panel.js";
+import { createControlsPickerSources } from "./controls_picker_sources.js";
 import { openReferenceMediaEditor, REFERENCE_MEDIA_EDITOR_SHORTCUTS } from "./reference_media_editor.js";
 import {
     applyPendingRecipeOverlays,
@@ -1295,6 +1296,7 @@ export class EditorWidget {
     }
 
     _setHostValueLocal(name, value) {
+        this._controlsPickerSources?.contextChanged();
         if (this.widgetHost?.setValueLocal) {
             this.widgetHost.setValueLocal(name, value);
             return;
@@ -1679,6 +1681,7 @@ export class EditorWidget {
             initialData: { assets: [], folders: [] },
             getCurrentSceneAssetIds: () => this._currentSceneAssetIdsForGallery(),
             formatReferenceTag: (tag) => this._formatReferenceTag(tag),
+            onFoldersChanged: () => this._controlsPickerSources?.foldersChanged(),
             onImportFiles: async (files, folder) => {
                 await this._importFilesWithProgress(Array.from(files || []), folder);
             },
@@ -4529,9 +4532,36 @@ export class EditorWidget {
         this._controlsPanelHandle = null;
         this._controlsPanelEl?.remove();
         this._controlsPanelEl = null;
-        this._controlsHost?.setVisible(false);
+        this._setControlsVisible(false);
         this._controlsHost = controlsHost || null;
         if (mounted) this._showFullscreenSidebarContent(this._settings?.layout?.fullscreenSidebarContent, { persist: false });
+    }
+
+    // Controls visibility drives the host's reads and the pickers' reads alike.
+    _setControlsVisible(visible) {
+        this._controlsHost?.setVisible(visible);
+        this._controlsPickerSources?.setVisible(visible);
+    }
+
+    // What the Controls lane and folder pickers list: this editor's project and
+    // active scene, read with the same window the canvas graph panels use.
+    _ensureControlsPickerSources() {
+        if (this._controlsPickerSources || this._destroyed) return this._controlsPickerSources;
+        this._controlsPickerSources = createControlsPickerSources({
+            apiURL: (path) => api.apiURL(path),
+            getContext: () => ({
+                projectId: this._projectDirName(),
+                // The loaded scene only: across a project switch the scene widget
+                // still names the previous project's scene.
+                sceneId: this.activeSceneId || "",
+                selectionStart: this._getWidgetValue("selection_start", 0),
+                selectionEnd: this._getWidgetValue("selection_end", 0),
+                preContextFrames: this._contextFrameValue("pre_context_frames"),
+                postContextFrames: this._contextFrameValue("post_context_frames"),
+            }),
+            getFolders: () => this._assetGallery?.getFolders?.() || [],
+        });
+        return this._controlsPickerSources;
     }
 
     _ensureControlsPanelMounted() {
@@ -4541,6 +4571,7 @@ export class EditorWidget {
         const adapter = this._controlsHost || { getView: () => ({ bindings: [], notes: [], error: "Open a connected workflow to edit its controls." }), subscribe: () => () => {}, applyChanges: async () => ({ ok: false }) };
         this._controlsPanelHandle = mountControlsPanel(this._controlsPanelEl, {
             ...adapter,
+            pickers: this._ensureControlsPickerSources(),
             getEditorSettings: () => this._settings,
             // Typed and whitelisted (editor_settings.js): throws on a refused value.
             setEditorSetting: (key, value) => this._updateSettings(controlsPanelSettingPatch(key, value)),
@@ -4625,7 +4656,7 @@ export class EditorWidget {
         const mode = ["references", "controls"].includes(value) ? value : "assets";
         if (mode === "controls") this._ensureControlsPanelMounted();
         else void this._controlsPanelHandle?.flushPending();
-        this._controlsHost?.setVisible(mode === "controls" && this.isFullscreen);
+        this._setControlsVisible(mode === "controls" && this.isFullscreen);
         if (this._controlsPanelEl) this._controlsPanelEl.style.display = mode === "controls" ? "flex" : "none";
         if (this._fsControlsTab) this._fsControlsTab.dataset.active = mode === "controls" ? "true" : "false";
         this._ensureReferenceLibraryMounted();
@@ -23570,7 +23601,7 @@ export class EditorWidget {
 
         // Set fullscreen state + recalc
         this.isFullscreen = true;
-        this._controlsHost?.setVisible(this._settings?.layout?.fullscreenSidebarContent === "controls");
+        this._setControlsVisible(this._settings?.layout?.fullscreenSidebarContent === "controls");
         EditorWidget._activeFullscreen = this;
         // Initial entry and project load share a wave; explicit events do not.
         this._sweepRenderCache(undefined, { generation: this._renderCacheSweepGeneration });
@@ -23619,7 +23650,7 @@ export class EditorWidget {
         this._renderCacheSweepInFlight = null;
         if (!this.isFullscreen) return;
         void this._controlsPanelHandle?.flushPending();
-        this._controlsHost?.setVisible(false);
+        this._setControlsVisible(false);
 
         // Stop playback before exiting
         this._stopPlayback();
@@ -27836,6 +27867,8 @@ export class EditorWidget {
 
     // ── Widget Value Helpers ───────────────────────────────────────────
     _setWidgetValue(name, value) {
+        // The Controls pickers read this editor's scene and window.
+        this._controlsPickerSources?.contextChanged();
         if (this._applyingWidgetState) {
             this._setHostValueLocal(name, value);
             return;
@@ -27859,6 +27892,7 @@ export class EditorWidget {
     // ── Public API ─────────────────────────────────────────────────────
     updateProject(projectDir) {
         if (projectDir === this.projectDir) return;
+        this._controlsPickerSources?.contextChanged();
         this._clearStaleReplayState();
         this._assetGallery?.cancelThumbnailRepairs?.();
         cancelThumbnailRepairOwner(this._thumbnailRepairOwnerId);
@@ -29345,7 +29379,9 @@ export class EditorWidget {
         }
         this._controlsPanelHandle?.destroy();
         this._controlsPanelHandle = null;
-        this._controlsHost?.setVisible(false);
+        this._setControlsVisible(false);
+        this._controlsPickerSources?.destroy();
+        this._controlsPickerSources = null;
         if (this._generationHost) this._generationHost.flushControlsPanel = null;
         if (this._referenceLibraryHandle) {
             this._referenceLibraryHandle.destroy();

@@ -2,7 +2,13 @@ import { EDITOR_COLORS as COLORS, FONT, RADIUS, SPACE, TYPE } from "./editor_the
 // Search becomes useful once a native select exceeds a short screenful.
 export const wantsComboPicker = spec => !!spec.options_truncated || (spec.options?.length || 0) > 20;
 
-export function mountComboPicker({ choose, cancel, onLeave, inputCss }) {
+// `freeText` (the asset-folder picker): the typed text is itself a valid value.
+// Enter and leaving the field commit it (normalized by `normalize`), "Use typed
+// value" is always offered, and `labels` give values a display name distinct
+// from the value (Root for ""). Without it the picker is unchanged: only a
+// listed option or, when the preview is capped, an explicit typed value commits.
+export function mountComboPicker({ choose, cancel, onLeave, inputCss, freeText = false,
+    normalize = value => String(value ?? ""), labels = {} }) {
     const box = document.createElement("div"),
         input = document.createElement("input"),
         list = document.createElement("select"),
@@ -28,16 +34,30 @@ export function mountComboPicker({ choose, cancel, onLeave, inputCss }) {
         query = "",
         current = "",
         open = false;
+    const labelOf = o => (Object.hasOwn(labels, String(o)) ? labels[String(o)] : String(o));
     function paint() {
-        const matches = options.filter(o => String(o).toLowerCase().includes(query.toLowerCase()));
-        list.replaceChildren(...matches.map(o => { const option = new Option(String(o), String(o)); option.disabled = !!optionDetails[o]?.disabled; option.title = optionDetails[o]?.title || ""; return option; }));
-        list.value = matches.some(o => String(o) === input.value) ? input.value : String(matches[0] ?? "");
+        const matches = options.filter(o => [String(o), labelOf(o)].some(text => text.toLowerCase().includes(query.toLowerCase())));
+        list.replaceChildren(...matches.map(o => { const option = new Option(labelOf(o), String(o)); option.disabled = !!optionDetails[o]?.disabled; option.title = optionDetails[o]?.title || ""; return option; }));
+        // A free-text picker commits what was typed, so it highlights only an exact
+        // match: a highlighted near match would read as the choice Enter makes.
+        if (freeText && !matches.some(o => String(o) === input.value)) list.selectedIndex = -1;
+        else list.value = matches.some(o => String(o) === input.value) ? input.value : String(matches[0] ?? "");
         list.hidden = !open || !matches.length;
+        typed.hidden = !(truncated || (freeText && open));
         hint.textContent = truncated
             ? "Preview limited. Choose a match or use an exact typed value."
             : open && !matches.length
-              ? "No matching options."
+              ? freeText ? "No matching folder. Enter keeps what you typed." : "No matching options."
               : "";
+    }
+    // A free-text picker's typed text, committed when it differs from the value.
+    function commitTyped() {
+        if (!freeText || input.value === current) return false;
+        // Typing a label ("Root") means its value, never a folder of that name.
+        const typedText = input.value.trim().toLowerCase();
+        const labelled = Object.keys(labels).find(value => String(labels[value]).toLowerCase() === typedText);
+        select(labelled !== undefined ? labelled : normalize(input.value));
+        return true;
     }
     function select(value) {
         const selected = String(value);
@@ -68,12 +88,13 @@ export function mountComboPicker({ choose, cancel, onLeave, inputCss }) {
     };
     const keepFocus = e => e.preventDefault(),
         useTyped = () => {
-            select(input.value);
+            select(normalize(input.value));
             if (document.activeElement === typed) typed.blur();
             else input.blur();
         };
     const leave = e => {
         if (!box.contains(e.relatedTarget)) {
+            if (commitTyped()) { onLeave?.(); return; }
             input.value = current;
             query = "";
             open = false;
@@ -92,12 +113,13 @@ export function mountComboPicker({ choose, cancel, onLeave, inputCss }) {
         box,
         input,
         list,
+        freeText,
+        commitTyped,
         contains: el => box.contains(el),
         update(spec) {
             options = spec.options || [];
             optionDetails = spec.optionDetails || {};
             truncated = !!spec.options_truncated;
-            typed.hidden = !truncated;
             input.disabled = list.disabled = typed.disabled = !["ok", "unlinked"].includes(spec.status);
             paint();
         },
@@ -125,6 +147,11 @@ export function mountComboPicker({ choose, cancel, onLeave, inputCss }) {
             if (e.key === "Enter") {
                 if (document.activeElement === typed) {
                     useTyped();
+                    return true;
+                }
+                if (freeText) {
+                    if (!commitTyped()) { open = false; paint(); }
+                    input.blur();
                     return true;
                 }
                 if (input.value === current) {

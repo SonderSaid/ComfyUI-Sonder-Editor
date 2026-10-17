@@ -119,8 +119,8 @@ def test_census_error(census, expected):
 @pytest.mark.parametrize("class_type, name", [
     ("SonderEditor", "project"), ("SonderEditor", "selection_start"), ("SonderEditor", "render_cache_max_bytes"),
     ("SonderEditor", "take_placement_muted"), ("SonderGuidesBridgeStart", "iteration_index"),
-    ("SonderDriverSelector", "driver_selector_overrides_json"), ("SonderSaveBridge", "target_folder"),
-    ("SonderReferenceSelector", "reference_lanes"), ("SonderMetadataCollector", "label_3"),
+    ("SonderDriverSelector", "driver_selector_overrides_json"), ("SonderGuidesBridgeStart", "bridge_overrides_json"),
+    ("SonderMetadataCollector", "label_3"),
     ("SonderMetadataCollectorV3", "label_12"), ("SonderControlRelay", "manifest"),
     ("KSampler", None), ("KSampler", 3),
 ])
@@ -134,6 +134,9 @@ def test_denied_inputs(class_type, name):
     # A real STRING widget named `prompt` (text encoders) is bindable; hidden
     # inputs never reach a prompt and describe as unsupported instead.
     ("TextEncodeQwenImageEdit", "prompt"), ("MinimaxH3TextEncode", "prompt"),
+    # Hidden on the canvas but plain user choices: Controls with pickers.
+    ("SonderSaveBridge", "target_folder"), ("SonderReferenceSelector", "reference_lanes"),
+    ("SonderDriverSelector", "driver_lane_index"),
 ])
 def test_allowed_inputs(class_type, name):
     assert not bp.is_denied(class_type, name)
@@ -153,6 +156,15 @@ def test_frontend_denylist_mirrors_the_server():
     assert mirrored == bp.denied_inputs()
     prefixes = dict(re.findall(r'(\w+): "(\w+)"', re.search(r"DENIED_PREFIXES = \{(.*?)\};", source).group(1)))
     assert prefixes == bp.denied_prefixes()
+
+
+def test_frontend_pickers_mirror_the_server():
+    source = (ROOT / "web/js/control_bindings.js").read_text(encoding="utf-8")
+    block = re.search(r"export const PICKERS = \{(.*?)\n\};", source, re.S).group(1)
+    mirrored = {tuple(key.split("/")): kind for key, kind in re.findall(r'"([^"]+)": "([^"]+)"', block)}
+    assert mirrored == bp.PICKERS
+    for (class_type, name) in bp.PICKERS:
+        assert not bp.is_denied(class_type, name), "a picker input must be bindable"
 
 
 def test_editor_classes_mirror_the_frontend():

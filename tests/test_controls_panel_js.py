@@ -68,6 +68,26 @@ if(SCENARIO==='markdown'){
         setEditorSetting(k,v){settingWrites.push([k,v]);if(refuseSetting)throw Error('setting refused');const [s,n]=k.split('.');settings[s][n]=v;},notify:m=>notices.push(m),
         async applyChanges(changes){calls.push(changes);if(defer)await new Promise(r=>resolveWrite=r);return refuse?{ok:false,rejected:[{reason:'server refusal'}]}:{ok:true,rejected:[]};}};
     if(SCENARIO==='initial-error')view={...view,state:'error',error:'cached read failed'};
+    // Lane and folder pickers (plans/bridge-selections-controls.md, D): the host's
+    // picker sources stand in for controls_picker_sources.js.
+    const pickerSubs=new Set();let pickerInterest=null;
+    const refLane=(i,kind='image')=>({lane_index:i,lane_name:`Ref ${i+1}`,recipe_id:'r',recipe_name:'Slots',
+        recipe:{hard:{assembly:'slots',max_members:16},soft:{}},media_kind:kind,item_count:1,member_count:1,
+        reserved_member_span:1,prompt_override:'',strength:1});
+    const pickerData={reference_lanes:{status:'ready',sceneName:'Saloon',source:'live',lanes:[refLane(0),refLane(1,'audio'),refLane(2),refLane(3)]},
+        driver_lane:{status:'ready',sceneName:'Saloon',drivers:[{laneIndex:0,name:'Zero'},{laneIndex:1,name:'One'}]},
+        asset_folder:{status:'ready',folders:['Shots','Takes/A']}};
+    if(SCENARIO==='pickers'){
+        host.pickers={get:k=>pickerData[k],setInterest(k){pickerInterest=[...k].sort();},
+            subscribe(cb){pickerSubs.add(cb);return()=>pickerSubs.delete(cb);}};
+        const b=(id,label,kind,value,extra)=>({source:'binding',binding_id:id,label,kind,value,status:'ok',order:0,group:'',section:'workflow',note:'',...extra});
+        view={state:'ready',notes:[],bindings:[
+            b('lanes','Lanes','STRING','0, bad',{order:1,picker:{kind:'reference_lanes',source:'host'}}),
+            b('lane','Driver','INT','1',{order:2,min:'0',max:'999',picker:{kind:'driver_lane',source:'host'}}),
+            b('folder','Folder','COMBO','Shots',{order:3,checked_at_run:true,picker:{kind:'asset_folder',source:'host'}}),
+            b('other','Other lanes','STRING','1',{order:4,picker:{kind:'reference_lanes',source:'other'}}),
+            b('atrun','Free combo','COMBO','x',{order:5,checked_at_run:true})]};
+    }
     const container=new El('div'),panel=mountControlsPanel(container,host);
     const byTarget=t=>walk(container).find(n=>n.dataset.controlTarget===t);
     const input=t=>walk(byTarget(t)).find(n=>n.tagName==='INPUT');
@@ -81,6 +101,122 @@ if(SCENARIO==='markdown'){
     const group=name=>walk(container).find(n=>n.dataset.controlsGroup===name);
     const mirror=key=>walk(container).find(n=>n.dataset.controlsMirror===key);
 
+    if(SCENARIO==='pickers'){
+        await settle();
+        assert.deepEqual(pickerInterest,['asset_folder','driver_lane','reference_lanes'],'interest follows the shown pickers');
+        // Reference lanes: named rows, the malformed token disclosed, nothing rewritten by viewing.
+        const lanesRow=byTarget('binding:lanes:value');
+        assert.match(lanesRow.textContent,/Ref 1 — Slots/);
+        assert.match(lanesRow.textContent,/Ignored unparseable lane token: bad/);
+        assert.equal(calls.length,0);
+        const entry=t=>walk(byTarget('binding:lanes:value')).find(n=>n.tagName==='BUTTON'&&n.textContent.startsWith(t));
+        button(lanesRow,'+ Add lane').dispatch('click');
+        assert.equal(entry('Ref 2').disabled,true);
+        assert.match(entry('Ref 2').textContent,/Media kind differs/);
+        // Two quick Adds: the second builds on the first, still pending.
+        entry('Ref 3').dispatch('click');
+        button(byTarget('binding:lanes:value'),'+ Add lane').dispatch('click');entry('Ref 4').dispatch('click');
+        await settle();
+        assert.deepEqual(calls.slice(-2),[{'binding:lanes:value':'0, 2'},{'binding:lanes:value':'0, 2, 3'}]);
+        walk(byTarget('binding:lanes:value')).find(n=>n.title==='Remove Reference 3').dispatch('click');
+        await settle();
+        assert.deepEqual(calls.at(-1),{'binding:lanes:value':'0, 3'});
+        // Driver lane: the scene's names, an integer commit, and a refusal resets the choice.
+        const laneSelect=()=>walk(byTarget('binding:lane:value')).find(n=>n.tagName==='SELECT');
+        assert.deepEqual(laneSelect().children.map(o=>o.textContent),['Zero','One']);
+        assert.equal(laneSelect().value,'1');
+        laneSelect().value='0';laneSelect().dispatch('change');await settle();
+        assert.deepEqual(calls.at(-1),{'binding:lane:value':0});
+        publish({...view,bindings:view.bindings.map(x=>x.binding_id==='lane'?{...x,value:'0'}:x)});
+        refuse=true;laneSelect().value='1';laneSelect().dispatch('change');await settle();refuse=false;
+        assert.deepEqual(calls.at(-1),{'binding:lane:value':1});
+        assert.equal(laneSelect().value,'0','a refused lane shows the stored one again');
+        // Folder: typed text is the value, normalized; Root is offered under its label.
+        const folderRow=byTarget('binding:folder:value');
+        const folderInput=walk(folderRow).find(n=>n.tagName==='INPUT');
+        assert.equal(folderInput.placeholder,'Root');
+        assert.ok(!folderRow.textContent.includes('Checked by the node'));
+        folderInput.focus();folderInput.value=' New\\Folder/ ';folderInput.dispatch('input');key('Enter');await settle();
+        assert.deepEqual(calls.at(-1),{'binding:folder:value':'New/Folder'});
+        folderInput.focus();folderInput.value='';folderInput.dispatch('input');
+        const choices=walk(folderRow).find(n=>n.tagName==='SELECT');
+        assert.ok(choices.children.some(o=>o.textContent==='Root'&&o.value===''));
+        assert.ok(choices.children.some(o=>o.value==='Takes/A'));
+        assert.equal(button(folderRow,'Use typed value').hidden,false,'a folder picker always offers the typed text');
+        folderInput.blur();await settle();
+        assert.deepEqual(calls.at(-1),{'binding:folder:value':''},'leaving the field keeps what was typed: Root');
+        // Generate saves a focused folder draft first.
+        folderInput.focus();folderInput.value='Flushed';folderInput.dispatch('input');
+        assert.equal(await panel.flushPending(),true);
+        assert.deepEqual(calls.at(-1),{'binding:folder:value':'Flushed'});
+        // Another Editor's lanes: the plain field, saying why. A combo checked at run with
+        // nothing to list is a text field, not an empty list.
+        const otherRow=byTarget('binding:other:value');
+        assert.ok(walk(otherRow).some(n=>n.tagName==='INPUT'&&n.type==='text'));
+        assert.match(otherRow.textContent,/Wired to another Sonder Editor/);
+        assert.ok(!button(otherRow,'+ Add lane'));
+        const atrun=byTarget('binding:atrun:value');
+        assert.ok(walk(atrun).some(n=>n.tagName==='INPUT'&&n.type==='text'));
+        assert.ok(!walk(atrun).some(n=>n.tagName==='SELECT'));
+        // The sources' news repaints the pickers.
+        pickerData.driver_lane={status:'ready',sceneName:'Saloon',drivers:[{laneIndex:0,name:'Renamed'},{laneIndex:1,name:'One'}]};
+        for(const cb of pickerSubs)cb();
+        assert.equal(laneSelect().children[0].textContent,'Renamed');
+        // host -> other rebuilds the row as a plain field, and interest drops the kind.
+        publish({...view,bindings:view.bindings.map(x=>x.binding_id==='lanes'?{...x,value:'0, 3',picker:{kind:'reference_lanes',source:'other'}}:x)});
+        await settle();
+        const rebuilt=byTarget('binding:lanes:value');
+        assert.ok(!button(rebuilt,'+ Add lane'));
+        assert.match(rebuilt.textContent,/Wired to another Sonder Editor/);
+        assert.deepEqual(pickerInterest,['asset_folder','driver_lane']);
+        // Without choices: numbered rows, no Add.
+        publish({...view,bindings:view.bindings.map(x=>x.binding_id==='lanes'?{...x,picker:{kind:'reference_lanes',source:'host'}}:x)});
+        pickerData.reference_lanes={status:'loading'};for(const cb of pickerSubs)cb();
+        const loading=byTarget('binding:lanes:value');
+        assert.match(loading.textContent,/Reference 1/);assert.match(loading.textContent,/Loading lanes/);
+        assert.equal(button(loading,'+ Add lane').disabled,true);
+        // No news, no repaint: a focused Remove keeps its element, so keyboard focus stays.
+        pickerData.reference_lanes={status:'ready',sceneName:'Saloon',source:'live',lanes:[refLane(0),refLane(1,'audio'),refLane(2),refLane(3)]};
+        for(const cb of pickerSubs)cb();
+        const lanesNow=()=>byTarget('binding:lanes:value');
+        const firstRemove=walk(lanesNow()).find(n=>n.title&&n.title.startsWith('Remove Reference'));
+        for(const cb of pickerSubs)cb();
+        assert.equal(walk(lanesNow()).find(n=>n.title===firstRemove.title),firstRemove,'an unchanged picker is not repainted');
+        // Revalidating keeps the list: a read in flight with lanes held still lists them and adds.
+        pickerData.reference_lanes={...pickerData.reference_lanes,status:'loading'};for(const cb of pickerSubs)cb();
+        assert.match(lanesNow().textContent,/Ref 1 — Slots/);
+        assert.equal(button(lanesNow(),'+ Add lane').disabled,false);
+        pickerData.reference_lanes={...pickerData.reference_lanes,status:'ready'};for(const cb of pickerSubs)cb();
+        // A view published while the lane menu is open is the base of the next Add.
+        walk(lanesNow()).find(n=>n.title==='Remove Reference 4').dispatch('click');await settle();
+        button(lanesNow(),'+ Add lane').dispatch('click');
+        publish({...view,bindings:view.bindings.map(x=>x.binding_id==='lanes'?{...x,value:'3'}:x)});await settle();
+        button(lanesNow(),'+ Add lane').dispatch('click');await settle();
+        button(lanesNow(),'+ Add lane').dispatch('click');
+        walk(lanesNow()).find(n=>n.tagName==='BUTTON'&&n.textContent.startsWith('Ref 3')).dispatch('click');await settle();
+        assert.deepEqual(calls.at(-1),{'binding:lanes:value':'2, 3'},'an external change seen mid-edit is not overwritten');
+        // Driver: a failed first read offers a typed lane number and Retry.
+        let retried=0;host.pickers.refresh=()=>{retried++;};
+        pickerData.driver_lane={status:'error',error:'Driver bridge fetch failed: 503'};for(const cb of pickerSubs)cb();
+        const driverRow=byTarget('binding:lane:value');
+        const typedLane=walk(driverRow).find(n=>n.tagName==='INPUT'&&n.type==='number');
+        assert.equal(typedLane.style.display,'');
+        assert.match(driverRow.textContent,/Type a lane number/);
+        button(driverRow,'Retry').dispatch('click');assert.equal(retried,1);
+        typedLane.value='3';typedLane.dispatch('change');await settle();
+        assert.deepEqual(calls.at(-1),{'binding:lane:value':2},'typed 1-based, stored zero-based');
+        // Folder: a near match is not highlighted, Escape saves nothing, and typing a
+        // label means its value.
+        const folderNow=byTarget('binding:folder:value');
+        const folderField=walk(folderNow).find(n=>n.tagName==='INPUT');
+        const sent=calls.length;
+        folderField.focus();folderField.value='Sho';folderField.dispatch('input');
+        assert.equal(walk(folderNow).find(n=>n.tagName==='SELECT').selectedIndex,-1);
+        key('Escape');await settle();
+        assert.equal(calls.length,sent,'Escape abandons the typed text');
+        folderField.focus();folderField.value='root';folderField.dispatch('input');key('Enter');await settle();
+        assert.deepEqual(calls.at(-1),{'binding:folder:value':''},'"Root" is the Root value, never a folder named Root');
+    }
     if(SCENARIO==='restore-notice'){
         publish({...view,relay:{status:'ok'},restore:{restorable:[{binding_id:'steps',path:'3',input:'steps'}],
             unmatched:[{binding_id:'seed',label:'Seed',reason:'ambiguous'}]}});
@@ -671,11 +807,12 @@ if(SCENARIO==='markdown'){
         }
     }
     panel.destroy();assert.equal(listeners.size,0);assert.equal(container.children.length,0);
+    if(SCENARIO==='pickers'){assert.equal(pickerSubs.size,0);assert.deepEqual(pickerInterest,[]);}
 }
 console.log('ok');
 '''
 
-@pytest.mark.parametrize('scenario',['value-title','editor-reorder','restore-notice','restore-all','description','group-editor-name','editor-focus-refresh','normal-view','manage','manage-sdk','manage-flush','hide-flush','combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','note-refusal','problem-statuses','loading','note-then-value','batch-mirror','search','advanced','advanced-refusal','hidden-pending','cards-scale','group-note','groups-manage','groups-cap','rows','rows-notice','rows-app'])
+@pytest.mark.parametrize('scenario',['value-title','editor-reorder','restore-notice','restore-all','description','group-editor-name','editor-focus-refresh','normal-view','manage','manage-sdk','manage-flush','hide-flush','combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','note-refusal','problem-statuses','loading','note-then-value','batch-mirror','search','advanced','advanced-refusal','hidden-pending','cards-scale','group-note','groups-manage','groups-cap','rows','rows-notice','rows-app','pickers'])
 def test_controls_panel(scenario, tmp_path):
     node=shutil.which('node')
     if not node:pytest.skip('node required for Controls renderer boundary tests')

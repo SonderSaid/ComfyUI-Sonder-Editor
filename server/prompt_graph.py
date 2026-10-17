@@ -176,6 +176,37 @@ def editor_keys(prompt: Any) -> list[str]:
     ]
 
 
+_PROJECT_HOPS = 32
+
+
+def project_editor(prompt: Any, node_id: Any) -> str | None:
+    """The Sonder Editor whose project ``node_id``'s ``project`` input carries.
+
+    Follows only ``project`` inputs, through nodes that pass a project on (a
+    Guides Bridge Start, a chained consumer), and stops at the first Editor.
+    Unlike ``upstream_reaches`` it never follows other inputs, so with Editor B
+    consuming Editor A, a node wired to B answers B. API prompts already
+    flatten reroutes, KJ Set/Get and subgraphs. None when the input is a
+    literal, unlinked, cyclic, too deep or reaches no Editor.
+    """
+    if not isinstance(prompt, dict):
+        return None
+    seen: set[str] = set()
+    current = node_id
+    for _ in range(_PROJECT_HOPS):
+        source = linked_node_id(node_inputs(prompt, current).get("project"))
+        if source is None or source in seen:
+            return None
+        seen.add(source)
+        node = prompt.get(source)
+        if not isinstance(node, dict):
+            return None
+        if node.get("class_type") == SONDER_EDITOR_CLASS_TYPE:
+            return source
+        current = source
+    return None
+
+
 def nodes_reaching(prompt: Any, editor_id: Any, class_types: Any) -> list[str]:
     """Prompt keys of nodes of the given class types whose ``project`` input
     takes its project from this editor."""

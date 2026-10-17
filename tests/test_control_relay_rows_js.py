@@ -137,6 +137,40 @@ if(SCENARIO==='groups'){
     const size=[...relay.size];relay.widgets[0].value=JSON.stringify({v:1,notes:{},groups:{},bindings:{seed:{label:'Seed'}}});
     sync();assert.deepEqual(relay.size,size);
 }
+if(SCENARIO==='pickers'){
+    // Lanes and folders are picked on their node or in Controls: the Relay shows a
+    // read-only summary, decided by each RESOLVED target's class (a promoted input's
+    // anchor is its subgraph host; its target is the inner Driver Selector).
+    const refSel=node('SonderReferenceSelector',7,[widget('reference_lanes','0, 2',{type:'text'})]);
+    const drvSel=node('SonderDriverSelector',8,[widget('driver_lane_index',1)]);
+    const bridge=node('SonderSaveBridge',9,[widget('target_folder','',{type:'combo',options:{values:['']}})]);
+    const inner=new Graph();
+    const innerDrv={id:5,type:'SonderDriverSelector',comfyClass:'SonderDriverSelector',mode:0,graph:inner,properties:{},
+        inputs:[{name:'driver_lane_index',widget:{name:'driver_lane_index'},link:70}],widgets:[widget('driver_lane_index',2)]};
+    inner._nodes.push(innerDrv);inner.links.set(70,{target_id:5,target_slot:0});inner.inputs=[{name:'lane',linkIds:[70]}];
+    const host=node('MySubgraph',20,[widget('lane',3)],{subgraph:inner,inputs:[{name:'lane',widget:{name:'lane'},link:null}]});
+    refSel.properties.sonderBindings={reference_lanes:'lanes'};drvSel.properties.sonderBindings={driver_lane_index:'lane'};
+    bridge.properties.sonderBindings={target_folder:'folder'};host.properties.sonderBindings={lane:'promoted'};
+    relay.widgets[0].value=manifest({lanes:{label:'Lanes',order:1},lane:{label:'Driver',order:2},folder:{label:'Folder',order:3},
+        promoted:{label:'Promoted',order:4},steps:{label:'Steps',order:5}});
+    sync();
+    const suffix=' — edit on the node or in Controls';
+    const shown=name=>[row(name).type,row(name).value,row(name).disabled];
+    assert.deepEqual(shown('lanes'),['text','Lanes 1, 3'+suffix,true]);
+    assert.deepEqual(shown('lane'),['text','Driver lane 2'+suffix,true]);
+    assert.deepEqual(shown('folder'),['text','Root'+suffix,true]);
+    assert.deepEqual(shown('promoted'),['text','Driver lane 4'+suffix,true],'the host value, summarised by the inner target');
+    assert.equal(row('steps').type,'number');
+    // The follow-native refresh recomputes the summary; nothing wraps a callback.
+    const callbacksBefore=[refSel,drvSel,bridge,host].map(n=>n.widgets[0].callback);
+    refSel.widgets[0].value='1';bridge.widgets[0].value='Takes/Day 1';
+    sync();
+    assert.equal(row('lanes').value,'Lane 2'+suffix);
+    assert.equal(row('folder').value,'Takes/Day 1'+suffix);
+    refSel.widgets[0].value='bad';sync();
+    assert.equal(row('lanes').value,'No lanes'+suffix);
+    assert.deepEqual([refSel,drvSel,bridge,host].map(n=>n.widgets[0].callback),callbacksBefore);
+}
 if(SCENARIO==='group-tolerance'){
     for(const [raw, expected] of [[' Look ','Look'],['bad:name',''],['',''],['constructor','']]){
         relay.widgets[0].value=JSON.stringify({bindings:{steps:{label:'Steps',group:raw}},groups:{}});
@@ -155,7 +189,7 @@ if(SCENARIO==='group-tolerance'){
 console.log('ok');
 '''
 
-SCENARIOS = ['restore', 'group-tolerance', 'rows', 'editing', 'hint-and-warnings', 'status-changes', 'groups']
+SCENARIOS = ['restore', 'group-tolerance', 'rows', 'editing', 'hint-and-warnings', 'status-changes', 'groups', 'pickers']
 
 
 @pytest.mark.parametrize('scenario', SCENARIOS)

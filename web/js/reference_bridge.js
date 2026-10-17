@@ -26,8 +26,10 @@ import {
     MAX_REFERENCE_SLOTS,
     SLOT_NAME_RE,
     canonicalOutputOrder,
+    formatLaneSelection,
     mergedBridgeShape,
     parseLaneSelection,
+    referenceBridgeUrl,
     resolveBridgeOutputs,
     selectorPanelView,
 } from "./reference_bridge_shape.js";
@@ -49,22 +51,6 @@ const ACCEPTED = Symbol("sonderReferenceAcceptedRead");
 
 const nodeType = (node) => String(node?.comfyClass || node?.type || "");
 const findWidget = (node, name) => (node?.widgets || []).find((widget) => widget?.name === name) || null;
-
-function referenceBridgeUrl(projectId, sceneId, controllerState) {
-    const params = new URLSearchParams();
-    for (const [name, value] of [
-        ["selection_start", controllerState?.selectionStart],
-        ["selection_end", controllerState?.selectionEnd],
-        ["pre_context_frames", controllerState?.preContextFrames],
-        ["post_context_frames", controllerState?.postContextFrames],
-    ]) {
-        const number = Number(value);
-        if (Number.isFinite(number)) params.set(name, String(Math.trunc(number)));
-    }
-    const query = params.toString();
-    const path = `/sonder-editor/project/${encodeURIComponent(projectId)}/scenes/${encodeURIComponent(sceneId)}/bridge-references`;
-    return query ? `${path}?${query}` : path;
-}
 
 function ensureState(node) {
     if (node[STATE]) return node[STATE];
@@ -311,11 +297,7 @@ function selectorState(node) {
 function setSelectorLanes(node, values) {
     const widget = findWidget(node, "reference_lanes");
     if (!widget) return;
-    const laneIndices = [...new Set((Array.isArray(values) ? values : [])
-        .map((value) => Number(value))
-        .filter((value) => Number.isSafeInteger(value) && value >= 0))]
-        .sort((left, right) => left - right);
-    const authored = laneIndices.join(", ");
+    const authored = formatLaneSelection(values);
     if (String(widget.value ?? "") === authored) return;
     widget.value = authored;
     widget.callback?.(authored);

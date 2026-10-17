@@ -85,6 +85,10 @@ export function createCanvasControlsHost({app, api, getEditorNode,
     };
     const describe = async (shot, changes, extra = {}) => {
         const body = {prompt: shot.prompt, relay_census: relayCensus(rootGraph()).census, definition_anchors: definitionAnchorIds(rootGraph()), ...extra};
+        // The hosting Editor's prompt key, for picker hints. Always sent: null when
+        // the Editor is not in the prompt (muted, bypassed, inside a subgraph), so
+        // the server never takes another Editor for it and pickers fall back.
+        body.editor_key = shot.editor_key || null;
         if (!body.relay_census.active) body.orphan_manifest = exportManifest("", rootGraph());
         const listing = activeManage();
         if (listing && changes === undefined) {

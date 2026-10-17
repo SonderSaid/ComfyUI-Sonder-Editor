@@ -2,6 +2,7 @@ import { mountRestore } from "./controls_restore.js";
 import { mountPresets } from "./controls_presets.js";
 import { mountComboPicker, wantsComboPicker } from "./controls_combo_picker.js";
 import { mountRowsEditor, NO_ROWS_NOTICE } from "./controls_rows_editor.js";
+import { mountDriverLanePicker, mountReferenceLanePicker, normalizeAssetFolder } from "./controls_lane_pickers.js";
 import { mountManageSection, smallButton } from "./controls_manage.js";
 import { mountPanelArrangement } from "./controls_panel_arrangement.js";
 import { EDITOR_PARTITION, comparePanelRows, canArrange, planPanelMove } from "./controls_panel_layout.js";
@@ -80,6 +81,45 @@ export function mountControlsPanel(container, host) {
         query = "",
         groupOrder = []; // every workflow group, in display order (Manage shows empty ones)
     const capabilities = () => host.capabilities || { hide: false, removeAuthored: true };
+    // The host's lane and folder choices (controls_picker_sources.js); absent on
+    // hosts without a project, where pickers fall back to plain fields.
+    const pickers = host.pickers || null;
+    // Which editor a Control's row uses. One predicate decides build, update and
+    // the rebuild check, so a picker hint moving between host and other rebuilds.
+    // A picker shows only for its own project (`source: "host"`); otherwise the
+    // plain field for the kind, with a note saying why.
+    function editorKind(spec) {
+        if (spec.source === "note") return "note";
+        if (spec.kind === "ROWS") return "rows";
+        const picker = spec.picker;
+        if (pickers && picker?.source === "host") {
+            if (picker.kind === "reference_lanes" && spec.kind === "STRING") return "reference_lanes";
+            if (picker.kind === "driver_lane" && spec.kind === "INT") return "driver_lane";
+            if (picker.kind === "asset_folder" && spec.kind === "COMBO") return "asset_folder";
+        }
+        if (spec.kind === "COMBO" && wantsComboPicker(spec)) return "combo";
+        // A combo its node checks at run, with no options to list, takes typed text.
+        if (spec.kind === "COMBO" && spec.checked_at_run && !(spec.options || []).length) return "text";
+        return "plain";
+    }
+    function pickerNote(spec) {
+        if (!spec.picker || !["plain", "text"].includes(editorKind(spec))) return "";
+        const what = spec.picker.kind === "asset_folder" ? "Folder suggestions" : "Lane names";
+        return spec.picker.source === "other"
+            ? `Wired to another Sonder Editor, so ${what.toLowerCase()} aren't listed here.`
+            : `${what} are unavailable here.`;
+    }
+    const pickerChoices = kind => pickers?.get(kind) || null;
+    // The sources read only for kinds this view shows. Declared after the render
+    // that found them: a source's synchronous "loading" notice must not re-enter it.
+    let declaredPickers = "";
+    function declarePickerInterest(kinds) {
+        const key = [...kinds].sort().join(",");
+        if (!pickers || key === declaredPickers) return;
+        declaredPickers = key;
+        queueMicrotask(() => { if (!destroyed) pickers.setInterest(kinds); });
+    }
+    const unsubscribePickers = pickers?.subscribe?.(() => { if (!destroyed) render(); });
     const settings = () => host.getEditorSettings?.() || {};
     const cards = () => !manageOn && settings().controls?.view === "cards";
     const showAdvanced = () => settings().controls?.showAdvanced === true;
@@ -534,7 +574,7 @@ export function mountControlsPanel(container, host) {
                 row[optimisticKey] = undefined;
                 // A row list keeps its own copy while a field has focus; the
                 // next edit's base must be the stored rows, not the refused ones.
-                if (row.rows && target === row.target) row.rows.reset(row.spec.value);
+                if (row.editor && target === row.target) row.editor.reset(row.spec.value);
                 if (row.input && target === row.target && (!row.editing || same(readInput(row), value))) {
                     setInput(row, row.spec.value ?? before);
                     row.editStart = readInput(row);
@@ -772,6 +812,7 @@ export function mountControlsPanel(container, host) {
             labelOptimistic: undefined,
             advancedOptimistic: undefined,
         };
+        row.editorKind = editorKind(spec);
         row.el = make("div");
         row.el.dataset.controlTarget = target;
         {
@@ -795,19 +836,28 @@ export function mountControlsPanel(container, host) {
             row.tags.style.cssText = `display:inline-flex;align-items:center;gap:${SPACE.s1}px;flex:0 0 auto;`;
             row.label.append(row.labelText, row.tags);
             row.control = make("div");
-            if (spec.kind === "ROWS") {
+            const onEditing = on => {
+                row.editing = on;
+                if (!on) render();
+            };
+            if (row.editorKind === "rows") {
                 // A row list edits as a whole; each edit carries the list it was made from.
-                row.rows = mountRowsEditor({
+                row.editor = mountRowsEditor({
                     commit: (next, before) => commit(row, row.target, { rows: next, base: before }, before),
-                    onEditing: on => {
-                        row.editing = on;
-                        if (!on) render();
-                    },
+                    onEditing,
                 });
-                row.control.append(row.rows.el);
-            } else if (spec.kind === "COMBO" && wantsComboPicker(spec)) {
+            } else if (row.editorKind === "reference_lanes") {
+                row.editor = mountReferenceLanePicker({ commit: (next, before) => commit(row, row.target, next, before), onEditing });
+            } else if (row.editorKind === "driver_lane") {
+                row.editor = mountDriverLanePicker({ commit: (next, before) => commit(row, row.target, next, before), onEditing });
+            } else if (row.editorKind === "combo" || row.editorKind === "asset_folder") {
+                const folder = row.editorKind === "asset_folder";
                 row.picker = mountComboPicker({
                     inputCss: S.inputCss,
+                    // A folder is any label: what you type is the value.
+                    freeText: folder,
+                    normalize: folder ? normalizeAssetFolder : undefined,
+                    labels: folder ? { "": "Root" } : {},
                     onLeave: () => {
                         row.editing = false;
                         render();
@@ -821,13 +871,16 @@ export function mountControlsPanel(container, host) {
                     },
                 });
                 row.input = row.picker.input;
+                if (folder) row.input.placeholder = "Root";
             } else {
                 row.input = make(
-                    spec.kind === "COMBO" ? "select" : spec.kind === "STRING" && spec.multiline ? "textarea" : "input",
+                    row.editorKind === "text" ? "input"
+                        : spec.kind === "COMBO" ? "select" : spec.kind === "STRING" && spec.multiline ? "textarea" : "input",
                 );
             }
-            // A row list has no single input: its editor owns its fields and listeners.
-            if (!row.rows) {
+            if (row.editor) row.control.append(row.editor.el);
+            // A dedicated editor has no single input: it owns its fields and listeners.
+            if (!row.editor) {
                 if (row.input.tagName === "INPUT" && !row.picker) {
                     row.input.type =
                         spec.kind === "BOOLEAN" ? "checkbox" : ["INT", "FLOAT"].includes(spec.kind) ? "number" : "text";
@@ -837,7 +890,7 @@ export function mountControlsPanel(container, host) {
                 row.input.setAttribute("aria-label", spec.label || "Control value");
                 row.input.id = `controls-${panelId}-${rows.size}`;
                 row.label.htmlFor = row.input.id;
-                if (spec.kind === "COMBO" && !row.picker) {
+                if (row.input.tagName === "SELECT") {
                     for (const option of spec.options || []) row.input.append(new Option(String(option), String(option)));
                 }
                 if (spec.min != null) row.input.min = String(spec.min);
@@ -899,7 +952,8 @@ export function mountControlsPanel(container, host) {
         const isCards = cards();
         const value = row.optimistic ?? spec.value;
         // A row list stacks under its label and takes a full-width card.
-        const stacked = (spec.kind === "STRING" && !!spec.multiline) || spec.kind === "ROWS";
+        const stacked = (spec.kind === "STRING" && !!spec.multiline) || spec.kind === "ROWS"
+            || row.editorKind === "reference_lanes";
         // A Control's note no longer widens its card (#11): it clamps inside it.
         const wide = spec.source === "note" || stacked
             || (spec.kind === "COMBO" && String(value ?? "").length > LONG_VALUE);
@@ -981,31 +1035,47 @@ export function mountControlsPanel(container, host) {
               ? "Edit this longer note on the canvas."
               : spec.reason ||
                 (rowsNotice ? "" : spec.error) ||
-                (spec.checked_at_run ? "Checked by the node when the run starts." : "");
+                pickerNote(spec) ||
+                // A folder is any label by design; the run-time check says nothing new.
+                (spec.checked_at_run && !spec.picker ? "Checked by the node when the run starts." : "");
         row.status.style.color = failure ? COLORS.warningText : COLORS.textDim;
         row.status.style.display = row.status.textContent ? "" : "none";
         if (row.editing) {
+            // An authoritative view seen mid-edit still retires settled
+            // optimistic values once the edit ends, so the next edit builds on it.
+            if (fresh) row.freshWhileEditing = true;
             rowActions(row);
             return;
         }
-        if (fresh) {
+        if (fresh || row.freshWhileEditing) {
+            row.freshWhileEditing = false;
             if (!row.mutations.get(row.target)?.pending) row.optimistic = undefined;
             if (!row.mutations.get(modeTarget)?.pending) row.modeOptimistic = undefined;
             if (!row.mutations.get(noteTarget)?.pending) row.noteOptimistic = undefined;
             if (!row.mutations.get(labelTarget)?.pending) row.labelOptimistic = undefined;
         }
-        if (row.rows) {
+        if (row.editorKind === "rows") {
             // The canvas can't edit rows its frontend never built; the Sonder
             // App builds its prompt on the server, so it edits them anyway.
-            row.rows.update(spec, row.optimistic?.rows ?? spec.value, {
+            row.editor.update(spec, row.optimistic?.rows ?? spec.value, {
                 canEdit: editable(spec),
                 unavailable: rowsNotice ? NO_ROWS_NOTICE : "",
+            });
+        } else if (row.editor) {
+            // Lane pickers derive Add and Remove from the pending value, so two
+            // quick edits build on each other rather than on the stored value.
+            row.editor.update(spec, row.optimistic ?? spec.value, {
+                canEdit: editable(spec),
+                choices: pickerChoices(row.editorKind),
+                retry: () => pickers?.refresh?.(row.editorKind),
             });
         }
         if (row.input) {
             row.input.disabled = !editable(spec);
-            if (row.picker) row.picker.update(spec);
-            if (spec.kind === "COMBO" && !row.picker && row.optionsKey !== JSON.stringify(spec.options || [])) {
+            if (row.editorKind === "asset_folder") {
+                row.picker.update({ ...spec, options: ["", ...(pickerChoices("asset_folder")?.folders || [])] });
+            } else if (row.picker) row.picker.update(spec);
+            if (row.input.tagName === "SELECT" && row.optionsKey !== JSON.stringify(spec.options || [])) {
                 row.optionsKey = JSON.stringify(spec.options || []);
                 row.input.replaceChildren(...(spec.options || []).map(o => new Option(String(o), String(o))));
             }
@@ -1172,16 +1242,19 @@ export function mountControlsPanel(container, host) {
             used = new Set(),
             placements = new Map(); // body -> its rows, in display order
         let shownTotal = 0;
+        const pickerKinds = new Set();
         for (const { target, spec, group } of entries) {
             alive.add(target);
+            const kind = editorKind(spec);
+            if (["reference_lanes", "driver_lane", "asset_folder"].includes(kind)) pickerKinds.add(kind);
             let row = rows.get(target);
             if (
                 row &&
-                (row.kind !== spec.kind || (spec.kind === "COMBO" && !!row.picker !== wantsComboPicker(spec))) &&
+                (row.kind !== spec.kind || row.editorKind !== editorKind(spec)) &&
                 !row.editing
             ) {
                 row.picker?.destroy();
-                row.rows?.destroy();
+                row.editor?.destroy();
                 row.el.remove();
                 rows.delete(target);
                 row = null;
@@ -1214,10 +1287,11 @@ export function mountControlsPanel(container, host) {
         for (const [target, row] of rows)
             if (!alive.has(target) && !row.editing) {
                 row.picker?.destroy();
-                row.rows?.destroy();
+                row.editor?.destroy();
                 row.el.remove();
                 rows.delete(target);
             }
+        declarePickerInterest(pickerKinds);
         paintGroup(editorGroup, editorVisible);
         setShown(editorGroup.el, manageOn || editorVisible > 0);
         groupOrder = groupPlan(view, entries.map(e => e.spec));
@@ -1311,10 +1385,10 @@ export function mountControlsPanel(container, host) {
                 if (e.key === "Enter") { closeRename(renaming, true); return true; }
                 return PRESERVE_DEFAULT;
             }
-            const listRow = [...rows.values()].find(row => row.rows?.contains(document.activeElement));
+            const listRow = [...rows.values()].find(row => row.editor?.contains(document.activeElement));
             if (listRow) {
                 if (e.isComposing || e.keyCode === 229) return PRESERVE_DEFAULT;
-                return listRow.rows.keydown(e) || PRESERVE_DEFAULT;
+                return listRow.editor.keydown(e) || PRESERVE_DEFAULT;
             }
             const row = [...rows.values()].find(
                 row =>
@@ -1347,7 +1421,11 @@ export function mountControlsPanel(container, host) {
     // started after the call (a tracked preset apply) are not awaited.
     async function flushPending() {
         // A focused row-list field commits on blur, before the snapshot.
-        for (const row of rows.values()) row.rows?.flush();
+        for (const row of rows.values()) row.editor?.flush();
+        // A focused folder field's typed text is its value: save it with the run.
+        for (const row of rows.values()) {
+            if (row.picker?.freeText && row.picker.contains(document.activeElement)) row.picker.commitTyped();
+        }
         // Snapshot before awaiting anything: a run save that settles while
         // the note saves was still in flight when the caller asked.
         const blocking = new Set(runPending);
@@ -1381,9 +1459,12 @@ export function mountControlsPanel(container, host) {
             restore.destroy();
             for (const row of rows.values()) {
                 row.picker?.destroy();
-                row.rows?.destroy();
+                row.editor?.destroy();
             }
             unsubscribe?.();
+            // A remounted panel (a workflow switch) declares its own interest.
+            unsubscribePickers?.();
+            pickers?.setInterest([]);
             unregister();
             rows.clear();
             groups.clear();

@@ -33,14 +33,19 @@ export const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"])
 // Mirrors server/binding_policy.py; hides candidates early, the server decides.
 export const DENIED_INPUTS = {
     SonderControlRelay: ["manifest"],
-    SonderDriverSelector: ["driver_lane_index", "driver_selector_overrides_json"],
+    SonderDriverSelector: ["driver_selector_overrides_json"],
     SonderEditor: ["mask_post_offset", "mask_pre_offset", "post_context_frames", "pre_context_frames", "project",
         "render_cache_max_bytes", "render_queue_active", "scene_id", "selection_end", "selection_start",
         "take_crop_position", "take_fit_mode", "take_placement_linked", "take_placement_mode", "take_placement_muted"],
     SonderGuidesBridgeStart: ["bridge_overrides_json", "iteration_index"],
-    SonderReferenceSelector: ["reference_lanes"],
-    SonderSaveBridge: ["target_folder"],
 };
+// Mirrors server/binding_policy.py PICKERS: "class/input" -> the picker kind.
+export const PICKERS = {
+    "SonderReferenceSelector/reference_lanes": "reference_lanes",
+    "SonderDriverSelector/driver_lane_index": "driver_lane",
+    "SonderSaveBridge/target_folder": "asset_folder",
+};
+export const pickerFor = (classType, input) => PICKERS[`${classType}/${input}`] || null;
 export const DENIED_PREFIXES = { SonderMetadataCollector: "label_", SonderMetadataCollectorV3: "label_" };
 // Mirrors server/binding_policy.py LEGACY_PRIMITIVE_CLASS: virtual, never in a prompt.
 export const LEGACY_PRIMITIVE = "PrimitiveNode";

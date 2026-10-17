@@ -746,3 +746,35 @@ def test_sdk_group_batch_uses_preceding_writes(world, changes, order, steps_grou
         if 'note:local:create' in changes:
             assert stored['local_notes']['local']['group'] == 'Look'
     asyncio.run(run())
+
+
+def test_bridge_selection_pickers_are_host_in_the_app_and_their_values_reach_generate(world):
+    # plans/bridge-selections-controls.md: the Sonder App's sole Editor hosts the
+    # panel, so the three bridge selections carry `host` picker hints, and their
+    # stored values (canonical lane text, an integer lane, a folder) are submitted.
+    graph = prompt({
+        'lanes': _binding('20', 'reference_lanes', label='Lanes'),
+        'lane': _binding('21', 'driver_lane_index', label='Driver lane'),
+        'folder': _binding('22', 'target_folder', label='Folder'),
+    })
+    graph['20'] = _node('SonderReferenceSelector', {'project': ['1', 0], 'reference_lanes': '0'})
+    graph['21'] = _node('SonderDriverSelector', {'project': ['1', 0], 'driver_lane_index': 0})
+    graph['22'] = _node('SonderSaveBridge', {'project': ['1', 0], 'target_folder': '', 'prefix': ''})
+    install(world, graph)
+
+    async def run():
+        session = await world.open()
+        view = (await world.runner.controls_view(session))['view']
+        hints = {b['binding_id']: b.get('picker') for b in view['bindings']}
+        await world.runner.change_controls(session.session_id, session.secret, 'tab-1', {
+            'binding:lanes:value': '0, 2', 'binding:lane:value': '1', 'binding:folder:value': 'Shots/App'})
+        await world.runner.generate(session, tab_session_id='tab-1')
+        return hints
+    hints = asyncio.run(run())
+    assert hints == {'lanes': {'kind': 'reference_lanes', 'source': 'host'},
+                     'lane': {'kind': 'driver_lane', 'source': 'host'},
+                     'folder': {'kind': 'asset_folder', 'source': 'host'}}
+    submitted = world.client.submitted[-1]
+    assert submitted['20']['inputs']['reference_lanes'] == '0, 2'
+    assert submitted['21']['inputs']['driver_lane_index'] == 1
+    assert submitted['22']['inputs']['target_folder'] == 'Shots/App'

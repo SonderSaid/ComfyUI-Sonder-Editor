@@ -14,9 +14,10 @@
 // Pure on import: the caller (control_relay.js) supplies the canvas and graph.
 import { CONTROL_SEED_MODES, findControlWidget } from "./control_widgets.js";
 import {
-    cleanGroup, defaultBindingLabel, effectiveGroupOrder, nodeType, parseManifest, planRestore, relayCensus, resolveAnchor, resolveBindings, sectionOf,
+    cleanGroup, defaultBindingLabel, effectiveGroupOrder, nodeType, parseManifest, pickerFor, planRestore, relayCensus, resolveAnchor, resolveBindings, sectionOf,
 } from "./control_bindings.js";
 import { readRows, summary } from "./control_rows.js";
+import { parseLaneSelection } from "./reference_bridge_shape.js";
 
 export const ROW_PREFIX = "sonder_row:";
 // Rows that are not a binding use `~`, which a binding id (ID_RE) cannot hold.
@@ -80,10 +81,16 @@ export function planRows(relay, root) {
         const name = entry.label || defaultBindingLabel(resolved);
         const label = entry.advanced ? `${name} · Adv` : name;
         const own = [];
+        const picker = pickerOf(resolved);
         if (resolved.rows) {
             // A row list is edited in Controls; the Relay shows its summary.
             own.push({ id: entry.id, nodeId: anchor.node.id, anchor: anchor.name, widgetName: null,
                 role: "summary", type: "text", label, options: {} });
+        } else if (picker) {
+            // Lanes and folders are picked on their node or in Controls, where the
+            // project's names are known; the Relay shows what is chosen.
+            own.push({ id: entry.id, nodeId: anchor.node.id, anchor: anchor.name, widgetName: resolved.widget.name,
+                role: "summary", type: "text", label, options: {}, picker });
         } else {
             const ref = { id: entry.id, nodeId: anchor.node.id, anchor: anchor.name, widgetName: resolved.widget.name };
             own.push({ ...ref, role: "value", type, label, options: rowOptions(resolved.widget, type) });
@@ -115,8 +122,37 @@ function rowOptions(native, type) {
     return options;
 }
 
+// The picker every target of a binding shares, by each RESOLVED target's class:
+// a promoted input's anchor is its subgraph host, never the node that owns the
+// value. Mixed or none: null.
+function pickerOf(resolved) {
+    const kinds = (resolved.targets || []).map(target => pickerFor(nodeType(target.node || resolved.node), target.input));
+    return kinds.length && kinds.every(kind => kind && kind === kinds[0]) ? kinds[0] : null;
+}
+
+const PICKER_SUFFIX = " — edit on the node or in Controls";
+
+/** A picker binding's Relay text from the native value (1-based, as the graph shows). */
+export function pickerSummary(kind, value) {
+    if (kind === "reference_lanes") {
+        const { laneIndices } = parseLaneSelection(value);
+        if (!laneIndices.length) return "No lanes";
+        return `${laneIndices.length === 1 ? "Lane" : "Lanes"} ${laneIndices.map(index => index + 1).join(", ")}`;
+    }
+    if (kind === "driver_lane") {
+        const lane = Number(value);
+        return `Driver lane ${Number.isSafeInteger(lane) && lane >= 0 ? lane + 1 : 1}`;
+    }
+    if (kind === "asset_folder") return String(value ?? "").trim() || "Root";
+    return String(value ?? "");
+}
+
 // A row list's Relay text, read live: "3 LoRAs · 2 on — edit in Controls".
 export function summaryText(root, row) {
+    if (row.picker) {
+        const native = nativeFor(root, row);
+        return native ? `${pickerSummary(row.picker, native.widget.value)}${PICKER_SUFFIX}` : "";
+    }
     const node = graphNode(root, row.nodeId);
     const rows = node ? resolveAnchor(node, row.anchor).rows : null;
     if (!rows) return "";

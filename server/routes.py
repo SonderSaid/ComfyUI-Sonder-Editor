@@ -249,9 +249,19 @@ def _describe_controls_body(raw: bytes) -> dict:
         except control_descriptors.ControlValueError as exc:
             raise _ControlsRequestError(str(exc)) from None
         inventory = control_descriptors.candidate_inventory(prompt, candidates)
+    # The Editor node hosting the canvas panel, so picker hints can tell its own
+    # project from another Editor's. Only a key naming an Editor in this prompt.
+    # An explicit null: the hosting Editor is not in this prompt (muted, bypassed,
+    # in a subgraph), so no hint may claim it. Absent: the sole-Editor default.
+    editor_key = body.get("editor_key", control_descriptors.SOLE_EDITOR)
+    if editor_key is not None and editor_key is not control_descriptors.SOLE_EDITOR and (
+            not isinstance(editor_key, str) or not isinstance(prompt.get(editor_key), dict)
+            or prompt[editor_key].get("class_type") != "SonderEditor"):
+        raise _ControlsRequestError("The editor key must name a Sonder Editor in the prompt.")
     try:
         view = control_descriptors.describe_bindings(prompt, relay_census=census,
-                                                    orphan_manifest=body.get("orphan_manifest"))
+                                                    orphan_manifest=body.get("orphan_manifest"),
+                                                    host_editor=editor_key)
     except control_descriptors.control_manifest.ManifestError as exc:
         raise _ControlsRequestError(str(exc)) from None
     from . import control_cleanup

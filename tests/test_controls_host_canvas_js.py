@@ -178,7 +178,10 @@ if(SCENARIO==='root') {
     assert.equal(manifest().bindings.steps.label,'Steps!');
     assert.equal(captures,2);assert.equal(root.dirty,1);assert.equal(sampler.widgets[0].callbacks,1);
     assert.deepEqual(calls.at(-1).relay_census,{active:1,muted:0,bypassed:0,nested:0});
+    // The hosting Editor's prompt key travels with writes and reads, for picker hints.
+    assert.equal(calls.at(-1).editor_key,'1');
     await host.refresh(true);assert.equal(host.getView().bindings[1].seed_mode,'increment');
+    assert.equal(calls.at(-1).editor_key,'1');
     assert.equal(host.setEditorSetting,undefined);
 }
 if(SCENARIO==='promoted'||SCENARIO==='promoted-seed') {

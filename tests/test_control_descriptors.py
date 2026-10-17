@@ -136,11 +136,47 @@ class Multi:
         return {"required": {"tags": ("COMBO", {"options": ["a", "b", "c"], "multi_select": True})}}
 
 
+class SonderReferenceSelector:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"project": ("SONDER_PROJECT",), "reference_lanes": ("STRING", {"default": "0"})}}
+
+
+class SonderDriverSelector:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"project": ("SONDER_PROJECT",)},
+                "optional": {"driver_lane_index": ("INT", {"default": 0, "min": 0, "max": 999}),
+                             "driver_selector_overrides_json": ("STRING", {"default": "{}"})}}
+
+
+class SonderSaveBridge:
+    """``nodes/io_nodes.py``: a `[""]` combo the browser fills, behind the varkw hatch."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"project": ("SONDER_PROJECT",), "target_folder": ([""], {"default": ""}),
+                             "prefix": ("STRING", {"default": ""})}}
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, **_kwargs):
+        return True
+
+
+class SonderGuidesBridgeStart:
+    """Passes the project on, as a chained consumer would."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"project": ("SONDER_PROJECT",)}}
+
+
 CLASSES = {
     cls.__name__: cls
     for cls in (
         KSampler, TextNode, AnySink, KwargsValidated, OtherInputValidated, SonderSelector,
         SonderSaveVideo, SonderEditor, SonderControlRelay, Multi,
+        SonderReferenceSelector, SonderDriverSelector, SonderSaveBridge, SonderGuidesBridgeStart,
     )
 }
 
@@ -937,3 +973,121 @@ def test_writes_refuse_a_group_past_max_groups():
     cleaned, rejected = cd.validate_binding_changes(
         view, {"binding:a:group": "g3", "group:g4:rename": "fresh"}, structural="canvas")
     assert rejected == []
+
+
+# ── Picker hints (plans/bridge-selections-controls.md, B) ────────────────────
+
+def _bridge_prompt(**bindings):
+    """Editor 2 feeds Editor 5 (chained); selectors hang off either."""
+    prompt = {
+        "1": _relay(bindings),
+        "2": _node("SonderEditor", {}),
+        "5": _node("SonderEditor", {"project": ["2", 0]}),
+        "10": _node("SonderReferenceSelector", {"project": ["2", 0], "reference_lanes": "0, 2"}),
+        "11": _node("SonderDriverSelector", {"project": ["2", 0], "driver_lane_index": 1}),
+        "12": _node("SonderSaveBridge", {"project": ["2", 0], "target_folder": "Shots/A", "prefix": ""}),
+        "20": _node("SonderReferenceSelector", {"project": ["5", 0], "reference_lanes": "1"}),
+        "21": _node("SonderDriverSelector", {"project": ["30", 0], "driver_lane_index": 0}),
+        "30": _node("SonderGuidesBridgeStart", {"project": ["5", 0]}),
+        "40": _node("SonderReferenceSelector", {"reference_lanes": "3"}),
+    }
+    return prompt
+
+
+def test_the_three_bridge_selections_describe_as_their_native_kinds():
+    prompt = _bridge_prompt(
+        lanes=_binding("10", "reference_lanes"), lane=_binding("11", "driver_lane_index"),
+        folder=_binding("12", "target_folder"))
+    view = describe(prompt, host_editor="2")
+    by_id = {b["binding_id"]: b for b in view["bindings"]}
+    assert (by_id["lanes"]["status"], by_id["lanes"]["kind"], by_id["lanes"]["value"]) == ("ok", "STRING", "0, 2")
+    assert (by_id["lane"]["kind"], by_id["lane"]["value"], by_id["lane"]["min"], by_id["lane"]["max"]) == ("INT", 1, 0, 999)
+    folder = by_id["folder"]
+    assert (folder["kind"], folder["value"], folder.get("checked_at_run")) == ("COMBO", "Shots/A", True)
+    assert "options" not in folder, "any folder label validates; the picker supplies suggestions"
+    assert {b: by_id[b]["picker"] for b in by_id} == {
+        "lanes": {"kind": "reference_lanes", "source": "host"},
+        "lane": {"kind": "driver_lane", "source": "host"},
+        "folder": {"kind": "asset_folder", "source": "host"},
+    }
+
+
+def test_picker_source_follows_only_project_inputs_through_chained_editors():
+    prompt = _bridge_prompt(
+        own=_binding("10", "reference_lanes"),           # Editor 2
+        chained=_binding("20", "reference_lanes"),       # Editor 5, which consumes Editor 2
+        via_start=_binding("21", "driver_lane_index"),   # Start -> Editor 5
+        unwired=_binding("40", "reference_lanes"))       # no project at all
+    hints = lambda **kw: {b["binding_id"]: b.get("picker") for b in describe(prompt, **kw)["bindings"]}
+    assert hints(host_editor="2") == {
+        "own": {"kind": "reference_lanes", "source": "host"},
+        "chained": {"kind": "reference_lanes", "source": "other"},
+        "via_start": {"kind": "driver_lane", "source": "other"},
+        "unwired": {"kind": "reference_lanes", "source": "other"},
+    }
+    assert hints(host_editor="5")["chained"]["source"] == "host"
+    assert hints(host_editor="5")["via_start"]["source"] == "host"
+    # Two Editors and no host named: nothing can be vouched for.
+    assert {hint["source"] for hint in hints().values()} == {"unknown"}
+    # A host key that is not in the prompt is no host.
+    assert {hint["source"] for hint in hints(host_editor="99").values()} == {"unknown"}
+
+
+def test_the_sole_editor_is_the_default_host():
+    prompt = _bridge_prompt(own=_binding("10", "reference_lanes"))
+    del prompt["5"], prompt["20"], prompt["21"], prompt["30"]
+    assert binding(prompt, "own")["picker"] == {"kind": "reference_lanes", "source": "host"}
+    # A canvas whose own Editor is not in the prompt (muted, bypassed, in a
+    # subgraph) says so with None: the only other Editor is never taken for it.
+    assert binding(prompt, "own", host_editor=None)["picker"] == {"kind": "reference_lanes", "source": "unknown"}
+
+
+def test_plural_and_mixed_picker_targets():
+    def plural(*targets):
+        entry = _binding("10", "reference_lanes")
+        entry["targets"] = [{"path": p, "input": i} for p, i in targets]
+        return entry
+    prompt = _bridge_prompt(
+        both=plural(("10", "reference_lanes"), ("20", "reference_lanes")),
+        same_host=plural(("40", "reference_lanes"), ("41", "reference_lanes")))
+    prompt["40"]["inputs"]["project"] = ["2", 0]
+    prompt["41"] = _node("SonderReferenceSelector", {"project": ["30", 0], "reference_lanes": "4"})
+    prompt["30"]["inputs"]["project"] = ["2", 0]
+    view = {b["binding_id"]: b for b in describe(prompt, host_editor="2")["bindings"]}
+    assert view["both"]["picker"] == {"kind": "reference_lanes", "source": "other"}, "one target is Editor 5's"
+    assert view["same_host"]["picker"] == {"kind": "reference_lanes", "source": "host"}
+    # Mixed kinds are unsupported before a picker is considered; a non-picker
+    # input never gets a hint.
+    prompt = _bridge_prompt(mixed=plural(("10", "reference_lanes"), ("12", "prefix")),
+                            prefix=_binding("12", "prefix"))
+    view = {b["binding_id"]: b for b in describe(prompt, host_editor="2")["bindings"]}
+    assert "picker" not in view["prefix"]
+    assert "picker" not in view["mixed"]
+
+
+def test_picker_hints_survive_json_safe():
+    prompt = _bridge_prompt(lane=_binding("11", "driver_lane_index"))
+    safe = cd.json_safe(describe(prompt, host_editor="2"))
+    lane = safe["bindings"][0]
+    assert lane["picker"] == {"kind": "driver_lane", "source": "host"} and lane["value"] == "1"
+
+
+def test_describe_route_validates_the_editor_key(monkeypatch):
+    from server import routes
+    original = cd.describe_bindings
+    monkeypatch.setattr(cd, "describe_bindings", lambda prompt, relay_census=None, **kw: original(
+        prompt, relay_census=relay_census, class_lookup=CLASSES.get, **kw))
+    prompt = _bridge_prompt(chained=_binding("20", "reference_lanes"))
+    body = lambda key: json.dumps({"prompt": prompt, "relay_census": {"active": 1}, "editor_key": key}).encode()
+    view = routes._describe_controls_body(body("5"))
+    assert view["bindings"][0]["picker"]["source"] == "host"
+    for bad in ("10", "nope", 5, ["5"]):
+        with pytest.raises(routes._ControlsRequestError):
+            routes._describe_controls_body(body(bad))
+    # An explicit null is "the host is not in this prompt"; absent keeps the
+    # sole-Editor default.
+    solo = _bridge_prompt(own=_binding("10", "reference_lanes"))
+    del solo["5"], solo["20"], solo["21"], solo["30"]
+    encode = lambda extra: json.dumps({"prompt": solo, "relay_census": {"active": 1}, **extra}).encode()
+    assert routes._describe_controls_body(encode({"editor_key": None}))["bindings"][0]["picker"]["source"] == "unknown"
+    assert routes._describe_controls_body(encode({}))["bindings"][0]["picker"]["source"] == "host"

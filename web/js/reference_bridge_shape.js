@@ -69,6 +69,37 @@ export function canonicalOutputOrder(bridgeType = "SonderReferenceImageBridge") 
     ];
 }
 
+/**
+ * The bridge-references request path for a project, scene and render window
+ * (`window` carries selectionStart/End and pre/postContextFrames). One builder
+ * for the graph panels and the Controls Reference picker, so equal windows give
+ * equal URLs and share one coordinator read.
+ */
+export function referenceBridgeUrl(projectId, sceneId, window) {
+    const params = new URLSearchParams();
+    for (const [name, value] of [
+        ["selection_start", window?.selectionStart],
+        ["selection_end", window?.selectionEnd],
+        ["pre_context_frames", window?.preContextFrames],
+        ["post_context_frames", window?.postContextFrames],
+    ]) {
+        const number = Number(value);
+        if (Number.isFinite(number)) params.set(name, String(Math.trunc(number)));
+    }
+    const query = params.toString();
+    const path = `/sonder-editor/project/${encodeURIComponent(projectId)}/scenes/${encodeURIComponent(sceneId)}/bridge-references`;
+    return query ? `${path}?${query}` : path;
+}
+
+/** Canonical authored form of a lane list: sorted, unique, zero-based. */
+export function formatLaneSelection(values) {
+    return [...new Set((Array.isArray(values) ? values : [])
+        .map((value) => Number(value))
+        .filter((value) => Number.isSafeInteger(value) && value >= 0))]
+        .sort((left, right) => left - right)
+        .join(", ");
+}
+
 export function parseLaneSelection(value) {
     const authored = String(value ?? "");
     const laneIndices = [];

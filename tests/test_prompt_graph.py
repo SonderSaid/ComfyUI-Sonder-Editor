@@ -159,3 +159,33 @@ def test_editor_keys_and_nodes_reaching():
     assert prompt_graph.nodes_reaching(prompt, "733:2", classes) == ["6"]
     assert prompt_graph.nodes_reaching(prompt, "", classes) == []
     assert prompt_graph.editor_keys(None) == []
+
+
+def test_project_editor_follows_only_project_inputs():
+    prompt = {
+        "a": {"class_type": "SonderEditor", "inputs": {}},
+        # Editor B consumes Editor A: a node wired to B belongs to B, though
+        # walking every input upstream would reach A too.
+        "b": {"class_type": "SonderEditor", "inputs": {"project": ["a", 0], "image": ["img", 0]}},
+        "img": {"class_type": "LoadImage", "inputs": {}},
+        "sel_a": {"class_type": "SonderReferenceSelector", "inputs": {"project": ["a", 0]}},
+        "sel_b": {"class_type": "SonderReferenceSelector", "inputs": {"project": ["b", 0]}},
+        "start": {"class_type": "SonderGuidesBridgeStart", "inputs": {"project": ["b", 0]}},
+        "via_start": {"class_type": "SonderDriverSelector", "inputs": {"project": ["start", 0]}},
+        # Reaches an Editor only through a non-project input: not its project.
+        "other_input": {"class_type": "SonderDriverSelector", "inputs": {"project": ["img", 0], "x": ["a", 0]}},
+        "literal": {"class_type": "SonderSaveBridge", "inputs": {"project": "Proj"}},
+        "loop1": {"class_type": "X", "inputs": {"project": ["loop2", 0]}},
+        "loop2": {"class_type": "X", "inputs": {"project": ["loop1", 0]}},
+        "dangling": {"class_type": "X", "inputs": {"project": ["gone", 0]}},
+    }
+    answer = {key: prompt_graph.project_editor(prompt, key) for key in
+              ("sel_a", "sel_b", "via_start", "other_input", "literal", "loop1", "dangling", "a", "missing")}
+    assert answer == {"sel_a": "a", "sel_b": "b", "via_start": "b", "other_input": None, "literal": None,
+                      "loop1": None, "dangling": None, "a": None, "missing": None}
+    assert prompt_graph.project_editor(None, "sel_a") is None
+    chain = {"e": {"class_type": "SonderEditor", "inputs": {}}}
+    for index in range(40):
+        chain[f"n{index}"] = {"class_type": "X", "inputs": {"project": [f"n{index + 1}" if index < 39 else "e", 0]}}
+    assert prompt_graph.project_editor(chain, "n35") == "e"
+    assert prompt_graph.project_editor(chain, "n0") is None, "past the hop cap"

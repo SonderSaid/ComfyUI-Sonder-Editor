@@ -569,3 +569,22 @@ def test_a_publication_with_many_groups_fits_the_mounted_budget():
         assert (await publish(body))['ok']
         assert (await sr.get_controls_view(PID, HID))['view']['group_order'] == names
     asyncio.run(run())
+
+
+def test_a_published_view_keeps_picker_hints_for_the_mounted_panel():
+    # plans/bridge-selections-controls.md: the mounted tab builds its lane and
+    # folder pickers from the canvas publication, so the hint must survive it.
+    body = {'view_seq': 1, 'prompt_hash': 'h', 'view': {'bindings': [
+        {'binding_id': 'lane', 'status': 'ok', 'kind': 'INT', 'value': 1, 'min': 0, 'max': 999,
+         'targets': [{'path': '21', 'input': 'driver_lane_index'}],
+         'picker': {'kind': 'driver_lane', 'source': 'host'}},
+        {'binding_id': 'folder', 'status': 'ok', 'kind': 'COMBO', 'value': 'Shots', 'checked_at_run': True,
+         'targets': [{'path': '22', 'input': 'target_folder'}],
+         'picker': {'kind': 'asset_folder', 'source': 'other'}},
+    ], 'notes': []}}
+    published = sr._prepare_control_publication(body)
+    view = published['view'] if 'view' in published else published
+    hints = {d['binding_id']: d.get('picker') for d in view['bindings']}
+    assert hints == {'lane': {'kind': 'driver_lane', 'source': 'host'},
+                     'folder': {'kind': 'asset_folder', 'source': 'other'}}
+    assert next(d for d in view['bindings'] if d['binding_id'] == 'lane')['value'] == '1'

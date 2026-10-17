@@ -677,3 +677,19 @@ console.log(JSON.stringify(calls));
     assert result[1] == {'tier': 'success', 'message': 'Exported quiet.mp4.'}
     assert result[2] == {'tier': 'warning', 'message': 'Timeline audio could not be placed'}
     assert result[3] == {'tier': 'success', 'message': 'Export complete.'}
+
+
+def test_controls_folder_normalizer_matches_the_save_bridge_box():
+    """The Controls folder picker and the graph's folder box store one form."""
+    source = EXTENSION.read_text(encoding="utf-8")
+    normalization = _between(source, "function normalizeFolderValue", "function uniqueFolderValues")
+    pickers = (ROOT / "web" / "js" / "controls_lane_pickers.js").as_uri()
+    samples = ["", "  ", "Shots", " Takes\\Day 1/ ", "//a//b//", "Root", "a\\b\\\\"]
+    script = f"""
+{normalization}
+const {{ normalizeAssetFolder }} = await import({json.dumps(pickers)});
+const samples = {json.dumps(samples)};
+console.log(JSON.stringify(samples.map(s => [normalizeFolderValue(s), normalizeAssetFolder?.(s)])));
+"""
+    pairs = _run_node(script)
+    assert all(left == right for left, right in pairs), pairs
