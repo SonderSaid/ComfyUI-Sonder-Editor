@@ -706,6 +706,10 @@ async function main() {
         host, controlsHost,
         hostMode: "tab",
         onFullscreenExit: () => window.close(),
+        // The tab is named after its project, as the Sonder App names its workflow.
+        onProjectIdentityChanged: name => {
+            document.title = name ? `${name} · Sonder Editor` : "Sonder Editor";
+        },
     });
     editor.updateProject(projectId);
     editor.applyWidgetState(host.values);

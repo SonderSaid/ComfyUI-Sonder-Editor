@@ -11,18 +11,21 @@ export function createDisclosureMemory(storageKey, { storage = null } = {}) {
             store = null;
         }
     }
-    let values = {};
-    try {
-        const parsed = JSON.parse(store?.getItem?.(String(storageKey || "")) || "{}");
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-            values = parsed;
-        }
-    } catch (_error) {
-        values = {};
-    }
-    const persist = () => {
+    const read = () => {
         try {
-            store?.setItem?.(String(storageKey || ""), JSON.stringify(values));
+            const parsed = JSON.parse(store?.getItem?.(String(storageKey || "")) || "{}");
+            return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+        } catch (_error) {
+            return {};
+        }
+    };
+    let values = read();
+    // Patches one key over what is stored now, so two open panels (a canvas
+    // editor and a mounted tab) do not overwrite each other's keys.
+    const persist = (name, open) => {
+        values = { ...values, [name]: open };
+        try {
+            store?.setItem?.(String(storageKey || ""), JSON.stringify({ ...read(), [name]: open }));
         } catch (_error) {
             // Local disclosure memory is optional presentation state.
         }
@@ -33,8 +36,7 @@ export function createDisclosureMemory(storageKey, { storage = null } = {}) {
             return Object.hasOwn(values, name) ? !!values[name] : !!fallback;
         },
         remember(key, open) {
-            values[String(key || "")] = !!open;
-            persist();
+            persist(String(key || ""), !!open);
         },
     };
 }

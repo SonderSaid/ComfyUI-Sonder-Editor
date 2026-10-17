@@ -458,6 +458,38 @@ def test_duplicate_staging_blocks_only_when_the_member_is_referenced():
     error = next(value for value in referenced["errors"]
                  if value["code"] == "ambiguous_physical_handle")
     assert "lane-a" in error["message"] and "lane-b" in error["message"]
+    # Without a Library record the message can only name the id.
+    assert "'portrait-member'" in error["message"]
+
+    # With one, it names the Reference the way the setup rows do.
+    named = prompt_context.compile_prompt_context(
+        global_channels={}, sections=[PromptSection(
+            0, 10, channels={"detailed_description": "A room."},
+            attachments=[attachment])],
+        window_start=0, window_end=10, fps=24, template="minimax_h3_ref",
+        context={**context, "references": [{
+            "reference_id": "ref-1", "name": "Settings",
+            "members": [{"member_id": "portrait-member", "name": "Growl"}]}]})
+    error = next(value for value in named["errors"]
+                 if value["code"] == "ambiguous_physical_handle")
+    assert "'Settings · Growl'" in error["message"]
+    assert "portrait-member" not in error["message"]
+    assert error["source_id"] == "portrait-member"
+
+
+def test_reference_source_label_prefers_the_setup_row_then_the_library():
+    context = {
+        "setup_manifest": {"presentation": [
+            {"video_member_id": "v-1", "display_name": "Anna · Walk"}]},
+        "references": [{"name": "Anna", "members": [
+            {"member_id": "m-1", "name": "Portrait"}, {"member_id": "m-2", "name": ""}]}],
+    }
+    label = prompt_context._reference_source_label
+    assert label("v-1", context) == "'Anna · Walk'"
+    assert label("m-1", context) == "'Anna · Portrait'"
+    assert label("m-2", context) == "'Anna'"
+    assert label("gone", context) == "'gone'"
+    assert label("m-1", {}) == "'m-1'"
 
 
 def test_the_local_handle_collision_check_matches_the_route():

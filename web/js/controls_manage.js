@@ -297,7 +297,6 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         if (draft || destroyed) return;
         const area = make("textarea");
         area.maxLength = 4000;
-        area.placeholder = "Markdown note shown with the Controls";
         area.dataset.sonderTextUndo = "true";
         area.style.cssText = chromeInputCss() + `width:100%;box-sizing:border-box;min-height:80px;resize:vertical;font-size:${TYPE.t12}px;font-family:${FONT.sans};`;
         const actions = make("div");
@@ -309,7 +308,8 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         setButtonDisabled(addNote, true);
         setButtonDisabled(addGroup, true);
         const edit = { kind: "note", area, group, composing: false, unregister: () => {} };
-        area.placeholder = group ? `Markdown note shown in ${group}` : "Markdown note shown with the Controls";
+        area.placeholder = (group ? `Markdown note shown in ${group}.` : "Markdown note shown with the Controls.")
+            + " Start it with a bold line to make it collapsible.";
         area.addEventListener("compositionstart", () => (edit.composing = true));
         area.addEventListener("compositionend", () => (edit.composing = false));
         save.addEventListener("click", () => closeDraft(true));

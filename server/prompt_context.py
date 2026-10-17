@@ -17,6 +17,7 @@ import uuid
 from collections import defaultdict
 
 from . import prompt_channel_templates, prompt_payload, prompt_tokens
+from .reference_prompt_formatter import reference_member_labels
 from .reference_resolution import REFERENCE_VERDICT_LABEL
 
 
@@ -2873,6 +2874,30 @@ def _setup_member_prompt(member_id, context) -> str:
     return ""
 
 
+def _reference_source_label(source_id, context) -> str:
+    """A staged member's display name for user-facing messages, quoted.
+
+    The setup row's `display_name` ("Entity · Member") first, then the
+    Library record, then the raw id when neither names it.
+    """
+    source_id = str(source_id or "")
+    for row in (context.get("setup_manifest", {}).get("presentation") or []):
+        row_member_id = str(
+            row.get("member_id") or row.get("video_member_id") or "")
+        if row_member_id == source_id and str(row.get("display_name") or "").strip():
+            return repr(str(row["display_name"]).strip())
+    for reference in context.get("references") or []:
+        if not isinstance(reference, dict):
+            continue
+        for member in reference.get("members") or []:
+            if isinstance(member, dict) and str(member.get("member_id") or "") == source_id:
+                display = reference_member_labels(
+                    reference.get("name") or "", member.get("name") or "")["display_name"]
+                if display:
+                    return repr(display)
+    return repr(source_id)
+
+
 def _subject_definition(config, unit, context) -> tuple[str, str]:
     """Resolve authored Subject prose and its inheritance source."""
     configured = str(config.get("definition") or "").strip()
@@ -4977,7 +5002,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                     if len(duplicate_slots) > 1:
                         reference_error(
                             "ambiguous_physical_handle",
-                            f"Physical Reference {source_id!r} occupies multiple {declaration.get('label') or 'physical'} slots: "
+                            f"Physical Reference {_reference_source_label(source_id, context)} occupies multiple {declaration.get('label') or 'physical'} slots: "
                             + ", ".join(str(row.get("label") or row.get("slot_id") or "slot")
                                         for row in duplicate_slots) + ".",
                             attachment["attachment_id"])
@@ -5006,7 +5031,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                     if not authored:
                         reference_warning(
                             "missing_h3_physical_definition",
-                            f"Reference source {source_id!r} needs an authored definition.",
+                            f"Reference source {_reference_source_label(source_id, context)} needs an authored definition.",
                             attachment["attachment_id"])
     for attachment, attachment_origin in all_attachment_origins:
         if not attachment["enabled"] or attachment["kind"] != "reference":
@@ -5067,7 +5092,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                     "code": "ambiguous_physical_handle",
                     "attachment_id": attachment["attachment_id"],
                     "source_id": source_id,
-                    "message": (f"Physical reference {source_id!r} occupies multiple "
+                    "message": (f"Physical reference {_reference_source_label(source_id, context)} occupies multiple "
                                 f"setup slots: {', '.join(labels)}. Choose a specific "
                                 "slot or remove the duplicate staging."),
                 })

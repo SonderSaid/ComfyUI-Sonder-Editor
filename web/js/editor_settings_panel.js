@@ -236,6 +236,8 @@ function syncSettingsPanelControls() {
     if (controls.linkedVideoAudioDrop) controls.linkedVideoAudioDrop.checked = this._settings.timelineBehavior.linkedVideoAudioDrop !== false;
     if (controls.snappingEnabled) controls.snappingEnabled.checked = !!this._settings.timelineBehavior.snappingEnabled;
     if (controls.snapThreshold) controls.snapThreshold.value = String(this._settings.timelineBehavior.snapThreshold);
+    if (controls.snapPlayhead) controls.snapPlayhead.checked = !!this._settings.timelineBehavior.snapPlayhead;
+    if (controls.snapRazor) controls.snapRazor.checked = !!this._settings.timelineBehavior.snapRazor;
     for (const option of SNAP_TARGET_OPTIONS) {
         const control = controls[`snapTarget_${option.key}`];
         if (control) control.checked = !!this._settings.timelineBehavior.snapTargets[option.key];
@@ -1169,7 +1171,7 @@ function showSettingsPanel() {
         timelineSection,
         "snappingEnabled",
         "Enable Snapping By Default",
-        "Use snap guides for drag, trim, and move operations unless toggled off.",
+        "Snap moved and trimmed edges to nearby targets (S toggles it). The playhead and Razor cuts snap only when their settings below are on.",
         () => this._settings.timelineBehavior.snappingEnabled,
         (checked) => this._setSnappingEnabled(checked)
     );
@@ -1185,6 +1187,22 @@ function showSettingsPanel() {
             getter: () => this._settings.timelineBehavior.snapThreshold,
             onChange: (value) => updateCategory("timelineBehavior", "snapThreshold", Math.round(value)),
         }
+    );
+    createCheckbox(
+        timelineSection,
+        "snapPlayhead",
+        "Snap Playhead on the Ruler",
+        "Pull the playhead to nearby snap targets when you click or drag on the ruler. Separate from the Playhead target below, which pulls items to the playhead.",
+        () => this._settings.timelineBehavior.snapPlayhead,
+        (checked) => updateCategory("timelineBehavior", "snapPlayhead", checked)
+    );
+    createCheckbox(
+        timelineSection,
+        "snapRazor",
+        "Snap Razor Cuts",
+        "Move a Razor cut to a nearby snap target inside the item, shown by the snap guide while you hover. Press S to cut freely.",
+        () => this._settings.timelineBehavior.snapRazor,
+        (checked) => updateCategory("timelineBehavior", "snapRazor", checked)
     );
     for (const option of SNAP_TARGET_OPTIONS) {
         createCheckbox(

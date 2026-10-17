@@ -467,8 +467,7 @@ export function buildEditorToolbar(widget) {
     });
 
     widget._toolBtnRazor = makeToolButton("\u2702 Cut", "C", "Toggle razor/cut mode", () => {
-        widget._razorMode = !widget._razorMode;
-        widget._updateToolbar();
+        widget._setRazorMode(!widget._razorMode);
     });
 
     // SELECTION-ONLY, deliberately. The button used to fall back to whatever sat

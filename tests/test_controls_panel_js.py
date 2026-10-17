@@ -37,7 +37,9 @@ class El {
 }
 const events={};globalThis.window={innerWidth:1366,innerHeight:900,addEventListener(k,f){(events[k]||=[]).push(f);},removeEventListener(k,f){events[k]=(events[k]||[]).filter(x=>x!==f);}};
 globalThis.requestAnimationFrame=f=>f();
-globalThis.localStorage={getItem(){return null;},setItem(){}};
+// Collapsed notes are remembered: that scenario reads its own writes back.
+const noteStore=new Map();
+globalThis.localStorage={getItem:k=>SCENARIO==='note-titles'?noteStore.get(k)??null:null,setItem(k,v){noteStore.set(k,String(v));}};
 globalThis.document={createElement:t=>new El(t),createTextNode:t=>new El('#TEXT',String(t)),createDocumentFragment:()=>new El('#FRAGMENT'),body:new El('body'),activeElement:null,
     addEventListener(){},removeEventListener(){}};
 document.activeElement=document.body;
@@ -398,6 +400,68 @@ if(SCENARIO==='markdown'){
         let el=input('binding:steps:value');assert.equal(el.min,'4');assert.equal(el.attributes['aria-label'],'Renamed steps');
         publish({...view,bindings:view.bindings.map(d=>d.binding_id==='steps'?{...d,min:null,max:null}:d)});
         assert.equal(el.min,'');assert.equal(el.max,'');
+    }
+    if(SCENARIO==='note-titles'){
+        // The title rule: a first-line heading or bold-only line, with a body after it.
+        const {splitPanelMarkdownTitle}=await import(MARKDOWN_URL);
+        assert.deepEqual(splitPanelMarkdownTitle('**Before you start**\n\nChoose a **Preset**.'),{title:'Before you start',body:'Choose a **Preset**.'});
+        assert.deepEqual(splitPanelMarkdownTitle('\r\n\r\n## Use `seed` [here](https://x.y)\r\nbody\r\n'),{title:'Use seed here',body:'body'});
+        assert.deepEqual(splitPanelMarkdownTitle('### Three\n- one'),{title:'Three',body:'- one'});
+        for(const text of ['**a** and **b**\nbody','Plain first line\n\nbody','#### Four\nbody','# Title only','**Title only**\n\n',''])
+            assert.equal(splitPanelMarkdownTitle(text),null,text);
+        // Headings take theme sizes, not the browser's.
+        const h2=walk(renderPanelMarkdown('## Head\ntext')).find(n=>n.tagName==='H2');
+        assert.match(h2.style.cssText,/font-size:12px/);
+        const titled={source:'note',note_id:'intro',text:'**Before you start**\n\nChoose a **Preset**.',status:'ok',order:0,group:''};
+        publish({...view,notes:[titled]});
+        const header=()=>walk(container).find(n=>n.dataset.noteHeader==='true');
+        const toggle=()=>walk(header()).find(n=>n.dataset.noteToggle==='true');
+        assert.equal(header().style.display,'flex');
+        assert.equal(walk(header()).find(n=>n.tagName==='SPAN').textContent,'Before you start');
+        assert.equal(toggle().attributes['aria-expanded'],'true');
+        assert.ok(note('note:intro:text').textContent.includes('Preset'));
+        assert.ok(!note('note:intro:text').textContent.includes('Before you start'),'the title is not repeated in the body');
+        // The header collapses (a double-click's second click is ignored).
+        header().dispatch('click',{detail:1});
+        assert.equal(note('note:intro:text').style.display,'none');
+        assert.equal(toggle().attributes['aria-expanded'],'false');
+        header().dispatch('click',{detail:2});
+        assert.equal(note('note:intro:text').style.display,'none');
+        // A refresh keeps it collapsed, and so does a fresh panel in this browser.
+        publish({...view,notes:[{...titled}]});
+        assert.equal(note('note:intro:text').style.display,'none');
+        assert.deepEqual(JSON.parse(noteStore.get('sonder-controls-disclosure-v1')),{'note:intro':false});
+        const other=new El('div'),second=mountControlsPanel(other,host);
+        assert.equal(walk(other).find(n=>n.dataset.noteTarget==='note:intro:text').style.display,'none');
+        second.destroy();
+        // Another panel's write is kept when this one remembers a different key.
+        const {createDisclosureMemory}=await import(new URL('./disclosure_memory.js',MARKDOWN_URL));
+        const a=createDisclosureMemory('two-panels'),b=createDisclosureMemory('two-panels');
+        a.remember('note:x',false);b.remember('note:y',false);
+        assert.deepEqual(JSON.parse(noteStore.get('two-panels')),{'note:x':false,'note:y':false});
+        // Manage: the header click no longer toggles; the toggle still does.
+        toggleManage();
+        header().dispatch('click',{detail:1});
+        assert.equal(note('note:intro:text').style.display,'none');
+        // Double-clicking the title edits the whole text, title line included,
+        // in a visible box with the header out of the way.
+        walk(header()).find(n=>n.tagName==='SPAN').dispatch('dblclick');
+        const area=walk(note('note:intro:text')).find(n=>n.tagName==='TEXTAREA');
+        assert.equal(area.value,titled.text);
+        assert.equal(note('note:intro:text').hidden,false);
+        assert.equal(note('note:intro:text').style.display,'');
+        assert.equal(header().style.display,'none');
+        key('Escape');await settle();
+        assert.equal(header().style.display,'flex');
+        assert.equal(note('note:intro:text').style.display,'none');
+        toggle().dispatch('click');
+        assert.equal(note('note:intro:text').style.display,'');
+        assert.equal(calls.length,0);
+        // Plain first line: no header, the whole note as before.
+        toggleManage();
+        publish({...view,notes:[{...titled,text:'Plain words\n\nmore'}]});
+        assert.equal(header().style.display,'none');
+        assert.ok(note('note:intro:text').textContent.includes('Plain words'));
     }
     if(SCENARIO==='cancel'||SCENARIO==='note-save'||SCENARIO==='ime'){
         note('note:intro:text').dispatch('dblclick');const area=walk(note('note:intro:text')).find(n=>n.tagName==='TEXTAREA');area.value='# Edited';
@@ -812,7 +876,7 @@ if(SCENARIO==='markdown'){
 console.log('ok');
 '''
 
-@pytest.mark.parametrize('scenario',['value-title','editor-reorder','restore-notice','restore-all','description','group-editor-name','editor-focus-refresh','normal-view','manage','manage-sdk','manage-flush','hide-flush','combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','note-refusal','problem-statuses','loading','note-then-value','batch-mirror','search','advanced','advanced-refusal','hidden-pending','cards-scale','group-note','groups-manage','groups-cap','rows','rows-notice','rows-app','pickers'])
+@pytest.mark.parametrize('scenario',['value-title','editor-reorder','restore-notice','restore-all','description','group-editor-name','editor-focus-refresh','normal-view','manage','manage-sdk','manage-flush','hide-flush','combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','note-refusal','problem-statuses','loading','note-then-value','batch-mirror','search','advanced','advanced-refusal','hidden-pending','cards-scale','group-note','groups-manage','groups-cap','rows','rows-notice','rows-app','pickers','note-titles'])
 def test_controls_panel(scenario, tmp_path):
     node=shutil.which('node')
     if not node:pytest.skip('node required for Controls renderer boundary tests')

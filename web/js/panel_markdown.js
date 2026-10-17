@@ -1,4 +1,23 @@
 // Safe, small Markdown subset. Author text never becomes HTML or attributes.
+import { SPACE, TYPE } from "./editor_theme.js";
+
+// Theme-sized blocks: browser defaults made a heading the panel's largest
+// text (18px h2 against 12px panel text). Body size and colour inherit.
+const HEADING_SIZE = { 1: TYPE.t12, 2: TYPE.t12, 3: TYPE.t11 };
+const BLOCK_MARGIN = `margin:${SPACE.s1}px 0;`;
+const blockCss = (tag) => {
+    const heading = /^h([1-3])$/.exec(tag);
+    if (heading) return `${BLOCK_MARGIN}font-size:${HEADING_SIZE[heading[1]]}px;font-weight:${TYPE.fwBold};line-height:1.35;`;
+    if (tag === "ul" || tag === "ol") return `${BLOCK_MARGIN}padding-left:${SPACE.s4}px;`;
+    return BLOCK_MARGIN;
+};
+function block(fragment, tag) {
+    const el = document.createElement(tag);
+    el.style.cssText = blockCss(tag) + (fragment.children.length ? "" : "margin-top:0;");
+    fragment.append(el);
+    return el;
+}
+
 function inline(parent, text, depth = 0) {
     if (depth > 8) {
         parent.append(document.createTextNode(text));
@@ -54,29 +73,47 @@ export function renderPanelMarkdown(text) {
         }
         if (heading) {
             paragraph = list = null;
-            const el = document.createElement("h" + heading[1].length);
-            inline(el, heading[2]);
-            fragment.append(el);
+            inline(block(fragment, "h" + heading[1].length), heading[2]);
             continue;
         }
         if (item) {
             paragraph = null;
             const tag = item[2] ? "ol" : "ul";
-            if (!list || list.tagName.toLowerCase() !== tag) {
-                list = document.createElement(tag);
-                fragment.append(list);
-            }
+            if (!list || list.tagName.toLowerCase() !== tag) list = block(fragment, tag);
             const el = document.createElement("li");
             inline(el, item[3]);
             list.append(el);
             continue;
         }
         list = null;
-        if (!paragraph) {
-            paragraph = document.createElement("p");
-            fragment.append(paragraph);
-        } else paragraph.append(document.createElement("br"));
+        if (!paragraph) paragraph = block(fragment, "p");
+        else paragraph.append(document.createElement("br"));
         inline(paragraph, line);
     }
+    const last = fragment.children[fragment.children.length - 1];
+    if (last) last.style.marginBottom = "0";
     return fragment;
+}
+
+const TITLE_HEADING = /^(#{1,3})\s+(.+)$/;
+const TITLE_BOLD = /^\s*\*\*([^*\n]+)\*\*\s*$/;
+
+/**
+ * A note's title, read from its first line: a `#`-`###` heading or a line
+ * that is only bold text. Returns `{title, body}` with `title` as plain text,
+ * or null when the first line is neither or nothing follows it (a title-only
+ * note renders as it always did).
+ */
+export function splitPanelMarkdownTitle(text) {
+    const lines = String(text ?? "").replace(/\r\n?/g, "\n").split("\n");
+    const first = lines.findIndex((line) => line.trim());
+    if (first < 0) return null;
+    const match = TITLE_HEADING.exec(lines[first])?.[2] ?? TITLE_BOLD.exec(lines[first])?.[1];
+    if (match === undefined) return null;
+    const body = lines.slice(first + 1).join("\n").replace(/^(\s*\n)+/, "").trimEnd();
+    if (!body.trim()) return null;
+    const holder = document.createElement("span");
+    inline(holder, match.trim());
+    const title = holder.textContent.trim();
+    return title ? { title, body } : null;
 }

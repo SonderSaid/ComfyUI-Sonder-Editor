@@ -9,6 +9,8 @@ export const EDITOR_DISCLOSURE = "editor";
 // Disclosure memory keys: one namespace, so a group named "editor" cannot
 // collide with the Editor section.
 export const disclosureKey = group => (group === null ? EDITOR_DISCLOSURE : `group:${group}`);
+// A titled note's open state, in the same namespace.
+export const noteDisclosureKey = noteId => `note:${noteId}`;
 
 const text = value => String(value ?? "").toLowerCase();
 

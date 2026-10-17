@@ -1514,8 +1514,15 @@ export function _drawPlayheadLine(host, ctx, width) {
     }
 
 export function _drawSnapIndicator(host, ctx, width, height = host.timelineCanvas?.height || 0) {
-        if (host._snapIndicator === null) return;
-        const x = host._frameToX(host._snapIndicator);
+        // The Razor's hover guide shares the look. It stays out of the layer
+        // cache gate (timelineCacheForFrame), so playback keeps its cache.
+        // Drawn only while it still applies, so a toggle or scene switch made
+        // before the pointer moves again never leaves it behind.
+        const razor = host._razorMode && host.snappingEnabled
+            && host._settings?.timelineBehavior?.snapRazor ? host._razorHoverFrame : null;
+        const frame = host._snapIndicator ?? razor ?? null;
+        if (frame === null) return;
+        const x = host._frameToX(frame);
         if (x < host._labelW || x > width) return;
 
         ctx.save();

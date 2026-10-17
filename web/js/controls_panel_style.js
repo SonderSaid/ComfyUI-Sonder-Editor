@@ -50,9 +50,15 @@ export const modeSelectCss = inputCss + "width:96px;flex:0 0 auto;cursor:pointer
 export const noteCss = `font-size:${TYPE.t11}px;line-height:1.45;color:${COLORS.textDim};overflow-wrap:anywhere;margin:0;`;
 
 // A standalone note: an instruction for the whole workflow or its group.
+// The frame holds an optional title header (a first-line heading or bold line)
+// above the note's body, so a collapsed note keeps its strip.
 export const standaloneNoteCss = `font-size:${TYPE.t11}px;line-height:1.5;color:${COLORS.textSecondary};overflow-wrap:anywhere;`
     + `padding:${SPACE.s1 + 2}px ${SPACE.s2}px;background:${COLORS.accentSoft};border-left:2px solid ${COLORS.accentLo};`
-    + `border-radius:0 ${RADIUS.r2}px ${RADIUS.r2}px 0;`;
+    + `border-radius:0 ${RADIUS.r2}px ${RADIUS.r2}px 0;display:flex;flex-direction:column;gap:${SPACE.s1}px;`;
+export const standaloneNoteBodyCss = "overflow-wrap:anywhere;min-width:0;";
+export const noteHeaderCss = `display:flex;align-items:center;gap:${SPACE.s1 + 2}px;min-width:0;user-select:none;`;
+export const noteTitleCss = `font-size:${TYPE.t11}px;font-weight:${TYPE.fwBold};color:${COLORS.text};`
+    + "line-height:1.35;overflow-wrap:anywhere;min-width:0;";
 
 export const tagCss = `font-size:${TYPE.t10 - 1}px;font-weight:${TYPE.fwBold};letter-spacing:0.04em;text-transform:uppercase;`
     + `color:${COLORS.textDim};border:1px solid ${COLORS.border};border-radius:${RADIUS.r1}px;padding:0 ${SPACE.s1}px;`

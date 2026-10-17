@@ -179,11 +179,21 @@ lives in the right-click menu.
 
 ## Editing gestures
 
-- **Snapping** (`S` to toggle) pulls dragged edges to clip edges, guides, and
-  the playhead, with a visible snap guide line. Threshold and per-type
-  targets are in Settings ▸ Timeline Behavior.
+- **Snapping** (`S` to toggle, or the **Snap** button above the timeline)
+  pulls a dragged item's start **or end**, and a trimmed edge, to nearby
+  clip, audio, prompt and Reference item edges, guides, the playhead, In/Out
+  and the scene's ends, with a dashed snap guide line where it lands. When
+  several items move together, the one you grabbed and the outer edges of
+  the group snap. The distance (in frames) and each kind of target are in
+  **Settings** (the gear at the right of the timeline toolbar) ▸ **Timeline
+  Behavior**. Two more switches there are off by default: **Snap Playhead on
+  the Ruler** pulls the playhead to those targets when you click or drag on
+  the ruler, and **Snap Razor Cuts** moves a Razor cut to a target inside
+  the item you click. Because the distance is in frames, it reaches further on screen
+  when you zoom in; press `S` to scrub or cut freely.
 - **Razor mode** (`C`): click a clip, audio track, prompt section or Reference
-  item to split it at that point. **⌇ Split Here** does the same to everything
+  item to split it at that point (with **Snap Razor Cuts** on, at the snap
+  guide shown while you hover, when a target is close). **⌇ Split Here** does the same to everything
   selected, at the playhead. Both cover the same four item types, and both say
   why when something cannot be cut — an item the frame falls outside, a locked
   lane, or a Driver clip. Split Here acts only on the **selection**: with

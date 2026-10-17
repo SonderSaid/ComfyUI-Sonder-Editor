@@ -503,6 +503,7 @@ import {
     referenceRowAfterMemberRemoval, stagedReferenceItem,
 } from "./scene_reference_geometry.js";
 import { applyGuideSwap, guideIdentityMatches } from "./scene_guide_geometry.js";
+import { collectSnapCandidates, nearestSnap, razorSnapTargets, snapItemKey } from "./timeline_snap.js";
 import { createViewportSurface } from "./viewport_surface.js";
 import {
     EDITOR_COLORS as COLORS,
@@ -939,6 +940,10 @@ export class EditorWidget {
         this.options = options;
         this.onFullscreenExit = options.onFullscreenExit || null;
         this.onMountInTab = options.onMountInTab || null;
+        // Opt-in: the mounted tab titles its page after the project. The canvas
+        // never passes it, since ComfyUI owns that page's title.
+        this.onProjectIdentityChanged = options.onProjectIdentityChanged || null;
+        this._reportedProjectName = undefined;
         this.hostMode = options.hostMode || "node";
         // A host that runs the workflow itself (Sonder App): the toolbar shows
         // Generate ×N for it (generate_controls.js). Absent on the canvas modes.
@@ -1112,6 +1117,7 @@ export class EditorWidget {
 
         // Razor / trim mode
         this._razorMode = false;
+        this._razorHoverFrame = null; // where a snapped Razor cut would land, or null
         this._trimItem = null;   // { type, id, data, edge: "left"|"right", origStart, origEnd, origSourceIn, origSourceOut }
 
         // Drag-to-move state
@@ -1952,6 +1958,7 @@ export class EditorWidget {
     }
 
     _setActiveScene(scene, { lifecycleToken = null, optimisticHistory = false } = {}) {
+        this._razorHoverFrame = null; // a frame of the scene being left
         const lifecycleOwnsSwitch = !!(lifecycleToken
             && this._sceneHistoryLifecycleOwner === lifecycleToken
             && lifecycleToken.allowSceneSwitch);
@@ -9621,6 +9628,7 @@ export class EditorWidget {
     }
 
     _setSnappingEnabled(enabled) {
+        this._razorHoverFrame = null;
         this._updateSettings({
             timelineBehavior: {
                 snappingEnabled: !!enabled,
@@ -11479,85 +11487,127 @@ export class EditorWidget {
         ctx.restore();
     }
 
+    /** The frames edges can snap to now (timeline_snap.js), minus the items
+     *  named in `exclude` (`snapItemKey`s) and, with `playhead: false`, the
+     *  playhead itself. */
+    _snapCandidates({ exclude = [], playhead = true } = {}) {
+        const targets = this._settings.timelineBehavior.snapTargets;
+        return collectSnapCandidates(this.activeScene, {
+            playhead: this.playhead,
+            selectionStart: this.selectionStart,
+            selectionEnd: this.selectionEnd,
+            totalFrames: this.totalFrames,
+            targets: playhead ? targets : { ...targets, playhead: false },
+            exclude: new Set(exclude),
+        });
+    }
+
     /** Snap a frame to nearby edges (clip edges, guide frames, playhead, selection bounds).
      *  Returns the snapped frame, or the original if no snap.
-     *  Sets this._snapIndicator for visual feedback. */
-    _snapFrame(frame, excludeIds = [], excludeFrames = []) {
+     *  Sets this._snapIndicator for visual feedback.
+     *  `exclude` holds `snapItemKey`s. Snap-back guard (#35): never snap to a
+     *  frame in `excludeFrames` (a drag's origin positions), or a drag beside
+     *  another edge is pulled back to where it began. */
+    _snapFrame(frame, exclude = [], excludeFrames = [], { playhead = true } = {}) {
         if (!this.snappingEnabled || !this.activeScene) {
             this._snapIndicator = null;
             return frame;
         }
+        const best = nearestSnap([frame], this._snapCandidates({ exclude, playhead }), this._snapThreshold,
+            excludeFrames.length ? new Set(excludeFrames) : null);
+        this._snapIndicator = best ? best.frame : null;
+        return best ? best.frame : frame;
+    }
 
-        const threshold = this._snapThreshold;
-        const candidates = [];
-        const snapTargets = this._settings.timelineBehavior.snapTargets;
-        // Snap-back guard (#35): never snap to a frame that exactly equals an excluded frame
-        // (the drag's origin positions). Without this, dragging a clip whose origin is
-        // adjacent to another clip's edge — or near scene bounds — gets pulled back to
-        // origin and frameDelta collapses to 0.
-        const excludeSet = excludeFrames.length > 0 ? new Set(excludeFrames) : null;
+    /** The ruler's playhead frame: snapped only when Settings asks for it. */
+    _snapPlayheadFrame(frame) {
+        if (!this._settings.timelineBehavior.snapPlayhead) return frame;
+        return this._snapFrame(frame, [], [], { playhead: false });
+    }
 
-        // Playhead
-        if (snapTargets.playhead) {
-            candidates.push(this.playhead);
+    /** A move's snapped frame delta. The grabbed item's start and end, and the
+     *  selection's outer bounds when several items move, snap to targets read
+     *  at mousedown (`_moveSnapCandidates`), before any preview moved a
+     *  neighbour. Snapping every member's edges would make a group sticky. */
+    _moveSnapDelta(rawDelta) {
+        if (!this.snappingEnabled || !this.activeScene) return { delta: rawDelta, frame: null };
+        // A guide pinned to the scene end is stored as -1.
+        const resolve = f => (f === -1 ? Math.max(0, this.totalFrames - 1) : f);
+        const origins = this._dragItemsOrig || [];
+        const grabStart = resolve(this._dragItemOrigStart);
+        const grabEnd = resolve(this._dragItemOrigEnd);
+        const points = [grabStart + rawDelta];
+        if (grabEnd !== grabStart) points.push(grabEnd + rawDelta);
+        if (origins.length > 1) {
+            points.push(Math.min(...origins.map(o => resolve(o.origStart))) + rawDelta,
+                Math.max(...origins.map(o => resolve(o.origEnd))) + rawDelta);
         }
-
-        // Selection bounds
-        if (snapTargets.selection && this.selectionStart < this.selectionEnd) {
-            candidates.push(this.selectionStart, this.selectionEnd);
-        }
-
-        // Clip edges
-        if (snapTargets.clipEdges) {
-            for (const clip of (this.activeScene.clips || [])) {
-                if (excludeIds.includes(clip.clip_id)) continue;
-                candidates.push(clip.timeline_start_frame, clip.timeline_end_frame);
+        const excludeFrames = new Set();
+        for (const o of origins) {
+            for (const f of [o.origStart, o.origEnd]) {
+                if (typeof f === "number") excludeFrames.add(f).add(resolve(f));
             }
         }
+        const live = this._settings.timelineBehavior.snapTargets.playhead && Number.isFinite(this.playhead)
+            ? [this.playhead] : [];
+        const best = nearestSnap(points, [...live, ...(this._moveSnapCandidates || [])], this._snapThreshold, excludeFrames);
+        return best ? { delta: rawDelta + best.delta, frame: best.frame } : { delta: rawDelta, frame: null };
+    }
 
-        // Audio track edges
-        if (snapTargets.audioEdges) {
-            for (const track of (this.activeScene.audio_tracks || [])) {
-                if (excludeIds.includes(track.track_id)) continue;
-                candidates.push(track.timeline_start_frame, track.timeline_end_frame);
-            }
+    /** The move's snap guide: shown only where the grabbed item actually
+     *  shows, since a clamp, swap or hold can place it elsewhere. */
+    _moveSnapIndicator(snap, frameDelta) {
+        if (snap.frame === null || frameDelta !== snap.delta) return null;
+        const origin = this._dragItemOrigStart === -1 ? Math.max(0, this.totalFrames - 1) : this._dragItemOrigStart;
+        return this._grabbedPreviewStart() === origin + snap.delta ? snap.frame : null;
+    }
+
+    /** Where the grabbed item's start shows now, after clamps, swaps and holds. */
+    _grabbedPreviewStart() {
+        const orig = (this._dragItemsOrig || []).find(o => o.type === this._dragAnchorType && o.id === this._dragAnchorId);
+        if (!orig) return null;
+        if (orig.type === "guide") return orig.data._previewFrameIndex ?? null;
+        return orig.data.timeline_start_frame ?? orig.data.start_frame ?? null;
+    }
+
+    /** A Razor click's frame: snapped, when Settings asks for it, to the
+     *  nearest target inside the item that divides its linked partners as the
+     *  pointer's frame would (`razorSnapTargets`); otherwise the pointer's frame. */
+    _razorFrame(hit, frame) {
+        if (!hit || !this.snappingEnabled || !this._settings.timelineBehavior.snapRazor || !this.activeScene) return frame;
+        const item = this._razorItemRange(hit);
+        if (!item) return frame;
+        const partners = this._expandItemsWithLinked([hit])
+            .filter(m => !(m.type === hit.type && m.id === hit.id))
+            .map(m => this._razorItemRange(m)).filter(Boolean);
+        const targets = razorSnapTargets(
+            this._snapCandidates({ exclude: [snapItemKey(hit.type, hit.id)] }), item, partners, frame);
+        return nearestSnap([frame], targets, this._snapThreshold)?.frame ?? frame;
+    }
+
+    _razorItemRange(item) {
+        const data = item?.data;
+        if (!data) return null;
+        if (item.type === "reference") return referenceItemEffectiveBounds(data, this.totalFrames);
+        if (item.type === "prompt") return { start: data.start_frame || 0, end: data.end_frame || 0 };
+        if (item.type === "clip" || item.type === "audio") {
+            return { start: data.timeline_start_frame || 0, end: data.timeline_end_frame || 0 };
         }
+        return null;
+    }
 
-        // Guide frames
-        if (snapTargets.guides) {
-            for (const g of (this.activeScene.guide_frames || [])) {
-                const idx = g.frame_index === -1 ? this.totalFrames - 1 : g.frame_index;
-                candidates.push(idx);
-            }
-        }
+    _setRazorMode(on) {
+        this._razorMode = !!on;
+        this._setRazorHoverFrame(null);
+        this._updateToolbar();
+    }
 
-        // Prompt section edges
-        if (snapTargets.promptSections) {
-            for (let i = 0; i < (this.activeScene.prompt_sections || []).length; i++) {
-                if (excludeIds.includes(i)) continue;
-                const s = this.activeScene.prompt_sections[i];
-                candidates.push(s.start_frame, s.end_frame);
-            }
-        }
-
-        // Frame 0 and last frame
-        if (snapTargets.sceneBounds) {
-            candidates.push(0, this.totalFrames);
-        }
-
-        let best = frame;
-        let bestDist = threshold + 1;
-        for (const c of candidates) {
-            if (excludeSet && excludeSet.has(c)) continue;
-            const d = Math.abs(frame - c);
-            if (d < bestDist) {
-                bestDist = d;
-                best = c;
-            }
-        }
-
-        this._snapIndicator = (bestDist <= threshold) ? best : null;
-        return (bestDist <= threshold) ? best : frame;
+    // Repaints only when the guide moves.
+    _setRazorHoverFrame(frame) {
+        const next = frame ?? null;
+        if ((this._razorHoverFrame ?? null) === next) return;
+        this._razorHoverFrame = next;
+        this._renderTimeline();
     }
 
     // ── Timeline Events ────────────────────────────────────────────────
@@ -11657,7 +11707,7 @@ export class EditorWidget {
 
             if (y < Math.round(RULER_HEIGHT * this._scaleTimeline)) {
                 // Click on ruler = move playhead
-                this.playhead = frame;
+                this.playhead = this._snapPlayheadFrame(frame);
                 this.isDragging = true;
                 this.dragType = "playhead";
                 if (this.isPlaying) this._stopPlayback();
@@ -11730,7 +11780,7 @@ export class EditorWidget {
                     // Razor mode: split clip or audio at click position
                     const hit = this._hitTestItem(x, rawY);
                     if (hit && SPLITTABLE_ITEM_TYPES.has(hit.type)) {
-                        this._splitItemsAtFrame([hit], frame);
+                        this._splitItemsAtFrame([hit], this._razorFrame(hit, frame));
                     }
                     return;
                 } else {
@@ -11864,6 +11914,13 @@ export class EditorWidget {
                             origTrackType: s.type === "clip" ? this._clipTrackType(s.data)
                                 : (s.type === "audio" ? TRACK_TYPE.AUDIO : (s.type === "reference" ? TRACK_TYPE.REFERENCE : "")),
                         }));
+                        // Snap targets as they stand now: a swap preview moves
+                        // neighbours mid-drag, and those spots are not edges.
+                        // The playhead is read live instead: playback can run on.
+                        this._moveSnapCandidates = this._snapCandidates({
+                            exclude: this.selectedItems.map(s => snapItemKey(s.type, s.id)),
+                            playhead: false,
+                        });
                         this._dragLaneChanged = false;
                         this._dragSwapTarget = null;
                         this._dragLastValidProposed = null;
@@ -11934,6 +11991,16 @@ export class EditorWidget {
                 } else {
                     this._hidePromptHoverPreview();
                 }
+                // Razor: the snap guide shows where a cut would land when it
+                // snaps away from the pointer.
+                const razorHit = this._razorMode ? this._hitTestItem(x, rawY) : null;
+                if (razorHit && SPLITTABLE_ITEM_TYPES.has(razorHit.type)) {
+                    const pointer = Math.max(0, Math.min(this.totalFrames, this._xToFrame(x)));
+                    const cut = this._razorFrame(razorHit, pointer);
+                    this._setRazorHoverFrame(cut !== pointer ? cut : null);
+                } else {
+                    this._setRazorHoverFrame(null);
+                }
                 // Update cursor based on position
                 if (this._hitTestHeaderEdge(x, y)) {
                     canvas.style.cursor = "col-resize";
@@ -11976,11 +12043,11 @@ export class EditorWidget {
             const frame = Math.max(0, Math.min(this.totalFrames, this._xToFrame(x)));
 
             if (this.dragType === "playhead") {
-                this.playhead = frame;
+                this.playhead = this._snapPlayheadFrame(frame);
                 this._renderViewportFrame();
             } else if (this.dragType === "trimEdge" && this._trimItem) {
                 canvas.style.cursor = "ew-resize";
-                const snappedFrame = this._snapFrame(frame, [this._trimItem.id]);
+                const snappedFrame = this._snapFrame(frame, [snapItemKey(this._trimItem.type, this._trimItem.id)]);
                 const item = this._trimItem;
 
                 if (item.type === "prompt" || item.type === "reference") {
@@ -12044,18 +12111,8 @@ export class EditorWidget {
             } else if (this.dragType === "moveItem" && this.selectedItems.length > 0) {
                 canvas.style.cursor = "grabbing";
                 const rawDelta = frame - this._dragStartFrame;
-                const excludeIds = this.selectedItems.map(s => s.id);
-                // Snap-back guard (#35): exclude every dragged item's origStart/origEnd so
-                // snapping cannot pull primaryNewStart back to where the drag began. Adjacent
-                // clip edges and scene bounds remain valid snap targets when they aren't the origin.
-                const excludeFrames = [];
-                for (const o of (this._dragItemsOrig || [])) {
-                    if (typeof o.origStart === "number") excludeFrames.push(o.origStart);
-                    if (typeof o.origEnd === "number" && o.origEnd !== o.origStart) excludeFrames.push(o.origEnd);
-                }
-                const primaryNewStart = Math.max(0, this._dragItemOrigStart + rawDelta);
-                const snappedStart = this._snapFrame(primaryNewStart, excludeIds, excludeFrames);
-                let frameDelta = snappedStart - this._dragItemOrigStart;
+                const snap = this._moveSnapDelta(rawDelta);
+                let frameDelta = snap.delta;
                 // Group-bounded delta (linked-collision follow-up): every dragged
                 // member shares ONE delta, so a member pinned at a scene bound
                 // stops the whole group instead of letting relative offsets drift.
@@ -12269,6 +12326,7 @@ export class EditorWidget {
                 }
                 this._previewPromptDrag(effectiveDelta, x, rawY);
                 this._previewReferenceDrag(effectiveDelta);
+                this._snapIndicator = this._moveSnapIndicator(snap, frameDelta);
             }
 
             this._renderTimeline();
@@ -12338,6 +12396,7 @@ export class EditorWidget {
                 }
                 canvas.style.cursor = "grab";
                 this._dragItemsOrig = null;
+                this._moveSnapCandidates = null;
                 this._origAllClipLanes = {};
                 this._origAllClipStarts = {};
                 this._origAllClipEnds = {};
@@ -12379,6 +12438,7 @@ export class EditorWidget {
         canvas.addEventListener("mouseleave", () => {
             this._hideGuideHoverPreview();
             this._hidePromptHoverPreview();
+            this._setRazorHoverFrame(null);
         });
 
         // Scroll to pan
@@ -22879,7 +22939,13 @@ export class EditorWidget {
     }
 
     _updateProjectIdentity() {
-        if (this._fsProjectLabel) this._fsProjectLabel.textContent = this._projectDirName() || "No Project";
+        const name = this._projectDirName();
+        if (this._fsProjectLabel) this._fsProjectLabel.textContent = name || "No Project";
+        // Reported once per change: a folder id becoming its full path keeps the name.
+        if (this.onProjectIdentityChanged && name !== this._reportedProjectName) {
+            this._reportedProjectName = name;
+            this.onProjectIdentityChanged(name);
+        }
     }
 
     _showSceneDropdown(anchorEl) {
@@ -23660,6 +23726,7 @@ export class EditorWidget {
     }
 
     _exitFullscreen() {
+        this._razorHoverFrame = null;
         TimelineCanvas._releaseTimelineLayerCache(this);
         // Re-entry must ask again even if the previous open's request is pending.
         this._renderCacheSweepGeneration += 1;
@@ -23881,8 +23948,7 @@ export class EditorWidget {
 
             // ── C = toggle razor mode ──
             if (key === "c" || key === "C") {
-                this._razorMode = !this._razorMode;
-                this._updateToolbar();
+                this._setRazorMode(!this._razorMode);
                 return true;
             }
 

@@ -148,6 +148,7 @@ export const SNAP_TARGET_OPTIONS = [
     { key: "audioEdges", label: "Audio Clip Edges" },
     { key: "guides", label: "Guide Frames" },
     { key: "promptSections", label: "Prompt Sections" },
+    { key: "referenceItems", label: "Reference Item Edges" },
     { key: "sceneBounds", label: "Scene Bounds" },
 ];
 
@@ -327,6 +328,10 @@ export const DEFAULT_EDITOR_SETTINGS = {
         linkedVideoAudioDrop: true,
         snappingEnabled: true,
         snapThreshold: 5,
+        // Pointer placements, off by default: the frame threshold can pull
+        // a scrub or a cut far when zoomed in.
+        snapPlayhead: false,
+        snapRazor: false,
         snapTargets: {
             playhead: true,
             selection: true,
@@ -334,6 +339,7 @@ export const DEFAULT_EDITOR_SETTINGS = {
             audioEdges: true,
             guides: true,
             promptSections: true,
+            referenceItems: true,
             sceneBounds: true,
         },
         timecodeMode: "frames",
@@ -1302,6 +1308,12 @@ export function normalizeEditorSettings(source = null) {
                 defaults.timelineBehavior.snapThreshold,
                 true,
             ),
+            snapPlayhead: stored?.timelineBehavior?.snapPlayhead == null
+                ? defaults.timelineBehavior.snapPlayhead
+                : !!stored.timelineBehavior.snapPlayhead,
+            snapRazor: stored?.timelineBehavior?.snapRazor == null
+                ? defaults.timelineBehavior.snapRazor
+                : !!stored.timelineBehavior.snapRazor,
             snapTargets: normalizeSnapTargets(stored?.timelineBehavior?.snapTargets),
             timecodeMode: VALID_TIMECODE_MODES.has(stored?.timelineBehavior?.timecodeMode)
                 ? stored.timelineBehavior.timecodeMode

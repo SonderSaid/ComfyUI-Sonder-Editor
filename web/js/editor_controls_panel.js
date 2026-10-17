@@ -9,9 +9,9 @@ import { EDITOR_PARTITION, comparePanelRows, canArrange, planPanelMove } from ".
 import { moveToGroupItems, openGroupMenu, startGroupRename } from "./controls_panel_groups.js";
 import { changesRun } from "./control_targets.js";
 import { openContextMenu } from "./editor_context_menu.js";
-import { disclosureKey, entryVisible, groupPlan, hasAdvanced, hiddenAdvanced, matchEntry } from "./controls_panel_view.js";
+import { disclosureKey, entryVisible, groupPlan, hasAdvanced, hiddenAdvanced, matchEntry, noteDisclosureKey } from "./controls_panel_view.js";
 import * as S from "./controls_panel_style.js";
-import { renderPanelMarkdown } from "./panel_markdown.js";
+import { renderPanelMarkdown, splitPanelMarkdownTitle } from "./panel_markdown.js";
 import { createDisclosureMemory } from "./disclosure_memory.js";
 import { register, PRIORITY, PRESERVE_DEFAULT } from "./keyboard_ownership.js";
 import { EDITOR_COLORS as COLORS, FONT, RADIUS, SPACE, TYPE, applyNativeControlTheme, setButtonVariant } from "./editor_theme.js";
@@ -23,6 +23,7 @@ const identified = d => !!(d.binding_id || d.note_id);
 const baseOf = d => (d.binding_id ? "binding:" + d.binding_id : d.note_id ? "note:" + d.note_id : "");
 const inEditor = d => d.source === "binding" && d.section === "editor";
 const CANVAS_EMPTY = "No Controls yet. Choose Manage to expose this workflow's settings here.";
+const EMPTY_NOTE = "Double-click to write this note. Start it with a bold line to make it collapsible.";
 const LONG_VALUE = 18; // a choice longer than this gets a wide card
 // Your own editor settings, shown first in the Editor group in every mode. They
 // write through the host's typed setter (editor_settings.js controlsPanelSettingPatch).
@@ -758,7 +759,11 @@ export function mountControlsPanel(container, host) {
         area.style.cssText = S.inputCss + "min-height:100px;resize:vertical;";
         done.type = "button";
         done.style.cssText = `border:1px solid ${COLORS.border};background:${COLORS.accentSoft};color:${COLORS.text};border-radius:${RADIUS.r2}px;padding:${SPACE.s1}px ${SPACE.s2}px;align-self:flex-end;cursor:pointer;`;
+        // A collapsed titled note opens whole: the title line is part of the text.
+        box.hidden = false;
         box.style.display = "";
+        if (row.noteHeader) row.noteHeader.style.display = "none";
+        if (row.noteFrame) row.noteFrame.style.display = "flex";
         box.replaceChildren(area, done);
         row.editing = true;
         const edit = { row, box, target, area, before: String(text ?? ""), composing: false, unregister: null };
@@ -792,12 +797,73 @@ export function mountControlsPanel(container, host) {
     function noteBox(row, target, standalone) {
         const box = make("div");
         box.dataset.noteTarget = target;
-        box.style.cssText = standalone ? S.standaloneNoteCss : S.noteCss;
+        box.style.cssText = standalone ? S.standaloneNoteBodyCss : S.noteCss;
         // Notes are authored in Manage; normal view shows them rendered.
         box.addEventListener("dblclick", () =>
             openNote(row, box, target, row.noteText, manageOn && identified(row.spec) && !row.spec.note_truncated),
         );
         return box;
+    }
+    // A standalone note's strip: a title header when the note starts with a
+    // heading or a bold line (splitPanelMarkdownTitle), then its body. The
+    // header sits outside the box openNote replaces with its editor.
+    function buildNoteFrame(row, target) {
+        row.noteFrame = make("div");
+        row.noteFrame.style.cssText = S.standaloneNoteCss;
+        row.noteHeader = make("div");
+        row.noteHeader.dataset.noteHeader = "true";
+        row.noteHeader.style.cssText = S.noteHeaderCss;
+        row.noteToggle = make("button");
+        row.noteToggle.type = "button";
+        row.noteToggle.dataset.noteToggle = "true";
+        row.noteToggle.style.cssText = S.groupToggleCss;
+        row.noteTitle = make("span");
+        row.noteTitle.style.cssText = S.noteTitleCss;
+        row.noteHeader.append(row.noteToggle, row.noteTitle);
+        row.noteFrame.append(row.noteHeader, row.note);
+        row.noteOpen = disclosure.isOpen(noteDisclosureKey(row.spec.note_id), true);
+        row.noteToggle.addEventListener("click", () => flipNote(row));
+        // The whole header toggles outside Manage. A double-click's second
+        // click is ignored, so it never flips twice; in Manage it edits.
+        row.noteHeader.addEventListener("click", event => {
+            if (event.target === row.noteToggle || manageOn || (event.detail ?? 1) > 1) return;
+            flipNote(row);
+        });
+        row.noteTitle.addEventListener("dblclick", () =>
+            openNote(row, row.note, target, row.noteText, manageOn && identified(row.spec) && !row.spec.note_truncated));
+    }
+    function flipNote(row) {
+        if (row.editing) return;
+        row.noteOpen = !row.noteOpen;
+        disclosure.remember(noteDisclosureKey(row.spec.note_id), row.noteOpen);
+        paintStandaloneNote(row);
+    }
+    function paintStandaloneNote(row) {
+        const text = row.noteText;
+        const split = text ? splitPanelMarkdownTitle(text) : null;
+        const open = !split || row.noteOpen;
+        row.note.hidden = false;
+        row.note.style.cursor = manageOn ? "text" : "default";
+        row.note.title = manageOn ? "Double-click to edit" : "";
+        if (text) {
+            row.note.replaceChildren(renderPanelMarkdown(split ? split.body : text));
+            row.note.style.fontStyle = "normal";
+        } else {
+            // A standalone note is never empty in practice; Manage invites one.
+            row.note.textContent = manageOn ? EMPTY_NOTE : "";
+            row.note.style.fontStyle = "italic";
+        }
+        row.note.style.display = open ? "" : "none";
+        row.noteFrame.style.display = text || manageOn ? "flex" : "none";
+        row.noteHeader.style.display = split ? "flex" : "none";
+        if (!split) return;
+        row.noteTitle.textContent = split.title;
+        row.noteTitle.title = manageOn ? "Double-click to edit" : "";
+        row.noteTitle.style.cursor = manageOn ? "text" : "pointer";
+        row.noteHeader.style.cursor = manageOn ? "default" : "pointer";
+        row.noteToggle.textContent = open ? "v" : ">";
+        row.noteToggle.title = `${open ? "Collapse" : "Expand"} ${split.title}`;
+        row.noteToggle.setAttribute("aria-expanded", String(open));
     }
     function build(spec, target) {
         const row = {
@@ -826,7 +892,8 @@ export function mountControlsPanel(container, host) {
         }
         if (spec.source === "note") {
             row.note = noteBox(row, target, true);
-            row.el.append(row.note);
+            buildNoteFrame(row, target);
+            row.el.append(row.noteFrame);
         } else {
             row.line = make("div");
             row.label = make("label");
@@ -1090,20 +1157,16 @@ export function mountControlsPanel(container, host) {
         }
         if (row.note) {
             row.noteText = row.noteOptimistic ?? (spec.source === "note" ? spec.text : spec.note) ?? "";
-            row.note.replaceChildren(renderPanelMarkdown(row.noteText));
-            row.note.style.cursor = manageOn ? "text" : "default";
-            row.note.title = manageOn ? "Double-click to edit" : "";
-            if (!row.noteText) {
-                // A standalone note is never empty in practice; a binding's empty
-                // note takes no space (Manage adds one through its Note action).
-                row.note.textContent = manageOn && spec.source === "note" ? "Double-click to write this note." : "";
-                row.note.style.fontStyle = "italic";
-                row.note.style.display = manageOn && spec.source === "note" ? "" : "none";
-            } else {
+            if (spec.source === "note") paintStandaloneNote(row);
+            else {
+                row.note.replaceChildren(renderPanelMarkdown(row.noteText));
+                row.note.style.cursor = manageOn ? "text" : "default";
+                row.note.title = manageOn ? "Double-click to edit" : "";
+                // A binding's empty note takes no space (Manage adds one through its Note action).
                 row.note.style.fontStyle = "normal";
-                row.note.style.display = "";
+                row.note.style.display = row.noteText ? "" : "none";
+                clampNote(row);
             }
-            if (spec.source !== "note") clampNote(row);
         }
         rowActions(row);
         styleRow(row, spec);
