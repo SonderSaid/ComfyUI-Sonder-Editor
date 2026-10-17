@@ -10,6 +10,9 @@ import { PRESERVE_DEFAULT, PRIORITY as KEY_PRIORITY,
     register as registerKeyboardConsumer } from "./keyboard_ownership.js";
 import { promptHandleMentions, promptToken,
     promptTokenDeclarationsFromProfile } from "./prompt_tokens.js";
+import { promptShotOpensAtCaret, promptShotOpensSection } from "./prompt_shot_plan.js";
+
+export { promptShotOpensSection };
 import { notifyWarning } from "./editor_notifications.js";
 import { openContextMenu } from "./editor_context_menu.js";
 import { createDisclosureMemory } from "./disclosure_memory.js";
@@ -57,6 +60,11 @@ export const SCOPE_ONLY_KINDS = ["timestamp", "prompt_link_scope"];
 // row may offer them; the compiler blocks legacy rows that already exist.
 export const INLINE_ONLY_KINDS = ["prompt_link", "vocal_event"];
 const SCOPE_KINDS = AUTHORING_KINDS.filter((kind) => !INLINE_ONLY_KINDS.includes(kind));
+// Draft attachment -> whether the Shot it will become opens its section. Set by
+// Insert at cursor, read once by `configurePromptAttachment`.
+const SHOT_ROLE_HINTS = new WeakMap();
+const SHOT_IN_PLACE_TIME_HINT = "Only the Shot that opens the section can carry its "
+    + "start time. This Shot comes after other text, so it is numbered without a time.";
 const LABELS = {
     shot: "Shot", timestamp: "Time", reference: "Reference",
     vocal_event: "Vocal event", prompt_link: "Prompt link",
@@ -223,6 +231,25 @@ export function promptDocumentText(documentValue) {
         .filter((node) => node.type === "text")
         .map((node) => node.text)
         .join("");
+}
+
+/**
+ * The `shotOpensSection` option for configuring an EXISTING Shot, from the
+ * host's live channel documents. Undefined for anything else, including a Shot
+ * not yet in any document: Insert at cursor states that one's role itself, and
+ * a section chip always opens its section.
+ */
+export function promptShotDialogRole({ attachment, documents, attachments,
+    shotChannel } = {}) {
+    if (attachment?.kind !== "shot") return undefined;
+    if (!promptAttachmentAnchoredChannels(documents, attachment.attachment_id).length) {
+        return undefined;
+    }
+    return promptShotOpensSection({
+        attachments, channelDocs: Object.fromEntries(Object.entries(documents || {})
+            .map(([key, value]) => [key, normalizePromptDocument(value)])),
+        shotChannel, attachmentId: attachment.attachment_id,
+    });
 }
 
 export function promptAttachmentAnchoredChannels(documents, attachmentId) {
@@ -1335,8 +1362,10 @@ export function dedupeReusableAttachments(attachments = [], { scene = null } = {
 
 export function attachmentLabel(attachment, preview = "", identityLabel = "", context = null) {
     const base = LABELS[attachment?.kind] || "Context";
-    if (attachment?.kind === "shot" && attachment?.config?.timestamp) {
-        return "Shot + time";
+    if (attachment?.kind === "shot") {
+        // The marker it resolved to (`[Shot 2]`) says more than the stored
+        // option, and for a Shot after other text the option does not apply.
+        return preview || (attachment?.config?.timestamp ? "Shot + time" : base);
     }
     if (attachment?.kind === "reference") {
         const identity = identityLabel || base;
@@ -3619,10 +3648,25 @@ function referenceMentionItem(editor, bookmark, referenceContext, onInserted) {
 export function createPromptContextMenuItems({ editor, bookmark = null,
     selection = null, allowedKinds = AUTHORING_KINDS, onCreate = null,
     writingAids = [], channelKey = "", profile = null,
-    referenceContext = null, onInserted = null } = {}) {
+    referenceContext = null, onInserted = null, shotPlacementAt = null } = {}) {
     const kinds = promptContextAuthoringKinds(allowedKinds, profile);
-    const insertionKinds = kinds.filter((kind) => kind !== "reference");
-    const hasReference = insertionKinds.length !== kinds.length;
+    // Where a Shot at this caret would land. A host that knows its channels
+    // answers `{offered, opensSection}`: Shot is offered only in the
+    // shot-marker channel, where it renders in place. Whatever the host leaves
+    // out, this editor's own document decides: offered, and opening the
+    // section when nothing that counts precedes the caret.
+    const hostedShot = kinds.includes("shot") && typeof shotPlacementAt === "function"
+        ? shotPlacementAt(bookmark) : null;
+    const shotPlacement = kinds.includes("shot") ? {
+        offered: hostedShot?.offered !== false,
+        opensSection: typeof hostedShot?.opensSection === "boolean"
+            ? hostedShot.opensSection
+            : promptShotOpensAtCaret(editor?.promptDocument, bookmark,
+                editor?.promptAttachments),
+    } : null;
+    const insertionKinds = kinds.filter((kind) => kind !== "reference"
+        && (kind !== "shot" || shotPlacement?.offered !== false));
+    const hasReference = kinds.includes("reference");
     const declared = promptWritingAids(writingAids);
     const aids = promptWritingAids(writingAids, channelKey);
     // An attachment always lands at a collapsed caret so a chip cannot swallow
@@ -3641,6 +3685,9 @@ export function createPromptContextMenuItems({ editor, bookmark = null,
                 kind,
                 action: async () => {
                     const attachment = normalizePromptAttachment({ kind });
+                    if (kind === "shot") {
+                        SHOT_ROLE_HINTS.set(attachment, shotPlacement?.opensSection !== false);
+                    }
                     const result = onCreate ? await onCreate(attachment) : { attachment };
                     const configured = promptAttachmentConfiguration(result);
                     if (!restorePromptInsertion(editor, bookmark)) return;
@@ -3817,7 +3864,8 @@ export function installPromptMentionMenu(area, { sources, onAccepted } = {}) {
 
 export function installPromptContextMenu({ editor, allowedKinds = AUTHORING_KINDS,
     onCreate = null, writingAids = [], channelKey = "", profile = null,
-    referenceContext = null, onInserted = null, onMentionAccepted = null } = {}) {
+    referenceContext = null, onInserted = null, onMentionAccepted = null,
+    shotPlacementAt = null } = {}) {
     if (!editor) return () => {};
     let closeMenu = null;
     const open = ({ x, y, pointCaret = false } = {}) => {
@@ -3839,7 +3887,7 @@ export function installPromptContextMenu({ editor, allowedKinds = AUTHORING_KIND
             // taken at install time would offer last week's verdicts.
             referenceContext: typeof referenceContext === "function"
                 ? referenceContext() : referenceContext,
-            onInserted,
+            onInserted, shotPlacementAt,
         }) });
         return true;
     };
@@ -4674,8 +4722,13 @@ export function configurePromptAttachment(rawAttachment, {
     scene = null, references = [], semanticUnits = [], channelKey = "", profileId = "generic@1",
     scope = "", origin = "", profile = null, placementPhases = [], managedSpeakerSubjectIds = [],
     ordinalManifest = {}, candidate = null, anchoredChannels = [],
-    referenceProsePolicy = "drop",
+    referenceProsePolicy = "drop", shotOpensSection = undefined,
 } = {}) {
+    // Insert at cursor records the role of the Shot it is about to place
+    // (`createPromptContextMenuItems`), keyed by the draft it hands `onCreate`,
+    // so no host has to thread it through its own positional parameters.
+    const opensSection = typeof shotOpensSection === "boolean"
+        ? shotOpensSection : SHOT_ROLE_HINTS.get(rawAttachment) ?? true;
     const attachment = normalizePromptAttachment(rawAttachment);
     const resolvedProfile = profile && typeof profile === "object"
         ? profile : (candidate?.profile || {});
@@ -4707,9 +4760,24 @@ export function configurePromptAttachment(rawAttachment, {
         if (attachment.kind === "shot") {
             controls.shotTimestamp = document.createElement("input");
             controls.shotTimestamp.type = "checkbox";
-            controls.shotTimestamp.checked = Boolean(attachment.config.timestamp);
+            controls.shotTimestamp.checked = opensSection
+                && Boolean(attachment.config.timestamp);
+            controls.shotTimestamp.disabled = !opensSection;
             panel.append(fieldRow("Include section time", controls.shotTimestamp,
-                "When enabled, this Shot marker also includes the section's start or cut time."));
+                opensSection
+                    ? "When enabled, this Shot marker also includes the section's start or cut time."
+                    : SHOT_IN_PLACE_TIME_HINT));
+            if (!opensSection) {
+                // Said in the dialog, not only in a tooltip: a disabled box
+                // with no visible reason reads as broken.
+                const notice = document.createElement("div");
+                notice.dataset.sonderShotInPlace = "1";
+                notice.style.cssText = `font:11px/1.45 system-ui;color:${COLORS.textDim};`;
+                notice.textContent = attachment.config.timestamp
+                    ? `${SHOT_IN_PLACE_TIME_HINT} Its saved time is kept and applies again if it becomes the first thing in the section.`
+                    : SHOT_IN_PLACE_TIME_HINT;
+                panel.appendChild(notice);
+            }
         } else if (attachment.kind === "timestamp") {
             attachment.config.standalone = true;
             const previewByChannel = candidate?.attachment_channel_previews
@@ -5493,7 +5561,11 @@ export function configurePromptAttachment(rawAttachment, {
         });
         save.addEventListener("click", () => {
             if (attachment.kind === "shot") {
-                attachment.config.timestamp = controls.shotTimestamp.checked;
+                // A disabled box shows the time as off; saving must not turn
+                // that display into a deleted preference.
+                attachment.config.timestamp = controls.shotTimestamp.disabled
+                    ? Boolean(attachment.config.timestamp)
+                    : controls.shotTimestamp.checked;
             } else if (attachment.kind === "timestamp") {
                 attachment.config.standalone = true;
             } else if (attachment.kind === "custom") {

@@ -1402,6 +1402,14 @@ MIRRORED_MODULES = {
             "test_format_declared_token_kind_has_python_javascript_parity",
             "test_declared_token_grammar_matches_between_python_and_javascript")),
     },
+    "prompt_shot_plan.js": {
+        "scope": ("Whether a Shot opens its section or sits in place, for the Shot "
+                  "dialog's time option; the compiler alone decides the prompt."),
+        "authorities": ("server/prompt_context.py::SHOT_LEAD_WHITESPACE",
+                        "server/prompt_context.py::shot_plan"),
+        "tests": ("test_inline_shot_markers.py::test_shot_plan_and_its_browser_mirror_agree",
+                  "test_inline_shot_markers.py::test_the_caret_check_agrees_with_inserting_a_shot_there"),
+    },
     "reference_library_model.js": {
         "scope": ("Default Reference class and tag normalization/preset-asset compatibility intent "
                   "(input tolerance and case handling are not certified equivalent); the Reference, "
@@ -1579,7 +1587,7 @@ def test_declared_mirror_headers_match_the_inventory_both_ways():
 
 def test_every_declared_mirror_has_a_live_parity_disposition():
     _assert_mirror_obligations(MIRRORED_MODULES, ROOT)
-    assert sum(len(row["authorities"]) for row in MIRRORED_MODULES.values()) == 65
+    assert sum(len(row["authorities"]) for row in MIRRORED_MODULES.values()) == 67
 
 @pytest.mark.parametrize("name, valid", [("TABLE", True), ("row", False), ("transform", True)])
 def test_mirror_authorities_are_module_declarations(tmp_path, name, valid):

@@ -1610,6 +1610,96 @@ def timestamp_attachment(*, attachment_id=None) -> dict:
                                  "config": {"standalone": True}})
 
 
+# Whether a Shot OPENS its section or sits IN PLACE inside the text.
+#
+# The section time is the section's window-local start, so only a Shot that
+# starts there may carry it: a section chip, a Shot anchored only outside the
+# shot-marker channel (where it never had a place of its own), or a Shot with
+# nothing before it in the shot-marker channel. Openers share one number and
+# render at the section start through the composer; every other Shot renders
+# `[Shot N]` where it sits, takes the next number, and never carries a time.
+#
+# "Nothing before it" ignores this exact whitespace set, Shot and Time anchors,
+# and anchors whose chip is missing or disabled. Mirrored by
+# `web/js/prompt_context_chips.js::SHOT_LEAD_WHITESPACE` / `promptShotPlan`,
+# held in parity by tests/test_inline_shot_markers.py.
+SHOT_LEAD_WHITESPACE = " \t\n\r\f\v ​﻿"
+SHOT_LEAD_IGNORED_KINDS = frozenset({"shot", "timestamp"})
+IN_PLACE_SHOT_REASON = ("This Shot follows other text in its section, so it is "
+                        "numbered where it sits and carries no section time.")
+EMPTY_SECTION_SHOT_REASON = ("This section has no text, so it is left out of the "
+                             "prompt and its Shot opens no shot.")
+# An in-place marker leaves the anchor renderer wrapped in a pair of tokens and
+# is resolved before its section's iteration ends: the prompt gets the marker
+# (spaced from neighbouring words), Prompt Relay gets neither. The tokens are
+# minted per compile, so no authored text can contain them, and nothing outside
+# that iteration ever sees them.
+def shot_marker_tokens() -> tuple[str, str]:
+    nonce = uuid.uuid4().hex
+    return f"{nonce}", f"{nonce}"
+
+
+def place_shot_markers(text, tokens) -> str:
+    """Keep in-place markers, padding a side only where a word touches them."""
+    open_token, close_token = tokens
+    value = re.sub(rf"(?<=\S){re.escape(open_token)}", lambda _match: f" {open_token}",
+                   str(text or ""))
+    value = re.sub(rf"{re.escape(close_token)}(?=\S)", lambda _match: f"{close_token} ",
+                   value)
+    return value.replace(open_token, "").replace(close_token, "")
+
+
+def drop_shot_markers(text, tokens) -> str:
+    """The same text without its in-place markers, for Prompt Relay.
+
+    A marker becomes a space so the words either side of it stay apart; the
+    relay sanitizer collapses any run of whitespace that leaves.
+    """
+    open_token, close_token = tokens
+    return re.sub(rf"{re.escape(open_token)}.*?{re.escape(close_token)}", " ",
+                  str(text or ""), flags=re.DOTALL).strip()
+
+
+def shot_plan(attachments, channel_docs, shot_channel) -> dict:
+    """Split a section's enabled Shots into openers and in-place Shots.
+
+    Returns `{"openers": [...], "in_place": [...], "timestamp": bool}`; the
+    in-place ids are in document order and `timestamp` is true when an opener
+    asks for the section time. Pure, so the browser mirror can be held to it.
+    """
+    by_id = {str(value.get("attachment_id") or ""): value
+             for value in attachments or [] if isinstance(value, dict)}
+    shots = [key for key, value in by_id.items()
+             if value.get("enabled", True) and value.get("kind") == "shot"]
+    document = (channel_docs or {}).get(shot_channel) if shot_channel else None
+    openers, in_place, placed = [], [], set()
+    content_before = False
+    if document is not None:
+        for node in normalize_prompt_document(document)["nodes"]:
+            if node["type"] == "text":
+                if str(node.get("text") or "").strip(SHOT_LEAD_WHITESPACE):
+                    content_before = True
+                continue
+            attachment_id = str(node.get("attachment_id") or "")
+            attachment = by_id.get(attachment_id)
+            if attachment is None or not attachment.get("enabled", True):
+                continue
+            if attachment.get("kind") == "shot":
+                if attachment_id not in placed:
+                    placed.add(attachment_id)
+                    (in_place if content_before else openers).append(attachment_id)
+                continue
+            if attachment.get("kind") not in SHOT_LEAD_IGNORED_KINDS:
+                content_before = True
+    openers.extend(key for key in shots if key not in placed)
+    return {
+        "openers": openers,
+        "in_place": in_place,
+        "timestamp": any(bool((by_id[key].get("config") or {}).get("timestamp"))
+                         for key in openers),
+    }
+
+
 def clone_for_split(channel_documents, attachments) -> tuple[dict, list]:
     """Clone applicable context for the right half of a section split.
 
@@ -3436,7 +3526,8 @@ def _reference_capability_parts(attachment, capability, context) -> list[tuple]:
             appearance = ""
             if identity_declaration is not None and appearances:
                 appearance = " (appears in " + ", ".join(
-                    f"[Shot {number}]" for number in appearances) + ")"
+                    prompt_payload.SHOT_LABEL_TEMPLATE.format(n=number)
+                    for number in appearances) + ")"
             details = config.get("retention_details")
             detail = ""
             if isinstance(details, dict):
@@ -5239,7 +5330,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     # remains self-contained when rendered alone.
     reference_group_shots = defaultdict(list)
     reference_unit_shots = defaultdict(list)
-    # `@shot(id)` resolves against the SAME counter that numbers the markers and
+
     def warn_unresolved_handles(origin, documents):
         """Say when authored prose names something this window cannot spell.
 
@@ -5280,30 +5371,70 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         warn_unresolved_handles(
             section.get("prompt_id", ""), section.get("channel_docs") or {})
 
-    # feeds `(appears in [Shot N])`, keyed by the Shot attachment that opens the
-    # shot. A section may carry more than one Shot attachment; each of them cites
-    # the single shot that section opens.
+    # THE shot numbering. `@shot(id)` citations, `(appears in [Shot N])` lists,
+    # in-place markers and (through `_inline_shot_count`, or `_shot_number` on
+    # drift) the composer's opener markers all read it. Keyed by Shot attachment:
+    # a section's openers share one number, then each in-place Shot takes the
+    # next in document order (`shot_plan`).
+    shot_channel = str(resolved_template.get("shot_marker_channel") or "")
+    if shot_channel not in keys:
+        shot_channel = ""
     shot_ordinals = {}
+    section_shot_plans = {}
     shot_number = 0
+
+    def composes_empty(section) -> bool:
+        """A section the final resolve is certain to drop.
+
+        Opener markers are composed outside channel text, so a section with no
+        authored text whose only live chips are Shot or Time markers composes to
+        nothing and is dropped after the preliminary vote kept it. Numbering it
+        put every later `@shot` citation one ahead of its marker.
+        """
+        mirrors = channel_document_mirrors(section.get("channel_docs") or {})
+        if any(str(mirrors.get(key) or "").strip() for key in keys):
+            return False
+        return all(value["kind"] in SHOT_LEAD_IGNORED_KINDS
+                   for value in section.get("attachments") or []
+                   if value["enabled"] and any(
+                       capability.get("enabled", True)
+                       for capability in _resolved_capabilities(
+                           value, resolved_profile)))
+
     for section in selected_sections:
         section_attachments = section.get("attachments") or []
-        opening_shots = [value for value in section_attachments
-                         if value["enabled"] and value["kind"] == "shot"]
-        if opening_shots:
+        plan = shot_plan(section_attachments, section.get("channel_docs") or {},
+                         shot_channel)
+        if composes_empty(section):
+            plan = {"openers": [], "in_place": [], "timestamp": False}
+        reached = []
+        if plan["openers"]:
             shot_number += 1
-            for value in opening_shots:
-                shot_ordinals[str(value["attachment_id"])] = shot_number
-        if shot_number:
-            for value in section_attachments:
-                if (value["enabled"] and value["kind"] == "reference"
-                        and reference_chip_conditions_window(value, context)):
-                    group = value["emission_group_id"]
-                    if shot_number not in reference_group_shots[group]:
-                        reference_group_shots[group].append(shot_number)
-                    for unit_id in value.get("source", {}).get(
-                            "semantic_unit_ids") or []:
-                        if shot_number not in reference_unit_shots[str(unit_id)]:
-                            reference_unit_shots[str(unit_id)].append(shot_number)
+            for attachment_id in plan["openers"]:
+                shot_ordinals[attachment_id] = shot_number
+            plan["number"] = shot_number
+            reached.append(shot_number)
+        elif shot_number:
+            # No opener: the text before the first in-place Shot continues the
+            # shot an earlier section opened.
+            reached.append(shot_number)
+        for attachment_id in plan["in_place"]:
+            shot_number += 1
+            shot_ordinals[attachment_id] = shot_number
+            reached.append(shot_number)
+        section_shot_plans[str(section.get("prompt_id") or "")] = plan
+        for value in section_attachments:
+            if not (value["enabled"] and value["kind"] == "reference"
+                    and reference_chip_conditions_window(value, context)):
+                continue
+            group = value["emission_group_id"]
+            for number in reached:
+                if number not in reference_group_shots[group]:
+                    reference_group_shots[group].append(number)
+                for unit_id in value.get("source", {}).get(
+                        "semantic_unit_ids") or []:
+                    if number not in reference_unit_shots[str(unit_id)]:
+                        reference_unit_shots[str(unit_id)].append(number)
     if shot_number:
         for value in global_attachment_values:
             if not value["enabled"] or value["kind"] != "reference":
@@ -5958,6 +6089,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             + prefixes + suffixes,
             global_attachment_separator)
 
+    marker_tokens = shot_marker_tokens()
     for section in selected_sections:
         section_index = section_positions.get(
             str(section.get("prompt_id") or ""), 0)
@@ -5965,9 +6097,30 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         mirrors = {}
         phase_parts = defaultdict(lambda: defaultdict(list))
         scope_link_prefixes = defaultdict(list)
+        section_shot_plan = section_shot_plans.get(
+            str(section.get("prompt_id") or ""),
+            {"openers": [], "in_place": [], "timestamp": False})
+        in_place_shots = set(section_shot_plan["in_place"])
 
         def anchor_renderer(attachment, capability_id, channel_key, anchor_node_id,
                             adjacent_raw_text=""):
+            if (attachment["kind"] == "shot" and channel_key == shot_channel
+                    and attachment["attachment_id"] in in_place_shots):
+                # An in-place Shot is its marker, at its anchor. It never takes
+                # the section time and never joins the capability phases, so it
+                # cannot also surface as a section-prefix strip pill.
+                marker = prompt_payload.SHOT_LABEL_TEMPLATE.format(
+                    n=shot_ordinals[attachment["attachment_id"]])
+                capabilities = _capabilities(attachment, resolved_profile)
+                projection = record_capability_projection(
+                    attachment, capabilities[0] if capabilities
+                    else _default_capability(attachment, resolved_profile),
+                    channel_key, section.get("prompt_id", ""), anchor_node_id)
+                set_projection_state(
+                    projection, "marker", marker, IN_PLACE_SHOT_REASON)
+                if projection is not None:
+                    projection["rendered_at_anchor"] = True
+                return f"{marker_tokens[0]}{marker}{marker_tokens[1]}"
             if attachment["kind"] == "prompt_link":
                 capabilities = _capabilities(attachment, resolved_profile)
                 if capability_id:
@@ -6104,14 +6257,12 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
 
         # Scope attachments are emitted by placement. Inline attachment nodes
         # already emitted above and are not emitted again here.
-        shot = any(a["enabled"] and a["kind"] == "shot"
-                   for a in attachment_by_id.values())
-        timestamp = any(
-            a["enabled"] and (
-                (a["kind"] == "shot"
-                 and bool((a.get("config") or {}).get("timestamp")))
-                or (a["kind"] == "timestamp"
-                    and bool((a.get("config") or {}).get("standalone"))))
+        # Only openers mark the section start; in-place Shots rendered above.
+        openers = set(section_shot_plan["openers"])
+        shot = bool(openers)
+        timestamp = (shot and section_shot_plan["timestamp"]) or any(
+            a["enabled"] and a["kind"] == "timestamp"
+            and bool((a.get("config") or {}).get("standalone"))
             for a in attachment_by_id.values())
         for attachment in attachment_by_id.values():
             if (not attachment["enabled"]
@@ -6129,7 +6280,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                             "inline anchor. Re-insert or remove it."),
             })
         for attachment in attachment_by_id.values():
-            if attachment["enabled"] and attachment["kind"] == "shot":
+            if (attachment["enabled"] and attachment["kind"] == "shot"
+                    and attachment["attachment_id"] not in in_place_shots):
                 for capability in _capabilities(attachment, resolved_profile):
                     route = _route_for(
                         attachment, capability, resolved_profile,
@@ -6137,9 +6289,13 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                     projection = record_capability_projection(
                         attachment, capability, route,
                         section.get("prompt_id", ""))
-                    set_projection_state(
-                        projection, "marker", reason=
-                        "This marker is composed by the prompt section composer.")
+                    if attachment["attachment_id"] in openers:
+                        set_projection_state(
+                            projection, "marker", reason=
+                            "This marker is composed by the prompt section composer.")
+                    else:
+                        set_projection_state(
+                            projection, "empty", reason=EMPTY_SECTION_SHOT_REASON)
             if (attachment["enabled"] and attachment["kind"] == "timestamp"
                     and bool((attachment.get("config") or {}).get("standalone"))):
                 for capability in _capabilities(attachment, resolved_profile):
@@ -6213,6 +6369,18 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             bar_mirrors[key] = _join_declared_emissions(
                 [(authored_mirrors[key], attachment_separator)] + prefixes + suffixes,
                 attachment_separator)
+        relay_mirrors = None
+        if in_place_shots:
+            # The in-place sentinels end here: the prompt and every preview keep
+            # the markers, Prompt Relay's copy drops them.
+            relay_mirrors = {key: drop_shot_markers(value, marker_tokens)
+                             for key, value in mirrors.items()}
+            mirrors = {key: place_shot_markers(value, marker_tokens)
+                       for key, value in mirrors.items()}
+            authored_mirrors = {key: place_shot_markers(value, marker_tokens)
+                                for key, value in authored_mirrors.items()}
+            bar_mirrors = {key: place_shot_markers(value, marker_tokens)
+                           for key, value in bar_mirrors.items()}
         prompt_id = str(section.get("prompt_id") or "")
         raw_index = raw_section_indexes.get(prompt_id, -1)
         original_prompt_id = (original_prompt_ids[raw_index]
@@ -6235,6 +6403,10 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             "channels": mirrors,
             "_opens_shot": shot,
             "_shot_timestamp": timestamp,
+            # Present only with in-place Shots (see prompt_payload's
+            # `_OPTIONAL_SHOT_KEYS`), so other segments keep their exact shape.
+            **({"_inline_shot_count": len(in_place_shots),
+                "_relay_channels": relay_mirrors} if in_place_shots else {}),
             "global_channel_exceptions": section.get("global_channel_exceptions", []),
         })
 
@@ -6323,6 +6495,20 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         expanded_sections, window_start, window_end,
         prompt_channel_templates.template_labels_on(resolved_template, labels_on),
         boundary_threshold_pct, resolved_template)
+    # The numbering above ran over the preliminary vote. If the final resolve
+    # still dropped a numbered section (its chips all rendered empty), the
+    # composer's running count would fall behind the numbers in-place markers,
+    # `@shot` citations and appearance lists already used. Pin the opener
+    # numbers where that happened; elsewhere the segment shape is unchanged.
+    running = 0
+    for segment in segments:
+        if segment.get("_opens_shot"):
+            planned = section_shot_plans.get(
+                str(segment.get("prompt_id") or ""), {}).get("number")
+            if planned and planned != running + 1:
+                segment["_shot_number"] = planned
+            running = planned or running + 1
+        running += int(segment.get("_inline_shot_count") or 0)
     rendered_global_mirror = {
         key: (value if global_channel_is_inherited(key) else "")
         for key, value in global_mirror.items()
@@ -6476,11 +6662,24 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             for channel_key in routes:
                 channel_previews[attachment_id][channel_key].append(marker)
 
+    # Every Shot chip previews the marker it resolved to: an opener the
+    # composer's section marker, an in-place Shot its own `[Shot N]`. Selected
+    # by ROLE: the in-place rows already carry their text and must never be
+    # overwritten with the section's opener marker.
     for section in selected_sections:
         origin = str(section.get("prompt_id") or "")
+        plan = section_shot_plans.get(origin) or {}
+        if origin not in segments_by_prompt_id:
+            continue
+        for attachment_id in plan.get("in_place") or []:
+            marker_text = prompt_payload.SHOT_LABEL_TEMPLATE.format(
+                n=shot_ordinals[attachment_id])
+            previews[attachment_id].append(marker_text)
+            channel_previews[attachment_id][shot_channel].append(marker_text)
         marker = markers_by_prompt_id.get(origin, "")
         if not marker:
             continue
+        openers = set(plan.get("openers") or [])
         for attachment in section.get("attachments") or []:
             kind = str(attachment.get("kind") or "")
             if kind not in {"shot", "timestamp"}:
@@ -6488,6 +6687,13 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             if (kind == "timestamp"
                     and not bool((attachment.get("config") or {}).get("standalone"))):
                 continue
+            if kind == "shot" and str(attachment.get("attachment_id") or "") not in openers:
+                continue
+            if kind == "shot":
+                previews[str(attachment["attachment_id"])].append(marker)
+                if shot_channel:
+                    channel_previews[str(attachment["attachment_id"])][
+                        shot_channel].append(marker)
             marker_text = marker
             if kind == "timestamp" and " At " in marker:
                 marker_text = f"At {marker.split(' At ', 1)[1]}"

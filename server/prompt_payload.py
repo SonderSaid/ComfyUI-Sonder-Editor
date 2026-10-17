@@ -290,6 +290,11 @@ def _section_entries(sections, keys=None):
             )
             opens_shot = bool(section.get("_opens_shot", False))
             shot_timestamp = bool(section.get("_shot_timestamp", False))
+            optional = {key: section[key] for key in _OPTIONAL_SHOT_KEYS
+                        if section.get(key)}
+            if "_relay_channels" in optional:
+                optional["_relay_channels"] = normalize_channels(
+                    optional["_relay_channels"], keys=keys)
             exceptions = normalize_channel_exceptions(
                 section.get("global_channel_exceptions"))
             prompt_id = str(section.get("prompt_id") or "")
@@ -306,6 +311,7 @@ def _section_entries(sections, keys=None):
                                           keys=keys)
             opens_shot = False
             shot_timestamp = False
+            optional = {}
             exceptions = normalize_channel_exceptions(
                 getattr(section, "global_channel_exceptions", None))
             prompt_id = str(getattr(section, "prompt_id", "") or "")
@@ -313,8 +319,31 @@ def _section_entries(sections, keys=None):
                         "prompt_id": prompt_id,
                         "_opens_shot": opens_shot,
                         "_shot_timestamp": shot_timestamp,
+                        **optional,
                         "global_channel_exceptions": exceptions})
     return entries
+
+
+# Compiler-supplied shot facts a segment carries ONLY when set, so a scene
+# without them keeps its exact segment shape (segments feed `content_hash` and
+# the prompt-history dedupe digest):
+#   `_inline_shot_count` -- Shots the compiler rendered in place inside this
+#       section's text; the marker count advances past them.
+#   `_shot_number`       -- explicit opener number, written only when the final
+#       resolve dropped a section the compiler had already numbered.
+#   `_relay_channels`    -- the same channels with in-place markers removed;
+#       Prompt Relay never carries shot markers. Consumed by `resolve_segments`,
+#       which keeps only the `_relay_text` it composes.
+_OPTIONAL_SHOT_KEYS = ("_inline_shot_count", "_shot_number", "_relay_channels")
+_SEGMENT_SHOT_KEYS = ("_inline_shot_count", "_shot_number", "_relay_text")
+
+
+def _optional_shot_fields(entry) -> dict:
+    # `_relay_text` is kept even when EMPTY: a section whose only output is an
+    # in-place marker has nothing for Prompt Relay, and dropping the key would
+    # send the marked text instead.
+    return {key: entry[key] for key in _SEGMENT_SHOT_KEYS
+            if (entry.get(key) is not None if key == "_relay_text" else entry.get(key))}
 
 
 def resolve_segments(sections, window_start, window_end, labels_on=True,
@@ -364,6 +393,11 @@ def resolve_segments(sections, window_start, window_end, labels_on=True,
         text = compose_section_text(entry["channels"], labels_on, resolved_template)
         if not text:
             continue
+        if entry.get("_relay_channels"):
+            # Prompt Relay text without the in-place shot markers. Kept beside
+            # `text` rather than replacing it: the single prompt carries them.
+            entry = {**entry, "_relay_text": compose_section_text(
+                entry["_relay_channels"], labels_on, resolved_template)}
         composed.append({**entry, "text": text})
     composed.sort(key=lambda e: e["start"])
 
@@ -381,6 +415,7 @@ def resolve_segments(sections, window_start, window_end, labels_on=True,
                           "prompt_id": entry.get("prompt_id", ""),
                           "_opens_shot": entry.get("_opens_shot", False),
                           "_shot_timestamp": entry.get("_shot_timestamp", False),
+                          **_optional_shot_fields(entry),
                           "global_channel_exceptions":
                               entry.get("global_channel_exceptions", []),
                           "authored_start": entry["start"],
@@ -405,6 +440,7 @@ def resolve_segments(sections, window_start, window_end, labels_on=True,
             "prompt_id": entry.get("prompt_id", ""),
             "_opens_shot": entry.get("_opens_shot", False),
             "_shot_timestamp": entry.get("_shot_timestamp", False),
+            **_optional_shot_fields(entry),
             "global_channel_exceptions": entry.get("global_channel_exceptions", []),
             "section_start": entry["authored_start"],
             "authored_start": entry["authored_start"],
@@ -457,14 +493,21 @@ def join_segment_texts(texts, delimiter=DEFAULT_SECTION_DELIMITER) -> str:
 
 
 def resolve_shot_markers(segments, fps) -> list[str]:
-    """Return the exact per-segment marker strings used by prompt composition."""
+    """Return the exact per-segment marker strings used by prompt composition.
+
+    THE marker routine; every composer path calls it. An opener takes the next
+    number unless the compiler supplied `_shot_number`, and the count then moves
+    past the Shots the compiler already rendered in place inside the section's
+    text (`_inline_shot_count`), so a later opener follows them.
+    """
     markers = []
     shot_number = 0
     for segment in segments or []:
         marker = ""
         if bool(segment.get("_opens_shot")):
-            shot_number += 1
+            shot_number = int(segment.get("_shot_number") or 0) or shot_number + 1
             marker = SHOT_LABEL_TEMPLATE.format(n=shot_number)
+        shot_number += int(segment.get("_inline_shot_count") or 0)
         if bool(segment.get("_shot_timestamp")):
             timecode = channel_templates.format_shot_timecode(
                 segment.get("start", 0), fps)
@@ -480,7 +523,9 @@ def _shot_marked_texts(segments, key, fps) -> list:
     Canonical authoring makes cut time an option on Shot. This lower-level
     composer still accepts a timestamp-only legacy segment so frozen/older
     payloads remain readable; `prompt_context` migrates current project state to
-    `[Shot N] At MM:SS.mmm,`. Numbering is dense over the EFFECTIVE set.
+    `[Shot N] At MM:SS.mmm,`. Numbering is dense over the EFFECTIVE set,
+    counting the Shots the compiler placed inside section text
+    (`resolve_shot_markers`).
 
     Timestamps are window-local, so the same section reads correctly whether the
     whole scene or one slice of it is rendered.
@@ -517,7 +562,9 @@ def compose_range_prompt(global_text, sections, window_start, window_end,
     Labels OFF keeps plain temporal concatenation of per-segment text.
     `boundary_threshold_pct` forwards to resolve_segments (boundary-spill
     drop). Relay payloads are NOT affected — each relay segment must stay
-    self-contained, so the bridge keeps per-segment labels.
+    self-contained, so the bridge keeps per-segment labels. Nor do they carry
+    shot markers: the composer adds openers here only, and `build_relay_payload`
+    reads `_relay_text`, the segment without the markers the compiler placed.
 
     `template` selects the channel set, labels, and the separators between
     fields; None is the default three-channel behavior. The template owns the
@@ -614,18 +661,8 @@ def compose_range_prompt(global_text, sections, window_start, window_end,
     else:
         if shot_channel:
             texts = []
-            shot_number = 0
-            for segment in segments:
+            for segment, marker in zip(segments, resolve_shot_markers(segments, fps)):
                 channels = dict(segment.get("channels") or {})
-                marker = ""
-                if bool(segment.get("_opens_shot")):
-                    shot_number += 1
-                    marker = SHOT_LABEL_TEMPLATE.format(n=shot_number)
-                if bool(segment.get("_shot_timestamp")):
-                    timecode = channel_templates.format_shot_timecode(
-                        segment.get("start", 0), fps)
-                    if timecode:
-                        marker = f"{marker} At {timecode},".strip()
                 if marker:
                     channels[shot_channel] = " ".join(
                         value for value in
@@ -683,7 +720,9 @@ def build_relay_payload(global_text, segments) -> dict:
     """
     sanitized = []
     for segment in segments or []:
-        text = sanitize_segment_text(segment.get("text", ""))
+        # `_relay_text` is the segment without its in-place shot markers.
+        text = sanitize_segment_text(segment["_relay_text"] if "_relay_text" in segment
+                                     else segment.get("text", ""))
         if not text:
             continue
         sanitized.append({"text": text, "start": int(segment["start"]),

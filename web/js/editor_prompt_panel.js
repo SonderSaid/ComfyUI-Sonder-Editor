@@ -65,6 +65,8 @@ import {
     normalizePromptAttachments,
     normalizePromptDocument,
     promptAttachmentAnchoredChannels,
+    promptShotDialogRole,
+    promptShotOpensSection,
     promptAttachmentConfiguration,
     propagateLinkedPromptAttachment,
     promptDocumentText,
@@ -833,6 +835,59 @@ export function coalesceScopedAttachments(values) {
         seen.add(identity); result.push(attachment);
     }
     return result;
+}
+
+const WRITING_SHOT_PROBE = "__sonder_shot_probe__";
+
+/** Where a Shot sits in the Writing draft: `{offered, opensSection}`.
+ *
+ *  The draft is one box over every block and channel, so the caret's own
+ *  document cannot answer. This runs the SAME block and channel split Apply
+ *  uses (`splitWritingPromptDocument` + `splitPromptDocumentChannels` with the
+ *  stamped default key) and judges the channel document the Shot lands in.
+ *  An existing Shot is found by `attachmentId`; a Shot about to be inserted is
+ *  stood in for by a probe anchor placed at `bookmark` (null appends, as
+ *  `restorePromptInsertion` does). Pure, so it is tested directly.
+ */
+export function writingShotPlacement({ document: draft, attachments = [],
+    bookmark = null, attachmentId = "", channelKeys = [], defaultKey = "",
+    shotChannel = "" } = {}) {
+    const targetId = attachmentId || WRITING_SHOT_PROBE;
+    let nodes = normalizePromptDocument(draft).nodes;
+    if (!attachmentId) {
+        const probe = { type: "attachment", node_id: WRITING_SHOT_PROBE,
+            attachment_id: WRITING_SHOT_PROBE };
+        const start = bookmark?.start || null;
+        const index = start ? nodes.findIndex((node) => node.node_id === start.node_id) : -1;
+        if (index < 0) {
+            nodes = [...nodes, probe];
+        } else if (nodes[index].type === "text") {
+            const offset = Math.max(0, start.offset | 0);
+            const head = nodes[index].text.slice(0, offset);
+            const tail = nodes[index].text.slice(offset);
+            nodes = [...nodes.slice(0, index),
+                ...(head ? [{ ...nodes[index], text: head }] : []), probe,
+                ...(tail ? [{ ...nodes[index], node_id: `${WRITING_SHOT_PROBE}:tail`,
+                    text: tail }] : []),
+                ...nodes.slice(index + 1)];
+        } else {
+            const at = Number(start.offset) > 0 ? index + 1 : index;
+            nodes = [...nodes.slice(0, at), probe, ...nodes.slice(at)];
+        }
+    }
+    const block = splitWritingPromptDocument({ nodes }, { keepEmpty: true })
+        .find((value) => value.nodes.some((node) => node.attachment_id === targetId));
+    if (!block) return { offered: false, opensSection: true };
+    const channelDocs = splitPromptDocumentChannels(block, channelKeys, { defaultKey });
+    const channel = Object.keys(channelDocs).find((key) => channelDocs[key].nodes
+        .some((node) => node.attachment_id === targetId)) || "";
+    const shots = attachmentId ? attachments
+        : [...attachments, { attachment_id: WRITING_SHOT_PROBE, kind: "shot" }];
+    return {
+        offered: Boolean(shotChannel) && channel === shotChannel,
+        opensSection: promptShotOpensSection({ attachments: shots, channelDocs,
+            shotChannel, attachmentId: targetId }),
+    };
 }
 
 /**
@@ -1901,9 +1956,23 @@ Server value: ${serverValue}` : ""}`;
                 selectedIndex,
             };
         };
+        const draftShotPlacement = (options) => writingShotPlacement({
+            document: draftArea?.promptDocument || writingState.document,
+            attachments: draftArea?.promptAttachments || writingState.attachments,
+            channelKeys: templateChannelKeys(host._channelTemplate()),
+            defaultKey: writingDefaultChannelKey(),
+            shotChannel: host._channelTemplate().shot_marker_channel || "",
+            ...options,
+        });
         const configureDraftAttachment = (attachment, nodeId = "") => {
             const context = draftAttachmentContext(nodeId);
+            const anchored = attachment?.kind === "shot" && normalizePromptDocument(
+                draftArea?.promptDocument || writingState.document).nodes.some((node) =>
+                node.attachment_id === attachment.attachment_id);
             return configurePromptAttachment(attachment, {
+                // An existing Shot's role; a new one's comes from Insert at cursor.
+                shotOpensSection: anchored ? draftShotPlacement({
+                    attachmentId: attachment.attachment_id }).opensSection : undefined,
                 referenceProsePolicy: host._referenceProsePolicy,
                 scene: context.scene,
                 references: offerableReferences(),
@@ -2479,6 +2548,9 @@ Server value: ${serverValue}` : ""}`;
                 saveWritingState();
             },
             onCreate: (attachment) => configureDraftAttachment(attachment),
+            // One box over every block and channel: Shot is offered only when
+            // the caret is in a block's shot-marker channel.
+            shotPlacementAt: (bookmark) => draftShotPlacement({ bookmark }),
             profile: host._resolvedPromptContextProfile?.(),
             // Resolved per open, like every other surface. Writing had no
             // reference context at all while its `@` completion was installed
@@ -4194,6 +4266,13 @@ Server value: ${serverValue}` : ""}`;
                 caption.textContent = key;
                 caption.title = channel.description || `${key} channel`;
                 const configureChannelAttachment = (attachment, anchoredChannels = [key]) => configurePromptAttachment(attachment, {
+                    shotOpensSection: promptShotDialogRole({
+                        attachment, attachments: sectionAttachments,
+                        shotChannel: template.shot_marker_channel,
+                        documents: { ...channelDocuments, ...Object.fromEntries(
+                            Object.entries(channelInputs).map(([channelKey, editor]) =>
+                                [channelKey, editor.promptDocument])) },
+                    }),
                     referenceProsePolicy: host._referenceProsePolicy,
                     scene: { ...(scene || {}), _context_channel_keys: channelKeys,
                         _context_consumer_start: section.start_frame,
@@ -4278,6 +4357,9 @@ Server value: ${serverValue}` : ""}`;
                         return ["writing_aid", "mention"].includes(type) ? commitChannels() : null;
                     },
                     onCreate: configureChannelAttachment,
+                    // A Shot renders where it is placed only in the
+                    // shot-marker channel, so that is the only box offering it.
+                    shotPlacementAt: () => ({ offered: key === template.shot_marker_channel }),
                     profile: host._resolvedPromptContextProfile?.(),
                     referenceContext: () => ({
                         scene: { ...(scene || {}),

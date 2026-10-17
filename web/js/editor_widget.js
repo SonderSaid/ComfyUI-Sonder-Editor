@@ -444,6 +444,7 @@ import {
     normalizePromptAttachments,
     normalizePromptDocument,
     promptAttachmentAnchoredChannels,
+    promptShotDialogRole,
     promptAttachmentConfiguration,
     propagateLinkedPromptAttachment,
     promptDocumentText,
@@ -16031,6 +16032,12 @@ export class EditorWidget {
                 _context_reference_frame_threshold: this._referenceFrameThreshold || 0,
             };
             const configure = (attachment) => configurePromptAttachment(attachment, {
+                shotOpensSection: promptShotDialogRole({
+                    attachment, attachments: sharedAttachments,
+                    shotChannel: template.shot_marker_channel,
+                    documents: Object.fromEntries(Object.entries(inputs)
+                        .map(([channelKey, editor]) => [channelKey, editor.promptDocument])),
+                }),
                 referenceProsePolicy: this._referenceProsePolicy,
                 scene: contextScene,
                 references: this._referencesOfferable(),
@@ -16116,6 +16123,9 @@ export class EditorWidget {
                     ? ["reference", "custom"]
                     : undefined,
                 onCreate: configure,
+                // A Shot renders where it is placed only in the shot-marker
+                // channel, so that is the only box offering it.
+                shotPlacementAt: () => ({ offered: key === template.shot_marker_channel }),
                 profile: this._resolvedPromptContextProfile(),
                 referenceContext: () => ({
                     scene: contextScene,
@@ -16210,6 +16220,13 @@ export class EditorWidget {
                     onActivate: async (attachment) => {
                         const configured = this._acceptPromptAttachmentConfiguration(
                             await configurePromptAttachment(attachment, {
+                            shotOpensSection: promptShotDialogRole({
+                                attachment, attachments: sharedAttachments,
+                                shotChannel: template.shot_marker_channel,
+                                documents: Object.fromEntries(Object.entries(inputs)
+                                    .map(([channelKey, editor]) =>
+                                        [channelKey, editor.promptDocument])),
+                            }),
                             referenceProsePolicy: this._referenceProsePolicy,
                             scene: { ...(this.activeScene || {}), _context_channel_keys: keys,
                                 _context_consumer_start: consumerSection?.start_frame ?? Infinity,

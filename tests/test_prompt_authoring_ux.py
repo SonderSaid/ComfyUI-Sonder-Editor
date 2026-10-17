@@ -8117,12 +8117,13 @@ def test_writing_draft_stamps_its_draft_channel_rather_than_resolving_at_apply()
     assert "defaultDraftChannel: writingState.defaultDraftChannel" in panel
     # One accessor feeds the hint and EVERY split call site, so what the panel
     # promises, what the contribution decorations are placed against, and what
-    # Apply writes cannot disagree. Four call sites: the Apply projection, the
-    # compile-candidate patch, the decoration region walk, and the decoration
-    # layout signature that decides whether that walk must repaint. A new
-    # splitter that resolves the channel itself instead of taking the stamp is
-    # the regression this counts.
-    assert panel.count("defaultKey: writingDefaultChannelKey()") == 4
+    # Apply writes cannot disagree. Five call sites: the Apply projection, the
+    # compile-candidate patch, the decoration region walk, the decoration
+    # layout signature that decides whether that walk must repaint, and the
+    # Shot placement that decides whether a Shot at the caret may take the
+    # section time. A new splitter that resolves the channel itself instead of
+    # taking the stamp is the regression this counts.
+    assert panel.count("defaultKey: writingDefaultChannelKey()") == 5
     assert "Unlabelled text goes to ${writingDefaultChannelKey()" in panel
     # Persisted only when set, exactly like `stash`, so an older record keeps
     # the shape it was written with.
