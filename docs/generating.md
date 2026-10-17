@@ -156,6 +156,53 @@ lanes by position — without decoding media — and exposes a `has_reference`
 flag for lazy routing; the **Image**, **Audio** and **Prompt Bridges** then
 decode what it resolved.
 
+## Choosing lanes and folders from Controls
+
+The Reference Selector's lanes, the Driver Selector's lane and the Save
+Bridge's target folder can be set from the **Controls** tab, with the same
+pickers their nodes show. This works in the fullscreen editor, in a tab opened
+with **Mount in Tab**, and in the Sonder App.
+
+1. Open the editor: on the **Sonder Editor** node, click **Open Editor**. (In
+   the Sonder App, open your project as in
+   [First generation in the Sonder App](../README.md#first-generation-in-the-sonder-app).)
+2. In the sidebar at the left, click the **Controls** tab.
+3. Click **Manage** at the top right of the Controls tab.
+4. Click **+ Setting** (in the row with + Note and + Group). Settings are
+   grouped under each node's title; type the node's or setting's name in
+   **Filter by node or setting** to find it. Click **Add** beside
+   `reference_lanes` (Sonder Reference Selector), `driver_lane_index` (Sonder
+   Driver Selector) or `target_folder` (Sonder Save Bridge).
+5. Click **Done**.
+
+The target folder appears in the **Editor** group at the top of the Controls
+tab; the lanes appear below it, with your other workflow settings. Each shows
+choices from the editor's current project and scene:
+
+- **Reference lanes**: the selected lanes with their recipe and status. Click
+  **×** on a lane to remove it, or **+ Add lane** to pick another; a lane that
+  can't join the others is greyed out with the reason underneath.
+- **Driver lane**: a menu of the scene's Driver lanes by name. If no lanes can
+  be read (no scene open, or the read failed), type the lane number instead and
+  press **Enter**; **Retry** appears when the read failed.
+- **Target folder**: type any folder name and press **Enter** (or click
+  elsewhere) to keep it; the project's folders and **Root** are offered as you
+  type. **Esc** abandons what you typed.
+
+A plain field with a note shows instead of a picker when the setting can't use
+this editor's project:
+
+- *Wired to another Sonder Editor*: the node takes its project from a different
+  editor, so its lanes or folders belong to that project.
+- *Lane names (or Folder suggestions) are unavailable here*: the editor you
+  opened is muted, bypassed or inside a subgraph, so Controls can't tell which
+  project the node uses.
+
+Settings added on the canvas also appear on the **Sonder Control Relay** node
+as a summary (for example *Lanes 1, 3*); change them in Controls or on the node
+itself. In the Sonder App, **+ Setting** adds an *App only* Control, which
+stays in the app and never appears on the canvas.
+
 ## Wiring your graph
 
 The editor's output socket feeds your generation workflow; optional bridge

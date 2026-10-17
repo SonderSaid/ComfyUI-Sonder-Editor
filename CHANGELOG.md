@@ -38,7 +38,7 @@ a fresh `[Unreleased]` block.
 - Render queue: a job that is waiting again or has failed shows why on a second line, such as a run interrupted before the job completed. Hover for the full text.
 
 ### Fixed
-- Guides Bridge Start and Driver Selector panels now follow editor edits, scene switches and project switches instead of staying stale until Refresh, and the Driver Selector follows a lane changed elsewhere. Overrides for guides or lanes that left the scene are kept and counted ("N stale overrides — Refresh to clear") until you click Refresh, so an Undo that brings them back keeps them.
+- Guides Bridge Start and Driver Selector panels now follow editor edits, scene switches and project switches instead of staying stale until Refresh, and the Driver Selector follows a lane changed elsewhere. Reference Selector and Reference Bridge nodes now also follow a project switch on their editor. Overrides for guides or lanes that left the scene are kept and counted ("N stale overrides — Refresh to clear") until you click Refresh, so an Undo that brings them back keeps them.
 - Save Bridge Target Folder: what you type is applied when you press Enter or leave the box (Ctrl+Enter queues with it), Escape abandons it, and the box no longer writes old text back over a folder set elsewhere.
 - Controls on the canvas: a workflow with `{a|b}` dynamic-prompt text no longer refuses every Controls edit as "The workflow changed", and such text shows and saves as written instead of as one random choice.
 - Sonder Selector: a choice or choice list fed by a link no longer fails ComfyUI's check before the run; the node checks the value when it runs.

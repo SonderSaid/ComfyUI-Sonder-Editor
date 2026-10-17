@@ -27,7 +27,7 @@ From top to bottom:
 
 1. **Header bar** — project pill, scene switcher (‹ › and the scene pill),
    **+ Scene**, and **Mount in Tab** / **✕ Exit**.
-2. **Top row** — the **Assets | References sidebar** on the left (Assets keeps
+2. **Top row** — the **Assets | References | Controls sidebar** on the left (Assets keeps
    the **Render Queue** panel docked at its bottom) and the **Viewport** in the center with its
    transport bar (Play, frame counter, clickable progress bar).
 3. **Toolbar** — grouped controls: undo/redo, the generation-window block,
