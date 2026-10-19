@@ -22,6 +22,7 @@ export function buildPromptContextDiagnostics(payload) {
                 capability_id: String(raw?.capability_id || ""),
                 origin: String(raw?.origin || ""),
                 semantic_unit_id: String(raw?.semantic_unit_id || ""),
+                field: String(raw?.field || ""),
             };
             if (Array.isArray(raw?.attachments) && raw.attachments.length) {
                 for (const owner of raw.attachments) {

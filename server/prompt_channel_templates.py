@@ -147,25 +147,24 @@ _MINIMAX_BASE_CHANNELS = (
 
 _MINIMAX_REF_CHANNELS = (
     _channel("subject_definitions", "subject_definitions",
-             "One `<Subject N> is ...` line per piece of referenced content, "
-             "saying what the label denotes and the features to follow. Also "
-             "define `<Picture N>`, `<Video N>` and `<Audio N>` here when they "
-             "are tracked separately."),
+             "Define characters, props, scenes and styles as Subjects citing their "
+             "source pictures. Use standalone Pictures for frame or storyboard "
+             "anchors; define Video and Audio roles when tracked separately."),
     _channel("summary", "summary",
              "One short paragraph summarizing the target video and its "
              "reference relationships, opening with a bracketed task-type "
              "prefix such as `[reference generation + audio reference]`. Use "
              "the reference labels; do not introduce new ones."),
     _channel("retention_analysis", "retention_analysis",
-             "One line per reference label saying how it is preserved, using "
-             "the fixed markers fully_preserved, partially_preserved, "
-             "attribute_transfer or weak_reference (audio uses fully_copy, "
-             "partially_copy, reference, weak_reference)."),
+             "Describe what each Subject, frame-anchor Picture, Video or Audio "
+             "retains. Attach a Reference chip and author its Preservation detail "
+             "after the relationship marker; use Audio preservation detail for "
+             "audio."),
     _channel("detailed_description", "detailed_description",
-             "The main body. Visuals, actions, sound and dialogue shot by shot "
-             "in playback order, inserting `<Subject N>`, `<Picture N>`, "
-             "`<Video N>` and `<Audio N>` where they apply. Shot markers are "
-             "inserted here."),
+             "Open with the overall style, then describe each shot: composition, "
+             "action, lighting, camera, sound and dialogue. Mention Subjects with "
+             "@handle at first appearance and where their roles apply. Shot "
+             "markers are inserted here."),
     _MINIMAX_SOUNDSCAPE,
     _MINIMAX_NON_DIEGETIC,
 )

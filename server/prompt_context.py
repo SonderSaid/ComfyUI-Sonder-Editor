@@ -3112,8 +3112,14 @@ def _render_reference_capability(attachment, capability, context):
         row = (context.get("generic_references") or {}).get(item_id) or {}
         return str(row.get("prompt") or "").strip()
     if kind in {"definitions", "retention"}:
-        return "\n".join(text for _owner, text in reference_capability_lines(
-            attachment, capability, context))
+        parts = reference_capability_segments(attachment, capability, context)
+        # The final Prompt Link renderer observes owners through this same
+        # assembly seam; speculative previews and Copy never supply a sink.
+        definition_owners = context.get("_emitted_subject_definitions")
+        if definition_owners is not None:
+            for owner, segments in parts:
+                definition_owners.update(defined_unit_ids(owner, segments))
+        return "\n".join(segments_text(segments) for _owner, segments in parts)
     if kind == "mentions":
         return str(config.get("text") or " ".join(labels)).strip()
     if kind == "summary":
@@ -3134,6 +3140,14 @@ def _render_reference_capability(attachment, capability, context):
 #
 # The prose-read renderer and Copy plan both need exactly this authored/derived
 # split. Delete it only if both are abandoned.
+# The chip editor's names for the fields a retention warning points at, used
+# when a format declares no label. Mirrors `REFERENCE_VALUE_LABELS` in
+# web/js/prompt_context_chips.js; a parity test keeps them equal.
+RETENTION_FIELD_LABELS = {
+    "retention_detail": "Preservation detail",
+    "audio_retention_detail": "Audio preservation detail",
+}
+
 SEGMENT_TEXT = "text"
 SEGMENT_LABEL = "label"
 SEGMENT_SOURCES = "sources"
@@ -3258,6 +3272,23 @@ def record_owner_key(owner) -> str:
     if isinstance(owner, (list, tuple)):
         return ":".join(str(part) for part in owner)
     return str(owner or "")
+
+
+def defined_unit_ids(owner, segments) -> set:
+    """Semantic units one emitted definition line defines.
+
+    A visual or assetless identity owns its line by unit id. A voice line is
+    owned by its audio label, so its unit comes from the speaker segment that
+    every voice definition carries.
+    """
+    if not segments_text(segments).strip():
+        return set()
+    if owner[0] in {"subject_definition", "identity_definition"}:
+        return {str(owner[1])}
+    if owner[0] == "audio_definition":
+        return {str(part["subject_id"]) for part in segments
+                if part.get("kind") == SEGMENT_SPEAKER and part.get("subject_id")}
+    return set()
 
 
 def reference_capability_lines(attachment, capability, context) -> list[tuple]:
@@ -3873,7 +3904,7 @@ def _handle_sources(context) -> dict:
     return result
 
 
-def _resolve_handle_mentions(text, context) -> str:
+def _resolve_handle_mentions(text, context, *, origin=None, channel_key="") -> str:
     """Replace `@handle` runs in authored prose with this format's mention label.
 
     A handle written in prose IS a mention — an authored placement that emits
@@ -3904,11 +3935,17 @@ def _resolve_handle_mentions(text, context) -> str:
             {"source": source}, context, include_unit_audio=False)
         if not labels:
             continue
+        if origin is not None:
+            # One record per Subject: its first mention names where to look.
+            for unit_id in source.get("semantic_unit_ids") or []:
+                context.setdefault("_mentioned_subjects", {}).setdefault(
+                    str(unit_id), (str(origin), str(channel_key), str(row["handle"])))
         value = value[:row["start"]] + " ".join(labels) + value[row["end"]:]
     return value
 
 
-def _document_render(document, attachment_by_id, render_anchor, context=None):
+def _document_render(document, attachment_by_id, render_anchor, context=None,
+                     *, origin=None, channel_key=""):
     parts = []
     adjacent_raw_text = ""
     for node in normalize_prompt_document(document)["nodes"]:
@@ -3917,7 +3954,8 @@ def _document_render(document, attachment_by_id, render_anchor, context=None):
             # attachment pass — a text handle has no attachment and never
             # will.
             parts.append(node["text"] if context is None
-                         else _resolve_handle_mentions(node["text"], context))
+                         else _resolve_handle_mentions(node["text"], context,
+                             origin=origin, channel_key=channel_key))
             adjacent_raw_text = str(node.get("text") or "")
             continue
         attachment = attachment_by_id.get(node["attachment_id"])
@@ -5492,6 +5530,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         warn_authored_ordinal_literals(
             section.get("prompt_id", ""), section.get("channel_docs") or {})
     emitted_groups = {}
+    emitted_subject_definitions = set()
+    context["_mentioned_subjects"] = {}
     # Same resolved text, different owner key. Definition/retention dedupe is
     # per semantic unit OR physical slot, so one member's Library prose reaching
     # a compile through both an identity chip and a physical chip produces two
@@ -5525,7 +5565,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                     "so this chip text stays as written. That is expected if "
                     "the Reference does not exist yet."),
             })
-        return _resolve_handle_mentions(value, context)
+        return _resolve_handle_mentions(value, context, origin=origin, channel_key=channel_key)
 
     def resolve_attachment_tokens(value, attachment, origin=""):
         resolved, token_diagnostics = inspect_attachment_tokens(
@@ -5598,9 +5638,12 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             # physical slot at a time, so overlapping chip selections neither
             # repeat a line nor hide a contradiction behind a differing tuple.
             kept = []
+            definition_owners = set()
+            retention_warnings = []
             resolved_lines = []
-            for owner, line in reference_capability_lines(
+            for owner, segments in reference_capability_segments(
                     attachment, capability, render_context):
+                line = segments_text(segments)
                 # Resolve before owner-level dedupe so stable-id aliases that
                 # name the same Subject/slot compare as the same emission.
                 if preserved and authored_ordinal_literals(line, resolved_profile, context):
@@ -5643,6 +5686,27 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                     emitted_group_text[text_identity] = owner
                 emitted_groups[line_identity] = line
                 kept.append(line)
+                definition_owners.update(defined_unit_ids(owner, segments))
+                marker = next((part for part in segments
+                               if part.get("kind") == SEGMENT_MARKER), None)
+                # Preserved out-of-window prose and authored retention_details
+                # have no marker, so they cannot be missing a marker's detail.
+                if capability_kind == "retention" and marker and not any(
+                        part.get("authored") and str(part.get("text") or "").strip()
+                        for part in segments):
+                    label = next((part["text"] for part in segments
+                                  if part.get("kind") == SEGMENT_LABEL), "Reference")
+                    field = "audio_retention_detail" if marker.get("is_audio") else "retention_detail"
+                    field_label = str(declared_reference_field(
+                        resolved_profile, "retention", field).get("label")
+                        or RETENTION_FIELD_LABELS[field])
+                    retention_warnings.append({
+                        "code": "missing_h3_retention_detail",
+                        "attachment_id": attachment["attachment_id"],
+                        "origin": origin, "channel_key": channel,
+                        "capability_id": capability["capability_id"], "field": field,
+                        "message": f'{label} needs authored detail in "{field_label}".',
+                    })
             value = "\n".join(kept)
             if len(value.encode("utf-8")) > MAX_ATTACHMENT_OUTPUT:
                 errors.append({"code": "attachment_output_limit",
@@ -5656,6 +5720,10 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                     "This capability exceeded the 16 KiB attachment output limit.")
                 return ""
             if value:
+                emitted_subject_definitions.update(definition_owners)
+                if (is_h3_reference_profile
+                        and (context.get("setup_manifest") or {}).get("setup", {}).get("mode") == "reference"):
+                    warnings.extend(retention_warnings)
                 emissions.append({"attachment_id": attachment["attachment_id"],
                                   "emission_group_id": attachment["emission_group_id"],
                                   "capability_id": capability["capability_id"],
@@ -5859,7 +5927,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                     return ""
                 return _render_generic(attachment, capability or _default_capability(
                     attachment, resolved_profile),
-                    {**context, "adjacent_raw_text": adjacent_raw_text},
+                    {**context, "adjacent_raw_text": adjacent_raw_text,
+                     "_emitted_subject_definitions": emitted_subject_definitions},
                     speakers_by_attachment.get(attachment["attachment_id"], []))
             return ""
 
@@ -5889,7 +5958,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 source_index, trail + (cache_key,), attachment["attachment_id"]))
         document_value = _document_render(
             source["channel_docs"].get(channel_key), attachment_by_id,
-            render_link_anchor, context)
+            render_link_anchor, context, origin=prompt_id, channel_key=channel_key)
         value = _join_emissions(
             scope_prefixes + [document_value],
             resolved_profile.get("separators", {}).get("attachment", " "))
@@ -6033,7 +6102,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 global_anchor_renderer(
                     attachment, capability_id, key, anchor_node_id,
                     adjacent_raw_text),
-            context)
+            context, origin="global" if global_channel_is_inherited(key) else None,
+            channel_key=key)
     global_authored_mirror = dict(global_mirror)
     global_bar_mirror = dict(global_authored_mirror)
     for attachment in global_by_id.values():
@@ -6276,7 +6346,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 key=key: anchor_renderer(
                     attachment, capability_id, key, anchor_node_id,
                     adjacent_raw_text),
-                context)
+                context, origin=section.get("prompt_id", ""), channel_key=key)
         authored_mirrors = dict(mirrors)
         bar_mirrors = dict(authored_mirrors)
 
@@ -6597,18 +6667,21 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 rf"^\[(?:{task_pattern})(?: \+ (?:{task_pattern}))*\]", summary)):
             warnings.append({"code": "invalid_h3_task_prefix", "message":
                              "Full Reference summary should begin with canonical task types."})
-        retention_emissions = [value for value in emissions
-                               if value.get("kind") == "reference"
-                               and value.get("capability_id") == "retention"]
-        for emission in retention_emissions:
-            for line in str(emission.get("text") or "").splitlines():
-                if line.strip() and " - " not in line:
-                    warnings.append({
-                        "code": "missing_h3_retention_detail",
-                        "attachment_id": emission.get("attachment_id", ""),
-                        "message": "MiniMax H3 retention markers require authored detail after ' - '.",
-                    })
-                    break
+    reference_declaration = (resolved_profile.get("capabilities") or {}).get("reference") or {}
+    # A format with no definitions capability gives the author no way to
+    # define a Subject, so a warning would name a fix they cannot apply.
+    declares_definitions = isinstance(reference_declaration, dict) and "definitions" in (
+        reference_declaration.get("derived") or {})
+    for unit_id, (origin, channel_key, handle) in context["_mentioned_subjects"].items():
+        if declares_definitions and unit_id not in emitted_subject_definitions:
+            warnings.append({
+                "code": "mentioned_subject_without_definition",
+                "origin": origin, "channel_key": channel_key,
+                "semantic_unit_id": unit_id,
+                "message": (f"@{handle} is mentioned, but no definition of it reaches this "
+                            f"prompt. Attach a Reference chip for @{handle} with its "
+                            "definition on, and stage its sources in this window."),
+            })
 
     for validator in resolved_profile.get("validators") or []:
         if not isinstance(validator, dict):

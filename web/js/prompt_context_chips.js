@@ -1648,6 +1648,7 @@ export function createPromptDocumentEditor({
     disabled = false,
     compact = false,
     ariaLabel = "Prompt channel",
+    placeholder = "",
     onChange = null,
     onActivateAttachment = null,
     getHostSnapshot = null,
@@ -1674,6 +1675,36 @@ export function createPromptDocumentEditor({
     editor.setAttribute("aria-label", ariaLabel);
     editor.setAttribute("aria-multiline", "true");
     editor.style.cssText = editorCss(compact);
+    // Guidance is a sibling, never authored content or a DOM emptiness test.
+    const guidance = document.createElement("div");
+    guidance.id = `sonder-prompt-guidance-${uid()}`;
+    guidance.dataset.sonderPromptPlaceholder = "1";
+    guidance.textContent = String(placeholder || "");
+    // The transparent border and the height cap keep its text where the caret
+    // starts and inside the box the editor can grow to.
+    guidance.style.cssText = `grid-area:1 / 1;box-sizing:border-box;min-width:0;pointer-events:none;`
+        + `padding:5px 7px;border:1px solid transparent;color:${COLORS.textDim};`
+        + `font:11px/1.4 system-ui,sans-serif;white-space:pre-wrap;overflow-wrap:anywhere;`
+        + `overflow:hidden;max-height:${compact ? "100px" : "none"};`;
+    guidance.setAttribute("aria-hidden", "true");
+    // The hosts label the box with the same text; describing it again would
+    // make a screen reader announce it twice.
+    if (placeholder && placeholder !== ariaLabel) editor.setAttribute("aria-describedby", guidance.id);
+    editor.promptPlaceholder = guidance;
+    const floor = compact ? "30px" : "48px";
+    const refreshGuidance = () => {
+        const empty = !model.nodes.some((node) =>
+            node.type !== "text" || String(node.text || "").length > 0);
+        // While the box has focus the hidden guidance still holds its height,
+        // so the first keystroke does not collapse the box under the caret.
+        const holdsHeight = document.activeElement === editor;
+        const laidOut = !!placeholder && (empty || holdsHeight);
+        guidance.style.display = laidOut ? "block" : "none";
+        guidance.style.visibility = empty && !composing ? "visible" : "hidden";
+        // The box grows to the guidance it shares a grid cell with, over a
+        // host's fixed height too, and never below its own floor.
+        editor.style.minHeight = laidOut ? `max(${floor}, 100%)` : floor;
+    };
 
     // The zero-width text node `paintTextSpan` appends after the LAST model
     // node when it ends in `\n`. Without it a caret after a final line break
@@ -2150,6 +2181,7 @@ export function createPromptDocumentEditor({
         // `readDom` compares like with like.
         paintedHandleSignature = handlePaintSignature();
         rendering = false;
+        refreshGuidance();
         if (ownedFocus && bookmark) {
             editor.focus({ preventScroll: true });
             restoreSelection(bookmark);
@@ -2273,6 +2305,7 @@ export function createPromptDocumentEditor({
             }
         }
         model = normalizePromptDocument({ nodes: next });
+        refreshGuidance();
         const stillAnchored = new Set(model.nodes
             .filter((node) => node.type === "attachment")
             .map((node) => node.attachment_id));
@@ -2303,11 +2336,14 @@ export function createPromptDocumentEditor({
     editor.addEventListener("compositionstart", () => {
         if (!composing) pushHistory();
         composing = true;
+        refreshGuidance();
     });
     editor.addEventListener("compositionend", () => {
         composing = false;
         readDom();
     });
+    editor.addEventListener("focus", refreshGuidance);
+    editor.addEventListener("blur", refreshGuidance);
     editor.addEventListener("click", (event) => {
         if (editor.disabled || event.target !== editor || event.button !== 0
                 || event.detail !== 1 || composing || event.isComposing === true) return;
@@ -4598,14 +4634,10 @@ export function promptReferenceSourceOptions({ scene = null, references = [],
             `Subject: ${value.name || value.semantic_unit_id}${eligibility.suffix}`,
             eligibility.eligible];
     };
-    const unitOptions = ((semanticUnits || []).length
-        ? semanticUnits.map((value) =>
-            makeUnitOption(value, value.sources || []))
-        : (references || []).map((value) => makeUnitOption({
-                semantic_unit_id: `unit:${value.reference_id}`,
-                name: value.name || value.reference_id,
-            }, referenceItems.flatMap((item) => (item.members || []).filter((member) =>
-                String(member?.entity_id || "") === String(value.reference_id || ""))))));
+    // Server auto-minting was retired in 71ee4ba. Only authored identities
+    // can bind a Subject; stale unit:<reference_id> chips stay unavailable.
+    const unitOptions = (semanticUnits || []).map((value) =>
+        makeUnitOption(value, value.sources || []));
     const physicalOptions = [];
     referenceItems.forEach((item, index) => {
         const verdict = verdictResult.verdicts.get(index) || "outside";
@@ -4718,6 +4750,16 @@ export function referenceSummaryEmissionSignatures(value, {
 }
 
 /** Bounded, deterministic attachment configuration. No provider prose is generated. */
+// A diagnostic's Fix asks the chip editor it is about to open to expand its
+// Reference fields and focus one. One-shot and keyed by attachment, so a plain
+// open of the chip never moves focus.
+let pendingFieldFocus = null;
+
+export function requestAttachmentFieldFocus(attachmentId, field) {
+    pendingFieldFocus = { attachmentId: String(attachmentId || ""),
+        field: String(field || "retention_detail") };
+}
+
 export function configurePromptAttachment(rawAttachment, {
     scene = null, references = [], semanticUnits = [], channelKey = "", profileId = "generic@1",
     scope = "", origin = "", profile = null, placementPhases = [], managedSpeakerSubjectIds = [],
@@ -4730,6 +4772,10 @@ export function configurePromptAttachment(rawAttachment, {
     const opensSection = typeof shotOpensSection === "boolean"
         ? shotOpensSection : SHOT_ROLE_HINTS.get(rawAttachment) ?? true;
     const attachment = normalizePromptAttachment(rawAttachment);
+    // Taken on every open, so a request never outlives the open it was for.
+    const focusRequest = pendingFieldFocus?.attachmentId === attachment.attachment_id
+        ? pendingFieldFocus : null;
+    pendingFieldFocus = null;
     const resolvedProfile = profile && typeof profile === "object"
         ? profile : (candidate?.profile || {});
     // Did a format actually RESOLVE, or is this the empty object the chip gets
@@ -5543,6 +5589,15 @@ export function configurePromptAttachment(rawAttachment, {
         panel.appendChild(actions);
         backdrop.appendChild(panel);
         document.body.appendChild(backdrop);
+        if (focusRequest && controls.referenceFieldset) {
+            const field = focusRequest.field;
+            const control = controls.referenceFieldset.controls.get(field);
+            if (control && controls.referenceFieldset.isApplicable(field)) {
+                controls.referenceFieldset.setExpanded(true);
+                control.focus();
+                control.scrollIntoView?.({ block: "nearest" });
+            }
+        }
 
         let releaseEscape = () => {};
         const finish = (value) => {
@@ -5766,7 +5821,15 @@ export function createPromptProjectionBox(editor, beforeHost, afterHost) {
     editor.style.border = "0";
     editor.style.borderRadius = "0";
     editor.style.background = "transparent";
-    wrapper.append(beforeHost, editor, afterHost);
+    const inputRegion = document.createElement("div");
+    // Both siblings share a grid cell. Empty guidance contributes its
+    // wrapped height, so narrow channel columns cannot clip it.
+    // The editor's min-height follows its guidance (`refreshGuidance`).
+    inputRegion.style.cssText = "display:grid;min-width:0;flex:0 0 auto;";
+    editor.style.gridArea = "1 / 1";
+    inputRegion.appendChild(editor);
+    if (editor.promptPlaceholder) inputRegion.appendChild(editor.promptPlaceholder);
+    wrapper.append(beforeHost, inputRegion, afterHost);
     return wrapper;
 }
 

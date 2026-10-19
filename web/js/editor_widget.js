@@ -16123,6 +16123,7 @@ export class EditorWidget {
                 attachmentLabelFor,
                 attachmentContext: { scene: this.activeScene, template },
                 compact: true,
+                placeholder: entry.description || "",
                 ariaLabel: entry.description || `${this._channelPlaceholder(key).slice(0, -1)} channel`,
                 onChange: ({ attachments, reason }) => {
                     sharedAttachments = attachments;

@@ -788,7 +788,8 @@ const makeHost=(ids)=>({
   activeScene:{reference_lane_count:ids.length,duration_frames:20,
     reference_lane_configs:ids.map(()=>({})),reference_lane_recipes:ids.map(recipe),
     reference_items:[]},
-  _referenceRecipePresets:[],_customReferenceRecipes:[],_referenceRecipeFieldSchema:[],
+  _referenceRecipePresets:[{id:"preset",name:"Preset",media_kind:"image",builtIn:true}],
+  _customReferenceRecipes:[],_referenceRecipeFieldSchema:[],
   _promptContextProfiles:[],_promptContextCatalog:{},
   _defaultReferenceLaneRecipe:()=>recipe(""),
   _referenceMemberForRef:()=>null,_findAssetById:()=>null,
@@ -798,8 +799,10 @@ const makeHost=(ids)=>({
     laneIndex:entries[0].laneIndex,expectedLaneId:options?.expectedLaneId,
     undoLabel:options?.undoLabel});},
 });
-const templateSelect=()=>walk(document.body.children.at(-1)).find((n)=>n.tagName==="SELECT");
-const change=async(select)=>{for(const h of select._handlers.change||[])h({});
+// This DOM keeps replaced children, so the newest select is the drawn one.
+const templateSelect=()=>walk(document.body.children.at(-1)).filter((n)=>n.tagName==="SELECT").at(-1);
+// A browser fires change only for a new value; an unchanged one never writes.
+const change=async(select)=>{select.value="preset";for(const h of select._handlers.change||[])h({});
   await new Promise((r)=>setTimeout(r,0));};
 
 const host=makeHost(["A","B"]);

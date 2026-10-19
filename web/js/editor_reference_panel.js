@@ -198,6 +198,9 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         laneIndex: Math.max(0, parseInt(laneIndex, 10) || 0),
         pickerItemId: "",
         pickerQuery: "",
+        // Ephemeral keyboard choice survives a repaint of the same lane.
+        templateDraft: null,
+        rendering: false,
         // The durable id of the lane the panel last drew (null before the first
         // render). Lanes reorder, and an Undo can shift them under an open
         // panel, so the index alone can name another lane by the time anything
@@ -283,6 +286,9 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         id: `sonder-reference-panel-${Date.now().toString(36)}`,
         priority: KEY_PRIORITY.OVERLAY,
         keydown: (event) => {
+            if (event.isComposing || event.keyCode === 229) return false;
+            if (event.target?.dataset?.sonderReferenceTemplate === "1"
+                    && event.target._sonderTemplateKeydown?.(event)) return true;
             if (event.key !== "Escape") return false;
             if (state.pickerItemId) {
                 // First Esc closes an open member picker; a second closes the panel.
@@ -297,7 +303,11 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
     });
 
     backdrop.addEventListener("mousedown", (event) => {
-        if (event.target === backdrop) close();
+        if (event.target !== backdrop) return;
+        // Leaving by the backdrop keeps a pending keyboard choice, as the
+        // Close button does through the select's blur.
+        state.flushTemplateDraft?.();
+        close();
     });
 
     // ── Lane + recipe accessors ────────────────────────────────────────────
@@ -874,25 +884,47 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         const templateRow = el("div", "", "display:flex;align-items:center;gap:8px;flex-wrap:wrap;");
         templateRow.appendChild(el("span", "Template", `font-size:11px;color:${COLORS.textMuted};min-width:64px;`));
         const select = el("select", "", chromeSelectCss({ padding: "4px 7px", fontSize: "11px" }) + "min-width:240px;");
+        select.dataset.sonderReferenceTemplate = "1";
+        const normalizeKind = (kind) => ["image", "video", "audio"].includes(kind) ? kind : "image";
+        const laneKind = normalizeKind(recipe.media_kind);
         const detached = el("option", DETACHED_LABEL);
         detached.value = "";
         select.appendChild(detached);
         for (const entry of definitions()) {
             const option = el("option", `${entry.builtIn ? "" : "★ "}${entry.name}`);
             option.value = entry.id;
+            const kind = normalizeKind(entry.media_kind);
+            option.disabled = occupied && kind !== laneKind;
+            if (option.disabled) option.textContent += ` (${kind} — lane holds ${laneKind} items)`;
             select.appendChild(option);
         }
         select.value = recipe.recipe_id || "";
         select.disabled = laneLocked();
-        select.addEventListener("change", () => {
+        const templateLaneKey = laneMemoryKey();
+        const pending = state.templateDraft;
+        const pendingOption = pending?.laneKey === templateLaneKey
+            ? [...select.options].find((option) => option.value === pending.value && !option.disabled)
+            : null;
+        let keyboardPending = !!pendingOption;
+        let committedValue = select.value;
+        if (pendingOption) select.value = pending.value;
+        else state.templateDraft = null;
+        const rememberSelection = () => {
+            state.templateDraft = { laneKey: templateLaneKey, value: select.value };
+        };
+        const commitTemplate = () => {
+            keyboardPending = false;
+            state.templateDraft = null;
+            if (select.value === committedValue) return;
+            committedValue = select.value;
             const chosen = definitionFor(select.value);
             const actingRecipe = laneRecipe();
             if (!chosen) {
                 void writeRecipe({ ...host._defaultReferenceLaneRecipe({ media_kind: actingRecipe.media_kind }) });
                 return;
             }
-            if (laneItems().length > 0 && chosen.media_kind !== actingRecipe.media_kind) {
-                notifyWarning("Clear the Reference lane before switching its model input kind.", { source: "reference-panel-refused" });
+            if (laneItems().length > 0 && normalizeKind(chosen.media_kind) !== normalizeKind(actingRecipe.media_kind)) {
+                notifyWarning(`“${chosen.name}” accepts ${normalizeKind(chosen.media_kind)}, but this lane holds ${normalizeKind(actingRecipe.media_kind)} items. Clear the lane before switching.`, { source: "reference-panel-refused" });
                 render();
                 return;
             }
@@ -902,7 +934,58 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                 recipe_id: chosen.id,
                 recipe: { name: chosen.name, hard: { ...(chosen.hard || {}) }, soft: { ...(chosen.soft || {}) } },
             });
+        };
+        // Keyboard navigation on the closed select previews a selection; Enter
+        // or leaving the select commits it and Escape reverts it. A pointer
+        // pick commits at once. Keys that open the popup (Space, Alt+Arrow)
+        // are not previews: the popup's own pick arrives as a pointer-less
+        // change and still commits on Enter or blur.
+        select._sonderTemplateKeydown = (event) => {
+            if (event.key === "Enter") { commitTemplate(); return true; }
+            if (event.key === "Escape" && select.value !== committedValue) {
+                select.value = committedValue;
+                keyboardPending = false;
+                state.templateDraft = null;
+                return true;
+            }
+            if (event.altKey || event.ctrlKey || event.metaKey) return false;
+            if (["ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"].includes(event.key)
+                    || (event.key.length === 1 && event.key !== " ")) {
+                keyboardPending = true;
+                rememberSelection();
+            }
+            return false;
+        };
+        select.addEventListener("pointerdown", () => {
+            keyboardPending = false;
         });
+        select.addEventListener("change", () => {
+            if (keyboardPending) rememberSelection();
+            else commitTemplate();
+        });
+        // A structural write repaints the panel, which removes the control
+        // focus was moving to. Restore focus to the control at the same
+        // distance from the template select.
+        const focusables = () => [...panel.querySelectorAll("button,select,input,textarea,[tabindex]")]
+            .filter((node) => !node.disabled && node.tabIndex >= 0);
+        select.addEventListener("blur", (event) => {
+            if (state.rendering || select.value === committedValue) return;
+            const next = event.relatedTarget;
+            const before = focusables();
+            const offset = next && panel.contains(next)
+                ? before.indexOf(next) - before.indexOf(select) : null;
+            commitTemplate();
+            if (offset === null || next.isConnected) return;
+            setTimeout(() => {
+                if (!mounted || (document.activeElement && document.activeElement !== document.body)) return;
+                const after = focusables();
+                const anchor = after.findIndex((node) => node.dataset?.sonderReferenceTemplate === "1");
+                if (anchor >= 0) after[anchor + offset]?.focus();
+            }, 0);
+        });
+        state.flushTemplateDraft = () => {
+            if (select.isConnected && select.value !== committedValue) commitTemplate();
+        };
         templateRow.appendChild(select);
 
         const mediaBtn = button(
@@ -1794,7 +1877,21 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
 
     const render = () => {
         if (!mounted) return;
+        const restoreTemplateFocus = document.activeElement?.dataset?.sonderReferenceTemplate === "1";
         if (!resyncDrawnLane()) return;
+        // Set while the body is rebuilt, so the template select's blur during
+        // that teardown never commits. Always cleared, even by an early return
+        // or a throw, or later blur commits would be suppressed.
+        state.rendering = true;
+        try {
+            paint();
+        } finally {
+            state.rendering = false;
+        }
+        if (restoreTemplateFocus) body.querySelector("[data-sonder-reference-template='1']")?.focus();
+    };
+
+    const paint = () => {
         const entries = laneEntries();
         if (entries.length && !entries.some((entry) => (entry.laneIndex || 0) === state.laneIndex)) {
             state.laneIndex = entries[0].laneIndex || 0;

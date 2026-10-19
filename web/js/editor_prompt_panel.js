@@ -78,6 +78,7 @@ import {
     normalizePromptAttachment,
     splitWritingPromptDocument,
     setPromptAttachmentCapabilityEnabled,
+    requestAttachmentFieldFocus,
 } from "./prompt_context_chips.js";
 import { getProjectVersion } from "./api_client.js";
 import { notifyInfo, notifySuccess, notifyWarning } from "./editor_notifications.js";
@@ -1757,6 +1758,31 @@ Server value: ${serverValue}` : ""}`;
                 line.textContent = `${state.attachmentDiagnosticCount} chip diagnostic${state.attachmentDiagnosticCount === 1 ? " is" : "s are"} marked below.`;
                 line.style.color = state.errorCount ? COLORS.dangerText : COLORS.warningText;
                 diagnostics.appendChild(line);
+                // A missing Preservation detail is fixed in one field of one
+                // chip, so its row opens that chip on that field.
+                for (const row of Object.values(state.byAttachment).flat()) {
+                    if (row.code !== "missing_h3_retention_detail") continue;
+                    const detail = document.createElement("div");
+                    detail.style.color = COLORS.warningText;
+                    detail.appendChild(document.createTextNode(`Warning: ${row.message}`));
+                    const fix = makeBtn("Fix", "Open this chip on the missing field");
+                    fix.style.marginLeft = "6px";
+                    fix.addEventListener("mousedown", (event) => event.preventDefault());
+                    fix.addEventListener("click", () => {
+                        const chips = [...panel.querySelectorAll(
+                            "[data-node-type='attachment'][data-attachment-id]")].filter(
+                            (chip) => chip.dataset.attachmentId === row.attachment_id);
+                        const chip = chips.find((value) => !row.origin || value.closest(
+                            "[data-sonder-prompt-origin]")?.dataset.sonderPromptOrigin === row.origin)
+                            || chips[0];
+                        if (!chip) return;
+                        chip.scrollIntoView?.({ block: "nearest" });
+                        requestAttachmentFieldFocus(row.attachment_id, row.field);
+                        chip.click();
+                    });
+                    detail.appendChild(fix);
+                    diagnostics.appendChild(detail);
+                }
             } else if (!state.general.length && payload) {
                 const clean = document.createElement("div");
                 clean.textContent = "No compile diagnostics in this render window.";
@@ -3925,6 +3951,7 @@ Server value: ${serverValue}` : ""}`;
                 attachmentLabelFor,
                 attachmentContext: { scene, template: globalTemplate },
                 disabled: globalLocked,
+                placeholder: channel.description || "",
                 ariaLabel: channel.description || `Global ${key}`,
                 onChange: ({ document: nextDocument, attachments, reason }) => {
                     globalDocuments[key] = nextDocument;
@@ -4300,6 +4327,7 @@ Server value: ${serverValue}` : ""}`;
                     attachmentLabelFor,
                     attachmentContext: { scene, template },
                     disabled: sectionsLocked,
+                    placeholder: channel.description || "",
                     ariaLabel: channel.description || `${key} channel`,
                     onChange: ({ document: nextDocument, attachments, reason }) => {
                         channelDocuments[key] = nextDocument;
