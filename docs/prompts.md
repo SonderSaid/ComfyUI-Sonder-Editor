@@ -16,6 +16,14 @@ References that feed prompts are in [References](references.md).
 
 ## How the output prompt is composed
 
+To write one part of a scene, double-click empty **Prompt** space near the
+bottom of the timeline, enter the text and click **Create**. Double-click an
+existing section to edit it. **Global**, just above Prompt, supplies scene-wide
+text. The **Channels** selector above the timeline changes the project's
+prompt fields; **Standard** offers one plain field. A timed section scopes
+which text reaches a generation window. How closely a model follows those
+times depends on the workflow and prompt format.
+
 The **Global** document plus every prompt section in the generation window compile
 into one provider-ready prompt. The project's Channel Template defines the
 fields—Standard, Visual/Speech/Sound, MiniMax H3, or a custom set—and its

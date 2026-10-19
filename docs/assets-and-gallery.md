@@ -103,6 +103,17 @@ Double-click (or Space) a gallery asset for fullscreen inspection.
 
 ## Compare mode
 
+To open comparison, click **Assets** at the upper left, double-click a result
+to inspect it, then click **Compare** in the inspection overlay (or press
+**C** there). A star marks a favorite in the gallery; it does not switch the
+visible timeline take. To keep a winner in the scene, place or unmute that
+clip and mute competing takes. Higher-numbered Video rows appear in front.
+Check its picture and the intended Audio with **Play** below the editor preview.
+Double-click opens a member's own properties, such as volume or opacity;
+**Mute** and **Unmute** still affect its linked group. To switch only the
+picture while keeping linked sound, hide its Video row with the lane's eye,
+or right-click the clip and choose **Unlink Linked Items** before muting it.
+
 **Compare** (`C` in the overlay) puts two same-type assets side by side —
 built for take review.
 
@@ -140,6 +151,13 @@ built for take review.
 ![The same pair in Side by Side layout, where a Linked Zoom toggle appears beside the layout buttons](images/compare-side-by-side.webp)
 
 ## Export timeline
+
+First play the intended result in the editor. Click **Export** above the
+timeline, choose the scene or selection range, the save preset, and whether
+to include video and audio. **Compatible MP4** is the starting choice for
+ordinary playback. Open the saved file to verify its picture, sound and
+duration. Export saves the arranged result; it does not generate new motion,
+upscale it with a model, or automatically join every scene in a project.
 
 The toolbar's **Export** button renders the timeline itself (full scene or
 active selection) to a file through a streaming compositing path:

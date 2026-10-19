@@ -21,7 +21,7 @@ can act on it. What each generation feature needs from your model:
 |---|---|
 | Chain clips into long-form video, or regenerate/inpaint a section inside existing footage | **Masked (in-context) generation** — the ability to hold provided frames fixed and generate the rest |
 | Drive video from audio, or audio from video | **Joint audio-video generation** |
-| Feed time-aligned prompt sections into the sampler | **Prompt relay support** in your workflow |
+| Interpret timed Prompt sections within one generated clip | **A compatible prompt format or time-varying conditioning path**; compiling sections into text alone does not guarantee frame-exact changes |
 | Use Drivers — unrendered video clips that steer motion, composition, look, or characters | **Video conditioning inputs** for that kind of signal |
 | Use References — reusable characters, locations, props and voices, staged per window | **Reference image, video or audio inputs** — a dedicated reference slot, or any image input that will take an assembled sheet |
 | Use guide frames | **Image conditioning at arbitrary frames** |
@@ -33,6 +33,10 @@ dependency. Model templates ship for Wan, HunyuanVideo, CogVideoX and others,
 and the Free template removes all constraints for anything else.
 
 ## The generation window
+
+For a first attempt, select a short range and keep the queue off. Moving the
+playhead with **GEN F** or the ruler only navigates; set **In/Out** to choose
+what generates.
 
 Everything a render will cover is defined by the **GEN block** in the toolbar.
 
@@ -135,6 +139,14 @@ Guide frames condition generation with a reference image at a specific frame
   guides through both.
 
 ## Drivers
+
+[Convert a Video clip to Driver](editor-basics.md#driver-clips) from its
+right-click menu. The original video remains an asset, but the Driver is no
+longer a visible picture layer. To exclude an old Driver from this workflow's
+guidance, hide its **Driver lane** with the eye icon at the left of that row.
+This does not hide a separate Audio lane. Collapse only folds the row; it does
+not disable guidance. A workflow's explicit Driver override can take priority
+over lane hiding, so check the selected workflow's instructions.
 
 Driver clips steer motion, composition, look, or characters without ever
 appearing in output (their editing rules are in

@@ -111,46 +111,22 @@ feature needs which capability.
 
 ## Highlights
 
-- **Multi-lane timeline** — edit the way you would in any NLE: drag clips along
-  the timeline, trim them, split one in two, mute an item, lock or hide a lane.
-  Video lanes are composited for the render output.
-- **Reference Library** — the characters, locations, props and outfits a project
-  reuses. Each holds image, video or audio members you can crop and trim in
-  place, name, tag, and give prompt text, including how closely the model should
-  preserve them.
-- **Reference lanes** — say when each Reference applies. Drop members onto a lane
-  over the frames they cover, then pick the lane's **recipe**: a named preset —
-  `MiniMax H3 Pictures`, `LTX IC-LoRA Ingredients` — that packages your members
-  the way that model wants them. A queued job keeps whichever References were
-  live when you queued it.
-- **Prompt sections** — cut prompts along the timeline so each applies to its own
-  range. A project chooses what fields a prompt has: one box of prose, or
-  separate ones for visuals, speech and sound. A section can carry **Context
-  chips**: a shot number, the timestamp relative to the generation window, a
-  Reference's descriptive text, a piece of speech or song, a link to an earlier
-  section, or custom text. Every chip resolves for the range you render, so you
-  never count `<Picture 2>` or `r03` by hand.
-- **Guide frames** — per-frame reference images for conditioning, on their own
-  lane, each with its own strength. **Animatic** mode plays them as a rough
-  storyboard, so you can judge a sequence before generating it.
-- **Drivers** — a video that steers a generation without appearing in it. Put an
-  OpenPose clip, a camera move, or reference footage on a Driver lane, and your
-  graph can use it to condition motion, composition or look across the frames it
-  covers.
-- **Selections & context** — saved in/out ranges with pre/post context frames
-  and mask offsets for generation overlap. The Sonder Masks Bridge compiles
-  that window into hard video and audio latent noise masks, so a section
-  regenerates in place while the frames around it are kept exactly.
-- **Render queue + batch render** — stage several jobs and run them unattended,
-  or split one long range into consecutive chunks so a sequence renders shot by
-  shot.
-- **Asset gallery** — every file saved to the project, imported or generated, in
-  one place. Inspect any image, video or audio, or put two of the same kind side
-  by side in compare mode; generated takes carry the settings that produced
-  them, so you can curate the best iteration onto your timeline.
-- **Timeline export** — export video and audio straight from the timeline. It
-  composites frame by frame instead of loading the whole thing, so length is
-  bounded by disk space rather than memory.
+What you can do from the editor:
+
+| You want to… | Use… |
+|---|---|
+| Organize your work | [Projects, scenes and Assets](docs/getting-started.md#use-a-prepared-workflow), with [folders, favorites and media recovery](docs/assets-and-gallery.md) |
+| Arrange picture and sound | [Video and Audio rows](docs/editor-basics.md#the-timeline): move, trim, split, layer and play media |
+| Describe what happens | [Global text and timed Prompt sections](docs/prompts.md), from a plain text field to structured instructions |
+| Guide the result | [Guides and Drivers](docs/generating.md#guides), or [reusable References](docs/references.md) staged where they apply |
+| Choose what to generate or change | [In/Out, surrounding context and picture/sound masks](docs/generating.md#the-generation-window) |
+| Generate, review and try again | Workflow [Controls and presets](#controls--sondercontrols), takes, [inspection and A/B comparison](docs/assets-and-gallery.md#compare-mode) |
+| Prepare several generations | The [Render Queue and Batch](docs/generating.md#the-render-queue) controls |
+| Export the finished scene | [Timeline Export](docs/assets-and-gallery.md#export-timeline), which combines the arranged picture and sound into a file |
+
+Start with [a prepared workflow or your own graph](docs/getting-started.md).
+The connected workflow decides which generation tasks are available; the editor
+provides the timeline, inputs, controls and review tools.
 
 ## The node in your graph
 
@@ -371,29 +347,10 @@ Generate reports a problem, see
 
 ### First generation in the Sonder App
 
-For a first take on an empty project:
-
-1. In the Launcher, click your project in the grid, then click the workflow in
-   the **Workflows** list on the left. Click **Open** in the bar at the bottom
-   (or press **Enter**).
-2. In the editor's toolbar, choose the **Model template** that matches the
-   workflow's model (for an LTX workflow, **LTX 2.3 / 2.5**).
-3. Double-click the **Global** lane at the bottom of the timeline and write the
-   scene-wide text. Then double-click the **Prompt** lane below it to add a
-   section and describe what happens.
-4. Leave the timeline without an In/Out selection, so the whole scene
-   generates.
-5. Open the **Controls** tab in the sidebar. If the workflow has a **Preset**
-   menu, pick a preset that generates from nothing (text to video), not one
-   that edits an existing video.
-6. An empty timeline is sent as black frames, so the workflow must run a
-   **full denoise (1.0)**. If **Controls** shows a denoise setting, set it
-   to 1.0.
-7. Click **Generate** in the toolbar. The progress message names the take's
-   workflow; when it finishes, the take lands on a new lane of the timeline.
-
-These are the same steps as [Getting Started](docs/getting-started.md), with
-**Generate** in place of ComfyUI's Run.
+Follow [Use a prepared workflow → Sonder App](docs/getting-started.md#open-the-prepared-workflow-in-sonder-app)
+after the setup above. That guide covers selecting a project and workflow,
+choosing a short range, writing a prompt, generating and reviewing a take.
+The canvas route uses ComfyUI's **Run**; Sonder App uses **Generate**.
 
 ## Example workflows
 
@@ -415,8 +372,8 @@ on Hugging Face, and needs Sonder Editor 0.6.0 or newer.
 
 ## Documentation
 
-- **[Getting Started](docs/getting-started.md)** — install to first
-  generated take, starting with pure text-to-video.
+- **[Getting Started](docs/getting-started.md)** — use a prepared workflow or
+  build your own, then generate, review and export a first take.
 - **[Editor Basics](docs/editor-basics.md)** — layout, timeline, item
   types, gestures, and shortcuts.
 - **[Generating](docs/generating.md)** — the generation window, model

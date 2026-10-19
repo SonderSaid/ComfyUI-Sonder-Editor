@@ -142,6 +142,12 @@ staging; what the model receives is its media and its prompt text.
 
 ## Reference lanes
 
+Adding media to the **Reference Library** alone does not send it to a model.
+In the **References** sidebar at the upper left, drag the intended member
+onto a **Reference** timeline row over the range where it applies. The lane's
+recipe and connected workflow decide how that staged input is used. A
+Reference guides a generation; it is not a visible Video layer.
+
 A Reference lane holds **Reference items** — ranges saying which Library
 members apply over which frames, say this character's face plus this outfit
 from frame 0 to 120.

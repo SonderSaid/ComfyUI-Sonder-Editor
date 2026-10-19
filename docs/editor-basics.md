@@ -108,6 +108,13 @@ the source edge), *Fill (crop)* with a crop anchor, or *Stretch*.
 
 ### Audio tracks
 
+Drop an audio asset from **Assets** onto an **Audio** row to place existing
+sound. A video with sound can create linked picture/audio items when dropped
+onto the timeline. Keep one intended copy of the sound; adding it again can
+double what you hear. Double-click opens that member's own volume or timing
+controls. Mute still affects linked members; to mute only the sound, first
+right-click its clip and choose **Unlink Linked Items**.
+
 An audio asset — or the extracted audio of a video — on an audio lane, drawn
 with its waveform. Same select/move/trim/split/mute model as video clips.
 The inline editor exposes start, volume, and mute.
@@ -122,6 +129,12 @@ playhead), or from Guide Management. Guides have a strength (0–1) and can be
 muted, replaced in place, or re-keyed.
 
 ### Driver clips
+
+To use an existing video as guidance, place it on a **Video** row at the
+bottom of the timeline. Right-click its clip and choose **Convert to Driver**.
+It moves to a Driver row and disappears from the normal preview; its media
+is still in the project. For visible footage again, right-click the Driver
+clip and choose **Convert to Render Clip**.
 
 A clip whose role is **motion/look conditioning, not visible output** —
 Drivers steer the generated clip's composition, movement, look, or
@@ -173,9 +186,10 @@ Double-click to edit.
 Any mix of items can be linked into a **symmetric edit group** (badge letter
 A…Z): move, delete, split, and mute act on the whole group and refuse
 atomically if any member is locked. Single-click selects the whole group;
-**double-click isolates one member** for per-item edits. Video+audio drops
-and generated takes auto-link (configurable in Settings). Link management
-lives in the right-click menu.
+**double-click isolates one member** for properties such as volume or
+opacity, while mute still affects the group. Video+audio drops and generated
+takes auto-link (configurable in Settings). Right-click **Unlink Linked Items**
+before muting only one member.
 
 ## Editing gestures
 
