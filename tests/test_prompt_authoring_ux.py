@@ -372,7 +372,7 @@ console.log(JSON.stringify({{
         "videoDefault": "appearance", "videoEntityAudio": "audio",
         "videoMemberAudio": "audio",
     }
-    source = _source("web/js/prompt_identity_panel.js")
+    source = _source("web/js/prompt_identity_editor.js")
     assert "Audio sources declare this character's voice." in source
 
 
@@ -2783,7 +2783,7 @@ def test_every_reference_chip_surface_uses_runtime_identity_and_authoring_contro
     # written channels and once for fed-but-unwritten ones — and now does
     # it through one `rowsFor` helper. A surface was merged, not lost.
     assert panel.count("attachmentLabelFor,") == 11
-    assert "Shared identity default · @" in chips
+    assert "Shared identity default · ${unit.handle ? `@${unit.handle}`" in chips
     assert "Prompt Format default ·" in chips
     assert "Audio target speaker" not in chips
     assert "managedVocalEventSubjectIds" not in chips
@@ -3889,7 +3889,9 @@ def test_prompt_identity_history_authorizes_cleanup_only_for_created_true_result
     start = widget.index("    _finalizePromptIdentityCreationHistory(")
     end = widget.index("    _mergeQueueMutationIntents(", start)
     method = widget[start:end]
+    transactions = (ROOT / "web/js/prompt_identity_transactions.js").as_uri()
     result = _run_node(f"""
+const {{PROMPT_IDENTITY_CREATE_TYPES}}=await import({json.dumps(transactions)});
 class Harness {{
 {method}
 }}
@@ -8831,7 +8833,9 @@ def test_writing_pending_identity_overlay_uses_shared_preview_and_atomic_apply_p
     assert "promptSemanticUnitCreates" in window_preview
     assert "pruneWritingSemanticUnitCreates())" in panel
     assert "prompt_semantic_unit_creates: promptSemanticUnitCreates" in panel
-    create_at = apply.index('type: "create_prompt_semantic_unit"')
+    # Each pending create keeps its own operation type (Vocal Event speaker or
+    # Attach "New identity…") through the shared builder.
+    create_at = apply.index("identityCreateIntents.map(promptIdentityCreateOperation)")
     replace_at = apply.index('type: "replace_prompt_sections"')
     assert create_at < replace_at
     assert "pending: identityCreateIntents.length > 0" in apply

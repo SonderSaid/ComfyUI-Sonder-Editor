@@ -78,9 +78,14 @@ EXPECTED_LITERAL_COUNTS = {
     # 82 -> 81 and the panel's 1 -> none in Phase 5: the panel's member edits
     # and the timeline append both go through that writer, so the panel's
     # `writeItem` and the append's own `update_reference_item` are gone.
-    "editor_widget.js": 81,
+    # 81 -> 79 and the chip editor's 1 -> 2 on 2026-10-19 (Reference Prompting
+    # Streamline Phase 2): Apply prompt setup and Redo build their identity
+    # creates through `promptIdentityCreateOperation`, which keeps each intent's
+    # own type, and the Attach dialog's "New identity…" emits the new
+    # `create_prompt_identity_with_sources`.
+    "editor_widget.js": 79,
     "editor_prompt_panel.js": 4,
-    "prompt_context_chips.js": 1,
+    "prompt_context_chips.js": 2,
     "prompt_identity_transactions.js": 1,
 }
 
@@ -842,6 +847,8 @@ REBASE_EXEMPT = {
     "replace_audio_source": "Names a durable track_id and an asset_id.",
     "create_prompt_semantic_unit": "Mints project-level prompt identity; carries "
                                    "no scene geometry.",
+    "create_prompt_identity_with_sources": "Mints project-level prompt identity with "
+        "Library sources; carries no scene geometry.",
     "import_prompt_context_dependencies": "Imports project-level profile and "
                                           "semantic-unit closures; no scene "
                                           "member is addressed.",
@@ -1204,6 +1211,8 @@ GUARD_EXEMPT_REASONS = {
                              "coordinate argument.",
     "create_prompt_semantic_unit": "Mints project-level prompt identity. No "
                                    "scene row exists yet or is named.",
+    "create_prompt_identity_with_sources": "Mints project-level prompt identity with "
+        "sources. No scene row exists yet or is named.",
     # The two creates that are NOT purely additive. A name-based exemption would
     # have hidden both, which is why there is no computed create class.
     "create_link_group": "NOT purely additive: its entire payload is references "
@@ -1243,9 +1252,6 @@ GUARD_EXEMPT_SITES = {
     ],
     "editor_prompt_panel.js:renderContextSettings:update_scene_fields": [
         ('fields', 'fields.prompt_context_profile_id', 'type'),
-    ],
-    "editor_widget.js:_applyPromptSetupWithinGesture:create_prompt_semantic_unit": [
-        ('handle_suggestion', 'type', 'unit', 'unit.<opaque>'),
     ],
     "editor_widget.js:_applyPromptSetupWithinGesture:import_prompt_context_dependencies": [
         ('profiles', 'profiles.<opaque>', 'semantic_units', 'semantic_units.<opaque>', 'type'),
@@ -1305,9 +1311,6 @@ GUARD_EXEMPT_SITES = {
     "editor_widget.js:_renameSceneWithinGesture:update_scene_fields": [
         ('fields', 'fields.name', 'type'),
     ],
-    "editor_widget.js:_runRedoWithinGesture:create_prompt_semantic_unit": [
-        ('handle_suggestion', 'type', 'unit', 'unit.<opaque>'),
-    ],
     "editor_widget.js:_saveNewPromptSectionWithinGesture:create_prompt_section": [
         ('fields', 'fields.<opaque>', 'type'),
     ],
@@ -1341,6 +1344,9 @@ GUARD_EXEMPT_SITES = {
     ],
     "prompt_context_chips.js:configurePromptAttachment:create_prompt_semantic_unit": [
         ('handle_suggestion', 'type', 'unit', 'unit.definition', 'unit.kind', 'unit.name', 'unit.semantic_unit_id'),
+    ],
+    "prompt_context_chips.js:adoptPendingIdentity:create_prompt_identity_with_sources": [
+        ('handle_suggestion', 'type', 'unit', 'unit.<opaque>'),
     ],
 }
 
@@ -2346,6 +2352,9 @@ GUARD_CONTRACTS.update({op: (_NOTHING, frozenset(), evidence) for op, evidence i
     "create_prompt_semantic_unit": "`_apply_create_prompt_semantic_unit` mints "
                                    "project-level identity and reads no "
                                    "expected, unlike its delete sibling.",
+    "create_prompt_identity_with_sources": "`_apply_create_prompt_identity_with_sources` "
+        "mints project-level identity and reads no expected; a replay "
+        "is compared field by field, sources included.",
     "delete_audio_track": "`_delete_audio_track` and `_apply_delete_link_refs` "
                           "are addressed by durable track_id; nothing compared.",
     "delete_clip": "`_delete_clip` and `_apply_delete_link_refs` are addressed "
@@ -3155,17 +3164,14 @@ GUARD_SITE_DISPOSITIONS = {
         "Additive, and a stale range does not apply silently: "
         "`_require_no_prompt_overlap` refuses a range history has since occupied. "
         "The same argument REBASE_EXEMPT records for this operation."),
-    "editor_widget.js:_applyPromptSetupWithinGesture:create_prompt_semantic_unit": (_FAIR,
-        "Mints project-level prompt identity through "
-        "`_apply_create_prompt_semantic_unit`. No scene row exists yet or is "
-        "named."),
-    "editor_widget.js:_runRedoWithinGesture:create_prompt_semantic_unit": (_FAIR,
-        "As `_applyPromptSetupWithinGesture`; Redo re-mints the same identity, and "
-        "`delete_prompt_semantic_unit_if_unreferenced` is the guarded half of "
-        "that pair."),
     "prompt_context_chips.js:configurePromptAttachment:create_prompt_semantic_unit": (
         _FAIR, "The same `create_prompt_semantic_unit` mint, from the shared "
         "`prompt_context_chips.js` editor."),
+    "prompt_context_chips.js:adoptPendingIdentity:create_prompt_identity_with_sources": (
+        _FAIR, "Mints project-level prompt identity with sources through "
+        "`_apply_create_prompt_identity_with_sources`, which validates each new "
+        "source against the Library. No scene row exists yet or is named; a "
+        "replay is compared field by field."),
     "editor_widget.js:_applyPromptSetupWithinGesture:import_prompt_context_dependencies": (
         _FAIR,
         "Project-level profile and semantic-unit closures; no scene row is "

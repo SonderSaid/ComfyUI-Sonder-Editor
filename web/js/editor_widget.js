@@ -608,7 +608,9 @@ import {
 } from "./prompt_preview_stream.js";
 import { applyPromptIdentityChange, sameIdentitySnapshot } from "./prompt_identity_panel.js";
 import {
+    PROMPT_IDENTITY_CREATE_TYPES,
     promptIdentityCleanupPlan,
+    promptIdentityCreateOperation,
     promptIdentityRedoPlan,
     reconcilePromptIdentityCreateOutcome,
 } from "./prompt_identity_transactions.js";
@@ -1523,6 +1525,9 @@ export class EditorWidget {
         });
         const previousGesture = this._activeMutationGesture;
         this._activeMutationGesture = gesture;
+        // Counts top-level gestures, so deferred follow-ups (Lane Setup's
+        // auto-open) can tell the author has done something since.
+        this._mutationGestureSeq = (this._mutationGestureSeq || 0) + 1;
         let result;
         try {
             result = callback(gesture);
@@ -3150,8 +3155,12 @@ export class EditorWidget {
     }
 
     _promptContextConsumersMounted() {
+        // Reference Lane Setup's prompt preview reads the windowed candidate
+        // under a format that numbers its pictures. It is a display consumer,
+        // so it compiles on the timeline's debounce.
         return this._promptContextEditingConsumersMounted()
-            || this._promptContextTimelineConsumerMounted();
+            || this._promptContextTimelineConsumerMounted()
+            || !!this._referencePanelHandle?.readsCandidate?.();
     }
 
     _promptContextPreviewDelay(immediateDelay = 0) {
@@ -6252,8 +6261,11 @@ export class EditorWidget {
         // A dialog opened before a Library delete and confirmed while it is in
         // flight: the chip is durable and its write never checks the member.
         const source = configured.attachment?.source || {};
-        const sourceIds = ["picture_ids", "video_ids", "audio_ids"].flatMap((key) =>
-            Array.isArray(source[key]) ? source[key] : []);
+        // A new identity's own sources are members the chip reaches too.
+        const sourceIds = [...["picture_ids", "video_ids", "audio_ids"].flatMap((key) =>
+            Array.isArray(source[key]) ? source[key] : []),
+        ...(configured.identityCreateIntent?.unit?.sources || [])
+            .map((value) => String(value?.member_id || "")).filter(Boolean)];
         if (sourceIds.some((id) => this._referenceMemberBeingDeleted(id))) {
             notifyWarning(REFERENCE_MEMBER_BEING_DELETED, { source: "prompt-reference-attach-refused" });
             return null;
@@ -6274,14 +6286,16 @@ export class EditorWidget {
             const unitId = String(intent.unit.semantic_unit_id);
             this._pendingPromptIdentityCreateIntents.set(
                 unitId, { attachmentId, intent: structuredClone(intent) });
-            // Optimistic name-only projection: the server owns the final
-            // collision-free handle and order, so neither is guessed here.
+            // Optimistic projection: the server owns the final collision-free
+            // handle and order, so neither is guessed here. Sources are the
+            // author's, so eligibility and "cites this picture" are right
+            // before the write lands.
             if (!(this._promptSemanticUnits || []).some((unit) =>
                     String(unit?.semantic_unit_id || "") === unitId)) {
                 this._promptSemanticUnits = [
                     ...(this._promptSemanticUnits || []),
                     { ...structuredClone(intent.unit), handle: "", order: 0,
-                        sources: [] },
+                        sources: structuredClone(intent.unit.sources || []) },
                 ];
             }
         }
@@ -6316,7 +6330,7 @@ export class EditorWidget {
         const createdIds = new Set();
         if (!entry?.promptIdentityCreateIntents?.length) return createdIds;
         const outcomes = new Map((result?.payload?.results || [])
-            .filter((value) => value?.type === "create_prompt_semantic_unit"
+            .filter((value) => PROMPT_IDENTITY_CREATE_TYPES.has(value?.type)
                 && value?.unit?.semantic_unit_id)
             .map((value) => [String(value.unit.semantic_unit_id), value]));
         for (const intent of entry.promptIdentityCreateIntents) {
@@ -12964,7 +12978,7 @@ export class EditorWidget {
             const laneEntry = (this._trackLayout || []).find((entry) =>
                 entry.type === TRACK_TYPE.REFERENCE && (entry.laneIndex || 0) === (hit.data.lane_index || 0));
             if (laneEntry) {
-                menuItems.push({ label: "Reference Lane Setup", action: () => void this._showReferenceLanePanel(laneEntry) });
+                menuItems.push({ label: "Reference Lane Setup…", action: () => void this._showReferenceLanePanel(laneEntry) });
             }
             menuItems.push({
                 label: itemLocked ? "Delete Reference (locked)" : "Delete Reference",
@@ -13326,13 +13340,54 @@ export class EditorWidget {
         if (!entry && !forceNewLane) entry = referenceEntries.find(canUse) || null;
 
         const laneIndex = entry ? (entry.laneIndex || 0) : laneCountFor(scene, TRACK_TYPE.REFERENCE);
+        // Decided before the paint: a new lane, or the first item on an empty
+        // one, is where a template still has to be chosen.
+        const firstStage = !entry || !(scene.reference_items || []).some((row) =>
+            (Number(row?.lane_index) || 0) === laneIndex);
+        const autoOpenToken = (this._laneSetupAutoOpenSeq = (this._laneSetupAutoOpenSeq || 0) + 1);
+        const stageGestureSeq = this._mutationGestureSeq || 0;
         // Its own Undo step, held rather than labelled, so a refused stage drops
         // the entry it created instead of leaving one with no post-snapshot.
         const historyEntry = this._pushUndo("add reference item");
-        return this._commitReferenceStageWithinGesture({
+        const outcome = await this._commitReferenceStageWithinGesture({
             payload, laneIndex, startFrame, laneEntry: entry, mediaKind, historyEntry,
             allowLaneWrites: true,
         });
+        if (outcome === "ok" && firstStage
+                && this._settings?.references?.openLaneSetupOnFirstStage !== false) {
+            this._openLaneSetupAfterFirstStage(laneIndex, autoOpenToken, stageGestureSeq);
+        }
+        return outcome;
+    }
+
+    /** Open Reference Lane Setup once a first stage has settled.
+     *
+     *  Outside the gesture, by the lane's durable id, and only when nothing
+     *  happened since that the author would lose: a newer stage, any other
+     *  gesture begun since the stage, or any panel or dialog already open. Never for a
+     *  locked lane. The panel's own + Add item and an append onto a bar never
+     *  reach here.
+     */
+    _openLaneSetupAfterFirstStage(laneIndex, token, gestureSeq = this._mutationGestureSeq || 0) {
+        const sceneId = this.activeSceneId;
+        const laneId = String(this.activeScene?.reference_lane_recipes?.[laneIndex]?.lane_id || "");
+        setTimeout(() => {
+            if (this._destroyed || token !== this._laneSetupAutoOpenSeq
+                    || sceneId !== this.activeSceneId
+                    || (this._mutationGestureSeq || 0) !== gestureSeq) return;
+            if (this._managementModalMounted() || this._exportPanelHandle
+                    || this._settingsPanelHandle) return;
+            if (typeof document !== "undefined" && document.querySelector?.(
+                "[data-sonder-prompt-context-modal], [data-prompt-identity-editor]")) return;
+            const recipes = this.activeScene?.reference_lane_recipes || [];
+            const index = laneId
+                ? recipes.findIndex((recipe) => String(recipe?.lane_id || "") === laneId)
+                : laneIndex;
+            if (index < 0 || this._isLaneLocked(TRACK_TYPE.REFERENCE, index)) return;
+            const laneEntry = (this._trackLayout || []).find((value) =>
+                value.type === TRACK_TYPE.REFERENCE && (value.laneIndex || 0) === index);
+            if (laneEntry) void this._showReferenceLanePanel(laneEntry);
+        }, 0);
     }
 
     /** Stage a panel-picked Library member as a new item on one Reference lane.
@@ -16092,6 +16147,7 @@ export class EditorWidget {
                 _context_reference_frame_threshold: this._referenceFrameThreshold || 0,
             };
             const configure = (attachment) => configurePromptAttachment(attachment, {
+                assets: this._allProjectAssetsForGallery?.() || [],
                 shotOpensSection: promptShotDialogRole({
                     attachment, attachments: sharedAttachments,
                     shotChannel: template.shot_marker_channel,
@@ -16281,6 +16337,7 @@ export class EditorWidget {
                     onActivate: async (attachment) => {
                         const configured = this._acceptPromptAttachmentConfiguration(
                             await configurePromptAttachment(attachment, {
+                            assets: this._allProjectAssetsForGallery?.() || [],
                             shotOpensSection: promptShotDialogRole({
                                 attachment, attachments: sharedAttachments,
                                 shotChannel: template.shot_marker_channel,
@@ -16389,6 +16446,7 @@ export class EditorWidget {
         const scopeHost = document.createElement("div");
         scopeHost.style.cssText = "flex:1 0 100%;min-width:0;";
         const configureScope = (attachment) => configurePromptAttachment(attachment, {
+            assets: this._allProjectAssetsForGallery?.() || [],
             referenceProsePolicy: this._referenceProsePolicy,
             scene: { ...(this.activeScene || {}), _context_channel_keys: keys,
                 _context_consumer_start: consumerSection?.start_frame ?? Infinity,
@@ -18377,6 +18435,8 @@ export class EditorWidget {
                 // render happened. Cheap when nothing it depends on changed.
                 this._promptPanelHandle?.applyCandidate?.(
                     this._promptContextCandidateCache);
+                this._referencePanelHandle?.applyCandidate?.(
+                    this._promptContextCandidateCache);
             } catch (error) {
                 if (!this._destroyed && dirName === this._projectDirName()
                         && sceneId === this.activeSceneId
@@ -18392,6 +18452,8 @@ export class EditorWidget {
                     this._refreshInlinePromptProjections?.();
                     this._renderTimeline();
                     this._promptPanelHandle?.applyCandidate?.(
+                        this._promptContextCandidateCache);
+                    this._referencePanelHandle?.applyCandidate?.(
                         this._promptContextCandidateCache);
                 }
             }
@@ -18783,11 +18845,7 @@ export class EditorWidget {
         const identityCreateIntents = Array.isArray(promptSemanticUnitCreates)
             ? structuredClone(promptSemanticUnitCreates) : [];
         const operations = [];
-        operations.push(...identityCreateIntents.map((intent) => ({
-            type: "create_prompt_semantic_unit",
-            handle_suggestion: intent.handle_suggestion,
-            unit: structuredClone(intent.unit || {}),
-        })));
+        operations.push(...identityCreateIntents.map(promptIdentityCreateOperation));
         if (Array.isArray(promptContextProfiles) || Array.isArray(promptSemanticUnits)) {
             operations.push({
                 type: "import_prompt_context_dependencies",
@@ -19463,7 +19521,7 @@ export class EditorWidget {
                 // The prompt moved to the Reference lane panel, which can show the
                 // derived text this override replaces. A bare input here could only
                 // ever offer the override half of that contract.
-                const setupBtn = this._makeBtn("Lane Setup…", "Recipe, staged members and prompt for this Reference lane");
+                const setupBtn = this._makeBtn("Reference Lane Setup…", "Recipe, staged members and prompt preview for this Reference lane");
                 setupBtnForLock = setupBtn;
                 setupBtn.addEventListener("click", () => {
                     const laneEntry = (this._trackLayout || []).find((entry) =>
@@ -27225,11 +27283,7 @@ export class EditorWidget {
                     throw new Error("Redo refused because a retained Prompt Identity changed.");
                 }
                 const createResult = createIntents.length
-                    ? await this._runSceneMutation(createIntents.map((intent) => ({
-                        type: "create_prompt_semantic_unit",
-                        handle_suggestion: intent.handle_suggestion,
-                        unit: structuredClone(intent.unit || {}),
-                    })), {
+                    ? await this._runSceneMutation(createIntents.map(promptIdentityCreateOperation), {
                         key: `prompt:${entry.sceneId}:identity-redo:${Date.now()}`,
                         label: `redo ${entry.label || "Other speaker"}`,
                         coalesce: false,
@@ -28149,7 +28203,11 @@ export class EditorWidget {
         if (!this._referencesLoaded) await this._fetchReferences({ force: true, reason: "reference_lane_panel" });
         this._referencePanelHandle?.close?.();
         this._installManagementPanelActivity();
+        const wasMounted = this._promptContextConsumersMounted();
         this._referencePanelHandle = mountReferenceLanePanel(this, { laneIndex: entry.laneIndex || 0 });
+        // Its prompt preview reads the windowed candidate, so it requests one
+        // on mount like any other consumer.
+        this._previewPromptContextForNewConsumer(wasMounted);
     }
 
     async _fetchProjectSettings({ ignoreMutationGate = false, reason = "project_settings" } = {}) {

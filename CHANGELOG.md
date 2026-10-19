@@ -32,6 +32,9 @@ a fresh `[Unreleased]` block.
 - Controls sidebar in fullscreen, mounted tabs and the Sonder App: edit workflow values, seed modes and Markdown notes beside shared take settings.
 - Prompt: an empty prompt field shows what it is for, in the timeline editor and in Prompt Management's Global and section rows.
 - Prompt: a Subject mentioned with `@handle` that no definition reaches gets a warning naming the handle and how to fix it.
+- Prompt: Attach offers **New Subject…** (or the format's own identity name) in its Reference list. It opens the identity editor seeded from the chosen picture; **Use for this attachment** then Attach creates the Subject and attaches it in one Undo step, also in Writing mode, where it waits for Apply. Under MiniMax H3 Full Reference this gives the guide's `<Subject 1> is … from <Picture 1>` route in a few clicks.
+- Reference Lane Setup opens by itself after you drop the first item onto a new or empty Reference lane, so you can choose its template. Turn it off in Settings › References › **Open Lane Setup on First Item**.
+- Prompt Management › Reference Prompting: each staged item's derived prompt has **Copy**, **Edit as override** and **Clear**. Under MiniMax H3 Full Reference the row notes that an override reaches only the Prompt Bridge.
 - Sonder Control Relay node: a workflow's Controls menu. It exposes existing node settings, a Sonder Selector's feature list included, in the Controls sidebar with labels, groups and Markdown notes, and the Sonder App reads the same menu from an Export (API) workflow. The settings stay on their own nodes, and a copied node is never exposed twice.
 
 ### Changed
@@ -44,6 +47,9 @@ a fresh `[Unreleased]` block.
 - Render queue: a job that is waiting again or has failed shows why on a second line, such as a run interrupted before the job completed. Hover for the full text.
 - Reference Lanes: with items on the lane, templates for another media kind are greyed out and say why. Choosing a template with the arrow keys saves once, on Enter or when you leave the list, instead of on every key press; Escape puts the previous template back.
 - MiniMax H3 Full Reference: the empty-field guidance for Subject definitions, retention analysis and the detailed description now follows MiniMax's reference guide: Subjects for characters, props, scenes and styles, standalone Pictures for frame anchors.
+- MiniMax H3 Full Reference: a Reference chip attached to a prompt section, rather than placed in its text, no longer puts its `<Subject N>` mention in front of the description, which doubled the Subject the text already names. Placed in the text it still mentions where it sits, and text you typed into the chip's Inline mention is kept; turn **Scene mention** on in the chip to keep the old behaviour. Existing projects compile this way from now on; jobs already queued are unchanged.
+- Reference Lane Setup (the panel's one name now, in its title, the bar menu and the item editor) shows each item's prompt as a read-only preview with Copy; click it to edit the words in Prompt Management. Under MiniMax H3 it lists each member's `<Picture N>`, role and Library text, and which Subjects cite it. Item options start open.
+- Reference Lane Setup counts a chip as attached to an item under MiniMax H3 when it cites one of the item's members, directly or through a Subject.
 
 ### Fixed
 - Prompt: Attach and the Mention menu no longer offer a "Subject: <Reference>" row for a Reference that has no Subject yet. Choosing it made the run fail. A chip already bound that way still says it needs a new source.

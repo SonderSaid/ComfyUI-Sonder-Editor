@@ -562,3 +562,117 @@ def test_output_limit_diagnostic_does_not_relabel_empty_sibling():
     states = {row["capability_id"]: row["state"]
               for row in result["attachment_capability_projections"]}
     assert states == {"big": "output_limit", "empty": "empty"}
+
+
+def _h3_mention_compile(*, anchored, enabled=None, disabled=()):
+    capability = {"capability_id": "mentions", "kind": "mentions"}
+    if enabled is not None:
+        capability["enabled"] = enabled
+    chip = prompt_context.normalize_attachment({
+        "attachment_id": "chip", "kind": "reference",
+        "source": {"semantic_unit_ids": ["hero"]}, "config": {},
+        "capabilities": [capability]})
+    nodes = [{"type": "text", "node_id": "prose", "text": "walks forward."}]
+    if anchored:
+        nodes = [{"type": "attachment", "node_id": "at", "attachment_id": "chip",
+                  "capability_id": "mentions"},
+                 {"type": "text", "node_id": "gap", "text": " "}] + nodes
+    compiled = prompt_context.compile_prompt_context(
+        sections=[{"prompt_id": "one", "start_frame": 0, "end_frame": 24,
+                   "channel_docs": {"detailed_description": {
+                       "schema": "prompt_document_v1", "nodes": nodes}},
+                   "attachments": [chip]}],
+        window_start=0, window_end=24, fps=24, template="minimax_h3_ref",
+        context={"setup_manifest": {"setup": {"mode": "reference"}},
+                 "ordinal_manifest": {"subjects": {"hero": 1}},
+                 "unit_source_labels": {"hero": ["<Picture 1>"]},
+                 "semantic_units": [{"semantic_unit_id": "hero", "name": "Hero",
+                                     "handle": "Hero", "definition": "a cowboy",
+                                     "disabled_capabilities": list(disabled),
+                                     "sources": [{"entity_id": "ref", "member_id": "portrait"}]}]})
+    return compiled["channels"].get("detailed_description")
+
+
+def test_h3_unanchored_mention_default_matches_the_browser_mirror():
+    """A section-attached H3 chip no longer prefixes the prose with its mention;
+    one placed in the text, or turned on, still mentions. The Attach checkbox
+    resolves the same answer before anything is stored."""
+    cases = [
+        # (anchored, stored enabled, identity disables mentions)
+        (True, None, False), (False, None, False), (False, True, False),
+        (True, False, False), (True, None, True), (False, None, True),
+    ]
+    compiled = [_h3_mention_compile(anchored=anchored, enabled=enabled,
+                                    disabled=("mentions",) if off else ())
+                for anchored, enabled, off in cases]
+    assert compiled == [
+        "<Subject 1> walks forward.", "walks forward.", "<Subject 1> walks forward.",
+        "walks forward.", "walks forward.", "walks forward."]
+
+    profile = prompt_context.BUILTIN_PROFILES["minimax_h3_ref@1"]
+    generic = prompt_context.BUILTIN_PROFILES["generic@1"]
+    result = _enabled_probe(f"""
+        const profile = {json.dumps(profile)};
+        const generic = {json.dumps(generic)};
+        const units = (off) => [{{ semantic_unit_id: "hero",
+            disabled_capabilities: off ? ["mentions"] : [] }}];
+        const call = (anchored, off, value = profile) => mod.resolveInheritedCapabilityEnabled(
+            "mentions", {{ selected: "hero", semanticUnits: units(off), profile: value, anchored }});
+        console.log(JSON.stringify({{
+            inherited: [[true, false], [false, false], [true, true], [false, true]]
+                .map(([anchored, off]) => call(anchored, off)),
+            genericAnchorless: call(false, false, generic),
+            stored: mod.sparseCapabilityRecord({{}}, {{ capabilityId: "mentions",
+                enabled: true, inheritedEnabled: call(false, false) }}),
+        }}));
+    """)
+    server = [prompt_context._inherited_capability_enabled(
+        {"kind": "reference", "source": {"semantic_unit_ids": ["hero"]}},
+        {"capability_id": "mentions", "kind": "mentions"},
+        {"profile": profile, "semantic_units_by_id": {"hero": {
+            "semantic_unit_id": "hero",
+            "disabled_capabilities": ["mentions"] if off else []}}},
+        anchored=anchored)
+        for anchored, off in [(True, False), (False, False), (True, True), (False, True)]]
+    assert result["inherited"] == server == [True, False, False, False]
+    assert result["genericAnchorless"] is True
+    # Turning it on against the off default is a deviation, so it is stored.
+    assert result["stored"]["enabled"] is True
+
+
+def test_h3_unanchored_default_never_drops_the_chips_own_mention_text():
+    """The default drops a DERIVED `<Subject N>` that doubles the prose. Words
+    the author typed into the chip's Inline mention are a choice, so they stay,
+    wherever the chip stores them; the Attach checkbox agrees."""
+    def compiled(config, capability_config=None):
+        capability = {"capability_id": "mentions", "kind": "mentions"}
+        if capability_config is not None:
+            capability["config"] = capability_config
+        chip = prompt_context.normalize_attachment({
+            "attachment_id": "chip", "kind": "reference",
+            "source": {"semantic_unit_ids": ["hero"]}, "config": config,
+            "capabilities": [capability]})
+        return prompt_context.compile_prompt_context(
+            sections=[{"prompt_id": "one", "start_frame": 0, "end_frame": 24,
+                       "channels": {"detailed_description": "walks forward."},
+                       "attachments": [chip]}],
+            window_start=0, window_end=24, fps=24, template="minimax_h3_ref",
+            context={"setup_manifest": {"setup": {"mode": "reference"}},
+                     "ordinal_manifest": {"subjects": {"hero": 1}},
+                     "semantic_units": [{"semantic_unit_id": "hero", "name": "Hero",
+                                         "handle": "Hero", "definition": "a cowboy"}]},
+        )["channels"]["detailed_description"]
+
+    assert compiled({"overrides": {"text": "At the bar,"}}) == "At the bar, walks forward."
+    assert compiled({"text": "At the bar,"}) == "At the bar, walks forward."
+    assert compiled({}, {"text": "At the bar,"}) == "At the bar, walks forward."
+    assert compiled({"overrides": {"text": "   "}}) == "walks forward."
+
+    profile = prompt_context.BUILTIN_PROFILES["minimax_h3_ref@1"]
+    result = _enabled_probe(f"""
+        const call = (authoredText) => mod.resolveInheritedCapabilityEnabled("mentions", {{
+            selected: "hero", semanticUnits: [{{ semantic_unit_id: "hero" }}],
+            profile: {json.dumps(profile)}, anchored: false, authoredText }});
+        console.log(JSON.stringify({{ authored: call(true), derived: call(false) }}));
+    """)
+    assert result == {"authored": True, "derived": False}

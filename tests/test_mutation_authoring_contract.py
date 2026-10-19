@@ -93,6 +93,7 @@ NO_MEDIA = {
     "create_link_group": "Creates membership records only.",
     "create_prompt_section": "Creates authored prompt data.",
     "create_prompt_semantic_unit": "Creates prompt identity data.",
+    "create_prompt_identity_with_sources": "Creates prompt identity data with Library sources.",
     "create_reference_item": "Stages existing Library members.",
     "delete_audio_track": "Removes a timeline reference.",
     "delete_clip": "Removes a timeline reference.",

@@ -4287,6 +4287,9 @@ _CLASS_C_SETUP = _SPLIT_SETUP + """
         w._renderSceneAfterLocalMutation = () => { w.paints += 1; };
         w._reconcileActiveSceneFromMutation = () => {};
         w._fetchScenes = async () => {};
+        // A first stage opens Reference Lane Setup once it lands; this
+        // harness has no DOM, and the opening has its own tests.
+        w._showReferenceLanePanel = async () => {};
         w.released = [];
         w._runSceneMutation = (operations, options) => {
             w.sent.push({operations, options});

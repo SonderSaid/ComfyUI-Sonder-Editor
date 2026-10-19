@@ -1551,27 +1551,8 @@ def test_an_unpainted_write_takes_the_baseline_from_an_open_chain(tmp_path):
     assert result["retention"] == "partial"
 
 
-def test_edit_as_override_derives_from_the_live_members(tmp_path):
-    result = run_item_panel(_FIELDS + """
-    const { deriveReferencePrompt } = await import(__RESOLUTION__);
-    mount();
-    const card = cardAt(10);
-    card.querySelectorAll('details').forEach((d) => { d.open = true; });
-    const take = walk(card).find((n) => n.tagName === 'BUTTON' && n.textContent === 'Edit as override');
-    // A reconcile replaced the scene since the card was drawn (the panel has
-    // not repainted), and the live row stages only member b now.
-    w.activeScene = structuredClone(w.activeScene);
-    item('item-1').members = [item('item-1').members[1]];
-    const soft = w.activeScene.reference_lane_recipes[0].recipe?.soft || {};
-    const expectedText = deriveReferencePrompt({ promptOverride: '', soft, members:
-      item('item-1').members.map((ref) => { const r = w._referenceMemberForRef(ref);
-        return { entity_name: r?.reference?.name || '', member_name: r?.member?.name || '',
-          prompt: r?.member?.prompt || '' }; }) });
-    take.dispatch('click');
-    await settle(4);
-    return { sent: updates().at(-1)?.fields?.prompt_override, expectedText };
-    """.replace("__RESOLUTION__", json.dumps((ROOT / "web/js/reference_resolution.js").as_uri())), tmp_path)
-    assert result["sent"] == result["expectedText"] and result["sent"]
+# Edit as override moved to the Prompt tool's Reference Prompting rows; its
+# live-row derivation is covered in `test_reference_prompting_writes_js.py`.
 
 
 def test_each_settled_field_edit_refreshes_the_prompt_consumers_once(tmp_path):

@@ -182,7 +182,13 @@ MINIMAX_H3_PHYSICAL_POPULATIONS = [
         "source_key": "picture_ids", "token_kind": "picture",
         "label": "Picture", "label_template": "<Picture {n}>",
         "media_kinds": ["image"], "cap": 9,
-        "description": "Still-image references presented to MiniMax as <Picture N>.",
+        # MiniMax's reference guide: a standalone Picture is a frame anchor,
+        # and characters, props, scenes and styles are Subjects citing it.
+        "description": ("Still-image references presented to MiniMax as <Picture N>. "
+                        "Use a standalone Picture as a frame anchor: a first or last "
+                        "frame, keyframe, storyboard or composition anchor. For a "
+                        "character, prop, scene or style, attach a Subject that cites "
+                        "the picture instead."),
     },
     {
         "key": "videos", "ordinal_key": "videos",
@@ -598,12 +604,16 @@ def _reference_declaration_errors(value, *, template, add):
                 field)
         unknown = set(declaration).difference({
             "order", "channel_key", "placement", "label", "description",
-            "example", "help", "fields", "separator",
+            "example", "help", "fields", "separator", "unanchored_default_enabled",
         })
         if unknown:
             add("incomplete_capability_declaration",
                 f"Unsupported derived capability fields: {', '.join(sorted(unknown))}.",
                 field)
+        if ("unanchored_default_enabled" in declaration
+                and not isinstance(declaration["unanchored_default_enabled"], bool)):
+            add("incomplete_capability_declaration",
+                "unanchored_default_enabled must be true or false.", field)
         separator = declaration.get("separator")
         if (separator is not None
                 and separator not in DECLARED_CAPABILITY_SEPARATORS):
@@ -2110,8 +2120,13 @@ BUILTIN_PROFILES = {
                         "placement": "inline", "label": "Scene mention",
                         "description": "Places resolved Reference and identity tokens in scene prose.",
                         "example": "<Subject 1> picks up <Picture 2>.",
-                        "help": "The editor resolves user handles to this format's canonical tokens.",
+                        "help": ("The editor resolves user handles to this format's canonical tokens. "
+                                 "A chip placed in the description mentions where it sits; a chip "
+                                 "attached to the section does not mention unless you turn it on."),
                         "fields": {},
+                        # A section-attached chip's mention lands before the
+                        # authored description, doubling what the prose names.
+                        "unanchored_default_enabled": False,
                     },
                     "audio_relationship": {
                         "order": 5, "channel_key": "summary",
@@ -2971,7 +2986,40 @@ def _attachment_member_ids(attachment, context) -> list[str]:
     return result
 
 
-def _inherited_capability_enabled(attachment, capability, context) -> bool:
+def unanchored_capability_default(profile, attachment_kind, capability_kind):
+    """A format's default for a capability whose chip has no document anchor.
+
+    `derived[kind].unanchored_default_enabled` (a bool) answers it; absent means
+    the format has no opinion. MiniMax H3 Full Reference turns `mentions` off
+    here: an anchorless chip's mention lands before the authored text, so the
+    scene doubled every Subject the prose already names.
+    """
+    declaration = ((profile or {}).get("capabilities") or {}).get(attachment_kind) or {}
+    derived = declaration.get("derived") if isinstance(declaration, dict) else None
+    entry = derived.get(str(capability_kind or "")) if isinstance(derived, dict) else None
+    value = entry.get("unanchored_default_enabled") if isinstance(entry, dict) else None
+    return value if isinstance(value, bool) else None
+
+
+# The chip fields that carry an author's own words for a capability. Words the
+# author wrote are a deliberate choice, so a format's unanchored default (which
+# exists to drop DERIVED labels that duplicate the prose) never silences them.
+_AUTHORED_CAPABILITY_TEXT_FIELDS = {"mentions": ("text",)}
+
+
+def _chip_authors_capability_text(attachment, capability) -> bool:
+    """Whether the chip itself holds non-blank text for this capability."""
+    fields = _AUTHORED_CAPABILITY_TEXT_FIELDS.get(
+        str(capability.get("kind") or capability.get("capability_id") or ""), ())
+    config = attachment.get("config") if isinstance(attachment.get("config"), dict) else {}
+    overrides = config.get("overrides") if isinstance(config.get("overrides"), dict) else {}
+    capability_config = (capability.get("config")
+                         if isinstance(capability.get("config"), dict) else {})
+    return any(str(source.get(field) or "").strip()
+               for source in (config, overrides, capability_config) for field in fields)
+
+
+def _inherited_capability_enabled(attachment, capability, context, *, anchored=True) -> bool:
     """Shared default for a capability the chip does not state an opinion on.
 
     Whether a Reference contributes a prompt part at all is a property of the
@@ -2982,7 +3030,9 @@ def _inherited_capability_enabled(attachment, capability, context) -> bool:
 
     Identity beats member, matching the field precedence chain. A member is
     consulted only when every selected member agrees, so two members disagreeing
-    fall through to enabled rather than one silently winning.
+    fall through to enabled rather than one silently winning. Below both sits
+    the format's default for a chip with no document anchor; mirrored by
+    `resolveInheritedCapabilityEnabled` under a parity test.
     """
     capability_id = str(capability.get("capability_id")
                         or capability.get("kind") or "")
@@ -2998,18 +3048,21 @@ def _inherited_capability_enabled(attachment, capability, context) -> bool:
                     for unit in selected_units]
         if all(opinions):
             return False
-        if not any(opinions):
-            return True
-        return True
-    members_by_id = _members_by_id(context)
-    selected_members = [members_by_id[member_id] for member_id
-                        in _attachment_member_ids(attachment, context)
-                        if member_id in members_by_id]
-    if selected_members:
-        opinions = [capability_id in (member.get("disabled_capabilities") or [])
-                    for member in selected_members]
-        if opinions and all(opinions):
-            return False
+    else:
+        members_by_id = _members_by_id(context)
+        selected_members = [members_by_id[member_id] for member_id
+                            in _attachment_member_ids(attachment, context)
+                            if member_id in members_by_id]
+        if selected_members:
+            opinions = [capability_id in (member.get("disabled_capabilities") or [])
+                        for member in selected_members]
+            if opinions and all(opinions):
+                return False
+    if (not anchored and unanchored_capability_default(
+            context.get("profile"), attachment.get("kind"),
+            capability.get("kind") or capability_id) is False
+            and not _chip_authors_capability_text(attachment, capability)):
+        return False
     return True
 
 
@@ -4315,11 +4368,21 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     # Otherwise a capability disabled by its shared Reference/identity default
     # can make an attachment-only section exclude a global channel even though
     # that section is inert everywhere downstream. Storage remains untouched.
+    # A chip placed in a document is an authored placement; one with no anchor
+    # is section- or scene-scope and may fall under the format's default.
+    anchored_attachment_ids = {
+        str(node.get("attachment_id") or "")
+        for documents in [global_docs, *(value["channel_docs"] for value in raw_sections)]
+        for document in (documents or {}).values()
+        for node in (document or {}).get("nodes") or []
+        if isinstance(node, dict) and node.get("type") == "attachment"}
     for attachment in scene_attachments:
         for capability in attachment.get("capabilities") or []:
             if "enabled" not in capability:
                 capability["enabled"] = _inherited_capability_enabled(
-                    attachment, capability, context)
+                    attachment, capability, context,
+                    anchored=str(attachment.get("attachment_id") or "")
+                    in anchored_attachment_ids)
 
     # Determine the effective segment origins before validating or rendering
     # section-owned Context.  Out-of-window chips are dormant for this job and

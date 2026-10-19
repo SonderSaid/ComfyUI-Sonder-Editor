@@ -357,6 +357,9 @@ def test_broken_global_identity_blocks_without_a_dormancy_warning():
         "invalid-route-chip", {"semantic_unit_ids": ["dormant"]}, {},
         capabilities=("mentions",))
     invalid_route["capabilities"][0]["channel_key"] = "not_a_channel"
+    # Turned on: an anchorless H3 mention is off by default, and an inert
+    # capability's route is never checked.
+    invalid_route["capabilities"][0]["enabled"] = True
     compiled = _identity_dormancy_fixture(global_chip=invalid_route)
     assert any(row["code"] == "invalid_attachment_route"
                and row.get("origin") == "global"

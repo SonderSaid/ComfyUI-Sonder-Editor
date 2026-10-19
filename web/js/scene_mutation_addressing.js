@@ -241,6 +241,12 @@ export const SCENE_MUTATION_ADDRESSING = freeze({
             + "`_apply_create_prompt_semantic_unit` refuses it outright when it is "
             + "missing. The locked mutation owns the collision check and the final "
             + "handle, so a replay mints the same identity or is refused." }),
+    create_prompt_identity_with_sources: freeze({
+        addressing: DURABLE, ids: freeze(["unit.semantic_unit_id"]),
+        evidence: "The same client-stable id contract as `create_prompt_semantic_unit`: "
+            + "`_apply_create_prompt_identity_with_sources` refuses a missing id, and "
+            + "a replay is the same request only when every authored field, sources "
+            + "included, matches the stored identity." }),
 
     // --- names no row and no document-derived destination ---------------------
     update_scene_fields: freeze({

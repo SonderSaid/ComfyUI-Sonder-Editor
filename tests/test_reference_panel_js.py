@@ -1267,10 +1267,11 @@ failedHandle.close();
     }
 
 
-def test_reference_panel_keeps_details_collapsed_and_offers_inspectable_thumbnails():
+def test_reference_panel_opens_item_details_and_offers_inspectable_thumbnails():
     panel = (ROOT / "web" / "js" / "editor_reference_panel.js").read_text(
         encoding="utf-8")
-    assert 'disclosureOpen("item", item.reference_item_id, false)' in panel
+    # Item options open by default; a remembered collapse still wins.
+    assert 'disclosureOpen("item", item.reference_item_id, true)' in panel
     assert 'disclosureOpen("advisories", "", false)' in panel
     # Lane order is user-controlled, so the memory is keyed on the lane's durable
     # id; an index key would hand a moved lane the other lane's expanded groups.
@@ -1681,7 +1682,7 @@ def test_reference_item_editor_defers_the_prompt_to_the_lane_panel():
     # A bare inline input could only offer the override half of the contract:
     # it has no way to show the derived text the override replaces.
     assert "prompt_override" not in block
-    assert 'this._makeBtn("Lane Setup…"' in block
+    assert 'this._makeBtn("Reference Lane Setup…"' in block
     assert "_showReferenceLanePanel(laneEntry)" in block
     strength = block.split('this._makeEditorLabel("Strength:")', 1)[1]
     assert 'strengthInput.addEventListener("change"' in strength

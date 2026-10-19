@@ -397,6 +397,9 @@ export const SCENE_MUTATION_COALESCING = Object.freeze({
         "creates a durable identity other operations in the same intent refer "
         + "to. `_updateSceneGlobalContextWithinGesture` PREPENDS these, and they "
         + "are consumed once -- a replacement loses them outright."),
+    create_prompt_identity_with_sources: preserved(
+        "the Attach dialog's identity create; the chip in the same intent binds "
+        + "it, and it is consumed once -- a replacement loses it outright."),
     create_link_group: preserved(
         "`_add_link_group` runs `_unlink_refs` first, so two of them are not two "
         + "assignments to one row."),

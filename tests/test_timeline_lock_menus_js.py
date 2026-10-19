@@ -436,7 +436,7 @@ def test_unlocked_reference_menu(menus):
     assert _labels(menus["reference_unlocked"]) == [
         "Mute Selected (1)",
         "Set Selection to Reference",
-        "Reference Lane Setup",
+        "Reference Lane Setup…",
         "Delete Reference [danger]",
     ]
 
@@ -614,7 +614,7 @@ def test_a_locked_item_gets_its_own_menu_without_touching_the_selection(menus):
         "reference_locked": [
             "Mute (locked) [disabled]",
             "Set Selection to Reference",
-            "Reference Lane Setup",
+            "Reference Lane Setup…",
             "Delete Reference (locked) [disabled] [danger]",
         ],
         "motion_driver_locked": [

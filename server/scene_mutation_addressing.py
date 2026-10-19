@@ -98,6 +98,7 @@ SCENE_MUTATION_ADDRESSING: dict[str, Entry] = {
     "delete_prompt_semantic_unit_if_unreferenced": Entry(
         DURABLE, ids=("semantic_unit_id",)),
     "create_prompt_semantic_unit": Entry(DURABLE, ids=("unit.semantic_unit_id",)),
+    "create_prompt_identity_with_sources": Entry(DURABLE, ids=("unit.semantic_unit_id",)),
 
     # --- names no row and no document-derived destination ------------------
     "update_scene_fields": Entry(UNADDRESSED, refine="lane_count_fields"),

@@ -4270,6 +4270,135 @@ def _apply_create_prompt_semantic_unit(
             "semantic_unit_id": unit_id, "unit": copy.deepcopy(unit)}
 
 
+# One identity may cite many members, but not an unbounded list: the editor
+# shows every source row, and a compile walks them per chip.
+MAX_PROMPT_IDENTITY_SOURCES = 64
+
+
+def _validated_prompt_identity_sources(project: TimelineProject, profile, sources,
+                                       *, previous=(), identity_name="") -> list:
+    """Refuse identity sources a write is ADDING that cannot resolve.
+
+    A source must name a Library member of the entity it says owns it, and its
+    contribution must be empty or come from the format's contribution
+    vocabulary. Sources already stored on the identity are tolerated as they
+    are: deleting a member prunes them, and the identity editor shows what
+    remains as "Missing saved sources" for repair, so refusing them would make
+    every later edit of that identity unsavable.
+    """
+    sources = list(sources or [])
+    if len(sources) > MAX_PROMPT_IDENTITY_SOURCES:
+        _mutation_error(
+            f"A Prompt Identity may cite at most {MAX_PROMPT_IDENTITY_SOURCES} sources.",
+            400, "prompt_identity_sources_over_cap")
+    stored = {(str(value.get("entity_id") or ""), str(value.get("member_id") or ""))
+              for value in previous or [] if isinstance(value, dict)}
+    owners = {member.member_id: reference.reference_id
+              for reference in project.references for member in reference.members}
+    # No profile: a project-level write that serves scenes under several
+    # formats, so only membership is checked.
+    vocabulary = None if profile is None else {
+        str(entry.get("value") or "")
+        for entries in prompt_context.effective_contribution_catalog(profile).values()
+        if isinstance(entries, list)
+        for entry in entries if isinstance(entry, dict)}
+    for source in sources:
+        key = (str(source.get("entity_id") or ""), str(source.get("member_id") or ""))
+        if key in stored:
+            continue
+        if owners.get(key[1]) != key[0]:
+            subject = f"{identity_name!r} cites" if identity_name else "A Prompt Identity cites"
+            _mutation_error(
+                f"{subject} a Library member that is no longer in its Reference "
+                f"(member {key[1]!r}, Reference {key[0]!r}). Choose its sources again.",
+                409, "prompt_identity_source_missing")
+        contribution = str(source.get("contribution") or "")
+        if vocabulary is not None and contribution and contribution not in vocabulary:
+            _mutation_error(
+                f"Contribution {contribution!r} is not declared by the active prompt format.",
+                400, "prompt_identity_contribution_undeclared")
+    return sources
+
+
+def _prompt_identity_create_fields(unit) -> dict:
+    """The authored fields one identity create decides; the server owns the rest."""
+    value = copy.deepcopy(unit)
+    for key in ("semantic_unit_id", "handle", "order"):
+        value.pop(key, None)
+    return value
+
+
+def _apply_create_prompt_identity_with_sources(
+        project: TimelineProject, scene: Scene, op: dict, *, template=None,
+        validate_sources=True) -> dict:
+    """Create one authored Prompt Identity, physical sources included.
+
+    The Attach dialog's "New identity…" route: the same fields as the identity
+    editor, committed in the scene transaction that binds the chip, so the
+    gesture is one Undo step and a Writing draft can hold it until Apply. A new
+    operation rather than a field on `create_prompt_semantic_unit`, which an
+    older server would accept while silently dropping the sources. Any kind the
+    format declares may be created here, speaking or not.
+
+    A preview overlay passes `validate_sources=False`: a pending Writing create
+    may cite a member deleted since it was drafted, and the compile's own
+    `broken_reference_source` names that on the chip instead of the whole
+    preview failing. Apply always validates.
+    """
+    raw = op.get("unit") if isinstance(op.get("unit"), dict) else {}
+    unit_id = str(raw.get("semantic_unit_id") or "").strip()
+    if not unit_id:
+        _mutation_error("A client-stable Prompt Identity id is required", 400,
+                        "invalid_prompt_semantic_unit")
+    if not str(raw.get("name") or "").strip():
+        _mutation_error("Prompt Identity name is required", 400,
+                        "invalid_prompt_semantic_unit")
+    if template is None:
+        template = prompt_channel_templates.resolve_channel_template(project.metadata)
+    try:
+        profile = prompt_context.resolve_profile(
+            _scene_prompt_context_profile_key(project, scene),
+            template=template,
+            custom_profiles=getattr(project, "prompt_context_profiles", []),
+        )
+    except prompt_context.ProfileResolutionError as exc:
+        _mutation_error(f"The active prompt format cannot create an identity: {exc}",
+                        409, "invalid_prompt_context_profile")
+    # `voice` is the retired voice binding; a new identity declares its voice
+    # as an audio source, so a client-sent one is not adopted.
+    unit = prompt_context.normalize_semantic_unit({
+        **{key: copy.deepcopy(value) for key, value in raw.items() if key != "voice"},
+        "semantic_unit_id": unit_id, "name": str(raw.get("name") or "").strip()})
+    if not prompt_context.identity_kind_for(profile, unit["kind"]):
+        _mutation_error(
+            f"Identity kind {unit['kind']!r} is not declared by the active prompt format.",
+            400, "prompt_identity_kind_undeclared")
+    existing = next((value for value in project.prompt_semantic_units
+                     if isinstance(value, dict)
+                     and str(value.get("semantic_unit_id") or "") == unit_id), None)
+    if existing is not None:
+        # A retry can replay a committed client id. It is the same request
+        # only when every authored field, sources included, is the same.
+        if (_prompt_identity_create_fields(prompt_context.normalize_semantic_unit(existing))
+                != _prompt_identity_create_fields(unit)):
+            _mutation_error(
+                f"Prompt Identity id {unit_id!r} already has a different definition.",
+                409, "prompt_semantic_unit_collision")
+        return {"type": "create_prompt_identity_with_sources", "created": False,
+                "semantic_unit_id": unit_id, "unit": copy.deepcopy(existing)}
+    if validate_sources:
+        unit["sources"] = _validated_prompt_identity_sources(
+            project, profile, unit["sources"], identity_name=unit["name"])
+    unit["handle"] = _materialized_prompt_handle(
+        project, op.get("handle_suggestion"), "prompt identity", unit_id)
+    unit["order"] = max(
+        [int(value.get("order") or 0) for value in project.prompt_semantic_units
+         if isinstance(value, dict)] or [-1]) + 1
+    project.prompt_semantic_units.append(unit)
+    return {"type": "create_prompt_identity_with_sources", "created": True,
+            "semantic_unit_id": unit_id, "unit": copy.deepcopy(unit)}
+
+
 def _prompt_semantic_unit_is_referenced(project: TimelineProject,
                                         unit_id: str) -> bool:
     """Whether a live authored scene still names one Prompt Identity."""
@@ -5660,6 +5789,8 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
         return _apply_prompt_context_dependencies(project, op)
     if op_type == "create_prompt_semantic_unit":
         return _apply_create_prompt_semantic_unit(project, scene, op)
+    if op_type == "create_prompt_identity_with_sources":
+        return _apply_create_prompt_identity_with_sources(project, scene, op)
     if op_type == "delete_prompt_semantic_unit_if_unreferenced":
         return _apply_delete_prompt_semantic_unit_if_unreferenced(project, op)
     if op_type == "swap_prompt_sections":
@@ -5826,6 +5957,7 @@ def _apply_scene_mutation_batch(project: TimelineProject, scene_id: str,
     if any(str(operation.get("type") or "") in {
                "import_prompt_context_dependencies",
                "create_prompt_semantic_unit",
+               "create_prompt_identity_with_sources",
                "delete_prompt_semantic_unit_if_unreferenced",
            }
            for operation in operations if isinstance(operation, dict)):
@@ -11054,13 +11186,18 @@ def _prepare_prompt_context_candidate_sync(
         compile_project = copy.deepcopy(project)
         try:
             for raw_create in raw_creates:
-                if (not isinstance(raw_create, dict)
-                        or raw_create.get("type") != "create_prompt_semantic_unit"):
+                create_type = raw_create.get("type") if isinstance(raw_create, dict) else None
+                if create_type == "create_prompt_identity_with_sources":
+                    _apply_create_prompt_identity_with_sources(
+                        compile_project, candidate, raw_create, template=template,
+                        validate_sources=False)
+                elif create_type == "create_prompt_semantic_unit":
+                    _apply_create_prompt_semantic_unit(
+                        compile_project, candidate, raw_create, template=template)
+                else:
                     _mutation_error(
                         "Invalid Prompt Identity preview create", 400,
                         "invalid_prompt_semantic_unit_overlay")
-                _apply_create_prompt_semantic_unit(
-                    compile_project, candidate, raw_create, template=template)
         except ProjectMutationRequestError as exc:
             payload = {"error": exc.message, "code": exc.code}
             if exc.details is not None:
@@ -11993,12 +12130,19 @@ if routes is not None:
             ids = [value["semantic_unit_id"] for value in units]
             if len(ids) != len(set(ids)):
                 return _json_error("Duplicate prompt semantic unit id", 400)
+            stored_sources = {
+                str(value.get("semantic_unit_id") or ""): value.get("sources") or []
+                for value in project.prompt_semantic_units if isinstance(value, dict)}
             try:
                 for unit in units:
                     handle = _validated_prompt_handle(unit.get("handle"))
                     _require_prompt_handle_available(
                         project, handle, "prompt identity",
                         unit["semantic_unit_id"], semantic_units=units)
+                    _validated_prompt_identity_sources(
+                        project, None, unit.get("sources"),
+                        previous=stored_sources.get(unit["semantic_unit_id"], ()),
+                        identity_name=str(unit.get("name") or ""))
             except ProjectMutationRequestError as exc:
                 return _mutation_json_error(exc)
             project.prompt_semantic_units = units

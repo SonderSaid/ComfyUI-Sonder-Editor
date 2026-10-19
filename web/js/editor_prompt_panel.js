@@ -997,6 +997,14 @@ export function mountPromptManagementPanel(host) {
         if (defaultsDrafts.projectKey !== projectKey) defaultsDrafts = { projectKey, drafts: new Map() };
         return defaultsDrafts.drafts;
     };
+    let overrideDraftStore = { projectKey: "", drafts: new Map() };
+    const referenceOverrideDrafts = () => {
+        const projectKey = String(host._projectDirName?.() || "");
+        if (overrideDraftStore.projectKey !== projectKey) {
+            overrideDraftStore = { projectKey, drafts: new Map() };
+        }
+        return overrideDraftStore.drafts;
+    };
     const acceptDraftConfiguration = (result) => {
         const configured = promptAttachmentConfiguration(result);
         const intent = configured.identityCreateIntent;
@@ -1172,9 +1180,12 @@ export function mountPromptManagementPanel(host) {
     };
     const writingSemanticUnits = () => [
         ...(host._promptSemanticUnits || []),
+        // A pending identity carries its own sources, so eligibility and
+        // "cites this picture" are right before Apply. Its handle stays empty:
+        // a suggestion is never a resolvable handle until the server stores it.
         ...writingState.pendingSemanticUnitCreates.map((intent) => ({
             ...structuredClone(intent.unit || {}),
-            handle: "", sources: [],
+            handle: "", sources: structuredClone(intent.unit?.sources || []),
             _pending_create: true,
         })),
     ];
@@ -1996,6 +2007,7 @@ Server value: ${serverValue}` : ""}`;
                 draftArea?.promptDocument || writingState.document).nodes.some((node) =>
                 node.attachment_id === attachment.attachment_id);
             return configurePromptAttachment(attachment, {
+                assets: host._allProjectAssetsForGallery?.() || [],
                 // An existing Shot's role; a new one's comes from Insert at cursor.
                 shotOpensSection: anchored ? draftShotPlacement({
                     attachmentId: attachment.attachment_id }).opensSection : undefined,
@@ -2866,6 +2878,7 @@ Server value: ${serverValue}` : ""}`;
                         onAdd: async (kind) => {
                             const configured = acceptDraftConfiguration(
                                 await configurePromptAttachment({ kind }, {
+                                assets: host._allProjectAssetsForGallery?.() || [],
                                 referenceProsePolicy: host._referenceProsePolicy,
                                 scene: attachmentScene,
                                 references: offerableReferences(),
@@ -2894,6 +2907,7 @@ Server value: ${serverValue}` : ""}`;
                         onActivate: async (attachment) => {
                             const configured = acceptDraftConfiguration(
                                 await configurePromptAttachment(attachment, {
+                                assets: host._allProjectAssetsForGallery?.() || [],
                                 referenceProsePolicy: host._referenceProsePolicy,
                                 scene: attachmentScene,
                                 references: offerableReferences(),
@@ -3811,6 +3825,14 @@ Server value: ${serverValue}` : ""}`;
             storedHandleFor: (memberId) => host._referenceStoredHandle?.(memberId) ?? "",
             handleCollision: (handle, memberId) => host._promptHandleCollision?.(handle, memberId) || null,
             defaultsDrafts: referenceDefaultsDrafts(),
+            // Reference Prompting's override rows: the lane panel's own item
+            // writer, drafts that survive this panel's remounts, and the
+            // panel's first-Escape-reverts handling.
+            writeReferenceItem: (itemId, intent, label) =>
+                host._writeReferenceItemFromPanel?.(itemId, intent, label),
+            overrideDrafts: referenceOverrideDrafts(),
+            registerBoxGuard: registerPromptBoxGuard,
+            isCommitSuppressed: () => guard.suppressBlurCommit,
             attachReference,
             assetPreviewUrl: (asset) => host._referenceAssetPreviewUrl?.(asset),
             confirm: (message) => globalThis.confirm?.(message) ?? false,
@@ -3927,6 +3949,7 @@ Server value: ${serverValue}` : ""}`;
                 || `Global ${key}. Each section chooses whether to take it.`;
 
             const configureGlobalAttachment = (attachment, anchoredChannels = [key]) => configurePromptAttachment(attachment, {
+                assets: host._allProjectAssetsForGallery?.() || [],
                 referenceProsePolicy: host._referenceProsePolicy,
                 scene: { ...(scene || {}), _context_channel_keys: globalKeys,
                     _context_reference_frame_threshold: host._referenceFrameThreshold || 0 },
@@ -4114,6 +4137,7 @@ Server value: ${serverValue}` : ""}`;
             .filter((node) => node.type === "attachment")
             .map((node) => node.attachment_id));
         const configureGlobalScope = (attachment) => configurePromptAttachment(attachment, {
+            assets: host._allProjectAssetsForGallery?.() || [],
             referenceProsePolicy: host._referenceProsePolicy,
             scene: { ...(scene || {}), _context_channel_keys: globalKeys,
                 _context_reference_frame_threshold: host._referenceFrameThreshold || 0 },
@@ -4293,6 +4317,7 @@ Server value: ${serverValue}` : ""}`;
                 caption.textContent = key;
                 caption.title = channel.description || `${key} channel`;
                 const configureChannelAttachment = (attachment, anchoredChannels = [key]) => configurePromptAttachment(attachment, {
+                    assets: host._allProjectAssetsForGallery?.() || [],
                     shotOpensSection: promptShotDialogRole({
                         attachment, attachments: sectionAttachments,
                         shotChannel: template.shot_marker_channel,
@@ -4526,6 +4551,7 @@ Server value: ${serverValue}` : ""}`;
             };
             const scopeHost = document.createElement("div");
             const configureScope = (attachment) => configurePromptAttachment(attachment, {
+                assets: host._allProjectAssetsForGallery?.() || [],
                 referenceProsePolicy: host._referenceProsePolicy,
                 scene: { ...(scene || {}), _context_channel_keys: channelKeys,
                     _context_consumer_start: section.start_frame,

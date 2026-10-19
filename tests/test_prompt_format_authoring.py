@@ -648,8 +648,9 @@ def test_modal_dismissal_is_guarded_without_blocking_teardown():
     Prompt panel's own OVERLAY consumer closes the panel underneath the modal.
     """
     panel = (ROOT / "web/js/prompt_identity_panel.js").read_text(encoding="utf-8")
-    editor = panel[panel.index("function openIdentityEditor("):
-                   panel.index("export function mountPromptIdentityPanel(")]
+    # The identity editor is its own module, shared with the Attach dialog.
+    editor_module = (ROOT / "web/js/prompt_identity_editor.js").read_text(encoding="utf-8")
+    editor = editor_module[editor_module.index("export function openIdentityEditor("):]
 
     close_body = editor[editor.index("const close = () => {"):]
     close_body = close_body[:close_body.index("};")]
@@ -671,7 +672,7 @@ def test_modal_dismissal_is_guarded_without_blocking_teardown():
     # like every other draft-holding modal. It was unguarded while it asked only
     # "where", when a dirty-confirm on a dropdown would have been noise.
     picker = panel[panel.index("function openAttachmentTargetPicker("):
-                   panel.index("function openIdentityEditor(")]
+                   panel.index("export function mountPromptIdentityPanel(")]
     assert "createModalDraftGuard({" in picker
     assert "event.target === backdrop && draftGuard.confirmDismiss()" in picker
     assert 'cancel.addEventListener("click", close);' in picker

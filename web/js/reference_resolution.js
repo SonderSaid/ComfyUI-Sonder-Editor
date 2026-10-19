@@ -105,17 +105,38 @@ export function memberPromptFragment(pattern, index, prompt, name, registryNumbe
  * disabled chip, and the compiler dedupes `derived_prompt` per reference item,
  * so an unfiltered number would claim *use* where there is only attachment.
  * Callers say "attached", never "used by".
+ *
+ * Under a format that binds chips to physical members and identities rather
+ * than to whole items (MiniMax H3 Full Reference), a chip is attached to an
+ * item when it cites one of the item's members, directly or through an
+ * identity's sources. `declaredSources` selects that reading.
  */
-export function countAttachedReferenceChips({ scene = null, referenceItemId = "" } = {}) {
+export function countAttachedReferenceChips({ scene = null, referenceItemId = "",
+    declaredSources = false, semanticUnits = [] } = {}) {
     const itemId = String(referenceItemId || "");
     if (!scene || !itemId) return 0;
     const attachments = [
         ...(scene.global_attachments || []),
         ...(scene.prompt_sections || []).flatMap((section) => section.attachments || []),
-    ];
-    return attachments.filter((attachment) => attachment?.kind === "reference"
-        && attachment?.enabled !== false
-        && String(attachment?.source?.reference_item_id || "") === itemId).length;
+    ].filter((attachment) => attachment?.kind === "reference" && attachment?.enabled !== false);
+    if (!declaredSources) {
+        return attachments.filter((attachment) =>
+            String(attachment?.source?.reference_item_id || "") === itemId).length;
+    }
+    const item = (scene.reference_items || []).find((row) =>
+        String(row?.reference_item_id || "") === itemId);
+    const memberIds = new Set((item?.members || [])
+        .map((member) => String(member?.member_id || "")).filter(Boolean));
+    if (!memberIds.size) return 0;
+    const citingUnits = new Set((semanticUnits || []).filter((unit) =>
+        (unit?.sources || []).some((source) => memberIds.has(String(source?.member_id || ""))))
+        .map((unit) => String(unit.semantic_unit_id || "")));
+    return attachments.filter((attachment) => {
+        const source = attachment?.source || {};
+        return ["picture_ids", "video_ids", "audio_ids"].some((key) =>
+            (source[key] || []).some((id) => memberIds.has(String(id || ""))))
+            || (source.semantic_unit_ids || []).some((id) => citingUnits.has(String(id || "")));
+    }).length;
 }
 
 export function deriveReferencePrompt({ promptOverride = "", members = [], soft = {} } = {}) {

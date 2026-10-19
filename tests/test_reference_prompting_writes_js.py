@@ -26,6 +26,8 @@ class N {
     this.checked=false; this.classNames=[]; this.classList={add:(value)=>this.classNames.push(value)}; }
   appendChild(c) { this.children.push(c); c.parentElement=this; if (c.tagName==="OPTION") this.options.push(c); return c; }
   append(...cs) { cs.forEach((c)=>c?.tagName && this.appendChild(c)); }
+  insertBefore(c, ref) { const i=ref ? this.children.indexOf(ref) : -1;
+    if (i < 0) return this.appendChild(c); this.children.splice(i, 0, c); c.parentElement=this; return c; }
   insertAdjacentElement(_where, c) { const list=this.parentElement.children;
     list.splice(list.indexOf(this)+1, 0, c); c.parentElement=this.parentElement; return c; }
   remove() { if (this.parentElement) this.parentElement.children=this.parentElement.children.filter((x)=>x!==this); }
@@ -199,3 +201,129 @@ def test_a_second_handle_edit_before_the_panel_redraws_is_guarded_by_the_first()
     return writes.map((write) => [write.drawn.handle, write.fields.handle]);
     """)
     assert result == [["", "First"], ["First", "Second"]]
+
+
+# -- Prompt-tool override rows (Reference Prompting Streamline, Phase 2) -----------
+
+_OVERRIDE = r"""
+const itemWrites=[]; const overrideDrafts=new Map(); const guards=[]; let suppressed=false;
+let liveScene=null;
+const scene={ reference_lane_count:1, duration_frames:120,
+  reference_lane_recipes:[{ lane_id:"lane-a", recipe:{ name:"Cast", soft:{} } }],
+  reference_items:[{ reference_item_id:"item-1", lane_index:0, start_frame:0, end_frame:120,
+    members:[{entity_id:"reference-1",member_id:"member-1"},{entity_id:"reference-1",member_id:"member-2"}],
+    prompt_override:"" }] };
+const references=[{reference_id:"reference-1",name:"Cast",members:[
+  {member_id:"member-1",name:"Hat",asset_id:"asset-1",prompt:"a wide straw hat"},
+  {member_id:"member-2",name:"Boot",asset_id:"asset-2",prompt:"a scuffed leather boot"}]}];
+const mountOverride=(profile={}, sceneValue=scene)=>{ const root=new N("div"); mod.mountPromptIdentityPanel(root, {
+  profile, candidate:{window:{start_frame:0,end_frame:120}}, scene:sceneValue, references,
+  assets:[], semanticUnits:[],
+  // The host writer applies a function intent to the row it holds NOW.
+  writeReferenceItem:(itemId, intent, label)=>{
+    const live=(liveScene || sceneValue).reference_items.find((i)=>i.reference_item_id===itemId);
+    const fields=typeof intent==="function" ? intent(live) : intent;
+    itemWrites.push({itemId, fields, label}); return Promise.resolve("ok"); },
+  overrideDrafts, registerBoxGuard:(box, stored)=>guards.push({box, stored}),
+  isCommitSuppressed:()=>suppressed,
+  onRefresh(){}, onError:(error)=>errors.push(error.message),
+}); return root; };
+const overrideBox=(root)=>find(root,(n)=>n.tagName==="TEXTAREA" && n.dataset.referenceItemId==="item-1");
+const rowText=(root)=>walk(find(root,(n)=>n.dataset?.sonderPromptOverride==="item-1")?.parentElement || new N("x"))
+  .map((n)=>n.textContent).filter(Boolean);
+"""
+
+
+def _run_override(body):
+    return _run(_OVERRIDE + body)
+
+
+def test_edit_as_override_derives_from_the_live_members():
+    """The button computes its text when the host acts, from the live row: a
+    reconcile that dropped a member since the panel drew is honoured."""
+    result = _run_override("""
+    const root = mountOverride();
+    liveScene = structuredClone(scene);
+    liveScene.reference_items[0].members = [scene.reference_items[0].members[1]];
+    const { deriveReferencePrompt } = await import(__RESOLUTION__);
+    const expected = deriveReferencePrompt({ promptOverride: "", soft: {},
+      members: [{ entity_name: "Cast", member_name: "Boot", prompt: "a scuffed leather boot" }] });
+    await button(root, "Edit as override").dispatch("click");
+    return { writes: itemWrites, expected };
+    """.replace("__RESOLUTION__", json.dumps((ROOT / "web/js/reference_resolution.js").as_uri())))
+    assert result["expected"] and "straw hat" not in result["expected"]
+    assert result["writes"] == [{"itemId": "item-1",
+                                 "fields": {"prompt_override": result["expected"]},
+                                 "label": "override reference prompt"}]
+
+
+def test_an_override_draft_survives_a_remount_and_saves_on_blur():
+    result = _run_override("""
+    scene.reference_items[0].prompt_override = "stored text";
+    const first = mountOverride();
+    const box = overrideBox(first);
+    box.value = "typed text";
+    await box.dispatch("input");
+    // The panel remounts on every render: the typed text comes back.
+    const again = mountOverride();
+    const reopened = overrideBox(again).value;
+    await overrideBox(again).dispatch("blur");
+    return { reopened, writes: itemWrites, draftsLeft: overrideDrafts.size,
+      guarded: guards.length >= 2 && guards.at(-1).stored() };
+    """)
+    assert result == {"reopened": "typed text", "draftsLeft": 0, "guarded": "stored text",
+                      "writes": [{"itemId": "item-1", "fields": {"prompt_override": "typed text"},
+                                  "label": "edit reference prompt override"}]}
+
+
+def test_an_escape_reverted_override_box_does_not_save_on_blur():
+    result = _run_override("""
+    scene.reference_items[0].prompt_override = "stored text";
+    const box = overrideBox(mountOverride());
+    box.value = "typed text";
+    await box.dispatch("input");
+    // The panel's first Escape puts the stored text back and suppresses the blur.
+    box.value = guards.at(-1).stored();
+    suppressed = true;
+    await box.dispatch("blur");
+    return { writes: itemWrites.length, draftsLeft: overrideDrafts.size };
+    """)
+    assert result == {"writes": 0, "draftsLeft": 0}
+
+
+def test_clear_goes_back_to_the_derived_text():
+    result = _run_override("""
+    scene.reference_items[0].prompt_override = "stored text";
+    const root = mountOverride();
+    await button(root, "Clear").dispatch("click");
+    return itemWrites;
+    """)
+    assert result == [{"itemId": "item-1", "fields": {"prompt_override": ""},
+                       "label": "clear reference prompt override"}]
+
+
+def test_h3_labels_the_override_as_prompt_bridge_only():
+    result = _run_override("""
+    const h3 = rowText(mountOverride({ physical_populations: [{ key: "pictures", label: "Picture",
+      source_key: "picture_ids", label_template: "<Picture {n}>" }] }));
+    const generic = rowText(mountOverride({}));
+    const label = "Override: Prompt Bridge / Generic formats only";
+    return { h3: h3.includes(label), generic: generic.includes(label),
+      copy: !!button(mountOverride({}), "Copy") };
+    """)
+    assert result == {"h3": True, "generic": False, "copy": True}
+
+
+def test_a_locked_lane_shows_its_override_controls_locked():
+    result = _run_override("""
+    scene.reference_lane_configs = [{ locked: true }];
+    const fresh = mountOverride();
+    scene.reference_items[0].prompt_override = "stored text";
+    const overridden = mountOverride();
+    const state = (b) => ({ disabled: !!b?.disabled || b?.attributes?.["aria-disabled"] === "true",
+      title: b?.title });
+    return { take: state(button(fresh, "Edit as override")), clear: state(button(overridden, "Clear")),
+      box: overrideBox(overridden).disabled };
+    """)
+    assert result["take"]["disabled"] and result["clear"]["disabled"] and result["box"] is True
+    assert "Unlock the lane" in result["take"]["title"]

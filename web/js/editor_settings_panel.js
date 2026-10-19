@@ -1586,7 +1586,15 @@ function showSettingsPanel() {
 
     const referencesSection = createSection(
         "References",
-        "Project-wide fitting for individual reference images and video frames. Sheet grids and strips use their recipe's layout."
+        "Fit Mode and Crop Anchor are PROJECT-WIDE fitting for individual reference images and video frames; sheet grids and strips use their recipe's layout. The rest are browser-local preferences."
+    );
+    createCheckbox(
+        referencesSection,
+        "openLaneSetupOnFirstStage",
+        "Open Lane Setup on First Item (browser)",
+        "After you drop the first item onto a new or empty Reference lane, open Reference Lane Setup to choose its template. A browser preference, not saved with the project.",
+        () => this._settings.references?.openLaneSetupOnFirstStage !== false,
+        (checked) => updateCategory("references", "openLaneSetupOnFirstStage", checked)
     );
     const commitReferenceFraming = (field, value) => {
         // The host shows the choice while it saves and restores the saved value

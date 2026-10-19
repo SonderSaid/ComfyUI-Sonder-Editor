@@ -289,6 +289,13 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             if (event.isComposing || event.keyCode === 229) return false;
             if (event.target?.dataset?.sonderReferenceTemplate === "1"
                     && event.target._sonderTemplateKeydown?.(event)) return true;
+            // The prompt preview is a button-like div: Enter or Space opens it.
+            if (event.target?.dataset?.sonderReferencePromptPreview
+                    && (event.key === "Enter" || event.key === " ")) {
+                event.preventDefault();
+                host._showPromptManagementPanel?.();
+                return true;
+            }
             if (event.key !== "Escape") return false;
             if (state.pickerItemId) {
                 // First Esc closes an open member picker; a second closes the panel.
@@ -1504,24 +1511,147 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
     // Names the two exits without claiming either is live. The Bridge half
     // reads the recipe's own output declaration, which the panel does know;
     // whether a graph WIRED that socket it cannot know, so it never says wired.
-    const promptExitNote = (item) => {
+    // Counted the way the active format binds chips: by item for Generic, by
+    // the item's members (directly or through an identity) for H3.
+    const promptExitNote = (item, activeProfile) => {
         const attached = countAttachedReferenceChips({
-            scene: host.activeScene, referenceItemId: item.reference_item_id });
+            scene: host.activeScene, referenceItemId: item.reference_item_id,
+            declaredSources: Boolean(activeProfile?.physical_populations?.length),
+            semanticUnits: host._promptSemanticUnits || [] });
         const bridgeLive = referenceLiveOutputs(laneRecipe().recipe?.hard).has("reference_prompt");
-        const parts = [
-            attached
-                ? `Attached to ${attached} prompt chip${attached === 1 ? "" : "s"}`
-                : "Not attached to any prompt chip",
-            bridgeLive
-                ? "available on the Prompt Bridge reference_prompt output"
-                : "the Prompt Bridge reference_prompt output is off for this recipe",
-        ];
-        const note = el("div", parts.join(" · "),
-            `font-size:9px;color:${COLORS.textMuted};line-height:1.35;`);
+        const note = el("div", "", `font-size:9px;color:${COLORS.textMuted};line-height:1.35;`);
+        // Status is never tinted: the live route reads at weight, not in a hue.
+        const chips = el("span", attached
+            ? `Attached to ${attached} prompt chip${attached === 1 ? "" : "s"}`
+            : "Not attached to any prompt chip",
+        attached ? `font-weight:600;color:${COLORS.text};` : "");
+        note.append(chips, el("span", " · "), el("span", bridgeLive
+            ? "available on the Prompt Bridge reference_prompt output"
+            : "the Prompt Bridge reference_prompt output is off for this recipe",
+        bridgeLive ? `font-weight:600;color:${COLORS.text};` : ""));
+        if (!attached && !bridgeLive) {
+            note.appendChild(el("div",
+                "Attach → Reference on the prompt sections where this text should appear.",
+                "margin-top:2px;"));
+        }
+        note.dataset.sonderReferencePromptExit = item.reference_item_id;
         note.title = "Attach this item as a Reference Context chip in the Prompt tool, "
             + "or wire the Prompt Bridge output in the graph. Both exits are opt-in.";
         return note;
     };
+
+    /** One staged member's line under H3, from the last compiled candidate. */
+    const manifestRowsForItem = (item, activeProfile) => {
+        const manifest = host._windowedPromptCandidate?.()?.setup_manifest || {};
+        const declarations = activeProfile?.physical_populations || [];
+        const units = host._promptSemanticUnits || [];
+        return (item.members || []).map((memberRef) => {
+            const memberId = String(memberRef?.member_id || "");
+            const resolved = host._referenceMemberForRef?.(memberRef);
+            let found = null;
+            for (const declaration of declarations) {
+                const row = (manifest[String(declaration?.key || "")] || []).find((value) =>
+                    String(value?.member_id || value?.video_member_id || "") === memberId);
+                if (row) { found = { declaration, row }; break; }
+            }
+            const citedBy = units.filter((unit) => (unit?.sources || []).some((source) =>
+                String(source?.member_id || "") === memberId))
+                .map((unit) => unit.handle ? `@${unit.handle}` : String(unit.name || ""));
+            const prose = String(found?.row?.member_prompt || resolved?.member?.prompt || "").trim();
+            if (!found) return { memberId, label: "", role: "", prose, citedBy };
+            const number = Number(found.row[`${String(found.declaration.token_kind || "")}_ordinal`] || 0);
+            const label = number > 0
+                ? String(found.declaration.label_template || "").replace("{n}", String(number)) : "";
+            const roleValue = String(found.row.role || "");
+            const roleLabel = referenceRoleChoices(activeProfile, String(found.declaration.key || ""))
+                .find((entry) => String(entry.value) === roleValue)?.label || roleValue;
+            return { memberId, label, role: String(roleLabel || ""), prose, citedBy,
+                populationLabel: String(found.declaration.label || "") };
+        });
+    };
+
+    // The read-only preview. Words are edited in the Prompt tool's Reference
+    // Prompting; recipe syntax stays in this panel's recipe form.
+    const renderPromptPreview = (item, { activeProfile = null, verdict = "" } = {}) => {
+        const preview = el("div", "", `display:flex;flex-direction:column;gap:3px;padding:5px 7px;border:1px solid ${COLORS.border};border-radius:5px;cursor:pointer;`);
+        preview.dataset.sonderReferencePromptPreview = item.reference_item_id;
+        preview.title = "Edit this text in the Prompt tool's Reference Prompting";
+        // A control, so the keyboard reaches it as well as the pointer.
+        preview.tabIndex = 0;
+        preview.setAttribute("role", "button");
+        preview.setAttribute("aria-label", "Open Prompt Management to edit this item's prompt text");
+        // Enter and Space reach it through the panel's keyboard consumer.
+        preview.addEventListener("click", () => host._showPromptManagementPanel?.());
+        const declared = Boolean(activeProfile?.physical_populations?.length);
+        const line = (text, css = "") => el("div", text,
+            `font-size:11px;line-height:1.4;color:${COLORS.text};white-space:pre-wrap;word-break:break-word;${css}`);
+        if (!declared) {
+            const overridden = !!item.prompt_override;
+            const text = overridden ? item.prompt_override : derivedPrompt(item);
+            preview.appendChild(line(text || "No prompt text.", text ? "" : `color:${COLORS.textMuted};`));
+            if (overridden) {
+                preview.appendChild(el("div", "Overridden in the Prompt tool",
+                    `font-size:9px;color:${COLORS.textMuted};`));
+            }
+            return preview;
+        }
+        // Named after this lane's population: a Video lane has no picture numbers.
+        const populationKey = String(laneRecipe().recipe?.soft?.physical_population || "");
+        const populationLabel = String((activeProfile?.physical_populations || []).find((value) =>
+            String(value?.key || "") === populationKey)?.label || "picture").toLowerCase();
+        for (const row of manifestRowsForItem(item, activeProfile)) {
+            const head = row.label
+                ? [row.label, row.role, row.prose || "No Library text"].filter(Boolean).join(" · ")
+                : `${verdict && verdict !== "winner" ? "Not in the current window" : "Not staged in the last compile"} — no ${populationLabel} number yet${row.prose ? ` · ${row.prose}` : ""}`;
+            preview.appendChild(line(head, row.label ? "" : `color:${COLORS.textMuted};`));
+            if (row.citedBy.length) {
+                preview.appendChild(el("div", `Cited by ${row.citedBy.join(", ")}`,
+                    `font-size:9px;color:${COLORS.textMuted};`));
+            }
+        }
+        return preview;
+    };
+    // Repaints only the preview and attached-count nodes when a compile
+    // lands, so focus in the recipe form survives. Compares what they read:
+    // the staged manifest, identity handles and sources, and chip sources.
+    let lastPreviewSignature = "";
+    const previewSignature = () => JSON.stringify([
+        host._windowedPromptCandidate?.()?.setup_manifest || {},
+        (host._promptSemanticUnits || []).map((unit) => [unit?.semantic_unit_id, unit?.handle,
+            unit?.name, unit?.sources]),
+        [...(host.activeScene?.global_attachments || []),
+            ...(host.activeScene?.prompt_sections || []).flatMap((section) => section?.attachments || [])]
+            .filter((attachment) => attachment?.kind === "reference")
+            .map((attachment) => [attachment.source, attachment.enabled]),
+    ]);
+    const refreshPromptPreviews = () => {
+        if (!mounted) return;
+        const signature = previewSignature();
+        if (signature === lastPreviewSignature) return;
+        lastPreviewSignature = signature;
+        const activeProfile = currentActiveProfile();
+        const verdicts = itemVerdicts();
+        for (const node of panel.querySelectorAll("[data-sonder-reference-prompt-preview]")) {
+            const item = liveItem(node.dataset.sonderReferencePromptPreview);
+            if (!item) continue;
+            // Keyboard focus on the preview survives its repaint.
+            const focused = document.activeElement === node;
+            const next = renderPromptPreview(item, { activeProfile,
+                verdict: verdicts.get(item.reference_item_id) || "" });
+            node.replaceWith(next);
+            if (focused) next.focus();
+        }
+        for (const node of panel.querySelectorAll("[data-sonder-reference-prompt-exit]")) {
+            const item = liveItem(node.dataset.sonderReferencePromptExit);
+            if (item) node.replaceWith(promptExitNote(item, activeProfile));
+        }
+    };
+    const currentActiveProfile = () => resolvedPromptProfile({
+        profileId: String(host.activeScene?.prompt_context_profile_id
+            || host._channelTemplate?.()?.default_context_profile || "generic@1"),
+        catalog: host._promptContextCatalog,
+        customProfiles: host._promptContextProfiles,
+    });
 
     /** The prompt `row` derives from its staged members under this lane's recipe. */
     const derivedPrompt = (row) => {
@@ -1537,68 +1667,28 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         return deriveReferencePrompt({ promptOverride: "", members, soft });
     };
 
-    const renderPromptRow = (item, locked) => {
-        const id = item.reference_item_id;
-        const derived = derivedPrompt(item);
+    const renderPromptRow = (item, { activeProfile = null, verdict = "" } = {}) => {
         const overridden = !!item.prompt_override;
+        const declared = Boolean(activeProfile?.physical_populations?.length);
         const wrap = el("div", "", "display:flex;flex-direction:column;gap:4px;");
         const header = el("div", "", `display:flex;align-items:center;gap:6px;font-size:10px;color:${COLORS.textMuted};`);
-        header.appendChild(el("span", overridden ? "Prompt — overridden" : "Prompt — derived from members"));
-        wrap.appendChild(header);
-
-        if (!overridden) {
-            const box = el("textarea", "", chromeInputCss({ padding: "4px 6px", fontSize: "11px" }) + "width:100%;box-sizing:border-box;resize:vertical;min-height:34px;");
-            box.value = derived;
-            box.readOnly = true;
-            box.title = "The text this item derives from its staged members. Two exits can "
-                + "carry it - a Reference Context chip and the Prompt Bridge output - and "
-                + "neither is on by default. Copy it, or take it over as an override.";
-            wrap.appendChild(box);
-            const copy = button("Copy", "Copy the derived prompt");
-            copy.addEventListener("click", async () => {
-                try {
-                    await navigator.clipboard.writeText(derived);
-                    notifySuccess("Derived prompt copied.", { source: "reference-panel-prompt" });
-                } catch {
-                    box.select();
-                }
-            });
-            // Seeding the box from the derived text is explicit: a pre-filled
-            // editable field would freeze the prompt on the first keystroke and
-            // silently stop tracking member changes.
-            const takeOver = button("Edit as override", "Start from this text and edit it freely");
-            takeOver.disabled = locked || !derived;
-            // The text is derived from the LIVE members when the host acts --
-            // after any member edit still saving -- not from this drawn card.
-            takeOver.addEventListener("click", () => void writeField(id, (row) => {
-                const text = derivedPrompt(row);
-                return text ? { prompt_override: text } : null;
-            }, "override reference prompt"));
-            header.append(copy, takeOver);
-            wrap.appendChild(promptExitNote(item));
-            return wrap;
-        }
-
-        const box = el("textarea", "", chromeInputCss({ padding: "4px 6px", fontSize: "11px" }) + "width:100%;box-sizing:border-box;resize:vertical;min-height:34px;");
-        box.value = item.prompt_override || "";
-        box.disabled = locked;
-        box.addEventListener("keydown", (event) => event.stopPropagation());
-        box.dataset.referenceItemId = id;
-        box.addEventListener("change", () => {
-            // No local "unchanged" check: the host decides after any earlier
-            // write on this item has settled, against the row it then holds.
-            void writeField(id, { prompt_override: box.value }, "edit reference prompt override")
-                .then((outcome) => resync(box, outcome, (row) => row.prompt_override || ""));
+        header.appendChild(el("span", declared ? "Prompt — what this item contributes"
+            : overridden ? "Prompt — overridden" : "Prompt — derived from members", "flex:1;min-width:0;"));
+        const copy = button("Copy", "Copy this prompt text");
+        copy.addEventListener("click", async () => {
+            const text = declared
+                ? manifestRowsForItem(item, activeProfile).map((row) =>
+                    [row.label, row.role, row.prose].filter(Boolean).join(" · ")).join("\n")
+                : (overridden ? item.prompt_override : derivedPrompt(item));
+            try {
+                await navigator.clipboard.writeText(text);
+                notifySuccess("Prompt text copied.", { source: "reference-panel-prompt" });
+            } catch {}
         });
-        wrap.appendChild(box);
-        const revert = button("Clear", "Go back to the prompt derived from the staged members");
-        revert.disabled = locked;
-        revert.addEventListener("click", () => void writeField(
-            id, { prompt_override: "" }, "clear reference prompt override"));
-        const derivedNote = el("span", derived ? `derived: ${derived}` : "", `flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
-        derivedNote.title = derived;
-        header.append(derivedNote, revert);
-        wrap.appendChild(promptExitNote(item));
+        header.appendChild(copy);
+        wrap.appendChild(header);
+        wrap.appendChild(renderPromptPreview(item, { activeProfile, verdict }));
+        wrap.appendChild(promptExitNote(item, activeProfile));
         return wrap;
     };
 
@@ -1789,7 +1879,9 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             const advanced = el("details", "", `border-top:1px solid ${COLORS.border};padding-top:4px;`);
             advanced.open = state.pickerItemId === item.reference_item_id
                 || !!invalidMember
-                || disclosureOpen("item", item.reference_item_id, false);
+                // Open unless the author closed it: the panel opens to set up
+                // what was just staged, and the options are that setup.
+                || disclosureOpen("item", item.reference_item_id, true);
             advanced.addEventListener("toggle", () => {
                 rememberDisclosure("item", item.reference_item_id, advanced.open);
             });
@@ -1797,7 +1889,8 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                 `${(item.members || []).length} member${(item.members || []).length === 1 ? "" : "s"} · prompt and per-member options`,
                 `font-size:10px;color:${COLORS.textMuted};cursor:pointer;user-select:none;padding:3px 0;`));
             const advancedBody = el("div", "", "display:flex;flex-direction:column;gap:6px;padding-top:5px;");
-            advancedBody.appendChild(renderPromptRow(item, locked));
+            advancedBody.appendChild(renderPromptRow(item, {
+                activeProfile, verdict: verdicts.get(item.reference_item_id) || "" }));
 
             const members = item.members || [];
             for (const [index, memberRef] of members.entries()) {
@@ -1855,7 +1948,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         border-bottom:1px solid ${COLORS.border}; flex-shrink:0;
     `);
     const titleWrap = el("div");
-    titleWrap.appendChild(el("div", "Reference Lanes", "font-size:15px;font-weight:700;color:#fff;"));
+    titleWrap.appendChild(el("div", "Reference Lane Setup", "font-size:15px;font-weight:700;color:#fff;"));
     const subtitle = el("div", "", `font-size:11px;color:${COLORS.textMuted};margin-top:3px;`);
     titleWrap.appendChild(subtitle);
     const closeBtn = el("button", "Close", chromeButtonCss({ variant: "subtle", padding: "6px 12px", fontSize: "11px", radius: "7px" }));
@@ -1888,6 +1981,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         } finally {
             state.rendering = false;
         }
+        lastPreviewSignature = previewSignature();
         if (restoreTemplateFocus) body.querySelector("[data-sonder-reference-template='1']")?.focus();
     };
 
@@ -2009,6 +2103,11 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         refresh: () => refreshFollowingLane(),
         get laneIndex() { return state.laneIndex; },
         followLane,
+        /** A compiled candidate landed: repaint the prompt previews only. */
+        applyCandidate: () => refreshPromptPreviews(),
+        /** Whether the preview reads the compiled candidate (H3-style
+         *  formats); Generic's preview derives from the recipe alone. */
+        readsCandidate: () => Boolean(currentActiveProfile()?.physical_populations?.length),
     };
     host._referencePanelHandle = handle;
     return handle;

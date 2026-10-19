@@ -1072,8 +1072,11 @@ export function referencePromptDefaults(selected, {
         const sharedValues = unit.attachment_defaults
             && typeof unit.attachment_defaults === "object"
             ? structuredClone(unit.attachment_defaults) : {};
-        const sharedSource = `Shared identity default · @${
-            unit.handle || unit.semantic_unit_id}`;
+        // A Subject Attach is about to create has no handle yet; its name
+        // reads better than its id.
+        const sharedSource = `Shared identity default · ${unit.handle ? `@${unit.handle}`
+            : unit._pending_create ? `${unit.name || "new identity"} (new)`
+                : `@${unit.semantic_unit_id}`}`;
         // Contributing members sit BELOW the identity, matching the server's
         // `_common_member_attachment_defaults` tier: a field inherits only when
         // every contributing member states it and they agree, so conflicting
@@ -1154,24 +1157,43 @@ export function referencePromptDefaults(selected, {
  * contributes a prompt part at all is a property of the Reference; WHERE that
  * part lands stays per-attachment. Identity beats member, and members are
  * consulted only when they all agree, so a disagreement falls through to
- * enabled rather than one member winning by ordering.
+ * enabled rather than one member winning by ordering. Below both sits the
+ * format's default for a chip with no document anchor
+ * (`derived[kind].unanchored_default_enabled`), which never silences text the
+ * chip's author wrote for that part (`authoredText`).
  */
 export function resolveInheritedCapabilityEnabled(capabilityId, {
-    selected = "", references = [], semanticUnits = [] } = {}) {
+    selected = "", references = [], semanticUnits = [],
+    profile = null, anchored = true, authoredText = false } = {}) {
     const wanted = String(capabilityId || "");
     if (!wanted) return true;
+    const formatDefault = () => anchored || authoredText
+        || profile?.capabilities?.reference?.derived?.[wanted]
+            ?.unanchored_default_enabled !== false;
     const value = String(selected || "");
     const unit = (semanticUnits || []).find((row) =>
         String(row?.semantic_unit_id || "") === value);
     if (unit) {
-        return !(unit.disabled_capabilities || []).map(String).includes(wanted);
+        return !(unit.disabled_capabilities || []).map(String).includes(wanted)
+            && formatDefault();
     }
     const physical = value.match(/^physical:[a-z][a-z0-9_]*:(.+)$/);
-    if (!physical) return true;
+    if (!physical) return formatDefault();
     const found = referenceMemberLookup(references).get(physical[1]);
-    if (!found) return true;
+    if (!found) return formatDefault();
     return !(found.member?.disabled_capabilities || [])
-        .map(String).includes(wanted);
+        .map(String).includes(wanted) && formatDefault();
+}
+
+/** The format's own words for why an unstated part follows its default. */
+function inheritedCapabilityTitle(capabilityId, { profile = null, anchored = true,
+    enabled = true } = {}) {
+    if (!anchored && !enabled && profile?.capabilities?.reference?.derived?.[
+        String(capabilityId || "")]?.unanchored_default_enabled === false) {
+        return "Following the format default (off) for a chip attached to the section. Turn it on, or place the chip in the text, to mention here.";
+    }
+    return enabled ? "Following the Reference default (on)."
+        : "Following the Reference default (off).";
 }
 
 export function referenceCapabilityInputProjection(capabilityKind, {
@@ -4631,7 +4653,7 @@ export function promptReferenceSourceOptions({ scene = null, references = [],
             scope: { globalScope, hasSelection },
         });
         return [value.semantic_unit_id,
-            `Subject: ${value.name || value.semantic_unit_id}${eligibility.suffix}`,
+            `${identityKindLabel(resolvedProfile, value.kind)}: ${value.name || value.semantic_unit_id}${eligibility.suffix}`,
             eligibility.eligible];
     };
     // Server auto-minting was retired in 71ee4ba. Only authored identities
@@ -4681,6 +4703,15 @@ export function promptReferenceSourceOptions({ scene = null, references = [],
         options: usesDeclaredSources
             ? [...unitOptions, ...physicalOptions] : itemOptions,
     };
+}
+
+/** The format's own name for an identity kind ("Subject" under H3). */
+export function identityKindLabel(profile, kind = "subject") {
+    const key = String(kind || "subject");
+    const declared = (profile?.identity_kinds || []).find((value) =>
+        String(value?.key || "") === key);
+    return String(declared?.label || "").trim()
+        || `${key[0]?.toUpperCase() || ""}${key.slice(1)}`;
 }
 
 /** Apply one option value from  to a chip. */
@@ -4749,7 +4780,9 @@ export function referenceSummaryEmissionSignatures(value, {
     }));
 }
 
-/** Bounded, deterministic attachment configuration. No provider prose is generated. */
+// The Reference select's "New identity…" row; never a stored source value.
+const NEW_IDENTITY_OPTION = "__new_identity__";
+
 // A diagnostic's Fix asks the chip editor it is about to open to expand its
 // Reference fields and focus one. One-shot and keyed by attachment, so a plain
 // open of the chip never moves focus.
@@ -4760,12 +4793,16 @@ export function requestAttachmentFieldFocus(attachmentId, field) {
         field: String(field || "retention_detail") };
 }
 
+/** Bounded, deterministic attachment configuration. No provider prose is generated. */
 export function configurePromptAttachment(rawAttachment, {
     scene = null, references = [], semanticUnits = [], channelKey = "", profileId = "generic@1",
     scope = "", origin = "", profile = null, placementPhases = [], managedSpeakerSubjectIds = [],
     ordinalManifest = {}, candidate = null, anchoredChannels = [],
-    referenceProsePolicy = "drop", shotOpensSection = undefined,
+    referenceProsePolicy = "drop", shotOpensSection = undefined, assets = [],
 } = {}) {
+    // A copy: "New identity…" adds its pending identity to this dialog's view
+    // without touching the host's list.
+    semanticUnits = [...(semanticUnits || [])];
     // Insert at cursor records the role of the Shot it is about to place
     // (`createPromptContextMenuItems`), keyed by the draft it hands `onCreate`,
     // so no host has to thread it through its own positional parameters.
@@ -5080,6 +5117,122 @@ export function configurePromptAttachment(rawAttachment, {
                     controls.reference.options[index].disabled = value[2] === false;
                 }
             });
+            // "New identity…" opens the same identity editor as Identity
+            // Prompting's +, in pending-create mode: its Save hands the
+            // identity back, and this dialog's Attach creates it and binds the
+            // chip in one gesture. Offered wherever the format declares
+            // identity kinds, named with the format's own label.
+            const identityKinds = (resolvedProfile?.identity_kinds || [])
+                .filter((value) => value?.key);
+            let pendingIdentity = null;
+            let lastReference = controls.reference.value;
+            if (usesDeclaredSources && identityKinds.length) {
+                const option = document.createElement("option");
+                option.value = NEW_IDENTITY_OPTION;
+                option.textContent = identityKinds.length === 1
+                    ? `New ${identityKindLabel(resolvedProfile, identityKinds[0].key)}…`
+                    : "New identity…";
+                controls.reference.insertBefore(option,
+                    controls.reference.options[1 + referenceSources.unitOptions.length] || null);
+            }
+            const seedFromSelection = (value) => {
+                const physical = String(value || "").match(/^physical:(?:picture|video|audio):(.+)$/);
+                const item = String(value || "").match(/^item:(.+)$/);
+                const staged = item ? (Array.isArray(scene?.reference_items)
+                    ? scene.reference_items : []).find((row) =>
+                    String(row?.reference_item_id || "") === item[1])?.members?.[0] : null;
+                const memberId = physical ? physical[1] : String(staged?.member_id || "");
+                if (!memberId) return null;
+                for (const reference of references || []) {
+                    const member = (reference?.members || []).find((row) =>
+                        String(row?.member_id || "") === memberId);
+                    if (member) return { reference, member };
+                }
+                return null;
+            };
+            const adoptPendingIdentity = (unit) => {
+                const kindLabel = identityKindLabel(resolvedProfile, unit.kind);
+                if (pendingIdentity) {
+                    [...controls.reference.options].find((row) =>
+                        row.value === pendingIdentity.unitId)?.remove();
+                    // In place: the fieldset holds this same array.
+                    const stale = semanticUnits.findIndex((row) =>
+                        row.semantic_unit_id === pendingIdentity.unitId);
+                    if (stale >= 0) semanticUnits.splice(stale, 1);
+                }
+                const unitId = String(unit.semantic_unit_id);
+                const { handle, order, ...fields } = unit;
+                pendingIdentity = { unitId, intent: {
+                    type: "create_prompt_identity_with_sources",
+                    handle_suggestion: handle, unit: structuredClone(fields),
+                } };
+                // The dialog's own view of identities gains the pending one, so
+                // inheritance and capability rows resolve against it. Its
+                // handle stays empty: a suggestion is never a resolvable handle.
+                semanticUnits.push({ ...structuredClone(fields), handle: "", order: 0,
+                    _pending_create: true });
+                const option = document.createElement("option");
+                option.value = unitId;
+                option.textContent = `${kindLabel}: ${unit.name} (new)`;
+                const sentinel = [...controls.reference.options].find((row) =>
+                    row.value === NEW_IDENTITY_OPTION);
+                controls.reference.insertBefore(option, sentinel || null);
+                controls.reference.value = unitId;
+                lastReference = unitId;
+                controls.reference.dispatchEvent(new Event("change"));
+            };
+            const openNewIdentity = async () => {
+                const { openIdentityEditor } = await import("./prompt_identity_editor.js");
+                openIdentityEditor({
+                    pendingCreate: true,
+                    initialKind: identityKinds.length === 1 ? identityKinds[0].key : "",
+                    seedSource: seedFromSelection(lastReference),
+                    profile: resolvedProfile, references, semanticUnits, assets,
+                    candidate, placementPhases,
+                    onSave: (unit) => adoptPendingIdentity(unit),
+                    onClose: () => controls.reference.focus?.(),
+                });
+            };
+            // Registered before the select's other listeners, so choosing the
+            // sentinel never reaches them as a selection. A pointer pick opens
+            // the editor at once. Arrow keys on the closed list only pass over
+            // it (Phase 1's template-select rule): Enter opens it, and leaving
+            // the list puts the previous target back.
+            let keyboardWalk = false;
+            const openFromSentinel = () => {
+                controls.reference.value = lastReference;
+                openNewIdentity().catch((error) => notifyWarning(
+                    error?.message || "The identity editor could not open.",
+                    { source: "prompt-new-identity-refused" }));
+            };
+            controls.reference.addEventListener("pointerdown", () => { keyboardWalk = false; });
+            controls.reference.addEventListener("keydown", (event) => {
+                if (event.key === "Enter" && controls.reference.value === NEW_IDENTITY_OPTION) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    keyboardWalk = false;
+                    openFromSentinel();
+                    return;
+                }
+                if (event.altKey || event.ctrlKey || event.metaKey) return;
+                if (["ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"].includes(event.key)
+                        || (event.key.length === 1 && event.key !== " ")) keyboardWalk = true;
+            });
+            controls.reference.addEventListener("blur", () => {
+                if (controls.reference.value !== NEW_IDENTITY_OPTION) return;
+                controls.reference.value = lastReference;
+                keyboardWalk = false;
+            });
+            controls.reference.addEventListener("change", (event) => {
+                if (controls.reference.value !== NEW_IDENTITY_OPTION) {
+                    lastReference = controls.reference.value;
+                    return;
+                }
+                event.stopImmediatePropagation();
+                if (keyboardWalk) return;
+                openFromSentinel();
+            });
+            controls.pendingIdentity = () => pendingIdentity;
             // A task-type list stored on the Summary capability record predates
             // chip overrides and outranks them; the fieldset keeps it
             // authoritative until the author edits or resets it.
@@ -5179,7 +5332,10 @@ export function configurePromptAttachment(rawAttachment, {
                     : "not in the current preview";
                 button.textContent = storedHandle
                     ? `@${storedHandle} · ${resolvedLabel}`
-                    : "Set this handle in Reference Prompting before inserting it";
+                    // Attach creates it and mints its handle; nothing to set.
+                    : selectedUnit?._pending_create
+                        ? "Insertable once Attach creates this identity"
+                        : "Set this handle in Reference Prompting before inserting it";
                 button.title = storedHandle
                     ? `Insert ${authoredToken}. The stable id is stored; provider ordinals resolve only during compilation.`
                     : "A suggested handle is presentation-only until the versioned Reference write succeeds.";
@@ -5204,6 +5360,28 @@ export function configurePromptAttachment(rawAttachment, {
             // declare that field's capability.
             const referenceRows = [referenceFieldRow("Reference", controls.reference,
                 "Choose a semantic Subject or a physical source from the active conditioning setup.")];
+            // What the chosen kind of source is for, in the format's own words:
+            // a physical population's or identity kind's declared description.
+            const sourceGuidance = document.createElement("div");
+            sourceGuidance.dataset.sonderReferenceSourceGuidance = "1";
+            sourceGuidance.style.cssText =
+                `grid-column:2;font:10px/1.35 system-ui;color:${COLORS.textSecondary};margin-top:-4px;white-space:pre-wrap;`;
+            const refreshSourceGuidance = () => {
+                const value = String(controls.reference.value || "");
+                const physical = value.match(/^physical:(picture|video|audio):/);
+                const unit = physical ? null : semanticUnits.find((row) =>
+                    String(row?.semantic_unit_id || "") === value);
+                const declaration = physical
+                    ? (resolvedProfile?.physical_populations || []).find((row) =>
+                        String(row?.token_kind || "") === physical[1])
+                    : unit ? (resolvedProfile?.identity_kinds || []).find((row) =>
+                        String(row?.key || "") === String(unit.kind || "subject")) : null;
+                sourceGuidance.textContent = String(declaration?.description || "");
+                sourceGuidance.style.display = sourceGuidance.textContent ? "block" : "none";
+            };
+            refreshSourceGuidance();
+            controls.reference.addEventListener("change", refreshSourceGuidance);
+            referenceRows.push(sourceGuidance);
             const inheritedProse = referenceProsePolicy === "keep" ? "Keep" : "Drop";
             controls.referenceProse = selectField([
                 ["", `Project default → ${inheritedProse}`], ["drop", "Drop"], ["keep", "Keep"],
@@ -5372,10 +5550,19 @@ export function configurePromptAttachment(rawAttachment, {
                     const current = existing.get(capabilityId) || {
                         capability_id: capabilityId, kind: capabilityId,
                     };
+                    const chipAnchored = Array.isArray(anchoredChannels)
+                        && anchoredChannels.length > 0;
+                    // Mirrors `_chip_authors_capability_text`: the chip's own
+                    // words for this part, wherever the chip stores them.
+                    const authoredText = (REFERENCE_CAPABILITY_VALUE_FIELDS[capabilityId] || [])
+                        .includes("text") && [attachment.config, attachment.config?.overrides,
+                        current.config].some((source) => String(source?.text || "").trim());
                     const inheritedEnabled = resolveInheritedCapabilityEnabled(
                         capabilityId, {
                             selected: controls.reference.value,
                             references, semanticUnits,
+                            profile: resolvedProfile, anchored: chipAnchored,
+                            authoredText,
                         });
                     const row = document.createElement("div");
                     row.className = "sonder-prompt-routing-row";
@@ -5386,9 +5573,9 @@ export function configurePromptAttachment(rawAttachment, {
                     checkbox.checked = Object.hasOwn(current, "enabled")
                         ? current.enabled !== false : inheritedEnabled;
                     if (!Object.hasOwn(current, "enabled")) {
-                        checkbox.title = inheritedEnabled
-                            ? "Following the Reference default (on)."
-                            : "Following the Reference default (off).";
+                        checkbox.title = inheritedCapabilityTitle(capabilityId, {
+                            profile: resolvedProfile, anchored: chipAnchored,
+                            enabled: inheritedEnabled });
                     }
                     const capabilityName = document.createElement("span");
                     capabilityName.textContent = String(
@@ -5759,6 +5946,10 @@ export function configurePromptAttachment(rawAttachment, {
                     attachment.source.semantic_unit_ids = [controls.reference.value];
                     delete attachment.source.reference_item_id;
                 }
+                const pendingIdentity = controls.pendingIdentity?.();
+                identityCreateIntent = pendingIdentity
+                        && pendingIdentity.unitId === controls.reference.value
+                    ? structuredClone(pendingIdentity.intent) : null;
                 if (controls.referenceProse.value) {
                     attachment.config.reference_prose = controls.referenceProse.value;
                 } else {

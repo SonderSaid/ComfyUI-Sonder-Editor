@@ -330,7 +330,7 @@ def test_a_locked_item_opens_read_only(results, name):
     controls = results[f"render_{name}"]["controls"]
     assert any(c["text"] == "(locked) Unlock the lane to edit." for c in controls)
     for control in _controls(results[f"render_{name}"]):
-        if control["text"] == "Lane Setup…":
+        if control["text"] == "Reference Lane Setup…":
             assert not control["disabled"], "Lane Setup keeps its own lock handling"
             continue
         assert control["disabled"], control
@@ -343,7 +343,7 @@ def test_a_locked_item_opens_read_only(results, name):
 
 
 def test_lane_setup_stays_available_on_a_locked_reference(results):
-    setup = [c for c in results["render_locked_reference"]["controls"] if c["text"] == "Lane Setup…"]
+    setup = [c for c in results["render_locked_reference"]["controls"] if c["text"] == "Reference Lane Setup…"]
     assert setup and not setup[0]["disabled"]
 
 

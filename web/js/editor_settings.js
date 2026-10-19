@@ -482,6 +482,13 @@ export const DEFAULT_EDITOR_SETTINGS = {
     // Controls sidebar presentation (personal, every editor mode). Show advanced
     // reveals Controls their workflow marks Advanced; their values apply either way.
     controls: { view: "rows", showAdvanced: false },
+    // Browser preferences for Reference work (Settings → References). The
+    // project-wide Reference settings there are stored with the project instead.
+    references: {
+        // Open Reference Lane Setup after the first item lands on a new or
+        // empty Reference lane, where a template still has to be chosen.
+        openLaneSetupOnFirstStage: true,
+    },
 };
 
 const VALID_SORT_MODES = new Set(GALLERY_SORT_OPTIONS.map((entry) => entry.value));
@@ -1622,6 +1629,12 @@ export function normalizeEditorSettings(source = null) {
             showAdvanced: typeof stored?.controls?.showAdvanced === "boolean"
                 ? stored.controls.showAdvanced
                 : defaults.controls.showAdvanced,
+        },
+        references: {
+            openLaneSetupOnFirstStage:
+                typeof stored?.references?.openLaneSetupOnFirstStage === "boolean"
+                    ? stored.references.openLaneSetupOnFirstStage
+                    : defaults.references.openLaneSetupOnFirstStage,
         },
     };
 }

@@ -769,6 +769,7 @@ CANONICAL_PAYLOAD = {
     "replace_prompt_sections": {"sections": [], "expected": {"sections": []}},
     "import_prompt_context_dependencies": {"profiles": [], "semantic_units": []},
     "create_prompt_semantic_unit": {"unit": {"semantic_unit_id": "u1"}},
+    "create_prompt_identity_with_sources": {"unit": {"semantic_unit_id": "u1"}},
     "delete_prompt_semantic_unit_if_unreferenced": {"semantic_unit_id": "u1",
                                                     "expected": {}},
     "swap_guides": {"frame_index_a": 1, "frame_index_b": 2,
