@@ -14,6 +14,21 @@ Timeline gestures for prompt sections are in
 prompt is in [Generating](generating.md#whats-frozen-vs-what-stays-live).
 References that feed prompts are in [References](references.md).
 
+## Opening Prompt Management
+
+**Prompt Management** is where you edit every prompt of the scene in one
+place, choose the prompt format, and name References and identities. Open it in
+any of these ways:
+
+- Click **☰** on the **Prompt** or **Global** row header of the timeline.
+- Right-click a Prompt section, or the Prompt row, and choose **Open Prompt
+  Management**.
+- In **Reference Lane Setup**, click an item's prompt preview.
+
+**Structured** and **Writing** switch between its two
+[modes](#structured-and-writing-prompt-modes). It also holds **Prompt Context**
+(the prompt format), **Reference Prompting** and **Identity Prompting**.
+
 ## How the output prompt is composed
 
 To write one part of a scene, double-click empty **Prompt** space near the
@@ -23,6 +38,8 @@ text. The **Channels** selector above the timeline changes the project's
 prompt fields; **Standard** offers one plain field. A timed section scopes
 which text reaches a generation window. How closely a model follows those
 times depends on the workflow and prompt format.
+
+![The Global lane holding a scene-wide description, with per-moment prompt sections beneath it](images/prompt-lanes.webp)
 
 The **Global** document plus every prompt section in the generation window compile
 into one provider-ready prompt. The project's Channel Template defines the
@@ -204,9 +221,10 @@ does not depend on the format declaring anything, so it is there on the default
 Generic format too. Edit that text in Reference Lane Setup; this screen reports
 it.
 
-## The Prompt Management panel
+## Structured and Writing Prompt modes
 
-Open it with **☰** on the Prompt or Global header. Two modes, and the difference
+<a id="the-prompt-management-panel"></a>
+[Prompt Management](#opening-prompt-management) has two modes. The difference
 that matters most is whether they write to your prompts as you type.
 
 ### Structured mode — live

@@ -12,14 +12,43 @@ inspection, and export, see [Assets & Gallery](assets-and-gallery.md).
 
 ## Opening the editor
 
-The **Sonder Editor** node on the ComfyUI canvas shows a compact dormant card
-with the project selector and expandable Assets / Preview / Queue modules.
-Click **Open Editor** to expand the full editing surface over the browser
-viewport. The node card shows a placeholder until you exit.
+### The node card
 
-If you've moved the editor to its own browser tab (see
-[Mount in Tab](#mount-in-tab)), the button reads **Open Mounted Editor** and
-focuses that tab instead of opening a second editor.
+Add the **Sonder Editor** node to your graph: double-click an empty spot on the
+canvas, type **Sonder Editor** and pick it. Closed, the node shows a card with
+the **project** selector, the project's size, length and selection, and
+**Assets**, **Preview** and **Queue** buttons that open small panels without
+leaving the graph.
+
+![The Sonder Editor node card with a project loaded and its Preview module expanded](images/node-card.webp)
+
+### Fullscreen
+
+Click **Open Editor** on the card. The editor covers the browser window, and
+the card shows a placeholder until you click **✕ Exit** at the top right.
+
+### Mount in Tab
+
+**Mount in Tab**, at the top right of the editor, moves the editor into a
+browser tab of its own, so the editor and the graph are both in view. Keep the
+canvas page open: the tab shows **● Canvas connected** while it can run the
+graph, and pauses run controls when the canvas is gone. On the canvas, the
+card's button reads **Open Mounted Editor** and brings that tab forward. If the
+tab was closed without exiting, click **Force Release** on the card.
+
+## Creating a project
+
+A project is a folder holding its media, scenes and generated takes, under
+`ComfyUI/output/sonder-projects/`.
+
+1. On the **Sonder Editor** card, click the **project** selector and choose
+   **+ Create New**.
+2. Type a name in **project_name** and set **fps**, **width** and **height**.
+3. Click **Create**. The card switches to the new project.
+
+To open another project, choose it in the same selector. Inside the editor,
+**+ Scene** at the top adds a scene to the project, and the scene pill beside
+it switches scenes.
 
 ## Screen layout
 
@@ -37,7 +66,7 @@ From top to bottom:
    directly beneath it.
 
 The sidebar width and timeline height are drag-resizable and remembered
-between sessions (**Settings ▸ Layout & UI Scale ▸ Reset Editor Layout**
+between sessions (**Settings ▸ Layout & UI Scale ▸ Reset Layout Section**
 clears them).
 
 **References** is the project-level authoring Library for reusable character,
@@ -76,9 +105,10 @@ Each media lane header has three independent controls plus the label:
 Clicking a collapse/lock/hide icon on a selected header applies that state to
 every selected lane at once.
 
-The fixed **Guides / Global / Prompt** headers carry a **☰** icon that opens
-their management panel. Their lock/hide semantics matter for generation — see
-[Generating](generating.md).
+The fixed **Guides / Global / Prompt** headers carry a **☰** icon:
+**Guide Management** on Guides, and
+[Prompt Management](prompts.md#opening-prompt-management) on Global and
+Prompt.
 
 ### Navigation
 
@@ -108,16 +138,14 @@ the source edge), *Fill (crop)* with a crop anchor, or *Stretch*.
 
 ### Audio tracks
 
-Drop an audio asset from **Assets** onto an **Audio** row to place existing
-sound. A video with sound can create linked picture/audio items when dropped
-onto the timeline. Keep one intended copy of the sound; adding it again can
-double what you hear. Double-click opens that member's own volume or timing
-controls. Mute still affects linked members; to mute only the sound, first
-right-click its clip and choose **Unlink Linked Items**.
+An audio asset, or the sound of a video, on an Audio row, drawn with its
+waveform. Move, trim, split and mute work as for video clips; double-click
+opens its start, volume and mute.
 
-An audio asset — or the extracted audio of a video — on an audio lane, drawn
-with its waveform. Same select/move/trim/split/mute model as video clips.
-The inline editor exposes start, volume, and mute.
+Where to drop an audio file or a video's sound is in
+[Dropping assets onto the timeline](#dropping-assets-onto-the-timeline). Keep
+one copy of a sound; placing it twice doubles what you hear. To mute only the
+sound of a linked clip, see [Linked groups](#linked-groups).
 
 ### Guide frames
 
@@ -177,9 +205,12 @@ exist, is covered in [Prompts](prompts.md).
 
 ### The Global prompt
 
-The scene-wide style/identity text — one full-width, non-draggable item on
-the Global lane, composed in front of the covering section's text.
-Double-click to edit.
+The **Global** bar spans the whole scene and can't be moved or split. Its text
+goes in front of every Prompt section's text: put what holds for the whole
+scene there (style, place, characters), and what happens at a moment in a
+Prompt section. Double-click the bar and type. There is no **Create** button:
+Global keeps your text when you press Enter or click elsewhere, and **Esc**
+discards what you typed.
 
 ### Linked groups
 
@@ -192,6 +223,8 @@ takes auto-link (configurable in Settings). Right-click **Unlink Linked Items**
 before muting only one member.
 
 ## Editing gestures
+
+![A working timeline: imported clips, placed takes, a Driver lane, guide frames, and prompts](images/timeline-editing.webp)
 
 - **Snapping** (`S` to toggle, or the **Snap** button above the timeline)
   pulls a dragged item's start **or end**, and a trimmed edge, to nearby
@@ -224,12 +257,12 @@ before muting only one member.
 
 Where you drop a gallery asset decides what happens:
 
-- **The ruler strip** → always creates a **new lane**. Video → a video lane;
-  audio → an audio lane; a video with extracted audio → both lanes, linked.
-  This is the only dual-drop path.
-- **An existing lane** → places on exactly that lane, matching type only.
-  Dropping a video on an audio lane places just its extracted audio; audio on
-  a video lane refuses.
+- **The ruler strip** (the frame numbers at the top) → always a **new row**.
+  A video → a Video row; audio → an Audio row; a video with sound → both,
+  linked. This is the only drop that places picture and sound together.
+- **An existing row** → that row only. A video with sound on a **Video** row
+  places the picture; on an **Audio** row, the sound. Audio on a Video row is
+  refused.
 - **The Guides track** → an image dropped there becomes a guide frame.
 - Locked lanes, overlaps, and dead space refuse with a toast pointing at the
   ruler gesture. A type-aware highlight always shows where the drop will land.
@@ -247,17 +280,6 @@ renders.
   playback resolution) are personal and live in Settings ▸ Playback.
 - Heavy scenes rebuffer adaptively: if decoding falls behind, playhead and
   audio pause together and resume in sync.
-
-## Mount in Tab
-
-**Mount in Tab** (header bar) moves the editor into its own browser tab,
-freeing the ComfyUI canvas while staying connected: scene, selection, and
-queue controls relay live to the node. The canvas page must stay open — the
-tab shows a **● Canvas connected** pill while healthy and pauses
-execution-bound controls when the canvas is gone. On the canvas, the dormant
-button becomes **Open Mounted Editor** while the tab owns the session, and
-**Force Release** is the explicit recovery action if the tab was closed
-uncleanly.
 
 ## Safety & recovery
 

@@ -1,234 +1,299 @@
 # Getting Started
 
-Choose the route that fits your goal. Both lead to the same timeline editor.
+<a id="1-install-the-pack"></a>
+Step-by-step instructions for common goals, with any model. Each goal gives the
+editor steps, then what your graph needs for it. First
+[install the node pack](../README.md#installation). For a ready-made graph, see
+[Examples](../README.md#examples).
 
-| Your goal | Start here |
-|---|---|
-| Use a workflow someone has already prepared | [Use a prepared workflow](#use-a-prepared-workflow) |
-| Wire the editor into your own ComfyUI graph | [Build a workflow](#build-a-workflow) |
+<a id="9-where-to-go-next"></a>
+| Goal | Your model needs | Steps |
+|---|---|---|
+| Generate a clip from a prompt | Text-to-video | [Make a first take](#make-a-first-take) |
+| Continue a clip past its end | Masked (in-context) generation | [Extend a video](#extend-a-video) |
+| Generate long-form video in seamless chunks | Masked (in-context) generation | [Generate long-form video](#generate-long-form-video) |
+| Regenerate a section of a clip | Masked (in-context) generation | [Redo a part of a clip](#redo-a-part-of-a-clip) |
+| Set keyframes at any point in your video | Image conditioning at chosen frames | [Guide with frames](#guide-with-frames) |
+| Steer a generation with a control video (pose, depth, edges, style…) | A video control input | [Drive with a control video](#drive-with-a-control-video) |
+| Use your own character or place | An image (or audio) reference input | [Use a Reference](references.md) |
+| Use several References as separate inputs | Separate reference inputs (MiniMax H3, for example) | [Use References with separate inputs](references.md) |
+| Save the finished scene as a file | Nothing: no graph runs | [Export the timeline](#export-the-timeline) |
 
-First [install the node pack](../README.md#installation). Each workflow also
-needs its own node packs and model files. A **Model template** sets frame and
-size rules; it does not install or load those models.
+## Make a first take
 
-## Use a prepared workflow
+<a id="2-add-the-node-and-create-a-project"></a>
+<a id="3-pick-a-model-template"></a>
+<a id="4-write-your-prompt"></a>
+<a id="5-choose-what-to-generate"></a>
+<a id="6-wire-the-handoff"></a>
+<a id="7-run-it"></a>
+**Goal:** generate a five-second clip from a prompt and see it on the timeline.
 
-Get the workflow and its requirements from its author. The
-[example workflows](../README.md#example-workflows) are ready-wired canvas
-graphs.
+**Your model needs:** text-to-video, in a ComfyUI graph that already runs.
 
-Choose one way to open your workflow below. Sonder App is optional and
-experimental; using a prepared workflow on the canvas does not require it.
+**In the editor:**
+1. On the ComfyUI canvas, double-click an empty spot, type **Sonder Editor**
+   and pick it.
+2. On the node, click the **project** selector and choose **+ Create New**.
+   Type a name in **project_name**, set **fps**, **width** and **height** to
+   values your model supports, then click **Create**.
+3. Click **Open Editor** on the same node.
+4. In the toolbar above the timeline, set **Model** to your model's
+   [template](generating.md#model-templates), or **No Model Template** if none
+   matches.
+5. Double-click the **Global** bar in the timeline and type what holds for the
+   whole scene (style, place, light). Press Enter or click elsewhere to keep it;
+   **Esc** discards what you typed.
+6. Double-click empty space on the **Prompt** row, the last row of the
+   timeline. Type what happens, then click **Create**.
+7. In the **GEN** box of the toolbar, type `0` in **In** and press Enter, then
+   about five seconds of frames in **Out** (for example `121` at 24 fps) and
+   press Enter.
+8. In the same box, set **Ctx: Pre**, **Post** and both **Mask** fields to `0`.
+9. At the bottom of the **Assets** sidebar, click **Render Queue** to open it
+   and untick **Queue Active**.
 
-### Open the prepared workflow on the canvas
+**In the graph:**
+1. Encode **Sonder Editor**'s `rendered_frames` (and `audio`, for a model that
+   generates sound) with your model's VAE, and sample that latent instead of an
+   empty one. Wire `prompt` into your text encoder. If your graph can only start
+   from an empty latent, wire `frame_count`, `width` and `height` into it
+   instead.
+2. Sample at full denoise: an empty timeline reaches the graph as
+   [black frames](generating.md#empty-timeline-means-black-frames).
+3. End the graph with **Sonder Save Video**, with `project` wired from the
+   editor and your decoded frames in `frames`. Set **mode** to **Take**. To keep
+   the generated sound too, wire your audio into `audio` and leave
+   **place_audio_on_timeline** on.
+4. Click **Run** at the top right of the canvas. In the
+   [Sonder App](sonder-app.md#generate), click **Generate** instead.
 
-1. Drop its **canvas/UI workflow JSON** onto the ComfyUI canvas. Install the
-   workflow's required nodes and models before continuing.
-2. Find the **Sonder Editor** node. On its card, choose your project, or
-   **+ Create New** to create an empty one. A supplied workflow may remember
-   its author's project: choose the project you intend to work in.
-3. Click **Open Editor** on that card. To keep the graph beside the editor,
-   click **Mount in Tab** in the editor's top bar; keep the canvas page open.
-4. Continue with [Make and review a first take](#make-and-review-a-first-take).
+**You'll see:** a new [take](assets-and-gallery.md#takes) on its own Video row,
+with any sound on a linked Audio row, covering **In** to **Out**. Click **Play**
+under the preview to watch it.
 
-### Open the prepared workflow in Sonder App
+**Learn more:** [The generation window](generating.md#the-generation-window) ·
+[Wiring your graph](generating.md#wiring-your-graph) ·
+[Prompts](prompts.md) ·
+Worked example: the [LTX 2.3 Playground](../README.md#examples) does this with
+its **Sonder Selector** on **LTXV Scheduler - First Pass**.
 
-1. Follow the one-time [Sonder App setup](../README.md#sonder-app-experimental).
-   Its entry is **Settings → Sonder App (experimental)**, at the bottom of
-   Settings. Then click **Open Launcher** there.
-2. In the Launcher, click **Import** in the Workflows area and select the
-   workflow's **API JSON**. This is a different file from a canvas/UI JSON.
-   Resolve any **Missing nodes** or model requirements listed for it.
-3. Click **New project** in the project grid to make an empty project, or
-   select an existing project. For a new one, enter **Project name** in the
-   dialog and use **Create** or **Create and open**, as shown.
-4. Select the project **first**, then select the intended workflow: selecting
-   a project can restore its last-used workflow. Click **Open** in the bottom bar.
-   If creation already opened the editor, continue there.
-5. Continue with [Make and review a first take](#make-and-review-a-first-take).
+## Extend a video
 
-### Make and review a first take
+<a id="8-bring-in-media"></a>
+**Goal:** continue a clip past its last frame.
 
-Use an empty scene for this first text-to-video pass. To edit existing footage,
-follow the selected workflow's input instructions instead.
+**Your model needs:** [masked (in-context) generation](generating.md#what-your-model-needs),
+so it keeps the frames it is given and generates the rest.
 
-1. Open **Controls** at the upper left. If it has **Preset**, choose the
-   workflow's text-to-video preset. In LTX 2.5 Edit this is **Make a New Video**.
-   A preset sets only its own settings; check its description and sound options.
-2. In the toolbar above the timeline, choose the **Model** template matching
-   the workflow. Set **Res**, **FPS** and **Frames** to a small supported
-   example. For the LTX 2.5 Edit candidate, a first preview can use
-   **896 × 512**, **24 FPS** and **17 Frames**.
-3. At **Channels** in the same toolbar, use **Standard** for one plain prompt
-   field unless your workflow requires another template. This choice is
-   project-wide. Double-click empty space on **Prompt**, near the bottom of
-   the timeline, enter your description, and click **Create**. Double-click
-   **Global** above it only if you also want scene-wide text.
-4. Set **In** and **Out** above the timeline to the short range you want to
-   generate; press Enter after each typed value. For the 17-frame LTX preview,
-   use **In 0**, **Out 17**, **Ctx: Pre 0**, **Post 0** and **Mask −/+ 0**.
-   The playhead alone does not select a range. With no selection the whole
-   scene generates. Check the frame-count readout after setting the range.
-5. Open **Render Queue** in the sidebar and turn **Queue Active** off. In
-   Sonder App, leave the take count beside **Generate** at **×1** and click
-   **Generate**. On the canvas, use ComfyUI's **Run** button. An empty timeline
-   needs a workflow configured to generate freely over its black input frames;
-   use its text-to-video preset rather than a partial-strength video edit.
-6. A **take** is one generated version. If the workflow saves as a take, a
-   new clip appears on the timeline. Click **Play** below the preview, inspect
-   the motion and listen to any sound. If the take starts muted, right-click
-   its clip and choose **Unmute**; linked picture and sound change together.
-   The workflow can expose this preference as
-   **Controls → Editor → Takes start muted**.
-7. To try another version, change your prompt or exposed Controls and generate
-   another short take. [Compare](assets-and-gallery.md#compare-mode) results
-   in Assets. Favoriting a result does not make it the active timeline picture.
-   Mute competing takes or put the chosen one in front; check playback again.
-8. Click **Export** above the timeline to save the arranged scene or selection.
-   Choose the range, include the intended picture and sound, and use
-   **Compatible MP4** for ordinary playback. See
-   [Export timeline](assets-and-gallery.md#export-timeline).
+**In the editor:**
+1. Put the clip on the timeline. For a file: drag it from your file manager
+   into the **Assets** sidebar, then from **Assets** onto the ruler (the strip
+   of frame numbers at the top of the timeline). It lands on a new Video row.
+2. Click the ruler near the clip's end. Use **←** / **→** to land on the first
+   frame after the clip, where the preview turns empty, and press **I**.
+3. If the scene ends there too, type a longer length in **Frames** (toolbar,
+   right side) and press Enter.
+4. Click the ruler where the new part should end and press **O**.
+5. Set **Ctx: Pre** to how many of the clip's last frames the model should see,
+   for example `24`. Set **Post** to `0`. These are the
+   [context frames](generating.md#the-generation-window).
+6. Write a **Prompt** section over the new range (double-click the **Prompt**
+   row, type, **Create**).
+7. In **Render Queue**, untick **Queue Active**.
 
-Continue with [Editor Basics](editor-basics.md) for locations and gestures,
-[Generating](generating.md) for range/context behavior, or your workflow's guide
-for a particular editing task.
+**In the graph:**
+1. Encode `rendered_frames` (and `audio`) as in
+   [Make a first take](#make-a-first-take).
+2. Add **Sonder Masks Bridge**, with `project` from the editor, so only the new
+   frames are generated. Two ways to use it:
+   - wire each latent and the VAE that encoded it into its `video_latent` /
+     `video_vae` (and `audio_latent` / `audio_vae`), and feed its `video_mask`
+     and `audio_mask` outputs into **Set Latent Noise Mask** on each latent;
+   - or feed its four time outputs (`video_mask_start_time` …
+     `audio_mask_end_time`) into your model's own mask node. On LTX with guides,
+     use this route; see
+     [Masking an audio-video latent](generating.md#masking-an-audio-video-latent).
+3. On **Sonder Masks Bridge**, set **edit_video** to **Edit**. To generate new
+   sound too, set **edit_audio** to **Edit** and leave **Sonder Save Video**'s
+   **place_audio_on_timeline** on. To keep the clip's sound, set **edit_audio**
+   to **Freeze** and turn **place_audio_on_timeline** off.
+4. **Sonder Save Video**: **mode** **Take**. Click **Run**.
 
-## Build a workflow
+**You'll see:** a take that starts at **In** and continues the clip's motion.
 
-This route is for wiring your own generation graph. If you already have a
-finished graph, use the [prepared-workflow route](#use-a-prepared-workflow).
-The numbered sections below retain the original tutorial's link destinations.
+**Learn more:** [Dropping assets onto the timeline](editor-basics.md#dropping-assets-onto-the-timeline) ·
+Worked example: the [LTX 2.3 Playground](../README.md#examples) wires the Masks
+Bridge times into `LTXVAudioVideoMask`.
 
-### 1. Install the pack
+## Generate long-form video
 
-Follow the [README installation steps](../README.md#installation)
-(ComfyUI-Manager, or git clone + `pip install -r requirements.txt`), then
-restart ComfyUI.
+**Goal:** generate long-form video in chunks that join seamlessly, rendered one
+after another.
 
-### 2. Add the node and create a project
+**Your model needs:** [masked (in-context) generation](generating.md#what-your-model-needs),
+as in [Extend a video](#extend-a-video).
 
-Add the **Sonder Editor** node to your graph (search "Sonder"). The node
-shows a compact card with a project selector. Type a name and create your
-first project — every project is a self-contained folder (media, scenes,
-cache) under ComfyUI's output area, in `sonder-projects/`.
+**In the editor:**
+1. In the sidebar at the left, open the **Controls** tab. In its **Editor**
+   group, set **Max frames per batch** to the longest chunk your computer
+   renders reliably, context frames included, for example `121`.
+2. In the same group, untick **Takes start muted**, so each chunk's take is the
+   source for the next ([Takes](assets-and-gallery.md#which-takes-should-start-muted)).
+3. Set **In** and **Out** to the range you want, or click **✕** in the **GEN**
+   box to use the whole scene.
+4. Set **Ctx: Pre**, for example to `24`, and **Post** to `0`.
+5. Click **+ Batch (N)** in the toolbar: *N* chunks appear as jobs in
+   [Render Queue](generating.md#the-render-queue).
+6. In **Render Queue**, tick **Queue Active**.
 
-Click **Open Editor** to enter the fullscreen editing surface.
+**In the graph:**
+1. Wire **Sonder Masks Bridge** as in [Extend a video](#extend-a-video).
+2. On **Sonder Save Video**, turn **mark_queue_complete** on, so each run
+   finishes its job and the next run takes the next one. Keep **mode** on
+   **Take**.
+3. Type the number of jobs in the box beside **Run**, then click **Run**.
 
-![The Sonder Editor node card with a project loaded and its Preview module expanded](images/node-card.webp)
+**You'll see:** each run renders the next job and marks it **Completed** in
+**Render Queue**; **Clear Completed Renders** removes finished jobs. The takes
+line up one after another across the range.
 
-> **Prefer to explore a finished project first?**
-> Open [**Project Sample — LTX 2.3**](https://huggingface.co/datasets/SonderSaid/Sonder-Editor-Projects#project-sample--ltx-23)
-> on Hugging Face. Its **Project-Sample** folder includes
-> four scenes with media, prompts, guides, and generated takes. The project entry
-> includes the matching workflow and opening instructions.
+To queue several takes of one selection instead, click **+ Queue** once per
+take, and set your seed to change on each run.
 
-### 3. Pick a model template
+**Learn more:** [What's frozen vs. what stays live](generating.md#whats-frozen-vs-what-stays-live)
 
-In the toolbar, choose the **model template** matching the model your
-workflow uses (e.g. **LTX 2.3 / 2.5**) — the editor then snaps frame counts and
-dimensions to what that model expects and warns when you exceed its
-comfortable ranges. Set the scene's resolution, FPS, and duration in the
-same toolbar group. No matching template? Use **No Model Template** and
-manage constraints yourself, or create a custom one in Settings.
-[Why templates matter →](generating.md#model-templates)
+## Redo a part of a clip
 
-### 4. Write your prompt
+**Goal:** regenerate a section of a clip and keep the frames around it.
 
-For a first text-to-video run, the scene can stay empty — no media needed.
+**Your model needs:** [masked (in-context) generation](generating.md#what-your-model-needs).
 
-- Double-click the **Global** lane at the bottom of the timeline and write
-  the scene-wide text: style, world, characters.
-- Double-click the **Prompt** lane below it to create a section and
-  describe what happens.
+**In the editor:**
+1. Click the ruler where the section starts and press **I**. Click where it
+   ends and press **O**.
+2. Set **Ctx: Pre** and **Post** to the number of frames to keep on each side,
+   for example `24`.
+3. Choose how far to change it:
+   - **A subtle fix** (a seam, lip-sync): you will sample at partial denoise.
+     In the **Controls** tab's **Editor** group, tick **Takes start muted**, so
+     every attempt starts from the original.
+   - **A new action or line:** you will sample at full denoise; takes can stay
+     unmuted.
+4. In **Render Queue**, untick **Queue Active**.
 
-That's a complete T2V setup. Sections hold until the next section starts,
-so one section covers the whole scene — add more later to
-[direct different moments](prompts.md).
+**In the graph:**
+1. Encode `rendered_frames` (and `audio`) and wire **Sonder Masks Bridge** as
+   in [Extend a video](#extend-a-video).
+2. Set denoise to match step 3: below 1 for a subtle fix, 1 for a new action.
+3. To keep the clip's sound, set **edit_audio** to **Freeze** and turn
+   **Sonder Save Video**'s **place_audio_on_timeline** off. To regenerate it
+   too, leave both on.
+4. **Sonder Save Video**: **mode** **Take**. Change the seed before each new
+   attempt, then click **Run**.
 
-![The Global lane holding a scene-wide description, with per-moment prompt sections beneath it](images/prompt-lanes.webp)
+**You'll see:** a take covering only **In** to **Out**, on a new Video row in
+front of the original. If it starts muted, right-click it and choose **Unmute
+Selected** to see it in place.
 
-### 5. Choose what to generate
+**Learn more:** [Takes](assets-and-gallery.md#takes) ·
+[Compare mode](assets-and-gallery.md#compare-mode) ·
+Worked example: for a subtle fix, the
+[LTX 2.3 Playground](../README.md#examples)'s **Manual Sigmas - Detail/Upscale
+Pass** choice.
 
-Start with a short **In/Out selection** above the timeline. Move the
-playhead, then press **I** and **O**, or type the two frame values and press
-Enter. With no selection, the **full scene** renders. For this first pass,
-set **Ctx: Pre** and **Post** to **0** and leave **Mask −/+** at **0**.
-Check the resulting frame count against your workflow's limits before running.
-[Selections, context and model padding](generating.md#the-generation-window).
+## Guide with frames
 
-### 6. Wire the handoff
+**Goal:** set keyframes at any point in your video: still images the video
+passes through at the frames you choose.
 
-Back on the ComfyUI canvas (Exit fullscreen, or use
-[Mount in Tab](editor-basics.md#mount-in-tab) to keep both visible), wire
-the Sonder Editor node's outputs into your generation workflow, and end the
-chain with a **Sonder Save Video** node so results register back into the
-project.
+**Your model needs:** [image conditioning at chosen frames](generating.md#what-your-model-needs).
 
-![The showcase workflow: the Sonder Editor node feeding conditioning, sampling, and finally Sonder Save Video](images/showcase-workflow.webp)
-<p align="center"><em>The showcase pipeline — your graph can be as small as
-editor → sampler → Sonder Save Video, and grow bridges as you need
-them.</em></p>
+**In the editor:**
+1. Drag the images from your file manager into the **Assets** sidebar.
+2. Drag each image from **Assets** onto the **Guides** row, at the frame where
+   it should appear. Each one is a keyframe, called a
+   [guide](generating.md#guides) in the editor.
+3. To set an exact frame or a strength, click **☰** on the **Guides** row
+   header to open **Guide Management**, and edit that guide's row.
+4. Set **In** and **Out** to the range to generate. The guides inside it are
+   used at their frames. If your model takes only a first and a last frame,
+   start and end the range on guides.
+5. In **Render Queue**, untick **Queue Active**.
 
-Prefer to start from a finished graph? Download the
-**[Sonder LTX 2.3 Playground](../example_workflows/sonder_ltx_2_3_playground.json)**
-and drop it onto the ComfyUI canvas — it wires prompt relay, multi-pass
-upscaling, image guides, and driver-controlled generation already.
+**In the graph:** use one of the two routes, not both.
+- **All guides at once:** wire **Sonder Editor**'s `guide_images`, `guide_idx`
+  and `guide_strengths` into a node that takes a batch of guide images with
+  their frames and strengths.
+- **One guide per pass:** place your model's per-guide node (for example
+  `LTXVAddGuide`) between **Sonder Guides Bridge Start** and **Sonder Guides
+  Bridge End**, both with `project` from the editor. Feed it Start's `image`,
+  `frame_index` and `strength`, carry your latent through the loop's `value`
+  sockets, and connect Start's `flow_control` to End.
 
-### 7. Run it
+Then save with **Sonder Save Video**, **mode** **Take**, and click **Run**.
 
-Turn **Queue Active** off in the editor's **Render Queue** panel, then click
-ComfyUI's **Run** button. The editor hands your window — geometry,
-prompt, and (empty) timeline — to the workflow; when **Sonder Save Video**
-finishes, the result comes back as a project asset and, as a **take**,
-lands on a fresh lane on your timeline.
+**You'll see:** a take that passes through each image at its frame.
 
-> Your sampler should run a **full denoise (1.0)** for this first pass — an
-> empty timeline renders as black frames, and only a full denoise generates
-> freely over them
-> ([why →](generating.md#empty-timeline-means-black-frames)).
+**Learn more:** [Guide frames](editor-basics.md#guide-frames) ·
+Worked example: the [LTX 2.3 Playground](../README.md#examples) loops
+`LTXVAddGuide` between the Guides Bridges.
 
-![A generated take placed on its own linked video and audio lanes](images/take-placed.webp)
+## Drive with a control video
 
-Click **Play** below the preview and inspect the result before requesting
-another take. Use [Compare mode](assets-and-gallery.md#compare-mode) to review
-alternatives. Make the chosen take visible on the timeline before
-[exporting it](assets-and-gallery.md#export-timeline).
+**Goal:** steer a generation with a control video (pose, depth, edges, style
+and more), without the control video appearing.
 
-### 8. Bring in media
+**Your model needs:** [a video control input](generating.md#what-your-model-needs)
+for that kind of signal, such as an IC-LoRA.
 
-Everything past pure T2V starts with assets. Drag video, audio, or image
-files (or a whole folder) from your file manager into the **asset gallery**
-on the left — originals are copied into the project, so it stays portable.
+**In the editor:**
+1. Drag the control video into **Assets**, then from **Assets** onto the ruler.
+   It lands on a new Video row.
+2. Right-click the clip and choose **Convert to Driver**. It becomes a
+   [Driver](generating.md#drivers): it moves to a **Driver** row and leaves the
+   preview.
+3. Write a **Prompt** section over the Driver's range.
+4. Set **In** and **Out** inside the Driver's range. Keep the range short:
+   driven generation is heavier.
+5. In **Render Queue**, untick **Queue Active**.
 
-Drag an asset from the gallery onto the **ruler strip** at the top of the
-timeline to give it a new lane (a video with sound creates linked
-video + audio lanes). Trim by dragging clip edges, split with razor mode
-(`C`). Existing footage, your kept takes, guide images, and Drivers all
-combine on the same timeline.
+**In the graph:**
+1. Add **Sonder Driver Selector** with `project` from the editor, and choose
+   your Driver row by name in its lane menu.
+2. Wire its `driver_ref` into **Sonder Driver Bridge**, and the Bridge's
+   `driver_images` (with `driver_idx` and `driver_strength` if your node takes
+   them) into your model's control input.
+3. If the Driver covers only part of the timeline, route the driver branch
+   through **Sonder Switch** or **Sonder Cluster** on the Selector's
+   `has_driver`, so ranges without a Driver skip it, including its LoRA.
+4. **Sonder Save Video**: **mode** **Take**. Click **Run**.
 
-![A working timeline: imported clips, placed takes, a Driver lane, guide frames, and prompts](images/timeline-editing.webp)
+**You'll see:** a take that follows the control video.
 
-### 9. Where to go next
+**Learn more:** [Driver clips](editor-basics.md#driver-clips) ·
+Worked example: the [LTX 2.3 Playground](../README.md#examples) drives an LTX
+IC-LoRA this way.
 
-- **Generate without the canvas** — the experimental
-  [Sonder App](../README.md#first-generation-in-the-sonder-app) runs the same
-  steps from its own page, with a **Generate** button.
-- **Write in more fields** — the default is one plain prompt box. A
-  [Channel Template](prompts.md#channel-templates) splits it into Visual /
-  Speech / Sound, or into a model's own fields.
-- **Draft a whole scene at once** —
-  [Writing mode](prompts.md#the-prompt-management-panel) turns one continuous
-  draft into timed sections.
-- **Generate longer sequences** — chain windows with context frames, or
-  stage many jobs at once with the [render queue](generating.md#the-render-queue).
-- **Regenerate part of a clip** —
-  [mask a window](generating.md#masking-an-audio-video-latent) so the frames
-  around it are kept exactly.
-- **Condition harder** — [guide frames](generating.md#guides),
-  [Drivers](generating.md#drivers), and time-aligned
-  [prompt sections](prompts.md).
-- **Reuse characters and places** — build a
-  [Reference Library](references.md) and stage its members over a range.
-- **Review and finish** — [compare takes](assets-and-gallery.md#compare-mode)
-  side by side, then
-  [export the timeline](assets-and-gallery.md#export-timeline).
+## Export the timeline
+
+**Goal:** save the arranged scene, picture and sound, as one file.
+
+**Your model needs:** nothing; no graph runs.
+
+**In the editor:**
+1. Make the version you want visible: right-click each
+   [take](assets-and-gallery.md#takes) you don't want and choose **Mute
+   Selected**. Click **Play** under the preview to check.
+2. To export part of the scene, set **In** and **Out**.
+3. Click **Export** in the toolbar.
+4. Under **Source**, choose **Full scene** or **Active selection**.
+5. Under **Save preset**, choose **High Quality MP4**.
+6. Tick **Include video**, and **Include audio** if the scene has sound. Untick
+   **Place as take** unless you want the file back on the timeline.
+7. Click **Export**.
+
+**You'll see:** a progress bar, then the file in the **Exports** folder of
+**Assets**. Double-click it to play it.
+
+**Learn more:** [Export timeline](assets-and-gallery.md#export-timeline)

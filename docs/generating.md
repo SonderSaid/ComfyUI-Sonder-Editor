@@ -7,15 +7,12 @@ queued job.
 Editing itself is covered in [Editor Basics](editor-basics.md); assets and
 export in [Assets & Gallery](assets-and-gallery.md).
 
-## Model-agnostic, capability-bounded
+## What your model needs
 
-Sonder Editor doesn't require any specific model. The editor works with
-**timeline math and your assets** — arranging, trimming, compositing,
-prompting, and queueing are pure editing operations that never touch a model.
-Generation happens in *your* ComfyUI graph, with whatever model you wire up.
-
-What the editor *hands* to your graph, however, is only useful if your model
-can act on it. What each generation feature needs from your model:
+<a id="model-agnostic-capability-bounded"></a>
+Sonder Editor works with any model: editing, prompting and queueing never touch
+one, and generation runs in your ComfyUI graph. What the editor hands your
+graph is useful only if the model can act on it:
 
 | If you want to… | Your model needs… |
 |---|---|
@@ -26,19 +23,19 @@ can act on it. What each generation feature needs from your model:
 | Use References — reusable characters, locations, props and voices, staged per window | **Reference image, video or audio inputs** — a dedicated reference slot, or any image input that will take an assembled sheet |
 | Use guide frames | **Image conditioning at arbitrary frames** |
 
-The showcase workflows use **LTX 2.3** and **MiniMax H3** — LTX 2.3 because it
-has a complete suite of these capabilities in one model, and MiniMax H3 to
-show References wired against dedicated reference inputs. Neither is a
-dependency. Model templates ship for Wan, HunyuanVideo, CogVideoX and others,
-and the Free template removes all constraints for anything else.
+For example, the showcase workflows use **LTX 2.3**, which covers most of
+these in one model, and **MiniMax H3**, which has dedicated reference inputs.
+[Model templates](../README.md#models) also ship for Wan, HunyuanVideo,
+CogVideoX and others, and **No Model Template** removes every constraint for
+anything else.
 
 ## The generation window
 
-For a first attempt, select a short range and keep the queue off. Moving the
-playhead with **GEN F** or the ruler only navigates; set **In/Out** to choose
-what generates.
-
-Everything a render will cover is defined by the **GEN block** in the toolbar.
+The **Selection** is the **In**–**Out** range you set. The **generation
+window** is what a render covers: the Selection plus any context frames. Both
+are set in the **GEN** box of the toolbar, which also shows their frame counts.
+Moving the playhead (the **F** field, or clicking the ruler) doesn't change
+either.
 
 - **Selection (In/Out)** is the live range a render executes. It persists per
   project + scene in your browser, so scene switches and refreshes restore
@@ -53,12 +50,21 @@ Everything a render will cover is defined by the **GEN block** in the toolbar.
 - **Saved Selections** (the bookmark button) capture the *full* recall state
   — in/out, context, and mask offsets — and live in the project, so they're
   shareable, unlike the live selection.
-- Quick setters live throughout the UI: `I`/`O` at the playhead, *Set
-  Selection to Clip/Audio/Prompt*, *Select Guide Range*, and per-guide
-  *Set Selection In/Out*.
+- **✕** in the **GEN** box clears the Selection (the **X** key does too).
 
-All GEN inputs accept simple arithmetic (`+ - * /`) on commit and switch
-between frames and seconds with Timecode mode (`T`).
+### Ways to set In and Out
+
+- **Type** a frame in **In** or **Out** and press Enter. The fields accept
+  arithmetic (`120+48`), and **TC** in the toolbar (or **T**) switches them to
+  seconds.
+- **At the playhead:** click the ruler, then press **I** for In or **O** for
+  Out.
+- **From an item:** right-click a clip, an audio track or a Prompt section and
+  choose **Set Selection to Clip**, **Set Selection to Audio** or **Set
+  Selection to Prompt**.
+- **From guides:** right-click a guide for **Set Selection In** or **Set
+  Selection Out** at its frame, or **Select Guide Range**.
+- **From a saved selection:** click the bookmark in the **GEN** box.
 
 ### Empty timeline means black frames
 
@@ -88,23 +94,21 @@ in the toolbar's scene-geometry group.
   recommended duration band show a **⚠** hint when exceeded but never clamp
   your values.
 
-Built-in templates: **No Model Template (Free)**, **LTX 2.3 / 2.5**,
-**MiniMax H3**, **Wan 2.1 / 2.2 (14B)**, **Wan 2.2 (TI2V-5B)**,
-**HunyuanVideo 1.5**, **CogVideoX 1.5 (T2V)**, and **CogVideoX 1.5 (I2V)**. Manage them in
-**Settings ▸ Model Templates**: create custom templates, edit any built-in
-(with reset), and pick the default for new projects. Template definitions
-live in your browser; the project stores only the selected template id, and
-falls back to Free on a machine without your custom template.
+The built-in templates are listed in the [README](../README.md#models). Manage
+them in **Settings ▸ Model Templates**: create custom templates, edit any
+built-in (with reset), and pick the default for new projects. Custom templates
+are saved in your browser, so a project opened on another computer without
+your custom template uses **No Model Template**.
 
-Switching to a template with a *different* frame rule clears the In/Out
-selection (the old endpoints would be off-grid); same-rule switches keep it.
-Already-queued jobs are never affected.
+Switching to a template with a different frame rule clears **In** and **Out**;
+a template with the same rule keeps them. Queued jobs keep the template they
+were queued with.
 
 When your generation window does not land on the frame rule, the editor rounds
 **up** rather than trimming your selection, and fills the extra frames itself:
 video holds the last frame, audio mirrors the end of its own window. Those
-frames are trimmed from where the Take is placed on your timeline, so you do
-not have to think about them - but they are inside the generated file.
+frames are left out of the take placed on the timeline, but they are inside the
+generated file.
 
 ## Prompts
 
@@ -125,11 +129,10 @@ Guide frames condition generation with a reference image at a specific frame
   re-keying, strength, mute, in-place image replacement, and deletion.
 - **Add Frame to Guides** on any clip captures that clip's frame at the
   playhead as a new image asset + guide.
-- For LTX-style workflows, **Settings ▸ Guides** exposes a project-durable
-  *Guide collision auto-offset* toggle (default on) that moves single-image
-  guides off temporal slots already occupied by a Driver, recording the
-  applied move in the generated asset's metadata. With the toggle off,
-  queueing warns about unresolved collisions instead.
+- **Settings ▸ Guides ▸ Collision Auto-Offset (project-wide)**, on by
+  default, moves a single-image guide off a frame a Driver already uses (for
+  LTX-style workflows), and the take's details record the move. With it off,
+  queueing warns about the collision instead.
 - Guides reach a graph two ways, and you pick one. The editor node's
   `guide_images` output carries every guide in the window as a single IMAGE
   batch, with `guide_idx` and `guide_strengths` as lists aligned to it, for a
@@ -151,10 +154,9 @@ over lane hiding, so check the selected workflow's instructions.
 Driver clips steer motion, composition, look, or characters without ever
 appearing in output (their editing rules are in
 [Editor Basics](editor-basics.md#driver-clips)). Each Driver has a
-**strength** (0–1). Downstream, the **Sonder Driver Selector** resolves one
-Driver lane by position — without decoding media — and exposes a `has_driver`
-flag for lazy routing; the **Sonder Driver Bridge** then decodes that lane's
-frames for the generation window.
+**strength** (0–1). In the graph, **Sonder Driver Selector** picks a Driver
+row from its lane menu and outputs `has_driver`; **Sonder Driver Bridge**
+outputs that row's frames for the generation window.
 
 ## References
 
@@ -163,68 +165,47 @@ voices — over frame ranges, and reach the model as media assembled by the
 lane's recipe plus prompt text derived from those members (authoring is in
 [References](references.md)). Each item has a **strength** (0–1) and a mute
 toggle, and for any generation window each lane resolves which of its items
-applies. Downstream, the **Sonder Reference Selector** resolves one or more
-lanes by position — without decoding media — and exposes a `has_reference`
-flag for lazy routing; the **Image**, **Audio** and **Prompt Bridges** then
-decode what it resolved.
-
-## Choosing lanes and folders from Controls
-
-The Reference Selector's lanes, the Driver Selector's lane and the Save
-Bridge's target folder can be set from the **Controls** tab, with the same
-pickers their nodes show. This works in the fullscreen editor, in a tab opened
-with **Mount in Tab**, and in the Sonder App.
-
-1. Open the editor: on the **Sonder Editor** node, click **Open Editor**. (In
-   the Sonder App, open your project as in
-   [First generation in the Sonder App](../README.md#first-generation-in-the-sonder-app).)
-2. In the sidebar at the left, click the **Controls** tab.
-3. Click **Manage** at the top right of the Controls tab.
-4. Click **+ Setting** (in the row with + Note and + Group). Settings are
-   grouped under each node's title; type the node's or setting's name in
-   **Filter by node or setting** to find it. Click **Add** beside
-   `reference_lanes` (Sonder Reference Selector), `driver_lane_index` (Sonder
-   Driver Selector) or `target_folder` (Sonder Save Bridge).
-5. Click **Done**.
-
-The target folder appears in the **Editor** group at the top of the Controls
-tab; the lanes appear below it, with your other workflow settings. Each shows
-choices from the editor's current project and scene:
-
-- **Reference lanes**: the selected lanes with their recipe and status. Click
-  **×** on a lane to remove it, or **+ Add lane** to pick another; a lane that
-  can't join the others is greyed out with the reason underneath.
-- **Driver lane**: a menu of the scene's Driver lanes by name. If no lanes can
-  be read (no scene open, or the read failed), type the lane number instead and
-  press **Enter**; **Retry** appears when the read failed.
-- **Target folder**: type any folder name and press **Enter** (or click
-  elsewhere) to keep it; the project's folders and **Root** are offered as you
-  type. **Esc** abandons what you typed.
-
-A plain field with a note shows instead of a picker when the setting can't use
-this editor's project:
-
-- *Wired to another Sonder Editor*: the node takes its project from a different
-  editor, so its lanes or folders belong to that project.
-- *Lane names (or Folder suggestions) are unavailable here*: the editor you
-  opened is muted, bypassed or inside a subgraph, so Controls can't tell which
-  project the node uses.
-
-Settings added on the canvas also appear on the **Sonder Control Relay** node
-as a summary (for example *Lanes 1, 3*); change them in Controls or on the node
-itself. In the Sonder App, **+ Setting** adds an *App only* Control, which
-stays in the app and never appears on the canvas.
+applies. The nodes that carry them into a graph are in
+[References › Wiring the nodes](references.md#wiring-the-nodes).
 
 ## Wiring your graph
 
-The editor's output socket feeds your generation workflow; optional bridge
-nodes carry each conditioning stream to where your graph needs it — guides
-(**Guides Bridge Start/End**), masks (**Masks Bridge**), prompts
-(**Prompt Relay Bridge**), Drivers (**Driver Selector/Bridge**), and
-References (**Reference Selector** plus the Image, Audio, and Prompt Bridges —
-see [References](references.md)). Results come back through **Sonder Save Video** or **Sonder Save Bridge**, which
-register outputs as project assets. The full node list is in the
-[README](../README.md#nodes).
+The **Sonder Editor** node has only outputs. Apart from the project fields on
+its card, its widgets are set by the editor.
+
+| Output | Type | What it carries |
+|---|---|---|
+| `project` | SONDER_PROJECT | A handle to the project. Every other Sonder node takes this. |
+| `rendered_frames` | IMAGE | The timeline's own frames for the generation window. |
+| `prompt` | STRING | The compiled prompt for that window, chips resolved. |
+| `audio` | AUDIO | The mixed timeline audio for that window. |
+| `guide_images` | IMAGE | Every guide frame in the window, as one batch. |
+| `guide_idx` / `guide_strengths` | STRING | Comma-separated frame positions and strengths, aligned with that batch. |
+| `frame_count` · `fps` · `width` · `height` | INT · FLOAT · INT · INT | The window's geometry, for your sampler and latents. |
+| `mask_start_time` / `mask_end_time` | FLOAT | Where the regenerated span begins and ends. |
+
+A text-to-video graph needs three of them and no bridge nodes:
+
+```
+Sonder Editor ──prompt────────> your text encoder ──> sampler ──> VAE Decode
+              ──frame_count───>                                        │
+              ──width/height──>                                        ▼
+                                                               Sonder Save Video
+```
+
+End every graph with **Sonder Save Video** (or **Sonder Save Bridge**) taking
+`project` from the editor, so results come back to the project. Wire `project`
+directly: Get/Set nodes, reroutes and Anything Everywhere break it.
+
+Add bridge nodes only for what your graph uses: guides (**Guides Bridge
+Start/End**), masks (**Masks Bridge**), timed prompts (**Prompt Relay
+Bridge**), Drivers (**Driver Selector/Bridge**) and References
+([Reference Selector and Bridges](references.md#wiring-the-nodes)). The full
+node list is in the [README](../README.md#nodes).
+
+![The showcase workflow: the Sonder Editor node feeding conditioning, sampling, and finally Sonder Save Video](images/showcase-workflow.webp)
+<p align="center"><em>The showcase pipeline. Your graph can be as small as
+editor → sampler → Sonder Save Video.</em></p>
 
 ### Masking an audio-video latent
 
@@ -316,8 +297,8 @@ The queue panel docks at the bottom of the Assets sidebar.
 - **+ Queue** freezes the current generation window into a job (see the next
   section for exactly what freezes). No selection queues the full scene.
 - **+ Batch (N)** splits the selection into contiguous chunks sharing a batch
-  id; chunk size follows the template's frame rule and the Batch Max Frames
-  setting. With zero context the chunks are independent; with context, later
+  id; chunk size follows the template's frame rule and **Max frames per
+  batch** (**Settings ▸ Render**). With zero context the chunks are independent; with context, later
   chunks read earlier chunks' placed takes.
 - **Queue Active** decides what a ComfyUI run renders: **ON** → the first
   pending queued job (FIFO, one per run); **OFF** → the live editor
@@ -326,8 +307,8 @@ The queue panel docks at the bottom of the Assets sidebar.
   or **Save Bridge** with `mark_queue_complete` on). If a batch chunk fails,
   later chunks in that batch are auto-skipped so a progressive batch can't
   continue over a gap.
-- New takes enter the timeline per your Render settings: linked video+audio
-  and optionally starting muted.
+- New takes land on the timeline as described in
+  [Takes](assets-and-gallery.md#takes).
 
 ## What's frozen vs. what stays live
 

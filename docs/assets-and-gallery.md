@@ -30,7 +30,8 @@ but the entry survives.
 
 **Importing**: the Import button, dropping OS files onto the gallery
 (imports into the hovered folder), or dropping an OS *folder* (imports as a
-gallery folder). Drag a row onto the timeline to place it — the drop-zone
+gallery folder). Imports are copied into the project folder, so the project
+keeps working if the originals move. Drag a row onto the timeline to place it — the drop-zone
 rules are in [Editor Basics](editor-basics.md#dropping-assets-onto-the-timeline).
 
 ## Asset lifecycle & safety
@@ -78,6 +79,51 @@ raw generation dump:
 first-class gallery entries: searchable and inspectable with a metadata
 card, but they render no media preview and can't be dropped on the timeline.
 
+## Takes
+
+A **take** is one generated version, saved by **Sonder Save Video** with
+**mode** set to **Take**. It lands in **Assets** under **Takes**, in a folder
+named after the scene, and on the timeline on a new Video row, with its sound
+on a linked Audio row.
+
+![A generated take placed on its own linked video and audio lanes](images/take-placed.webp)
+
+How takes land is set in **Settings** (the **⚙** at the right end of the
+toolbar) **▸ Render**. **Takes start muted** and **Link take video + audio**
+also appear in the **Editor** group of the [Controls](controls.md) tab:
+
+- **Take Placement Mode:** **Trimmed** places only the Selection;
+  **Untrimmed** also places the context frames, for checking seams.
+- **Link Take Video + Audio:** picture and sound move and mute together.
+- **New Takes Start Muted:** a new take doesn't change what plays until you
+  unmute it.
+
+### Which takes should start muted
+
+The timeline renders what is visible, so an unmuted take in front becomes the
+source of the next render over that range.
+
+- **Muted:** you are trying several versions of the same selection at a
+  denoise below 1. Each attempt then starts from the original, not from the
+  last take.
+- **Unmuted:** each take should feed the next, as when chunks of a batch or an
+  extension continue from the take before them.
+- **Either:** at full denoise the source picture is regenerated anyway.
+
+For sound, keep **place_audio_on_timeline** on **Sonder Save Video** when you
+generate new sound and want later takes to continue from it. When the sound is
+frozen (**Sonder Masks Bridge** **edit_audio** on **Freeze**), turn it off, so
+the same audio isn't stacked on a new row with every take.
+
+**Choosing the take that plays.** Higher-numbered Video rows appear in front.
+To keep one take, right-click it and choose **Unmute Selected**, then mute the
+competing takes with **Mute Selected**, or hide their Video row with the eye at
+the left of the row. Click **Play** under the preview to check picture and
+sound. A favorite star in **Assets** doesn't change what plays.
+
+To switch only the picture and keep the sound, hide the Video row, or unlink
+the take first ([Linked groups](editor-basics.md#linked-groups)).
+
 ## Manage mode & bulk actions
 
 **Manage** toggles multi-select (checkboxes; Ctrl/Shift-click also work in
@@ -105,14 +151,7 @@ Double-click (or Space) a gallery asset for fullscreen inspection.
 
 To open comparison, click **Assets** at the upper left, double-click a result
 to inspect it, then click **Compare** in the inspection overlay (or press
-**C** there). A star marks a favorite in the gallery; it does not switch the
-visible timeline take. To keep a winner in the scene, place or unmute that
-clip and mute competing takes. Higher-numbered Video rows appear in front.
-Check its picture and the intended Audio with **Play** below the editor preview.
-Double-click opens a member's own properties, such as volume or opacity;
-**Mute** and **Unmute** still affect its linked group. To switch only the
-picture while keeping linked sound, hide its Video row with the lane's eye,
-or right-click the clip and choose **Unlink Linked Items** before muting it.
+**C** there). To make the winner the take that plays, see [Takes](#takes).
 
 **Compare** (`C` in the overlay) puts two same-type assets side by side —
 built for take review.
@@ -154,7 +193,7 @@ built for take review.
 
 First play the intended result in the editor. Click **Export** above the
 timeline, choose the scene or selection range, the save preset, and whether
-to include video and audio. **Compatible MP4** is the starting choice for
+to include video and audio. **High Quality MP4** is the starting choice for
 ordinary playback. Open the saved file to verify its picture, sound and
 duration. Export saves the arranged result; it does not generate new motion,
 upscale it with a model, or automatically join every scene in a project.
@@ -170,7 +209,7 @@ active selection) to a file through a streaming compositing path:
   result straight onto a fresh lane in the active scene (with optional
   linked, muted take placement).
 - Exports show determinate progress and land in the gallery's `Exports`
-  folder; place-as-take exports land in Root like takes.
+  folder; place-as-take exports land in Root.
 
 ## Audio fidelity
 
