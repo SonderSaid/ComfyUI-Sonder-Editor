@@ -3203,6 +3203,9 @@ def test_authored_ordinals_report_resolved_and_unresolved_numbers():
     for spelling in ("<Picture 2>", "[Shot 2]", "(S1,S3)"):
         assert (f"{spelling} does not resolve to anything currently staged"
                 in row["message"]), row
+    # The advisory names the dynamic alternative, not only the problem.
+    assert "Insert it as a chip (Shot, Reference or Vocal Event) or an @handle" \
+        in row["message"], row
 
 
 def test_authored_ordinal_patterns_include_assetless_and_escape_templates():

@@ -39,6 +39,7 @@ a fresh `[Unreleased]` block.
 
 ### Changed
 - Reorganized the documentation around step-by-step goals, with new pages for Controls and the Sonder App.
+- Prompt: the warning about a typed label such as `[Shot 1]` or `<Picture 1>` now says what to do instead: insert it as a chip (Shot, Reference or Vocal Event) or an @handle, so its number follows staging.
 - A mounted editor tab is titled after its project ("Project · Sonder Editor") and follows a project switch.
 - Enqueue errors about a Reference staged in two slots, or missing its definition, name the Reference ("Entity · Member") instead of printing its id.
 - The built-in **LTX 2.3** model template is now labelled **LTX 2.3 / 2.5**: LTX 2.5 uses the same frame and size rules. Projects and workflows that use it are unchanged.

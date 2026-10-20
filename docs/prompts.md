@@ -169,7 +169,8 @@ the current generation window** shows scene-wide numbering instead.
 ![A prompt section in Structured mode: chips inline inside a channel and in the section's own context row, with @mentions written directly into the prose](images/prompt-structured-chips.webp)
 
 Fields following a source appear in a collapsed row naming that source.
-Expand the row to change them. Fields you have overridden stay visible.
+Click **Override…** on that row to show and change them. Fields you have
+overridden stay visible.
 
 Leave optional fields empty when you have nothing to add. A field following
 a source can still contribute that source's text; switch off that capability

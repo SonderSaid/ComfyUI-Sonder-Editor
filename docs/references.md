@@ -409,6 +409,28 @@ Choose **MiniMax H3 (full reference)** in the toolbar's **Channels** selector.
 Check **Prompt Management → Prompt Context** if the scene has an explicit
 prompt-format choice; it must use **MiniMax H3 (full reference)** too.
 
+Each Reference chip writes part of the prompt for you:
+
+- `subject_definitions`: one line per chip, such as
+  `<Subject 1> is a weathered cowboy … from <Picture 1>`, from its
+  **Definition**.
+- `retention_analysis`: one line per chip, from its **Visual handling** and
+  **Preservation detail**.
+- The task type that opens `summary`, such as `[reference generation]`, from
+  the staged members' roles (below).
+
+Don't type these again in those sections, or the prompt says them twice. You
+write the rest of `summary`, and `detailed_description`, `overall_soundscape`
+and `non_diegetic_music`.
+
+Set each staged member's role in **Reference Lane Setup**: the select on the
+member's row reads **Role: choose…** until you pick one. **Identity**,
+**Environment**, **Style**, **Motion** and **Storyboard** give
+`[reference generation]`; **First frame**, **Last frame**, **Keyframe**,
+**Edited keyframe** and **Composition anchor** give `[keyframe completion]`.
+To choose the task types yourself instead, click **Customize** under
+**Summary task types** in the chip dialog.
+
 A **Subject** names reusable content: a person, place, outfit or style. It
 can draw on several Library members. A **Picture** source names the image
 itself, such as a composition anchor. For a character taken from a picture,
@@ -423,7 +445,9 @@ To create a Subject while attaching a chip:
    that supply the Subject.
    Describe the content in **Definition**; source labels are added for you.
 3. Click **Use for this attachment** to return to the chip dialog.
-4. Set the chip's fields and click **Attach**. The Subject is created with
+4. Set the chip's fields and click **Attach**. A field still following its
+   default, such as an empty **Preservation detail**, stays hidden until you
+   click **Override…**. The Subject is created with
    the attachment; cancelling before this leaves no new Subject.
 
 To name the Subject in the shot's action, type its `@handle` in the

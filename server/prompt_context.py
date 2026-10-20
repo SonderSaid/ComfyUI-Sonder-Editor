@@ -4618,7 +4618,9 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 "origin": str(origin or ""),
                 "channel_key": str(channel_key or ""),
                 "message": (f"Authored ordinal text ({'; '.join(details)}) is sent "
-                            "literally; its number will not follow later staging."),
+                            "literally; its number will not follow later staging. "
+                            "Insert it as a chip (Shot, Reference or Vocal Event) "
+                            "or an @handle instead, and the number stays current."),
             })
 
     warn_authored_prompt_tokens("global", global_docs)
