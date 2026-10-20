@@ -13,6 +13,10 @@ The **Editor** group at the top holds take settings such as
 **Takes start muted**. Below it are the settings the workflow exposes, under
 the group names its author chose.
 
+![The Controls tab: the workflow's description, the Editor group with Takes start muted, Link take video + audio, Max frames per batch and Output preset, then a Generation group with a note, Seed set to Randomize, Steps and Scheduler](images/controls-tab.webp)
+<p align="center"><em>The Controls tab with the Editor group and one
+workflow group, Generation, which starts with an author's note.</em></p>
+
 A workflow without Controls says *No Controls yet*. Click
 [Manage](#manage) and add a setting; on the canvas, the editor adds the
 **Sonder Control Relay** node to the graph for you (one per workflow).

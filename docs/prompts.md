@@ -177,6 +177,10 @@ a source can still contribute that source's text; switch off that capability
 for the field if you want no contribution. If an advisory names a missing
 field, use its **Fix** to open the field and supply the requested detail.
 
+![The top of Prompt Management: a warning that a Subject needs authored detail in "Preservation detail", with a Fix button beside it](images/prompt-management-fix.webp)
+<p align="center"><em>Warnings sit at the top of Prompt Management; <strong>Fix</strong>
+opens the chip on the field the warning names.</em></p>
+
 ## Writing aids
 
 Some provider syntax is fixed — a dialogue wrapper, a scene-transition marker, a

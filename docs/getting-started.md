@@ -373,6 +373,11 @@ For MiniMax H3, use its reference-to-video model mode.
    model choice.
 5. Save with **Sonder Save Video**, **mode** **Take**, then click **Run**.
 
+![A ComfyUI graph: Sonder Editor feeding Sonder Reference Selector with reference_lanes set to two lanes, Sonder Reference Image Bridge with outputs labelled r01 · Picture 1 and r02 · Picture 2, two Preview Image nodes showing the staged pictures, and Preview as Text showing the compiled MiniMax H3 prompt](images/reference-graph.webp)
+<p align="center"><em>The Reference half of an H3 graph, checked with previews
+before the model nodes are added. Each Bridge output names the picture it
+carries, matching the labels in the prompt.</em></p>
+
 **You'll see:** a take conditioned by the numbered inputs. The prompt's
 Reference labels follow the selected generation window.
 

@@ -261,10 +261,10 @@ recipe. The recipe fields below depend on its **Assembly**.
 The prompt preview is read-only. Click it to open
 [Prompt Management → Reference Prompting](#the-lanes-derived-prompt).
 
-![Reference lane tabs, staged member thumbnails and the recipe selector](images/reference-lane-setup.webp)
-<p align="center"><em>The screenshot shows an older layout. Prompt editing now
-lives in Prompt Management → Reference Prompting; click the item's preview
-in Reference Lane Setup to open it.</em></p>
+![Reference Lane Setup: lane tabs, one staged item with two members, the read-only prompt preview with Copy, each member's role and preservation selects, and the MiniMax H3 Pictures template](images/reference-lane-setup.webp)
+<p align="center"><em>An item with two members on a MiniMax H3 Pictures lane.
+Each member row has its role and preservation; the prompt preview above them
+is read-only.</em></p>
 
 Some values are **pegged** rather than typed — the frame grid and snap multiple
 follow the scene's model template, a sheet's loop length follows the render
@@ -449,6 +449,14 @@ To create a Subject while attaching a chip:
    default, such as an empty **Preservation detail**, stays hidden until you
    click **Override…**. The Subject is created with
    the attachment; cancelling before this leaves no new Subject.
+
+![The Create prompt identity dialog: Handle, Name and Definition filled, Physical sources expanded with one Library member ticked, and the Use for this attachment button](images/new-subject-identity.webp)
+<p align="center"><em>Step 2: the identity editor with one Library member
+ticked under <strong>Physical sources — optional</strong>.</em></p>
+
+![The Reference attachment dialog for a new Subject: a row reading "10 fields following Shared identity default" with an Override… button](images/chip-override.webp)
+<p align="center"><em>Step 4: fields that follow their default stay folded;
+<strong>Override…</strong> shows them, Preservation detail included.</em></p>
 
 To name the Subject in the shot's action, type its `@handle` in the
 description, for example `@Anna opens the door.` (see [Mentions](#mentions)).

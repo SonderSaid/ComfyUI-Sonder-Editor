@@ -8,6 +8,10 @@ click) beside **+ Queue** and the workflow's settings in the
 
 The app is optional: the editor and every node work without it.
 
+![The Sonder App Launcher: imported workflows listed on the left with the selected one showing its description and Controls, and project cards on the right with a New project card](images/sonder-app-launcher.webp)
+<p align="center"><em>The Launcher: pick a workflow on the left and a project
+on the right, then click <strong>Open</strong>.</em></p>
+
 ## Set it up
 
 Do this once, in a browser on the ComfyUI machine.
