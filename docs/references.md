@@ -399,6 +399,12 @@ block, not each member.
 
 ### MiniMax H3 (full reference)
 
+MiniMax H3 uses a more complex prompt syntax than other models: the prompt is
+split into named sections, and References are named by labels such as
+`<Subject 1>`. The editor writes the labels for you; for what each section
+should say, read
+[MiniMax's full-reference prompt guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md).
+
 Choose **MiniMax H3 (full reference)** in the toolbar's **Channels** selector.
 Check **Prompt Management → Prompt Context** if the scene has an explicit
 prompt-format choice; it must use **MiniMax H3 (full reference)** too.
@@ -432,9 +438,6 @@ Fill **Preservation detail** with what should carry over, for example
 Prompt Management names a missing **Preservation detail**, click its **Fix**
 to open that chip on the field.
 Empty optional fields can stay empty; address the fields named by advisories.
-
-For the output sections and provider syntax, see
-[MiniMax's full-reference prompt guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md).
 
 ### When the Reference isn't in the window
 
