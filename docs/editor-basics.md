@@ -93,12 +93,9 @@ range of frames. See
 
 Each media lane header has three independent controls plus the label:
 
-- **▾ Collapse** — folds the lane visually. Layout only — it never affects
-  rendering.
-- **🔒 Lock** — blocks edits on that lane; locked items can't be selected and
-  destructive actions refuse.
-- **👁 / 🔊 Hide** — removes the lane's content from preview *and* render
-  output. **Hiding is the only render-skip control**; collapsing never is.
+- **▾ Collapse** — folds the lane to make room on the timeline.
+- **🔒 Lock** — prevents selecting and editing items on that lane.
+- **👁 / 🔊 Hide** — excludes the lane from preview and generation.
 - **Label** — drag across headers to select multiple lanes; rename via
   right-click.
 
@@ -158,26 +155,19 @@ muted, replaced in place, or re-keyed.
 
 ### Driver clips
 
-To use an existing video as guidance, place it on a **Video** row at the
-bottom of the timeline. Right-click its clip and choose **Convert to Driver**.
-It moves to a Driver row and disappears from the normal preview; its media
-is still in the project. For visible footage again, right-click the Driver
-clip and choose **Convert to Render Clip**.
+A Driver uses a clip to steer generation without appearing in the output.
+To create one, right-click a Video clip and choose **Convert to Driver**.
+To show it as footage again, right-click it and choose
+**Convert to Render Clip**. For the graph connections, follow
+[Drive with a control video](getting-started.md#drive-with-a-control-video).
 
-A clip whose role is **motion/look conditioning, not visible output** —
-Drivers steer the generated clip's composition, movement, look, or
-characters, depending on what your model supports. Driver lanes hold at most
-one clip each, and Driver clips never appear in normal preview or renders
-(only in Animatic mode, as animated reference). Drivers can't be split — use
-separate Driver lanes for separate conditioning sources. Convert a video clip
-to a Driver (and back) from its right-click menu.
+Each Driver lane holds one clip. Drivers appear in **Animatic** preview;
+they cannot be split. Use separate lanes for separate conditioning sources.
 
 ### Reference items
 
-A range on a Reference lane saying **which Library members apply over which
-frames** — say, this character's face plus this outfit, from frame 0 to 120.
-The lane points at the [Reference Library](references.md); trimming an item
-changes when those references apply, never the media itself.
+A [Reference item](references.md#reference-lanes) places Library members over
+a range of frames. Drag to move it; trim its edges to change the range.
 
 Create one by dragging a Reference from the **References** sidebar onto the
 timeline. Dropping on the **ruler** always makes a new lane; dropping on an

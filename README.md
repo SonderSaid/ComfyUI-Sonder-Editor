@@ -257,7 +257,7 @@ version and opening instructions, is on
   templates, guides, Drivers, wiring your graph, the render queue, and what's
   frozen vs. live in queued jobs.
 - **[Prompts](docs/prompts.md)** — Prompt Management, how a prompt is composed,
-  Channel Templates, prompt formats and Context chips.
+  Channel Templates, prompt formats, Context chips and Prompt Relay.
 - **[References](docs/references.md)** — the Reference Library, Reference
   lanes and recipes, Reference prompting, and the Reference nodes.
 - **[Assets & Gallery](docs/assets-and-gallery.md)** — asset lifecycle,

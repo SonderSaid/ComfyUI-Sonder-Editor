@@ -14,11 +14,17 @@ the Editor interface.
 
 ### `torch` / `torchaudio` got reinstalled and GPU stopped working
 
-ComfyUI ships a torch build matched to your GPU/CUDA. This pack intentionally
-does **not** list `torch`/`torchaudio` in its requirements so an automatic
-`pip install` can't overwrite that build with a mismatched (often CPU-only)
-wheel. Sonder's audio decode, mixing and export use FFmpeg. An optional waveform
-thumbnail fallback can use ComfyUI's existing `torchaudio` installation.
+Stop ComfyUI and restore the PyTorch packages required by your ComfyUI
+installation and GPU. Use that installation's Python environment, not a
+system Python:
+
+1. For a managed installation, use its installer's repair or dependency
+   reinstall procedure.
+2. For a manual installation, follow the GPU-specific PyTorch commands in
+   [ComfyUI's installation instructions](https://docs.comfy.org/installation/manual_install).
+   Reinstall the matching `torch`, `torchvision` and `torchaudio` set together.
+3. Restart ComfyUI and check its startup output identifies your GPU rather
+   than CPU mode.
 
 ### `cv2` import errors after installing another custom node
 
@@ -40,42 +46,28 @@ more capable across formats.
 
 ### Sonder Switch runs every branch or reports a selected branch unavailable
 
-Sonder Switch's branch skipping requires ComfyUI **0.40.0 or newer**. Older
-ComfyUI cores can evaluate every connected branch before the Switch selects its
-output because their scheduler misses lazy metadata on growing inputs. Sonder
-does not work around that upstream scheduling defect. A branch also used by
-another active consumer may still run independently of the Switch.
+Update ComfyUI to **0.40.0 or newer**, then restart it. An older scheduler
+can run every connected Switch branch.
 
-If ComfyUI 0.40+ reports `Selected branch 'itemN' is not available (None)`, update
-Sonder Editor as well, then restart ComfyUI. Older Sonder builds did not recognize
-the executor's lazy-input placeholders, a defect exposed by the scheduler fix.
-The fix preserves existing Switch sockets and connections; rewiring is not needed.
-
-This is a Switch-specific scheduling requirement, not a minimum ComfyUI version
-for the entire node pack. Cluster and Gate use fixed inputs and are unaffected
-by this growing-input issue.
+If it reports `Selected branch 'itemN' is not available (None)`, update
+Sonder Editor too and restart ComfyUI. Keep the existing connections.
+If a branch still runs, check whether another active node also consumes it.
 
 ## Projects & storage
 
 ### An older Sonder version refuses a project saved by a newer one
 
-Sonder 0.6.0 moves projects to storage format 3 the first time it saves them,
-and this version creates new projects in it; after that they need 0.6.0 or
-newer. Keep the whole project folder, including `state/`, when moving it.
+Update Sonder Editor to **0.6.0 or newer** to open a storage-format-3
+project. Keep the whole project folder, including `state/`, when moving it.
 
 ### A project won't open, save or extract on Windows
 
-Windows limits file paths to 260 characters unless
-[long-path support](https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation)
-is enabled. This is a Windows limit, not specific to Sonder. Since 0.6.0 Sonder
-keeps its own file names short to stay well inside it, but a deeply nested
-ComfyUI install can still reach it. Enabling long-path support is the
-recommended fix. Windows' built-in compressed-folder tool (**Send to →
-Compressed folder** and **Extract All**) ignores long-path support even when
-it's enabled, so use a third-party archive tool to compress or extract
-projects. Otherwise, keep ComfyUI in a short location and extract downloaded
-projects directly into `ComfyUI/output/sonder-projects/`. If a project already
-fails to open, move it somewhere shallower and open it there.
+Update Sonder Editor to **0.6.0 or newer**, which uses shorter file names.
+If the error still reports a path that is too long, move the project to a
+shallower folder or enable
+[Windows long-path support](https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation).
+Use a third-party archive tool when Windows **Extract All** fails on long
+paths, and extract projects directly into `ComfyUI/output/sonder-projects/`.
 
 ### An export says the files were saved but registration could not be confirmed
 
@@ -216,5 +208,8 @@ address.
 
 ### Video does not play in the editor when ComfyUI runs with `--disable-api-nodes`
 
-That option makes ComfyUI replace the editor's content security policy with one
-that blocks the video the editor loads for playback. Start ComfyUI without it.
+Update ComfyUI to **0.40.0 or newer** and restart it; there the option is called
+`--offline` and video plays. On an older ComfyUI, start it without the
+option. If the browser console still reports a `media-src` policy violation,
+check the policy added by your proxy or another extension; it must allow
+`blob:` media.

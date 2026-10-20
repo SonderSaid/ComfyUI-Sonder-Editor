@@ -125,13 +125,10 @@ composition-anchor inputs. These are suggestions, not requirements — nothing
 is blocked, and the only hard limit is the recipe's member cap.
 
 A tag describing content is universal. A tag naming a provider input slot
-carries its family: for example **Motion Reference** is universal, while
-**MiniMax H3 · Motion** names an H3 slot. The picker groups those families, and
-the Library, timeline, lane setup, live graph Selector, advisories, and asset
-usage rows all resolve them from the same declared label. Compact canvas labels
-use the same data in a shorter form, such as **H3·Motion**. A running frozen
-Selector deliberately keeps its frozen raw ids instead of relabelling them from
-live metadata. Custom and unknown tags also keep their authored text.
+carries its family: **Motion Reference** is universal, while
+**MiniMax H3 · Motion** names an H3 slot. The picker groups tags by family;
+compact timeline labels use shorter names, such as **H3·Motion**.
+Custom tags keep the text you entered.
 
 Built-in tags are media-aware, so once you pick an asset only the tags that fit
 it are offered: Voice Identity takes standalone audio, and video only when the
@@ -167,17 +164,17 @@ Create items by dragging from the **References** sidebar onto the timeline, or
 with **Add to timeline** on an expanded Library card; the rules are in
 [Editor Basics › Reference items](editor-basics.md#reference-items).
 
-A Reference lane header's **☰** (also on its right-click menu) opens the lane
-Setup overlay — staged members, their order, and the recipe that decides how
-they're assembled for the model.
+A Reference lane header's **☰** (also on its right-click menu) opens **Reference Lane Setup**.
+It also opens after the first item is added to a new or empty lane. To turn
+that off, open **Settings → References** and untick
+**Open Lane Setup on First Item (browser)**.
 
 ## Reference image fitting
 
 **Settings → References** sets how individual reference images and video
 frames fill their recipe's output dimensions, across all built-in and custom
 recipes in the project. New and existing projects default to **Fill (crop),
-Center** until you choose a setting. Earlier versions padded these outputs with
-edge pixels; choose **Fit (edge pad)** to keep that look in an existing project.
+Center** until you choose a setting.
 
 | Fit Mode | Result |
 |---|---|
@@ -197,10 +194,10 @@ chooses output dimensions. It applies to **Batch**, **Temporal** and **Slots**.
 **Sheet** grids and strips keep their recipe's fitting, layout and background.
 
 Queued jobs keep the fit mode and anchor captured when they were added, even
-if Settings changes before they run. Jobs the editor queued before these
-controls were added retain the former **Fit (edge pad), Center** behavior.
+if Settings changes before they run.
 
-## Recipes and lane setup
+<a id="recipes-and-lane-setup"></a>
+## Recipes and Reference Lane Setup
 
 A lane's **recipe** decides how its staged members become model input. Open it
 from the lane header's **☰**.
@@ -231,15 +228,18 @@ Recipes that ship built in:
 | MiniMax H3 Videos (IMAGE sequences) | image | slots | 3 |
 | MiniMax H3 Standalone Audio | audio | audio | 3 |
 
-Selecting a built-in recipe materializes its current values onto the lane; an
-existing lane does not generally live-follow later catalog corrections.
-**Edit as custom** forks those values into a project recipe you can change. To
-return to the current built-in, pick it again from the lane's template dropdown.
-That re-materializes the built-in and discards the fork's edits.
+Choose a recipe in **Reference Lane Setup → Recipe → Template**.
+Recipes for a different media kind are greyed out while the lane holds items,
+with the reason beside the name. Stage that kind on another lane instead.
+A mouse selection applies immediately. When browsing with the keyboard, press
+Enter or leave the selector to apply; Esc restores the previous choice.
+
+**Edit as custom** makes an editable project recipe from the selected values.
+To reset it to the built-in recipe, select that built-in again in **Template**.
 
 Several model contracts need one extra setup detail outside the recipe:
 
-- **LTX Best Face ID** uses a canonical lone-reference frame of `460×406`
+- **LTX Best Face ID** uses a single-reference frame of `460×406`
   (`1.133:1`). A portrait face crop is therefore pillarboxed to roughly 59–66%
   frame fill unless the Library member's crop box matches that aspect.
 - **LTX IC-LoRA Ingredients** needs both `Reference sheet: [...]` and
@@ -252,17 +252,19 @@ Several model contracts need one extra setup detail outside the recipe:
   area and discards the recipe's 2048-short-edge preparation. The recipe mirrors
   the node's nearest-`/32` image rounding; set the node to `max` when using it.
 
-The **Reference Lanes** overlay opens on the lane's staged items: each item's
-frame range, strength and Active state, its members as `Reference · Member`
-thumbnails, and its advisory count. Tabs along the top switch between Reference
-lanes without closing it.
+**Reference Lane Setup** shows each staged item's frame range, strength,
+**Active** state, members and advisories. Tabs along the top switch lanes.
+Item options start expanded; fold them when you only need the summary.
+Per-member controls include the role and preservation choices offered by the
+recipe. The recipe fields below depend on its **Assembly**.
 
-Expanding an item reaches its derived prompt and its per-member controls, where
-each member carries a **role** and a **preservation** choice drawn from the
-recipe's own catalogs. The recipe itself sits below, showing only the fields
-your Assembly actually uses.
+The prompt preview is read-only. Click it to open
+[Prompt Management → Reference Prompting](#the-lanes-derived-prompt).
 
-![The Reference Lanes overlay: lane tabs across the top, one staged item with its frame range, strength and Active state, its two members as thumbnails, and the recipe template below](images/reference-lane-setup.webp)
+![Reference lane tabs, staged member thumbnails and the recipe selector](images/reference-lane-setup.webp)
+<p align="center"><em>The screenshot shows an older layout. Prompt editing now
+lives in Prompt Management → Reference Prompting; click the item's preview
+in Reference Lane Setup to open it.</em></p>
 
 Some values are **pegged** rather than typed — the frame grid and snap multiple
 follow the scene's model template, a sheet's loop length follows the render
@@ -276,12 +278,12 @@ the accepted `4×1` layout rather than reserving empty cells.
 ## What a generation window resolves to
 
 Staging an item doesn't guarantee the model sees it. For the current generation
-window every staged item gets a verdict, shown on the timeline and in the lane
-panel alike:
+window every staged item gets a verdict, shown on the timeline and in
+Reference Lane Setup:
 
 | Verdict | Meaning |
 |---|---|
-| **In window** | Most-specific-wins resolved this item; it's the one the model receives. |
+| **In window** | This item won on its lane and is available to the graph through a Selector that selects the lane. |
 | **Superseded** | Another item on this lane covers this window more tightly, so that one is sent instead. |
 | **Below threshold** | The overlap is below the threshold relative to the shorter item/window span, so this item is not sent. |
 | **Outside window** | The item doesn't overlap the window. |
@@ -296,8 +298,8 @@ window, or fully inside it, scores 100% and stays even at threshold 100.
 Crossing an edge reduces coverage smoothly; a short neighbor mostly inside a
 long window can still stay. Unlike prompts, filtering can leave a lane with
 *nothing*. Lower the threshold or extend the staged range into the window.
-Surviving items still compete by overlap divided by their own span; winner
-scoring is unchanged.
+If several items pass, the item with the greatest overlap relative to its own
+span wins on that lane.
 
 With no selection nothing is marked, since the marks answer "what will this
 render use".
@@ -306,21 +308,63 @@ Queueing a **batch** predicts all of this per chunk before anything runs, and
 says whether a lane drops because of the threshold or because that chunk falls
 outside the staged range. A lane that resolves in no chunk always warns.
 
-## Prompts from References
+### Use cases
 
-References reach a prompt two ways, and they suit different jobs.
+- **One lane: versions of the same thing.** For example, a character "Before
+  Fight" and "After Fight". Stage each version as its own item, one after the
+  other on the lane; only one is used at a time. If a generation window spans
+  both, only one of them is sent.
+- **Separate lanes: things that appear together.** For example, a character
+  and a location in the same shot. Give each its own lane and add both lanes
+  to the **Sonder Reference Selector**'s lane list. Lanes with different
+  recipes need a Selector each.
+
+<a id="prompts-from-references"></a>
+## Reference prompting
+
+### Attaching a Context chip
+
+Open [Prompt Management](prompts.md#opening-prompt-management), find the
+Global or timed section you are writing, and click **+ Attach**. Choose
+**Reference**, choose its source, then click **Attach**. Click the chip's
+**✎** to change its fields later.
+
+With **Generic**, the source is a staged Reference item and its chip uses the
+[lane's derived prompt](#the-lanes-derived-prompt). With
+**MiniMax H3 (full reference)**, choose a Subject or a physical Picture,
+Video or Audio source as described [below](#minimax-h3-full-reference).
+The chip resolves for the current generation window and contributes to the
+editor's `prompt` output.
+
+**Reference Prompting** holds member handles, prompt defaults and staged-item
+overrides. **Identity Prompting** holds [prompt identities](prompts.md#prompt-identities).
+Adding a Library Reference does not create an identity.
+
+### The Prompt Bridge
+
+To keep the recipe's text separate from the editor's main prompt, wire
+**Sonder Reference Prompt Bridge** from the Selector's `reference_set`.
+Its `reference_prompt` output carries the combined recipe text; `p01`–`p16`
+carry individual member text. Connect the output to your model's matching
+text input or combine it with `prompt` before encoding. Avoid adding the
+same recipe text through both a chip and the Bridge.
 
 ### The lane's derived prompt
 
 A staged item carries prompt text as well as media, assembled from the members
 themselves so it tracks what you stage.
 
-The lane panel shows it in one of two states. **Prompt — derived from members**
-is read-only, built from each member's own text through the recipe's pattern,
-and follows every staging change. **Copy** takes the text; **Edit as override**
-hands you the same text as an editable draft. Once overridden the header reads
-**Prompt — overridden**, the derived version stays visible beside it, and
-**Clear** goes back to following the members.
+For the **Generic** prompt format, open
+[Prompt Management](prompts.md#opening-prompt-management) and scroll down
+to **Reference Prompting**, in the **Prompt Context** section. Under
+**Recipe-derived prompt**, find the staged item's row: **Copy** copies its
+derived text; **Edit as override** starts an editable version for that item.
+Edit the box and leave it to save; Esc reverts the unsaved edit. **Clear**
+removes the override and returns to the recipe's text.
+
+These overrides affect the Prompt Bridge and Generic chips. For
+**MiniMax H3 (full reference)**, author the Subject or Picture chip's fields
+instead; see [below](#minimax-h3-full-reference).
 
 Three recipe fields shape the derived text:
 
@@ -353,39 +397,44 @@ output, so a graph can wire one member's text separately from the aggregate.
 The prefix and suffix are not repeated there — they open and close the whole
 block, not each member.
 
-The derived text has two exits and neither is automatic: wire the Prompt
-Bridge's `reference_prompt` output in the graph, or attach the staged item as a
-Reference Context chip. The lane panel says which of the two are available and
-whether a chip is attached.
+### MiniMax H3 (full reference)
 
-Prompt Management's **Reference Prompting** section lists the same text for
-every staged Reference, read-only, with whether it falls in the current render
-window and which parts the recipe added. It is the one place to read what all
-your staged References contribute without opening each lane.
+Choose **MiniMax H3 (full reference)** in the toolbar's **Channels** selector.
+Check **Prompt Management → Prompt Context** if the scene has an explicit
+prompt-format choice; it must use **MiniMax H3 (full reference)** too.
 
-### Attaching a Context chip
+A **Subject** names reusable content: a person, place, outfit or style. It
+can draw on several Library members. A **Picture** source names the image
+itself, such as a composition anchor. For a character taken from a picture,
+attach a Subject and select that picture as its source.
 
-A fixed pattern only goes so far. When the wording depends on which References
-actually win the window, or the provider expects numbered labels you would
-otherwise count by hand, **attach a Context chip to the prompt field** instead.
-**+ Attach** picks the target Reference or identity and configures its
-overrides in the same dialog; the chip then resolves against the selected
-generation window when the prompt compiles.
+To create a Subject while attaching a chip:
 
-This is how **MiniMax H3 (full reference)** prompts are built. That format
-declares subject, picture, video, and audio populations, and the chips take
-their ordinals from the compiled setup rather than from anything you number
-yourself.
+1. In the prompt section, click **+ Attach**, choose **Reference**, then
+   **New Subject…** in the source selector.
+2. Fill **Name**, **Handle** and **Definition** in the identity editor.
+   Expand **Physical sources — optional** and select the Library members
+   that supply the Subject.
+   Describe the content in **Definition**; source labels are added for you.
+3. Click **Use for this attachment** to return to the chip dialog.
+4. Set the chip's fields and click **Attach**. The Subject is created with
+   the attachment; cancelling before this leaves no new Subject.
 
-**Reference Prompting** in Prompt Management is where this is authored. It shows
-the physical media resolved from the active setup and window, and is where you
-give each member the handle and prompt text its chips will use. Staging stays
-in Reference lanes — Reference Prompting never moves anything on the timeline.
+To name the Subject in the shot's action, type its `@handle` in the
+description, for example `@Anna opens the door.` (see [Mentions](#mentions)).
+A chip attached to the section adds no mention to `detailed_description` by
+default. To add one, expand **Prompt parts and routing** in the chip dialog
+and tick **Scene mention**; leave it off if your text already names the
+Subject.
 
-Beside it, **Identity Prompting** authors semantic prompt identities —
-provider-neutral records that may combine several Library members or exist from
-a description alone. An identity is not a Reference, and the Library never
-creates one for you; see [Prompts](prompts.md).
+Fill **Preservation detail** with what should carry over, for example
+“Keep the coat's red color and the face shape.” If a warning at the top of
+Prompt Management names a missing **Preservation detail**, click its **Fix**
+to open that chip on the field.
+Empty optional fields can stay empty; address the fields named by advisories.
+
+For the output sections and provider syntax, see
+[MiniMax's full-reference prompt guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md).
 
 ### When the Reference isn't in the window
 
@@ -425,7 +474,7 @@ conditioning the window under either policy.
 Advisories aggregate per lane and cause, so muting a lane on a dense timeline
 reads as one advisory naming every affected chip. When text is kept a second
 advisory says so. Either way every affected chip is still marked individually in the
-Prompt panel.
+Prompt Management.
 
 ### Mentions
 
@@ -435,17 +484,17 @@ and the editor marks it so you can see it is live.
 
 Mentions are ordinary text, which is what lets them survive copy, cut, and
 paste. Prose can name a handle that doesn't exist yet and wire itself up when
-you create it. An `@` that isn't one of your handles — an email address
-included — is left exactly as you wrote it.
+you create it. An unrecognized `@handle` stays as typed and raises a warning: correct its
+spelling or create the intended identity/member handle.
 
 Reference **Context chips**, which carry the same intent without typing
 provider ordinals by hand, are covered in
-[Prompts](prompts.md#how-the-output-prompt-is-composed).
+[Prompts › Context chips](prompts.md#context-chips).
 
 ## Wiring the nodes
 
-Four nodes carry References into a graph: the **Selector** resolves lanes
-without decoding anything, and the three **Bridges** decode what it resolved.
+Use **Sonder Reference Selector** to choose lanes, then connect the matching
+Image, Audio or Prompt Bridge to send their media or text to your model.
 
 ```
 Sonder Editor ──project──> Reference Selector ──reference_set──> Image Bridge
@@ -473,8 +522,8 @@ It emits:
 - `reference_strength` — the authored strength of the first effective lane in
   lane order, or `0.0`.
 
-Co-selected lanes must agree. A candidate whose media kind, materialized
-recipe, or effective prompt override differs from the lanes already selected is
+Co-selected lanes must agree. A candidate whose media kind,
+recipe settings, or prompt override differs from the lanes already selected is
 listed but disabled, with the reason shown; a blank or detached recipe can only
 be selected alone.
 
@@ -490,10 +539,9 @@ Slot order follows staged member order, and lanes concatenate in lane-index
 order. Non-slot assemblies emit one payload per lane; slot recipes emit one
 member per output.
 
-**Slots never move.** A selected lane reserves its widest staged member count
-whether or not it is currently effective, so an inactive earlier lane leaves
-its outputs reading `(unused)` rather than shifting later lanes down — a
-socket's position is what ComfyUI type-checks against.
+An inactive earlier lane leaves its outputs reading `(unused)`; later lanes
+keep their socket positions. Each selected lane reserves enough outputs for
+its largest staged item.
 
 The Image and Audio Bridges take an **`unused_slots`** choice for outputs the
 recipe does not drive:

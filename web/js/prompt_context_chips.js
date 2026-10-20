@@ -4793,6 +4793,31 @@ export function requestAttachmentFieldFocus(attachmentId, field) {
         field: String(field || "retention_detail") };
 }
 
+/**
+ * Open the chip a diagnostic names on one of its fields. The chip is either
+ * placed in prompt text (`data-node-type="attachment"`, whose click opens the
+ * editor) or attached to a section's scope row (whose click opens a menu, so
+ * it carries `_sonderConfigure` to open the editor directly). Projections share
+ * `data-attachment-id` but open nothing, so they are skipped. Returns whether a
+ * chip was opened.
+ */
+export function openAttachmentChipOnField(root, { attachmentId, origin = "", field } = {}) {
+    const id = String(attachmentId || "");
+    const chips = [...(root?.querySelectorAll?.("[data-attachment-id]") || [])].filter(
+        (chip) => chip.dataset.attachmentId === id
+            && (chip.dataset.nodeType === "attachment"
+                || typeof chip._sonderConfigure === "function"));
+    const chip = chips.find((value) => !origin || value.closest(
+        "[data-sonder-prompt-origin]")?.dataset.sonderPromptOrigin === origin)
+        || chips[0];
+    if (!chip) return false;
+    chip.scrollIntoView?.({ block: "nearest" });
+    requestAttachmentFieldFocus(id, field);
+    if (typeof chip._sonderConfigure === "function") chip._sonderConfigure();
+    else chip.click();
+    return true;
+}
+
 /** Bounded, deterministic attachment configuration. No provider prose is generated. */
 export function configurePromptAttachment(rawAttachment, {
     scene = null, references = [], semanticUnits = [], channelKey = "", profileId = "generic@1",
@@ -6452,6 +6477,9 @@ export function createScopeChipRow({ attachments = [], previews = {}, disabled =
             chip.style.borderColor = COLORS.dangerBorder;
             chip.style.color = COLORS.dangerText;
         }
+        // A diagnostic's Fix opens the editor without the menu in between
+        // (`openAttachmentChipOnField`); the same Configure… the menu offers.
+        if (onActivate && !disabled) chip._sonderConfigure = () => onActivate(attachment);
         let menu = null;
         chip.addEventListener("click", () => {
             if (disabled) return;

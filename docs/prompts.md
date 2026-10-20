@@ -27,7 +27,9 @@ any of these ways:
 
 **Structured** and **Writing** switch between its two
 [modes](#structured-and-writing-prompt-modes). It also holds **Prompt Context**
-(the prompt format), **Reference Prompting** and **Identity Prompting**.
+(the prompt format),
+[Reference Prompting](references.md#reference-prompting) and
+[Identity Prompting](#prompt-identities).
 
 ## How the output prompt is composed
 
@@ -47,26 +49,21 @@ fields—Standard, Visual/Speech/Sound, MiniMax H3, or a custom set—and its
 **prompt format** (technical: Prompt Context Profile) owns labels, separators,
 dynamic syntax, writing aids, and validation.
 
-Text stays yours. Dynamic **Context chips** store stable intent and source ids,
-then resolve for the selected window: Shot numbering and its optional relative
-time, Reference context, Custom text with an optional H3 physical Guide binding,
-managed Vocal Events, and links to earlier prompt sections. Fixed syntax such as
-dialogue wrappers and camera phrases is inserted as a profile-provided **Writing
-aid**. Hover previews use the latest live
-compiler result; blocking diagnostics must be repaired before queueing.
+Context chips update their text for the selected generation window: shot
+numbers, Reference labels, timestamps and links to earlier sections. Hover a
+chip to preview its contribution. Fix any blocking diagnostic before queueing.
+For fixed phrases such as camera motion or dialogue wrappers, use a
+[Writing aid](#writing-aids).
 
-Timeline prompt bars show **All channels** by default. You can focus one channel,
-and that presentation choice is remembered per Channel Template. Hidden
-channels stay mounted with their caret/undo state and show non-empty counts
-beside the Channel selector. Switching is presentation only; it never moves or
-flattens authored text or chips.
+Timeline prompt bars show **All channels** by default. Choose a channel to
+focus on its field; other fields keep their text and still contribute to the
+prompt. The choice is remembered for each Channel Template.
 
 - **Boundary Prompt Threshold** (project-wide) drops a section from a window
   when its clipped coverage is below that percentage of the shorter of its
   authored span and the generation window. Containment in either direction stays;
   lower-coverage ends drop first (trailing first on ties), with at least one
-  section kept. Short windows can retain neighbors that previously dropped,
-  including at the default 10%. The timeline shows
+  section kept. The default is 10%. The timeline shows
   affected slivers with a dim "Ignored" hatch, and sections that *will*
   compose get a strong accent.
 - **Out-of-window Reference text** (project-wide) decides whether a Reference
@@ -117,7 +114,7 @@ settings card says so, and **Use** replaces it.
 
 Where a Channel Template says what the fields *are*, a **prompt format** says
 how they are written: labels, separators, dynamic syntax, writing aids, and what
-counts as valid. Diagnostics and the code call it a Prompt Context Profile.
+counts as valid. Error messages call it a "prompt context profile".
 
 A format is chosen **per scene**, in the Prompt Management panel's
 **Prompt Context** section — though you rarely have to. Each Channel Template names the format it
@@ -128,13 +125,13 @@ Formats target a particular template, so one built for a different template
 appears **disabled rather than hidden**, and an existing mismatched pairing
 stays visible instead of vanishing.
 
-Built-in formats are immutable. **Save as custom…** creates your own from one,
-and editing a custom format creates a **new version** rather than changing the
-one your scenes already point at.
+To change a built-in format, click **Save as custom…** and edit the copy.
+Saving an edited custom format creates a new version; select that version
+in each scene that should use it.
 
-A custom format is purely declarative: routing and placement, the vocabularies
-its controls offer, label templates, descriptions, examples and help, identity
-kinds, reference populations, and speaker policy.
+A custom format lets you choose where chip text appears, its labels and
+available choices, the identity kinds and Reference sources it supports,
+and its speaker labels.
 
 ## Context chips
 
@@ -147,22 +144,18 @@ It also means you can name the same thing wherever it belongs without repeating
 it in the output. Chips resolving to equivalent text in one channel emit
 **once**; the rest report *deduplicated* instead of writing the line again. When
 the same text would be emitted for a *different* subject or slot, that is
-flagged rather than silently merged — the fix there is to blank one chip's
-field, not to drop a line. Splitting a section keeps this intact: the halves
-carry separate chips that still deduplicate against each other in a combined
-render.
+flagged. Switch off that capability on the chip whose contribution you do
+not want.
 
-**+ Attach** adds one, and the same dialog configures it before it exists. A
-chip carries a small `✎` because
-it is an editor, not a static token. Chips sit either inline in a field or in the
-section's own context row, depending on where the format places them.
+**+ Attach** adds one. Chips sit either inline in a field or in the section's own context row, depending on
+where the format places them. To change a chip later, click an inline chip
+(marked `✎`), or click a context-row chip and choose **Configure…**.
 
 A chip can also be switched off for a single field without being removed. That
 field then says the capability is disabled and contributes no text.
 
 Because a chip resolves against a window, editing a section that falls **outside
-the current generation window** shows scene-wide numbering instead — the panel says
-so, and warns that those numbers can differ from what the section will render.
+the current generation window** shows scene-wide numbering instead.
 
 | Chip | What it contributes |
 |---|---|
@@ -171,13 +164,17 @@ so, and warns that those numbers can differ from what the section will render.
 | **Reference** | Context for a staged Reference or a prompt identity. |
 | **Vocal Event** | A managed piece of speech or song. |
 | **Prompt Link** | A link to an earlier prompt section. |
-| **Custom** | Your own text, optionally bound to an H3 physical Guide. |
+| **Custom** | Your own text. |
 
 ![A prompt section in Structured mode: chips inline inside a channel and in the section's own context row, with @mentions written directly into the prose](images/prompt-structured-chips.webp)
 
-Overrides on a chip disclose by **state, not category**: fields still following
-their source collapse into one line naming the most specific source in play,
-while an actual override always stays visible.
+Fields following a source appear in a collapsed row naming that source.
+Expand the row to change them. Fields you have overridden stay visible.
+
+Leave optional fields empty when you have nothing to add. A field following
+a source can still contribute that source's text; switch off that capability
+for the field if you want no contribution. If an advisory names a missing
+field, use its **Fix** to open the field and supply the requested detail.
 
 ## Writing aids
 
@@ -194,6 +191,26 @@ Generic formats offer dialogue, voiceover, group speech, singing, scene
 transition, cutoff, visible text, camera motion and framing. Some take fields —
 dialogue asks for a language, camera motion offers a list of moves — and what
 they insert is ordinary text you can edit afterwards.
+
+## Prompt Relay
+
+Prompt Relay lets a supported model use different prompts during one
+generation. Install [kijai's ComfyUI-PromptRelay](https://github.com/kijai/ComfyUI-PromptRelay)
+and use its workflow for your model. Add **Sonder Prompt Relay Bridge**,
+with `project` wired from **Sonder Editor**.
+
+| Bridge output | Connect to |
+|---|---|
+| `global_prompt` | The Relay encoder's `global_prompt` input, for scene-wide text |
+| `smart_prompt` | **Prompt Relay Encode (Smart)**'s `smart_prompt`, with timed sections |
+| `local_prompts` | **Prompt Relay Encode**'s `local_prompts`, for the manual route |
+| `segment_lengths` | **Prompt Relay Encode**'s `segment_lengths`, alongside `local_prompts` |
+
+Choose the Smart route or the manual pair. If Global is empty, the Smart
+encoder also uses the first local segment as its global prompt. Feed the
+Relay encoder your model, CLIP and sampled latent, then connect both its
+`model` and `positive` outputs onward to the sampler. Follow the dependency's
+model-specific example and avoid combining it with other attention patchers.
 
 ## Prompt identities
 
@@ -213,13 +230,10 @@ relationship but leaves the identity visible for repair.
 Identities live under **Identity Prompting**, beside **Reference Prompting** in
 Prompt Management. Which identity kinds exist is declared by your prompt format.
 
-**Reference Prompting** shows the physical media your prompt format asks for —
-editable handles and per-member defaults — and, below that, the prompt text each
-staged Reference derives from its lane recipe, read-only, with whether it falls
-in the current generation window and which parts the recipe added. The derived list
-does not depend on the format declaring anything, so it is there on the default
-Generic format too. Edit that text in Reference Lane Setup; this screen reports
-it.
+For member defaults and staged-item text, use
+[Reference Prompting](references.md#reference-prompting). To create an H3
+Subject while attaching a chip, follow
+[New Subject](references.md#minimax-h3-full-reference).
 
 ## Structured and Writing Prompt modes
 
@@ -267,10 +281,6 @@ resets every block to an equal share of the scene.
 
 ![The Writing mode tool row above the allocation strip, with seven blocks showing their frame lengths, timecodes and per-block context rows](images/writing-mode-allocation.webp)
 <p align="center"><em><strong>Restore draft</strong> appears only while a draft is stashed, which is what makes <strong>Reset from sections</strong> safe to press.</em></p>
-
-Applying an unchanged draft is safe: muted state, per-channel global opt-outs,
-stable empty sections, and internal Prompt Link identities all survive it, as
-does a deliberate split or merge.
 
 Drafts are saved in your browser, per project and scene — not in the project.
 They don't travel to another machine, and clearing site data loses them.

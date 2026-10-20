@@ -78,7 +78,7 @@ import {
     normalizePromptAttachment,
     splitWritingPromptDocument,
     setPromptAttachmentCapabilityEnabled,
-    requestAttachmentFieldFocus,
+    openAttachmentChipOnField,
 } from "./prompt_context_chips.js";
 import { getProjectVersion } from "./api_client.js";
 import { notifyInfo, notifySuccess, notifyWarning } from "./editor_notifications.js";
@@ -1779,18 +1779,8 @@ Server value: ${serverValue}` : ""}`;
                     const fix = makeBtn("Fix", "Open this chip on the missing field");
                     fix.style.marginLeft = "6px";
                     fix.addEventListener("mousedown", (event) => event.preventDefault());
-                    fix.addEventListener("click", () => {
-                        const chips = [...panel.querySelectorAll(
-                            "[data-node-type='attachment'][data-attachment-id]")].filter(
-                            (chip) => chip.dataset.attachmentId === row.attachment_id);
-                        const chip = chips.find((value) => !row.origin || value.closest(
-                            "[data-sonder-prompt-origin]")?.dataset.sonderPromptOrigin === row.origin)
-                            || chips[0];
-                        if (!chip) return;
-                        chip.scrollIntoView?.({ block: "nearest" });
-                        requestAttachmentFieldFocus(row.attachment_id, row.field);
-                        chip.click();
-                    });
+                    fix.addEventListener("click", () => openAttachmentChipOnField(panel, {
+                        attachmentId: row.attachment_id, origin: row.origin, field: row.field }));
                     detail.appendChild(fix);
                     diagnostics.appendChild(detail);
                 }

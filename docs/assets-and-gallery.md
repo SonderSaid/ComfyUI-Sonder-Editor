@@ -191,20 +191,13 @@ built for take review.
 
 ## Export timeline
 
-First play the intended result in the editor. Click **Export** above the
-timeline, choose the scene or selection range, the save preset, and whether
-to include video and audio. **High Quality MP4** is the starting choice for
-ordinary playback. Open the saved file to verify its picture, sound and
-duration. Export saves the arranged result; it does not generate new motion,
-upscale it with a model, or automatically join every scene in a project.
-
-The toolbar's **Export** button renders the timeline itself (full scene or
-active selection) to a file through a streaming compositing path:
+Export saves the arranged picture and sound of one scene. For the steps, see
+[Export the timeline](getting-started.md#export-the-timeline).
+The toolbar's **Export** dialog offers:
 
 - **Save presets** — Compatible MP4, High Quality MP4, Editing Master MP4,
   ProRes 422 HQ, Lossless FFV1 (RGB), or Custom with expert encode
-  controls. Video presets encode and tag BT.709, and timeline decoding
-  honors source color tags, so exports match the browser preview.
+  controls.
 - **Include video / audio** checkboxes, and **Place as take** to drop the
   result straight onto a fresh lane in the active scene (with optional
   linked, muted take placement).
@@ -213,31 +206,21 @@ active selection) to a file through a streaming compositing path:
 
 ## Audio fidelity
 
-Editor AUDIO and timeline export share floating-point mixing, preserving timing,
-track balance and dynamics. Source decoding retains native rates; scene mixing
-uses the highest audible source rate across the scene. New WAV sidecars use the
-prepared mix's rate, including any conversion required by the delivery codec.
-Mono sources retain their level when duplicated into the stereo mix.
-Intermediate AUDIO may exceed full scale without clipping.
+Saved and previewed results may be lowered in volume to leave peak headroom.
+The completion message reports a reduction; quiet material is not boosted.
+Check the result in the gallery before delivery.
 
-Saved and previewed results may receive one constant, linked gain reduction to
-leave approximately 1 dB of peak headroom. Completion messages report any reduction;
-generation provenance records the rate, precision, measured peaks and applied gain.
-Quiet material is never boosted. Encoded audio is checked for overload before
-video encoding. Timeline sidecars bypass delivery compression and carry the same
-gain. Existing sidecars remain unchanged.
+A video export has no audio stream when its window has no audible tracks.
+For an audio-only export, a silent window still produces a file. If corrupt
+audio blocks an export, the error names the source to replace or mute.
 
-Video exports omit the audio stream when the selected window has no audible
-contributors, including muted, hidden, or zero-volume tracks. Audio-only exports
-of silent windows still produce a file. Consecutive windows can therefore have
-different stream layouts. Missing files are logged; corrupt audio blocks only a
-window that uses it and names the source.
+If **Sonder Save Video** or Preview cannot prepare supplied audio, it keeps
+the video and shows a warning about the missing sound. Check that warning
+before using the file.
 
-If supplied AUDIO cannot be prepared, Save Video and Preview keep the video and
-show a persistent warning explaining the missing audio. Failed take-audio
-placement also warns while retaining the delivered video. Routine headroom
-notices dismiss automatically. Editing Master audio-only exports use `.flac`;
-check FLAC-in-MP4 support in your target NLE before choosing its video preset.
+Choose the delivery format your editing or playback software accepts.
+**Editing Master MP4** uses FLAC audio; check that your editor can read it
+inside MP4. Audio-only exports with that preset use `.flac`.
 
 | Preset | Audio delivery |
 |---|---|
@@ -247,10 +230,9 @@ check FLAC-in-MP4 support in your target NLE before choosing its video preset.
 | ProRes 422 HQ | PCM, 24-bit |
 | Lossless FFV1 (RGB) | FLAC, 24-bit |
 
-Integer delivery uses rounding and triangular dither once; digital silence stays
-silent. Lossless audio codecs preserve this prepared PCM representation.
-Explicit Custom choices retain their meaning, including 16-bit PCM. Live browser
-scheduling and device output can differ from an offline render.
+**Custom** lets you choose other audio settings, including 16-bit PCM.
+Browser playback can sound different from the saved file; listen to the
+export in its target player or editor.
 
 ## Gallery & overlay shortcuts
 

@@ -15,8 +15,8 @@ editor steps, then what your graph needs for it. First
 | Regenerate a section of a clip | Masked (in-context) generation | [Redo a part of a clip](#redo-a-part-of-a-clip) |
 | Set keyframes at any point in your video | Image conditioning at chosen frames | [Guide with frames](#guide-with-frames) |
 | Steer a generation with a control video (pose, depth, edges, style…) | A video control input | [Drive with a control video](#drive-with-a-control-video) |
-| Use your own character or place | An image (or audio) reference input | [Use a Reference](references.md) |
-| Use several References as separate inputs | Separate reference inputs (MiniMax H3, for example) | [Use References with separate inputs](references.md) |
+| Use your own character or place | An image (or audio) reference input | [Use a Reference](#use-a-reference) |
+| Use several References as separate inputs | Separate reference inputs (MiniMax H3, for example) | [Use References with separate inputs](#use-references-with-separate-inputs) |
 | Save the finished scene as a file | Nothing: no graph runs | [Export the timeline](#export-the-timeline) |
 
 ## Make a first take
@@ -274,6 +274,110 @@ for that kind of signal, such as an IC-LoRA.
 **Learn more:** [Driver clips](editor-basics.md#driver-clips) ·
 Worked example: the [LTX 2.3 Playground](../README.md#examples) drives an LTX
 IC-LoRA this way.
+
+## Use a Reference
+
+**Goal:** use your own character, place or voice to condition a generation.
+
+**Your model needs:** an [image or audio reference input](generating.md#what-your-model-needs),
+in a graph that already generates. Choose a
+[Reference lane recipe](references.md#recipes-and-reference-lane-setup) that
+matches what that input accepts.
+
+**In the editor:**
+1. Drag your source files into **Assets**. Open the **References** tab at the
+   upper left, click **+**, fill **Name** and click **Save**.
+2. Click the new [Reference](references.md#reference-library) to expand it,
+   then **+ Member**. Click **Image**, **Audio** or **Video**, choose the
+   asset with **Select**, fill **Member name** and **Prompt**, then **Save**.
+3. Drag the member from **References** onto the timeline ruler to create a
+   [Reference lane](references.md#reference-lanes). Move or trim the item to
+   cover the range where it should apply.
+4. In **Reference Lane Setup**, which opens on the first item, choose
+   **Recipe → Template** to match your model's input. If it did not open,
+   click **☰** on the Reference lane header.
+5. Set **In** and **Out** in the **GEN** box inside the item's range; set
+   **Ctx: Pre**, **Post** and both **Mask** fields to `0` for this first run.
+   Check that the item reads [In window](references.md#what-a-generation-window-resolves-to).
+6. Write the action in a **Prompt** section. To include the Reference's text,
+   [attach a Context chip](references.md#attaching-a-context-chip).
+   In **Render Queue**, untick **Queue Active**.
+
+**In the graph:**
+1. Add **Sonder Reference Selector** and connect **Sonder Editor**'s `project`
+   to it. In the Selector's lane list, click **+** and select your lane.
+2. Connect `reference_set` to **Sonder Reference Image Bridge** for images,
+   or **Sonder Reference Audio Bridge** for audio. Connect `r01` or `a01` to
+   your model's reference input; use more outputs if the recipe calls for them.
+3. On the Bridge, set **unused_slots** to `nothing` for optional inputs that
+   should receive no reference. Use `placeholder` for required inputs that
+   need a value. See [unused outputs](references.md#wiring-the-nodes).
+4. Connect the editor's `prompt` to your text encoder. If you need the
+   recipe text separately, use **Sonder Reference Prompt Bridge** from the
+   same `reference_set` and wire `reference_prompt` to the matching text input
+   instead of also attaching that text as a chip.
+5. For windows without a Reference, use `has_reference` to select the
+   conditioned or unconditioned branch with **Sonder Switch** or
+   **Sonder Cluster**. Keep the Bridges on the conditional branch so they
+   are skipped when `has_reference` is `0`.
+6. Save the decoded result with **Sonder Save Video**, `project` from the
+   editor and **mode** **Take**, then click **Run**.
+
+**You'll see:** a new [take](assets-and-gallery.md#takes) generated with the
+Reference input. How strongly it follows the media depends on your model.
+
+**Learn more:** [Wiring the Reference nodes](references.md#wiring-the-nodes) ·
+[Reference prompting](references.md#reference-prompting).
+There is no shipped generic Reference example; add these nodes to your
+model's working graph.
+
+## Use References with separate inputs
+
+**Goal:** send several References to separate model inputs, with a prompt
+that names their roles.
+
+**Your model needs:** [separate reference inputs](generating.md#what-your-model-needs)
+and a matching [Slots recipe](references.md#recipes-and-reference-lane-setup).
+For MiniMax H3, use its reference-to-video model mode.
+
+**In the editor:**
+1. Add your Library members and stage the first as in
+   [Use a Reference](#use-a-reference). In **Reference Lane Setup**, expand
+   that item's options and click **+ Add member** to include another Library
+   member in the same item. Use [separate lanes](references.md#use-cases)
+   for different timing or recipes.
+2. In each lane's **Reference Lane Setup → Recipe → Template**, select the
+   matching slot recipe. For H3 images, choose **MiniMax H3 Pictures**.
+   Use **↑** / **↓** beside the staged members to put inputs in the order you want.
+3. Choose the appropriate **Channels** template above the timeline. For H3,
+   choose **MiniMax H3 (full reference)**, then follow
+   [Subject or Picture setup](references.md#minimax-h3-full-reference).
+4. Write the action in a **Prompt** section. Attach chips for the sources
+   it uses, and fill any fields named by the prompt advisories.
+5. Set **In** and **Out**, check which items are **In window**, and untick
+   **Queue Active** in **Render Queue**.
+
+**In the graph:**
+1. Connect `project` from **Sonder Editor** to **Sonder Reference Selector**.
+   Use its **+** lane picker to select the staged lanes. Use separate
+   Selectors for incompatible recipes or media kinds.
+2. Connect each Selector's `reference_set` to its Image or Audio Bridge.
+   Wire the numbered outputs to the corresponding numbered model inputs,
+   preserving lane and member order.
+3. Set **unused_slots** for required or optional inputs; for H3's optional
+   reference inputs use `nothing`. Gate empty Reference branches with
+   `has_reference`, as in
+   [Use a Reference](#use-a-reference).
+4. Connect the editor's `prompt` to the text encoder. For H3, set the
+   consuming node's **ref_image_size** to `max`, and use the `ref2va`
+   model choice.
+5. Save with **Sonder Save Video**, **mode** **Take**, then click **Run**.
+
+**You'll see:** a take conditioned by the numbered inputs. The prompt's
+Reference labels follow the selected generation window.
+
+**Learn more:** [MiniMax H3 prompting](references.md#minimax-h3-full-reference) ·
+Worked example: [Sonder MiniMax H3 References](../example_workflows/sonder_minimax_h3_references.json).
 
 ## Export the timeline
 

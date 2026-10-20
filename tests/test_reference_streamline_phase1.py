@@ -400,3 +400,42 @@ def test_retention_diagnostic_expands_and_focuses_its_field_without_writing():
     assert result == {"plain": {"focused": False, "expanded": False, "cancelled": None},
                       "fix": {"focused": True, "expanded": True, "cancelled": None},
                       "other": False, "after": False, "unchanged": True}
+
+
+def test_retention_fix_opens_a_section_attached_chip_as_well_as_an_inline_one():
+    # The Fix button once looked only for chips placed in prompt text, so a chip
+    # attached through + Attach -- the H3 route the docs teach -- did nothing.
+    result = _run_chip_dom_script(r'''
+        const chip = {attachment_id:'chip',kind:'reference',source:{semantic_unit_ids:['hero']},config:{}};
+        const panel = document.createElement('div');
+        const host = (origin) => { const el = document.createElement('div');
+            el.dataset.sonderPromptOrigin = origin; panel.appendChild(el); return el; };
+        // A projection shares the id but opens nothing; it must be skipped.
+        const projection = document.createElement('button');
+        projection.dataset.attachmentId = 'chip';
+        host('first').appendChild(projection);
+        const opened = [];
+        const row = (origin, disabled = false) => host(origin).appendChild(mod.createScopeChipRow({
+            attachments:[chip], disabled, onActivate:(value) => opened.push([origin, value.attachment_id])}));
+        row('first'); row('live');
+        const inline = document.createElement('span');
+        inline.dataset.nodeType = 'attachment'; inline.dataset.attachmentId = 'inline';
+        inline.click = () => opened.push(['inline', 'inline']);
+        host('live').appendChild(inline);
+        const all = n => [n,...n.children.flatMap(all)];
+        const menus = () => all(document.body).filter(n => n.attributes.role === 'menu').length;
+        const scoped = mod.openAttachmentChipOnField(panel,
+            {attachmentId:'chip', origin:'live', field:'retention_detail'});
+        const anyOrigin = mod.openAttachmentChipOnField(panel, {attachmentId:'chip'});
+        const inText = mod.openAttachmentChipOnField(panel, {attachmentId:'inline'});
+        const missing = mod.openAttachmentChipOnField(panel, {attachmentId:'nope'});
+        const locked = document.createElement('div');
+        locked.appendChild(mod.createScopeChipRow({attachments:[chip], disabled:true,
+            onActivate:() => opened.push(['locked', 'chip'])}));
+        const disabled = mod.openAttachmentChipOnField(locked, {attachmentId:'chip'});
+        console.log(JSON.stringify({scoped, anyOrigin, inText, missing, disabled, opened,
+            menus: menus()}));
+    ''')
+    assert result == {"scoped": True, "anyOrigin": True, "inText": True, "missing": False,
+                      "disabled": False, "menus": 0,
+                      "opened": [["live", "chip"], ["first", "chip"], ["inline", "inline"]]}

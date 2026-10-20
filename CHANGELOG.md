@@ -38,6 +38,7 @@ a fresh `[Unreleased]` block.
 - Sonder Control Relay node: a workflow's Controls menu. It exposes existing node settings, a Sonder Selector's feature list included, in the Controls sidebar with labels, groups and Markdown notes, and the Sonder App reads the same menu from an Export (API) workflow. The settings stay on their own nodes, and a copied node is never exposed twice.
 
 ### Changed
+- Reorganized the documentation around step-by-step goals, with new pages for Controls and the Sonder App.
 - A mounted editor tab is titled after its project ("Project · Sonder Editor") and follows a project switch.
 - Enqueue errors about a Reference staged in two slots, or missing its definition, name the Reference ("Entity · Member") instead of printing its id.
 - The built-in **LTX 2.3** model template is now labelled **LTX 2.3 / 2.5**: LTX 2.5 uses the same frame and size rules. Projects and workflows that use it are unchanged.

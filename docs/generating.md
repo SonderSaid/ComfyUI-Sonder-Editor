@@ -45,8 +45,9 @@ either.
 - **Context frames (Ctx Pre/Post)** extend the source window beyond the
   selection, feeding your graph already-rendered frames for generation
   overlap — this is what makes seamless chaining possible.
-- **Mask offsets (Mask −/+)** fine-tune which of those context frames are
-  masked for regeneration versus passed through untouched.
+- **Mask offsets (Mask −/+)** move the start and end of the region the
+  Masks Bridge marks for regeneration. Check the mask against your intended
+  edit before running; these values do not change In/Out.
 - **Saved Selections** (the bookmark button) capture the *full* recall state
   — in/out, context, and mask offsets — and live in the project, so they're
   shareable, unlike the live selection.
@@ -323,11 +324,11 @@ edits affect a queued job and which don't.
 | **Context frames** | pre + post as set at queue time |
 | **Mask offsets** | mask − / mask + values |
 | **Guides** | every guide in the window: image, frame, strength, mute state |
-| **Prompts** | canonical documents/Context chips, complete immutable profile and hash, setup/ordinal manifest, chronological Relay channels, diagnostics, and the byte-exact final compiled prompt |
-| **References** | effective winning Reference inputs and the resolved MiniMax H3 setup slot plan, when used |
+| **Prompts** | prompt text, format, resolved Context chips and Prompt Relay sections |
+| **References** | the winning Reference inputs, their fitting settings and H3 input order, when used |
 | **Drivers** | Driver clip snapshots and lane configuration |
 | **Scene geometry** | width, height, FPS at queue time |
-| **Model template** | template id and frame rule — later switches never re-snap a job |
+| **Model template** | the selected template and its frame rule |
 | **Take placement mode** | trimmed/untrimmed, per job |
 
 ### Still live at execution time
@@ -344,11 +345,7 @@ Rules of thumb:
 
 - Edit **conditioning** (guides, prompts, References, Drivers, geometry, template)
   *before* queueing — those are locked per job.
-- **Picture is live, and that cuts both ways.** Clips and audio render as
-  they are at the moment a job executes. That's what lets a later batch
-  chunk read earlier chunks' placed takes — but it also means muting,
-  moving, or trimming content that a pending job expects to read (for
-  example, a clip inside its pre-context window) changes that job's result.
-  While jobs are pending or running, leave the timeline content inside their
-  windows alone; edit freely outside them.
+- Clips and audio are read when the job runs. Muting, moving or trimming
+  content inside a pending job's window changes what it receives. Leave that
+  content in place until the job finishes.
 - The queue row always shows the frozen range/context/mask.
